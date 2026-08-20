@@ -4,7 +4,7 @@
 
 Magnetar is an open-source compute runtime written in Rust for executing AI workloads across heterogeneous hardware.
 
-Unlike traditional inference engines, Magnetar is **hardware-agnostic** and **model-agnostic**. It provides a portable execution layer capable of orchestrating computation graphs on CPUs, GPUs, NPUs, TPUs and future accelerators through a modular plugin architecture.
+Unlike traditional inference engines, Magnetar is **hardware-agnostic** and **model-agnostic**. It provides a portable execution layer capable of orchestrating computation graphs on CPUs, GPUs, NPUs, TPUs and future accelerators through a modular provider architecture.
 
 The goal of Magnetar is not to replace machine learning frameworks, but to become the execution runtime sitting between AI applications and compute devices.
 
@@ -43,7 +43,7 @@ Instead of coupling model implementations to hardware-specific code, Magnetar se
 
 - **Hardware Agnostic**
 - **Model Agnostic**
-- **Plugin First**
+- **Provider First**
 - **Compiler Driven**
 - **Zero Vendor Lock-in**
 - **Portable Execution**
@@ -70,7 +70,8 @@ Instead of coupling model implementations to hardware-specific code, Magnetar se
 | Graph Optimizer                                           |
 | Memory Planner                                            |
 | Device Manager                                            |
-| Plugin Loader                                             |
+| Provider Loader                                             |
+| Capability Registry                                       |
 +-------------------------+---------------------------------+
                           |
         +-----------------+-----------------------------+
@@ -89,27 +90,27 @@ Magnetar is organized as a collection of independent crates.
 
 ```text
 magnetar
-├── magnetar-runtime
-├── magnetar-core
-├── magnetar-ir
-├── magnetar-compiler
-├── magnetar-memory
-├── magnetar-plugin
-├── magnetar-device
-├── magnetar-kernel
-│
-├── magnetar-cpu
-├── magnetar-cuda
-├── magnetar-metal
-├── magnetar-vulkan
-├── magnetar-openvino
-├── magnetar-qnn
-├── magnetar-webgpu
-│
-├── magnetar-gguf
-├── magnetar-huggingface
-├── magnetar-onnx
-└── magnetar-safetensors
+â”œâ”€â”€ magnetar-runtime
+â”œâ”€â”€ magnetar-core
+â”œâ”€â”€ magnetar-ir
+â”œâ”€â”€ magnetar-compiler
+â”œâ”€â”€ magnetar-memory
+â”œâ”€â”€ magnetar-provider
+â”œâ”€â”€ magnetar-device
+â”œâ”€â”€ magnetar-kernel
+â”‚
+â”œâ”€â”€ magnetar-cpu
+â”œâ”€â”€ magnetar-cuda
+â”œâ”€â”€ magnetar-metal
+â”œâ”€â”€ magnetar-vulkan
+â”œâ”€â”€ magnetar-openvino
+â”œâ”€â”€ magnetar-qnn
+â”œâ”€â”€ magnetar-webgpu
+â”‚
+â”œâ”€â”€ magnetar-gguf
+â”œâ”€â”€ magnetar-huggingface
+â”œâ”€â”€ magnetar-onnx
+â””â”€â”€ magnetar-safetensors
 ```
 
 ---
@@ -118,29 +119,29 @@ magnetar
 
 ```text
           Model
-            │
-            ▼
+            â”‚
+            â–¼
      Model Loader
-            │
-            ▼
+            â”‚
+            â–¼
      Intermediate Graph
-            │
-            ▼
+            â”‚
+            â–¼
       Graph Compiler
-            │
-            ▼
+            â”‚
+            â–¼
     Optimization Passes
-            │
-            ▼
+            â”‚
+            â–¼
      Execution Planner
-            │
-            ▼
+            â”‚
+            â–¼
          Scheduler
-            │
-            ▼
+            â”‚
+            â–¼
      Selected Backend
-            │
-            ▼
+            â”‚
+            â–¼
          Hardware
 ```
 
@@ -171,6 +172,10 @@ Runtime / RuntimeBuilder ----> registered Backend implementations
     |                                  |
     v                                  v
 ExecutionContext                   Device implementations
+
+Components declare WIT capability imports. The runtime resolves those imports
+through the Capability Registry to one or more Providers; the first matching
+Provider is used first and the remaining compatible Providers are fallbacks.
 ```
 
 ### Public API example
@@ -201,7 +206,7 @@ runtime.shutdown();
 - Automatic backend selection
 - Capability-aware execution
 
-### Plugins
+### Providers
 
 - Dynamic loading
 - Independent versioning
@@ -231,7 +236,7 @@ Planned support:
 
 - Runtime
 - CPU backend
-- Plugin API
+- Provider API
 
 ### Phase 2
 
@@ -287,7 +292,7 @@ without requiring a garbage collector.
 
 ---
 
-## 📄 License
+## ðŸ“„ License
 
 Distributed under the MIT License. See `LICENSE` for more information.
 
@@ -295,6 +300,6 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 ## Status
 
-⚠️ Magnetar is in active development.
+âš ï¸ Magnetar is in active development.
 
 The architecture is evolving rapidly and APIs should be considered unstable until the first stable release.

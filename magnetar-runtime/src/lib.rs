@@ -1,4 +1,4 @@
-//! Hardware-agnostic runtime contracts and plugin support for Magnetar.
+//! Hardware-agnostic runtime contracts and provider support for Magnetar.
 
 use libloading::Library;
 use std::{
@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-pub const PLUGIN_API_VERSION: u32 = 1;
+pub const PROVIDER_API_VERSION: u32 = 1;
 
 /// A WIT interface identified by its package-qualified name and version.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -394,22 +394,22 @@ pub trait Device: Send + Sync {
     fn device_type(&self) -> DeviceType;
 }
 
-/// A hardware execution contribution. It is distinct from [`Plugin`].
+/// A hardware execution contribution. It is distinct from [`Provider`].
 pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
     fn devices(&self) -> Vec<Arc<dyn Device>>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PluginMetadata {
+pub struct ProviderMetadata {
     pub name: String,
     pub version: String,
     pub vendor: String,
     pub api_version: u32,
     pub description: String,
-    pub capabilities: PluginCapabilities,
+    pub capabilities: BTreeSet<Capability>,
 }
-impl PluginMetadata {
+impl ProviderMetadata {
     pub fn new(
         name: impl Into<String>,
         version: impl Into<String>,
@@ -420,46 +420,80 @@ impl PluginMetadata {
             name: name.into(),
             version: version.into(),
             vendor: vendor.into(),
-            api_version: PLUGIN_API_VERSION,
+            api_version: PROVIDER_API_VERSION,
             description: description.into(),
-            capabilities: PluginCapabilities::default(),
+            capabilities: BTreeSet::new(),
         }
     }
 }
 
-/// Categories reserved for plugins. Backends are the only implemented category today.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PluginCapabilities {
-    pub backend: bool,
-    pub model_loader: bool,
-    pub kernel_provider: bool,
-    pub compiler_pass: bool,
-    pub scheduler_extension: bool,
-    pub telemetry_provider: bool,
+/// A discovered provider library and the metadata it declares.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderDescriptor {
+    pub metadata: ProviderMetadata,
+    pub artifact_path: PathBuf,
 }
 
-/// General extension contract; a plugin may register any supported contribution.
-pub trait Plugin: Send + Sync {
-    fn metadata(&self) -> PluginMetadata;
-    fn register(&self, registry: &mut Registry) -> Result<(), PluginError>;
-    fn initialize(&self) -> Result<(), PluginError> {
+/// A versioned WIT contract that a provider can implement.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Capability {
+    pub name: String,
+    pub version: String,
+}
+impl Capability {
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+        }
+    }
+}
+impl From<WitInterface> for Capability {
+    fn from(interface: WitInterface) -> Self {
+        Self::new(interface.name, interface.version)
+    }
+}
+impl From<&WitInterface> for Capability {
+    fn from(interface: &WitInterface) -> Self {
+        Self::new(&interface.name, &interface.version)
+    }
+}
+
+/// General extension contract; a provider may register any supported contribution.
+pub trait Provider: Send + Sync {
+    fn metadata(&self) -> ProviderMetadata;
+    fn register(&self, registry: &mut ProviderRegistry) -> Result<(), ProviderError>;
+    fn initialize(&self) -> Result<(), ProviderError> {
         Ok(())
     }
-    fn shutdown(&self) -> Result<(), PluginError> {
+    fn shutdown(&self) -> Result<(), ProviderError> {
         Ok(())
     }
 }
 
-/// Receives plugin contributions.
+/// Receives provider contributions.
 #[derive(Clone, Default)]
-pub struct Registry {
+pub struct ProviderRegistry {
     backends: BTreeMap<String, Arc<dyn Backend>>,
+    capabilities: BTreeMap<Capability, BTreeSet<String>>,
 }
-impl Registry {
-    pub fn register_backend(&mut self, backend: Arc<dyn Backend>) -> Result<(), PluginError> {
+impl ProviderRegistry {
+    pub fn register_capabilities(
+        &mut self,
+        provider: &str,
+        capabilities: impl IntoIterator<Item = Capability>,
+    ) {
+        for capability in capabilities {
+            self.capabilities
+                .entry(capability)
+                .or_default()
+                .insert(provider.into());
+        }
+    }
+    pub fn register_backend(&mut self, backend: Arc<dyn Backend>) -> Result<(), ProviderError> {
         let name = backend.name().to_owned();
         if self.backends.contains_key(&name) {
-            return Err(PluginError::BackendAlreadyRegistered(name));
+            return Err(ProviderError::BackendAlreadyRegistered(name));
         }
         self.backends.insert(name, backend);
         Ok(())
@@ -470,70 +504,93 @@ impl Registry {
     pub fn backend_names(&self) -> impl Iterator<Item = &str> {
         self.backends.keys().map(String::as_str)
     }
+    /// Returns compatible providers in deterministic preference order.
+    pub fn providers_for(&self, capability: &Capability) -> impl Iterator<Item = &str> {
+        self.capabilities
+            .get(capability)
+            .into_iter()
+            .flat_map(|providers| providers.iter().map(String::as_str))
+    }
+    pub fn has_capability(&self, capability: &Capability) -> bool {
+        self.capabilities.contains_key(capability)
+    }
     fn clear(&mut self) {
         self.backends.clear();
+        self.capabilities.clear();
     }
 }
 
 #[derive(Default)]
-pub struct PluginManager {
-    registry: Registry,
-    plugins: BTreeMap<String, Arc<dyn Plugin>>,
+pub struct ProviderLoader {
+    registry: ProviderRegistry,
+    providers: BTreeMap<String, Arc<dyn Provider>>,
     order: Vec<String>,
-    /* declared last: unloaded after plugin drops */ libraries: Vec<Library>,
+    /* declared last: unloaded after provider drops */ libraries: Vec<Library>,
 }
-impl PluginManager {
+impl ProviderLoader {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn registry(&self) -> &Registry {
+    pub fn registry(&self) -> &ProviderRegistry {
         &self.registry
     }
-    pub fn registry_mut(&mut self) -> &mut Registry {
+    pub fn registry_mut(&mut self) -> &mut ProviderRegistry {
         &mut self.registry
     }
-    pub fn plugin(&self, name: &str) -> Option<&dyn Plugin> {
-        self.plugins.get(name).map(AsRef::as_ref)
+    pub fn provider(&self, name: &str) -> Option<&dyn Provider> {
+        self.providers.get(name).map(AsRef::as_ref)
     }
-    pub fn plugin_names(&self) -> impl Iterator<Item = &str> {
-        self.plugins.keys().map(String::as_str)
+    pub fn provider_names(&self) -> impl Iterator<Item = &str> {
+        self.providers.keys().map(String::as_str)
     }
-    pub fn register_plugin(&mut self, plugin: Arc<dyn Plugin>) -> Result<(), PluginError> {
-        let metadata = plugin.metadata();
-        if metadata.api_version != PLUGIN_API_VERSION {
-            return Err(PluginError::IncompatibleApiVersion {
-                plugin: metadata.name,
-                expected: PLUGIN_API_VERSION,
+    pub fn resolve_providers(&self, capability: &Capability) -> Vec<&dyn Provider> {
+        self.registry
+            .providers_for(capability)
+            .filter_map(|name| self.provider(name))
+            .collect()
+    }
+    pub fn register_provider(&mut self, provider: Arc<dyn Provider>) -> Result<(), ProviderError> {
+        let metadata = provider.metadata();
+        if metadata.api_version != PROVIDER_API_VERSION {
+            return Err(ProviderError::IncompatibleApiVersion {
+                provider: metadata.name,
+                expected: PROVIDER_API_VERSION,
                 found: metadata.api_version,
             });
         }
-        if self.plugins.contains_key(&metadata.name) {
-            return Err(PluginError::PluginAlreadyRegistered(metadata.name));
+        if self.providers.contains_key(&metadata.name) {
+            return Err(ProviderError::ProviderAlreadyRegistered(metadata.name));
         }
         let previous = self.registry.clone();
-        if let Err(error) = plugin
+        if let Err(error) = provider
             .register(&mut self.registry)
-            .and_then(|()| plugin.initialize())
+            .and_then(|()| provider.initialize())
         {
             self.registry = previous;
             return Err(error);
         }
+        self.registry
+            .register_capabilities(&metadata.name, metadata.capabilities);
         self.order.push(metadata.name.clone());
-        self.plugins.insert(metadata.name, plugin);
+        self.providers.insert(metadata.name, provider);
         Ok(())
+    }
+    /// Registers a provider without allowing one failed extension to abort runtime startup.
+    pub fn register_provider_isolated(&mut self, provider: Arc<dyn Provider>) -> bool {
+        self.register_provider(provider).is_ok()
     }
     pub fn discover(
         paths: impl IntoIterator<Item = impl AsRef<Path>>,
-    ) -> Result<Vec<PathBuf>, PluginError> {
+    ) -> Result<Vec<PathBuf>, ProviderError> {
         let mut found = BTreeSet::new();
         for dir in paths {
             let dir = dir.as_ref();
-            for entry in std::fs::read_dir(dir).map_err(|source| PluginError::Discovery {
+            for entry in std::fs::read_dir(dir).map_err(|source| ProviderError::Discovery {
                 path: dir.into(),
                 source,
             })? {
                 let path = entry
-                    .map_err(|source| PluginError::Discovery {
+                    .map_err(|source| ProviderError::Discovery {
                         path: dir.into(),
                         source,
                     })?
@@ -550,45 +607,56 @@ impl PluginManager {
         }
         Ok(found.into_iter().collect())
     }
-    /// Loads a compatible Rust library exporting `magnetar_plugin_create`.
-    pub unsafe fn load_dynamic(&mut self, path: impl AsRef<Path>) -> Result<(), PluginError> {
+    /// Loads a compatible Rust library exporting `magnetar_provider_create`.
+    ///
+    /// # Safety
+    ///
+    /// The library must be trusted, remain loaded while its provider is used,
+    /// and export a factory with the exact declared Rust ABI and contract.
+    pub unsafe fn load_dynamic(&mut self, path: impl AsRef<Path>) -> Result<(), ProviderError> {
         let path = path.as_ref();
-        let library = unsafe { Library::new(path) }.map_err(|e| PluginError::Load {
+        let library = unsafe { Library::new(path) }.map_err(|e| ProviderError::Load {
             path: path.into(),
             message: e.to_string(),
         })?;
-        type Factory = unsafe fn() -> Box<dyn Plugin>;
+        type Factory = unsafe fn() -> Box<dyn Provider>;
         let factory =
-            unsafe { library.get::<Factory>(b"magnetar_plugin_create") }.map_err(|e| {
-                PluginError::Load {
+            unsafe { library.get::<Factory>(b"magnetar_provider_create") }.map_err(|e| {
+                ProviderError::Load {
                     path: path.into(),
                     message: e.to_string(),
                 }
             })?;
-        self.register_plugin(Arc::from(unsafe { factory() }))?;
+        self.register_provider(Arc::from(unsafe { factory() }))?;
         self.libraries.push(library);
         Ok(())
     }
+    /// Discovers and loads every compatible provider library in the given paths.
+    ///
+    /// # Safety
+    ///
+    /// Every discovered dynamic library must satisfy the safety requirements of
+    /// [`Self::load_dynamic`].
     pub unsafe fn discover_and_load(
         &mut self,
         paths: impl IntoIterator<Item = impl AsRef<Path>>,
-    ) -> Result<(), PluginError> {
+    ) -> Result<(), ProviderError> {
         for path in Self::discover(paths)? {
             unsafe { self.load_dynamic(path) }?;
         }
         Ok(())
     }
-    pub fn shutdown(&mut self) -> Result<(), PluginError> {
+    pub fn shutdown(&mut self) -> Result<(), ProviderError> {
         let mut first = None;
         for name in self.order.iter().rev() {
-            if let Some(plugin) = self.plugins.get(name) {
-                if let Err(error) = plugin.shutdown() {
-                    first.get_or_insert(error);
-                }
+            if let Some(provider) = self.providers.get(name)
+                && let Err(error) = provider.shutdown()
+            {
+                first.get_or_insert(error);
             }
         }
         self.order.clear();
-        self.plugins.clear();
+        self.providers.clear();
         self.registry.clear();
         self.libraries.clear();
         first.map_or(Ok(()), Err)
@@ -616,7 +684,7 @@ impl ExecutionContext {
 pub struct RuntimeBuilder {
     config: RuntimeConfig,
     backends: Vec<Arc<dyn Backend>>,
-    plugins: Vec<Arc<dyn Plugin>>,
+    providers: Vec<Arc<dyn Provider>>,
 }
 impl RuntimeBuilder {
     pub fn new() -> Self {
@@ -630,24 +698,24 @@ impl RuntimeBuilder {
         self.backends.push(x);
         self
     }
-    pub fn register_plugin(mut self, x: Arc<dyn Plugin>) -> Self {
-        self.plugins.push(x);
+    pub fn register_provider(mut self, x: Arc<dyn Provider>) -> Self {
+        self.providers.push(x);
         self
     }
-    pub fn build(self) -> Result<Runtime, PluginError> {
-        let mut plugins = PluginManager::new();
+    pub fn build(self) -> Result<Runtime, ProviderError> {
+        let mut providers = ProviderLoader::new();
         for x in self.backends {
-            plugins.registry_mut().register_backend(x)?;
+            providers.registry_mut().register_backend(x)?;
         }
-        for x in self.plugins {
-            plugins.register_plugin(x)?;
+        for x in self.providers {
+            providers.register_provider_isolated(x);
         }
         let mut runtime = Runtime {
             context: ExecutionContext {
                 config: self.config,
                 backend_name: None,
             },
-            plugins,
+            providers,
             initialized: true,
         };
         if let Some(x) = runtime.context.config.preferred_backend.clone() {
@@ -658,7 +726,7 @@ impl RuntimeBuilder {
 }
 pub struct Runtime {
     context: ExecutionContext,
-    plugins: PluginManager,
+    providers: ProviderLoader,
     initialized: bool,
 }
 impl Runtime {
@@ -677,18 +745,27 @@ impl Runtime {
     pub fn context(&self) -> &ExecutionContext {
         &self.context
     }
-    pub fn plugins(&self) -> &PluginManager {
-        &self.plugins
+    pub fn providers(&self) -> &ProviderLoader {
+        &self.providers
     }
-    pub fn register_backend(&mut self, x: Arc<dyn Backend>) -> Result<(), PluginError> {
-        self.plugins.registry_mut().register_backend(x)
+    pub fn register_backend(&mut self, x: Arc<dyn Backend>) -> Result<(), ProviderError> {
+        self.providers.registry_mut().register_backend(x)
     }
-    pub fn register_plugin(&mut self, x: Arc<dyn Plugin>) -> Result<(), PluginError> {
-        self.plugins.register_plugin(x)
+    pub fn register_provider(&mut self, x: Arc<dyn Provider>) -> Result<(), ProviderError> {
+        self.providers.register_provider(x)
     }
-    pub fn select_backend(&mut self, name: &str) -> Result<(), PluginError> {
-        if self.plugins.registry().backend(name).is_none() {
-            return Err(PluginError::BackendNotFound(name.into()));
+    /// Resolves all compatible providers, ordered for deterministic fallback.
+    pub fn resolve_providers(&self, capability: &Capability) -> Vec<&dyn Provider> {
+        self.providers.resolve_providers(capability)
+    }
+    /// Resolves providers for a component's WIT import without exposing a
+    /// provider dependency to the component itself.
+    pub fn resolve_component_import(&self, interface: &WitInterface) -> Vec<&dyn Provider> {
+        self.resolve_providers(&Capability::from(interface))
+    }
+    pub fn select_backend(&mut self, name: &str) -> Result<(), ProviderError> {
+        if self.providers.registry().backend(name).is_none() {
+            return Err(ProviderError::BackendNotFound(name.into()));
         }
         self.context.backend_name = Some(name.into());
         Ok(())
@@ -697,22 +774,22 @@ impl Runtime {
         self.context
             .backend_name
             .as_deref()
-            .and_then(|x| self.plugins.registry().backend(x))
+            .and_then(|x| self.providers.registry().backend(x))
     }
     pub fn shutdown(&mut self) {
-        let _ = self.plugins.shutdown();
+        let _ = self.providers.shutdown();
         self.context.backend_name = None;
         self.initialized = false;
     }
 }
 
 #[derive(Debug)]
-pub enum PluginError {
-    PluginAlreadyRegistered(String),
+pub enum ProviderError {
+    ProviderAlreadyRegistered(String),
     BackendAlreadyRegistered(String),
     BackendNotFound(String),
     IncompatibleApiVersion {
-        plugin: String,
+        provider: String,
         expected: u32,
         found: u32,
     },
@@ -727,34 +804,34 @@ pub enum PluginError {
     Registration(String),
     Lifecycle(String),
 }
-impl fmt::Display for PluginError {
+impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PluginAlreadyRegistered(x) => write!(f, "plugin '{x}' is already registered"),
+            Self::ProviderAlreadyRegistered(x) => write!(f, "provider '{x}' is already registered"),
             Self::BackendAlreadyRegistered(x) => write!(f, "backend '{x}' is already registered"),
             Self::BackendNotFound(x) => write!(f, "backend '{x}' is not registered"),
             Self::IncompatibleApiVersion {
-                plugin,
+                provider,
                 expected,
                 found,
             } => write!(
                 f,
-                "plugin '{plugin}' targets API {found}, but Magnetar supports API {expected}"
+                "provider '{provider}' targets API {found}, but Magnetar supports API {expected}"
             ),
             Self::Discovery { path, source } => write!(
                 f,
-                "could not discover plugins in '{}': {source}",
+                "could not discover providers in '{}': {source}",
                 path.display()
             ),
             Self::Load { path, message } => {
-                write!(f, "could not load plugin '{}': {message}", path.display())
+                write!(f, "could not load provider '{}': {message}", path.display())
             }
-            Self::Registration(x) => write!(f, "plugin registration failed: {x}"),
-            Self::Lifecycle(x) => write!(f, "plugin lifecycle operation failed: {x}"),
+            Self::Registration(x) => write!(f, "provider registration failed: {x}"),
+            Self::Lifecycle(x) => write!(f, "provider lifecycle operation failed: {x}"),
         }
     }
 }
-impl Error for PluginError {
+impl Error for ProviderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         if let Self::Discovery { source, .. } = self {
             Some(source)
@@ -781,76 +858,112 @@ mod tests {
             vec![]
         }
     }
-    struct TestPlugin {
-        metadata: PluginMetadata,
+    struct TestProvider {
+        metadata: ProviderMetadata,
         initialized: AtomicBool,
         shut_down: AtomicBool,
         backend: bool,
+        fail_initialization: bool,
     }
-    impl TestPlugin {
+    impl TestProvider {
         fn new(name: &str) -> Self {
             Self {
-                metadata: PluginMetadata::new(name, "1", "test", "test"),
+                metadata: ProviderMetadata::new(name, "1", "test", "test"),
                 initialized: AtomicBool::new(false),
                 shut_down: AtomicBool::new(false),
                 backend: false,
+                fail_initialization: false,
             }
         }
     }
-    impl Plugin for TestPlugin {
-        fn metadata(&self) -> PluginMetadata {
+    impl Provider for TestProvider {
+        fn metadata(&self) -> ProviderMetadata {
             self.metadata.clone()
         }
-        fn register(&self, r: &mut Registry) -> Result<(), PluginError> {
+        fn register(&self, r: &mut ProviderRegistry) -> Result<(), ProviderError> {
             if self.backend {
                 r.register_backend(Arc::new(TestBackend))
             } else {
                 Ok(())
             }
         }
-        fn initialize(&self) -> Result<(), PluginError> {
+        fn initialize(&self) -> Result<(), ProviderError> {
+            if self.fail_initialization {
+                return Err(ProviderError::Lifecycle("unavailable".into()));
+            }
             self.initialized.store(true, Ordering::SeqCst);
             Ok(())
         }
-        fn shutdown(&self) -> Result<(), PluginError> {
+        fn shutdown(&self) -> Result<(), ProviderError> {
             self.shut_down.store(true, Ordering::SeqCst);
             Ok(())
         }
     }
     #[test]
-    fn load_valid_plugin() {
-        let p = Arc::new(TestPlugin::new("valid"));
-        let mut m = PluginManager::new();
-        m.register_plugin(p.clone()).unwrap();
-        assert!(m.plugin("valid").is_some());
+    fn load_valid_provider() {
+        let p = Arc::new(TestProvider::new("valid"));
+        let mut m = ProviderLoader::new();
+        m.register_provider(p.clone()).unwrap();
+        assert!(m.provider("valid").is_some());
         assert!(p.initialized.load(Ordering::SeqCst));
     }
     #[test]
+    fn registers_capabilities_and_resolves_fallbacks_by_name() {
+        let capability = Capability::new("magnetar:runtime/execute", "1.0.0");
+        let mut primary = TestProvider::new("a-primary");
+        primary.metadata.capabilities.insert(capability.clone());
+        let mut fallback = TestProvider::new("z-fallback");
+        fallback.metadata.capabilities.insert(capability.clone());
+        let mut loader = ProviderLoader::new();
+        loader.register_provider(Arc::new(fallback)).unwrap();
+        loader.register_provider(Arc::new(primary)).unwrap();
+
+        assert!(loader.registry().has_capability(&capability));
+        let names = loader
+            .resolve_providers(&capability)
+            .into_iter()
+            .map(|provider| provider.metadata().name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["a-primary", "z-fallback"]);
+    }
+    #[test]
+    fn builder_isolates_failed_provider_initialization() {
+        let mut failed = TestProvider::new("failed");
+        failed.fail_initialization = true;
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(failed))
+            .register_provider(Arc::new(TestProvider::new("available")))
+            .build()
+            .unwrap();
+        assert!(runtime.providers().provider("failed").is_none());
+        assert!(runtime.providers().provider("available").is_some());
+    }
+    #[test]
     fn reject_incompatible() {
-        let mut p = TestPlugin::new("old");
+        let mut p = TestProvider::new("old");
         p.metadata.api_version += 1;
         assert!(matches!(
-            PluginManager::new().register_plugin(Arc::new(p)),
-            Err(PluginError::IncompatibleApiVersion { .. })
+            ProviderLoader::new().register_provider(Arc::new(p)),
+            Err(ProviderError::IncompatibleApiVersion { .. })
         ));
     }
     #[test]
     fn reject_duplicate() {
-        let mut m = PluginManager::new();
-        m.register_plugin(Arc::new(TestPlugin::new("same")))
+        let mut m = ProviderLoader::new();
+        m.register_provider(Arc::new(TestProvider::new("same")))
             .unwrap();
         assert!(matches!(
-            m.register_plugin(Arc::new(TestPlugin::new("same"))),
-            Err(PluginError::PluginAlreadyRegistered(_))
+            m.register_provider(Arc::new(TestProvider::new("same"))),
+            Err(ProviderError::ProviderAlreadyRegistered(_))
         ));
     }
     #[test]
-    fn backend_plugin_and_shutdown() {
-        let mut p = TestPlugin::new("backend");
+    fn backend_provider_and_shutdown() {
+        let mut p = TestProvider::new("backend");
         p.backend = true;
         let p = Arc::new(p);
-        let mut m = PluginManager::new();
-        m.register_plugin(p.clone()).unwrap();
+        let mut m = ProviderLoader::new();
+        m.register_provider(p.clone()).unwrap();
         assert!(m.registry().backend("test").is_some());
         m.shutdown().unwrap();
         assert!(p.shut_down.load(Ordering::SeqCst));
