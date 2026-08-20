@@ -434,29 +434,125 @@ pub struct ProviderDescriptor {
     pub artifact_path: PathBuf,
 }
 
-/// A versioned WIT contract that a provider can implement.
+/// A globally unique, package-qualified capability identifier.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Capability {
-    pub name: String,
-    pub version: String,
+pub struct CapabilityId(String);
+impl CapabilityId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
-impl Capability {
-    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+impl fmt::Display for CapabilityId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A semantic capability version.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CapabilityVersion {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+impl CapabilityVersion {
+    pub const fn new(major: u64, minor: u64, patch: u64) -> Self {
         Self {
-            name: name.into(),
-            version: version.into(),
+            major,
+            minor,
+            patch,
         }
     }
-}
-impl From<WitInterface> for Capability {
-    fn from(interface: WitInterface) -> Self {
-        Self::new(interface.name, interface.version)
+    /// Whether this available version satisfies `required`.
+    pub fn is_compatible_with(&self, required: Self) -> bool {
+        if self.major != required.major {
+            return false;
+        }
+        if self.major == 0 {
+            return self == &required;
+        }
+        self >= &required
     }
 }
-impl From<&WitInterface> for Capability {
-    fn from(interface: &WitInterface) -> Self {
-        Self::new(&interface.name, &interface.version)
+impl fmt::Display for CapabilityVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
     }
+}
+
+/// Declarative contracts and dependencies of a capability.
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CapabilityDescriptor {
+    pub description: String,
+    pub contracts: BTreeSet<WitInterface>,
+    pub dependencies: BTreeMap<CapabilityId, CapabilityVersion>,
+}
+impl CapabilityDescriptor {
+    pub fn new(description: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            ..Self::default()
+        }
+    }
+    pub fn with_contract(mut self, contract: WitInterface) -> Self {
+        self.contracts.insert(contract);
+        self
+    }
+    pub fn with_dependency(mut self, id: CapabilityId, version: CapabilityVersion) -> Self {
+        self.dependencies.insert(id, version);
+        self
+    }
+}
+
+/// A versioned, independently registered runtime capability contract.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Capability {
+    pub id: CapabilityId,
+    pub version: CapabilityVersion,
+    pub descriptor: CapabilityDescriptor,
+}
+impl Capability {
+    pub fn new(
+        id: CapabilityId,
+        version: CapabilityVersion,
+        descriptor: CapabilityDescriptor,
+    ) -> Self {
+        Self {
+            id,
+            version,
+            descriptor,
+        }
+    }
+    pub fn from_wit(interface: WitInterface) -> Result<Self, ProviderError> {
+        let version = parse_capability_version(&interface.version)?;
+        Ok(Self::new(
+            CapabilityId::new(&interface.name),
+            version,
+            CapabilityDescriptor::default().with_contract(interface),
+        ))
+    }
+}
+
+fn parse_capability_version(value: &str) -> Result<CapabilityVersion, ProviderError> {
+    let mut segments = value.split('.');
+    let parse = |segment: Option<&str>| {
+        segment
+            .ok_or_else(|| ProviderError::InvalidCapabilityVersion(value.into()))?
+            .parse::<u64>()
+            .map_err(|_| ProviderError::InvalidCapabilityVersion(value.into()))
+    };
+    let version = CapabilityVersion::new(
+        parse(segments.next())?,
+        parse(segments.next())?,
+        parse(segments.next())?,
+    );
+    if segments.next().is_some() {
+        return Err(ProviderError::InvalidCapabilityVersion(value.into()));
+    }
+    Ok(version)
 }
 
 /// General extension contract; a provider may register any supported contribution.
@@ -475,19 +571,49 @@ pub trait Provider: Send + Sync {
 #[derive(Clone, Default)]
 pub struct ProviderRegistry {
     backends: BTreeMap<String, Arc<dyn Backend>>,
-    capabilities: BTreeMap<Capability, BTreeSet<String>>,
+    capabilities: BTreeMap<CapabilityId, BTreeMap<CapabilityVersion, Capability>>,
+    capability_providers: BTreeMap<(CapabilityId, CapabilityVersion), BTreeSet<String>>,
 }
 impl ProviderRegistry {
     pub fn register_capabilities(
         &mut self,
         provider: &str,
         capabilities: impl IntoIterator<Item = Capability>,
-    ) {
+    ) -> Result<(), ProviderError> {
         for capability in capabilities {
-            self.capabilities
-                .entry(capability)
+            self.register_capability(capability.clone())?;
+            self.capability_providers
+                .entry((capability.id, capability.version))
                 .or_default()
                 .insert(provider.into());
+        }
+        Ok(())
+    }
+    pub fn register_capability(&mut self, capability: Capability) -> Result<(), ProviderError> {
+        if capability.id.as_str().trim().is_empty() {
+            return Err(ProviderError::InvalidCapability(
+                "identifier must not be empty".into(),
+            ));
+        }
+        if capability.descriptor.contracts.is_empty() {
+            return Err(ProviderError::InvalidCapability(format!(
+                "capability '{}' must declare at least one WIT contract",
+                capability.id
+            )));
+        }
+        let versions = self.capabilities.entry(capability.id.clone()).or_default();
+        match versions.get(&capability.version) {
+            Some(existing) if existing != &capability => {
+                Err(ProviderError::ConflictingCapability {
+                    id: capability.id,
+                    version: capability.version,
+                })
+            }
+            Some(_) => Ok(()),
+            None => {
+                versions.insert(capability.version, capability);
+                Ok(())
+            }
         }
     }
     pub fn register_backend(&mut self, backend: Arc<dyn Backend>) -> Result<(), ProviderError> {
@@ -504,19 +630,60 @@ impl ProviderRegistry {
     pub fn backend_names(&self) -> impl Iterator<Item = &str> {
         self.backends.keys().map(String::as_str)
     }
-    /// Returns compatible providers in deterministic preference order.
-    pub fn providers_for(&self, capability: &Capability) -> impl Iterator<Item = &str> {
+    pub fn capabilities(&self) -> impl Iterator<Item = &Capability> {
         self.capabilities
-            .get(capability)
+            .values()
+            .flat_map(|versions| versions.values())
+    }
+    pub fn capability(&self, id: &CapabilityId, version: CapabilityVersion) -> Option<&Capability> {
+        self.capabilities.get(id)?.get(&version)
+    }
+    /// Returns the latest registered version that satisfies `required`.
+    pub fn resolve_capability(
+        &self,
+        id: &CapabilityId,
+        required: CapabilityVersion,
+    ) -> Option<&Capability> {
+        self.capabilities
+            .get(id)?
+            .iter()
+            .rev()
+            .find_map(|(_, capability)| {
+                capability
+                    .version
+                    .is_compatible_with(required)
+                    .then_some(capability)
+            })
+    }
+    pub fn validate_dependencies(&self) -> Result<(), ProviderError> {
+        for capability in self.capabilities() {
+            for (dependency, version) in &capability.descriptor.dependencies {
+                if self.resolve_capability(dependency, *version).is_none() {
+                    return Err(ProviderError::MissingCapabilityDependency {
+                        capability: capability.id.clone(),
+                        dependency: dependency.clone(),
+                        required: *version,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Returns implementations for an exact, resolved capability version in deterministic order.
+    pub fn providers_for(&self, capability: &Capability) -> impl Iterator<Item = &str> {
+        self.capability_providers
+            .get(&(capability.id.clone(), capability.version))
             .into_iter()
             .flat_map(|providers| providers.iter().map(String::as_str))
     }
     pub fn has_capability(&self, capability: &Capability) -> bool {
-        self.capabilities.contains_key(capability)
+        self.capability(&capability.id, capability.version)
+            .is_some()
     }
     fn clear(&mut self) {
         self.backends.clear();
         self.capabilities.clear();
+        self.capability_providers.clear();
     }
 }
 
@@ -543,11 +710,25 @@ impl ProviderLoader {
     pub fn provider_names(&self) -> impl Iterator<Item = &str> {
         self.providers.keys().map(String::as_str)
     }
-    pub fn resolve_providers(&self, capability: &Capability) -> Vec<&dyn Provider> {
-        self.registry
-            .providers_for(capability)
+    pub fn try_resolve_providers(
+        &self,
+        capability: &Capability,
+    ) -> Result<Vec<&dyn Provider>, ProviderError> {
+        self.registry.validate_dependencies()?;
+        let Some(resolved) = self
+            .registry
+            .resolve_capability(&capability.id, capability.version)
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .registry
+            .providers_for(resolved)
             .filter_map(|name| self.provider(name))
-            .collect()
+            .collect())
+    }
+    pub fn resolve_providers(&self, capability: &Capability) -> Vec<&dyn Provider> {
+        self.try_resolve_providers(capability).unwrap_or_default()
     }
     pub fn register_provider(&mut self, provider: Arc<dyn Provider>) -> Result<(), ProviderError> {
         let metadata = provider.metadata();
@@ -569,8 +750,13 @@ impl ProviderLoader {
             self.registry = previous;
             return Err(error);
         }
-        self.registry
-            .register_capabilities(&metadata.name, metadata.capabilities);
+        if let Err(error) = self
+            .registry
+            .register_capabilities(&metadata.name, metadata.capabilities)
+        {
+            self.registry = previous;
+            return Err(error);
+        }
         self.order.push(metadata.name.clone());
         self.providers.insert(metadata.name, provider);
         Ok(())
@@ -758,10 +944,20 @@ impl Runtime {
     pub fn resolve_providers(&self, capability: &Capability) -> Vec<&dyn Provider> {
         self.providers.resolve_providers(capability)
     }
+    /// Resolves providers while reporting invalid capability dependencies.
+    pub fn try_resolve_providers(
+        &self,
+        capability: &Capability,
+    ) -> Result<Vec<&dyn Provider>, ProviderError> {
+        self.providers.try_resolve_providers(capability)
+    }
     /// Resolves providers for a component's WIT import without exposing a
     /// provider dependency to the component itself.
-    pub fn resolve_component_import(&self, interface: &WitInterface) -> Vec<&dyn Provider> {
-        self.resolve_providers(&Capability::from(interface))
+    pub fn resolve_component_import(
+        &self,
+        interface: &WitInterface,
+    ) -> Result<Vec<&dyn Provider>, ProviderError> {
+        self.try_resolve_providers(&Capability::from_wit(interface.clone())?)
     }
     pub fn select_backend(&mut self, name: &str) -> Result<(), ProviderError> {
         if self.providers.registry().backend(name).is_none() {
@@ -793,6 +989,17 @@ pub enum ProviderError {
         expected: u32,
         found: u32,
     },
+    InvalidCapability(String),
+    InvalidCapabilityVersion(String),
+    ConflictingCapability {
+        id: CapabilityId,
+        version: CapabilityVersion,
+    },
+    MissingCapabilityDependency {
+        capability: CapabilityId,
+        dependency: CapabilityId,
+        required: CapabilityVersion,
+    },
     Discovery {
         path: PathBuf,
         source: std::io::Error,
@@ -817,6 +1024,24 @@ impl fmt::Display for ProviderError {
             } => write!(
                 f,
                 "provider '{provider}' targets API {found}, but Magnetar supports API {expected}"
+            ),
+            Self::InvalidCapability(message) => write!(f, "invalid capability: {message}"),
+            Self::InvalidCapabilityVersion(version) => {
+                write!(f, "invalid capability semantic version '{version}'")
+            }
+            Self::ConflictingCapability { id, version } => {
+                write!(
+                    f,
+                    "capability '{id}@{version}' has a conflicting definition"
+                )
+            }
+            Self::MissingCapabilityDependency {
+                capability,
+                dependency,
+                required,
+            } => write!(
+                f,
+                "capability '{capability}' requires unavailable dependency '{dependency}@{required}'"
             ),
             Self::Discovery { path, source } => write!(
                 f,
@@ -876,6 +1101,15 @@ mod tests {
             }
         }
     }
+
+    fn capability(name: &str, version: CapabilityVersion) -> Capability {
+        Capability::new(
+            CapabilityId::new(name),
+            version,
+            CapabilityDescriptor::new("test capability")
+                .with_contract(WitInterface::new(name, version.to_string())),
+        )
+    }
     impl Provider for TestProvider {
         fn metadata(&self) -> ProviderMetadata {
             self.metadata.clone()
@@ -909,7 +1143,7 @@ mod tests {
     }
     #[test]
     fn registers_capabilities_and_resolves_fallbacks_by_name() {
-        let capability = Capability::new("magnetar:runtime/execute", "1.0.0");
+        let capability = capability("magnetar:runtime/execute", CapabilityVersion::new(1, 0, 0));
         let mut primary = TestProvider::new("a-primary");
         primary.metadata.capabilities.insert(capability.clone());
         let mut fallback = TestProvider::new("z-fallback");
@@ -925,6 +1159,116 @@ mod tests {
             .map(|provider| provider.metadata().name)
             .collect::<Vec<_>>();
         assert_eq!(names, ["a-primary", "z-fallback"]);
+    }
+    #[test]
+    fn semantic_versions_select_the_latest_compatible_capability() {
+        let mut registry = ProviderRegistry::default();
+        registry
+            .register_capability(capability(
+                "magnetar:compute/run",
+                CapabilityVersion::new(1, 0, 0),
+            ))
+            .unwrap();
+        registry
+            .register_capability(capability(
+                "magnetar:compute/run",
+                CapabilityVersion::new(1, 2, 0),
+            ))
+            .unwrap();
+        registry
+            .register_capability(capability(
+                "magnetar:compute/run",
+                CapabilityVersion::new(2, 0, 0),
+            ))
+            .unwrap();
+
+        let id = CapabilityId::new("magnetar:compute/run");
+        assert_eq!(
+            registry
+                .resolve_capability(&id, CapabilityVersion::new(1, 1, 0))
+                .unwrap()
+                .version,
+            CapabilityVersion::new(1, 2, 0)
+        );
+        assert!(
+            registry
+                .resolve_capability(&id, CapabilityVersion::new(3, 0, 0))
+                .is_none()
+        );
+        assert!(
+            !CapabilityVersion::new(0, 1, 1).is_compatible_with(CapabilityVersion::new(0, 1, 0))
+        );
+    }
+    #[test]
+    fn capability_validation_rejects_invalid_and_conflicting_definitions() {
+        let mut registry = ProviderRegistry::default();
+        let invalid = Capability::new(
+            CapabilityId::new("magnetar:invalid"),
+            CapabilityVersion::new(1, 0, 0),
+            CapabilityDescriptor::new("missing contract"),
+        );
+        assert!(matches!(
+            registry.register_capability(invalid),
+            Err(ProviderError::InvalidCapability(_))
+        ));
+
+        let original = capability("magnetar:compute/run", CapabilityVersion::new(1, 0, 0));
+        registry.register_capability(original).unwrap();
+        let conflicting = Capability::new(
+            CapabilityId::new("magnetar:compute/run"),
+            CapabilityVersion::new(1, 0, 0),
+            CapabilityDescriptor::new("different")
+                .with_contract(WitInterface::new("magnetar:compute/other", "1.0.0")),
+        );
+        assert!(matches!(
+            registry.register_capability(conflicting),
+            Err(ProviderError::ConflictingCapability { .. })
+        ));
+    }
+    #[test]
+    fn capability_dependencies_must_resolve_compatibly() {
+        let mut registry = ProviderRegistry::default();
+        let dependent = Capability::new(
+            CapabilityId::new("magnetar:app/run"),
+            CapabilityVersion::new(1, 0, 0),
+            CapabilityDescriptor::new("dependent")
+                .with_contract(WitInterface::new("magnetar:app/run", "1.0.0"))
+                .with_dependency(
+                    CapabilityId::new("magnetar:compute/run"),
+                    CapabilityVersion::new(1, 1, 0),
+                ),
+        );
+        registry.register_capability(dependent).unwrap();
+        assert!(matches!(
+            registry.validate_dependencies(),
+            Err(ProviderError::MissingCapabilityDependency { .. })
+        ));
+        registry
+            .register_capability(capability(
+                "magnetar:compute/run",
+                CapabilityVersion::new(1, 2, 0),
+            ))
+            .unwrap();
+        registry.validate_dependencies().unwrap();
+    }
+    #[test]
+    fn component_import_uses_a_semantic_capability_version() {
+        let mut provider = TestProvider::new("compute");
+        provider.metadata.capabilities.insert(capability(
+            "magnetar:compute/run",
+            CapabilityVersion::new(1, 1, 0),
+        ));
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        assert_eq!(
+            runtime
+                .resolve_component_import(&WitInterface::new("magnetar:compute/run", "1.0.0"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
     #[test]
     fn builder_isolates_failed_provider_initialization() {
