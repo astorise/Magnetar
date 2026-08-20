@@ -6,3 +6,4 @@ license = "MIT"
 description = "Hardware-agnostic execution runtime contracts for magnetar."
 
 [dependencies]
+libloading = "0.8"
