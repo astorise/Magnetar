@@ -156,6 +156,35 @@ magnetar
 - Device discovery
 - Backend selection
 
+### Initial runtime architecture
+
+The `magnetar-runtime` crate is the hardware-independent entry point. It owns
+runtime lifecycle and backend registration, while concrete backends own device
+discovery. The runtime can be initialized without any backend; callers select a
+registered backend only when one is needed.
+
+```text
+Application
+    |
+    v
+Runtime / RuntimeBuilder ----> registered Backend implementations
+    |                                  |
+    v                                  v
+ExecutionContext                   Device implementations
+```
+
+### Public API example
+
+```rust
+use magnetar_runtime::{Runtime, RuntimeConfig};
+
+let mut runtime = Runtime::initialize(RuntimeConfig::default());
+assert!(runtime.is_initialized());
+
+// Backends are optional and may be registered and selected later.
+runtime.shutdown();
+```
+
 ### Compiler
 
 - Intermediate Representation (IR)

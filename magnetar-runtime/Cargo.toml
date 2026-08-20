@@ -1,0 +1,8 @@
+[package]
+name = "magnetar-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Hardware-agnostic execution runtime contracts for magnetar."
+
+[dependencies]
