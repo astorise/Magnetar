@@ -389,9 +389,65 @@ pub enum DeviceType {
     Tpu,
     Other,
 }
+
+/// Immutable metadata describing a hardware execution target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceMetadata {
+    pub id: DeviceId,
+    pub name: String,
+    pub device_type: DeviceType,
+    pub vendor: String,
+    pub architecture: String,
+    pub memory_capacity: u64,
+    pub compute_units: u32,
+    pub execution_capabilities: BTreeSet<CapabilityId>,
+    /// Stable name of the Provider that discovered this device.
+    pub provider: String,
+}
+impl DeviceMetadata {
+    pub fn new(
+        id: DeviceId,
+        name: impl Into<String>,
+        device_type: DeviceType,
+        provider: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            device_type,
+            vendor: String::new(),
+            architecture: String::new(),
+            memory_capacity: 0,
+            compute_units: 0,
+            execution_capabilities: BTreeSet::new(),
+            provider: provider.into(),
+        }
+    }
+}
+
+/// A reusable concrete device implementation backed by [`DeviceMetadata`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceDescriptor {
+    pub metadata: DeviceMetadata,
+}
+impl DeviceDescriptor {
+    pub fn new(metadata: DeviceMetadata) -> Self {
+        Self { metadata }
+    }
+}
 pub trait Device: Send + Sync {
-    fn id(&self) -> &DeviceId;
-    fn device_type(&self) -> DeviceType;
+    fn metadata(&self) -> &DeviceMetadata;
+    fn id(&self) -> &DeviceId {
+        &self.metadata().id
+    }
+    fn device_type(&self) -> DeviceType {
+        self.metadata().device_type
+    }
+}
+impl Device for DeviceDescriptor {
+    fn metadata(&self) -> &DeviceMetadata {
+        &self.metadata
+    }
 }
 
 /// A hardware execution contribution. It is distinct from [`Provider`].
@@ -559,6 +615,10 @@ fn parse_capability_version(value: &str) -> Result<CapabilityVersion, ProviderEr
 pub trait Provider: Send + Sync {
     fn metadata(&self) -> ProviderMetadata;
     fn register(&self, registry: &mut ProviderRegistry) -> Result<(), ProviderError>;
+    /// Discovers the execution devices owned by this provider.
+    fn devices(&self) -> Vec<Arc<dyn Device>> {
+        Vec::new()
+    }
     fn initialize(&self) -> Result<(), ProviderError> {
         Ok(())
     }
@@ -571,10 +631,54 @@ pub trait Provider: Send + Sync {
 #[derive(Clone, Default)]
 pub struct ProviderRegistry {
     backends: BTreeMap<String, Arc<dyn Backend>>,
+    devices: BTreeMap<DeviceId, Arc<dyn Device>>,
+    device_providers: BTreeMap<DeviceId, String>,
     capabilities: BTreeMap<CapabilityId, BTreeMap<CapabilityVersion, Capability>>,
     capability_providers: BTreeMap<(CapabilityId, CapabilityVersion), BTreeSet<String>>,
 }
 impl ProviderRegistry {
+    pub fn register_devices(
+        &mut self,
+        provider: &str,
+        devices: impl IntoIterator<Item = Arc<dyn Device>>,
+    ) -> Result<(), ProviderError> {
+        let devices = devices.into_iter().collect::<Vec<_>>();
+        let mut ids = BTreeSet::new();
+        for device in &devices {
+            let metadata = device.metadata();
+            if metadata.id.as_str().trim().is_empty() {
+                return Err(ProviderError::InvalidDevice(
+                    "identifier must not be empty".into(),
+                ));
+            }
+            if metadata.provider != provider {
+                return Err(ProviderError::DeviceProviderMismatch {
+                    device: metadata.id.clone(),
+                    expected: provider.into(),
+                    found: metadata.provider.clone(),
+                });
+            }
+            if self.devices.contains_key(&metadata.id) || !ids.insert(metadata.id.clone()) {
+                return Err(ProviderError::DeviceAlreadyRegistered(metadata.id.clone()));
+            }
+        }
+        for device in devices {
+            let metadata = device.metadata();
+            self.device_providers
+                .insert(metadata.id.clone(), provider.into());
+            self.devices.insert(metadata.id.clone(), device);
+        }
+        Ok(())
+    }
+    pub fn device(&self, id: &DeviceId) -> Option<&dyn Device> {
+        self.devices.get(id).map(AsRef::as_ref)
+    }
+    pub fn devices(&self) -> impl Iterator<Item = &dyn Device> {
+        self.devices.values().map(AsRef::as_ref)
+    }
+    pub fn provider_for_device(&self, id: &DeviceId) -> Option<&str> {
+        self.device_providers.get(id).map(String::as_str)
+    }
     pub fn register_capabilities(
         &mut self,
         provider: &str,
@@ -682,6 +786,8 @@ impl ProviderRegistry {
     }
     fn clear(&mut self) {
         self.backends.clear();
+        self.devices.clear();
+        self.device_providers.clear();
         self.capabilities.clear();
         self.capability_providers.clear();
     }
@@ -746,6 +852,10 @@ impl ProviderLoader {
         if let Err(error) = provider
             .register(&mut self.registry)
             .and_then(|()| provider.initialize())
+            .and_then(|()| {
+                self.registry
+                    .register_devices(&metadata.name, provider.devices())
+            })
         {
             self.registry = previous;
             return Err(error);
@@ -940,6 +1050,13 @@ impl Runtime {
     pub fn register_provider(&mut self, x: Arc<dyn Provider>) -> Result<(), ProviderError> {
         self.providers.register_provider(x)
     }
+    /// Returns every registered execution target in deterministic ID order.
+    pub fn devices(&self) -> impl Iterator<Item = &dyn Device> {
+        self.providers.registry().devices()
+    }
+    pub fn device(&self, id: &DeviceId) -> Option<&dyn Device> {
+        self.providers.registry().device(id)
+    }
     /// Resolves all compatible providers, ordered for deterministic fallback.
     pub fn resolve_providers(&self, capability: &Capability) -> Vec<&dyn Provider> {
         self.providers.resolve_providers(capability)
@@ -984,6 +1101,13 @@ pub enum ProviderError {
     ProviderAlreadyRegistered(String),
     BackendAlreadyRegistered(String),
     BackendNotFound(String),
+    DeviceAlreadyRegistered(DeviceId),
+    DeviceProviderMismatch {
+        device: DeviceId,
+        expected: String,
+        found: String,
+    },
+    InvalidDevice(String),
     IncompatibleApiVersion {
         provider: String,
         expected: u32,
@@ -1017,6 +1141,16 @@ impl fmt::Display for ProviderError {
             Self::ProviderAlreadyRegistered(x) => write!(f, "provider '{x}' is already registered"),
             Self::BackendAlreadyRegistered(x) => write!(f, "backend '{x}' is already registered"),
             Self::BackendNotFound(x) => write!(f, "backend '{x}' is not registered"),
+            Self::DeviceAlreadyRegistered(id) => write!(f, "device '{id}' is already registered"),
+            Self::DeviceProviderMismatch {
+                device,
+                expected,
+                found,
+            } => write!(
+                f,
+                "device '{device}' is owned by provider '{found}', not registering provider '{expected}'"
+            ),
+            Self::InvalidDevice(message) => write!(f, "invalid device: {message}"),
             Self::IncompatibleApiVersion {
                 provider,
                 expected,
@@ -1089,6 +1223,7 @@ mod tests {
         shut_down: AtomicBool,
         backend: bool,
         fail_initialization: bool,
+        devices: Vec<Arc<dyn Device>>,
     }
     impl TestProvider {
         fn new(name: &str) -> Self {
@@ -1098,6 +1233,7 @@ mod tests {
                 shut_down: AtomicBool::new(false),
                 backend: false,
                 fail_initialization: false,
+                devices: Vec::new(),
             }
         }
     }
@@ -1128,6 +1264,9 @@ mod tests {
             self.initialized.store(true, Ordering::SeqCst);
             Ok(())
         }
+        fn devices(&self) -> Vec<Arc<dyn Device>> {
+            self.devices.clone()
+        }
         fn shutdown(&self) -> Result<(), ProviderError> {
             self.shut_down.store(true, Ordering::SeqCst);
             Ok(())
@@ -1140,6 +1279,70 @@ mod tests {
         m.register_provider(p.clone()).unwrap();
         assert!(m.provider("valid").is_some());
         assert!(p.initialized.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn runtime_enumerates_provider_devices_with_metadata() {
+        let mut provider = TestProvider::new("cuda");
+        let mut metadata = DeviceMetadata::new(
+            DeviceId::new("cuda:gpu:0"),
+            "NVIDIA Test GPU",
+            DeviceType::Gpu,
+            "cuda",
+        );
+        metadata.vendor = "NVIDIA".into();
+        metadata.architecture = "Ada".into();
+        metadata.memory_capacity = 24 * 1024 * 1024 * 1024;
+        metadata.compute_units = 128;
+        metadata
+            .execution_capabilities
+            .insert(CapabilityId::new("magnetar:compute/run"));
+        provider
+            .devices
+            .push(Arc::new(DeviceDescriptor::new(metadata)));
+
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let devices = runtime.devices().collect::<Vec<_>>();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id().as_str(), "cuda:gpu:0");
+        assert_eq!(devices[0].metadata().vendor, "NVIDIA");
+        assert_eq!(
+            runtime
+                .providers()
+                .registry()
+                .provider_for_device(&DeviceId::new("cuda:gpu:0")),
+            Some("cuda")
+        );
+    }
+    #[test]
+    fn device_registration_rejects_duplicate_ids_and_mismatched_owners() {
+        let device = |id: &str, provider: &str| {
+            Arc::new(DeviceDescriptor::new(DeviceMetadata::new(
+                DeviceId::new(id),
+                "test",
+                DeviceType::Gpu,
+                provider,
+            ))) as Arc<dyn Device>
+        };
+        let mut registry = ProviderRegistry::default();
+        registry
+            .register_devices("cuda", [device("gpu:0", "cuda")])
+            .unwrap();
+        assert!(matches!(
+            registry.register_devices("other", [device("gpu:0", "other")]),
+            Err(ProviderError::DeviceAlreadyRegistered(_))
+        ));
+        assert!(matches!(
+            registry.register_devices("cuda", [device("gpu:2", "cuda"), device("gpu:0", "cuda")]),
+            Err(ProviderError::DeviceAlreadyRegistered(_))
+        ));
+        assert!(registry.device(&DeviceId::new("gpu:2")).is_none());
+        assert!(matches!(
+            registry.register_devices("cuda", [device("gpu:1", "other")]),
+            Err(ProviderError::DeviceProviderMismatch { .. })
+        ));
     }
     #[test]
     fn registers_capabilities_and_resolves_fallbacks_by_name() {
