@@ -88,6 +88,10 @@ Instead of coupling model implementations to hardware-specific code, Magnetar se
 
 Magnetar is organized as a collection of independent crates.
 
+The source-derived boundaries for future Compute, model, generation, and
+application contracts are documented in the
+[capability contract taxonomy](docs/architecture/capability-taxonomy.md).
+
 ```text
 magnetar
 â”œâ”€â”€ magnetar-runtime
