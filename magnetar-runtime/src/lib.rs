@@ -592,6 +592,32 @@ impl Capability {
     }
 }
 
+/// Package-qualified identifier of the portable Compute capability.
+pub const COMPUTE_CAPABILITY_ID: &str = "magnetar:compute/run";
+/// WIT package that defines the Compute capability contract.
+pub const COMPUTE_WIT_PACKAGE: &str = "magnetar:compute";
+/// WIT interface implemented by Compute providers.
+pub const COMPUTE_WIT_INTERFACE: &str = COMPUTE_CAPABILITY_ID;
+/// Initial stable version of the Compute capability and its WIT contract.
+pub const COMPUTE_CAPABILITY_VERSION: CapabilityVersion = CapabilityVersion::new(1, 0, 0);
+
+/// Returns the canonical hardware-independent Compute capability declaration.
+///
+/// Providers add this value to their metadata to advertise support for the
+/// `magnetar:compute/run@1.0.0` WIT contract.
+pub fn compute_capability() -> Capability {
+    Capability::new(
+        CapabilityId::new(COMPUTE_CAPABILITY_ID),
+        COMPUTE_CAPABILITY_VERSION,
+        CapabilityDescriptor::new("hardware-independent mathematical execution").with_contract(
+            WitInterface::new(
+                COMPUTE_WIT_INTERFACE,
+                COMPUTE_CAPABILITY_VERSION.to_string(),
+            ),
+        ),
+    )
+}
+
 fn parse_capability_version(value: &str) -> Result<CapabilityVersion, ProviderError> {
     let mut segments = value.split('.');
     let parse = |segment: Option<&str>| {
@@ -1468,6 +1494,34 @@ mod tests {
         assert_eq!(
             runtime
                 .resolve_component_import(&WitInterface::new("magnetar:compute/run", "1.0.0"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn compute_capability_has_the_canonical_wit_contract() {
+        let compute = compute_capability();
+        assert_eq!(compute.id.as_str(), COMPUTE_CAPABILITY_ID);
+        assert_eq!(compute.version, COMPUTE_CAPABILITY_VERSION);
+        assert_eq!(COMPUTE_WIT_PACKAGE, "magnetar:compute");
+        assert_eq!(
+            compute.descriptor.contracts,
+            BTreeSet::from([WitInterface::new(COMPUTE_WIT_INTERFACE, "1.0.0")])
+        );
+    }
+    #[test]
+    fn compute_providers_register_and_resolve_compatibly() {
+        let mut provider = TestProvider::new("portable-compute");
+        provider.metadata.capabilities.insert(compute_capability());
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .resolve_component_import(&WitInterface::new(COMPUTE_WIT_INTERFACE, "1.0.0",))
                 .unwrap()
                 .len(),
             1

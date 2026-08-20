@@ -1,0 +1,9 @@
+package magnetar:compute@1.0.0;
+
+/// Portable Compute capability marker. Operations are introduced by future
+/// compatible revisions after their semantics are specified.
+interface run {}
+
+world compute {
+  export run;
+}
