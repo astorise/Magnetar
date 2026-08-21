@@ -467,6 +467,7 @@ pub struct ProviderMetadata {
     pub api_version: u32,
     pub description: String,
     pub capabilities: BTreeSet<Capability>,
+    pub compute_advertisement: ProviderComputeAdvertisement,
     pub compute_operation_schema_support: BTreeMap<ComputeOperationId, ComputeOperationSupport>,
     pub compute_operation_support: BTreeMap<ComputeOperationFamily, ComputeOperationSupport>,
     pub compute_data_movement_support:
@@ -486,6 +487,7 @@ impl ProviderMetadata {
             api_version: PROVIDER_API_VERSION,
             description: description.into(),
             capabilities: BTreeSet::new(),
+            compute_advertisement: ProviderComputeAdvertisement::default(),
             compute_operation_schema_support: BTreeMap::new(),
             compute_operation_support: BTreeMap::new(),
             compute_data_movement_support: BTreeMap::new(),
@@ -1959,6 +1961,153 @@ pub enum ComputePrecision {
     Mixed,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DTypeSupport {
+    pub portable: BTreeSet<ComputeDType>,
+    pub provider_specific: BTreeSet<String>,
+}
+impl DTypeSupport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_portable(mut self, dtypes: impl IntoIterator<Item = ComputeDType>) -> Self {
+        self.portable.extend(dtypes);
+        self
+    }
+    pub fn with_provider_specific(
+        mut self,
+        dtypes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.provider_specific
+            .extend(dtypes.into_iter().map(Into::into));
+        self
+    }
+}
+impl Default for DTypeSupport {
+    fn default() -> Self {
+        Self {
+            portable: BTreeSet::new(),
+            provider_specific: BTreeSet::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LayoutSupport {
+    pub input: BTreeSet<ComputeLayout>,
+    pub output: BTreeSet<ComputeLayout>,
+    pub consumes_views: bool,
+    pub requires_materialization: bool,
+}
+impl LayoutSupport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_input(mut self, layouts: impl IntoIterator<Item = ComputeLayout>) -> Self {
+        self.input.extend(layouts);
+        self
+    }
+    pub fn with_output(mut self, layouts: impl IntoIterator<Item = ComputeLayout>) -> Self {
+        self.output.extend(layouts);
+        self
+    }
+    pub const fn with_view_consumption(mut self) -> Self {
+        self.consumes_views = true;
+        self
+    }
+    pub const fn with_materialization_required(mut self) -> Self {
+        self.requires_materialization = true;
+        self
+    }
+}
+impl Default for LayoutSupport {
+    fn default() -> Self {
+        Self {
+            input: BTreeSet::new(),
+            output: BTreeSet::new(),
+            consumes_views: true,
+            requires_materialization: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShapeLimitSupport {
+    pub descriptor_limits: TensorDescriptorLimits,
+    pub max_broadcast_rank: Option<u64>,
+    pub max_batch_dimensions: Option<u64>,
+}
+impl ShapeLimitSupport {
+    pub fn new(limits: TensorDescriptorLimits) -> Self {
+        Self {
+            descriptor_limits: limits,
+            max_broadcast_rank: None,
+            max_batch_dimensions: None,
+        }
+    }
+    pub const fn with_broadcast_rank(mut self, rank: u64) -> Self {
+        self.max_broadcast_rank = Some(rank);
+        self
+    }
+    pub const fn with_batch_dimensions(mut self, dimensions: u64) -> Self {
+        self.max_batch_dimensions = Some(dimensions);
+        self
+    }
+}
+impl Default for ShapeLimitSupport {
+    fn default() -> Self {
+        Self::new(TensorDescriptorLimits::default())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrecisionSupport {
+    pub modes: BTreeSet<ComputePrecision>,
+    pub accumulation_dtypes: BTreeSet<ComputeDType>,
+    pub approximate_math: bool,
+    pub deterministic_execution: bool,
+    pub deterministic_random_generation: bool,
+}
+impl PrecisionSupport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_modes(mut self, modes: impl IntoIterator<Item = ComputePrecision>) -> Self {
+        self.modes.extend(modes);
+        self
+    }
+    pub fn with_accumulation_dtypes(
+        mut self,
+        dtypes: impl IntoIterator<Item = ComputeDType>,
+    ) -> Self {
+        self.accumulation_dtypes.extend(dtypes);
+        self
+    }
+    pub const fn with_approximate_math(mut self) -> Self {
+        self.approximate_math = true;
+        self
+    }
+    pub const fn with_deterministic_execution(mut self) -> Self {
+        self.deterministic_execution = true;
+        self
+    }
+    pub const fn with_deterministic_random_generation(mut self) -> Self {
+        self.deterministic_random_generation = true;
+        self
+    }
+}
+impl Default for PrecisionSupport {
+    fn default() -> Self {
+        Self {
+            modes: BTreeSet::new(),
+            accumulation_dtypes: BTreeSet::new(),
+            approximate_math: false,
+            deterministic_execution: false,
+            deterministic_random_generation: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ComputeOperationSupport {
     pub dtypes: BTreeSet<ComputeDType>,
@@ -2077,6 +2226,167 @@ impl ComputeOperationSupport {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeCapabilitySupport {
+    pub capability_id: CapabilityId,
+    pub versions: BTreeSet<CapabilityVersion>,
+    pub operation_catalog_revision: String,
+    pub operation_schema_revision: String,
+    pub experimental_extensions: BTreeSet<String>,
+}
+impl Default for ComputeCapabilitySupport {
+    fn default() -> Self {
+        Self {
+            capability_id: CapabilityId::new(COMPUTE_CAPABILITY_ID),
+            versions: BTreeSet::new(),
+            operation_catalog_revision: String::new(),
+            operation_schema_revision: String::new(),
+            experimental_extensions: BTreeSet::new(),
+        }
+    }
+}
+impl ComputeCapabilitySupport {
+    pub fn with_versions(mut self, versions: impl IntoIterator<Item = CapabilityVersion>) -> Self {
+        self.versions.extend(versions);
+        self
+    }
+    pub fn with_operation_catalog_revision(mut self, revision: impl Into<String>) -> Self {
+        self.operation_catalog_revision = revision.into();
+        self
+    }
+    pub fn with_operation_schema_revision(mut self, revision: impl Into<String>) -> Self {
+        self.operation_schema_revision = revision.into();
+        self
+    }
+    pub fn with_experimental_extensions(
+        mut self,
+        extensions: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.experimental_extensions
+            .extend(extensions.into_iter().map(Into::into));
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationFamilySupport {
+    pub family: ComputeOperationFamily,
+    pub dtypes: DTypeSupport,
+    pub layouts: LayoutSupport,
+    pub shapes: ShapeLimitSupport,
+    pub precision: PrecisionSupport,
+    pub portable: bool,
+}
+impl OperationFamilySupport {
+    pub fn new(family: ComputeOperationFamily) -> Self {
+        Self {
+            family,
+            dtypes: DTypeSupport::default(),
+            layouts: LayoutSupport::default(),
+            shapes: ShapeLimitSupport::default(),
+            precision: PrecisionSupport::default(),
+            portable: true,
+        }
+    }
+    pub fn from_operation_support(
+        family: ComputeOperationFamily,
+        support: ComputeOperationSupport,
+    ) -> Self {
+        Self {
+            family,
+            dtypes: DTypeSupport {
+                portable: support.dtypes,
+                provider_specific: support.provider_specific_dtypes,
+            },
+            layouts: LayoutSupport {
+                input: support.layouts.clone(),
+                output: support.layouts,
+                ..LayoutSupport::default()
+            },
+            shapes: ShapeLimitSupport::new(support.descriptor_limits),
+            precision: PrecisionSupport {
+                modes: support.precision_modes,
+                ..PrecisionSupport::default()
+            },
+            portable: true,
+        }
+    }
+    fn operation_support(&self) -> ComputeOperationSupport {
+        ComputeOperationSupport {
+            dtypes: self.dtypes.portable.clone(),
+            provider_specific_dtypes: self.dtypes.provider_specific.clone(),
+            layouts: self
+                .layouts
+                .input
+                .union(&self.layouts.output)
+                .copied()
+                .collect(),
+            precision_modes: self.precision.modes.clone(),
+            descriptor_limits: self.shapes.descriptor_limits.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationSchemaSupport {
+    pub operation: ComputeOperationId,
+    pub family: ComputeOperationFamily,
+    pub dtypes: DTypeSupport,
+    pub layouts: LayoutSupport,
+    pub shapes: ShapeLimitSupport,
+    pub precision: PrecisionSupport,
+    pub portable: bool,
+}
+impl OperationSchemaSupport {
+    pub fn new(operation: ComputeOperationId, family: ComputeOperationFamily) -> Self {
+        Self {
+            operation,
+            family,
+            dtypes: DTypeSupport::default(),
+            layouts: LayoutSupport::default(),
+            shapes: ShapeLimitSupport::default(),
+            precision: PrecisionSupport::default(),
+            portable: true,
+        }
+    }
+    pub fn from_operation_support(
+        operation: ComputeOperationId,
+        family: ComputeOperationFamily,
+        support: ComputeOperationSupport,
+    ) -> Self {
+        Self {
+            operation,
+            family,
+            dtypes: DTypeSupport {
+                portable: support.dtypes,
+                provider_specific: support.provider_specific_dtypes,
+            },
+            layouts: LayoutSupport {
+                input: support.layouts.clone(),
+                output: support.layouts,
+                ..LayoutSupport::default()
+            },
+            shapes: ShapeLimitSupport::new(support.descriptor_limits),
+            precision: PrecisionSupport {
+                modes: support.precision_modes,
+                ..PrecisionSupport::default()
+            },
+            portable: true,
+        }
+    }
+    fn operation_support(&self) -> ComputeOperationSupport {
+        OperationFamilySupport {
+            family: self.family,
+            dtypes: self.dtypes.clone(),
+            layouts: self.layouts.clone(),
+            shapes: self.shapes.clone(),
+            precision: self.precision.clone(),
+            portable: self.portable,
+        }
+        .operation_support()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ComputeDataMovementKind {
     Upload,
@@ -2106,6 +2416,63 @@ impl ComputeDataMovementKind {
             Self::Transfer => "transfer",
             Self::DTypeConversion => "dtype-conversion",
             Self::PlacementConversion => "placement-conversion",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DataMovementSupport {
+    pub kind: ComputeDataMovementKind,
+    pub dtypes: DTypeSupport,
+    pub layouts: LayoutSupport,
+    pub host_encodings: BTreeSet<HostBufferEncoding>,
+    pub shapes: ShapeLimitSupport,
+    pub allow_host_staging: bool,
+}
+impl DataMovementSupport {
+    pub fn new(kind: ComputeDataMovementKind) -> Self {
+        Self {
+            kind,
+            dtypes: DTypeSupport::default(),
+            layouts: LayoutSupport::default(),
+            host_encodings: BTreeSet::new(),
+            shapes: ShapeLimitSupport::default(),
+            allow_host_staging: false,
+        }
+    }
+    pub fn from_compute_support(
+        kind: ComputeDataMovementKind,
+        support: ComputeDataMovementSupport,
+    ) -> Self {
+        Self {
+            kind,
+            dtypes: DTypeSupport {
+                portable: support.dtypes,
+                provider_specific: support.provider_specific_dtypes,
+            },
+            layouts: LayoutSupport {
+                input: support.layouts.clone(),
+                output: support.layouts,
+                ..LayoutSupport::default()
+            },
+            host_encodings: support.host_encodings,
+            shapes: ShapeLimitSupport::new(support.descriptor_limits),
+            allow_host_staging: support.allow_host_staging,
+        }
+    }
+    fn movement_support(&self) -> ComputeDataMovementSupport {
+        ComputeDataMovementSupport {
+            dtypes: self.dtypes.portable.clone(),
+            provider_specific_dtypes: self.dtypes.provider_specific.clone(),
+            layouts: self
+                .layouts
+                .input
+                .union(&self.layouts.output)
+                .copied()
+                .collect(),
+            host_encodings: self.host_encodings.clone(),
+            descriptor_limits: self.shapes.descriptor_limits.clone(),
+            allow_host_staging: self.allow_host_staging,
         }
     }
 }
@@ -2437,6 +2804,136 @@ impl fmt::Display for ComputeOperationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceComputeSupport {
+    pub device: DeviceId,
+    pub memory_bytes: Option<u64>,
+    pub operation_families: BTreeMap<ComputeOperationFamily, OperationFamilySupport>,
+    pub operation_schemas: BTreeMap<ComputeOperationId, OperationSchemaSupport>,
+    pub data_movement: BTreeMap<ComputeDataMovementKind, DataMovementSupport>,
+}
+impl DeviceComputeSupport {
+    pub fn new(device: DeviceId) -> Self {
+        Self {
+            device,
+            memory_bytes: None,
+            operation_families: BTreeMap::new(),
+            operation_schemas: BTreeMap::new(),
+            data_movement: BTreeMap::new(),
+        }
+    }
+    pub const fn with_memory_bytes(mut self, memory_bytes: u64) -> Self {
+        self.memory_bytes = Some(memory_bytes);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProviderComputeAdvertisement {
+    pub capability: ComputeCapabilitySupport,
+    pub operation_families: BTreeMap<ComputeOperationFamily, OperationFamilySupport>,
+    pub operation_schemas: BTreeMap<ComputeOperationId, OperationSchemaSupport>,
+    pub unsupported_operation_schemas: BTreeSet<ComputeOperationId>,
+    pub provider_extension_schemas: BTreeSet<ComputeOperationId>,
+    pub data_movement: BTreeMap<ComputeDataMovementKind, DataMovementSupport>,
+    pub devices: BTreeMap<DeviceId, DeviceComputeSupport>,
+    pub diagnostics: BTreeMap<String, String>,
+}
+impl ProviderComputeAdvertisement {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.capability.versions.is_empty()
+            && self.operation_families.is_empty()
+            && self.operation_schemas.is_empty()
+            && self.unsupported_operation_schemas.is_empty()
+            && self.provider_extension_schemas.is_empty()
+            && self.data_movement.is_empty()
+            && self.devices.is_empty()
+            && self.diagnostics.is_empty()
+    }
+    pub fn supports_capability_version(&self, required: CapabilityVersion) -> bool {
+        self.capability.versions.is_empty()
+            || self
+                .capability
+                .versions
+                .iter()
+                .any(|version| version.is_compatible_with(required))
+    }
+    pub fn with_capability(mut self, capability: ComputeCapabilitySupport) -> Self {
+        self.capability = capability;
+        self
+    }
+    pub fn with_operation_family(mut self, support: OperationFamilySupport) -> Self {
+        self.operation_families.insert(support.family, support);
+        self
+    }
+    pub fn with_operation_schema(mut self, support: OperationSchemaSupport) -> Self {
+        self.operation_schemas
+            .insert(support.operation.clone(), support);
+        self
+    }
+    pub fn with_unsupported_operation_schema(mut self, operation: ComputeOperationId) -> Self {
+        self.unsupported_operation_schemas.insert(operation);
+        self
+    }
+    pub fn with_provider_extension_schema(mut self, operation: ComputeOperationId) -> Self {
+        self.provider_extension_schemas.insert(operation);
+        self
+    }
+    pub fn with_data_movement(mut self, support: DataMovementSupport) -> Self {
+        self.data_movement.insert(support.kind, support);
+        self
+    }
+    pub fn with_device(mut self, support: DeviceComputeSupport) -> Self {
+        self.devices.insert(support.device.clone(), support);
+        self
+    }
+}
+
+fn effective_compute_advertisement(metadata: &ProviderMetadata) -> ProviderComputeAdvertisement {
+    let mut advertisement = metadata.compute_advertisement.clone();
+    for capability in metadata
+        .capabilities
+        .iter()
+        .filter(|capability| capability.id.as_str() == COMPUTE_CAPABILITY_ID)
+    {
+        advertisement.capability.versions.insert(capability.version);
+    }
+    for (family, support) in &metadata.compute_operation_support {
+        advertisement
+            .operation_families
+            .entry(*family)
+            .or_insert_with(|| {
+                OperationFamilySupport::from_operation_support(*family, support.clone())
+            });
+    }
+    for (operation, support) in &metadata.compute_operation_schema_support {
+        let family = initial_compute_operation_schemas()
+            .get(operation)
+            .map(|schema| schema.family)
+            .unwrap_or(ComputeOperationFamily::DescriptorAndView);
+        advertisement
+            .operation_schemas
+            .entry(operation.clone())
+            .or_insert_with(|| {
+                OperationSchemaSupport::from_operation_support(
+                    operation.clone(),
+                    family,
+                    support.clone(),
+                )
+            });
+    }
+    for (kind, support) in &metadata.compute_data_movement_support {
+        advertisement
+            .data_movement
+            .entry(*kind)
+            .or_insert_with(|| DataMovementSupport::from_compute_support(*kind, support.clone()));
+    }
+    advertisement
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -4089,6 +4586,14 @@ pub enum ComputeValidationError {
         provider: ProviderBinding,
         family: ComputeOperationFamily,
     },
+    UnsupportedOperationSchema {
+        provider: ProviderBinding,
+        operation: ComputeOperationId,
+    },
+    UnsupportedAdvertisement {
+        provider: ProviderBinding,
+        reason: String,
+    },
     UnsupportedDType {
         family: ComputeOperationFamily,
         dtype: ComputeDType,
@@ -4176,6 +4681,19 @@ impl fmt::Display for ComputeValidationError {
                 "provider '{provider}' does not support compute operation family '{}'",
                 family.id()
             ),
+            Self::UnsupportedOperationSchema {
+                provider,
+                operation,
+            } => write!(
+                f,
+                "provider '{provider}' does not support compute operation schema '{operation}'"
+            ),
+            Self::UnsupportedAdvertisement { provider, reason } => {
+                write!(
+                    f,
+                    "provider '{provider}' compute advertisement is unsupported: {reason}"
+                )
+            }
             Self::UnsupportedDType { family, dtype } => write!(
                 f,
                 "compute operation family '{}' does not support dtype {dtype:?}",
@@ -4285,6 +4803,23 @@ impl From<ComputeValidationError> for ComputeError {
                         ComputeDiagnostic::new()
                             .with_provider(provider)
                             .with_operation_family(family),
+                    )
+            }
+            ComputeValidationError::UnsupportedOperationSchema {
+                provider,
+                operation,
+            } => ComputeError::validation(ComputeErrorCode::UnsupportedOperation, message)
+                .with_diagnostic(
+                    ComputeDiagnostic::new()
+                        .with_provider(provider)
+                        .with_backend_message(format!("unsupported operation schema: {operation}")),
+                ),
+            ComputeValidationError::UnsupportedAdvertisement { provider, reason } => {
+                ComputeError::validation(ComputeErrorCode::NoCompatibleProvider, message)
+                    .with_diagnostic(
+                        ComputeDiagnostic::new()
+                            .with_provider(provider)
+                            .with_backend_message(reason),
                     )
             }
             ComputeValidationError::UnsupportedDType { family, .. }
@@ -5295,22 +5830,49 @@ impl Runtime {
             .ok_or_else(|| {
                 ComputeValidationError::ProviderUnavailable(ProviderBinding::new(provider))
             })?;
+        let advertisement = effective_compute_advertisement(&metadata);
+        if !advertisement.supports_capability_version(COMPUTE_CAPABILITY_VERSION) {
+            return Err(ComputeValidationError::UnsupportedAdvertisement {
+                provider: ProviderBinding::new(&metadata.name),
+                reason: format!(
+                    "provider does not advertise compatible '{}' version {}",
+                    COMPUTE_CAPABILITY_ID, COMPUTE_CAPABILITY_VERSION
+                ),
+            });
+        }
         for operation in operations {
+            if let Some(schema_id) = &operation.schema_id
+                && advertisement
+                    .unsupported_operation_schemas
+                    .contains(schema_id)
+            {
+                return Err(ComputeValidationError::UnsupportedOperationSchema {
+                    provider: ProviderBinding::new(&metadata.name),
+                    operation: schema_id.clone(),
+                });
+            }
             let schema_result = validate_compute_operation_schema(operation)?;
             let support = if let Some(schema_id) = &operation.schema_id {
-                metadata
-                    .compute_operation_schema_support
+                advertisement
+                    .operation_schemas
                     .get(schema_id)
-                    .or_else(|| metadata.compute_operation_support.get(&operation.family))
-                    .ok_or(ComputeValidationError::UnsupportedOperationFamily {
+                    .map(OperationSchemaSupport::operation_support)
+                    .or_else(|| {
+                        advertisement
+                            .operation_families
+                            .get(&operation.family)
+                            .map(OperationFamilySupport::operation_support)
+                    })
+                    .ok_or_else(|| ComputeValidationError::UnsupportedOperationFamily {
                         provider: ProviderBinding::new(&metadata.name),
                         family: operation.family,
                     })?
             } else {
-                metadata
-                    .compute_operation_support
+                advertisement
+                    .operation_families
                     .get(&operation.family)
-                    .ok_or(ComputeValidationError::UnsupportedOperationFamily {
+                    .map(OperationFamilySupport::operation_support)
+                    .ok_or_else(|| ComputeValidationError::UnsupportedOperationFamily {
                         provider: ProviderBinding::new(&metadata.name),
                         family: operation.family,
                     })?
@@ -5351,6 +5913,7 @@ impl Runtime {
                 ComputeValidationError::ProviderUnavailable(ProviderBinding::new(provider))
             })?;
         let provider_binding = ProviderBinding::new(&metadata.name);
+        let advertisement = effective_compute_advertisement(&metadata);
         let target = ResourceAffinity::new(FallbackClass::ProviderPinned)
             .with_provider(provider_binding.clone())
             .with_capability(CapabilityBinding::new(
@@ -5358,9 +5921,10 @@ impl Runtime {
                 COMPUTE_CAPABILITY_VERSION,
             ));
         for movement in movements {
-            let support = metadata
-                .compute_data_movement_support
+            let support = advertisement
+                .data_movement
                 .get(&movement.kind)
+                .map(DataMovementSupport::movement_support)
                 .ok_or_else(|| ComputeValidationError::UnsupportedDataMovement {
                     provider: provider_binding.clone(),
                     kind: movement.kind,
@@ -6452,6 +7016,96 @@ mod tests {
         assert!(scatter.provider_specific_semantics);
     }
     #[test]
+    fn provider_compute_advertisement_drives_operation_validation() {
+        let schemas = initial_compute_operation_schemas();
+        let add = schemas
+            .get(&ComputeOperationId::new("elementwise.binary.add"))
+            .unwrap();
+        let mut provider = provider_with_capabilities("advertised-compute", [compute_capability()]);
+        provider.metadata.compute_advertisement = ProviderComputeAdvertisement::new()
+            .with_capability(
+                ComputeCapabilitySupport::default()
+                    .with_versions([COMPUTE_CAPABILITY_VERSION])
+                    .with_operation_catalog_revision("initial")
+                    .with_operation_schema_revision("initial"),
+            )
+            .with_operation_schema(OperationSchemaSupport::from_operation_support(
+                add.id.clone(),
+                add.family,
+                ComputeOperationSupport::new()
+                    .with_dtypes([ComputeDType::Float32])
+                    .with_layouts([ComputeLayout::Dense])
+                    .with_precision_modes([ComputePrecision::Default]),
+            ));
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let tensor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+
+        runtime
+            .validate_compute_operations(
+                "advertised-compute",
+                &[ComputeOperationDescriptor::from_schema(add)
+                    .with_tensor(tensor.clone())
+                    .with_tensor(tensor.clone())
+                    .with_tensor(tensor)],
+            )
+            .unwrap();
+    }
+    #[test]
+    fn provider_compute_advertisement_reports_version_and_schema_rejections() {
+        let schemas = initial_compute_operation_schemas();
+        let add = schemas
+            .get(&ComputeOperationId::new("elementwise.binary.add"))
+            .unwrap();
+        let mut incompatible = TestProvider::new("incompatible-compute");
+        incompatible.metadata.compute_advertisement = ProviderComputeAdvertisement::new()
+            .with_capability(
+                ComputeCapabilitySupport::default()
+                    .with_versions([CapabilityVersion::new(0, 9, 0)]),
+            );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(incompatible))
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "incompatible-compute",
+                &[ComputeOperationDescriptor::from_schema(add)]
+            ),
+            Err(ComputeValidationError::UnsupportedAdvertisement { .. })
+        ));
+
+        let mut unsupported =
+            provider_with_capabilities("unsupported-schema", [compute_capability()]);
+        unsupported.metadata.compute_advertisement = ProviderComputeAdvertisement::new()
+            .with_capability(
+                ComputeCapabilitySupport::default().with_versions([COMPUTE_CAPABILITY_VERSION]),
+            )
+            .with_operation_family(OperationFamilySupport::from_operation_support(
+                ComputeOperationFamily::Elementwise,
+                ComputeOperationSupport::new().with_dtypes([ComputeDType::Float32]),
+            ))
+            .with_unsupported_operation_schema(add.id.clone());
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(unsupported))
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "unsupported-schema",
+                &[ComputeOperationDescriptor::from_schema(add)]
+            ),
+            Err(ComputeValidationError::UnsupportedOperationSchema { .. })
+        ));
+    }
+    #[test]
     fn compute_operation_schema_validation_checks_attributes_and_shapes() {
         let schemas = initial_compute_operation_schemas();
         let add = schemas
@@ -6835,6 +7489,40 @@ mod tests {
             runtime.validate_compute_data_movement("portable-compute", &[invalid_materialize]),
             Err(ComputeValidationError::MaterializationRequired { .. })
         ));
+    }
+    #[test]
+    fn provider_compute_advertisement_drives_data_movement_validation() {
+        let mut provider =
+            provider_with_capabilities("advertised-movement", [compute_capability()]);
+        provider.metadata.compute_advertisement = ProviderComputeAdvertisement::new()
+            .with_capability(
+                ComputeCapabilitySupport::default().with_versions([COMPUTE_CAPABILITY_VERSION]),
+            )
+            .with_data_movement(DataMovementSupport::from_compute_support(
+                ComputeDataMovementKind::Upload,
+                ComputeDataMovementSupport::new()
+                    .with_dtypes([ComputeDType::Float32])
+                    .with_layouts([ComputeLayout::Dense])
+                    .with_host_encodings([HostBufferEncoding::LittleEndian]),
+            ));
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+
+        runtime
+            .validate_compute_data_movement(
+                "advertised-movement",
+                &[ComputeDataMovementDescriptor::upload(
+                    HostBufferDescriptor::new(16, HostBufferEncoding::LittleEndian),
+                    descriptor,
+                )],
+            )
+            .unwrap();
     }
     #[test]
     fn compute_operation_requests_reject_unknown_family_ids() {
