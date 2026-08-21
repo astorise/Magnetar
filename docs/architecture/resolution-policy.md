@@ -8,6 +8,9 @@ Resources that already carry Provider affinity remain bound to that Provider
 until the caller explicitly releases, cancels, interrupts, fails, or recreates
 them.
 
+Provider, Device and Capability health states are defined in the
+[Provider Health Model](provider-health.md).
+
 ## Lifecycle
 
 1. Convert a Component import or host request into a `CapabilityId` and required
@@ -42,9 +45,9 @@ silently choose another Provider.
 - `MemoryConstrained`: placeholder for future memory-fit scoring, with
   deterministic fallback today.
 
-All built-in policies reject unavailable Providers, unavailable Devices,
-affinity-incompatible candidates, and fallback attempts that are not safe for
-the current execution phase.
+All built-in policies reject Provider, Device and Capability candidates whose
+health does not accept new work by default, affinity-incompatible candidates,
+and fallback attempts that are not safe for the current execution phase.
 
 ## CPU and GPU Selection
 

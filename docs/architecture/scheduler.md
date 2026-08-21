@@ -6,6 +6,9 @@ places it in a bounded queue, exposes stable operation state, and preserves the
 Provider, Device, Resource Affinity and Memory Plan decisions made during
 execution planning.
 
+Provider and Device health states are defined in the
+[Provider Health Model](provider-health.md).
+
 Components never receive native Provider queues, Device streams, thread handles,
 locks, GPU pointers or backend execution handles. They observe scheduled work
 through stable `ScheduledOperationId`, `SchedulingState`,
@@ -18,7 +21,7 @@ through stable `ScheduledOperationId`, `SchedulingState`,
 3. Accepted work is queued according to the active `SchedulingPolicy`.
 4. The initial policy is deterministic FIFO.
 5. Before Provider submission, the Scheduler checks selected Provider and Device
-   availability when that information is available.
+   health when that information is available.
 6. The operation moves through accepted, queued, ready, submitted, running and a
    terminal state.
 7. Completed, cancelled, failed and interrupted operations remain terminal.
@@ -47,11 +50,11 @@ pretending cancellation succeeded.
 
 ## Interruption
 
-Provider, Device or Runtime unavailability during scheduling is reported as an
-interrupted terminal state. Provider-pinned work is not silently migrated to
-another Provider after state creation or observable output. A future retry or
-replanning policy may use restartability metadata, but automatic replay is not
-part of this Scheduler model.
+Provider, Device or Runtime health loss during scheduling is reported as an
+interrupted or failed terminal state. Provider-pinned work is not silently
+migrated to another Provider after state creation or observable output. A future
+retry or replanning policy may use restartability metadata, but automatic replay
+is not part of this Scheduler model.
 
 ## Relationship To Execution Planning
 

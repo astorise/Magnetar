@@ -446,6 +446,13 @@ pub trait Device: Send + Sync {
     fn availability(&self) -> DeviceAvailability {
         DeviceAvailability::Available
     }
+    fn health_report(&self) -> DeviceHealth {
+        DeviceHealth::new(
+            ProviderBinding::new(&self.metadata().provider),
+            DeviceBinding::new(self.id().clone()),
+            self.availability(),
+        )
+    }
 }
 impl Device for DeviceDescriptor {
     fn metadata(&self) -> &DeviceMetadata {
@@ -734,22 +741,220 @@ pub enum ExecutionPhase {
     AfterObservableOutput,
 }
 
-/// Stable health category reported by the host-facing Provider wrapper.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ProviderHealth {
-    #[default]
-    Healthy,
-    Degraded,
-    Unavailable,
-}
-
-/// Stable availability category for a candidate Device.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum DeviceAvailability {
+/// Stable portable health states reported by Providers, Devices and Capabilities.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum HealthState {
+    Unknown,
+    Initializing,
     #[default]
     Available,
-    Busy,
+    Degraded,
+    Saturated,
+    Draining,
     Unavailable,
+    Interrupted,
+}
+impl HealthState {
+    pub const fn priority(self) -> u8 {
+        match self {
+            Self::Available => 0,
+            Self::Degraded => 1,
+            Self::Saturated => 2,
+            Self::Draining => 3,
+            Self::Initializing => 4,
+            Self::Unknown => 5,
+            Self::Unavailable => 6,
+            Self::Interrupted => 7,
+        }
+    }
+    pub const fn accepts_new_work_by_default(self) -> bool {
+        matches!(self, Self::Available | Self::Degraded)
+    }
+}
+impl Ord for HealthState {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority().cmp(&other.priority())
+    }
+}
+impl PartialOrd for HealthState {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Stable health category reported by the host-facing Provider wrapper.
+pub type ProviderHealth = HealthState;
+
+/// Stable availability category for a candidate Device.
+pub type DeviceAvailability = HealthState;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum HealthScope {
+    Provider,
+    Device,
+    Capability,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HealthTimestamp(u64);
+impl HealthTimestamp {
+    pub const fn unix_millis(value: u64) -> Self {
+        Self(value)
+    }
+    pub const fn as_unix_millis(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HealthTimeToLive(u64);
+impl HealthTimeToLive {
+    pub const fn millis(value: u64) -> Self {
+        Self(value)
+    }
+    pub const fn as_millis(self) -> u64 {
+        self.0
+    }
+    pub const fn is_expired_at(self, timestamp: HealthTimestamp, now: HealthTimestamp) -> bool {
+        now.as_unix_millis()
+            .saturating_sub(timestamp.as_unix_millis())
+            > self.0
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HealthCapacityHints {
+    pub queue_depth: Option<u32>,
+    pub available_memory_bytes: Option<u64>,
+    pub memory_pressure: Option<u8>,
+    pub active_operations: Option<u32>,
+    pub maximum_accepted_operations: Option<u32>,
+    pub recommended_admission_limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthDiagnostic {
+    pub scope: HealthScope,
+    pub state: HealthState,
+    pub code: Option<String>,
+    pub message: Option<String>,
+    pub trace_id: Option<String>,
+}
+impl HealthDiagnostic {
+    pub fn new(scope: HealthScope, state: HealthState) -> Self {
+        Self {
+            scope,
+            state,
+            code: None,
+            message: None,
+            trace_id: None,
+        }
+    }
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
+    pub fn with_message(mut self, message: impl AsRef<str>) -> Self {
+        self.message = Some(redact_backend_diagnostic(message.as_ref()));
+        self
+    }
+    pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderHealthReport {
+    pub provider: ProviderBinding,
+    pub state: ProviderHealth,
+    pub timestamp: Option<HealthTimestamp>,
+    pub time_to_live: Option<HealthTimeToLive>,
+    pub diagnostics: Vec<HealthDiagnostic>,
+    pub capacity: HealthCapacityHints,
+    pub devices: Vec<DeviceHealth>,
+    pub capabilities: Vec<CapabilityHealth>,
+}
+impl ProviderHealthReport {
+    pub fn new(provider: ProviderBinding, state: ProviderHealth) -> Self {
+        Self {
+            provider,
+            state,
+            timestamp: None,
+            time_to_live: None,
+            diagnostics: Vec::new(),
+            capacity: HealthCapacityHints::default(),
+            devices: Vec::new(),
+            capabilities: Vec::new(),
+        }
+    }
+    pub fn is_stale_at(&self, now: HealthTimestamp) -> bool {
+        match (self.timestamp, self.time_to_live) {
+            (Some(timestamp), Some(ttl)) => ttl.is_expired_at(timestamp, now),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceHealth {
+    pub provider: ProviderBinding,
+    pub device: DeviceBinding,
+    pub state: DeviceAvailability,
+    pub timestamp: Option<HealthTimestamp>,
+    pub time_to_live: Option<HealthTimeToLive>,
+    pub diagnostics: Vec<HealthDiagnostic>,
+    pub capacity: HealthCapacityHints,
+}
+impl DeviceHealth {
+    pub fn new(
+        provider: ProviderBinding,
+        device: DeviceBinding,
+        state: DeviceAvailability,
+    ) -> Self {
+        Self {
+            provider,
+            device,
+            state,
+            timestamp: None,
+            time_to_live: None,
+            diagnostics: Vec::new(),
+            capacity: HealthCapacityHints::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityHealth {
+    pub provider: ProviderBinding,
+    pub capability: CapabilityBinding,
+    pub state: HealthState,
+    pub timestamp: Option<HealthTimestamp>,
+    pub time_to_live: Option<HealthTimeToLive>,
+    pub diagnostics: Vec<HealthDiagnostic>,
+}
+impl CapabilityHealth {
+    pub fn new(
+        provider: ProviderBinding,
+        capability: CapabilityBinding,
+        state: HealthState,
+    ) -> Self {
+        Self {
+            provider,
+            capability,
+            state,
+            timestamp: None,
+            time_to_live: None,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HealthReport {
+    Provider(ProviderHealthReport),
+    Device(DeviceHealth),
+    Capability(CapabilityHealth),
 }
 
 /// Immutable ownership and compatibility facts carried by one opaque resource.
@@ -1291,6 +1496,7 @@ pub struct ResolutionCandidate {
     pub capability: CapabilityBinding,
     pub device: Option<DeviceBinding>,
     pub provider_health: ProviderHealth,
+    pub capability_health: Option<HealthState>,
     pub device_availability: DeviceAvailability,
     pub affinity_compatible: bool,
     pub priority: i32,
@@ -1317,8 +1523,17 @@ pub struct ResolutionContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolutionRejectionReason {
     IncompatibleCapability,
+    ProviderHealthUnknown,
+    ProviderInitializing,
+    ProviderSaturated,
+    ProviderDraining,
     ProviderUnavailable,
+    ProviderInterrupted,
+    DeviceHealthUnknown,
+    DeviceSaturated,
     DeviceUnavailable,
+    DeviceInterrupted,
+    CapabilityUnavailable,
     AffinityIncompatible,
     FallbackNotAllowed,
     PolicyRejected,
@@ -1378,16 +1593,15 @@ impl ResolutionPolicy for BuiltInResolutionPolicy {
                     candidate,
                     ResolutionRejectionReason::IncompatibleCapability,
                 ));
-            } else if candidate.provider_health == ProviderHealth::Unavailable {
-                rejected_candidates.push(rejection(
-                    candidate,
-                    ResolutionRejectionReason::ProviderUnavailable,
-                ));
-            } else if candidate.device_availability == DeviceAvailability::Unavailable {
-                rejected_candidates.push(rejection(
-                    candidate,
-                    ResolutionRejectionReason::DeviceUnavailable,
-                ));
+            } else if let Some(reason) = provider_health_rejection(candidate.provider_health) {
+                rejected_candidates.push(rejection(candidate, reason));
+            } else if let Some(reason) = candidate
+                .capability_health
+                .and_then(capability_health_rejection)
+            {
+                rejected_candidates.push(rejection(candidate, reason));
+            } else if let Some(reason) = device_health_rejection(candidate.device_availability) {
+                rejected_candidates.push(rejection(candidate, reason));
             } else if !candidate.affinity_compatible {
                 rejected_candidates.push(rejection(
                     candidate,
@@ -1452,6 +1666,41 @@ fn rejection(
         provider: candidate.provider.clone(),
         capability: candidate.capability.clone(),
         reason,
+    }
+}
+
+fn provider_health_rejection(health: ProviderHealth) -> Option<ResolutionRejectionReason> {
+    match health {
+        HealthState::Unknown => Some(ResolutionRejectionReason::ProviderHealthUnknown),
+        HealthState::Initializing => Some(ResolutionRejectionReason::ProviderInitializing),
+        HealthState::Available | HealthState::Degraded => None,
+        HealthState::Saturated => Some(ResolutionRejectionReason::ProviderSaturated),
+        HealthState::Draining => Some(ResolutionRejectionReason::ProviderDraining),
+        HealthState::Unavailable => Some(ResolutionRejectionReason::ProviderUnavailable),
+        HealthState::Interrupted => Some(ResolutionRejectionReason::ProviderInterrupted),
+    }
+}
+
+fn device_health_rejection(health: DeviceAvailability) -> Option<ResolutionRejectionReason> {
+    match health {
+        HealthState::Unknown => Some(ResolutionRejectionReason::DeviceHealthUnknown),
+        HealthState::Initializing => Some(ResolutionRejectionReason::DeviceHealthUnknown),
+        HealthState::Available | HealthState::Degraded | HealthState::Draining => None,
+        HealthState::Saturated => Some(ResolutionRejectionReason::DeviceSaturated),
+        HealthState::Unavailable => Some(ResolutionRejectionReason::DeviceUnavailable),
+        HealthState::Interrupted => Some(ResolutionRejectionReason::DeviceInterrupted),
+    }
+}
+
+fn capability_health_rejection(health: HealthState) -> Option<ResolutionRejectionReason> {
+    match health {
+        HealthState::Available | HealthState::Degraded => None,
+        HealthState::Unknown
+        | HealthState::Initializing
+        | HealthState::Saturated
+        | HealthState::Draining
+        | HealthState::Unavailable
+        | HealthState::Interrupted => Some(ResolutionRejectionReason::CapabilityUnavailable),
     }
 }
 
@@ -4546,8 +4795,17 @@ pub enum SchedulingDiagnostic {
 pub enum SchedulerErrorCode {
     InvalidExecutionPlan,
     QueueCapacityExceeded,
+    ProviderHealthUnknown,
+    ProviderInitializing,
+    ProviderDegradedRejected,
+    ProviderSaturated,
+    ProviderDraining,
     ProviderUnavailable,
+    ProviderInterrupted,
+    DeviceHealthUnknown,
+    DeviceSaturated,
     DeviceUnavailable,
+    StaleHealthReport,
     ResourceAffinityConflict,
     MemoryPlanInvalid,
     SubmissionFailed,
@@ -4566,8 +4824,17 @@ pub enum SchedulerError {
     QueueCapacityExceeded {
         capacity: usize,
     },
+    ProviderHealthUnknown(ProviderBinding),
+    ProviderInitializing(ProviderBinding),
+    ProviderDegradedRejected(ProviderBinding),
+    ProviderSaturated(ProviderBinding),
+    ProviderDraining(ProviderBinding),
     ProviderUnavailable(ProviderBinding),
+    ProviderInterrupted(ProviderBinding),
+    DeviceHealthUnknown(DeviceBinding),
+    DeviceSaturated(DeviceBinding),
     DeviceUnavailable(DeviceBinding),
+    StaleHealthReport(ProviderBinding),
     ResourceAffinityConflict {
         reason: String,
     },
@@ -4598,8 +4865,17 @@ impl SchedulerError {
         match self {
             Self::InvalidExecutionPlan { .. } => SchedulerErrorCode::InvalidExecutionPlan,
             Self::QueueCapacityExceeded { .. } => SchedulerErrorCode::QueueCapacityExceeded,
+            Self::ProviderHealthUnknown(_) => SchedulerErrorCode::ProviderHealthUnknown,
+            Self::ProviderInitializing(_) => SchedulerErrorCode::ProviderInitializing,
+            Self::ProviderDegradedRejected(_) => SchedulerErrorCode::ProviderDegradedRejected,
+            Self::ProviderSaturated(_) => SchedulerErrorCode::ProviderSaturated,
+            Self::ProviderDraining(_) => SchedulerErrorCode::ProviderDraining,
             Self::ProviderUnavailable(_) => SchedulerErrorCode::ProviderUnavailable,
+            Self::ProviderInterrupted(_) => SchedulerErrorCode::ProviderInterrupted,
+            Self::DeviceHealthUnknown(_) => SchedulerErrorCode::DeviceHealthUnknown,
+            Self::DeviceSaturated(_) => SchedulerErrorCode::DeviceSaturated,
             Self::DeviceUnavailable(_) => SchedulerErrorCode::DeviceUnavailable,
+            Self::StaleHealthReport(_) => SchedulerErrorCode::StaleHealthReport,
             Self::ResourceAffinityConflict { .. } => SchedulerErrorCode::ResourceAffinityConflict,
             Self::MemoryPlanInvalid { .. } => SchedulerErrorCode::MemoryPlanInvalid,
             Self::SubmissionFailed { .. } => SchedulerErrorCode::SubmissionFailed,
@@ -4620,11 +4896,44 @@ impl fmt::Display for SchedulerError {
             Self::QueueCapacityExceeded { capacity } => {
                 write!(f, "scheduler queue capacity {capacity} exceeded")
             }
+            Self::ProviderHealthUnknown(provider) => {
+                write!(
+                    f,
+                    "provider '{provider}' health is unknown before submission"
+                )
+            }
+            Self::ProviderInitializing(provider) => {
+                write!(f, "provider '{provider}' is initializing before submission")
+            }
+            Self::ProviderDegradedRejected(provider) => {
+                write!(
+                    f,
+                    "provider '{provider}' is degraded and rejected by policy"
+                )
+            }
+            Self::ProviderSaturated(provider) => {
+                write!(f, "provider '{provider}' is saturated before submission")
+            }
+            Self::ProviderDraining(provider) => {
+                write!(f, "provider '{provider}' is draining before submission")
+            }
             Self::ProviderUnavailable(provider) => {
                 write!(f, "provider '{provider}' is unavailable before submission")
             }
+            Self::ProviderInterrupted(provider) => {
+                write!(f, "provider '{provider}' is interrupted before submission")
+            }
+            Self::DeviceHealthUnknown(device) => {
+                write!(f, "device '{device}' health is unknown before submission")
+            }
+            Self::DeviceSaturated(device) => {
+                write!(f, "device '{device}' is saturated before submission")
+            }
             Self::DeviceUnavailable(device) => {
                 write!(f, "device '{device}' is unavailable before submission")
+            }
+            Self::StaleHealthReport(provider) => {
+                write!(f, "provider '{provider}' health report is stale")
             }
             Self::ResourceAffinityConflict { reason } => {
                 write!(f, "resource affinity conflict: {reason}")
@@ -4779,8 +5088,18 @@ pub enum ProviderExecutionPhase {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ProviderExecutionErrorCode {
+    ProviderHealthUnknown,
+    ProviderInitializing,
+    ProviderDegradedRejected,
+    ProviderSaturated,
+    ProviderDraining,
     ProviderUnavailable,
+    ProviderInterrupted,
+    DeviceHealthUnknown,
+    DeviceSaturated,
     DeviceUnavailable,
+    StaleHealthReport,
+    CapabilityUnavailable,
     InvalidExecutionPlan,
     IncompatibleResourceAffinity,
     MemoryPlanRejected,
@@ -4937,10 +5256,29 @@ impl ProviderExecutionError {
     }
     pub fn scheduler_code(&self) -> SchedulerErrorCode {
         match self.code {
+            ProviderExecutionErrorCode::ProviderHealthUnknown => {
+                SchedulerErrorCode::ProviderHealthUnknown
+            }
+            ProviderExecutionErrorCode::ProviderInitializing => {
+                SchedulerErrorCode::ProviderInitializing
+            }
+            ProviderExecutionErrorCode::ProviderDegradedRejected => {
+                SchedulerErrorCode::ProviderDegradedRejected
+            }
+            ProviderExecutionErrorCode::ProviderSaturated => SchedulerErrorCode::ProviderSaturated,
+            ProviderExecutionErrorCode::ProviderDraining => SchedulerErrorCode::ProviderDraining,
             ProviderExecutionErrorCode::ProviderUnavailable => {
                 SchedulerErrorCode::ProviderUnavailable
             }
+            ProviderExecutionErrorCode::ProviderInterrupted => {
+                SchedulerErrorCode::ProviderInterrupted
+            }
+            ProviderExecutionErrorCode::DeviceHealthUnknown => {
+                SchedulerErrorCode::DeviceHealthUnknown
+            }
+            ProviderExecutionErrorCode::DeviceSaturated => SchedulerErrorCode::DeviceSaturated,
             ProviderExecutionErrorCode::DeviceUnavailable => SchedulerErrorCode::DeviceUnavailable,
+            ProviderExecutionErrorCode::StaleHealthReport => SchedulerErrorCode::StaleHealthReport,
             ProviderExecutionErrorCode::InvalidExecutionPlan => {
                 SchedulerErrorCode::InvalidExecutionPlan
             }
@@ -4961,7 +5299,8 @@ impl ProviderExecutionError {
             ProviderExecutionErrorCode::ExecutionInterrupted => {
                 SchedulerErrorCode::ExecutionInterrupted
             }
-            ProviderExecutionErrorCode::UnsupportedOperation
+            ProviderExecutionErrorCode::CapabilityUnavailable
+            | ProviderExecutionErrorCode::UnsupportedOperation
             | ProviderExecutionErrorCode::UnsupportedDType
             | ProviderExecutionErrorCode::UnsupportedLayout
             | ProviderExecutionErrorCode::DataMovementFailed
@@ -5115,15 +5454,17 @@ impl Scheduler {
                 operation: id,
                 reason: "operation is not registered".into(),
             })?;
-        if runtime
+        let provider_health = runtime
             .providers()
             .provider(provider.as_str())
             .map(Provider::health)
-            .unwrap_or(ProviderHealth::Unavailable)
-            == ProviderHealth::Unavailable
-        {
-            self.interrupt_operation(id, "selected Provider is unavailable before submission");
-            return Err(SchedulerError::ProviderUnavailable(provider));
+            .unwrap_or(ProviderHealth::Unavailable);
+        if let Some(error) = scheduler_error_for_provider_health(&provider, provider_health) {
+            self.interrupt_operation(
+                id,
+                format!("selected Provider is {provider_health:?} before submission"),
+            );
+            return Err(error);
         }
         if let Some(device) = self
             .operations
@@ -5133,11 +5474,17 @@ impl Scheduler {
                 .device(device.id())
                 .map(Device::availability)
                 .unwrap_or(DeviceAvailability::Unavailable)
-                == DeviceAvailability::Unavailable
+                .accepts_new_work_by_default()
+                == false
         {
             let device = device.clone();
+            let health = runtime
+                .device(device.id())
+                .map(Device::availability)
+                .unwrap_or(DeviceAvailability::Unavailable);
             self.interrupt_operation(id, "selected Device is unavailable before submission");
-            return Err(SchedulerError::DeviceUnavailable(device));
+            return Err(scheduler_error_for_device_health(&device, health)
+                .unwrap_or_else(|| SchedulerError::DeviceUnavailable(device)));
         }
         let operation = self
             .operations
@@ -5271,6 +5618,37 @@ impl Scheduler {
                 diagnostics: operation.diagnostics.clone(),
                 error: Some(error),
             });
+        }
+    }
+}
+
+fn scheduler_error_for_provider_health(
+    provider: &ProviderBinding,
+    health: ProviderHealth,
+) -> Option<SchedulerError> {
+    match health {
+        HealthState::Unknown => Some(SchedulerError::ProviderHealthUnknown(provider.clone())),
+        HealthState::Initializing => Some(SchedulerError::ProviderInitializing(provider.clone())),
+        HealthState::Available | HealthState::Degraded => None,
+        HealthState::Saturated => Some(SchedulerError::ProviderSaturated(provider.clone())),
+        HealthState::Draining => Some(SchedulerError::ProviderDraining(provider.clone())),
+        HealthState::Unavailable => Some(SchedulerError::ProviderUnavailable(provider.clone())),
+        HealthState::Interrupted => Some(SchedulerError::ProviderInterrupted(provider.clone())),
+    }
+}
+
+fn scheduler_error_for_device_health(
+    device: &DeviceBinding,
+    health: DeviceAvailability,
+) -> Option<SchedulerError> {
+    match health {
+        HealthState::Unknown | HealthState::Initializing => {
+            Some(SchedulerError::DeviceHealthUnknown(device.clone()))
+        }
+        HealthState::Available | HealthState::Degraded | HealthState::Draining => None,
+        HealthState::Saturated => Some(SchedulerError::DeviceSaturated(device.clone())),
+        HealthState::Unavailable | HealthState::Interrupted => {
+            Some(SchedulerError::DeviceUnavailable(device.clone()))
         }
     }
 }
@@ -6730,7 +7108,17 @@ pub trait Provider: Send + Sync {
     fn metadata(&self) -> ProviderMetadata;
     fn register(&self, registry: &mut ProviderRegistry) -> Result<(), ProviderError>;
     fn health(&self) -> ProviderHealth {
-        ProviderHealth::Healthy
+        ProviderHealth::Available
+    }
+    fn health_report(&self) -> ProviderHealthReport {
+        ProviderHealthReport::new(ProviderBinding::new(self.metadata().name), self.health())
+    }
+    fn capability_health(&self, capability: &CapabilityBinding) -> Option<CapabilityHealth> {
+        Some(CapabilityHealth::new(
+            ProviderBinding::new(self.metadata().name),
+            capability.clone(),
+            self.health(),
+        ))
     }
     /// Discovers the execution devices owned by this provider.
     fn devices(&self) -> Vec<Arc<dyn Device>> {
@@ -7099,11 +7487,16 @@ impl ProviderLoader {
                     device.availability(),
                 )
             });
+        let capability_binding = CapabilityBinding::new(capability.id.clone(), capability.version);
+        let capability_health = provider
+            .capability_health(&capability_binding)
+            .map(|health| health.state);
         ResolutionCandidate {
             provider: ProviderBinding::new(provider_name),
-            capability: CapabilityBinding::new(capability.id.clone(), capability.version),
+            capability: capability_binding,
             device: device.as_ref().map(|(binding, _)| binding.clone()),
             provider_health: provider.health(),
+            capability_health,
             device_availability: device
                 .map(|(_, availability)| availability)
                 .unwrap_or(DeviceAvailability::Available),
@@ -8231,7 +8624,7 @@ impl Runtime {
                 self.providers
                     .registry()
                     .devices_for_provider(provider_binding.as_str())
-                    .find(|device| device.availability() != DeviceAvailability::Unavailable)
+                    .find(|device| device.availability().accepts_new_work_by_default())
                     .map(|device| DeviceBinding::new(device.id().clone()))
             })
         });
@@ -8850,13 +9243,13 @@ impl Runtime {
                 "selected Provider is unavailable",
             )
         })?;
-        if provider_ref.health() == ProviderHealth::Unavailable {
+        if let Some(code) = provider_execution_error_for_health(provider_ref.health()) {
             return Err(ProviderExecutionError::new(
-                ProviderExecutionErrorCode::ProviderUnavailable,
+                code,
                 phase,
                 provider.clone(),
                 device.cloned(),
-                "selected Provider is unhealthy",
+                format!("selected Provider health is {:?}", provider_ref.health()),
             ));
         }
         if let Some(device) = device {
@@ -8869,13 +9262,16 @@ impl Runtime {
                     "selected Device is unavailable",
                 ));
             };
-            if runtime_device.availability() == DeviceAvailability::Unavailable {
+            if let Some(code) = device_execution_error_for_health(runtime_device.availability()) {
                 return Err(ProviderExecutionError::new(
-                    ProviderExecutionErrorCode::DeviceUnavailable,
+                    code,
                     phase,
                     provider.clone(),
                     Some(device.clone()),
-                    "selected Device is unavailable",
+                    format!(
+                        "selected Device health is {:?}",
+                        runtime_device.availability()
+                    ),
                 ));
             }
             if runtime_device.metadata().provider != provider.as_str() {
@@ -9094,6 +9490,35 @@ impl Runtime {
         let _ = self.providers.shutdown();
         self.context.backend_name = None;
         self.initialized = false;
+    }
+}
+
+fn provider_execution_error_for_health(
+    health: ProviderHealth,
+) -> Option<ProviderExecutionErrorCode> {
+    match health {
+        HealthState::Unknown => Some(ProviderExecutionErrorCode::ProviderHealthUnknown),
+        HealthState::Initializing => Some(ProviderExecutionErrorCode::ProviderInitializing),
+        HealthState::Available | HealthState::Degraded => None,
+        HealthState::Saturated => Some(ProviderExecutionErrorCode::ProviderSaturated),
+        HealthState::Draining => Some(ProviderExecutionErrorCode::ProviderDraining),
+        HealthState::Unavailable => Some(ProviderExecutionErrorCode::ProviderUnavailable),
+        HealthState::Interrupted => Some(ProviderExecutionErrorCode::ProviderInterrupted),
+    }
+}
+
+fn device_execution_error_for_health(
+    health: DeviceAvailability,
+) -> Option<ProviderExecutionErrorCode> {
+    match health {
+        HealthState::Unknown | HealthState::Initializing => {
+            Some(ProviderExecutionErrorCode::DeviceHealthUnknown)
+        }
+        HealthState::Available | HealthState::Degraded | HealthState::Draining => None,
+        HealthState::Saturated => Some(ProviderExecutionErrorCode::DeviceSaturated),
+        HealthState::Unavailable | HealthState::Interrupted => {
+            Some(ProviderExecutionErrorCode::DeviceUnavailable)
+        }
     }
 }
 
@@ -9338,6 +9763,7 @@ mod tests {
         backend: bool,
         fail_initialization: bool,
         health: ProviderHealth,
+        capability_health: BTreeMap<CapabilityId, HealthState>,
         devices: Vec<Arc<dyn Device>>,
         execution_api: Option<Arc<dyn ProviderExecutionApi>>,
     }
@@ -9349,7 +9775,8 @@ mod tests {
                 shut_down: AtomicBool::new(false),
                 backend: false,
                 fail_initialization: false,
-                health: ProviderHealth::Healthy,
+                health: ProviderHealth::Available,
+                capability_health: BTreeMap::new(),
                 devices: Vec::new(),
                 execution_api: None,
             }
@@ -9388,6 +9815,16 @@ mod tests {
         }
         fn health(&self) -> ProviderHealth {
             self.health
+        }
+        fn capability_health(&self, capability: &CapabilityBinding) -> Option<CapabilityHealth> {
+            Some(CapabilityHealth::new(
+                ProviderBinding::new(&self.metadata.name),
+                capability.clone(),
+                self.capability_health
+                    .get(capability.id())
+                    .copied()
+                    .unwrap_or(self.health),
+            ))
         }
         fn initialize(&self) -> Result<(), ProviderError> {
             if self.fail_initialization {
@@ -11466,6 +11903,83 @@ mod tests {
             runtime.resolve_component_import(&WitInterface::new(COMPUTE_WIT_INTERFACE, "1.1.0"));
 
         assert_eq!(providers.unwrap()[0].metadata().name, "z-healthy");
+    }
+    #[test]
+    fn capability_health_rejects_unavailable_implementation() {
+        let compute = compute_capability();
+        let mut provider = provider_with_capabilities("provider-a", [compute.clone()]);
+        provider
+            .capability_health
+            .insert(compute.id.clone(), HealthState::Unavailable);
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            runtime.resolve_component_import(&WitInterface::new(COMPUTE_WIT_INTERFACE, "1.1.0")),
+            Err(ProviderError::PolicyRejectedProvider { .. })
+        ));
+
+        let candidates = runtime
+            .providers()
+            .candidates_for_capability(&compute)
+            .unwrap();
+        let context = ResolutionContext {
+            requested_capability: compute.id.clone(),
+            requested_version: compute.version,
+            candidates,
+            affinity: None,
+            fallback: FallbackClass::Transparent,
+            execution_phase: ExecutionPhase::BeforeResourceCreation,
+            replayable_input: true,
+        };
+        let decision = BuiltInResolutionPolicy::Deterministic.decide(&context);
+        assert_eq!(
+            decision.rejected_candidates[0].reason,
+            ResolutionRejectionReason::CapabilityUnavailable
+        );
+    }
+    #[test]
+    fn health_reports_redact_diagnostics_and_track_freshness() {
+        let provider = ProviderBinding::new("provider-a");
+        let mut report = ProviderHealthReport::new(provider.clone(), HealthState::Saturated);
+        report.timestamp = Some(HealthTimestamp::unix_millis(1_000));
+        report.time_to_live = Some(HealthTimeToLive::millis(250));
+        report.capacity.queue_depth = Some(8);
+        report.diagnostics.push(
+            HealthDiagnostic::new(HealthScope::Provider, HealthState::Saturated)
+                .with_code("queue-pressure")
+                .with_message("cuda stream /tmp/secret token=abc is saturated")
+                .with_trace_id("trace-1"),
+        );
+
+        assert!(report.is_stale_at(HealthTimestamp::unix_millis(1_251)));
+        assert_eq!(report.capacity.queue_depth, Some(8));
+        let message = report.diagnostics[0].message.as_deref().unwrap();
+        assert!(!message.contains("/tmp/secret"));
+        assert!(!message.contains("token=abc"));
+        assert_eq!(message, "[redacted backend diagnostic]");
+        assert_eq!(report.diagnostics[0].trace_id.as_deref(), Some("trace-1"));
+
+        let device_health = DeviceHealth::new(
+            provider.clone(),
+            DeviceBinding::new(DeviceId::new("gpu:0")),
+            HealthState::Available,
+        );
+        let capability_health = CapabilityHealth::new(
+            provider,
+            CapabilityBinding::new(compute_capability().id, COMPUTE_CAPABILITY_VERSION),
+            HealthState::Degraded,
+        );
+        assert!(matches!(
+            HealthReport::Device(device_health),
+            HealthReport::Device(_)
+        ));
+        assert!(matches!(
+            HealthReport::Capability(capability_health),
+            HealthReport::Capability(_)
+        ));
     }
     #[test]
     fn phase_aware_resolution_rejects_restart_after_observable_output() {

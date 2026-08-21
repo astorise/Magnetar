@@ -93,6 +93,8 @@ application contracts are documented in the
 [capability contract taxonomy](docs/architecture/capability-taxonomy.md).
 Provider selection rules are documented in the
 [resolution policy model](docs/architecture/resolution-policy.md).
+Provider, Device and Capability availability are documented in the
+[provider health model](docs/architecture/provider-health.md).
 
 ```text
 magnetar
