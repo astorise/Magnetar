@@ -1,0 +1,182 @@
+package magnetar:observability@1.0.0;
+
+interface emit {
+  enum metric-kind {
+    counter,
+    gauge,
+    histogram,
+  }
+
+  enum log-severity {
+    trace,
+    debug,
+    info,
+    warn,
+    error,
+  }
+
+  enum observability-error-code {
+    invalid-observation,
+    unsupported-observation,
+    access-denied,
+    invalid-filter,
+    stream-closed,
+    stream-interrupted,
+    exporter-unavailable,
+    exporter-saturated,
+    exporter-failed,
+    sink-unavailable,
+    sink-unauthorized,
+    sink-timeout,
+    serialization-failed,
+    observability-policy-rejected,
+    observation-dropped,
+  }
+
+  record observability-error {
+    code: observability-error-code,
+    message: string,
+    diagnostic: option<string>,
+  }
+
+  record metric-tag {
+    key: string,
+    value: string,
+  }
+
+  record custom-metric {
+    namespace: string,
+    name: string,
+    kind: metric-kind,
+    value: s64,
+    tags: list<metric-tag>,
+  }
+
+  record custom-log {
+    severity: log-severity,
+    message: string,
+    fields: list<metric-tag>,
+  }
+
+  record custom-event {
+    namespace: string,
+    name: string,
+    attributes: list<metric-tag>,
+  }
+
+  variant custom-observation {
+    metric(custom-metric),
+    log(custom-log),
+    event(custom-event),
+  }
+
+  submit: func(observation: custom-observation) -> result<_, observability-error>;
+}
+
+interface reader {
+  use emit.{observability-error};
+
+  record runtime-metrics-snapshot {
+    submitted-operations: u64,
+    running-operations: u64,
+    completed-operations: u64,
+    failed-operations: u64,
+    cancelled-operations: u64,
+    interrupted-operations: u64,
+    queue-depth: u64,
+    provider-count: u64,
+    device-count: u64,
+    available-provider-count: u64,
+    available-device-count: u64,
+    estimated-memory-pressure: u64,
+    observation-queue-depth: u64,
+    dropped-observation-count: u64,
+  }
+
+  record scheduler-metrics-snapshot {
+    queue-depth: u64,
+    submitted: u64,
+    running: u64,
+    completed: u64,
+    failed: u64,
+  }
+
+  record observability-metrics-snapshot {
+    dropped-observations: u64,
+    stream-count: u64,
+    snapshot-requests: u64,
+  }
+
+  record observability-snapshot {
+    runtime: runtime-metrics-snapshot,
+    scheduler: scheduler-metrics-snapshot,
+    observability: observability-metrics-snapshot,
+  }
+
+  snapshot: func() -> result<observability-snapshot, observability-error>;
+}
+
+interface stream {
+  use emit.{log-severity, observability-error};
+
+  enum observation-category {
+    runtime-event,
+    runtime-metric,
+    runtime-trace,
+    runtime-diagnostic,
+    provider-health,
+    device-health,
+    scheduler,
+    execution-lifecycle,
+    data-movement,
+    memory-planning,
+    custom-metric,
+    custom-log,
+    custom-event,
+  }
+
+  record observation-filter {
+    categories: list<observation-category>,
+    min-severity: option<log-severity>,
+    providers: list<string>,
+    devices: list<string>,
+    components: list<string>,
+    subsystems: list<string>,
+  }
+
+  record observation-record {
+    category: observation-category,
+    trace-id: option<string>,
+    span-id: option<string>,
+    correlation-id: option<string>,
+    provider-id: option<string>,
+    device-id: option<string>,
+    component-id: option<string>,
+    message: option<string>,
+  }
+
+  record observation-batch {
+    records: list<observation-record>,
+    end-of-stream: bool,
+    interrupted: bool,
+  }
+
+  resource observation-stream {
+    next: func(max-records: u32) -> result<observation-batch, observability-error>;
+    close: func();
+  }
+
+  subscribe: func(filter: observation-filter) -> result<observation-stream, observability-error>;
+}
+
+world observability-exporter {
+  import stream;
+}
+
+world observability-snapshot-exposer {
+  import reader;
+}
+
+world custom-observer {
+  import emit;
+}

@@ -1,5 +1,8 @@
 //! Hardware-agnostic runtime contracts and provider support for Magnetar.
 
+mod observability_exporter;
+pub use observability_exporter::*;
+
 use libloading::Library;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
