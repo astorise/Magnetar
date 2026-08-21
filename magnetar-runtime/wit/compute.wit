@@ -19,6 +19,52 @@ interface run {
     float64,
   }
 
+  /// Semantic operation families inside the coarse Compute capability.
+  enum operation-family {
+    descriptor-and-view,
+    construction-and-allocation,
+    data-movement-and-conversion,
+    elementwise,
+    comparison-and-selection,
+    reduction,
+    linear-algebra,
+    convolution-and-spatial-transform,
+    indexing-and-update,
+    random-generation,
+    synchronization-and-completion,
+  }
+
+  /// Portable layout categories. Provider-native layout details stay opaque.
+  enum layout-constraint {
+    dense,
+    strided,
+    provider-opaque,
+  }
+
+  /// Portable precision policy categories for operation-family support.
+  enum precision-mode {
+    exact,
+    default,
+    reduced,
+    mixed,
+  }
+
+  /// Provider advertisement for one operation family.
+  record operation-family-support {
+    family: operation-family,
+    element-types: list<element-type>,
+    layouts: list<layout-constraint>,
+    precision-modes: list<precision-mode>,
+  }
+
+  /// Placeholder until future revisions define operation-specific schemas.
+  record operation-descriptor {
+    family: operation-family,
+    element-type: option<element-type>,
+    layout: option<layout-constraint>,
+    precision: option<precision-mode>,
+  }
+
   /// Tensor shape using fixed-width dimensions.
   record shape-descriptor {
     dimensions: list<u64>,
@@ -42,6 +88,10 @@ interface run {
     invalid-descriptor,
     invalid-graph,
     invalid-state,
+    unsupported-operation-family,
+    unsupported-element-type,
+    unsupported-layout,
+    unsupported-precision,
     unsupported,
     resource-exhausted,
     unavailable,

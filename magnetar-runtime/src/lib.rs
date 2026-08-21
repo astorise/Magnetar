@@ -467,6 +467,7 @@ pub struct ProviderMetadata {
     pub api_version: u32,
     pub description: String,
     pub capabilities: BTreeSet<Capability>,
+    pub compute_operation_support: BTreeMap<ComputeOperationFamily, ComputeOperationSupport>,
 }
 impl ProviderMetadata {
     pub fn new(
@@ -482,6 +483,7 @@ impl ProviderMetadata {
             api_version: PROVIDER_API_VERSION,
             description: description.into(),
             capabilities: BTreeSet::new(),
+            compute_operation_support: BTreeMap::new(),
         }
     }
 }
@@ -1322,6 +1324,373 @@ pub const COMPUTE_WIT_PACKAGE: &str = "magnetar:compute";
 pub const COMPUTE_WIT_INTERFACE: &str = COMPUTE_CAPABILITY_ID;
 /// Current stable version of the executable Compute capability WIT contract.
 pub const COMPUTE_CAPABILITY_VERSION: CapabilityVersion = CapabilityVersion::new(1, 1, 0);
+
+/// Semantic operation families covered by the portable Compute capability.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputeOperationFamily {
+    DescriptorAndView,
+    ConstructionAndAllocation,
+    DataMovementAndConversion,
+    Elementwise,
+    ComparisonAndSelection,
+    Reduction,
+    LinearAlgebra,
+    ConvolutionAndSpatialTransform,
+    IndexingAndUpdate,
+    RandomGeneration,
+    SynchronizationAndCompletion,
+}
+impl ComputeOperationFamily {
+    pub const ALL: [Self; 11] = [
+        Self::DescriptorAndView,
+        Self::ConstructionAndAllocation,
+        Self::DataMovementAndConversion,
+        Self::Elementwise,
+        Self::ComparisonAndSelection,
+        Self::Reduction,
+        Self::LinearAlgebra,
+        Self::ConvolutionAndSpatialTransform,
+        Self::IndexingAndUpdate,
+        Self::RandomGeneration,
+        Self::SynchronizationAndCompletion,
+    ];
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::DescriptorAndView => "descriptor-and-view",
+            Self::ConstructionAndAllocation => "construction-and-allocation",
+            Self::DataMovementAndConversion => "data-movement-and-conversion",
+            Self::Elementwise => "elementwise",
+            Self::ComparisonAndSelection => "comparison-and-selection",
+            Self::Reduction => "reduction",
+            Self::LinearAlgebra => "linear-algebra",
+            Self::ConvolutionAndSpatialTransform => "convolution-and-spatial-transform",
+            Self::IndexingAndUpdate => "indexing-and-update",
+            Self::RandomGeneration => "random-generation",
+            Self::SynchronizationAndCompletion => "synchronization-and-completion",
+        }
+    }
+    pub const fn metadata(self) -> ComputeOperationFamilyMetadata {
+        match self {
+            Self::DescriptorAndView => ComputeOperationFamilyMetadata {
+                family: self,
+                name: "Descriptor and view",
+                scope: "tensor metadata and view transformations",
+                examples: &[
+                    "shape",
+                    "dtype",
+                    "reshape",
+                    "flatten",
+                    "squeeze",
+                    "unsqueeze",
+                    "transpose",
+                    "permute",
+                    "narrow",
+                    "slice",
+                    "broadcast",
+                ],
+            },
+            Self::ConstructionAndAllocation => ComputeOperationFamilyMetadata {
+                family: self,
+                name: "Construction and allocation",
+                scope: "portable tensor construction and allocation requests",
+                examples: &["scalar", "zeros", "ones", "range", "allocate"],
+            },
+            Self::DataMovementAndConversion => ComputeOperationFamilyMetadata {
+                family: self,
+                name: "Data movement and conversion",
+                scope: "explicit transfer, copy, materialization and dtype conversion",
+                examples: &[
+                    "upload",
+                    "download",
+                    "copy",
+                    "materialize",
+                    "convert",
+                    "transfer",
+                ],
+            },
+            Self::Elementwise => ComputeOperationFamilyMetadata {
+                family: self,
+                name: "Elementwise",
+                scope: "portable unary, binary, activation and affine tensor operations",
+                examples: &["add", "sub", "mul", "div", "exp", "log", "relu", "pow"],
+            },
+            Self::ComparisonAndSelection => ComputeOperationFamilyMetadata {
+                family: self,
+                name: "Comparison and selection",
+                scope: "comparisons and conditional selection",
+                examples: &["eq", "lt", "gt", "where"],
+            },
+            Self::Reduction => ComputeOperationFamilyMetadata {
+                family: self,
+                name: "Reduction",
+                scope: "axis-based reductions with future schema-defined edge behavior",
+                examples: &["sum", "mean", "min", "max", "argmin", "argmax"],
+            },
+            Self::LinearAlgebra => ComputeOperationFamilyMetadata {
+                family: self,
+                name: "Linear algebra",
+                scope: "matrix and batched matrix operations",
+                examples: &["matmul", "batched-matmul", "broadcast-matmul"],
+            },
+            Self::ConvolutionAndSpatialTransform => ComputeOperationFamilyMetadata {
+                family: self,
+                name: "Convolution and spatial transform",
+                scope: "convolutions, pooling and spatial resampling",
+                examples: &[
+                    "conv",
+                    "conv-transpose",
+                    "pool",
+                    "upsample-nearest",
+                    "upsample-bilinear",
+                ],
+            },
+            Self::IndexingAndUpdate => ComputeOperationFamilyMetadata {
+                family: self,
+                name: "Indexing and update",
+                scope: "indexing, scatter/gather and explicit update-like result semantics",
+                examples: &[
+                    "gather",
+                    "index-select",
+                    "index-add",
+                    "scatter",
+                    "scatter-add",
+                    "concat",
+                ],
+            },
+            Self::RandomGeneration => ComputeOperationFamilyMetadata {
+                family: self,
+                name: "Random generation",
+                scope: "provider-owned random tensor generation with optional seeds",
+                examples: &["uniform", "normal", "seeded-generation"],
+            },
+            Self::SynchronizationAndCompletion => ComputeOperationFamilyMetadata {
+                family: self,
+                name: "Synchronization and completion",
+                scope: "coarse operation status, await, cancellation and output retrieval",
+                examples: &["status", "await", "cancel", "take-outputs"],
+            },
+        }
+    }
+    pub fn from_id(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|family| family.id() == value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComputeOperationFamilyMetadata {
+    pub family: ComputeOperationFamily,
+    pub name: &'static str,
+    pub scope: &'static str,
+    pub examples: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputeDType {
+    Boolean,
+    UInt8,
+    SInt8,
+    UInt16,
+    SInt16,
+    UInt32,
+    SInt32,
+    UInt64,
+    SInt64,
+    Float16,
+    BrainFloat16,
+    Float32,
+    Float64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputeLayout {
+    Dense,
+    Strided,
+    ProviderOpaque,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputePrecision {
+    Exact,
+    Default,
+    Reduced,
+    Mixed,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ComputeOperationSupport {
+    pub dtypes: BTreeSet<ComputeDType>,
+    pub layouts: BTreeSet<ComputeLayout>,
+    pub precision_modes: BTreeSet<ComputePrecision>,
+}
+impl ComputeOperationSupport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_dtypes(mut self, dtypes: impl IntoIterator<Item = ComputeDType>) -> Self {
+        self.dtypes.extend(dtypes);
+        self
+    }
+    pub fn with_layouts(mut self, layouts: impl IntoIterator<Item = ComputeLayout>) -> Self {
+        self.layouts.extend(layouts);
+        self
+    }
+    pub fn with_precision_modes(
+        mut self,
+        precision_modes: impl IntoIterator<Item = ComputePrecision>,
+    ) -> Self {
+        self.precision_modes.extend(precision_modes);
+        self
+    }
+    fn supports(
+        &self,
+        operation: &ComputeOperationDescriptor,
+    ) -> Result<(), ComputeValidationError> {
+        if let Some(dtype) = operation.dtype
+            && !self.dtypes.is_empty()
+            && !self.dtypes.contains(&dtype)
+        {
+            return Err(ComputeValidationError::UnsupportedDType {
+                family: operation.family,
+                dtype,
+            });
+        }
+        if let Some(layout) = operation.layout
+            && !self.layouts.is_empty()
+            && !self.layouts.contains(&layout)
+        {
+            return Err(ComputeValidationError::UnsupportedLayout {
+                family: operation.family,
+                layout,
+            });
+        }
+        if let Some(precision) = operation.precision
+            && !self.precision_modes.is_empty()
+            && !self.precision_modes.contains(&precision)
+        {
+            return Err(ComputeValidationError::UnsupportedPrecision {
+                family: operation.family,
+                precision,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Placeholder for future operation-specific schemas inside `magnetar:compute/run`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeOperationDescriptor {
+    pub family: ComputeOperationFamily,
+    pub dtype: Option<ComputeDType>,
+    pub layout: Option<ComputeLayout>,
+    pub precision: Option<ComputePrecision>,
+}
+impl ComputeOperationDescriptor {
+    pub fn new(family: ComputeOperationFamily) -> Self {
+        Self {
+            family,
+            dtype: None,
+            layout: None,
+            precision: None,
+        }
+    }
+    pub fn with_dtype(mut self, dtype: ComputeDType) -> Self {
+        self.dtype = Some(dtype);
+        self
+    }
+    pub fn with_layout(mut self, layout: ComputeLayout) -> Self {
+        self.layout = Some(layout);
+        self
+    }
+    pub fn with_precision(mut self, precision: ComputePrecision) -> Self {
+        self.precision = Some(precision);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeOperationRequest {
+    pub family_id: String,
+    pub dtype: Option<ComputeDType>,
+    pub layout: Option<ComputeLayout>,
+    pub precision: Option<ComputePrecision>,
+}
+impl ComputeOperationRequest {
+    pub fn new(family_id: impl Into<String>) -> Self {
+        Self {
+            family_id: family_id.into(),
+            dtype: None,
+            layout: None,
+            precision: None,
+        }
+    }
+    pub fn with_dtype(mut self, dtype: ComputeDType) -> Self {
+        self.dtype = Some(dtype);
+        self
+    }
+    pub fn with_layout(mut self, layout: ComputeLayout) -> Self {
+        self.layout = Some(layout);
+        self
+    }
+    pub fn with_precision(mut self, precision: ComputePrecision) -> Self {
+        self.precision = Some(precision);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComputeValidationError {
+    UnknownOperationFamily(String),
+    UnsupportedOperationFamily {
+        provider: ProviderBinding,
+        family: ComputeOperationFamily,
+    },
+    UnsupportedDType {
+        family: ComputeOperationFamily,
+        dtype: ComputeDType,
+    },
+    UnsupportedLayout {
+        family: ComputeOperationFamily,
+        layout: ComputeLayout,
+    },
+    UnsupportedPrecision {
+        family: ComputeOperationFamily,
+        precision: ComputePrecision,
+    },
+    ProviderUnavailable(ProviderBinding),
+}
+impl fmt::Display for ComputeValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownOperationFamily(family) => {
+                write!(f, "unknown compute operation family '{family}'")
+            }
+            Self::UnsupportedOperationFamily { provider, family } => write!(
+                f,
+                "provider '{provider}' does not support compute operation family '{}'",
+                family.id()
+            ),
+            Self::UnsupportedDType { family, dtype } => write!(
+                f,
+                "compute operation family '{}' does not support dtype {dtype:?}",
+                family.id()
+            ),
+            Self::UnsupportedLayout { family, layout } => write!(
+                f,
+                "compute operation family '{}' does not support layout {layout:?}",
+                family.id()
+            ),
+            Self::UnsupportedPrecision { family, precision } => write!(
+                f,
+                "compute operation family '{}' does not support precision {precision:?}",
+                family.id()
+            ),
+            Self::ProviderUnavailable(provider) => {
+                write!(f, "provider '{provider}' is unavailable")
+            }
+        }
+    }
+}
+impl Error for ComputeValidationError {}
 
 /// Returns the canonical hardware-independent Compute capability declaration.
 ///
@@ -2246,6 +2615,53 @@ impl Runtime {
             self.context.config.resolution_policy,
         )
     }
+    pub fn validate_compute_operation_requests(
+        &self,
+        provider: &str,
+        operations: &[ComputeOperationRequest],
+    ) -> Result<Vec<ComputeOperationDescriptor>, ComputeValidationError> {
+        let descriptors = operations
+            .iter()
+            .map(|operation| {
+                let family =
+                    ComputeOperationFamily::from_id(&operation.family_id).ok_or_else(|| {
+                        ComputeValidationError::UnknownOperationFamily(operation.family_id.clone())
+                    })?;
+                Ok(ComputeOperationDescriptor {
+                    family,
+                    dtype: operation.dtype,
+                    layout: operation.layout,
+                    precision: operation.precision,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.validate_compute_operations(provider, &descriptors)?;
+        Ok(descriptors)
+    }
+    pub fn validate_compute_operations(
+        &self,
+        provider: &str,
+        operations: &[ComputeOperationDescriptor],
+    ) -> Result<(), ComputeValidationError> {
+        let metadata = self
+            .providers
+            .provider(provider)
+            .map(Provider::metadata)
+            .ok_or_else(|| {
+                ComputeValidationError::ProviderUnavailable(ProviderBinding::new(provider))
+            })?;
+        for operation in operations {
+            let support = metadata
+                .compute_operation_support
+                .get(&operation.family)
+                .ok_or(ComputeValidationError::UnsupportedOperationFamily {
+                    provider: ProviderBinding::new(&metadata.name),
+                    family: operation.family,
+                })?;
+            support.supports(operation)?;
+        }
+        Ok(())
+    }
     pub fn select_backend(&mut self, name: &str) -> Result<(), ProviderError> {
         if self.providers.registry().backend(name).is_none() {
             return Err(ProviderError::BackendNotFound(name.into()));
@@ -2686,16 +3102,139 @@ mod tests {
         );
     }
     #[test]
+    fn compute_operation_catalog_defines_stable_family_metadata() {
+        let families = ComputeOperationFamily::ALL
+            .into_iter()
+            .map(|family| family.id())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(families.len(), 11);
+        assert!(families.contains("descriptor-and-view"));
+        assert!(families.contains("construction-and-allocation"));
+        assert!(families.contains("data-movement-and-conversion"));
+        assert!(families.contains("elementwise"));
+        assert!(families.contains("comparison-and-selection"));
+        assert!(families.contains("reduction"));
+        assert!(families.contains("linear-algebra"));
+        assert!(families.contains("convolution-and-spatial-transform"));
+        assert!(families.contains("indexing-and-update"));
+        assert!(families.contains("random-generation"));
+        assert!(families.contains("synchronization-and-completion"));
+
+        let metadata = ComputeOperationFamily::LinearAlgebra.metadata();
+        assert_eq!(metadata.family, ComputeOperationFamily::LinearAlgebra);
+        assert_eq!(metadata.scope, "matrix and batched matrix operations");
+        assert!(metadata.examples.contains(&"matmul"));
+        assert_eq!(
+            ComputeOperationFamily::from_id("elementwise"),
+            Some(ComputeOperationFamily::Elementwise)
+        );
+        assert_eq!(ComputeOperationFamily::from_id("autograd"), None);
+    }
+    #[test]
     fn compute_wit_defines_the_stabilized_run_surface() {
         let wit = include_str!("../wit/compute.wit");
         assert!(wit.contains("package magnetar:compute@1.1.0;"));
         assert!(wit.contains("resource tensor"));
         assert!(wit.contains("resource graph"));
         assert!(wit.contains("resource operation"));
+        assert!(wit.contains("enum operation-family"));
+        assert!(wit.contains("record operation-descriptor"));
+        assert!(wit.contains("unsupported-operation-family"));
+        assert!(wit.contains("unsupported-element-type"));
+        assert!(wit.contains("unsupported-layout"));
         assert!(wit.contains("submit: func("));
         assert!(wit.contains("result<operation, compute-error>"));
         assert!(!wit.contains("BackendStorage"));
         assert!(!wit.contains("Tensor`"));
+        assert!(!wit.contains("autograd"));
+        assert!(!wit.contains("training"));
+        assert!(!wit.contains("kernel-name"));
+        assert!(!wit.contains("queue"));
+        assert!(!wit.contains("custom-operation"));
+    }
+    #[test]
+    fn compute_operation_validation_uses_provider_advertisements() {
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32, ComputeDType::Float64])
+                .with_layouts([ComputeLayout::Dense])
+                .with_precision_modes([ComputePrecision::Default, ComputePrecision::Reduced]),
+        );
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::LinearAlgebra,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense])
+                .with_precision_modes([ComputePrecision::Default]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+
+        runtime
+            .validate_compute_operations(
+                "portable-compute",
+                &[
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                        .with_dtype(ComputeDType::Float32)
+                        .with_layout(ComputeLayout::Dense)
+                        .with_precision(ComputePrecision::Reduced),
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::LinearAlgebra)
+                        .with_dtype(ComputeDType::Float32)
+                        .with_layout(ComputeLayout::Dense),
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "portable-compute",
+                &[ComputeOperationDescriptor::new(
+                    ComputeOperationFamily::Reduction
+                )],
+            ),
+            Err(ComputeValidationError::UnsupportedOperationFamily { .. })
+        ));
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "portable-compute",
+                &[
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                        .with_dtype(ComputeDType::UInt8)
+                ],
+            ),
+            Err(ComputeValidationError::UnsupportedDType { .. })
+        ));
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "portable-compute",
+                &[
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                        .with_layout(ComputeLayout::Strided)
+                ],
+            ),
+            Err(ComputeValidationError::UnsupportedLayout { .. })
+        ));
+    }
+    #[test]
+    fn compute_operation_requests_reject_unknown_family_ids() {
+        let provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            runtime.validate_compute_operation_requests(
+                "portable-compute",
+                &[ComputeOperationRequest::new("backend-kernel-name")]
+            ),
+            Err(ComputeValidationError::UnknownOperationFamily(_))
+        ));
     }
     #[test]
     fn compute_providers_register_and_resolve_compatibly() {
