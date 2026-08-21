@@ -2,7 +2,7 @@
 
 use libloading::Library;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt,
     path::{Path, PathBuf},
@@ -4474,6 +4474,525 @@ impl ComputeExecutionPlan {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ScheduledOperationId(u64);
+impl ScheduledOperationId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+impl fmt::Display for ScheduledOperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SchedulingPolicy {
+    #[default]
+    Fifo,
+    Priority,
+    Deadline,
+    ResourceAware,
+    BatchAware,
+    Fairness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SchedulingState {
+    Accepted,
+    Queued,
+    Ready,
+    Submitted,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+    Interrupted,
+}
+impl SchedulingState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Cancelled | Self::Failed | Self::Interrupted
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SchedulingDiagnostic {
+    Accepted {
+        operation: ScheduledOperationId,
+    },
+    Queued {
+        operation: ScheduledOperationId,
+        position: usize,
+    },
+    SelectedProvider(ProviderBinding),
+    SelectedDevice(DeviceBinding),
+    QueueTime {
+        accepted_order: u64,
+    },
+    CancellationRequested,
+    CancellationForwardedToProvider(ProviderBinding),
+    TerminalState(SchedulingState),
+    StableFailureReason(SchedulerErrorCode),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SchedulerErrorCode {
+    InvalidExecutionPlan,
+    QueueCapacityExceeded,
+    ProviderUnavailable,
+    DeviceUnavailable,
+    ResourceAffinityConflict,
+    MemoryPlanInvalid,
+    SubmissionFailed,
+    CancellationUnsupported,
+    CancellationFailed,
+    ExecutionFailed,
+    ExecutionInterrupted,
+    OperationTimeout,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SchedulerError {
+    InvalidExecutionPlan {
+        reason: String,
+    },
+    QueueCapacityExceeded {
+        capacity: usize,
+    },
+    ProviderUnavailable(ProviderBinding),
+    DeviceUnavailable(DeviceBinding),
+    ResourceAffinityConflict {
+        reason: String,
+    },
+    MemoryPlanInvalid {
+        reason: String,
+    },
+    SubmissionFailed {
+        operation: ScheduledOperationId,
+        reason: String,
+    },
+    CancellationUnsupported(ScheduledOperationId),
+    CancellationFailed {
+        operation: ScheduledOperationId,
+        reason: String,
+    },
+    ExecutionFailed {
+        operation: ScheduledOperationId,
+        reason: String,
+    },
+    ExecutionInterrupted {
+        operation: ScheduledOperationId,
+        reason: String,
+    },
+    OperationTimeout(ScheduledOperationId),
+}
+impl SchedulerError {
+    pub const fn code(&self) -> SchedulerErrorCode {
+        match self {
+            Self::InvalidExecutionPlan { .. } => SchedulerErrorCode::InvalidExecutionPlan,
+            Self::QueueCapacityExceeded { .. } => SchedulerErrorCode::QueueCapacityExceeded,
+            Self::ProviderUnavailable(_) => SchedulerErrorCode::ProviderUnavailable,
+            Self::DeviceUnavailable(_) => SchedulerErrorCode::DeviceUnavailable,
+            Self::ResourceAffinityConflict { .. } => SchedulerErrorCode::ResourceAffinityConflict,
+            Self::MemoryPlanInvalid { .. } => SchedulerErrorCode::MemoryPlanInvalid,
+            Self::SubmissionFailed { .. } => SchedulerErrorCode::SubmissionFailed,
+            Self::CancellationUnsupported(_) => SchedulerErrorCode::CancellationUnsupported,
+            Self::CancellationFailed { .. } => SchedulerErrorCode::CancellationFailed,
+            Self::ExecutionFailed { .. } => SchedulerErrorCode::ExecutionFailed,
+            Self::ExecutionInterrupted { .. } => SchedulerErrorCode::ExecutionInterrupted,
+            Self::OperationTimeout(_) => SchedulerErrorCode::OperationTimeout,
+        }
+    }
+}
+impl fmt::Display for SchedulerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidExecutionPlan { reason } => {
+                write!(f, "invalid execution plan: {reason}")
+            }
+            Self::QueueCapacityExceeded { capacity } => {
+                write!(f, "scheduler queue capacity {capacity} exceeded")
+            }
+            Self::ProviderUnavailable(provider) => {
+                write!(f, "provider '{provider}' is unavailable before submission")
+            }
+            Self::DeviceUnavailable(device) => {
+                write!(f, "device '{device}' is unavailable before submission")
+            }
+            Self::ResourceAffinityConflict { reason } => {
+                write!(f, "resource affinity conflict: {reason}")
+            }
+            Self::MemoryPlanInvalid { reason } => write!(f, "memory plan invalid: {reason}"),
+            Self::SubmissionFailed { operation, reason } => {
+                write!(
+                    f,
+                    "scheduled operation '{operation}' submission failed: {reason}"
+                )
+            }
+            Self::CancellationUnsupported(operation) => {
+                write!(
+                    f,
+                    "scheduled operation '{operation}' cancellation is unsupported"
+                )
+            }
+            Self::CancellationFailed { operation, reason } => {
+                write!(
+                    f,
+                    "scheduled operation '{operation}' cancellation failed: {reason}"
+                )
+            }
+            Self::ExecutionFailed { operation, reason } => {
+                write!(
+                    f,
+                    "scheduled operation '{operation}' execution failed: {reason}"
+                )
+            }
+            Self::ExecutionInterrupted { operation, reason } => {
+                write!(
+                    f,
+                    "scheduled operation '{operation}' execution interrupted: {reason}"
+                )
+            }
+            Self::OperationTimeout(operation) => {
+                write!(f, "scheduled operation '{operation}' timed out")
+            }
+        }
+    }
+}
+impl Error for SchedulerError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduledOperationResult {
+    pub state: SchedulingState,
+    pub outputs: Vec<ExecutionOutput>,
+    pub diagnostics: Vec<SchedulingDiagnostic>,
+    pub error: Option<SchedulerError>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduledOperation {
+    pub id: ScheduledOperationId,
+    pub plan: ComputeExecutionPlan,
+    pub state: SchedulingState,
+    pub accepted_order: u64,
+    pub diagnostics: Vec<SchedulingDiagnostic>,
+    pub result: Option<ScheduledOperationResult>,
+}
+impl ScheduledOperation {
+    pub fn provider(&self) -> &ProviderBinding {
+        &self.plan.provider
+    }
+    pub fn device(&self) -> Option<&DeviceBinding> {
+        self.plan.device.as_ref()
+    }
+    pub fn state(&self) -> SchedulingState {
+        self.state
+    }
+    pub fn is_terminal(&self) -> bool {
+        self.state.is_terminal()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchedulerQueue {
+    capacity: usize,
+    order: VecDeque<ScheduledOperationId>,
+}
+impl SchedulerQueue {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            order: VecDeque::new(),
+        }
+    }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+    fn push(&mut self, id: ScheduledOperationId) -> Result<usize, SchedulerError> {
+        if self.order.len() >= self.capacity {
+            return Err(SchedulerError::QueueCapacityExceeded {
+                capacity: self.capacity,
+            });
+        }
+        self.order.push_back(id);
+        Ok(self.order.len() - 1)
+    }
+    fn pop_next(&mut self) -> Option<ScheduledOperationId> {
+        self.order.pop_front()
+    }
+    fn remove(&mut self, id: ScheduledOperationId) -> bool {
+        let Some(position) = self.order.iter().position(|candidate| *candidate == id) else {
+            return false;
+        };
+        self.order.remove(position);
+        true
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Scheduler {
+    queue: SchedulerQueue,
+    policy: SchedulingPolicy,
+    operations: BTreeMap<ScheduledOperationId, ScheduledOperation>,
+    next_order: u64,
+}
+impl Scheduler {
+    pub fn new(policy: SchedulingPolicy, capacity: usize) -> Self {
+        Self {
+            queue: SchedulerQueue::new(capacity),
+            policy,
+            operations: BTreeMap::new(),
+            next_order: 0,
+        }
+    }
+    pub fn policy(&self) -> SchedulingPolicy {
+        self.policy
+    }
+    pub fn queue(&self) -> &SchedulerQueue {
+        &self.queue
+    }
+    pub fn operation(&self, id: ScheduledOperationId) -> Option<&ScheduledOperation> {
+        self.operations.get(&id)
+    }
+    pub fn schedule(
+        &mut self,
+        runtime: &Runtime,
+        plan: ComputeExecutionPlan,
+    ) -> Result<ScheduledOperationId, SchedulerError> {
+        runtime.validate_scheduler_plan(&plan).map_err(|error| {
+            SchedulerError::InvalidExecutionPlan {
+                reason: error.to_string(),
+            }
+        })?;
+        let id = next_scheduled_operation_id();
+        let accepted_order = self.next_order;
+        self.next_order += 1;
+        let mut operation = ScheduledOperation {
+            id,
+            plan,
+            state: SchedulingState::Accepted,
+            accepted_order,
+            diagnostics: vec![
+                SchedulingDiagnostic::Accepted { operation: id },
+                SchedulingDiagnostic::QueueTime { accepted_order },
+            ],
+            result: None,
+        };
+        let position = match self.queue.push(id) {
+            Ok(position) => position,
+            Err(error) => {
+                operation
+                    .diagnostics
+                    .push(SchedulingDiagnostic::StableFailureReason(error.code()));
+                return Err(error);
+            }
+        };
+        operation.state = SchedulingState::Queued;
+        operation.diagnostics.push(SchedulingDiagnostic::Queued {
+            operation: id,
+            position,
+        });
+        operation
+            .diagnostics
+            .push(SchedulingDiagnostic::SelectedProvider(
+                operation.plan.provider.clone(),
+            ));
+        if let Some(device) = &operation.plan.device {
+            operation
+                .diagnostics
+                .push(SchedulingDiagnostic::SelectedDevice(device.clone()));
+        }
+        self.operations.insert(id, operation);
+        Ok(id)
+    }
+    pub fn submit_next(
+        &mut self,
+        runtime: &Runtime,
+    ) -> Result<Option<ScheduledOperationId>, SchedulerError> {
+        let Some(id) = self.queue.pop_next() else {
+            return Ok(None);
+        };
+        let provider = self
+            .operations
+            .get(&id)
+            .map(|operation| operation.plan.provider.clone())
+            .ok_or_else(|| SchedulerError::SubmissionFailed {
+                operation: id,
+                reason: "operation is not registered".into(),
+            })?;
+        if runtime
+            .providers()
+            .provider(provider.as_str())
+            .map(Provider::health)
+            .unwrap_or(ProviderHealth::Unavailable)
+            == ProviderHealth::Unavailable
+        {
+            self.interrupt_operation(id, "selected Provider is unavailable before submission");
+            return Err(SchedulerError::ProviderUnavailable(provider));
+        }
+        if let Some(device) = self
+            .operations
+            .get(&id)
+            .and_then(ScheduledOperation::device)
+            && runtime
+                .device(device.id())
+                .map(Device::availability)
+                .unwrap_or(DeviceAvailability::Unavailable)
+                == DeviceAvailability::Unavailable
+        {
+            let device = device.clone();
+            self.interrupt_operation(id, "selected Device is unavailable before submission");
+            return Err(SchedulerError::DeviceUnavailable(device));
+        }
+        let operation = self
+            .operations
+            .get_mut(&id)
+            .expect("operation checked above");
+        operation.state = SchedulingState::Ready;
+        operation.state = SchedulingState::Submitted;
+        operation.state = SchedulingState::Running;
+        Ok(Some(id))
+    }
+    pub fn complete(&mut self, id: ScheduledOperationId) -> Result<(), SchedulerError> {
+        let operation = self.operation_mut(id)?;
+        if operation.state.is_terminal() {
+            return Ok(());
+        }
+        operation.state = SchedulingState::Completed;
+        operation
+            .diagnostics
+            .push(SchedulingDiagnostic::TerminalState(
+                SchedulingState::Completed,
+            ));
+        operation.result = Some(ScheduledOperationResult {
+            state: SchedulingState::Completed,
+            outputs: operation.plan.outputs.clone(),
+            diagnostics: operation.diagnostics.clone(),
+            error: None,
+        });
+        Ok(())
+    }
+    pub fn fail(
+        &mut self,
+        id: ScheduledOperationId,
+        reason: impl Into<String>,
+    ) -> Result<(), SchedulerError> {
+        let reason = reason.into();
+        let error = SchedulerError::ExecutionFailed {
+            operation: id,
+            reason: reason.clone(),
+        };
+        let operation = self.operation_mut(id)?;
+        if operation.state.is_terminal() {
+            return Ok(());
+        }
+        operation.state = SchedulingState::Failed;
+        operation
+            .diagnostics
+            .push(SchedulingDiagnostic::StableFailureReason(error.code()));
+        operation
+            .diagnostics
+            .push(SchedulingDiagnostic::TerminalState(SchedulingState::Failed));
+        operation.result = Some(ScheduledOperationResult {
+            state: SchedulingState::Failed,
+            outputs: Vec::new(),
+            diagnostics: operation.diagnostics.clone(),
+            error: Some(error),
+        });
+        Ok(())
+    }
+    pub fn cancel(&mut self, id: ScheduledOperationId) -> Result<(), SchedulerError> {
+        let state = self.operation_mut(id)?.state;
+        match state {
+            SchedulingState::Accepted | SchedulingState::Queued | SchedulingState::Ready => {
+                self.queue.remove(id);
+                let operation = self.operation_mut(id)?;
+                operation.state = SchedulingState::Cancelled;
+                operation
+                    .diagnostics
+                    .push(SchedulingDiagnostic::CancellationRequested);
+                operation
+                    .diagnostics
+                    .push(SchedulingDiagnostic::TerminalState(
+                        SchedulingState::Cancelled,
+                    ));
+                operation.result = Some(ScheduledOperationResult {
+                    state: SchedulingState::Cancelled,
+                    outputs: Vec::new(),
+                    diagnostics: operation.diagnostics.clone(),
+                    error: None,
+                });
+                Ok(())
+            }
+            SchedulingState::Submitted | SchedulingState::Running => {
+                let operation = self.operation_mut(id)?;
+                operation
+                    .diagnostics
+                    .push(SchedulingDiagnostic::CancellationRequested);
+                operation
+                    .diagnostics
+                    .push(SchedulingDiagnostic::CancellationForwardedToProvider(
+                        operation.plan.provider.clone(),
+                    ));
+                Err(SchedulerError::CancellationUnsupported(id))
+            }
+            SchedulingState::Completed
+            | SchedulingState::Cancelled
+            | SchedulingState::Failed
+            | SchedulingState::Interrupted => Ok(()),
+        }
+    }
+    pub fn result(&self, id: ScheduledOperationId) -> Option<&ScheduledOperationResult> {
+        self.operations.get(&id)?.result.as_ref()
+    }
+    fn operation_mut(
+        &mut self,
+        id: ScheduledOperationId,
+    ) -> Result<&mut ScheduledOperation, SchedulerError> {
+        self.operations
+            .get_mut(&id)
+            .ok_or_else(|| SchedulerError::InvalidExecutionPlan {
+                reason: format!("scheduled operation '{id}' is unknown"),
+            })
+    }
+    fn interrupt_operation(&mut self, id: ScheduledOperationId, reason: impl Into<String>) {
+        if let Some(operation) = self.operations.get_mut(&id) {
+            let error = SchedulerError::ExecutionInterrupted {
+                operation: id,
+                reason: reason.into(),
+            };
+            operation.state = SchedulingState::Interrupted;
+            operation
+                .diagnostics
+                .push(SchedulingDiagnostic::StableFailureReason(error.code()));
+            operation
+                .diagnostics
+                .push(SchedulingDiagnostic::TerminalState(
+                    SchedulingState::Interrupted,
+                ));
+            operation.result = Some(ScheduledOperationResult {
+                state: SchedulingState::Interrupted,
+                outputs: Vec::new(),
+                diagnostics: operation.diagnostics.clone(),
+                error: Some(error),
+            });
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComputePlanningError {
     PlanningFailed {
@@ -6560,6 +7079,8 @@ impl ProviderLoader {
 static NEXT_EXECUTION_CONTEXT_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 static NEXT_AFFINITY_GROUP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_SCHEDULED_OPERATION_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 fn next_execution_context_id() -> ExecutionContextId {
     ExecutionContextId::new(
@@ -6568,6 +7089,11 @@ fn next_execution_context_id() -> ExecutionContextId {
 }
 fn next_affinity_group_id() -> AffinityGroupId {
     AffinityGroupId::new(NEXT_AFFINITY_GROUP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+fn next_scheduled_operation_id() -> ScheduledOperationId {
+    ScheduledOperationId::new(
+        NEXT_SCHEDULED_OPERATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -7730,6 +8256,36 @@ impl Runtime {
             });
         }
         Ok(())
+    }
+    pub fn scheduler(&self, capacity: usize) -> Scheduler {
+        Scheduler::new(SchedulingPolicy::Fifo, capacity)
+    }
+    pub fn validate_scheduler_plan(
+        &self,
+        plan: &ComputeExecutionPlan,
+    ) -> Result<(), ComputePlanningError> {
+        if !plan.is_validated() {
+            return Err(ComputePlanningError::InvalidExecutionPlan {
+                reason: "scheduler accepts only validated execution plans".into(),
+            });
+        }
+        self.validate_compute_execution_plan(plan)?;
+        if plan.constraints.iter().any(|constraint| {
+            matches!(constraint, ExecutionConstraint::NoImplicitProviderMigration)
+        }) == false
+        {
+            return Err(ComputePlanningError::InvalidExecutionPlan {
+                reason: "execution plan must forbid implicit Provider migration".into(),
+            });
+        }
+        Ok(())
+    }
+    pub fn schedule_compute_execution(
+        &self,
+        scheduler: &mut Scheduler,
+        plan: ComputeExecutionPlan,
+    ) -> Result<ScheduledOperationId, SchedulerError> {
+        scheduler.schedule(self, plan)
     }
     pub fn validate_compute_graph(
         &self,
@@ -9532,6 +10088,220 @@ mod tests {
             plan.steps
                 .iter()
                 .any(|step| step.kind == ExecutionStepKind::PreserveProviderPinnedAffinity)
+        );
+    }
+    #[test]
+    fn scheduler_accepts_validated_plans_and_runs_fifo() {
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let first_graph = ComputeGraph::new(ComputeGraphId::new("first")).with_node(
+            ComputeNode::new(
+                ComputeNodeId::new("node"),
+                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                    .with_dtype(ComputeDType::Float32)
+                    .with_layout(ComputeLayout::Dense),
+            )
+            .with_output(ComputeNodeOutput::new(
+                ComputeOutputId::new("out"),
+                descriptor.clone(),
+            )),
+        );
+        let second_graph = ComputeGraph::new(ComputeGraphId::new("second")).with_node(
+            ComputeNode::new(
+                ComputeNodeId::new("node"),
+                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                    .with_dtype(ComputeDType::Float32)
+                    .with_layout(ComputeLayout::Dense),
+            )
+            .with_output(ComputeNodeOutput::new(
+                ComputeOutputId::new("out"),
+                descriptor,
+            )),
+        );
+        let first_plan = runtime.plan_compute_execution(&first_graph).unwrap();
+        let second_plan = runtime.plan_compute_execution(&second_graph).unwrap();
+        let mut scheduler = runtime.scheduler(2);
+
+        let first = runtime
+            .schedule_compute_execution(&mut scheduler, first_plan)
+            .unwrap();
+        let second = runtime
+            .schedule_compute_execution(&mut scheduler, second_plan)
+            .unwrap();
+
+        assert_eq!(scheduler.policy(), SchedulingPolicy::Fifo);
+        assert_eq!(scheduler.submit_next(&runtime).unwrap(), Some(first));
+        assert_eq!(
+            scheduler.operation(first).unwrap().state(),
+            SchedulingState::Running
+        );
+        assert_eq!(scheduler.submit_next(&runtime).unwrap(), Some(second));
+    }
+    #[test]
+    fn scheduler_rejects_over_capacity_and_cancels_queued_work() {
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("queued")).with_node(
+            ComputeNode::new(
+                ComputeNodeId::new("node"),
+                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                    .with_dtype(ComputeDType::Float32)
+                    .with_layout(ComputeLayout::Dense),
+            )
+            .with_output(ComputeNodeOutput::new(
+                ComputeOutputId::new("out"),
+                descriptor,
+            )),
+        );
+        let plan = runtime.plan_compute_execution(&graph).unwrap();
+        let mut scheduler = runtime.scheduler(1);
+        let operation = scheduler.schedule(&runtime, plan.clone()).unwrap();
+
+        assert!(matches!(
+            scheduler.schedule(&runtime, plan),
+            Err(SchedulerError::QueueCapacityExceeded { capacity: 1 })
+        ));
+
+        scheduler.cancel(operation).unwrap();
+        assert_eq!(
+            scheduler.operation(operation).unwrap().state(),
+            SchedulingState::Cancelled
+        );
+        assert_eq!(
+            scheduler.result(operation).unwrap().state,
+            SchedulingState::Cancelled
+        );
+        assert_eq!(scheduler.submit_next(&runtime).unwrap(), None);
+    }
+    #[test]
+    fn scheduler_completion_exposes_terminal_result_without_native_handles() {
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("completed"))
+            .with_node(
+                ComputeNode::new(
+                    ComputeNodeId::new("node"),
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                        .with_dtype(ComputeDType::Float32)
+                        .with_layout(ComputeLayout::Dense),
+                )
+                .with_output(ComputeNodeOutput::new(
+                    ComputeOutputId::new("out"),
+                    descriptor,
+                )),
+            )
+            .with_output(ComputeOutput::new(
+                ComputeOutputId::new("result"),
+                ComputeValueRef::NodeOutput {
+                    node: ComputeNodeId::new("node"),
+                    output: ComputeOutputId::new("out"),
+                },
+            ));
+        let plan = runtime.plan_compute_execution(&graph).unwrap();
+        let mut scheduler = runtime.scheduler(1);
+        let operation = scheduler.schedule(&runtime, plan).unwrap();
+
+        scheduler.submit_next(&runtime).unwrap();
+        scheduler.complete(operation).unwrap();
+
+        let result = scheduler.result(operation).unwrap();
+        assert_eq!(result.state, SchedulingState::Completed);
+        assert_eq!(result.outputs.len(), 1);
+        assert!(result.error.is_none());
+    }
+    #[test]
+    fn scheduler_interrupts_when_provider_is_unavailable_before_submission() {
+        let mut healthy = provider_with_capabilities("portable-compute", [compute_capability()]);
+        healthy.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let planning_runtime = Runtime::builder()
+            .register_provider(Arc::new(healthy))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("interrupted")).with_node(
+            ComputeNode::new(
+                ComputeNodeId::new("node"),
+                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                    .with_dtype(ComputeDType::Float32)
+                    .with_layout(ComputeLayout::Dense),
+            )
+            .with_output(ComputeNodeOutput::new(
+                ComputeOutputId::new("out"),
+                descriptor,
+            )),
+        );
+        let plan = planning_runtime.plan_compute_execution(&graph).unwrap();
+        let mut unavailable =
+            provider_with_capabilities("portable-compute", [compute_capability()]);
+        unavailable.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        unavailable.health = ProviderHealth::Unavailable;
+        let submission_runtime = Runtime::builder()
+            .register_provider(Arc::new(unavailable))
+            .build()
+            .unwrap();
+        let mut scheduler = submission_runtime.scheduler(1);
+        let operation = scheduler.schedule(&submission_runtime, plan).unwrap();
+
+        assert!(matches!(
+            scheduler.submit_next(&submission_runtime),
+            Err(SchedulerError::ProviderUnavailable(provider))
+                if provider.as_str() == "portable-compute"
+        ));
+        assert_eq!(
+            scheduler.operation(operation).unwrap().state(),
+            SchedulingState::Interrupted
         );
     }
     #[test]

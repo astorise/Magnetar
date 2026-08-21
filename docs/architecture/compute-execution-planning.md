@@ -30,7 +30,7 @@ memory planning state needed to make one coherent decision.
    required by resource placement or view semantics.
 8. Validate that all plan dependencies are resolved and that no hidden Provider
    migration or hidden CPU staging has been introduced.
-9. Hand the validated plan to future scheduling or Provider-submission code.
+9. Hand the validated plan to the Runtime Scheduler or Provider-submission code.
 
 ## Resolution Policy
 
@@ -56,9 +56,8 @@ Provider execution begins.
 
 ## Scheduler Relationship
 
-The current model does not introduce a Scheduler. A future Scheduler should
-consume validated `ComputeExecutionPlan` values rather than re-resolving
-Provider, Device, memory or affinity decisions.
+The Scheduler consumes validated `ComputeExecutionPlan` values rather than
+re-resolving Provider, Device, memory or affinity decisions.
 
 Scheduling may decide when work runs. It must not rewrite the selected Provider,
 selected Device, memory requirements or affinity constraints without producing a
