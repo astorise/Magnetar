@@ -4700,6 +4700,288 @@ impl ScheduledOperation {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderExecutionId(String);
+impl ProviderExecutionId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for ProviderExecutionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderExecutionHandle {
+    pub id: ProviderExecutionId,
+    pub operation: ScheduledOperationId,
+    pub plan: ExecutionPlanId,
+    pub provider: ProviderBinding,
+    pub device: Option<DeviceBinding>,
+}
+impl ProviderExecutionHandle {
+    pub fn new(
+        operation: ScheduledOperationId,
+        plan: ExecutionPlanId,
+        provider: ProviderBinding,
+        device: Option<DeviceBinding>,
+    ) -> Self {
+        Self {
+            id: provider_execution_id(operation, &plan, &provider),
+            operation,
+            plan,
+            provider,
+            device,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderExecutionRequest {
+    pub operation: ScheduledOperationId,
+    pub plan: ComputeExecutionPlan,
+    pub provider: ProviderBinding,
+    pub device: Option<DeviceBinding>,
+    pub affinity: ResourceAffinity,
+    pub memory_plan: MemoryPlan,
+    pub steps: Vec<ExecutionStep>,
+    pub constraints: Vec<ExecutionConstraint>,
+}
+impl ProviderExecutionRequest {
+    pub fn from_operation(operation: &ScheduledOperation) -> Self {
+        Self {
+            operation: operation.id,
+            plan: operation.plan.clone(),
+            provider: operation.plan.provider.clone(),
+            device: operation.plan.device.clone(),
+            affinity: operation.plan.memory_plan.output_affinity.clone(),
+            memory_plan: operation.plan.memory_plan.clone(),
+            steps: operation.plan.steps.clone(),
+            constraints: operation.plan.constraints.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ProviderExecutionPhase {
+    Prepare,
+    Submit,
+    Observe,
+    Cancel,
+    Complete,
+    Release,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ProviderExecutionErrorCode {
+    ProviderUnavailable,
+    DeviceUnavailable,
+    InvalidExecutionPlan,
+    IncompatibleResourceAffinity,
+    MemoryPlanRejected,
+    UnsupportedOperation,
+    UnsupportedDType,
+    UnsupportedLayout,
+    DataMovementFailed,
+    MaterializationFailed,
+    SubmissionFailed,
+    ExecutionFailed,
+    ExecutionInterrupted,
+    CancellationUnsupported,
+    CancellationFailed,
+    ResourceExhausted,
+    OutOfMemory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderExecutionDiagnostic {
+    pub provider: ProviderBinding,
+    pub device: Option<DeviceBinding>,
+    pub phase: ProviderExecutionPhase,
+    pub stable_reason: Option<ProviderExecutionErrorCode>,
+    pub detail: Option<String>,
+    pub trace_id: Option<String>,
+}
+impl ProviderExecutionDiagnostic {
+    pub fn new(provider: ProviderBinding, phase: ProviderExecutionPhase) -> Self {
+        Self {
+            provider,
+            device: None,
+            phase,
+            stable_reason: None,
+            detail: None,
+            trace_id: None,
+        }
+    }
+    pub fn with_device(mut self, device: Option<DeviceBinding>) -> Self {
+        self.device = device;
+        self
+    }
+    pub fn with_reason(mut self, reason: ProviderExecutionErrorCode) -> Self {
+        self.stable_reason = Some(reason);
+        self
+    }
+    pub fn with_detail(mut self, detail: impl AsRef<str>) -> Self {
+        self.detail = Some(redact_backend_diagnostic(detail.as_ref()));
+        self
+    }
+    pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderExecutionProgress {
+    pub completed_steps: u32,
+    pub total_steps: u32,
+    pub message: Option<String>,
+}
+impl ProviderExecutionProgress {
+    pub fn new(completed_steps: u32, total_steps: u32) -> Self {
+        Self {
+            completed_steps,
+            total_steps,
+            message: None,
+        }
+    }
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderExecutionStatus {
+    pub handle: ProviderExecutionHandle,
+    pub state: SchedulingState,
+    pub progress: Option<ProviderExecutionProgress>,
+    pub diagnostics: Vec<ProviderExecutionDiagnostic>,
+}
+impl ProviderExecutionStatus {
+    pub fn new(handle: ProviderExecutionHandle, state: SchedulingState) -> Self {
+        Self {
+            handle,
+            state,
+            progress: None,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ProviderCancellationOutcome {
+    Accepted,
+    Unsupported,
+    AlreadyTerminal(SchedulingState),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderExecutionResult {
+    pub handle: ProviderExecutionHandle,
+    pub state: SchedulingState,
+    pub outputs: Vec<TensorResourceDescriptor>,
+    pub diagnostics: Vec<ProviderExecutionDiagnostic>,
+}
+impl ProviderExecutionResult {
+    pub fn completed(
+        handle: ProviderExecutionHandle,
+        outputs: impl IntoIterator<Item = TensorResourceDescriptor>,
+    ) -> Self {
+        Self {
+            handle,
+            state: SchedulingState::Completed,
+            outputs: outputs.into_iter().collect(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderExecutionError {
+    pub code: ProviderExecutionErrorCode,
+    pub phase: ProviderExecutionPhase,
+    pub provider: ProviderBinding,
+    pub device: Option<DeviceBinding>,
+    pub message: String,
+    pub diagnostics: Vec<ProviderExecutionDiagnostic>,
+}
+impl ProviderExecutionError {
+    pub fn new(
+        code: ProviderExecutionErrorCode,
+        phase: ProviderExecutionPhase,
+        provider: ProviderBinding,
+        device: Option<DeviceBinding>,
+        message: impl Into<String>,
+    ) -> Self {
+        let diagnostic = ProviderExecutionDiagnostic::new(provider.clone(), phase)
+            .with_device(device.clone())
+            .with_reason(code);
+        Self {
+            code,
+            phase,
+            provider,
+            device,
+            message: message.into(),
+            diagnostics: vec![diagnostic],
+        }
+    }
+    pub fn with_diagnostic(mut self, diagnostic: ProviderExecutionDiagnostic) -> Self {
+        self.diagnostics.push(diagnostic);
+        self
+    }
+    pub fn scheduler_code(&self) -> SchedulerErrorCode {
+        match self.code {
+            ProviderExecutionErrorCode::ProviderUnavailable => {
+                SchedulerErrorCode::ProviderUnavailable
+            }
+            ProviderExecutionErrorCode::DeviceUnavailable => SchedulerErrorCode::DeviceUnavailable,
+            ProviderExecutionErrorCode::InvalidExecutionPlan => {
+                SchedulerErrorCode::InvalidExecutionPlan
+            }
+            ProviderExecutionErrorCode::IncompatibleResourceAffinity => {
+                SchedulerErrorCode::ResourceAffinityConflict
+            }
+            ProviderExecutionErrorCode::MemoryPlanRejected
+            | ProviderExecutionErrorCode::OutOfMemory
+            | ProviderExecutionErrorCode::ResourceExhausted => {
+                SchedulerErrorCode::MemoryPlanInvalid
+            }
+            ProviderExecutionErrorCode::CancellationUnsupported => {
+                SchedulerErrorCode::CancellationUnsupported
+            }
+            ProviderExecutionErrorCode::CancellationFailed => {
+                SchedulerErrorCode::CancellationFailed
+            }
+            ProviderExecutionErrorCode::ExecutionInterrupted => {
+                SchedulerErrorCode::ExecutionInterrupted
+            }
+            ProviderExecutionErrorCode::UnsupportedOperation
+            | ProviderExecutionErrorCode::UnsupportedDType
+            | ProviderExecutionErrorCode::UnsupportedLayout
+            | ProviderExecutionErrorCode::DataMovementFailed
+            | ProviderExecutionErrorCode::MaterializationFailed
+            | ProviderExecutionErrorCode::SubmissionFailed
+            | ProviderExecutionErrorCode::ExecutionFailed => SchedulerErrorCode::ExecutionFailed,
+        }
+    }
+}
+impl fmt::Display for ProviderExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "provider execution error {:?} during {:?} for provider '{}': {}",
+            self.code, self.phase, self.provider, self.message
+        )
+    }
+}
+impl Error for ProviderExecutionError {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchedulerQueue {
     capacity: usize,
@@ -6351,6 +6633,14 @@ fn execution_plan_id(graph: &ComputeGraphId, provider: &ProviderBinding) -> Exec
     ExecutionPlanId::new(format!("plan:{graph}:{provider}"))
 }
 
+fn provider_execution_id(
+    operation: ScheduledOperationId,
+    plan: &ExecutionPlanId,
+    provider: &ProviderBinding,
+) -> ProviderExecutionId {
+    ProviderExecutionId::new(format!("provider-execution:{operation}:{plan}:{provider}"))
+}
+
 fn classify_execution_plan(inputs: &[ExecutionInput]) -> ComputeExecutionClassification {
     if inputs.iter().any(|input| {
         input.resource.is_some() && input.affinity.fallback() == FallbackClass::ProviderPinned
@@ -6452,6 +6742,30 @@ pub trait Provider: Send + Sync {
     fn shutdown(&self) -> Result<(), ProviderError> {
         Ok(())
     }
+    fn execution_api(&self) -> Option<&dyn ProviderExecutionApi> {
+        None
+    }
+}
+
+/// Native Runtime-to-Provider execution boundary for validated planned work.
+pub trait ProviderExecutionApi: Send + Sync {
+    fn submit(
+        &self,
+        request: ProviderExecutionRequest,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError>;
+    fn status(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionStatus, ProviderExecutionError>;
+    fn cancel(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderCancellationOutcome, ProviderExecutionError>;
+    fn complete(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError>;
+    fn release(&self, handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError>;
 }
 
 /// Receives provider contributions.
@@ -8287,6 +8601,295 @@ impl Runtime {
     ) -> Result<ScheduledOperationId, SchedulerError> {
         scheduler.schedule(self, plan)
     }
+    pub fn prepare_provider_execution(
+        &self,
+        operation: &ScheduledOperation,
+    ) -> Result<ProviderExecutionRequest, ProviderExecutionError> {
+        self.validate_scheduler_plan(&operation.plan)
+            .map_err(|error| {
+                ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::InvalidExecutionPlan,
+                    ProviderExecutionPhase::Prepare,
+                    operation.plan.provider.clone(),
+                    operation.plan.device.clone(),
+                    error.to_string(),
+                )
+            })?;
+        self.validate_provider_execution_bindings(
+            &operation.plan.provider,
+            operation.plan.device.as_ref(),
+            ProviderExecutionPhase::Prepare,
+        )?;
+        if operation.plan.provider != operation.plan.memory_plan.provider {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::MemoryPlanRejected,
+                ProviderExecutionPhase::Prepare,
+                operation.plan.provider.clone(),
+                operation.plan.device.clone(),
+                "memory plan provider does not match selected Provider",
+            ));
+        }
+        let provider_affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(operation.plan.provider.clone())
+            .with_capability(operation.plan.capability.clone());
+        provider_affinity
+            .validate_with(&operation.plan.memory_plan.output_affinity)
+            .map_err(|error| {
+                ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::IncompatibleResourceAffinity,
+                    ProviderExecutionPhase::Prepare,
+                    operation.plan.provider.clone(),
+                    operation.plan.device.clone(),
+                    error.to_string(),
+                )
+            })?;
+        if !operation
+            .plan
+            .steps
+            .iter()
+            .any(|step| step.kind == ExecutionStepKind::SubmitToProvider)
+        {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::InvalidExecutionPlan,
+                ProviderExecutionPhase::Prepare,
+                operation.plan.provider.clone(),
+                operation.plan.device.clone(),
+                "execution plan does not contain a Provider submission step",
+            ));
+        }
+        Ok(ProviderExecutionRequest::from_operation(operation))
+    }
+    pub fn submit_provider_execution(
+        &self,
+        request: ProviderExecutionRequest,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        self.validate_compute_execution_plan(&request.plan)
+            .map_err(|error| {
+                ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::InvalidExecutionPlan,
+                    ProviderExecutionPhase::Submit,
+                    request.provider.clone(),
+                    request.device.clone(),
+                    error.to_string(),
+                )
+            })?;
+        if !request.plan.is_validated() {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::InvalidExecutionPlan,
+                ProviderExecutionPhase::Submit,
+                request.provider.clone(),
+                request.device.clone(),
+                "Provider execution accepts only validated execution plans",
+            ));
+        }
+        if request.provider != request.plan.provider || request.device != request.plan.device {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::InvalidExecutionPlan,
+                ProviderExecutionPhase::Submit,
+                request.provider.clone(),
+                request.device.clone(),
+                "Provider execution request changed selected Provider or Device",
+            ));
+        }
+        self.validate_provider_execution_bindings(
+            &request.provider,
+            request.device.as_ref(),
+            ProviderExecutionPhase::Submit,
+        )?;
+        let api = self.provider_execution_api(
+            &request.provider,
+            request.device.as_ref(),
+            ProviderExecutionPhase::Submit,
+        )?;
+        let handle = api.submit(request.clone())?;
+        if handle.operation != request.operation
+            || handle.plan != request.plan.id
+            || handle.provider != request.provider
+            || handle.device != request.device
+        {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::SubmissionFailed,
+                ProviderExecutionPhase::Submit,
+                request.provider,
+                request.device,
+                "Provider returned a handle that does not match the scheduled operation",
+            ));
+        }
+        Ok(handle)
+    }
+    pub fn observe_provider_execution(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+        let api = self.provider_execution_api(
+            &handle.provider,
+            handle.device.as_ref(),
+            ProviderExecutionPhase::Observe,
+        )?;
+        let status = api.status(handle)?;
+        if status.handle != *handle {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::ExecutionFailed,
+                ProviderExecutionPhase::Observe,
+                handle.provider.clone(),
+                handle.device.clone(),
+                "Provider returned status for a different execution handle",
+            ));
+        }
+        Ok(status)
+    }
+    pub fn cancel_provider_execution(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderCancellationOutcome, ProviderExecutionError> {
+        let api = self.provider_execution_api(
+            &handle.provider,
+            handle.device.as_ref(),
+            ProviderExecutionPhase::Cancel,
+        )?;
+        api.cancel(handle)
+    }
+    pub fn complete_provider_execution(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        let api = self.provider_execution_api(
+            &handle.provider,
+            handle.device.as_ref(),
+            ProviderExecutionPhase::Complete,
+        )?;
+        let result = api.complete(handle)?;
+        if result.handle != *handle {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::ExecutionFailed,
+                ProviderExecutionPhase::Complete,
+                handle.provider.clone(),
+                handle.device.clone(),
+                "Provider returned result for a different execution handle",
+            ));
+        }
+        if !result.state.is_terminal() {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::ExecutionFailed,
+                ProviderExecutionPhase::Complete,
+                handle.provider.clone(),
+                handle.device.clone(),
+                "Provider completion result must be terminal",
+            ));
+        }
+        let expected_affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(handle.provider.clone())
+            .with_capability(CapabilityBinding::new(
+                CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                COMPUTE_CAPABILITY_VERSION,
+            ));
+        for output in &result.outputs {
+            expected_affinity
+                .validate_with(&output.affinity)
+                .map_err(|error| {
+                    ProviderExecutionError::new(
+                        ProviderExecutionErrorCode::IncompatibleResourceAffinity,
+                        ProviderExecutionPhase::Complete,
+                        handle.provider.clone(),
+                        handle.device.clone(),
+                        error.to_string(),
+                    )
+                })?;
+        }
+        Ok(result)
+    }
+    pub fn release_provider_execution(
+        &self,
+        handle: ProviderExecutionHandle,
+    ) -> Result<(), ProviderExecutionError> {
+        let api = self.provider_execution_api(
+            &handle.provider,
+            handle.device.as_ref(),
+            ProviderExecutionPhase::Release,
+        )?;
+        api.release(handle)
+    }
+    fn provider_execution_api(
+        &self,
+        provider: &ProviderBinding,
+        device: Option<&DeviceBinding>,
+        phase: ProviderExecutionPhase,
+    ) -> Result<&dyn ProviderExecutionApi, ProviderExecutionError> {
+        self.validate_provider_execution_bindings(provider, device, phase)?;
+        let provider_ref = self.providers.provider(provider.as_str()).ok_or_else(|| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::ProviderUnavailable,
+                phase,
+                provider.clone(),
+                device.cloned(),
+                "selected Provider is unavailable",
+            )
+        })?;
+        provider_ref.execution_api().ok_or_else(|| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::UnsupportedOperation,
+                phase,
+                provider.clone(),
+                device.cloned(),
+                "selected Provider does not implement ProviderExecutionApi",
+            )
+        })
+    }
+    fn validate_provider_execution_bindings(
+        &self,
+        provider: &ProviderBinding,
+        device: Option<&DeviceBinding>,
+        phase: ProviderExecutionPhase,
+    ) -> Result<(), ProviderExecutionError> {
+        let provider_ref = self.providers.provider(provider.as_str()).ok_or_else(|| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::ProviderUnavailable,
+                phase,
+                provider.clone(),
+                device.cloned(),
+                "selected Provider is unavailable",
+            )
+        })?;
+        if provider_ref.health() == ProviderHealth::Unavailable {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::ProviderUnavailable,
+                phase,
+                provider.clone(),
+                device.cloned(),
+                "selected Provider is unhealthy",
+            ));
+        }
+        if let Some(device) = device {
+            let Some(runtime_device) = self.device(device.id()) else {
+                return Err(ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::DeviceUnavailable,
+                    phase,
+                    provider.clone(),
+                    Some(device.clone()),
+                    "selected Device is unavailable",
+                ));
+            };
+            if runtime_device.availability() == DeviceAvailability::Unavailable {
+                return Err(ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::DeviceUnavailable,
+                    phase,
+                    provider.clone(),
+                    Some(device.clone()),
+                    "selected Device is unavailable",
+                ));
+            }
+            if runtime_device.metadata().provider != provider.as_str() {
+                return Err(ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::IncompatibleResourceAffinity,
+                    phase,
+                    provider.clone(),
+                    Some(device.clone()),
+                    "selected Device is owned by a different Provider",
+                ));
+            }
+        }
+        Ok(())
+    }
     pub fn validate_compute_graph(
         &self,
         provider: &str,
@@ -8736,6 +9339,7 @@ mod tests {
         fail_initialization: bool,
         health: ProviderHealth,
         devices: Vec<Arc<dyn Device>>,
+        execution_api: Option<Arc<dyn ProviderExecutionApi>>,
     }
     impl TestProvider {
         fn new(name: &str) -> Self {
@@ -8747,6 +9351,7 @@ mod tests {
                 fail_initialization: false,
                 health: ProviderHealth::Healthy,
                 devices: Vec::new(),
+                execution_api: None,
             }
         }
     }
@@ -8796,6 +9401,69 @@ mod tests {
         }
         fn shutdown(&self) -> Result<(), ProviderError> {
             self.shut_down.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn execution_api(&self) -> Option<&dyn ProviderExecutionApi> {
+            self.execution_api.as_deref()
+        }
+    }
+    struct TestProviderExecutionApi {
+        submitted: Mutex<Vec<ProviderExecutionRequest>>,
+        released: AtomicBool,
+        cancel_outcome: Mutex<ProviderCancellationOutcome>,
+        outputs: Mutex<Vec<TensorResourceDescriptor>>,
+    }
+    impl TestProviderExecutionApi {
+        fn new() -> Self {
+            Self {
+                submitted: Mutex::new(Vec::new()),
+                released: AtomicBool::new(false),
+                cancel_outcome: Mutex::new(ProviderCancellationOutcome::Unsupported),
+                outputs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl ProviderExecutionApi for TestProviderExecutionApi {
+        fn submit(
+            &self,
+            request: ProviderExecutionRequest,
+        ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+            let handle = ProviderExecutionHandle::new(
+                request.operation,
+                request.plan.id.clone(),
+                request.provider.clone(),
+                request.device.clone(),
+            );
+            self.submitted.lock().unwrap().push(request);
+            Ok(handle)
+        }
+        fn status(
+            &self,
+            handle: &ProviderExecutionHandle,
+        ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+            let mut status = ProviderExecutionStatus::new(handle.clone(), SchedulingState::Running);
+            status.progress = Some(
+                ProviderExecutionProgress::new(1, 3).with_message("provider execution is running"),
+            );
+            Ok(status)
+        }
+        fn cancel(
+            &self,
+            _handle: &ProviderExecutionHandle,
+        ) -> Result<ProviderCancellationOutcome, ProviderExecutionError> {
+            Ok(*self.cancel_outcome.lock().unwrap())
+        }
+        fn complete(
+            &self,
+            handle: &ProviderExecutionHandle,
+        ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+            Ok(ProviderExecutionResult::completed(
+                handle.clone(),
+                self.outputs.lock().unwrap().clone(),
+            ))
+        }
+        fn release(&self, _handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+            self.released.store(true, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -10149,6 +10817,208 @@ mod tests {
             SchedulingState::Running
         );
         assert_eq!(scheduler.submit_next(&runtime).unwrap(), Some(second));
+    }
+    #[test]
+    fn provider_execution_api_submits_validated_scheduled_work() {
+        let api = Arc::new(TestProviderExecutionApi::new());
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.execution_api = Some(api.clone());
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("provider-execution")).with_node(
+            ComputeNode::new(
+                ComputeNodeId::new("node"),
+                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                    .with_dtype(ComputeDType::Float32)
+                    .with_layout(ComputeLayout::Dense),
+            )
+            .with_output(ComputeNodeOutput::new(
+                ComputeOutputId::new("out"),
+                descriptor.clone(),
+            )),
+        );
+        let plan = runtime.plan_compute_execution(&graph).unwrap();
+        let mut scheduler = runtime.scheduler(1);
+        let operation_id = runtime
+            .schedule_compute_execution(&mut scheduler, plan)
+            .unwrap();
+        let operation = scheduler.operation(operation_id).unwrap();
+
+        let request = runtime.prepare_provider_execution(operation).unwrap();
+        let handle = runtime.submit_provider_execution(request).unwrap();
+        let status = runtime.observe_provider_execution(&handle).unwrap();
+
+        assert_eq!(handle.operation, operation_id);
+        assert_eq!(handle.provider.as_str(), "portable-compute");
+        assert!(handle.id.as_str().contains("provider-execution:"));
+        assert_eq!(status.state, SchedulingState::Running);
+        assert_eq!(
+            status
+                .progress
+                .as_ref()
+                .map(|progress| progress.total_steps),
+            Some(3)
+        );
+        let submitted = api.submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 1);
+        assert!(submitted[0].plan.is_validated());
+        assert!(submitted[0].constraints.iter().any(|constraint| matches!(
+            constraint,
+            ExecutionConstraint::NoImplicitProviderMigration
+        )));
+    }
+    #[test]
+    fn provider_execution_completion_preserves_output_affinity_and_releases() {
+        let api = Arc::new(TestProviderExecutionApi::new());
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.execution_api = Some(api.clone());
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("provider-complete")).with_node(
+            ComputeNode::new(
+                ComputeNodeId::new("node"),
+                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                    .with_dtype(ComputeDType::Float32)
+                    .with_layout(ComputeLayout::Dense),
+            )
+            .with_output(ComputeNodeOutput::new(
+                ComputeOutputId::new("out"),
+                descriptor.clone(),
+            )),
+        );
+        let plan = runtime.plan_compute_execution(&graph).unwrap();
+        let mut scheduler = runtime.scheduler(1);
+        let operation_id = runtime
+            .schedule_compute_execution(&mut scheduler, plan)
+            .unwrap();
+        let request = runtime
+            .prepare_provider_execution(scheduler.operation(operation_id).unwrap())
+            .unwrap();
+        let handle = runtime.submit_provider_execution(request).unwrap();
+        api.outputs
+            .lock()
+            .unwrap()
+            .push(TensorResourceDescriptor::new(
+                TensorResourceId::new("out-resource"),
+                descriptor,
+                ResourceAffinity::new(FallbackClass::ProviderPinned)
+                    .with_provider(ProviderBinding::new("portable-compute"))
+                    .with_capability(CapabilityBinding::new(
+                        CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                        COMPUTE_CAPABILITY_VERSION,
+                    )),
+            ));
+
+        let result = runtime.complete_provider_execution(&handle).unwrap();
+        runtime.release_provider_execution(handle).unwrap();
+
+        assert_eq!(result.state, SchedulingState::Completed);
+        assert_eq!(result.outputs.len(), 1);
+        assert_eq!(
+            result.outputs[0]
+                .affinity
+                .provider()
+                .map(ProviderBinding::as_str),
+            Some("portable-compute")
+        );
+        assert!(api.released.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn provider_execution_rejects_mismatched_provider_request_and_maps_cancellation() {
+        let api = Arc::new(TestProviderExecutionApi::new());
+        *api.cancel_outcome.lock().unwrap() = ProviderCancellationOutcome::Accepted;
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.execution_api = Some(api);
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("provider-cancel")).with_node(
+            ComputeNode::new(
+                ComputeNodeId::new("node"),
+                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                    .with_dtype(ComputeDType::Float32)
+                    .with_layout(ComputeLayout::Dense),
+            )
+            .with_output(ComputeNodeOutput::new(
+                ComputeOutputId::new("out"),
+                descriptor,
+            )),
+        );
+        let plan = runtime.plan_compute_execution(&graph).unwrap();
+        let mut scheduler = runtime.scheduler(1);
+        let operation_id = runtime
+            .schedule_compute_execution(&mut scheduler, plan)
+            .unwrap();
+        let mut request = runtime
+            .prepare_provider_execution(scheduler.operation(operation_id).unwrap())
+            .unwrap();
+        request.provider = ProviderBinding::new("other-provider");
+
+        assert!(matches!(
+            runtime.submit_provider_execution(request),
+            Err(ProviderExecutionError {
+                code: ProviderExecutionErrorCode::InvalidExecutionPlan,
+                phase: ProviderExecutionPhase::Submit,
+                ..
+            })
+        ));
+
+        let request = runtime
+            .prepare_provider_execution(scheduler.operation(operation_id).unwrap())
+            .unwrap();
+        let handle = runtime.submit_provider_execution(request).unwrap();
+        assert_eq!(
+            runtime.cancel_provider_execution(&handle).unwrap(),
+            ProviderCancellationOutcome::Accepted
+        );
+    }
+    #[test]
+    fn provider_execution_diagnostics_redact_native_details() {
+        let diagnostic = ProviderExecutionDiagnostic::new(
+            ProviderBinding::new("provider"),
+            ProviderExecutionPhase::Submit,
+        )
+        .with_detail("backend handle=0xdeadbeef");
+
+        assert_eq!(
+            diagnostic.detail.as_deref(),
+            Some("[redacted backend diagnostic]")
+        );
     }
     #[test]
     fn scheduler_rejects_over_capacity_and_cancels_queued_work() {
