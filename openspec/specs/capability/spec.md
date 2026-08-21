@@ -1003,3 +1003,626 @@ When the Runtime reports the error
 
 Then the error uses a stable structured Tensor Descriptor error variant.
 
+### Requirement: Compute Graph Submission
+
+`magnetar:compute/run` SHALL support coarse compute graph submission.
+
+A Compute Graph SHALL represent a graph, batch or equivalent coarse unit of
+compute work.
+
+Components SHALL NOT call one WIT function per eager tensor primitive.
+
+#### Scenario: Submit graph
+
+Given a Component has compute work to execute
+
+When it calls `magnetar:compute/run`
+
+Then the work is submitted as a Compute Graph or equivalent coarse unit.
+
+---
+
+### Requirement: Compute Graph
+
+A Compute Graph SHALL contain compute nodes, graph inputs and graph outputs.
+
+A Compute Graph SHALL be portable across compatible Providers.
+
+A Compute Graph SHALL NOT contain native handles, backend kernel names, Rust
+objects, pointers, queues or streams.
+
+#### Scenario: Validate graph shape
+
+Given a Compute Graph
+
+When the Runtime validates it
+
+Then the Runtime verifies graph inputs, graph nodes and graph outputs before
+Provider execution.
+
+---
+
+### Requirement: Compute Node
+
+A Compute Node SHALL describe one semantic compute operation.
+
+A Compute Node SHALL reference an operation family from the Compute Operation
+Catalog.
+
+A Compute Node SHALL reference inputs and outputs using portable graph values.
+
+#### Scenario: Validate node operation family
+
+Given a Compute Node references an operation family
+
+When the Runtime validates the graph
+
+Then the Runtime checks that the operation family is known and supported by at
+least one compatible Provider.
+
+---
+
+### Requirement: Compute Values
+
+A Compute Graph SHALL represent intermediate values using portable Compute
+Values.
+
+Compute Values MAY represent:
+
+- graph inputs
+- node outputs
+- constants
+- opaque tensor resources
+- tensor descriptors
+
+Compute Values SHALL NOT expose native storage.
+
+#### Scenario: Use tensor resource input
+
+Given a Compute Graph input references an opaque Tensor Resource
+
+When the Runtime validates the graph
+
+Then the Runtime checks descriptor compatibility and Resource Affinity before
+Provider execution.
+
+---
+
+### Requirement: Tensor Descriptor Integration
+
+Compute Graph inputs and outputs SHALL use the Tensor Descriptor Model.
+
+Tensor descriptors SHALL be validated before Provider execution.
+
+#### Scenario: Invalid tensor descriptor
+
+Given a Compute Graph contains an invalid Tensor Descriptor
+
+When the Runtime validates the graph
+
+Then graph submission fails before Provider execution begins.
+
+---
+
+### Requirement: Resource Affinity Validation
+
+The Runtime SHALL validate Resource Affinity for all opaque resources used by a
+Compute Graph.
+
+Provider-pinned resources SHALL only be consumed by compatible Providers unless
+an explicit transfer, copy, materialization or replay step exists.
+
+#### Scenario: Incompatible tensor resource
+
+Given a Compute Graph references a Tensor Resource bound to one Provider
+
+When the selected Provider is incompatible with that resource
+
+Then the Runtime rejects submission or requires an explicit data movement step.
+
+---
+
+### Requirement: Provider Capability Validation
+
+The Runtime SHALL validate that the selected Provider supports every required
+operation family, dtype, layout and descriptor constraint.
+
+#### Scenario: Unsupported operation
+
+Given a Compute Graph contains an operation unsupported by the selected Provider
+
+When the Runtime validates Provider compatibility
+
+Then the Runtime rejects the graph with a structured unsupported-operation
+error.
+
+---
+
+### Requirement: Graph Acyclicity
+
+A Compute Graph SHALL be acyclic unless a future control-flow contract
+explicitly defines cyclic semantics.
+
+#### Scenario: Cyclic graph
+
+Given a Compute Graph contains a cycle
+
+When the Runtime validates it
+
+Then the Runtime rejects it with a structured invalid-graph error.
+
+---
+
+### Requirement: Explicit Graph Inputs
+
+A Compute Graph SHALL declare all external inputs explicitly.
+
+External inputs MAY include tensor resources, tensor descriptors or constants.
+
+#### Scenario: Missing input
+
+Given a Compute Node references an undeclared graph input
+
+When the Runtime validates the graph
+
+Then the Runtime rejects it with a structured missing-input error.
+
+---
+
+### Requirement: Explicit Graph Outputs
+
+A Compute Graph SHALL declare all observable outputs explicitly.
+
+Outputs MAY become opaque Tensor Resources.
+
+Produced Tensor Resources SHALL carry Resource Affinity metadata.
+
+#### Scenario: Produce tensor output
+
+Given a Compute Graph declares a tensor output
+
+When execution completes successfully
+
+Then the Runtime returns an opaque Tensor Resource with descriptor and affinity
+metadata.
+
+---
+
+### Requirement: Compute Submission Resource
+
+A submitted Compute Graph SHALL produce a Compute Submission or operation
+resource.
+
+The submission resource SHALL expose completion state.
+
+Completion states SHALL include:
+
+- pending
+- running
+- completed
+- cancelled
+- failed
+
+#### Scenario: Track submission
+
+Given a Compute Graph has been submitted
+
+When the caller queries the submission
+
+Then the Runtime returns the current stable completion state.
+
+---
+
+### Requirement: Await Completion
+
+The Runtime SHALL support awaiting Compute Submission completion.
+
+#### Scenario: Await graph execution
+
+Given a Compute Submission is running
+
+When the caller awaits completion
+
+Then the Runtime returns completed, cancelled or failed terminal state.
+
+---
+
+### Requirement: Cancellation
+
+The Runtime SHALL support cancellation of Compute Submissions when the selected
+Provider can safely cancel the underlying work.
+
+Cancellation SHALL eventually produce a terminal state.
+
+#### Scenario: Cancel graph execution
+
+Given a Compute Submission is running
+
+When cancellation is requested
+
+Then the Runtime forwards the request to the selected Provider
+
+And the submission eventually reaches cancelled, completed or failed state.
+
+---
+
+### Requirement: Structured Graph Errors
+
+The Runtime SHALL return stable structured errors for graph submission and
+validation failures.
+
+Structured errors SHALL include categories for:
+
+- invalid graph
+- cyclic graph
+- missing input
+- missing output
+- invalid tensor descriptor
+- incompatible resource affinity
+- unsupported operation
+- unsupported dtype
+- unsupported layout
+- Provider unavailable
+- execution failed
+- cancelled
+
+Backend diagnostics MAY be attached but SHALL NOT define the stable contract.
+
+#### Scenario: Report graph validation failure
+
+Given graph validation fails
+
+When the Runtime reports the error
+
+Then the error uses a stable structured graph error variant.
+
+---
+
+### Requirement: Provider-Owned Execution
+
+Providers SHALL own native graph execution details.
+
+Native graph execution details include:
+
+- kernel selection
+- command submission
+- memory planning
+- storage allocation
+- device queues
+- synchronization
+- backend-specific optimization
+
+#### Scenario: Execute graph on Provider
+
+Given a Compute Graph has passed Runtime validation
+
+When it is submitted to a Provider
+
+Then the Provider executes it using native mechanisms without exposing those
+mechanisms to the Component.
+
+---
+
+### Requirement: No Autograd or Training Graph
+
+Compute Graph submission SHALL NOT include autograd or training graph behavior
+in the initial contract.
+
+#### Scenario: Submit training graph
+
+Given a Compute Graph contains training-specific metadata
+
+When the Runtime validates it
+
+Then the Runtime rejects the graph as unsupported.
+
+### Requirement: Explicit Data Movement
+
+`magnetar:compute/run` SHALL model data movement explicitly.
+
+The Runtime SHALL NOT silently upload, download, copy, transfer, materialize or
+stage tensor data without an explicit data movement operation.
+
+#### Scenario: Cross-device tensor use
+
+Given a Tensor Resource is bound to one Device
+
+When a compute graph requires the tensor on another Device
+
+Then the Runtime requires an explicit transfer, copy or materialization operation
+before execution.
+
+---
+
+### Requirement: Upload Operation
+
+The data movement model SHALL include an Upload operation.
+
+Upload SHALL create a Tensor Resource from host-provided data and a Tensor
+Descriptor.
+
+Upload SHALL validate the host buffer size against the Tensor Descriptor.
+
+#### Scenario: Upload host data
+
+Given host-owned tensor data
+
+And a compatible Tensor Descriptor
+
+When Upload is executed
+
+Then the Runtime creates an opaque Tensor Resource with Resource Affinity
+metadata.
+
+---
+
+### Requirement: Download Operation
+
+The data movement model SHALL include a Download operation.
+
+Download SHALL copy data from a Tensor Resource into a portable host-visible
+representation.
+
+Download SHALL NOT expose Provider-owned storage directly.
+
+#### Scenario: Download tensor data
+
+Given a Tensor Resource
+
+When Download is executed
+
+Then the Runtime returns host-visible data that matches the validated Tensor
+Descriptor.
+
+---
+
+### Requirement: Copy Operation
+
+The data movement model SHALL include a Copy operation.
+
+Copy SHALL create a distinct Tensor Resource from an existing Tensor Resource.
+
+Copy SHALL preserve semantic tensor contents.
+
+#### Scenario: Copy tensor resource
+
+Given a Tensor Resource
+
+When Copy is executed
+
+Then the Runtime returns a distinct Tensor Resource with its own Resource
+Affinity metadata.
+
+---
+
+### Requirement: Materialize Operation
+
+The data movement model SHALL include a Materialize operation.
+
+Materialize SHALL convert a tensor view into a distinct Tensor Resource.
+
+Materialize SHALL be explicit.
+
+#### Scenario: Materialize tensor view
+
+Given a Tensor Resource represents a view
+
+When a selected Provider cannot consume that view directly
+
+Then the Runtime requires an explicit Materialize operation before execution.
+
+---
+
+### Requirement: Transfer Operation
+
+The data movement model SHALL include a Transfer operation.
+
+Transfer SHALL move or copy tensor data between compatible Provider or Device
+placements.
+
+Transfer SHALL validate source affinity, destination constraints and Provider
+support.
+
+#### Scenario: Transfer between Providers
+
+Given a Tensor Resource is owned by one Provider
+
+And another Provider must consume it
+
+When Transfer is requested
+
+Then the Runtime validates that a supported transfer path exists before
+execution.
+
+---
+
+### Requirement: DType Conversion
+
+The data movement model SHALL support explicit dtype conversion.
+
+DType conversion SHALL validate source dtype, target dtype and Provider support.
+
+#### Scenario: Convert dtype
+
+Given a Tensor Resource with dtype `f32`
+
+When conversion to `f16` is requested
+
+Then the Runtime validates that the selected Provider supports the conversion.
+
+---
+
+### Requirement: Placement Conversion
+
+The data movement model SHALL support explicit placement conversion.
+
+Placement conversion SHALL describe a requested movement between resource
+placements such as host, Provider, Device or Affinity Group.
+
+#### Scenario: Convert placement
+
+Given a Tensor Resource has one placement
+
+When another placement is requested
+
+Then the Runtime validates that the conversion is explicit and supported.
+
+---
+
+### Requirement: Host Buffer Descriptor
+
+Upload and Download operations SHALL use a portable Host Buffer Descriptor.
+
+The Host Buffer Descriptor SHALL include stable byte length and encoding
+metadata.
+
+The Host Buffer Descriptor SHALL NOT expose raw pointers or native memory
+handles.
+
+#### Scenario: Validate host buffer
+
+Given an Upload operation with a Host Buffer Descriptor
+
+When the Runtime validates it
+
+Then the Runtime checks byte length, dtype, shape and encoding compatibility.
+
+---
+
+### Requirement: Resource Affinity Preservation
+
+Data movement operations SHALL preserve or create Resource Affinity metadata.
+
+Produced Tensor Resources SHALL record their owning Provider and Device when
+applicable.
+
+#### Scenario: Produced resource affinity
+
+Given a Transfer operation creates a Tensor Resource on another Device
+
+When the operation completes
+
+Then the produced Tensor Resource records the new Device affinity.
+
+---
+
+### Requirement: No Implicit CPU Staging
+
+The Runtime SHALL NOT hide CPU staging as an implementation detail when it
+changes observable placement, cost or synchronization behavior.
+
+If CPU staging is required for a transfer, the operation SHALL be represented or
+reported through diagnostics.
+
+#### Scenario: CPU staging required
+
+Given a Provider cannot transfer directly to another Provider
+
+And the only available path uses host staging
+
+When Transfer is requested
+
+Then the Runtime either executes an explicit host-staged transfer or rejects the
+request.
+
+---
+
+### Requirement: No Native Handle Exposure
+
+Data movement operations SHALL NOT expose native handles.
+
+Forbidden values include:
+
+- raw pointers
+- GPU pointers
+- backend storage objects
+- device queues
+- streams
+- locks
+- Provider handles
+- file descriptors used as native memory handles
+
+#### Scenario: Inspect transfer result
+
+Given a Component receives a Tensor Resource after Transfer
+
+When it inspects portable metadata
+
+Then it observes descriptors and stable affinity identifiers only.
+
+---
+
+### Requirement: Provider Advertisement
+
+Providers SHALL advertise supported data movement operations.
+
+Provider advertisements MAY include:
+
+- supported upload paths
+- supported download paths
+- supported copy paths
+- supported materialization behavior
+- supported transfer paths
+- supported dtype conversions
+- supported layout conversions
+- size limits
+
+#### Scenario: Select Provider for movement
+
+Given a data movement operation is requested
+
+When the Runtime evaluates compatible Providers
+
+Then Provider data movement support is considered before execution.
+
+---
+
+### Requirement: Incompatible Movement Rejection
+
+The Runtime SHALL reject unsupported or unsafe data movement before Provider
+execution begins.
+
+#### Scenario: Unsupported transfer
+
+Given a Tensor Resource is bound to one Provider
+
+And no compatible transfer path exists to the requested Provider
+
+When Transfer is requested
+
+Then the Runtime rejects the operation with a structured unsupported-transfer
+error.
+
+---
+
+### Requirement: Structured Data Movement Errors
+
+The Runtime SHALL return stable structured errors for data movement failures.
+
+Structured errors SHALL include categories for:
+
+- invalid host buffer
+- invalid tensor descriptor
+- incompatible resource affinity
+- unsupported upload
+- unsupported download
+- unsupported copy
+- unsupported materialization
+- unsupported transfer
+- unsupported dtype conversion
+- unsupported layout conversion
+- size overflow
+- execution failed
+- cancelled
+
+Backend diagnostics MAY be attached for debugging but SHALL NOT define the
+stable contract.
+
+#### Scenario: Report data movement failure
+
+Given a data movement operation fails validation
+
+When the Runtime reports the error
+
+Then the error uses a stable structured data movement error variant.
+

@@ -67,6 +67,39 @@ interface run {
     descriptor-limits: tensor-descriptor-limits,
   }
 
+  enum data-movement-kind {
+    upload,
+    download,
+    copy,
+    materialize,
+    transfer,
+    dtype-conversion,
+    placement-conversion,
+  }
+
+  enum host-buffer-encoding {
+    raw-bytes,
+    native-endian,
+    little-endian,
+    big-endian,
+  }
+
+  record host-buffer-descriptor {
+    byte-len: u64,
+    encoding: host-buffer-encoding,
+  }
+
+  /// Provider advertisement for explicit tensor movement and conversion.
+  record data-movement-support {
+    kind: data-movement-kind,
+    element-types: list<element-type>,
+    provider-specific-element-types: list<string>,
+    layouts: list<layout-constraint>,
+    host-encodings: list<host-buffer-encoding>,
+    descriptor-limits: tensor-descriptor-limits,
+    allow-host-staging: bool,
+  }
+
   /// Placeholder until future revisions define operation-specific schemas.
   record operation-descriptor {
     family: operation-family,
@@ -117,6 +150,56 @@ interface run {
     descriptor: tensor-descriptor,
   }
 
+  variant data-movement-source {
+    host(host-buffer-descriptor),
+    tensor(tensor-resource-descriptor),
+  }
+
+  record data-movement-descriptor {
+    kind: data-movement-kind,
+    source: data-movement-source,
+    output: tensor-descriptor,
+    target-provider: option<string>,
+    target-device: option<string>,
+    target-affinity-group: option<u64>,
+    allow-host-staging: bool,
+  }
+
+  record graph-input {
+    id: string,
+    descriptor: tensor-descriptor,
+    resource-id: option<string>,
+  }
+
+  variant graph-value-ref {
+    input(string),
+    node-output(tuple<string, string>),
+  }
+
+  record graph-node-output {
+    id: string,
+    descriptor: tensor-descriptor,
+  }
+
+  record graph-node {
+    id: string,
+    operation: operation-descriptor,
+    inputs: list<graph-value-ref>,
+    outputs: list<graph-node-output>,
+  }
+
+  record graph-output {
+    id: string,
+    source: graph-value-ref,
+  }
+
+  record graph-descriptor {
+    id: string,
+    inputs: list<graph-input>,
+    nodes: list<graph-node>,
+    outputs: list<graph-output>,
+  }
+
   /// Stable error codes. Provider-specific detail belongs in diagnostics.
   enum compute-error-code {
     invalid-descriptor,
@@ -129,6 +212,12 @@ interface run {
     unsupported-element-type,
     unsupported-layout,
     unsupported-precision,
+    unsupported-data-movement,
+    incompatible-affinity,
+    invalid-host-buffer,
+    invalid-transfer,
+    unsupported-conversion,
+    materialization-required,
     unsupported,
     resource-exhausted,
     unavailable,

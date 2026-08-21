@@ -468,6 +468,8 @@ pub struct ProviderMetadata {
     pub description: String,
     pub capabilities: BTreeSet<Capability>,
     pub compute_operation_support: BTreeMap<ComputeOperationFamily, ComputeOperationSupport>,
+    pub compute_data_movement_support:
+        BTreeMap<ComputeDataMovementKind, ComputeDataMovementSupport>,
 }
 impl ProviderMetadata {
     pub fn new(
@@ -484,6 +486,7 @@ impl ProviderMetadata {
             description: description.into(),
             capabilities: BTreeSet::new(),
             compute_operation_support: BTreeMap::new(),
+            compute_data_movement_support: BTreeMap::new(),
         }
     }
 }
@@ -1940,6 +1943,352 @@ impl ComputeOperationSupport {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputeDataMovementKind {
+    Upload,
+    Download,
+    Copy,
+    Materialize,
+    Transfer,
+    DTypeConversion,
+    PlacementConversion,
+}
+impl ComputeDataMovementKind {
+    pub const ALL: [Self; 7] = [
+        Self::Upload,
+        Self::Download,
+        Self::Copy,
+        Self::Materialize,
+        Self::Transfer,
+        Self::DTypeConversion,
+        Self::PlacementConversion,
+    ];
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Download => "download",
+            Self::Copy => "copy",
+            Self::Materialize => "materialize",
+            Self::Transfer => "transfer",
+            Self::DTypeConversion => "dtype-conversion",
+            Self::PlacementConversion => "placement-conversion",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum HostBufferEncoding {
+    RawBytes,
+    NativeEndian,
+    LittleEndian,
+    BigEndian,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostBufferDescriptor {
+    pub byte_len: u64,
+    pub encoding: HostBufferEncoding,
+}
+impl HostBufferDescriptor {
+    pub const fn new(byte_len: u64, encoding: HostBufferEncoding) -> Self {
+        Self { byte_len, encoding }
+    }
+    pub fn validate_for(&self, tensor: &TensorDescriptor) -> Result<(), ComputeValidationError> {
+        let expected = tensor.byte_size()?;
+        if self.byte_len != expected {
+            return Err(ComputeValidationError::InvalidHostBuffer {
+                reason: format!(
+                    "host buffer byte length {} does not match tensor byte size {expected}",
+                    self.byte_len
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComputeDataMovementSource {
+    Host(HostBufferDescriptor),
+    Tensor(TensorResourceDescriptor),
+}
+impl ComputeDataMovementSource {
+    fn tensor(&self) -> Option<&TensorResourceDescriptor> {
+        match self {
+            Self::Host(_) => None,
+            Self::Tensor(tensor) => Some(tensor),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeDataMovementDescriptor {
+    pub kind: ComputeDataMovementKind,
+    pub source: ComputeDataMovementSource,
+    pub output: TensorDescriptor,
+    pub target_provider: Option<ProviderBinding>,
+    pub target_device: Option<DeviceBinding>,
+    pub target_group: Option<AffinityGroupId>,
+    pub allow_host_staging: bool,
+}
+impl ComputeDataMovementDescriptor {
+    pub fn upload(host: HostBufferDescriptor, output: TensorDescriptor) -> Self {
+        Self::new(
+            ComputeDataMovementKind::Upload,
+            ComputeDataMovementSource::Host(host),
+            output,
+        )
+    }
+    pub fn download(source: TensorResourceDescriptor, output: TensorDescriptor) -> Self {
+        Self::new(
+            ComputeDataMovementKind::Download,
+            ComputeDataMovementSource::Tensor(source),
+            output,
+        )
+    }
+    pub fn copy(source: TensorResourceDescriptor, output: TensorDescriptor) -> Self {
+        Self::new(
+            ComputeDataMovementKind::Copy,
+            ComputeDataMovementSource::Tensor(source),
+            output,
+        )
+    }
+    pub fn materialize(source: TensorResourceDescriptor, output: TensorDescriptor) -> Self {
+        Self::new(
+            ComputeDataMovementKind::Materialize,
+            ComputeDataMovementSource::Tensor(source),
+            output,
+        )
+    }
+    pub fn transfer(source: TensorResourceDescriptor, output: TensorDescriptor) -> Self {
+        Self::new(
+            ComputeDataMovementKind::Transfer,
+            ComputeDataMovementSource::Tensor(source),
+            output,
+        )
+    }
+    pub fn dtype_conversion(source: TensorResourceDescriptor, output: TensorDescriptor) -> Self {
+        Self::new(
+            ComputeDataMovementKind::DTypeConversion,
+            ComputeDataMovementSource::Tensor(source),
+            output,
+        )
+    }
+    pub fn placement_conversion(
+        source: TensorResourceDescriptor,
+        output: TensorDescriptor,
+    ) -> Self {
+        Self::new(
+            ComputeDataMovementKind::PlacementConversion,
+            ComputeDataMovementSource::Tensor(source),
+            output,
+        )
+    }
+    fn new(
+        kind: ComputeDataMovementKind,
+        source: ComputeDataMovementSource,
+        output: TensorDescriptor,
+    ) -> Self {
+        Self {
+            kind,
+            source,
+            output,
+            target_provider: None,
+            target_device: None,
+            target_group: None,
+            allow_host_staging: false,
+        }
+    }
+    pub fn with_target_provider(mut self, provider: ProviderBinding) -> Self {
+        self.target_provider = Some(provider);
+        self
+    }
+    pub fn with_target_device(mut self, device: DeviceBinding) -> Self {
+        self.target_device = Some(device);
+        self
+    }
+    pub fn with_target_group(mut self, group: AffinityGroupId) -> Self {
+        self.target_group = Some(group);
+        self
+    }
+    pub fn with_host_staging(mut self) -> Self {
+        self.allow_host_staging = true;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeDataMovementSupport {
+    pub dtypes: BTreeSet<ComputeDType>,
+    pub provider_specific_dtypes: BTreeSet<String>,
+    pub layouts: BTreeSet<ComputeLayout>,
+    pub host_encodings: BTreeSet<HostBufferEncoding>,
+    pub descriptor_limits: TensorDescriptorLimits,
+    pub allow_host_staging: bool,
+}
+impl Default for ComputeDataMovementSupport {
+    fn default() -> Self {
+        Self {
+            dtypes: BTreeSet::new(),
+            provider_specific_dtypes: BTreeSet::new(),
+            layouts: BTreeSet::new(),
+            host_encodings: BTreeSet::new(),
+            descriptor_limits: TensorDescriptorLimits::default(),
+            allow_host_staging: false,
+        }
+    }
+}
+impl ComputeDataMovementSupport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_dtypes(mut self, dtypes: impl IntoIterator<Item = ComputeDType>) -> Self {
+        self.dtypes.extend(dtypes);
+        self
+    }
+    pub fn with_provider_specific_dtypes(
+        mut self,
+        dtypes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.provider_specific_dtypes
+            .extend(dtypes.into_iter().map(Into::into));
+        self
+    }
+    pub fn with_layouts(mut self, layouts: impl IntoIterator<Item = ComputeLayout>) -> Self {
+        self.layouts.extend(layouts);
+        self
+    }
+    pub fn with_host_encodings(
+        mut self,
+        encodings: impl IntoIterator<Item = HostBufferEncoding>,
+    ) -> Self {
+        self.host_encodings.extend(encodings);
+        self
+    }
+    pub fn with_descriptor_limits(mut self, limits: TensorDescriptorLimits) -> Self {
+        self.descriptor_limits = limits;
+        self
+    }
+    pub const fn with_host_staging(mut self) -> Self {
+        self.allow_host_staging = true;
+        self
+    }
+    fn supports(
+        &self,
+        _provider: &ProviderBinding,
+        movement: &ComputeDataMovementDescriptor,
+    ) -> Result<(), ComputeValidationError> {
+        movement.output.validate(&self.descriptor_limits)?;
+        self.supports_dtype(&movement.output.dtype, movement.kind)?;
+        self.supports_layout(movement.output.layout.kind(), movement.kind)?;
+        if let Some(source) = movement.source.tensor() {
+            source.descriptor.validate(&self.descriptor_limits)?;
+            self.supports_dtype(&source.descriptor.dtype, movement.kind)?;
+            self.supports_layout(source.descriptor.layout.kind(), movement.kind)?;
+        }
+        match &movement.source {
+            ComputeDataMovementSource::Host(host) => {
+                if movement.kind != ComputeDataMovementKind::Upload {
+                    return Err(ComputeValidationError::InvalidTransfer {
+                        reason: "host buffers are valid only as upload sources".into(),
+                    });
+                }
+                if !self.host_encodings.is_empty() && !self.host_encodings.contains(&host.encoding)
+                {
+                    return Err(ComputeValidationError::InvalidHostBuffer {
+                        reason: format!("host encoding {:?} is not supported", host.encoding),
+                    });
+                }
+                host.validate_for(&movement.output)?;
+            }
+            ComputeDataMovementSource::Tensor(source) => {
+                if movement.kind == ComputeDataMovementKind::Upload {
+                    return Err(ComputeValidationError::InvalidTransfer {
+                        reason: "upload requires a host buffer source".into(),
+                    });
+                }
+                if movement.kind == ComputeDataMovementKind::Download {
+                    source.descriptor.byte_size()?;
+                }
+                if movement.kind == ComputeDataMovementKind::Materialize
+                    && source.descriptor.view.is_none()
+                {
+                    return Err(ComputeValidationError::MaterializationRequired {
+                        reason: "materialize requires a tensor view source".into(),
+                    });
+                }
+                if movement.kind == ComputeDataMovementKind::DTypeConversion
+                    && source.descriptor.dtype == movement.output.dtype
+                {
+                    return Err(ComputeValidationError::UnsupportedConversion {
+                        reason: "dtype conversion requires a different output dtype".into(),
+                    });
+                }
+                if movement.kind == ComputeDataMovementKind::PlacementConversion
+                    && movement.target_provider.is_none()
+                    && movement.target_device.is_none()
+                    && movement.target_group.is_none()
+                {
+                    return Err(ComputeValidationError::InvalidTransfer {
+                        reason: "placement conversion requires an explicit target placement".into(),
+                    });
+                }
+                if movement.allow_host_staging && !self.allow_host_staging {
+                    return Err(ComputeValidationError::InvalidTransfer {
+                        reason: "host-staged data movement is not advertised by the provider"
+                            .into(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+    fn supports_dtype(
+        &self,
+        dtype: &DTypeDescriptor,
+        kind: ComputeDataMovementKind,
+    ) -> Result<(), ComputeValidationError> {
+        match dtype {
+            DTypeDescriptor::Portable(dtype) => {
+                if !self.dtypes.is_empty() && !self.dtypes.contains(dtype) {
+                    return Err(ComputeValidationError::UnsupportedConversion {
+                        reason: format!(
+                            "data movement '{}' does not support dtype {dtype:?}",
+                            kind.id()
+                        ),
+                    });
+                }
+            }
+            DTypeDescriptor::ProviderSpecific { id, .. } => {
+                if !self.provider_specific_dtypes.contains(id) {
+                    return Err(ComputeValidationError::UnsupportedConversion {
+                        reason: format!(
+                            "data movement '{}' does not support provider-specific dtype '{id}'",
+                            kind.id()
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+    fn supports_layout(
+        &self,
+        layout: ComputeLayout,
+        kind: ComputeDataMovementKind,
+    ) -> Result<(), ComputeValidationError> {
+        if !self.layouts.is_empty() && !self.layouts.contains(&layout) {
+            return Err(ComputeValidationError::UnsupportedConversion {
+                reason: format!(
+                    "data movement '{}' does not support layout {layout:?}",
+                    kind.id()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Placeholder for future operation-specific schemas inside `magnetar:compute/run`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComputeOperationDescriptor {
@@ -2013,9 +2362,373 @@ impl ComputeOperationRequest {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ComputeGraphId(String);
+impl ComputeGraphId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for ComputeGraphId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ComputeNodeId(String);
+impl ComputeNodeId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for ComputeNodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ComputeInputId(String);
+impl ComputeInputId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for ComputeInputId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ComputeOutputId(String);
+impl ComputeOutputId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for ComputeOutputId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComputeInputValue {
+    TensorResource(TensorResourceDescriptor),
+    TensorDescriptor(TensorDescriptor),
+    Constant(TensorDescriptor),
+}
+impl ComputeInputValue {
+    fn descriptor(&self) -> &TensorDescriptor {
+        match self {
+            Self::TensorResource(resource) => &resource.descriptor,
+            Self::TensorDescriptor(descriptor) | Self::Constant(descriptor) => descriptor,
+        }
+    }
+    fn affinity(&self) -> Option<&ResourceAffinity> {
+        match self {
+            Self::TensorResource(resource) => Some(&resource.affinity),
+            Self::TensorDescriptor(_) | Self::Constant(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeInput {
+    pub id: ComputeInputId,
+    pub value: ComputeInputValue,
+}
+impl ComputeInput {
+    pub fn new(id: ComputeInputId, value: ComputeInputValue) -> Self {
+        Self { id, value }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputeValueRef {
+    Input(ComputeInputId),
+    NodeOutput {
+        node: ComputeNodeId,
+        output: ComputeOutputId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeNodeOutput {
+    pub id: ComputeOutputId,
+    pub descriptor: TensorDescriptor,
+}
+impl ComputeNodeOutput {
+    pub fn new(id: ComputeOutputId, descriptor: TensorDescriptor) -> Self {
+        Self { id, descriptor }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeNode {
+    pub id: ComputeNodeId,
+    pub operation: ComputeOperationDescriptor,
+    pub inputs: Vec<ComputeValueRef>,
+    pub outputs: Vec<ComputeNodeOutput>,
+}
+impl ComputeNode {
+    pub fn new(id: ComputeNodeId, operation: ComputeOperationDescriptor) -> Self {
+        Self {
+            id,
+            operation,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+    pub fn with_input(mut self, input: ComputeValueRef) -> Self {
+        self.inputs.push(input);
+        self
+    }
+    pub fn with_output(mut self, output: ComputeNodeOutput) -> Self {
+        self.outputs.push(output);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeOutput {
+    pub id: ComputeOutputId,
+    pub source: ComputeValueRef,
+}
+impl ComputeOutput {
+    pub fn new(id: ComputeOutputId, source: ComputeValueRef) -> Self {
+        Self { id, source }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeGraph {
+    pub id: ComputeGraphId,
+    pub inputs: Vec<ComputeInput>,
+    pub nodes: Vec<ComputeNode>,
+    pub outputs: Vec<ComputeOutput>,
+}
+impl ComputeGraph {
+    pub fn new(id: ComputeGraphId) -> Self {
+        Self {
+            id,
+            inputs: Vec::new(),
+            nodes: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+    pub fn with_input(mut self, input: ComputeInput) -> Self {
+        self.inputs.push(input);
+        self
+    }
+    pub fn with_node(mut self, node: ComputeNode) -> Self {
+        self.nodes.push(node);
+        self
+    }
+    pub fn with_output(mut self, output: ComputeOutput) -> Self {
+        self.outputs.push(output);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComputeSubmissionState {
+    Pending,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+}
+impl ComputeSubmissionState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeExecutionResult {
+    pub state: ComputeSubmissionState,
+    pub outputs: Vec<TensorResourceDescriptor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeSubmission {
+    pub graph: ComputeGraphId,
+    pub provider: ProviderBinding,
+    pub affinity: ResourceAffinity,
+    state: ComputeSubmissionState,
+    result: Option<ComputeExecutionResult>,
+}
+impl ComputeSubmission {
+    pub fn new(
+        graph: ComputeGraphId,
+        provider: ProviderBinding,
+        affinity: ResourceAffinity,
+    ) -> Self {
+        Self {
+            graph,
+            provider,
+            affinity,
+            state: ComputeSubmissionState::Pending,
+            result: None,
+        }
+    }
+    pub fn state(&self) -> ComputeSubmissionState {
+        self.state
+    }
+    pub fn start(&mut self) -> Result<(), ComputeValidationError> {
+        if self.state != ComputeSubmissionState::Pending {
+            return Err(ComputeValidationError::InvalidState {
+                reason: format!("cannot start submission from {:?} state", self.state),
+            });
+        }
+        self.state = ComputeSubmissionState::Running;
+        Ok(())
+    }
+    pub fn complete(
+        &mut self,
+        outputs: Vec<TensorResourceDescriptor>,
+    ) -> Result<(), ComputeValidationError> {
+        if self.state.is_terminal() {
+            return Err(ComputeValidationError::InvalidState {
+                reason: "submission is already terminal".into(),
+            });
+        }
+        self.state = ComputeSubmissionState::Completed;
+        self.result = Some(ComputeExecutionResult {
+            state: self.state,
+            outputs,
+        });
+        Ok(())
+    }
+    pub fn cancel(&mut self) -> Result<(), ComputeValidationError> {
+        if self.state.is_terminal() {
+            return Err(ComputeValidationError::InvalidState {
+                reason: "submission is already terminal".into(),
+            });
+        }
+        self.state = ComputeSubmissionState::Cancelled;
+        self.result = Some(ComputeExecutionResult {
+            state: self.state,
+            outputs: Vec::new(),
+        });
+        Ok(())
+    }
+    pub fn fail(&mut self) -> Result<(), ComputeValidationError> {
+        if self.state.is_terminal() {
+            return Err(ComputeValidationError::InvalidState {
+                reason: "submission is already terminal".into(),
+            });
+        }
+        self.state = ComputeSubmissionState::Failed;
+        self.result = Some(ComputeExecutionResult {
+            state: self.state,
+            outputs: Vec::new(),
+        });
+        Ok(())
+    }
+    pub fn result(&self) -> Option<&ComputeExecutionResult> {
+        self.result.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeGraphValidationReport {
+    pub provider: ProviderBinding,
+    pub graph: ComputeGraphId,
+    pub node_count: usize,
+    pub input_count: usize,
+    pub output_count: usize,
+}
+
+fn ensure_non_empty_id(kind: &str, value: &str) -> Result<(), ComputeValidationError> {
+    if value.trim().is_empty() {
+        return Err(ComputeValidationError::InvalidGraph {
+            reason: format!("{kind} identifier must not be empty"),
+        });
+    }
+    Ok(())
+}
+
+fn insert_unique<T: Ord + Clone + fmt::Display>(
+    ids: &mut BTreeSet<T>,
+    kind: &str,
+    id: &T,
+) -> Result<(), ComputeValidationError> {
+    if !ids.insert(id.clone()) {
+        return Err(ComputeValidationError::InvalidGraph {
+            reason: format!("duplicate {kind} identifier '{id}'"),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_compute_value_descriptor<'a>(
+    current_node: Option<&ComputeNodeId>,
+    value: &ComputeValueRef,
+    input_descriptors: &'a BTreeMap<ComputeInputId, TensorDescriptor>,
+    output_descriptors: &'a BTreeMap<(ComputeNodeId, ComputeOutputId), TensorDescriptor>,
+    completed_nodes: &BTreeSet<ComputeNodeId>,
+) -> Result<&'a TensorDescriptor, ComputeValidationError> {
+    match value {
+        ComputeValueRef::Input(input) => {
+            input_descriptors
+                .get(input)
+                .ok_or_else(|| ComputeValidationError::MissingInput {
+                    input: input.clone(),
+                })
+        }
+        ComputeValueRef::NodeOutput { node, output } => {
+            if !completed_nodes.contains(node) {
+                return Err(ComputeValidationError::CyclicGraph {
+                    node: current_node.cloned().unwrap_or_else(|| node.clone()),
+                    depends_on: node.clone(),
+                });
+            }
+            output_descriptors
+                .get(&(node.clone(), output.clone()))
+                .ok_or_else(|| ComputeValidationError::MissingOutput {
+                    node: node.clone(),
+                    output: output.clone(),
+                })
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComputeValidationError {
     UnknownOperationFamily(String),
+    InvalidGraph {
+        reason: String,
+    },
+    MissingInput {
+        input: ComputeInputId,
+    },
+    MissingOutput {
+        node: ComputeNodeId,
+        output: ComputeOutputId,
+    },
+    CyclicGraph {
+        node: ComputeNodeId,
+        depends_on: ComputeNodeId,
+    },
+    InvalidState {
+        reason: String,
+    },
     InvalidShape {
         reason: String,
     },
@@ -2045,6 +2758,22 @@ pub enum ComputeValidationError {
         family: ComputeOperationFamily,
         precision: ComputePrecision,
     },
+    UnsupportedDataMovement {
+        provider: ProviderBinding,
+        kind: ComputeDataMovementKind,
+    },
+    InvalidHostBuffer {
+        reason: String,
+    },
+    InvalidTransfer {
+        reason: String,
+    },
+    UnsupportedConversion {
+        reason: String,
+    },
+    MaterializationRequired {
+        reason: String,
+    },
     ProviderUnavailable(ProviderBinding),
     IncompatibleResourceAffinity(AffinityError),
 }
@@ -2053,6 +2782,21 @@ impl fmt::Display for ComputeValidationError {
         match self {
             Self::UnknownOperationFamily(family) => {
                 write!(f, "unknown compute operation family '{family}'")
+            }
+            Self::InvalidGraph { reason } => write!(f, "invalid compute graph: {reason}"),
+            Self::MissingInput { input } => {
+                write!(f, "compute graph references missing input '{input}'")
+            }
+            Self::MissingOutput { node, output } => write!(
+                f,
+                "compute graph references missing output '{output}' on node '{node}'"
+            ),
+            Self::CyclicGraph { node, depends_on } => write!(
+                f,
+                "compute graph node '{node}' depends on future or cyclic node '{depends_on}'"
+            ),
+            Self::InvalidState { reason } => {
+                write!(f, "invalid compute submission state: {reason}")
             }
             Self::InvalidShape { reason } => write!(f, "invalid tensor shape: {reason}"),
             Self::InvalidLayout { reason } => write!(f, "invalid tensor layout: {reason}"),
@@ -2082,6 +2826,23 @@ impl fmt::Display for ComputeValidationError {
                 "compute operation family '{}' does not support precision {precision:?}",
                 family.id()
             ),
+            Self::UnsupportedDataMovement { provider, kind } => write!(
+                f,
+                "provider '{provider}' does not support compute data movement '{}'",
+                kind.id()
+            ),
+            Self::InvalidHostBuffer { reason } => {
+                write!(f, "invalid host buffer: {reason}")
+            }
+            Self::InvalidTransfer { reason } => {
+                write!(f, "invalid compute data transfer: {reason}")
+            }
+            Self::UnsupportedConversion { reason } => {
+                write!(f, "unsupported compute data conversion: {reason}")
+            }
+            Self::MaterializationRequired { reason } => {
+                write!(f, "materialization required: {reason}")
+            }
             Self::ProviderUnavailable(provider) => {
                 write!(f, "provider '{provider}' is unavailable")
             }
@@ -3082,6 +3843,273 @@ impl Runtime {
         }
         Ok(())
     }
+    pub fn validate_compute_data_movement(
+        &self,
+        provider: &str,
+        movements: &[ComputeDataMovementDescriptor],
+    ) -> Result<(), ComputeValidationError> {
+        let metadata = self
+            .providers
+            .provider(provider)
+            .map(Provider::metadata)
+            .ok_or_else(|| {
+                ComputeValidationError::ProviderUnavailable(ProviderBinding::new(provider))
+            })?;
+        let provider_binding = ProviderBinding::new(&metadata.name);
+        let target = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(provider_binding.clone())
+            .with_capability(CapabilityBinding::new(
+                CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                COMPUTE_CAPABILITY_VERSION,
+            ));
+        for movement in movements {
+            let support = metadata
+                .compute_data_movement_support
+                .get(&movement.kind)
+                .ok_or_else(|| ComputeValidationError::UnsupportedDataMovement {
+                    provider: provider_binding.clone(),
+                    kind: movement.kind,
+                })?;
+            support.supports(&provider_binding, movement)?;
+            if let Some(source) = movement.source.tensor() {
+                let permits_explicit_replacement = matches!(
+                    movement.kind,
+                    ComputeDataMovementKind::Transfer
+                        | ComputeDataMovementKind::PlacementConversion
+                );
+                if !permits_explicit_replacement
+                    || source
+                        .affinity
+                        .provider()
+                        .is_none_or(|source_provider| source_provider.as_str() == provider)
+                {
+                    target
+                        .validate_with(&source.affinity)
+                        .map_err(ComputeValidationError::IncompatibleResourceAffinity)?;
+                }
+                if let Some(target_device) = &movement.target_device {
+                    match source.affinity.device() {
+                        Some(source_device) if source_device == target_device => {}
+                        _ if matches!(
+                            movement.kind,
+                            ComputeDataMovementKind::Transfer
+                                | ComputeDataMovementKind::PlacementConversion
+                        ) => {}
+                        _ => {
+                            return Err(ComputeValidationError::InvalidTransfer {
+                                reason:
+                                    "device changes require explicit transfer or placement conversion"
+                                        .into(),
+                            });
+                        }
+                    }
+                }
+                if let Some(target_group) = movement.target_group {
+                    match source.affinity.group() {
+                        Some(source_group) if source_group == target_group => {}
+                        _ if matches!(
+                            movement.kind,
+                            ComputeDataMovementKind::Transfer
+                                | ComputeDataMovementKind::PlacementConversion
+                        ) => {}
+                        _ => {
+                            return Err(ComputeValidationError::InvalidTransfer {
+                                reason:
+                                    "affinity group changes require explicit transfer or placement conversion"
+                                        .into(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn validate_compute_graph(
+        &self,
+        provider: &str,
+        graph: &ComputeGraph,
+    ) -> Result<ComputeGraphValidationReport, ComputeValidationError> {
+        ensure_non_empty_id("graph", graph.id.as_str())?;
+
+        let mut input_ids = BTreeSet::new();
+        let mut input_descriptors = BTreeMap::new();
+        let mut resource_affinities = Vec::new();
+        for input in &graph.inputs {
+            ensure_non_empty_id("input", input.id.as_str())?;
+            insert_unique(&mut input_ids, "input", &input.id)?;
+            input
+                .value
+                .descriptor()
+                .validate(&TensorDescriptorLimits::default())?;
+            input_descriptors.insert(input.id.clone(), input.value.descriptor().clone());
+            if let Some(affinity) = input.value.affinity() {
+                resource_affinities.push(affinity);
+            }
+        }
+
+        let mut node_ids = BTreeSet::new();
+        let mut completed_nodes = BTreeSet::new();
+        let mut output_descriptors = BTreeMap::new();
+        let mut operations = Vec::new();
+        for node in &graph.nodes {
+            ensure_non_empty_id("node", node.id.as_str())?;
+            insert_unique(&mut node_ids, "node", &node.id)?;
+
+            let mut node_output_ids = BTreeSet::new();
+            for output in &node.outputs {
+                ensure_non_empty_id("node output", output.id.as_str())?;
+                insert_unique(&mut node_output_ids, "node output", &output.id)?;
+                output
+                    .descriptor
+                    .validate(&TensorDescriptorLimits::default())?;
+                output_descriptors.insert(
+                    (node.id.clone(), output.id.clone()),
+                    output.descriptor.clone(),
+                );
+            }
+
+            let mut operation = node.operation.clone();
+            for input in &node.inputs {
+                operation.tensors.push(
+                    resolve_compute_value_descriptor(
+                        Some(&node.id),
+                        input,
+                        &input_descriptors,
+                        &output_descriptors,
+                        &completed_nodes,
+                    )?
+                    .clone(),
+                );
+            }
+            operation
+                .tensors
+                .extend(node.outputs.iter().map(|output| output.descriptor.clone()));
+            operations.push(operation);
+            completed_nodes.insert(node.id.clone());
+        }
+
+        let mut graph_output_ids = BTreeSet::new();
+        for output in &graph.outputs {
+            ensure_non_empty_id("graph output", output.id.as_str())?;
+            insert_unique(&mut graph_output_ids, "graph output", &output.id)?;
+            resolve_compute_value_descriptor(
+                None,
+                &output.source,
+                &input_descriptors,
+                &output_descriptors,
+                &completed_nodes,
+            )?;
+        }
+
+        self.validate_compute_operations(provider, &operations)?;
+        if !resource_affinities.is_empty() {
+            let resources = graph
+                .inputs
+                .iter()
+                .filter_map(|input| match &input.value {
+                    ComputeInputValue::TensorResource(resource) => Some(resource.clone()),
+                    ComputeInputValue::TensorDescriptor(_) | ComputeInputValue::Constant(_) => None,
+                })
+                .collect::<Vec<_>>();
+            self.validate_compute_tensor_resources(provider, &resources)?;
+        }
+
+        Ok(ComputeGraphValidationReport {
+            provider: ProviderBinding::new(provider),
+            graph: graph.id.clone(),
+            node_count: graph.nodes.len(),
+            input_count: graph.inputs.len(),
+            output_count: graph.outputs.len(),
+        })
+    }
+    pub fn submit_validated_compute_graph(
+        &self,
+        provider: &str,
+        graph: &ComputeGraph,
+    ) -> Result<ComputeSubmission, ComputeValidationError> {
+        self.validate_compute_graph(provider, graph)?;
+        let dependencies = graph
+            .inputs
+            .iter()
+            .filter_map(|input| input.value.affinity())
+            .collect::<Vec<_>>();
+        let mut constraints = AffinityConstraints::try_from_affinities(dependencies)
+            .map_err(ComputeValidationError::IncompatibleResourceAffinity)?;
+        constraints.require_fallback(FallbackClass::ProviderPinned);
+        constraints
+            .merge(
+                &ResourceAffinity::new(FallbackClass::ProviderPinned)
+                    .with_provider(ProviderBinding::new(provider))
+                    .with_capability(CapabilityBinding::new(
+                        CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                        COMPUTE_CAPABILITY_VERSION,
+                    ))
+                    .with_execution_context(self.context.id),
+            )
+            .map_err(ComputeValidationError::IncompatibleResourceAffinity)?;
+        if constraints.affinity().group().is_none() {
+            constraints
+                .merge(
+                    &ResourceAffinity::new(FallbackClass::Transparent)
+                        .with_group(next_affinity_group_id()),
+                )
+                .map_err(ComputeValidationError::IncompatibleResourceAffinity)?;
+        }
+        let affinity = constraints.into_affinity();
+        Ok(ComputeSubmission::new(
+            graph.id.clone(),
+            ProviderBinding::new(provider),
+            affinity,
+        ))
+    }
+    pub fn wrap_compute_outputs(
+        &self,
+        submission: &ComputeSubmission,
+        outputs: impl IntoIterator<Item = (TensorResourceId, TensorDescriptor)>,
+    ) -> Vec<TensorResourceDescriptor> {
+        outputs
+            .into_iter()
+            .map(|(id, descriptor)| {
+                TensorResourceDescriptor::new(id, descriptor, submission.affinity.clone())
+            })
+            .collect()
+    }
+    pub fn wrap_compute_data_movement_output(
+        &self,
+        provider: &str,
+        movement: &ComputeDataMovementDescriptor,
+        id: TensorResourceId,
+    ) -> Result<TensorResourceDescriptor, ComputeValidationError> {
+        self.validate_compute_data_movement(provider, std::slice::from_ref(movement))?;
+        let mut affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(
+                movement
+                    .target_provider
+                    .clone()
+                    .unwrap_or_else(|| ProviderBinding::new(provider)),
+            )
+            .with_capability(CapabilityBinding::new(
+                CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                COMPUTE_CAPABILITY_VERSION,
+            ))
+            .with_execution_context(self.context.id);
+        if let Some(device) = &movement.target_device {
+            affinity = affinity.with_device(device.clone());
+        }
+        if let Some(group) = movement.target_group {
+            affinity = affinity.with_group(group);
+        } else if let Some(source) = movement.source.tensor()
+            && let Some(group) = source.affinity.group()
+        {
+            affinity = affinity.with_group(group);
+        }
+        Ok(TensorResourceDescriptor::new(
+            id,
+            movement.output.clone(),
+            affinity,
+        ))
+    }
     pub fn select_backend(&mut self, name: &str) -> Result<(), ProviderError> {
         if self.providers.registry().backend(name).is_none() {
             return Err(ProviderError::BackendNotFound(name.into()));
@@ -3560,16 +4588,28 @@ mod tests {
         assert!(wit.contains("resource operation"));
         assert!(wit.contains("enum operation-family"));
         assert!(wit.contains("record operation-descriptor"));
+        assert!(wit.contains("record graph-descriptor"));
+        assert!(wit.contains("record graph-node"));
+        assert!(wit.contains("variant graph-value-ref"));
         assert!(wit.contains("record shape-descriptor"));
         assert!(wit.contains("variant dtype-descriptor"));
         assert!(wit.contains("variant layout-descriptor"));
         assert!(wit.contains("record view-descriptor"));
         assert!(wit.contains("record tensor-resource-descriptor"));
+        assert!(wit.contains("enum data-movement-kind"));
+        assert!(wit.contains("record host-buffer-descriptor"));
+        assert!(wit.contains("record data-movement-support"));
+        assert!(wit.contains("record data-movement-descriptor"));
         assert!(wit.contains("invalid-shape"));
         assert!(wit.contains("size-overflow"));
         assert!(wit.contains("unsupported-operation-family"));
         assert!(wit.contains("unsupported-element-type"));
         assert!(wit.contains("unsupported-layout"));
+        assert!(wit.contains("unsupported-data-movement"));
+        assert!(wit.contains("invalid-host-buffer"));
+        assert!(wit.contains("invalid-transfer"));
+        assert!(wit.contains("unsupported-conversion"));
+        assert!(wit.contains("materialization-required"));
         assert!(wit.contains("submit: func("));
         assert!(wit.contains("result<operation, compute-error>"));
         assert!(!wit.contains("BackendStorage"));
@@ -3792,6 +4832,90 @@ mod tests {
         ));
     }
     #[test]
+    fn compute_data_movement_validates_host_buffers_affinity_and_provider_support() {
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_data_movement_support.insert(
+            ComputeDataMovementKind::Upload,
+            ComputeDataMovementSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense])
+                .with_host_encodings([HostBufferEncoding::LittleEndian]),
+        );
+        provider.metadata.compute_data_movement_support.insert(
+            ComputeDataMovementKind::Transfer,
+            ComputeDataMovementSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        provider.metadata.compute_data_movement_support.insert(
+            ComputeDataMovementKind::Materialize,
+            ComputeDataMovementSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense, ComputeLayout::Strided]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+
+        let upload = ComputeDataMovementDescriptor::upload(
+            HostBufferDescriptor::new(16, HostBufferEncoding::LittleEndian),
+            descriptor.clone(),
+        );
+        runtime
+            .validate_compute_data_movement("portable-compute", &[upload.clone()])
+            .unwrap();
+        let uploaded = runtime
+            .wrap_compute_data_movement_output(
+                "portable-compute",
+                &upload,
+                TensorResourceId::new("uploaded"),
+            )
+            .unwrap();
+        assert_eq!(
+            uploaded.affinity.provider().map(ProviderBinding::as_str),
+            Some("portable-compute")
+        );
+
+        let invalid_upload = ComputeDataMovementDescriptor::upload(
+            HostBufferDescriptor::new(8, HostBufferEncoding::LittleEndian),
+            descriptor.clone(),
+        );
+        assert!(matches!(
+            runtime.validate_compute_data_movement("portable-compute", &[invalid_upload]),
+            Err(ComputeValidationError::InvalidHostBuffer { .. })
+        ));
+
+        let foreign = TensorResourceDescriptor::new(
+            TensorResourceId::new("foreign"),
+            descriptor.clone(),
+            ResourceAffinity::new(FallbackClass::ProviderPinned)
+                .with_provider(ProviderBinding::new("other-provider")),
+        );
+        let transfer = ComputeDataMovementDescriptor::transfer(foreign, descriptor.clone())
+            .with_target_provider(ProviderBinding::new("portable-compute"));
+        runtime
+            .validate_compute_data_movement("portable-compute", &[transfer])
+            .unwrap();
+
+        let materialized = TensorResourceDescriptor::new(
+            TensorResourceId::new("materialized"),
+            descriptor.clone(),
+            ResourceAffinity::new(FallbackClass::ProviderPinned)
+                .with_provider(ProviderBinding::new("portable-compute")),
+        );
+        let invalid_materialize =
+            ComputeDataMovementDescriptor::materialize(materialized, descriptor);
+        assert!(matches!(
+            runtime.validate_compute_data_movement("portable-compute", &[invalid_materialize]),
+            Err(ComputeValidationError::MaterializationRequired { .. })
+        ));
+    }
+    #[test]
     fn compute_operation_requests_reject_unknown_family_ids() {
         let provider = provider_with_capabilities("portable-compute", [compute_capability()]);
         let runtime = Runtime::builder()
@@ -3805,6 +4929,129 @@ mod tests {
                 &[ComputeOperationRequest::new("backend-kernel-name")]
             ),
             Err(ComputeValidationError::UnknownOperationFamily(_))
+        ));
+    }
+    #[test]
+    fn compute_graph_validation_checks_references_provider_support_and_submission_affinity() {
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("graph-1"))
+            .with_input(ComputeInput::new(
+                ComputeInputId::new("x"),
+                ComputeInputValue::TensorDescriptor(descriptor.clone()),
+            ))
+            .with_node(
+                ComputeNode::new(
+                    ComputeNodeId::new("add"),
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                        .with_dtype(ComputeDType::Float32)
+                        .with_layout(ComputeLayout::Dense),
+                )
+                .with_input(ComputeValueRef::Input(ComputeInputId::new("x")))
+                .with_output(ComputeNodeOutput::new(
+                    ComputeOutputId::new("y"),
+                    descriptor,
+                )),
+            )
+            .with_output(ComputeOutput::new(
+                ComputeOutputId::new("result"),
+                ComputeValueRef::NodeOutput {
+                    node: ComputeNodeId::new("add"),
+                    output: ComputeOutputId::new("y"),
+                },
+            ));
+
+        let report = runtime
+            .validate_compute_graph("portable-compute", &graph)
+            .unwrap();
+        assert_eq!(report.node_count, 1);
+        assert_eq!(report.input_count, 1);
+        assert_eq!(report.output_count, 1);
+
+        let submission = runtime
+            .submit_validated_compute_graph("portable-compute", &graph)
+            .unwrap();
+        assert_eq!(submission.graph, ComputeGraphId::new("graph-1"));
+        assert_eq!(submission.state(), ComputeSubmissionState::Pending);
+        assert_eq!(
+            submission.affinity.provider().map(ProviderBinding::as_str),
+            Some("portable-compute")
+        );
+    }
+    #[test]
+    fn compute_graph_validation_rejects_missing_and_future_references() {
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let missing_input = ComputeGraph::new(ComputeGraphId::new("bad-input")).with_node(
+            ComputeNode::new(
+                ComputeNodeId::new("node"),
+                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise),
+            )
+            .with_input(ComputeValueRef::Input(ComputeInputId::new("missing")))
+            .with_output(ComputeNodeOutput::new(
+                ComputeOutputId::new("out"),
+                descriptor.clone(),
+            )),
+        );
+        assert!(matches!(
+            runtime.validate_compute_graph("portable-compute", &missing_input),
+            Err(ComputeValidationError::MissingInput { .. })
+        ));
+
+        let future_reference = ComputeGraph::new(ComputeGraphId::new("cycle"))
+            .with_node(
+                ComputeNode::new(
+                    ComputeNodeId::new("first"),
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise),
+                )
+                .with_input(ComputeValueRef::NodeOutput {
+                    node: ComputeNodeId::new("second"),
+                    output: ComputeOutputId::new("out"),
+                })
+                .with_output(ComputeNodeOutput::new(
+                    ComputeOutputId::new("out"),
+                    descriptor.clone(),
+                )),
+            )
+            .with_node(
+                ComputeNode::new(
+                    ComputeNodeId::new("second"),
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise),
+                )
+                .with_output(ComputeNodeOutput::new(
+                    ComputeOutputId::new("out"),
+                    descriptor,
+                )),
+            );
+        assert!(matches!(
+            runtime.validate_compute_graph("portable-compute", &future_reference),
+            Err(ComputeValidationError::CyclicGraph { .. })
         ));
     }
     #[test]
