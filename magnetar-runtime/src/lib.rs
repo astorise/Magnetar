@@ -4703,6 +4703,7 @@ pub enum ExecutionDiagnostic {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComputeExecutionPlan {
     pub id: ExecutionPlanId,
+    pub trace_id: TraceId,
     pub graph: ComputeGraphId,
     pub provider: ProviderBinding,
     pub device: Option<DeviceBinding>,
@@ -4721,6 +4722,12 @@ impl ComputeExecutionPlan {
     pub fn is_validated(&self) -> bool {
         self.validated
     }
+    pub fn trace_id(&self) -> &TraceId {
+        &self.trace_id
+    }
+    pub fn observations(&self) -> Vec<RuntimeEvent> {
+        runtime_events_for_execution_plan(self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -4737,6 +4744,321 @@ impl fmt::Display for ScheduledOperationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CorrelationId(String);
+impl CorrelationId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for CorrelationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TraceId(String);
+impl TraceId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for TraceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SpanId(String);
+impl SpanId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for SpanId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RuntimeObservationPhase {
+    Resolution,
+    ResourceAffinity,
+    MemoryPlanning,
+    ExecutionPlanning,
+    Scheduling,
+    ProviderExecution,
+    Health,
+    Diagnostic,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RuntimeEventKind {
+    CapabilityResolution,
+    ProviderSelected,
+    ProviderRejected,
+    ResourceAffinityDecision,
+    TransferRequired,
+    MaterializationRequired,
+    MemoryPlanning,
+    ExecutionPlanning,
+    Scheduled,
+    SchedulerBackpressure,
+    ProviderSubmission,
+    ExecutionStarted,
+    ExecutionCompleted,
+    ExecutionCancelled,
+    ExecutionInterrupted,
+    ProviderHealthChanged,
+    DeviceHealthChanged,
+    DiagnosticEmitted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeEvent {
+    pub sequence: u64,
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    pub correlation_id: Option<CorrelationId>,
+    pub phase: RuntimeObservationPhase,
+    pub kind: RuntimeEventKind,
+    pub execution_plan: Option<ExecutionPlanId>,
+    pub scheduled_operation: Option<ScheduledOperationId>,
+    pub provider: Option<ProviderBinding>,
+    pub device: Option<DeviceBinding>,
+    pub capability: Option<CapabilityBinding>,
+    pub diagnostic_code: Option<RuntimeDiagnosticCode>,
+    pub message: String,
+}
+impl RuntimeEvent {
+    pub fn new(
+        trace_id: TraceId,
+        span_id: SpanId,
+        phase: RuntimeObservationPhase,
+        kind: RuntimeEventKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            sequence: next_runtime_observation_sequence(),
+            trace_id,
+            span_id,
+            correlation_id: None,
+            phase,
+            kind,
+            execution_plan: None,
+            scheduled_operation: None,
+            provider: None,
+            device: None,
+            capability: None,
+            diagnostic_code: None,
+            message: redact_backend_diagnostic(&message.into()),
+        }
+    }
+    pub fn with_correlation(mut self, correlation_id: CorrelationId) -> Self {
+        self.correlation_id = Some(correlation_id);
+        self
+    }
+    pub fn with_plan(mut self, plan: ExecutionPlanId) -> Self {
+        self.execution_plan = Some(plan);
+        self
+    }
+    pub fn with_operation(mut self, operation: ScheduledOperationId) -> Self {
+        self.scheduled_operation = Some(operation);
+        self
+    }
+    pub fn with_provider(mut self, provider: ProviderBinding) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+    pub fn with_device(mut self, device: DeviceBinding) -> Self {
+        self.device = Some(device);
+        self
+    }
+    pub fn with_capability(mut self, capability: CapabilityBinding) -> Self {
+        self.capability = Some(capability);
+        self
+    }
+    pub fn with_diagnostic_code(mut self, code: RuntimeDiagnosticCode) -> Self {
+        self.diagnostic_code = Some(code);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeTrace {
+    pub trace_id: TraceId,
+    pub events: Vec<RuntimeEvent>,
+}
+impl RuntimeTrace {
+    pub fn new(trace_id: TraceId) -> Self {
+        Self {
+            trace_id,
+            events: Vec::new(),
+        }
+    }
+    pub fn push(&mut self, event: RuntimeEvent) {
+        if event.trace_id == self.trace_id {
+            self.events.push(event);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RuntimeMetricKind {
+    QueueLatency,
+    PlanningLatency,
+    ExecutionLatency,
+    MemoryUsageEstimate,
+    TransferVolume,
+    MaterializationCount,
+    ProviderUtilization,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeMetric {
+    pub kind: RuntimeMetricKind,
+    pub value: u64,
+    pub unit: &'static str,
+    pub trace_id: Option<TraceId>,
+    pub provider: Option<ProviderBinding>,
+    pub device: Option<DeviceBinding>,
+}
+impl RuntimeMetric {
+    pub fn new(kind: RuntimeMetricKind, value: u64, unit: &'static str) -> Self {
+        Self {
+            kind,
+            value,
+            unit,
+            trace_id: None,
+            provider: None,
+            device: None,
+        }
+    }
+    pub fn with_trace(mut self, trace_id: TraceId) -> Self {
+        self.trace_id = Some(trace_id);
+        self
+    }
+    pub fn with_provider(mut self, provider: ProviderBinding) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+    pub fn with_device(mut self, device: Option<DeviceBinding>) -> Self {
+        self.device = device;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RuntimeDiagnosticCode {
+    CapabilityResolutionFailed,
+    ProviderRejected,
+    ResourceAffinityConflict,
+    TransferRequired,
+    MaterializationRequired,
+    MemoryPlanningFailed,
+    ExecutionPlanningFailed,
+    SchedulerBackpressure,
+    ProviderUnavailable,
+    DeviceUnavailable,
+    ExecutionFailed,
+    ExecutionInterrupted,
+    ExecutionCancelled,
+    ProviderHealthChanged,
+    DeviceHealthChanged,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeDiagnostic {
+    pub code: RuntimeDiagnosticCode,
+    pub message: String,
+    pub trace_id: Option<TraceId>,
+    pub correlation_id: Option<CorrelationId>,
+    pub execution_plan: Option<ExecutionPlanId>,
+    pub scheduled_operation: Option<ScheduledOperationId>,
+    pub provider: Option<ProviderBinding>,
+    pub device: Option<DeviceBinding>,
+}
+impl RuntimeDiagnostic {
+    pub fn new(code: RuntimeDiagnosticCode, message: impl AsRef<str>) -> Self {
+        Self {
+            code,
+            message: redact_backend_diagnostic(message.as_ref()),
+            trace_id: None,
+            correlation_id: None,
+            execution_plan: None,
+            scheduled_operation: None,
+            provider: None,
+            device: None,
+        }
+    }
+    pub fn with_trace(mut self, trace_id: TraceId) -> Self {
+        self.trace_id = Some(trace_id);
+        self
+    }
+    pub fn with_correlation(mut self, correlation_id: CorrelationId) -> Self {
+        self.correlation_id = Some(correlation_id);
+        self
+    }
+    pub fn with_plan(mut self, plan: ExecutionPlanId) -> Self {
+        self.execution_plan = Some(plan);
+        self
+    }
+    pub fn with_operation(mut self, operation: ScheduledOperationId) -> Self {
+        self.scheduled_operation = Some(operation);
+        self
+    }
+    pub fn with_provider(mut self, provider: ProviderBinding) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+    pub fn with_device(mut self, device: DeviceBinding) -> Self {
+        self.device = Some(device);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservabilityExporterDescriptor {
+    pub component: ComponentMetadata,
+    pub input_contract: WitInterface,
+    pub accepted_events: BTreeSet<RuntimeEventKind>,
+    pub sink: ObservabilitySink,
+}
+impl ObservabilityExporterDescriptor {
+    pub fn new(component: ComponentMetadata, sink: ObservabilitySink) -> Self {
+        Self {
+            component,
+            input_contract: runtime_observability_wit(),
+            accepted_events: BTreeSet::new(),
+            sink,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObservabilitySink {
+    OpenTelemetry,
+    Prometheus,
+    Jaeger,
+    Custom(String),
+}
+
+pub fn runtime_observability_wit() -> WitInterface {
+    WitInterface::new("magnetar:runtime/observability", "1.0.0")
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -5368,6 +5690,7 @@ pub struct Scheduler {
     queue: SchedulerQueue,
     policy: SchedulingPolicy,
     operations: BTreeMap<ScheduledOperationId, ScheduledOperation>,
+    observations: Vec<RuntimeEvent>,
     next_order: u64,
 }
 impl Scheduler {
@@ -5376,6 +5699,7 @@ impl Scheduler {
             queue: SchedulerQueue::new(capacity),
             policy,
             operations: BTreeMap::new(),
+            observations: Vec::new(),
             next_order: 0,
         }
     }
@@ -5387,6 +5711,9 @@ impl Scheduler {
     }
     pub fn operation(&self, id: ScheduledOperationId) -> Option<&ScheduledOperation> {
         self.operations.get(&id)
+    }
+    pub fn observations(&self) -> &[RuntimeEvent] {
+        &self.observations
     }
     pub fn schedule(
         &mut self,
@@ -5418,6 +5745,19 @@ impl Scheduler {
                 operation
                     .diagnostics
                     .push(SchedulingDiagnostic::StableFailureReason(error.code()));
+                self.observations.push(
+                    RuntimeEvent::new(
+                        operation.plan.trace_id.clone(),
+                        SpanId::new(format!("schedule:{id}")),
+                        RuntimeObservationPhase::Scheduling,
+                        RuntimeEventKind::SchedulerBackpressure,
+                        "scheduler queue capacity exceeded",
+                    )
+                    .with_plan(operation.plan.id.clone())
+                    .with_operation(id)
+                    .with_provider(operation.plan.provider.clone())
+                    .with_diagnostic_code(RuntimeDiagnosticCode::SchedulerBackpressure),
+                );
                 return Err(error);
             }
         };
@@ -5436,6 +5776,18 @@ impl Scheduler {
                 .diagnostics
                 .push(SchedulingDiagnostic::SelectedDevice(device.clone()));
         }
+        self.observations.push(
+            RuntimeEvent::new(
+                operation.plan.trace_id.clone(),
+                SpanId::new(format!("schedule:{id}")),
+                RuntimeObservationPhase::Scheduling,
+                RuntimeEventKind::Scheduled,
+                "scheduled operation queued",
+            )
+            .with_plan(operation.plan.id.clone())
+            .with_operation(id)
+            .with_provider(operation.plan.provider.clone()),
+        );
         self.operations.insert(id, operation);
         Ok(id)
     }
@@ -5486,32 +5838,75 @@ impl Scheduler {
             return Err(scheduler_error_for_device_health(&device, health)
                 .unwrap_or_else(|| SchedulerError::DeviceUnavailable(device)));
         }
-        let operation = self
-            .operations
-            .get_mut(&id)
-            .expect("operation checked above");
-        operation.state = SchedulingState::Ready;
-        operation.state = SchedulingState::Submitted;
-        operation.state = SchedulingState::Running;
+        let submitted_event = {
+            let operation = self
+                .operations
+                .get_mut(&id)
+                .expect("operation checked above");
+            operation.state = SchedulingState::Ready;
+            operation.state = SchedulingState::Submitted;
+            RuntimeEvent::new(
+                operation.plan.trace_id.clone(),
+                SpanId::new(format!("submit:{id}")),
+                RuntimeObservationPhase::ProviderExecution,
+                RuntimeEventKind::ProviderSubmission,
+                "scheduled operation submitted to Provider",
+            )
+            .with_plan(operation.plan.id.clone())
+            .with_operation(id)
+            .with_provider(operation.plan.provider.clone())
+        };
+        self.observations.push(submitted_event);
+        let started_event = {
+            let operation = self
+                .operations
+                .get_mut(&id)
+                .expect("operation checked above");
+            operation.state = SchedulingState::Running;
+            RuntimeEvent::new(
+                operation.plan.trace_id.clone(),
+                SpanId::new(format!("run:{id}")),
+                RuntimeObservationPhase::ProviderExecution,
+                RuntimeEventKind::ExecutionStarted,
+                "scheduled operation execution started",
+            )
+            .with_plan(operation.plan.id.clone())
+            .with_operation(id)
+            .with_provider(operation.plan.provider.clone())
+        };
+        self.observations.push(started_event);
         Ok(Some(id))
     }
     pub fn complete(&mut self, id: ScheduledOperationId) -> Result<(), SchedulerError> {
-        let operation = self.operation_mut(id)?;
-        if operation.state.is_terminal() {
-            return Ok(());
-        }
-        operation.state = SchedulingState::Completed;
-        operation
-            .diagnostics
-            .push(SchedulingDiagnostic::TerminalState(
-                SchedulingState::Completed,
-            ));
-        operation.result = Some(ScheduledOperationResult {
-            state: SchedulingState::Completed,
-            outputs: operation.plan.outputs.clone(),
-            diagnostics: operation.diagnostics.clone(),
-            error: None,
-        });
+        let event = {
+            let operation = self.operation_mut(id)?;
+            if operation.state.is_terminal() {
+                return Ok(());
+            }
+            operation.state = SchedulingState::Completed;
+            operation
+                .diagnostics
+                .push(SchedulingDiagnostic::TerminalState(
+                    SchedulingState::Completed,
+                ));
+            operation.result = Some(ScheduledOperationResult {
+                state: SchedulingState::Completed,
+                outputs: operation.plan.outputs.clone(),
+                diagnostics: operation.diagnostics.clone(),
+                error: None,
+            });
+            RuntimeEvent::new(
+                operation.plan.trace_id.clone(),
+                SpanId::new(format!("complete:{id}")),
+                RuntimeObservationPhase::ProviderExecution,
+                RuntimeEventKind::ExecutionCompleted,
+                "scheduled operation execution completed",
+            )
+            .with_plan(operation.plan.id.clone())
+            .with_operation(id)
+            .with_provider(operation.plan.provider.clone())
+        };
+        self.observations.push(event);
         Ok(())
     }
     pub fn fail(
@@ -5524,23 +5919,37 @@ impl Scheduler {
             operation: id,
             reason: reason.clone(),
         };
-        let operation = self.operation_mut(id)?;
-        if operation.state.is_terminal() {
-            return Ok(());
-        }
-        operation.state = SchedulingState::Failed;
-        operation
-            .diagnostics
-            .push(SchedulingDiagnostic::StableFailureReason(error.code()));
-        operation
-            .diagnostics
-            .push(SchedulingDiagnostic::TerminalState(SchedulingState::Failed));
-        operation.result = Some(ScheduledOperationResult {
-            state: SchedulingState::Failed,
-            outputs: Vec::new(),
-            diagnostics: operation.diagnostics.clone(),
-            error: Some(error),
-        });
+        let event = {
+            let operation = self.operation_mut(id)?;
+            if operation.state.is_terminal() {
+                return Ok(());
+            }
+            operation.state = SchedulingState::Failed;
+            operation
+                .diagnostics
+                .push(SchedulingDiagnostic::StableFailureReason(error.code()));
+            operation
+                .diagnostics
+                .push(SchedulingDiagnostic::TerminalState(SchedulingState::Failed));
+            operation.result = Some(ScheduledOperationResult {
+                state: SchedulingState::Failed,
+                outputs: Vec::new(),
+                diagnostics: operation.diagnostics.clone(),
+                error: Some(error),
+            });
+            RuntimeEvent::new(
+                operation.plan.trace_id.clone(),
+                SpanId::new(format!("fail:{id}")),
+                RuntimeObservationPhase::ProviderExecution,
+                RuntimeEventKind::DiagnosticEmitted,
+                "scheduled operation execution failed",
+            )
+            .with_plan(operation.plan.id.clone())
+            .with_operation(id)
+            .with_provider(operation.plan.provider.clone())
+            .with_diagnostic_code(RuntimeDiagnosticCode::ExecutionFailed)
+        };
+        self.observations.push(event);
         Ok(())
     }
     pub fn cancel(&mut self, id: ScheduledOperationId) -> Result<(), SchedulerError> {
@@ -5548,22 +5957,36 @@ impl Scheduler {
         match state {
             SchedulingState::Accepted | SchedulingState::Queued | SchedulingState::Ready => {
                 self.queue.remove(id);
-                let operation = self.operation_mut(id)?;
-                operation.state = SchedulingState::Cancelled;
-                operation
-                    .diagnostics
-                    .push(SchedulingDiagnostic::CancellationRequested);
-                operation
-                    .diagnostics
-                    .push(SchedulingDiagnostic::TerminalState(
-                        SchedulingState::Cancelled,
-                    ));
-                operation.result = Some(ScheduledOperationResult {
-                    state: SchedulingState::Cancelled,
-                    outputs: Vec::new(),
-                    diagnostics: operation.diagnostics.clone(),
-                    error: None,
-                });
+                let event = {
+                    let operation = self.operation_mut(id)?;
+                    operation.state = SchedulingState::Cancelled;
+                    operation
+                        .diagnostics
+                        .push(SchedulingDiagnostic::CancellationRequested);
+                    operation
+                        .diagnostics
+                        .push(SchedulingDiagnostic::TerminalState(
+                            SchedulingState::Cancelled,
+                        ));
+                    operation.result = Some(ScheduledOperationResult {
+                        state: SchedulingState::Cancelled,
+                        outputs: Vec::new(),
+                        diagnostics: operation.diagnostics.clone(),
+                        error: None,
+                    });
+                    RuntimeEvent::new(
+                        operation.plan.trace_id.clone(),
+                        SpanId::new(format!("cancel:{id}")),
+                        RuntimeObservationPhase::ProviderExecution,
+                        RuntimeEventKind::ExecutionCancelled,
+                        "scheduled operation cancelled",
+                    )
+                    .with_plan(operation.plan.id.clone())
+                    .with_operation(id)
+                    .with_provider(operation.plan.provider.clone())
+                    .with_diagnostic_code(RuntimeDiagnosticCode::ExecutionCancelled)
+                };
+                self.observations.push(event);
                 Ok(())
             }
             SchedulingState::Submitted | SchedulingState::Running => {
@@ -5618,8 +6041,179 @@ impl Scheduler {
                 diagnostics: operation.diagnostics.clone(),
                 error: Some(error),
             });
+            let event = RuntimeEvent::new(
+                operation.plan.trace_id.clone(),
+                SpanId::new(format!("interrupt:{id}")),
+                RuntimeObservationPhase::ProviderExecution,
+                RuntimeEventKind::ExecutionInterrupted,
+                "scheduled operation execution interrupted",
+            )
+            .with_plan(operation.plan.id.clone())
+            .with_operation(id)
+            .with_provider(operation.plan.provider.clone())
+            .with_diagnostic_code(RuntimeDiagnosticCode::ExecutionInterrupted);
+            self.observations.push(event);
         }
     }
+}
+
+fn runtime_events_for_execution_plan(plan: &ComputeExecutionPlan) -> Vec<RuntimeEvent> {
+    let mut events = Vec::new();
+    let base = |phase, kind, message: &str| {
+        RuntimeEvent::new(
+            plan.trace_id.clone(),
+            SpanId::new(format!("plan:{}:{kind:?}", plan.id)),
+            phase,
+            kind,
+            message,
+        )
+        .with_plan(plan.id.clone())
+        .with_provider(plan.provider.clone())
+        .with_capability(plan.capability.clone())
+    };
+
+    events.push(base(
+        RuntimeObservationPhase::Resolution,
+        RuntimeEventKind::CapabilityResolution,
+        "capability resolution completed",
+    ));
+    events.push(base(
+        RuntimeObservationPhase::Resolution,
+        RuntimeEventKind::ProviderSelected,
+        "Provider selected for execution plan",
+    ));
+    if let Some(device) = &plan.device {
+        events.last_mut().expect("event exists").device = Some(device.clone());
+    }
+
+    for diagnostic in &plan.diagnostics {
+        match diagnostic {
+            ExecutionDiagnostic::RejectedProviderCandidate { provider, reason } => {
+                events.push(
+                    RuntimeEvent::new(
+                        plan.trace_id.clone(),
+                        SpanId::new(format!("plan:{}:rejected:{provider}", plan.id)),
+                        RuntimeObservationPhase::Resolution,
+                        RuntimeEventKind::ProviderRejected,
+                        format!("Provider rejected: {reason:?}"),
+                    )
+                    .with_plan(plan.id.clone())
+                    .with_provider(provider.clone())
+                    .with_capability(plan.capability.clone())
+                    .with_diagnostic_code(RuntimeDiagnosticCode::ProviderRejected),
+                );
+            }
+            ExecutionDiagnostic::TransferRequired { resource, .. } => {
+                events.push(
+                    base(
+                        RuntimeObservationPhase::ResourceAffinity,
+                        RuntimeEventKind::TransferRequired,
+                        &format!("transfer required for resource '{resource}'"),
+                    )
+                    .with_diagnostic_code(RuntimeDiagnosticCode::TransferRequired),
+                );
+            }
+            ExecutionDiagnostic::MaterializationRequired { source } => {
+                events.push(
+                    base(
+                        RuntimeObservationPhase::ResourceAffinity,
+                        RuntimeEventKind::MaterializationRequired,
+                        &format!("materialization required for '{source}'"),
+                    )
+                    .with_diagnostic_code(RuntimeDiagnosticCode::MaterializationRequired),
+                );
+            }
+            ExecutionDiagnostic::Memory(_) => {
+                events.push(base(
+                    RuntimeObservationPhase::MemoryPlanning,
+                    RuntimeEventKind::MemoryPlanning,
+                    "memory planning diagnostic recorded",
+                ));
+            }
+            ExecutionDiagnostic::SelectedProvider(_)
+            | ExecutionDiagnostic::SelectedDevice(_)
+            | ExecutionDiagnostic::SelectedCapability(_)
+            | ExecutionDiagnostic::ResolutionDecision(_)
+            | ExecutionDiagnostic::PolicyDecisionReason(_) => {}
+        }
+    }
+
+    for constraint in &plan.constraints {
+        if matches!(constraint, ExecutionConstraint::ResourceAffinity(_)) {
+            events.push(base(
+                RuntimeObservationPhase::ResourceAffinity,
+                RuntimeEventKind::ResourceAffinityDecision,
+                "resource affinity constraint preserved",
+            ));
+        }
+    }
+
+    events.push(base(
+        RuntimeObservationPhase::ExecutionPlanning,
+        RuntimeEventKind::ExecutionPlanning,
+        "execution plan created",
+    ));
+    events
+}
+
+pub fn runtime_metrics_for_execution_plan(plan: &ComputeExecutionPlan) -> Vec<RuntimeMetric> {
+    let mut metrics = vec![
+        RuntimeMetric::new(
+            RuntimeMetricKind::MemoryUsageEstimate,
+            plan.memory_plan.pressure.estimated_required_bytes,
+            "bytes",
+        ),
+        RuntimeMetric::new(
+            RuntimeMetricKind::TransferVolume,
+            plan.memory_plan.pressure.transfer_buffer_cost_bytes,
+            "bytes",
+        ),
+        RuntimeMetric::new(
+            RuntimeMetricKind::MaterializationCount,
+            plan.memory_plan
+                .decisions
+                .iter()
+                .filter(|decision| {
+                    matches!(
+                        decision,
+                        MemoryPlanningDecision::RequireMaterialization { .. }
+                    )
+                })
+                .count() as u64,
+            "count",
+        ),
+    ];
+    for metric in &mut metrics {
+        metric.trace_id = Some(plan.trace_id.clone());
+        metric.provider = Some(plan.provider.clone());
+        metric.device = plan.device.clone();
+    }
+    metrics
+}
+
+pub fn runtime_event_for_provider_health(report: &ProviderHealthReport) -> RuntimeEvent {
+    RuntimeEvent::new(
+        TraceId::new(format!("trace:health:{}", report.provider)),
+        SpanId::new(format!("health:provider:{}", report.provider)),
+        RuntimeObservationPhase::Health,
+        RuntimeEventKind::ProviderHealthChanged,
+        format!("Provider health changed to {:?}", report.state),
+    )
+    .with_provider(report.provider.clone())
+    .with_diagnostic_code(RuntimeDiagnosticCode::ProviderHealthChanged)
+}
+
+pub fn runtime_event_for_device_health(report: &DeviceHealth) -> RuntimeEvent {
+    RuntimeEvent::new(
+        TraceId::new(format!("trace:health:{}", report.device)),
+        SpanId::new(format!("health:device:{}", report.device)),
+        RuntimeObservationPhase::Health,
+        RuntimeEventKind::DeviceHealthChanged,
+        format!("Device health changed to {:?}", report.state),
+    )
+    .with_provider(report.provider.clone())
+    .with_device(report.device.clone())
+    .with_diagnostic_code(RuntimeDiagnosticCode::DeviceHealthChanged)
 }
 
 fn scheduler_error_for_provider_health(
@@ -7788,6 +8382,8 @@ static NEXT_EXECUTION_CONTEXT_ID: std::sync::atomic::AtomicU64 =
 static NEXT_AFFINITY_GROUP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static NEXT_SCHEDULED_OPERATION_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
+static NEXT_RUNTIME_OBSERVATION_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 fn next_execution_context_id() -> ExecutionContextId {
     ExecutionContextId::new(
@@ -7801,6 +8397,9 @@ fn next_scheduled_operation_id() -> ScheduledOperationId {
     ScheduledOperationId::new(
         NEXT_SCHEDULED_OPERATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     )
+}
+fn next_runtime_observation_sequence() -> u64 {
+    NEXT_RUNTIME_OBSERVATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -8885,6 +9484,7 @@ impl Runtime {
 
         let mut plan = ComputeExecutionPlan {
             id: execution_plan_id(&graph.id, &provider_binding),
+            trace_id: TraceId::new(format!("trace:{}", graph.id)),
             graph: graph.id.clone(),
             provider: provider_binding,
             device: selected_device,
@@ -11255,6 +11855,116 @@ mod tests {
         );
         assert_eq!(scheduler.submit_next(&runtime).unwrap(), Some(second));
     }
+
+    #[test]
+    fn runtime_observability_correlates_plan_scheduler_and_metrics() {
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("observable")).with_node(
+            ComputeNode::new(
+                ComputeNodeId::new("node"),
+                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                    .with_dtype(ComputeDType::Float32)
+                    .with_layout(ComputeLayout::Dense),
+            )
+            .with_output(ComputeNodeOutput::new(
+                ComputeOutputId::new("out"),
+                descriptor,
+            )),
+        );
+        let plan = runtime.plan_compute_execution(&graph).unwrap();
+        let trace = plan.trace_id().clone();
+
+        let plan_events = plan.observations();
+        assert!(plan_events.iter().all(|event| event.trace_id == trace));
+        assert!(plan_events.iter().any(|event| {
+            event.kind == RuntimeEventKind::CapabilityResolution
+                && event.provider.as_ref().map(ProviderBinding::as_str) == Some("portable-compute")
+        }));
+        assert!(plan_events.iter().any(|event| {
+            event.kind == RuntimeEventKind::ExecutionPlanning
+                && event.execution_plan.as_ref() == Some(&plan.id)
+        }));
+
+        let metrics = runtime_metrics_for_execution_plan(&plan);
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.kind == RuntimeMetricKind::MemoryUsageEstimate)
+        );
+        assert!(metrics.iter().all(|metric| {
+            metric.trace_id.as_ref() == Some(&trace)
+                && metric.provider.as_ref().map(ProviderBinding::as_str) == Some("portable-compute")
+        }));
+
+        let mut scheduler = runtime.scheduler(1);
+        let operation = runtime
+            .schedule_compute_execution(&mut scheduler, plan)
+            .unwrap();
+        scheduler.submit_next(&runtime).unwrap();
+        scheduler.complete(operation).unwrap();
+
+        assert!(
+            scheduler
+                .observations()
+                .iter()
+                .all(|event| event.trace_id == trace)
+        );
+        assert!(
+            scheduler
+                .observations()
+                .iter()
+                .any(|event| event.kind == RuntimeEventKind::ExecutionStarted)
+        );
+        assert!(
+            scheduler
+                .observations()
+                .iter()
+                .any(|event| event.kind == RuntimeEventKind::ExecutionCompleted)
+        );
+    }
+
+    #[test]
+    fn runtime_diagnostics_redact_native_details_and_exporters_are_components() {
+        let diagnostic = RuntimeDiagnostic::new(
+            RuntimeDiagnosticCode::ExecutionFailed,
+            "backend handle=0xdeadbeef at C:\\native\\queue",
+        )
+        .with_trace(TraceId::new("trace:failure"))
+        .with_provider(ProviderBinding::new("provider-a"));
+        assert_eq!(diagnostic.message, "[redacted backend diagnostic]");
+
+        let component = ComponentMetadata::new("otel-exporter", "1", "exports observations");
+        let mut exporter =
+            ObservabilityExporterDescriptor::new(component, ObservabilitySink::OpenTelemetry);
+        exporter
+            .accepted_events
+            .insert(RuntimeEventKind::ExecutionCompleted);
+
+        assert_eq!(
+            exporter.input_contract,
+            WitInterface::new("magnetar:runtime/observability", "1.0.0")
+        );
+        assert!(
+            exporter
+                .accepted_events
+                .contains(&RuntimeEventKind::ExecutionCompleted)
+        );
+    }
+
     #[test]
     fn provider_execution_api_submits_validated_scheduled_work() {
         let api = Arc::new(TestProviderExecutionApi::new());
