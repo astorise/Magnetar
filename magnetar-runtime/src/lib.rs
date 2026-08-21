@@ -4293,6 +4293,279 @@ impl ComputeSubmission {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExecutionPlanId(String);
+impl ExecutionPlanId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for ExecutionPlanId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputeExecutionPhase {
+    Validation,
+    Resolution,
+    Planning,
+    DataMovement,
+    Materialization,
+    MemoryAllocation,
+    ProviderSubmission,
+    Execution,
+    Completion,
+    Cancellation,
+    Interruption,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputeExecutionClassification {
+    Transparent,
+    Restartable,
+    ProviderPinned,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionStepKind {
+    ValidateGraph,
+    ResolveProvider,
+    ResolveDevice,
+    ValidateCapabilityVersion,
+    ValidateOperationSchema,
+    ValidateDType,
+    ValidateLayout,
+    ValidatePrecisionPolicy,
+    ValidateDeterminism,
+    BindInputResource,
+    BindOutputResource,
+    PreserveProviderPinnedAffinity,
+    PreserveDeviceBoundAffinity,
+    PreserveAffinityGroup,
+    RejectIncompatibleResourceChain,
+    Upload,
+    Download,
+    Copy,
+    Transfer,
+    Materialize,
+    AllocateMemory,
+    ValidateMemory,
+    SubmitToProvider,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionStep {
+    pub id: String,
+    pub phase: ComputeExecutionPhase,
+    pub kind: ExecutionStepKind,
+    pub provider: ProviderBinding,
+    pub device: Option<DeviceBinding>,
+    pub dependencies: Vec<String>,
+}
+impl ExecutionStep {
+    pub fn new(
+        id: impl Into<String>,
+        phase: ComputeExecutionPhase,
+        kind: ExecutionStepKind,
+        provider: ProviderBinding,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            phase,
+            kind,
+            provider,
+            device: None,
+            dependencies: Vec::new(),
+        }
+    }
+    pub fn with_device(mut self, device: Option<DeviceBinding>) -> Self {
+        self.device = device;
+        self
+    }
+    pub fn depends_on(mut self, dependency: impl Into<String>) -> Self {
+        self.dependencies.push(dependency.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionInput {
+    pub id: ComputeInputId,
+    pub descriptor: TensorDescriptor,
+    pub resource: Option<TensorResourceId>,
+    pub affinity: ResourceAffinity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionOutput {
+    pub id: ComputeOutputId,
+    pub descriptor: TensorDescriptor,
+    pub affinity: ResourceAffinity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionConstraint {
+    ResolutionPolicy(ResolutionPolicyId),
+    CapabilityVersion(CapabilityBinding),
+    Provider(ProviderBinding),
+    Device(DeviceBinding),
+    ResourceAffinity(ResourceAffinity),
+    AffinityGroup(AffinityGroupId),
+    OperationSchema(ComputeOperationId),
+    DType(ComputeDType),
+    Layout(ComputeLayout),
+    PrecisionPolicy(ComputePrecision),
+    DeterministicBehavior,
+    MemoryRequirement(String),
+    ExplicitTransferRequired(TensorResourceId),
+    ExplicitTransferRequirement(String),
+    ExplicitMaterializationRequired(String),
+    NoHiddenCpuStaging,
+    NoImplicitProviderMigration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionDiagnostic {
+    SelectedProvider(ProviderBinding),
+    SelectedDevice(DeviceBinding),
+    SelectedCapability(CapabilityBinding),
+    ResolutionDecision(ResolutionDecision),
+    RejectedProviderCandidate {
+        provider: ProviderBinding,
+        reason: ResolutionRejectionReason,
+    },
+    Memory(MemoryPlanningDiagnostic),
+    TransferRequired {
+        resource: TensorResourceId,
+        from: ResourceAffinity,
+        to: ResourceAffinity,
+    },
+    MaterializationRequired {
+        source: String,
+    },
+    PolicyDecisionReason(ResolutionDecisionReason),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeExecutionPlan {
+    pub id: ExecutionPlanId,
+    pub graph: ComputeGraphId,
+    pub provider: ProviderBinding,
+    pub device: Option<DeviceBinding>,
+    pub capability: CapabilityBinding,
+    pub policy: ResolutionPolicyId,
+    pub classification: ComputeExecutionClassification,
+    pub inputs: Vec<ExecutionInput>,
+    pub outputs: Vec<ExecutionOutput>,
+    pub constraints: Vec<ExecutionConstraint>,
+    pub steps: Vec<ExecutionStep>,
+    pub memory_plan: MemoryPlan,
+    pub diagnostics: Vec<ExecutionDiagnostic>,
+    validated: bool,
+}
+impl ComputeExecutionPlan {
+    pub fn is_validated(&self) -> bool {
+        self.validated
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComputePlanningError {
+    PlanningFailed {
+        reason: String,
+    },
+    NoCompatibleProvider {
+        capability: CapabilityBinding,
+    },
+    NoCompatibleDevice {
+        provider: ProviderBinding,
+    },
+    PolicyRejectedProvider {
+        capability: CapabilityBinding,
+        policy: ResolutionPolicyId,
+    },
+    UnsupportedOperation(ComputeOperationId),
+    UnsupportedDType(ComputeDType),
+    UnsupportedLayout(ComputeLayout),
+    UnsupportedPrecisionPolicy(ComputePrecision),
+    IncompatibleResourceAffinity(AffinityError),
+    UnresolvedAffinityGroup(AffinityGroupId),
+    MemoryPlanFailed(MemoryPlanningError),
+    DataMovementRequired {
+        resource: TensorResourceId,
+    },
+    UnsupportedTransfer {
+        reason: String,
+    },
+    MaterializationRequired {
+        source: String,
+    },
+    ProviderUnavailable(ProviderBinding),
+    DeviceUnavailable(DeviceBinding),
+    InvalidExecutionPlan {
+        reason: String,
+    },
+}
+impl fmt::Display for ComputePlanningError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlanningFailed { reason } => {
+                write!(f, "compute execution planning failed: {reason}")
+            }
+            Self::NoCompatibleProvider { capability } => {
+                write!(f, "no compatible provider for capability '{capability}'")
+            }
+            Self::NoCompatibleDevice { provider } => {
+                write!(f, "no compatible device for provider '{provider}'")
+            }
+            Self::PolicyRejectedProvider { capability, policy } => write!(
+                f,
+                "resolution policy '{policy}' rejected all providers for capability '{capability}'"
+            ),
+            Self::UnsupportedOperation(operation) => {
+                write!(f, "unsupported operation schema '{operation}'")
+            }
+            Self::UnsupportedDType(dtype) => write!(f, "unsupported dtype {dtype:?}"),
+            Self::UnsupportedLayout(layout) => write!(f, "unsupported layout {layout:?}"),
+            Self::UnsupportedPrecisionPolicy(precision) => {
+                write!(f, "unsupported precision policy {precision:?}")
+            }
+            Self::IncompatibleResourceAffinity(error) => {
+                write!(f, "incompatible execution resource affinity: {error}")
+            }
+            Self::UnresolvedAffinityGroup(group) => {
+                write!(f, "unresolved affinity group '{group}'")
+            }
+            Self::MemoryPlanFailed(error) => write!(f, "{error}"),
+            Self::DataMovementRequired { resource } => {
+                write!(
+                    f,
+                    "explicit data movement required for resource '{resource}'"
+                )
+            }
+            Self::UnsupportedTransfer { reason } => {
+                write!(f, "unsupported execution transfer: {reason}")
+            }
+            Self::MaterializationRequired { source } => {
+                write!(f, "explicit materialization required for '{source}'")
+            }
+            Self::ProviderUnavailable(provider) => {
+                write!(f, "provider '{provider}' is unavailable")
+            }
+            Self::DeviceUnavailable(device) => write!(f, "device '{device}' is unavailable"),
+            Self::InvalidExecutionPlan { reason } => {
+                write!(f, "invalid compute execution plan: {reason}")
+            }
+        }
+    }
+}
+impl Error for ComputePlanningError {}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum MemoryRegionKind {
     GraphInput,
@@ -4525,6 +4798,9 @@ pub enum ComputeErrorPhase {
     Validation,
     Resolution,
     AffinityValidation,
+    Planning,
+    DataMovement,
+    Materialization,
     MemoryPlanning,
     Submission,
     Execution,
@@ -4565,6 +4841,7 @@ pub enum ComputeErrorCode {
     MissingInput,
     MissingOutput,
     NoCompatibleProvider,
+    NoCompatibleDevice,
     PolicyRejectedProvider,
     ProviderUnavailable,
     DeviceUnavailable,
@@ -4583,6 +4860,10 @@ pub enum ComputeErrorCode {
     ExecutionInterrupted,
     ExecutionCancelled,
     OperationTimeout,
+    PlanningFailed,
+    InvalidExecutionPlan,
+    DataMovementRequired,
+    UnsupportedTransfer,
     MemoryPlanningFailed,
     OutOfMemory,
     ResourceExhausted,
@@ -5096,6 +5377,130 @@ impl From<ComputeValidationError> for ComputeError {
     }
 }
 
+impl From<ComputePlanningError> for ComputeError {
+    fn from(error: ComputePlanningError) -> Self {
+        let message = error.to_string();
+        match error {
+            ComputePlanningError::PlanningFailed { .. } => ComputeError::new(
+                ComputeErrorCode::PlanningFailed,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::NoCompatibleProvider { capability } => ComputeError::new(
+                ComputeErrorCode::NoCompatibleProvider,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_capability(capability))
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::NoCompatibleDevice { provider } => ComputeError::new(
+                ComputeErrorCode::NoCompatibleDevice,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_provider(provider))
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::PolicyRejectedProvider { capability, .. } => ComputeError::new(
+                ComputeErrorCode::PolicyRejectedProvider,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_capability(capability))
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::UnsupportedOperation(operation) => ComputeError::new(
+                ComputeErrorCode::UnsupportedOperation,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new()
+                    .with_backend_message(format!("unsupported operation schema: {operation}")),
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::UnsupportedDType(_) => ComputeError::new(
+                ComputeErrorCode::UnsupportedDType,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::UnsupportedLayout(_) => ComputeError::new(
+                ComputeErrorCode::UnsupportedLayout,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::UnsupportedPrecisionPolicy(_) => ComputeError::new(
+                ComputeErrorCode::UnsupportedOperation,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::IncompatibleResourceAffinity(error) => ComputeError::from(error),
+            ComputePlanningError::UnresolvedAffinityGroup(_) => ComputeError::new(
+                ComputeErrorCode::AffinityGroupMismatch,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::MemoryPlanFailed(error) => ComputeError::from(error),
+            ComputePlanningError::DataMovementRequired { .. } => ComputeError::new(
+                ComputeErrorCode::DataMovementRequired,
+                ComputeErrorPhase::DataMovement,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ExplicitTransferRequired),
+            ComputePlanningError::UnsupportedTransfer { .. } => ComputeError::new(
+                ComputeErrorCode::UnsupportedTransfer,
+                ComputeErrorPhase::DataMovement,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ExplicitTransferRequired),
+            ComputePlanningError::MaterializationRequired { .. } => ComputeError::new(
+                ComputeErrorCode::MaterializationRequired,
+                ComputeErrorPhase::Materialization,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ExplicitMaterializationRequired),
+            ComputePlanningError::ProviderUnavailable(provider) => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_provider(provider))
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            ComputePlanningError::DeviceUnavailable(device) => ComputeError::new(
+                ComputeErrorCode::DeviceUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_device(device))
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            ComputePlanningError::InvalidExecutionPlan { .. } => ComputeError::new(
+                ComputeErrorCode::InvalidExecutionPlan,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+        }
+    }
+}
+
 impl From<MemoryPlanningError> for ComputeError {
     fn from(error: MemoryPlanningError) -> Self {
         let message = error.to_string();
@@ -5365,6 +5770,114 @@ fn graph_output_uses(graph: &ComputeGraph, node: &ComputeNodeId, output: &Comput
             } if candidate_node == node && candidate_output == output
         )
     })
+}
+
+fn planning_error_from_affinity(error: AffinityError) -> ComputePlanningError {
+    match error {
+        AffinityError::NoCompatibleProvider(capability) => {
+            ComputePlanningError::NoCompatibleProvider { capability }
+        }
+        AffinityError::PolicyRejectedProvider { capability, policy } => {
+            ComputePlanningError::PolicyRejectedProvider { capability, policy }
+        }
+        AffinityError::BoundProviderUnavailable(provider) => {
+            ComputePlanningError::ProviderUnavailable(provider)
+        }
+        AffinityError::BoundDeviceUnavailable(device) => {
+            ComputePlanningError::DeviceUnavailable(device)
+        }
+        other => ComputePlanningError::IncompatibleResourceAffinity(other),
+    }
+}
+
+fn planning_error_from_validation(error: ComputeValidationError) -> ComputePlanningError {
+    match error {
+        ComputeValidationError::UnknownOperationSchema(operation)
+        | ComputeValidationError::UnsupportedOperationSchema { operation, .. } => {
+            ComputePlanningError::UnsupportedOperation(operation)
+        }
+        ComputeValidationError::UnsupportedDType { dtype, .. } => {
+            ComputePlanningError::UnsupportedDType(dtype)
+        }
+        ComputeValidationError::UnsupportedLayout { layout, .. } => {
+            ComputePlanningError::UnsupportedLayout(layout)
+        }
+        ComputeValidationError::UnsupportedPrecision { precision, .. } => {
+            ComputePlanningError::UnsupportedPrecisionPolicy(precision)
+        }
+        ComputeValidationError::UnsupportedDataMovement { kind, .. } => {
+            ComputePlanningError::UnsupportedTransfer {
+                reason: format!("provider does not advertise '{}'", kind.id()),
+            }
+        }
+        ComputeValidationError::MaterializationRequired { reason } => {
+            ComputePlanningError::MaterializationRequired { source: reason }
+        }
+        ComputeValidationError::MemoryPlanning(error) => {
+            ComputePlanningError::MemoryPlanFailed(error)
+        }
+        ComputeValidationError::ProviderUnavailable(provider) => {
+            ComputePlanningError::ProviderUnavailable(provider)
+        }
+        ComputeValidationError::IncompatibleResourceAffinity(error) => {
+            ComputePlanningError::IncompatibleResourceAffinity(error)
+        }
+        other => ComputePlanningError::PlanningFailed {
+            reason: other.to_string(),
+        },
+    }
+}
+
+fn execution_plan_id(graph: &ComputeGraphId, provider: &ProviderBinding) -> ExecutionPlanId {
+    ExecutionPlanId::new(format!("plan:{graph}:{provider}"))
+}
+
+fn classify_execution_plan(inputs: &[ExecutionInput]) -> ComputeExecutionClassification {
+    if inputs.iter().any(|input| {
+        input.resource.is_some() && input.affinity.fallback() == FallbackClass::ProviderPinned
+    }) {
+        ComputeExecutionClassification::ProviderPinned
+    } else if inputs.iter().any(|input| {
+        input.resource.is_some() && input.affinity.fallback() == FallbackClass::Restartable
+    }) {
+        ComputeExecutionClassification::Restartable
+    } else {
+        ComputeExecutionClassification::Transparent
+    }
+}
+
+fn execution_step_kind_from_memory_decision(
+    decision: &MemoryPlanningDecision,
+) -> ExecutionStepKind {
+    match decision {
+        MemoryPlanningDecision::Allocate { .. } | MemoryPlanningDecision::Reuse { .. } => {
+            ExecutionStepKind::AllocateMemory
+        }
+        MemoryPlanningDecision::PreservePinnedResource { .. } => {
+            ExecutionStepKind::PreserveProviderPinnedAffinity
+        }
+        MemoryPlanningDecision::RequireMaterialization { .. } => ExecutionStepKind::Materialize,
+        MemoryPlanningDecision::RequireTransfer { .. } => ExecutionStepKind::Transfer,
+        MemoryPlanningDecision::AccountHostStaging { .. } => ExecutionStepKind::Transfer,
+    }
+}
+
+fn execution_phase_from_step_kind(kind: &ExecutionStepKind) -> ComputeExecutionPhase {
+    match kind {
+        ExecutionStepKind::Upload
+        | ExecutionStepKind::Download
+        | ExecutionStepKind::Copy
+        | ExecutionStepKind::Transfer => ComputeExecutionPhase::DataMovement,
+        ExecutionStepKind::Materialize => ComputeExecutionPhase::Materialization,
+        ExecutionStepKind::AllocateMemory | ExecutionStepKind::ValidateMemory => {
+            ComputeExecutionPhase::MemoryAllocation
+        }
+        ExecutionStepKind::ResolveProvider | ExecutionStepKind::ResolveDevice => {
+            ComputeExecutionPhase::Resolution
+        }
+        ExecutionStepKind::SubmitToProvider => ComputeExecutionPhase::ProviderSubmission,
+        _ => ComputeExecutionPhase::Validation,
+    }
 }
 
 /// Returns the canonical hardware-independent Compute capability declaration.
@@ -6820,6 +7333,401 @@ impl Runtime {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+    pub fn plan_compute_execution(
+        &self,
+        graph: &ComputeGraph,
+    ) -> Result<ComputeExecutionPlan, ComputePlanningError> {
+        if !self.initialized {
+            return Err(ComputePlanningError::PlanningFailed {
+                reason: "runtime is not initialized".into(),
+            });
+        }
+
+        let dependencies = graph
+            .inputs
+            .iter()
+            .filter_map(|input| input.value.affinity())
+            .collect::<Vec<_>>();
+        let mut constraints = AffinityConstraints::try_from_affinities(dependencies)
+            .map_err(ComputePlanningError::IncompatibleResourceAffinity)?;
+        constraints.require_fallback(FallbackClass::ProviderPinned);
+        constraints
+            .merge(
+                &ResourceAffinity::new(FallbackClass::ProviderPinned)
+                    .with_capability(CapabilityBinding::new(
+                        CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                        COMPUTE_CAPABILITY_VERSION,
+                    ))
+                    .with_execution_context(self.context.id),
+            )
+            .map_err(ComputePlanningError::IncompatibleResourceAffinity)?;
+        if !graph.inputs.is_empty() && constraints.affinity().group().is_none() {
+            constraints
+                .merge(
+                    &ResourceAffinity::new(FallbackClass::Transparent)
+                        .with_group(next_affinity_group_id()),
+                )
+                .map_err(ComputePlanningError::IncompatibleResourceAffinity)?;
+        }
+
+        let compute = compute_capability();
+        let (provider, capability, decision) = self
+            .providers
+            .resolve_with_constraints(
+                &compute,
+                &constraints,
+                self.context.config.resolution_policy,
+                ExecutionPhase::BeforeResourceCreation,
+                true,
+            )
+            .map_err(planning_error_from_affinity)?;
+        let metadata = provider.metadata();
+        let provider_binding = ProviderBinding::new(&metadata.name);
+        let selected_device = decision.selected_device.clone().or_else(|| {
+            constraints.affinity().device().cloned().or_else(|| {
+                self.providers
+                    .registry()
+                    .devices_for_provider(provider_binding.as_str())
+                    .find(|device| device.availability() != DeviceAvailability::Unavailable)
+                    .map(|device| DeviceBinding::new(device.id().clone()))
+            })
+        });
+        if let Some(device) = &selected_device
+            && self.device(device.id()).is_none()
+        {
+            return Err(ComputePlanningError::DeviceUnavailable(device.clone()));
+        }
+
+        self.validate_compute_graph(provider_binding.as_str(), graph)
+            .map_err(planning_error_from_validation)?;
+        let memory_plan = self
+            .plan_compute_graph_memory(provider_binding.as_str(), graph)
+            .map_err(ComputePlanningError::MemoryPlanFailed)?;
+
+        let target_affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(provider_binding.clone())
+            .with_capability(CapabilityBinding::new(
+                capability.id.clone(),
+                capability.version,
+            ))
+            .with_execution_context(self.context.id);
+        let mut input_descriptors = BTreeMap::new();
+        let mut output_descriptors = BTreeMap::new();
+        let mut completed_nodes = BTreeSet::new();
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        let mut constraints_out = vec![
+            ExecutionConstraint::ResolutionPolicy(decision.policy_id.clone()),
+            ExecutionConstraint::Provider(provider_binding.clone()),
+            ExecutionConstraint::CapabilityVersion(CapabilityBinding::new(
+                capability.id.clone(),
+                capability.version,
+            )),
+            ExecutionConstraint::NoHiddenCpuStaging,
+            ExecutionConstraint::NoImplicitProviderMigration,
+            ExecutionConstraint::DeterministicBehavior,
+        ];
+        if let Some(device) = &selected_device {
+            constraints_out.push(ExecutionConstraint::Device(device.clone()));
+        }
+
+        for input in &graph.inputs {
+            let descriptor = input.value.descriptor().clone();
+            input_descriptors.insert(input.id.clone(), descriptor.clone());
+            let affinity = input
+                .value
+                .affinity()
+                .cloned()
+                .unwrap_or_else(|| target_affinity.clone());
+            if let Some(group) = affinity.group() {
+                constraints_out.push(ExecutionConstraint::AffinityGroup(group));
+            }
+            constraints_out.push(ExecutionConstraint::ResourceAffinity(affinity.clone()));
+            let resource = match &input.value {
+                ComputeInputValue::TensorResource(resource) => Some(resource.id.clone()),
+                ComputeInputValue::TensorDescriptor(_) | ComputeInputValue::Constant(_) => None,
+            };
+            inputs.push(ExecutionInput {
+                id: input.id.clone(),
+                descriptor,
+                resource,
+                affinity,
+            });
+        }
+
+        for node in &graph.nodes {
+            if let Some(schema_id) = &node.operation.schema_id {
+                constraints_out.push(ExecutionConstraint::OperationSchema(schema_id.clone()));
+            }
+            if let Some(dtype) = node.operation.dtype {
+                constraints_out.push(ExecutionConstraint::DType(dtype));
+            }
+            if let Some(layout) = node.operation.layout {
+                constraints_out.push(ExecutionConstraint::Layout(layout));
+            }
+            if let Some(precision) = node.operation.precision {
+                constraints_out.push(ExecutionConstraint::PrecisionPolicy(precision));
+            }
+            for output in &node.outputs {
+                output_descriptors.insert(
+                    (node.id.clone(), output.id.clone()),
+                    output.descriptor.clone(),
+                );
+            }
+            completed_nodes.insert(node.id.clone());
+        }
+
+        for requirement in &memory_plan.requirements {
+            constraints_out.push(ExecutionConstraint::MemoryRequirement(
+                requirement.id.clone(),
+            ));
+        }
+        for decision in &memory_plan.decisions {
+            match decision {
+                MemoryPlanningDecision::RequireTransfer { requirement }
+                | MemoryPlanningDecision::AccountHostStaging { requirement } => {
+                    constraints_out.push(ExecutionConstraint::ExplicitTransferRequirement(
+                        requirement.clone(),
+                    ));
+                }
+                MemoryPlanningDecision::RequireMaterialization { requirement } => {
+                    constraints_out.push(ExecutionConstraint::ExplicitMaterializationRequired(
+                        requirement.clone(),
+                    ));
+                }
+                MemoryPlanningDecision::PreservePinnedResource { .. } => {}
+                MemoryPlanningDecision::Allocate { .. } | MemoryPlanningDecision::Reuse { .. } => {}
+            }
+        }
+
+        for output in &graph.outputs {
+            let descriptor = resolve_compute_value_descriptor(
+                None,
+                &output.source,
+                &input_descriptors,
+                &output_descriptors,
+                &completed_nodes,
+            )
+            .map_err(planning_error_from_validation)?
+            .clone();
+            let affinity = match &output.source {
+                ComputeValueRef::Input(input) => inputs
+                    .iter()
+                    .find(|candidate| &candidate.id == input)
+                    .map(|input| input.affinity.clone())
+                    .unwrap_or_else(|| target_affinity.clone()),
+                ComputeValueRef::NodeOutput { .. } => memory_plan.output_affinity.clone(),
+            };
+            outputs.push(ExecutionOutput {
+                id: output.id.clone(),
+                descriptor,
+                affinity,
+            });
+        }
+
+        let mut steps = vec![
+            ExecutionStep::new(
+                "validate:graph",
+                ComputeExecutionPhase::Validation,
+                ExecutionStepKind::ValidateGraph,
+                provider_binding.clone(),
+            )
+            .with_device(selected_device.clone()),
+            ExecutionStep::new(
+                "resolve:provider",
+                ComputeExecutionPhase::Resolution,
+                ExecutionStepKind::ResolveProvider,
+                provider_binding.clone(),
+            )
+            .with_device(selected_device.clone())
+            .depends_on("validate:graph"),
+        ];
+        if selected_device.is_some() {
+            steps.push(
+                ExecutionStep::new(
+                    "resolve:device",
+                    ComputeExecutionPhase::Resolution,
+                    ExecutionStepKind::ResolveDevice,
+                    provider_binding.clone(),
+                )
+                .with_device(selected_device.clone())
+                .depends_on("resolve:provider"),
+            );
+        }
+        for input in &inputs {
+            let kind = if input.affinity.fallback() == FallbackClass::ProviderPinned {
+                ExecutionStepKind::PreserveProviderPinnedAffinity
+            } else if input.affinity.device().is_some() {
+                ExecutionStepKind::PreserveDeviceBoundAffinity
+            } else if input.affinity.group().is_some() {
+                ExecutionStepKind::PreserveAffinityGroup
+            } else {
+                ExecutionStepKind::BindInputResource
+            };
+            steps.push(
+                ExecutionStep::new(
+                    format!("bind:input:{}", input.id),
+                    ComputeExecutionPhase::Planning,
+                    kind,
+                    provider_binding.clone(),
+                )
+                .with_device(selected_device.clone())
+                .depends_on("resolve:provider"),
+            );
+        }
+        for decision in &memory_plan.decisions {
+            let kind = execution_step_kind_from_memory_decision(decision);
+            steps.push(
+                ExecutionStep::new(
+                    format!("memory:{decision:?}"),
+                    execution_phase_from_step_kind(&kind),
+                    kind,
+                    provider_binding.clone(),
+                )
+                .with_device(selected_device.clone())
+                .depends_on("resolve:provider"),
+            );
+        }
+        steps.push(
+            ExecutionStep::new(
+                "validate:memory",
+                ComputeExecutionPhase::MemoryAllocation,
+                ExecutionStepKind::ValidateMemory,
+                provider_binding.clone(),
+            )
+            .with_device(selected_device.clone())
+            .depends_on("resolve:provider"),
+        );
+        for output in &outputs {
+            steps.push(
+                ExecutionStep::new(
+                    format!("bind:output:{}", output.id),
+                    ComputeExecutionPhase::Planning,
+                    ExecutionStepKind::BindOutputResource,
+                    provider_binding.clone(),
+                )
+                .with_device(selected_device.clone())
+                .depends_on("validate:memory"),
+            );
+        }
+        steps.push(
+            ExecutionStep::new(
+                "submit:provider",
+                ComputeExecutionPhase::ProviderSubmission,
+                ExecutionStepKind::SubmitToProvider,
+                provider_binding.clone(),
+            )
+            .with_device(selected_device.clone())
+            .depends_on("validate:memory"),
+        );
+
+        let mut diagnostics = vec![
+            ExecutionDiagnostic::SelectedProvider(provider_binding.clone()),
+            ExecutionDiagnostic::SelectedCapability(CapabilityBinding::new(
+                capability.id.clone(),
+                capability.version,
+            )),
+            ExecutionDiagnostic::PolicyDecisionReason(decision.reason.clone()),
+            ExecutionDiagnostic::ResolutionDecision(decision.clone()),
+        ];
+        if let Some(device) = &selected_device {
+            diagnostics.push(ExecutionDiagnostic::SelectedDevice(device.clone()));
+        }
+        diagnostics.extend(decision.rejected_candidates.iter().map(|rejection| {
+            ExecutionDiagnostic::RejectedProviderCandidate {
+                provider: rejection.provider.clone(),
+                reason: rejection.reason.clone(),
+            }
+        }));
+        diagnostics.extend(
+            memory_plan
+                .diagnostics
+                .iter()
+                .cloned()
+                .map(ExecutionDiagnostic::Memory),
+        );
+
+        let mut plan = ComputeExecutionPlan {
+            id: execution_plan_id(&graph.id, &provider_binding),
+            graph: graph.id.clone(),
+            provider: provider_binding,
+            device: selected_device,
+            capability: CapabilityBinding::new(capability.id.clone(), capability.version),
+            policy: decision.policy_id,
+            classification: classify_execution_plan(&inputs),
+            inputs,
+            outputs,
+            constraints: constraints_out,
+            steps,
+            memory_plan,
+            diagnostics,
+            validated: false,
+        };
+        self.validate_compute_execution_plan(&plan)?;
+        plan.validated = true;
+        Ok(plan)
+    }
+    pub fn validate_compute_execution_plan(
+        &self,
+        plan: &ComputeExecutionPlan,
+    ) -> Result<(), ComputePlanningError> {
+        if plan.graph
+            != plan.memory_plan.graph.clone().ok_or_else(|| {
+                ComputePlanningError::InvalidExecutionPlan {
+                    reason: "execution plan memory plan is not tied to a graph".into(),
+                }
+            })?
+        {
+            return Err(ComputePlanningError::InvalidExecutionPlan {
+                reason: "execution plan graph does not match memory plan graph".into(),
+            });
+        }
+        if self.providers.provider(plan.provider.as_str()).is_none() {
+            return Err(ComputePlanningError::ProviderUnavailable(
+                plan.provider.clone(),
+            ));
+        }
+        if let Some(device) = &plan.device
+            && self.device(device.id()).is_none()
+        {
+            return Err(ComputePlanningError::DeviceUnavailable(device.clone()));
+        }
+        let step_ids = plan
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for step in &plan.steps {
+            for dependency in &step.dependencies {
+                if !step_ids.contains(dependency.as_str()) {
+                    return Err(ComputePlanningError::InvalidExecutionPlan {
+                        reason: format!(
+                            "step '{}' has unresolved dependency '{}'",
+                            step.id, dependency
+                        ),
+                    });
+                }
+            }
+            if step.provider != plan.provider {
+                return Err(ComputePlanningError::InvalidExecutionPlan {
+                    reason: format!(
+                        "step '{}' migrates provider from '{}' to '{}'",
+                        step.id, plan.provider, step.provider
+                    ),
+                });
+            }
+        }
+        if plan
+            .inputs
+            .iter()
+            .any(|input| input.resource.is_some() && input.affinity.provider().is_none())
+        {
+            return Err(ComputePlanningError::InvalidExecutionPlan {
+                reason: "tensor resource inputs must retain Provider affinity".into(),
+            });
         }
         Ok(())
     }
@@ -8476,6 +9384,154 @@ mod tests {
         assert_eq!(
             submission.affinity.provider().map(ProviderBinding::as_str),
             Some("portable-compute")
+        );
+    }
+    #[test]
+    fn compute_execution_planning_selects_provider_device_and_validates_plan() {
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let mut device = DeviceMetadata::new(
+            DeviceId::new("gpu:0"),
+            "GPU 0",
+            DeviceType::Gpu,
+            "portable-compute",
+        );
+        device.memory_capacity = 1_048_576;
+        provider
+            .devices
+            .push(Arc::new(DeviceDescriptor::new(device)));
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("planned-graph"))
+            .with_input(ComputeInput::new(
+                ComputeInputId::new("x"),
+                ComputeInputValue::TensorDescriptor(descriptor.clone()),
+            ))
+            .with_node(
+                ComputeNode::new(
+                    ComputeNodeId::new("add"),
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                        .with_dtype(ComputeDType::Float32)
+                        .with_layout(ComputeLayout::Dense),
+                )
+                .with_input(ComputeValueRef::Input(ComputeInputId::new("x")))
+                .with_output(ComputeNodeOutput::new(
+                    ComputeOutputId::new("y"),
+                    descriptor,
+                )),
+            )
+            .with_output(ComputeOutput::new(
+                ComputeOutputId::new("result"),
+                ComputeValueRef::NodeOutput {
+                    node: ComputeNodeId::new("add"),
+                    output: ComputeOutputId::new("y"),
+                },
+            ));
+
+        let plan = runtime.plan_compute_execution(&graph).unwrap();
+
+        assert!(plan.is_validated());
+        assert_eq!(plan.provider.as_str(), "portable-compute");
+        assert_eq!(
+            plan.device.as_ref().map(|device| device.id().as_str()),
+            Some("gpu:0")
+        );
+        assert_eq!(plan.policy, BuiltInResolutionPolicy::Deterministic.id());
+        assert_eq!(
+            plan.classification,
+            ComputeExecutionClassification::Transparent
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.kind == ExecutionStepKind::SubmitToProvider)
+        );
+        assert!(
+            plan.constraints
+                .iter()
+                .any(|constraint| matches!(constraint, ExecutionConstraint::NoHiddenCpuStaging))
+        );
+        assert_eq!(
+            plan.memory_plan.graph,
+            Some(ComputeGraphId::new("planned-graph"))
+        );
+    }
+    #[test]
+    fn compute_execution_planning_preserves_provider_pinned_resources() {
+        let mut provider_a = provider_with_capabilities("provider-a", [compute_capability()]);
+        provider_a.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let mut provider_b = provider_with_capabilities("provider-b", [compute_capability()]);
+        provider_b.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider_b))
+            .register_provider(Arc::new(provider_a))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let resource = TensorResourceDescriptor::new(
+            TensorResourceId::new("pinned"),
+            descriptor.clone(),
+            ResourceAffinity::new(FallbackClass::ProviderPinned)
+                .with_provider(ProviderBinding::new("provider-b"))
+                .with_capability(CapabilityBinding::new(
+                    CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                    COMPUTE_CAPABILITY_VERSION,
+                )),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("pinned-graph"))
+            .with_input(ComputeInput::new(
+                ComputeInputId::new("x"),
+                ComputeInputValue::TensorResource(resource),
+            ))
+            .with_node(
+                ComputeNode::new(
+                    ComputeNodeId::new("add"),
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                        .with_dtype(ComputeDType::Float32)
+                        .with_layout(ComputeLayout::Dense),
+                )
+                .with_input(ComputeValueRef::Input(ComputeInputId::new("x")))
+                .with_output(ComputeNodeOutput::new(
+                    ComputeOutputId::new("y"),
+                    descriptor,
+                )),
+            );
+
+        let plan = runtime.plan_compute_execution(&graph).unwrap();
+
+        assert_eq!(plan.provider.as_str(), "provider-b");
+        assert_eq!(
+            plan.classification,
+            ComputeExecutionClassification::ProviderPinned
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.kind == ExecutionStepKind::PreserveProviderPinnedAffinity)
         );
     }
     #[test]
