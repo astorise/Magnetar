@@ -1059,6 +1059,136 @@ impl fmt::Display for AffinityError {
 }
 impl Error for AffinityError {}
 
+impl From<AffinityError> for ComputeError {
+    fn from(error: AffinityError) -> Self {
+        let message = error.to_string();
+        match error {
+            AffinityError::ProviderMismatch { expected, found } => ComputeError::new(
+                ComputeErrorCode::ProviderPinnedResource,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new()
+                    .with_provider(found)
+                    .with_rejected_candidate(expected),
+            )
+            .with_recovery_hint(RecoveryHint::ProviderPinned),
+            AffinityError::DeviceMismatch { expected: _, found } => ComputeError::new(
+                ComputeErrorCode::DeviceBoundResource,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_device(found))
+            .with_recovery_hint(RecoveryHint::ExplicitTransferRequired),
+            AffinityError::CapabilityMismatch {
+                id,
+                expected,
+                found: _,
+            } => ComputeError::new(
+                ComputeErrorCode::CapabilityVersionMismatch,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new()
+                    .with_capability(CapabilityBinding::new(id, expected)),
+            ),
+            AffinityError::ArtifactMismatch { .. } => ComputeError::new(
+                ComputeErrorCode::ArtifactFingerprintMismatch,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ProviderPinned),
+            AffinityError::ExecutionContextMismatch { .. } => ComputeError::new(
+                ComputeErrorCode::ProviderPinnedResource,
+                ComputeErrorPhase::Interruption,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ProviderPinned),
+            AffinityError::AffinityGroupMismatch { .. } => ComputeError::new(
+                ComputeErrorCode::AffinityGroupMismatch,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ExplicitTransferRequired),
+            AffinityError::BoundProviderUnavailable(provider) => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Interruption,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_provider(provider))
+            .with_recovery_hint(RecoveryHint::ProviderPinned),
+            AffinityError::BoundDeviceUnavailable(device) => ComputeError::new(
+                ComputeErrorCode::DeviceUnavailable,
+                ComputeErrorPhase::Interruption,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_device(device))
+            .with_recovery_hint(RecoveryHint::ProviderPinned),
+            AffinityError::DeviceProviderMismatch {
+                device,
+                provider,
+                owner,
+            } => ComputeError::new(
+                ComputeErrorCode::DeviceBoundResource,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new()
+                    .with_device(device)
+                    .with_provider(owner)
+                    .with_rejected_candidate(provider),
+            ),
+            AffinityError::ProviderDoesNotImplementCapability {
+                provider,
+                capability,
+            } => ComputeError::new(
+                ComputeErrorCode::UnsupportedOperation,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new()
+                    .with_provider(provider)
+                    .with_capability(capability),
+            ),
+            AffinityError::NoCompatibleProvider(capability) => ComputeError::new(
+                ComputeErrorCode::NoCompatibleProvider,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_capability(capability)),
+            AffinityError::PolicyRejectedProvider { capability, policy: _ } => ComputeError::new(
+                ComputeErrorCode::PolicyRejectedProvider,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_capability(capability)),
+            AffinityError::RuntimeNotInitialized => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+        }
+    }
+}
+
 /// Host-side opaque value paired with immutable Resource Affinity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AffinityResource<T> {
@@ -2655,6 +2785,185 @@ pub struct ComputeGraphValidationReport {
     pub output_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputeErrorPhase {
+    Validation,
+    Resolution,
+    AffinityValidation,
+    Submission,
+    Execution,
+    Cancellation,
+    Completion,
+    Interruption,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputeErrorSeverity {
+    Recoverable,
+    Terminal,
+    Fatal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RecoveryHint {
+    NotRetryable,
+    RetryBeforeState,
+    RestartableWithReplay,
+    ExplicitTransferRequired,
+    ExplicitMaterializationRequired,
+    ProviderPinned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputeErrorCode {
+    InvalidTensorDescriptor,
+    InvalidShape,
+    InvalidDType,
+    InvalidLayout,
+    SizeOverflow,
+    InvalidGraph,
+    CyclicGraph,
+    MissingInput,
+    MissingOutput,
+    NoCompatibleProvider,
+    PolicyRejectedProvider,
+    ProviderUnavailable,
+    DeviceUnavailable,
+    CapabilityVersionMismatch,
+    UnsupportedOperation,
+    UnsupportedOperationFamily,
+    UnsupportedDType,
+    UnsupportedLayout,
+    UnsupportedDataMovement,
+    IncompatibleResourceAffinity,
+    ProviderPinnedResource,
+    DeviceBoundResource,
+    ArtifactFingerprintMismatch,
+    AffinityGroupMismatch,
+    ExecutionFailed,
+    ExecutionInterrupted,
+    ExecutionCancelled,
+    OperationTimeout,
+    OutOfMemory,
+    ResourceExhausted,
+    InvalidHostBuffer,
+    InvalidTransfer,
+    UnsupportedConversion,
+    MaterializationRequired,
+    InvalidState,
+    Internal,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ComputeDiagnostic {
+    pub provider: Option<ProviderBinding>,
+    pub device: Option<DeviceBinding>,
+    pub capability: Option<CapabilityBinding>,
+    pub operation_family: Option<ComputeOperationFamily>,
+    pub rejected_candidates: Vec<ProviderBinding>,
+    pub backend_message: Option<String>,
+    pub debug_trace_id: Option<String>,
+}
+impl ComputeDiagnostic {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_provider(mut self, provider: ProviderBinding) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+    pub fn with_device(mut self, device: DeviceBinding) -> Self {
+        self.device = Some(device);
+        self
+    }
+    pub fn with_capability(mut self, capability: CapabilityBinding) -> Self {
+        self.capability = Some(capability);
+        self
+    }
+    pub fn with_operation_family(mut self, family: ComputeOperationFamily) -> Self {
+        self.operation_family = Some(family);
+        self
+    }
+    pub fn with_rejected_candidate(mut self, provider: ProviderBinding) -> Self {
+        self.rejected_candidates.push(provider);
+        self
+    }
+    pub fn with_backend_message(mut self, message: impl AsRef<str>) -> Self {
+        self.backend_message = Some(redact_backend_diagnostic(message.as_ref()));
+        self
+    }
+    pub fn with_debug_trace_id(mut self, trace_id: impl Into<String>) -> Self {
+        self.debug_trace_id = Some(trace_id.into());
+        self
+    }
+}
+
+fn redact_backend_diagnostic(message: &str) -> String {
+    let contains_native_handle = message.contains("0x") || message.contains("handle=");
+    let contains_path = message.contains('\\') || message.contains('/');
+    if contains_native_handle || contains_path {
+        "[redacted backend diagnostic]".into()
+    } else {
+        message.into()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeError {
+    pub code: ComputeErrorCode,
+    pub phase: ComputeErrorPhase,
+    pub severity: ComputeErrorSeverity,
+    pub message: String,
+    pub diagnostics: Vec<ComputeDiagnostic>,
+    pub recovery_hints: Vec<RecoveryHint>,
+}
+impl ComputeError {
+    pub fn new(
+        code: ComputeErrorCode,
+        phase: ComputeErrorPhase,
+        severity: ComputeErrorSeverity,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            phase,
+            severity,
+            message: message.into(),
+            diagnostics: Vec::new(),
+            recovery_hints: Vec::new(),
+        }
+    }
+    pub fn with_diagnostic(mut self, diagnostic: ComputeDiagnostic) -> Self {
+        self.diagnostics.push(diagnostic);
+        self
+    }
+    pub fn with_recovery_hint(mut self, hint: RecoveryHint) -> Self {
+        if !self.recovery_hints.contains(&hint) {
+            self.recovery_hints.push(hint);
+        }
+        self
+    }
+    pub fn validation(code: ComputeErrorCode, message: impl Into<String>) -> Self {
+        Self::new(
+            code,
+            ComputeErrorPhase::Validation,
+            ComputeErrorSeverity::Terminal,
+            message,
+        )
+        .with_recovery_hint(RecoveryHint::NotRetryable)
+    }
+}
+impl fmt::Display for ComputeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "compute error {:?} during {:?}: {}",
+            self.code, self.phase, self.message
+        )
+    }
+}
+impl Error for ComputeError {}
+
 fn ensure_non_empty_id(kind: &str, value: &str) -> Result<(), ComputeValidationError> {
     if value.trim().is_empty() {
         return Err(ComputeValidationError::InvalidGraph {
@@ -2853,6 +3162,101 @@ impl fmt::Display for ComputeValidationError {
     }
 }
 impl Error for ComputeValidationError {}
+
+impl From<ComputeValidationError> for ComputeError {
+    fn from(error: ComputeValidationError) -> Self {
+        let message = error.to_string();
+        match error {
+            ComputeValidationError::UnknownOperationFamily(family) => ComputeError::validation(
+                ComputeErrorCode::UnsupportedOperationFamily,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new()
+                    .with_backend_message(format!("unknown operation family: {family}")),
+            ),
+            ComputeValidationError::InvalidGraph { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidGraph, message)
+            }
+            ComputeValidationError::MissingInput { .. } => {
+                ComputeError::validation(ComputeErrorCode::MissingInput, message)
+            }
+            ComputeValidationError::MissingOutput { .. } => {
+                ComputeError::validation(ComputeErrorCode::MissingOutput, message)
+            }
+            ComputeValidationError::CyclicGraph { .. } => {
+                ComputeError::validation(ComputeErrorCode::CyclicGraph, message)
+            }
+            ComputeValidationError::InvalidState { .. } => ComputeError::new(
+                ComputeErrorCode::InvalidState,
+                ComputeErrorPhase::Submission,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputeValidationError::InvalidShape { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidShape, message)
+            }
+            ComputeValidationError::InvalidLayout { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidLayout, message)
+            }
+            ComputeValidationError::SizeOverflow { .. } => {
+                ComputeError::validation(ComputeErrorCode::SizeOverflow, message)
+            }
+            ComputeValidationError::UnsupportedOperationFamily { provider, family } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedOperationFamily, message)
+                    .with_diagnostic(
+                        ComputeDiagnostic::new()
+                            .with_provider(provider)
+                            .with_operation_family(family),
+                    )
+            }
+            ComputeValidationError::UnsupportedDType { family, .. }
+            | ComputeValidationError::UnsupportedProviderDType { family, .. } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedDType, message)
+                    .with_diagnostic(ComputeDiagnostic::new().with_operation_family(family))
+            }
+            ComputeValidationError::UnsupportedLayout { family, layout: _ } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedLayout, message)
+                    .with_diagnostic(ComputeDiagnostic::new().with_operation_family(family))
+            }
+            ComputeValidationError::UnsupportedPrecision { family, .. } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedOperation, message)
+                    .with_diagnostic(ComputeDiagnostic::new().with_operation_family(family))
+            }
+            ComputeValidationError::UnsupportedDataMovement { provider, .. } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedDataMovement, message)
+                    .with_diagnostic(ComputeDiagnostic::new().with_provider(provider))
+                    .with_recovery_hint(RecoveryHint::ExplicitTransferRequired)
+            }
+            ComputeValidationError::InvalidHostBuffer { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidHostBuffer, message)
+            }
+            ComputeValidationError::InvalidTransfer { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidTransfer, message)
+                    .with_recovery_hint(RecoveryHint::ExplicitTransferRequired)
+            }
+            ComputeValidationError::UnsupportedConversion { .. } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedConversion, message)
+            }
+            ComputeValidationError::MaterializationRequired { .. } => {
+                ComputeError::validation(ComputeErrorCode::MaterializationRequired, message)
+                    .with_recovery_hint(RecoveryHint::ExplicitMaterializationRequired)
+            }
+            ComputeValidationError::ProviderUnavailable(provider) => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_provider(provider))
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            ComputeValidationError::IncompatibleResourceAffinity(error) => {
+                ComputeError::from(error)
+            }
+        }
+    }
+}
 
 /// Returns the canonical hardware-independent Compute capability declaration.
 ///
@@ -4249,6 +4653,99 @@ impl Error for ProviderError {
     }
 }
 
+impl From<ProviderError> for ComputeError {
+    fn from(error: ProviderError) -> Self {
+        let message = error.to_string();
+        match error {
+            ProviderError::NoCompatibleProvider(capability) => ComputeError::new(
+                ComputeErrorCode::NoCompatibleProvider,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_capability(capability)),
+            ProviderError::PolicyRejectedProvider { capability, policy: _ } => ComputeError::new(
+                ComputeErrorCode::PolicyRejectedProvider,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_capability(capability)),
+            ProviderError::BackendNotFound(provider) => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_provider(ProviderBinding::new(provider)))
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            ProviderError::DeviceAlreadyRegistered(device) => ComputeError::new(
+                ComputeErrorCode::DeviceUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_device(DeviceBinding::new(device))),
+            ProviderError::DeviceProviderMismatch {
+                device,
+                expected,
+                found,
+            } => ComputeError::new(
+                ComputeErrorCode::DeviceBoundResource,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new()
+                    .with_device(DeviceBinding::new(device))
+                    .with_provider(ProviderBinding::new(found))
+                    .with_rejected_candidate(ProviderBinding::new(expected)),
+            ),
+            ProviderError::IncompatibleApiVersion { provider, .. } => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_provider(ProviderBinding::new(provider))),
+            ProviderError::InvalidCapabilityVersion(version) => ComputeError::new(
+                ComputeErrorCode::CapabilityVersionMismatch,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_backend_message(version)),
+            ProviderError::Lifecycle(message_text) => ComputeError::new(
+                ComputeErrorCode::ExecutionInterrupted,
+                ComputeErrorPhase::Interruption,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_backend_message(message_text))
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            ProviderError::Load {
+                path: _,
+                message: backend_message,
+            } => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_backend_message(backend_message))
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            other => ComputeError::new(
+                ComputeErrorCode::Internal,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_backend_message(other.to_string())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4603,13 +5100,31 @@ mod tests {
         assert!(wit.contains("invalid-shape"));
         assert!(wit.contains("size-overflow"));
         assert!(wit.contains("unsupported-operation-family"));
-        assert!(wit.contains("unsupported-element-type"));
+        assert!(wit.contains("invalid-tensor-descriptor"));
+        assert!(wit.contains("invalid-dtype"));
+        assert!(wit.contains("unsupported-dtype"));
         assert!(wit.contains("unsupported-layout"));
         assert!(wit.contains("unsupported-data-movement"));
+        assert!(wit.contains("no-compatible-provider"));
+        assert!(wit.contains("policy-rejected-provider"));
+        assert!(wit.contains("provider-unavailable"));
+        assert!(wit.contains("device-unavailable"));
+        assert!(wit.contains("provider-pinned-resource"));
+        assert!(wit.contains("device-bound-resource"));
+        assert!(wit.contains("artifact-fingerprint-mismatch"));
+        assert!(wit.contains("affinity-group-mismatch"));
+        assert!(wit.contains("execution-interrupted"));
+        assert!(wit.contains("execution-cancelled"));
         assert!(wit.contains("invalid-host-buffer"));
         assert!(wit.contains("invalid-transfer"));
         assert!(wit.contains("unsupported-conversion"));
         assert!(wit.contains("materialization-required"));
+        assert!(wit.contains("enum compute-error-phase"));
+        assert!(wit.contains("enum compute-error-severity"));
+        assert!(wit.contains("record compute-diagnostic"));
+        assert!(wit.contains("enum recovery-hint"));
+        assert!(wit.contains("diagnostics: list<compute-diagnostic>"));
+        assert!(wit.contains("recovery-hints: list<recovery-hint>"));
         assert!(wit.contains("submit: func("));
         assert!(wit.contains("result<operation, compute-error>"));
         assert!(!wit.contains("BackendStorage"));
@@ -4619,6 +5134,89 @@ mod tests {
         assert!(!wit.contains("kernel-name"));
         assert!(!wit.contains("queue"));
         assert!(!wit.contains("custom-operation"));
+    }
+    #[test]
+    fn compute_error_model_maps_validation_resolution_affinity_and_execution_failures() {
+        let invalid_shape = ComputeError::from(ComputeValidationError::InvalidShape {
+            reason: "rank exceeds limit".into(),
+        });
+        assert_eq!(invalid_shape.code, ComputeErrorCode::InvalidShape);
+        assert_eq!(invalid_shape.phase, ComputeErrorPhase::Validation);
+        assert_eq!(invalid_shape.severity, ComputeErrorSeverity::Terminal);
+        assert!(invalid_shape
+            .recovery_hints
+            .contains(&RecoveryHint::NotRetryable));
+
+        let materialization = ComputeError::from(ComputeValidationError::MaterializationRequired {
+            reason: "view must be materialized".into(),
+        });
+        assert_eq!(materialization.code, ComputeErrorCode::MaterializationRequired);
+        assert!(materialization
+            .recovery_hints
+            .contains(&RecoveryHint::ExplicitMaterializationRequired));
+
+        let affinity = ComputeError::from(AffinityError::BoundProviderUnavailable(
+            ProviderBinding::new("provider-a"),
+        ));
+        assert_eq!(affinity.code, ComputeErrorCode::ProviderUnavailable);
+        assert_eq!(affinity.phase, ComputeErrorPhase::Interruption);
+        assert!(affinity
+            .recovery_hints
+            .contains(&RecoveryHint::ProviderPinned));
+
+        let policy = ComputeError::from(ProviderError::PolicyRejectedProvider {
+            capability: CapabilityBinding::new(
+                CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                COMPUTE_CAPABILITY_VERSION,
+            ),
+            policy: BuiltInResolutionPolicy::Availability.id(),
+        });
+        assert_eq!(policy.code, ComputeErrorCode::PolicyRejectedProvider);
+        assert_eq!(policy.phase, ComputeErrorPhase::Resolution);
+        assert_eq!(
+            policy.diagnostics[0].capability.as_ref().unwrap().id().as_str(),
+            COMPUTE_CAPABILITY_ID
+        );
+
+        let execution = ComputeError::from(ProviderError::Lifecycle("device lost".into()));
+        assert_eq!(execution.code, ComputeErrorCode::ExecutionInterrupted);
+        assert_eq!(execution.phase, ComputeErrorPhase::Interruption);
+        assert!(execution
+            .recovery_hints
+            .contains(&RecoveryHint::RetryBeforeState));
+    }
+    #[test]
+    fn compute_diagnostics_are_optional_redacted_and_non_contractual() {
+        let diagnostic = ComputeDiagnostic::new()
+            .with_provider(ProviderBinding::new("provider-a"))
+            .with_device(DeviceBinding::new(DeviceId::new("gpu:0")))
+            .with_operation_family(ComputeOperationFamily::LinearAlgebra)
+            .with_backend_message("native handle=0xdeadbeef at C:\\secret\\tensor.bin")
+            .with_debug_trace_id("trace-42");
+
+        assert_eq!(
+            diagnostic.provider.as_ref().map(ProviderBinding::as_str),
+            Some("provider-a")
+        );
+        assert_eq!(
+            diagnostic.backend_message.as_deref(),
+            Some("[redacted backend diagnostic]")
+        );
+
+        let error = ComputeError::new(
+            ComputeErrorCode::ExecutionFailed,
+            ComputeErrorPhase::Execution,
+            ComputeErrorSeverity::Terminal,
+            "provider execution failed",
+        )
+        .with_diagnostic(diagnostic)
+        .with_recovery_hint(RecoveryHint::RestartableWithReplay);
+
+        assert_eq!(error.code, ComputeErrorCode::ExecutionFailed);
+        assert_eq!(error.diagnostics.len(), 1);
+        assert!(error
+            .recovery_hints
+            .contains(&RecoveryHint::RestartableWithReplay));
     }
     #[test]
     fn compute_operation_validation_uses_provider_advertisements() {

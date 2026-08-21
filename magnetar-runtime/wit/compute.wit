@@ -202,33 +202,88 @@ interface run {
 
   /// Stable error codes. Provider-specific detail belongs in diagnostics.
   enum compute-error-code {
-    invalid-descriptor,
+    invalid-tensor-descriptor,
     invalid-shape,
+    invalid-dtype,
     invalid-layout,
     size-overflow,
     invalid-graph,
-    invalid-state,
+    cyclic-graph,
+    missing-input,
+    missing-output,
+    no-compatible-provider,
+    policy-rejected-provider,
+    provider-unavailable,
+    device-unavailable,
+    capability-version-mismatch,
+    unsupported-operation,
     unsupported-operation-family,
-    unsupported-element-type,
+    unsupported-dtype,
     unsupported-layout,
-    unsupported-precision,
     unsupported-data-movement,
-    incompatible-affinity,
+    incompatible-resource-affinity,
+    provider-pinned-resource,
+    device-bound-resource,
+    artifact-fingerprint-mismatch,
+    affinity-group-mismatch,
+    execution-failed,
+    execution-interrupted,
+    execution-cancelled,
+    operation-timeout,
+    out-of-memory,
+    resource-exhausted,
     invalid-host-buffer,
     invalid-transfer,
     unsupported-conversion,
     materialization-required,
-    unsupported,
-    resource-exhausted,
-    unavailable,
-    execution-failed,
+    invalid-state,
     internal,
   }
 
-  /// Structured compute failure with optional Provider diagnostic text.
+  enum compute-error-phase {
+    validation,
+    resolution,
+    affinity-validation,
+    submission,
+    execution,
+    cancellation,
+    completion,
+    interruption,
+  }
+
+  enum compute-error-severity {
+    recoverable,
+    terminal,
+    fatal,
+  }
+
+  enum recovery-hint {
+    not-retryable,
+    retry-before-state,
+    restartable-with-replay,
+    explicit-transfer-required,
+    explicit-materialization-required,
+    provider-pinned,
+  }
+
+  record compute-diagnostic {
+    provider-id: option<string>,
+    device-id: option<string>,
+    capability-id: option<string>,
+    operation-family: option<operation-family>,
+    rejected-candidate-ids: list<string>,
+    backend-message: option<string>,
+    debug-trace-id: option<string>,
+  }
+
+  /// Structured compute failure with optional redacted diagnostics.
   record compute-error {
     code: compute-error-code,
-    diagnostic: option<string>,
+    phase: compute-error-phase,
+    severity: compute-error-severity,
+    message: string,
+    diagnostics: list<compute-diagnostic>,
+    recovery-hints: list<recovery-hint>,
   }
 
   /// Non-terminal and terminal lifecycle states for submitted work.
