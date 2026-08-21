@@ -598,18 +598,18 @@ pub const COMPUTE_CAPABILITY_ID: &str = "magnetar:compute/run";
 pub const COMPUTE_WIT_PACKAGE: &str = "magnetar:compute";
 /// WIT interface implemented by Compute providers.
 pub const COMPUTE_WIT_INTERFACE: &str = COMPUTE_CAPABILITY_ID;
-/// Initial stable version of the Compute capability and its WIT contract.
-pub const COMPUTE_CAPABILITY_VERSION: CapabilityVersion = CapabilityVersion::new(1, 0, 0);
+/// Current stable version of the executable Compute capability WIT contract.
+pub const COMPUTE_CAPABILITY_VERSION: CapabilityVersion = CapabilityVersion::new(1, 1, 0);
 
 /// Returns the canonical hardware-independent Compute capability declaration.
 ///
 /// Providers add this value to their metadata to advertise support for the
-/// `magnetar:compute/run@1.0.0` WIT contract.
+/// `magnetar:compute/run@1.1.0` WIT contract.
 pub fn compute_capability() -> Capability {
     Capability::new(
         CapabilityId::new(COMPUTE_CAPABILITY_ID),
         COMPUTE_CAPABILITY_VERSION,
-        CapabilityDescriptor::new("hardware-independent mathematical execution").with_contract(
+        CapabilityDescriptor::new("coarse provider-owned graph execution").with_contract(
             WitInterface::new(
                 COMPUTE_WIT_INTERFACE,
                 COMPUTE_CAPABILITY_VERSION.to_string(),
@@ -1507,8 +1507,20 @@ mod tests {
         assert_eq!(COMPUTE_WIT_PACKAGE, "magnetar:compute");
         assert_eq!(
             compute.descriptor.contracts,
-            BTreeSet::from([WitInterface::new(COMPUTE_WIT_INTERFACE, "1.0.0")])
+            BTreeSet::from([WitInterface::new(COMPUTE_WIT_INTERFACE, "1.1.0")])
         );
+    }
+    #[test]
+    fn compute_wit_defines_the_stabilized_run_surface() {
+        let wit = include_str!("../wit/compute.wit");
+        assert!(wit.contains("package magnetar:compute@1.1.0;"));
+        assert!(wit.contains("resource tensor"));
+        assert!(wit.contains("resource graph"));
+        assert!(wit.contains("resource operation"));
+        assert!(wit.contains("submit: func("));
+        assert!(wit.contains("result<operation, compute-error>"));
+        assert!(!wit.contains("BackendStorage"));
+        assert!(!wit.contains("Tensor`"));
     }
     #[test]
     fn compute_providers_register_and_resolve_compatibly() {

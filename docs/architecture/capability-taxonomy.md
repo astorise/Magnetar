@@ -2,10 +2,12 @@
 
 ## Status and scope
 
-This document records the evidence used to prepare future Magnetar capability
-contracts. It is a discovery artifact, not a registry of stable capabilities:
-the package names below are provisional, and this change does not alter
-`magnetar:compute/run@1.0.0` or add runtime APIs.
+This document records the evidence used to prepare Magnetar capability
+contracts. Most package names below remain provisional discovery artifacts.
+`magnetar:compute/run@1.1.0` is the first stabilized result of this taxonomy:
+it evolves the `1.0.0` marker into a coarse graph execution boundary while
+leaving graph construction, data movement, operation catalogs, and numerical
+semantics to later changes.
 
 The taxonomy distinguishes three things that source runtimes often combine:
 
@@ -312,7 +314,7 @@ follow-up may rename, split, or reject it.
 
 | Candidate family | Provisional package/interface | Coarse WIT-facing responsibility | Native owner retained | Decisions required before versioning |
 | --- | --- | --- | --- | --- |
-| Compute graph execution and tensor resources | Existing `magnetar:compute/run`; possible tensor, graph, and execution boundaries are conceptual, not proposed interface names | Validated fixed-width descriptors, opaque tensor/graph/operation resources, coarse submit/await/cancel | Allocation, storage, kernels, device contexts, synchronization | Graph representation; resource sharing; numerical semantics; evolve `run` as one coarse contract or register separate Capability IDs; interface-to-Capability mapping; package/version migration |
+| Compute graph execution and tensor resources | Stabilized `magnetar:compute/run@1.1.0` `run` interface | Validated fixed-width descriptors, opaque tensor/graph/operation resources, coarse submit/await/cancel/status/output retrieval, stable structured errors | Allocation, storage, kernels, device contexts, synchronization | Graph construction, data movement, resource sharing policy beyond opaque handles, operation catalogs, numerical semantics |
 | Model loading | `magnetar:model/load` | Load from a host-authorized artifact resource; return opaque model plus metadata, fingerprint, and abilities | Artifact cache, format detection, weights, mmap, placement, loader implementation | Artifact identity and permissions; ability metadata; affinity and unload lifecycle |
 | Tokenization | `magnetar:tokenization/tokenizer` | Open a fingerprinted tokenizer; encode/decode; incremental decoder; special-token metadata | Native tokenizer implementation and cache, when used | Normalization/offset semantics; limits; incremental decode; model fingerprint compatibility |
 | Prompt formatting | `magnetar:prompt/chat-template` | Render structured messages/tools/reasoning policy with a fingerprinted template | Template storage and sandbox policy | Message/tool schema; escaping; determinism; template trust and limits |
@@ -325,11 +327,12 @@ follow-up may rename, split, or reject it.
 | Vision-language | `magnetar:vision-language/generate` | Image resources plus structured messages, generation policy, response events | Image encoder, model/KV state, Compute | Stable input parts; multi-image limits; placeholder source gaps; reuse of generation events |
 
 The current runtime derives a `CapabilityId` from each imported WIT interface.
-Consequently, an import such as `magnetar:compute/tensor` would request that
-Capability ID and would not resolve to the existing `magnetar:compute/run`
-registration. A follow-up must therefore either evolve `run` as one coarse
-interface or deliberately register and version separate Capability IDs; this
-change does not choose names that the current resolver would treat as real.
+Consequently, the stabilized Compute contract evolves the existing
+`magnetar:compute/run` interface rather than introducing names such as
+`magnetar:compute/tensor`, which the resolver would treat as separate
+Capability IDs. Later changes may deliberately register separate Capability
+IDs, but those changes must specify dependency, resource-affinity, and fallback
+rules first.
 
 Candidate-to-source evidence index:
 

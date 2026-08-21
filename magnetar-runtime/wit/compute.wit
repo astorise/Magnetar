@@ -1,8 +1,99 @@
-package magnetar:compute@1.0.0;
+package magnetar:compute@1.1.0;
 
-/// Portable Compute capability marker. Operations are introduced by future
-/// compatible revisions after their semantics are specified.
-interface run {}
+/// Portable Compute capability for coarse Provider-owned graph execution.
+interface run {
+  /// Stable tensor element kinds accepted at the Compute boundary.
+  enum element-type {
+    boolean,
+    uint8,
+    sint8,
+    uint16,
+    sint16,
+    uint32,
+    sint32,
+    uint64,
+    sint64,
+    float16,
+    brain-float16,
+    float32,
+    float64,
+  }
+
+  /// Tensor shape using fixed-width dimensions.
+  record shape-descriptor {
+    dimensions: list<u64>,
+  }
+
+  /// Tensor view metadata. Strides and offsets are expressed in elements.
+  record view-descriptor {
+    offset-elements: u64,
+    strides-elements: list<u64>,
+  }
+
+  /// Portable tensor metadata. Storage remains Provider-owned and opaque.
+  record tensor-descriptor {
+    shape: shape-descriptor,
+    element-type: element-type,
+    view: view-descriptor,
+  }
+
+  /// Stable error codes. Provider-specific detail belongs in diagnostics.
+  enum compute-error-code {
+    invalid-descriptor,
+    invalid-graph,
+    invalid-state,
+    unsupported,
+    resource-exhausted,
+    unavailable,
+    execution-failed,
+    internal,
+  }
+
+  /// Structured compute failure with optional Provider diagnostic text.
+  record compute-error {
+    code: compute-error-code,
+    diagnostic: option<string>,
+  }
+
+  /// Non-terminal and terminal lifecycle states for submitted work.
+  enum operation-state {
+    submitted,
+    running,
+    completed,
+    cancelled,
+    failed,
+  }
+
+  /// Opaque tensor resource owned by the selected Provider.
+  resource tensor {
+    /// Return portable metadata for this tensor.
+    descriptor: func() -> tensor-descriptor;
+  }
+
+  /// Opaque compute graph or batch resource owned by the selected Provider.
+  resource graph {}
+
+  /// Submitted compute work pinned to the Provider that owns its resources.
+  resource operation {
+    /// Return the current operation state without blocking for completion.
+    status: func() -> operation-state;
+
+    /// Wait until the operation reaches a terminal state.
+    await-completion: func() -> result<operation-state, compute-error>;
+
+    /// Request cancellation when the Provider can safely cancel the work.
+    cancel: func() -> result<_, compute-error>;
+
+    /// Transfer completed output tensor resources. Valid at most once.
+    take-outputs: func() -> result<list<tensor>, compute-error>;
+  }
+
+  /// Submit coarse compute work represented by an opaque graph and inputs.
+  submit: func(
+    graph: borrow<graph>,
+    inputs: list<borrow<tensor>>,
+  ) -> result<operation, compute-error>;
+}
 
 world compute {
   export run;
