@@ -4293,6 +4293,224 @@ impl ComputeSubmission {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum MemoryRegionKind {
+    GraphInput,
+    GraphOutput,
+    Intermediate,
+    Temporary,
+    Materialization,
+    Transfer,
+    HostStaging,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryRequirement {
+    pub id: String,
+    pub region: MemoryRegionKind,
+    pub byte_size: u64,
+    pub affinity: ResourceAffinity,
+    pub reusable: bool,
+}
+impl MemoryRequirement {
+    pub fn new(
+        id: impl Into<String>,
+        region: MemoryRegionKind,
+        byte_size: u64,
+        affinity: ResourceAffinity,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            region,
+            byte_size,
+            affinity,
+            reusable: false,
+        }
+    }
+    pub const fn reusable(mut self) -> Self {
+        self.reusable = true;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TensorLifetime {
+    pub id: String,
+    pub first_step: usize,
+    pub last_step: usize,
+    pub byte_size: u64,
+    pub affinity: ResourceAffinity,
+}
+impl TensorLifetime {
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.first_step <= other.last_step && other.first_step <= self.last_step
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BufferLifetime {
+    pub id: String,
+    pub source: String,
+    pub first_step: usize,
+    pub last_step: usize,
+    pub byte_size: u64,
+    pub affinity: ResourceAffinity,
+    pub reuses: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MemoryPressureReport {
+    pub estimated_required_bytes: u64,
+    pub estimated_peak_bytes: u64,
+    pub selected_provider: Option<ProviderBinding>,
+    pub selected_device: Option<DeviceBinding>,
+    pub rejected_device_limit: Option<u64>,
+    pub materialization_cost_bytes: u64,
+    pub transfer_buffer_cost_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemoryPlanningDecision {
+    Allocate { requirement: String },
+    Reuse { requirement: String, buffer: String },
+    PreservePinnedResource { resource: TensorResourceId },
+    RequireMaterialization { requirement: String },
+    RequireTransfer { requirement: String },
+    AccountHostStaging { requirement: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemoryPlanningDiagnostic {
+    EstimatedRequirement {
+        requirement: String,
+        bytes: u64,
+    },
+    PeakBytes {
+        bytes: u64,
+    },
+    ProviderLimit {
+        provider: ProviderBinding,
+        max_bytes: u64,
+    },
+    DeviceLimit {
+        device: DeviceBinding,
+        max_bytes: u64,
+    },
+    MaterializationCost {
+        bytes: u64,
+    },
+    TransferCost {
+        bytes: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryPlan {
+    pub provider: ProviderBinding,
+    pub graph: Option<ComputeGraphId>,
+    pub requirements: Vec<MemoryRequirement>,
+    pub tensor_lifetimes: Vec<TensorLifetime>,
+    pub buffer_lifetimes: Vec<BufferLifetime>,
+    pub pressure: MemoryPressureReport,
+    pub decisions: Vec<MemoryPlanningDecision>,
+    pub diagnostics: Vec<MemoryPlanningDiagnostic>,
+    pub output_affinity: ResourceAffinity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemoryPlanningError {
+    MemoryPlanningFailed {
+        reason: String,
+        report: MemoryPressureReport,
+    },
+    OutOfMemory {
+        required: u64,
+        limit: u64,
+        report: MemoryPressureReport,
+    },
+    ResourceExhausted {
+        reason: String,
+        report: MemoryPressureReport,
+    },
+    SizeOverflow {
+        reason: String,
+        report: MemoryPressureReport,
+    },
+    IncompatibleResourceAffinity(AffinityError),
+    UnsupportedLayout {
+        layout: ComputeLayout,
+        report: MemoryPressureReport,
+    },
+    MaterializationRequired {
+        reason: String,
+        report: MemoryPressureReport,
+    },
+    TransferRequired {
+        reason: String,
+        report: MemoryPressureReport,
+    },
+    ProviderMemoryLimitExceeded {
+        provider: ProviderBinding,
+        required: u64,
+        limit: u64,
+        report: MemoryPressureReport,
+    },
+    DeviceMemoryLimitExceeded {
+        device: DeviceBinding,
+        required: u64,
+        limit: u64,
+        report: MemoryPressureReport,
+    },
+}
+impl fmt::Display for MemoryPlanningError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MemoryPlanningFailed { reason, .. } => {
+                write!(f, "memory planning failed: {reason}")
+            }
+            Self::OutOfMemory {
+                required, limit, ..
+            } => write!(
+                f,
+                "memory planning requires {required} bytes but only {limit} bytes are available"
+            ),
+            Self::ResourceExhausted { reason, .. } => write!(f, "resource exhausted: {reason}"),
+            Self::SizeOverflow { reason, .. } => write!(f, "memory size overflow: {reason}"),
+            Self::IncompatibleResourceAffinity(error) => {
+                write!(f, "incompatible memory resource affinity: {error}")
+            }
+            Self::UnsupportedLayout { layout, .. } => {
+                write!(f, "memory planning does not support layout {layout:?}")
+            }
+            Self::MaterializationRequired { reason, .. } => {
+                write!(f, "memory planning requires materialization: {reason}")
+            }
+            Self::TransferRequired { reason, .. } => {
+                write!(f, "memory planning requires explicit transfer: {reason}")
+            }
+            Self::ProviderMemoryLimitExceeded {
+                provider,
+                required,
+                limit,
+                ..
+            } => write!(
+                f,
+                "provider '{provider}' memory limit exceeded: required {required}, limit {limit}"
+            ),
+            Self::DeviceMemoryLimitExceeded {
+                device,
+                required,
+                limit,
+                ..
+            } => write!(
+                f,
+                "device '{device}' memory limit exceeded: required {required}, limit {limit}"
+            ),
+        }
+    }
+}
+impl Error for MemoryPlanningError {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComputeGraphValidationReport {
     pub provider: ProviderBinding,
@@ -4307,6 +4525,7 @@ pub enum ComputeErrorPhase {
     Validation,
     Resolution,
     AffinityValidation,
+    MemoryPlanning,
     Submission,
     Execution,
     Cancellation,
@@ -4364,8 +4583,11 @@ pub enum ComputeErrorCode {
     ExecutionInterrupted,
     ExecutionCancelled,
     OperationTimeout,
+    MemoryPlanningFailed,
     OutOfMemory,
     ResourceExhausted,
+    ProviderMemoryLimitExceeded,
+    DeviceMemoryLimitExceeded,
     InvalidHostBuffer,
     InvalidTransfer,
     UnsupportedConversion,
@@ -4626,6 +4848,7 @@ pub enum ComputeValidationError {
     MaterializationRequired {
         reason: String,
     },
+    MemoryPlanning(MemoryPlanningError),
     ProviderUnavailable(ProviderBinding),
     IncompatibleResourceAffinity(AffinityError),
 }
@@ -4730,6 +4953,9 @@ impl fmt::Display for ComputeValidationError {
             }
             Self::MaterializationRequired { reason } => {
                 write!(f, "materialization required: {reason}")
+            }
+            Self::MemoryPlanning(error) => {
+                write!(f, "{error}")
             }
             Self::ProviderUnavailable(provider) => {
                 write!(f, "provider '{provider}' is unavailable")
@@ -4854,6 +5080,7 @@ impl From<ComputeValidationError> for ComputeError {
                 ComputeError::validation(ComputeErrorCode::MaterializationRequired, message)
                     .with_recovery_hint(RecoveryHint::ExplicitMaterializationRequired)
             }
+            ComputeValidationError::MemoryPlanning(error) => ComputeError::from(error),
             ComputeValidationError::ProviderUnavailable(provider) => ComputeError::new(
                 ComputeErrorCode::ProviderUnavailable,
                 ComputeErrorPhase::Resolution,
@@ -4867,6 +5094,277 @@ impl From<ComputeValidationError> for ComputeError {
             }
         }
     }
+}
+
+impl From<MemoryPlanningError> for ComputeError {
+    fn from(error: MemoryPlanningError) -> Self {
+        let message = error.to_string();
+        match error {
+            MemoryPlanningError::MemoryPlanningFailed { report, .. } => ComputeError::new(
+                ComputeErrorCode::MemoryPlanningFailed,
+                ComputeErrorPhase::MemoryPlanning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(memory_pressure_diagnostic(&report))
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            MemoryPlanningError::OutOfMemory { report, .. } => ComputeError::new(
+                ComputeErrorCode::OutOfMemory,
+                ComputeErrorPhase::MemoryPlanning,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(memory_pressure_diagnostic(&report)),
+            MemoryPlanningError::ResourceExhausted { report, .. } => ComputeError::new(
+                ComputeErrorCode::ResourceExhausted,
+                ComputeErrorPhase::MemoryPlanning,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(memory_pressure_diagnostic(&report)),
+            MemoryPlanningError::SizeOverflow { report, .. } => ComputeError::new(
+                ComputeErrorCode::SizeOverflow,
+                ComputeErrorPhase::MemoryPlanning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(memory_pressure_diagnostic(&report)),
+            MemoryPlanningError::IncompatibleResourceAffinity(error) => ComputeError::from(error),
+            MemoryPlanningError::UnsupportedLayout { report, .. } => ComputeError::new(
+                ComputeErrorCode::UnsupportedLayout,
+                ComputeErrorPhase::MemoryPlanning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(memory_pressure_diagnostic(&report)),
+            MemoryPlanningError::MaterializationRequired { report, .. } => ComputeError::new(
+                ComputeErrorCode::MaterializationRequired,
+                ComputeErrorPhase::MemoryPlanning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(memory_pressure_diagnostic(&report))
+            .with_recovery_hint(RecoveryHint::ExplicitMaterializationRequired),
+            MemoryPlanningError::TransferRequired { report, .. } => ComputeError::new(
+                ComputeErrorCode::InvalidTransfer,
+                ComputeErrorPhase::MemoryPlanning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(memory_pressure_diagnostic(&report))
+            .with_recovery_hint(RecoveryHint::ExplicitTransferRequired),
+            MemoryPlanningError::ProviderMemoryLimitExceeded { report, .. } => ComputeError::new(
+                ComputeErrorCode::ProviderMemoryLimitExceeded,
+                ComputeErrorPhase::MemoryPlanning,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(memory_pressure_diagnostic(&report)),
+            MemoryPlanningError::DeviceMemoryLimitExceeded { report, .. } => ComputeError::new(
+                ComputeErrorCode::DeviceMemoryLimitExceeded,
+                ComputeErrorPhase::MemoryPlanning,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(memory_pressure_diagnostic(&report)),
+        }
+    }
+}
+
+fn memory_pressure_diagnostic(report: &MemoryPressureReport) -> ComputeDiagnostic {
+    let mut diagnostic = ComputeDiagnostic::new();
+    if let Some(provider) = &report.selected_provider {
+        diagnostic = diagnostic.with_provider(provider.clone());
+    }
+    if let Some(device) = &report.selected_device {
+        diagnostic = diagnostic.with_device(device.clone());
+    }
+    diagnostic.with_backend_message(format!(
+        "memory pressure: required={} peak={} materialization={} transfer={}",
+        report.estimated_required_bytes,
+        report.estimated_peak_bytes,
+        report.materialization_cost_bytes,
+        report.transfer_buffer_cost_bytes
+    ))
+}
+
+impl MemoryPlan {
+    fn new(
+        provider: ProviderBinding,
+        graph: Option<ComputeGraphId>,
+        execution_context: ExecutionContextId,
+    ) -> Self {
+        let output_affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(provider.clone())
+            .with_capability(CapabilityBinding::new(
+                CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                COMPUTE_CAPABILITY_VERSION,
+            ))
+            .with_execution_context(execution_context);
+        Self {
+            provider: provider.clone(),
+            graph,
+            requirements: Vec::new(),
+            tensor_lifetimes: Vec::new(),
+            buffer_lifetimes: Vec::new(),
+            pressure: MemoryPressureReport {
+                selected_provider: Some(provider),
+                ..MemoryPressureReport::default()
+            },
+            decisions: Vec::new(),
+            diagnostics: Vec::new(),
+            output_affinity,
+        }
+    }
+    fn add_requirement(
+        &mut self,
+        requirement: MemoryRequirement,
+    ) -> Result<(), MemoryPlanningError> {
+        self.pressure.estimated_required_bytes = self
+            .pressure
+            .estimated_required_bytes
+            .checked_add(requirement.byte_size)
+            .ok_or_else(|| MemoryPlanningError::SizeOverflow {
+                reason: "total memory requirements overflow u64".into(),
+                report: self.pressure.clone(),
+            })?;
+        self.pressure.estimated_peak_bytes = self
+            .pressure
+            .estimated_peak_bytes
+            .checked_add(requirement.byte_size)
+            .ok_or_else(|| MemoryPlanningError::SizeOverflow {
+                reason: "peak memory requirements overflow u64".into(),
+                report: self.pressure.clone(),
+            })?;
+        self.diagnostics
+            .push(MemoryPlanningDiagnostic::EstimatedRequirement {
+                requirement: requirement.id.clone(),
+                bytes: requirement.byte_size,
+            });
+        self.diagnostics.push(MemoryPlanningDiagnostic::PeakBytes {
+            bytes: self.pressure.estimated_peak_bytes,
+        });
+        self.requirements.push(requirement);
+        Ok(())
+    }
+    fn find_reusable_buffer(&self, lifetime: &TensorLifetime) -> Option<String> {
+        self.buffer_lifetimes
+            .iter()
+            .find(|buffer| {
+                buffer.byte_size >= lifetime.byte_size
+                    && buffer.last_step < lifetime.first_step
+                    && buffer.affinity.validate_with(&lifetime.affinity).is_ok()
+            })
+            .map(|buffer| buffer.id.clone())
+    }
+}
+
+fn provider_memory_limit(metadata: &ProviderMetadata) -> u64 {
+    let advertisement = effective_compute_advertisement(metadata);
+    advertisement
+        .operation_families
+        .values()
+        .map(|support| support.shapes.descriptor_limits.max_bytes)
+        .chain(
+            advertisement
+                .operation_schemas
+                .values()
+                .map(|support| support.shapes.descriptor_limits.max_bytes),
+        )
+        .chain(
+            advertisement
+                .data_movement
+                .values()
+                .map(|support| support.shapes.descriptor_limits.max_bytes),
+        )
+        .min()
+        .unwrap_or(u64::MAX)
+}
+
+fn memory_bytes(
+    descriptor: &TensorDescriptor,
+    report: &MemoryPressureReport,
+) -> Result<u64, MemoryPlanningError> {
+    descriptor
+        .byte_size()
+        .map_err(|error| MemoryPlanningError::SizeOverflow {
+            reason: error.to_string(),
+            report: report.clone(),
+        })
+}
+
+fn memory_error_from_compute_validation(error: ComputeValidationError) -> MemoryPlanningError {
+    match error {
+        ComputeValidationError::SizeOverflow { reason } => MemoryPlanningError::SizeOverflow {
+            reason,
+            report: MemoryPressureReport::default(),
+        },
+        ComputeValidationError::IncompatibleResourceAffinity(error) => {
+            MemoryPlanningError::IncompatibleResourceAffinity(error)
+        }
+        other => MemoryPlanningError::MemoryPlanningFailed {
+            reason: other.to_string(),
+            report: MemoryPressureReport::default(),
+        },
+    }
+}
+
+fn last_use_for_input(graph: &ComputeGraph, input: &ComputeInputId) -> Option<usize> {
+    let mut last = None;
+    for (index, node) in graph.nodes.iter().enumerate() {
+        if node
+            .inputs
+            .iter()
+            .any(|value| matches!(value, ComputeValueRef::Input(id) if id == input))
+        {
+            last = Some(index + 1);
+        }
+    }
+    if graph
+        .outputs
+        .iter()
+        .any(|output| matches!(&output.source, ComputeValueRef::Input(id) if id == input))
+    {
+        last = Some(graph.nodes.len() + 1);
+    }
+    last
+}
+
+fn last_use_for_node_output(
+    graph: &ComputeGraph,
+    node: &ComputeNodeId,
+    output: &ComputeOutputId,
+) -> Option<usize> {
+    let mut last = None;
+    for (index, candidate) in graph.nodes.iter().enumerate() {
+        if candidate.inputs.iter().any(|value| {
+            matches!(
+                value,
+                ComputeValueRef::NodeOutput {
+                    node: candidate_node,
+                    output: candidate_output,
+                } if candidate_node == node && candidate_output == output
+            )
+        }) {
+            last = Some(index + 1);
+        }
+    }
+    if graph_output_uses(graph, node, output) {
+        last = Some(graph.nodes.len() + 1);
+    }
+    last
+}
+
+fn graph_output_uses(graph: &ComputeGraph, node: &ComputeNodeId, output: &ComputeOutputId) -> bool {
+    graph.outputs.iter().any(|graph_output| {
+        matches!(
+            &graph_output.source,
+            ComputeValueRef::NodeOutput {
+                node: candidate_node,
+                output: candidate_output,
+            } if candidate_node == node && candidate_output == output
+        )
+    })
 }
 
 /// Returns the canonical hardware-independent Compute capability declaration.
@@ -5984,6 +6482,347 @@ impl Runtime {
         }
         Ok(())
     }
+    pub fn plan_compute_data_movement_memory(
+        &self,
+        provider: &str,
+        movements: &[ComputeDataMovementDescriptor],
+    ) -> Result<MemoryPlan, MemoryPlanningError> {
+        let metadata = self
+            .providers
+            .provider(provider)
+            .map(Provider::metadata)
+            .ok_or_else(|| MemoryPlanningError::MemoryPlanningFailed {
+                reason: format!("provider '{provider}' is unavailable"),
+                report: MemoryPressureReport::default(),
+            })?;
+        let provider_binding = ProviderBinding::new(&metadata.name);
+        let mut plan = MemoryPlan::new(provider_binding.clone(), None, self.context.id);
+        let advertisement = effective_compute_advertisement(&metadata);
+
+        for (index, movement) in movements.iter().enumerate() {
+            let support = advertisement
+                .data_movement
+                .get(&movement.kind)
+                .ok_or_else(|| MemoryPlanningError::TransferRequired {
+                    reason: format!("provider does not advertise '{}'", movement.kind.id()),
+                    report: plan.pressure.clone(),
+                })?;
+            if movement.allow_host_staging && !support.allow_host_staging {
+                return Err(MemoryPlanningError::TransferRequired {
+                    reason: "host staging must be explicit and advertised".into(),
+                    report: plan.pressure.clone(),
+                });
+            }
+            let output_bytes = memory_bytes(&movement.output, &plan.pressure)?;
+            let mut affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
+                .with_provider(
+                    movement
+                        .target_provider
+                        .clone()
+                        .unwrap_or_else(|| provider_binding.clone()),
+                )
+                .with_capability(CapabilityBinding::new(
+                    CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                    COMPUTE_CAPABILITY_VERSION,
+                ))
+                .with_execution_context(self.context.id);
+            if let Some(device) = &movement.target_device {
+                affinity = affinity.with_device(device.clone());
+            }
+            let requirement_id = format!("movement:{index}:{}", movement.kind.id());
+            let region = match movement.kind {
+                ComputeDataMovementKind::Materialize => MemoryRegionKind::Materialization,
+                ComputeDataMovementKind::Transfer => MemoryRegionKind::Transfer,
+                ComputeDataMovementKind::Upload
+                | ComputeDataMovementKind::Download
+                | ComputeDataMovementKind::Copy
+                | ComputeDataMovementKind::DTypeConversion
+                | ComputeDataMovementKind::PlacementConversion => MemoryRegionKind::Transfer,
+            };
+            plan.add_requirement(MemoryRequirement::new(
+                requirement_id.clone(),
+                region,
+                output_bytes,
+                affinity.clone(),
+            ))?;
+            plan.decisions.push(match movement.kind {
+                ComputeDataMovementKind::Materialize => {
+                    plan.pressure.materialization_cost_bytes = plan
+                        .pressure
+                        .materialization_cost_bytes
+                        .checked_add(output_bytes)
+                        .ok_or_else(|| MemoryPlanningError::SizeOverflow {
+                            reason: "materialization memory cost overflows u64".into(),
+                            report: plan.pressure.clone(),
+                        })?;
+                    MemoryPlanningDecision::RequireMaterialization {
+                        requirement: requirement_id.clone(),
+                    }
+                }
+                _ if movement.allow_host_staging => {
+                    plan.pressure.transfer_buffer_cost_bytes = plan
+                        .pressure
+                        .transfer_buffer_cost_bytes
+                        .checked_add(output_bytes)
+                        .ok_or_else(|| MemoryPlanningError::SizeOverflow {
+                            reason: "transfer memory cost overflows u64".into(),
+                            report: plan.pressure.clone(),
+                        })?;
+                    MemoryPlanningDecision::AccountHostStaging {
+                        requirement: requirement_id.clone(),
+                    }
+                }
+                _ => MemoryPlanningDecision::RequireTransfer {
+                    requirement: requirement_id.clone(),
+                },
+            });
+            plan.tensor_lifetimes.push(TensorLifetime {
+                id: requirement_id,
+                first_step: index,
+                last_step: index,
+                byte_size: output_bytes,
+                affinity,
+            });
+        }
+        self.validate_memory_plan(&metadata, &mut plan)?;
+        Ok(plan)
+    }
+    pub fn plan_compute_graph_memory(
+        &self,
+        provider: &str,
+        graph: &ComputeGraph,
+    ) -> Result<MemoryPlan, MemoryPlanningError> {
+        let metadata = self
+            .providers
+            .provider(provider)
+            .map(Provider::metadata)
+            .ok_or_else(|| MemoryPlanningError::MemoryPlanningFailed {
+                reason: format!("provider '{provider}' is unavailable"),
+                report: MemoryPressureReport::default(),
+            })?;
+        let provider_binding = ProviderBinding::new(&metadata.name);
+        let mut plan = MemoryPlan::new(
+            provider_binding.clone(),
+            Some(graph.id.clone()),
+            self.context.id,
+        );
+        let mut input_descriptors = BTreeMap::new();
+        let mut input_affinities = BTreeMap::new();
+        let mut output_descriptors = BTreeMap::new();
+        let mut completed_nodes = BTreeSet::new();
+        let graph_end = graph.nodes.len() + 1;
+        let target = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(provider_binding.clone())
+            .with_capability(CapabilityBinding::new(
+                CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                COMPUTE_CAPABILITY_VERSION,
+            ))
+            .with_execution_context(self.context.id);
+
+        for input in &graph.inputs {
+            input_descriptors.insert(input.id.clone(), input.value.descriptor().clone());
+            let affinity = input
+                .value
+                .affinity()
+                .cloned()
+                .unwrap_or_else(|| target.clone());
+            if let ComputeInputValue::TensorResource(resource) = &input.value {
+                if let Some(source_provider) = resource.affinity.provider()
+                    && source_provider.as_str() != provider
+                {
+                    return Err(MemoryPlanningError::TransferRequired {
+                        reason: format!(
+                            "input resource '{}' is bound to provider '{source_provider}'",
+                            resource.id
+                        ),
+                        report: plan.pressure.clone(),
+                    });
+                }
+                if resource.affinity.fallback() == FallbackClass::ProviderPinned {
+                    plan.decisions
+                        .push(MemoryPlanningDecision::PreservePinnedResource {
+                            resource: resource.id.clone(),
+                        });
+                }
+            }
+            let bytes = memory_bytes(input.value.descriptor(), &plan.pressure)?;
+            let id = format!("input:{}", input.id);
+            plan.add_requirement(MemoryRequirement::new(
+                id.clone(),
+                MemoryRegionKind::GraphInput,
+                bytes,
+                affinity.clone(),
+            ))?;
+            plan.tensor_lifetimes.push(TensorLifetime {
+                id,
+                first_step: 0,
+                last_step: last_use_for_input(graph, &input.id).unwrap_or(graph_end),
+                byte_size: bytes,
+                affinity: affinity.clone(),
+            });
+            input_affinities.insert(input.id.clone(), affinity);
+        }
+
+        for (node_index, node) in graph.nodes.iter().enumerate() {
+            let step = node_index + 1;
+            for input in &node.inputs {
+                let descriptor = resolve_compute_value_descriptor(
+                    Some(&node.id),
+                    input,
+                    &input_descriptors,
+                    &output_descriptors,
+                    &completed_nodes,
+                )
+                .map_err(memory_error_from_compute_validation)?;
+                if descriptor.view.is_some() && descriptor.layout.kind() != ComputeLayout::Dense {
+                    let bytes = memory_bytes(descriptor, &plan.pressure)?;
+                    let requirement_id = format!("materialize:{}:{step}", node.id);
+                    plan.add_requirement(MemoryRequirement::new(
+                        requirement_id.clone(),
+                        MemoryRegionKind::Materialization,
+                        bytes,
+                        target.clone(),
+                    ))?;
+                    plan.pressure.materialization_cost_bytes = plan
+                        .pressure
+                        .materialization_cost_bytes
+                        .checked_add(bytes)
+                        .ok_or_else(|| MemoryPlanningError::SizeOverflow {
+                            reason: "materialization memory cost overflows u64".into(),
+                            report: plan.pressure.clone(),
+                        })?;
+                    plan.decisions
+                        .push(MemoryPlanningDecision::RequireMaterialization {
+                            requirement: requirement_id,
+                        });
+                }
+            }
+            for output in &node.outputs {
+                let bytes = memory_bytes(&output.descriptor, &plan.pressure)?;
+                let id = format!("node:{}:{}", node.id, output.id);
+                let lifetime = TensorLifetime {
+                    id: id.clone(),
+                    first_step: step,
+                    last_step: last_use_for_node_output(graph, &node.id, &output.id)
+                        .unwrap_or(step),
+                    byte_size: bytes,
+                    affinity: target.clone(),
+                };
+                let reuses = plan.find_reusable_buffer(&lifetime);
+                let mut requirement = MemoryRequirement::new(
+                    id.clone(),
+                    if graph_output_uses(graph, &node.id, &output.id) {
+                        MemoryRegionKind::GraphOutput
+                    } else {
+                        MemoryRegionKind::Intermediate
+                    },
+                    bytes,
+                    target.clone(),
+                );
+                if !graph_output_uses(graph, &node.id, &output.id) {
+                    requirement = requirement.reusable();
+                }
+                plan.add_requirement(requirement)?;
+                plan.buffer_lifetimes.push(BufferLifetime {
+                    id: format!("buffer:{id}"),
+                    source: id.clone(),
+                    first_step: lifetime.first_step,
+                    last_step: lifetime.last_step,
+                    byte_size: bytes,
+                    affinity: target.clone(),
+                    reuses: reuses.clone(),
+                });
+                plan.decisions.push(match reuses {
+                    Some(buffer) => MemoryPlanningDecision::Reuse {
+                        requirement: id.clone(),
+                        buffer,
+                    },
+                    None => MemoryPlanningDecision::Allocate {
+                        requirement: id.clone(),
+                    },
+                });
+                output_descriptors.insert(
+                    (node.id.clone(), output.id.clone()),
+                    output.descriptor.clone(),
+                );
+                plan.tensor_lifetimes.push(lifetime);
+            }
+            completed_nodes.insert(node.id.clone());
+        }
+
+        for output in &graph.outputs {
+            match &output.source {
+                ComputeValueRef::Input(input) => {
+                    if let Some(affinity) = input_affinities.get(input) {
+                        plan.output_affinity = affinity.clone();
+                    }
+                }
+                ComputeValueRef::NodeOutput { .. } => {
+                    plan.output_affinity = target.clone();
+                }
+            }
+        }
+        self.validate_memory_plan(&metadata, &mut plan)?;
+        Ok(plan)
+    }
+    pub fn validate_memory_plan(
+        &self,
+        metadata: &ProviderMetadata,
+        plan: &mut MemoryPlan,
+    ) -> Result<(), MemoryPlanningError> {
+        let provider_limit = provider_memory_limit(metadata);
+        if provider_limit != u64::MAX {
+            plan.diagnostics
+                .push(MemoryPlanningDiagnostic::ProviderLimit {
+                    provider: plan.provider.clone(),
+                    max_bytes: provider_limit,
+                });
+        }
+        for requirement in &plan.requirements {
+            if requirement.byte_size > provider_limit {
+                return Err(MemoryPlanningError::ProviderMemoryLimitExceeded {
+                    provider: plan.provider.clone(),
+                    required: requirement.byte_size,
+                    limit: provider_limit,
+                    report: plan.pressure.clone(),
+                });
+            }
+        }
+        let selected_device = plan
+            .requirements
+            .iter()
+            .find_map(|requirement| requirement.affinity.device().cloned())
+            .or_else(|| {
+                self.providers
+                    .registry()
+                    .devices_for_provider(plan.provider.as_str())
+                    .find(|device| device.metadata().memory_capacity > 0)
+                    .map(|device| DeviceBinding::new(device.id().clone()))
+            });
+        if let Some(device) = selected_device {
+            if let Some(runtime_device) = self.device(device.id()) {
+                let limit = runtime_device.metadata().memory_capacity;
+                if limit > 0 {
+                    plan.pressure.selected_device = Some(device.clone());
+                    plan.diagnostics
+                        .push(MemoryPlanningDiagnostic::DeviceLimit {
+                            device: device.clone(),
+                            max_bytes: limit,
+                        });
+                    if plan.pressure.estimated_peak_bytes > limit {
+                        plan.pressure.rejected_device_limit = Some(limit);
+                        return Err(MemoryPlanningError::DeviceMemoryLimitExceeded {
+                            device,
+                            required: plan.pressure.estimated_peak_bytes,
+                            limit,
+                            report: plan.pressure.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn validate_compute_graph(
         &self,
         provider: &str,
@@ -6062,6 +6901,8 @@ impl Runtime {
         }
 
         self.validate_compute_operations(provider, &operations)?;
+        self.plan_compute_graph_memory(provider, graph)
+            .map_err(ComputeValidationError::MemoryPlanning)?;
         if !resource_affinities.is_empty() {
             let resources = graph
                 .inputs
@@ -7491,6 +8332,43 @@ mod tests {
         ));
     }
     #[test]
+    fn memory_planning_accounts_for_explicit_host_staged_transfers() {
+        let mut provider = provider_with_capabilities("movement-compute", [compute_capability()]);
+        provider.metadata.compute_data_movement_support.insert(
+            ComputeDataMovementKind::Transfer,
+            ComputeDataMovementSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense])
+                .with_host_staging(),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let source = TensorResourceDescriptor::new(
+            TensorResourceId::new("source"),
+            descriptor.clone(),
+            ResourceAffinity::new(FallbackClass::ProviderPinned)
+                .with_provider(ProviderBinding::new("other-provider")),
+        );
+        let movement = ComputeDataMovementDescriptor::transfer(source, descriptor)
+            .with_target_provider(ProviderBinding::new("movement-compute"))
+            .with_host_staging();
+
+        let plan = runtime
+            .plan_compute_data_movement_memory("movement-compute", &[movement])
+            .unwrap();
+
+        assert_eq!(plan.pressure.transfer_buffer_cost_bytes, 16);
+        assert!(plan.decisions.iter().any(|decision| {
+            matches!(decision, MemoryPlanningDecision::AccountHostStaging { .. })
+        }));
+    }
+    #[test]
     fn provider_compute_advertisement_drives_data_movement_validation() {
         let mut provider =
             provider_with_capabilities("advertised-movement", [compute_capability()]);
@@ -7661,6 +8539,147 @@ mod tests {
         assert!(matches!(
             runtime.validate_compute_graph("portable-compute", &future_reference),
             Err(ComputeValidationError::CyclicGraph { .. })
+        ));
+    }
+    #[test]
+    fn memory_planning_tracks_lifetimes_reuse_and_output_affinity() {
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("memory-graph"))
+            .with_input(ComputeInput::new(
+                ComputeInputId::new("x"),
+                ComputeInputValue::TensorDescriptor(descriptor.clone()),
+            ))
+            .with_node(
+                ComputeNode::new(
+                    ComputeNodeId::new("temp"),
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                        .with_dtype(ComputeDType::Float32)
+                        .with_layout(ComputeLayout::Dense),
+                )
+                .with_input(ComputeValueRef::Input(ComputeInputId::new("x")))
+                .with_output(ComputeNodeOutput::new(
+                    ComputeOutputId::new("tmp"),
+                    descriptor.clone(),
+                )),
+            )
+            .with_node(
+                ComputeNode::new(
+                    ComputeNodeId::new("result-node"),
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                        .with_dtype(ComputeDType::Float32)
+                        .with_layout(ComputeLayout::Dense),
+                )
+                .with_input(ComputeValueRef::Input(ComputeInputId::new("x")))
+                .with_output(ComputeNodeOutput::new(
+                    ComputeOutputId::new("y"),
+                    descriptor,
+                )),
+            )
+            .with_output(ComputeOutput::new(
+                ComputeOutputId::new("result"),
+                ComputeValueRef::NodeOutput {
+                    node: ComputeNodeId::new("result-node"),
+                    output: ComputeOutputId::new("y"),
+                },
+            ));
+
+        let plan = runtime
+            .plan_compute_graph_memory("portable-compute", &graph)
+            .unwrap();
+
+        assert!(
+            plan.decisions
+                .iter()
+                .any(|decision| matches!(decision, MemoryPlanningDecision::Reuse { .. }))
+        );
+        assert_eq!(
+            plan.output_affinity.provider().map(ProviderBinding::as_str),
+            Some("portable-compute")
+        );
+        assert!(
+            plan.requirements
+                .iter()
+                .any(|requirement| requirement.region == MemoryRegionKind::Intermediate)
+        );
+    }
+    #[test]
+    fn memory_planning_rejects_provider_and_device_memory_limits() {
+        let mut limited_provider =
+            provider_with_capabilities("limited-compute", [compute_capability()]);
+        limited_provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense])
+                .with_descriptor_limits(TensorDescriptorLimits {
+                    max_bytes: 8,
+                    ..TensorDescriptorLimits::default()
+                }),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(limited_provider))
+            .build()
+            .unwrap();
+        let descriptor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let graph = ComputeGraph::new(ComputeGraphId::new("too-large")).with_node(
+            ComputeNode::new(
+                ComputeNodeId::new("node"),
+                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                    .with_dtype(ComputeDType::Float32)
+                    .with_layout(ComputeLayout::Dense),
+            )
+            .with_output(ComputeNodeOutput::new(
+                ComputeOutputId::new("out"),
+                descriptor.clone(),
+            )),
+        );
+        assert!(matches!(
+            runtime.plan_compute_graph_memory("limited-compute", &graph),
+            Err(MemoryPlanningError::ProviderMemoryLimitExceeded { .. })
+        ));
+
+        let mut device_provider =
+            provider_with_capabilities("device-limited", [compute_capability()]);
+        device_provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let mut device = DeviceMetadata::new(
+            DeviceId::new("gpu:tiny"),
+            "Tiny GPU",
+            DeviceType::Gpu,
+            "device-limited",
+        );
+        device.memory_capacity = 8;
+        device_provider
+            .devices
+            .push(Arc::new(DeviceDescriptor::new(device)));
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(device_provider))
+            .build()
+            .unwrap();
+        assert!(matches!(
+            runtime.plan_compute_graph_memory("device-limited", &graph),
+            Err(MemoryPlanningError::DeviceMemoryLimitExceeded { .. })
         ));
     }
     #[test]
