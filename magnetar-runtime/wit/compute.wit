@@ -67,6 +67,92 @@ interface run {
     descriptor-limits: tensor-descriptor-limits,
   }
 
+  /// Stable provider-independent operation schema identifier.
+  type operation-id = string;
+
+  enum operation-attribute-kind {
+    boolean,
+    integer,
+    float,
+    string,
+    dtype,
+    shape,
+    axes,
+  }
+
+  variant operation-attribute {
+    boolean(bool),
+    integer(s64),
+    float(float64),
+    string(string),
+    dtype(element-type),
+    shape(shape-descriptor),
+    axes(list<u64>),
+  }
+
+  record operation-attribute-rule {
+    kind: operation-attribute-kind,
+    required: bool,
+  }
+
+  record operation-attribute-entry {
+    name: string,
+    rule: operation-attribute-rule,
+  }
+
+  record operation-input-rule {
+    min-inputs: u32,
+    max-inputs: option<u32>,
+    require-same-dtype: bool,
+    allow-broadcast: bool,
+    boolean-inputs: list<u32>,
+    integer-index-inputs: list<u32>,
+  }
+
+  variant operation-output-dtype-rule {
+    same-as-input(u32),
+    boolean,
+    explicit-attribute(string),
+    integer-index,
+    provider-defined,
+  }
+
+  variant operation-output-shape-rule {
+    same-as-input(u32),
+    explicit-attribute(string),
+    broadcast-inputs,
+    reduction(tuple<string, string>),
+    matrix-multiplication,
+    batched-matrix-multiplication,
+    concatenation(string),
+    provider-defined,
+  }
+
+  record operation-output-rule {
+    output-count: u32,
+    dtype: operation-output-dtype-rule,
+    shape: operation-output-shape-rule,
+  }
+
+  record operation-schema {
+    id: operation-id,
+    family: operation-family,
+    attributes: list<operation-attribute-entry>,
+    input-rule: operation-input-rule,
+    output-rule: operation-output-rule,
+    provider-specific-semantics: bool,
+  }
+
+  /// Provider advertisement for one operation schema.
+  record operation-schema-support {
+    operation: operation-id,
+    element-types: list<element-type>,
+    provider-specific-element-types: list<string>,
+    layouts: list<layout-constraint>,
+    precision-modes: list<precision-mode>,
+    descriptor-limits: tensor-descriptor-limits,
+  }
+
   enum data-movement-kind {
     upload,
     download,
@@ -102,10 +188,12 @@ interface run {
 
   /// Placeholder until future revisions define operation-specific schemas.
   record operation-descriptor {
+    schema-id: option<operation-id>,
     family: operation-family,
     element-type: option<element-type>,
     layout: option<layout-constraint>,
     precision: option<precision-mode>,
+    attributes: list<tuple<string, operation-attribute>>,
   }
 
   /// Tensor shape using fixed-width dimensions.
@@ -206,6 +294,9 @@ interface run {
     invalid-shape,
     invalid-dtype,
     invalid-layout,
+    invalid-operation-attribute,
+    invalid-operation-arity,
+    invalid-output-descriptor,
     size-overflow,
     invalid-graph,
     cyclic-graph,

@@ -467,6 +467,7 @@ pub struct ProviderMetadata {
     pub api_version: u32,
     pub description: String,
     pub capabilities: BTreeSet<Capability>,
+    pub compute_operation_schema_support: BTreeMap<ComputeOperationId, ComputeOperationSupport>,
     pub compute_operation_support: BTreeMap<ComputeOperationFamily, ComputeOperationSupport>,
     pub compute_data_movement_support:
         BTreeMap<ComputeDataMovementKind, ComputeDataMovementSupport>,
@@ -485,6 +486,7 @@ impl ProviderMetadata {
             api_version: PROVIDER_API_VERSION,
             description: description.into(),
             capabilities: BTreeSet::new(),
+            compute_operation_schema_support: BTreeMap::new(),
             compute_operation_support: BTreeMap::new(),
             compute_data_movement_support: BTreeMap::new(),
         }
@@ -1094,8 +1096,7 @@ impl From<AffinityError> for ComputeError {
                 message,
             )
             .with_diagnostic(
-                ComputeDiagnostic::new()
-                    .with_capability(CapabilityBinding::new(id, expected)),
+                ComputeDiagnostic::new().with_capability(CapabilityBinding::new(id, expected)),
             ),
             AffinityError::ArtifactMismatch { .. } => ComputeError::new(
                 ComputeErrorCode::ArtifactFingerprintMismatch,
@@ -1171,7 +1172,10 @@ impl From<AffinityError> for ComputeError {
                 message,
             )
             .with_diagnostic(ComputeDiagnostic::new().with_capability(capability)),
-            AffinityError::PolicyRejectedProvider { capability, policy: _ } => ComputeError::new(
+            AffinityError::PolicyRejectedProvider {
+                capability,
+                policy: _,
+            } => ComputeError::new(
                 ComputeErrorCode::PolicyRejectedProvider,
                 ComputeErrorPhase::Resolution,
                 ComputeErrorSeverity::Terminal,
@@ -2419,22 +2423,250 @@ impl ComputeDataMovementSupport {
     }
 }
 
-/// Placeholder for future operation-specific schemas inside `magnetar:compute/run`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ComputeOperationId(String);
+impl ComputeOperationId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for ComputeOperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputeAttributeKind {
+    Boolean,
+    Integer,
+    Float,
+    String,
+    DType,
+    Shape,
+    Axes,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ComputeOperationAttribute {
+    Boolean(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    DType(ComputeDType),
+    Shape(ShapeDescriptor),
+    Axes(Vec<u64>),
+}
+impl ComputeOperationAttribute {
+    pub const fn kind(&self) -> ComputeAttributeKind {
+        match self {
+            Self::Boolean(_) => ComputeAttributeKind::Boolean,
+            Self::Integer(_) => ComputeAttributeKind::Integer,
+            Self::Float(_) => ComputeAttributeKind::Float,
+            Self::String(_) => ComputeAttributeKind::String,
+            Self::DType(_) => ComputeAttributeKind::DType,
+            Self::Shape(_) => ComputeAttributeKind::Shape,
+            Self::Axes(_) => ComputeAttributeKind::Axes,
+        }
+    }
+}
+impl Eq for ComputeOperationAttribute {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeOperationAttributeRule {
+    pub kind: ComputeAttributeKind,
+    pub required: bool,
+}
+impl ComputeOperationAttributeRule {
+    pub const fn required(kind: ComputeAttributeKind) -> Self {
+        Self {
+            kind,
+            required: true,
+        }
+    }
+    pub const fn optional(kind: ComputeAttributeKind) -> Self {
+        Self {
+            kind,
+            required: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeOperationInputRule {
+    pub min_inputs: usize,
+    pub max_inputs: Option<usize>,
+    pub require_same_dtype: bool,
+    pub allow_broadcast: bool,
+    pub boolean_inputs: BTreeSet<usize>,
+    pub integer_index_inputs: BTreeSet<usize>,
+}
+impl ComputeOperationInputRule {
+    pub fn exactly(count: usize) -> Self {
+        Self {
+            min_inputs: count,
+            max_inputs: Some(count),
+            require_same_dtype: false,
+            allow_broadcast: false,
+            boolean_inputs: BTreeSet::new(),
+            integer_index_inputs: BTreeSet::new(),
+        }
+    }
+    pub fn at_least(count: usize) -> Self {
+        Self {
+            min_inputs: count,
+            max_inputs: None,
+            require_same_dtype: false,
+            allow_broadcast: false,
+            boolean_inputs: BTreeSet::new(),
+            integer_index_inputs: BTreeSet::new(),
+        }
+    }
+    pub fn with_same_dtype(mut self) -> Self {
+        self.require_same_dtype = true;
+        self
+    }
+    pub fn with_broadcast(mut self) -> Self {
+        self.allow_broadcast = true;
+        self
+    }
+    pub fn with_boolean_input(mut self, index: usize) -> Self {
+        self.boolean_inputs.insert(index);
+        self
+    }
+    pub fn with_integer_index_input(mut self, index: usize) -> Self {
+        self.integer_index_inputs.insert(index);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComputeOutputDTypeRule {
+    SameAsInput(usize),
+    Boolean,
+    ExplicitAttribute(String),
+    IntegerIndex,
+    ProviderDefined,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComputeOutputShapeRule {
+    SameAsInput(usize),
+    ExplicitAttribute(String),
+    BroadcastInputs,
+    Reduction {
+        axes_attribute: String,
+        keep_dimensions_attribute: String,
+    },
+    MatrixMultiplication,
+    BatchedMatrixMultiplication,
+    Concatenation {
+        axis_attribute: String,
+    },
+    ProviderDefined,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeOperationOutputRule {
+    pub output_count: usize,
+    pub dtype: ComputeOutputDTypeRule,
+    pub shape: ComputeOutputShapeRule,
+}
+impl ComputeOperationOutputRule {
+    pub fn new(
+        output_count: usize,
+        dtype: ComputeOutputDTypeRule,
+        shape: ComputeOutputShapeRule,
+    ) -> Self {
+        Self {
+            output_count,
+            dtype,
+            shape,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeOperationSchema {
+    pub id: ComputeOperationId,
+    pub family: ComputeOperationFamily,
+    pub attributes: BTreeMap<String, ComputeOperationAttributeRule>,
+    pub input_rule: ComputeOperationInputRule,
+    pub output_rule: ComputeOperationOutputRule,
+    pub provider_specific_semantics: bool,
+}
+impl ComputeOperationSchema {
+    pub fn new(
+        id: impl Into<String>,
+        family: ComputeOperationFamily,
+        input_rule: ComputeOperationInputRule,
+        output_rule: ComputeOperationOutputRule,
+    ) -> Self {
+        Self {
+            id: ComputeOperationId::new(id),
+            family,
+            attributes: BTreeMap::new(),
+            input_rule,
+            output_rule,
+            provider_specific_semantics: false,
+        }
+    }
+    pub fn with_attribute(
+        mut self,
+        name: impl Into<String>,
+        rule: ComputeOperationAttributeRule,
+    ) -> Self {
+        self.attributes.insert(name.into(), rule);
+        self
+    }
+    pub const fn with_provider_specific_semantics(mut self) -> Self {
+        self.provider_specific_semantics = true;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeOperationValidationResult {
+    pub schema: ComputeOperationId,
+    pub family: ComputeOperationFamily,
+    pub input_count: usize,
+    pub output_count: usize,
+}
+
+/// Portable operation-specific schema descriptor inside `magnetar:compute/run`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComputeOperationDescriptor {
+    pub schema_id: Option<ComputeOperationId>,
     pub family: ComputeOperationFamily,
     pub dtype: Option<ComputeDType>,
     pub layout: Option<ComputeLayout>,
     pub precision: Option<ComputePrecision>,
+    pub attributes: BTreeMap<String, ComputeOperationAttribute>,
     pub tensors: Vec<TensorDescriptor>,
 }
 impl ComputeOperationDescriptor {
     pub fn new(family: ComputeOperationFamily) -> Self {
         Self {
+            schema_id: None,
             family,
             dtype: None,
             layout: None,
             precision: None,
+            attributes: BTreeMap::new(),
+            tensors: Vec::new(),
+        }
+    }
+    pub fn from_schema(schema: &ComputeOperationSchema) -> Self {
+        Self {
+            schema_id: Some(schema.id.clone()),
+            family: schema.family,
+            dtype: None,
+            layout: None,
+            precision: None,
+            attributes: BTreeMap::new(),
             tensors: Vec::new(),
         }
     }
@@ -2450,10 +2682,798 @@ impl ComputeOperationDescriptor {
         self.precision = Some(precision);
         self
     }
+    pub fn with_attribute(
+        mut self,
+        name: impl Into<String>,
+        value: ComputeOperationAttribute,
+    ) -> Self {
+        self.attributes.insert(name.into(), value);
+        self
+    }
     pub fn with_tensor(mut self, tensor: TensorDescriptor) -> Self {
         self.tensors.push(tensor);
         self
     }
+}
+
+pub fn initial_compute_operation_schemas() -> BTreeMap<ComputeOperationId, ComputeOperationSchema> {
+    let mut schemas = BTreeMap::new();
+    let same_output = || {
+        ComputeOperationOutputRule::new(
+            1,
+            ComputeOutputDTypeRule::SameAsInput(0),
+            ComputeOutputShapeRule::SameAsInput(0),
+        )
+    };
+    for id in [
+        "tensor.transpose",
+        "tensor.permute",
+        "tensor.slice",
+        "tensor.squeeze",
+        "tensor.unsqueeze",
+    ] {
+        insert_schema(
+            &mut schemas,
+            ComputeOperationSchema::new(
+                id,
+                ComputeOperationFamily::DescriptorAndView,
+                ComputeOperationInputRule::exactly(1),
+                same_output(),
+            ),
+        );
+    }
+    insert_schema(
+        &mut schemas,
+        ComputeOperationSchema::new(
+            "tensor.reshape",
+            ComputeOperationFamily::DescriptorAndView,
+            ComputeOperationInputRule::exactly(1),
+            ComputeOperationOutputRule::new(
+                1,
+                ComputeOutputDTypeRule::SameAsInput(0),
+                ComputeOutputShapeRule::ExplicitAttribute("shape".into()),
+            ),
+        )
+        .with_attribute(
+            "shape",
+            ComputeOperationAttributeRule::required(ComputeAttributeKind::Shape),
+        ),
+    );
+    insert_schema(
+        &mut schemas,
+        ComputeOperationSchema::new(
+            "tensor.broadcast",
+            ComputeOperationFamily::DescriptorAndView,
+            ComputeOperationInputRule::exactly(1).with_broadcast(),
+            ComputeOperationOutputRule::new(
+                1,
+                ComputeOutputDTypeRule::SameAsInput(0),
+                ComputeOutputShapeRule::ExplicitAttribute("shape".into()),
+            ),
+        )
+        .with_attribute(
+            "shape",
+            ComputeOperationAttributeRule::required(ComputeAttributeKind::Shape),
+        ),
+    );
+    for op in [
+        "abs", "neg", "exp", "log", "sqrt", "recip", "sin", "cos", "tanh", "relu", "silu", "gelu",
+        "erf", "floor", "ceil", "round",
+    ] {
+        insert_schema(
+            &mut schemas,
+            ComputeOperationSchema::new(
+                format!("elementwise.unary.{op}"),
+                ComputeOperationFamily::Elementwise,
+                ComputeOperationInputRule::exactly(1),
+                same_output(),
+            ),
+        );
+    }
+    for op in ["add", "sub", "mul", "div", "maximum", "minimum"] {
+        insert_schema(
+            &mut schemas,
+            ComputeOperationSchema::new(
+                format!("elementwise.binary.{op}"),
+                ComputeOperationFamily::Elementwise,
+                ComputeOperationInputRule::exactly(2)
+                    .with_same_dtype()
+                    .with_broadcast(),
+                ComputeOperationOutputRule::new(
+                    1,
+                    ComputeOutputDTypeRule::SameAsInput(0),
+                    ComputeOutputShapeRule::BroadcastInputs,
+                ),
+            ),
+        );
+    }
+    for op in ["eq", "ne", "lt", "le", "gt", "ge"] {
+        insert_schema(
+            &mut schemas,
+            ComputeOperationSchema::new(
+                format!("comparison.{op}"),
+                ComputeOperationFamily::ComparisonAndSelection,
+                ComputeOperationInputRule::exactly(2)
+                    .with_same_dtype()
+                    .with_broadcast(),
+                ComputeOperationOutputRule::new(
+                    1,
+                    ComputeOutputDTypeRule::Boolean,
+                    ComputeOutputShapeRule::BroadcastInputs,
+                ),
+            ),
+        );
+    }
+    insert_schema(
+        &mut schemas,
+        ComputeOperationSchema::new(
+            "selection.where",
+            ComputeOperationFamily::ComparisonAndSelection,
+            ComputeOperationInputRule::exactly(3)
+                .with_boolean_input(0)
+                .with_broadcast(),
+            ComputeOperationOutputRule::new(
+                1,
+                ComputeOutputDTypeRule::SameAsInput(1),
+                ComputeOutputShapeRule::BroadcastInputs,
+            ),
+        ),
+    );
+    for op in ["sum", "mean", "min", "max", "argmin", "argmax"] {
+        let dtype = if matches!(op, "argmin" | "argmax") {
+            ComputeOutputDTypeRule::IntegerIndex
+        } else {
+            ComputeOutputDTypeRule::SameAsInput(0)
+        };
+        insert_schema(
+            &mut schemas,
+            ComputeOperationSchema::new(
+                format!("reduction.{op}"),
+                ComputeOperationFamily::Reduction,
+                ComputeOperationInputRule::exactly(1),
+                ComputeOperationOutputRule::new(
+                    1,
+                    dtype,
+                    ComputeOutputShapeRule::Reduction {
+                        axes_attribute: "axes".into(),
+                        keep_dimensions_attribute: "keep-dimensions".into(),
+                    },
+                ),
+            )
+            .with_attribute(
+                "axes",
+                ComputeOperationAttributeRule::required(ComputeAttributeKind::Axes),
+            )
+            .with_attribute(
+                "keep-dimensions",
+                ComputeOperationAttributeRule::optional(ComputeAttributeKind::Boolean),
+            ),
+        );
+    }
+    for (id, shape_rule) in [
+        (
+            "linalg.matmul",
+            ComputeOutputShapeRule::MatrixMultiplication,
+        ),
+        (
+            "linalg.batched-matmul",
+            ComputeOutputShapeRule::BatchedMatrixMultiplication,
+        ),
+    ] {
+        insert_schema(
+            &mut schemas,
+            ComputeOperationSchema::new(
+                id,
+                ComputeOperationFamily::LinearAlgebra,
+                ComputeOperationInputRule::exactly(2).with_same_dtype(),
+                ComputeOperationOutputRule::new(
+                    1,
+                    ComputeOutputDTypeRule::SameAsInput(0),
+                    shape_rule,
+                ),
+            )
+            .with_attribute(
+                "transpose-a",
+                ComputeOperationAttributeRule::optional(ComputeAttributeKind::Boolean),
+            )
+            .with_attribute(
+                "transpose-b",
+                ComputeOperationAttributeRule::optional(ComputeAttributeKind::Boolean),
+            )
+            .with_attribute(
+                "accumulation-dtype",
+                ComputeOperationAttributeRule::optional(ComputeAttributeKind::DType),
+            )
+            .with_attribute(
+                "precision",
+                ComputeOperationAttributeRule::optional(ComputeAttributeKind::String),
+            ),
+        );
+    }
+    for id in ["tensor.gather", "tensor.index-select"] {
+        insert_schema(
+            &mut schemas,
+            ComputeOperationSchema::new(
+                id,
+                ComputeOperationFamily::IndexingAndUpdate,
+                ComputeOperationInputRule::exactly(2).with_integer_index_input(1),
+                ComputeOperationOutputRule::new(
+                    1,
+                    ComputeOutputDTypeRule::SameAsInput(0),
+                    ComputeOutputShapeRule::ProviderDefined,
+                ),
+            )
+            .with_attribute(
+                "axis",
+                ComputeOperationAttributeRule::required(ComputeAttributeKind::Integer),
+            ),
+        );
+    }
+    for id in ["tensor.scatter", "tensor.scatter-add"] {
+        insert_schema(
+            &mut schemas,
+            ComputeOperationSchema::new(
+                id,
+                ComputeOperationFamily::IndexingAndUpdate,
+                ComputeOperationInputRule::exactly(3)
+                    .with_same_dtype()
+                    .with_integer_index_input(1),
+                ComputeOperationOutputRule::new(
+                    1,
+                    ComputeOutputDTypeRule::SameAsInput(0),
+                    ComputeOutputShapeRule::SameAsInput(0),
+                ),
+            )
+            .with_attribute(
+                "axis",
+                ComputeOperationAttributeRule::required(ComputeAttributeKind::Integer),
+            )
+            .with_provider_specific_semantics(),
+        );
+    }
+    insert_schema(
+        &mut schemas,
+        ComputeOperationSchema::new(
+            "tensor.concat",
+            ComputeOperationFamily::IndexingAndUpdate,
+            ComputeOperationInputRule::at_least(1).with_same_dtype(),
+            ComputeOperationOutputRule::new(
+                1,
+                ComputeOutputDTypeRule::SameAsInput(0),
+                ComputeOutputShapeRule::Concatenation {
+                    axis_attribute: "axis".into(),
+                },
+            ),
+        )
+        .with_attribute(
+            "axis",
+            ComputeOperationAttributeRule::required(ComputeAttributeKind::Integer),
+        ),
+    );
+    for id in ["random.uniform", "random.normal"] {
+        insert_schema(
+            &mut schemas,
+            ComputeOperationSchema::new(
+                id,
+                ComputeOperationFamily::RandomGeneration,
+                ComputeOperationInputRule::exactly(0),
+                ComputeOperationOutputRule::new(
+                    1,
+                    ComputeOutputDTypeRule::ExplicitAttribute("dtype".into()),
+                    ComputeOutputShapeRule::ExplicitAttribute("shape".into()),
+                ),
+            )
+            .with_attribute(
+                "shape",
+                ComputeOperationAttributeRule::required(ComputeAttributeKind::Shape),
+            )
+            .with_attribute(
+                "dtype",
+                ComputeOperationAttributeRule::required(ComputeAttributeKind::DType),
+            )
+            .with_attribute(
+                "seed",
+                ComputeOperationAttributeRule::optional(ComputeAttributeKind::Integer),
+            ),
+        );
+    }
+    schemas
+}
+
+fn insert_schema(
+    schemas: &mut BTreeMap<ComputeOperationId, ComputeOperationSchema>,
+    schema: ComputeOperationSchema,
+) {
+    schemas.insert(schema.id.clone(), schema);
+}
+
+fn validate_compute_operation_schema(
+    operation: &ComputeOperationDescriptor,
+) -> Result<Option<ComputeOperationValidationResult>, ComputeValidationError> {
+    let Some(schema_id) = &operation.schema_id else {
+        return Ok(None);
+    };
+    let schemas = initial_compute_operation_schemas();
+    let schema = schemas
+        .get(schema_id)
+        .ok_or_else(|| ComputeValidationError::UnknownOperationSchema(schema_id.clone()))?;
+    if schema.family != operation.family {
+        return Err(ComputeValidationError::UnknownOperationFamily(
+            operation.family.id().into(),
+        ));
+    }
+    validate_operation_attributes(schema, operation)?;
+
+    if operation.tensors.len() < schema.output_rule.output_count {
+        return Err(ComputeValidationError::InvalidOutputDescriptor {
+            operation: schema.id.clone(),
+            reason: format!(
+                "operation declares {} tensor descriptors but schema requires {} output(s)",
+                operation.tensors.len(),
+                schema.output_rule.output_count
+            ),
+        });
+    }
+    let input_count = operation.tensors.len() - schema.output_rule.output_count;
+    validate_operation_arity(schema, input_count)?;
+    let (inputs, outputs) = operation.tensors.split_at(input_count);
+    validate_operation_input_rule(schema, inputs)?;
+    validate_operation_output_rule(schema, operation, inputs, outputs)?;
+    Ok(Some(ComputeOperationValidationResult {
+        schema: schema.id.clone(),
+        family: schema.family,
+        input_count,
+        output_count: outputs.len(),
+    }))
+}
+
+fn validate_operation_attributes(
+    schema: &ComputeOperationSchema,
+    operation: &ComputeOperationDescriptor,
+) -> Result<(), ComputeValidationError> {
+    for name in operation.attributes.keys() {
+        if !schema.attributes.contains_key(name) {
+            return Err(ComputeValidationError::InvalidOperationAttribute {
+                operation: schema.id.clone(),
+                attribute: name.clone(),
+                reason: "attribute is not defined by the operation schema".into(),
+            });
+        }
+    }
+    for (name, rule) in &schema.attributes {
+        match operation.attributes.get(name) {
+            Some(value) if value.kind() == rule.kind => {}
+            Some(value) => {
+                return Err(ComputeValidationError::InvalidOperationAttribute {
+                    operation: schema.id.clone(),
+                    attribute: name.clone(),
+                    reason: format!("expected {:?}, found {:?}", rule.kind, value.kind()),
+                });
+            }
+            None if rule.required => {
+                return Err(ComputeValidationError::InvalidOperationAttribute {
+                    operation: schema.id.clone(),
+                    attribute: name.clone(),
+                    reason: "required attribute is missing".into(),
+                });
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_operation_arity(
+    schema: &ComputeOperationSchema,
+    input_count: usize,
+) -> Result<(), ComputeValidationError> {
+    let too_few = input_count < schema.input_rule.min_inputs;
+    let too_many = schema
+        .input_rule
+        .max_inputs
+        .is_some_and(|max| input_count > max);
+    if too_few || too_many {
+        let expected = match schema.input_rule.max_inputs {
+            Some(max) if max == schema.input_rule.min_inputs => max.to_string(),
+            Some(max) => format!("{}..={max}", schema.input_rule.min_inputs),
+            None => format!("at least {}", schema.input_rule.min_inputs),
+        };
+        return Err(ComputeValidationError::InvalidOperationArity {
+            operation: schema.id.clone(),
+            expected,
+            found: input_count,
+        });
+    }
+    Ok(())
+}
+
+fn validate_operation_input_rule(
+    schema: &ComputeOperationSchema,
+    inputs: &[TensorDescriptor],
+) -> Result<(), ComputeValidationError> {
+    for index in &schema.input_rule.boolean_inputs {
+        match inputs.get(*index).map(|tensor| &tensor.dtype) {
+            Some(DTypeDescriptor::Portable(ComputeDType::Boolean)) => {}
+            _ => {
+                return Err(ComputeValidationError::InvalidOperationAttribute {
+                    operation: schema.id.clone(),
+                    attribute: format!("input[{index}]"),
+                    reason: "input must have boolean dtype".into(),
+                });
+            }
+        }
+    }
+    for index in &schema.input_rule.integer_index_inputs {
+        match inputs.get(*index).map(|tensor| &tensor.dtype) {
+            Some(DTypeDescriptor::Portable(dtype)) if dtype.is_integer() => {}
+            _ => {
+                return Err(ComputeValidationError::InvalidOperationAttribute {
+                    operation: schema.id.clone(),
+                    attribute: format!("input[{index}]"),
+                    reason: "index input must have an integer dtype".into(),
+                });
+            }
+        }
+    }
+    if schema.input_rule.require_same_dtype {
+        let Some(first) = inputs.first().map(|tensor| &tensor.dtype) else {
+            return Ok(());
+        };
+        if inputs.iter().any(|tensor| &tensor.dtype != first) {
+            return Err(ComputeValidationError::UnsupportedDType {
+                family: schema.family,
+                dtype: portable_dtype(first).unwrap_or(ComputeDType::UInt8),
+            });
+        }
+    }
+    if schema.input_rule.allow_broadcast && inputs.len() > 1 {
+        broadcast_shape(inputs.iter().map(|tensor| &tensor.shape)).map_err(|reason| {
+            ComputeValidationError::InvalidShape {
+                reason: format!("operation schema '{}': {reason}", schema.id),
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_operation_output_rule(
+    schema: &ComputeOperationSchema,
+    operation: &ComputeOperationDescriptor,
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+) -> Result<(), ComputeValidationError> {
+    if outputs.len() != schema.output_rule.output_count {
+        return Err(ComputeValidationError::InvalidOutputDescriptor {
+            operation: schema.id.clone(),
+            reason: format!(
+                "expected {} output(s), found {}",
+                schema.output_rule.output_count,
+                outputs.len()
+            ),
+        });
+    }
+    for output in outputs {
+        validate_output_dtype(schema, operation, inputs, output)?;
+    }
+    validate_output_shape(schema, operation, inputs, outputs)
+}
+
+fn validate_output_dtype(
+    schema: &ComputeOperationSchema,
+    operation: &ComputeOperationDescriptor,
+    inputs: &[TensorDescriptor],
+    output: &TensorDescriptor,
+) -> Result<(), ComputeValidationError> {
+    match &schema.output_rule.dtype {
+        ComputeOutputDTypeRule::SameAsInput(index) => {
+            let Some(input) = inputs.get(*index) else {
+                return Ok(());
+            };
+            if output.dtype != input.dtype {
+                return Err(ComputeValidationError::InvalidOutputDescriptor {
+                    operation: schema.id.clone(),
+                    reason: "output dtype must match input dtype".into(),
+                });
+            }
+        }
+        ComputeOutputDTypeRule::Boolean => {
+            if output.dtype != DTypeDescriptor::Portable(ComputeDType::Boolean) {
+                return Err(ComputeValidationError::InvalidOutputDescriptor {
+                    operation: schema.id.clone(),
+                    reason: "output dtype must be boolean".into(),
+                });
+            }
+        }
+        ComputeOutputDTypeRule::ExplicitAttribute(name) => {
+            if let Some(ComputeOperationAttribute::DType(dtype)) = operation.attributes.get(name)
+                && output.dtype != DTypeDescriptor::Portable(*dtype)
+            {
+                return Err(ComputeValidationError::InvalidOutputDescriptor {
+                    operation: schema.id.clone(),
+                    reason: format!("output dtype must match '{name}' attribute"),
+                });
+            }
+        }
+        ComputeOutputDTypeRule::IntegerIndex => {
+            if !matches!(&output.dtype, DTypeDescriptor::Portable(dtype) if dtype.is_integer()) {
+                return Err(ComputeValidationError::InvalidOutputDescriptor {
+                    operation: schema.id.clone(),
+                    reason: "output dtype must be an integer index dtype".into(),
+                });
+            }
+        }
+        ComputeOutputDTypeRule::ProviderDefined => {}
+    }
+    Ok(())
+}
+
+fn validate_output_shape(
+    schema: &ComputeOperationSchema,
+    operation: &ComputeOperationDescriptor,
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+) -> Result<(), ComputeValidationError> {
+    let Some(output) = outputs.first() else {
+        return Ok(());
+    };
+    let expected = match &schema.output_rule.shape {
+        ComputeOutputShapeRule::SameAsInput(index) => inputs.get(*index).map(|t| t.shape.clone()),
+        ComputeOutputShapeRule::ExplicitAttribute(name) => match operation.attributes.get(name) {
+            Some(ComputeOperationAttribute::Shape(shape)) => Some(shape.clone()),
+            _ => None,
+        },
+        ComputeOutputShapeRule::BroadcastInputs => {
+            Some(broadcast_shape(inputs.iter().map(|t| &t.shape))?)
+        }
+        ComputeOutputShapeRule::Reduction {
+            axes_attribute,
+            keep_dimensions_attribute,
+        } => Some(reduction_shape(
+            &schema.id,
+            inputs.first(),
+            operation.attributes.get(axes_attribute),
+            operation.attributes.get(keep_dimensions_attribute),
+        )?),
+        ComputeOutputShapeRule::MatrixMultiplication => Some(matmul_shape(&schema.id, inputs)?),
+        ComputeOutputShapeRule::BatchedMatrixMultiplication => {
+            Some(batched_matmul_shape(&schema.id, inputs)?)
+        }
+        ComputeOutputShapeRule::Concatenation { axis_attribute } => Some(concat_shape(
+            &schema.id,
+            inputs,
+            operation.attributes.get(axis_attribute),
+        )?),
+        ComputeOutputShapeRule::ProviderDefined => None,
+    };
+    if let Some(expected) = expected
+        && output.shape != expected
+    {
+        return Err(ComputeValidationError::InvalidOutputDescriptor {
+            operation: schema.id.clone(),
+            reason: format!(
+                "output shape {:?} does not match expected {:?}",
+                output.shape.dimensions, expected.dimensions
+            ),
+        });
+    }
+    Ok(())
+}
+
+impl ComputeDType {
+    pub const fn is_integer(self) -> bool {
+        matches!(
+            self,
+            Self::UInt8
+                | Self::SInt8
+                | Self::UInt16
+                | Self::SInt16
+                | Self::UInt32
+                | Self::SInt32
+                | Self::UInt64
+                | Self::SInt64
+        )
+    }
+}
+
+fn portable_dtype(dtype: &DTypeDescriptor) -> Option<ComputeDType> {
+    match dtype {
+        DTypeDescriptor::Portable(dtype) => Some(*dtype),
+        DTypeDescriptor::ProviderSpecific { .. } => None,
+    }
+}
+
+fn broadcast_shape<'a>(
+    shapes: impl IntoIterator<Item = &'a ShapeDescriptor>,
+) -> Result<ShapeDescriptor, ComputeValidationError> {
+    let shapes = shapes.into_iter().collect::<Vec<_>>();
+    let max_rank = shapes
+        .iter()
+        .map(|shape| shape.dimensions.len())
+        .max()
+        .unwrap_or(0);
+    let mut result = vec![1_u64; max_rank];
+    for shape in shapes {
+        for (offset, dimension) in shape.dimensions.iter().rev().enumerate() {
+            let index = max_rank - 1 - offset;
+            let current = result[index];
+            if current == 1 {
+                result[index] = *dimension;
+            } else if *dimension == 1 || current == *dimension {
+                continue;
+            } else {
+                return Err(ComputeValidationError::InvalidShape {
+                    reason: format!(
+                        "dimensions {current} and {dimension} are not broadcast-compatible"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(ShapeDescriptor::new(result))
+}
+
+fn reduction_shape(
+    operation: &ComputeOperationId,
+    input: Option<&TensorDescriptor>,
+    axes: Option<&ComputeOperationAttribute>,
+    keep_dimensions: Option<&ComputeOperationAttribute>,
+) -> Result<ShapeDescriptor, ComputeValidationError> {
+    let input = input.ok_or_else(|| ComputeValidationError::InvalidOperationArity {
+        operation: operation.clone(),
+        expected: "1".into(),
+        found: 0,
+    })?;
+    let axes = match axes {
+        Some(ComputeOperationAttribute::Axes(axes)) => axes,
+        _ => {
+            return Err(ComputeValidationError::InvalidOperationAttribute {
+                operation: operation.clone(),
+                attribute: "axes".into(),
+                reason: "axes attribute is required".into(),
+            });
+        }
+    };
+    let keep = matches!(
+        keep_dimensions,
+        Some(ComputeOperationAttribute::Boolean(true))
+    );
+    let rank = input.shape.dimensions.len() as u64;
+    for axis in axes {
+        if *axis >= rank {
+            return Err(ComputeValidationError::InvalidShape {
+                reason: format!("reduction axis {axis} is outside rank {rank}"),
+            });
+        }
+    }
+    let axis_set = axes.iter().copied().collect::<BTreeSet<_>>();
+    let dimensions = input
+        .shape
+        .dimensions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, dimension)| {
+            if axis_set.contains(&(index as u64)) {
+                keep.then_some(1)
+            } else {
+                Some(*dimension)
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(ShapeDescriptor::new(dimensions))
+}
+
+fn matmul_shape(
+    operation: &ComputeOperationId,
+    inputs: &[TensorDescriptor],
+) -> Result<ShapeDescriptor, ComputeValidationError> {
+    let [lhs, rhs] = inputs else {
+        return Err(ComputeValidationError::InvalidOperationArity {
+            operation: operation.clone(),
+            expected: "2".into(),
+            found: inputs.len(),
+        });
+    };
+    if lhs.shape.dimensions.len() != 2 || rhs.shape.dimensions.len() != 2 {
+        return Err(ComputeValidationError::InvalidShape {
+            reason: "matrix multiplication requires rank-2 inputs".into(),
+        });
+    }
+    if lhs.shape.dimensions[1] != rhs.shape.dimensions[0] {
+        return Err(ComputeValidationError::InvalidShape {
+            reason: "matrix multiplication inner dimensions are incompatible".into(),
+        });
+    }
+    Ok(ShapeDescriptor::new([
+        lhs.shape.dimensions[0],
+        rhs.shape.dimensions[1],
+    ]))
+}
+
+fn batched_matmul_shape(
+    operation: &ComputeOperationId,
+    inputs: &[TensorDescriptor],
+) -> Result<ShapeDescriptor, ComputeValidationError> {
+    let [lhs, rhs] = inputs else {
+        return Err(ComputeValidationError::InvalidOperationArity {
+            operation: operation.clone(),
+            expected: "2".into(),
+            found: inputs.len(),
+        });
+    };
+    if lhs.shape.dimensions.len() < 3 || rhs.shape.dimensions.len() < 3 {
+        return Err(ComputeValidationError::InvalidShape {
+            reason: "batched matrix multiplication requires rank >= 3 inputs".into(),
+        });
+    }
+    let lhs_rank = lhs.shape.dimensions.len();
+    let rhs_rank = rhs.shape.dimensions.len();
+    if lhs.shape.dimensions[lhs_rank - 1] != rhs.shape.dimensions[rhs_rank - 2] {
+        return Err(ComputeValidationError::InvalidShape {
+            reason: "batched matrix multiplication inner dimensions are incompatible".into(),
+        });
+    }
+    let mut batch = broadcast_shape(
+        [
+            ShapeDescriptor::new(lhs.shape.dimensions[..lhs_rank - 2].to_vec()),
+            ShapeDescriptor::new(rhs.shape.dimensions[..rhs_rank - 2].to_vec()),
+        ]
+        .iter(),
+    )?
+    .dimensions;
+    batch.push(lhs.shape.dimensions[lhs_rank - 2]);
+    batch.push(rhs.shape.dimensions[rhs_rank - 1]);
+    Ok(ShapeDescriptor::new(batch))
+}
+
+fn concat_shape(
+    operation: &ComputeOperationId,
+    inputs: &[TensorDescriptor],
+    axis: Option<&ComputeOperationAttribute>,
+) -> Result<ShapeDescriptor, ComputeValidationError> {
+    let Some(first) = inputs.first() else {
+        return Err(ComputeValidationError::InvalidOperationArity {
+            operation: operation.clone(),
+            expected: "at least 1".into(),
+            found: 0,
+        });
+    };
+    let axis = match axis {
+        Some(ComputeOperationAttribute::Integer(axis)) if *axis >= 0 => *axis as usize,
+        _ => {
+            return Err(ComputeValidationError::InvalidOperationAttribute {
+                operation: operation.clone(),
+                attribute: "axis".into(),
+                reason: "axis must be a non-negative integer".into(),
+            });
+        }
+    };
+    if axis >= first.shape.dimensions.len() {
+        return Err(ComputeValidationError::InvalidShape {
+            reason: "concatenation axis is outside input rank".into(),
+        });
+    }
+    let mut dimensions = first.shape.dimensions.clone();
+    for input in &inputs[1..] {
+        if input.shape.dimensions.len() != dimensions.len() {
+            return Err(ComputeValidationError::InvalidShape {
+                reason: "all concatenation inputs must have the same rank".into(),
+            });
+        }
+        for (index, dimension) in input.shape.dimensions.iter().enumerate() {
+            if index == axis {
+                dimensions[index] = dimensions[index].checked_add(*dimension).ok_or(
+                    ComputeValidationError::SizeOverflow {
+                        reason: "concatenated dimension overflows u64".into(),
+                    },
+                )?;
+            } else if dimensions[index] != *dimension {
+                return Err(ComputeValidationError::InvalidShape {
+                    reason: "non-concatenated dimensions must match".into(),
+                });
+            }
+        }
+    }
+    Ok(ShapeDescriptor::new(dimensions))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2820,6 +3840,9 @@ pub enum ComputeErrorCode {
     InvalidShape,
     InvalidDType,
     InvalidLayout,
+    InvalidOperationAttribute,
+    InvalidOperationArity,
+    InvalidOutputDescriptor,
     SizeOverflow,
     InvalidGraph,
     CyclicGraph,
@@ -3021,6 +4044,7 @@ fn resolve_compute_value_descriptor<'a>(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComputeValidationError {
     UnknownOperationFamily(String),
+    UnknownOperationSchema(ComputeOperationId),
     InvalidGraph {
         reason: String,
     },
@@ -3036,6 +4060,20 @@ pub enum ComputeValidationError {
         depends_on: ComputeNodeId,
     },
     InvalidState {
+        reason: String,
+    },
+    InvalidOperationAttribute {
+        operation: ComputeOperationId,
+        attribute: String,
+        reason: String,
+    },
+    InvalidOperationArity {
+        operation: ComputeOperationId,
+        expected: String,
+        found: usize,
+    },
+    InvalidOutputDescriptor {
+        operation: ComputeOperationId,
         reason: String,
     },
     InvalidShape {
@@ -3092,6 +4130,9 @@ impl fmt::Display for ComputeValidationError {
             Self::UnknownOperationFamily(family) => {
                 write!(f, "unknown compute operation family '{family}'")
             }
+            Self::UnknownOperationSchema(operation) => {
+                write!(f, "unknown compute operation schema '{operation}'")
+            }
             Self::InvalidGraph { reason } => write!(f, "invalid compute graph: {reason}"),
             Self::MissingInput { input } => {
                 write!(f, "compute graph references missing input '{input}'")
@@ -3107,6 +4148,26 @@ impl fmt::Display for ComputeValidationError {
             Self::InvalidState { reason } => {
                 write!(f, "invalid compute submission state: {reason}")
             }
+            Self::InvalidOperationAttribute {
+                operation,
+                attribute,
+                reason,
+            } => write!(
+                f,
+                "invalid attribute '{attribute}' for operation schema '{operation}': {reason}"
+            ),
+            Self::InvalidOperationArity {
+                operation,
+                expected,
+                found,
+            } => write!(
+                f,
+                "invalid arity for operation schema '{operation}': expected {expected}, found {found}"
+            ),
+            Self::InvalidOutputDescriptor { operation, reason } => write!(
+                f,
+                "invalid output descriptor for operation schema '{operation}': {reason}"
+            ),
             Self::InvalidShape { reason } => write!(f, "invalid tensor shape: {reason}"),
             Self::InvalidLayout { reason } => write!(f, "invalid tensor layout: {reason}"),
             Self::SizeOverflow { reason } => write!(f, "invalid tensor size: {reason}"),
@@ -3167,14 +4228,20 @@ impl From<ComputeValidationError> for ComputeError {
     fn from(error: ComputeValidationError) -> Self {
         let message = error.to_string();
         match error {
-            ComputeValidationError::UnknownOperationFamily(family) => ComputeError::validation(
-                ComputeErrorCode::UnsupportedOperationFamily,
-                message,
-            )
-            .with_diagnostic(
-                ComputeDiagnostic::new()
-                    .with_backend_message(format!("unknown operation family: {family}")),
-            ),
+            ComputeValidationError::UnknownOperationFamily(family) => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedOperationFamily, message)
+                    .with_diagnostic(
+                        ComputeDiagnostic::new()
+                            .with_backend_message(format!("unknown operation family: {family}")),
+                    )
+            }
+            ComputeValidationError::UnknownOperationSchema(operation) => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedOperation, message)
+                    .with_diagnostic(
+                        ComputeDiagnostic::new()
+                            .with_backend_message(format!("unknown operation schema: {operation}")),
+                    )
+            }
             ComputeValidationError::InvalidGraph { .. } => {
                 ComputeError::validation(ComputeErrorCode::InvalidGraph, message)
             }
@@ -3194,6 +4261,15 @@ impl From<ComputeValidationError> for ComputeError {
                 message,
             )
             .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputeValidationError::InvalidOperationAttribute { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidOperationAttribute, message)
+            }
+            ComputeValidationError::InvalidOperationArity { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidOperationArity, message)
+            }
+            ComputeValidationError::InvalidOutputDescriptor { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidOutputDescriptor, message)
+            }
             ComputeValidationError::InvalidShape { .. } => {
                 ComputeError::validation(ComputeErrorCode::InvalidShape, message)
             }
@@ -4194,10 +5270,12 @@ impl Runtime {
                         ComputeValidationError::UnknownOperationFamily(operation.family_id.clone())
                     })?;
                 Ok(ComputeOperationDescriptor {
+                    schema_id: None,
                     family,
                     dtype: operation.dtype,
                     layout: operation.layout,
                     precision: operation.precision,
+                    attributes: BTreeMap::new(),
                     tensors: operation.tensors.clone(),
                 })
             })
@@ -4218,14 +5296,27 @@ impl Runtime {
                 ComputeValidationError::ProviderUnavailable(ProviderBinding::new(provider))
             })?;
         for operation in operations {
-            let support = metadata
-                .compute_operation_support
-                .get(&operation.family)
-                .ok_or(ComputeValidationError::UnsupportedOperationFamily {
-                    provider: ProviderBinding::new(&metadata.name),
-                    family: operation.family,
-                })?;
+            let schema_result = validate_compute_operation_schema(operation)?;
+            let support = if let Some(schema_id) = &operation.schema_id {
+                metadata
+                    .compute_operation_schema_support
+                    .get(schema_id)
+                    .or_else(|| metadata.compute_operation_support.get(&operation.family))
+                    .ok_or(ComputeValidationError::UnsupportedOperationFamily {
+                        provider: ProviderBinding::new(&metadata.name),
+                        family: operation.family,
+                    })?
+            } else {
+                metadata
+                    .compute_operation_support
+                    .get(&operation.family)
+                    .ok_or(ComputeValidationError::UnsupportedOperationFamily {
+                        provider: ProviderBinding::new(&metadata.name),
+                        family: operation.family,
+                    })?
+            };
             support.supports(operation)?;
+            drop(schema_result);
         }
         Ok(())
     }
@@ -4664,7 +5755,10 @@ impl From<ProviderError> for ComputeError {
                 message,
             )
             .with_diagnostic(ComputeDiagnostic::new().with_capability(capability)),
-            ProviderError::PolicyRejectedProvider { capability, policy: _ } => ComputeError::new(
+            ProviderError::PolicyRejectedProvider {
+                capability,
+                policy: _,
+            } => ComputeError::new(
                 ComputeErrorCode::PolicyRejectedProvider,
                 ComputeErrorPhase::Resolution,
                 ComputeErrorSeverity::Terminal,
@@ -4708,7 +5802,9 @@ impl From<ProviderError> for ComputeError {
                 ComputeErrorSeverity::Terminal,
                 message,
             )
-            .with_diagnostic(ComputeDiagnostic::new().with_provider(ProviderBinding::new(provider))),
+            .with_diagnostic(
+                ComputeDiagnostic::new().with_provider(ProviderBinding::new(provider)),
+            ),
             ProviderError::InvalidCapabilityVersion(version) => ComputeError::new(
                 ComputeErrorCode::CapabilityVersionMismatch,
                 ComputeErrorPhase::Resolution,
@@ -5084,7 +6180,15 @@ mod tests {
         assert!(wit.contains("resource graph"));
         assert!(wit.contains("resource operation"));
         assert!(wit.contains("enum operation-family"));
+        assert!(wit.contains("type operation-id = string"));
+        assert!(wit.contains("record operation-schema"));
+        assert!(wit.contains("record operation-schema-support"));
+        assert!(wit.contains("variant operation-attribute"));
+        assert!(wit.contains("record operation-input-rule"));
+        assert!(wit.contains("record operation-output-rule"));
         assert!(wit.contains("record operation-descriptor"));
+        assert!(wit.contains("schema-id: option<operation-id>"));
+        assert!(wit.contains("attributes: list<tuple<string, operation-attribute>>"));
         assert!(wit.contains("record graph-descriptor"));
         assert!(wit.contains("record graph-node"));
         assert!(wit.contains("variant graph-value-ref"));
@@ -5102,6 +6206,9 @@ mod tests {
         assert!(wit.contains("unsupported-operation-family"));
         assert!(wit.contains("invalid-tensor-descriptor"));
         assert!(wit.contains("invalid-dtype"));
+        assert!(wit.contains("invalid-operation-attribute"));
+        assert!(wit.contains("invalid-operation-arity"));
+        assert!(wit.contains("invalid-output-descriptor"));
         assert!(wit.contains("unsupported-dtype"));
         assert!(wit.contains("unsupported-layout"));
         assert!(wit.contains("unsupported-data-movement"));
@@ -5143,26 +6250,35 @@ mod tests {
         assert_eq!(invalid_shape.code, ComputeErrorCode::InvalidShape);
         assert_eq!(invalid_shape.phase, ComputeErrorPhase::Validation);
         assert_eq!(invalid_shape.severity, ComputeErrorSeverity::Terminal);
-        assert!(invalid_shape
-            .recovery_hints
-            .contains(&RecoveryHint::NotRetryable));
+        assert!(
+            invalid_shape
+                .recovery_hints
+                .contains(&RecoveryHint::NotRetryable)
+        );
 
         let materialization = ComputeError::from(ComputeValidationError::MaterializationRequired {
             reason: "view must be materialized".into(),
         });
-        assert_eq!(materialization.code, ComputeErrorCode::MaterializationRequired);
-        assert!(materialization
-            .recovery_hints
-            .contains(&RecoveryHint::ExplicitMaterializationRequired));
+        assert_eq!(
+            materialization.code,
+            ComputeErrorCode::MaterializationRequired
+        );
+        assert!(
+            materialization
+                .recovery_hints
+                .contains(&RecoveryHint::ExplicitMaterializationRequired)
+        );
 
         let affinity = ComputeError::from(AffinityError::BoundProviderUnavailable(
             ProviderBinding::new("provider-a"),
         ));
         assert_eq!(affinity.code, ComputeErrorCode::ProviderUnavailable);
         assert_eq!(affinity.phase, ComputeErrorPhase::Interruption);
-        assert!(affinity
-            .recovery_hints
-            .contains(&RecoveryHint::ProviderPinned));
+        assert!(
+            affinity
+                .recovery_hints
+                .contains(&RecoveryHint::ProviderPinned)
+        );
 
         let policy = ComputeError::from(ProviderError::PolicyRejectedProvider {
             capability: CapabilityBinding::new(
@@ -5174,16 +6290,23 @@ mod tests {
         assert_eq!(policy.code, ComputeErrorCode::PolicyRejectedProvider);
         assert_eq!(policy.phase, ComputeErrorPhase::Resolution);
         assert_eq!(
-            policy.diagnostics[0].capability.as_ref().unwrap().id().as_str(),
+            policy.diagnostics[0]
+                .capability
+                .as_ref()
+                .unwrap()
+                .id()
+                .as_str(),
             COMPUTE_CAPABILITY_ID
         );
 
         let execution = ComputeError::from(ProviderError::Lifecycle("device lost".into()));
         assert_eq!(execution.code, ComputeErrorCode::ExecutionInterrupted);
         assert_eq!(execution.phase, ComputeErrorPhase::Interruption);
-        assert!(execution
-            .recovery_hints
-            .contains(&RecoveryHint::RetryBeforeState));
+        assert!(
+            execution
+                .recovery_hints
+                .contains(&RecoveryHint::RetryBeforeState)
+        );
     }
     #[test]
     fn compute_diagnostics_are_optional_redacted_and_non_contractual() {
@@ -5214,9 +6337,11 @@ mod tests {
 
         assert_eq!(error.code, ComputeErrorCode::ExecutionFailed);
         assert_eq!(error.diagnostics.len(), 1);
-        assert!(error
-            .recovery_hints
-            .contains(&RecoveryHint::RestartableWithReplay));
+        assert!(
+            error
+                .recovery_hints
+                .contains(&RecoveryHint::RestartableWithReplay)
+        );
     }
     #[test]
     fn compute_operation_validation_uses_provider_advertisements() {
@@ -5284,6 +6409,204 @@ mod tests {
             ),
             Err(ComputeValidationError::UnsupportedLayout { .. })
         ));
+    }
+    #[test]
+    fn compute_operation_schemas_define_initial_portable_operations() {
+        let schemas = initial_compute_operation_schemas();
+
+        for id in [
+            "tensor.reshape",
+            "tensor.transpose",
+            "tensor.permute",
+            "tensor.slice",
+            "tensor.broadcast",
+            "tensor.squeeze",
+            "tensor.unsqueeze",
+            "elementwise.unary.relu",
+            "elementwise.binary.add",
+            "comparison.eq",
+            "selection.where",
+            "reduction.sum",
+            "linalg.matmul",
+            "linalg.batched-matmul",
+            "tensor.gather",
+            "tensor.index-select",
+            "tensor.scatter",
+            "tensor.scatter-add",
+            "tensor.concat",
+            "random.uniform",
+            "random.normal",
+        ] {
+            assert!(schemas.contains_key(&ComputeOperationId::new(id)), "{id}");
+        }
+        assert!(!schemas.contains_key(&ComputeOperationId::new("convolution.conv2d")));
+        assert!(!schemas.contains_key(&ComputeOperationId::new("pooling.max")));
+        assert!(!schemas.contains_key(&ComputeOperationId::new("attention.flash")));
+        assert!(!schemas.contains_key(&ComputeOperationId::new("quantized.matmul")));
+        assert!(!schemas.contains_key(&ComputeOperationId::new("custom.kernel")));
+        assert!(!schemas.contains_key(&ComputeOperationId::new("autograd.backward")));
+
+        let scatter = schemas
+            .get(&ComputeOperationId::new("tensor.scatter"))
+            .unwrap();
+        assert!(scatter.provider_specific_semantics);
+    }
+    #[test]
+    fn compute_operation_schema_validation_checks_attributes_and_shapes() {
+        let schemas = initial_compute_operation_schemas();
+        let add = schemas
+            .get(&ComputeOperationId::new("elementwise.binary.add"))
+            .unwrap();
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_operation_schema_support.insert(
+            add.id.clone(),
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let lhs = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 1]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let rhs = TensorDescriptor::materialized(
+            ShapeDescriptor::new([1, 3]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        let output = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 3]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+
+        runtime
+            .validate_compute_operations(
+                "portable-compute",
+                &[ComputeOperationDescriptor::from_schema(add)
+                    .with_tensor(lhs.clone())
+                    .with_tensor(rhs.clone())
+                    .with_tensor(output.clone())],
+            )
+            .unwrap();
+
+        let bad_output = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 2]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "portable-compute",
+                &[ComputeOperationDescriptor::from_schema(add)
+                    .with_tensor(lhs.clone())
+                    .with_tensor(rhs.clone())
+                    .with_tensor(bad_output)]
+            ),
+            Err(ComputeValidationError::InvalidOutputDescriptor { .. })
+        ));
+
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "portable-compute",
+                &[ComputeOperationDescriptor::from_schema(add)
+                    .with_attribute("unknown", ComputeOperationAttribute::Boolean(true))
+                    .with_tensor(lhs)
+                    .with_tensor(rhs)
+                    .with_tensor(output)]
+            ),
+            Err(ComputeValidationError::InvalidOperationAttribute { .. })
+        ));
+    }
+    #[test]
+    fn compute_operation_schema_validation_checks_reduction_matmul_and_random_rules() {
+        let schemas = initial_compute_operation_schemas();
+        let sum = schemas
+            .get(&ComputeOperationId::new("reduction.sum"))
+            .unwrap();
+        let matmul = schemas
+            .get(&ComputeOperationId::new("linalg.matmul"))
+            .unwrap();
+        let random = schemas
+            .get(&ComputeOperationId::new("random.uniform"))
+            .unwrap();
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        for schema in [sum, matmul, random] {
+            provider.metadata.compute_operation_schema_support.insert(
+                schema.id.clone(),
+                ComputeOperationSupport::new()
+                    .with_dtypes([ComputeDType::Float32, ComputeDType::SInt64])
+                    .with_layouts([ComputeLayout::Dense]),
+            );
+        }
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let f32_2x3 = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 3]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+
+        runtime
+            .validate_compute_operations(
+                "portable-compute",
+                &[ComputeOperationDescriptor::from_schema(sum)
+                    .with_attribute("axes", ComputeOperationAttribute::Axes(vec![1]))
+                    .with_attribute("keep-dimensions", ComputeOperationAttribute::Boolean(true))
+                    .with_tensor(f32_2x3.clone())
+                    .with_tensor(TensorDescriptor::materialized(
+                        ShapeDescriptor::new([2, 1]),
+                        DTypeDescriptor::portable(ComputeDType::Float32),
+                    ))],
+            )
+            .unwrap();
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "portable-compute",
+                &[ComputeOperationDescriptor::from_schema(sum)
+                    .with_attribute("axes", ComputeOperationAttribute::Axes(vec![2]))
+                    .with_tensor(f32_2x3.clone())
+                    .with_tensor(f32_2x3.clone())]
+            ),
+            Err(ComputeValidationError::InvalidShape { .. })
+        ));
+
+        runtime
+            .validate_compute_operations(
+                "portable-compute",
+                &[ComputeOperationDescriptor::from_schema(matmul)
+                    .with_tensor(f32_2x3.clone())
+                    .with_tensor(TensorDescriptor::materialized(
+                        ShapeDescriptor::new([3, 4]),
+                        DTypeDescriptor::portable(ComputeDType::Float32),
+                    ))
+                    .with_tensor(TensorDescriptor::materialized(
+                        ShapeDescriptor::new([2, 4]),
+                        DTypeDescriptor::portable(ComputeDType::Float32),
+                    ))],
+            )
+            .unwrap();
+
+        runtime
+            .validate_compute_operations(
+                "portable-compute",
+                &[ComputeOperationDescriptor::from_schema(random)
+                    .with_attribute(
+                        "shape",
+                        ComputeOperationAttribute::Shape(ShapeDescriptor::new([2, 2])),
+                    )
+                    .with_attribute(
+                        "dtype",
+                        ComputeOperationAttribute::DType(ComputeDType::Float32),
+                    )
+                    .with_attribute("seed", ComputeOperationAttribute::Integer(42))
+                    .with_tensor(TensorDescriptor::materialized(
+                        ShapeDescriptor::new([2, 2]),
+                        DTypeDescriptor::portable(ComputeDType::Float32),
+                    ))],
+            )
+            .unwrap();
     }
     #[test]
     fn tensor_descriptors_validate_shape_dtype_layout_and_provider_support() {
