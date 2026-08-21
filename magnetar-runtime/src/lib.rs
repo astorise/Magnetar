@@ -443,6 +443,9 @@ pub trait Device: Send + Sync {
     fn device_type(&self) -> DeviceType {
         self.metadata().device_type
     }
+    fn availability(&self) -> DeviceAvailability {
+        DeviceAvailability::Available
+    }
 }
 impl Device for DeviceDescriptor {
     fn metadata(&self) -> &DeviceMetadata {
@@ -712,6 +715,34 @@ pub enum FallbackClass {
     ProviderPinned,
 }
 
+/// Logical point at which resolution or re-resolution is being considered.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ExecutionPhase {
+    #[default]
+    BeforeResourceCreation,
+    AfterResourceCreation,
+    AfterSubmittedWork,
+    AfterObservableOutput,
+}
+
+/// Stable health category reported by the host-facing Provider wrapper.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ProviderHealth {
+    #[default]
+    Healthy,
+    Degraded,
+    Unavailable,
+}
+
+/// Stable availability category for a candidate Device.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DeviceAvailability {
+    #[default]
+    Available,
+    Busy,
+    Unavailable,
+}
+
 /// Immutable ownership and compatibility facts carried by one opaque resource.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceAffinity {
@@ -943,6 +974,10 @@ pub enum AffinityError {
         capability: CapabilityBinding,
     },
     NoCompatibleProvider(CapabilityBinding),
+    PolicyRejectedProvider {
+        capability: CapabilityBinding,
+        policy: ResolutionPolicyId,
+    },
     RuntimeNotInitialized,
 }
 impl fmt::Display for AffinityError {
@@ -1007,6 +1042,10 @@ impl fmt::Display for AffinityError {
                     "no Provider implements compatible capability '{capability}'"
                 )
             }
+            Self::PolicyRejectedProvider { capability, policy } => write!(
+                f,
+                "resolution policy '{policy}' rejected every Provider for capability '{capability}'"
+            ),
             Self::RuntimeNotInitialized => {
                 write!(f, "runtime is not initialized for affinity resolution")
             }
@@ -1041,6 +1080,7 @@ pub struct AffinityResolution<'a> {
     provider: &'a dyn Provider,
     capability: &'a Capability,
     affinity: ResourceAffinity,
+    decision: ResolutionDecision,
 }
 impl<'a> AffinityResolution<'a> {
     pub fn provider(&self) -> &'a dyn Provider {
@@ -1052,8 +1092,225 @@ impl<'a> AffinityResolution<'a> {
     pub fn affinity(&self) -> &ResourceAffinity {
         &self.affinity
     }
+    pub fn decision(&self) -> &ResolutionDecision {
+        &self.decision
+    }
     pub fn into_affinity(self) -> ResourceAffinity {
         self.affinity
+    }
+}
+
+/// Stable identifier for a resolution policy.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ResolutionPolicyId(String);
+impl ResolutionPolicyId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for ResolutionPolicyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Built-in runtime policy families. Preference placeholders currently use the
+/// deterministic ordering after applying their eligibility gates.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum BuiltInResolutionPolicy {
+    #[default]
+    Deterministic,
+    Priority,
+    Availability,
+    PerformancePreferred,
+    EnergyPreferred,
+    MemoryConstrained,
+}
+impl BuiltInResolutionPolicy {
+    pub fn id(self) -> ResolutionPolicyId {
+        let id = match self {
+            Self::Deterministic => "magnetar:policy/deterministic",
+            Self::Priority => "magnetar:policy/priority",
+            Self::Availability => "magnetar:policy/availability",
+            Self::PerformancePreferred => "magnetar:policy/performance-preferred",
+            Self::EnergyPreferred => "magnetar:policy/energy-preferred",
+            Self::MemoryConstrained => "magnetar:policy/memory-constrained",
+        };
+        ResolutionPolicyId::new(id)
+    }
+}
+
+/// A stable, inspectable candidate considered by a [`ResolutionPolicy`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionCandidate {
+    pub provider: ProviderBinding,
+    pub capability: CapabilityBinding,
+    pub device: Option<DeviceBinding>,
+    pub provider_health: ProviderHealth,
+    pub device_availability: DeviceAvailability,
+    pub affinity_compatible: bool,
+    pub priority: i32,
+}
+impl ResolutionCandidate {
+    fn sort_key(&self) -> (&ProviderBinding, &CapabilityBinding, Option<&DeviceBinding>) {
+        (&self.provider, &self.capability, self.device.as_ref())
+    }
+}
+
+/// Policy input assembled by the Runtime before execution begins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionContext {
+    pub requested_capability: CapabilityId,
+    pub requested_version: CapabilityVersion,
+    pub candidates: Vec<ResolutionCandidate>,
+    pub affinity: Option<ResourceAffinity>,
+    pub fallback: FallbackClass,
+    pub execution_phase: ExecutionPhase,
+    pub replayable_input: bool,
+}
+
+/// Stable reason a candidate was rejected before or by policy selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolutionRejectionReason {
+    IncompatibleCapability,
+    ProviderUnavailable,
+    DeviceUnavailable,
+    AffinityIncompatible,
+    FallbackNotAllowed,
+    PolicyRejected,
+}
+
+/// Stable rejection record; backend-specific strings are intentionally absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionCandidateRejection {
+    pub provider: ProviderBinding,
+    pub capability: CapabilityBinding,
+    pub reason: ResolutionRejectionReason,
+}
+
+/// Stable decision reason emitted by policy evaluation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolutionDecisionReason {
+    SelectedDeterministically,
+    SelectedByPriority,
+    SelectedByAvailability,
+    SelectedByPreferencePlaceholder,
+    PreservedAffinity,
+    NoCompatibleProvider,
+    PolicyRejectedAllCandidates,
+}
+
+/// Inspectable result of applying a Resolution Policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolutionDecision {
+    pub policy_id: ResolutionPolicyId,
+    pub selected_provider: Option<ProviderBinding>,
+    pub selected_device: Option<DeviceBinding>,
+    pub selected_capability: Option<CapabilityBinding>,
+    pub reason: ResolutionDecisionReason,
+    pub rejected_candidates: Vec<ResolutionCandidateRejection>,
+}
+
+/// Selects one candidate from a deterministic context.
+pub trait ResolutionPolicy {
+    fn id(&self) -> ResolutionPolicyId;
+    fn decide(&self, context: &ResolutionContext) -> ResolutionDecision;
+}
+impl ResolutionPolicy for BuiltInResolutionPolicy {
+    fn id(&self) -> ResolutionPolicyId {
+        (*self).id()
+    }
+
+    fn decide(&self, context: &ResolutionContext) -> ResolutionDecision {
+        let mut rejected_candidates = Vec::new();
+        let mut eligible = Vec::new();
+        for candidate in &context.candidates {
+            if !candidate
+                .capability
+                .version()
+                .is_compatible_with(context.requested_version)
+            {
+                rejected_candidates.push(rejection(
+                    candidate,
+                    ResolutionRejectionReason::IncompatibleCapability,
+                ));
+            } else if candidate.provider_health == ProviderHealth::Unavailable {
+                rejected_candidates.push(rejection(
+                    candidate,
+                    ResolutionRejectionReason::ProviderUnavailable,
+                ));
+            } else if candidate.device_availability == DeviceAvailability::Unavailable {
+                rejected_candidates.push(rejection(
+                    candidate,
+                    ResolutionRejectionReason::DeviceUnavailable,
+                ));
+            } else if !candidate.affinity_compatible {
+                rejected_candidates.push(rejection(
+                    candidate,
+                    ResolutionRejectionReason::AffinityIncompatible,
+                ));
+            } else if context.execution_phase >= ExecutionPhase::AfterObservableOutput
+                || (context.fallback >= FallbackClass::Restartable && !context.replayable_input)
+            {
+                rejected_candidates.push(rejection(
+                    candidate,
+                    ResolutionRejectionReason::FallbackNotAllowed,
+                ));
+            } else {
+                eligible.push(candidate);
+            }
+        }
+
+        eligible.sort_by(|left, right| match self {
+            Self::Priority => right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.sort_key().cmp(&right.sort_key())),
+            Self::Availability => left
+                .provider_health
+                .cmp(&right.provider_health)
+                .then_with(|| left.device_availability.cmp(&right.device_availability))
+                .then_with(|| left.sort_key().cmp(&right.sort_key())),
+            _ => left.sort_key().cmp(&right.sort_key()),
+        });
+
+        let reason = match self {
+            Self::Deterministic => ResolutionDecisionReason::SelectedDeterministically,
+            Self::Priority => ResolutionDecisionReason::SelectedByPriority,
+            Self::Availability => ResolutionDecisionReason::SelectedByAvailability,
+            Self::PerformancePreferred | Self::EnergyPreferred | Self::MemoryConstrained => {
+                ResolutionDecisionReason::SelectedByPreferencePlaceholder
+            }
+        };
+        let selected = eligible.first();
+        ResolutionDecision {
+            policy_id: self.id(),
+            selected_provider: selected.map(|candidate| candidate.provider.clone()),
+            selected_device: selected.and_then(|candidate| candidate.device.clone()),
+            selected_capability: selected.map(|candidate| candidate.capability.clone()),
+            reason: if selected.is_some() {
+                reason
+            } else if context.candidates.is_empty() {
+                ResolutionDecisionReason::NoCompatibleProvider
+            } else {
+                ResolutionDecisionReason::PolicyRejectedAllCandidates
+            },
+            rejected_candidates,
+        }
+    }
+}
+
+fn rejection(
+    candidate: &ResolutionCandidate,
+    reason: ResolutionRejectionReason,
+) -> ResolutionCandidateRejection {
+    ResolutionCandidateRejection {
+        provider: candidate.provider.clone(),
+        capability: candidate.capability.clone(),
+        reason,
     }
 }
 
@@ -1106,6 +1363,9 @@ fn parse_capability_version(value: &str) -> Result<CapabilityVersion, ProviderEr
 pub trait Provider: Send + Sync {
     fn metadata(&self) -> ProviderMetadata;
     fn register(&self, registry: &mut ProviderRegistry) -> Result<(), ProviderError>;
+    fn health(&self) -> ProviderHealth {
+        ProviderHealth::Healthy
+    }
     /// Discovers the execution devices owned by this provider.
     fn devices(&self) -> Vec<Arc<dyn Device>> {
         Vec::new()
@@ -1169,6 +1429,14 @@ impl ProviderRegistry {
     }
     pub fn provider_for_device(&self, id: &DeviceId) -> Option<&str> {
         self.device_providers.get(id).map(String::as_str)
+    }
+    pub fn devices_for_provider<'a>(
+        &'a self,
+        provider: &'a str,
+    ) -> impl Iterator<Item = &'a dyn Device> {
+        self.devices.iter().filter_map(move |(id, device)| {
+            (self.provider_for_device(id) == Some(provider)).then_some(device.as_ref())
+        })
     }
     pub fn register_capabilities(
         &mut self,
@@ -1358,11 +1626,109 @@ impl ProviderLoader {
     pub fn resolve_providers(&self, capability: &Capability) -> Vec<&dyn Provider> {
         self.try_resolve_providers(capability).unwrap_or_default()
     }
+    pub fn try_resolve_providers_with_policy(
+        &self,
+        capability: &Capability,
+        policy: BuiltInResolutionPolicy,
+    ) -> Result<Vec<&dyn Provider>, ProviderError> {
+        let candidates = self.candidates_for_capability(capability)?;
+        let context = ResolutionContext {
+            requested_capability: capability.id.clone(),
+            requested_version: capability.version,
+            candidates,
+            affinity: None,
+            fallback: FallbackClass::Transparent,
+            execution_phase: ExecutionPhase::BeforeResourceCreation,
+            replayable_input: true,
+        };
+        let decision = policy.decide(&context);
+        let Some(selected) = decision.selected_provider.as_ref() else {
+            let requested = CapabilityBinding::new(capability.id.clone(), capability.version);
+            return if context.candidates.is_empty() {
+                Err(ProviderError::NoCompatibleProvider(requested))
+            } else {
+                Err(ProviderError::PolicyRejectedProvider {
+                    capability: requested,
+                    policy: decision.policy_id,
+                })
+            };
+        };
+        let mut names = vec![selected.as_str().to_owned()];
+        for candidate in &context.candidates {
+            if candidate.provider.as_str() != selected.as_str()
+                && !decision
+                    .rejected_candidates
+                    .iter()
+                    .any(|rejected| rejected.provider == candidate.provider)
+            {
+                names.push(candidate.provider.as_str().to_owned());
+            }
+        }
+        Ok(names
+            .into_iter()
+            .filter_map(|name| self.provider(&name))
+            .collect())
+    }
+    fn candidates_for_capability(
+        &self,
+        capability: &Capability,
+    ) -> Result<Vec<ResolutionCandidate>, ProviderError> {
+        self.registry.validate_dependencies()?;
+        let Some(resolved) = self
+            .registry
+            .resolve_capability(&capability.id, capability.version)
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .registry
+            .providers_for(resolved)
+            .filter_map(|name| {
+                let provider = self.provider(name)?;
+                Some(self.resolution_candidate(provider, resolved, true))
+            })
+            .collect())
+    }
+    fn resolution_candidate(
+        &self,
+        provider: &dyn Provider,
+        capability: &Capability,
+        affinity_compatible: bool,
+    ) -> ResolutionCandidate {
+        let provider_name = provider.metadata().name;
+        let device = self
+            .registry
+            .devices_for_provider(&provider_name)
+            .find(|device| {
+                let capabilities = &device.metadata().execution_capabilities;
+                capabilities.is_empty() || capabilities.contains(&capability.id)
+            })
+            .map(|device| {
+                (
+                    DeviceBinding::new(device.id().clone()),
+                    device.availability(),
+                )
+            });
+        ResolutionCandidate {
+            provider: ProviderBinding::new(provider_name),
+            capability: CapabilityBinding::new(capability.id.clone(), capability.version),
+            device: device.as_ref().map(|(binding, _)| binding.clone()),
+            provider_health: provider.health(),
+            device_availability: device
+                .map(|(_, availability)| availability)
+                .unwrap_or(DeviceAvailability::Available),
+            affinity_compatible,
+            priority: 0,
+        }
+    }
     fn resolve_with_constraints<'a>(
         &'a self,
         requested: &Capability,
         constraints: &AffinityConstraints,
-    ) -> Result<(&'a dyn Provider, &'a Capability), AffinityError> {
+        policy: BuiltInResolutionPolicy,
+        execution_phase: ExecutionPhase,
+        replayable_input: bool,
+    ) -> Result<(&'a dyn Provider, &'a Capability, ResolutionDecision), AffinityError> {
         let affinity = constraints.affinity();
         let mut bound_provider = affinity.provider().cloned();
 
@@ -1432,9 +1798,26 @@ impl ProviderLoader {
             }
             .ok_or(AffinityError::ProviderDoesNotImplementCapability {
                 provider: provider_binding,
-                capability: requested_binding,
+                capability: requested_binding.clone(),
             })?;
-            return Ok((provider, capability));
+            let context = ResolutionContext {
+                requested_capability: requested.id.clone(),
+                requested_version: requested.version,
+                candidates: vec![self.resolution_candidate(provider, capability, true)],
+                affinity: Some(affinity.clone()),
+                fallback: FallbackClass::Transparent,
+                execution_phase,
+                replayable_input,
+            };
+            let mut decision = policy.decide(&context);
+            if decision.selected_provider.is_none() {
+                return Err(AffinityError::PolicyRejectedProvider {
+                    capability: requested_binding,
+                    policy: decision.policy_id,
+                });
+            }
+            decision.reason = ResolutionDecisionReason::PreservedAffinity;
+            return Ok((provider, capability, decision));
         }
 
         let requested_binding = affinity
@@ -1456,22 +1839,43 @@ impl ProviderLoader {
         }
         .ok_or_else(|| AffinityError::NoCompatibleProvider(requested_binding.clone()))?;
 
-        let provider = self
+        let candidates = self
             .registry
             .providers_for(capability)
-            .find_map(|name| {
+            .filter_map(|name| {
                 let provider = self.provider(name)?;
-                affinity
-                    .capabilities()
-                    .all(|binding| {
-                        self.registry
-                            .capability_for_provider(binding.id(), binding.version(), name)
-                            .is_some()
-                    })
-                    .then_some(provider)
+                let affinity_compatible = affinity.capabilities().all(|binding| {
+                    self.registry
+                        .capability_for_provider(binding.id(), binding.version(), name)
+                        .is_some()
+                });
+                Some(self.resolution_candidate(provider, capability, affinity_compatible))
             })
-            .ok_or(AffinityError::NoCompatibleProvider(requested_binding))?;
-        Ok((provider, capability))
+            .collect::<Vec<_>>();
+        let context = ResolutionContext {
+            requested_capability: requested.id.clone(),
+            requested_version: requested.version,
+            candidates,
+            affinity: Some(affinity.clone()),
+            fallback: affinity.fallback(),
+            execution_phase,
+            replayable_input,
+        };
+        let decision = policy.decide(&context);
+        let Some(selected_provider) = decision.selected_provider.as_ref() else {
+            return if context.candidates.is_empty() {
+                Err(AffinityError::NoCompatibleProvider(requested_binding))
+            } else {
+                Err(AffinityError::PolicyRejectedProvider {
+                    capability: requested_binding,
+                    policy: decision.policy_id,
+                })
+            };
+        };
+        let provider = self
+            .provider(selected_provider.as_str())
+            .ok_or_else(|| AffinityError::BoundProviderUnavailable(selected_provider.clone()))?;
+        Ok((provider, capability, decision))
     }
     pub fn register_provider(&mut self, provider: Arc<dyn Provider>) -> Result<(), ProviderError> {
         let metadata = provider.metadata();
@@ -1612,6 +2016,7 @@ fn next_affinity_group_id() -> AffinityGroupId {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeConfig {
     pub preferred_backend: Option<String>,
+    pub resolution_policy: BuiltInResolutionPolicy,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionContext {
@@ -1723,14 +2128,15 @@ impl Runtime {
     }
     /// Resolves all compatible providers, ordered for deterministic fallback.
     pub fn resolve_providers(&self, capability: &Capability) -> Vec<&dyn Provider> {
-        self.providers.resolve_providers(capability)
+        self.try_resolve_providers(capability).unwrap_or_default()
     }
     /// Resolves providers while reporting invalid capability dependencies.
     pub fn try_resolve_providers(
         &self,
         capability: &Capability,
     ) -> Result<Vec<&dyn Provider>, ProviderError> {
-        self.providers.try_resolve_providers(capability)
+        self.providers
+            .try_resolve_providers_with_policy(capability, self.context.config.resolution_policy)
     }
     /// Resolves one coherent Provider for resources that already carry state.
     ///
@@ -1760,9 +2166,13 @@ impl Runtime {
             )?;
         }
 
-        let (provider, selected) = self
-            .providers
-            .resolve_with_constraints(capability, &constraints)?;
+        let (provider, selected, decision) = self.providers.resolve_with_constraints(
+            capability,
+            &constraints,
+            self.context.config.resolution_policy,
+            ExecutionPhase::BeforeResourceCreation,
+            true,
+        )?;
         let provider_binding = ProviderBinding::new(provider.metadata().name);
         let affinity = constraints
             .into_affinity()
@@ -1775,6 +2185,54 @@ impl Runtime {
             provider,
             capability: selected,
             affinity,
+            decision,
+        })
+    }
+    pub fn resolve_with_affinity_at_phase<'a>(
+        &'a self,
+        capability: &Capability,
+        dependencies: &[&ResourceAffinity],
+        fallback: FallbackClass,
+        execution_phase: ExecutionPhase,
+        replayable_input: bool,
+    ) -> Result<AffinityResolution<'a>, AffinityError> {
+        if !self.initialized {
+            return Err(AffinityError::RuntimeNotInitialized);
+        }
+        let mut constraints =
+            AffinityConstraints::try_from_affinities(dependencies.iter().copied())?;
+        constraints.require_fallback(fallback);
+        constraints.merge(
+            &ResourceAffinity::new(FallbackClass::Transparent)
+                .with_execution_context(self.context.id),
+        )?;
+        if !dependencies.is_empty() && constraints.affinity().group().is_none() {
+            constraints.merge(
+                &ResourceAffinity::new(FallbackClass::Transparent)
+                    .with_group(next_affinity_group_id()),
+            )?;
+        }
+
+        let (provider, selected, decision) = self.providers.resolve_with_constraints(
+            capability,
+            &constraints,
+            self.context.config.resolution_policy,
+            execution_phase,
+            replayable_input,
+        )?;
+        let provider_binding = ProviderBinding::new(provider.metadata().name);
+        let affinity = constraints
+            .into_affinity()
+            .with_provider(provider_binding)
+            .with_capability(CapabilityBinding::new(
+                selected.id.clone(),
+                selected.version,
+            ));
+        Ok(AffinityResolution {
+            provider,
+            capability: selected,
+            affinity,
+            decision,
         })
     }
     /// Resolves providers for a component's WIT import without exposing a
@@ -1783,7 +2241,10 @@ impl Runtime {
         &self,
         interface: &WitInterface,
     ) -> Result<Vec<&dyn Provider>, ProviderError> {
-        self.try_resolve_providers(&Capability::from_wit(interface.clone())?)
+        self.providers.try_resolve_providers_with_policy(
+            &Capability::from_wit(interface.clone())?,
+            self.context.config.resolution_policy,
+        )
     }
     pub fn select_backend(&mut self, name: &str) -> Result<(), ProviderError> {
         if self.providers.registry().backend(name).is_none() {
@@ -1832,6 +2293,11 @@ pub enum ProviderError {
         capability: CapabilityId,
         dependency: CapabilityId,
         required: CapabilityVersion,
+    },
+    NoCompatibleProvider(CapabilityBinding),
+    PolicyRejectedProvider {
+        capability: CapabilityBinding,
+        policy: ResolutionPolicyId,
     },
     Discovery {
         path: PathBuf,
@@ -1886,6 +2352,16 @@ impl fmt::Display for ProviderError {
                 f,
                 "capability '{capability}' requires unavailable dependency '{dependency}@{required}'"
             ),
+            Self::NoCompatibleProvider(capability) => {
+                write!(
+                    f,
+                    "no Provider implements compatible capability '{capability}'"
+                )
+            }
+            Self::PolicyRejectedProvider { capability, policy } => write!(
+                f,
+                "resolution policy '{policy}' rejected every Provider for capability '{capability}'"
+            ),
             Self::Discovery { path, source } => write!(
                 f,
                 "could not discover providers in '{}': {source}",
@@ -1932,6 +2408,7 @@ mod tests {
         shut_down: AtomicBool,
         backend: bool,
         fail_initialization: bool,
+        health: ProviderHealth,
         devices: Vec<Arc<dyn Device>>,
     }
     impl TestProvider {
@@ -1942,6 +2419,7 @@ mod tests {
                 shut_down: AtomicBool::new(false),
                 backend: false,
                 fail_initialization: false,
+                health: ProviderHealth::Healthy,
                 devices: Vec::new(),
             }
         }
@@ -1976,6 +2454,9 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+        fn health(&self) -> ProviderHealth {
+            self.health
         }
         fn initialize(&self) -> Result<(), ProviderError> {
             if self.fail_initialization {
@@ -2232,6 +2713,98 @@ mod tests {
                 .len(),
             1
         );
+    }
+    #[test]
+    fn resolution_policy_records_selected_provider_capability_and_reason() {
+        let compute = compute_capability();
+        let provider_a = provider_with_capabilities("provider-a", [compute.clone()]);
+        let provider_b = provider_with_capabilities("provider-b", [compute.clone()]);
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider_b))
+            .register_provider(Arc::new(provider_a))
+            .build()
+            .unwrap();
+
+        let resolution = runtime
+            .resolve_with_affinity(&compute, &[], FallbackClass::Transparent)
+            .unwrap();
+        let decision = resolution.decision();
+
+        assert_eq!(resolution.provider().metadata().name, "provider-a");
+        assert_eq!(
+            decision
+                .selected_provider
+                .as_ref()
+                .map(ProviderBinding::as_str),
+            Some("provider-a")
+        );
+        assert_eq!(
+            decision.selected_capability,
+            Some(CapabilityBinding::new(compute.id.clone(), compute.version))
+        );
+        assert_eq!(
+            decision.reason,
+            ResolutionDecisionReason::SelectedDeterministically
+        );
+    }
+    #[test]
+    fn policy_rejection_is_structured_when_all_candidates_are_unhealthy() {
+        let compute = compute_capability();
+        let mut provider = provider_with_capabilities("provider-a", [compute.clone()]);
+        provider.health = ProviderHealth::Unavailable;
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            runtime.resolve_component_import(&WitInterface::new(COMPUTE_WIT_INTERFACE, "1.1.0")),
+            Err(ProviderError::PolicyRejectedProvider { capability, policy })
+                if capability.id() == &compute.id
+                    && capability.version() == compute.version
+                    && policy == BuiltInResolutionPolicy::Deterministic.id()
+        ));
+    }
+    #[test]
+    fn availability_policy_prefers_healthy_candidates() {
+        let compute = compute_capability();
+        let mut degraded = provider_with_capabilities("a-degraded", [compute.clone()]);
+        degraded.health = ProviderHealth::Degraded;
+        let healthy = provider_with_capabilities("z-healthy", [compute.clone()]);
+        let runtime = Runtime::builder()
+            .config(RuntimeConfig {
+                preferred_backend: None,
+                resolution_policy: BuiltInResolutionPolicy::Availability,
+            })
+            .register_provider(Arc::new(degraded))
+            .register_provider(Arc::new(healthy))
+            .build()
+            .unwrap();
+
+        let providers =
+            runtime.resolve_component_import(&WitInterface::new(COMPUTE_WIT_INTERFACE, "1.1.0"));
+
+        assert_eq!(providers.unwrap()[0].metadata().name, "z-healthy");
+    }
+    #[test]
+    fn phase_aware_resolution_rejects_restart_after_observable_output() {
+        let compute = compute_capability();
+        let provider = provider_with_capabilities("provider-a", [compute.clone()]);
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            runtime.resolve_with_affinity_at_phase(
+                &compute,
+                &[],
+                FallbackClass::Restartable,
+                ExecutionPhase::AfterObservableOutput,
+                true,
+            ),
+            Err(AffinityError::PolicyRejectedProvider { .. })
+        ));
     }
     #[test]
     fn builder_isolates_failed_provider_initialization() {

@@ -91,6 +91,8 @@ Magnetar is organized as a collection of independent crates.
 The source-derived boundaries for future Compute, model, generation, and
 application contracts are documented in the
 [capability contract taxonomy](docs/architecture/capability-taxonomy.md).
+Provider selection rules are documented in the
+[resolution policy model](docs/architecture/resolution-policy.md).
 
 ```text
 magnetar
@@ -178,8 +180,9 @@ Runtime / RuntimeBuilder ----> registered Backend implementations
 ExecutionContext                   Device implementations
 
 Components declare WIT capability imports. The runtime resolves those imports
-through the Capability Registry to one or more Providers; the first matching
-Provider is used first and the remaining compatible Providers are fallbacks.
+through the Capability Registry and active Resolution Policy to compatible
+Providers. Affinity-aware calls preserve Provider-pinned live state instead of
+silently selecting another Provider.
 ```
 
 ### Public API example
