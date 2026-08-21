@@ -1,9 +1,7 @@
 ## Purpose
 
 Define the requirements for runtime Providers and capability-based resolution.
-
 ## Requirements
-
 ### Requirement: Providers
 
 The runtime SHALL use Providers as the native extension mechanism.
@@ -54,19 +52,28 @@ Then the runtime selects a compatible Provider.
 
 ### Requirement: Provider Fallback
 
-The runtime SHALL support fallback Providers.
+The runtime SHALL support fallback Providers while resolving work that has not
+created or consumed Provider-owned state.
 
-#### Scenario: Primary Provider unavailable
+Once live resource affinity binds a call to a Provider or Device, the runtime
+SHALL only use a Provider that satisfies the complete affinity constraint set.
+An unavailable bound Provider SHALL produce a structured affinity failure
+instead of implicit migration.
 
-Given the preferred Provider cannot execute a capability
+#### Scenario: Primary Provider unavailable before state creation
 
-And another compatible Provider exists
+- **GIVEN** the preferred Provider cannot execute a Capability
+- **AND** no live resource affinity constrains the call
+- **AND** another compatible Provider exists
+- **WHEN** execution is resolved
+- **THEN** the runtime selects the fallback Provider
 
-When execution begins
+#### Scenario: Bound Provider unavailable after state creation
 
-Then the runtime selects the fallback Provider.
-
----
+- **GIVEN** a live opaque resource bound to a Provider
+- **WHEN** that Provider becomes unavailable for a dependent call
+- **THEN** the runtime reports an affinity failure
+- **AND** it does not select another Provider for that live resource
 
 ### Requirement: Provider Isolation
 
@@ -115,3 +122,4 @@ And different Providers implementing the required capability
 When execution occurs
 
 Then the Component executes without modification.
+

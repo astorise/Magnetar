@@ -592,6 +592,471 @@ impl Capability {
     }
 }
 
+/// Process-local identity of a Runtime execution context.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExecutionContextId(u64);
+impl ExecutionContextId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+impl fmt::Display for ExecutionContextId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Process-local identity for resources resolved as one affinity cohort.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AffinityGroupId(u64);
+impl AffinityGroupId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+impl fmt::Display for AffinityGroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Stable name of the Provider that owns a live resource in one Runtime.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderBinding(String);
+impl ProviderBinding {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for ProviderBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Globally unique Device selected for a device-resident resource.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DeviceBinding(DeviceId);
+impl DeviceBinding {
+    pub fn new(id: DeviceId) -> Self {
+        Self(id)
+    }
+    pub fn id(&self) -> &DeviceId {
+        &self.0
+    }
+}
+impl fmt::Display for DeviceBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Exact Capability implementation that created or constrains a live resource.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CapabilityBinding {
+    id: CapabilityId,
+    version: CapabilityVersion,
+}
+impl CapabilityBinding {
+    pub fn new(id: CapabilityId, version: CapabilityVersion) -> Self {
+        Self { id, version }
+    }
+    pub fn id(&self) -> &CapabilityId {
+        &self.id
+    }
+    pub const fn version(&self) -> CapabilityVersion {
+        self.version
+    }
+}
+impl fmt::Display for CapabilityBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.id, self.version)
+    }
+}
+
+/// Canonical content fingerprint attached under a semantic artifact role.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ArtifactBinding {
+    role: String,
+    fingerprint: String,
+}
+impl ArtifactBinding {
+    pub fn new(role: impl Into<String>, fingerprint: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            fingerprint: fingerprint.into(),
+        }
+    }
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+/// Recovery classification for state associated with an affinity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FallbackClass {
+    Transparent,
+    Restartable,
+    ProviderPinned,
+}
+
+/// Immutable ownership and compatibility facts carried by one opaque resource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceAffinity {
+    provider: Option<ProviderBinding>,
+    device: Option<DeviceBinding>,
+    capabilities: BTreeMap<CapabilityId, CapabilityBinding>,
+    artifacts: BTreeMap<String, ArtifactBinding>,
+    execution_context: Option<ExecutionContextId>,
+    group: Option<AffinityGroupId>,
+    fallback: FallbackClass,
+}
+impl ResourceAffinity {
+    pub fn new(fallback: FallbackClass) -> Self {
+        Self {
+            provider: None,
+            device: None,
+            capabilities: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
+            execution_context: None,
+            group: None,
+            fallback,
+        }
+    }
+    pub fn with_provider(mut self, binding: ProviderBinding) -> Self {
+        self.provider = Some(binding);
+        self
+    }
+    pub fn with_device(mut self, binding: DeviceBinding) -> Self {
+        self.device = Some(binding);
+        self
+    }
+    pub fn with_capability(mut self, binding: CapabilityBinding) -> Self {
+        self.capabilities.insert(binding.id.clone(), binding);
+        self
+    }
+    pub fn with_artifact(mut self, binding: ArtifactBinding) -> Self {
+        self.artifacts.insert(binding.role.clone(), binding);
+        self
+    }
+    pub fn with_execution_context(mut self, id: ExecutionContextId) -> Self {
+        self.execution_context = Some(id);
+        self
+    }
+    pub fn with_group(mut self, id: AffinityGroupId) -> Self {
+        self.group = Some(id);
+        self
+    }
+    pub fn with_fallback(mut self, fallback: FallbackClass) -> Self {
+        self.fallback = fallback;
+        self
+    }
+    pub fn provider(&self) -> Option<&ProviderBinding> {
+        self.provider.as_ref()
+    }
+    pub fn device(&self) -> Option<&DeviceBinding> {
+        self.device.as_ref()
+    }
+    pub fn capability(&self, id: &CapabilityId) -> Option<&CapabilityBinding> {
+        self.capabilities.get(id)
+    }
+    pub fn capabilities(&self) -> impl Iterator<Item = &CapabilityBinding> {
+        self.capabilities.values()
+    }
+    pub fn artifact(&self, role: &str) -> Option<&ArtifactBinding> {
+        self.artifacts.get(role)
+    }
+    pub fn artifacts(&self) -> impl Iterator<Item = &ArtifactBinding> {
+        self.artifacts.values()
+    }
+    pub const fn execution_context(&self) -> Option<ExecutionContextId> {
+        self.execution_context
+    }
+    pub const fn group(&self) -> Option<AffinityGroupId> {
+        self.group
+    }
+    pub const fn fallback(&self) -> FallbackClass {
+        self.fallback
+    }
+    pub fn validate_with(&self, other: &Self) -> Result<(), AffinityError> {
+        AffinityConstraints::try_from_affinities([self, other]).map(|_| ())
+    }
+}
+
+/// A conflict-checked aggregation of all affinities consumed by one call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AffinityConstraints {
+    affinity: ResourceAffinity,
+}
+impl AffinityConstraints {
+    pub fn new(fallback: FallbackClass) -> Self {
+        Self {
+            affinity: ResourceAffinity::new(fallback),
+        }
+    }
+    pub fn try_from_affinities<'a>(
+        affinities: impl IntoIterator<Item = &'a ResourceAffinity>,
+    ) -> Result<Self, AffinityError> {
+        let mut constraints = Self::new(FallbackClass::Transparent);
+        for affinity in affinities {
+            constraints.merge(affinity)?;
+        }
+        Ok(constraints)
+    }
+    pub fn affinity(&self) -> &ResourceAffinity {
+        &self.affinity
+    }
+    pub fn into_affinity(self) -> ResourceAffinity {
+        self.affinity
+    }
+    pub fn require_fallback(&mut self, fallback: FallbackClass) {
+        self.affinity.fallback = self.affinity.fallback.max(fallback);
+    }
+    fn merge(&mut self, incoming: &ResourceAffinity) -> Result<(), AffinityError> {
+        if let Some(found) = &incoming.provider {
+            match &self.affinity.provider {
+                Some(expected) if expected != found => {
+                    return Err(AffinityError::ProviderMismatch {
+                        expected: expected.clone(),
+                        found: found.clone(),
+                    });
+                }
+                None => self.affinity.provider = Some(found.clone()),
+                _ => {}
+            }
+        }
+        if let Some(found) = &incoming.device {
+            match &self.affinity.device {
+                Some(expected) if expected != found => {
+                    return Err(AffinityError::DeviceMismatch {
+                        expected: expected.clone(),
+                        found: found.clone(),
+                    });
+                }
+                None => self.affinity.device = Some(found.clone()),
+                _ => {}
+            }
+        }
+        if let Some(found) = incoming.execution_context {
+            match self.affinity.execution_context {
+                Some(expected) if expected != found => {
+                    return Err(AffinityError::ExecutionContextMismatch { expected, found });
+                }
+                None => self.affinity.execution_context = Some(found),
+                _ => {}
+            }
+        }
+        if let Some(found) = incoming.group {
+            match self.affinity.group {
+                Some(expected) if expected != found => {
+                    return Err(AffinityError::AffinityGroupMismatch { expected, found });
+                }
+                None => self.affinity.group = Some(found),
+                _ => {}
+            }
+        }
+        for (id, found) in &incoming.capabilities {
+            match self.affinity.capabilities.get(id) {
+                Some(expected) if expected != found => {
+                    return Err(AffinityError::CapabilityMismatch {
+                        id: id.clone(),
+                        expected: expected.version,
+                        found: found.version,
+                    });
+                }
+                None => {
+                    self.affinity.capabilities.insert(id.clone(), found.clone());
+                }
+                _ => {}
+            }
+        }
+        for (role, found) in &incoming.artifacts {
+            match self.affinity.artifacts.get(role) {
+                Some(expected) if expected != found => {
+                    return Err(AffinityError::ArtifactMismatch {
+                        role: role.clone(),
+                        expected: expected.fingerprint.clone(),
+                        found: found.fingerprint.clone(),
+                    });
+                }
+                None => {
+                    self.affinity.artifacts.insert(role.clone(), found.clone());
+                }
+                _ => {}
+            }
+        }
+        self.affinity.fallback = self.affinity.fallback.max(incoming.fallback);
+        Ok(())
+    }
+}
+
+/// Structured validation and constrained-resolution failures for affinities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AffinityError {
+    ProviderMismatch {
+        expected: ProviderBinding,
+        found: ProviderBinding,
+    },
+    DeviceMismatch {
+        expected: DeviceBinding,
+        found: DeviceBinding,
+    },
+    CapabilityMismatch {
+        id: CapabilityId,
+        expected: CapabilityVersion,
+        found: CapabilityVersion,
+    },
+    ArtifactMismatch {
+        role: String,
+        expected: String,
+        found: String,
+    },
+    ExecutionContextMismatch {
+        expected: ExecutionContextId,
+        found: ExecutionContextId,
+    },
+    AffinityGroupMismatch {
+        expected: AffinityGroupId,
+        found: AffinityGroupId,
+    },
+    BoundProviderUnavailable(ProviderBinding),
+    BoundDeviceUnavailable(DeviceBinding),
+    DeviceProviderMismatch {
+        device: DeviceBinding,
+        provider: ProviderBinding,
+        owner: ProviderBinding,
+    },
+    ProviderDoesNotImplementCapability {
+        provider: ProviderBinding,
+        capability: CapabilityBinding,
+    },
+    NoCompatibleProvider(CapabilityBinding),
+    RuntimeNotInitialized,
+}
+impl fmt::Display for AffinityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProviderMismatch { expected, found } => write!(
+                f,
+                "resource provider mismatch: expected '{expected}', found '{found}'"
+            ),
+            Self::DeviceMismatch { expected, found } => write!(
+                f,
+                "resource device mismatch: expected '{expected}', found '{found}'"
+            ),
+            Self::CapabilityMismatch {
+                id,
+                expected,
+                found,
+            } => write!(
+                f,
+                "resource capability mismatch for '{id}': expected {expected}, found {found}"
+            ),
+            Self::ArtifactMismatch {
+                role,
+                expected,
+                found,
+            } => write!(
+                f,
+                "resource artifact mismatch for role '{role}': expected '{expected}', found '{found}'"
+            ),
+            Self::ExecutionContextMismatch { expected, found } => write!(
+                f,
+                "resource execution-context mismatch: expected {expected}, found {found}"
+            ),
+            Self::AffinityGroupMismatch { expected, found } => write!(
+                f,
+                "resource affinity-group mismatch: expected {expected}, found {found}"
+            ),
+            Self::BoundProviderUnavailable(provider) => {
+                write!(f, "bound provider '{provider}' is unavailable")
+            }
+            Self::BoundDeviceUnavailable(device) => {
+                write!(f, "bound device '{device}' is unavailable")
+            }
+            Self::DeviceProviderMismatch {
+                device,
+                provider,
+                owner,
+            } => write!(
+                f,
+                "bound device '{device}' belongs to provider '{owner}', not '{provider}'"
+            ),
+            Self::ProviderDoesNotImplementCapability {
+                provider,
+                capability,
+            } => write!(
+                f,
+                "bound provider '{provider}' does not implement compatible capability '{capability}'"
+            ),
+            Self::NoCompatibleProvider(capability) => {
+                write!(
+                    f,
+                    "no Provider implements compatible capability '{capability}'"
+                )
+            }
+            Self::RuntimeNotInitialized => {
+                write!(f, "runtime is not initialized for affinity resolution")
+            }
+        }
+    }
+}
+impl Error for AffinityError {}
+
+/// Host-side opaque value paired with immutable Resource Affinity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AffinityResource<T> {
+    value: T,
+    affinity: ResourceAffinity,
+}
+impl<T> AffinityResource<T> {
+    pub fn new(value: T, affinity: ResourceAffinity) -> Self {
+        Self { value, affinity }
+    }
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+    pub fn affinity(&self) -> &ResourceAffinity {
+        &self.affinity
+    }
+    pub fn into_parts(self) -> (T, ResourceAffinity) {
+        (self.value, self.affinity)
+    }
+}
+
+/// One coherent Provider and Capability selection plus affinity for its output.
+pub struct AffinityResolution<'a> {
+    provider: &'a dyn Provider,
+    capability: &'a Capability,
+    affinity: ResourceAffinity,
+}
+impl<'a> AffinityResolution<'a> {
+    pub fn provider(&self) -> &'a dyn Provider {
+        self.provider
+    }
+    pub fn capability(&self) -> &'a Capability {
+        self.capability
+    }
+    pub fn affinity(&self) -> &ResourceAffinity {
+        &self.affinity
+    }
+    pub fn into_affinity(self) -> ResourceAffinity {
+        self.affinity
+    }
+}
+
 /// Package-qualified identifier of the portable Compute capability.
 pub const COMPUTE_CAPABILITY_ID: &str = "magnetar:compute/run";
 /// WIT package that defines the Compute capability contract.
@@ -785,6 +1250,37 @@ impl ProviderRegistry {
                     .then_some(capability)
             })
     }
+    /// Returns one exact Capability only when `provider` advertises it.
+    pub fn capability_for_provider(
+        &self,
+        id: &CapabilityId,
+        version: CapabilityVersion,
+        provider: &str,
+    ) -> Option<&Capability> {
+        let capability = self.capability(id, version)?;
+        self.providers_for(capability)
+            .any(|candidate| candidate == provider)
+            .then_some(capability)
+    }
+    /// Returns the latest compatible version advertised by one Provider.
+    pub fn resolve_capability_for_provider(
+        &self,
+        id: &CapabilityId,
+        required: CapabilityVersion,
+        provider: &str,
+    ) -> Option<&Capability> {
+        self.capabilities
+            .get(id)?
+            .iter()
+            .rev()
+            .find_map(|(_, capability)| {
+                (capability.version.is_compatible_with(required)
+                    && self
+                        .providers_for(capability)
+                        .any(|candidate| candidate == provider))
+                .then_some(capability)
+            })
+    }
     pub fn validate_dependencies(&self) -> Result<(), ProviderError> {
         for capability in self.capabilities() {
             for (dependency, version) in &capability.descriptor.dependencies {
@@ -861,6 +1357,121 @@ impl ProviderLoader {
     }
     pub fn resolve_providers(&self, capability: &Capability) -> Vec<&dyn Provider> {
         self.try_resolve_providers(capability).unwrap_or_default()
+    }
+    fn resolve_with_constraints<'a>(
+        &'a self,
+        requested: &Capability,
+        constraints: &AffinityConstraints,
+    ) -> Result<(&'a dyn Provider, &'a Capability), AffinityError> {
+        let affinity = constraints.affinity();
+        let mut bound_provider = affinity.provider().cloned();
+
+        if let Some(device) = affinity.device() {
+            let owner = self
+                .registry
+                .provider_for_device(device.id())
+                .map(ProviderBinding::new)
+                .ok_or_else(|| AffinityError::BoundDeviceUnavailable(device.clone()))?;
+            if let Some(provider) = &bound_provider
+                && provider != &owner
+            {
+                return Err(AffinityError::DeviceProviderMismatch {
+                    device: device.clone(),
+                    provider: provider.clone(),
+                    owner,
+                });
+            }
+            bound_provider = Some(owner);
+        }
+
+        if let Some(provider_binding) = bound_provider {
+            let provider = self
+                .provider(provider_binding.as_str())
+                .ok_or_else(|| AffinityError::BoundProviderUnavailable(provider_binding.clone()))?;
+            let requested_binding = affinity
+                .capability(&requested.id)
+                .cloned()
+                .unwrap_or_else(|| CapabilityBinding::new(requested.id.clone(), requested.version));
+            if let Some(bound) = affinity.capability(&requested.id)
+                && !bound.version.is_compatible_with(requested.version)
+            {
+                return Err(AffinityError::CapabilityMismatch {
+                    id: requested.id.clone(),
+                    expected: requested.version,
+                    found: bound.version,
+                });
+            }
+            for binding in affinity.capabilities() {
+                if self
+                    .registry
+                    .capability_for_provider(
+                        binding.id(),
+                        binding.version(),
+                        provider_binding.as_str(),
+                    )
+                    .is_none()
+                {
+                    return Err(AffinityError::ProviderDoesNotImplementCapability {
+                        provider: provider_binding.clone(),
+                        capability: binding.clone(),
+                    });
+                }
+            }
+            let capability = if let Some(bound) = affinity.capability(&requested.id) {
+                self.registry.capability_for_provider(
+                    &requested.id,
+                    bound.version,
+                    provider_binding.as_str(),
+                )
+            } else {
+                self.registry.resolve_capability_for_provider(
+                    &requested.id,
+                    requested.version,
+                    provider_binding.as_str(),
+                )
+            }
+            .ok_or(AffinityError::ProviderDoesNotImplementCapability {
+                provider: provider_binding,
+                capability: requested_binding,
+            })?;
+            return Ok((provider, capability));
+        }
+
+        let requested_binding = affinity
+            .capability(&requested.id)
+            .cloned()
+            .unwrap_or_else(|| CapabilityBinding::new(requested.id.clone(), requested.version));
+        let capability = if let Some(bound) = affinity.capability(&requested.id) {
+            if !bound.version.is_compatible_with(requested.version) {
+                return Err(AffinityError::CapabilityMismatch {
+                    id: requested.id.clone(),
+                    expected: requested.version,
+                    found: bound.version,
+                });
+            }
+            self.registry.capability(&requested.id, bound.version)
+        } else {
+            self.registry
+                .resolve_capability(&requested.id, requested.version)
+        }
+        .ok_or_else(|| AffinityError::NoCompatibleProvider(requested_binding.clone()))?;
+
+        let provider = self
+            .registry
+            .providers_for(capability)
+            .find_map(|name| {
+                let provider = self.provider(name)?;
+                affinity
+                    .capabilities()
+                    .all(|binding| {
+                        self.registry
+                            .capability_for_provider(binding.id(), binding.version(), name)
+                            .is_some()
+                    })
+                    .then_some(provider)
+            })
+            .ok_or(AffinityError::NoCompatibleProvider(requested_binding))?;
+        Ok((provider, capability))
     }
     pub fn register_provider(&mut self, provider: Arc<dyn Provider>) -> Result<(), ProviderError> {
         let metadata = provider.metadata();
@@ -985,16 +1596,42 @@ impl ProviderLoader {
     }
 }
 
+static NEXT_EXECUTION_CONTEXT_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+static NEXT_AFFINITY_GROUP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_execution_context_id() -> ExecutionContextId {
+    ExecutionContextId::new(
+        NEXT_EXECUTION_CONTEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+fn next_affinity_group_id() -> AffinityGroupId {
+    AffinityGroupId::new(NEXT_AFFINITY_GROUP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeConfig {
     pub preferred_backend: Option<String>,
 }
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionContext {
+    id: ExecutionContextId,
     config: RuntimeConfig,
     backend_name: Option<String>,
 }
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self {
+            id: next_execution_context_id(),
+            config: RuntimeConfig::default(),
+            backend_name: None,
+        }
+    }
+}
 impl ExecutionContext {
+    pub const fn id(&self) -> ExecutionContextId {
+        self.id
+    }
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
     }
@@ -1034,6 +1671,7 @@ impl RuntimeBuilder {
         }
         let mut runtime = Runtime {
             context: ExecutionContext {
+                id: next_execution_context_id(),
                 config: self.config,
                 backend_name: None,
             },
@@ -1093,6 +1731,51 @@ impl Runtime {
         capability: &Capability,
     ) -> Result<Vec<&dyn Provider>, ProviderError> {
         self.providers.try_resolve_providers(capability)
+    }
+    /// Resolves one coherent Provider for resources that already carry state.
+    ///
+    /// A group is created only when `dependencies` is non-empty and no input
+    /// group exists. Independent resources therefore remain shareable until a
+    /// dependent operation creates a grouped resource from them.
+    pub fn resolve_with_affinity<'a>(
+        &'a self,
+        capability: &Capability,
+        dependencies: &[&ResourceAffinity],
+        fallback: FallbackClass,
+    ) -> Result<AffinityResolution<'a>, AffinityError> {
+        if !self.initialized {
+            return Err(AffinityError::RuntimeNotInitialized);
+        }
+        let mut constraints =
+            AffinityConstraints::try_from_affinities(dependencies.iter().copied())?;
+        constraints.require_fallback(fallback);
+        constraints.merge(
+            &ResourceAffinity::new(FallbackClass::Transparent)
+                .with_execution_context(self.context.id),
+        )?;
+        if !dependencies.is_empty() && constraints.affinity().group().is_none() {
+            constraints.merge(
+                &ResourceAffinity::new(FallbackClass::Transparent)
+                    .with_group(next_affinity_group_id()),
+            )?;
+        }
+
+        let (provider, selected) = self
+            .providers
+            .resolve_with_constraints(capability, &constraints)?;
+        let provider_binding = ProviderBinding::new(provider.metadata().name);
+        let affinity = constraints
+            .into_affinity()
+            .with_provider(provider_binding)
+            .with_capability(CapabilityBinding::new(
+                selected.id.clone(),
+                selected.version,
+            ));
+        Ok(AffinityResolution {
+            provider,
+            capability: selected,
+            affinity,
+        })
     }
     /// Resolves providers for a component's WIT import without exposing a
     /// provider dependency to the component itself.
@@ -1271,6 +1954,17 @@ mod tests {
             CapabilityDescriptor::new("test capability")
                 .with_contract(WitInterface::new(name, version.to_string())),
         )
+    }
+    fn capability_binding(name: &str, version: CapabilityVersion) -> CapabilityBinding {
+        CapabilityBinding::new(CapabilityId::new(name), version)
+    }
+    fn provider_with_capabilities(
+        name: &str,
+        capabilities: impl IntoIterator<Item = Capability>,
+    ) -> TestProvider {
+        let mut provider = TestProvider::new(name);
+        provider.metadata.capabilities.extend(capabilities);
+        provider
     }
     impl Provider for TestProvider {
         fn metadata(&self) -> ProviderMetadata {
@@ -1580,6 +2274,355 @@ mod tests {
         assert!(m.registry().backend("test").is_some());
         m.shutdown().unwrap();
         assert!(p.shut_down.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn execution_context_default_allocates_unique_ids() {
+        let first = ExecutionContext::default();
+        let second = ExecutionContext::default();
+        assert_ne!(first.id(), second.id());
+        assert_ne!(first.id(), ExecutionContextId::default());
+    }
+
+    #[test]
+    fn affinity_constraints_preserve_compatible_facts_and_fallback_precedence() {
+        let capability_a =
+            capability_binding("magnetar:compute/run", CapabilityVersion::new(1, 1, 0));
+        let capability_b =
+            capability_binding("magnetar:tokenize/run", CapabilityVersion::new(1, 0, 0));
+        let provider = ProviderBinding::new("provider-a");
+        let device = DeviceBinding::new(DeviceId::new("gpu:0"));
+        let context = ExecutionContextId::new(42);
+        let group = AffinityGroupId::new(7);
+
+        let model = ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(provider.clone())
+            .with_device(device.clone())
+            .with_capability(capability_a.clone())
+            .with_artifact(ArtifactBinding::new("model", "sha256:model"))
+            .with_artifact(ArtifactBinding::new("bundle", "sha256:bundle"))
+            .with_execution_context(context)
+            .with_group(group);
+        let tokenizer = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(provider)
+            .with_device(device)
+            .with_capability(capability_b.clone())
+            .with_artifact(ArtifactBinding::new("tokenizer", "sha256:tokenizer"))
+            .with_artifact(ArtifactBinding::new("bundle", "sha256:bundle"))
+            .with_execution_context(context)
+            .with_group(group);
+
+        let constraints = AffinityConstraints::try_from_affinities([&model, &tokenizer]).unwrap();
+        let aggregate = constraints.affinity();
+        assert_eq!(aggregate.capability(capability_a.id()), Some(&capability_a));
+        assert_eq!(aggregate.capability(capability_b.id()), Some(&capability_b));
+        assert_eq!(
+            aggregate.artifact("model").unwrap().fingerprint(),
+            "sha256:model"
+        );
+        assert_eq!(
+            aggregate.artifact("tokenizer").unwrap().fingerprint(),
+            "sha256:tokenizer"
+        );
+        assert_eq!(
+            aggregate.artifact("bundle").unwrap().fingerprint(),
+            "sha256:bundle"
+        );
+        assert_eq!(aggregate.fallback(), FallbackClass::ProviderPinned);
+    }
+
+    #[test]
+    fn affinity_constraints_report_each_binding_conflict() {
+        let base = ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new("provider-a"))
+            .with_device(DeviceBinding::new(DeviceId::new("gpu:0")))
+            .with_capability(capability_binding(
+                "magnetar:compute/run",
+                CapabilityVersion::new(1, 1, 0),
+            ))
+            .with_artifact(ArtifactBinding::new("bundle", "sha256:a"))
+            .with_execution_context(ExecutionContextId::new(1))
+            .with_group(AffinityGroupId::new(1));
+
+        let provider_conflict = base
+            .clone()
+            .with_provider(ProviderBinding::new("provider-b"));
+        assert!(matches!(
+            base.validate_with(&provider_conflict),
+            Err(AffinityError::ProviderMismatch { .. })
+        ));
+
+        let device_conflict = base
+            .clone()
+            .with_device(DeviceBinding::new(DeviceId::new("gpu:1")));
+        assert!(matches!(
+            base.validate_with(&device_conflict),
+            Err(AffinityError::DeviceMismatch { .. })
+        ));
+
+        let capability_conflict = base.clone().with_capability(capability_binding(
+            "magnetar:compute/run",
+            CapabilityVersion::new(1, 2, 0),
+        ));
+        assert!(matches!(
+            base.validate_with(&capability_conflict),
+            Err(AffinityError::CapabilityMismatch { .. })
+        ));
+
+        let artifact_conflict = base
+            .clone()
+            .with_artifact(ArtifactBinding::new("bundle", "sha256:b"));
+        assert!(matches!(
+            base.validate_with(&artifact_conflict),
+            Err(AffinityError::ArtifactMismatch { .. })
+        ));
+
+        let context_conflict = base
+            .clone()
+            .with_execution_context(ExecutionContextId::new(2));
+        assert!(matches!(
+            base.validate_with(&context_conflict),
+            Err(AffinityError::ExecutionContextMismatch { .. })
+        ));
+
+        let group_conflict = base.clone().with_group(AffinityGroupId::new(2));
+        assert!(matches!(
+            base.validate_with(&group_conflict),
+            Err(AffinityError::AffinityGroupMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn affinity_resource_keeps_value_and_affinity_together() {
+        let affinity = ResourceAffinity::new(FallbackClass::Restartable)
+            .with_provider(ProviderBinding::new("provider-a"));
+        let resource = AffinityResource::new("native-handle", affinity.clone());
+
+        assert_eq!(resource.value(), &"native-handle");
+        assert_eq!(resource.affinity(), &affinity);
+        assert_eq!(resource.into_parts(), ("native-handle", affinity));
+    }
+
+    #[test]
+    fn affinity_resolution_uses_provider_local_compatible_version() {
+        let requested = capability("magnetar:compute/run", CapabilityVersion::new(1, 1, 0));
+        let provider_a = provider_with_capabilities(
+            "provider-a",
+            [capability(
+                "magnetar:compute/run",
+                CapabilityVersion::new(1, 1, 0),
+            )],
+        );
+        let provider_b = provider_with_capabilities(
+            "provider-b",
+            [capability(
+                "magnetar:compute/run",
+                CapabilityVersion::new(1, 2, 0),
+            )],
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider_a))
+            .register_provider(Arc::new(provider_b))
+            .build()
+            .unwrap();
+        let dependency = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(ProviderBinding::new("provider-a"));
+
+        let resolution = runtime
+            .resolve_with_affinity(&requested, &[&dependency], FallbackClass::ProviderPinned)
+            .unwrap();
+        assert_eq!(resolution.provider().metadata().name, "provider-a");
+        assert_eq!(
+            resolution.capability().version,
+            CapabilityVersion::new(1, 1, 0)
+        );
+        assert_eq!(
+            resolution
+                .affinity()
+                .provider()
+                .map(ProviderBinding::as_str),
+            Some("provider-a")
+        );
+    }
+
+    #[test]
+    fn affinity_resolution_preserves_exact_live_capability_version() {
+        let requested = capability("magnetar:compute/run", CapabilityVersion::new(1, 1, 0));
+        let provider = provider_with_capabilities(
+            "provider-a",
+            [
+                capability("magnetar:compute/run", CapabilityVersion::new(1, 1, 0)),
+                capability("magnetar:compute/run", CapabilityVersion::new(1, 2, 0)),
+            ],
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let dependency = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(ProviderBinding::new("provider-a"))
+            .with_capability(capability_binding(
+                "magnetar:compute/run",
+                CapabilityVersion::new(1, 1, 0),
+            ));
+
+        let resolution = runtime
+            .resolve_with_affinity(&requested, &[&dependency], FallbackClass::ProviderPinned)
+            .unwrap();
+        assert_eq!(
+            resolution.capability().version,
+            CapabilityVersion::new(1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn affinity_resolution_requires_selected_provider_to_implement_all_bound_capabilities() {
+        let compute = capability("magnetar:compute/run", CapabilityVersion::new(1, 1, 0));
+        let provider = provider_with_capabilities("provider-a", [compute.clone()]);
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let dependency = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(ProviderBinding::new("provider-a"))
+            .with_capability(capability_binding(
+                "magnetar:tokenize/run",
+                CapabilityVersion::new(1, 0, 0),
+            ));
+
+        assert!(matches!(
+            runtime.resolve_with_affinity(&compute, &[&dependency], FallbackClass::ProviderPinned),
+            Err(AffinityError::ProviderDoesNotImplementCapability { .. })
+        ));
+    }
+
+    #[test]
+    fn affinity_resolution_reconciles_devices_with_provider_ownership() {
+        let compute = compute_capability();
+        let device_id = DeviceId::new("gpu:0");
+        let mut provider = provider_with_capabilities("provider-a", [compute.clone()]);
+        provider
+            .devices
+            .push(Arc::new(DeviceDescriptor::new(DeviceMetadata::new(
+                device_id.clone(),
+                "test gpu",
+                DeviceType::Gpu,
+                "provider-a",
+            ))));
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let dependency = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_device(DeviceBinding::new(device_id.clone()));
+
+        let resolution = runtime
+            .resolve_with_affinity(&compute, &[&dependency], FallbackClass::ProviderPinned)
+            .unwrap();
+        assert_eq!(
+            resolution.affinity().device().map(DeviceBinding::id),
+            Some(&device_id)
+        );
+        assert_eq!(
+            resolution
+                .affinity()
+                .provider()
+                .map(ProviderBinding::as_str),
+            Some("provider-a")
+        );
+
+        let mismatched = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(ProviderBinding::new("other"))
+            .with_device(DeviceBinding::new(device_id));
+        assert!(matches!(
+            runtime.resolve_with_affinity(&compute, &[&mismatched], FallbackClass::ProviderPinned),
+            Err(AffinityError::DeviceProviderMismatch { .. })
+        ));
+
+        let missing = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_device(DeviceBinding::new(DeviceId::new("missing")));
+        assert!(matches!(
+            runtime.resolve_with_affinity(&compute, &[&missing], FallbackClass::ProviderPinned),
+            Err(AffinityError::BoundDeviceUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn affinity_resolution_reports_unavailable_bound_provider_without_fallback() {
+        let compute = compute_capability();
+        let mut fallback = provider_with_capabilities("fallback", [compute.clone()]);
+        fallback.metadata.capabilities.insert(compute.clone());
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(fallback))
+            .build()
+            .unwrap();
+        let dependency = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(ProviderBinding::new("missing"));
+
+        assert!(matches!(
+            runtime.resolve_with_affinity(&compute, &[&dependency], FallbackClass::ProviderPinned),
+            Err(AffinityError::BoundProviderUnavailable(provider)) if provider.as_str() == "missing"
+        ));
+    }
+
+    #[test]
+    fn affinity_resolution_rejects_foreign_context_and_preserves_groups() {
+        let compute = compute_capability();
+        let first = Runtime::builder()
+            .register_provider(Arc::new(provider_with_capabilities(
+                "provider-a",
+                [compute.clone()],
+            )))
+            .build()
+            .unwrap();
+        let second = Runtime::builder()
+            .register_provider(Arc::new(provider_with_capabilities(
+                "provider-a",
+                [compute.clone()],
+            )))
+            .build()
+            .unwrap();
+
+        let ungrouped = first
+            .resolve_with_affinity(&compute, &[], FallbackClass::ProviderPinned)
+            .unwrap()
+            .into_affinity();
+        assert_eq!(ungrouped.group(), None);
+
+        let grouped = first
+            .resolve_with_affinity(&compute, &[&ungrouped], FallbackClass::ProviderPinned)
+            .unwrap()
+            .into_affinity();
+        assert!(grouped.group().is_some());
+
+        let inherited = first
+            .resolve_with_affinity(&compute, &[&grouped], FallbackClass::ProviderPinned)
+            .unwrap()
+            .into_affinity();
+        assert_eq!(inherited.group(), grouped.group());
+
+        assert!(matches!(
+            second.resolve_with_affinity(&compute, &[&grouped], FallbackClass::ProviderPinned),
+            Err(AffinityError::ExecutionContextMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn affinity_resolution_rejects_shutdown_runtime() {
+        let compute = compute_capability();
+        let mut runtime = Runtime::builder()
+            .register_provider(Arc::new(provider_with_capabilities(
+                "provider-a",
+                [compute.clone()],
+            )))
+            .build()
+            .unwrap();
+        runtime.shutdown();
+
+        assert!(matches!(
+            runtime.resolve_with_affinity(&compute, &[], FallbackClass::Transparent),
+            Err(AffinityError::RuntimeNotInitialized)
+        ));
     }
 
     struct TestComponent {
