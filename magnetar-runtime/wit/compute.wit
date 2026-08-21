@@ -36,9 +36,17 @@ interface run {
 
   /// Portable layout categories. Provider-native layout details stay opaque.
   enum layout-constraint {
-    dense,
+    contiguous,
     strided,
     provider-opaque,
+  }
+
+  record tensor-descriptor-limits {
+    max-rank: u64,
+    max-dimension: u64,
+    max-elements: u64,
+    max-bytes: u64,
+    allow-zero-sized: bool,
   }
 
   /// Portable precision policy categories for operation-family support.
@@ -53,8 +61,10 @@ interface run {
   record operation-family-support {
     family: operation-family,
     element-types: list<element-type>,
+    provider-specific-element-types: list<string>,
     layouts: list<layout-constraint>,
     precision-modes: list<precision-mode>,
+    descriptor-limits: tensor-descriptor-limits,
   }
 
   /// Placeholder until future revisions define operation-specific schemas.
@@ -70,22 +80,49 @@ interface run {
     dimensions: list<u64>,
   }
 
-  /// Tensor view metadata. Strides and offsets are expressed in elements.
+  variant dtype-descriptor {
+    portable(element-type),
+    provider-specific(tuple<string, u64>),
+  }
+
+  /// Portable layout metadata. Strides and offsets are expressed in elements.
+  variant layout-descriptor {
+    contiguous,
+    strided(tuple<list<s64>, u64>),
+    provider-opaque(string),
+  }
+
+  variant view-source {
+    descriptor,
+    resource(string),
+  }
+
+  /// Tensor view metadata. A materialized copy is a separate tensor resource.
   record view-descriptor {
+    source: view-source,
     offset-elements: u64,
-    strides-elements: list<u64>,
+    strides-elements: list<s64>,
   }
 
   /// Portable tensor metadata. Storage remains Provider-owned and opaque.
   record tensor-descriptor {
     shape: shape-descriptor,
-    element-type: element-type,
-    view: view-descriptor,
+    dtype: dtype-descriptor,
+    layout: layout-descriptor,
+    view: option<view-descriptor>,
+  }
+
+  record tensor-resource-descriptor {
+    resource-id: string,
+    descriptor: tensor-descriptor,
   }
 
   /// Stable error codes. Provider-specific detail belongs in diagnostics.
   enum compute-error-code {
     invalid-descriptor,
+    invalid-shape,
+    invalid-layout,
+    size-overflow,
     invalid-graph,
     invalid-state,
     unsupported-operation-family,

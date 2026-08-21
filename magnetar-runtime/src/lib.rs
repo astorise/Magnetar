@@ -1500,12 +1500,318 @@ pub enum ComputeDType {
     Float32,
     Float64,
 }
+impl ComputeDType {
+    pub const fn size_bytes(self) -> u64 {
+        match self {
+            Self::Boolean | Self::UInt8 | Self::SInt8 => 1,
+            Self::UInt16 | Self::SInt16 | Self::Float16 | Self::BrainFloat16 => 2,
+            Self::UInt32 | Self::SInt32 | Self::Float32 => 4,
+            Self::UInt64 | Self::SInt64 | Self::Float64 => 8,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DTypeDescriptor {
+    Portable(ComputeDType),
+    ProviderSpecific { id: String, size_bytes: u64 },
+}
+impl DTypeDescriptor {
+    pub const fn portable(dtype: ComputeDType) -> Self {
+        Self::Portable(dtype)
+    }
+    pub fn size_bytes(&self) -> u64 {
+        match self {
+            Self::Portable(dtype) => dtype.size_bytes(),
+            Self::ProviderSpecific { size_bytes, .. } => *size_bytes,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ComputeLayout {
     Dense,
     Strided,
     ProviderOpaque,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LayoutDescriptor {
+    Contiguous,
+    Strided {
+        strides_elements: Vec<i64>,
+        offset_elements: u64,
+    },
+    ProviderOpaque {
+        layout_id: String,
+    },
+}
+impl LayoutDescriptor {
+    pub const fn kind(&self) -> ComputeLayout {
+        match self {
+            Self::Contiguous => ComputeLayout::Dense,
+            Self::Strided { .. } => ComputeLayout::Strided,
+            Self::ProviderOpaque { .. } => ComputeLayout::ProviderOpaque,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TensorResourceId(String);
+impl TensorResourceId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for TensorResourceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShapeDescriptor {
+    pub dimensions: Vec<u64>,
+}
+impl ShapeDescriptor {
+    pub fn new(dimensions: impl Into<Vec<u64>>) -> Self {
+        Self {
+            dimensions: dimensions.into(),
+        }
+    }
+    pub fn rank(&self) -> u64 {
+        self.dimensions.len() as u64
+    }
+    pub fn element_count(&self) -> Result<u64, ComputeValidationError> {
+        self.dimensions.iter().try_fold(1_u64, |acc, dimension| {
+            acc.checked_mul(*dimension)
+                .ok_or(ComputeValidationError::SizeOverflow {
+                    reason: "tensor element count overflows u64".into(),
+                })
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TensorViewSource {
+    Descriptor,
+    Resource(TensorResourceId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ViewDescriptor {
+    pub source: TensorViewSource,
+    pub offset_elements: u64,
+    pub strides_elements: Vec<i64>,
+}
+impl ViewDescriptor {
+    pub fn from_resource(
+        source: TensorResourceId,
+        offset_elements: u64,
+        strides_elements: impl Into<Vec<i64>>,
+    ) -> Self {
+        Self {
+            source: TensorViewSource::Resource(source),
+            offset_elements,
+            strides_elements: strides_elements.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TensorDescriptor {
+    pub shape: ShapeDescriptor,
+    pub dtype: DTypeDescriptor,
+    pub layout: LayoutDescriptor,
+    pub view: Option<ViewDescriptor>,
+}
+impl TensorDescriptor {
+    pub fn new(shape: ShapeDescriptor, dtype: DTypeDescriptor, layout: LayoutDescriptor) -> Self {
+        Self {
+            shape,
+            dtype,
+            layout,
+            view: None,
+        }
+    }
+    pub fn with_view(mut self, view: ViewDescriptor) -> Self {
+        self.view = Some(view);
+        self
+    }
+    pub fn materialized(shape: ShapeDescriptor, dtype: DTypeDescriptor) -> Self {
+        Self::new(shape, dtype, LayoutDescriptor::Contiguous)
+    }
+    pub fn byte_size(&self) -> Result<u64, ComputeValidationError> {
+        self.shape
+            .element_count()?
+            .checked_mul(self.dtype.size_bytes())
+            .ok_or(ComputeValidationError::SizeOverflow {
+                reason: "tensor byte size overflows u64".into(),
+            })
+    }
+    pub fn validate(&self, limits: &TensorDescriptorLimits) -> Result<(), ComputeValidationError> {
+        limits.validate_shape(&self.shape)?;
+        let byte_size = self.byte_size()?;
+        if byte_size > limits.max_bytes {
+            return Err(ComputeValidationError::SizeOverflow {
+                reason: format!(
+                    "tensor byte size {byte_size} exceeds provider limit {}",
+                    limits.max_bytes
+                ),
+            });
+        }
+        validate_layout_bounds(&self.shape, &self.layout)?;
+        if let Some(view) = &self.view {
+            validate_strides(&self.shape, &view.strides_elements, view.offset_elements)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TensorResourceDescriptor {
+    pub id: TensorResourceId,
+    pub descriptor: TensorDescriptor,
+    pub affinity: ResourceAffinity,
+}
+impl TensorResourceDescriptor {
+    pub fn new(
+        id: TensorResourceId,
+        descriptor: TensorDescriptor,
+        affinity: ResourceAffinity,
+    ) -> Self {
+        Self {
+            id,
+            descriptor,
+            affinity,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TensorDescriptorLimits {
+    pub max_rank: u64,
+    pub max_dimension: u64,
+    pub max_elements: u64,
+    pub max_bytes: u64,
+    pub allow_zero_sized: bool,
+}
+impl Default for TensorDescriptorLimits {
+    fn default() -> Self {
+        Self {
+            max_rank: 64,
+            max_dimension: u64::MAX,
+            max_elements: u64::MAX,
+            max_bytes: u64::MAX,
+            allow_zero_sized: false,
+        }
+    }
+}
+impl TensorDescriptorLimits {
+    pub fn validate_shape(&self, shape: &ShapeDescriptor) -> Result<(), ComputeValidationError> {
+        if shape.rank() > self.max_rank {
+            return Err(ComputeValidationError::InvalidShape {
+                reason: format!(
+                    "tensor rank {} exceeds provider limit {}",
+                    shape.rank(),
+                    self.max_rank
+                ),
+            });
+        }
+        for dimension in &shape.dimensions {
+            if *dimension > self.max_dimension {
+                return Err(ComputeValidationError::InvalidShape {
+                    reason: format!(
+                        "tensor dimension {dimension} exceeds provider limit {}",
+                        self.max_dimension
+                    ),
+                });
+            }
+            if *dimension == 0 && !self.allow_zero_sized {
+                return Err(ComputeValidationError::InvalidShape {
+                    reason: "zero-sized tensor dimensions are not supported".into(),
+                });
+            }
+        }
+        let element_count = shape.element_count()?;
+        if element_count > self.max_elements {
+            return Err(ComputeValidationError::SizeOverflow {
+                reason: format!(
+                    "tensor element count {element_count} exceeds provider limit {}",
+                    self.max_elements
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_layout_bounds(
+    shape: &ShapeDescriptor,
+    layout: &LayoutDescriptor,
+) -> Result<(), ComputeValidationError> {
+    match layout {
+        LayoutDescriptor::Contiguous | LayoutDescriptor::ProviderOpaque { .. } => Ok(()),
+        LayoutDescriptor::Strided {
+            strides_elements,
+            offset_elements,
+        } => validate_strides(shape, strides_elements, *offset_elements),
+    }
+}
+
+fn validate_strides(
+    shape: &ShapeDescriptor,
+    strides_elements: &[i64],
+    offset_elements: u64,
+) -> Result<(), ComputeValidationError> {
+    if strides_elements.len() as u64 != shape.rank() {
+        return Err(ComputeValidationError::InvalidLayout {
+            reason: format!(
+                "stride rank {} does not match tensor rank {}",
+                strides_elements.len(),
+                shape.rank()
+            ),
+        });
+    }
+    let element_count = shape.element_count()?;
+    if element_count == 0 {
+        return Ok(());
+    }
+    if offset_elements >= element_count {
+        return Err(ComputeValidationError::InvalidLayout {
+            reason: "view offset is outside tensor bounds".into(),
+        });
+    }
+    let max_relative_offset = shape.dimensions.iter().zip(strides_elements).try_fold(
+        0_u64,
+        |acc, (dimension, stride)| {
+            let stride = stride.unsigned_abs();
+            let extent = dimension.saturating_sub(1);
+            let span = extent
+                .checked_mul(stride)
+                .ok_or(ComputeValidationError::SizeOverflow {
+                    reason: "strided layout span overflows u64".into(),
+                })?;
+            acc.checked_add(span)
+                .ok_or(ComputeValidationError::SizeOverflow {
+                    reason: "strided layout span overflows u64".into(),
+                })
+        },
+    )?;
+    let max_offset = offset_elements.checked_add(max_relative_offset).ok_or(
+        ComputeValidationError::SizeOverflow {
+            reason: "strided layout offset overflows u64".into(),
+        },
+    )?;
+    if max_offset >= element_count {
+        return Err(ComputeValidationError::InvalidLayout {
+            reason: "strided layout addresses elements outside tensor bounds".into(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1519,8 +1825,10 @@ pub enum ComputePrecision {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ComputeOperationSupport {
     pub dtypes: BTreeSet<ComputeDType>,
+    pub provider_specific_dtypes: BTreeSet<String>,
     pub layouts: BTreeSet<ComputeLayout>,
     pub precision_modes: BTreeSet<ComputePrecision>,
+    pub descriptor_limits: TensorDescriptorLimits,
 }
 impl ComputeOperationSupport {
     pub fn new() -> Self {
@@ -1530,8 +1838,20 @@ impl ComputeOperationSupport {
         self.dtypes.extend(dtypes);
         self
     }
+    pub fn with_provider_specific_dtypes(
+        mut self,
+        dtypes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.provider_specific_dtypes
+            .extend(dtypes.into_iter().map(Into::into));
+        self
+    }
     pub fn with_layouts(mut self, layouts: impl IntoIterator<Item = ComputeLayout>) -> Self {
         self.layouts.extend(layouts);
+        self
+    }
+    pub fn with_descriptor_limits(mut self, limits: TensorDescriptorLimits) -> Self {
+        self.descriptor_limits = limits;
         self
     }
     pub fn with_precision_modes(
@@ -1563,6 +1883,15 @@ impl ComputeOperationSupport {
                 layout,
             });
         }
+        for tensor in &operation.tensors {
+            tensor.validate(&self.descriptor_limits)?;
+            self.supports_dtype(&tensor.dtype, operation.family)?;
+            self.supports_layout(tensor.layout.kind(), operation.family)?;
+            if let Some(view) = &tensor.view {
+                self.supports_layout(ComputeLayout::Strided, operation.family)?;
+                validate_strides(&tensor.shape, &view.strides_elements, view.offset_elements)?;
+            }
+        }
         if let Some(precision) = operation.precision
             && !self.precision_modes.is_empty()
             && !self.precision_modes.contains(&precision)
@@ -1571,6 +1900,41 @@ impl ComputeOperationSupport {
                 family: operation.family,
                 precision,
             });
+        }
+        Ok(())
+    }
+    fn supports_dtype(
+        &self,
+        dtype: &DTypeDescriptor,
+        family: ComputeOperationFamily,
+    ) -> Result<(), ComputeValidationError> {
+        match dtype {
+            DTypeDescriptor::Portable(dtype) => {
+                if !self.dtypes.is_empty() && !self.dtypes.contains(dtype) {
+                    return Err(ComputeValidationError::UnsupportedDType {
+                        family,
+                        dtype: *dtype,
+                    });
+                }
+            }
+            DTypeDescriptor::ProviderSpecific { id, .. } => {
+                if !self.provider_specific_dtypes.contains(id) {
+                    return Err(ComputeValidationError::UnsupportedProviderDType {
+                        family,
+                        dtype: id.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+    fn supports_layout(
+        &self,
+        layout: ComputeLayout,
+        family: ComputeOperationFamily,
+    ) -> Result<(), ComputeValidationError> {
+        if !self.layouts.is_empty() && !self.layouts.contains(&layout) {
+            return Err(ComputeValidationError::UnsupportedLayout { family, layout });
         }
         Ok(())
     }
@@ -1583,6 +1947,7 @@ pub struct ComputeOperationDescriptor {
     pub dtype: Option<ComputeDType>,
     pub layout: Option<ComputeLayout>,
     pub precision: Option<ComputePrecision>,
+    pub tensors: Vec<TensorDescriptor>,
 }
 impl ComputeOperationDescriptor {
     pub fn new(family: ComputeOperationFamily) -> Self {
@@ -1591,6 +1956,7 @@ impl ComputeOperationDescriptor {
             dtype: None,
             layout: None,
             precision: None,
+            tensors: Vec::new(),
         }
     }
     pub fn with_dtype(mut self, dtype: ComputeDType) -> Self {
@@ -1603,6 +1969,10 @@ impl ComputeOperationDescriptor {
     }
     pub fn with_precision(mut self, precision: ComputePrecision) -> Self {
         self.precision = Some(precision);
+        self
+    }
+    pub fn with_tensor(mut self, tensor: TensorDescriptor) -> Self {
+        self.tensors.push(tensor);
         self
     }
 }
@@ -1613,6 +1983,7 @@ pub struct ComputeOperationRequest {
     pub dtype: Option<ComputeDType>,
     pub layout: Option<ComputeLayout>,
     pub precision: Option<ComputePrecision>,
+    pub tensors: Vec<TensorDescriptor>,
 }
 impl ComputeOperationRequest {
     pub fn new(family_id: impl Into<String>) -> Self {
@@ -1621,6 +1992,7 @@ impl ComputeOperationRequest {
             dtype: None,
             layout: None,
             precision: None,
+            tensors: Vec::new(),
         }
     }
     pub fn with_dtype(mut self, dtype: ComputeDType) -> Self {
@@ -1635,11 +2007,24 @@ impl ComputeOperationRequest {
         self.precision = Some(precision);
         self
     }
+    pub fn with_tensor(mut self, tensor: TensorDescriptor) -> Self {
+        self.tensors.push(tensor);
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComputeValidationError {
     UnknownOperationFamily(String),
+    InvalidShape {
+        reason: String,
+    },
+    InvalidLayout {
+        reason: String,
+    },
+    SizeOverflow {
+        reason: String,
+    },
     UnsupportedOperationFamily {
         provider: ProviderBinding,
         family: ComputeOperationFamily,
@@ -1647,6 +2032,10 @@ pub enum ComputeValidationError {
     UnsupportedDType {
         family: ComputeOperationFamily,
         dtype: ComputeDType,
+    },
+    UnsupportedProviderDType {
+        family: ComputeOperationFamily,
+        dtype: String,
     },
     UnsupportedLayout {
         family: ComputeOperationFamily,
@@ -1657,6 +2046,7 @@ pub enum ComputeValidationError {
         precision: ComputePrecision,
     },
     ProviderUnavailable(ProviderBinding),
+    IncompatibleResourceAffinity(AffinityError),
 }
 impl fmt::Display for ComputeValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1664,6 +2054,9 @@ impl fmt::Display for ComputeValidationError {
             Self::UnknownOperationFamily(family) => {
                 write!(f, "unknown compute operation family '{family}'")
             }
+            Self::InvalidShape { reason } => write!(f, "invalid tensor shape: {reason}"),
+            Self::InvalidLayout { reason } => write!(f, "invalid tensor layout: {reason}"),
+            Self::SizeOverflow { reason } => write!(f, "invalid tensor size: {reason}"),
             Self::UnsupportedOperationFamily { provider, family } => write!(
                 f,
                 "provider '{provider}' does not support compute operation family '{}'",
@@ -1672,6 +2065,11 @@ impl fmt::Display for ComputeValidationError {
             Self::UnsupportedDType { family, dtype } => write!(
                 f,
                 "compute operation family '{}' does not support dtype {dtype:?}",
+                family.id()
+            ),
+            Self::UnsupportedProviderDType { family, dtype } => write!(
+                f,
+                "compute operation family '{}' does not support provider-specific dtype '{dtype}'",
                 family.id()
             ),
             Self::UnsupportedLayout { family, layout } => write!(
@@ -1686,6 +2084,9 @@ impl fmt::Display for ComputeValidationError {
             ),
             Self::ProviderUnavailable(provider) => {
                 write!(f, "provider '{provider}' is unavailable")
+            }
+            Self::IncompatibleResourceAffinity(error) => {
+                write!(f, "incompatible tensor resource affinity: {error}")
             }
         }
     }
@@ -2632,6 +3033,7 @@ impl Runtime {
                     dtype: operation.dtype,
                     layout: operation.layout,
                     precision: operation.precision,
+                    tensors: operation.tensors.clone(),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2659,6 +3061,24 @@ impl Runtime {
                     family: operation.family,
                 })?;
             support.supports(operation)?;
+        }
+        Ok(())
+    }
+    pub fn validate_compute_tensor_resources(
+        &self,
+        provider: &str,
+        resources: &[TensorResourceDescriptor],
+    ) -> Result<(), ComputeValidationError> {
+        let target = ResourceAffinity::new(FallbackClass::ProviderPinned)
+            .with_provider(ProviderBinding::new(provider))
+            .with_capability(CapabilityBinding::new(
+                CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                COMPUTE_CAPABILITY_VERSION,
+            ));
+        for resource in resources {
+            target
+                .validate_with(&resource.affinity)
+                .map_err(ComputeValidationError::IncompatibleResourceAffinity)?;
         }
         Ok(())
     }
@@ -3140,6 +3560,13 @@ mod tests {
         assert!(wit.contains("resource operation"));
         assert!(wit.contains("enum operation-family"));
         assert!(wit.contains("record operation-descriptor"));
+        assert!(wit.contains("record shape-descriptor"));
+        assert!(wit.contains("variant dtype-descriptor"));
+        assert!(wit.contains("variant layout-descriptor"));
+        assert!(wit.contains("record view-descriptor"));
+        assert!(wit.contains("record tensor-resource-descriptor"));
+        assert!(wit.contains("invalid-shape"));
+        assert!(wit.contains("size-overflow"));
         assert!(wit.contains("unsupported-operation-family"));
         assert!(wit.contains("unsupported-element-type"));
         assert!(wit.contains("unsupported-layout"));
@@ -3218,6 +3645,150 @@ mod tests {
                 ],
             ),
             Err(ComputeValidationError::UnsupportedLayout { .. })
+        ));
+    }
+    #[test]
+    fn tensor_descriptors_validate_shape_dtype_layout_and_provider_support() {
+        let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        provider.metadata.compute_operation_support.insert(
+            ComputeOperationFamily::DescriptorAndView,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense, ComputeLayout::Strided])
+                .with_descriptor_limits(TensorDescriptorLimits {
+                    max_rank: 4,
+                    max_dimension: 1024,
+                    max_elements: 4096,
+                    max_bytes: 16_384,
+                    allow_zero_sized: false,
+                }),
+        );
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let tensor = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 3, 4]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+
+        runtime
+            .validate_compute_operations(
+                "portable-compute",
+                &[
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::DescriptorAndView)
+                        .with_tensor(tensor.clone()),
+                ],
+            )
+            .unwrap();
+
+        let zero_dim = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 0]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "portable-compute",
+                &[
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::DescriptorAndView)
+                        .with_tensor(zero_dim)
+                ]
+            ),
+            Err(ComputeValidationError::InvalidShape { .. })
+        ));
+
+        let unsupported_dtype = TensorDescriptor::materialized(
+            ShapeDescriptor::new([2, 3]),
+            DTypeDescriptor::portable(ComputeDType::Float64),
+        );
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "portable-compute",
+                &[
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::DescriptorAndView)
+                        .with_tensor(unsupported_dtype)
+                ]
+            ),
+            Err(ComputeValidationError::UnsupportedDType { .. })
+        ));
+
+        let unsupported_layout = TensorDescriptor::new(
+            ShapeDescriptor::new([2, 3]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+            LayoutDescriptor::ProviderOpaque {
+                layout_id: "native-blocked".into(),
+            },
+        );
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "portable-compute",
+                &[
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::DescriptorAndView)
+                        .with_tensor(unsupported_layout)
+                ]
+            ),
+            Err(ComputeValidationError::UnsupportedLayout { .. })
+        ));
+
+        let overflowing = TensorDescriptor::materialized(
+            ShapeDescriptor::new([64, 65]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        );
+        assert!(matches!(
+            runtime.validate_compute_operations(
+                "portable-compute",
+                &[
+                    ComputeOperationDescriptor::new(ComputeOperationFamily::DescriptorAndView)
+                        .with_tensor(overflowing)
+                ]
+            ),
+            Err(ComputeValidationError::SizeOverflow { .. })
+        ));
+    }
+    #[test]
+    fn tensor_views_and_resources_preserve_affinity_and_materialization_boundaries() {
+        let provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+        let source = TensorResourceId::new("tensor-1");
+        let descriptor = TensorDescriptor::new(
+            ShapeDescriptor::new([4, 4]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+            LayoutDescriptor::Strided {
+                strides_elements: vec![4, 1],
+                offset_elements: 0,
+            },
+        )
+        .with_view(ViewDescriptor::from_resource(source.clone(), 4, [4, 1]));
+        let resource = TensorResourceDescriptor::new(
+            source,
+            descriptor,
+            ResourceAffinity::new(FallbackClass::ProviderPinned)
+                .with_provider(ProviderBinding::new("portable-compute"))
+                .with_capability(CapabilityBinding::new(
+                    CapabilityId::new(COMPUTE_CAPABILITY_ID),
+                    COMPUTE_CAPABILITY_VERSION,
+                )),
+        );
+
+        runtime
+            .validate_compute_tensor_resources("portable-compute", &[resource])
+            .unwrap();
+
+        let foreign = TensorResourceDescriptor::new(
+            TensorResourceId::new("tensor-2"),
+            TensorDescriptor::materialized(
+                ShapeDescriptor::new([4, 4]),
+                DTypeDescriptor::portable(ComputeDType::Float32),
+            ),
+            ResourceAffinity::new(FallbackClass::ProviderPinned)
+                .with_provider(ProviderBinding::new("other-provider")),
+        );
+        assert!(matches!(
+            runtime.validate_compute_tensor_resources("portable-compute", &[foreign]),
+            Err(ComputeValidationError::IncompatibleResourceAffinity(_))
         ));
     }
     #[test]
