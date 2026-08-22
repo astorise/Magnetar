@@ -3255,3 +3255,624 @@ fn component_discovery_returns_only_wasm_artifacts() {
     fs::remove_dir_all(&directory).unwrap();
     assert_eq!(discovered, vec![directory.join("valid.wasm")]);
 }
+
+fn temp_component_artifact_dir(label: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-component-artifact-{label}-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).unwrap();
+    directory
+}
+
+fn manifest_yaml(digest: &str, runtime_version: &str) -> String {
+    format!(
+        r#"schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "{digest}"
+component:
+  name: "magnetar.examples.hello"
+  version: "0.1.0"
+  description: "Minimal Magnetar Component fixture"
+  role: "test-fixture"
+runtime:
+  magnetar:
+    min_version: "{runtime_version}"
+wit:
+  imports:
+    - package: "magnetar:test"
+      interface: "echo"
+      version: "1.0.0"
+  exports:
+    - package: "magnetar:test"
+      interface: "run"
+      version: "1.0.0"
+capabilities:
+  requires:
+    - id: "magnetar:test/echo"
+      version: "1.0.0"
+authority:
+  requires: []
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./fixtures/hello.component.wasm"
+signatures: []
+"#
+    )
+}
+
+fn trust_store_yaml(digest: &str) -> String {
+    format!(
+        r#"schema: magnetar-component-trust
+schema_version: 1
+trusted_digests:
+  - "{digest}"
+rejected_digests: []
+revoked_digests: []
+trusted_publishers: []
+trusted_sources: []
+development:
+  allow_unsigned_local: false
+"#
+    )
+}
+
+#[test]
+fn component_artifact_pipeline_requires_external_trust_policy_before_prepare() {
+    let directory = temp_component_artifact_dir("trusted");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    let manifest = directory.join("hello.component.wasm.magnetar-component.yaml");
+    fs::write(
+        &manifest,
+        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
+    )
+    .unwrap();
+
+    let import = WitInterface::new("magnetar:test/echo", "1.0.0");
+    let export = WitInterface::new("magnetar:test/run", "1.0.0");
+    let metadata = ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+        .with_import(import)
+        .with_export(export);
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value.clone()));
+    manager
+        .register_component(ComponentDescriptor::new(metadata, &artifact))
+        .unwrap();
+
+    manager
+        .prepare_component("magnetar.examples.hello")
+        .unwrap();
+    let definition = manager.definition("magnetar.examples.hello").unwrap();
+    assert_eq!(definition.artifact_digest, Some(digest));
+    assert!(matches!(
+        definition.trust_decision,
+        Some(ComponentTrustDecision {
+            status: ComponentTrustStatus::Trusted,
+            ..
+        })
+    ));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_artifact_rejects_local_wasm_without_manifest() {
+    let directory = temp_component_artifact_dir("missing-manifest");
+    let artifact = directory.join("unknown.component.wasm");
+    fs::write(&artifact, b"component-bytes").unwrap();
+    let mut manager = ComponentManager::new();
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("unknown", "0.1.0", "fixture"),
+            &artifact,
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.prepare_component("unknown"),
+        Err(ComponentError::ManifestMissing { .. })
+    ));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_artifact_rejects_digest_mismatch_before_prepare() {
+    let directory = temp_component_artifact_dir("digest-mismatch");
+    let artifact = directory.join("hello.component.wasm");
+    fs::write(&artifact, b"component-bytes").unwrap();
+    let digest = ComponentDigest::sha256(b"different-bytes");
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
+    )
+    .unwrap();
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Rejected,
+            ..
+        })
+    ));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_artifact_rejects_manifest_wit_that_differs_from_actual_contract() {
+    let directory = temp_component_artifact_dir("wit-mismatch");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
+    )
+    .unwrap();
+
+    let mut engine = MockComponentEngine::new();
+    let mut actual = ComponentContract::default();
+    actual.imports.insert(ComponentImportRequirement::new(
+        WitInterface::new("magnetar:test/other", "1.0.0"),
+        ComponentInterfaceShape::Interface,
+    ));
+    engine.prepared_contract = Some(actual);
+    let mut manager = ComponentManager::with_engine(Box::new(engine));
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture"),
+            &artifact,
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ContractValidationFailed { .. })
+    ));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_trust_store_revocation_overrides_digest_allowlist() {
+    let directory = temp_component_artifact_dir("revoked");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
+    )
+    .unwrap();
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(
+        ComponentTrustStore::default()
+            .trust_digest(digest.value.clone())
+            .revoke_digest(digest.value),
+    );
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Revoked,
+            ..
+        })
+    ));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_trust_store_loads_minimal_yaml_format() {
+    let directory = temp_component_artifact_dir("trust-store");
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let trust_store = directory.join("trust.yaml");
+    fs::write(&trust_store, trust_store_yaml(&digest.value)).unwrap();
+
+    let loaded = ComponentTrustStore::load_yaml(&trust_store).unwrap();
+    assert!(loaded.trusted_digests.contains(&digest.value));
+    assert!(!loaded.allow_unsigned_local_development);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_manifest_may_declare_optional_wit_import_metadata() {
+    let directory = temp_component_artifact_dir("optional-import");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    let manifest = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION).replace(
+        "  exports:",
+        "    - package: \"magnetar:optional\"\n      interface: \"telemetry\"\n      version: \"1.0.0\"\n      optional: true\n  exports:",
+    );
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest,
+    )
+    .unwrap();
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        ))
+        .unwrap();
+
+    manager
+        .prepare_component("magnetar.examples.hello")
+        .unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_artifact_rejects_runtime_max_version_incompatibility() {
+    let directory = temp_component_artifact_dir("runtime-max");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    let manifest = manifest_yaml(&digest.value, "0.0.1").replace(
+        "    min_version: \"0.0.1\"",
+        "    min_version: \"0.0.1\"\n    max_version: \"0.0.1\"",
+    );
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest,
+    )
+    .unwrap();
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Rejected,
+            ..
+        })
+    ));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_artifact_rejects_incompatible_capability_versions() {
+    for (label, capability_block) in [
+        (
+            "cap-major",
+            "    - id: \"magnetar:test/echo\"\n      version: \"2.0.0\"",
+        ),
+        (
+            "cap-range",
+            "    - id: \"magnetar:test/echo\"\n      version: \"1.0.0\"\n      max_version: \"0.9.0\"",
+        ),
+    ] {
+        let directory = temp_component_artifact_dir(label);
+        let artifact = directory.join("hello.component.wasm");
+        let bytes = b"component-bytes";
+        fs::write(&artifact, bytes).unwrap();
+        let digest = ComponentDigest::sha256(bytes);
+        let manifest = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION).replace(
+            "    - id: \"magnetar:test/echo\"\n      version: \"1.0.0\"",
+            capability_block,
+        );
+        fs::write(
+            directory.join("hello.component.wasm.magnetar-component.yaml"),
+            manifest,
+        )
+        .unwrap();
+        let mut manager = ComponentManager::new();
+        manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+        manager
+            .register_component(ComponentDescriptor::new(
+                ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                    .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                    .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+                &artifact,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            manager.prepare_component("magnetar.examples.hello"),
+            Err(ComponentError::ArtifactRejected {
+                status: ComponentTrustStatus::Rejected,
+                ..
+            })
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn component_publisher_trust_is_only_policy_driven() {
+    let directory = temp_component_artifact_dir("publisher-policy");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
+    )
+    .unwrap();
+    let descriptor = || {
+        ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        )
+    };
+    let mut untrusted = ComponentManager::new();
+    untrusted.register_component(descriptor()).unwrap();
+    assert!(matches!(
+        untrusted.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Unknown,
+            ..
+        })
+    ));
+
+    let mut trusted = ComponentManager::new();
+    trusted.set_trust_store(ComponentTrustStore::default().trust_publisher("local-dev"));
+    trusted.register_component(descriptor()).unwrap();
+    trusted
+        .prepare_component("magnetar.examples.hello")
+        .unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_signature_metadata_is_recorded_but_not_trusted_by_itself() {
+    let directory = temp_component_artifact_dir("signature");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    let signed_manifest = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION).replace(
+        "signatures: []",
+        &format!(
+            "signatures:\n  - algorithm: \"test\"\n    digest: \"{}\"",
+            digest.value
+        ),
+    );
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        signed_manifest,
+    )
+    .unwrap();
+    let descriptor = || {
+        ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        )
+    };
+    let mut no_trust = ComponentManager::new();
+    no_trust.register_component(descriptor()).unwrap();
+    assert!(matches!(
+        no_trust.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Unknown,
+            ..
+        })
+    ));
+
+    let mut trusted = ComponentManager::new();
+    trusted.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value.clone()));
+    trusted.register_component(descriptor()).unwrap();
+    trusted
+        .prepare_component("magnetar.examples.hello")
+        .unwrap();
+
+    let bad_manifest = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION).replace(
+        "signatures: []",
+        "signatures:\n  - algorithm: \"test\"\n    digest: \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+    );
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        bad_manifest,
+    )
+    .unwrap();
+    let mut mismatch = ComponentManager::new();
+    mismatch.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    mismatch.register_component(descriptor()).unwrap();
+    assert!(matches!(
+        mismatch.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Rejected,
+            ..
+        })
+    ));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_development_mode_is_explicit_and_still_validates_artifact() {
+    let directory = temp_component_artifact_dir("development");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
+    )
+    .unwrap();
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().allow_unsigned_local_development(true));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        ))
+        .unwrap();
+
+    manager
+        .prepare_component("magnetar.examples.hello")
+        .unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_artifact_cache_is_digest_keyed_and_non_authoritative() {
+    let bytes = b"component-bytes".to_vec();
+    let mut cache = ComponentArtifactCache::default();
+    let digest = cache.insert(bytes.clone());
+    assert!(cache.contains_untrusted(&digest));
+    assert_eq!(cache.get_verified(&digest).unwrap(), Some(bytes.as_slice()));
+
+    let wrong_digest = ComponentDigest::sha256(b"wrong");
+    cache.insert_unchecked_for_test(wrong_digest.clone(), bytes);
+    assert!(matches!(
+        cache.get_verified(&wrong_digest),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Rejected,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn component_quarantine_prevents_preparation_and_preserves_diagnostic_status() {
+    let directory = temp_component_artifact_dir("quarantine");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
+    )
+    .unwrap();
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().quarantine_digest(digest.value));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Quarantined,
+            ..
+        })
+    ));
+    assert!(
+        manager
+            .observations()
+            .iter()
+            .any(|observation| observation.message.contains("Quarantined"))
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_artifact_validation_emits_structured_observations() {
+    let directory = temp_component_artifact_dir("observations");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
+    )
+    .unwrap();
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        ))
+        .unwrap();
+
+    manager
+        .prepare_component("magnetar.examples.hello")
+        .unwrap();
+    let messages = manager
+        .observations()
+        .iter()
+        .map(|observation| observation.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("discovered"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("digest computed"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("manifest loaded"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("WIT declarations match"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("compatibility validated"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("trust decision"))
+    );
+    fs::remove_dir_all(directory).unwrap();
+}

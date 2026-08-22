@@ -1,9 +1,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
 };
+
+use serde::Deserialize;
+use sha2::{Digest as ShaDigest, Sha256};
+
+pub const COMPONENT_ARTIFACT_SCHEMA: &str = "magnetar-component-artifact";
+pub const COMPONENT_TRUST_SCHEMA: &str = "magnetar-component-trust";
+pub const COMPONENT_ARTIFACT_SCHEMA_VERSION: u64 = 1;
+pub const MAGNETAR_RUNTIME_VERSION: &str = "0.1.0";
 
 static NEXT_COMPONENT_DEFINITION_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -77,6 +85,7 @@ impl ComponentMetadata {
 pub struct ComponentDescriptor {
     pub metadata: ComponentMetadata,
     pub artifact_path: PathBuf,
+    pub manifest_path: Option<PathBuf>,
 }
 
 impl ComponentDescriptor {
@@ -84,7 +93,13 @@ impl ComponentDescriptor {
         Self {
             metadata,
             artifact_path: artifact_path.into(),
+            manifest_path: None,
         }
+    }
+
+    pub fn with_manifest_path(mut self, manifest_path: impl Into<PathBuf>) -> Self {
+        self.manifest_path = Some(manifest_path.into());
+        self
     }
 
     pub fn artifact_reference(&self) -> ComponentArtifactReference<'_> {
@@ -222,6 +237,9 @@ pub struct ComponentDefinition {
     pub id: ComponentDefinitionId,
     pub metadata: ComponentMetadata,
     pub artifact_path: PathBuf,
+    pub manifest_path: Option<PathBuf>,
+    pub artifact_digest: Option<ComponentDigest>,
+    pub trust_decision: Option<ComponentTrustDecision>,
     pub state: ComponentDefinitionState,
 }
 
@@ -231,12 +249,597 @@ impl ComponentDefinition {
             id: next_component_definition_id(),
             metadata: descriptor.metadata,
             artifact_path: descriptor.artifact_path,
+            manifest_path: descriptor.manifest_path,
+            artifact_digest: None,
+            trust_decision: None,
             state: ComponentDefinitionState::Registered,
         }
     }
 
     pub fn artifact_reference(&self) -> ComponentArtifactReference<'_> {
         ComponentArtifactReference::LocalPath(&self.artifact_path)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ComponentDigest {
+    pub algorithm: String,
+    pub value: String,
+}
+
+impl ComponentDigest {
+    pub fn sha256(bytes: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let digest = hasher.finalize();
+        Self {
+            algorithm: "sha256".into(),
+            value: format!("sha256:{}", lower_hex(&digest)),
+        }
+    }
+
+    pub fn parse(algorithm: impl Into<String>, value: impl Into<String>) -> Self {
+        let algorithm = algorithm.into().to_ascii_lowercase();
+        let value = value.into().to_ascii_lowercase();
+        let value = if value.starts_with(&format!("{algorithm}:")) {
+            value
+        } else {
+            format!("{algorithm}:{value}")
+        };
+        Self { algorithm, value }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComponentTrustStatus {
+    Unknown,
+    Trusted,
+    Rejected,
+    Quarantined,
+    Revoked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentTrustDecision {
+    pub status: ComponentTrustStatus,
+    pub reason: String,
+}
+
+impl ComponentTrustDecision {
+    pub fn new(status: ComponentTrustStatus, reason: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ComponentTrustStore {
+    pub trusted_digests: BTreeSet<String>,
+    pub rejected_digests: BTreeSet<String>,
+    pub revoked_digests: BTreeSet<String>,
+    pub quarantined_digests: BTreeSet<String>,
+    pub trusted_publishers: BTreeSet<String>,
+    pub trusted_sources: BTreeSet<String>,
+    pub allow_unsigned_local_development: bool,
+}
+
+impl ComponentTrustStore {
+    pub fn load_yaml(path: impl AsRef<Path>) -> Result<Self, ComponentError> {
+        let path = path.as_ref();
+        let content = fs::read_to_string(path).map_err(|source| ComponentError::TrustStore {
+            path: path.into(),
+            message: source.to_string(),
+            source: Some(source),
+        })?;
+        let raw: TrustStoreYaml =
+            serde_yaml::from_str(&content).map_err(|source| ComponentError::TrustStore {
+                path: path.into(),
+                message: source.to_string(),
+                source: None,
+            })?;
+        raw.validate(path)
+    }
+
+    pub fn trust_digest(mut self, digest: impl Into<String>) -> Self {
+        self.trusted_digests
+            .insert(digest.into().to_ascii_lowercase());
+        self
+    }
+
+    pub fn reject_digest(mut self, digest: impl Into<String>) -> Self {
+        self.rejected_digests
+            .insert(digest.into().to_ascii_lowercase());
+        self
+    }
+
+    pub fn revoke_digest(mut self, digest: impl Into<String>) -> Self {
+        self.revoked_digests
+            .insert(digest.into().to_ascii_lowercase());
+        self
+    }
+
+    pub fn quarantine_digest(mut self, digest: impl Into<String>) -> Self {
+        self.quarantined_digests
+            .insert(digest.into().to_ascii_lowercase());
+        self
+    }
+
+    pub fn trust_publisher(mut self, publisher: impl Into<String>) -> Self {
+        self.trusted_publishers.insert(publisher.into());
+        self
+    }
+
+    pub fn trust_source(mut self, source: impl Into<String>) -> Self {
+        self.trusted_sources.insert(source.into());
+        self
+    }
+
+    pub fn allow_unsigned_local_development(mut self, allow: bool) -> Self {
+        self.allow_unsigned_local_development = allow;
+        self
+    }
+
+    fn evaluate(
+        &self,
+        manifest: &ComponentManifest,
+        digest: &ComponentDigest,
+    ) -> ComponentTrustDecision {
+        if self.revoked_digests.contains(&digest.value) {
+            return ComponentTrustDecision::new(ComponentTrustStatus::Revoked, "digest revoked");
+        }
+        if self.quarantined_digests.contains(&digest.value) {
+            return ComponentTrustDecision::new(
+                ComponentTrustStatus::Quarantined,
+                "digest quarantined",
+            );
+        }
+        if self.rejected_digests.contains(&digest.value) {
+            return ComponentTrustDecision::new(ComponentTrustStatus::Rejected, "digest rejected");
+        }
+        if self.trusted_digests.contains(&digest.value) {
+            return ComponentTrustDecision::new(ComponentTrustStatus::Trusted, "digest trusted");
+        }
+        if let Some(publisher) = &manifest.publisher
+            && self.trusted_publishers.contains(&publisher.id)
+        {
+            return ComponentTrustDecision::new(
+                ComponentTrustStatus::Trusted,
+                "publisher trusted by policy",
+            );
+        }
+        if self.trusted_sources.contains(&manifest.source.kind) {
+            return ComponentTrustDecision::new(
+                ComponentTrustStatus::Trusted,
+                "source trusted by policy",
+            );
+        }
+        if self.allow_unsigned_local_development && manifest.source.kind == "local" {
+            return ComponentTrustDecision::new(
+                ComponentTrustStatus::Trusted,
+                "explicit development local trust",
+            );
+        }
+        ComponentTrustDecision::new(ComponentTrustStatus::Unknown, "no trust policy matched")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentManifest {
+    pub component: ComponentMetadata,
+    pub role: String,
+    pub digest: ComponentDigest,
+    pub runtime_min_version: String,
+    pub runtime_max_version: Option<String>,
+    pub imports: BTreeSet<WitInterface>,
+    pub optional_imports: BTreeSet<WitInterface>,
+    pub exports: BTreeSet<WitInterface>,
+    pub capabilities: Vec<ComponentCapabilityRequirement>,
+    pub authority: Vec<ComponentAuthorityRequirement>,
+    pub publisher: Option<ComponentPublisher>,
+    pub source: ComponentSource,
+    pub signatures: Vec<ComponentSignature>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentCapabilityRequirement {
+    pub id: String,
+    pub min_version: String,
+    pub max_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentAuthorityRequirement {
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentPublisher {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentSource {
+    pub kind: String,
+    pub uri: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentSignature {
+    pub algorithm: Option<String>,
+    pub digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ComponentArtifactCache {
+    entries: BTreeMap<String, Vec<u8>>,
+}
+
+impl ComponentArtifactCache {
+    pub fn insert(&mut self, bytes: Vec<u8>) -> ComponentDigest {
+        let digest = ComponentDigest::sha256(&bytes);
+        self.entries.insert(digest.value.clone(), bytes);
+        digest
+    }
+
+    pub fn get_verified(&self, digest: &ComponentDigest) -> Result<Option<&[u8]>, ComponentError> {
+        let Some(bytes) = self.entries.get(&digest.value) else {
+            return Ok(None);
+        };
+        let computed = ComponentDigest::sha256(bytes);
+        if &computed != digest {
+            return Err(ComponentError::ArtifactRejected {
+                component: "cache".into(),
+                status: ComponentTrustStatus::Rejected,
+                message: "cached artifact digest does not match cache key".into(),
+            });
+        }
+        Ok(Some(bytes))
+    }
+
+    pub fn contains_untrusted(&self, digest: &ComponentDigest) -> bool {
+        self.entries.contains_key(&digest.value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_unchecked_for_test(&mut self, digest: ComponentDigest, bytes: Vec<u8>) {
+        self.entries.insert(digest.value, bytes);
+    }
+}
+
+impl ComponentManifest {
+    pub fn load_yaml(path: impl AsRef<Path>) -> Result<Self, ComponentError> {
+        let path = path.as_ref();
+        let content = fs::read_to_string(path).map_err(|source| ComponentError::Manifest {
+            path: path.into(),
+            message: source.to_string(),
+            source: Some(source),
+        })?;
+        let raw: ComponentManifestYaml =
+            serde_yaml::from_str(&content).map_err(|source| ComponentError::Manifest {
+                path: path.into(),
+                message: source.to_string(),
+                source: None,
+            })?;
+        raw.validate(path)
+    }
+}
+
+#[derive(Deserialize)]
+struct ComponentManifestYaml {
+    schema: String,
+    schema_version: u64,
+    artifact: ManifestArtifactYaml,
+    component: ManifestComponentYaml,
+    runtime: ManifestRuntimeYaml,
+    wit: ManifestWitYaml,
+    capabilities: ManifestCapabilitiesYaml,
+    authority: ManifestAuthorityYaml,
+    publisher: Option<ComponentPublisherYaml>,
+    source: ComponentSourceYaml,
+    #[serde(default)]
+    signatures: Vec<ComponentSignatureYaml>,
+}
+
+#[derive(Deserialize)]
+struct ManifestArtifactYaml {
+    kind: String,
+    digest: ManifestDigestYaml,
+}
+
+#[derive(Deserialize)]
+struct ManifestDigestYaml {
+    algorithm: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct ManifestComponentYaml {
+    name: String,
+    version: String,
+    #[serde(default)]
+    description: String,
+    role: String,
+}
+
+#[derive(Deserialize)]
+struct ManifestRuntimeYaml {
+    magnetar: ManifestMagnetarRuntimeYaml,
+}
+
+#[derive(Deserialize)]
+struct ManifestMagnetarRuntimeYaml {
+    min_version: String,
+    max_version: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ManifestWitYaml {
+    #[serde(default)]
+    imports: Vec<ManifestWitInterfaceYaml>,
+    #[serde(default)]
+    exports: Vec<ManifestWitInterfaceYaml>,
+}
+
+#[derive(Deserialize)]
+struct ManifestWitInterfaceYaml {
+    package: String,
+    interface: String,
+    version: String,
+    #[serde(default)]
+    optional: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct ManifestCapabilitiesYaml {
+    #[serde(default)]
+    requires: Vec<ManifestCapabilityYaml>,
+}
+
+#[derive(Deserialize)]
+struct ManifestCapabilityYaml {
+    id: String,
+    version: String,
+    max_version: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ManifestAuthorityYaml {
+    #[serde(default)]
+    requires: Vec<ManifestAuthorityRequirementYaml>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ManifestAuthorityRequirementYaml {
+    String(String),
+    Object { kind: String },
+}
+
+#[derive(Deserialize)]
+struct ComponentPublisherYaml {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct ComponentSourceYaml {
+    kind: String,
+    uri: String,
+}
+
+#[derive(Deserialize)]
+struct ComponentSignatureYaml {
+    algorithm: Option<String>,
+    digest: Option<String>,
+}
+
+impl ComponentManifestYaml {
+    fn validate(self, path: &Path) -> Result<ComponentManifest, ComponentError> {
+        if self.schema != COMPONENT_ARTIFACT_SCHEMA {
+            return Err(manifest_validation_error(
+                path,
+                "unsupported manifest schema",
+            ));
+        }
+        if self.schema_version != COMPONENT_ARTIFACT_SCHEMA_VERSION {
+            return Err(manifest_validation_error(
+                path,
+                "unsupported manifest schema version",
+            ));
+        }
+        if self.artifact.kind != "component" {
+            return Err(manifest_validation_error(
+                path,
+                "artifact kind must be component",
+            ));
+        }
+        validate_component_name(&self.component.name)
+            .map_err(|message| manifest_validation_error(path, message))?;
+        validate_semver(&self.component.version)
+            .map_err(|message| manifest_validation_error(path, message))?;
+        validate_semver(&self.runtime.magnetar.min_version)
+            .map_err(|message| manifest_validation_error(path, message))?;
+        if let Some(max_version) = &self.runtime.magnetar.max_version {
+            validate_semver(max_version)
+                .map_err(|message| manifest_validation_error(path, message))?;
+        }
+        if self.component.role.trim().is_empty() {
+            return Err(manifest_validation_error(
+                path,
+                "component role must not be empty",
+            ));
+        }
+        if self.source.kind.trim().is_empty() || self.source.uri.trim().is_empty() {
+            return Err(manifest_validation_error(
+                path,
+                "source kind and uri are required",
+            ));
+        }
+
+        let digest =
+            ComponentDigest::parse(self.artifact.digest.algorithm, self.artifact.digest.value);
+        if digest.algorithm != "sha256" || !is_sha256_digest(&digest.value) {
+            return Err(manifest_validation_error(
+                path,
+                "artifact digest must be canonical sha256:<64 lowercase hex>",
+            ));
+        }
+
+        let mut imports = BTreeSet::new();
+        let mut optional_imports = BTreeSet::new();
+        for interface in self.wit.imports {
+            let optional = interface.optional;
+            let interface = wit_interface_from_manifest(interface, path)?;
+            if optional {
+                optional_imports.insert(interface);
+            } else {
+                imports.insert(interface);
+            }
+        }
+        let exports = self
+            .wit
+            .exports
+            .into_iter()
+            .map(|interface| wit_interface_from_manifest(interface, path))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let capabilities = self
+            .capabilities
+            .requires
+            .into_iter()
+            .map(|capability| {
+                validate_wit_identity(&capability.id)
+                    .map_err(|message| manifest_validation_error(path, message))?;
+                validate_semver(&capability.version)
+                    .map_err(|message| manifest_validation_error(path, message))?;
+                if let Some(max_version) = &capability.max_version {
+                    validate_semver(max_version)
+                        .map_err(|message| manifest_validation_error(path, message))?;
+                }
+                Ok(ComponentCapabilityRequirement {
+                    id: capability.id,
+                    min_version: capability.version,
+                    max_version: capability.max_version,
+                })
+            })
+            .collect::<Result<Vec<_>, ComponentError>>()?;
+        let authority = self
+            .authority
+            .requires
+            .into_iter()
+            .map(|requirement| {
+                let kind = match requirement {
+                    ManifestAuthorityRequirementYaml::String(kind) => kind,
+                    ManifestAuthorityRequirementYaml::Object { kind } => kind,
+                };
+                validate_authority_kind(&kind)
+                    .map_err(|message| manifest_validation_error(path, message))?;
+                Ok(ComponentAuthorityRequirement { kind })
+            })
+            .collect::<Result<Vec<_>, ComponentError>>()?;
+        let publisher = self.publisher.map(|publisher| ComponentPublisher {
+            id: publisher.id,
+            name: publisher.name,
+        });
+        let signatures = self
+            .signatures
+            .into_iter()
+            .map(|signature| ComponentSignature {
+                algorithm: signature.algorithm,
+                digest: signature.digest,
+            })
+            .collect();
+
+        Ok(ComponentManifest {
+            component: ComponentMetadata {
+                name: self.component.name,
+                version: self.component.version,
+                description: self.component.description,
+                imports: imports.clone(),
+                exports: exports.clone(),
+            },
+            role: self.component.role,
+            digest,
+            runtime_min_version: self.runtime.magnetar.min_version,
+            runtime_max_version: self.runtime.magnetar.max_version,
+            imports,
+            optional_imports,
+            exports,
+            capabilities,
+            authority,
+            publisher,
+            source: ComponentSource {
+                kind: self.source.kind,
+                uri: self.source.uri,
+            },
+            signatures,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct TrustStoreYaml {
+    schema: String,
+    schema_version: u64,
+    #[serde(default)]
+    trusted_digests: BTreeSet<String>,
+    #[serde(default)]
+    rejected_digests: BTreeSet<String>,
+    #[serde(default)]
+    revoked_digests: BTreeSet<String>,
+    #[serde(default)]
+    quarantined_digests: BTreeSet<String>,
+    #[serde(default)]
+    trusted_publishers: BTreeSet<String>,
+    #[serde(default)]
+    trusted_sources: BTreeSet<String>,
+    development: Option<TrustStoreDevelopmentYaml>,
+}
+
+#[derive(Deserialize)]
+struct TrustStoreDevelopmentYaml {
+    #[serde(default)]
+    allow_unsigned_local: bool,
+}
+
+impl TrustStoreYaml {
+    fn validate(self, path: &Path) -> Result<ComponentTrustStore, ComponentError> {
+        if self.schema != COMPONENT_TRUST_SCHEMA {
+            return Err(trust_store_error(path, "unsupported trust store schema"));
+        }
+        if self.schema_version != COMPONENT_ARTIFACT_SCHEMA_VERSION {
+            return Err(trust_store_error(
+                path,
+                "unsupported trust store schema version",
+            ));
+        }
+        for digest in self
+            .trusted_digests
+            .iter()
+            .chain(self.rejected_digests.iter())
+            .chain(self.revoked_digests.iter())
+            .chain(self.quarantined_digests.iter())
+        {
+            if !is_sha256_digest(digest) {
+                return Err(trust_store_error(
+                    path,
+                    "trust store digests must be canonical sha256 values",
+                ));
+            }
+        }
+        Ok(ComponentTrustStore {
+            trusted_digests: lower_set(self.trusted_digests),
+            rejected_digests: lower_set(self.rejected_digests),
+            revoked_digests: lower_set(self.revoked_digests),
+            quarantined_digests: lower_set(self.quarantined_digests),
+            trusted_publishers: self.trusted_publishers,
+            trusted_sources: self.trusted_sources,
+            allow_unsigned_local_development: self
+                .development
+                .is_some_and(|development| development.allow_unsigned_local),
+        })
     }
 }
 
@@ -482,6 +1085,10 @@ impl ComponentInvocationResult {
 
 pub trait ComponentEngine: Send {
     fn capabilities(&self) -> ComponentEngineCapabilities;
+    fn inspect_contract(
+        &mut self,
+        definition: &ComponentDefinition,
+    ) -> Result<ComponentContract, ComponentError>;
     fn prepare(
         &mut self,
         definition: &ComponentDefinition,
@@ -542,6 +1149,16 @@ impl MockComponentEngine {
 impl ComponentEngine for MockComponentEngine {
     fn capabilities(&self) -> ComponentEngineCapabilities {
         self.capabilities.clone()
+    }
+
+    fn inspect_contract(
+        &mut self,
+        definition: &ComponentDefinition,
+    ) -> Result<ComponentContract, ComponentError> {
+        Ok(self
+            .prepared_contract
+            .clone()
+            .unwrap_or_else(|| ComponentContract::from_metadata(&definition.metadata)))
     }
 
     fn prepare(
@@ -636,6 +1253,7 @@ pub struct ComponentManager {
     active_invocations: BTreeMap<ComponentInstanceId, u32>,
     observations: Vec<ComponentObservation>,
     limits: ComponentResourceLimits,
+    trust_store: ComponentTrustStore,
     shutdown: bool,
 }
 
@@ -661,6 +1279,7 @@ impl ComponentManager {
             active_invocations: BTreeMap::new(),
             observations: Vec::new(),
             limits: ComponentResourceLimits::default(),
+            trust_store: ComponentTrustStore::default(),
             shutdown: false,
         }
     }
@@ -676,6 +1295,10 @@ impl ComponentManager {
 
     pub fn set_resource_limits(&mut self, limits: ComponentResourceLimits) {
         self.limits = limits;
+    }
+
+    pub fn set_trust_store(&mut self, trust_store: ComponentTrustStore) {
+        self.trust_store = trust_store;
     }
 
     pub fn observations(&self) -> &[ComponentObservation] {
@@ -732,6 +1355,26 @@ impl ComponentManager {
             .definitions
             .get_mut(name)
             .ok_or_else(|| ComponentError::NotFound(name.into()))?;
+        if definition.artifact_path.exists() {
+            match validate_component_artifact(self.engine.as_mut(), definition, &self.trust_store) {
+                Ok(outcome) => {
+                    self.observations.extend(outcome.observations);
+                    definition.metadata = outcome.manifest.component;
+                    definition.artifact_digest = Some(outcome.digest);
+                    definition.trust_decision = Some(outcome.trust_decision);
+                }
+                Err(error) => {
+                    definition.state = ComponentDefinitionState::Failed;
+                    self.observations.push(ComponentObservation::new(
+                        ComponentObservationKind::Validation,
+                        Some(name.into()),
+                        None,
+                        error.to_string(),
+                    ));
+                    return Err(error);
+                }
+            }
+        }
         definition.state = ComponentDefinitionState::Validated;
         self.observations.push(ComponentObservation::new(
             ComponentObservationKind::Validation,
@@ -1004,6 +1647,260 @@ impl ComponentManager {
     }
 }
 
+struct ComponentArtifactValidationOutcome {
+    manifest: ComponentManifest,
+    digest: ComponentDigest,
+    trust_decision: ComponentTrustDecision,
+    observations: Vec<ComponentObservation>,
+}
+
+fn validate_component_artifact(
+    engine: &mut dyn ComponentEngine,
+    definition: &mut ComponentDefinition,
+    trust_store: &ComponentTrustStore,
+) -> Result<ComponentArtifactValidationOutcome, ComponentError> {
+    let mut observations = vec![ComponentObservation::new(
+        ComponentObservationKind::Validation,
+        Some(definition.metadata.name.clone()),
+        None,
+        format!(
+            "component artifact discovered at {}",
+            definition.artifact_path.display()
+        ),
+    )];
+    let bytes = fs::read(&definition.artifact_path).map_err(|source| {
+        ComponentError::ComponentLoadFailed {
+            path: definition.artifact_path.clone(),
+            message: source.to_string(),
+            source: Some(source),
+        }
+    })?;
+    let digest = ComponentDigest::sha256(&bytes);
+    observations.push(ComponentObservation::new(
+        ComponentObservationKind::Validation,
+        Some(definition.metadata.name.clone()),
+        None,
+        format!("component artifact digest computed: {}", digest.value),
+    ));
+    let manifest_path = manifest_path_for_definition(definition)?;
+    let manifest = ComponentManifest::load_yaml(&manifest_path)?;
+    observations.push(ComponentObservation::new(
+        ComponentObservationKind::Validation,
+        Some(definition.metadata.name.clone()),
+        None,
+        "component artifact manifest loaded and schema validated",
+    ));
+    if manifest.digest != digest {
+        return Err(ComponentError::ArtifactRejected {
+            component: definition.metadata.name.clone(),
+            status: ComponentTrustStatus::Rejected,
+            message: "manifest digest does not match artifact bytes".into(),
+        });
+    }
+    let actual_contract = engine.inspect_contract(definition)?;
+    validate_manifest_wit(definition, &manifest, &actual_contract)?;
+    observations.push(ComponentObservation::new(
+        ComponentObservationKind::Validation,
+        Some(definition.metadata.name.clone()),
+        None,
+        "component artifact WIT declarations match executable contract",
+    ));
+    validate_runtime_compatibility(definition, &manifest)?;
+    validate_capability_compatibility(definition, &manifest)?;
+    observations.push(ComponentObservation::new(
+        ComponentObservationKind::Validation,
+        Some(definition.metadata.name.clone()),
+        None,
+        "component artifact runtime and capability compatibility validated",
+    ));
+    validate_signature_metadata(definition, &manifest, &digest)?;
+    let trust_decision = trust_store.evaluate(&manifest, &digest);
+    observations.push(ComponentObservation::new(
+        ComponentObservationKind::Validation,
+        Some(manifest.component.name.clone()),
+        None,
+        format!(
+            "component artifact trust decision: {:?}",
+            trust_decision.status
+        ),
+    ));
+    if trust_decision.status != ComponentTrustStatus::Trusted {
+        return Err(ComponentError::ArtifactRejected {
+            component: manifest.component.name.clone(),
+            status: trust_decision.status,
+            message: trust_decision.reason,
+        });
+    }
+    Ok(ComponentArtifactValidationOutcome {
+        manifest,
+        digest,
+        trust_decision,
+        observations,
+    })
+}
+
+fn manifest_path_for_definition(
+    definition: &ComponentDefinition,
+) -> Result<PathBuf, ComponentError> {
+    if let Some(path) = &definition.manifest_path {
+        return Ok(path.clone());
+    }
+    let Some(file_name) = definition
+        .artifact_path
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
+        return Err(ComponentError::ManifestMissing {
+            artifact: definition.artifact_path.clone(),
+        });
+    };
+    let candidate = definition
+        .artifact_path
+        .with_file_name(format!("{file_name}.magnetar-component.yaml"));
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    Err(ComponentError::ManifestMissing {
+        artifact: definition.artifact_path.clone(),
+    })
+}
+
+fn validate_manifest_wit(
+    definition: &ComponentDefinition,
+    manifest: &ComponentManifest,
+    actual: &ComponentContract,
+) -> Result<(), ComponentError> {
+    let actual_imports = actual.import_interfaces();
+    if manifest.imports != actual_imports {
+        return Err(ComponentError::ContractValidationFailed {
+            component: definition.metadata.name.clone(),
+            message: "manifest WIT imports do not match executable imports".into(),
+        });
+    }
+    if !manifest.optional_imports.is_disjoint(&actual_imports) {
+        return Err(ComponentError::ContractValidationFailed {
+            component: definition.metadata.name.clone(),
+            message: "manifest optional WIT imports overlap executable required imports".into(),
+        });
+    }
+    let actual_exports = actual.export_interfaces();
+    if !manifest.exports.is_subset(&actual_exports) {
+        return Err(ComponentError::ContractValidationFailed {
+            component: definition.metadata.name.clone(),
+            message: "manifest WIT exports are not provided by executable exports".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_runtime_compatibility(
+    definition: &ComponentDefinition,
+    manifest: &ComponentManifest,
+) -> Result<(), ComponentError> {
+    if compare_semver(&manifest.runtime_min_version, MAGNETAR_RUNTIME_VERSION)
+        .is_some_and(|ordering| ordering == std::cmp::Ordering::Greater)
+    {
+        return Err(ComponentError::ArtifactRejected {
+            component: definition.metadata.name.clone(),
+            status: ComponentTrustStatus::Rejected,
+            message: format!(
+                "component requires Magnetar Runtime {} but current runtime is {}",
+                manifest.runtime_min_version, MAGNETAR_RUNTIME_VERSION
+            ),
+        });
+    }
+    if let Some(max_version) = &manifest.runtime_max_version
+        && compare_semver(max_version, MAGNETAR_RUNTIME_VERSION)
+            .is_some_and(|ordering| ordering == std::cmp::Ordering::Less)
+    {
+        return Err(ComponentError::ArtifactRejected {
+            component: definition.metadata.name.clone(),
+            status: ComponentTrustStatus::Rejected,
+            message: format!(
+                "component supports Magnetar Runtime up to {max_version} but current runtime is {MAGNETAR_RUNTIME_VERSION}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_capability_compatibility(
+    definition: &ComponentDefinition,
+    manifest: &ComponentManifest,
+) -> Result<(), ComponentError> {
+    for capability in &manifest.capabilities {
+        let Some(import) = manifest
+            .imports
+            .iter()
+            .find(|import| import.name == capability.id)
+        else {
+            return Err(ComponentError::ArtifactRejected {
+                component: definition.metadata.name.clone(),
+                status: ComponentTrustStatus::Rejected,
+                message: format!(
+                    "required capability '{}@{}' is not backed by a WIT import",
+                    capability.id, capability.min_version
+                ),
+            });
+        };
+        if semver_major(&import.version) != semver_major(&capability.min_version) {
+            return Err(ComponentError::ArtifactRejected {
+                component: definition.metadata.name.clone(),
+                status: ComponentTrustStatus::Rejected,
+                message: format!(
+                    "required capability '{}' major version is incompatible with WIT import '{}'",
+                    capability.id, import.version
+                ),
+            });
+        }
+        if compare_semver(&import.version, &capability.min_version)
+            .is_some_and(|ordering| ordering == std::cmp::Ordering::Less)
+        {
+            return Err(ComponentError::ArtifactRejected {
+                component: definition.metadata.name.clone(),
+                status: ComponentTrustStatus::Rejected,
+                message: format!(
+                    "required capability '{}' needs at least {} but WIT import is {}",
+                    capability.id, capability.min_version, import.version
+                ),
+            });
+        }
+        if let Some(max_version) = &capability.max_version
+            && compare_semver(&import.version, max_version)
+                .is_some_and(|ordering| ordering == std::cmp::Ordering::Greater)
+        {
+            return Err(ComponentError::ArtifactRejected {
+                component: definition.metadata.name.clone(),
+                status: ComponentTrustStatus::Rejected,
+                message: format!(
+                    "required capability '{}' allows at most {max_version} but WIT import is {}",
+                    capability.id, import.version
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_signature_metadata(
+    definition: &ComponentDefinition,
+    manifest: &ComponentManifest,
+    digest: &ComponentDigest,
+) -> Result<(), ComponentError> {
+    for signature in &manifest.signatures {
+        if let Some(signature_digest) = &signature.digest
+            && signature_digest.to_ascii_lowercase() != digest.value
+        {
+            return Err(ComponentError::ArtifactRejected {
+                component: definition.metadata.name.clone(),
+                status: ComponentTrustStatus::Rejected,
+                message: "signature metadata digest does not match artifact digest".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_prepared_contract(
     definition: &ComponentDefinition,
     contract: &ComponentContract,
@@ -1046,6 +1943,149 @@ fn validate_prepared_contract(
     }
 
     Ok(())
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn lower_set(values: BTreeSet<String>) -> BTreeSet<String> {
+    values
+        .into_iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn wit_interface_from_manifest(
+    interface: ManifestWitInterfaceYaml,
+    path: &Path,
+) -> Result<WitInterface, ComponentError> {
+    validate_wit_package(&interface.package)
+        .map_err(|message| manifest_validation_error(path, message))?;
+    if interface.interface.trim().is_empty() || interface.interface.contains('/') {
+        return Err(manifest_validation_error(
+            path,
+            "WIT interface name is invalid",
+        ));
+    }
+    validate_semver(&interface.version)
+        .map_err(|message| manifest_validation_error(path, message))?;
+    Ok(WitInterface::new(
+        format!("{}/{}", interface.package, interface.interface),
+        interface.version,
+    ))
+}
+
+fn validate_wit_package(value: &str) -> Result<(), &'static str> {
+    if value.trim().is_empty() || !value.contains(':') {
+        return Err("WIT package must include a namespace");
+    }
+    if value.contains('/') || value.contains('@') || value.contains(' ') {
+        return Err("WIT package must not include interface, version, or spaces");
+    }
+    Ok(())
+}
+
+fn validate_component_name(value: &str) -> Result<(), &'static str> {
+    if value.trim().is_empty() {
+        return Err("component name must not be empty");
+    }
+    if value.starts_with('.') || value.ends_with('.') || value.contains("..") {
+        return Err("component name must not be ambiguous");
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || byte == b'.'
+            || byte == b'-'
+            || byte == b'_'
+    }) {
+        return Err("component name must use lowercase ASCII segments");
+    }
+    Ok(())
+}
+
+fn validate_wit_identity(value: &str) -> Result<(), &'static str> {
+    if value.trim().is_empty() || !value.contains(':') || !value.contains('/') {
+        return Err("WIT identity must include package namespace and interface");
+    }
+    if value.contains('@') || value.contains(' ') {
+        return Err("WIT identity must not include version or spaces");
+    }
+    Ok(())
+}
+
+fn validate_authority_kind(value: &str) -> Result<(), &'static str> {
+    match value {
+        "filesystem" | "network" | "environment" | "process" | "secret" | "clock"
+        | "randomness" | "source-control" | "tool" | "external-service" => Ok(()),
+        _ => Err("unsupported authority kind"),
+    }
+}
+
+fn validate_semver(value: &str) -> Result<(), &'static str> {
+    parse_semver(value).map(|_| ())
+}
+
+fn parse_semver(value: &str) -> Result<(u64, u64, u64), &'static str> {
+    let mut parts = value.split('.');
+    let parse = |part: Option<&str>| {
+        let part = part.ok_or("version must have major.minor.patch")?;
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("version segments must be numeric");
+        }
+        part.parse::<u64>()
+            .map_err(|_| "version segment is invalid")
+    };
+    let version = (
+        parse(parts.next())?,
+        parse(parts.next())?,
+        parse(parts.next())?,
+    );
+    if parts.next().is_some() {
+        return Err("version must have exactly three segments");
+    }
+    Ok(version)
+}
+
+fn compare_semver(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    Some(parse_semver(left).ok()?.cmp(&parse_semver(right).ok()?))
+}
+
+fn semver_major(value: &str) -> Option<u64> {
+    Some(parse_semver(value).ok()?.0)
+}
+
+fn manifest_validation_error(path: &Path, message: impl Into<String>) -> ComponentError {
+    ComponentError::Manifest {
+        path: path.into(),
+        message: message.into(),
+        source: None,
+    }
+}
+
+fn trust_store_error(path: &Path, message: impl Into<String>) -> ComponentError {
+    ComponentError::TrustStore {
+        path: path.into(),
+        message: message.into(),
+        source: None,
+    }
 }
 
 #[derive(Debug)]
@@ -1099,6 +2139,24 @@ pub enum ComponentError {
         path: PathBuf,
         message: String,
         source: Option<std::io::Error>,
+    },
+    ManifestMissing {
+        artifact: PathBuf,
+    },
+    Manifest {
+        path: PathBuf,
+        message: String,
+        source: Option<std::io::Error>,
+    },
+    TrustStore {
+        path: PathBuf,
+        message: String,
+        source: Option<std::io::Error>,
+    },
+    ArtifactRejected {
+        component: String,
+        status: ComponentTrustStatus,
+        message: String,
     },
     InvalidInstanceTransition {
         instance: ComponentInstanceId,
@@ -1198,6 +2256,29 @@ impl fmt::Display for ComponentError {
                 "component artifact '{}' could not be loaded: {message}",
                 path.display()
             ),
+            Self::ManifestMissing { artifact } => write!(
+                f,
+                "component artifact '{}' is missing a sidecar manifest",
+                artifact.display()
+            ),
+            Self::Manifest { path, message, .. } => write!(
+                f,
+                "component manifest '{}' is invalid: {message}",
+                path.display()
+            ),
+            Self::TrustStore { path, message, .. } => write!(
+                f,
+                "component trust store '{}' is invalid: {message}",
+                path.display()
+            ),
+            Self::ArtifactRejected {
+                component,
+                status,
+                message,
+            } => write!(
+                f,
+                "component artifact '{component}' is not trusted ({status:?}): {message}"
+            ),
             Self::InvalidInstanceTransition {
                 instance,
                 state,
@@ -1221,6 +2302,14 @@ impl Error for ComponentError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ComponentLoadFailed {
+                source: Some(source),
+                ..
+            } => Some(source),
+            Self::Manifest {
+                source: Some(source),
+                ..
+            } => Some(source),
+            Self::TrustStore {
                 source: Some(source),
                 ..
             } => Some(source),

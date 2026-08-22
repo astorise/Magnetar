@@ -100,7 +100,7 @@ impl WasmtimeComponentEngine {
         })
     }
 
-    fn inspect_contract(&self, component: &WasmtimeComponent) -> ComponentContract {
+    fn inspect_wasmtime_contract(&self, component: &WasmtimeComponent) -> ComponentContract {
         let component_type = component.component_type();
         ComponentContract {
             imports: component_type
@@ -123,6 +123,20 @@ impl WasmtimeComponentEngine {
                 .collect(),
         }
     }
+
+    fn load_and_inspect_contract(
+        &self,
+        definition: &ComponentDefinition,
+    ) -> Result<ComponentContract, ComponentError> {
+        let bytes = Self::load_component_bytes(&definition.artifact_path)?;
+        let component = WasmtimeComponent::new(&self.engine, bytes).map_err(|source| {
+            ComponentError::PreparationFailed {
+                component: definition.metadata.name.clone(),
+                message: redact_engine_message(source),
+            }
+        })?;
+        Ok(self.inspect_wasmtime_contract(&component))
+    }
 }
 
 impl ComponentEngine for WasmtimeComponentEngine {
@@ -133,6 +147,13 @@ impl ComponentEngine for WasmtimeComponentEngine {
             interruption: true,
             resource_limits: true,
         }
+    }
+
+    fn inspect_contract(
+        &mut self,
+        definition: &ComponentDefinition,
+    ) -> Result<ComponentContract, ComponentError> {
+        self.load_and_inspect_contract(definition)
     }
 
     fn prepare(
@@ -163,7 +184,7 @@ impl ComponentEngine for WasmtimeComponentEngine {
                 message: redact_engine_message(source),
             }
         })?;
-        let contract = self.inspect_contract(&component);
+        let contract = self.inspect_wasmtime_contract(&component);
         let key = self.next_key(definition.id);
         self.prepared.insert(
             key.clone(),
@@ -524,6 +545,9 @@ mod tests {
             id: ComponentDefinitionId::new(1),
             metadata: crate::ComponentMetadata::new("missing", "1", "missing component"),
             artifact_path: std::path::PathBuf::from("missing-component.wasm"),
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
 
@@ -546,6 +570,9 @@ mod tests {
             id: ComponentDefinitionId::new(2),
             metadata: crate::ComponentMetadata::new("invalid", "1", "invalid component"),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
 
@@ -571,6 +598,9 @@ mod tests {
             id: ComponentDefinitionId::new(17),
             metadata: crate::ComponentMetadata::new("malformed", "1", "malformed component"),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
 
@@ -606,6 +636,9 @@ mod tests {
             id: ComponentDefinitionId::new(7),
             metadata: crate::ComponentMetadata::new("empty", "1", "empty component"),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -642,6 +675,9 @@ mod tests {
             metadata: crate::ComponentMetadata::new("importer", "1", "importing component")
                 .with_import(interface.clone()),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -670,6 +706,9 @@ mod tests {
             metadata: crate::ComponentMetadata::new("ok", "1", "callable component")
                 .with_export(interface.clone()),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -704,6 +743,9 @@ mod tests {
             metadata: crate::ComponentMetadata::new("u32", "1", "u32 component")
                 .with_export(interface.clone()),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -746,6 +788,9 @@ mod tests {
             metadata: crate::ComponentMetadata::new("deadline", "1", "deadline component")
                 .with_export(interface.clone()),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -787,6 +832,9 @@ mod tests {
             metadata: crate::ComponentMetadata::new("cancel-local", "1", "cancel component")
                 .with_export(interface.clone()),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -847,6 +895,9 @@ mod tests {
                 .with_import(import.clone())
                 .with_export(export.clone()),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -892,6 +943,9 @@ mod tests {
                 .with_import(import.clone())
                 .with_export(export.clone()),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -932,6 +986,9 @@ mod tests {
                 .with_import(import.clone())
                 .with_export(export.clone()),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -982,6 +1039,9 @@ mod tests {
             metadata: crate::ComponentMetadata::new("compute-import", "1", "compute import")
                 .with_import(interface.clone()),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -1035,6 +1095,9 @@ mod tests {
                 )
                 .with_import(interface),
                 artifact_path: artifact,
+                manifest_path: None,
+                artifact_digest: None,
+                trust_decision: None,
                 state: crate::ComponentDefinitionState::Registered,
             };
             let prepared = engine
@@ -1064,6 +1127,9 @@ mod tests {
             metadata: crate::ComponentMetadata::new("resource-import", "1", "resource import")
                 .with_import(interface.clone()),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -1103,6 +1169,9 @@ mod tests {
             id: ComponentDefinitionId::new(9),
             metadata: crate::ComponentMetadata::new("memory", "1", "memory component"),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine
@@ -1138,6 +1207,9 @@ mod tests {
             metadata: crate::ComponentMetadata::new("callable", "1", "callable component")
                 .with_export(interface.clone()),
             artifact_path: artifact,
+            manifest_path: None,
+            artifact_digest: None,
+            trust_decision: None,
             state: crate::ComponentDefinitionState::Registered,
         };
         let prepared = engine

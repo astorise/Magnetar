@@ -27,14 +27,18 @@ pub use affinity::{
 };
 pub use capability::{Capability, CapabilityDescriptor, CapabilityId, CapabilityVersion};
 pub use component::{
-    ComponentArtifactReference, ComponentContract, ComponentDefinition, ComponentDefinitionId,
-    ComponentDefinitionState, ComponentDescriptor, ComponentEndpoint, ComponentEngine,
-    ComponentEngineCapabilities, ComponentEngineInstance, ComponentError,
+    COMPONENT_ARTIFACT_SCHEMA, COMPONENT_ARTIFACT_SCHEMA_VERSION, COMPONENT_TRUST_SCHEMA,
+    ComponentArtifactCache, ComponentArtifactReference, ComponentAuthorityRequirement,
+    ComponentCapabilityRequirement, ComponentContract, ComponentDefinition, ComponentDefinitionId,
+    ComponentDefinitionState, ComponentDescriptor, ComponentDigest, ComponentEndpoint,
+    ComponentEngine, ComponentEngineCapabilities, ComponentEngineInstance, ComponentError,
     ComponentExportDescription, ComponentImportRequirement, ComponentInstance, ComponentInstanceId,
     ComponentInstanceState, ComponentInterfaceShape, ComponentInterruptionReason,
     ComponentInvocation, ComponentInvocationResult, ComponentLinkPlan, ComponentManager,
-    ComponentMetadata, ComponentObservation, ComponentObservationKind, ComponentResourceLimits,
-    ComponentTrapKind, ComponentValue, MockComponentEngine, PreparedComponent, WitInterface,
+    ComponentManifest, ComponentMetadata, ComponentObservation, ComponentObservationKind,
+    ComponentPublisher, ComponentResourceLimits, ComponentSignature, ComponentSource,
+    ComponentTrapKind, ComponentTrustDecision, ComponentTrustStatus, ComponentTrustStore,
+    ComponentValue, MAGNETAR_RUNTIME_VERSION, MockComponentEngine, PreparedComponent, WitInterface,
 };
 #[cfg(feature = "wasmtime-component-engine")]
 pub use component_wasmtime::WasmtimeComponentEngine;
