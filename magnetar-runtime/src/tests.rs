@@ -2976,6 +2976,219 @@ fn component_link_plan_is_runtime_owned_and_immutable_to_callers() {
 }
 
 #[test]
+fn component_link_plan_rejects_forbidden_external_interfaces_even_if_provided() {
+    for interface in [
+        WitInterface::new("wasi:filesystem/types", "0.2.0"),
+        WitInterface::new("wasi:sockets/tcp", "0.2.0"),
+        WitInterface::new("magnetar:workspace/read", "1.0.0"),
+        WitInterface::new("magnetar:git/status", "1.0.0"),
+        WitInterface::new("magnetar:process/run", "1.0.0"),
+        WitInterface::new("magnetar:secrets/read", "1.0.0"),
+    ] {
+        let mut manager = ComponentManager::new();
+        manager.provide_interface(interface.clone());
+        manager
+            .register_component(ComponentDescriptor::new(
+                ComponentMetadata::new("external", "1", "external component")
+                    .with_import(interface),
+                "external.wasm",
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            manager.link_plan("external"),
+            Err(ComponentError::UnauthorizedImport { .. })
+        ));
+    }
+}
+
+#[test]
+fn component_authority_requirements_map_to_inference_runtime_endpoints() {
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "compute-capability".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::Capability { interface }
+            if interface == WitInterface::new("magnetar:compute/run", "2.0.0")
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "model-artifact-read".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Model
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "tokenizer-artifact-read".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Tokenizer
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "prompt-template-read".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::PromptTemplate
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "adapter-artifact-read".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Adapter
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "quantization-artifact-read".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Quantization
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "kv-cache-access".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceCacheService {
+            kind: InferenceCacheKind::Kv
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "prefix-cache-access".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceCacheService {
+            kind: InferenceCacheKind::Prefix
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "observability-emit".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::Observability
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "runtime-diagnostics".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::RuntimeDiagnostics
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "generation-capability".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::PendingRuntimeService { .. }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "sampling-capability".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::PendingRuntimeService { .. }
+    ));
+}
+
+#[test]
+fn inference_artifact_registry_uses_identities_not_paths_and_scopes_sessions() {
+    let mut manager = ComponentManager::new();
+    let digest = ComponentDigest::sha256(b"model");
+    let session = InferenceSessionId::new("session-a").unwrap();
+    manager
+        .register_inference_artifact(
+            InferenceArtifactReference::new(InferenceArtifactKind::Model, "qwen-model", digest)
+                .unwrap()
+                .with_session(session.clone()),
+        )
+        .unwrap();
+
+    let artifact = manager
+        .resolve_inference_artifact(InferenceArtifactKind::Model, "qwen-model", Some(&session))
+        .unwrap();
+    assert_eq!(artifact.id, "qwen-model");
+    assert!(matches!(
+        manager.resolve_inference_artifact(InferenceArtifactKind::Model, "../qwen-model", None),
+        Err(ComponentError::ArtifactRejected { .. })
+    ));
+    assert!(matches!(
+        manager.resolve_inference_artifact(
+            InferenceArtifactKind::Model,
+            "qwen-model",
+            Some(&InferenceSessionId::new("session-b").unwrap())
+        ),
+        Err(ComponentError::ArtifactRejected { .. })
+    ));
+}
+
+#[test]
+fn inference_artifact_registry_handles_tokenizer_template_adapter_and_quantization() {
+    let mut registry = InferenceArtifactRegistry::default();
+    for kind in [
+        InferenceArtifactKind::Tokenizer,
+        InferenceArtifactKind::PromptTemplate,
+        InferenceArtifactKind::Adapter,
+        InferenceArtifactKind::Quantization,
+    ] {
+        let id = format!("{kind:?}").to_ascii_lowercase();
+        registry
+            .register(
+                InferenceArtifactReference::new(kind, &id, ComponentDigest::sha256(id.as_bytes()))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(registry.resolve(kind, &id, None).unwrap().kind, kind);
+    }
+    assert!(matches!(
+        registry.resolve(InferenceArtifactKind::Tokenizer, "C:\\tokenizer.json", None),
+        Err(ComponentError::ArtifactRejected { .. })
+    ));
+}
+
+#[test]
+fn inference_cache_registry_scopes_access_to_session_and_model() {
+    let mut registry = InferenceCacheRegistry::default();
+    let session = InferenceSessionId::new("session-a").unwrap();
+    let authorized =
+        InferenceCacheScope::new(InferenceCacheKind::Kv, session.clone(), "qwen-model").unwrap();
+    registry.authorize(authorized.clone());
+
+    registry.authorize_access(&authorized).unwrap();
+    assert!(matches!(
+        registry.authorize_access(
+            &InferenceCacheScope::new(InferenceCacheKind::Kv, session, "other-model").unwrap()
+        ),
+        Err(ComponentError::ArtifactRejected { .. })
+    ));
+    assert!(matches!(
+        registry.authorize_access(
+            &InferenceCacheScope::new(
+                InferenceCacheKind::Prefix,
+                InferenceSessionId::new("session-b").unwrap(),
+                "qwen-model"
+            )
+            .unwrap()
+        ),
+        Err(ComponentError::ArtifactRejected { .. })
+    ));
+}
+
+#[test]
 fn prepared_component_contract_must_match_declared_imports() {
     let declared = WitInterface::new("example:declared/api", "1.0.0");
     let undeclared = WitInterface::new("example:undeclared/api", "1.0.0");
@@ -3309,6 +3522,64 @@ signatures: []
     )
 }
 
+fn tokenizer_manifest_yaml(digest: &str) -> String {
+    format!(
+        r#"schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "{digest}"
+component:
+  name: "magnetar.examples.tokenizer"
+  version: "0.1.0"
+  description: "Tokenizer Component fixture"
+  role: "tokenizer"
+runtime:
+  magnetar:
+    min_version: "0.1.0"
+wit:
+  imports:
+    - package: "magnetar:compute"
+      interface: "run"
+      version: "2.0.0"
+  exports:
+    - package: "magnetar:tokenizer"
+      interface: "tokenize"
+      version: "1.0.0"
+capabilities:
+  requires:
+    - id: "magnetar:compute/run"
+      version: "2.0.0"
+authority:
+  requires:
+    - tokenizer-artifact-read
+    - compute-capability
+    - observability-emit
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./fixtures/tokenizer.component.wasm"
+signatures: []
+"#
+    )
+}
+
+fn manifest_yaml_with_authority(digest: &str, authorities: &[&str]) -> String {
+    let requires = authorities
+        .iter()
+        .map(|authority| format!("    - {authority}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    manifest_yaml(digest, MAGNETAR_RUNTIME_VERSION).replace(
+        "authority:\n  requires: []",
+        &format!("authority:\n  requires:\n{requires}"),
+    )
+}
+
 fn trust_store_yaml(digest: &str) -> String {
     format!(
         r#"schema: magnetar-component-trust
@@ -3323,6 +3594,271 @@ development:
   allow_unsigned_local: false
 "#
     )
+}
+
+#[test]
+fn component_artifact_accepts_target_tokenizer_manifest_authorities() {
+    let directory = temp_component_artifact_dir("tokenizer-authority");
+    let artifact = directory.join("tokenizer.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    fs::write(
+        directory.join("tokenizer.component.wasm.magnetar-component.yaml"),
+        tokenizer_manifest_yaml(&digest.value),
+    )
+    .unwrap();
+
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.tokenizer", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:compute/run", "2.0.0"))
+                .with_export(WitInterface::new("magnetar:tokenizer/tokenize", "1.0.0")),
+            &artifact,
+        ))
+        .unwrap();
+
+    manager
+        .prepare_component("magnetar.examples.tokenizer")
+        .unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_artifact_rejects_broad_authority_kinds() {
+    for authority in [
+        "filesystem",
+        "network",
+        "secrets",
+        "git",
+        "workspace",
+        "process",
+    ] {
+        let directory = temp_component_artifact_dir(authority);
+        let artifact = directory.join("hello.component.wasm");
+        let bytes = b"component-bytes";
+        fs::write(&artifact, bytes).unwrap();
+        let digest = ComponentDigest::sha256(bytes);
+        fs::write(
+            directory.join("hello.component.wasm.magnetar-component.yaml"),
+            manifest_yaml_with_authority(&digest.value, &[authority]),
+        )
+        .unwrap();
+        let mut manager = ComponentManager::new();
+        manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+        manager
+            .register_component(ComponentDescriptor::new(
+                ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                    .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                    .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+                &artifact,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            manager.prepare_component("magnetar.examples.hello"),
+            Err(ComponentError::Manifest { message, .. })
+                if message == "authority kind is outside Magnetar inference scope"
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn component_artifact_rejects_unknown_authority_kinds() {
+    let directory = temp_component_artifact_dir("unknown-authority");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml_with_authority(&digest.value, &["workspace-admin"]),
+    )
+    .unwrap();
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::Manifest { message, .. }) if message == "unsupported authority kind"
+    ));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_artifact_accepts_model_artifact_read_authority_when_trusted() {
+    let directory = temp_component_artifact_dir("model-artifact-authority");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml_with_authority(&digest.value, &["model-artifact-read"]),
+    )
+    .unwrap();
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        ))
+        .unwrap();
+
+    manager
+        .prepare_component("magnetar.examples.hello")
+        .unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_trust_overrides_do_not_allow_forbidden_authority() {
+    for (label, trust_store, source_kind) in [
+        ("trusted-digest", ComponentTrustStore::default(), "local"),
+        (
+            "trusted-publisher",
+            ComponentTrustStore::default().trust_publisher("local-dev"),
+            "local",
+        ),
+        (
+            "trusted-tachyon-source",
+            ComponentTrustStore::default().trust_source("tachyon"),
+            "tachyon",
+        ),
+        (
+            "trusted-local-source",
+            ComponentTrustStore::default().trust_source("local"),
+            "local",
+        ),
+        (
+            "development-mode",
+            ComponentTrustStore::default().allow_unsigned_local_development(true),
+            "local",
+        ),
+    ] {
+        let directory = temp_component_artifact_dir(label);
+        let artifact = directory.join("hello.component.wasm");
+        let bytes = b"component-bytes";
+        fs::write(&artifact, bytes).unwrap();
+        let digest = ComponentDigest::sha256(bytes);
+        let mut trust_store = trust_store;
+        if label == "trusted-digest" {
+            trust_store = trust_store.trust_digest(digest.value.clone());
+        }
+        let manifest = manifest_yaml_with_authority(&digest.value, &["filesystem"])
+            .replace("  kind: \"local\"", &format!("  kind: \"{source_kind}\""));
+        fs::write(
+            directory.join("hello.component.wasm.magnetar-component.yaml"),
+            manifest,
+        )
+        .unwrap();
+        let mut manager = ComponentManager::new();
+        manager.set_trust_store(trust_store);
+        manager
+            .register_component(ComponentDescriptor::new(
+                ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                    .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                    .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+                &artifact,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            manager.prepare_component("magnetar.examples.hello"),
+            Err(ComponentError::Manifest { message, .. })
+                if message == "authority kind is outside Magnetar inference scope"
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn component_authority_rejection_is_observed_with_reason_before_prepare() {
+    let directory = temp_component_artifact_dir("authority-diagnostic");
+    let artifact = directory.join("hello.component.wasm");
+    let bytes = b"component-bytes";
+    fs::write(&artifact, bytes).unwrap();
+    let digest = ComponentDigest::sha256(bytes);
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml_with_authority(&digest.value, &["filesystem"]),
+    )
+    .unwrap();
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
+                .with_import(WitInterface::new("magnetar:test/echo", "1.0.0"))
+                .with_export(WitInterface::new("magnetar:test/run", "1.0.0")),
+            &artifact,
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::Manifest { .. })
+    ));
+    assert_eq!(
+        manager.definition_state("magnetar.examples.hello"),
+        Some(ComponentDefinitionState::Failed)
+    );
+    assert!(manager.observations().iter().any(|observation| {
+        observation.kind == ComponentObservationKind::Validation
+            && observation.message.contains("component authority rejected")
+            && observation
+                .message
+                .contains("authority kind is outside Magnetar inference scope")
+    }));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn component_validation_observations_redact_paths_and_secrets() {
+    let directory = temp_component_artifact_dir("redacted-diagnostic");
+    let artifact = directory.join("hello.component.wasm");
+    fs::write(&artifact, b"component-bytes").unwrap();
+    let mut manager = ComponentManager::new();
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture"),
+            &artifact,
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ManifestMissing { .. })
+    ));
+    let messages = manager
+        .observations()
+        .iter()
+        .map(|observation| observation.message.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("[redacted]"))
+    );
+    assert!(!messages.iter().any(|message| {
+        message.contains(directory.to_string_lossy().as_ref())
+            || message.to_ascii_lowercase().contains("secret")
+    }));
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

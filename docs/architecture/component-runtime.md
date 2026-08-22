@@ -44,16 +44,100 @@ execution state.
 
 ## Authority
 
-The Component Runtime is fail-closed. An interface absent from the authorized
-Link Plan is unavailable to the Component instance.
+The Component Runtime is fail-closed and scoped to inference. An interface
+absent from the authorized Link Plan is unavailable to the Component instance.
+
+Magnetar Component manifests may request only inference-scoped authority:
+
+- model-artifact-read
+- tokenizer-artifact-read
+- prompt-template-read
+- adapter-artifact-read
+- quantization-artifact-read
+- inference-session-state
+- generation-session-state
+- kv-cache-access
+- prefix-cache-access
+- compute-capability
+- generation-capability
+- sampling-capability
+- observability-emit
+- runtime-diagnostics
 
 Filesystem, network, environment variables, process execution, secrets,
-sockets, host command execution, and WASI interfaces are not ambient. Each
-interface must be explicitly authorized and linked by Runtime policy.
+sockets, Git, workspace access, host command execution, and broad WASI
+interfaces are outside Magnetar inference scope. They belong to clients or
+orchestrators such as `magnetar-cli`, not to the Magnetar Runtime.
 
 The first Wasmtime adapter does not install broad default WASI. Authorized
-WASI will be added only through explicit scoped Link Plan entries in a later
-change.
+inference interfaces will be added only through explicit scoped Link Plan
+entries.
+
+The target Component Artifact manifest shape for an inference Component is:
+
+```yaml
+schema: magnetar-component-artifact
+schema_version: 1
+
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "sha256:0123456789abcdef..."
+
+component:
+  name: "magnetar.examples.tokenizer"
+  version: "0.1.0"
+  description: "Tokenizer Component fixture"
+  role: "tokenizer"
+
+runtime:
+  magnetar:
+    min_version: "0.1.0"
+
+wit:
+  imports:
+    - package: "magnetar:compute"
+      interface: "run"
+      version: "2.0.0"
+  exports:
+    - package: "magnetar:tokenizer"
+      interface: "tokenize"
+      version: "1.0.0"
+
+capabilities:
+  requires:
+    - id: "magnetar:compute/run"
+      version: "2.0.0"
+
+authority:
+  requires:
+    - tokenizer-artifact-read
+    - compute-capability
+    - observability-emit
+
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+
+source:
+  kind: "local"
+  uri: "./fixtures/tokenizer.component.wasm"
+
+signatures: []
+```
+
+This authority block is invalid for Magnetar:
+
+```yaml
+authority:
+  requires:
+    - filesystem
+    - network
+    - secrets
+    - git
+    - workspace
+```
 
 ## Resource Limits and Concurrency
 

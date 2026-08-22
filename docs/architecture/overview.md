@@ -54,8 +54,8 @@ Affinity, Provider and Device health, and the active Resolution Policy.
 | Resolution Policy | Runtime policy for choosing among compatible candidates. |
 | Artifact | Versioned content consumed by Magnetar, such as Component code or model data. |
 | Model | Future Runtime-managed AI model identity and execution state. |
-| Agent | Future Runtime-managed behavior that uses generation and tools. |
-| Tool | Future authorized operation exposed to agent or application behavior. |
+| Agent | Client-owned behavior that may call Magnetar for inference and execute tools externally. |
+| Tool | Client-owned operation outside Magnetar inference Runtime authority. |
 
 Deprecated or non-canonical primary terms:
 
@@ -68,8 +68,9 @@ Deprecated or non-canonical primary terms:
 ## Component Boundary
 
 Components are portable and sandboxable. They consume portable WIT contracts and
-may expose higher-level behavior such as model architecture logic, prompt
-formatting, tools, agents, or observability export.
+may expose inference-related behavior such as model architecture logic,
+tokenization, prompt formatting, sampling, logits processing, generation
+helpers, inference diagnostics, or observability emission.
 
 Components must not receive:
 
@@ -107,14 +108,22 @@ Examples:
 
 ## AI Runtime Scope
 
-Magnetar is intended to become a standalone AI Runtime. Future Magnetar
-responsibilities include model loading, model residency, tokenization, prompt
-templates, generation, streaming, continuous batching, KV cache, prefix cache,
-adapters, LoRA, quantization, multi-device execution, agent execution, tool
-execution, local CLI usage, and service/API usage.
+Magnetar is intended to become a standalone AI inference Runtime. Future
+Magnetar responsibilities include model loading, model residency,
+tokenization, prompt templates, generation, streaming, continuous batching, KV
+cache, prefix cache, adapters, LoRA, quantization, multi-device execution, and
+service/API usage.
+
+Magnetar does not own general-purpose workspace, filesystem, Git, network,
+secret, process, shell, or agent tool authority. A client such as
+`magnetar-cli` may read files, inspect Git, call network APIs, manage secrets,
+execute tools, orchestrate an agent workflow, and call Magnetar for inference.
+Magnetar receives prompt/context input, loads authorized models, tokenizes,
+generates, streams tokens, manages inference cache state, executes compute, and
+returns inference results.
 
 These are roadmap responsibilities until their dedicated changes are completed.
-Current documentation must not describe future model, generation, or agent WIT
+Current documentation must not describe future model or generation WIT
 contracts as stable.
 
 ## Magnetar and Tachyon

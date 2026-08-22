@@ -28,17 +28,20 @@ pub use affinity::{
 pub use capability::{Capability, CapabilityDescriptor, CapabilityId, CapabilityVersion};
 pub use component::{
     COMPONENT_ARTIFACT_SCHEMA, COMPONENT_ARTIFACT_SCHEMA_VERSION, COMPONENT_TRUST_SCHEMA,
-    ComponentArtifactCache, ComponentArtifactReference, ComponentAuthorityRequirement,
-    ComponentCapabilityRequirement, ComponentContract, ComponentDefinition, ComponentDefinitionId,
-    ComponentDefinitionState, ComponentDescriptor, ComponentDigest, ComponentEndpoint,
-    ComponentEngine, ComponentEngineCapabilities, ComponentEngineInstance, ComponentError,
-    ComponentExportDescription, ComponentImportRequirement, ComponentInstance, ComponentInstanceId,
-    ComponentInstanceState, ComponentInterfaceShape, ComponentInterruptionReason,
-    ComponentInvocation, ComponentInvocationResult, ComponentLinkPlan, ComponentManager,
-    ComponentManifest, ComponentMetadata, ComponentObservation, ComponentObservationKind,
-    ComponentPublisher, ComponentResourceLimits, ComponentSignature, ComponentSource,
-    ComponentTrapKind, ComponentTrustDecision, ComponentTrustStatus, ComponentTrustStore,
-    ComponentValue, MAGNETAR_RUNTIME_VERSION, MockComponentEngine, PreparedComponent, WitInterface,
+    ComponentArtifactCache, ComponentArtifactReference, ComponentAuthorityEndpoint,
+    ComponentAuthorityRequirement, ComponentCapabilityRequirement, ComponentContract,
+    ComponentDefinition, ComponentDefinitionId, ComponentDefinitionState, ComponentDescriptor,
+    ComponentDigest, ComponentEndpoint, ComponentEngine, ComponentEngineCapabilities,
+    ComponentEngineInstance, ComponentError, ComponentExportDescription,
+    ComponentImportRequirement, ComponentInstance, ComponentInstanceId, ComponentInstanceState,
+    ComponentInterfaceShape, ComponentInterruptionReason, ComponentInvocation,
+    ComponentInvocationResult, ComponentLinkPlan, ComponentManager, ComponentManifest,
+    ComponentMetadata, ComponentObservation, ComponentObservationKind, ComponentPublisher,
+    ComponentResourceLimits, ComponentSignature, ComponentSource, ComponentTrapKind,
+    ComponentTrustDecision, ComponentTrustStatus, ComponentTrustStore, ComponentValue,
+    InferenceArtifactKind, InferenceArtifactReference, InferenceArtifactRegistry,
+    InferenceCacheKind, InferenceCacheRegistry, InferenceCacheScope, InferenceSessionId,
+    MAGNETAR_RUNTIME_VERSION, MockComponentEngine, PreparedComponent, WitInterface,
 };
 #[cfg(feature = "wasmtime-component-engine")]
 pub use component_wasmtime::WasmtimeComponentEngine;

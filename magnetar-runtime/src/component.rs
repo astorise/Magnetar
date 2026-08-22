@@ -454,6 +454,188 @@ pub struct ComponentAuthorityRequirement {
     pub kind: String,
 }
 
+impl ComponentAuthorityRequirement {
+    pub fn endpoint(&self) -> ComponentAuthorityEndpoint {
+        authority_endpoint_for_kind(&self.kind)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum InferenceArtifactKind {
+    Model,
+    Tokenizer,
+    PromptTemplate,
+    Adapter,
+    Quantization,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum InferenceCacheKind {
+    Kv,
+    Prefix,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct InferenceSessionId(String);
+
+impl InferenceSessionId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ComponentError> {
+        let value = value.into();
+        validate_runtime_identity(&value).map_err(|message| ComponentError::ArtifactRejected {
+            component: "inference-session".into(),
+            status: ComponentTrustStatus::Rejected,
+            message: message.into(),
+        })?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InferenceArtifactReference {
+    pub kind: InferenceArtifactKind,
+    pub id: String,
+    pub digest: ComponentDigest,
+    pub session: Option<InferenceSessionId>,
+}
+
+impl InferenceArtifactReference {
+    pub fn new(
+        kind: InferenceArtifactKind,
+        id: impl Into<String>,
+        digest: ComponentDigest,
+    ) -> Result<Self, ComponentError> {
+        let id = id.into();
+        validate_runtime_identity(&id).map_err(|message| ComponentError::ArtifactRejected {
+            component: id.clone(),
+            status: ComponentTrustStatus::Rejected,
+            message: message.into(),
+        })?;
+        Ok(Self {
+            kind,
+            id,
+            digest,
+            session: None,
+        })
+    }
+
+    pub fn with_session(mut self, session: InferenceSessionId) -> Self {
+        self.session = Some(session);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InferenceArtifactRegistry {
+    entries: BTreeMap<(InferenceArtifactKind, String), InferenceArtifactReference>,
+}
+
+impl InferenceArtifactRegistry {
+    pub fn register(&mut self, artifact: InferenceArtifactReference) -> Result<(), ComponentError> {
+        self.entries
+            .insert((artifact.kind, artifact.id.clone()), artifact);
+        Ok(())
+    }
+
+    pub fn resolve(
+        &self,
+        kind: InferenceArtifactKind,
+        id: &str,
+        session: Option<&InferenceSessionId>,
+    ) -> Result<&InferenceArtifactReference, ComponentError> {
+        if id.contains('/') || id.contains('\\') || id.contains(':') {
+            return Err(ComponentError::ArtifactRejected {
+                component: id.into(),
+                status: ComponentTrustStatus::Rejected,
+                message: "inference artifact access requires a registered artifact identity".into(),
+            });
+        }
+        let artifact = self.entries.get(&(kind, id.into())).ok_or_else(|| {
+            ComponentError::ArtifactRejected {
+                component: id.into(),
+                status: ComponentTrustStatus::Rejected,
+                message: "inference artifact is not registered".into(),
+            }
+        })?;
+        if let Some(expected) = &artifact.session
+            && Some(expected) != session
+        {
+            return Err(ComponentError::ArtifactRejected {
+                component: id.into(),
+                status: ComponentTrustStatus::Rejected,
+                message: "inference artifact is not authorized for this session".into(),
+            });
+        }
+        Ok(artifact)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct InferenceCacheScope {
+    pub kind: InferenceCacheKind,
+    pub session: InferenceSessionId,
+    pub model_artifact_id: String,
+}
+
+impl InferenceCacheScope {
+    pub fn new(
+        kind: InferenceCacheKind,
+        session: InferenceSessionId,
+        model_artifact_id: impl Into<String>,
+    ) -> Result<Self, ComponentError> {
+        let model_artifact_id = model_artifact_id.into();
+        validate_runtime_identity(&model_artifact_id).map_err(|message| {
+            ComponentError::ArtifactRejected {
+                component: model_artifact_id.clone(),
+                status: ComponentTrustStatus::Rejected,
+                message: message.into(),
+            }
+        })?;
+        Ok(Self {
+            kind,
+            session,
+            model_artifact_id,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InferenceCacheRegistry {
+    scopes: BTreeSet<InferenceCacheScope>,
+}
+
+impl InferenceCacheRegistry {
+    pub fn authorize(&mut self, scope: InferenceCacheScope) {
+        self.scopes.insert(scope);
+    }
+
+    pub fn authorize_access(&self, scope: &InferenceCacheScope) -> Result<(), ComponentError> {
+        if self.scopes.contains(scope) {
+            Ok(())
+        } else {
+            Err(ComponentError::ArtifactRejected {
+                component: scope.model_artifact_id.clone(),
+                status: ComponentTrustStatus::Rejected,
+                message: "cache access is not authorized for this session and model".into(),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComponentAuthorityEndpoint {
+    Capability { interface: WitInterface },
+    RuntimeService { interface: WitInterface },
+    InferenceArtifactRegistry { kind: InferenceArtifactKind },
+    InferenceCacheService { kind: InferenceCacheKind },
+    Observability,
+    RuntimeDiagnostics,
+    PendingRuntimeService { authority: String },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentPublisher {
     pub id: String,
@@ -734,6 +916,7 @@ impl ComponentManifestYaml {
                     ManifestAuthorityRequirementYaml::String(kind) => kind,
                     ManifestAuthorityRequirementYaml::Object { kind } => kind,
                 };
+                let kind = kind.trim().to_ascii_lowercase();
                 validate_authority_kind(&kind)
                     .map_err(|message| manifest_validation_error(path, message))?;
                 Ok(ComponentAuthorityRequirement { kind })
@@ -1247,6 +1430,8 @@ pub struct ComponentManager {
     engine: Box<dyn ComponentEngine>,
     host_interfaces: BTreeSet<WitInterface>,
     authorized_interfaces: BTreeSet<WitInterface>,
+    inference_artifacts: InferenceArtifactRegistry,
+    inference_caches: InferenceCacheRegistry,
     definitions: BTreeMap<String, ComponentDefinition>,
     prepared: BTreeMap<ComponentDefinitionId, PreparedComponent>,
     instances: BTreeMap<ComponentInstanceId, ComponentInstance>,
@@ -1273,6 +1458,8 @@ impl ComponentManager {
             engine,
             host_interfaces: BTreeSet::new(),
             authorized_interfaces: BTreeSet::new(),
+            inference_artifacts: InferenceArtifactRegistry::default(),
+            inference_caches: InferenceCacheRegistry::default(),
             definitions: BTreeMap::new(),
             prepared: BTreeMap::new(),
             instances: BTreeMap::new(),
@@ -1299,6 +1486,33 @@ impl ComponentManager {
 
     pub fn set_trust_store(&mut self, trust_store: ComponentTrustStore) {
         self.trust_store = trust_store;
+    }
+
+    pub fn register_inference_artifact(
+        &mut self,
+        artifact: InferenceArtifactReference,
+    ) -> Result<(), ComponentError> {
+        self.inference_artifacts.register(artifact)
+    }
+
+    pub fn resolve_inference_artifact(
+        &self,
+        kind: InferenceArtifactKind,
+        id: &str,
+        session: Option<&InferenceSessionId>,
+    ) -> Result<&InferenceArtifactReference, ComponentError> {
+        self.inference_artifacts.resolve(kind, id, session)
+    }
+
+    pub fn authorize_inference_cache(&mut self, scope: InferenceCacheScope) {
+        self.inference_caches.authorize(scope);
+    }
+
+    pub fn authorize_inference_cache_access(
+        &self,
+        scope: &InferenceCacheScope,
+    ) -> Result<(), ComponentError> {
+        self.inference_caches.authorize_access(scope)
     }
 
     pub fn observations(&self) -> &[ComponentObservation] {
@@ -1365,12 +1579,7 @@ impl ComponentManager {
                 }
                 Err(error) => {
                     definition.state = ComponentDefinitionState::Failed;
-                    self.observations.push(ComponentObservation::new(
-                        ComponentObservationKind::Validation,
-                        Some(name.into()),
-                        None,
-                        error.to_string(),
-                    ));
+                    self.observe_authority_or_validation_error(name, &error);
                     return Err(error);
                 }
             }
@@ -1596,6 +1805,12 @@ impl ComponentManager {
     ) -> Result<ComponentLinkPlan, ComponentError> {
         let mut links = BTreeMap::new();
         for interface in &definition.metadata.imports {
+            if is_forbidden_external_interface(&interface.name) {
+                return Err(ComponentError::UnauthorizedImport {
+                    component: definition.metadata.name.clone(),
+                    interface: interface.clone(),
+                });
+            }
             if !self.authorized_interfaces.contains(interface) {
                 return Err(ComponentError::UnauthorizedImport {
                     component: definition.metadata.name.clone(),
@@ -1604,6 +1819,12 @@ impl ComponentManager {
             }
             if !self.host_interfaces.contains(interface) {
                 return Err(ComponentError::UnresolvedImport {
+                    component: definition.metadata.name.clone(),
+                    interface: interface.clone(),
+                });
+            }
+            if !is_inference_linkable_interface(&interface.name) {
+                return Err(ComponentError::UnauthorizedImport {
                     component: definition.metadata.name.clone(),
                     interface: interface.clone(),
                 });
@@ -1642,8 +1863,29 @@ impl ComponentManager {
             kind,
             None,
             instance,
-            error.to_string(),
+            redact_component_diagnostic(&error.to_string()),
         ));
+    }
+
+    fn observe_authority_or_validation_error(&mut self, component: &str, error: &ComponentError) {
+        let message = redact_component_diagnostic(&error.to_string());
+        if message.contains("authority kind is outside Magnetar inference scope")
+            || message.contains("unsupported authority kind")
+        {
+            self.observations.push(ComponentObservation::new(
+                ComponentObservationKind::Validation,
+                Some(component.into()),
+                None,
+                format!("component authority rejected: {message}"),
+            ));
+        } else {
+            self.observations.push(ComponentObservation::new(
+                ComponentObservationKind::Validation,
+                Some(component.into()),
+                None,
+                message,
+            ));
+        }
     }
 }
 
@@ -2031,12 +2273,123 @@ fn validate_wit_identity(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn validate_runtime_identity(value: &str) -> Result<(), &'static str> {
+    if value.trim().is_empty() {
+        return Err("runtime identity must not be empty");
+    }
+    if value.contains('/') || value.contains('\\') || value.contains(':') {
+        return Err("runtime identity must not be a path or URI");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err("runtime identity must use portable ASCII characters");
+    }
+    Ok(())
+}
+
 fn validate_authority_kind(value: &str) -> Result<(), &'static str> {
     match value {
-        "filesystem" | "network" | "environment" | "process" | "secret" | "clock"
-        | "randomness" | "source-control" | "tool" | "external-service" => Ok(()),
+        "model-artifact-read"
+        | "tokenizer-artifact-read"
+        | "prompt-template-read"
+        | "adapter-artifact-read"
+        | "quantization-artifact-read"
+        | "inference-session-state"
+        | "generation-session-state"
+        | "kv-cache-access"
+        | "prefix-cache-access"
+        | "compute-capability"
+        | "generation-capability"
+        | "sampling-capability"
+        | "observability-emit"
+        | "runtime-diagnostics" => Ok(()),
+        "filesystem" | "network" | "environment" | "process" | "shell" | "secret" | "secrets"
+        | "workspace" | "git" | "source-control" | "tool" | "tool-execution"
+        | "external-service" => Err("authority kind is outside Magnetar inference scope"),
         _ => Err("unsupported authority kind"),
     }
+}
+
+fn authority_endpoint_for_kind(kind: &str) -> ComponentAuthorityEndpoint {
+    match kind {
+        "model-artifact-read" => ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Model,
+        },
+        "tokenizer-artifact-read" => ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Tokenizer,
+        },
+        "prompt-template-read" => ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::PromptTemplate,
+        },
+        "adapter-artifact-read" => ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Adapter,
+        },
+        "quantization-artifact-read" => ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Quantization,
+        },
+        "kv-cache-access" => ComponentAuthorityEndpoint::InferenceCacheService {
+            kind: InferenceCacheKind::Kv,
+        },
+        "prefix-cache-access" => ComponentAuthorityEndpoint::InferenceCacheService {
+            kind: InferenceCacheKind::Prefix,
+        },
+        "compute-capability" => ComponentAuthorityEndpoint::Capability {
+            interface: WitInterface::new("magnetar:compute/run", "2.0.0"),
+        },
+        "generation-capability" => ComponentAuthorityEndpoint::PendingRuntimeService {
+            authority: kind.into(),
+        },
+        "sampling-capability" => ComponentAuthorityEndpoint::PendingRuntimeService {
+            authority: kind.into(),
+        },
+        "observability-emit" => ComponentAuthorityEndpoint::Observability,
+        "runtime-diagnostics" => ComponentAuthorityEndpoint::RuntimeDiagnostics,
+        "inference-session-state" | "generation-session-state" => {
+            ComponentAuthorityEndpoint::RuntimeService {
+                interface: WitInterface::new("magnetar:runtime/session-state", "1.0.0"),
+            }
+        }
+        _ => ComponentAuthorityEndpoint::PendingRuntimeService {
+            authority: kind.into(),
+        },
+    }
+}
+
+fn is_forbidden_external_interface(value: &str) -> bool {
+    value.starts_with("wasi:filesystem/")
+        || value.starts_with("wasi:sockets/")
+        || value.starts_with("wasi:cli/")
+        || value.starts_with("magnetar:secrets/")
+        || value.starts_with("magnetar:git/")
+        || value.starts_with("magnetar:workspace/")
+        || value.starts_with("magnetar:process/")
+        || value.starts_with("magnetar:shell/")
+        || value.starts_with("magnetar:network/")
+}
+
+fn is_inference_linkable_interface(value: &str) -> bool {
+    value.starts_with("magnetar:")
+        && !is_forbidden_external_interface(value)
+        && !value.starts_with("magnetar:tool/")
+        && !value.starts_with("magnetar:external-service/")
+}
+
+fn redact_component_diagnostic(value: &str) -> String {
+    let mut redacted = Vec::new();
+    for token in value.split_whitespace() {
+        let trimmed = token.trim_matches(|ch| matches!(ch, '\'' | '"' | ',' | ':' | ';'));
+        if trimmed.contains("\\")
+            || trimmed.contains('/')
+            || trimmed.to_ascii_lowercase().contains("secret")
+        {
+            redacted.push("[redacted]");
+        } else {
+            redacted.push(token);
+        }
+    }
+    redacted.join(" ")
 }
 
 fn validate_semver(value: &str) -> Result<(), &'static str> {
