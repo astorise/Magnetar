@@ -1833,3 +1833,60 @@ Then the adapter applies documented migration policy
 
 And the v2 portable contract itself remains free of Provider routing input.
 
+### Requirement: No Duplicate Implementations During Completion
+
+At completion of the modularization, one canonical implementation SHALL exist
+for each migrated architectural concept.
+
+Temporary forwarding code MAY exist during implementation but SHALL NOT leave
+parallel implementations behind.
+
+#### Scenario: Provider registry moved
+
+Given ProviderRegistry is migrated to `provider`
+
+When the change completes
+
+Then no second ProviderRegistry implementation remains in `lib.rs`.
+
+---
+
+### Requirement: No Semantic Changes Hidden as Refactoring
+
+Unexpected architectural issues discovered during modularization SHALL NOT be
+silently redesigned as part of source movement.
+
+They SHALL be documented and, when materially semantic, addressed through a
+dedicated OpenSpec change.
+
+#### Scenario: Circular dependency exposes model issue
+
+Given modularization reveals that two domains depend on each other because an
+existing responsibility is misplaced
+
+When resolving the issue would change public Runtime semantics
+
+Then the semantic redesign is proposed separately
+
+Rather than hidden inside file movement.
+
+---
+
+### Requirement: Crate Root Size Is Not the Goal
+
+The objective of this change SHALL be architectural modularity rather than an
+arbitrary maximum line or byte count.
+
+Large cohesive modules MAY remain large when their responsibility is clear.
+
+#### Scenario: Compute module remains substantial
+
+Given the Compute domain contains many coherent schemas and descriptors
+
+When modularization completes
+
+Then the module may remain sizeable
+
+Provided its ownership is clear and unrelated Runtime responsibilities are not
+mixed into it.
+

@@ -1,4 +1,4 @@
-use crate::{
+﻿use crate::{
     Capability, CapabilityDescriptor, CapabilityId, CapabilityVersion, ComponentMetadata,
     DeviceBinding, ExecutionPlanId, HealthState, ProviderBinding, RuntimeDiagnostic, RuntimeEvent,
     RuntimeMetric, ScheduledOperationId, TraceId, WitInterface,
