@@ -80,3 +80,18 @@ The first production engine may use Wasmtime, but Wasmtime is an implementation
 choice rather than an architectural dependency. The public Component Runtime
 model must remain valid if a future Component Engine implementation replaces
 Wasmtime.
+
+## Wasmtime Feature Policy
+
+The concrete Wasmtime adapter is available behind the
+`wasmtime-component-engine` Cargo feature. The feature is disabled by default
+so engine-neutral Runtime contracts remain cheap to build and test. Enabling
+the feature adds Wasmtime with Component Model and async Component support, but
+Wasmtime-native types remain contained in the adapter module and are not part
+of canonical Magnetar APIs.
+
+Use this local check for the concrete adapter:
+
+```text
+cargo check -p magnetar-runtime --features wasmtime-component-engine
+```

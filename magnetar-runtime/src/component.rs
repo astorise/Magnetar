@@ -701,6 +701,10 @@ pub enum ComponentError {
         component: String,
         limit: &'static str,
     },
+    ComponentLoadFailed {
+        path: PathBuf,
+        message: String,
+    },
     InvalidInstanceTransition {
         instance: ComponentInstanceId,
         state: ComponentInstanceState,
@@ -777,6 +781,11 @@ impl fmt::Display for ComponentError {
             Self::ResourceLimitUnsupported { component, limit } => write!(
                 f,
                 "component '{component}' requires unsupported resource limit '{limit}'"
+            ),
+            Self::ComponentLoadFailed { path, message } => write!(
+                f,
+                "component artifact '{}' could not be loaded: {message}",
+                path.display()
             ),
             Self::InvalidInstanceTransition {
                 instance,

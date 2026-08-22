@@ -7,6 +7,8 @@
 pub mod affinity;
 pub mod capability;
 pub mod component;
+#[cfg(feature = "wasmtime-component-engine")]
+pub mod component_wasmtime;
 pub mod compute;
 pub mod device;
 pub mod observability;
@@ -32,6 +34,8 @@ pub use component::{
     ComponentMetadata, ComponentResourceLimits, ComponentTrapKind, MockComponentEngine,
     PreparedComponent, WitInterface,
 };
+#[cfg(feature = "wasmtime-component-engine")]
+pub use component_wasmtime::WasmtimeComponentEngine;
 pub use compute::{
     COMPUTE_CAPABILITY_ID, COMPUTE_CAPABILITY_VERSION, COMPUTE_WIT_INTERFACE, COMPUTE_WIT_PACKAGE,
     ComputeAttributeKind, ComputeCapabilitySupport, ComputeDType, ComputeDataMovementDescriptor,
