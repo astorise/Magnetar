@@ -17,6 +17,8 @@ static NEXT_COMPONENT_DEFINITION_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 static NEXT_COMPONENT_INSTANCE_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
+static NEXT_DISTRIBUTED_PACKAGE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 fn next_component_definition_id() -> ComponentDefinitionId {
     ComponentDefinitionId(
@@ -648,6 +650,106 @@ pub struct ComponentSource {
     pub uri: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ComponentDistributionSourceKind {
+    LocalDirectory,
+    LocalCache,
+    ClientProvided,
+    DevelopmentFixture,
+    ExternalRegistry,
+    Tachyon,
+}
+
+impl ComponentDistributionSourceKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalDirectory => "local-directory",
+            Self::LocalCache => "local-cache",
+            Self::ClientProvided => "client-provided",
+            Self::DevelopmentFixture => "development-fixture",
+            Self::ExternalRegistry => "external-registry",
+            Self::Tachyon => "tachyon",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentDistributionSource {
+    pub kind: ComponentDistributionSourceKind,
+    pub identity: String,
+}
+
+impl ComponentDistributionSource {
+    pub fn new(kind: ComponentDistributionSourceKind, identity: impl Into<String>) -> Self {
+        Self {
+            kind,
+            identity: identity.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentProvenance {
+    pub builder: Option<String>,
+    pub source_repository: Option<String>,
+    pub commit_digest: Option<String>,
+    pub build_timestamp: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentArtifactPackage {
+    pub component_bytes: Vec<u8>,
+    pub manifest_bytes: Vec<u8>,
+    pub declared_digest: ComponentDigest,
+    pub source: ComponentDistributionSource,
+    pub publisher: Option<ComponentPublisher>,
+    pub signatures: Vec<ComponentSignature>,
+    pub provenance: Option<ComponentProvenance>,
+}
+
+impl ComponentArtifactPackage {
+    pub fn new(
+        component_bytes: Vec<u8>,
+        manifest_bytes: Vec<u8>,
+        declared_digest: ComponentDigest,
+        source: ComponentDistributionSource,
+    ) -> Self {
+        Self {
+            component_bytes,
+            manifest_bytes,
+            declared_digest,
+            source,
+            publisher: None,
+            signatures: Vec::new(),
+            provenance: None,
+        }
+    }
+
+    pub fn with_publisher(mut self, publisher: ComponentPublisher) -> Self {
+        self.publisher = Some(publisher);
+        self
+    }
+
+    pub fn with_signature(mut self, signature: ComponentSignature) -> Self {
+        self.signatures.push(signature);
+        self
+    }
+
+    pub fn with_provenance(mut self, provenance: ComponentProvenance) -> Self {
+        self.provenance = Some(provenance);
+        self
+    }
+}
+
+pub trait ComponentDistributionSourceProvider {
+    fn resolve(
+        &self,
+        component: &str,
+        version_requirement: Option<&str>,
+    ) -> Result<Vec<ComponentDigest>, ComponentError>;
+    fn fetch(&self, digest: &ComponentDigest) -> Result<ComponentArtifactPackage, ComponentError>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentSignature {
     pub algorithm: Option<String>,
@@ -1159,6 +1261,7 @@ impl Default for ComponentResourceLimits {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComponentObservationKind {
+    Distribution,
     Validation,
     Preparation,
     LinkPlan,
@@ -1616,6 +1719,39 @@ impl ComponentManager {
         Ok(id)
     }
 
+    pub fn prepare_pushed_package(
+        &mut self,
+        package: ComponentArtifactPackage,
+    ) -> Result<ComponentDefinitionId, ComponentError> {
+        self.prepare_distributed_package(package, "package received")
+    }
+
+    pub fn prepare_pulled_package(
+        &mut self,
+        source: &dyn ComponentDistributionSourceProvider,
+        component: &str,
+        version_requirement: Option<&str>,
+    ) -> Result<ComponentDefinitionId, ComponentError> {
+        let candidates = source.resolve(component, version_requirement)?;
+        self.observations.push(ComponentObservation::new(
+            ComponentObservationKind::Distribution,
+            Some(component.into()),
+            None,
+            format!(
+                "source resolution returned {} candidate digest(s)",
+                candidates.len()
+            ),
+        ));
+        let digest = candidates
+            .first()
+            .ok_or_else(|| ComponentError::Distribution {
+                category: ComponentDistributionErrorCategory::ArtifactNotFound,
+                message: "source returned no candidate artifact digests".into(),
+            })?;
+        let package = source.fetch(digest)?;
+        self.prepare_distributed_package(package, "fetch success")
+    }
+
     pub fn instantiate_component(
         &mut self,
         name: &str,
@@ -1797,6 +1933,95 @@ impl ComponentManager {
             }
         }
         Ok(found.into_iter().collect())
+    }
+
+    fn prepare_distributed_package(
+        &mut self,
+        package: ComponentArtifactPackage,
+        event: &'static str,
+    ) -> Result<ComponentDefinitionId, ComponentError> {
+        if self.shutdown {
+            return Err(ComponentError::RuntimeShutdown);
+        }
+        let computed = ComponentDigest::sha256(&package.component_bytes);
+        let source_kind = package.source.kind.as_str();
+        self.observations.push(ComponentObservation::new(
+            ComponentObservationKind::Distribution,
+            None,
+            None,
+            format!("{event} from {source_kind}"),
+        ));
+        if computed != package.declared_digest {
+            let error = ComponentError::Distribution {
+                category: ComponentDistributionErrorCategory::DigestMismatch,
+                message: "source-declared digest does not match received bytes".into(),
+            };
+            self.observe_error(None, &error);
+            return Err(error);
+        }
+
+        let distribution_dir = std::env::temp_dir().join(format!(
+            "magnetar-distributed-component-{}-{}",
+            computed.value.replace(':', "-"),
+            NEXT_DISTRIBUTED_PACKAGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&distribution_dir).map_err(|source| ComponentError::Distribution {
+            category: ComponentDistributionErrorCategory::PolicyDenied,
+            message: source.to_string(),
+        })?;
+        let artifact_path = distribution_dir.join("component.wasm");
+        let manifest_path = distribution_dir.join("component.wasm.magnetar-component.yaml");
+        fs::write(&artifact_path, &package.component_bytes).map_err(|source| {
+            ComponentError::ComponentLoadFailed {
+                path: artifact_path.clone(),
+                message: source.to_string(),
+                source: Some(source),
+            }
+        })?;
+        fs::write(&manifest_path, &package.manifest_bytes).map_err(|source| {
+            ComponentError::Manifest {
+                path: manifest_path.clone(),
+                message: source.to_string(),
+                source: Some(source),
+            }
+        })?;
+
+        let manifest = ComponentManifest::load_yaml(&manifest_path)?;
+        if manifest.digest != computed {
+            let error = ComponentError::Distribution {
+                category: ComponentDistributionErrorCategory::DigestMismatch,
+                message: "manifest-declared digest does not match received bytes".into(),
+            };
+            self.observe_error(None, &error);
+            return Err(error);
+        }
+        if manifest.component.name.contains("tool")
+            || manifest.role.contains("tool")
+            || manifest.role.contains("filesystem")
+            || manifest.role.contains("shell")
+        {
+            let error = ComponentError::Distribution {
+                category: ComponentDistributionErrorCategory::ForbiddenAuthority,
+                message: "distributed package is outside Magnetar inference scope".into(),
+            };
+            self.observe_error(None, &error);
+            return Err(error);
+        }
+
+        let descriptor = ComponentDescriptor::new(manifest.component.clone(), artifact_path)
+            .with_manifest_path(manifest_path);
+        if self.definitions.contains_key(&descriptor.metadata.name) {
+            return Err(ComponentError::AlreadyRegistered(descriptor.metadata.name));
+        }
+        let name = descriptor.metadata.name.clone();
+        self.register_component(descriptor)?;
+        match self.prepare_component(&name) {
+            Ok(id) => Ok(id),
+            Err(error) => {
+                self.definitions.remove(&name);
+                Err(error)
+            }
+        }
     }
 
     fn build_link_plan(
@@ -2493,6 +2718,10 @@ pub enum ComponentError {
         message: String,
         source: Option<std::io::Error>,
     },
+    Distribution {
+        category: ComponentDistributionErrorCategory,
+        message: String,
+    },
     ManifestMissing {
         artifact: PathBuf,
     },
@@ -2523,6 +2752,25 @@ pub enum ComponentError {
         source: std::io::Error,
     },
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComponentDistributionErrorCategory {
+    SourceUnavailable,
+    ArtifactNotFound,
+    VersionNotFound,
+    DigestMismatch,
+    ManifestMissing,
+    ManifestInvalid,
+    WitMismatch,
+    CompatibilityFailure,
+    ForbiddenAuthority,
+    TrustRejected,
+    RevokedArtifact,
+    CacheIntegrityFailure,
+    UnsupportedSignature,
+    PolicyDenied,
+}
+
 impl fmt::Display for ComponentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2608,6 +2856,10 @@ impl fmt::Display for ComponentError {
                 f,
                 "component artifact '{}' could not be loaded: {message}",
                 path.display()
+            ),
+            Self::Distribution { category, message } => write!(
+                f,
+                "component distribution failed as {category:?}: {message}"
             ),
             Self::ManifestMissing { artifact } => write!(
                 f,

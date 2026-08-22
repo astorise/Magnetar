@@ -3596,6 +3596,196 @@ development:
     )
 }
 
+fn component_artifact_package(
+    bytes: &[u8],
+    source_kind: ComponentDistributionSourceKind,
+) -> ComponentArtifactPackage {
+    let digest = ComponentDigest::sha256(bytes);
+    ComponentArtifactPackage::new(
+        bytes.to_vec(),
+        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION).into_bytes(),
+        digest,
+        ComponentDistributionSource::new(source_kind, "test-source"),
+    )
+}
+
+#[derive(Clone)]
+struct TestComponentDistributionSource {
+    package: ComponentArtifactPackage,
+    candidates: Vec<ComponentDigest>,
+}
+
+impl ComponentDistributionSourceProvider for TestComponentDistributionSource {
+    fn resolve(
+        &self,
+        component: &str,
+        _version_requirement: Option<&str>,
+    ) -> Result<Vec<ComponentDigest>, ComponentError> {
+        if component == "magnetar.examples.hello" {
+            Ok(self.candidates.clone())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn fetch(&self, digest: &ComponentDigest) -> Result<ComponentArtifactPackage, ComponentError> {
+        if self.package.declared_digest == *digest {
+            Ok(self.package.clone())
+        } else {
+            Err(ComponentError::Distribution {
+                category: ComponentDistributionErrorCategory::ArtifactNotFound,
+                message: "digest not found".into(),
+            })
+        }
+    }
+}
+
+#[test]
+fn pushed_component_package_is_validated_before_preparation() {
+    let bytes = b"component-bytes";
+    let digest = ComponentDigest::sha256(bytes);
+    let package =
+        component_artifact_package(bytes, ComponentDistributionSourceKind::ClientProvided);
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value.clone()));
+
+    manager.prepare_pushed_package(package).unwrap();
+
+    let definition = manager.definition("magnetar.examples.hello").unwrap();
+    assert_eq!(definition.artifact_digest, Some(digest));
+    assert!(matches!(
+        definition.trust_decision,
+        Some(ComponentTrustDecision {
+            status: ComponentTrustStatus::Trusted,
+            ..
+        })
+    ));
+    assert!(manager.observations().iter().any(|observation| {
+        observation.kind == ComponentObservationKind::Distribution
+            && observation.message.contains("client-provided")
+    }));
+}
+
+#[test]
+fn pushed_component_package_rejects_source_digest_mismatch() {
+    let mut package =
+        component_artifact_package(b"component-bytes", ComponentDistributionSourceKind::Tachyon);
+    package.declared_digest = ComponentDigest::sha256(b"different");
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_source("tachyon"));
+
+    assert!(matches!(
+        manager.prepare_pushed_package(package),
+        Err(ComponentError::Distribution {
+            category: ComponentDistributionErrorCategory::DigestMismatch,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn distribution_source_identity_does_not_imply_trust() {
+    let package =
+        component_artifact_package(b"component-bytes", ComponentDistributionSourceKind::Tachyon);
+    let mut manager = ComponentManager::new();
+
+    assert!(matches!(
+        manager.prepare_pushed_package(package),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Unknown,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn trusted_distribution_source_still_rejects_forbidden_authority() {
+    let bytes = b"component-bytes";
+    let digest = ComponentDigest::sha256(bytes);
+    let manifest = manifest_yaml_with_authority(&digest.value, &["filesystem"])
+        .replace("  kind: \"local\"", "  kind: \"tachyon\"");
+    let package = ComponentArtifactPackage::new(
+        bytes.to_vec(),
+        manifest.into_bytes(),
+        digest,
+        ComponentDistributionSource::new(ComponentDistributionSourceKind::Tachyon, "tachyon"),
+    );
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_source("tachyon"));
+
+    assert!(matches!(
+        manager.prepare_pushed_package(package),
+        Err(ComponentError::Manifest { message, .. })
+            if message == "authority kind is outside Magnetar inference scope"
+    ));
+}
+
+#[test]
+fn pulled_component_package_resolves_fetches_and_validates_locally() {
+    let bytes = b"component-bytes";
+    let digest = ComponentDigest::sha256(bytes);
+    let package =
+        component_artifact_package(bytes, ComponentDistributionSourceKind::LocalDirectory);
+    let source = TestComponentDistributionSource {
+        package,
+        candidates: vec![digest.clone()],
+    };
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value.clone()));
+
+    manager
+        .prepare_pulled_package(&source, "magnetar.examples.hello", Some(">=0.1.0,<1.0.0"))
+        .unwrap();
+
+    assert_eq!(
+        manager
+            .definition("magnetar.examples.hello")
+            .and_then(|definition| definition.artifact_digest.clone()),
+        Some(digest)
+    );
+    assert!(manager.observations().iter().any(|observation| {
+        observation.kind == ComponentObservationKind::Distribution
+            && observation.message.contains("candidate digest")
+    }));
+}
+
+#[test]
+fn pulled_component_package_rejects_empty_candidate_list() {
+    let package = component_artifact_package(
+        b"component-bytes",
+        ComponentDistributionSourceKind::LocalCache,
+    );
+    let source = TestComponentDistributionSource {
+        package,
+        candidates: Vec::new(),
+    };
+    let mut manager = ComponentManager::new();
+
+    assert!(matches!(
+        manager.prepare_pulled_package(&source, "magnetar.examples.hello", None),
+        Err(ComponentError::Distribution {
+            category: ComponentDistributionErrorCategory::ArtifactNotFound,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn local_distribution_does_not_require_tachyon_or_network() {
+    let bytes = b"component-bytes";
+    let digest = ComponentDigest::sha256(bytes);
+    let package =
+        component_artifact_package(bytes, ComponentDistributionSourceKind::LocalDirectory);
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+
+    manager.prepare_pushed_package(package).unwrap();
+    assert_eq!(
+        manager.definition_state("magnetar.examples.hello"),
+        Some(ComponentDefinitionState::Prepared)
+    );
+}
+
 #[test]
 fn component_artifact_accepts_target_tokenizer_manifest_authorities() {
     let directory = temp_component_artifact_dir("tokenizer-authority");
