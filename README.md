@@ -312,3 +312,8 @@ Distributed under the MIT License. See `LICENSE` for more information.
 âš ï¸ Magnetar is in active development.
 
 The architecture is evolving rapidly and APIs should be considered unstable until the first stable release.
+
+## Quality
+
+Repository quality gates and equivalent local commands are documented in
+[docs/quality.md](docs/quality.md).

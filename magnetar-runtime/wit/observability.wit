@@ -116,7 +116,7 @@ interface reader {
   snapshot: func() -> result<observability-snapshot, observability-error>;
 }
 
-interface stream {
+interface %stream {
   use emit.{log-severity, observability-error};
 
   enum observation-category {
@@ -170,7 +170,7 @@ interface stream {
 }
 
 world observability-exporter {
-  import stream;
+  import %stream;
 }
 
 world observability-snapshot-exposer {

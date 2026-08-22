@@ -1,0 +1,14 @@
+{
+  "line_coverage_percent": 72.31093702922567,
+  "function_coverage_percent": 72.31833910034602,
+  "branch_coverage_percent": null,
+  "scope": "workspace production Rust source; test source and target output are excluded",
+  "tool": "cargo-llvm-cov",
+  "measured_at": "2026-08-21",
+  "exclusions": [
+    {
+      "pattern": "(^|/)(target|tests?)/",
+      "reason": "Generated build output and Rust test source are not production Runtime implementation source."
+    }
+  ]
+}

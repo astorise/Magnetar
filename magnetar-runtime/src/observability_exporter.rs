@@ -412,10 +412,10 @@ impl ObservationFilter {
         {
             return false;
         }
-        if let Some(min_severity) = self.min_severity {
-            if let ObservationRecord::CustomLog(log) = record {
-                return log.severity >= min_severity;
-            }
+        if let Some(min_severity) = self.min_severity
+            && let ObservationRecord::CustomLog(log) = record
+        {
+            return log.severity >= min_severity;
         }
         true
     }

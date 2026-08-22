@@ -74,7 +74,7 @@ interface run {
     boolean,
     integer,
     float,
-    string,
+    text,
     dtype,
     shape,
     axes,
@@ -83,8 +83,8 @@ interface run {
   variant operation-attribute {
     boolean(bool),
     integer(s64),
-    float(float64),
-    string(string),
+    float(f64),
+    text(string),
     dtype(element-type),
     shape(shape-descriptor),
     axes(list<u64>),
@@ -215,7 +215,7 @@ interface run {
 
   variant view-source {
     descriptor,
-    resource(string),
+    tensor-resource(string),
   }
 
   /// Tensor view metadata. A materialized copy is a separate tensor resource.

@@ -1,0 +1,155 @@
+name: Quality
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rustfmt:
+    name: quality / rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Validate formatting
+        run: cargo fmt --all -- --check
+
+  check:
+    name: quality / check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --all-features
+
+  clippy:
+    name: quality / clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: quality / test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --workspace --all-targets
+
+  docs:
+    name: quality / docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+      - name: Build Rust documentation
+        run: cargo doc --workspace --all-features --no-deps
+
+  wit:
+    name: quality / wit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install wasm-tools
+        uses: taiki-e/install-action@wasm-tools
+      - name: Validate WIT packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -path '*/wit/*.wit' -print0 | while IFS= read -r -d '' wit; do
+            wasm-tools component wit "$wit" >/dev/null
+          done
+
+  openspec:
+    name: quality / openspec
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install OpenSpec
+        run: npm install -g @fission-ai/openspec@1.2.0
+      - name: Validate OpenSpec artifacts
+        run: openspec validate --all --strict
+
+  coverage:
+    name: quality / coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+      - name: Prepare coverage output
+        run: mkdir -p target/llvm-cov
+      - name: Generate coverage
+        run: >
+          cargo llvm-cov --workspace --all-targets --all-features
+          --ignore-filename-regex '(^|/)(target|tests?)/'
+          --json --summary-only --output-path target/llvm-cov/coverage.json
+      - name: Generate LCOV artifact
+        run: >
+          cargo llvm-cov report
+          --ignore-filename-regex '(^|/)(target|tests?)/'
+          --lcov --output-path target/llvm-cov/lcov.info
+      - name: Check coverage ratchet
+        run: cargo run --manifest-path tools/coverage-ratchet/Cargo.toml -- target/llvm-cov/coverage.json quality/coverage-baseline.json
+      - name: Publish coverage summary
+        if: always()
+        run: cargo run --manifest-path tools/coverage-ratchet/Cargo.toml -- --summary target/llvm-cov/coverage.json quality/coverage-baseline.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: target/llvm-cov/
+          if-no-files-found: warn

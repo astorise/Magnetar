@@ -2213,7 +2213,7 @@ pub enum ComputePrecision {
     Mixed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DTypeSupport {
     pub portable: BTreeSet<ComputeDType>,
     pub provider_specific: BTreeSet<String>,
@@ -2235,15 +2235,6 @@ impl DTypeSupport {
         self
     }
 }
-impl Default for DTypeSupport {
-    fn default() -> Self {
-        Self {
-            portable: BTreeSet::new(),
-            provider_specific: BTreeSet::new(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LayoutSupport {
     pub input: BTreeSet<ComputeLayout>,
@@ -2312,7 +2303,7 @@ impl Default for ShapeLimitSupport {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PrecisionSupport {
     pub modes: BTreeSet<ComputePrecision>,
     pub accumulation_dtypes: BTreeSet<ComputeDType>,
@@ -2348,18 +2339,6 @@ impl PrecisionSupport {
         self
     }
 }
-impl Default for PrecisionSupport {
-    fn default() -> Self {
-        Self {
-            modes: BTreeSet::new(),
-            accumulation_dtypes: BTreeSet::new(),
-            approximate_math: false,
-            deterministic_execution: false,
-            deterministic_random_generation: false,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ComputeOperationSupport {
     pub dtypes: BTreeSet<ComputeDType>,
@@ -2870,7 +2849,7 @@ impl ComputeDataMovementDescriptor {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ComputeDataMovementSupport {
     pub dtypes: BTreeSet<ComputeDType>,
     pub provider_specific_dtypes: BTreeSet<String>,
@@ -2878,18 +2857,6 @@ pub struct ComputeDataMovementSupport {
     pub host_encodings: BTreeSet<HostBufferEncoding>,
     pub descriptor_limits: TensorDescriptorLimits,
     pub allow_host_staging: bool,
-}
-impl Default for ComputeDataMovementSupport {
-    fn default() -> Self {
-        Self {
-            dtypes: BTreeSet::new(),
-            provider_specific_dtypes: BTreeSet::new(),
-            layouts: BTreeSet::new(),
-            host_encodings: BTreeSet::new(),
-            descriptor_limits: TensorDescriptorLimits::default(),
-            allow_host_staging: false,
-        }
-    }
 }
 impl ComputeDataMovementSupport {
     pub fn new() -> Self {
@@ -5825,12 +5792,11 @@ impl Scheduler {
             .operations
             .get(&id)
             .and_then(ScheduledOperation::device)
-            && runtime
+            && !runtime
                 .device(device.id())
                 .map(Device::availability)
                 .unwrap_or(DeviceAvailability::Unavailable)
                 .accepts_new_work_by_default()
-                == false
         {
             let device = device.clone();
             let health = runtime
@@ -5839,7 +5805,7 @@ impl Scheduler {
                 .unwrap_or(DeviceAvailability::Unavailable);
             self.interrupt_operation(id, "selected Device is unavailable before submission");
             return Err(scheduler_error_for_device_health(&device, health)
-                .unwrap_or_else(|| SchedulerError::DeviceUnavailable(device)));
+                .unwrap_or(SchedulerError::DeviceUnavailable(device)));
         }
         let submitted_event = {
             let operation = self
@@ -9147,25 +9113,25 @@ impl Runtime {
                     .find(|device| device.metadata().memory_capacity > 0)
                     .map(|device| DeviceBinding::new(device.id().clone()))
             });
-        if let Some(device) = selected_device {
-            if let Some(runtime_device) = self.device(device.id()) {
-                let limit = runtime_device.metadata().memory_capacity;
-                if limit > 0 {
-                    plan.pressure.selected_device = Some(device.clone());
-                    plan.diagnostics
-                        .push(MemoryPlanningDiagnostic::DeviceLimit {
-                            device: device.clone(),
-                            max_bytes: limit,
-                        });
-                    if plan.pressure.estimated_peak_bytes > limit {
-                        plan.pressure.rejected_device_limit = Some(limit);
-                        return Err(MemoryPlanningError::DeviceMemoryLimitExceeded {
-                            device,
-                            required: plan.pressure.estimated_peak_bytes,
-                            limit,
-                            report: plan.pressure.clone(),
-                        });
-                    }
+        if let Some(device) = selected_device
+            && let Some(runtime_device) = self.device(device.id())
+        {
+            let limit = runtime_device.metadata().memory_capacity;
+            if limit > 0 {
+                plan.pressure.selected_device = Some(device.clone());
+                plan.diagnostics
+                    .push(MemoryPlanningDiagnostic::DeviceLimit {
+                        device: device.clone(),
+                        max_bytes: limit,
+                    });
+                if plan.pressure.estimated_peak_bytes > limit {
+                    plan.pressure.rejected_device_limit = Some(limit);
+                    return Err(MemoryPlanningError::DeviceMemoryLimitExceeded {
+                        device,
+                        required: plan.pressure.estimated_peak_bytes,
+                        limit,
+                        report: plan.pressure.clone(),
+                    });
                 }
             }
         }
@@ -9580,10 +9546,9 @@ impl Runtime {
             });
         }
         self.validate_compute_execution_plan(plan)?;
-        if plan.constraints.iter().any(|constraint| {
+        if !plan.constraints.iter().any(|constraint| {
             matches!(constraint, ExecutionConstraint::NoImplicitProviderMigration)
-        }) == false
-        {
+        }) {
             return Err(ComputePlanningError::InvalidExecutionPlan {
                 reason: "execution plan must forbid implicit Provider migration".into(),
             });
@@ -11455,7 +11420,7 @@ mod tests {
             descriptor.clone(),
         );
         runtime
-            .validate_compute_data_movement("portable-compute", &[upload.clone()])
+            .validate_compute_data_movement("portable-compute", std::slice::from_ref(&upload))
             .unwrap();
         let uploaded = runtime
             .wrap_compute_data_movement_output(
