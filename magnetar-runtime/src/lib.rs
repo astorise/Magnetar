@@ -27,12 +27,14 @@ pub use affinity::{
 };
 pub use capability::{Capability, CapabilityDescriptor, CapabilityId, CapabilityVersion};
 pub use component::{
-    ComponentDefinition, ComponentDefinitionId, ComponentDefinitionState, ComponentDescriptor,
-    ComponentEndpoint, ComponentEngine, ComponentEngineCapabilities, ComponentEngineInstance,
-    ComponentError, ComponentInstance, ComponentInstanceId, ComponentInstanceState,
-    ComponentInterruptionReason, ComponentInvocation, ComponentLinkPlan, ComponentManager,
-    ComponentMetadata, ComponentResourceLimits, ComponentTrapKind, MockComponentEngine,
-    PreparedComponent, WitInterface,
+    ComponentArtifactReference, ComponentContract, ComponentDefinition, ComponentDefinitionId,
+    ComponentDefinitionState, ComponentDescriptor, ComponentEndpoint, ComponentEngine,
+    ComponentEngineCapabilities, ComponentEngineInstance, ComponentError,
+    ComponentExportDescription, ComponentImportRequirement, ComponentInstance, ComponentInstanceId,
+    ComponentInstanceState, ComponentInterfaceShape, ComponentInterruptionReason,
+    ComponentInvocation, ComponentInvocationResult, ComponentLinkPlan, ComponentManager,
+    ComponentMetadata, ComponentObservation, ComponentObservationKind, ComponentResourceLimits,
+    ComponentTrapKind, ComponentValue, MockComponentEngine, PreparedComponent, WitInterface,
 };
 #[cfg(feature = "wasmtime-component-engine")]
 pub use component_wasmtime::WasmtimeComponentEngine;

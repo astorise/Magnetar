@@ -51,6 +51,32 @@ Filesystem, network, environment variables, process execution, secrets,
 sockets, host command execution, and WASI interfaces are not ambient. Each
 interface must be explicitly authorized and linked by Runtime policy.
 
+The first Wasmtime adapter does not install broad default WASI. Authorized
+WASI will be added only through explicit scoped Link Plan entries in a later
+change.
+
+## Resource Limits and Concurrency
+
+Runtime policy can require memory limits, cap live Component instances, and
+cap concurrent invocations per instance. The Wasmtime adapter maps
+`max_memory_bytes` to a private `StoreLimits` limiter. If a required memory
+limit cannot be represented, preparation fails closed.
+
+The current invocation API is synchronous and receives `&mut self`, so one
+manager cannot mutate the same engine Store concurrently. Multiple Component
+instances receive distinct engine Store state. Broader async host-call
+concurrency and resource-table ownership fixtures remain part of the host
+adapter work.
+
+## Host Adapter Scope
+
+The first Wasmtime host adapter translates approved Link Plan entries for
+unit-shaped Component imports, such as `() -> ()` test hooks, into private
+Wasmtime linker entries. The fixture path covers unit exports, primitive `u32`
+returns, host-call round trips, traps, and deadline-triggered interruption.
+More complex WIT signatures, resources, and async host operations fail closed
+until typed Runtime adapters are added.
+
 ## Lifecycle
 
 Generic Components are not required to export universal `start` or `stop`

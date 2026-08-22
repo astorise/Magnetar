@@ -1,10 +1,10 @@
 {
-  "line_coverage_percent": 72.31093702922567,
-  "function_coverage_percent": 72.31833910034602,
+  "line_coverage_percent": 68.42396109637488,
+  "function_coverage_percent": 71.67832167832168,
   "branch_coverage_percent": null,
   "scope": "workspace production Rust source; test source and target output are excluded",
   "tool": "cargo-llvm-cov",
-  "measured_at": "2026-08-21",
+  "measured_at": "2026-08-22",
   "exclusions": [
     {
       "pattern": "(^|/)(target|tests?)/",

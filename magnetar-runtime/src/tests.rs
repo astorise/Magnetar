@@ -2452,6 +2452,30 @@ fn runtime_source_does_not_restore_legacy_backend_or_plugin_surface() {
 }
 
 #[test]
+fn public_component_api_does_not_expose_wasmtime_native_types() {
+    let public_sources = [include_str!("lib.rs"), include_str!("component.rs")];
+    let forbidden = [
+        "wasmtime::Engine",
+        "wasmtime::Config",
+        "wasmtime::Store",
+        "wasmtime::component::Component",
+        "wasmtime::component::Linker",
+        "wasmtime::component::Instance",
+        "wasmtime::Trap",
+        "wasmtime::Error",
+    ];
+
+    for source in public_sources {
+        for term in forbidden {
+            assert!(
+                !source.contains(term),
+                "public Component API exposes concrete engine type: {term}"
+            );
+        }
+    }
+}
+
+#[test]
 fn execution_context_default_allocates_unique_ids() {
     let first = ExecutionContext::default();
     let second = ExecutionContext::default();
@@ -2827,6 +2851,19 @@ fn component_runtime_instantiates_without_generic_start_or_stop() {
 }
 
 #[test]
+fn component_artifact_reference_prepares_future_artifact_model_without_trust_policy() {
+    let descriptor = ComponentDescriptor::new(
+        ComponentMetadata::new("component", "1", "test component"),
+        "component.wasm",
+    );
+
+    assert!(matches!(
+        descriptor.artifact_reference(),
+        ComponentArtifactReference::LocalPath(path) if path == std::path::Path::new("component.wasm")
+    ));
+}
+
+#[test]
 fn component_imports_are_authorized_and_linked_explicitly() {
     let interface = WitInterface::new("magnetar:runtime/run", "1.0.0");
     let metadata =
@@ -2853,6 +2890,133 @@ fn component_imports_are_authorized_and_linked_explicitly() {
         manager.instance_state(instance),
         Some(ComponentInstanceState::Ready)
     );
+}
+
+#[test]
+fn component_import_version_must_match_authorized_interface() {
+    let authorized = WitInterface::new("magnetar:runtime/run", "1.0.0");
+    let requested = WitInterface::new("magnetar:runtime/run", "2.0.0");
+    let metadata = ComponentMetadata::new("consumer", "1", "test component").with_import(requested);
+    let mut manager = ComponentManager::new();
+    manager.provide_interface(authorized);
+    manager
+        .register_component(ComponentDescriptor::new(metadata, "consumer.wasm"))
+        .unwrap();
+
+    assert!(matches!(
+        manager.instantiate_component("consumer"),
+        Err(ComponentError::UnauthorizedImport { .. })
+    ));
+}
+
+#[test]
+fn component_wasi_imports_fail_closed_without_authorization() {
+    let filesystem = WitInterface::new("wasi:filesystem/types", "0.2.0");
+    let environment = WitInterface::new("wasi:cli/environment", "0.2.0");
+    let mut manager = ComponentManager::new();
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("wasi-consumer", "1", "test component")
+                .with_import(filesystem)
+                .with_import(environment),
+            "wasi-consumer.wasm",
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.instantiate_component("wasi-consumer"),
+        Err(ComponentError::UnauthorizedImport { .. })
+    ));
+}
+
+#[test]
+fn component_ambient_network_process_and_secret_imports_fail_closed() {
+    let interfaces = [
+        WitInterface::new("wasi:sockets/tcp", "0.2.0"),
+        WitInterface::new("wasi:cli/run", "0.2.0"),
+        WitInterface::new("magnetar:secrets/read", "1.0.0"),
+    ];
+    for (index, interface) in interfaces.into_iter().enumerate() {
+        let name = format!("authority-{index}");
+        let mut manager = ComponentManager::new();
+        manager
+            .register_component(ComponentDescriptor::new(
+                ComponentMetadata::new(&name, "1", "test component").with_import(interface),
+                format!("{name}.wasm"),
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            manager.instantiate_component(&name),
+            Err(ComponentError::UnauthorizedImport { .. })
+        ));
+    }
+}
+
+#[test]
+fn component_link_plan_is_runtime_owned_and_immutable_to_callers() {
+    let interface = WitInterface::new("magnetar:runtime/run", "1.0.0");
+    let metadata =
+        ComponentMetadata::new("consumer", "1", "test component").with_import(interface.clone());
+    let mut manager = ComponentManager::new();
+    manager.provide_interface(interface.clone());
+    manager
+        .register_component(ComponentDescriptor::new(metadata, "consumer.wasm"))
+        .unwrap();
+
+    let plan = manager.link_plan("consumer").unwrap();
+    let links = plan.links().collect::<Vec<_>>();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].0, &interface);
+    assert!(matches!(
+        links[0].1,
+        ComponentEndpoint::Capability { interface: linked } if linked == &interface
+    ));
+    assert_eq!(plan.endpoint(&interface), Some(links[0].1));
+}
+
+#[test]
+fn prepared_component_contract_must_match_declared_imports() {
+    let declared = WitInterface::new("example:declared/api", "1.0.0");
+    let undeclared = WitInterface::new("example:undeclared/api", "1.0.0");
+    let mut contract = ComponentContract::default();
+    contract.imports.insert(ComponentImportRequirement::new(
+        undeclared,
+        ComponentInterfaceShape::Interface,
+    ));
+    let mut engine = MockComponentEngine::new();
+    engine.prepared_contract = Some(contract);
+    let mut manager = ComponentManager::with_engine(Box::new(engine));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("consumer", "1", "test component").with_import(declared),
+            "consumer.wasm",
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.prepare_component("consumer"),
+        Err(ComponentError::ContractValidationFailed { .. })
+    ));
+}
+
+#[test]
+fn prepared_component_contract_must_include_declared_exports() {
+    let exported = WitInterface::new("example:export/api", "1.0.0");
+    let mut engine = MockComponentEngine::new();
+    engine.prepared_contract = Some(ComponentContract::default());
+    let mut manager = ComponentManager::with_engine(Box::new(engine));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("producer", "1", "test component").with_export(exported),
+            "producer.wasm",
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        manager.prepare_component("producer"),
+        Err(ComponentError::ContractValidationFailed { .. })
+    ));
 }
 
 #[test]
@@ -2899,6 +3063,52 @@ fn component_definition_can_create_multiple_isolated_instances() {
 }
 
 #[test]
+fn component_manager_enforces_instance_and_invocation_limits() {
+    let mut manager = ComponentManager::new();
+    manager.set_resource_limits(ComponentResourceLimits {
+        max_instances: Some(1),
+        ..ComponentResourceLimits::default()
+    });
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component"),
+            "component.wasm",
+        ))
+        .unwrap();
+
+    manager.instantiate_component("component").unwrap();
+    assert!(matches!(
+        manager.instantiate_component("component"),
+        Err(ComponentError::ResourceLimitExceeded {
+            limit: "instances",
+            ..
+        })
+    ));
+
+    let interface = WitInterface::new("example:app/run", "1.0.0");
+    let mut manager = ComponentManager::new();
+    manager.set_resource_limits(ComponentResourceLimits {
+        max_concurrent_invocations: Some(0),
+        ..ComponentResourceLimits::default()
+    });
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("callable", "1", "test component")
+                .with_export(interface.clone()),
+            "callable.wasm",
+        ))
+        .unwrap();
+    let instance = manager.instantiate_component("callable").unwrap();
+    assert!(matches!(
+        manager.invoke(ComponentInvocation::new(instance, interface, "run")),
+        Err(ComponentError::ResourceLimitExceeded {
+            limit: "concurrent invocations",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn component_invocation_after_destruction_fails() {
     let interface = WitInterface::new("example:app/run", "1.0.0");
     let mut manager = ComponentManager::new();
@@ -2916,6 +3126,79 @@ fn component_invocation_after_destruction_fails() {
         manager.invoke(ComponentInvocation::new(instance, interface, "run")),
         Err(ComponentError::InstanceNotFound(_))
     ));
+}
+
+#[test]
+fn component_shutdown_prevents_new_lifecycle_operations() {
+    let interface = WitInterface::new("example:app/run", "1.0.0");
+    let mut manager = ComponentManager::new();
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component")
+                .with_export(interface.clone()),
+            "component.wasm",
+        ))
+        .unwrap();
+    let instance = manager.instantiate_component("component").unwrap();
+    manager.shutdown();
+
+    assert!(matches!(
+        manager.invoke(ComponentInvocation::new(instance, interface, "run")),
+        Err(ComponentError::RuntimeShutdown)
+    ));
+    assert!(matches!(
+        manager.instantiate_component("component"),
+        Err(ComponentError::RuntimeShutdown)
+    ));
+    assert!(matches!(
+        manager.register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("other", "1", "test component"),
+            "other.wasm",
+        )),
+        Err(ComponentError::RuntimeShutdown)
+    ));
+}
+
+#[test]
+fn component_observations_are_non_authoritative_and_redacted() {
+    let interface = WitInterface::new("example:app/run", "1.0.0");
+    let mut engine = MockComponentEngine::new();
+    engine.trap_on_invoke = Some(ComponentTrapKind::Trap);
+    let mut manager = ComponentManager::with_engine(Box::new(engine));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component")
+                .with_export(interface.clone()),
+            "component.wasm",
+        ))
+        .unwrap();
+    let instance = manager.instantiate_component("component").unwrap();
+
+    assert!(matches!(
+        manager.invoke(ComponentInvocation::new(instance, interface, "run")),
+        Err(ComponentError::Trap { .. })
+    ));
+    assert!(
+        manager
+            .observations()
+            .iter()
+            .any(
+                |observation| observation.kind == ComponentObservationKind::Trap
+                    && observation.instance == Some(instance)
+                    && observation.message.contains("[redacted component trap]")
+            )
+    );
+    assert!(
+        !manager
+            .observations()
+            .iter()
+            .any(|observation| observation.message.contains("wasmtime::"))
+    );
+    assert!(!manager.observations().iter().any(|observation| {
+        observation.message.contains("Provider")
+            || observation.message.contains("Device")
+            || observation.message.contains("Store")
+    }));
 }
 
 #[test]

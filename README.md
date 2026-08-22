@@ -66,12 +66,15 @@ Implemented today:
 - Runtime configuration
 - Provider registration foundations
 - Capability and Provider metadata foundations
+- WebAssembly Component registration, contract validation, fail-closed import
+  authorization, lifecycle management, and a feature-gated Wasmtime Component
+  Engine adapter
 - Resource Affinity and Resolution Policy model foundations
 - Quality gates documented in [docs/quality.md](docs/quality.md)
 
 Planned, not yet implemented as stable public functionality:
 
-- WebAssembly Component loading and WIT linking
+- complete Component host adapters and end-to-end WIT host-call fixtures
 - native CPU, CUDA, ROCm, Metal, OpenVINO, QNN, Vulkan, and WebGPU Providers
 - model loading and model residency
 - tokenization and prompt formatting

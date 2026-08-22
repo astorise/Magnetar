@@ -186,10 +186,16 @@ And concrete Provider resolution is deferred until Compute work is submitted.
 
 ---
 
-### Requirement: Async Host Call Support
+### Requirement: Async Host Call Scope
 
-The concrete engine integration SHALL support asynchronous host calls when a
-linked Magnetar Capability requires asynchronous execution.
+The concrete engine integration SHALL keep async host-call support internal to
+the adapter boundary and SHALL NOT expose a concrete async runtime through
+public Magnetar APIs.
+
+The first implementation MAY support only synchronous unit-shaped host
+adapters. If a linked Magnetar Capability requires asynchronous execution and
+no typed async adapter exists, the adapter SHALL fail closed rather than
+blocking a long-running Provider operation on an engine thread.
 
 #### Scenario: Async Runtime endpoint
 
@@ -197,8 +203,10 @@ Given a linked host Capability completes asynchronously
 
 When the Component invokes it
 
-Then the engine adapter can await or coordinate completion without exposing the
-concrete async runtime through public Magnetar APIs.
+Then the engine adapter either coordinates completion through a typed Runtime
+adapter
+
+Or rejects the unsupported async host signature before execution.
 
 ---
 
@@ -222,6 +230,9 @@ Engine resource table entries SHALL remain private implementation details.
 
 They SHALL not become stable Magnetar resource identifiers.
 
+The first implementation SHALL reject WIT resource imports unless an explicit
+Runtime resource mapping exists for the linked host adapter.
+
 #### Scenario: Engine creates resource entry
 
 Given a Component call creates a WIT resource
@@ -229,6 +240,16 @@ Given a Component call creates a WIT resource
 When the engine stores the resource internally
 
 Then the table entry is not exposed as a stable public Magnetar handle.
+
+#### Scenario: Resource import lacks Runtime mapping
+
+Given a Component imports a WIT resource
+
+And no Runtime resource mapping exists for that resource type
+
+When the Component is linked
+
+Then instantiation fails closed.
 
 ---
 

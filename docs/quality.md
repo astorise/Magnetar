@@ -39,6 +39,12 @@ Run the complete Rust test suite:
 cargo test --workspace --all-targets
 ```
 
+Run concrete Wasmtime Component Engine tests:
+
+```powershell
+cargo test -p magnetar-runtime --features wasmtime-component-engine
+```
+
 Build Rust documentation with warnings denied:
 
 ```powershell
@@ -51,6 +57,15 @@ Validate WIT packages:
 ```powershell
 wasm-tools component wit magnetar-runtime/wit/compute.wit
 wasm-tools component wit magnetar-runtime/wit/observability.wit
+```
+
+Validate Component fixtures:
+
+```powershell
+Get-ChildItem magnetar-runtime/fixtures/components/*.component.wat | ForEach-Object {
+  wasm-tools parse $_.FullName -o "$env:TEMP/component-fixture.wasm"
+  wasm-tools validate "$env:TEMP/component-fixture.wasm" --features component-model
+}
 ```
 
 Validate OpenSpec artifacts:

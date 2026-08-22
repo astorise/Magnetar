@@ -75,6 +75,19 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets
 
+  wasmtime-component-engine:
+    name: quality / wasmtime component engine
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+      - name: Test Wasmtime Component Engine
+        run: cargo test -p magnetar-runtime --features wasmtime-component-engine
+
   docs:
     name: quality / docs
     runs-on: ubuntu-latest
@@ -104,6 +117,10 @@ jobs:
           set -euo pipefail
           find . -path '*/wit/*.wit' -print0 | while IFS= read -r -d '' wit; do
             wasm-tools component wit "$wit" >/dev/null
+          done
+          find . -path '*/fixtures/components/*.component.wat' -print0 | while IFS= read -r -d '' wat; do
+            wasm-tools parse "$wat" -o /tmp/component-fixture.wasm
+            wasm-tools validate /tmp/component-fixture.wasm --features component-model
           done
 
   openspec:
