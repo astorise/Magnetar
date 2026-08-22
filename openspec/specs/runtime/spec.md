@@ -17,15 +17,15 @@ Then a runtime instance is returned.
 
 ---
 
-### Requirement: Backend Independence
+### Requirement: Provider Independence
 
-The runtime SHALL execute independently from any hardware backend.
+The runtime SHALL execute independently from any hardware Provider.
 
-#### Scenario: No backend implementation
+#### Scenario: No Provider implementation
 
 Given a runtime instance
 
-When no backend is registered
+When no Provider is registered
 
 Then the runtime initializes successfully.
 
@@ -1331,4 +1331,3 @@ Given a newer Runtime version
 When existing observability tooling consumes observations
 
 Then existing observation types remain compatible.
-

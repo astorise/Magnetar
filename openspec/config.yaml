@@ -1,20 +1,110 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  Magnetar is a Rust-first local AI Runtime. The workspace currently contains
+  `magnetar-runtime`; additional crates and AI inference features are roadmap
+  items until their dedicated OpenSpec changes are implemented.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  Canonical architecture:
+
+      Component
+          |
+          | imports Capability
+          v
+      Runtime
+          |
+          | Resolution Policy plus Resource Affinity
+          v
+      Provider
+          |
+          v
+      Device
+
+  Canonical vocabulary:
+  - Runtime: the local-node orchestration authority for Magnetar execution.
+  - Component: portable WebAssembly Component Model code that uses WIT
+    contracts.
+  - Capability: a portable WIT contract that describes an ability available to
+    Components.
+  - Provider: a trusted native Runtime extension implementing one or more
+    Capabilities.
+  - Device: a Provider-owned physical or logical execution target.
+  - Resource Affinity: authoritative metadata constraining where live resources
+    may be used.
+  - Resolution Policy: Runtime selection among compatible candidates after
+    compatibility and affinity constraints.
+  - Component Artifact: executable WASM Component code.
+  - Model Artifact: weights and associated model data.
+
+  Architectural invariants:
+  - Components request Capabilities, not Providers or Devices.
+  - Components SHALL NOT directly select CUDA, Metal, CPU, ROCm, OpenVINO, QNN,
+    or another hardware implementation.
+  - Components SHALL NOT receive native Runtime, Provider, or Device handles.
+  - Components SHALL NOT receive raw pointers, queues, streams, backend storage,
+    allocators, kernels, Rust trait objects, or process-local object references.
+  - Component WIT contracts should be coarse-grained: graph, batch, model,
+    session, or equivalent execution units.
+  - Providers own native implementation details such as kernels, allocators,
+    queues, streams, native contexts, driver APIs, and Device resources.
+  - Providers implement Capabilities and expose Devices, but Runtime owns global
+    Provider and Device resolution.
+  - Resource Affinity constrains resolution whenever resources are bound to
+    Provider, Device, Capability implementation, execution context, artifact,
+    model, adapter, tokenizer, prompt template, cache, or another resource
+    identity.
+  - Resolution Policy cannot override authoritative Resource Affinity.
+  - `Backend`, `Plugin`, and `Host` are not primary Magnetar architectural
+    concepts. Use Provider, Component, Runtime, Device, or environment-specific
+    language instead.
+  - Archived OpenSpec history may retain historical terminology; current specs
+    and canonical architecture docs take precedence.
+
+  Magnetar/Tachyon boundary:
+  - Magnetar owns local AI execution.
+  - Tachyon owns distributed service orchestration, including cluster
+    membership, routing, deployment, GitOps, and node selection.
+  - Tachyon may distribute Magnetar-compatible Components and Model Artifacts.
+  - Magnetar validates Components, controls Capability linking and authority,
+    and performs local execution.
+  - Magnetar SHALL NOT depend on Tachyon for standalone operation.
+  - The permitted dependency direction is Tachyon -> Magnetar, not Magnetar ->
+    Tachyon.
+
+  Future AI Runtime scope:
+  - model loading and model residency
+  - tokenization and prompt formatting
+  - generation, streaming, continuous batching, KV cache, prefix cache,
+    adapters, LoRA, quantization, and multi-device execution
+  - agent execution and tool execution
+  - local CLI and service/API usage
+
+  These future responsibilities must be described as planned until implemented.
+
+rules:
+  proposal:
+    - State why new responsibilities belong in Magnetar.
+    - For execution changes, identify the owning architectural layer.
+    - For Component changes, identify imported and exported Capabilities.
+    - For Provider changes, identify implemented Capabilities, exposed Devices,
+      native responsibilities, compatibility expectations, and Resource
+      Affinity behavior where applicable.
+    - For stateful resources, define Resource Affinity and recovery semantics.
+    - For external access, define authority and scope for resources such as
+      filesystem, network, secrets, process execution, source control, and
+      external services.
+    - Identify compatibility impact on existing WIT contracts.
+    - Include explicit non-goals for ambiguous cross-layer responsibilities.
+  specs:
+    - Use normative SHALL, SHOULD, and MAY language where applicable.
+    - Include scenarios for architectural invariants.
+    - Do not treat archived historical terminology as canonical.
+    - Portable Component contracts must avoid native implementation types.
+    - Do not define roadmap ideas as stable contracts before implementation.
+  tasks:
+    - Include implementation tasks.
+    - Include test or validation tasks.
+    - Include documentation tasks when public architecture changes.
+    - Include WIT validation tasks when WIT changes.
+    - Include cross-platform consideration for native Runtime changes.
+    - Include migration tasks when an existing public contract changes.

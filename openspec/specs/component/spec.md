@@ -39,11 +39,11 @@ Then every imported and exported interface is validated.
 
 Components SHALL execute independently from hardware implementations.
 
-#### Scenario: Execute on different hosts
+#### Scenario: Execute on different Runtime environments
 
 Given the same Component
 
-And two compatible Hosts
+And two compatible Runtime environments
 
 When the Component executes
 

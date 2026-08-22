@@ -1,109 +1,46 @@
 # plugin Specification
 
 ## Purpose
-TBD - created by archiving change add-plugin-system. Update Purpose after archive.
+
+This specification is retained for compatibility with historical Plugin work.
+`Plugin` is not a canonical primary Magnetar architectural concept for new
+designs. New trusted native extensions SHALL use Provider terminology. New
+portable WebAssembly extensions SHALL use Component terminology.
+
 ## Requirements
-### Requirement: Plugin Discovery
 
-The runtime SHALL discover plugins from configured plugin locations.
+### Requirement: Plugin Terminology Is Compatibility-Only
 
-#### Scenario: Plugin is discovered
+The runtime SHALL NOT require new architecture to use Plugin as a primary
+extension concept.
 
-Given a valid plugin library
+Compatibility references to Plugin MAY remain when describing historical
+artifacts or migration from the earlier plugin model.
 
-When the runtime starts
+#### Scenario: Classify new extension
 
-Then the plugin is discovered automatically.
+Given a new Magnetar extension is proposed
 
----
+When it is trusted native code
 
-### Requirement: Plugin Initialization
+Then it is modeled as a Provider
 
-The runtime SHALL initialize every compatible plugin before accepting execution requests.
+And when it is portable WebAssembly code
 
-#### Scenario: Compatible plugin
-
-Given a compatible plugin
-
-When Magnetar starts
-
-Then the plugin is initialized successfully.
+Then it is modeled as a Component.
 
 ---
 
-### Requirement: Plugin Version Compatibility
+### Requirement: Legacy Plugin Migration
 
-The runtime SHALL reject plugins targeting an unsupported plugin API version.
+Historical Plugin requirements SHALL be migrated to Provider or Component
+requirements before they are implemented as current architecture.
 
-#### Scenario: Incompatible plugin
+#### Scenario: Migrate backend-contributing plugin
 
-Given a plugin compiled against an unsupported API version
+Given a historical Plugin contributed a hardware backend
 
-When Magnetar loads the plugin
+When the concept is updated to current Magnetar architecture
 
-Then the plugin is rejected.
-
----
-
-### Requirement: Plugin Metadata
-
-Every plugin SHALL expose metadata.
-
-Metadata SHALL include:
-
-- name
-- version
-- vendor
-- api version
-- description
-
-#### Scenario: Metadata is available
-
-Given a loaded plugin
-
-When the runtime queries its metadata
-
-Then its name, version, vendor, API version, and description are available.
-
-### Requirement: General Plugin Interface
-
-The runtime SHALL expose a `Plugin` interface separate from `Backend`.
-
-A plugin SHALL expose its metadata and register its contributions with a `Registry`.
-
-#### Scenario: Plugin registers a backend
-
-Given a plugin that contributes a backend
-
-When the plugin is registered
-
-Then the backend is available through the runtime registry.
-
-### Requirement: Extensible Plugin Registry
-
-The runtime SHALL provide a `Registry` as the plugin contribution point.
-
-The registry SHALL support backend contributions and SHALL reserve distinct extension categories for model loaders, kernel providers, compiler passes, scheduler extensions, and telemetry providers.
-
-#### Scenario: Non-backend plugin
-
-Given a plugin with no backend contribution
-
-When it is registered
-
-Then it is accepted without requiring a hardware backend.
-
----
-
-### Requirement: Plugin Lifecycle
-
-Plugins SHALL support initialization and shutdown.
-
-#### Scenario: Runtime shutdown
-
-Given initialized plugins
-
-When the runtime shuts down
-
-Then every plugin is shut down gracefully.
-
+Then the native implementation is represented as a Provider that exposes
+Devices and implements Capabilities.
