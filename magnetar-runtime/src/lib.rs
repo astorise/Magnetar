@@ -463,12 +463,6 @@ impl Device for DeviceDescriptor {
     }
 }
 
-/// A hardware execution contribution. It is distinct from [`Provider`].
-pub trait Backend: Send + Sync {
-    fn name(&self) -> &str;
-    fn devices(&self) -> Vec<Arc<dyn Device>>;
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderMetadata {
     pub name: String,
@@ -7666,7 +7660,7 @@ fn parse_capability_version(value: &str) -> Result<CapabilityVersion, ProviderEr
     Ok(version)
 }
 
-/// General extension contract; a provider may register any supported contribution.
+/// Trusted native extension contract for provider-owned execution capabilities.
 pub trait Provider: Send + Sync {
     fn metadata(&self) -> ProviderMetadata;
     fn register(&self, registry: &mut ProviderRegistry) -> Result<(), ProviderError>;
@@ -7722,7 +7716,6 @@ pub trait ProviderExecutionApi: Send + Sync {
 /// Receives provider contributions.
 #[derive(Clone, Default)]
 pub struct ProviderRegistry {
-    backends: BTreeMap<String, Arc<dyn Backend>>,
     devices: BTreeMap<DeviceId, Arc<dyn Device>>,
     device_providers: BTreeMap<DeviceId, String>,
     capabilities: BTreeMap<CapabilityId, BTreeMap<CapabilityVersion, Capability>>,
@@ -7820,20 +7813,6 @@ impl ProviderRegistry {
             }
         }
     }
-    pub fn register_backend(&mut self, backend: Arc<dyn Backend>) -> Result<(), ProviderError> {
-        let name = backend.name().to_owned();
-        if self.backends.contains_key(&name) {
-            return Err(ProviderError::BackendAlreadyRegistered(name));
-        }
-        self.backends.insert(name, backend);
-        Ok(())
-    }
-    pub fn backend(&self, name: &str) -> Option<&dyn Backend> {
-        self.backends.get(name).map(AsRef::as_ref)
-    }
-    pub fn backend_names(&self) -> impl Iterator<Item = &str> {
-        self.backends.keys().map(String::as_str)
-    }
     pub fn capabilities(&self) -> impl Iterator<Item = &Capability> {
         self.capabilities
             .values()
@@ -7916,7 +7895,6 @@ impl ProviderRegistry {
             .is_some()
     }
     fn clear(&mut self) {
-        self.backends.clear();
         self.devices.clear();
         self.device_providers.clear();
         self.capabilities.clear();
@@ -8373,21 +8351,18 @@ fn next_runtime_observation_sequence() -> u64 {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeConfig {
-    pub preferred_backend: Option<String>,
     pub resolution_policy: BuiltInResolutionPolicy,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionContext {
     id: ExecutionContextId,
     config: RuntimeConfig,
-    backend_name: Option<String>,
 }
 impl Default for ExecutionContext {
     fn default() -> Self {
         Self {
             id: next_execution_context_id(),
             config: RuntimeConfig::default(),
-            backend_name: None,
         }
     }
 }
@@ -8398,14 +8373,10 @@ impl ExecutionContext {
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
     }
-    pub fn backend_name(&self) -> Option<&str> {
-        self.backend_name.as_deref()
-    }
 }
 #[derive(Default)]
 pub struct RuntimeBuilder {
     config: RuntimeConfig,
-    backends: Vec<Arc<dyn Backend>>,
     providers: Vec<Arc<dyn Provider>>,
 }
 impl RuntimeBuilder {
@@ -8416,34 +8387,23 @@ impl RuntimeBuilder {
         self.config = x;
         self
     }
-    pub fn register_backend(mut self, x: Arc<dyn Backend>) -> Self {
-        self.backends.push(x);
-        self
-    }
     pub fn register_provider(mut self, x: Arc<dyn Provider>) -> Self {
         self.providers.push(x);
         self
     }
     pub fn build(self) -> Result<Runtime, ProviderError> {
         let mut providers = ProviderLoader::new();
-        for x in self.backends {
-            providers.registry_mut().register_backend(x)?;
-        }
         for x in self.providers {
             providers.register_provider_isolated(x);
         }
-        let mut runtime = Runtime {
+        let runtime = Runtime {
             context: ExecutionContext {
                 id: next_execution_context_id(),
                 config: self.config,
-                backend_name: None,
             },
             providers,
             initialized: true,
         };
-        if let Some(x) = runtime.context.config.preferred_backend.clone() {
-            runtime.select_backend(&x)?;
-        }
         Ok(runtime)
     }
 }
@@ -8470,9 +8430,6 @@ impl Runtime {
     }
     pub fn providers(&self) -> &ProviderLoader {
         &self.providers
-    }
-    pub fn register_backend(&mut self, x: Arc<dyn Backend>) -> Result<(), ProviderError> {
-        self.providers.registry_mut().register_backend(x)
     }
     pub fn register_provider(&mut self, x: Arc<dyn Provider>) -> Result<(), ProviderError> {
         self.providers.register_provider(x)
@@ -10041,22 +9998,8 @@ impl Runtime {
             affinity,
         ))
     }
-    pub fn select_backend(&mut self, name: &str) -> Result<(), ProviderError> {
-        if self.providers.registry().backend(name).is_none() {
-            return Err(ProviderError::BackendNotFound(name.into()));
-        }
-        self.context.backend_name = Some(name.into());
-        Ok(())
-    }
-    pub fn selected_backend(&self) -> Option<&dyn Backend> {
-        self.context
-            .backend_name
-            .as_deref()
-            .and_then(|x| self.providers.registry().backend(x))
-    }
     pub fn shutdown(&mut self) {
         let _ = self.providers.shutdown();
-        self.context.backend_name = None;
         self.initialized = false;
     }
 }
@@ -10093,8 +10036,6 @@ fn device_execution_error_for_health(
 #[derive(Debug)]
 pub enum ProviderError {
     ProviderAlreadyRegistered(String),
-    BackendAlreadyRegistered(String),
-    BackendNotFound(String),
     DeviceAlreadyRegistered(DeviceId),
     DeviceProviderMismatch {
         device: DeviceId,
@@ -10138,8 +10079,6 @@ impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ProviderAlreadyRegistered(x) => write!(f, "provider '{x}' is already registered"),
-            Self::BackendAlreadyRegistered(x) => write!(f, "backend '{x}' is already registered"),
-            Self::BackendNotFound(x) => write!(f, "backend '{x}' is not registered"),
             Self::DeviceAlreadyRegistered(id) => write!(f, "device '{id}' is already registered"),
             Self::DeviceProviderMismatch {
                 device,
@@ -10230,14 +10169,6 @@ impl From<ProviderError> for ComputeError {
                 message,
             )
             .with_diagnostic(ComputeDiagnostic::new().with_capability(capability)),
-            ProviderError::BackendNotFound(provider) => ComputeError::new(
-                ComputeErrorCode::ProviderUnavailable,
-                ComputeErrorPhase::Resolution,
-                ComputeErrorSeverity::Recoverable,
-                message,
-            )
-            .with_diagnostic(ComputeDiagnostic::new().with_provider(ProviderBinding::new(provider)))
-            .with_recovery_hint(RecoveryHint::RetryBeforeState),
             ProviderError::DeviceAlreadyRegistered(device) => ComputeError::new(
                 ComputeErrorCode::DeviceUnavailable,
                 ComputeErrorPhase::Resolution,
@@ -10315,20 +10246,10 @@ mod tests {
         Mutex,
         atomic::{AtomicBool, Ordering},
     };
-    struct TestBackend;
-    impl Backend for TestBackend {
-        fn name(&self) -> &str {
-            "test"
-        }
-        fn devices(&self) -> Vec<Arc<dyn Device>> {
-            vec![]
-        }
-    }
     struct TestProvider {
         metadata: ProviderMetadata,
         initialized: AtomicBool,
         shut_down: AtomicBool,
-        backend: bool,
         fail_initialization: bool,
         health: ProviderHealth,
         capability_health: BTreeMap<CapabilityId, HealthState>,
@@ -10341,7 +10262,6 @@ mod tests {
                 metadata: ProviderMetadata::new(name, "1", "test", "test"),
                 initialized: AtomicBool::new(false),
                 shut_down: AtomicBool::new(false),
-                backend: false,
                 fail_initialization: false,
                 health: ProviderHealth::Available,
                 capability_health: BTreeMap::new(),
@@ -10374,12 +10294,8 @@ mod tests {
         fn metadata(&self) -> ProviderMetadata {
             self.metadata.clone()
         }
-        fn register(&self, r: &mut ProviderRegistry) -> Result<(), ProviderError> {
-            if self.backend {
-                r.register_backend(Arc::new(TestBackend))
-            } else {
-                Ok(())
-            }
+        fn register(&self, _registry: &mut ProviderRegistry) -> Result<(), ProviderError> {
+            Ok(())
         }
         fn health(&self) -> ProviderHealth {
             self.health
@@ -12569,7 +12485,6 @@ mod tests {
         let healthy = provider_with_capabilities("z-healthy", [compute.clone()]);
         let runtime = Runtime::builder()
             .config(RuntimeConfig {
-                preferred_backend: None,
                 resolution_policy: BuiltInResolutionPolicy::Availability,
             })
             .register_provider(Arc::new(degraded))
@@ -12711,15 +12626,34 @@ mod tests {
         ));
     }
     #[test]
-    fn backend_provider_and_shutdown() {
-        let mut p = TestProvider::new("backend");
-        p.backend = true;
+    fn provider_shutdown_releases_registered_provider() {
+        let p = TestProvider::new("provider");
         let p = Arc::new(p);
         let mut m = ProviderLoader::new();
         m.register_provider(p.clone()).unwrap();
-        assert!(m.registry().backend("test").is_some());
+        assert!(m.provider("provider").is_some());
         m.shutdown().unwrap();
         assert!(p.shut_down.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn runtime_source_does_not_restore_legacy_backend_or_plugin_surface() {
+        let source = include_str!("lib.rs");
+        let forbidden = [
+            concat!("trait ", "Backend"),
+            concat!("register_", "backend"),
+            concat!("preferred_", "backend"),
+            concat!("backend_", "names"),
+            concat!("trait ", "Plugin"),
+            concat!("Plugin", "Registry"),
+        ];
+
+        for term in forbidden {
+            assert!(
+                !source.contains(term),
+                "legacy architecture surface remains in runtime source: {term}"
+            );
+        }
     }
 
     #[test]

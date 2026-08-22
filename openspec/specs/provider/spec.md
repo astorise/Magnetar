@@ -20,6 +20,29 @@ Then the Provider is registered.
 
 ---
 
+### Requirement: Provider Is Sole Native Execution Extension
+
+Provider SHALL be the only active trusted native execution extension mechanism.
+
+Provider implementations SHALL own native hardware execution details and expose
+Devices through Provider metadata and registration.
+
+Provider implementations SHALL NOT depend on a separate Backend or Plugin
+registry to participate in Runtime resolution.
+
+#### Scenario: Register native implementation
+
+Given a native implementation exposes execution capabilities
+
+When it is registered with the Runtime
+
+Then it is registered as a Provider
+
+And its Devices and Capability advertisements are evaluated through Provider
+resolution.
+
+---
+
 ### Requirement: Capability Registration
 
 Every Provider SHALL advertise the capabilities it implements.
@@ -1476,4 +1499,3 @@ Given a Provider is unavailable
 When work is scheduled or submitted to that Provider
 
 Then the Runtime reports a stable structured Provider unavailable error.
-
