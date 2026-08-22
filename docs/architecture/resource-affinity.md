@@ -12,7 +12,7 @@ contract. A fallback classification never permits the Runtime to ignore a
 live binding.
 
 This change provides the runtime foundation only. It does not change
-`magnetar:compute@1.1.0`, expose Provider or Device identity through WIT, or
+`magnetar:compute@2.0.0`, expose Provider or Device identity through WIT, or
 create model, tokenizer, prompt-template, or generation WIT contracts. The
 adapter examples below describe how a future WASM host integration should use
 the runtime types around its native handles.
@@ -112,7 +112,7 @@ Version handling deliberately differs before and after resource creation:
 | Provider already bound | Search compatible versions implemented by that Provider; do not select a global version and filter afterward. |
 | Live resource binds the requested Capability ID | Require its exact version. A newer compatible version is not interchangeable with the live handle. |
 
-For example, a tensor created by `magnetar:compute/run@1.1.0` remains bound to
+For example, a tensor created by `magnetar:compute/run@2.0.0` remains bound to
 `1.1.0`. A Provider advertising `1.2.0` cannot consume it merely because
 `1.2.0` satisfies an initial request for `1.1.0`.
 
@@ -445,4 +445,4 @@ Each future model, tokenizer, template, or generation proposal must define:
 
 Until those contracts exist, `ResourceAffinity` and `AffinityResource<T>` are
 host-side building blocks only. They must not be used to invent placeholder
-model or generation resources under `magnetar:compute@1.1.0`.
+model or generation resources under `magnetar:compute@2.0.0`.

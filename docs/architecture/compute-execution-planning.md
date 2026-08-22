@@ -16,21 +16,29 @@ select themselves. The Runtime owns planning because it has the portable graph,
 resource affinity metadata, Provider advertisements, Resolution Policy and
 memory planning state needed to make one coherent decision.
 
+For data movement, Components may provide portable placement intent such as
+`preserve-source-affinity`, `runtime-selected`, or `host-accessible`, plus a
+host-staging policy. They do not provide Provider IDs, Device IDs, or Runtime
+affinity-group IDs. The execution plan may record the resolved Provider and
+Device after Runtime resolution, and the Scheduler executes that resolved plan.
+
 ## Lifecycle
 
 1. Validate the `ComputeGraph`, tensor descriptors and operation schemas.
 2. Merge input `ResourceAffinity` into planning constraints.
-3. Resolve the compute Provider through the active `ResolutionPolicy`.
-4. Select a compatible Device from affinity constraints, policy output or
+3. Resolve portable placement intent against Resource Affinity and Capability
+   constraints.
+4. Resolve the compute Provider through the active `ResolutionPolicy`.
+5. Select a compatible Device from affinity constraints, policy output or
    registered Provider devices.
-5. Validate Provider compute advertisements for capability version, operation
+6. Validate Provider compute advertisements for capability version, operation
    schema, dtype, layout, precision and data movement support.
-6. Build or validate the `MemoryPlan`.
-7. Record explicit transfer, upload, download, copy and materialization steps
+7. Build or validate the `MemoryPlan`.
+8. Record explicit transfer, upload, download, copy and materialization steps
    required by resource placement or view semantics.
-8. Validate that all plan dependencies are resolved and that no hidden Provider
+9. Validate that all plan dependencies are resolved and that no hidden Provider
    migration or hidden CPU staging has been introduced.
-9. Hand the validated plan to the Runtime Scheduler or Provider-submission code.
+10. Hand the validated plan to the Runtime Scheduler or Provider-submission code.
 
 ## Resolution Policy
 

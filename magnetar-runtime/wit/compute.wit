@@ -1,4 +1,4 @@
-package magnetar:compute@1.1.0;
+package magnetar:compute@2.0.0;
 
 /// Portable Compute capability for coarse Provider-owned graph execution.
 interface run {
@@ -163,6 +163,17 @@ interface run {
     placement-conversion,
   }
 
+  enum placement-intent {
+    preserve-source-affinity,
+    runtime-selected,
+    host-accessible,
+  }
+
+  enum host-staging-policy {
+    forbid,
+    permit,
+  }
+
   enum host-buffer-encoding {
     raw-bytes,
     native-endian,
@@ -247,10 +258,8 @@ interface run {
     kind: data-movement-kind,
     source: data-movement-source,
     output: tensor-descriptor,
-    target-provider: option<string>,
-    target-device: option<string>,
-    target-affinity-group: option<u64>,
-    allow-host-staging: bool,
+    placement: placement-intent,
+    host-staging: host-staging-policy,
   }
 
   record graph-input {
@@ -417,6 +426,6 @@ interface run {
   ) -> result<operation, compute-error>;
 }
 
-world compute {
-  export run;
+world compute-consumer {
+  import run;
 }

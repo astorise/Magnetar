@@ -1708,7 +1708,7 @@ pub const COMPUTE_WIT_PACKAGE: &str = "magnetar:compute";
 /// WIT interface implemented by Compute providers.
 pub const COMPUTE_WIT_INTERFACE: &str = COMPUTE_CAPABILITY_ID;
 /// Current stable version of the executable Compute capability WIT contract.
-pub const COMPUTE_CAPABILITY_VERSION: CapabilityVersion = CapabilityVersion::new(1, 1, 0);
+pub const COMPUTE_CAPABILITY_VERSION: CapabilityVersion = CapabilityVersion::new(2, 0, 0);
 
 /// Semantic operation families covered by the portable Compute capability.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -2747,15 +2747,43 @@ impl ComputeDataMovementSource {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ComputePlacementIntent {
+    PreserveSourceAffinity,
+    RuntimeSelected,
+    HostAccessible,
+}
+impl ComputePlacementIntent {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::PreserveSourceAffinity => "preserve-source-affinity",
+            Self::RuntimeSelected => "runtime-selected",
+            Self::HostAccessible => "host-accessible",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum HostStagingPolicy {
+    Forbid,
+    Permit,
+}
+impl HostStagingPolicy {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Forbid => "forbid",
+            Self::Permit => "permit",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComputeDataMovementDescriptor {
     pub kind: ComputeDataMovementKind,
     pub source: ComputeDataMovementSource,
     pub output: TensorDescriptor,
-    pub target_provider: Option<ProviderBinding>,
-    pub target_device: Option<DeviceBinding>,
-    pub target_group: Option<AffinityGroupId>,
-    pub allow_host_staging: bool,
+    pub placement: ComputePlacementIntent,
+    pub host_staging: HostStagingPolicy,
 }
 impl ComputeDataMovementDescriptor {
     pub fn upload(host: HostBufferDescriptor, output: TensorDescriptor) -> Self {
@@ -2815,30 +2843,37 @@ impl ComputeDataMovementDescriptor {
         source: ComputeDataMovementSource,
         output: TensorDescriptor,
     ) -> Self {
+        let placement = match kind {
+            ComputeDataMovementKind::Upload
+            | ComputeDataMovementKind::Transfer
+            | ComputeDataMovementKind::PlacementConversion => {
+                ComputePlacementIntent::RuntimeSelected
+            }
+            ComputeDataMovementKind::Download => ComputePlacementIntent::HostAccessible,
+            ComputeDataMovementKind::Copy
+            | ComputeDataMovementKind::Materialize
+            | ComputeDataMovementKind::DTypeConversion => {
+                ComputePlacementIntent::PreserveSourceAffinity
+            }
+        };
         Self {
             kind,
             source,
             output,
-            target_provider: None,
-            target_device: None,
-            target_group: None,
-            allow_host_staging: false,
+            placement,
+            host_staging: HostStagingPolicy::Forbid,
         }
     }
-    pub fn with_target_provider(mut self, provider: ProviderBinding) -> Self {
-        self.target_provider = Some(provider);
+    pub const fn with_placement(mut self, placement: ComputePlacementIntent) -> Self {
+        self.placement = placement;
         self
     }
-    pub fn with_target_device(mut self, device: DeviceBinding) -> Self {
-        self.target_device = Some(device);
+    pub const fn with_host_staging_policy(mut self, host_staging: HostStagingPolicy) -> Self {
+        self.host_staging = host_staging;
         self
     }
-    pub fn with_target_group(mut self, group: AffinityGroupId) -> Self {
-        self.target_group = Some(group);
-        self
-    }
-    pub fn with_host_staging(mut self) -> Self {
-        self.allow_host_staging = true;
+    pub const fn permit_host_staging(mut self) -> Self {
+        self.host_staging = HostStagingPolicy::Permit;
         self
     }
 }
@@ -2892,6 +2927,7 @@ impl ComputeDataMovementSupport {
         _provider: &ProviderBinding,
         movement: &ComputeDataMovementDescriptor,
     ) -> Result<(), ComputeValidationError> {
+        validate_data_movement_placement(movement.kind, movement.placement)?;
         movement.output.validate(&self.descriptor_limits)?;
         self.supports_dtype(&movement.output.dtype, movement.kind)?;
         self.supports_layout(movement.output.layout.kind(), movement.kind)?;
@@ -2936,21 +2972,6 @@ impl ComputeDataMovementSupport {
                 {
                     return Err(ComputeValidationError::UnsupportedConversion {
                         reason: "dtype conversion requires a different output dtype".into(),
-                    });
-                }
-                if movement.kind == ComputeDataMovementKind::PlacementConversion
-                    && movement.target_provider.is_none()
-                    && movement.target_device.is_none()
-                    && movement.target_group.is_none()
-                {
-                    return Err(ComputeValidationError::InvalidTransfer {
-                        reason: "placement conversion requires an explicit target placement".into(),
-                    });
-                }
-                if movement.allow_host_staging && !self.allow_host_staging {
-                    return Err(ComputeValidationError::InvalidTransfer {
-                        reason: "host-staged data movement is not advertised by the provider"
-                            .into(),
                     });
                 }
             }
@@ -3000,6 +3021,43 @@ impl ComputeDataMovementSupport {
             });
         }
         Ok(())
+    }
+}
+
+fn validate_data_movement_placement(
+    kind: ComputeDataMovementKind,
+    placement: ComputePlacementIntent,
+) -> Result<(), ComputeValidationError> {
+    let valid = match kind {
+        ComputeDataMovementKind::Upload => {
+            matches!(placement, ComputePlacementIntent::RuntimeSelected)
+        }
+        ComputeDataMovementKind::Download => {
+            matches!(placement, ComputePlacementIntent::HostAccessible)
+        }
+        ComputeDataMovementKind::Copy
+        | ComputeDataMovementKind::Materialize
+        | ComputeDataMovementKind::DTypeConversion => matches!(
+            placement,
+            ComputePlacementIntent::PreserveSourceAffinity | ComputePlacementIntent::HostAccessible
+        ),
+        ComputeDataMovementKind::Transfer | ComputeDataMovementKind::PlacementConversion => {
+            matches!(
+                placement,
+                ComputePlacementIntent::RuntimeSelected | ComputePlacementIntent::HostAccessible
+            )
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ComputeValidationError::InvalidTransfer {
+            reason: format!(
+                "placement intent '{}' is not valid for data movement '{}'",
+                placement.id(),
+                kind.id()
+            ),
+        })
     }
 }
 
@@ -7627,7 +7685,7 @@ fn execution_phase_from_step_kind(kind: &ExecutionStepKind) -> ComputeExecutionP
 /// Returns the canonical hardware-independent Compute capability declaration.
 ///
 /// Providers add this value to their metadata to advertise support for the
-/// `magnetar:compute/run@1.1.0` WIT contract.
+/// `magnetar:compute/run@2.0.0` WIT contract.
 pub fn compute_capability() -> Capability {
     Capability::new(
         CapabilityId::new(COMPUTE_CAPABILITY_ID),
@@ -8701,9 +8759,14 @@ impl Runtime {
             support.supports(&provider_binding, movement)?;
             if let Some(source) = movement.source.tensor() {
                 let permits_explicit_replacement = matches!(
+                    movement.placement,
+                    ComputePlacementIntent::RuntimeSelected
+                        | ComputePlacementIntent::HostAccessible
+                ) && matches!(
                     movement.kind,
                     ComputeDataMovementKind::Transfer
                         | ComputeDataMovementKind::PlacementConversion
+                        | ComputeDataMovementKind::Download
                 );
                 if !permits_explicit_replacement
                     || source
@@ -8714,40 +8777,6 @@ impl Runtime {
                     target
                         .validate_with(&source.affinity)
                         .map_err(ComputeValidationError::IncompatibleResourceAffinity)?;
-                }
-                if let Some(target_device) = &movement.target_device {
-                    match source.affinity.device() {
-                        Some(source_device) if source_device == target_device => {}
-                        _ if matches!(
-                            movement.kind,
-                            ComputeDataMovementKind::Transfer
-                                | ComputeDataMovementKind::PlacementConversion
-                        ) => {}
-                        _ => {
-                            return Err(ComputeValidationError::InvalidTransfer {
-                                reason:
-                                    "device changes require explicit transfer or placement conversion"
-                                        .into(),
-                            });
-                        }
-                    }
-                }
-                if let Some(target_group) = movement.target_group {
-                    match source.affinity.group() {
-                        Some(source_group) if source_group == target_group => {}
-                        _ if matches!(
-                            movement.kind,
-                            ComputeDataMovementKind::Transfer
-                                | ComputeDataMovementKind::PlacementConversion
-                        ) => {}
-                        _ => {
-                            return Err(ComputeValidationError::InvalidTransfer {
-                                reason:
-                                    "affinity group changes require explicit transfer or placement conversion"
-                                        .into(),
-                            });
-                        }
-                    }
                 }
             }
         }
@@ -8778,26 +8807,25 @@ impl Runtime {
                     reason: format!("provider does not advertise '{}'", movement.kind.id()),
                     report: plan.pressure.clone(),
                 })?;
-            if movement.allow_host_staging && !support.allow_host_staging {
+            let host_staging_permitted = movement.host_staging == HostStagingPolicy::Permit;
+            if host_staging_permitted && !support.allow_host_staging {
                 return Err(MemoryPlanningError::TransferRequired {
-                    reason: "host staging must be explicit and advertised".into(),
+                    reason: "host staging must be permitted by the component and advertised".into(),
                     report: plan.pressure.clone(),
                 });
             }
             let output_bytes = memory_bytes(&movement.output, &plan.pressure)?;
             let mut affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
-                .with_provider(
-                    movement
-                        .target_provider
-                        .clone()
-                        .unwrap_or_else(|| provider_binding.clone()),
-                )
+                .with_provider(provider_binding.clone())
                 .with_capability(CapabilityBinding::new(
                     CapabilityId::new(COMPUTE_CAPABILITY_ID),
                     COMPUTE_CAPABILITY_VERSION,
                 ))
                 .with_execution_context(self.context.id);
-            if let Some(device) = &movement.target_device {
+            if movement.placement == ComputePlacementIntent::PreserveSourceAffinity
+                && let Some(source) = movement.source.tensor()
+                && let Some(device) = source.affinity.device()
+            {
                 affinity = affinity.with_device(device.clone());
             }
             let requirement_id = format!("movement:{index}:{}", movement.kind.id());
@@ -8830,7 +8858,7 @@ impl Runtime {
                         requirement: requirement_id.clone(),
                     }
                 }
-                _ if movement.allow_host_staging => {
+                _ if host_staging_permitted => {
                     plan.pressure.transfer_buffer_cost_bytes = plan
                         .pressure
                         .transfer_buffer_cost_bytes
@@ -9971,26 +9999,21 @@ impl Runtime {
     ) -> Result<TensorResourceDescriptor, ComputeValidationError> {
         self.validate_compute_data_movement(provider, std::slice::from_ref(movement))?;
         let mut affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
-            .with_provider(
-                movement
-                    .target_provider
-                    .clone()
-                    .unwrap_or_else(|| ProviderBinding::new(provider)),
-            )
+            .with_provider(ProviderBinding::new(provider))
             .with_capability(CapabilityBinding::new(
                 CapabilityId::new(COMPUTE_CAPABILITY_ID),
                 COMPUTE_CAPABILITY_VERSION,
             ))
             .with_execution_context(self.context.id);
-        if let Some(device) = &movement.target_device {
-            affinity = affinity.with_device(device.clone());
-        }
-        if let Some(group) = movement.target_group {
-            affinity = affinity.with_group(group);
-        } else if let Some(source) = movement.source.tensor()
-            && let Some(group) = source.affinity.group()
-        {
-            affinity = affinity.with_group(group);
+        if let Some(source) = movement.source.tensor() {
+            if movement.placement == ComputePlacementIntent::PreserveSourceAffinity
+                && let Some(device) = source.affinity.device()
+            {
+                affinity = affinity.with_device(device.clone());
+            }
+            if let Some(group) = source.affinity.group() {
+                affinity = affinity.with_group(group);
+            }
         }
         Ok(TensorResourceDescriptor::new(
             id,
@@ -10597,8 +10620,23 @@ mod tests {
         assert_eq!(COMPUTE_WIT_PACKAGE, "magnetar:compute");
         assert_eq!(
             compute.descriptor.contracts,
-            BTreeSet::from([WitInterface::new(COMPUTE_WIT_INTERFACE, "1.1.0")])
+            BTreeSet::from([WitInterface::new(COMPUTE_WIT_INTERFACE, "2.0.0")])
         );
+    }
+    #[test]
+    fn compute_v1_import_is_not_satisfied_by_compute_v2_provider() {
+        let provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+        let runtime = Runtime::builder()
+            .register_provider(Arc::new(provider))
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            runtime.resolve_component_import(&WitInterface::new(COMPUTE_WIT_INTERFACE, "1.1.0")),
+            Err(ProviderError::NoCompatibleProvider(capability))
+                if capability.id().as_str() == COMPUTE_CAPABILITY_ID
+                    && capability.version() == CapabilityVersion::new(1, 1, 0)
+        ));
     }
     #[test]
     fn compute_operation_catalog_defines_stable_family_metadata() {
@@ -10633,7 +10671,7 @@ mod tests {
     #[test]
     fn compute_wit_defines_the_stabilized_run_surface() {
         let wit = include_str!("../wit/compute.wit");
-        assert!(wit.contains("package magnetar:compute@1.1.0;"));
+        assert!(wit.contains("package magnetar:compute@2.0.0;"));
         assert!(wit.contains("resource tensor"));
         assert!(wit.contains("resource graph"));
         assert!(wit.contains("resource operation"));
@@ -10659,6 +10697,20 @@ mod tests {
         assert!(wit.contains("record host-buffer-descriptor"));
         assert!(wit.contains("record data-movement-support"));
         assert!(wit.contains("record data-movement-descriptor"));
+        assert!(wit.contains("enum placement-intent"));
+        assert!(wit.contains("preserve-source-affinity"));
+        assert!(wit.contains("runtime-selected"));
+        assert!(wit.contains("host-accessible"));
+        assert!(wit.contains("enum host-staging-policy"));
+        assert!(wit.contains("forbid"));
+        assert!(wit.contains("permit"));
+        assert!(wit.contains("placement: placement-intent"));
+        assert!(wit.contains("host-staging: host-staging-policy"));
+        assert!(wit.contains("world compute-consumer"));
+        assert!(wit.contains("import run"));
+        assert!(!wit.contains("target-provider"));
+        assert!(!wit.contains("target-device"));
+        assert!(!wit.contains("target-affinity-group"));
         assert!(wit.contains("invalid-shape"));
         assert!(wit.contains("size-overflow"));
         assert!(wit.contains("unsupported-operation-family"));
@@ -11365,8 +11417,7 @@ mod tests {
             ResourceAffinity::new(FallbackClass::ProviderPinned)
                 .with_provider(ProviderBinding::new("other-provider")),
         );
-        let transfer = ComputeDataMovementDescriptor::transfer(foreign, descriptor.clone())
-            .with_target_provider(ProviderBinding::new("portable-compute"));
+        let transfer = ComputeDataMovementDescriptor::transfer(foreign, descriptor.clone());
         runtime
             .validate_compute_data_movement("portable-compute", &[transfer])
             .unwrap();
@@ -11408,9 +11459,8 @@ mod tests {
             ResourceAffinity::new(FallbackClass::ProviderPinned)
                 .with_provider(ProviderBinding::new("other-provider")),
         );
-        let movement = ComputeDataMovementDescriptor::transfer(source, descriptor)
-            .with_target_provider(ProviderBinding::new("movement-compute"))
-            .with_host_staging();
+        let movement =
+            ComputeDataMovementDescriptor::transfer(source, descriptor).permit_host_staging();
 
         let plan = runtime
             .plan_compute_data_movement_memory("movement-compute", &[movement])
@@ -12420,7 +12470,10 @@ mod tests {
 
         assert_eq!(
             runtime
-                .resolve_component_import(&WitInterface::new(COMPUTE_WIT_INTERFACE, "1.0.0",))
+                .resolve_component_import(&WitInterface::new(
+                    COMPUTE_WIT_INTERFACE,
+                    COMPUTE_CAPABILITY_VERSION.to_string(),
+                ))
                 .unwrap()
                 .len(),
             1
@@ -12470,7 +12523,10 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            runtime.resolve_component_import(&WitInterface::new(COMPUTE_WIT_INTERFACE, "1.1.0")),
+            runtime.resolve_component_import(&WitInterface::new(
+                COMPUTE_WIT_INTERFACE,
+                COMPUTE_CAPABILITY_VERSION.to_string(),
+            )),
             Err(ProviderError::PolicyRejectedProvider { capability, policy })
                 if capability.id() == &compute.id
                     && capability.version() == compute.version
@@ -12492,8 +12548,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let providers =
-            runtime.resolve_component_import(&WitInterface::new(COMPUTE_WIT_INTERFACE, "1.1.0"));
+        let providers = runtime.resolve_component_import(&WitInterface::new(
+            COMPUTE_WIT_INTERFACE,
+            COMPUTE_CAPABILITY_VERSION.to_string(),
+        ));
 
         assert_eq!(providers.unwrap()[0].metadata().name, "z-healthy");
     }
@@ -12510,7 +12568,10 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            runtime.resolve_component_import(&WitInterface::new(COMPUTE_WIT_INTERFACE, "1.1.0")),
+            runtime.resolve_component_import(&WitInterface::new(
+                COMPUTE_WIT_INTERFACE,
+                COMPUTE_CAPABILITY_VERSION.to_string(),
+            )),
             Err(ProviderError::PolicyRejectedProvider { .. })
         ));
 

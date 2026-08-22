@@ -77,7 +77,7 @@ movement or incompatible Resource Affinity.
 
 CPU Provider:
 
-- advertises `magnetar:compute/run@1.1.0`;
+- advertises `magnetar:compute/run@2.0.0`;
 - supports dense and strided layouts for common elementwise, reduction and
   linear algebra schemas;
 - supports host upload and download without host staging;

@@ -31,9 +31,9 @@ version negotiation SHALL occur only before a resource is created.
 
 #### Scenario: Preserve an exact live capability binding
 
-- **GIVEN** a resource created by `magnetar:compute/run@1.1.0`
+- **GIVEN** a resource created by `magnetar:compute/run@2.0.0`
 - **WHEN** the Runtime aggregates constraints for a dependent call
-- **THEN** the resource remains bound to `magnetar:compute/run@1.1.0`
+- **THEN** the resource remains bound to `magnetar:compute/run@2.0.0`
 - **AND** the Runtime does not reinterpret it as a resource from another
   compatible Capability version
 
@@ -190,5 +190,5 @@ WIT contract.
 - **WHEN** it reads the descriptor
 - **THEN** it observes stable identifiers, versions, classifications, and
   fingerprints only
-- **AND** the `magnetar:compute@1.1.0` WIT contract remains unchanged
+- **AND** the `magnetar:compute@2.0.0` WIT contract remains unchanged
 

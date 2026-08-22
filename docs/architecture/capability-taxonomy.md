@@ -4,7 +4,7 @@
 
 This document records the evidence used to prepare Magnetar capability
 contracts. Most package names below remain provisional discovery artifacts.
-`magnetar:compute/run@1.1.0` is the first stabilized result of this taxonomy:
+`magnetar:compute/run@2.0.0` is the first stabilized result of this taxonomy:
 it evolves the `1.0.0` marker into a coarse graph execution boundary while
 leaving graph construction, data movement, operation catalogs, and numerical
 semantics to later changes.
@@ -314,7 +314,7 @@ follow-up may rename, split, or reject it.
 
 | Candidate family | Provisional package/interface | Coarse WIT-facing responsibility | Native owner retained | Decisions required before versioning |
 | --- | --- | --- | --- | --- |
-| Compute graph execution and tensor resources | Stabilized `magnetar:compute/run@1.1.0` `run` interface | Validated fixed-width descriptors, opaque tensor/graph/operation resources, coarse submit/await/cancel/status/output retrieval, stable structured errors | Allocation, storage, kernels, device contexts, synchronization | Graph construction, data movement, resource sharing policy beyond opaque handles, operation catalogs, numerical semantics |
+| Compute graph execution and tensor resources | Stabilized `magnetar:compute/run@2.0.0` `run` interface | Validated fixed-width descriptors, opaque tensor/graph/operation resources, coarse submit/await/cancel/status/output retrieval, stable structured errors | Allocation, storage, kernels, device contexts, synchronization | Graph construction, data movement, resource sharing policy beyond opaque handles, operation catalogs, numerical semantics |
 | Model loading | `magnetar:model/load` | Load from a host-authorized artifact resource; return opaque model plus metadata, fingerprint, and abilities | Artifact cache, format detection, weights, mmap, placement, loader implementation | Artifact identity and permissions; ability metadata; affinity and unload lifecycle |
 | Tokenization | `magnetar:tokenization/tokenizer` | Open a fingerprinted tokenizer; encode/decode; incremental decoder; special-token metadata | Native tokenizer implementation and cache, when used | Normalization/offset semantics; limits; incremental decode; model fingerprint compatibility |
 | Prompt formatting | `magnetar:prompt/chat-template` | Render structured messages/tools/reasoning policy with a fingerprinted template | Template storage and sandbox policy | Message/tool schema; escaping; determinism; template trust and limits |

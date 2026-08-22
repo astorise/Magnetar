@@ -15,8 +15,8 @@ The portable movement model contains seven operation kinds:
 - `materialize`: turns a tensor view into a distinct materialized resource.
 - `transfer`: moves or copies data between Provider or Device placements.
 - `dtype-conversion`: changes dtype only when Provider support is advertised.
-- `placement-conversion`: requests a different host, Provider, Device, or
-  affinity-group placement.
+- `placement-conversion`: explicitly requests a placement change whose
+  concrete Provider, Device and affinity result are resolved by the Runtime.
 
 These are validation and contract objects. Native buffer handles, queues,
 streams, locks, backend storage and Provider-private handles remain outside the
@@ -32,13 +32,24 @@ the same stable metadata rather than exposing Provider-owned storage directly.
 Supported encodings are raw bytes, native endian, little endian and big endian.
 Providers advertise which encodings they accept for each movement kind.
 
-## Affinity
+## Placement Intent
 
-Every produced tensor resource receives `ResourceAffinity` for the selected
-Provider and Compute capability version. Target Device and affinity group are
-attached when requested. Non-transfer operations preserve strict compatibility
-with the selected Provider. Cross-Provider or cross-Device changes require an
-explicit `transfer` or `placement-conversion` descriptor.
+Portable data movement requests describe semantic placement intent:
+
+- `preserve-source-affinity`: preserve the source resource's authoritative
+  affinity and reject plans that would violate it.
+- `runtime-selected`: let the Runtime choose compatible placement from
+  Resource Affinity, Capability requirements, Provider advertisements,
+  Resolution Policy, Device state and memory planning.
+- `host-accessible`: require a portable host-accessible data path without
+  selecting a CPU Provider.
+
+Every produced tensor resource receives `ResourceAffinity` for the resolved
+Provider and Compute capability version. Device and affinity-group bindings are
+attached from Runtime-owned resolution state, not from Component-supplied
+target IDs. Non-transfer operations preserve strict compatibility with the
+selected Provider. Cross-Provider or cross-Device changes require an explicit
+`transfer` or `placement-conversion` descriptor.
 
 Affinity validation happens before Provider execution. Incompatible Provider,
 Device or group usage is rejected as a structured data movement failure instead
@@ -55,11 +66,13 @@ Runtime validation checks both the source and output tensor descriptors against
 that advertisement. Unsupported dtype or layout conversion is reported before
 Provider code runs.
 
-## CPU Staging
+## Host Staging
 
-CPU staging is not an invisible fallback. If a transfer needs host staging, the
-request must opt into it and the selected Provider must advertise support. The
-Runtime otherwise rejects the movement request.
+Host staging is not an invisible fallback. A request uses `host-staging:
+permit` only to say staging is semantically acceptable; it does not force or
+authorize staging. Runtime policy, Provider advertisement, Resource Affinity
+and memory planning may still reject staging. `host-staging: forbid` rejects
+any plan that requires staging through host memory.
 
 ## Relationship To Graph Submission
 
