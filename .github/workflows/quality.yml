@@ -165,7 +165,7 @@ jobs:
         run: cargo run --manifest-path tools/coverage-ratchet/Cargo.toml -- --summary target/llvm-cov/coverage.json quality/coverage-baseline.json >> "$GITHUB_STEP_SUMMARY"
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: target/llvm-cov/
