@@ -2798,91 +2798,166 @@ fn affinity_resolution_rejects_shutdown_runtime() {
     ));
 }
 
-struct TestComponent {
-    metadata: ComponentMetadata,
-    events: Arc<Mutex<Vec<String>>>,
-}
-impl TestComponent {
-    fn new(name: &str, events: Arc<Mutex<Vec<String>>>) -> Self {
-        Self {
-            metadata: ComponentMetadata::new(name, "1", "test component"),
-            events,
-        }
-    }
-    fn event(&self, event: &str) {
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("{}:{event}", self.metadata.name));
-    }
-}
-impl Component for TestComponent {
-    fn metadata(&self) -> ComponentMetadata {
-        self.metadata.clone()
-    }
-    fn instantiate(&mut self) -> Result<(), ComponentError> {
-        self.event("instantiate");
-        Ok(())
-    }
-    fn start(&mut self) -> Result<(), ComponentError> {
-        self.event("start");
-        Ok(())
-    }
-    fn stop(&mut self) -> Result<(), ComponentError> {
-        self.event("stop");
-        Ok(())
-    }
-    fn destroy(&mut self) -> Result<(), ComponentError> {
-        self.event("destroy");
-        Ok(())
-    }
-}
-
 #[test]
-fn component_lifecycle_resolves_dependencies_and_stops_in_reverse_order() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let first = TestComponent::new("first", events.clone());
-    let mut second = TestComponent::new("second", events.clone());
-    second.metadata.dependencies.insert("first".into());
+fn component_runtime_instantiates_without_generic_start_or_stop() {
     let mut manager = ComponentManager::new();
-    manager.register_component(Box::new(second)).unwrap();
-    manager.register_component(Box::new(first)).unwrap();
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component"),
+            "component.wasm",
+        ))
+        .unwrap();
 
-    manager.start_all().unwrap();
+    let instance = manager.instantiate_component("component").unwrap();
     assert_eq!(
-        manager.component_state("first"),
-        Some(ComponentState::Started)
+        manager.definition_state("component"),
+        Some(ComponentDefinitionState::Prepared)
     );
+    assert_eq!(
+        manager.instance_state(instance),
+        Some(ComponentInstanceState::Ready)
+    );
+
     manager.shutdown();
     assert_eq!(
-        *events.lock().unwrap(),
-        vec![
-            "first:instantiate",
-            "first:start",
-            "second:instantiate",
-            "second:start",
-            "second:stop",
-            "first:stop",
-            "first:destroy",
-            "second:destroy",
-        ]
+        manager.instance_state(instance),
+        None,
+        "shutdown removes Runtime-owned Component instances"
     );
 }
 
 #[test]
-fn component_contracts_require_host_or_component_exports() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let mut component = TestComponent::new("consumer", events);
+fn component_imports_are_authorized_and_linked_explicitly() {
     let interface = WitInterface::new("magnetar:runtime/run", "1.0.0");
-    component.metadata.imports.insert(interface.clone());
+    let metadata =
+        ComponentMetadata::new("consumer", "1", "test component").with_import(interface.clone());
     let mut manager = ComponentManager::new();
-    manager.register_component(Box::new(component)).unwrap();
+    manager
+        .register_component(ComponentDescriptor::new(metadata, "consumer.wasm"))
+        .unwrap();
+
     assert!(matches!(
-        manager.validate_interfaces(),
-        Err(ComponentError::MissingInterface { .. })
+        manager.instantiate_component("consumer"),
+        Err(ComponentError::UnauthorizedImport { .. })
     ));
+
+    manager.authorize_interface(interface.clone());
+    assert!(matches!(
+        manager.instantiate_component("consumer"),
+        Err(ComponentError::UnresolvedImport { .. })
+    ));
+
     manager.provide_interface(interface);
-    manager.validate_interfaces().unwrap();
+    let instance = manager.instantiate_component("consumer").unwrap();
+    assert_eq!(
+        manager.instance_state(instance),
+        Some(ComponentInstanceState::Ready)
+    );
+}
+
+#[test]
+fn component_exports_do_not_automatically_satisfy_imports() {
+    let interface = WitInterface::new("example:service/api", "1.0.0");
+    let producer =
+        ComponentMetadata::new("producer", "1", "producer").with_export(interface.clone());
+    let consumer = ComponentMetadata::new("consumer", "1", "consumer").with_import(interface);
+    let mut manager = ComponentManager::new();
+    manager
+        .register_component(ComponentDescriptor::new(producer, "producer.wasm"))
+        .unwrap();
+    manager
+        .register_component(ComponentDescriptor::new(consumer, "consumer.wasm"))
+        .unwrap();
+
+    assert!(matches!(
+        manager.instantiate_component("consumer"),
+        Err(ComponentError::UnauthorizedImport { .. })
+    ));
+}
+
+#[test]
+fn component_definition_can_create_multiple_isolated_instances() {
+    let mut manager = ComponentManager::new();
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component"),
+            "component.wasm",
+        ))
+        .unwrap();
+
+    let first = manager.instantiate_component("component").unwrap();
+    let second = manager.instantiate_component("component").unwrap();
+    assert_ne!(first, second);
+    assert_eq!(
+        manager.instance_state(first),
+        Some(ComponentInstanceState::Ready)
+    );
+    assert_eq!(
+        manager.instance_state(second),
+        Some(ComponentInstanceState::Ready)
+    );
+}
+
+#[test]
+fn component_invocation_after_destruction_fails() {
+    let interface = WitInterface::new("example:app/run", "1.0.0");
+    let mut manager = ComponentManager::new();
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component")
+                .with_export(interface.clone()),
+            "component.wasm",
+        ))
+        .unwrap();
+    let instance = manager.instantiate_component("component").unwrap();
+    manager.destroy_instance(instance).unwrap();
+
+    assert!(matches!(
+        manager.invoke(ComponentInvocation::new(instance, interface, "run")),
+        Err(ComponentError::InstanceNotFound(_))
+    ));
+}
+
+#[test]
+fn component_engine_normalizes_traps_interruptions_and_limit_failures() {
+    let interface = WitInterface::new("example:app/run", "1.0.0");
+    let mut trapping_engine = MockComponentEngine::new();
+    trapping_engine.trap_on_invoke = Some(ComponentTrapKind::Trap);
+    let mut manager = ComponentManager::with_engine(Box::new(trapping_engine));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component")
+                .with_export(interface.clone()),
+            "component.wasm",
+        ))
+        .unwrap();
+    let instance = manager.instantiate_component("component").unwrap();
+    assert!(matches!(
+        manager.invoke(ComponentInvocation::new(instance, interface, "run")),
+        Err(ComponentError::Trap {
+            kind: ComponentTrapKind::Trap,
+            ..
+        })
+    ));
+
+    let mut manager = ComponentManager::with_engine(Box::new(
+        MockComponentEngine::new().without_resource_limits(),
+    ));
+    manager.set_resource_limits(ComponentResourceLimits {
+        require_memory_limit: true,
+        max_memory_bytes: Some(1024),
+        ..ComponentResourceLimits::default()
+    });
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("limited", "1", "test component"),
+            "limited.wasm",
+        ))
+        .unwrap();
+    assert!(matches!(
+        manager.instantiate_component("limited"),
+        Err(ComponentError::ResourceLimitUnsupported { .. })
+    ));
 }
 
 #[test]

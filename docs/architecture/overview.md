@@ -195,6 +195,7 @@ Future work:
 ## Related Documents
 
 - [Capability taxonomy](capability-taxonomy.md)
+- [Component runtime boundary](component-runtime.md)
 - [Resource affinity](resource-affinity.md)
 - [Resolution policy](resolution-policy.md)
 - [Provider health](provider-health.md)

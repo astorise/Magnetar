@@ -25,8 +25,12 @@ pub use affinity::{
 };
 pub use capability::{Capability, CapabilityDescriptor, CapabilityId, CapabilityVersion};
 pub use component::{
-    Component, ComponentDescriptor, ComponentError, ComponentManager, ComponentMetadata,
-    ComponentState, WitInterface,
+    ComponentDefinition, ComponentDefinitionId, ComponentDefinitionState, ComponentDescriptor,
+    ComponentEndpoint, ComponentEngine, ComponentEngineCapabilities, ComponentEngineInstance,
+    ComponentError, ComponentInstance, ComponentInstanceId, ComponentInstanceState,
+    ComponentInterruptionReason, ComponentInvocation, ComponentLinkPlan, ComponentManager,
+    ComponentMetadata, ComponentResourceLimits, ComponentTrapKind, MockComponentEngine,
+    PreparedComponent, WitInterface,
 };
 pub use compute::{
     COMPUTE_CAPABILITY_ID, COMPUTE_CAPABILITY_VERSION, COMPUTE_WIT_INTERFACE, COMPUTE_WIT_PACKAGE,
