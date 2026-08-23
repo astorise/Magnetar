@@ -101,6 +101,7 @@ impl RuntimeBuilder {
                 config: self.config.clone(),
             },
             memory: MemoryManager::new(self.config.memory),
+            kv_caches: KvCacheManager::new(),
             providers,
             sessions: BTreeMap::new(),
             session_observations: Vec::new(),
@@ -112,6 +113,7 @@ impl RuntimeBuilder {
 pub struct Runtime {
     context: ExecutionContext,
     memory: MemoryManager,
+    kv_caches: KvCacheManager,
     providers: ProviderLoader,
     sessions: BTreeMap<InferenceSessionId, InferenceSession>,
     session_observations: Vec<SessionObservation>,
@@ -138,6 +140,12 @@ impl Runtime {
     }
     pub fn memory_mut(&mut self) -> &mut MemoryManager {
         &mut self.memory
+    }
+    pub fn kv_caches(&self) -> &KvCacheManager {
+        &self.kv_caches
+    }
+    pub fn kv_caches_mut(&mut self) -> &mut KvCacheManager {
+        &mut self.kv_caches
     }
     pub fn providers(&self) -> &ProviderLoader {
         &self.providers
@@ -286,6 +294,19 @@ impl Runtime {
         session: &InferenceSessionId,
     ) -> Result<(), SessionError> {
         self.inference_session_mut(session)?.close()?;
+        let cache_ids = self.session_kv_cache_ids(session);
+        for cache in &cache_ids {
+            self.release_kv_cache_memory(cache).map_err(|error| {
+                SessionError::ResourceCleanupFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
+        self.kv_caches
+            .release_session_caches(session)
+            .map_err(|error| SessionError::ResourceCleanupFailed {
+                reason: error.to_string(),
+            })?;
         self.observe_session(
             SessionObservationKind::Closed,
             Some(session.clone()),
@@ -301,6 +322,10 @@ impl Runtime {
             .filter_map(|(id, session)| session.expire_if_needed(now_millis).then_some(id.clone()))
             .collect::<Vec<_>>();
         for session in &expired {
+            for cache in self.session_kv_cache_ids(session) {
+                let _ = self.release_kv_cache_memory(&cache);
+            }
+            let _ = self.kv_caches.release_session_caches(session);
             self.observe_session(
                 SessionObservationKind::Expired,
                 Some(session.clone()),
@@ -337,6 +362,67 @@ impl Runtime {
     ) -> Result<MemoryAdmissionDecision, SessionError> {
         self.inference_session(session)?
             .memory_admission(&self.memory)
+    }
+    pub fn create_kv_cache(&mut self, cache: KvCache) -> Result<KvCacheId, KvCacheError> {
+        self.kv_caches.create(cache)
+    }
+    pub fn allocate_kv_cache_memory(
+        &mut self,
+        cache: &KvCacheId,
+    ) -> Result<MemoryAllocationId, KvCacheError> {
+        self.kv_caches.allocate_memory(cache, &mut self.memory)
+    }
+    pub fn kv_cache(&self, cache: &KvCacheId) -> Result<&KvCache, KvCacheError> {
+        self.kv_caches.cache(cache)
+    }
+    pub fn validate_kv_cache_reuse(
+        &mut self,
+        cache: &KvCacheId,
+        compatibility: &KvCacheCompatibility,
+        affinity: Option<&ResourceAffinity>,
+    ) -> Result<(), KvCacheError> {
+        self.kv_caches
+            .validate_reuse(cache, compatibility, affinity)
+    }
+    pub fn prefill_kv_cache_completed(
+        &mut self,
+        cache: &KvCacheId,
+        tokens: u32,
+    ) -> Result<(), KvCacheError> {
+        self.kv_caches.prefill_completed(cache, tokens)
+    }
+    pub fn append_decode_kv_cache(
+        &mut self,
+        cache: &KvCacheId,
+        tokens: u32,
+    ) -> Result<(), KvCacheError> {
+        self.kv_caches.decode_append(cache, tokens)
+    }
+    pub fn seal_kv_cache(&mut self, cache: &KvCacheId) -> Result<(), KvCacheError> {
+        self.kv_caches.seal(cache)
+    }
+    pub fn evict_kv_cache(&mut self, cache: &KvCacheId) -> Result<(), KvCacheError> {
+        self.release_kv_cache_memory(cache)?;
+        self.kv_caches.evict(cache)
+    }
+    pub fn release_kv_cache(&mut self, cache: &KvCacheId) -> Result<(), KvCacheError> {
+        self.release_kv_cache_memory(cache)?;
+        self.kv_caches.release(cache)
+    }
+    fn release_kv_cache_memory(&mut self, cache: &KvCacheId) -> Result<(), KvCacheError> {
+        if let Some(allocation) = self.kv_cache(cache)?.residency.memory_allocation {
+            self.memory
+                .release(allocation)
+                .map_err(|_| KvCacheError::CacheReleased)?;
+        }
+        Ok(())
+    }
+    fn session_kv_cache_ids(&self, session: &InferenceSessionId) -> Vec<KvCacheId> {
+        self.kv_caches
+            .caches()
+            .filter(|cache| cache.session.as_ref() == Some(session))
+            .map(|cache| cache.id.clone())
+            .collect()
     }
     pub fn register_provider(&mut self, x: Arc<dyn Provider>) -> Result<(), ProviderError> {
         self.providers.register_provider(x)

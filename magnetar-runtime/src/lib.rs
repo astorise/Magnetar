@@ -15,6 +15,7 @@ pub mod compute;
 pub mod conformance;
 pub mod device;
 pub mod generation;
+pub mod kv_cache;
 pub mod memory;
 pub mod model;
 pub mod observability;
@@ -99,6 +100,13 @@ pub use generation::{
     StopConditions, StreamingMode, decode_step, finish_reason_from_provider_error,
     memory_admission, prefill, prepare_stop_sequences, stop_reason_for, streaming_text_chunk,
     token_stream_events,
+};
+pub use kv_cache::{
+    KvCache, KvCacheCompatibility, KvCacheError, KvCacheId, KvCacheLayoutFormat,
+    KvCacheLayoutMetadata, KvCacheLifecycleState, KvCacheManager, KvCacheObservation,
+    KvCacheObservationKind, KvCachePageMetadata, KvCachePolicy, KvCacheQuantization,
+    KvCacheResidency, KvCacheRetentionPolicy, KvCacheScope, KvCacheSharingPolicy,
+    PrefixFingerprint, ProviderKvCacheResource,
 };
 pub use memory::{
     MemoryAdmissionDecision, MemoryAdmissionRequest, MemoryAllocation, MemoryAllocationClass,

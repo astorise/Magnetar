@@ -6,9 +6,10 @@
 
 use crate::{
     CorrelationId, FallbackClass, GenerationModelReference, GenerationParameters,
-    GenerationTokenizerReference, MemoryAdmissionDecision, MemoryAdmissionRequest,
-    MemoryAllocationClass, MemoryAllocationId, MemoryAllocationOwner, MemoryAllocationRequest,
-    MemoryManager, MemoryPlacement, ResourceAffinity, StreamingDecodeState,
+    GenerationTokenizerReference, KvCacheId, KvCachePolicy, MemoryAdmissionDecision,
+    MemoryAdmissionRequest, MemoryAllocationClass, MemoryAllocationId, MemoryAllocationOwner,
+    MemoryAllocationRequest, MemoryManager, MemoryPlacement, ResourceAffinity,
+    StreamingDecodeState,
 };
 use std::{collections::BTreeSet, error::Error, fmt};
 
@@ -100,6 +101,7 @@ pub struct SessionPolicy {
     pub concurrency: SessionConcurrencyPolicy,
     pub memory_budget_bytes: Option<u64>,
     pub kv_cache_budget_bytes: Option<u64>,
+    pub kv_cache_policy: KvCachePolicy,
     pub prefix_cache_allowed: bool,
     pub redaction: SessionRedactionPolicy,
     pub raw_prompt_logging_allowed: bool,
@@ -120,6 +122,7 @@ impl Default for SessionPolicy {
             concurrency: SessionConcurrencyPolicy::default(),
             memory_budget_bytes: None,
             kv_cache_budget_bytes: None,
+            kv_cache_policy: KvCachePolicy::default(),
             prefix_cache_allowed: false,
             redaction: SessionRedactionPolicy::RedactRawInputs,
             raw_prompt_logging_allowed: false,
@@ -338,7 +341,7 @@ pub struct SessionResources {
     pub output_token_buffer_tokens: usize,
     pub temporary_generation_buffer_bytes: u64,
     pub memory_allocations: BTreeSet<MemoryAllocationId>,
-    pub kv_cache_placeholder: Option<String>,
+    pub kv_cache: Option<KvCacheId>,
     pub prefix_cache_placeholder: Option<String>,
     pub model_residency_reference: Option<String>,
 }
@@ -351,7 +354,7 @@ impl Default for SessionResources {
             output_token_buffer_tokens: 0,
             temporary_generation_buffer_bytes: 0,
             memory_allocations: BTreeSet::new(),
-            kv_cache_placeholder: Some("future-kv-cache".into()),
+            kv_cache: None,
             prefix_cache_placeholder: None,
             model_residency_reference: None,
         }

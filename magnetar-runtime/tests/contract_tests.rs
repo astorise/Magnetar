@@ -5,6 +5,7 @@ mod contract_tests {
     mod artifact;
     mod component;
     mod distribution;
+    mod kv_cache;
     mod model;
     mod provider;
     mod resolution;
