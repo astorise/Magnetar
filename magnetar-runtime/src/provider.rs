@@ -1,5 +1,4 @@
 use crate::*;
-use libloading::Library;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -9,6 +8,374 @@ use std::{
 };
 
 pub const PROVIDER_API_VERSION: u32 = 1;
+pub const PROVIDER_ABI_MAJOR_VERSION: u16 = 1;
+pub const PROVIDER_ABI_MINOR_VERSION: u16 = 0;
+pub const PROVIDER_ABI_FACTORY_SYMBOL_V1: &str = "magnetar_provider_v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderAbiVersion {
+    pub major: u16,
+    pub minor: u16,
+}
+impl ProviderAbiVersion {
+    pub const CURRENT: Self = Self {
+        major: PROVIDER_ABI_MAJOR_VERSION,
+        minor: PROVIDER_ABI_MINOR_VERSION,
+    };
+
+    pub const fn new(major: u16, minor: u16) -> Self {
+        Self { major, minor }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderLoadingMode {
+    BuiltIn,
+    DynamicLibrary,
+    TestProvider,
+    DevelopmentProvider,
+}
+
+impl ProviderLoadingMode {
+    pub const fn is_dynamic(self) -> bool {
+        matches!(self, Self::DynamicLibrary | Self::DevelopmentProvider)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderLoadingPolicy {
+    pub mode: ProviderLoadingMode,
+    pub allowed_paths: Vec<PathBuf>,
+    pub development_mode: bool,
+}
+impl ProviderLoadingPolicy {
+    pub fn dynamic_library(allowed_paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
+        Self {
+            mode: ProviderLoadingMode::DynamicLibrary,
+            allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
+            development_mode: false,
+        }
+    }
+
+    pub fn development(allowed_paths: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
+        Self {
+            mode: ProviderLoadingMode::DevelopmentProvider,
+            allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
+            development_mode: true,
+        }
+    }
+
+    pub fn allows(&self, path: &Path) -> bool {
+        self.mode.is_dynamic()
+            && !self.allowed_paths.is_empty()
+            && self.allowed_paths.iter().any(|root| path.starts_with(root))
+    }
+}
+
+impl Default for ProviderLoadingPolicy {
+    fn default() -> Self {
+        Self {
+            mode: ProviderLoadingMode::DynamicLibrary,
+            allowed_paths: Vec::new(),
+            development_mode: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ProviderAbiFeature {
+    ProviderMetadata,
+    CapabilityAdvertisement,
+    DeviceListing,
+    StatusReporting,
+    Execution,
+    Cancellation,
+    BlockingExecution,
+    AsyncExecution,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderAbiThreadingModel {
+    SingleThreaded,
+    RuntimeSynchronized,
+    InternallyThreadSafe,
+    Reentrant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderAbiExecutionBehavior {
+    Blocking,
+    AsyncCapable,
+    LongRunning,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderAbiMemoryOwner {
+    Runtime,
+    Provider,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderAbiRetentionPolicy {
+    BorrowedForCall,
+    RetainedUntilRelease,
+    OwnershipTransferred,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderAbiMemoryRule {
+    pub owner: ProviderAbiMemoryOwner,
+    pub retention: ProviderAbiRetentionPolicy,
+    pub release_required: bool,
+}
+
+impl ProviderAbiMemoryRule {
+    pub const fn runtime_borrowed() -> Self {
+        Self {
+            owner: ProviderAbiMemoryOwner::Runtime,
+            retention: ProviderAbiRetentionPolicy::BorrowedForCall,
+            release_required: false,
+        }
+    }
+
+    pub const fn provider_released() -> Self {
+        Self {
+            owner: ProviderAbiMemoryOwner::Provider,
+            retention: ProviderAbiRetentionPolicy::RetainedUntilRelease,
+            release_required: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderAbiOwnershipRules {
+    pub strings: ProviderAbiMemoryRule,
+    pub lists: ProviderAbiMemoryRule,
+    pub descriptors: ProviderAbiMemoryRule,
+    pub error_messages: ProviderAbiMemoryRule,
+    pub opaque_handles: ProviderAbiMemoryRule,
+    pub runtime_buffers: ProviderAbiMemoryRule,
+    pub provider_buffers: ProviderAbiMemoryRule,
+}
+
+impl Default for ProviderAbiOwnershipRules {
+    fn default() -> Self {
+        Self {
+            strings: ProviderAbiMemoryRule::provider_released(),
+            lists: ProviderAbiMemoryRule::provider_released(),
+            descriptors: ProviderAbiMemoryRule::provider_released(),
+            error_messages: ProviderAbiMemoryRule::provider_released(),
+            opaque_handles: ProviderAbiMemoryRule::provider_released(),
+            runtime_buffers: ProviderAbiMemoryRule::runtime_borrowed(),
+            provider_buffers: ProviderAbiMemoryRule::provider_released(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProviderAbiHandle(u64);
+
+impl ProviderAbiHandle {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderAbiHandleKind {
+    ProviderInstance,
+    ProviderResource,
+    Operation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderAbiHandleDescriptor {
+    pub kind: ProviderAbiHandleKind,
+    pub handle: ProviderAbiHandle,
+    pub destroy_required: bool,
+}
+
+impl ProviderAbiHandleDescriptor {
+    pub const fn new(kind: ProviderAbiHandleKind, handle: ProviderAbiHandle) -> Self {
+        Self {
+            kind,
+            handle,
+            destroy_required: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderAbiLoadingLifecycle {
+    Discovered,
+    LibraryLoaded,
+    DescriptorValidated,
+    Initialized,
+    Registered,
+    Ready,
+    Draining,
+    Stopped,
+    Failed,
+    Destroyed,
+}
+
+impl ProviderAbiLoadingLifecycle {
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Discovered, Self::LibraryLoaded)
+                | (Self::LibraryLoaded, Self::DescriptorValidated)
+                | (Self::LibraryLoaded, Self::Failed)
+                | (Self::DescriptorValidated, Self::Initialized)
+                | (Self::DescriptorValidated, Self::Failed)
+                | (Self::Initialized, Self::Registered)
+                | (Self::Initialized, Self::Failed)
+                | (Self::Registered, Self::Ready)
+                | (Self::Registered, Self::Failed)
+                | (Self::Ready, Self::Draining)
+                | (Self::Ready, Self::Failed)
+                | (Self::Draining, Self::Stopped)
+                | (Self::Draining, Self::Failed)
+                | (Self::Stopped, Self::Destroyed)
+                | (Self::Failed, Self::Destroyed)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderAbiUnloadPolicy {
+    NeverUnload,
+    UnloadAfterNoResources,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderAbiErrorCode {
+    InvalidAbiDescriptor,
+    UnsupportedAbiVersion,
+    InvalidMetadata,
+    InvalidAdvertisement,
+    InvalidDeviceMetadata,
+    InitializationFailure,
+    ProviderNotReady,
+    ProviderDraining,
+    ProviderSaturated,
+    ExecutionRejected,
+    ExecutionFailed,
+    CancellationUnsupported,
+    CancellationFailed,
+    ResourceInvalid,
+    InternalProviderError,
+    PanicOrUnwindViolation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderAbiFunctionTable {
+    pub metadata: bool,
+    pub advertisements: bool,
+    pub devices: bool,
+    pub status: bool,
+    pub execution: bool,
+    pub release: bool,
+    pub destroy: bool,
+}
+
+impl ProviderAbiFunctionTable {
+    pub const REQUIRED: Self = Self {
+        metadata: true,
+        advertisements: true,
+        devices: true,
+        status: true,
+        execution: true,
+        release: true,
+        destroy: true,
+    };
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderAbiDescriptor {
+    pub descriptor_size: usize,
+    pub abi_version: ProviderAbiVersion,
+    pub features: BTreeSet<ProviderAbiFeature>,
+    pub functions: ProviderAbiFunctionTable,
+    pub ownership: ProviderAbiOwnershipRules,
+    pub threading: ProviderAbiThreadingModel,
+    pub execution_behavior: ProviderAbiExecutionBehavior,
+    pub unload_policy: ProviderAbiUnloadPolicy,
+}
+
+impl ProviderAbiDescriptor {
+    pub fn current() -> Self {
+        let features = [
+            ProviderAbiFeature::ProviderMetadata,
+            ProviderAbiFeature::CapabilityAdvertisement,
+            ProviderAbiFeature::DeviceListing,
+            ProviderAbiFeature::StatusReporting,
+            ProviderAbiFeature::Execution,
+            ProviderAbiFeature::Cancellation,
+            ProviderAbiFeature::BlockingExecution,
+        ]
+        .into_iter()
+        .collect();
+        Self {
+            descriptor_size: std::mem::size_of::<Self>(),
+            abi_version: ProviderAbiVersion::CURRENT,
+            features,
+            functions: ProviderAbiFunctionTable::REQUIRED,
+            ownership: ProviderAbiOwnershipRules::default(),
+            threading: ProviderAbiThreadingModel::RuntimeSynchronized,
+            execution_behavior: ProviderAbiExecutionBehavior::Blocking,
+            unload_policy: ProviderAbiUnloadPolicy::NeverUnload,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProviderError> {
+        if self.descriptor_size < std::mem::size_of::<Self>() {
+            return Err(ProviderError::InvalidAbiDescriptor(
+                "descriptor size is smaller than the current layout".into(),
+            ));
+        }
+        if self.abi_version.major != PROVIDER_ABI_MAJOR_VERSION {
+            return Err(ProviderError::UnsupportedAbiVersion {
+                expected: ProviderAbiVersion::CURRENT,
+                found: self.abi_version,
+            });
+        }
+        if self.abi_version.minor > PROVIDER_ABI_MINOR_VERSION {
+            return Err(ProviderError::UnsupportedAbiVersion {
+                expected: ProviderAbiVersion::CURRENT,
+                found: self.abi_version,
+            });
+        }
+        if !self.functions.metadata
+            || !self.functions.advertisements
+            || !self.functions.devices
+            || !self.functions.status
+            || !self.functions.execution
+            || !self.functions.release
+            || !self.functions.destroy
+        {
+            return Err(ProviderError::InvalidAbiDescriptor(
+                "required ABI function is missing".into(),
+            ));
+        }
+        if !self.ownership.strings.release_required
+            || !self.ownership.lists.release_required
+            || !self.ownership.descriptors.release_required
+            || !self.ownership.error_messages.release_required
+            || !self.ownership.opaque_handles.release_required
+        {
+            return Err(ProviderError::InvalidAbiDescriptor(
+                "provider-owned ABI memory requires provider release functions".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderMetadata {
     pub name: String,
@@ -311,7 +678,6 @@ pub struct ProviderLoader {
     registry: ProviderRegistry,
     providers: BTreeMap<String, Arc<dyn Provider>>,
     order: Vec<String>,
-    /* declared last: unloaded after provider drops */ libraries: Vec<Library>,
 }
 impl ProviderLoader {
     pub fn new() -> Self {
@@ -674,29 +1040,40 @@ impl ProviderLoader {
         }
         Ok(found.into_iter().collect())
     }
-    /// Loads a compatible Rust library exporting `magnetar_provider_create`.
+    /// Loads a dynamic provider library through the stable Provider ABI.
     ///
     /// # Safety
     ///
-    /// The library must be trusted, remain loaded while its provider is used,
-    /// and export a factory with the exact declared Rust ABI and contract.
+    /// Dynamic providers are trusted native code. Callers must only pass
+    /// libraries allowed by Runtime policy.
     pub unsafe fn load_dynamic(&mut self, path: impl AsRef<Path>) -> Result<(), ProviderError> {
+        unsafe { self.load_dynamic_with_policy(path, &ProviderLoadingPolicy::default()) }
+    }
+
+    /// Loads a dynamic provider library only when policy allows the path.
+    ///
+    /// The current Runtime intentionally rejects the legacy Rust trait-object
+    /// factory shape. Full C-compatible descriptor loading is defined by policy
+    /// but not implemented in this runtime revision.
+    ///
+    /// # Safety
+    ///
+    /// Dynamic providers are trusted native code. Callers must only pass
+    /// libraries allowed by Runtime policy.
+    pub unsafe fn load_dynamic_with_policy(
+        &mut self,
+        path: impl AsRef<Path>,
+        policy: &ProviderLoadingPolicy,
+    ) -> Result<(), ProviderError> {
         let path = path.as_ref();
-        let library = unsafe { Library::new(path) }.map_err(|e| ProviderError::Load {
+        if !policy.allows(path) {
+            return Err(ProviderError::ProviderPathDenied { path: path.into() });
+        }
+        Err(ProviderError::UnsupportedDynamicAbi {
             path: path.into(),
-            message: e.to_string(),
-        })?;
-        type Factory = unsafe fn() -> Box<dyn Provider>;
-        let factory =
-            unsafe { library.get::<Factory>(b"magnetar_provider_create") }.map_err(|e| {
-                ProviderError::Load {
-                    path: path.into(),
-                    message: e.to_string(),
-                }
-            })?;
-        self.register_provider(Arc::from(unsafe { factory() }))?;
-        self.libraries.push(library);
-        Ok(())
+            expected_symbol: PROVIDER_ABI_FACTORY_SYMBOL_V1,
+            expected_descriptor: ProviderAbiDescriptor::current(),
+        })
     }
     /// Discovers and loads every compatible provider library in the given paths.
     ///
@@ -725,7 +1102,6 @@ impl ProviderLoader {
         self.order.clear();
         self.providers.clear();
         self.registry.clear();
-        self.libraries.clear();
         first.map_or(Ok(()), Err)
     }
 }
@@ -767,6 +1143,36 @@ pub enum ProviderError {
     Load {
         path: PathBuf,
         message: String,
+    },
+    ProviderPathDenied {
+        path: PathBuf,
+    },
+    UnsupportedDynamicAbi {
+        path: PathBuf,
+        expected_symbol: &'static str,
+        expected_descriptor: ProviderAbiDescriptor,
+    },
+    InvalidAbiDescriptor(String),
+    UnsupportedAbiVersion {
+        expected: ProviderAbiVersion,
+        found: ProviderAbiVersion,
+    },
+    InvalidMetadata(String),
+    InvalidAdvertisement(String),
+    InvalidDeviceMetadata(String),
+    InitializationFailure(String),
+    ProviderNotReady(String),
+    ProviderDraining(String),
+    ProviderSaturated(String),
+    ExecutionRejected(String),
+    ExecutionFailed(String),
+    CancellationUnsupported(String),
+    ResourceInvalid(String),
+    PanicOrUnwindViolation(String),
+    InternalProviderError(String),
+    CancellationFailed {
+        operation: ScheduledOperationId,
+        reason: String,
     },
     Registration(String),
     Lifecycle(String),
@@ -828,6 +1234,61 @@ impl fmt::Display for ProviderError {
             ),
             Self::Load { path, message } => {
                 write!(f, "could not load provider '{}': {message}", path.display())
+            }
+            Self::ProviderPathDenied { path } => write!(
+                f,
+                "provider library '{}' is denied by loading policy",
+                path.display()
+            ),
+            Self::UnsupportedDynamicAbi {
+                path,
+                expected_symbol,
+                expected_descriptor,
+            } => write!(
+                f,
+                "provider library '{}' does not implement stable Provider ABI symbol '{expected_symbol}' v{}.{}; Rust trait-object factories are not supported as the stable dynamic ABI",
+                path.display(),
+                expected_descriptor.abi_version.major,
+                expected_descriptor.abi_version.minor
+            ),
+            Self::InvalidAbiDescriptor(message) => {
+                write!(f, "invalid Provider ABI descriptor: {message}")
+            }
+            Self::UnsupportedAbiVersion { expected, found } => write!(
+                f,
+                "unsupported Provider ABI version {}.{}, expected {}.{}",
+                found.major, found.minor, expected.major, expected.minor
+            ),
+            Self::InvalidMetadata(message) => write!(f, "invalid Provider metadata: {message}"),
+            Self::InvalidAdvertisement(message) => {
+                write!(f, "invalid Provider Capability advertisement: {message}")
+            }
+            Self::InvalidDeviceMetadata(message) => {
+                write!(f, "invalid Provider Device metadata: {message}")
+            }
+            Self::InitializationFailure(message) => {
+                write!(f, "provider initialization failed: {message}")
+            }
+            Self::ProviderNotReady(message) => write!(f, "provider is not ready: {message}"),
+            Self::ProviderDraining(message) => write!(f, "provider is draining: {message}"),
+            Self::ProviderSaturated(message) => write!(f, "provider is saturated: {message}"),
+            Self::ExecutionRejected(message) => write!(f, "provider rejected execution: {message}"),
+            Self::ExecutionFailed(message) => write!(f, "provider execution failed: {message}"),
+            Self::CancellationUnsupported(message) => {
+                write!(f, "provider cancellation is unsupported: {message}")
+            }
+            Self::ResourceInvalid(message) => write!(f, "provider resource is invalid: {message}"),
+            Self::PanicOrUnwindViolation(message) => {
+                write!(f, "provider violated panic/unwind ABI boundary: {message}")
+            }
+            Self::InternalProviderError(message) => {
+                write!(f, "internal provider error: {message}")
+            }
+            Self::CancellationFailed { operation, reason } => {
+                write!(
+                    f,
+                    "provider cancellation failed for operation '{operation}': {reason}"
+                )
             }
             Self::Registration(x) => write!(f, "provider registration failed: {x}"),
             Self::Lifecycle(x) => write!(f, "provider lifecycle operation failed: {x}"),
@@ -923,6 +1384,51 @@ impl From<ProviderError> for ComputeError {
             )
             .with_diagnostic(ComputeDiagnostic::new().with_backend_message(backend_message))
             .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            ProviderError::ProviderPathDenied { path } => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_backend_message(path.to_string_lossy()))
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            ProviderError::UnsupportedDynamicAbi {
+                path: _,
+                expected_symbol,
+                expected_descriptor,
+            } => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_backend_message(format!(
+                "{expected_symbol} v{}.{}",
+                expected_descriptor.abi_version.major, expected_descriptor.abi_version.minor
+            )))
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            ProviderError::InvalidAbiDescriptor(_)
+            | ProviderError::UnsupportedAbiVersion { .. }
+            | ProviderError::InvalidMetadata(_)
+            | ProviderError::InvalidAdvertisement(_)
+            | ProviderError::InvalidDeviceMetadata(_)
+            | ProviderError::InitializationFailure(_)
+            | ProviderError::ProviderNotReady(_)
+            | ProviderError::ProviderDraining(_)
+            | ProviderError::ProviderSaturated(_)
+            | ProviderError::ExecutionRejected(_)
+            | ProviderError::ExecutionFailed(_)
+            | ProviderError::CancellationUnsupported(_)
+            | ProviderError::ResourceInvalid(_)
+            | ProviderError::PanicOrUnwindViolation(_)
+            | ProviderError::InternalProviderError(_)
+            | ProviderError::CancellationFailed { .. } => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message.clone(),
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_backend_message(message)),
             other => ComputeError::new(
                 ComputeErrorCode::Internal,
                 ComputeErrorPhase::Resolution,

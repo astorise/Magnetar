@@ -2799,6 +2799,176 @@ fn provider_shutdown_releases_registered_provider() {
 }
 
 #[test]
+fn dynamic_provider_loading_denies_paths_by_default() {
+    let mut loader = ProviderLoader::new();
+    let path = std::path::PathBuf::from("target/test-provider.dll");
+
+    let result = unsafe { loader.load_dynamic(&path) };
+
+    assert!(matches!(
+        result,
+        Err(ProviderError::ProviderPathDenied { path: denied }) if denied == path
+    ));
+}
+
+#[test]
+fn dynamic_provider_loading_rejects_legacy_trait_object_factory_contract() {
+    let mut loader = ProviderLoader::new();
+    let root = std::path::PathBuf::from("target");
+    let path = root.join("test-provider.dll");
+    let policy = ProviderLoadingPolicy::development([root]);
+
+    let result = unsafe { loader.load_dynamic_with_policy(&path, &policy) };
+
+    assert!(matches!(
+        result,
+        Err(ProviderError::UnsupportedDynamicAbi {
+            expected_symbol: PROVIDER_ABI_FACTORY_SYMBOL_V1,
+            expected_descriptor,
+            ..
+        }) if expected_descriptor.abi_version == ProviderAbiVersion::CURRENT
+    ));
+    assert!(
+        !include_str!("provider.rs").contains("Box<dyn Provider>"),
+        "stable dynamic loading must not use Rust trait-object factories"
+    );
+}
+
+#[test]
+fn provider_abi_descriptor_validates_version_layout_functions_and_ownership() {
+    let descriptor = ProviderAbiDescriptor::current();
+    descriptor.validate().unwrap();
+    assert_eq!(descriptor.abi_version, ProviderAbiVersion::CURRENT);
+    assert!(descriptor.features.contains(&ProviderAbiFeature::Execution));
+    assert_eq!(
+        descriptor.threading,
+        ProviderAbiThreadingModel::RuntimeSynchronized
+    );
+    assert_eq!(
+        descriptor.execution_behavior,
+        ProviderAbiExecutionBehavior::Blocking
+    );
+    assert_eq!(
+        descriptor.unload_policy,
+        ProviderAbiUnloadPolicy::NeverUnload
+    );
+    assert!(descriptor.ownership.strings.release_required);
+    assert!(!descriptor.ownership.runtime_buffers.release_required);
+
+    let mut too_small = descriptor.clone();
+    too_small.descriptor_size = 1;
+    assert!(matches!(
+        too_small.validate(),
+        Err(ProviderError::InvalidAbiDescriptor(_))
+    ));
+
+    let mut unsupported_major = descriptor.clone();
+    unsupported_major.abi_version = ProviderAbiVersion::new(PROVIDER_ABI_MAJOR_VERSION + 1, 0);
+    assert!(matches!(
+        unsupported_major.validate(),
+        Err(ProviderError::UnsupportedAbiVersion { .. })
+    ));
+
+    let mut unsupported_minor = descriptor.clone();
+    unsupported_minor.abi_version =
+        ProviderAbiVersion::new(PROVIDER_ABI_MAJOR_VERSION, PROVIDER_ABI_MINOR_VERSION + 1);
+    assert!(matches!(
+        unsupported_minor.validate(),
+        Err(ProviderError::UnsupportedAbiVersion { .. })
+    ));
+
+    let mut missing_status = descriptor.clone();
+    missing_status.functions.status = false;
+    assert!(matches!(
+        missing_status.validate(),
+        Err(ProviderError::InvalidAbiDescriptor(_))
+    ));
+
+    let mut cross_allocator = descriptor;
+    cross_allocator.ownership.error_messages = ProviderAbiMemoryRule::runtime_borrowed();
+    assert!(matches!(
+        cross_allocator.validate(),
+        Err(ProviderError::InvalidAbiDescriptor(_))
+    ));
+}
+
+#[test]
+fn provider_abi_handles_lifecycle_and_errors_are_internal_runtime_contracts() {
+    let instance = ProviderAbiHandleDescriptor::new(
+        ProviderAbiHandleKind::ProviderInstance,
+        ProviderAbiHandle::new(7),
+    );
+    let resource = ProviderAbiHandleDescriptor::new(
+        ProviderAbiHandleKind::ProviderResource,
+        ProviderAbiHandle::new(8),
+    );
+    let operation = ProviderAbiHandleDescriptor::new(
+        ProviderAbiHandleKind::Operation,
+        ProviderAbiHandle::new(9),
+    );
+
+    assert!(instance.destroy_required);
+    assert_eq!(resource.handle.as_u64(), 8);
+    assert_eq!(operation.kind, ProviderAbiHandleKind::Operation);
+    assert!(
+        ProviderAbiLoadingLifecycle::Discovered
+            .can_transition_to(ProviderAbiLoadingLifecycle::LibraryLoaded)
+    );
+    assert!(
+        !ProviderAbiLoadingLifecycle::Discovered
+            .can_transition_to(ProviderAbiLoadingLifecycle::Registered)
+    );
+    assert!(
+        ProviderAbiLoadingLifecycle::Failed
+            .can_transition_to(ProviderAbiLoadingLifecycle::Destroyed)
+    );
+
+    let categories = [
+        ProviderAbiErrorCode::InvalidAbiDescriptor,
+        ProviderAbiErrorCode::UnsupportedAbiVersion,
+        ProviderAbiErrorCode::InvalidMetadata,
+        ProviderAbiErrorCode::InvalidAdvertisement,
+        ProviderAbiErrorCode::InvalidDeviceMetadata,
+        ProviderAbiErrorCode::InitializationFailure,
+        ProviderAbiErrorCode::ProviderNotReady,
+        ProviderAbiErrorCode::ProviderDraining,
+        ProviderAbiErrorCode::ProviderSaturated,
+        ProviderAbiErrorCode::ExecutionRejected,
+        ProviderAbiErrorCode::ExecutionFailed,
+        ProviderAbiErrorCode::CancellationUnsupported,
+        ProviderAbiErrorCode::CancellationFailed,
+        ProviderAbiErrorCode::ResourceInvalid,
+        ProviderAbiErrorCode::InternalProviderError,
+        ProviderAbiErrorCode::PanicOrUnwindViolation,
+    ];
+    assert_eq!(categories.len(), 16);
+
+    let compute_error = ComputeError::from(ProviderError::PanicOrUnwindViolation(
+        "panic crossed boundary".into(),
+    ));
+    assert_eq!(compute_error.code, ComputeErrorCode::ProviderUnavailable);
+    assert_eq!(compute_error.phase, ComputeErrorPhase::Resolution);
+}
+
+#[test]
+fn provider_loading_policy_is_explicit_for_dynamic_and_development_modes() {
+    let root = std::path::PathBuf::from("target/providers");
+    let provider = root.join("provider.dll");
+    let outside = std::path::PathBuf::from("target/other/provider.dll");
+    let dynamic = ProviderLoadingPolicy::dynamic_library([root.clone()]);
+    let development = ProviderLoadingPolicy::development([root.clone()]);
+
+    assert_eq!(dynamic.mode, ProviderLoadingMode::DynamicLibrary);
+    assert!(!dynamic.development_mode);
+    assert!(dynamic.allows(&provider));
+    assert!(!dynamic.allows(&outside));
+    assert_eq!(development.mode, ProviderLoadingMode::DevelopmentProvider);
+    assert!(development.development_mode);
+    assert!(development.allows(&provider));
+    assert!(!ProviderLoadingPolicy::default().allows(&provider));
+}
+
+#[test]
 fn runtime_source_does_not_restore_legacy_backend_or_plugin_surface() {
     let source = include_str!("lib.rs");
     let forbidden = [

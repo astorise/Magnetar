@@ -100,8 +100,14 @@ pub use planning::{
     MemoryRegionKind, MemoryRequirement, TensorLifetime,
 };
 pub use provider::{
-    PROVIDER_API_VERSION, Provider, ProviderDescriptor, ProviderError, ProviderExecutionApi,
-    ProviderLoader, ProviderMetadata, ProviderRegistry,
+    PROVIDER_ABI_FACTORY_SYMBOL_V1, PROVIDER_ABI_MAJOR_VERSION, PROVIDER_ABI_MINOR_VERSION,
+    PROVIDER_API_VERSION, Provider, ProviderAbiDescriptor, ProviderAbiErrorCode,
+    ProviderAbiExecutionBehavior, ProviderAbiFeature, ProviderAbiFunctionTable, ProviderAbiHandle,
+    ProviderAbiHandleDescriptor, ProviderAbiHandleKind, ProviderAbiLoadingLifecycle,
+    ProviderAbiMemoryOwner, ProviderAbiMemoryRule, ProviderAbiOwnershipRules,
+    ProviderAbiRetentionPolicy, ProviderAbiThreadingModel, ProviderAbiUnloadPolicy,
+    ProviderAbiVersion, ProviderDescriptor, ProviderError, ProviderExecutionApi, ProviderLoader,
+    ProviderLoadingMode, ProviderLoadingPolicy, ProviderMetadata, ProviderRegistry,
 };
 pub use resolution::{
     BuiltInResolutionPolicy, ResolutionCandidate, ResolutionCandidateRejection, ResolutionContext,
