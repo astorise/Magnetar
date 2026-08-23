@@ -45,6 +45,12 @@ Run concrete Wasmtime Component Engine tests:
 cargo test -p magnetar-runtime --features wasmtime-component-engine
 ```
 
+Run hardware-independent Provider conformance tests:
+
+```powershell
+cargo test -p magnetar-runtime provider_conformance -- --nocapture
+```
+
 Build Rust documentation with warnings denied:
 
 ```powershell

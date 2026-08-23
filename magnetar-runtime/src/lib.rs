@@ -10,6 +10,7 @@ pub mod component;
 #[cfg(feature = "wasmtime-component-engine")]
 pub mod component_wasmtime;
 pub mod compute;
+pub mod conformance;
 pub mod device;
 pub mod observability;
 pub mod planning;
@@ -72,6 +73,12 @@ pub use compute::{
     ShapeLimitSupport, TensorDescriptor, TensorDescriptorLimits, TensorResourceDescriptor,
     TensorResourceId, TensorViewSource, ViewDescriptor, compute_capability,
     initial_compute_operation_schemas,
+};
+pub use conformance::{
+    PROVIDER_CONFORMANCE_SUITE_VERSION, ProviderConformanceConfig, ProviderConformanceProfile,
+    ProviderConformanceReport, ProviderConformanceSuite, ProviderConformanceTarget,
+    ProviderConformanceTargetKind, ProviderConformanceTestResult, ProviderConformanceTestStatus,
+    provider_conformance_profile_ids, provider_conformance_report_json,
 };
 pub use device::{Device, DeviceDescriptor, DeviceId, DeviceMetadata, DeviceType};
 pub use observability::{

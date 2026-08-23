@@ -88,6 +88,19 @@ jobs:
       - name: Test Wasmtime Component Engine
         run: cargo test -p magnetar-runtime --features wasmtime-component-engine
 
+  provider-conformance:
+    name: quality / provider conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+      - name: Run hardware-independent Provider conformance
+        run: cargo test -p magnetar-runtime provider_conformance -- --nocapture
+
   docs:
     name: quality / docs
     runs-on: ubuntu-latest
