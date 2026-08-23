@@ -98,6 +98,15 @@ pub enum RuntimeEventKind {
     ExecutionInterrupted,
     ProviderHealthChanged,
     DeviceHealthChanged,
+    ProviderLifecycleChanged,
+    ProviderReadinessChanged,
+    ProviderPressureChanged,
+    ProviderAdmissionChanged,
+    ProviderStatusStale,
+    ProviderDrainStarted,
+    ProviderDrainCompleted,
+    DeviceStatusChanged,
+    CapabilityStatusChanged,
     DiagnosticEmitted,
 }
 
@@ -252,6 +261,15 @@ pub enum RuntimeDiagnosticCode {
     ExecutionCancelled,
     ProviderHealthChanged,
     DeviceHealthChanged,
+    ProviderLifecycleChanged,
+    ProviderReadinessChanged,
+    ProviderPressureChanged,
+    ProviderAdmissionChanged,
+    ProviderStatusStale,
+    ProviderDrainStarted,
+    ProviderDrainCompleted,
+    DeviceStatusChanged,
+    CapabilityStatusChanged,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

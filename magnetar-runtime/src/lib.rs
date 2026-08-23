@@ -20,10 +20,14 @@ pub mod scheduler;
 
 pub use affinity::{
     AffinityConstraints, AffinityError, AffinityGroupId, AffinityResolution, AffinityResource,
-    ArtifactBinding, CapabilityBinding, CapabilityHealth, DeviceAvailability, DeviceBinding,
-    DeviceHealth, ExecutionContextId, ExecutionPhase, FallbackClass, HealthCapacityHints,
-    HealthDiagnostic, HealthReport, HealthScope, HealthState, HealthTimeToLive, HealthTimestamp,
-    ProviderBinding, ProviderHealth, ProviderHealthReport, ResourceAffinity,
+    ArtifactBinding, CapabilityBinding, CapabilityHealth, CapabilityStatus, DeviceAvailability,
+    DeviceBinding, DeviceHealth, DeviceStatus, ExecutionContextId, ExecutionPhase, FallbackClass,
+    HealthCapacityHints, HealthDiagnostic, HealthReport, HealthScope, HealthState,
+    HealthTimeToLive, HealthTimestamp, OperationFamilyStatus, ProviderAdmission,
+    ProviderAdmissionDecision, ProviderBinding, ProviderHealth, ProviderHealthReport,
+    ProviderHealthState, ProviderInterruptionReason, ProviderLifecycleState, ProviderPressureLevel,
+    ProviderReadinessState, ProviderStatusReason, ProviderStatusScope, ProviderStatusSeverity,
+    ProviderStatusSnapshot, ResourceAffinity, provider_admission_from_dimensions,
 };
 pub use capability::{Capability, CapabilityDescriptor, CapabilityId, CapabilityVersion};
 pub use component::{
@@ -112,7 +116,8 @@ pub use scheduler::{
     ProviderExecutionResult, ProviderExecutionStatus, ScheduledOperation, ScheduledOperationId,
     ScheduledOperationResult, Scheduler, SchedulerError, SchedulerErrorCode, SchedulerQueue,
     SchedulingDiagnostic, SchedulingPolicy, SchedulingState, runtime_event_for_device_health,
-    runtime_event_for_provider_health, runtime_metrics_for_execution_plan,
+    runtime_event_for_provider_health, runtime_events_for_provider_status,
+    runtime_metrics_for_execution_plan,
 };
 
 #[cfg(test)]

@@ -13,6 +13,7 @@ struct TestProvider {
     shut_down: AtomicBool,
     fail_initialization: bool,
     health: ProviderHealth,
+    status_snapshot: Option<ProviderStatusSnapshot>,
     capability_health: BTreeMap<CapabilityId, HealthState>,
     devices: Vec<Arc<dyn Device>>,
     execution_api: Option<Arc<dyn ProviderExecutionApi>>,
@@ -25,6 +26,7 @@ impl TestProvider {
             shut_down: AtomicBool::new(false),
             fail_initialization: false,
             health: ProviderHealth::Available,
+            status_snapshot: None,
             capability_health: BTreeMap::new(),
             devices: Vec::new(),
             execution_api: None,
@@ -51,6 +53,24 @@ fn provider_with_capabilities(
     provider.metadata.capabilities.extend(capabilities);
     provider
 }
+fn simple_elementwise_compute_graph(name: &str) -> ComputeGraph {
+    let descriptor = TensorDescriptor::materialized(
+        ShapeDescriptor::new([2, 2]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    ComputeGraph::new(ComputeGraphId::new(name)).with_node(
+        ComputeNode::new(
+            ComputeNodeId::new("node"),
+            ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                .with_dtype(ComputeDType::Float32)
+                .with_layout(ComputeLayout::Dense),
+        )
+        .with_output(ComputeNodeOutput::new(
+            ComputeOutputId::new("out"),
+            descriptor,
+        )),
+    )
+}
 impl Provider for TestProvider {
     fn metadata(&self) -> ProviderMetadata {
         self.metadata.clone()
@@ -60,6 +80,11 @@ impl Provider for TestProvider {
     }
     fn health(&self) -> ProviderHealth {
         self.health
+    }
+    fn status_snapshot(&self) -> ProviderStatusSnapshot {
+        self.status_snapshot
+            .clone()
+            .unwrap_or_else(|| ProviderStatusSnapshot::from_health_report(self.health_report()))
     }
     fn capability_health(&self, capability: &CapabilityBinding) -> Option<CapabilityHealth> {
         Some(CapabilityHealth::new(
@@ -2367,6 +2392,348 @@ fn health_reports_redact_diagnostics_and_track_freshness() {
     assert!(matches!(
         HealthReport::Capability(capability_health),
         HealthReport::Capability(_)
+    ));
+}
+
+#[test]
+fn provider_status_snapshot_separates_health_readiness_pressure_and_admission() {
+    let provider = ProviderBinding::new("provider-a");
+    let mut snapshot = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        provider.clone(),
+        HealthState::Available,
+    ));
+    snapshot.health = ProviderHealthState::Healthy;
+    snapshot.readiness = ProviderReadinessState::NotReady;
+    snapshot.pressure = ProviderPressureLevel::Low;
+    snapshot.admission = provider_admission_from_dimensions(
+        snapshot.lifecycle,
+        snapshot.health,
+        snapshot.readiness,
+        snapshot.pressure,
+    );
+    snapshot.timestamp = Some(HealthTimestamp::unix_millis(10));
+    snapshot.time_to_live = Some(HealthTimeToLive::millis(5));
+
+    assert_eq!(snapshot.provider, provider);
+    assert_eq!(snapshot.health, ProviderHealthState::Healthy);
+    assert_eq!(snapshot.readiness, ProviderReadinessState::NotReady);
+    assert_eq!(snapshot.pressure, ProviderPressureLevel::Low);
+    assert_eq!(snapshot.admission, ProviderAdmissionDecision::Reject);
+    assert!(!snapshot.accepts_new_work_by_default());
+    assert!(snapshot.is_stale_at(HealthTimestamp::unix_millis(16)));
+}
+
+#[test]
+fn provider_lifecycle_transitions_and_drain_completion_are_explicit() {
+    assert!(ProviderLifecycleState::Registered.can_transition_to(ProviderLifecycleState::Loading));
+    assert!(
+        ProviderLifecycleState::Loading.can_transition_to(ProviderLifecycleState::Initializing)
+    );
+    assert!(ProviderLifecycleState::Initializing.can_transition_to(ProviderLifecycleState::Ready));
+    assert!(ProviderLifecycleState::Ready.can_transition_to(ProviderLifecycleState::Draining));
+    assert!(ProviderLifecycleState::Draining.can_transition_to(ProviderLifecycleState::Stopped));
+    assert!(!ProviderLifecycleState::Ready.can_transition_to(ProviderLifecycleState::Removed));
+
+    let mut draining = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        ProviderBinding::new("provider-a"),
+        HealthState::Draining,
+    ));
+    draining.lifecycle = ProviderLifecycleState::Draining;
+    draining.readiness = ProviderReadinessState::Draining;
+    draining.in_flight_operations = 1;
+    assert!(!draining.is_drain_complete());
+    assert!(draining.pinned_work_allowed_during_drain());
+    draining.in_flight_operations = 0;
+    assert!(draining.is_drain_complete());
+}
+
+#[test]
+fn operation_family_status_falls_back_to_capability_status_when_absent() {
+    let provider = ProviderBinding::new("provider-a");
+    let mut snapshot = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        provider.clone(),
+        HealthState::Available,
+    ));
+    assert_eq!(
+        snapshot.operation_family_or_capability_status(ComputeOperationFamily::LinearAlgebra),
+        ProviderReadinessState::Ready
+    );
+
+    let unsupported =
+        OperationFamilyStatus::unsupported(provider.clone(), ComputeOperationFamily::LinearAlgebra);
+    snapshot = snapshot.with_operation_family_status(unsupported);
+    assert_eq!(
+        snapshot.operation_family_or_capability_status(ComputeOperationFamily::LinearAlgebra),
+        ProviderReadinessState::NotReady
+    );
+
+    let mut saturated =
+        OperationFamilyStatus::available(provider, ComputeOperationFamily::Elementwise);
+    saturated.pressure = ProviderPressureLevel::Saturated;
+    saturated.readiness = ProviderReadinessState::NotReady;
+    snapshot = snapshot.with_operation_family_status(saturated);
+    assert_eq!(
+        snapshot
+            .operation_family_status(ComputeOperationFamily::Elementwise)
+            .unwrap()
+            .pressure,
+        ProviderPressureLevel::Saturated
+    );
+}
+
+#[test]
+fn provider_status_maps_interruption_to_health_readiness_and_admission() {
+    let snapshot = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        ProviderBinding::new("provider-a"),
+        HealthState::Interrupted,
+    ));
+
+    assert_eq!(snapshot.lifecycle, ProviderLifecycleState::Failed);
+    assert_eq!(snapshot.health, ProviderHealthState::Failed);
+    assert_eq!(snapshot.readiness, ProviderReadinessState::NotReady);
+    assert_eq!(snapshot.admission, ProviderAdmissionDecision::Reject);
+    assert_eq!(snapshot.health_reason, ProviderStatusReason::Interrupted);
+    assert!(matches!(
+        snapshot.interruption,
+        Some(ProviderInterruptionReason::DriverLoss)
+    ));
+}
+
+#[test]
+fn provider_status_observations_cover_all_status_dimensions() {
+    let mut report =
+        ProviderHealthReport::new(ProviderBinding::new("provider-a"), HealthState::Draining);
+    report.timestamp = Some(HealthTimestamp::unix_millis(10));
+    report.time_to_live = Some(HealthTimeToLive::millis(5));
+    report.devices.push(DeviceHealth::new(
+        ProviderBinding::new("provider-a"),
+        DeviceBinding::new(DeviceId::new("gpu:0")),
+        HealthState::Available,
+    ));
+    report.capabilities.push(CapabilityHealth::new(
+        ProviderBinding::new("provider-a"),
+        CapabilityBinding::new(compute_capability().id, COMPUTE_CAPABILITY_VERSION),
+        HealthState::Available,
+    ));
+    let mut snapshot = ProviderStatusSnapshot::from_health_report(report);
+    snapshot.lifecycle = ProviderLifecycleState::Draining;
+    snapshot.readiness = ProviderReadinessState::Draining;
+    snapshot.in_flight_operations = 0;
+
+    let events =
+        runtime_events_for_provider_status(&snapshot, Some(HealthTimestamp::unix_millis(16)));
+    let kinds = events
+        .iter()
+        .map(|event| event.kind.clone())
+        .collect::<BTreeSet<_>>();
+
+    assert!(kinds.contains(&RuntimeEventKind::ProviderLifecycleChanged));
+    assert!(kinds.contains(&RuntimeEventKind::ProviderHealthChanged));
+    assert!(kinds.contains(&RuntimeEventKind::ProviderReadinessChanged));
+    assert!(kinds.contains(&RuntimeEventKind::ProviderPressureChanged));
+    assert!(kinds.contains(&RuntimeEventKind::ProviderAdmissionChanged));
+    assert!(kinds.contains(&RuntimeEventKind::ProviderStatusStale));
+    assert!(kinds.contains(&RuntimeEventKind::ProviderDrainStarted));
+    assert!(kinds.contains(&RuntimeEventKind::ProviderDrainCompleted));
+    assert!(kinds.contains(&RuntimeEventKind::DeviceStatusChanged));
+    assert!(kinds.contains(&RuntimeEventKind::CapabilityStatusChanged));
+}
+
+#[test]
+fn resolution_rejects_healthy_provider_that_is_not_ready() {
+    let compute = compute_capability();
+    let mut provider = provider_with_capabilities("provider-a", [compute.clone()]);
+    let mut snapshot = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        ProviderBinding::new("provider-a"),
+        HealthState::Available,
+    ));
+    snapshot.health = ProviderHealthState::Healthy;
+    snapshot.readiness = ProviderReadinessState::NotReady;
+    snapshot.admission = provider_admission_from_dimensions(
+        snapshot.lifecycle,
+        snapshot.health,
+        snapshot.readiness,
+        snapshot.pressure,
+    );
+    provider.status_snapshot = Some(snapshot);
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+
+    let candidates = runtime
+        .providers()
+        .candidates_for_capability(&compute)
+        .unwrap();
+    let context = ResolutionContext {
+        requested_capability: compute.id.clone(),
+        requested_version: compute.version,
+        candidates,
+        affinity: None,
+        fallback: FallbackClass::Transparent,
+        execution_phase: ExecutionPhase::BeforeResourceCreation,
+        replayable_input: true,
+    };
+    let decision = BuiltInResolutionPolicy::Deterministic.decide(&context);
+
+    assert_eq!(decision.selected_provider, None);
+    assert_eq!(
+        decision.rejected_candidates[0].reason,
+        ResolutionRejectionReason::ProviderInitializing
+    );
+}
+
+#[test]
+fn resolution_records_selected_provider_status_and_stale_rejection_reason() {
+    let compute = compute_capability();
+    let ready_provider = provider_with_capabilities("provider-a", [compute.clone()]);
+    let mut stale_provider = provider_with_capabilities("provider-b", [compute.clone()]);
+    let mut stale = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        ProviderBinding::new("provider-b"),
+        HealthState::Available,
+    ));
+    stale.health_reason = ProviderStatusReason::Stale;
+    stale_provider.status_snapshot = Some(stale);
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(stale_provider))
+        .register_provider(Arc::new(ready_provider))
+        .build()
+        .unwrap();
+
+    let candidates = runtime
+        .providers()
+        .candidates_for_capability(&compute)
+        .unwrap();
+    let context = ResolutionContext {
+        requested_capability: compute.id.clone(),
+        requested_version: compute.version,
+        candidates,
+        affinity: None,
+        fallback: FallbackClass::Transparent,
+        execution_phase: ExecutionPhase::BeforeResourceCreation,
+        replayable_input: true,
+    };
+    let decision = BuiltInResolutionPolicy::Deterministic.decide(&context);
+
+    assert_eq!(
+        decision
+            .selected_provider_status
+            .as_ref()
+            .map(|status| status.provider.as_str()),
+        Some("provider-a")
+    );
+    assert!(decision.rejected_candidates.iter().any(|candidate| {
+        candidate.provider.as_str() == "provider-b"
+            && candidate.reason == ResolutionRejectionReason::ProviderStatusStale
+    }));
+}
+
+#[test]
+fn scheduler_checks_refined_provider_status_before_submission() {
+    let compute = compute_capability();
+    let mut planning_provider = provider_with_capabilities("provider-a", [compute]);
+    planning_provider.metadata.compute_operation_support.insert(
+        ComputeOperationFamily::Elementwise,
+        ComputeOperationSupport::new()
+            .with_dtypes([ComputeDType::Float32])
+            .with_layouts([ComputeLayout::Dense]),
+    );
+    planning_provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
+    let planning_runtime = Runtime::builder()
+        .register_provider(Arc::new(planning_provider))
+        .build()
+        .unwrap();
+    let graph = simple_elementwise_compute_graph("status-change");
+    let plan = planning_runtime.plan_compute_execution(&graph).unwrap();
+
+    let mut submission_provider = provider_with_capabilities("provider-a", [compute_capability()]);
+    submission_provider
+        .metadata
+        .compute_operation_support
+        .insert(
+            ComputeOperationFamily::Elementwise,
+            ComputeOperationSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense]),
+        );
+    submission_provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
+    let mut snapshot = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        ProviderBinding::new("provider-a"),
+        HealthState::Available,
+    ));
+    snapshot.health = ProviderHealthState::Healthy;
+    snapshot.readiness = ProviderReadinessState::Ready;
+    snapshot.pressure = ProviderPressureLevel::Saturated;
+    snapshot.admission = provider_admission_from_dimensions(
+        snapshot.lifecycle,
+        snapshot.health,
+        snapshot.readiness,
+        snapshot.pressure,
+    );
+    submission_provider.status_snapshot = Some(snapshot);
+    let submission_runtime = Runtime::builder()
+        .register_provider(Arc::new(submission_provider))
+        .build()
+        .unwrap();
+    let mut scheduler = submission_runtime.scheduler(1);
+    let operation = scheduler.schedule(&submission_runtime, plan).unwrap();
+
+    assert!(matches!(
+        scheduler.submit_next(&submission_runtime),
+        Err(SchedulerError::ProviderSaturated(provider)) if provider.as_str() == "provider-a"
+    ));
+    assert_eq!(
+        scheduler.operation(operation).unwrap().state(),
+        SchedulingState::Interrupted
+    );
+}
+
+#[test]
+fn scheduler_and_provider_execution_reject_stale_provider_status() {
+    let mut provider = provider_with_capabilities("provider-a", [compute_capability()]);
+    provider.metadata.compute_operation_support.insert(
+        ComputeOperationFamily::Elementwise,
+        ComputeOperationSupport::new()
+            .with_dtypes([ComputeDType::Float32])
+            .with_layouts([ComputeLayout::Dense]),
+    );
+    provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
+    let planning_runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+    let plan = planning_runtime
+        .plan_compute_execution(&simple_elementwise_compute_graph("stale-status"))
+        .unwrap();
+
+    let mut stale_provider = provider_with_capabilities("provider-a", [compute_capability()]);
+    stale_provider.metadata.compute_operation_support.insert(
+        ComputeOperationFamily::Elementwise,
+        ComputeOperationSupport::new()
+            .with_dtypes([ComputeDType::Float32])
+            .with_layouts([ComputeLayout::Dense]),
+    );
+    stale_provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
+    let mut stale = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        ProviderBinding::new("provider-a"),
+        HealthState::Available,
+    ));
+    stale.health_reason = ProviderStatusReason::Stale;
+    stale_provider.status_snapshot = Some(stale);
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(stale_provider))
+        .build()
+        .unwrap();
+    let mut scheduler = runtime.scheduler(1);
+    let operation = scheduler.schedule(&runtime, plan).unwrap();
+
+    assert!(matches!(
+        scheduler.submit_next(&runtime),
+        Err(SchedulerError::StaleHealthReport(provider)) if provider.as_str() == "provider-a"
+    ));
+    assert!(matches!(
+        runtime.prepare_provider_execution(scheduler.operation(operation).unwrap()),
+        Err(error) if error.code == ProviderExecutionErrorCode::StaleHealthReport
     ));
 }
 #[test]

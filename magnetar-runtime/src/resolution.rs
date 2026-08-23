@@ -1,4 +1,4 @@
-﻿use crate::*;
+use crate::*;
 use std::fmt;
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ResolutionPolicyId(String);
@@ -49,6 +49,7 @@ pub struct ResolutionCandidate {
     pub capability: CapabilityBinding,
     pub device: Option<DeviceBinding>,
     pub provider_health: ProviderHealth,
+    pub provider_status: ProviderStatusSnapshot,
     pub capability_health: Option<HealthState>,
     pub device_availability: DeviceAvailability,
     pub affinity_compatible: bool,
@@ -80,6 +81,7 @@ pub enum ResolutionRejectionReason {
     ProviderInitializing,
     ProviderSaturated,
     ProviderDraining,
+    ProviderStatusStale,
     ProviderUnavailable,
     ProviderInterrupted,
     DeviceHealthUnknown,
@@ -119,6 +121,7 @@ pub struct ResolutionDecision {
     pub selected_provider: Option<ProviderBinding>,
     pub selected_device: Option<DeviceBinding>,
     pub selected_capability: Option<CapabilityBinding>,
+    pub selected_provider_status: Option<ProviderStatusSnapshot>,
     pub reason: ResolutionDecisionReason,
     pub rejected_candidates: Vec<ResolutionCandidateRejection>,
 }
@@ -146,7 +149,7 @@ impl ResolutionPolicy for BuiltInResolutionPolicy {
                     candidate,
                     ResolutionRejectionReason::IncompatibleCapability,
                 ));
-            } else if let Some(reason) = provider_health_rejection(candidate.provider_health) {
+            } else if let Some(reason) = provider_status_rejection(&candidate.provider_status) {
                 rejected_candidates.push(rejection(candidate, reason));
             } else if let Some(reason) = candidate
                 .capability_health
@@ -199,6 +202,7 @@ impl ResolutionPolicy for BuiltInResolutionPolicy {
             selected_provider: selected.map(|candidate| candidate.provider.clone()),
             selected_device: selected.and_then(|candidate| candidate.device.clone()),
             selected_capability: selected.map(|candidate| candidate.capability.clone()),
+            selected_provider_status: selected.map(|candidate| candidate.provider_status.clone()),
             reason: if selected.is_some() {
                 reason
             } else if context.candidates.is_empty() {
@@ -232,6 +236,35 @@ fn provider_health_rejection(health: ProviderHealth) -> Option<ResolutionRejecti
         HealthState::Unavailable => Some(ResolutionRejectionReason::ProviderUnavailable),
         HealthState::Interrupted => Some(ResolutionRejectionReason::ProviderInterrupted),
     }
+}
+
+fn provider_status_rejection(status: &ProviderStatusSnapshot) -> Option<ResolutionRejectionReason> {
+    if matches!(status.health_reason, ProviderStatusReason::Stale) {
+        return Some(ResolutionRejectionReason::ProviderStatusStale);
+    }
+    if matches!(status.lifecycle, ProviderLifecycleState::Failed) {
+        return Some(ResolutionRejectionReason::ProviderUnavailable);
+    }
+    if matches!(
+        status.health,
+        ProviderHealthState::Unknown | ProviderHealthState::Unhealthy | ProviderHealthState::Failed
+    ) {
+        return provider_health_rejection(status.provider_health_compat());
+    }
+    if matches!(status.readiness, ProviderReadinessState::NotReady) {
+        return Some(ResolutionRejectionReason::ProviderInitializing);
+    }
+    if matches!(status.readiness, ProviderReadinessState::Draining)
+        || matches!(status.lifecycle, ProviderLifecycleState::Draining)
+    {
+        return Some(ResolutionRejectionReason::ProviderDraining);
+    }
+    if matches!(status.pressure, ProviderPressureLevel::Saturated)
+        || matches!(status.admission, ProviderAdmissionDecision::Reject)
+    {
+        return Some(ResolutionRejectionReason::ProviderSaturated);
+    }
+    None
 }
 
 fn device_health_rejection(health: DeviceAvailability) -> Option<ResolutionRejectionReason> {

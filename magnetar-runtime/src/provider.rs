@@ -63,6 +63,17 @@ pub trait Provider: Send + Sync {
     fn health_report(&self) -> ProviderHealthReport {
         ProviderHealthReport::new(ProviderBinding::new(self.metadata().name), self.health())
     }
+    fn status_snapshot(&self) -> ProviderStatusSnapshot {
+        let metadata = self.metadata();
+        let mut snapshot = ProviderStatusSnapshot::from_health_report(self.health_report());
+        for family in metadata.compute_operation_support.keys() {
+            snapshot = snapshot.with_operation_family_status(OperationFamilyStatus::available(
+                ProviderBinding::new(&metadata.name),
+                *family,
+            ));
+        }
+        snapshot
+    }
     fn capability_health(&self, capability: &CapabilityBinding) -> Option<CapabilityHealth> {
         Some(CapabilityHealth::new(
             ProviderBinding::new(self.metadata().name),
@@ -425,11 +436,13 @@ impl ProviderLoader {
         let capability_health = provider
             .capability_health(&capability_binding)
             .map(|health| health.state);
+        let provider_status = provider.status_snapshot();
         ResolutionCandidate {
             provider: ProviderBinding::new(provider_name),
             capability: capability_binding,
             device: device.as_ref().map(|(binding, _)| binding.clone()),
             provider_health: provider.health(),
+            provider_status,
             capability_health,
             device_availability: device
                 .map(|(_, availability)| availability)

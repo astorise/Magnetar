@@ -1427,13 +1427,31 @@ impl Runtime {
                 "selected Provider is unavailable",
             )
         })?;
-        if let Some(code) = provider_execution_error_for_health(provider_ref.health()) {
+        let provider_status = provider_ref.status_snapshot();
+        if matches!(provider_status.health_reason, ProviderStatusReason::Stale) {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::StaleHealthReport,
+                phase,
+                provider.clone(),
+                device.cloned(),
+                "selected Provider status is stale",
+            ));
+        }
+        if let Some(code) =
+            provider_execution_error_for_health(provider_status.provider_health_compat())
+        {
             return Err(ProviderExecutionError::new(
                 code,
                 phase,
                 provider.clone(),
                 device.cloned(),
-                format!("selected Provider health is {:?}", provider_ref.health()),
+                format!(
+                    "selected Provider status is {:?}/{:?}/{:?}/{:?}",
+                    provider_status.lifecycle,
+                    provider_status.health,
+                    provider_status.readiness,
+                    provider_status.pressure
+                ),
             ));
         }
         if let Some(device) = device {

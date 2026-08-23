@@ -771,8 +771,13 @@ impl Scheduler {
         let provider_health = runtime
             .providers()
             .provider(provider.as_str())
-            .map(Provider::health)
-            .unwrap_or(ProviderHealth::Unavailable);
+            .map(|provider| provider.status_snapshot())
+            .ok_or_else(|| SchedulerError::ProviderUnavailable(provider.clone()))?;
+        if matches!(provider_health.health_reason, ProviderStatusReason::Stale) {
+            self.interrupt_operation(id, "selected Provider status is stale before submission");
+            return Err(SchedulerError::StaleHealthReport(provider));
+        }
+        let provider_health = provider_health.provider_health_compat();
         if let Some(error) = scheduler_error_for_provider_health(&provider, provider_health) {
             self.interrupt_operation(
                 id,
@@ -1175,6 +1180,109 @@ pub fn runtime_event_for_device_health(report: &DeviceHealth) -> RuntimeEvent {
     .with_provider(report.provider.clone())
     .with_device(report.device.clone())
     .with_diagnostic_code(RuntimeDiagnosticCode::DeviceHealthChanged)
+}
+
+pub fn runtime_events_for_provider_status(
+    status: &ProviderStatusSnapshot,
+    now: Option<HealthTimestamp>,
+) -> Vec<RuntimeEvent> {
+    let trace = TraceId::new(format!("trace:status:{}", status.provider));
+    let base = |kind, code, label: &str| {
+        RuntimeEvent::new(
+            trace.clone(),
+            SpanId::new(format!("status:{}:{kind:?}", status.provider)),
+            RuntimeObservationPhase::Health,
+            kind,
+            label,
+        )
+        .with_provider(status.provider.clone())
+        .with_diagnostic_code(code)
+    };
+    let mut events = vec![
+        base(
+            RuntimeEventKind::ProviderLifecycleChanged,
+            RuntimeDiagnosticCode::ProviderLifecycleChanged,
+            format!("Provider lifecycle is {:?}", status.lifecycle).as_str(),
+        ),
+        base(
+            RuntimeEventKind::ProviderHealthChanged,
+            RuntimeDiagnosticCode::ProviderHealthChanged,
+            format!("Provider health is {:?}", status.health).as_str(),
+        ),
+        base(
+            RuntimeEventKind::ProviderReadinessChanged,
+            RuntimeDiagnosticCode::ProviderReadinessChanged,
+            format!("Provider readiness is {:?}", status.readiness).as_str(),
+        ),
+        base(
+            RuntimeEventKind::ProviderPressureChanged,
+            RuntimeDiagnosticCode::ProviderPressureChanged,
+            format!("Provider pressure is {:?}", status.pressure).as_str(),
+        ),
+        base(
+            RuntimeEventKind::ProviderAdmissionChanged,
+            RuntimeDiagnosticCode::ProviderAdmissionChanged,
+            format!("Provider admission is {:?}", status.admission).as_str(),
+        ),
+    ];
+    if now.is_some_and(|timestamp| status.is_stale_at(timestamp))
+        || matches!(status.health_reason, ProviderStatusReason::Stale)
+    {
+        events.push(base(
+            RuntimeEventKind::ProviderStatusStale,
+            RuntimeDiagnosticCode::ProviderStatusStale,
+            "Provider status is stale",
+        ));
+    }
+    if matches!(status.lifecycle, ProviderLifecycleState::Draining) {
+        events.push(base(
+            RuntimeEventKind::ProviderDrainStarted,
+            RuntimeDiagnosticCode::ProviderDrainStarted,
+            "Provider drain is active",
+        ));
+        if status.is_drain_complete() {
+            events.push(base(
+                RuntimeEventKind::ProviderDrainCompleted,
+                RuntimeDiagnosticCode::ProviderDrainCompleted,
+                "Provider drain is complete",
+            ));
+        }
+    }
+    for device in &status.devices {
+        events.push(
+            RuntimeEvent::new(
+                trace.clone(),
+                SpanId::new(format!(
+                    "status:{}:device:{}",
+                    status.provider, device.device
+                )),
+                RuntimeObservationPhase::Health,
+                RuntimeEventKind::DeviceStatusChanged,
+                format!("Device status is {:?}", device.readiness),
+            )
+            .with_provider(status.provider.clone())
+            .with_device(device.device.clone())
+            .with_diagnostic_code(RuntimeDiagnosticCode::DeviceStatusChanged),
+        );
+    }
+    for capability in &status.capabilities {
+        events.push(
+            RuntimeEvent::new(
+                trace.clone(),
+                SpanId::new(format!(
+                    "status:{}:capability:{}",
+                    status.provider, capability.capability
+                )),
+                RuntimeObservationPhase::Health,
+                RuntimeEventKind::CapabilityStatusChanged,
+                format!("Capability status is {:?}", capability.readiness),
+            )
+            .with_provider(status.provider.clone())
+            .with_capability(capability.capability.clone())
+            .with_diagnostic_code(RuntimeDiagnosticCode::CapabilityStatusChanged),
+        );
+    }
+    events
 }
 
 pub(crate) fn scheduler_error_for_provider_health(

@@ -279,26 +279,26 @@
 
 ## 25. CI
 
-- [ ] Run Component distribution tests in CI.
-- [ ] Run artifact validation tests in CI.
-- [ ] Run cache integrity tests in CI if cache is implemented.
-- [ ] Run offline tests in CI.
-- [ ] Run WIT fixture validation in CI.
-- [ ] Ensure tests do not require external network.
-- [ ] Ensure tests do not require Tachyon.
+- [x] Run Component distribution tests in CI.
+- [x] Run artifact validation tests in CI.
+- [x] Run cache integrity tests in CI if cache is implemented.
+- [x] Run offline tests in CI.
+- [x] Run WIT fixture validation in CI.
+- [x] Ensure tests do not require external network.
+- [x] Ensure tests do not require Tachyon.
 
 ## 26. Final Validation
 
 - [x] Run formatting.
 - [x] Run compilation checks.
-- [ ] Run Clippy.
+- [x] Run Clippy.
 - [x] Run complete tests.
 - [x] Run WASM Component Runtime tests.
 - [x] Run Component Artifact trust tests.
 - [x] Run Component distribution tests.
-- [ ] Run WIT validation.
+- [x] Run WIT validation.
 - [x] Run OpenSpec validation.
-- [ ] Run coverage validation.
+- [x] Run coverage validation.
 - [x] Verify distributed artifacts are validated locally.
 - [x] Verify distribution is inference-scoped.
 - [x] Verify Tachyon is optional.

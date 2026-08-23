@@ -208,6 +208,7 @@ Future work:
 - [Resource affinity](resource-affinity.md)
 - [Resolution policy](resolution-policy.md)
 - [Provider health](provider-health.md)
+- [Provider status](provider-status.md)
 - [Provider compute advertisement](provider-compute-advertisement.md)
 - [Compute operation catalog](compute-operation-catalog.md)
 - [Compute operation schemas](compute-operation-schemas.md)
