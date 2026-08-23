@@ -5769,6 +5769,7 @@ fn generation_request() -> GenerationRequest {
     let metadata = generation_tokenizer_metadata();
     GenerationRequest {
         request_id: GenerationRequestId::new("gen-1").unwrap(),
+        session: None,
         model: GenerationModelReference::LoadedModelContext("model-context".into()),
         tokenizer: GenerationTokenizerReference {
             tokenizer_id: metadata.id.clone(),

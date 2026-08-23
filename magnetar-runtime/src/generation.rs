@@ -5,10 +5,11 @@
 //! selection, sampling implementation, or KV cache internals.
 
 use crate::{
-    CorrelationId, MemoryAdmissionDecision, MemoryAdmissionRequest, MemoryAllocationClass,
-    MemoryAllocationOwner, MemoryAllocationRequest, MemoryManager, MemoryPlacement,
-    ModelArtifactId, ProviderExecutionErrorCode, RuntimeTokenizer, StreamingDecodeState, TokenId,
-    TokenStopPattern, Tokenizer, TokenizerError, TokenizerId, TokenizerMetadata, TraceId,
+    CorrelationId, InferenceSessionId, MemoryAdmissionDecision, MemoryAdmissionRequest,
+    MemoryAllocationClass, MemoryAllocationOwner, MemoryAllocationRequest, MemoryManager,
+    MemoryPlacement, ModelArtifactId, ProviderExecutionErrorCode, RuntimeTokenizer,
+    StreamingDecodeState, TokenId, TokenStopPattern, Tokenizer, TokenizerError, TokenizerId,
+    TokenizerMetadata, TraceId,
 };
 use std::{error::Error, fmt};
 
@@ -49,6 +50,7 @@ pub struct GenerationTokenizerReference {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationRequest {
     pub request_id: GenerationRequestId,
+    pub session: Option<InferenceSessionId>,
     pub model: GenerationModelReference,
     pub tokenizer: GenerationTokenizerReference,
     pub input_token_ids: Vec<TokenId>,

@@ -20,6 +20,8 @@ static NEXT_SCHEDULED_OPERATION_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 static NEXT_RUNTIME_OBSERVATION_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
+static NEXT_INFERENCE_SESSION_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 pub(crate) fn next_execution_context_id() -> ExecutionContextId {
     ExecutionContextId::new(
@@ -36,6 +38,13 @@ pub(crate) fn next_scheduled_operation_id() -> ScheduledOperationId {
 }
 pub(crate) fn next_runtime_observation_sequence() -> u64 {
     NEXT_RUNTIME_OBSERVATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+pub(crate) fn next_inference_session_id() -> InferenceSessionId {
+    InferenceSessionId::new(format!(
+        "session-{}",
+        NEXT_INFERENCE_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+    .expect("generated session id is valid")
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -93,6 +102,8 @@ impl RuntimeBuilder {
             },
             memory: MemoryManager::new(self.config.memory),
             providers,
+            sessions: BTreeMap::new(),
+            session_observations: Vec::new(),
             initialized: true,
         };
         Ok(runtime)
@@ -102,6 +113,8 @@ pub struct Runtime {
     context: ExecutionContext,
     memory: MemoryManager,
     providers: ProviderLoader,
+    sessions: BTreeMap<InferenceSessionId, InferenceSession>,
+    session_observations: Vec<SessionObservation>,
     initialized: bool,
 }
 impl Runtime {
@@ -128,6 +141,202 @@ impl Runtime {
     }
     pub fn providers(&self) -> &ProviderLoader {
         &self.providers
+    }
+    pub fn sessions(&self) -> impl Iterator<Item = &InferenceSession> {
+        self.sessions.values()
+    }
+    pub fn session_observations(&self) -> &[SessionObservation] {
+        &self.session_observations
+    }
+    pub fn create_inference_session(
+        &mut self,
+        request: SessionCreationRequest,
+    ) -> Result<InferenceSessionId, SessionError> {
+        if !self.initialized {
+            return Err(SessionError::RuntimeShutdown);
+        }
+        self.observe_session(
+            SessionObservationKind::CreateRequested,
+            None,
+            "session create requested",
+            request.correlation_id.clone(),
+        );
+        let id = next_inference_session_id();
+        let affinity = runtime_session_affinity(self.context.id);
+        match InferenceSession::create(id.clone(), request, affinity) {
+            Ok(session) => {
+                self.observe_session(
+                    SessionObservationKind::Created,
+                    Some(id.clone()),
+                    "session created",
+                    session.correlation_id.clone(),
+                );
+                self.observe_session(
+                    SessionObservationKind::Ready,
+                    Some(id.clone()),
+                    "session ready",
+                    session.correlation_id.clone(),
+                );
+                self.sessions.insert(id.clone(), session);
+                Ok(id)
+            }
+            Err(error) => {
+                self.observe_session(
+                    SessionObservationKind::CreationFailed,
+                    Some(id),
+                    error.to_string(),
+                    None,
+                );
+                Err(error)
+            }
+        }
+    }
+    pub fn create_one_shot_session(
+        &mut self,
+        request: SessionCreationRequest,
+    ) -> Result<InferenceSessionId, SessionError> {
+        self.create_inference_session(request)
+    }
+    pub fn inference_session(
+        &self,
+        session: &InferenceSessionId,
+    ) -> Result<&InferenceSession, SessionError> {
+        self.sessions
+            .get(session)
+            .ok_or(SessionError::SessionNotFound)
+    }
+    pub fn inference_session_mut(
+        &mut self,
+        session: &InferenceSessionId,
+    ) -> Result<&mut InferenceSession, SessionError> {
+        self.sessions
+            .get_mut(session)
+            .ok_or(SessionError::SessionNotFound)
+    }
+    pub fn session_status(
+        &self,
+        session: &InferenceSessionId,
+        access: &SessionAccessPolicy,
+    ) -> Result<SessionStatus, SessionError> {
+        if !access.permits(session) {
+            return Err(SessionError::Unauthorized);
+        }
+        Ok(self.inference_session(session)?.status())
+    }
+    pub fn start_session_operation(
+        &mut self,
+        session: &InferenceSessionId,
+    ) -> Result<SessionOperationAdmission, SessionError> {
+        let admission = self.inference_session_mut(session)?.start_operation()?;
+        self.observe_session(
+            match admission {
+                SessionOperationAdmission::Started => SessionObservationKind::OperationStarted,
+                SessionOperationAdmission::Queued => SessionObservationKind::PolicyRejection,
+            },
+            Some(session.clone()),
+            match admission {
+                SessionOperationAdmission::Started => "session operation started",
+                SessionOperationAdmission::Queued => "session operation queued",
+            },
+            None,
+        );
+        Ok(admission)
+    }
+    pub fn finish_session_operation(
+        &mut self,
+        session: &InferenceSessionId,
+    ) -> Result<(), SessionError> {
+        self.inference_session_mut(session)?.finish_operation()?;
+        self.observe_session(
+            SessionObservationKind::OperationCompleted,
+            Some(session.clone()),
+            "session operation completed",
+            None,
+        );
+        Ok(())
+    }
+    pub fn cancel_inference_session(
+        &mut self,
+        session: &InferenceSessionId,
+    ) -> Result<(), SessionError> {
+        self.inference_session_mut(session)?.cancel()?;
+        self.observe_session(
+            SessionObservationKind::Cancelled,
+            Some(session.clone()),
+            "session cancelled",
+            None,
+        );
+        Ok(())
+    }
+    pub fn drain_inference_session(
+        &mut self,
+        session: &InferenceSessionId,
+    ) -> Result<(), SessionError> {
+        self.inference_session_mut(session)?.drain()?;
+        self.observe_session(
+            SessionObservationKind::Draining,
+            Some(session.clone()),
+            "session draining",
+            None,
+        );
+        Ok(())
+    }
+    pub fn close_inference_session(
+        &mut self,
+        session: &InferenceSessionId,
+    ) -> Result<(), SessionError> {
+        self.inference_session_mut(session)?.close()?;
+        self.observe_session(
+            SessionObservationKind::Closed,
+            Some(session.clone()),
+            "session closed",
+            None,
+        );
+        Ok(())
+    }
+    pub fn expire_inference_sessions(&mut self, now_millis: u64) -> Vec<InferenceSessionId> {
+        let expired = self
+            .sessions
+            .iter_mut()
+            .filter_map(|(id, session)| session.expire_if_needed(now_millis).then_some(id.clone()))
+            .collect::<Vec<_>>();
+        for session in &expired {
+            self.observe_session(
+                SessionObservationKind::Expired,
+                Some(session.clone()),
+                "session expired",
+                None,
+            );
+        }
+        expired
+    }
+    pub fn apply_session_to_generation(
+        &self,
+        request: &mut GenerationRequest,
+    ) -> Result<(), SessionError> {
+        let Some(session_id) = request.session.as_ref() else {
+            return Ok(());
+        };
+        let session = self.inference_session(session_id)?;
+        session
+            .policy
+            .validate_generation(request.prompt_token_count, request.max_new_tokens)?;
+        request.model = session.model.clone();
+        request.tokenizer = session.tokenizer.clone();
+        request.max_total_tokens = session.policy.max_total_tokens;
+        request.cancellation.requested |= session.operation.cancellation_requested;
+        request.correlation_id = session
+            .correlation_id
+            .clone()
+            .or_else(|| request.correlation_id.clone());
+        Ok(())
+    }
+    pub fn session_memory_admission(
+        &self,
+        session: &InferenceSessionId,
+    ) -> Result<MemoryAdmissionDecision, SessionError> {
+        self.inference_session(session)?
+            .memory_admission(&self.memory)
     }
     pub fn register_provider(&mut self, x: Arc<dyn Provider>) -> Result<(), ProviderError> {
         self.providers.register_provider(x)
@@ -1708,7 +1917,25 @@ impl Runtime {
     }
     pub fn shutdown(&mut self) {
         let _ = self.providers.shutdown();
+        for session in self.sessions.values_mut() {
+            let _ = session.drain();
+        }
         self.initialized = false;
+    }
+
+    fn observe_session(
+        &mut self,
+        kind: SessionObservationKind,
+        session: Option<InferenceSessionId>,
+        message: impl Into<String>,
+        correlation_id: Option<CorrelationId>,
+    ) {
+        self.session_observations.push(SessionObservation {
+            kind,
+            session,
+            message: message.into(),
+            correlation_id,
+        });
     }
 }
 

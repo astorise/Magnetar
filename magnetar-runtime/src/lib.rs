@@ -23,6 +23,7 @@ pub mod provider;
 pub mod resolution;
 pub mod runtime;
 pub mod scheduler;
+pub mod session;
 pub mod tokenizer;
 
 pub use affinity::{
@@ -55,8 +56,7 @@ pub use component::{
     ComponentSource, ComponentTrapKind, ComponentTrustDecision, ComponentTrustStatus,
     ComponentTrustStore, ComponentValue, InferenceArtifactKind, InferenceArtifactReference,
     InferenceArtifactRegistry, InferenceCacheKind, InferenceCacheRegistry, InferenceCacheScope,
-    InferenceSessionId, MAGNETAR_RUNTIME_VERSION, MockComponentEngine, PreparedComponent,
-    WitInterface,
+    MAGNETAR_RUNTIME_VERSION, MockComponentEngine, PreparedComponent, WitInterface,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub use component_wasmtime::WasmtimeComponentEngine;
@@ -169,6 +169,13 @@ pub use scheduler::{
     SchedulingDiagnostic, SchedulingPolicy, SchedulingState, runtime_event_for_device_health,
     runtime_event_for_provider_health, runtime_events_for_provider_status,
     runtime_metrics_for_execution_plan,
+};
+pub use session::{
+    InferenceSession, InferenceSessionId, SessionAccessPolicy, SessionConcurrencyPolicy,
+    SessionCreationRequest, SessionError, SessionGenerationParameter, SessionLifecycleState,
+    SessionMemoryBudget, SessionMemoryUsage, SessionObservation, SessionObservationKind,
+    SessionOperationAdmission, SessionOperationState, SessionPolicy, SessionRedactionPolicy,
+    SessionResources, SessionStatus, SessionStreamingStatus, runtime_session_affinity,
 };
 pub use tokenizer::{
     BatchEncodeInput, BatchEncodeOutput, DecodeInput, DecodeOutput, EncodeInput, EncodeOutput,

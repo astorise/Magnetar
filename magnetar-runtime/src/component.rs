@@ -8,6 +8,8 @@ use std::{
 use serde::Deserialize;
 use sha2::{Digest as ShaDigest, Sha256};
 
+use crate::InferenceSessionId;
+
 pub const COMPONENT_ARTIFACT_SCHEMA: &str = "magnetar-component-artifact";
 pub const COMPONENT_TRUST_SCHEMA: &str = "magnetar-component-trust";
 pub const COMPONENT_ARTIFACT_SCHEMA_VERSION: u64 = 1;
@@ -520,25 +522,6 @@ pub enum InferenceArtifactKind {
 pub enum InferenceCacheKind {
     Kv,
     Prefix,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct InferenceSessionId(String);
-
-impl InferenceSessionId {
-    pub fn new(value: impl Into<String>) -> Result<Self, ComponentError> {
-        let value = value.into();
-        validate_runtime_identity(&value).map_err(|message| ComponentError::ArtifactRejected {
-            component: "inference-session".into(),
-            status: ComponentTrustStatus::Rejected,
-            message: message.into(),
-        })?;
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
