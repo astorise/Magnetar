@@ -718,6 +718,10 @@ impl<T: Tokenizer> RuntimeTokenizer<T> {
     pub fn memory_requests(&self) -> Vec<MemoryAllocationRequest> {
         self.artifacts.memory_requests()
     }
+
+    pub fn implementation(&self) -> &T {
+        &self.implementation
+    }
 }
 
 #[derive(Clone, Debug)]

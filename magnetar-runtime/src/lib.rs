@@ -14,6 +14,7 @@ pub mod component_web;
 pub mod compute;
 pub mod conformance;
 pub mod device;
+pub mod generation;
 pub mod memory;
 pub mod model;
 pub mod observability;
@@ -89,6 +90,16 @@ pub use conformance::{
     provider_conformance_profile_ids, provider_conformance_report_json,
 };
 pub use device::{Device, DeviceDescriptor, DeviceId, DeviceMetadata, DeviceType};
+pub use generation::{
+    CancellationMetadata, DecodeStepInput, DecodeStepOutput, EosMode, EosOutputPolicy, EosPolicy,
+    FinishReason, GenerationDiagnostic, GenerationDiagnosticKind, GenerationError, GenerationEvent,
+    GenerationEventKind, GenerationMemoryEstimate, GenerationModelReference, GenerationOutput,
+    GenerationParameters, GenerationPriority, GenerationRequest, GenerationRequestId,
+    GenerationTokenizerReference, LogitsProcessorReference, PrefillState, Probability,
+    StopConditions, StreamingMode, decode_step, finish_reason_from_provider_error,
+    memory_admission, prefill, prepare_stop_sequences, stop_reason_for, streaming_text_chunk,
+    token_stream_events,
+};
 pub use memory::{
     MemoryAdmissionDecision, MemoryAdmissionRequest, MemoryAllocation, MemoryAllocationClass,
     MemoryAllocationId, MemoryAllocationLifetime, MemoryAllocationOwner, MemoryAllocationRequest,
