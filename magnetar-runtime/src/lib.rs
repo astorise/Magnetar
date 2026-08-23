@@ -22,6 +22,7 @@ pub mod provider;
 pub mod resolution;
 pub mod runtime;
 pub mod scheduler;
+pub mod tokenizer;
 
 pub use affinity::{
     AffinityConstraints, AffinityError, AffinityGroupId, AffinityResolution, AffinityResource,
@@ -157,6 +158,16 @@ pub use scheduler::{
     SchedulingDiagnostic, SchedulingPolicy, SchedulingState, runtime_event_for_device_health,
     runtime_event_for_provider_health, runtime_events_for_provider_status,
     runtime_metrics_for_execution_plan,
+};
+pub use tokenizer::{
+    BatchEncodeInput, BatchEncodeOutput, DecodeInput, DecodeOutput, EncodeInput, EncodeOutput,
+    FixtureTokenizer, PaddingPolicy, RuntimeTokenizer, SpecialToken, SpecialTokenKind,
+    SpecialTokenPolicy, StreamingDecodeState, TokenId, TokenIdRange, TokenOffset, TokenStopPattern,
+    Tokenizer, TokenizerArtifactId, TokenizerArtifactReference, TokenizerArtifactSet,
+    TokenizerCompatibility, TokenizerDiagnostic, TokenizerDiagnosticKind, TokenizerError,
+    TokenizerFamily, TokenizerId, TokenizerMetadata, TokenizerObservation,
+    TokenizerObservationKind, TokenizerObserver, TokenizerRevision, TruncationPolicy,
+    tokenizer_component_artifact_reference, tokenizer_memory_feasibility,
 };
 
 #[cfg(test)]
