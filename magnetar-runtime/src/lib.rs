@@ -15,6 +15,7 @@ pub mod compute;
 pub mod conformance;
 pub mod device;
 pub mod memory;
+pub mod model;
 pub mod observability;
 pub mod planning;
 pub mod provider;
@@ -95,6 +96,16 @@ pub use memory::{
     MemoryManagerConfig, MemoryObservation, MemoryObservationKind, MemoryPlacement,
     MemoryPressureLevel, MemoryPressureSnapshot, PendingMemoryAllocation, StagingFeasibility,
     TensorResidency, ZeroCopyFeasibility,
+};
+pub use model::{
+    MODEL_ARTIFACT_SCHEMA, MODEL_ARTIFACT_SCHEMA_VERSION, ModelAdapterCompatibility,
+    ModelArchitecture, ModelArtifactError, ModelArtifactId, ModelArtifactKind,
+    ModelArtifactObserver, ModelArtifactPart, ModelArtifactRecord, ModelArtifactSource,
+    ModelComponentRequirement, ModelDType, ModelDigest, ModelGenerationDefaults,
+    ModelLicenseMetadata, ModelManifest, ModelName, ModelObservation, ModelObservationKind,
+    ModelProvenance, ModelQuantization, ModelQuantizationFormat, ModelResidencyPlan, ModelRevision,
+    ModelShard, ModelShardId, ModelSignature, ModelSourceIdentity, ModelTensorMetadata,
+    ModelTrustDecision, ModelTrustStatus, ModelTrustStore, ModelVariant,
 };
 pub use observability::{
     CorrelationId, CustomEventRecord, CustomLogRecord, CustomMetricKind, CustomMetricRecord,
