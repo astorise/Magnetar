@@ -12,6 +12,7 @@ pub mod component_wasmtime;
 pub mod compute;
 pub mod conformance;
 pub mod device;
+pub mod memory;
 pub mod observability;
 pub mod planning;
 pub mod provider;
@@ -81,6 +82,15 @@ pub use conformance::{
     provider_conformance_profile_ids, provider_conformance_report_json,
 };
 pub use device::{Device, DeviceDescriptor, DeviceId, DeviceMetadata, DeviceType};
+pub use memory::{
+    MemoryAdmissionDecision, MemoryAdmissionRequest, MemoryAllocation, MemoryAllocationClass,
+    MemoryAllocationId, MemoryAllocationLifetime, MemoryAllocationOwner, MemoryAllocationRequest,
+    MemoryAllocationState, MemoryArena, MemoryArenaGrowthPolicy, MemoryArenaId, MemoryArenaOwner,
+    MemoryArenaShrinkPolicy, MemoryDTypeRelation, MemoryError, MemoryFeasibility, MemoryManager,
+    MemoryManagerConfig, MemoryObservation, MemoryObservationKind, MemoryPlacement,
+    MemoryPressureLevel, MemoryPressureSnapshot, PendingMemoryAllocation, StagingFeasibility,
+    TensorResidency, ZeroCopyFeasibility,
+};
 pub use observability::{
     CorrelationId, CustomEventRecord, CustomLogRecord, CustomMetricKind, CustomMetricRecord,
     DeviceMetricsSnapshot, ExporterRuntimeStatus, LogSeverity, MetricTags,

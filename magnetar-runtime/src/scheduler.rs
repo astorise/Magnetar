@@ -687,6 +687,11 @@ impl Scheduler {
                 reason: error.to_string(),
             }
         })?;
+        if let MemoryAdmissionDecision::Reject { reason } =
+            runtime.memory_admission_for_plan(&plan.memory_plan, true)
+        {
+            return Err(SchedulerError::MemoryPlanInvalid { reason });
+        }
         let id = next_scheduled_operation_id();
         let accepted_order = self.next_order;
         self.next_order += 1;

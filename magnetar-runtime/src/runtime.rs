@@ -41,6 +41,7 @@ pub(crate) fn next_runtime_observation_sequence() -> u64 {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeConfig {
     pub resolution_policy: BuiltInResolutionPolicy,
+    pub memory: MemoryManagerConfig,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionContext {
@@ -88,8 +89,9 @@ impl RuntimeBuilder {
         let runtime = Runtime {
             context: ExecutionContext {
                 id: next_execution_context_id(),
-                config: self.config,
+                config: self.config.clone(),
             },
+            memory: MemoryManager::new(self.config.memory),
             providers,
             initialized: true,
         };
@@ -98,6 +100,7 @@ impl RuntimeBuilder {
 }
 pub struct Runtime {
     context: ExecutionContext,
+    memory: MemoryManager,
     providers: ProviderLoader,
     initialized: bool,
 }
@@ -116,6 +119,12 @@ impl Runtime {
     }
     pub fn context(&self) -> &ExecutionContext {
         &self.context
+    }
+    pub fn memory(&self) -> &MemoryManager {
+        &self.memory
+    }
+    pub fn memory_mut(&mut self) -> &mut MemoryManager {
+        &mut self.memory
     }
     pub fn providers(&self) -> &ProviderLoader {
         &self.providers
@@ -413,6 +422,24 @@ impl Runtime {
         }
         Ok(())
     }
+    pub fn memory_admission_for_plan(
+        &self,
+        plan: &MemoryPlan,
+        queue_allowed: bool,
+    ) -> MemoryAdmissionDecision {
+        let request = MemoryAllocationRequest::new(
+            MemoryAllocationClass::TemporaryWorkspace,
+            plan.pressure.estimated_peak_bytes,
+            MemoryPlacement::ProviderOwnedOpaque(plan.provider.clone()),
+            MemoryAllocationOwner::Provider(plan.provider.clone()),
+        )
+        .with_affinity(plan.output_affinity.clone());
+        self.memory.admit(MemoryAdmissionRequest {
+            allocation: request,
+            pressure: self.memory.pressure_snapshot(),
+            queue_allowed,
+        })
+    }
     pub fn plan_compute_data_movement_memory(
         &self,
         provider: &str,
@@ -446,6 +473,15 @@ impl Runtime {
                 });
             }
             let output_bytes = memory_bytes(&movement.output, &plan.pressure)?;
+            let staging = self
+                .memory
+                .staging_feasibility(movement.host_staging, output_bytes);
+            if host_staging_permitted && !staging.feasible {
+                return Err(MemoryPlanningError::TransferRequired {
+                    reason: staging.reason,
+                    report: plan.pressure.clone(),
+                });
+            }
             let mut affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
                 .with_provider(provider_binding.clone())
                 .with_capability(CapabilityBinding::new(
