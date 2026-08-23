@@ -438,6 +438,7 @@ pub struct ComponentManifest {
     pub optional_imports: BTreeSet<WitInterface>,
     pub exports: BTreeSet<WitInterface>,
     pub capabilities: Vec<ComponentCapabilityRequirement>,
+    pub engine: ComponentEngineRequirements,
     pub authority: Vec<ComponentAuthorityRequirement>,
     pub publisher: Option<ComponentPublisher>,
     pub source: ComponentSource,
@@ -449,6 +450,50 @@ pub struct ComponentCapabilityRequirement {
     pub id: String,
     pub min_version: String,
     pub max_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ComponentEngineRequirements {
+    pub profile: Option<ComponentEngineProfile>,
+    pub features: BTreeSet<ComponentEngineFeature>,
+}
+
+impl ComponentEngineRequirements {
+    pub fn require_profile(mut self, profile: ComponentEngineProfile) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    pub fn require_feature(mut self, feature: ComponentEngineFeature) -> Self {
+        self.features.insert(feature);
+        self
+    }
+
+    pub fn validate(
+        &self,
+        component: &str,
+        capabilities: &ComponentEngineCapabilities,
+    ) -> Result<(), ComponentError> {
+        if let Some(required) = self.profile
+            && capabilities.profile != required
+        {
+            return Err(ComponentError::EngineProfileMismatch {
+                component: component.into(),
+                required,
+                actual: capabilities.profile,
+            });
+        }
+        for feature in &self.features {
+            if !capabilities.supports(*feature) {
+                return Err(ComponentError::EngineFeatureUnavailable {
+                    component: component.into(),
+                    feature: *feature,
+                    profile: capabilities.profile,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -820,6 +865,8 @@ struct ComponentManifestYaml {
     runtime: ManifestRuntimeYaml,
     wit: ManifestWitYaml,
     capabilities: ManifestCapabilitiesYaml,
+    #[serde(default)]
+    engine: Option<ManifestEngineYaml>,
     authority: ManifestAuthorityYaml,
     publisher: Option<ComponentPublisherYaml>,
     source: ComponentSourceYaml,
@@ -880,6 +927,13 @@ struct ManifestWitInterfaceYaml {
 struct ManifestCapabilitiesYaml {
     #[serde(default)]
     requires: Vec<ManifestCapabilityYaml>,
+}
+
+#[derive(Deserialize)]
+struct ManifestEngineYaml {
+    profile: Option<String>,
+    #[serde(default)]
+    features: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1009,6 +1063,24 @@ impl ComponentManifestYaml {
                 })
             })
             .collect::<Result<Vec<_>, ComponentError>>()?;
+        let mut engine = ComponentEngineRequirements::default();
+        if let Some(raw_engine) = self.engine {
+            if let Some(profile) = raw_engine.profile {
+                engine.profile = Some(
+                    ComponentEngineProfile::from_manifest_value(&profile).ok_or_else(|| {
+                        manifest_validation_error(path, "engine profile is invalid")
+                    })?,
+                );
+            }
+            engine.features = raw_engine
+                .features
+                .into_iter()
+                .map(|feature| {
+                    ComponentEngineFeature::from_manifest_value(&feature)
+                        .ok_or_else(|| manifest_validation_error(path, "engine feature is invalid"))
+                })
+                .collect::<Result<BTreeSet<_>, ComponentError>>()?;
+        }
         let authority = self
             .authority
             .requires
@@ -1053,6 +1125,7 @@ impl ComponentManifestYaml {
             optional_imports,
             exports,
             capabilities,
+            engine,
             authority,
             publisher,
             source: ComponentSource {
@@ -1262,6 +1335,9 @@ impl Default for ComponentResourceLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComponentObservationKind {
     Distribution,
+    EngineSelection,
+    EngineRejection,
+    PlatformUnsupported,
     Validation,
     Preparation,
     LinkPlan,
@@ -1298,12 +1374,156 @@ impl ComponentObservation {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ComponentEngineProfile {
+    #[default]
+    Test,
+    Native,
+    Web,
+}
+
+impl ComponentEngineProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "component-engine-native",
+            Self::Web => "component-engine-web",
+            Self::Test => "component-engine-test",
+        }
+    }
+
+    fn from_manifest_value(value: &str) -> Option<Self> {
+        match value {
+            "component-engine-native" | "native" => Some(Self::Native),
+            "component-engine-web" | "web" => Some(Self::Web),
+            "component-engine-test" | "test" => Some(Self::Test),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ComponentEngineFeature {
+    ComponentModel,
+    AsyncHostCalls,
+    Interruption,
+    ResourceLimits,
+    BrowserCompatible,
+    NativeProviderEndpoints,
+    ControlledWasi,
+    JsMediatedHostCalls,
+    BrowserMemory,
+}
+
+impl ComponentEngineFeature {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ComponentModel => "component-model",
+            Self::AsyncHostCalls => "async-host-calls",
+            Self::Interruption => "interruption",
+            Self::ResourceLimits => "resource-limits",
+            Self::BrowserCompatible => "browser-compatible",
+            Self::NativeProviderEndpoints => "native-provider-endpoints",
+            Self::ControlledWasi => "controlled-wasi",
+            Self::JsMediatedHostCalls => "js-mediated-host-calls",
+            Self::BrowserMemory => "browser-memory",
+        }
+    }
+
+    fn from_manifest_value(value: &str) -> Option<Self> {
+        match value {
+            "component-model" => Some(Self::ComponentModel),
+            "async-host-calls" => Some(Self::AsyncHostCalls),
+            "interruption" => Some(Self::Interruption),
+            "resource-limits" => Some(Self::ResourceLimits),
+            "browser-compatible" => Some(Self::BrowserCompatible),
+            "native-provider-endpoints" => Some(Self::NativeProviderEndpoints),
+            "controlled-wasi" => Some(Self::ControlledWasi),
+            "js-mediated-host-calls" => Some(Self::JsMediatedHostCalls),
+            "browser-memory" => Some(Self::BrowserMemory),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComponentEngineCapabilities {
+    pub profile: ComponentEngineProfile,
     pub component_model: bool,
     pub async_host_calls: bool,
     pub interruption: bool,
     pub resource_limits: bool,
+    pub browser_compatible: bool,
+    pub native_provider_endpoints: bool,
+    pub controlled_wasi: bool,
+    pub js_mediated_host_calls: bool,
+    pub browser_memory: bool,
+}
+
+impl Default for ComponentEngineCapabilities {
+    fn default() -> Self {
+        Self::test()
+    }
+}
+
+impl ComponentEngineCapabilities {
+    pub const fn native() -> Self {
+        Self {
+            profile: ComponentEngineProfile::Native,
+            component_model: true,
+            async_host_calls: true,
+            interruption: true,
+            resource_limits: true,
+            browser_compatible: false,
+            native_provider_endpoints: true,
+            controlled_wasi: true,
+            js_mediated_host_calls: false,
+            browser_memory: false,
+        }
+    }
+
+    pub const fn web() -> Self {
+        Self {
+            profile: ComponentEngineProfile::Web,
+            component_model: true,
+            async_host_calls: true,
+            interruption: false,
+            resource_limits: false,
+            browser_compatible: true,
+            native_provider_endpoints: false,
+            controlled_wasi: false,
+            js_mediated_host_calls: true,
+            browser_memory: true,
+        }
+    }
+
+    pub const fn test() -> Self {
+        Self {
+            profile: ComponentEngineProfile::Test,
+            component_model: true,
+            async_host_calls: true,
+            interruption: true,
+            resource_limits: true,
+            browser_compatible: true,
+            native_provider_endpoints: false,
+            controlled_wasi: false,
+            js_mediated_host_calls: true,
+            browser_memory: true,
+        }
+    }
+
+    pub const fn supports(&self, feature: ComponentEngineFeature) -> bool {
+        match feature {
+            ComponentEngineFeature::ComponentModel => self.component_model,
+            ComponentEngineFeature::AsyncHostCalls => self.async_host_calls,
+            ComponentEngineFeature::Interruption => self.interruption,
+            ComponentEngineFeature::ResourceLimits => self.resource_limits,
+            ComponentEngineFeature::BrowserCompatible => self.browser_compatible,
+            ComponentEngineFeature::NativeProviderEndpoints => self.native_provider_endpoints,
+            ComponentEngineFeature::ControlledWasi => self.controlled_wasi,
+            ComponentEngineFeature::JsMediatedHostCalls => self.js_mediated_host_calls,
+            ComponentEngineFeature::BrowserMemory => self.browser_memory,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1416,12 +1636,7 @@ pub struct MockComponentEngine {
 impl MockComponentEngine {
     pub fn new() -> Self {
         Self {
-            capabilities: ComponentEngineCapabilities {
-                component_model: true,
-                async_host_calls: true,
-                interruption: true,
-                resource_limits: true,
-            },
+            capabilities: ComponentEngineCapabilities::test(),
             ..Self::default()
         }
     }
@@ -1622,6 +1837,10 @@ impl ComponentManager {
         &self.observations
     }
 
+    pub fn engine_capabilities(&self) -> ComponentEngineCapabilities {
+        self.engine.capabilities()
+    }
+
     pub fn register_component(
         &mut self,
         descriptor: ComponentDescriptor,
@@ -1694,6 +1913,23 @@ impl ComponentManager {
             None,
             "component definition validated",
         ));
+        let capabilities = self.engine.capabilities();
+        self.observations.push(ComponentObservation::new(
+            ComponentObservationKind::EngineSelection,
+            Some(definition.metadata.name.clone()),
+            None,
+            format!(
+                "selected Component Engine profile '{}'",
+                capabilities.profile.as_str()
+            ),
+        ));
+        if let Err(error) = ComponentEngineRequirements::default()
+            .validate(&definition.metadata.name, &capabilities)
+        {
+            definition.state = ComponentDefinitionState::Failed;
+            self.observe_error(None, &error);
+            return Err(error);
+        }
         let prepared = match self.engine.prepare(definition, &self.limits) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -2072,6 +2308,17 @@ impl ComponentManager {
             | ComponentError::ResourceLimitExceeded { .. } => {
                 ComponentObservationKind::ResourceLimit
             }
+            ComponentError::NoCompatibleEngine { .. }
+            | ComponentError::EngineProfileMismatch { .. }
+            | ComponentError::EngineFeatureUnavailable { .. }
+            | ComponentError::WasmtimeUnavailable { .. }
+            | ComponentError::BrowserEngineUnavailable { .. } => {
+                ComponentObservationKind::EngineRejection
+            }
+            ComponentError::PlatformUnsupported { .. } => {
+                ComponentObservationKind::PlatformUnsupported
+            }
+            ComponentError::HostBindingFailed { .. } => ComponentObservationKind::Instantiation,
             ComponentError::InstantiationFailed { .. } => ComponentObservationKind::Instantiation,
             ComponentError::InvocationFailed { .. } => ComponentObservationKind::Invocation,
             ComponentError::PreparationFailed { .. }
@@ -2156,6 +2403,19 @@ fn validate_component_artifact(
         Some(definition.metadata.name.clone()),
         None,
         "component artifact manifest loaded and schema validated",
+    ));
+    let capabilities = engine.capabilities();
+    manifest
+        .engine
+        .validate(&manifest.component.name, &capabilities)?;
+    observations.push(ComponentObservation::new(
+        ComponentObservationKind::EngineSelection,
+        Some(manifest.component.name.clone()),
+        None,
+        format!(
+            "Component artifact compatible with engine profile '{}'",
+            capabilities.profile.as_str()
+        ),
     ));
     if manifest.digest != digest {
         return Err(ComponentError::ArtifactRejected {
@@ -2713,6 +2973,34 @@ pub enum ComponentError {
         component: String,
         limit: &'static str,
     },
+    NoCompatibleEngine {
+        component: String,
+        target: &'static str,
+    },
+    EngineProfileMismatch {
+        component: String,
+        required: ComponentEngineProfile,
+        actual: ComponentEngineProfile,
+    },
+    EngineFeatureUnavailable {
+        component: String,
+        feature: ComponentEngineFeature,
+        profile: ComponentEngineProfile,
+    },
+    WasmtimeUnavailable {
+        component: String,
+    },
+    BrowserEngineUnavailable {
+        component: String,
+    },
+    PlatformUnsupported {
+        component: String,
+        target: &'static str,
+    },
+    HostBindingFailed {
+        component: String,
+        message: String,
+    },
     ComponentLoadFailed {
         path: PathBuf,
         message: String,
@@ -2852,6 +3140,47 @@ impl fmt::Display for ComponentError {
                 f,
                 "component '{component}' exceeded resource limit '{limit}'"
             ),
+            Self::NoCompatibleEngine { component, target } => write!(
+                f,
+                "component '{component}' has no compatible Component Engine for target '{target}'"
+            ),
+            Self::EngineProfileMismatch {
+                component,
+                required,
+                actual,
+            } => write!(
+                f,
+                "component '{component}' requires Component Engine profile '{}' but selected profile is '{}'",
+                required.as_str(),
+                actual.as_str()
+            ),
+            Self::EngineFeatureUnavailable {
+                component,
+                feature,
+                profile,
+            } => write!(
+                f,
+                "component '{component}' requires Component Engine feature '{}' unavailable on profile '{}'",
+                feature.as_str(),
+                profile.as_str()
+            ),
+            Self::WasmtimeUnavailable { component } => {
+                write!(
+                    f,
+                    "component '{component}' requires unavailable Wasmtime engine"
+                )
+            }
+            Self::BrowserEngineUnavailable { component } => write!(
+                f,
+                "component '{component}' requires unavailable browser Component Engine"
+            ),
+            Self::PlatformUnsupported { component, target } => write!(
+                f,
+                "component '{component}' is unsupported on target '{target}'"
+            ),
+            Self::HostBindingFailed { component, message } => {
+                write!(f, "component '{component}' host binding failed: {message}")
+            }
             Self::ComponentLoadFailed { path, message, .. } => write!(
                 f,
                 "component artifact '{}' could not be loaded: {message}",

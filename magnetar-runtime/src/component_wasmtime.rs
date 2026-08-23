@@ -141,12 +141,7 @@ impl WasmtimeComponentEngine {
 
 impl ComponentEngine for WasmtimeComponentEngine {
     fn capabilities(&self) -> ComponentEngineCapabilities {
-        ComponentEngineCapabilities {
-            component_model: true,
-            async_host_calls: true,
-            interruption: true,
-            resource_limits: true,
-        }
+        ComponentEngineCapabilities::native()
     }
 
     fn inspect_contract(

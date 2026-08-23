@@ -8,6 +8,7 @@ description = "Hardware-agnostic execution runtime contracts for magnetar."
 [features]
 default = []
 wasmtime-component-engine = ["dep:wasmtime"]
+web-component-engine = []
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -15,4 +16,6 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 sha2 = "0.11"
 libloading = "0.9"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wasmtime = { version = "48.0.0", optional = true, default-features = false, features = ["anyhow", "runtime", "component-model", "component-model-async", "cranelift", "std", "wat"] }

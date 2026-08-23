@@ -191,17 +191,68 @@ choice rather than an architectural dependency. The public Component Runtime
 model must remain valid if a future Component Engine implementation replaces
 Wasmtime.
 
-## Wasmtime Feature Policy
+## Platform Engine Profiles
+
+Component Engines declare a platform profile and capability set before
+preparation. Initial profiles are:
+
+- `component-engine-native`: native server execution, currently represented by
+  the Wasmtime adapter when the native target and feature allow it.
+- `component-engine-web`: browser-compatible execution for `wasm32` targets,
+  JavaScript-mediated host bindings, browser memory constraints, and no native
+  Provider ABI loading.
+- `component-engine-test`: deterministic contract testing without requiring
+  Wasmtime or browser APIs.
+
+Component Artifacts may declare engine requirements in their manifest:
+
+```yaml
+engine:
+  profile: component-engine-web
+  features:
+    - browser-compatible
+    - js-mediated-host-calls
+```
+
+Runtime validates these requirements before engine preparation. Missing
+profiles or unavailable features fail closed with structured Component errors
+such as no-compatible-engine, engine-profile-mismatch, and
+engine-feature-unavailable.
+
+## Feature And Target Policy
 
 The concrete Wasmtime adapter is available behind the
-`wasmtime-component-engine` Cargo feature. The feature is disabled by default
-so engine-neutral Runtime contracts remain cheap to build and test. Enabling
-the feature adds Wasmtime with Component Model and async Component support, but
-Wasmtime-native types remain contained in the adapter module and are not part
-of canonical Magnetar APIs.
+`wasmtime-component-engine` Cargo feature and is target-gated to non-`wasm32`
+builds. The feature is disabled by default so engine-neutral Runtime contracts
+remain cheap to build and test. Enabling the feature adds Wasmtime with
+Component Model and async Component support on native targets, but
+Wasmtime-native types remain contained in the adapter module and are not part of
+canonical Magnetar APIs.
+
+The browser adapter is available behind `web-component-engine` on
+`wasm32` targets. It does not import Wasmtime and does not expose native
+Provider loading. The initial web adapter defines the platform boundary and
+fails closed for host binding and invocation paths until the JavaScript adapter
+is implemented.
+
+Feature and target matrix:
+
+```text
+native target + wasmtime-component-engine -> WasmtimeComponentEngine available
+native target + web-component-engine      -> no browser engine compiled
+wasm32 target + web-component-engine      -> WebComponentEngine available
+wasm32 target + wasmtime-component-engine -> Wasmtime module not compiled
+default features                          -> test/profile-neutral contracts
+```
 
 Use this local check for the concrete adapter:
 
 ```text
 cargo check -p magnetar-runtime --features wasmtime-component-engine
+```
+
+Use this check for browser compatibility:
+
+```text
+cargo check -p magnetar-runtime --target wasm32-unknown-unknown --all-features
 ```

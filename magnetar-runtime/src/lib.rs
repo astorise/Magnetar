@@ -7,8 +7,10 @@
 pub mod affinity;
 pub mod capability;
 pub mod component;
-#[cfg(feature = "wasmtime-component-engine")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub mod component_wasmtime;
+#[cfg(all(target_arch = "wasm32", feature = "web-component-engine"))]
+pub mod component_web;
 pub mod compute;
 pub mod conformance;
 pub mod device;
@@ -40,7 +42,8 @@ pub use component::{
     ComponentDescriptor, ComponentDigest, ComponentDistributionErrorCategory,
     ComponentDistributionSource, ComponentDistributionSourceKind,
     ComponentDistributionSourceProvider, ComponentEndpoint, ComponentEngine,
-    ComponentEngineCapabilities, ComponentEngineInstance, ComponentError,
+    ComponentEngineCapabilities, ComponentEngineFeature, ComponentEngineInstance,
+    ComponentEngineProfile, ComponentEngineRequirements, ComponentError,
     ComponentExportDescription, ComponentImportRequirement, ComponentInstance, ComponentInstanceId,
     ComponentInstanceState, ComponentInterfaceShape, ComponentInterruptionReason,
     ComponentInvocation, ComponentInvocationResult, ComponentLinkPlan, ComponentManager,
@@ -52,8 +55,10 @@ pub use component::{
     InferenceSessionId, MAGNETAR_RUNTIME_VERSION, MockComponentEngine, PreparedComponent,
     WitInterface,
 };
-#[cfg(feature = "wasmtime-component-engine")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub use component_wasmtime::WasmtimeComponentEngine;
+#[cfg(all(target_arch = "wasm32", feature = "web-component-engine"))]
+pub use component_web::WebComponentEngine;
 pub use compute::{
     COMPUTE_CAPABILITY_ID, COMPUTE_CAPABILITY_VERSION, COMPUTE_WIT_INTERFACE, COMPUTE_WIT_PACKAGE,
     ComputeAttributeKind, ComputeCapabilitySupport, ComputeDType, ComputeDataMovementDescriptor,

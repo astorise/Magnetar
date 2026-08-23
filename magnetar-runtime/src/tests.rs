@@ -3141,6 +3141,94 @@ fn public_component_api_does_not_expose_wasmtime_native_types() {
 }
 
 #[test]
+fn component_engine_profiles_declare_platform_capabilities() {
+    let native = ComponentEngineCapabilities::native();
+    assert_eq!(native.profile, ComponentEngineProfile::Native);
+    assert!(native.supports(ComponentEngineFeature::ComponentModel));
+    assert!(native.supports(ComponentEngineFeature::NativeProviderEndpoints));
+    assert!(!native.supports(ComponentEngineFeature::BrowserCompatible));
+
+    let web = ComponentEngineCapabilities::web();
+    assert_eq!(web.profile, ComponentEngineProfile::Web);
+    assert!(web.supports(ComponentEngineFeature::BrowserCompatible));
+    assert!(web.supports(ComponentEngineFeature::JsMediatedHostCalls));
+    assert!(web.supports(ComponentEngineFeature::BrowserMemory));
+    assert!(!web.supports(ComponentEngineFeature::NativeProviderEndpoints));
+
+    let test = ComponentEngineCapabilities::test();
+    assert_eq!(test.profile, ComponentEngineProfile::Test);
+    assert!(test.supports(ComponentEngineFeature::Interruption));
+    assert!(!test.supports(ComponentEngineFeature::ControlledWasi));
+}
+
+#[test]
+fn component_engine_requirements_fail_closed_on_profile_or_feature_mismatch() {
+    let requirements = ComponentEngineRequirements::default()
+        .require_profile(ComponentEngineProfile::Web)
+        .require_feature(ComponentEngineFeature::BrowserCompatible);
+
+    assert!(
+        requirements
+            .validate("browser-component", &ComponentEngineCapabilities::web())
+            .is_ok()
+    );
+
+    assert!(matches!(
+        requirements.validate("browser-component", &ComponentEngineCapabilities::native()),
+        Err(ComponentError::EngineProfileMismatch {
+            required: ComponentEngineProfile::Web,
+            actual: ComponentEngineProfile::Native,
+            ..
+        })
+    ));
+
+    let requirements = ComponentEngineRequirements::default()
+        .require_feature(ComponentEngineFeature::NativeProviderEndpoints);
+    assert!(matches!(
+        requirements.validate("native-component", &ComponentEngineCapabilities::web()),
+        Err(ComponentError::EngineFeatureUnavailable {
+            feature: ComponentEngineFeature::NativeProviderEndpoints,
+            profile: ComponentEngineProfile::Web,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn component_manager_observes_engine_selection_and_rejection() {
+    let mut manager = ComponentManager::new();
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component"),
+            "component.wasm",
+        ))
+        .unwrap();
+
+    manager.prepare_component("component").unwrap();
+    assert!(
+        manager.observations().iter().any(|observation| {
+            observation.kind == ComponentObservationKind::EngineSelection
+                && observation
+                    .message
+                    .contains(ComponentEngineProfile::Test.as_str())
+        }),
+        "selected engine profile should be observable"
+    );
+
+    let error = ComponentEngineRequirements::default()
+        .require_feature(ComponentEngineFeature::ControlledWasi)
+        .validate("component", &manager.engine_capabilities())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ComponentError::EngineFeatureUnavailable {
+            feature: ComponentEngineFeature::ControlledWasi,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn execution_context_default_allocates_unique_ids() {
     let first = ExecutionContext::default();
     let second = ExecutionContext::default();

@@ -88,6 +88,19 @@ jobs:
       - name: Test Wasmtime Component Engine
         run: cargo test -p magnetar-runtime --features wasmtime-component-engine
 
+  wasm32-component-engine:
+    name: quality / wasm32 component engine
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --target wasm32-unknown-unknown
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+      - name: Check wasm32 Component Runtime
+        run: cargo check -p magnetar-runtime --target wasm32-unknown-unknown --all-features
+
   provider-conformance:
     name: quality / provider conformance
     runs-on: ubuntu-latest
