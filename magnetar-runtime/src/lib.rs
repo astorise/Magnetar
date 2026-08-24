@@ -21,6 +21,7 @@ pub mod model;
 pub mod model_loading;
 pub mod observability;
 pub mod planning;
+pub mod prefix_cache;
 pub mod provider;
 pub mod resolution;
 pub mod runtime;
@@ -165,6 +166,13 @@ pub use planning::{
     ExecutionOutput, ExecutionPlanId, ExecutionStep, ExecutionStepKind, MemoryPlan,
     MemoryPlanningDecision, MemoryPlanningDiagnostic, MemoryPlanningError, MemoryPressureReport,
     MemoryRegionKind, MemoryRequirement, TensorLifetime,
+};
+pub use prefix_cache::{
+    PrefixCacheBackingKvCache, PrefixCacheCompatibility, PrefixCacheEntry, PrefixCacheEntryId,
+    PrefixCacheError, PrefixCacheFingerprint, PrefixCacheLifecycleState, PrefixCacheLookupRequest,
+    PrefixCacheLookupResult, PrefixCacheManager, PrefixCacheMatchKind, PrefixCacheObservation,
+    PrefixCacheObservationKind, PrefixCachePolicy, PrefixCachePrivacyPolicy, PrefixCacheScope,
+    PrefixCacheSharingPolicy,
 };
 pub use provider::{
     PROVIDER_ABI_FACTORY_SYMBOL_V1, PROVIDER_ABI_MAJOR_VERSION, PROVIDER_ABI_MINOR_VERSION,

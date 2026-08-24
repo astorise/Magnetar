@@ -102,6 +102,7 @@ impl RuntimeBuilder {
             },
             memory: MemoryManager::new(self.config.memory),
             kv_caches: KvCacheManager::new(),
+            prefix_caches: PrefixCacheManager::new(),
             providers,
             sessions: BTreeMap::new(),
             session_observations: Vec::new(),
@@ -114,6 +115,7 @@ pub struct Runtime {
     context: ExecutionContext,
     memory: MemoryManager,
     kv_caches: KvCacheManager,
+    prefix_caches: PrefixCacheManager,
     providers: ProviderLoader,
     sessions: BTreeMap<InferenceSessionId, InferenceSession>,
     session_observations: Vec<SessionObservation>,
@@ -146,6 +148,12 @@ impl Runtime {
     }
     pub fn kv_caches_mut(&mut self) -> &mut KvCacheManager {
         &mut self.kv_caches
+    }
+    pub fn prefix_caches(&self) -> &PrefixCacheManager {
+        &self.prefix_caches
+    }
+    pub fn prefix_caches_mut(&mut self) -> &mut PrefixCacheManager {
+        &mut self.prefix_caches
     }
     pub fn providers(&self) -> &ProviderLoader {
         &self.providers
@@ -307,6 +315,9 @@ impl Runtime {
             .map_err(|error| SessionError::ResourceCleanupFailed {
                 reason: error.to_string(),
             })?;
+        let persist_prefix_entries = self.inference_session(session)?.policy.prefix_cache_allowed;
+        self.prefix_caches
+            .release_session_entries(session, persist_prefix_entries);
         self.observe_session(
             SessionObservationKind::Closed,
             Some(session.clone()),
@@ -326,6 +337,7 @@ impl Runtime {
                 let _ = self.release_kv_cache_memory(&cache);
             }
             let _ = self.kv_caches.release_session_caches(session);
+            self.prefix_caches.release_session_entries(session, false);
             self.observe_session(
                 SessionObservationKind::Expired,
                 Some(session.clone()),
@@ -366,6 +378,58 @@ impl Runtime {
     pub fn create_kv_cache(&mut self, cache: KvCache) -> Result<KvCacheId, KvCacheError> {
         self.kv_caches.create(cache)
     }
+    pub fn create_prefix_cache_entry(
+        &mut self,
+        entry: PrefixCacheEntry,
+        policy: &PrefixCachePolicy,
+    ) -> Result<PrefixCacheEntryId, PrefixCacheError> {
+        self.prefix_caches.create(entry, policy)
+    }
+    pub fn allocate_prefix_cache_memory(
+        &mut self,
+        entry: &PrefixCacheEntryId,
+    ) -> Result<MemoryAllocationId, PrefixCacheError> {
+        self.prefix_caches.allocate_memory(entry, &mut self.memory)
+    }
+    pub fn prefix_cache_entry(
+        &self,
+        entry: &PrefixCacheEntryId,
+    ) -> Result<&PrefixCacheEntry, PrefixCacheError> {
+        self.prefix_caches.entry(entry)
+    }
+    pub fn lookup_prefix_cache(
+        &mut self,
+        request: &PrefixCacheLookupRequest,
+    ) -> PrefixCacheLookupResult {
+        self.prefix_caches.lookup(request)
+    }
+    pub fn validate_prefix_cache_reuse(
+        &mut self,
+        entry: &PrefixCacheEntryId,
+        request: &PrefixCacheLookupRequest,
+    ) -> Result<(), PrefixCacheError> {
+        self.prefix_caches.validate_reuse(entry, request)
+    }
+    pub fn evict_prefix_cache_entry(
+        &mut self,
+        entry: &PrefixCacheEntryId,
+    ) -> Result<(), PrefixCacheError> {
+        self.release_prefix_cache_memory(entry)?;
+        self.prefix_caches.evict(entry)
+    }
+    pub fn invalidate_prefix_cache_entry(
+        &mut self,
+        entry: &PrefixCacheEntryId,
+    ) -> Result<(), PrefixCacheError> {
+        self.prefix_caches.invalidate(entry)
+    }
+    pub fn release_prefix_cache_entry(
+        &mut self,
+        entry: &PrefixCacheEntryId,
+    ) -> Result<(), PrefixCacheError> {
+        self.release_prefix_cache_memory(entry)?;
+        self.prefix_caches.release(entry)
+    }
     pub fn allocate_kv_cache_memory(
         &mut self,
         cache: &KvCacheId,
@@ -403,17 +467,38 @@ impl Runtime {
     }
     pub fn evict_kv_cache(&mut self, cache: &KvCacheId) -> Result<(), KvCacheError> {
         self.release_kv_cache_memory(cache)?;
-        self.kv_caches.evict(cache)
+        let result = self.kv_caches.evict(cache);
+        if result.is_ok() {
+            self.prefix_caches
+                .mark_backing_kv_cache_state(cache, KvCacheLifecycleState::Evicted);
+        }
+        result
     }
     pub fn release_kv_cache(&mut self, cache: &KvCacheId) -> Result<(), KvCacheError> {
         self.release_kv_cache_memory(cache)?;
-        self.kv_caches.release(cache)
+        let result = self.kv_caches.release(cache);
+        if result.is_ok() {
+            self.prefix_caches
+                .mark_backing_kv_cache_state(cache, KvCacheLifecycleState::Released);
+        }
+        result
     }
     fn release_kv_cache_memory(&mut self, cache: &KvCacheId) -> Result<(), KvCacheError> {
         if let Some(allocation) = self.kv_cache(cache)?.residency.memory_allocation {
             self.memory
                 .release(allocation)
                 .map_err(|_| KvCacheError::CacheReleased)?;
+        }
+        Ok(())
+    }
+    fn release_prefix_cache_memory(
+        &mut self,
+        entry: &PrefixCacheEntryId,
+    ) -> Result<(), PrefixCacheError> {
+        if let Some(allocation) = self.prefix_cache_entry(entry)?.memory_allocation {
+            self.memory
+                .release(allocation)
+                .map_err(|_| PrefixCacheError::PrefixAllocationFailed)?;
         }
         Ok(())
     }
