@@ -1,0 +1,1675 @@
+//! Reference CPU Provider: a correctness-first, host-memory execution baseline
+//! for portable Operators. It is not required to be fast; it exists to prove
+//! portable semantics before optimized Providers (CUDA, Metal, OpenVINO, QNN,
+//! WebGPU) define behavior.
+//!
+//! Tensor storage is Provider-owned and opaque to the rest of the Runtime, the
+//! same way any other Provider's device buffers would be: the Kernel Contract
+//! and Memory Manager only see resource identity and accounting, never raw
+//! bytes. [`ReferenceCpuExecutor`] keeps the actual host-visible [`HostTensor`]
+//! data behind [`TensorResourceId`] keys.
+//!
+//! # Versus an optimized CPU Provider
+//!
+//! An optimized CPU Provider (SIMD-vectorized, multi-threaded, quantization-
+//! aware, kernel-fused) would advertise the same portable Operators but with
+//! richer `KernelPrecisionMetadata`/`KernelDeterminism` (approximate math,
+//! fused semantics, hardware-feature-dependent determinism) and would beat
+//! Reference CPU on `estimated_cost` during Kernel candidate ranking.
+//! Reference CPU exists to define what "correct" means first, independent of
+//! any such optimization; it advertises `approximate_math: false` and
+//! `deterministic: true` by leaving `KernelPrecisionMetadata`/`KernelDeterminism`
+//! at their conservative defaults, and never advertises fused or quantized
+//! kernels.
+//!
+//! # Versus CUDA/Metal/OpenVINO/QNN Providers
+//!
+//! Hardware-accelerated Providers execute on a different [`DeviceType`]
+//! (`Gpu`/`Npu`) with device-resident memory classes and Provider-specific
+//! ABI/dynamic-loading concerns (`ProviderAbiDescriptor`, `ProviderLoader::
+//! load_dynamic`) that Reference CPU has no need for: it is always built-in
+//! (`REFERENCE_CPU_BUILT_IN`), never dynamically loaded, and only ever
+//! targets `DeviceType::Cpu`/`KernelMemoryClass::Host`. Reference CPU's
+//! numeric outputs are meant to be the correctness baseline those Providers'
+//! outputs get compared against within a declared tolerance profile (see the
+//! Conformance capability), not a competing execution target.
+//!
+//! # Versus Model Component
+//!
+//! A Model Component owns model-level concerns (weights, tokenizer,
+//! architecture, generation policy) and is Provider-agnostic; it never picks
+//! a Provider or Device directly. Reference CPU sits one layer below: it is
+//! one of the Providers a Model Component's execution graph might ultimately
+//! be dispatched to (via Runtime-owned resolution), advertising Kernels for
+//! individual portable Operators (matmul, attention, ...), never model-level
+//! concepts. Reference CPU has no knowledge of Model Components at all — the
+//! dependency only ever points from higher layers down to Kernel Contract
+//! Providers like this one.
+//!
+//! # DType support
+//!
+//! Reference CPU only ever stores `f32` elements. Every advertised kernel
+//! declares `Float32` as its only supported input/output dtype; any other
+//! portable dtype (or a requested `accumulation_dtype` other than `f32`, for
+//! `matmul`) is rejected explicitly via [`dtype_conversion`] and
+//! `reference-cpu-dtype-unsupported` rather than silently converted.
+//!
+//! # Layout support
+//!
+//! Reference CPU only stores contiguous, row-major tensors. [`TensorLayoutKind::Strided`]
+//! targets get a distinct "defined placeholder, not yet implemented" rejection from
+//! [`layout_conversion`]; blocked, paged, and other provider-opaque layouts get the
+//! generic `reference-cpu-layout-unsupported` rejection. Nothing is ever silently
+//! reinterpreted into a different layout.
+//!
+//! # Attention baseline
+//!
+//! [`attention`] implements causal or unmasked scaled dot-product attention.
+//! It supports grouped-query attention (`kv_head_count` dividing `head_count`,
+//! each group of query heads sharing one key/value head) and sliding-window
+//! attention (`window_size` restricting each query to its most recent keys).
+//! Paged KV cache is not implemented: the `paged-attention` Operator is never
+//! advertised, so Runtime never assumes Reference CPU can serve it.
+//!
+//! # RoPE baseline
+//!
+//! [`rope`] implements real rotary position embedding (not a stub): it
+//! rotates consecutive element pairs within the first `dimension` elements of
+//! each row using `position = row index`, `base`, and `scale`. Base and scale
+//! must both be finite and positive.
+//!
+//! # RMSNorm baseline
+//!
+//! [`rmsnorm`] implements RMSNorm with `f32` accumulation: each row is scaled
+//! by `1 / sqrt(mean(x^2) + epsilon)`, then multiplied element-wise by the
+//! weight vector. `epsilon` must be positive and the weight width must match
+//! the row width.
+//!
+//! # Browser limitations
+//!
+//! The Provider, Device, and Kernel contracts here are platform-neutral and
+//! build cleanly on `wasm32-unknown-unknown` (`std::thread::available_parallelism`
+//! and `std::env::consts::ARCH` both work there). Nothing in this module
+//! requires native dynamic-library loading. `reference-cpu-browser-feature-unsupported`
+//! is defined in the error model for future use if a browser-specific limitation
+//! is identified; none is known today.
+
+use crate::*;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    sync::{Arc, Mutex},
+};
+
+/// Stable, package-qualified Reference CPU Provider identity.
+pub const REFERENCE_CPU_PROVIDER_NAME: &str = "magnetar:provider/reference-cpu";
+pub const REFERENCE_CPU_PROVIDER_VERSION: &str = "0.1.0";
+pub const REFERENCE_CPU_PROVIDER_VENDOR: &str = "magnetar";
+pub const REFERENCE_CPU_DEVICE_ID: &str = "reference-cpu:host:0";
+pub const REFERENCE_CPU_CONFORMANCE_PROFILE: &str = "reference-cpu-conformance-v1";
+pub const REFERENCE_CPU_KERNEL_FAMILY: KernelImplementationFamily =
+    KernelImplementationFamily::CpuScalar;
+
+/// Reference CPU always ships built into the Runtime binary; it is never
+/// loaded as an external dynamic library.
+pub const REFERENCE_CPU_BUILT_IN: bool = true;
+
+/// Runtime Provider ABI version range this build of Reference CPU was
+/// validated against, expressed as `(min, max)` over [`PROVIDER_API_VERSION`].
+pub const REFERENCE_CPU_SUPPORTED_RUNTIME_VERSION_RANGE: (u32, u32) =
+    (PROVIDER_API_VERSION, PROVIDER_API_VERSION);
+
+/// Explicit, non-default feature toggles for the Reference CPU Provider.
+///
+/// Registration decisions must be explicit (never an implicit default), so
+/// callers construct flags deliberately rather than relying on `Default`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReferenceCpuFeatureFlags {
+    pub attention: bool,
+    pub rope: bool,
+    pub quantization: bool,
+}
+
+impl ReferenceCpuFeatureFlags {
+    /// The correctness baseline: attention and RoPE implemented, quantization
+    /// explicitly unsupported.
+    pub const fn baseline() -> Self {
+        Self {
+            attention: true,
+            rope: true,
+            quantization: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error model
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ReferenceCpuErrorCode {
+    ProviderUnavailable,
+    ProviderDisabledByPolicy,
+    DeviceUnavailable,
+    KernelNotFound,
+    DTypeUnsupported,
+    LayoutUnsupported,
+    ShapeUnsupported,
+    MemoryClassUnsupported,
+    WorkspaceUnavailable,
+    ExecutionFailed,
+    DeterministicModeUnsupported,
+    PrecisionUnsupported,
+    ConformanceFailed,
+    FallbackDenied,
+    BrowserFeatureUnsupported,
+    Internal,
+}
+
+impl ReferenceCpuErrorCode {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::ProviderUnavailable => "reference-cpu-provider-unavailable",
+            Self::ProviderDisabledByPolicy => "reference-cpu-provider-disabled-by-policy",
+            Self::DeviceUnavailable => "reference-cpu-device-unavailable",
+            Self::KernelNotFound => "reference-cpu-kernel-not-found",
+            Self::DTypeUnsupported => "reference-cpu-dtype-unsupported",
+            Self::LayoutUnsupported => "reference-cpu-layout-unsupported",
+            Self::ShapeUnsupported => "reference-cpu-shape-unsupported",
+            Self::MemoryClassUnsupported => "reference-cpu-memory-class-unsupported",
+            Self::WorkspaceUnavailable => "reference-cpu-workspace-unavailable",
+            Self::ExecutionFailed => "reference-cpu-execution-failed",
+            Self::DeterministicModeUnsupported => "reference-cpu-deterministic-mode-unsupported",
+            Self::PrecisionUnsupported => "reference-cpu-precision-unsupported",
+            Self::ConformanceFailed => "reference-cpu-conformance-failed",
+            Self::FallbackDenied => "reference-cpu-fallback-denied",
+            Self::BrowserFeatureUnsupported => "reference-cpu-browser-feature-unsupported",
+            Self::Internal => "internal-reference-cpu",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceCpuError {
+    pub code: ReferenceCpuErrorCode,
+    pub reason: String,
+}
+
+impl ReferenceCpuError {
+    pub fn new(code: ReferenceCpuErrorCode, reason: impl Into<String>) -> Self {
+        Self {
+            code,
+            reason: reason.into(),
+        }
+    }
+
+    pub const fn id(&self) -> &'static str {
+        self.code.id()
+    }
+}
+
+impl fmt::Display for ReferenceCpuError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.id(), self.reason)
+    }
+}
+
+impl Error for ReferenceCpuError {}
+
+impl From<ReferenceCpuError> for KernelError {
+    fn from(error: ReferenceCpuError) -> Self {
+        match error.code {
+            ReferenceCpuErrorCode::DTypeUnsupported => Self::KernelDTypeUnsupported {
+                dtype: error.reason,
+            },
+            ReferenceCpuErrorCode::LayoutUnsupported => Self::KernelLayoutUnsupported {
+                layout: error.reason,
+            },
+            ReferenceCpuErrorCode::ShapeUnsupported => Self::KernelShapeUnsupported {
+                reason: error.reason,
+            },
+            ReferenceCpuErrorCode::MemoryClassUnsupported => Self::KernelMemoryClassUnsupported {
+                memory_class: error.reason,
+            },
+            ReferenceCpuErrorCode::WorkspaceUnavailable => Self::KernelWorkspaceUnavailable,
+            ReferenceCpuErrorCode::KernelNotFound => Self::KernelNotFound {
+                kernel: error.reason,
+            },
+            ReferenceCpuErrorCode::DeviceUnavailable => Self::KernelDeviceUnsupported {
+                device: error.reason,
+            },
+            ReferenceCpuErrorCode::ProviderUnavailable
+            | ReferenceCpuErrorCode::ProviderDisabledByPolicy => Self::KernelProviderUnavailable {
+                provider: error.reason,
+            },
+            ReferenceCpuErrorCode::DeterministicModeUnsupported => {
+                Self::KernelDeterminismUnsupported
+            }
+            ReferenceCpuErrorCode::PrecisionUnsupported => Self::KernelPrecisionUnsupported,
+            ReferenceCpuErrorCode::ConformanceFailed => Self::KernelConformanceFailed {
+                report: error.reason,
+            },
+            ReferenceCpuErrorCode::BrowserFeatureUnsupported => {
+                Self::KernelBrowserFeatureUnsupported {
+                    feature: error.reason,
+                }
+            }
+            ReferenceCpuErrorCode::FallbackDenied
+            | ReferenceCpuErrorCode::ExecutionFailed
+            | ReferenceCpuErrorCode::Internal => Self::KernelExecutionFailed {
+                reason: error.reason,
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host tensor storage (Provider-owned, opaque)
+// ---------------------------------------------------------------------------
+
+/// A concrete, host-visible tensor. Only the Reference CPU Provider itself
+/// reads or writes this representation; the Runtime only ever sees
+/// [`TensorResourceId`] and [`TensorDescriptor`] metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostTensor {
+    pub shape: Vec<u64>,
+    pub data: Vec<f32>,
+}
+
+impl HostTensor {
+    pub fn new(
+        shape: impl Into<Vec<u64>>,
+        data: impl Into<Vec<f32>>,
+    ) -> Result<Self, ReferenceCpuError> {
+        let shape = shape.into();
+        let data = data.into();
+        let expected = shape.iter().product::<u64>() as usize;
+        if expected != data.len() {
+            return Err(ReferenceCpuError::new(
+                ReferenceCpuErrorCode::ShapeUnsupported,
+                format!(
+                    "shape {shape:?} expects {expected} elements, got {}",
+                    data.len()
+                ),
+            ));
+        }
+        Ok(Self { shape, data })
+    }
+
+    pub fn rows_cols(&self) -> Result<(u64, u64), ReferenceCpuError> {
+        match self.shape.as_slice() {
+            [rows, cols] => Ok((*rows, *cols)),
+            other => Err(ReferenceCpuError::new(
+                ReferenceCpuErrorCode::ShapeUnsupported,
+                format!("expected rank-2 tensor, got shape {other:?}"),
+            )),
+        }
+    }
+}
+
+fn same_shape(a: &HostTensor, b: &HostTensor) -> Result<(), ReferenceCpuError> {
+    if a.shape != b.shape {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("shape mismatch: {:?} vs {:?}", a.shape, b.shape),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Correctness-first numeric kernels (pure functions, independently testable)
+// ---------------------------------------------------------------------------
+
+/// Correctness-first matmul: `a @ b` with optional logical transpose of
+/// either operand and an explicit accumulation dtype (always `f32` here).
+pub fn matmul(
+    a: &HostTensor,
+    b: &HostTensor,
+    transpose_a: bool,
+    transpose_b: bool,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let (a_rows, a_cols) = a.rows_cols()?;
+    let (b_rows, b_cols) = b.rows_cols()?;
+    let (m, k) = if transpose_a {
+        (a_cols, a_rows)
+    } else {
+        (a_rows, a_cols)
+    };
+    let (k2, n) = if transpose_b {
+        (b_cols, b_rows)
+    } else {
+        (b_rows, b_cols)
+    };
+    if k != k2 {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("matmul inner dimension mismatch: {k} vs {k2}"),
+        ));
+    }
+    let (m, k, n) = (m as usize, k as usize, n as usize);
+    let a_at = |row: usize, col: usize| -> f32 {
+        if transpose_a {
+            a.data[col * (a_cols as usize) + row]
+        } else {
+            a.data[row * (a_cols as usize) + col]
+        }
+    };
+    let b_at = |row: usize, col: usize| -> f32 {
+        if transpose_b {
+            b.data[col * (b_cols as usize) + row]
+        } else {
+            b.data[row * (b_cols as usize) + col]
+        }
+    };
+    let mut out = vec![0.0_f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut accumulator = 0.0_f32;
+            for inner in 0..k {
+                accumulator += a_at(row, inner) * b_at(inner, col);
+            }
+            out[row * n + col] = accumulator;
+        }
+    }
+    HostTensor::new([m as u64, n as u64], out)
+}
+
+/// Correctness-first embedding lookup: `ids` select rows out of `table`.
+pub fn embedding_lookup(
+    table: &HostTensor,
+    ids: &HostTensor,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let (vocab, dim) = table.rows_cols()?;
+    let mut out = Vec::with_capacity(ids.data.len() * dim as usize);
+    for &raw_id in &ids.data {
+        if raw_id < 0.0 || raw_id.fract() != 0.0 {
+            return Err(ReferenceCpuError::new(
+                ReferenceCpuErrorCode::ShapeUnsupported,
+                format!("token id {raw_id} is not a non-negative integer"),
+            ));
+        }
+        let id = raw_id as u64;
+        if id >= vocab {
+            return Err(ReferenceCpuError::new(
+                ReferenceCpuErrorCode::ShapeUnsupported,
+                format!("token id {id} exceeds vocabulary size {vocab}"),
+            ));
+        }
+        let start = (id * dim) as usize;
+        out.extend_from_slice(&table.data[start..start + dim as usize]);
+    }
+    HostTensor::new([ids.data.len() as u64, dim], out)
+}
+
+/// Correctness-first RMSNorm with `f32` accumulation.
+pub fn rmsnorm(
+    input: &HostTensor,
+    weight: &HostTensor,
+    epsilon: f32,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let (rows, cols) = input.rows_cols()?;
+    if weight.shape != [cols] {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "RMSNorm weight shape must be [{cols}], got {:?}",
+                weight.shape
+            ),
+        ));
+    }
+    if epsilon <= 0.0 {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "RMSNorm epsilon must be positive",
+        ));
+    }
+    let mut out = vec![0.0_f32; input.data.len()];
+    for row in 0..rows as usize {
+        let slice = &input.data[row * cols as usize..(row + 1) * cols as usize];
+        let mean_square = slice.iter().map(|value| value * value).sum::<f32>() / cols as f32;
+        let scale = 1.0 / (mean_square + epsilon).sqrt();
+        for (col, value) in slice.iter().enumerate() {
+            out[row * cols as usize + col] = value * scale * weight.data[col];
+        }
+    }
+    HostTensor::new(input.shape.clone(), out)
+}
+
+/// Rotary position embedding, rotating consecutive pairs within the first
+/// `dimension` elements of each row using `position = row index`.
+pub fn rope(
+    input: &HostTensor,
+    base: f32,
+    scale: f32,
+    dimension: u64,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let (rows, cols) = input.rows_cols()?;
+    if dimension == 0 || !dimension.is_multiple_of(2) || dimension > cols {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "RoPE dimension {dimension} must be a positive, even divisor of row width {cols}"
+            ),
+        ));
+    }
+    if !base.is_finite() || base <= 0.0 {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "RoPE base must be finite and positive",
+        ));
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "RoPE scale must be finite and positive",
+        ));
+    }
+    let mut out = input.data.clone();
+    let half = (dimension / 2) as usize;
+    for row in 0..rows as usize {
+        let position = (row as f32) * scale;
+        let row_start = row * cols as usize;
+        for pair in 0..half {
+            let frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
+            let angle = position * frequency;
+            let (sin, cos) = angle.sin_cos();
+            let even = input.data[row_start + 2 * pair];
+            let odd = input.data[row_start + 2 * pair + 1];
+            out[row_start + 2 * pair] = even * cos - odd * sin;
+            out[row_start + 2 * pair + 1] = even * sin + odd * cos;
+        }
+    }
+    HostTensor::new(input.shape.clone(), out)
+}
+
+/// Numerically stable softmax, applied per row (subtracts the row max before
+/// exponentiating).
+pub fn softmax_rows(input: &HostTensor) -> Result<HostTensor, ReferenceCpuError> {
+    let (rows, cols) = input.rows_cols()?;
+    let mut out = vec![0.0_f32; input.data.len()];
+    for row in 0..rows as usize {
+        let slice = &input.data[row * cols as usize..(row + 1) * cols as usize];
+        let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exponentials = slice
+            .iter()
+            .map(|value| (value - max).exp())
+            .collect::<Vec<_>>();
+        let sum: f32 = exponentials.iter().sum();
+        for (col, value) in exponentials.into_iter().enumerate() {
+            out[row * cols as usize + col] = value / sum;
+        }
+    }
+    HostTensor::new(input.shape.clone(), out)
+}
+
+/// Simple causal (or unmasked) scaled dot-product attention over `head_count`
+/// query heads of `head_dimension` each. `q` has shape
+/// `[sequence_length, head_count * head_dimension]`; `k`/`v` have shape
+/// `[sequence_length, kv_head_count * head_dimension]`, where `kv_head_count`
+/// defaults to `head_count` (standard multi-head attention) but may be
+/// smaller as long as it evenly divides `head_count` (grouped-query
+/// attention: each group of `head_count / kv_head_count` query heads shares
+/// one key/value head). `window_size`, when set, additionally restricts each
+/// query to the last `window_size` keys (sliding-window attention).
+#[allow(clippy::too_many_arguments)]
+pub fn attention(
+    q: &HostTensor,
+    k: &HostTensor,
+    v: &HostTensor,
+    head_count: u64,
+    head_dimension: u64,
+    kv_head_count: Option<u64>,
+    window_size: Option<u64>,
+    causal: bool,
+) -> Result<HostTensor, ReferenceCpuError> {
+    same_shape(k, v)?;
+    let kv_head_count = kv_head_count.unwrap_or(head_count);
+    if head_count == 0 || head_dimension == 0 || kv_head_count == 0 {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "head_count, kv_head_count, and head_dimension must all be positive",
+        ));
+    }
+    if !head_count.is_multiple_of(kv_head_count) {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "head_count {head_count} must be an exact multiple of kv_head_count {kv_head_count}"
+            ),
+        ));
+    }
+    let (seq_len, q_model_dim) = q.rows_cols()?;
+    let (kv_seq_len, kv_model_dim) = k.rows_cols()?;
+    if seq_len != kv_seq_len {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("q sequence length {seq_len} must match k/v sequence length {kv_seq_len}"),
+        ));
+    }
+    if head_count * head_dimension != q_model_dim {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "head_count * head_dimension must equal q row width {q_model_dim}, got {head_count} * {head_dimension}"
+            ),
+        ));
+    }
+    if kv_head_count * head_dimension != kv_model_dim {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "kv_head_count * head_dimension must equal k/v row width {kv_model_dim}, got {kv_head_count} * {head_dimension}"
+            ),
+        ));
+    }
+    let group_size = (head_count / kv_head_count) as usize;
+    let seq_len = seq_len as usize;
+    let q_model_dim = q_model_dim as usize;
+    let kv_model_dim = kv_model_dim as usize;
+    let head_dimension = head_dimension as usize;
+    let scale = 1.0 / (head_dimension as f32).sqrt();
+    let mut out = vec![0.0_f32; seq_len * q_model_dim];
+    for head in 0..head_count as usize {
+        let kv_head = head / group_size;
+        let q_offset = head * head_dimension;
+        let kv_offset = kv_head * head_dimension;
+        for query_index in 0..seq_len {
+            let key_upper = if causal { query_index + 1 } else { seq_len };
+            let key_lower = window_size
+                .map(|window| query_index.saturating_sub((window as usize).saturating_sub(1)))
+                .unwrap_or(0)
+                .min(key_upper);
+            let mut scores = vec![f32::NEG_INFINITY; seq_len];
+            for (key_index, score) in scores
+                .iter_mut()
+                .enumerate()
+                .take(key_upper)
+                .skip(key_lower)
+            {
+                let mut dot = 0.0_f32;
+                for dim in 0..head_dimension {
+                    dot += q.data[query_index * q_model_dim + q_offset + dim]
+                        * k.data[key_index * kv_model_dim + kv_offset + dim];
+                }
+                *score = dot * scale;
+            }
+            let max = scores[key_lower..key_upper]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let exponentials = scores[key_lower..key_upper]
+                .iter()
+                .map(|value| (value - max).exp())
+                .collect::<Vec<_>>();
+            let sum: f32 = exponentials.iter().sum();
+            for dim in 0..head_dimension {
+                let mut accumulator = 0.0_f32;
+                for (offset, weight) in exponentials.iter().enumerate() {
+                    let key_index = key_lower + offset;
+                    accumulator +=
+                        (weight / sum) * v.data[key_index * kv_model_dim + kv_offset + dim];
+                }
+                out[query_index * q_model_dim + q_offset + dim] = accumulator;
+            }
+        }
+    }
+    HostTensor::new(q.shape.clone(), out)
+}
+
+/// SiLU activation: `x * sigmoid(x)`.
+pub fn silu(input: &HostTensor) -> HostTensor {
+    let data = input
+        .data
+        .iter()
+        .map(|&x| x * (1.0 / (1.0 + (-x).exp())))
+        .collect::<Vec<_>>();
+    HostTensor {
+        shape: input.shape.clone(),
+        data,
+    }
+}
+
+/// GELU activation using the tanh approximation.
+pub fn gelu(input: &HostTensor) -> HostTensor {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    let data = input
+        .data
+        .iter()
+        .map(|&x| 0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)).tanh()))
+        .collect::<Vec<_>>();
+    HostTensor {
+        shape: input.shape.clone(),
+        data,
+    }
+}
+
+pub fn add(a: &HostTensor, b: &HostTensor) -> Result<HostTensor, ReferenceCpuError> {
+    same_shape(a, b)?;
+    let data = a
+        .data
+        .iter()
+        .zip(&b.data)
+        .map(|(x, y)| x + y)
+        .collect::<Vec<_>>();
+    Ok(HostTensor {
+        shape: a.shape.clone(),
+        data,
+    })
+}
+
+pub fn mul(a: &HostTensor, b: &HostTensor) -> Result<HostTensor, ReferenceCpuError> {
+    same_shape(a, b)?;
+    let data = a
+        .data
+        .iter()
+        .zip(&b.data)
+        .map(|(x, y)| x * y)
+        .collect::<Vec<_>>();
+    Ok(HostTensor {
+        shape: a.shape.clone(),
+        data,
+    })
+}
+
+pub fn residual_add(
+    input: &HostTensor,
+    residual: &HostTensor,
+) -> Result<HostTensor, ReferenceCpuError> {
+    add(input, residual)
+}
+
+/// Reference CPU only stores `f32`; any other portable dtype requires an
+/// explicit conversion step and is never converted silently.
+pub fn dtype_conversion(
+    input: &HostTensor,
+    from: ComputeDType,
+    to: ComputeDType,
+) -> Result<HostTensor, ReferenceCpuError> {
+    if from != ComputeDType::Float32 || to != ComputeDType::Float32 {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::DTypeUnsupported,
+            format!("Reference CPU only supports explicit f32; requested {from:?} -> {to:?}"),
+        ));
+    }
+    Ok(input.clone())
+}
+
+/// Reference CPU only stores contiguous, row-major layouts. Any other target
+/// layout is explicitly rejected rather than silently reinterpreted. Strided
+/// targets get a distinct, clearly-labeled placeholder rejection (strided
+/// support is defined but not yet implemented); blocked, paged, and other
+/// provider-opaque layouts get the generic unsupported-layout rejection.
+pub fn layout_conversion(
+    input: &HostTensor,
+    from: TensorLayoutKind,
+    to: TensorLayoutKind,
+) -> Result<HostTensor, ReferenceCpuError> {
+    if from == TensorLayoutKind::Contiguous && to == TensorLayoutKind::Contiguous {
+        return Ok(input.clone());
+    }
+    if to == TensorLayoutKind::Strided || from == TensorLayoutKind::Strided {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::LayoutUnsupported,
+            format!(
+                "strided layout conversion is a defined placeholder, not yet implemented (requested {from:?} -> {to:?})"
+            ),
+        ));
+    }
+    Err(ReferenceCpuError::new(
+        ReferenceCpuErrorCode::LayoutUnsupported,
+        format!("Reference CPU only supports contiguous layout; requested {from:?} -> {to:?}"),
+    ))
+}
+
+/// Quantized formats are not implemented; this always fails explicitly.
+pub fn dequantize_placeholder() -> ReferenceCpuError {
+    ReferenceCpuError::new(
+        ReferenceCpuErrorCode::DTypeUnsupported,
+        "Reference CPU has no quantized kernel implementation",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Fallback policy
+// ---------------------------------------------------------------------------
+
+/// Policy inputs that decide whether Reference CPU fallback is permitted for
+/// one candidate resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FallbackPolicyContext {
+    pub policy_allows_fallback: bool,
+    pub dtype_conversion_required: bool,
+    pub dtype_conversion_allowed: bool,
+    pub layout_conversion_required: bool,
+    pub layout_conversion_allowed: bool,
+}
+
+impl FallbackPolicyContext {
+    /// The strictest default: fallback itself, and any conversion it would
+    /// require, must each be explicitly permitted.
+    pub const fn new(policy_allows_fallback: bool) -> Self {
+        Self {
+            policy_allows_fallback,
+            dtype_conversion_required: false,
+            dtype_conversion_allowed: false,
+            layout_conversion_required: false,
+            layout_conversion_allowed: false,
+        }
+    }
+
+    pub const fn with_dtype_conversion(mut self, required: bool, allowed: bool) -> Self {
+        self.dtype_conversion_required = required;
+        self.dtype_conversion_allowed = allowed;
+        self
+    }
+
+    pub const fn with_layout_conversion(mut self, required: bool, allowed: bool) -> Self {
+        self.layout_conversion_required = required;
+        self.layout_conversion_allowed = allowed;
+        self
+    }
+}
+
+/// Whether Reference CPU fallback is permitted for one candidate resource.
+///
+/// Fallback is denied unless the caller explicitly permits it, is always
+/// denied when Resource Affinity forbids host movement, and is denied when it
+/// would require a dtype or layout conversion that policy does not allow.
+pub fn evaluate_fallback(
+    affinity: &ResourceAffinity,
+    context: &FallbackPolicyContext,
+) -> Result<(), ReferenceCpuError> {
+    if !context.policy_allows_fallback {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::FallbackDenied,
+            "Runtime policy does not permit Reference CPU fallback",
+        ));
+    }
+    if matches!(affinity.fallback(), FallbackClass::ProviderPinned) {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::FallbackDenied,
+            "Resource Affinity forbids host movement",
+        ));
+    }
+    if context.dtype_conversion_required && !context.dtype_conversion_allowed {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::FallbackDenied,
+            "fallback would require a dtype conversion that policy forbids",
+        ));
+    }
+    if context.layout_conversion_required && !context.layout_conversion_allowed {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::FallbackDenied,
+            "fallback would require a layout conversion that policy forbids",
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Provider identity, Device, Kernel advertisement
+// ---------------------------------------------------------------------------
+
+pub fn reference_cpu_provider_metadata() -> ProviderMetadata {
+    ProviderMetadata::new(
+        REFERENCE_CPU_PROVIDER_NAME,
+        REFERENCE_CPU_PROVIDER_VERSION,
+        REFERENCE_CPU_PROVIDER_VENDOR,
+        "Correctness-first, host-memory reference implementation of portable Operators",
+    )
+}
+
+/// Runtime-detected SIMD feature ids, expressed as [`CapabilityId`]s under the
+/// `magnetar:cpu-feature/*` namespace so they use the same extensibility
+/// point as any other Device execution capability.
+#[cfg(target_arch = "x86_64")]
+fn detected_simd_capabilities() -> Vec<CapabilityId> {
+    let mut features = Vec::new();
+    if std::is_x86_feature_detected!("sse4.2") {
+        features.push(CapabilityId::new("magnetar:cpu-feature/sse4.2"));
+    }
+    if std::is_x86_feature_detected!("avx2") {
+        features.push(CapabilityId::new("magnetar:cpu-feature/avx2"));
+    }
+    if std::is_x86_feature_detected!("fma") {
+        features.push(CapabilityId::new("magnetar:cpu-feature/fma"));
+    }
+    features
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn detected_simd_capabilities() -> Vec<CapabilityId> {
+    Vec::new()
+}
+
+pub fn reference_cpu_device() -> DeviceDescriptor {
+    let mut metadata = DeviceMetadata::new(
+        DeviceId::new(REFERENCE_CPU_DEVICE_ID),
+        "Reference CPU",
+        DeviceType::Cpu,
+        REFERENCE_CPU_PROVIDER_NAME,
+    );
+    metadata.vendor = REFERENCE_CPU_PROVIDER_VENDOR.into();
+    metadata.architecture = std::env::consts::ARCH.into();
+    metadata.compute_units = std::thread::available_parallelism()
+        .map(|count| count.get() as u32)
+        .unwrap_or(1);
+    metadata
+        .execution_capabilities
+        .extend(detected_simd_capabilities());
+    // Mirrors the dtype/layout/memory-class support already advertised at
+    // Kernel granularity (see `baseline_advertisement`): Reference CPU only
+    // ever executes `f32`, contiguous, host-resident tensors.
+    metadata.dtype_support = [ComputeDType::Float32].into_iter().collect();
+    metadata.layout_support = [TensorLayoutKind::Contiguous].into_iter().collect();
+    metadata.memory_class_support = [KernelMemoryClass::Host].into_iter().collect();
+    metadata.execution_limits = DeviceExecutionLimits {
+        max_concurrent_operations: Some(metadata.compute_units),
+        max_workspace_bytes: Some(1 << 20),
+    };
+    metadata.pressure = ProviderPressureLevel::Low;
+    DeviceDescriptor::new(metadata)
+}
+
+fn reference_cpu_kernel_id(operator: OperatorId, name: &str) -> KernelId {
+    KernelId::new(
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        name,
+        CapabilityVersion::new(1, 0, 0),
+        operator,
+        KernelOperatorVersionRange::exact(1),
+        REFERENCE_CPU_KERNEL_FAMILY,
+    )
+    .with_conformance_profile(REFERENCE_CPU_CONFORMANCE_PROFILE)
+}
+
+fn baseline_advertisement(name: &str, family: OperatorFamily) -> KernelAdvertisement {
+    let operator = OperatorId::magnetar(name, 1, family);
+    let id = reference_cpu_kernel_id(operator, name);
+    let mut advertisement = KernelAdvertisement::new(id)
+        .with_dtypes(TensorRole::Input, [ComputeDType::Float32])
+        .with_dtypes(TensorRole::Output, [ComputeDType::Float32])
+        .with_layouts([TensorLayoutKind::Contiguous])
+        .with_memory_classes([KernelMemoryClass::Host]);
+    // Reference CPU executes synchronously and cannot cooperatively cancel
+    // mid-kernel, but it does honor a deadline that has already elapsed
+    // before dispatch starts (see `execute_invocation`).
+    advertisement.cancellation = KernelCancellationSupport::TimeoutOnly;
+    // Kernels whose tensors are always rank-2 in this implementation advertise
+    // that constraint explicitly; kernels that mix ranks across resources
+    // (e.g. embedding's rank-1 ids against its rank-2 table) or accept
+    // arbitrary rank (elementwise, activations, conversions) are left
+    // unconstrained.
+    if matches!(
+        name,
+        "matmul" | "rmsnorm" | "rope" | "attention" | "softmax"
+    ) {
+        advertisement.shape.rank = Some(2);
+    }
+    advertisement
+}
+
+/// The initial, correctness-first Reference CPU kernel set. Kernels that are
+/// not implemented (quantized formats) are intentionally absent: unsupported
+/// Operators are never assumed available just because Reference CPU exists.
+pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
+    let mut attention = baseline_advertisement("attention", OperatorFamily::Attention);
+    // Attention is the one Kernel that genuinely needs scratch space (the
+    // per-query score buffer), so it requests it through the Memory
+    // Manager rather than allocating it invisibly to the Runtime. It is
+    // also not advertised as browser-compatible: Host-class workspace
+    // allocation is not meaningful against browser linear memory (see
+    // `run_invocation`, which explicitly rejects it on `wasm32`).
+    attention.workspace =
+        KernelWorkspaceRequirements::required(1 << 20, KernelMemoryClass::Host, 4);
+    attention.browser_compatible = false;
+    // No incremental/paged KV cache is implemented; state that explicitly
+    // rather than leaving the metadata slot silently absent.
+    attention.kv_cache = Some(KernelKvCacheMetadata {
+        layouts: BTreeSet::new(),
+        paged_cache: false,
+        append: false,
+        read: false,
+        dtypes: BTreeSet::new(),
+        memory_classes: BTreeSet::new(),
+        affinity: None,
+    });
+
+    vec![
+        baseline_advertisement("matmul", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("embedding", OperatorFamily::Tensor),
+        baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
+        baseline_advertisement("rope", OperatorFamily::PositionEncoding),
+        attention,
+        baseline_advertisement("softmax", OperatorFamily::Activation),
+        baseline_advertisement("silu", OperatorFamily::Activation),
+        baseline_advertisement("gelu", OperatorFamily::Activation),
+        baseline_advertisement("activation", OperatorFamily::Activation),
+        baseline_advertisement("add", OperatorFamily::Tensor),
+        baseline_advertisement("mul", OperatorFamily::Tensor),
+        baseline_advertisement("residual-add", OperatorFamily::Tensor),
+        baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
+        baseline_advertisement("layout-conversion", OperatorFamily::Layout),
+    ]
+}
+
+/// One check within a [`ReferenceCpuConformanceReport`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceCpuConformanceCheck {
+    pub name: &'static str,
+    pub passed: bool,
+    pub detail: Option<String>,
+}
+
+/// Reference CPU's own conformance report: a small, fixed set of
+/// known-input/known-output checks against its Kernel functions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceCpuConformanceReport {
+    pub profile: &'static str,
+    pub checks: Vec<ReferenceCpuConformanceCheck>,
+}
+
+impl ReferenceCpuConformanceReport {
+    pub fn is_conformant(&self) -> bool {
+        self.checks.iter().all(|check| check.passed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Executor: opaque host storage + ProviderExecutionApi + KernelInvocation execution
+// ---------------------------------------------------------------------------
+
+/// Reference CPU's execution boundary. Holds Provider-owned, opaque tensor
+/// storage keyed by [`TensorResourceId`]; the Runtime only ever references
+/// resources by identity.
+pub struct ReferenceCpuExecutor {
+    storage: Mutex<BTreeMap<TensorResourceId, HostTensor>>,
+    observations: Mutex<Vec<KernelObservation>>,
+    submitted: Mutex<Vec<ProviderExecutionRequest>>,
+}
+
+impl Default for ReferenceCpuExecutor {
+    fn default() -> Self {
+        Self {
+            storage: Mutex::new(BTreeMap::new()),
+            observations: Mutex::new(Vec::new()),
+            submitted: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ReferenceCpuExecutor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) {
+        self.storage.lock().unwrap().insert(id, tensor);
+    }
+
+    pub fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
+        self.storage.lock().unwrap().get(id).cloned()
+    }
+
+    pub fn observations(&self) -> Vec<KernelObservation> {
+        self.observations.lock().unwrap().clone()
+    }
+
+    fn observe(&self, observation: KernelObservation) {
+        self.observations.lock().unwrap().push(observation);
+    }
+
+    /// Runs a small, fixed set of known-input/known-output checks against
+    /// this Provider's own correctness-first Kernel functions and records
+    /// the result as a Kernel observation. This is Reference CPU's own
+    /// conformance report; it is distinct from the shared
+    /// `ProviderConformanceSuite` (which exercises Provider/Device/Kernel
+    /// contract structure generically, not per-Operator numeric semantics).
+    pub fn run_conformance_checks(&self) -> ReferenceCpuConformanceReport {
+        let close = |a: &[f32], b: &[f32]| -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4)
+        };
+        let mut checks = Vec::new();
+
+        let matmul_result = matmul(
+            &HostTensor::new([2, 2], [1.0, 2.0, 3.0, 4.0]).unwrap(),
+            &HostTensor::new([2, 2], [5.0, 6.0, 7.0, 8.0]).unwrap(),
+            false,
+            false,
+        );
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "matmul-known-output",
+            passed: matches!(&matmul_result, Ok(output) if close(&output.data, &[19.0, 22.0, 43.0, 50.0])),
+            detail: matmul_result.err().map(|error| error.to_string()),
+        });
+
+        let rmsnorm_result = rmsnorm(
+            &HostTensor::new([1, 2], [3.0, 4.0]).unwrap(),
+            &HostTensor::new([2], [1.0, 1.0]).unwrap(),
+            1e-6,
+        );
+        // mean_square = (3^2 + 4^2) / 2 = 12.5; scale = 1 / sqrt(12.5).
+        let rmsnorm_scale = 1.0_f32 / 12.5_f32.sqrt();
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "rmsnorm-known-output",
+            passed: matches!(&rmsnorm_result, Ok(output) if close(&output.data, &[3.0 * rmsnorm_scale, 4.0 * rmsnorm_scale])),
+            detail: rmsnorm_result.err().map(|error| error.to_string()),
+        });
+
+        let softmax_result = softmax_rows(&HostTensor::new([1, 2], [0.0, 0.0]).unwrap());
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "softmax-uniform-input",
+            passed: matches!(&softmax_result, Ok(output) if close(&output.data, &[0.5, 0.5])),
+            detail: softmax_result.err().map(|error| error.to_string()),
+        });
+
+        let silu_result = silu(&HostTensor::new([1], [0.0]).unwrap());
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "silu-zero-input",
+            passed: close(&silu_result.data, &[0.0]),
+            detail: None,
+        });
+
+        let add_result = add(
+            &HostTensor::new([2], [1.0, 2.0]).unwrap(),
+            &HostTensor::new([2], [3.0, 4.0]).unwrap(),
+        );
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "add-known-output",
+            passed: matches!(&add_result, Ok(output) if close(&output.data, &[4.0, 6.0])),
+            detail: add_result.err().map(|error| error.to_string()),
+        });
+
+        let report = ReferenceCpuConformanceReport {
+            profile: REFERENCE_CPU_CONFORMANCE_PROFILE,
+            checks,
+        };
+        self.observe(
+            KernelObservation::new(KernelObservationKind::KernelConformanceResult)
+                .with_redacted_metadata("profile", report.profile)
+                .with_redacted_metadata("passed", report.is_conformant().to_string())
+                .with_redacted_metadata("checks", report.checks.len().to_string()),
+        );
+        report
+    }
+
+    fn attribute_float(
+        attributes: &BTreeMap<String, OperatorAttributeValue>,
+        key: &str,
+        default: f32,
+    ) -> f32 {
+        match attributes.get(key) {
+            Some(OperatorAttributeValue::Float(value)) => *value as f32,
+            _ => default,
+        }
+    }
+
+    fn attribute_integer(
+        attributes: &BTreeMap<String, OperatorAttributeValue>,
+        key: &str,
+    ) -> Option<u64> {
+        match attributes.get(key) {
+            Some(OperatorAttributeValue::Integer(value)) if *value >= 0 => Some(*value as u64),
+            _ => None,
+        }
+    }
+
+    fn attribute_bool(
+        attributes: &BTreeMap<String, OperatorAttributeValue>,
+        key: &str,
+        default: bool,
+    ) -> bool {
+        match attributes.get(key) {
+            Some(OperatorAttributeValue::Boolean(value)) => *value,
+            _ => default,
+        }
+    }
+
+    /// Evaluates [`evaluate_fallback`] and records the decision as a Kernel
+    /// observation (considered, then used or failed) so fallback use is
+    /// observable rather than silent.
+    pub fn evaluate_fallback_observed(
+        &self,
+        kernel: &KernelId,
+        affinity: &ResourceAffinity,
+        context: &FallbackPolicyContext,
+    ) -> Result<(), ReferenceCpuError> {
+        self.observe(
+            KernelObservation::new(KernelObservationKind::KernelFallbackConsidered)
+                .with_kernel(kernel),
+        );
+        match evaluate_fallback(affinity, context) {
+            Ok(()) => {
+                self.observe(
+                    KernelObservation::new(KernelObservationKind::KernelFallbackUsed)
+                        .with_kernel(kernel),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.observe(
+                    KernelObservation::new(KernelObservationKind::KernelFallbackFailed)
+                        .with_kernel(kernel)
+                        .with_redacted_metadata("error", error.id()),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Requests scratch-space workspace through the Runtime's
+    /// [`MemoryManager`] (used by Kernels, such as `attention`, that
+    /// advertise a required workspace) and returns the allocation to attach
+    /// to the [`KernelInvocation`] via `with_workspace`.
+    pub fn allocate_workspace(
+        &self,
+        memory: &mut MemoryManager,
+        size_bytes: u64,
+    ) -> Result<MemoryAllocationId, MemoryError> {
+        let provider = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+        let request = MemoryAllocationRequest::new(
+            MemoryAllocationClass::TemporaryWorkspace,
+            size_bytes,
+            MemoryPlacement::HostOrdinary,
+            MemoryAllocationOwner::Provider(provider),
+        );
+        memory.allocate(request).map(|allocation| allocation.id)
+    }
+
+    /// Executes one Runtime-created [`KernelInvocation`], then additionally
+    /// requests output allocation and records tensor residency through the
+    /// Runtime's [`MemoryManager`], so Memory Manager accounting stays in
+    /// sync with the Provider's own opaque storage.
+    pub fn execute_invocation_with_memory_manager(
+        &self,
+        advertisement: &KernelAdvertisement,
+        operator: &OperatorSpec,
+        invocation: &KernelInvocation,
+        memory: &mut MemoryManager,
+    ) -> KernelResult {
+        let result = self.execute_invocation(advertisement, operator, invocation);
+        if result.status != KernelResultStatus::Succeeded {
+            return result;
+        }
+        let provider = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+        for resource in &result.updated_resources {
+            let Ok(byte_size) = resource.descriptor.byte_size() else {
+                continue;
+            };
+            let request = MemoryAllocationRequest::new(
+                MemoryAllocationClass::Tensor,
+                byte_size,
+                MemoryPlacement::ProviderOwnedOpaque(provider.clone()),
+                MemoryAllocationOwner::Provider(provider.clone()),
+            )
+            .with_affinity(resource.affinity.clone());
+            match memory.allocate(request) {
+                Ok(allocation) => {
+                    let _ = memory.record_tensor_residency(
+                        TensorResidency::new(
+                            resource.id.clone(),
+                            MemoryPlacement::ProviderOwnedOpaque(provider.clone()),
+                            resource.affinity.clone(),
+                        )
+                        .with_allocation(allocation.id),
+                    );
+                }
+                Err(_) => {
+                    self.observe(
+                        KernelObservation::new(
+                            KernelObservationKind::KernelMemoryFeasibilityFailed,
+                        )
+                        .with_kernel(&invocation.kernel)
+                        .with_invocation(invocation.id.clone()),
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    /// Executes one Runtime-created [`KernelInvocation`] against this
+    /// Provider's advertised Kernel, dispatching to the matching pure kernel
+    /// function and recording its output(s) in opaque host storage.
+    pub fn execute_invocation(
+        &self,
+        advertisement: &KernelAdvertisement,
+        operator: &OperatorSpec,
+        invocation: &KernelInvocation,
+    ) -> KernelResult {
+        self.observe(
+            KernelObservation::new(KernelObservationKind::KernelDispatchStarted)
+                .with_kernel(&invocation.kernel)
+                .with_invocation(invocation.id.clone()),
+        );
+        if invocation.deadline_millis == Some(0) {
+            let error = KernelError::KernelTimeout;
+            self.observe(
+                KernelObservation::new(KernelObservationKind::KernelTimeout)
+                    .with_kernel(&invocation.kernel)
+                    .with_invocation(invocation.id.clone()),
+            );
+            return KernelResult::failure(invocation.id.clone(), error);
+        }
+        match advertisement
+            .validate_invocation(operator, invocation)
+            .and_then(|()| self.run_invocation(invocation))
+        {
+            Ok(result) => {
+                self.observe(
+                    KernelObservation::new(KernelObservationKind::KernelDispatchCompleted)
+                        .with_kernel(&invocation.kernel)
+                        .with_invocation(invocation.id.clone()),
+                );
+                result
+            }
+            Err(error) => {
+                self.observe(
+                    KernelObservation::new(KernelObservationKind::KernelDispatchFailed)
+                        .with_kernel(&invocation.kernel)
+                        .with_invocation(invocation.id.clone())
+                        .with_redacted_metadata("error", error.id()),
+                );
+                KernelResult::failure(invocation.id.clone(), error)
+            }
+        }
+    }
+
+    fn input_tensor(
+        &self,
+        invocation: &KernelInvocation,
+        index: usize,
+    ) -> Result<HostTensor, KernelError> {
+        let resource =
+            invocation
+                .inputs
+                .get(index)
+                .ok_or_else(|| KernelError::KernelExecutionFailed {
+                    reason: format!("missing input at index {index}"),
+                })?;
+        self.read_tensor(&resource.resource.id)
+            .ok_or_else(|| KernelError::KernelExecutionFailed {
+                reason: format!(
+                    "no materialized data for input resource {}",
+                    resource.resource.id
+                ),
+            })
+    }
+
+    fn store_output(
+        &self,
+        invocation: &KernelInvocation,
+        index: usize,
+        tensor: HostTensor,
+    ) -> Result<TensorResourceDescriptor, KernelError> {
+        let resource =
+            invocation
+                .outputs
+                .get(index)
+                .ok_or_else(|| KernelError::KernelExecutionFailed {
+                    reason: format!("missing output at index {index}"),
+                })?;
+        self.write_tensor(resource.resource.id.clone(), tensor);
+        Ok(resource.resource.clone())
+    }
+
+    fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
+        let name = invocation.kernel.name.as_str();
+        let mut result = KernelResult::success(invocation.id.clone());
+        let output = match name {
+            "matmul" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                let transpose_a =
+                    Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                let transpose_b =
+                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                if let Some(OperatorAttributeValue::DType(dtype)) =
+                    invocation.attributes.get("accumulation_dtype")
+                    && *dtype != ComputeDType::Float32
+                {
+                    return Err(KernelError::KernelDTypeUnsupported {
+                        dtype: format!(
+                            "Reference CPU only accumulates in f32; requested {dtype:?}"
+                        ),
+                    });
+                }
+                matmul(&a, &b, transpose_a, transpose_b).map_err(KernelError::from)?
+            }
+            "embedding" => {
+                let table = self.input_tensor(invocation, 0)?;
+                let ids = self.input_tensor(invocation, 1)?;
+                embedding_lookup(&table, &ids).map_err(KernelError::from)?
+            }
+            "rmsnorm" => {
+                let input = self.input_tensor(invocation, 0)?;
+                let weight = self.input_tensor(invocation, 1)?;
+                let epsilon = Self::attribute_float(&invocation.attributes, "epsilon", 1e-6);
+                rmsnorm(&input, &weight, epsilon).map_err(KernelError::from)?
+            }
+            "rope" => {
+                let input = self.input_tensor(invocation, 0)?;
+                let base = Self::attribute_float(&invocation.attributes, "base", 10000.0);
+                let scale = Self::attribute_float(&invocation.attributes, "scale", 1.0);
+                let dimension = Self::attribute_integer(&invocation.attributes, "dimension")
+                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                        attribute: "dimension".into(),
+                    })?;
+                // The portable `rope` Operator's attribute schema defines an
+                // optional `position_mode` string. Reference CPU only
+                // implements the default sequential mode (position = row
+                // index); anything else is explicitly rejected rather than
+                // silently treated as sequential.
+                if let Some(OperatorAttributeValue::String(mode)) =
+                    invocation.attributes.get("position_mode")
+                    && mode != "sequential"
+                {
+                    return Err(KernelError::KernelAttributeUnsupported {
+                        attribute: format!("position_mode '{mode}' is not implemented"),
+                    });
+                }
+                rope(&input, base, scale, dimension).map_err(KernelError::from)?
+            }
+            "attention" => {
+                if cfg!(target_arch = "wasm32") {
+                    // Attention requires a Memory-Manager-backed workspace
+                    // (see the `Host` workspace requirement on its
+                    // advertisement); Host-class workspace allocation is not
+                    // meaningful against browser linear memory, so this
+                    // Kernel is explicitly unsupported there rather than
+                    // silently degraded.
+                    return Err(KernelError::KernelBrowserFeatureUnsupported {
+                        feature: "reference-cpu-attention-workspace".into(),
+                    });
+                }
+                let q = self.input_tensor(invocation, 0)?;
+                let k = self.input_tensor(invocation, 1)?;
+                let v = self.input_tensor(invocation, 2)?;
+                let head_count = Self::attribute_integer(&invocation.attributes, "head_count")
+                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                        attribute: "head_count".into(),
+                    })?;
+                let head_dimension =
+                    Self::attribute_integer(&invocation.attributes, "head_dimension").ok_or_else(
+                        || KernelError::KernelAttributeUnsupported {
+                            attribute: "head_dimension".into(),
+                        },
+                    )?;
+                let kv_head_count =
+                    Self::attribute_integer(&invocation.attributes, "kv_head_count");
+                let window_size = Self::attribute_integer(&invocation.attributes, "window_size");
+                let causal = Self::attribute_bool(&invocation.attributes, "causal", false);
+                // `attention_mask_kind` is a portable Operator attribute
+                // already in the shared schema. Reference CPU supports the
+                // two mask kinds expressible without a dedicated mask
+                // tensor input (arity is fixed at q/k/v by the shared
+                // Operator schema): "causal" and "bidirectional", and
+                // requires them to agree with the `causal` boolean.
+                if let Some(OperatorAttributeValue::String(mask_kind)) =
+                    invocation.attributes.get("attention_mask_kind")
+                {
+                    let expected_causal = match mask_kind.as_str() {
+                        "causal" => true,
+                        "bidirectional" => false,
+                        other => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "attention_mask_kind '{other}' is not implemented"
+                                ),
+                            });
+                        }
+                    };
+                    if expected_causal != causal {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!(
+                                "attention_mask_kind '{mask_kind}' is inconsistent with causal={causal}"
+                            ),
+                        });
+                    }
+                }
+                attention(
+                    &q,
+                    &k,
+                    &v,
+                    head_count,
+                    head_dimension,
+                    kv_head_count,
+                    window_size,
+                    causal,
+                )
+                .map_err(KernelError::from)?
+            }
+            "softmax" => {
+                let input = self.input_tensor(invocation, 0)?;
+                softmax_rows(&input).map_err(KernelError::from)?
+            }
+            "silu" => silu(&self.input_tensor(invocation, 0)?),
+            "gelu" => gelu(&self.input_tensor(invocation, 0)?),
+            "activation" => {
+                let input = self.input_tensor(invocation, 0)?;
+                let kind = match invocation.attributes.get("kind") {
+                    Some(OperatorAttributeValue::String(kind)) => kind.as_str(),
+                    _ => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "kind".into(),
+                        });
+                    }
+                };
+                match kind {
+                    "silu" => silu(&input),
+                    "gelu" => gelu(&input),
+                    other => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("activation kind '{other}' is not implemented"),
+                        });
+                    }
+                }
+            }
+            "add" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                add(&a, &b).map_err(KernelError::from)?
+            }
+            "mul" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                mul(&a, &b).map_err(KernelError::from)?
+            }
+            "residual-add" => {
+                let input = self.input_tensor(invocation, 0)?;
+                let residual = self.input_tensor(invocation, 1)?;
+                residual_add(&input, &residual).map_err(KernelError::from)?
+            }
+            "dtype-conversion" => {
+                let input = self.input_tensor(invocation, 0)?;
+                dtype_conversion(&input, ComputeDType::Float32, ComputeDType::Float32)
+                    .map_err(KernelError::from)?
+            }
+            "layout-conversion" => {
+                let input = self.input_tensor(invocation, 0)?;
+                layout_conversion(
+                    &input,
+                    TensorLayoutKind::Contiguous,
+                    TensorLayoutKind::Contiguous,
+                )
+                .map_err(KernelError::from)?
+            }
+            "quantize" | "dequantize" => return Err(dequantize_placeholder().into()),
+            other => {
+                return Err(KernelError::KernelNotFound {
+                    kernel: other.into(),
+                });
+            }
+        };
+        let descriptor = self.store_output(invocation, 0, output)?;
+        result
+            .output_readiness
+            .insert(descriptor.id.to_string(), true);
+        result.updated_resources.push(descriptor);
+        Ok(result)
+    }
+}
+
+impl ProviderExecutionApi for ReferenceCpuExecutor {
+    fn submit(
+        &self,
+        request: ProviderExecutionRequest,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        let handle = ProviderExecutionHandle::new(
+            request.operation,
+            request.plan.id.clone(),
+            request.provider.clone(),
+            request.device.clone(),
+        );
+        self.submitted.lock().unwrap().push(request);
+        Ok(handle)
+    }
+
+    fn status(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+        Ok(ProviderExecutionStatus::new(
+            handle.clone(),
+            SchedulingState::Completed,
+        ))
+    }
+
+    fn cancel(
+        &self,
+        _handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderCancellationOutcome, ProviderExecutionError> {
+        Ok(ProviderCancellationOutcome::Unsupported)
+    }
+
+    fn complete(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        Ok(ProviderExecutionResult::completed(
+            handle.clone(),
+            Vec::new(),
+        ))
+    }
+
+    fn release(&self, _handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provider
+// ---------------------------------------------------------------------------
+
+/// The Reference CPU Provider itself: correctness baseline for portable
+/// Operator semantics, enabled explicitly by policy (development, test,
+/// conformance, local-runtime, fallback-policy).
+pub struct ReferenceCpuProvider {
+    metadata: ProviderMetadata,
+    device: Arc<DeviceDescriptor>,
+    executor: Arc<ReferenceCpuExecutor>,
+    features: ReferenceCpuFeatureFlags,
+    pressure: Mutex<ProviderPressureLevel>,
+}
+
+impl ReferenceCpuProvider {
+    pub fn new() -> Self {
+        Self::with_features(ReferenceCpuFeatureFlags::baseline())
+    }
+
+    pub fn with_features(features: ReferenceCpuFeatureFlags) -> Self {
+        Self {
+            metadata: reference_cpu_provider_metadata(),
+            device: Arc::new(reference_cpu_device()),
+            executor: Arc::new(ReferenceCpuExecutor::new()),
+            features,
+            pressure: Mutex::new(ProviderPressureLevel::Low),
+        }
+    }
+
+    pub fn features(&self) -> ReferenceCpuFeatureFlags {
+        self.features
+    }
+
+    pub fn executor(&self) -> Arc<ReferenceCpuExecutor> {
+        self.executor.clone()
+    }
+
+    /// Reports this Provider's current pressure. Reference CPU has no
+    /// automatic load model of its own (it executes synchronously with no
+    /// queue), so pressure is reported explicitly by whoever observes real
+    /// load (e.g. the Runtime, from concurrent invocation counts) rather
+    /// than silently defaulting to `Low` regardless of actual usage.
+    pub fn report_pressure(&self, level: ProviderPressureLevel) {
+        *self.pressure.lock().unwrap() = level;
+    }
+}
+
+impl Default for ReferenceCpuProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Provider for ReferenceCpuProvider {
+    fn metadata(&self) -> ProviderMetadata {
+        self.metadata.clone()
+    }
+
+    fn register(&self, _registry: &mut ProviderRegistry) -> Result<(), ProviderError> {
+        // Device registration is performed by the Runtime/ProviderLoader via
+        // `devices()`; registering here too would double-register them.
+        Ok(())
+    }
+
+    fn health(&self) -> ProviderHealth {
+        ProviderHealth::Available
+    }
+
+    fn status_snapshot(&self) -> ProviderStatusSnapshot {
+        let mut snapshot = ProviderStatusSnapshot::from_health_report(self.health_report());
+        snapshot.pressure = *self.pressure.lock().unwrap();
+        snapshot
+    }
+
+    fn devices(&self) -> Vec<Arc<dyn Device>> {
+        vec![self.device.clone()]
+    }
+
+    fn kernel_advertisements(&self) -> Vec<KernelAdvertisement> {
+        let mut advertisements = reference_cpu_kernel_advertisements();
+        if !self.features.attention {
+            advertisements.retain(|advertisement| advertisement.id.name != "attention");
+        }
+        if !self.features.rope {
+            advertisements.retain(|advertisement| advertisement.id.name != "rope");
+        }
+        advertisements
+    }
+
+    fn initialize(&self) -> Result<(), ProviderError> {
+        // No Runtime-wide provider/device registration observability channel
+        // exists yet for any Provider (see `design.md`), so these are
+        // recorded on this Provider's own executor, inspectable by tests and
+        // by any caller holding the executor handle.
+        self.executor.observe(
+            KernelObservation::new(KernelObservationKind::ProviderRegistered)
+                .with_redacted_metadata("provider", REFERENCE_CPU_PROVIDER_NAME),
+        );
+        self.executor.observe(
+            KernelObservation::new(KernelObservationKind::DeviceDetected)
+                .with_redacted_metadata("device", REFERENCE_CPU_DEVICE_ID),
+        );
+        Ok(())
+    }
+
+    fn shutdown(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    fn execution_api(&self) -> Option<&dyn ProviderExecutionApi> {
+        Some(self.executor.as_ref())
+    }
+}

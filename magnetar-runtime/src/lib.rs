@@ -32,6 +32,7 @@ pub mod operator;
 pub mod planning;
 pub mod prefix_cache;
 pub mod provider;
+pub mod reference_cpu;
 pub mod resolution;
 pub mod runtime;
 pub mod sampling;
@@ -123,7 +124,9 @@ pub use conformance::{
     ProviderConformanceTargetKind, ProviderConformanceTestResult, ProviderConformanceTestStatus,
     provider_conformance_profile_ids, provider_conformance_report_json,
 };
-pub use device::{Device, DeviceDescriptor, DeviceId, DeviceMetadata, DeviceType};
+pub use device::{
+    Device, DeviceDescriptor, DeviceExecutionLimits, DeviceId, DeviceMetadata, DeviceType,
+};
 pub use execution_graph::{
     ExecutionGraph, ExecutionGraphId, ExecutionGraphPhase, ExecutionGraphPlan,
     ExecutionGraphProducer, ExecutionGraphVersion, ExecutionNode, ExecutionNodeId,
@@ -278,6 +281,17 @@ pub use provider::{
     ProviderAbiRetentionPolicy, ProviderAbiThreadingModel, ProviderAbiUnloadPolicy,
     ProviderAbiVersion, ProviderDescriptor, ProviderError, ProviderExecutionApi, ProviderLoader,
     ProviderLoadingMode, ProviderLoadingPolicy, ProviderMetadata, ProviderRegistry,
+};
+pub use reference_cpu::{
+    FallbackPolicyContext, HostTensor, REFERENCE_CPU_BUILT_IN, REFERENCE_CPU_CONFORMANCE_PROFILE,
+    REFERENCE_CPU_DEVICE_ID, REFERENCE_CPU_KERNEL_FAMILY, REFERENCE_CPU_PROVIDER_NAME,
+    REFERENCE_CPU_PROVIDER_VENDOR, REFERENCE_CPU_PROVIDER_VERSION,
+    REFERENCE_CPU_SUPPORTED_RUNTIME_VERSION_RANGE, ReferenceCpuConformanceCheck,
+    ReferenceCpuConformanceReport, ReferenceCpuError, ReferenceCpuErrorCode, ReferenceCpuExecutor,
+    ReferenceCpuFeatureFlags, ReferenceCpuProvider, add, attention, dequantize_placeholder,
+    dtype_conversion, embedding_lookup, evaluate_fallback, gelu, layout_conversion, matmul, mul,
+    reference_cpu_device, reference_cpu_kernel_advertisements, reference_cpu_provider_metadata,
+    residual_add, rmsnorm, rope, silu, softmax_rows,
 };
 pub use resolution::{
     BuiltInResolutionPolicy, ResolutionCandidate, ResolutionCandidateRejection, ResolutionContext,

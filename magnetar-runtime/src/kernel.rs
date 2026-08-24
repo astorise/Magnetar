@@ -848,6 +848,8 @@ impl KernelConformanceProfile {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum KernelObservationKind {
+    ProviderRegistered,
+    DeviceDetected,
     KernelAdvertised,
     KernelAdvertisementReceived,
     KernelAdvertisementAccepted,

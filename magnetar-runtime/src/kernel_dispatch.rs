@@ -421,6 +421,11 @@ impl KernelDispatcher {
                 memory_capacity: status.capacity.available_memory_bytes.unwrap_or(0),
                 compute_units: 0,
                 execution_capabilities: Default::default(),
+                dtype_support: Default::default(),
+                layout_support: Default::default(),
+                memory_class_support: Default::default(),
+                execution_limits: Default::default(),
+                pressure: Default::default(),
                 provider: status.provider.to_string(),
             });
             if !matches!(

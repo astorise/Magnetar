@@ -24,6 +24,18 @@ pub enum DeviceType {
     Other,
 }
 
+/// Soft, Device-level execution limits, coarser than the per-Kernel
+/// constraints a Provider advertises on each [`crate::KernelAdvertisement`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeviceExecutionLimits {
+    /// Maximum number of Kernel invocations this Device can usefully run
+    /// concurrently, if bounded.
+    pub max_concurrent_operations: Option<u32>,
+    /// Maximum workspace size, in bytes, this Device can provide to a single
+    /// Kernel invocation, if bounded.
+    pub max_workspace_bytes: Option<u64>,
+}
+
 /// Immutable metadata describing a hardware execution target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceMetadata {
@@ -35,6 +47,16 @@ pub struct DeviceMetadata {
     pub memory_capacity: u64,
     pub compute_units: u32,
     pub execution_capabilities: BTreeSet<CapabilityId>,
+    /// Portable dtypes this Device can execute directly.
+    pub dtype_support: BTreeSet<ComputeDType>,
+    /// Tensor layouts this Device can execute directly.
+    pub layout_support: BTreeSet<TensorLayoutKind>,
+    /// Memory classes this Device supports for tensor placement.
+    pub memory_class_support: BTreeSet<KernelMemoryClass>,
+    /// Soft, Device-level execution limits.
+    pub execution_limits: DeviceExecutionLimits,
+    /// Coarse current pressure signal for this Device.
+    pub pressure: ProviderPressureLevel,
     /// Stable name of the Provider that discovered this device.
     pub provider: String,
 }
@@ -54,6 +76,11 @@ impl DeviceMetadata {
             memory_capacity: 0,
             compute_units: 0,
             execution_capabilities: BTreeSet::new(),
+            dtype_support: BTreeSet::new(),
+            layout_support: BTreeSet::new(),
+            memory_class_support: BTreeSet::new(),
+            execution_limits: DeviceExecutionLimits::default(),
+            pressure: ProviderPressureLevel::default(),
             provider: provider.into(),
         }
     }
