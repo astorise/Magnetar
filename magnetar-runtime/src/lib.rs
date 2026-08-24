@@ -29,6 +29,7 @@ pub mod model_instance;
 pub mod model_loading;
 pub mod observability;
 pub mod operator;
+pub mod operator_scope;
 pub mod planning;
 pub mod prefix_cache;
 pub mod provider;
@@ -257,6 +258,17 @@ pub use operator::{
     OperatorMemoryBehavior, OperatorObservation, OperatorObservationKind, OperatorSpec, ShapeRule,
     TensorLayoutKind, TensorRole, initial_operator_catalog, layout_kind,
     validate_affinity_compatibility,
+};
+pub use operator_scope::{
+    FIRST_OPERATOR_SCOPE_VERSION, FirstScopeDTypeTier, FirstScopeError, FirstScopeErrorCode,
+    FirstScopeLayoutTier, FirstScopeObservation, FirstScopeObservationKind,
+    FutureOptimizedOperator, OperatorScopeEntry, OperatorScopeTier, first_operator_scope,
+    first_scope_dtype_tier, first_scope_layout_tier, first_scope_required_fixture_names,
+    future_optimized_operators, operator_scope_entry, validate_first_scope_dtype,
+    validate_first_scope_graph, validate_first_scope_kernel_selection_request,
+    validate_first_scope_layout, validate_model_component_first_scope_requirements,
+    validate_no_placeholder_kernel_advertisements, validate_reference_cpu_required_kernel_coverage,
+    validate_required_now_operator,
 };
 pub use planning::{
     BufferLifetime, ComputeExecutionClassification, ComputeExecutionPhase, ComputeExecutionPlan,

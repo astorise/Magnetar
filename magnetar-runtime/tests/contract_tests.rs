@@ -13,6 +13,7 @@ mod contract_tests {
     mod model_component;
     mod model_instance;
     mod model_loading;
+    mod operator_scope;
     mod prefix_cache;
     mod provider;
     mod resolution;

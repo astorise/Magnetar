@@ -1045,6 +1045,16 @@ impl ReferenceCpuExecutor {
             detail: matmul_result.err().map(|error| error.to_string()),
         });
 
+        let embedding_result = embedding_lookup(
+            &HostTensor::new([2, 2], [1.0, 2.0, 3.0, 4.0]).unwrap(),
+            &HostTensor::new([1], [1.0]).unwrap(),
+        );
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "embedding-known-output",
+            passed: matches!(&embedding_result, Ok(output) if close(&output.data, &[3.0, 4.0])),
+            detail: embedding_result.err().map(|error| error.to_string()),
+        });
+
         let rmsnorm_result = rmsnorm(
             &HostTensor::new([1, 2], [3.0, 4.0]).unwrap(),
             &HostTensor::new([2], [1.0, 1.0]).unwrap(),
@@ -1056,6 +1066,34 @@ impl ReferenceCpuExecutor {
             name: "rmsnorm-known-output",
             passed: matches!(&rmsnorm_result, Ok(output) if close(&output.data, &[3.0 * rmsnorm_scale, 4.0 * rmsnorm_scale])),
             detail: rmsnorm_result.err().map(|error| error.to_string()),
+        });
+
+        let rope_result = rope(
+            &HostTensor::new([1, 2], [1.0, 0.0]).unwrap(),
+            10000.0,
+            1.0,
+            2,
+        );
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "rope-baseline-known-output",
+            passed: matches!(&rope_result, Ok(output) if close(&output.data, &[1.0, 0.0])),
+            detail: rope_result.err().map(|error| error.to_string()),
+        });
+
+        let attention_result = attention(
+            &HostTensor::new([1, 2], [1.0, 0.0]).unwrap(),
+            &HostTensor::new([1, 2], [1.0, 0.0]).unwrap(),
+            &HostTensor::new([1, 2], [5.0, 6.0]).unwrap(),
+            1,
+            2,
+            None,
+            None,
+            true,
+        );
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "attention-single-token-known-output",
+            passed: matches!(&attention_result, Ok(output) if close(&output.data, &[5.0, 6.0])),
+            detail: attention_result.err().map(|error| error.to_string()),
         });
 
         let softmax_result = softmax_rows(&HostTensor::new([1, 2], [0.0, 0.0]).unwrap());
@@ -1080,6 +1118,50 @@ impl ReferenceCpuExecutor {
             name: "add-known-output",
             passed: matches!(&add_result, Ok(output) if close(&output.data, &[4.0, 6.0])),
             detail: add_result.err().map(|error| error.to_string()),
+        });
+
+        let mul_result = mul(
+            &HostTensor::new([2], [2.0, 3.0]).unwrap(),
+            &HostTensor::new([2], [4.0, 5.0]).unwrap(),
+        );
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "mul-known-output",
+            passed: matches!(&mul_result, Ok(output) if close(&output.data, &[8.0, 15.0])),
+            detail: mul_result.err().map(|error| error.to_string()),
+        });
+
+        let residual_add_result = residual_add(
+            &HostTensor::new([2], [1.0, 2.0]).unwrap(),
+            &HostTensor::new([2], [10.0, 20.0]).unwrap(),
+        );
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "residual-add-known-output",
+            passed: matches!(&residual_add_result, Ok(output) if close(&output.data, &[11.0, 22.0])),
+            detail: residual_add_result.err().map(|error| error.to_string()),
+        });
+
+        let dtype_conversion_result = dtype_conversion(
+            &HostTensor::new([1], [1.0]).unwrap(),
+            ComputeDType::Float32,
+            ComputeDType::Float32,
+        );
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "dtype-conversion-f32-explicit",
+            passed: matches!(&dtype_conversion_result, Ok(output) if close(&output.data, &[1.0])),
+            detail: dtype_conversion_result.err().map(|error| error.to_string()),
+        });
+
+        let layout_conversion_result = layout_conversion(
+            &HostTensor::new([1], [1.0]).unwrap(),
+            TensorLayoutKind::Contiguous,
+            TensorLayoutKind::Contiguous,
+        );
+        checks.push(ReferenceCpuConformanceCheck {
+            name: "layout-conversion-contiguous-explicit",
+            passed: matches!(&layout_conversion_result, Ok(output) if close(&output.data, &[1.0])),
+            detail: layout_conversion_result
+                .err()
+                .map(|error| error.to_string()),
         });
 
         let report = ReferenceCpuConformanceReport {
