@@ -6,6 +6,7 @@ mod contract_tests {
     mod batching;
     mod component;
     mod distribution;
+    mod kernel;
     mod kv_cache;
     mod model;
     mod model_instance;

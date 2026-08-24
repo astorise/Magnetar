@@ -18,6 +18,7 @@ pub mod conformance;
 pub mod device;
 pub mod execution_graph;
 pub mod generation;
+pub mod kernel;
 pub mod kv_cache;
 pub mod memory;
 pub mod model;
@@ -138,6 +139,16 @@ pub use generation::{
     StopConditions, StreamingMode, decode_step, decode_step_from_sampling,
     finish_reason_from_provider_error, memory_admission, prefill, prepare_stop_sequences,
     stop_reason_for, streaming_text_chunk, token_stream_events,
+};
+pub use kernel::{
+    KernelAdapterMetadata, KernelAdvertisement, KernelAliasing, KernelBatchMetadata,
+    KernelCancellationSupport, KernelConformanceProfile, KernelDeterminism, KernelError,
+    KernelErrorCode, KernelExecutionMode, KernelFallbackClass, KernelFusionMetadata, KernelId,
+    KernelImplementationFamily, KernelInvocation, KernelInvocationId, KernelKvCacheMetadata,
+    KernelMemoryClass, KernelObservation, KernelObservationKind, KernelOperatorVersionRange,
+    KernelPrecisionMetadata, KernelPrefixCacheMetadata, KernelResource, KernelResult,
+    KernelResultStatus, KernelShapeConstraints, KernelWorkspaceLifetime,
+    KernelWorkspaceRequirements, KernelWorkspaceReuse,
 };
 pub use kv_cache::{
     KvCache, KvCacheCompatibility, KvCacheError, KvCacheId, KvCacheLayoutFormat,
