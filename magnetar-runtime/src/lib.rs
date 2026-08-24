@@ -18,6 +18,7 @@ pub mod conformance;
 pub mod device;
 pub mod execution_graph;
 pub mod generation;
+pub mod inference_api;
 pub mod kernel;
 pub mod kernel_dispatch;
 pub mod kernel_registry;
@@ -144,10 +145,31 @@ pub use generation::{
     FinishReason, GenerationDiagnostic, GenerationDiagnosticKind, GenerationError, GenerationEvent,
     GenerationEventKind, GenerationMemoryEstimate, GenerationModelReference, GenerationOutput,
     GenerationParameters, GenerationPriority, GenerationRequest, GenerationRequestId,
-    GenerationTokenizerReference, LogitsProcessorReference, PrefillState, Probability,
-    StopConditions, StreamingMode, decode_step, decode_step_from_sampling,
+    GenerationTokenizerReference, GenerationUsage, LogitsProcessorReference, PrefillState,
+    Probability, StopConditions, StreamingMode, decode_step, decode_step_from_sampling,
     finish_reason_from_provider_error, memory_admission, prefill, prepare_stop_sequences,
     stop_reason_for, streaming_text_chunk, token_stream_events,
+};
+pub use inference_api::{
+    AdmissionState, BrowserInferenceCapabilities, CacheUsageSummary, CancellationOutcome,
+    CancellationStage, CancellationToken, ChatMessage, ChatTemplateFormatter,
+    FORBIDDEN_INFERENCE_API_SCOPES, GenerationApiRequest, GenerationResult, InferenceApiError,
+    InferenceApiObservation, InferenceApiObservationKind, InferenceApiObserver,
+    ModelLoadingApiRequest, ModelRef, ModelRegistry, ModelResolutionRequest, ModelResolutionResult,
+    ModelResolutionSource, ModelResolutionStatus, PromptInput, RuntimeDiagnostics,
+    RuntimeDiagnosticsInputs, StreamingDecodeRequest, StreamingHandle, TokenizationRequest,
+    TokenizationResult, UNSUPPORTED_BROWSER_FEATURES, UsageReport, activate_adapter,
+    activate_adapter_observed, build_generation_request, cancel_inference_session,
+    close_inference_session, close_inference_session_observed, create_inference_session,
+    create_inference_session_observed, create_model_instance, create_model_instance_observed,
+    create_one_shot_session, decode_tokens, decode_tokens_streaming, drain_model_instance,
+    load_model, load_model_observed, model_instance_status, prepare_generation,
+    request_cancellation, request_cancellation_at_stage, request_cancellation_at_stage_observed,
+    require_browser_supported, resume_model_instance, run_generation_loop, runtime_diagnostics,
+    runtime_diagnostics_with, session_status, submit_generation, submit_generation_observed,
+    suspend_model_instance, tokenize_prompt_input, tokenize_prompt_input_observed,
+    unload_model_instance, validate_inference_scope, validate_inference_scopes,
+    validate_tokenizer_compatibility, warm_model_instance,
 };
 pub use kernel::{
     KernelAdapterMetadata, KernelAdvertisement, KernelAliasing, KernelBatchMetadata,
