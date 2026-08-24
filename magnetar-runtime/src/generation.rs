@@ -7,9 +7,10 @@
 use crate::{
     CorrelationId, InferenceSessionId, MemoryAdmissionDecision, MemoryAdmissionRequest,
     MemoryAllocationClass, MemoryAllocationOwner, MemoryAllocationRequest, MemoryManager,
-    MemoryPlacement, ModelArtifactId, ProviderExecutionErrorCode, RuntimeTokenizer, SamplingPolicy,
-    SamplingRequest, SamplingRequestId, SamplingResult, SamplingStopMetadata, StreamingDecodeState,
-    TokenId, TokenStopPattern, Tokenizer, TokenizerError, TokenizerId, TokenizerMetadata, TraceId,
+    MemoryPlacement, ModelArtifactId, ModelInstanceId, ProviderExecutionErrorCode,
+    RuntimeTokenizer, SamplingPolicy, SamplingRequest, SamplingRequestId, SamplingResult,
+    SamplingStopMetadata, StreamingDecodeState, TokenId, TokenStopPattern, Tokenizer,
+    TokenizerError, TokenizerId, TokenizerMetadata, TraceId,
 };
 use std::{error::Error, fmt};
 
@@ -38,6 +39,7 @@ impl fmt::Display for GenerationRequestId {
 pub enum GenerationModelReference {
     ModelArtifact(ModelArtifactId),
     LoadedModelContext(String),
+    ModelInstance(ModelInstanceId),
     FutureModelInstance(String),
 }
 

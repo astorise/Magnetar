@@ -8,12 +8,12 @@
 //! token selection semantics.
 
 use crate::{
-    ComputeDType, DTypeDescriptor, DeviceBinding, GenerationModelReference, GenerationPriority,
-    GenerationRequest, GenerationRequestId, InferenceSessionId, KvCacheId, KvCacheLayoutFormat,
-    MemoryAdmissionRequest, MemoryAllocationClass, MemoryAllocationId, MemoryAllocationLifetime,
-    MemoryAllocationOwner, MemoryAllocationRequest, MemoryPlacement, MemoryPressureLevel,
-    PrefixCacheEntryId, ProviderBinding, ProviderPressureLevel, ResourceAffinity, SamplingPolicy,
-    TokenizerId,
+    AdapterSetId, ComputeDType, DTypeDescriptor, DeviceBinding, GenerationModelReference,
+    GenerationPriority, GenerationRequest, GenerationRequestId, InferenceSessionId, KvCacheId,
+    KvCacheLayoutFormat, MemoryAdmissionRequest, MemoryAllocationClass, MemoryAllocationId,
+    MemoryAllocationLifetime, MemoryAllocationOwner, MemoryAllocationRequest, MemoryPlacement,
+    MemoryPressureLevel, ModelInstanceReadiness, PrefixCacheEntryId, ProviderBinding,
+    ProviderPressureLevel, ResourceAffinity, SamplingPolicy, TokenizerId,
 };
 use std::{collections::BTreeMap, error::Error, fmt};
 
@@ -204,6 +204,9 @@ pub struct BatchCompatibility {
     pub sampling_policy: Option<SamplingPolicy>,
     pub memory_placement: Option<MemoryPlacement>,
     pub provider_assisted_sampling: bool,
+    pub model_instance_readiness: Option<ModelInstanceReadiness>,
+    pub active_adapter_set: Option<AdapterSetId>,
+    pub provider_pressure: Option<ProviderPressureLevel>,
 }
 
 impl BatchCompatibility {
@@ -222,6 +225,9 @@ impl BatchCompatibility {
             sampling_policy: None,
             memory_placement: Some(request.memory.placement.clone()),
             provider_assisted_sampling: false,
+            model_instance_readiness: None,
+            active_adapter_set: None,
+            provider_pressure: None,
         }
     }
 
@@ -255,6 +261,25 @@ impl BatchCompatibility {
             return Err(BatchingError::BatchCompatibilityFailed {
                 reason: "provider-assisted sampling policy differs".into(),
             });
+        }
+        if self.model_instance_readiness != other.model_instance_readiness {
+            return Err(BatchingError::BatchCompatibilityFailed {
+                reason: "model instance readiness differs".into(),
+            });
+        }
+        if self.active_adapter_set != other.active_adapter_set {
+            return Err(BatchingError::BatchCompatibilityFailed {
+                reason: "active adapter set differs".into(),
+            });
+        }
+        if matches!(
+            self.provider_pressure,
+            Some(ProviderPressureLevel::Saturated)
+        ) || matches!(
+            other.provider_pressure,
+            Some(ProviderPressureLevel::Saturated)
+        ) {
+            return Err(BatchingError::ProviderSaturated);
         }
         if let (Some(left), Some(right)) = (&self.affinity, &other.affinity) {
             left.validate_with(right)

@@ -20,6 +20,7 @@ pub mod generation;
 pub mod kv_cache;
 pub mod memory;
 pub mod model;
+pub mod model_instance;
 pub mod model_loading;
 pub mod observability;
 pub mod planning;
@@ -152,6 +153,18 @@ pub use model::{
     ModelProvenance, ModelQuantization, ModelQuantizationFormat, ModelResidencyPlan, ModelRevision,
     ModelShard, ModelShardId, ModelSignature, ModelSourceIdentity, ModelTensorMetadata,
     ModelTrustDecision, ModelTrustStatus, ModelTrustStore, ModelVariant,
+};
+pub use model_instance::{
+    ModelInstance, ModelInstanceAdapterState, ModelInstanceCreationChecks, ModelInstanceDefinition,
+    ModelInstanceError, ModelInstanceId, ModelInstanceInvalidationReport,
+    ModelInstanceLifecycleState, ModelInstanceManager, ModelInstanceMutationKind,
+    ModelInstanceObservation, ModelInstanceObservationKind, ModelInstancePlacement,
+    ModelInstancePolicy, ModelInstanceReadiness, ModelInstanceReadinessChecks,
+    ModelInstanceReloadRequest, ModelInstanceResourceBindings, ModelInstanceSharingContext,
+    ModelInstanceSharingPolicy, ModelInstanceStatus, ModelInstanceSuspensionReason,
+    ModelInstanceUnloadPolicy, ModelInstanceUnloadReport, ModelInstanceUsage,
+    ModelInstanceWarmupPlan, ModelInstanceWarmupPolicy, ModelInstanceWarmupStep,
+    ProviderModelResource, readiness_error, readiness_for_lifecycle,
 };
 pub use model_loading::{
     ArtifactResidencyPlan, LoadedModelContext, ModelArchitectureImplementation,

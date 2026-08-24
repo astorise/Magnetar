@@ -102,6 +102,7 @@ impl RuntimeBuilder {
             },
             memory: MemoryManager::new(self.config.memory),
             batching: ContinuousBatchingManager::new(),
+            model_instances: ModelInstanceManager::new(),
             kv_caches: KvCacheManager::new(),
             prefix_caches: PrefixCacheManager::new(),
             providers,
@@ -116,6 +117,7 @@ pub struct Runtime {
     context: ExecutionContext,
     memory: MemoryManager,
     batching: ContinuousBatchingManager,
+    model_instances: ModelInstanceManager,
     kv_caches: KvCacheManager,
     prefix_caches: PrefixCacheManager,
     providers: ProviderLoader,
@@ -150,6 +152,12 @@ impl Runtime {
     }
     pub fn batching_mut(&mut self) -> &mut ContinuousBatchingManager {
         &mut self.batching
+    }
+    pub fn model_instances(&self) -> &ModelInstanceManager {
+        &self.model_instances
+    }
+    pub fn model_instances_mut(&mut self) -> &mut ModelInstanceManager {
+        &mut self.model_instances
     }
     pub fn kv_caches(&self) -> &KvCacheManager {
         &self.kv_caches
@@ -388,6 +396,54 @@ impl Runtime {
     }
     pub fn create_continuous_batch(&mut self, policy: BatchingPolicy) -> BatchId {
         self.batching.create_batch(policy)
+    }
+    pub fn create_model_instance(
+        &mut self,
+        loaded: &LoadedModelContext,
+        architecture: ModelArchitectureImplementation,
+        affinity: ResourceAffinity,
+    ) -> Result<ModelInstanceId, ModelInstanceError> {
+        let definition =
+            ModelInstanceDefinition::from_loaded_context(loaded, architecture, affinity);
+        self.model_instances.create(definition)
+    }
+    pub fn model_instance(
+        &self,
+        instance: &ModelInstanceId,
+    ) -> Result<&ModelInstance, ModelInstanceError> {
+        self.model_instances.instance(instance)
+    }
+    pub fn model_instance_status(
+        &self,
+        instance: &ModelInstanceId,
+    ) -> Result<ModelInstanceStatus, ModelInstanceError> {
+        Ok(self.model_instance(instance)?.status())
+    }
+    pub fn model_instance_generation_reference(
+        &self,
+        instance: &ModelInstanceId,
+    ) -> Result<GenerationModelReference, ModelInstanceError> {
+        self.model_instances.generation_reference(instance)
+    }
+    pub fn acquire_model_instance_usage(
+        &mut self,
+        instance: &ModelInstanceId,
+        now_millis: u64,
+    ) -> Result<(), ModelInstanceError> {
+        self.model_instances.acquire_usage(instance, now_millis)
+    }
+    pub fn release_model_instance_usage(
+        &mut self,
+        instance: &ModelInstanceId,
+    ) -> Result<(), ModelInstanceError> {
+        self.model_instances.release_usage(instance)
+    }
+    pub fn unload_model_instance(
+        &mut self,
+        instance: &ModelInstanceId,
+        policy: ModelInstanceUnloadPolicy,
+    ) -> Result<ModelInstanceUnloadReport, ModelInstanceError> {
+        self.model_instances.unload(instance, policy)
     }
     pub fn admit_generation_to_batch(
         &mut self,
