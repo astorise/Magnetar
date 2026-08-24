@@ -16,6 +16,7 @@ pub mod component_web;
 pub mod compute;
 pub mod conformance;
 pub mod device;
+pub mod execution_graph;
 pub mod generation;
 pub mod kv_cache;
 pub mod memory;
@@ -23,6 +24,7 @@ pub mod model;
 pub mod model_instance;
 pub mod model_loading;
 pub mod observability;
+pub mod operator;
 pub mod planning;
 pub mod prefix_cache;
 pub mod provider;
@@ -118,6 +120,15 @@ pub use conformance::{
     provider_conformance_profile_ids, provider_conformance_report_json,
 };
 pub use device::{Device, DeviceDescriptor, DeviceId, DeviceMetadata, DeviceType};
+pub use execution_graph::{
+    ExecutionGraph, ExecutionGraphId, ExecutionGraphPhase, ExecutionGraphPlan,
+    ExecutionGraphProducer, ExecutionGraphVersion, ExecutionNode, ExecutionNodeId,
+    GraphAdapterMetadata, GraphError, GraphKvCacheBehavior, GraphKvCacheMetadata,
+    GraphModelCompatibility, GraphObservation, GraphObservationKind, GraphPlanStep,
+    GraphPlanningPolicy, GraphPrefixCacheMetadata, GraphValidationReport, TensorAliasing,
+    TensorEdge, TensorEdgeId, TensorLifetimeHint, TensorMutability, TensorResidencyConstraint,
+    default_graph_catalog, execute_graph_boundary, plan_execution_graph, validate_execution_graph,
+};
 pub use generation::{
     CancellationMetadata, DecodeStepInput, DecodeStepOutput, EosMode, EosOutputPolicy, EosPolicy,
     FinishReason, GenerationDiagnostic, GenerationDiagnosticKind, GenerationError, GenerationEvent,
@@ -195,6 +206,14 @@ pub use observability::{
     observability_emit_wit, observability_reader_capability, observability_reader_wit,
     observability_stream_capability, observability_stream_wit, opentelemetry_exporter_component,
     prometheus_exposer_component, prometheus_snapshot_lines, runtime_observability_wit,
+};
+pub use operator::{
+    OPERATOR_CATALOG_VERSION, OPERATOR_NAMESPACE, OperatorAttributeKind, OperatorAttributeRule,
+    OperatorAttributeSchema, OperatorAttributeValue, OperatorCatalog, OperatorDTypeContract,
+    OperatorDeterminism, OperatorError, OperatorFamily, OperatorId, OperatorLayoutContract,
+    OperatorMemoryBehavior, OperatorObservation, OperatorObservationKind, OperatorSpec, ShapeRule,
+    TensorLayoutKind, TensorRole, initial_operator_catalog, layout_kind,
+    validate_affinity_compatibility,
 };
 pub use planning::{
     BufferLifetime, ComputeExecutionClassification, ComputeExecutionPhase, ComputeExecutionPlan,
