@@ -33,6 +33,7 @@ pub mod operator_scope;
 pub mod planning;
 pub mod prefix_cache;
 pub mod provider;
+pub mod qwen_model_component;
 pub mod reference_cpu;
 pub mod resolution;
 pub mod runtime;
@@ -294,6 +295,18 @@ pub use provider::{
     ProviderAbiRetentionPolicy, ProviderAbiThreadingModel, ProviderAbiUnloadPolicy,
     ProviderAbiVersion, ProviderDescriptor, ProviderError, ProviderExecutionApi, ProviderLoader,
     ProviderLoadingMode, ProviderLoadingPolicy, ProviderMetadata, ProviderRegistry,
+};
+pub use qwen_model_component::{
+    QWEN_ARCHITECTURE_FAMILY, QWEN_BASELINE_CONTRACT_VERSION, QwenComponentError, QwenConfig,
+    QwenRopeConfig, QwenRopePositionMode, qwen_adapter_architecture_compatibility,
+    qwen_architecture_metadata, qwen_authority, qwen_browser_supported,
+    qwen_component_compatibility_key, qwen_component_descriptor, qwen_component_identity,
+    qwen_conformance_fixture_names, qwen_decode_graph, qwen_expected_tensor_names,
+    qwen_expected_tensor_shape, qwen_kv_cache_metadata, qwen_operator_requirements,
+    qwen_prefill_graph, qwen_quantization_compatibility, qwen_target_modules,
+    qwen_tokenizer_compatibility, qwen_validate_generation_defaults, qwen_validate_model_artifact,
+    qwen_validate_reference_cpu_coverage, qwen_validate_tensor_inventory,
+    qwen_validate_tensor_shapes, qwen_validate_tokenizer_compatibility,
 };
 pub use reference_cpu::{
     FallbackPolicyContext, HostTensor, REFERENCE_CPU_BUILT_IN, REFERENCE_CPU_CONFORMANCE_PROFILE,
