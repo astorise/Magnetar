@@ -19,6 +19,8 @@ pub mod device;
 pub mod execution_graph;
 pub mod generation;
 pub mod kernel;
+pub mod kernel_dispatch;
+pub mod kernel_registry;
 pub mod kv_cache;
 pub mod memory;
 pub mod model;
@@ -149,6 +151,16 @@ pub use kernel::{
     KernelPrecisionMetadata, KernelPrefixCacheMetadata, KernelResource, KernelResult,
     KernelResultStatus, KernelShapeConstraints, KernelWorkspaceLifetime,
     KernelWorkspaceRequirements, KernelWorkspaceReuse,
+};
+pub use kernel_dispatch::{
+    KernelDispatchError, KernelDispatchLifecycleState, KernelDispatchPlan, KernelDispatchPlanId,
+    KernelDispatchResult, KernelDispatchRevalidationContext, KernelDispatcher, KernelFallbackStep,
+    kernel_dispatch_error_from_provider_execution,
+};
+pub use kernel_registry::{
+    KernelCandidate, KernelCandidateRejection, KernelRegistrationAuthority, KernelRegistry,
+    KernelRegistryEntry, KernelRegistryError, KernelSelectionRequest, KernelSelectionResult,
+    validate_kernel_advertisement,
 };
 pub use kv_cache::{
     KvCache, KvCacheCompatibility, KvCacheError, KvCacheId, KvCacheLayoutFormat,

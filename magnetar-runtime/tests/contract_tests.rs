@@ -7,6 +7,7 @@ mod contract_tests {
     mod component;
     mod distribution;
     mod kernel;
+    mod kernel_registry_dispatch;
     mod kv_cache;
     mod model;
     mod model_instance;

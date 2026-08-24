@@ -92,8 +92,17 @@ impl RuntimeBuilder {
     }
     pub fn build(self) -> Result<Runtime, ProviderError> {
         let mut providers = ProviderLoader::new();
+        let mut kernel_registry = KernelRegistry::new();
         for x in self.providers {
+            let advertisements = x.kernel_advertisements();
+            let provider_name = x.metadata().name;
+            let provider_binding = ProviderBinding::new(provider_name);
             providers.register_provider_isolated(x);
+            for advertisement in advertisements {
+                if let Err(error) = kernel_registry.register_provider_advertisement(advertisement) {
+                    kernel_registry.invalidate_provider(&provider_binding, error.code());
+                }
+            }
         }
         let runtime = Runtime {
             context: ExecutionContext {
@@ -105,6 +114,7 @@ impl RuntimeBuilder {
             model_instances: ModelInstanceManager::new(),
             kv_caches: KvCacheManager::new(),
             prefix_caches: PrefixCacheManager::new(),
+            kernel_registry,
             providers,
             sessions: BTreeMap::new(),
             session_observations: Vec::new(),
@@ -120,6 +130,7 @@ pub struct Runtime {
     model_instances: ModelInstanceManager,
     kv_caches: KvCacheManager,
     prefix_caches: PrefixCacheManager,
+    kernel_registry: KernelRegistry,
     providers: ProviderLoader,
     sessions: BTreeMap<InferenceSessionId, InferenceSession>,
     session_observations: Vec<SessionObservation>,
@@ -170,6 +181,12 @@ impl Runtime {
     }
     pub fn prefix_caches_mut(&mut self) -> &mut PrefixCacheManager {
         &mut self.prefix_caches
+    }
+    pub fn kernel_registry(&self) -> &KernelRegistry {
+        &self.kernel_registry
+    }
+    pub fn kernel_registry_mut(&mut self) -> &mut KernelRegistry {
+        &mut self.kernel_registry
     }
     pub fn providers(&self) -> &ProviderLoader {
         &self.providers
@@ -613,7 +630,14 @@ impl Runtime {
             .collect()
     }
     pub fn register_provider(&mut self, x: Arc<dyn Provider>) -> Result<(), ProviderError> {
-        self.providers.register_provider(x)
+        let advertisements = x.kernel_advertisements();
+        self.providers.register_provider(x)?;
+        for advertisement in advertisements {
+            self.kernel_registry
+                .register_provider_advertisement(advertisement)
+                .map_err(|error| ProviderError::InvalidAdvertisement(error.to_string()))?;
+        }
+        Ok(())
     }
     /// Returns every registered execution target in deterministic ID order.
     pub fn devices(&self) -> impl Iterator<Item = &dyn Device> {
@@ -2191,6 +2215,15 @@ impl Runtime {
     }
     pub fn shutdown(&mut self) {
         let _ = self.providers.shutdown();
+        let providers = self
+            .kernel_registry
+            .entries()
+            .map(|entry| entry.advertisement.id.provider.clone())
+            .collect::<Vec<_>>();
+        for provider in providers {
+            self.kernel_registry
+                .invalidate_provider(&provider, "runtime shutdown");
+        }
         for session in self.sessions.values_mut() {
             let _ = session.drain();
         }

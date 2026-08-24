@@ -452,6 +452,9 @@ pub trait Provider: Send + Sync {
     fn devices(&self) -> Vec<Arc<dyn Device>> {
         Vec::new()
     }
+    fn kernel_advertisements(&self) -> Vec<KernelAdvertisement> {
+        Vec::new()
+    }
     fn initialize(&self) -> Result<(), ProviderError> {
         Ok(())
     }
