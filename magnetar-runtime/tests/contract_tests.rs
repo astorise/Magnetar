@@ -11,6 +11,7 @@ mod contract_tests {
     mod provider;
     mod resolution;
     mod runtime;
+    mod sampling;
     mod session;
     mod tokenizer;
 }

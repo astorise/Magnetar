@@ -7,9 +7,9 @@
 use crate::{
     CorrelationId, InferenceSessionId, MemoryAdmissionDecision, MemoryAdmissionRequest,
     MemoryAllocationClass, MemoryAllocationOwner, MemoryAllocationRequest, MemoryManager,
-    MemoryPlacement, ModelArtifactId, ProviderExecutionErrorCode, RuntimeTokenizer,
-    StreamingDecodeState, TokenId, TokenStopPattern, Tokenizer, TokenizerError, TokenizerId,
-    TokenizerMetadata, TraceId,
+    MemoryPlacement, ModelArtifactId, ProviderExecutionErrorCode, RuntimeTokenizer, SamplingPolicy,
+    SamplingRequest, SamplingRequestId, SamplingResult, SamplingStopMetadata, StreamingDecodeState,
+    TokenId, TokenStopPattern, Tokenizer, TokenizerError, TokenizerId, TokenizerMetadata, TraceId,
 };
 use std::{error::Error, fmt};
 
@@ -566,6 +566,59 @@ pub fn decode_step(
         finish_reason,
         state_update: Some("runtime-owned-decode-state".into()),
     })
+}
+
+pub fn decode_step_from_sampling(
+    request: &GenerationRequest,
+    generated_so_far: &[TokenId],
+    logits: Vec<f32>,
+    policy: SamplingPolicy,
+) -> Result<(SamplingResult, DecodeStepOutput), GenerationError> {
+    let mut sampling_request = SamplingRequest::host_scores(
+        SamplingRequestId::new(format!(
+            "{}.step{}",
+            request.request_id,
+            generated_so_far.len()
+        ))
+        .map_err(|error| GenerationError::SamplingModeUnsupported {
+            message: error.to_string(),
+        })?,
+        logits,
+        request.tokenizer.metadata.clone(),
+    );
+    sampling_request.step_index = generated_so_far.len();
+    sampling_request.token_history = request
+        .input_token_ids
+        .iter()
+        .chain(generated_so_far.iter())
+        .copied()
+        .collect();
+    sampling_request.parameters = request.parameters.clone();
+    sampling_request.processors = request
+        .parameters
+        .logits_processors
+        .iter()
+        .map(crate::LogitsProcessorConfig::from_generation)
+        .collect();
+    sampling_request.rng_seed = request.parameters.seed;
+    sampling_request.deterministic = request.parameters.deterministic;
+    sampling_request.banned_token_ids = request.parameters.banned_token_ids.clone();
+    sampling_request.stop = SamplingStopMetadata {
+        eos_token_ids: request.stop_conditions.eos.eos_token_ids.clone(),
+        stop_token_ids: request.stop_conditions.stop_token_ids.clone(),
+        minimum_generated_tokens: None,
+        mask_stop_tokens_before_minimum: false,
+    };
+    sampling_request.policy = policy;
+    sampling_request.correlation_id = request.correlation_id.clone();
+
+    let sampling_result = crate::select_next_token(&sampling_request).map_err(|error| {
+        GenerationError::SamplingModeUnsupported {
+            message: error.to_string(),
+        }
+    })?;
+    let step = decode_step(request, generated_so_far, sampling_result.selected_token_id)?;
+    Ok((sampling_result, step))
 }
 
 pub fn stop_reason_for(request: &GenerationRequest, generated: &[TokenId]) -> Option<FinishReason> {

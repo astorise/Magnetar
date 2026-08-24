@@ -24,6 +24,7 @@ pub mod planning;
 pub mod provider;
 pub mod resolution;
 pub mod runtime;
+pub mod sampling;
 pub mod scheduler;
 pub mod session;
 pub mod tokenizer;
@@ -98,9 +99,9 @@ pub use generation::{
     GenerationEventKind, GenerationMemoryEstimate, GenerationModelReference, GenerationOutput,
     GenerationParameters, GenerationPriority, GenerationRequest, GenerationRequestId,
     GenerationTokenizerReference, LogitsProcessorReference, PrefillState, Probability,
-    StopConditions, StreamingMode, decode_step, finish_reason_from_provider_error,
-    memory_admission, prefill, prepare_stop_sequences, stop_reason_for, streaming_text_chunk,
-    token_stream_events,
+    StopConditions, StreamingMode, decode_step, decode_step_from_sampling,
+    finish_reason_from_provider_error, memory_admission, prefill, prepare_stop_sequences,
+    stop_reason_for, streaming_text_chunk, token_stream_events,
 };
 pub use kv_cache::{
     KvCache, KvCacheCompatibility, KvCacheError, KvCacheId, KvCacheLayoutFormat,
@@ -181,6 +182,14 @@ pub use resolution::{
     ResolutionRejectionReason,
 };
 pub use runtime::{ExecutionContext, Runtime, RuntimeBuilder, RuntimeConfig};
+pub use sampling::{
+    LogitsProcessorAuthority, LogitsProcessorConfig, LogitsProcessorKind, LogitsReference,
+    SamplingDiagnostic, SamplingDiagnosticKind, SamplingError, SamplingErrorKind,
+    SamplingFinishHint, SamplingObservation, SamplingObservationKind, SamplingPolicy,
+    SamplingRequest, SamplingRequestId, SamplingResult, SamplingRngState, SamplingSelectionMode,
+    SamplingStopMetadata, TemperatureZeroPolicy, processor_order, sampling_observation,
+    sampling_workspace_requests, select_next_token,
+};
 pub use scheduler::{
     ProviderCancellationOutcome, ProviderExecutionDiagnostic, ProviderExecutionError,
     ProviderExecutionErrorCode, ProviderExecutionHandle, ProviderExecutionId,

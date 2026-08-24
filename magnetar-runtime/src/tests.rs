@@ -5936,6 +5936,23 @@ fn generation_decode_step_preserves_token_index_and_state_boundary() {
 }
 
 #[test]
+fn generation_decode_step_delegates_next_token_selection_to_sampling() {
+    let mut request = generation_request();
+    request.parameters = GenerationParameters::greedy();
+    request.stop_conditions = StopConditions::default();
+    let mut logits = vec![0.0; request.tokenizer.metadata.vocabulary_size as usize];
+    logits[21] = 10.0;
+
+    let (sampling, step) =
+        decode_step_from_sampling(&request, &[20, 21], logits, SamplingPolicy::default()).unwrap();
+
+    assert_eq!(sampling.selected_token_id, 22);
+    assert_eq!(step.token_id, 22);
+    assert_eq!(step.token_index, 2);
+    assert!(step.state_update.is_some());
+}
+
+#[test]
 fn generation_prefill_validates_tokens_and_records_prompt_count() {
     let request = generation_request();
     let state = prefill(&request).unwrap();
