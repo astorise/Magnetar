@@ -3,6 +3,7 @@ mod contract_tests {
 
     mod affinity;
     mod artifact;
+    mod batching;
     mod component;
     mod distribution;
     mod kv_cache;

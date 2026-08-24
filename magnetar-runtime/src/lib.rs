@@ -5,6 +5,7 @@
 //! added through dedicated contracts instead of expanding this file again.
 
 pub mod affinity;
+pub mod batching;
 pub mod capability;
 pub mod component;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -40,6 +41,12 @@ pub use affinity::{
     ProviderHealthState, ProviderInterruptionReason, ProviderLifecycleState, ProviderPressureLevel,
     ProviderReadinessState, ProviderStatusReason, ProviderStatusScope, ProviderStatusSeverity,
     ProviderStatusSnapshot, ResourceAffinity, provider_admission_from_dimensions,
+};
+pub use batching::{
+    BatchAdmission, BatchCompatibility, BatchExecutionStep, BatchId, BatchMemoryEstimate,
+    BatchObservation, BatchObservationKind, BatchPhase, BatchSchedulingMode, BatchSlot,
+    BatchSlotId, BatchedOperationState, BatchingError, BatchingErrorCode, BatchingPolicy,
+    ContinuousBatch, ContinuousBatchingManager, portable_batch_dtype,
 };
 pub use capability::{Capability, CapabilityDescriptor, CapabilityId, CapabilityVersion};
 pub use component::{

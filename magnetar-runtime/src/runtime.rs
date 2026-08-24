@@ -101,6 +101,7 @@ impl RuntimeBuilder {
                 config: self.config.clone(),
             },
             memory: MemoryManager::new(self.config.memory),
+            batching: ContinuousBatchingManager::new(),
             kv_caches: KvCacheManager::new(),
             prefix_caches: PrefixCacheManager::new(),
             providers,
@@ -114,6 +115,7 @@ impl RuntimeBuilder {
 pub struct Runtime {
     context: ExecutionContext,
     memory: MemoryManager,
+    batching: ContinuousBatchingManager,
     kv_caches: KvCacheManager,
     prefix_caches: PrefixCacheManager,
     providers: ProviderLoader,
@@ -142,6 +144,12 @@ impl Runtime {
     }
     pub fn memory_mut(&mut self) -> &mut MemoryManager {
         &mut self.memory
+    }
+    pub fn batching(&self) -> &ContinuousBatchingManager {
+        &self.batching
+    }
+    pub fn batching_mut(&mut self) -> &mut ContinuousBatchingManager {
+        &mut self.batching
     }
     pub fn kv_caches(&self) -> &KvCacheManager {
         &self.kv_caches
@@ -377,6 +385,45 @@ impl Runtime {
     }
     pub fn create_kv_cache(&mut self, cache: KvCache) -> Result<KvCacheId, KvCacheError> {
         self.kv_caches.create(cache)
+    }
+    pub fn create_continuous_batch(&mut self, policy: BatchingPolicy) -> BatchId {
+        self.batching.create_batch(policy)
+    }
+    pub fn admit_generation_to_batch(
+        &mut self,
+        batch: &BatchId,
+        request: &GenerationRequest,
+    ) -> Result<BatchSlotId, BatchingError> {
+        request
+            .validate()
+            .map_err(|error| BatchingError::BatchAdmissionRejected {
+                reason: error.to_string(),
+            })?;
+        self.batching
+            .admit_operation(batch, BatchAdmission::from_generation(request))
+    }
+    pub fn schedule_batch_prefill(
+        &mut self,
+        batch: &BatchId,
+        max_slots: usize,
+    ) -> Result<BatchExecutionStep, BatchingError> {
+        self.batching.schedule_prefill(batch, max_slots)
+    }
+    pub fn schedule_batch_decode(
+        &mut self,
+        batch: &BatchId,
+        max_slots: usize,
+    ) -> Result<BatchExecutionStep, BatchingError> {
+        self.batching.schedule_decode(batch, max_slots)
+    }
+    pub fn batch_memory_admission(
+        &self,
+        batch: &BatchId,
+        estimate: &BatchMemoryEstimate,
+    ) -> Result<MemoryAdmissionDecision, BatchingError> {
+        let mut request = self.batching.memory_admission_request(batch, estimate)?;
+        request.pressure = self.memory.pressure_snapshot();
+        Ok(self.memory.admit(request))
     }
     pub fn create_prefix_cache_entry(
         &mut self,
