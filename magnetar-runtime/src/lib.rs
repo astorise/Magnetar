@@ -4,6 +4,7 @@
 //! architectural modules so the future Component engine and AI domains can be
 //! added through dedicated contracts instead of expanding this file again.
 
+pub mod adapter;
 pub mod affinity;
 pub mod batching;
 pub mod capability;
@@ -31,6 +32,21 @@ pub mod scheduler;
 pub mod session;
 pub mod tokenizer;
 
+pub use adapter::{
+    AdapterActivationPolicy, AdapterActivationRequest, AdapterActivationScope,
+    AdapterArchitectureCompatibility, AdapterArtifact, AdapterArtifactId,
+    AdapterBaseModelCompatibility, AdapterBatchCompatibility, AdapterCacheCompatibility,
+    AdapterCompositionPolicy, AdapterDeactivationRequest, AdapterDigest, AdapterError,
+    AdapterGenerationContext, AdapterLayerSelector, AdapterLifecycleState, AdapterLoadingRequest,
+    AdapterLoadingRequestId, AdapterMemoryEstimate, AdapterMergePolicy, AdapterMergeRecord,
+    AdapterMethod, AdapterName, AdapterObservation, AdapterObservationKind, AdapterResidency,
+    AdapterResidencyId, AdapterResidencyLocation, AdapterResidencyPolicy, AdapterRevision,
+    AdapterSessionPolicy, AdapterSetId, AdapterSharingPolicy, AdapterTargetModule,
+    AdapterTargetModuleRole, AdapterTargetUsage, AdapterTrustStatus, AdapterUnloadPolicy,
+    ProviderAdapterCapabilities, ProviderAdapterResource, activation_uses_adapter,
+    adapter_memory_feasibility, apply_adapter_deactivation, validate_adapter_activation,
+    validate_adapter_compatibility,
+};
 pub use affinity::{
     AffinityConstraints, AffinityError, AffinityGroupId, AffinityResolution, AffinityResource,
     ArtifactBinding, CapabilityBinding, CapabilityHealth, CapabilityStatus, DeviceAvailability,
