@@ -7,6 +7,7 @@ mod contract_tests {
     mod distribution;
     mod kv_cache;
     mod model;
+    mod model_loading;
     mod provider;
     mod resolution;
     mod runtime;

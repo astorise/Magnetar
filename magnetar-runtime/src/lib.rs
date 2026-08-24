@@ -18,6 +18,7 @@ pub mod generation;
 pub mod kv_cache;
 pub mod memory;
 pub mod model;
+pub mod model_loading;
 pub mod observability;
 pub mod planning;
 pub mod provider;
@@ -126,6 +127,18 @@ pub use model::{
     ModelProvenance, ModelQuantization, ModelQuantizationFormat, ModelResidencyPlan, ModelRevision,
     ModelShard, ModelShardId, ModelSignature, ModelSourceIdentity, ModelTensorMetadata,
     ModelTrustDecision, ModelTrustStatus, ModelTrustStore, ModelVariant,
+};
+pub use model_loading::{
+    ArtifactResidencyPlan, LoadedModelContext, ModelArchitectureImplementation,
+    ModelArchitectureImplementationKind, ModelLoadingCachePolicy, ModelLoadingCoordinator,
+    ModelLoadingError, ModelLoadingErrorCode, ModelLoadingObservation, ModelLoadingObservationKind,
+    ModelLoadingPhase, ModelLoadingRequest, ModelLoadingRequestId, ModelLoadingResidencyPlan,
+    ModelLoadingResidencyPolicy, ModelLoadingState, ModelLoadingTargetUsage,
+    ModelPlacementPreference, ModelQuantizationHandling, ModelQuantizationPolicy,
+    ModelReloadRequest, ModelResidencyId, ModelResidencyLocation, ModelShardingPolicy,
+    ModelStorageHandling, ModelUnloadPolicy, ModelUnloadRequest, allocation_released,
+    compute_dtype_supported, invalidates_kv_cache_on_unload, reload_is_new_loading_process,
+    storage_to_compute_relation,
 };
 pub use observability::{
     CorrelationId, CustomEventRecord, CustomLogRecord, CustomMetricKind, CustomMetricRecord,
