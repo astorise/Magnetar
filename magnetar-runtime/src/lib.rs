@@ -24,6 +24,7 @@ pub mod kernel_registry;
 pub mod kv_cache;
 pub mod memory;
 pub mod model;
+pub mod model_component;
 pub mod model_instance;
 pub mod model_loading;
 pub mod observability;
@@ -187,6 +188,22 @@ pub use model::{
     ModelProvenance, ModelQuantization, ModelQuantizationFormat, ModelResidencyPlan, ModelRevision,
     ModelShard, ModelShardId, ModelSignature, ModelSourceIdentity, ModelTensorMetadata,
     ModelTrustDecision, ModelTrustStatus, ModelTrustStore, ModelVariant,
+};
+pub use model_component::{
+    ActivationKind, AttentionVariant, GraphProductionRequest, GraphProductionResult,
+    MODEL_COMPONENT_CONTRACT_VERSION, MODEL_COMPONENT_ROLE, ModelComponentArchitectureMetadata,
+    ModelComponentAuthority, ModelComponentCapabilityKind, ModelComponentCapabilityRequirement,
+    ModelComponentConformanceProfile, ModelComponentDescriptor, ModelComponentError,
+    ModelComponentId, ModelComponentIdentity, ModelComponentImplementationKind,
+    ModelComponentKvCacheMetadata, ModelComponentModelType, ModelComponentObservation,
+    ModelComponentObservationKind, ModelComponentProvenance,
+    ModelComponentQuantizationCompatibility, ModelComponentSignatureState,
+    ModelComponentTokenizerCompatibility, ModelComponentTrustStatus, ModelComponentVersion,
+    NormalizationKind, OperatorRequirement, PositionEncodingKind, TargetModuleMetadata,
+    TargetModuleRole, browser_feature_supported, device_handle_access_error,
+    kernel_handle_access_error, memory_pointer_access_error, provider_handle_access_error,
+    provider_owned_resource_access_error, validate_model_component_authority,
+    validate_model_component_config_data, validate_model_component_role,
 };
 pub use model_instance::{
     ModelInstance, ModelInstanceAdapterState, ModelInstanceCreationChecks, ModelInstanceDefinition,

@@ -10,6 +10,7 @@ mod contract_tests {
     mod kernel_registry_dispatch;
     mod kv_cache;
     mod model;
+    mod model_component;
     mod model_instance;
     mod model_loading;
     mod prefix_cache;
