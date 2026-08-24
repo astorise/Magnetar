@@ -220,7 +220,20 @@ impl DTypeDescriptor {
 pub enum ComputeLayout {
     Dense,
     Strided,
+    Blocked,
+    Paged,
+    PackedQuantized,
+    AttentionSpecific,
+    BrowserCompatible,
     ProviderOpaque,
+}
+
+/// How a Paged layout's logical length may grow after creation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum PagedAppendBehavior {
+    Forbidden,
+    FixedCapacity,
+    GrowOnDemand,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,6 +242,38 @@ pub enum LayoutDescriptor {
     Strided {
         strides_elements: Vec<i64>,
         offset_elements: u64,
+    },
+    /// Reserved for tiled or block-structured storage; MAY be a future or
+    /// Provider-specific placeholder in the first implementation scope.
+    Blocked {
+        block_dimensions: Vec<u64>,
+    },
+    /// Page/block-based storage, especially for future KV cache and
+    /// attention paths. Raw page pointers SHALL not be exposed: the
+    /// logical-to-physical map holds page *indices*, never addresses.
+    Paged {
+        page_size_elements: u64,
+        block_size_elements: u64,
+        capacity_pages: Option<u64>,
+        current_length_elements: Option<u64>,
+        logical_to_physical: Option<BTreeMap<u64, u64>>,
+        append_behavior: Option<PagedAppendBehavior>,
+    },
+    /// Quantized packed storage. MAY be future or placeholder initially.
+    PackedQuantized {
+        method: String,
+        bits_per_value: u32,
+        group_size: Option<u64>,
+        scale_dtype: Option<Box<DTypeDescriptor>>,
+        zero_point_dtype: Option<Box<DTypeDescriptor>>,
+        packing_order: Option<String>,
+        dequantization_requirements: Option<String>,
+    },
+    AttentionSpecific {
+        layout_id: String,
+    },
+    BrowserCompatible {
+        layout_id: String,
     },
     ProviderOpaque {
         layout_id: String,
@@ -239,6 +284,11 @@ impl LayoutDescriptor {
         match self {
             Self::Contiguous => ComputeLayout::Dense,
             Self::Strided { .. } => ComputeLayout::Strided,
+            Self::Blocked { .. } => ComputeLayout::Blocked,
+            Self::Paged { .. } => ComputeLayout::Paged,
+            Self::PackedQuantized { .. } => ComputeLayout::PackedQuantized,
+            Self::AttentionSpecific { .. } => ComputeLayout::AttentionSpecific,
+            Self::BrowserCompatible { .. } => ComputeLayout::BrowserCompatible,
             Self::ProviderOpaque { .. } => ComputeLayout::ProviderOpaque,
         }
     }
@@ -260,15 +310,33 @@ impl fmt::Display for TensorResourceId {
     }
 }
 
+/// Per-dimension declaration for shapes that describe more than one
+/// concrete extent: a `Fixed` dimension must match the concrete value in
+/// `ShapeDescriptor::dimensions`; `Symbolic` names a dimension shared across
+/// tensors (e.g. a sequence-length symbol); `Dynamic` marks a dimension
+/// whose concrete value may change between invocations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SymbolicDimension {
+    Fixed(u64),
+    Symbolic(String),
+    Dynamic,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShapeDescriptor {
     pub dimensions: Vec<u64>,
+    pub symbolic: Option<Vec<SymbolicDimension>>,
 }
 impl ShapeDescriptor {
     pub fn new(dimensions: impl Into<Vec<u64>>) -> Self {
         Self {
             dimensions: dimensions.into(),
+            symbolic: None,
         }
+    }
+    pub fn with_symbolic_dimensions(mut self, symbolic: impl Into<Vec<SymbolicDimension>>) -> Self {
+        self.symbolic = Some(symbolic.into());
+        self
     }
     pub fn rank(&self) -> u64 {
         self.dimensions.len() as u64
@@ -280,6 +348,43 @@ impl ShapeDescriptor {
                     reason: "tensor element count overflows u64".into(),
                 })
         })
+    }
+    /// Row-major (C-order) strides implied by this shape, in elements. This
+    /// is the explicit dimension order Contiguous layout uses.
+    pub fn row_major_strides(&self) -> Vec<i64> {
+        let mut strides = vec![1_i64; self.dimensions.len()];
+        for index in (0..self.dimensions.len().saturating_sub(1)).rev() {
+            strides[index] = strides[index + 1] * self.dimensions[index + 1] as i64;
+        }
+        strides
+    }
+    /// Symbolic dimension count must match rank, and any `Fixed` entry must
+    /// agree with the concrete dimension it annotates.
+    pub fn validate_symbolic(&self) -> Result<(), ComputeValidationError> {
+        let Some(symbolic) = &self.symbolic else {
+            return Ok(());
+        };
+        if symbolic.len() != self.dimensions.len() {
+            return Err(ComputeValidationError::InvalidShape {
+                reason: format!(
+                    "symbolic dimension count {} does not match rank {}",
+                    symbolic.len(),
+                    self.dimensions.len()
+                ),
+            });
+        }
+        for (symbol, concrete) in symbolic.iter().zip(&self.dimensions) {
+            if let SymbolicDimension::Fixed(value) = symbol
+                && value != concrete
+            {
+                return Err(ComputeValidationError::InvalidShape {
+                    reason: format!(
+                        "fixed symbolic dimension {value} does not match concrete dimension {concrete}"
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -315,6 +420,14 @@ pub struct TensorDescriptor {
     pub dtype: DTypeDescriptor,
     pub layout: LayoutDescriptor,
     pub view: Option<ViewDescriptor>,
+    pub storage_dtype: Option<DTypeDescriptor>,
+    pub compute_dtype: Option<DTypeDescriptor>,
+    pub memory_class_intent: Option<crate::TensorMemoryClass>,
+    pub mutability_intent: Option<crate::TensorMutabilityKind>,
+    pub aliasing_intent: Option<crate::TensorAliasingKind>,
+    pub affinity_constraints: Option<Box<ResourceAffinity>>,
+    pub semantic_role: Option<crate::TensorRole>,
+    pub dimension_roles: Option<Vec<crate::DimensionRole>>,
 }
 impl TensorDescriptor {
     pub fn new(shape: ShapeDescriptor, dtype: DTypeDescriptor, layout: LayoutDescriptor) -> Self {
@@ -323,10 +436,50 @@ impl TensorDescriptor {
             dtype,
             layout,
             view: None,
+            storage_dtype: None,
+            compute_dtype: None,
+            memory_class_intent: None,
+            mutability_intent: None,
+            aliasing_intent: None,
+            affinity_constraints: None,
+            semantic_role: None,
+            dimension_roles: None,
         }
     }
     pub fn with_view(mut self, view: ViewDescriptor) -> Self {
         self.view = Some(view);
+        self
+    }
+    pub fn with_storage_dtype(mut self, dtype: DTypeDescriptor) -> Self {
+        self.storage_dtype = Some(dtype);
+        self
+    }
+    pub fn with_compute_dtype(mut self, dtype: DTypeDescriptor) -> Self {
+        self.compute_dtype = Some(dtype);
+        self
+    }
+    pub fn with_memory_class_intent(mut self, class: crate::TensorMemoryClass) -> Self {
+        self.memory_class_intent = Some(class);
+        self
+    }
+    pub fn with_mutability_intent(mut self, mutability: crate::TensorMutabilityKind) -> Self {
+        self.mutability_intent = Some(mutability);
+        self
+    }
+    pub fn with_aliasing_intent(mut self, aliasing: crate::TensorAliasingKind) -> Self {
+        self.aliasing_intent = Some(aliasing);
+        self
+    }
+    pub fn with_affinity_constraints(mut self, affinity: ResourceAffinity) -> Self {
+        self.affinity_constraints = Some(Box::new(affinity));
+        self
+    }
+    pub fn with_semantic_role(mut self, role: crate::TensorRole) -> Self {
+        self.semantic_role = Some(role);
+        self
+    }
+    pub fn with_dimension_roles(mut self, roles: impl Into<Vec<crate::DimensionRole>>) -> Self {
+        self.dimension_roles = Some(roles.into());
         self
     }
     pub fn materialized(shape: ShapeDescriptor, dtype: DTypeDescriptor) -> Self {
@@ -340,8 +493,26 @@ impl TensorDescriptor {
                 reason: "tensor byte size overflows u64".into(),
             })
     }
+    /// Conservative byte-size estimate honoring packed/quantized layout
+    /// metadata. Falls back to `byte_size()` for layouts without explicit
+    /// packing, since bits-per-value there is the same as the dtype width.
+    pub fn estimated_byte_size(&self) -> Result<u64, ComputeValidationError> {
+        match &self.layout {
+            LayoutDescriptor::PackedQuantized { bits_per_value, .. } => {
+                let elements = self.shape.element_count()?;
+                let total_bits = elements.checked_mul(u64::from(*bits_per_value)).ok_or(
+                    ComputeValidationError::SizeOverflow {
+                        reason: "packed quantized tensor bit size overflows u64".into(),
+                    },
+                )?;
+                Ok(total_bits.div_ceil(8))
+            }
+            _ => self.byte_size(),
+        }
+    }
     pub fn validate(&self, limits: &TensorDescriptorLimits) -> Result<(), ComputeValidationError> {
         limits.validate_shape(&self.shape)?;
+        self.shape.validate_symbolic()?;
         let byte_size = self.byte_size()?;
         if byte_size > limits.max_bytes {
             return Err(ComputeValidationError::SizeOverflow {
@@ -354,6 +525,17 @@ impl TensorDescriptor {
         validate_layout_bounds(&self.shape, &self.layout)?;
         if let Some(view) = &self.view {
             validate_strides(&self.shape, &view.strides_elements, view.offset_elements)?;
+        }
+        if let Some(roles) = &self.dimension_roles
+            && roles.len() as u64 != self.shape.rank()
+        {
+            return Err(ComputeValidationError::InvalidShape {
+                reason: format!(
+                    "dimension role count {} does not match tensor rank {}",
+                    roles.len(),
+                    self.shape.rank()
+                ),
+            });
         }
         Ok(())
     }
@@ -442,7 +624,13 @@ fn validate_layout_bounds(
     layout: &LayoutDescriptor,
 ) -> Result<(), ComputeValidationError> {
     match layout {
-        LayoutDescriptor::Contiguous | LayoutDescriptor::ProviderOpaque { .. } => Ok(()),
+        LayoutDescriptor::Contiguous
+        | LayoutDescriptor::ProviderOpaque { .. }
+        | LayoutDescriptor::Blocked { .. }
+        | LayoutDescriptor::Paged { .. }
+        | LayoutDescriptor::PackedQuantized { .. }
+        | LayoutDescriptor::AttentionSpecific { .. }
+        | LayoutDescriptor::BrowserCompatible { .. } => Ok(()),
         LayoutDescriptor::Strided {
             strides_elements,
             offset_elements,

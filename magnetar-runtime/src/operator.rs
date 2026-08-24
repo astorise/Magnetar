@@ -7,7 +7,7 @@
 
 use crate::{
     CapabilityVersion, ComputeDType, DTypeDescriptor, LayoutDescriptor, ResourceAffinity,
-    TensorDescriptor,
+    TensorDescriptor, TensorMutabilityKind,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -119,6 +119,8 @@ pub enum TensorRole {
     Storage,
     Compute,
     Accumulation,
+    Index,
+    Mask,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -443,6 +445,8 @@ impl OperatorSpec {
                 return Err(OperatorError::LayoutUnsupported { layout });
             }
         }
+        validate_memory_behavior(&self.memory, inputs, outputs)?;
+        validate_aliasing_intent(&self.memory, inputs, outputs)?;
         Ok(())
     }
 }
@@ -565,6 +569,9 @@ pub enum OperatorError {
     MemoryBehaviorUnsupported {
         reason: String,
     },
+    AliasingUnsupported {
+        reason: String,
+    },
     WorkspaceUnavailable {
         bytes: u64,
     },
@@ -629,6 +636,7 @@ impl fmt::Display for OperatorError {
             Self::MemoryBehaviorUnsupported { reason } => {
                 write!(f, "memory behavior unsupported: {reason}")
             }
+            Self::AliasingUnsupported { reason } => write!(f, "aliasing unsupported: {reason}"),
             Self::WorkspaceUnavailable { bytes } => write!(f, "workspace unavailable: {bytes}"),
             Self::ResourceAffinityConflict { reason } => {
                 write!(f, "resource affinity conflict: {reason}")
@@ -656,6 +664,11 @@ pub fn layout_kind(layout: &LayoutDescriptor) -> TensorLayoutKind {
     match layout {
         LayoutDescriptor::Contiguous => TensorLayoutKind::Contiguous,
         LayoutDescriptor::Strided { .. } => TensorLayoutKind::Strided,
+        LayoutDescriptor::Blocked { .. } => TensorLayoutKind::Blocked,
+        LayoutDescriptor::Paged { .. } => TensorLayoutKind::Paged,
+        LayoutDescriptor::PackedQuantized { .. } => TensorLayoutKind::QuantizedPacked,
+        LayoutDescriptor::AttentionSpecific { .. } => TensorLayoutKind::AttentionSpecific,
+        LayoutDescriptor::BrowserCompatible { .. } => TensorLayoutKind::BrowserCompatible,
         LayoutDescriptor::ProviderOpaque { .. } => TensorLayoutKind::ProviderOpaque,
     }
 }
@@ -997,6 +1010,70 @@ fn validate_shape_rule(
             Ok(())
         }
     }
+}
+
+/// Reject an invocation whose tensors declare memory-class or mutability
+/// intent that conflicts with the Operator's declared memory behavior.
+fn validate_memory_behavior(
+    memory: &OperatorMemoryBehavior,
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+) -> Result<(), OperatorError> {
+    for tensor in inputs.iter().chain(outputs) {
+        if let Some(class) = tensor.memory_class_intent {
+            if memory.requires_host_visible && !class.is_host_accessible() {
+                return Err(OperatorError::MemoryBehaviorUnsupported {
+                    reason: format!(
+                        "operator requires host-visible memory but tensor declares {class:?}"
+                    ),
+                });
+            }
+            if memory.requires_device_resident && class.is_host_accessible() {
+                return Err(OperatorError::MemoryBehaviorUnsupported {
+                    reason: format!(
+                        "operator requires device-resident memory but tensor declares {class:?}"
+                    ),
+                });
+            }
+        }
+    }
+    for tensor in inputs {
+        if memory.mutates_input
+            && matches!(
+                tensor.mutability_intent,
+                Some(TensorMutabilityKind::Immutable)
+            )
+        {
+            return Err(OperatorError::MemoryBehaviorUnsupported {
+                reason:
+                    "operator mutates its input but tensor declares immutable mutability intent"
+                        .into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Reject an invocation whose tensors declare an aliasing intent that
+/// requires in-place support the Operator does not advertise.
+fn validate_aliasing_intent(
+    memory: &OperatorMemoryBehavior,
+    inputs: &[TensorDescriptor],
+    outputs: &[TensorDescriptor],
+) -> Result<(), OperatorError> {
+    for tensor in inputs.iter().chain(outputs) {
+        if let Some(aliasing) = tensor.aliasing_intent
+            && aliasing.requires_in_place_support()
+            && !memory.supports_in_place
+        {
+            return Err(OperatorError::AliasingUnsupported {
+                reason: format!(
+                    "tensor declares {aliasing:?} but operator does not support in-place mutation"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_dtype_contracts(

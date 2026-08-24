@@ -8,7 +8,7 @@
 use crate::{
     CapabilityVersion, ComputeDType, ComputePrecision, DTypeDescriptor, DeviceBinding, DeviceType,
     MemoryAllocationId, OperatorAttributeValue, OperatorId, OperatorMemoryBehavior, OperatorSpec,
-    ProviderBinding, ResourceAffinity, TensorDescriptor, TensorLayoutKind,
+    ProviderBinding, ResourceAffinity, TensorAliasingKind, TensorDescriptor, TensorLayoutKind,
     TensorResourceDescriptor, layout_kind, validate_affinity_compatibility,
 };
 use std::{
@@ -745,6 +745,10 @@ pub struct KernelResult {
     pub status: KernelResultStatus,
     pub output_readiness: BTreeMap<String, bool>,
     pub updated_resources: Vec<TensorResourceDescriptor>,
+    /// Aliasing relationship Kernel execution left each named tensor in,
+    /// where it differs from what was requested (e.g. an in-place op
+    /// resolving `InputOutputAlias` on its output).
+    pub updated_aliasing: BTreeMap<String, TensorAliasingKind>,
     pub workspace_release: Option<MemoryAllocationId>,
     pub timing_micros: Option<u64>,
     pub determinism: Option<KernelDeterminism>,
@@ -761,6 +765,7 @@ impl KernelResult {
             status: KernelResultStatus::Succeeded,
             output_readiness: BTreeMap::new(),
             updated_resources: Vec::new(),
+            updated_aliasing: BTreeMap::new(),
             workspace_release: None,
             timing_micros: None,
             determinism: None,
@@ -777,6 +782,7 @@ impl KernelResult {
             status: KernelResultStatus::Failed,
             output_readiness: BTreeMap::new(),
             updated_resources: Vec::new(),
+            updated_aliasing: BTreeMap::new(),
             workspace_release: None,
             timing_micros: None,
             determinism: None,
@@ -785,6 +791,15 @@ impl KernelResult {
             device_diagnostics: BTreeMap::new(),
             error: Some(error),
         }
+    }
+
+    pub fn with_aliasing_update(
+        mut self,
+        tensor_name: impl Into<String>,
+        aliasing: TensorAliasingKind,
+    ) -> Self {
+        self.updated_aliasing.insert(tensor_name.into(), aliasing);
+        self
     }
 }
 

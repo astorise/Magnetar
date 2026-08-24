@@ -731,6 +731,16 @@ pub fn dequantize_placeholder() -> ReferenceCpuError {
     )
 }
 
+/// Quantization mirrors [`dequantize_placeholder`]: Reference CPU declares
+/// the operation explicitly rather than silently accepting a quantized
+/// output, but does not implement it in the first scope.
+pub fn quantize_placeholder() -> ReferenceCpuError {
+    ReferenceCpuError::new(
+        ReferenceCpuErrorCode::DTypeUnsupported,
+        "Reference CPU has no quantized kernel implementation",
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Fallback policy
 // ---------------------------------------------------------------------------
@@ -977,6 +987,50 @@ impl ReferenceCpuConformanceReport {
     }
 }
 
+/// Validates the Tensor Resource and Layout contract for the host
+/// contiguous case Reference CPU supports: a valid `TensorDescriptor`
+/// (shape, dtype, contiguous layout), a lifecycle walk from `Declared` to
+/// `Ready`, and a readiness state Kernels can dispatch against, all
+/// without touching raw pointers or Provider handles.
+fn reference_cpu_tensor_resource_conformance_check() -> ReferenceCpuConformanceCheck {
+    let descriptor = TensorDescriptor::materialized(
+        ShapeDescriptor::new([2, 2]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let descriptor_valid = descriptor
+        .validate(&TensorDescriptorLimits::default())
+        .is_ok();
+    let residency = TensorResidency::new(
+        TensorResourceId::new("conformance-tensor-resource"),
+        MemoryPlacement::HostOrdinary,
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    let host_visible = residency.is_host_visible();
+    let mut resource = TensorResource::new(
+        TensorResourceId::new("conformance-tensor-resource"),
+        descriptor,
+        residency,
+    );
+    let lifecycle_ok = resource
+        .transition_to(TensorLifecycleState::Planned)
+        .is_ok()
+        && resource
+            .transition_to(TensorLifecycleState::Allocating)
+            .is_ok()
+        && resource.mark_ready().is_ok();
+    let ready = resource.ensure_usable().is_ok() && resource.readiness == TensorReadiness::Ready;
+    let passed = descriptor_valid && host_visible && lifecycle_ok && ready;
+    ReferenceCpuConformanceCheck {
+        name: "tensor-resource-metadata-and-readiness",
+        passed,
+        detail: (!passed).then(|| {
+            format!(
+                "descriptor_valid={descriptor_valid} host_visible={host_visible} lifecycle_ok={lifecycle_ok} ready={ready}"
+            )
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Executor: opaque host storage + ProviderExecutionApi + KernelInvocation execution
 // ---------------------------------------------------------------------------
@@ -1163,6 +1217,8 @@ impl ReferenceCpuExecutor {
                 .err()
                 .map(|error| error.to_string()),
         });
+
+        checks.push(reference_cpu_tensor_resource_conformance_check());
 
         let report = ReferenceCpuConformanceReport {
             profile: REFERENCE_CPU_CONFORMANCE_PROFILE,

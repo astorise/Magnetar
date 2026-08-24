@@ -219,3 +219,4 @@ Future work:
 - [Scheduler](scheduler.md)
 - [Runtime observability](runtime-observability.md)
 - [Observability exporter components](observability-exporter-components.md)
+- [Tensor resource and layout contract](tensor-resource-and-layout.md)

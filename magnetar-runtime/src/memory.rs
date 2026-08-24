@@ -206,6 +206,26 @@ impl MemoryAllocationRequest {
         self.priority = priority;
         self
     }
+
+    /// Build a Tensor allocation request from a descriptor's estimated
+    /// size, so callers never hand-compute tensor byte sizes. Unknown or
+    /// overflowing size is reported rather than guessed, so admission can
+    /// reject it conservatively instead of under-provisioning.
+    pub fn for_tensor(
+        descriptor: &TensorDescriptor,
+        placement: MemoryPlacement,
+        owner: MemoryAllocationOwner,
+    ) -> Result<Self, crate::TensorError> {
+        let size_bytes = descriptor
+            .estimated_byte_size()
+            .map_err(|error| crate::TensorError::size_unknown(error.to_string()))?;
+        Ok(Self::new(
+            MemoryAllocationClass::Tensor,
+            size_bytes,
+            placement,
+            owner,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -298,6 +318,8 @@ pub struct TensorResidency {
     pub affinity: ResourceAffinity,
     pub provider_owned: bool,
     pub staged: bool,
+    pub eviction_eligible: bool,
+    pub size_bytes_estimate: Option<u64>,
 }
 
 impl TensorResidency {
@@ -315,12 +337,34 @@ impl TensorResidency {
             affinity,
             provider_owned,
             staged,
+            eviction_eligible: false,
+            size_bytes_estimate: None,
         }
     }
 
     pub const fn with_allocation(mut self, allocation: MemoryAllocationId) -> Self {
         self.allocation = Some(allocation);
         self
+    }
+
+    pub const fn with_eviction_eligible(mut self, eviction_eligible: bool) -> Self {
+        self.eviction_eligible = eviction_eligible;
+        self
+    }
+
+    pub const fn with_size_estimate(mut self, size_bytes: u64) -> Self {
+        self.size_bytes_estimate = Some(size_bytes);
+        self
+    }
+
+    /// Portable memory-class classification derived from `placement`.
+    pub fn memory_class(&self) -> crate::TensorMemoryClass {
+        crate::TensorMemoryClass::from(&self.placement)
+    }
+
+    /// Whether this residency's storage is reachable from host code.
+    pub fn is_host_visible(&self) -> bool {
+        self.memory_class().is_host_accessible()
     }
 }
 
@@ -808,6 +852,34 @@ impl MemoryManager {
                 reason: feasibility.reason,
             }
         }
+    }
+
+    /// Evaluate admission for a Tensor Resource, deriving its size from the
+    /// descriptor via [`MemoryAllocationRequest::for_tensor`] instead of
+    /// requiring the caller to compute it. A descriptor whose size cannot be
+    /// determined (e.g. an underspecified packed/quantized layout) is
+    /// rejected rather than conservatively admitted, so admission never
+    /// under-reserves for an unknown-sized tensor.
+    pub fn admit_tensor(
+        &self,
+        descriptor: &TensorDescriptor,
+        placement: MemoryPlacement,
+        owner: MemoryAllocationOwner,
+        pressure: MemoryPressureSnapshot,
+    ) -> MemoryAdmissionDecision {
+        let allocation = match MemoryAllocationRequest::for_tensor(descriptor, placement, owner) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                return MemoryAdmissionDecision::Reject {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        self.admit(MemoryAdmissionRequest {
+            allocation,
+            pressure,
+            queue_allowed: self.config.allow_pending_allocations,
+        })
     }
 
     pub fn record_tensor_residency(

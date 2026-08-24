@@ -39,6 +39,7 @@ pub mod runtime;
 pub mod sampling;
 pub mod scheduler;
 pub mod session;
+pub mod tensor;
 pub mod tokenizer;
 
 pub use adapter::{
@@ -114,10 +115,10 @@ pub use compute::{
     ComputeValidationError, ComputeValueRef, DTypeDescriptor, DTypeSupport, DataMovementSupport,
     DeviceComputeSupport, HostBufferDescriptor, HostBufferEncoding, HostStagingPolicy,
     LayoutDescriptor, LayoutSupport, OperationFamilySupport, OperationSchemaSupport,
-    PrecisionSupport, ProviderComputeAdvertisement, RecoveryHint, ShapeDescriptor,
-    ShapeLimitSupport, TensorDescriptor, TensorDescriptorLimits, TensorResourceDescriptor,
-    TensorResourceId, TensorViewSource, ViewDescriptor, compute_capability,
-    initial_compute_operation_schemas,
+    PagedAppendBehavior, PrecisionSupport, ProviderComputeAdvertisement, RecoveryHint,
+    ShapeDescriptor, ShapeLimitSupport, SymbolicDimension, TensorDescriptor,
+    TensorDescriptorLimits, TensorResourceDescriptor, TensorResourceId, TensorViewSource,
+    ViewDescriptor, compute_capability, initial_compute_operation_schemas,
 };
 pub use conformance::{
     PROVIDER_CONFORMANCE_SUITE_VERSION, ProviderConformanceConfig, ProviderConformanceProfile,
@@ -302,8 +303,8 @@ pub use reference_cpu::{
     ReferenceCpuConformanceReport, ReferenceCpuError, ReferenceCpuErrorCode, ReferenceCpuExecutor,
     ReferenceCpuFeatureFlags, ReferenceCpuProvider, add, attention, dequantize_placeholder,
     dtype_conversion, embedding_lookup, evaluate_fallback, gelu, layout_conversion, matmul, mul,
-    reference_cpu_device, reference_cpu_kernel_advertisements, reference_cpu_provider_metadata,
-    residual_add, rmsnorm, rope, silu, softmax_rows,
+    quantize_placeholder, reference_cpu_device, reference_cpu_kernel_advertisements,
+    reference_cpu_provider_metadata, residual_add, rmsnorm, rope, silu, softmax_rows,
 };
 pub use resolution::{
     BuiltInResolutionPolicy, ResolutionCandidate, ResolutionCandidateRejection, ResolutionContext,
@@ -335,6 +336,12 @@ pub use session::{
     SessionMemoryBudget, SessionMemoryUsage, SessionObservation, SessionObservationKind,
     SessionOperationAdmission, SessionOperationState, SessionPolicy, SessionRedactionPolicy,
     SessionResources, SessionStatus, SessionStreamingStatus, runtime_session_affinity,
+};
+pub use tensor::{
+    DimensionRole, TensorAliasingKind, TensorError, TensorLifecycleState, TensorMemoryClass,
+    TensorMutabilityKind, TensorObservation, TensorObservationKind, TensorOwnerSubsystem,
+    TensorReadiness, TensorResource, TensorView, validate_aliasing_for_dispatch,
+    validate_memory_class_for_kernel, validate_mutability_for_dispatch,
 };
 pub use tokenizer::{
     BatchEncodeInput, BatchEncodeOutput, DecodeInput, DecodeOutput, EncodeInput, EncodeOutput,

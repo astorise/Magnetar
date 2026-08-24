@@ -7034,3 +7034,594 @@ fn reference_cpu_no_raw_handles_exposed_in_invocation_or_result() {
     assert!(!text.contains("0x"));
     assert!(!text.contains("raw handle"));
 }
+
+fn tensor_resource_for_test(id: &str) -> TensorResource {
+    let descriptor = TensorDescriptor::materialized(
+        ShapeDescriptor::new([2, 2]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let residency = TensorResidency::new(
+        TensorResourceId::new(id),
+        MemoryPlacement::HostOrdinary,
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    TensorResource::new(TensorResourceId::new(id), descriptor, residency)
+}
+
+#[test]
+fn tensor_lifecycle_allows_declared_to_ready_happy_path() {
+    let mut resource = tensor_resource_for_test("tensor-lifecycle-1");
+    resource
+        .transition_to(TensorLifecycleState::Planned)
+        .unwrap();
+    resource
+        .transition_to(TensorLifecycleState::Allocating)
+        .unwrap();
+    resource.mark_ready().unwrap();
+    assert_eq!(resource.lifecycle, TensorLifecycleState::Ready);
+    assert_eq!(resource.readiness, TensorReadiness::Ready);
+    assert!(resource.ensure_usable().is_ok());
+}
+
+#[test]
+fn tensor_lifecycle_rejects_declared_to_ready_skip() {
+    let mut resource = tensor_resource_for_test("tensor-lifecycle-2");
+    let error = resource
+        .transition_to(TensorLifecycleState::Ready)
+        .unwrap_err();
+    assert!(matches!(error, TensorError::ResourceInvalid { .. }));
+}
+
+#[test]
+fn tensor_resource_released_is_rejected_for_use() {
+    let mut resource = tensor_resource_for_test("tensor-lifecycle-3");
+    resource
+        .transition_to(TensorLifecycleState::Planned)
+        .unwrap();
+    resource
+        .transition_to(TensorLifecycleState::Allocating)
+        .unwrap();
+    resource.mark_ready().unwrap();
+    resource
+        .transition_to(TensorLifecycleState::Released)
+        .unwrap();
+    assert_eq!(
+        resource.ensure_usable().unwrap_err(),
+        TensorError::ResourceReleased
+    );
+}
+
+#[test]
+fn tensor_readiness_blocks_dispatch_until_ready() {
+    let mut resource = tensor_resource_for_test("tensor-readiness-1");
+    resource
+        .transition_to(TensorLifecycleState::Planned)
+        .unwrap();
+    resource
+        .transition_to(TensorLifecycleState::Allocating)
+        .unwrap();
+    resource.transition_to(TensorLifecycleState::Ready).unwrap();
+    resource.readiness = TensorReadiness::PendingTransfer;
+    assert!(matches!(
+        resource.ensure_usable().unwrap_err(),
+        TensorError::ResourceNotReady { .. }
+    ));
+    resource.readiness = TensorReadiness::Ready;
+    assert!(resource.ensure_usable().is_ok());
+}
+
+#[test]
+fn tensor_mutability_denies_mutation_of_immutable_resource() {
+    let error =
+        validate_mutability_for_dispatch(TensorMutabilityKind::Immutable, true).unwrap_err();
+    assert!(matches!(error, TensorError::MutabilityViolation { .. }));
+    assert!(validate_mutability_for_dispatch(TensorMutabilityKind::Mutable, true).is_ok());
+    assert!(validate_mutability_for_dispatch(TensorMutabilityKind::Immutable, false).is_ok());
+}
+
+#[test]
+fn tensor_aliasing_requires_in_place_kernel_support() {
+    let error =
+        validate_aliasing_for_dispatch(TensorAliasingKind::InputOutputAlias, false).unwrap_err();
+    assert!(matches!(error, TensorError::AliasingViolation { .. }));
+    assert!(validate_aliasing_for_dispatch(TensorAliasingKind::InputOutputAlias, true).is_ok());
+    assert!(validate_aliasing_for_dispatch(TensorAliasingKind::NoAlias, false).is_ok());
+}
+
+#[test]
+fn tensor_memory_class_is_derived_from_memory_placement() {
+    assert_eq!(
+        TensorMemoryClass::from(&MemoryPlacement::HostOrdinary),
+        TensorMemoryClass::Host
+    );
+    assert_eq!(
+        TensorMemoryClass::from(&MemoryPlacement::HostPinned),
+        TensorMemoryClass::PinnedHost
+    );
+    assert_eq!(
+        TensorMemoryClass::from(&MemoryPlacement::BrowserLinearMemory),
+        TensorMemoryClass::BrowserLinearMemory
+    );
+    let staged = MemoryPlacement::StagedTemporary(Box::new(MemoryPlacement::HostOrdinary));
+    assert_eq!(TensorMemoryClass::from(&staged), TensorMemoryClass::Host);
+}
+
+#[test]
+fn tensor_memory_class_validation_rejects_unsupported_class() {
+    let error = validate_memory_class_for_kernel(
+        TensorMemoryClass::Device,
+        &[TensorMemoryClass::Host, TensorMemoryClass::PinnedHost],
+    )
+    .unwrap_err();
+    assert!(matches!(error, TensorError::MemoryClassUnsupported { .. }));
+    assert!(validate_memory_class_for_kernel(TensorMemoryClass::Device, &[]).is_ok());
+    assert!(
+        validate_memory_class_for_kernel(TensorMemoryClass::Host, &[TensorMemoryClass::Host])
+            .is_ok()
+    );
+}
+
+#[test]
+fn tensor_view_becomes_unavailable_once_base_is_terminal() {
+    let view = TensorView::new(
+        TensorResourceId::new("base"),
+        ViewDescriptor::from_resource(TensorResourceId::new("base"), 0, [1, 1]),
+        ShapeDescriptor::new([2, 2]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    assert!(
+        view.validate_against_base(TensorLifecycleState::Ready)
+            .is_ok()
+    );
+    let error = view
+        .validate_against_base(TensorLifecycleState::Released)
+        .unwrap_err();
+    assert!(matches!(error, TensorError::ViewBaseUnavailable { .. }));
+}
+
+#[test]
+fn tensor_layout_descriptor_kind_covers_every_layout_category() {
+    assert_eq!(LayoutDescriptor::Contiguous.kind(), ComputeLayout::Dense);
+    assert_eq!(
+        LayoutDescriptor::Blocked {
+            block_dimensions: vec![2, 2],
+        }
+        .kind(),
+        ComputeLayout::Blocked
+    );
+    assert_eq!(
+        LayoutDescriptor::Paged {
+            page_size_elements: 16,
+            block_size_elements: 4,
+            capacity_pages: None,
+            current_length_elements: None,
+            logical_to_physical: None,
+            append_behavior: None,
+        }
+        .kind(),
+        ComputeLayout::Paged
+    );
+    assert_eq!(
+        LayoutDescriptor::PackedQuantized {
+            method: "int4".into(),
+            bits_per_value: 4,
+            group_size: Some(32),
+            scale_dtype: None,
+            zero_point_dtype: None,
+            packing_order: None,
+            dequantization_requirements: None,
+        }
+        .kind(),
+        ComputeLayout::PackedQuantized
+    );
+    assert_eq!(
+        LayoutDescriptor::AttentionSpecific {
+            layout_id: "paged-attention".into(),
+        }
+        .kind(),
+        ComputeLayout::AttentionSpecific
+    );
+    assert_eq!(
+        LayoutDescriptor::BrowserCompatible {
+            layout_id: "wasm-linear".into(),
+        }
+        .kind(),
+        ComputeLayout::BrowserCompatible
+    );
+}
+
+#[test]
+fn operator_layout_kind_maps_every_layout_descriptor_variant() {
+    assert_eq!(
+        layout_kind(&LayoutDescriptor::Blocked {
+            block_dimensions: vec![4],
+        }),
+        TensorLayoutKind::Blocked
+    );
+    assert_eq!(
+        layout_kind(&LayoutDescriptor::Paged {
+            page_size_elements: 16,
+            block_size_elements: 4,
+            capacity_pages: None,
+            current_length_elements: None,
+            logical_to_physical: None,
+            append_behavior: None,
+        }),
+        TensorLayoutKind::Paged
+    );
+    assert_eq!(
+        layout_kind(&LayoutDescriptor::PackedQuantized {
+            method: "int4".into(),
+            bits_per_value: 4,
+            group_size: None,
+            scale_dtype: None,
+            zero_point_dtype: None,
+            packing_order: None,
+            dequantization_requirements: None,
+        }),
+        TensorLayoutKind::QuantizedPacked
+    );
+}
+
+#[test]
+fn tensor_error_and_observation_redact_backend_diagnostics() {
+    let error = TensorError::resource_invalid("native handle=0xdeadbeef");
+    assert_eq!(
+        error.to_string(),
+        "tensor resource invalid: [redacted backend diagnostic]"
+    );
+    let observation = TensorObservation::new(TensorObservationKind::ResourceReady)
+        .with_message("C:\\weights\\model.bin");
+    assert_eq!(observation.message, "[redacted backend diagnostic]");
+}
+
+#[test]
+fn tensor_descriptor_builder_sets_intents_and_semantic_role() {
+    let descriptor = TensorDescriptor::materialized(
+        ShapeDescriptor::new([2, 3]),
+        DTypeDescriptor::portable(ComputeDType::Float16),
+    )
+    .with_storage_dtype(DTypeDescriptor::portable(ComputeDType::Float16))
+    .with_compute_dtype(DTypeDescriptor::portable(ComputeDType::Float32))
+    .with_memory_class_intent(TensorMemoryClass::Host)
+    .with_mutability_intent(TensorMutabilityKind::Immutable)
+    .with_aliasing_intent(TensorAliasingKind::NoAlias)
+    .with_affinity_constraints(ResourceAffinity::new(FallbackClass::Transparent))
+    .with_semantic_role(TensorRole::Input)
+    .with_dimension_roles([DimensionRole::Batch, DimensionRole::Hidden]);
+
+    assert_eq!(
+        descriptor.compute_dtype,
+        Some(DTypeDescriptor::portable(ComputeDType::Float32))
+    );
+    assert_eq!(
+        descriptor.memory_class_intent,
+        Some(TensorMemoryClass::Host)
+    );
+    assert_eq!(descriptor.semantic_role, Some(TensorRole::Input));
+    assert!(
+        descriptor
+            .validate(&TensorDescriptorLimits::default())
+            .is_ok()
+    );
+
+    let mismatched = descriptor.with_dimension_roles([DimensionRole::Batch]);
+    assert!(
+        mismatched
+            .validate(&TensorDescriptorLimits::default())
+            .is_err()
+    );
+}
+
+#[test]
+fn shape_descriptor_row_major_strides_matches_expected_layout() {
+    let shape = ShapeDescriptor::new([2, 3, 4]);
+    assert_eq!(shape.row_major_strides(), vec![12, 4, 1]);
+    assert_eq!(ShapeDescriptor::new([5]).row_major_strides(), vec![1]);
+}
+
+#[test]
+fn tensor_descriptor_estimated_byte_size_honors_packed_quantized_bits() {
+    let packed = TensorDescriptor::new(
+        ShapeDescriptor::new([16]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+        LayoutDescriptor::PackedQuantized {
+            method: "int4".into(),
+            bits_per_value: 4,
+            group_size: Some(16),
+            scale_dtype: None,
+            zero_point_dtype: None,
+            packing_order: None,
+            dequantization_requirements: None,
+        },
+    );
+    assert_eq!(packed.estimated_byte_size().unwrap(), 8);
+
+    let dense = TensorDescriptor::materialized(
+        ShapeDescriptor::new([16]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    assert_eq!(
+        dense.estimated_byte_size().unwrap(),
+        dense.byte_size().unwrap()
+    );
+}
+
+#[test]
+fn tensor_residency_tracks_eviction_size_estimate_and_host_visibility() {
+    let host = TensorResidency::new(
+        TensorResourceId::new("residency-host"),
+        MemoryPlacement::HostOrdinary,
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_eviction_eligible(true)
+    .with_size_estimate(4096);
+    assert!(host.eviction_eligible);
+    assert_eq!(host.size_bytes_estimate, Some(4096));
+    assert!(host.is_host_visible());
+    assert_eq!(host.memory_class(), TensorMemoryClass::Host);
+
+    let device = TensorResidency::new(
+        TensorResourceId::new("residency-device"),
+        MemoryPlacement::Device(DeviceBinding::new(DeviceId::new("gpu-0"))),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    assert!(!device.is_host_visible());
+    assert_eq!(device.memory_class(), TensorMemoryClass::Device);
+}
+
+#[test]
+fn tensor_residency_affinity_rejects_forged_device_binding() {
+    let claimed = TensorResidency::new(
+        TensorResourceId::new("forged"),
+        MemoryPlacement::Device(DeviceBinding::new(DeviceId::new("gpu-0"))),
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_device(DeviceBinding::new(DeviceId::new("gpu-0"))),
+    );
+    let actual = TensorResidency::new(
+        TensorResourceId::new("forged"),
+        MemoryPlacement::Device(DeviceBinding::new(DeviceId::new("gpu-1"))),
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_device(DeviceBinding::new(DeviceId::new("gpu-1"))),
+    );
+    let error = AffinityConstraints::try_from_affinities([&claimed.affinity, &actual.affinity])
+        .unwrap_err();
+    assert!(matches!(error, AffinityError::DeviceMismatch { .. }));
+}
+
+#[test]
+fn tensor_layout_placeholder_variants_validate_without_bounds_checking() {
+    let blocked = TensorDescriptor::new(
+        ShapeDescriptor::new([4, 4]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+        LayoutDescriptor::Blocked {
+            block_dimensions: vec![2, 2],
+        },
+    );
+    let paged = TensorDescriptor::new(
+        ShapeDescriptor::new([256]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+        LayoutDescriptor::Paged {
+            page_size_elements: 16,
+            block_size_elements: 4,
+            capacity_pages: Some(16),
+            current_length_elements: Some(200),
+            logical_to_physical: None,
+            append_behavior: None,
+        },
+    );
+    for descriptor in [blocked, paged] {
+        assert!(
+            descriptor
+                .validate(&TensorDescriptorLimits::default())
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn kernel_result_tracks_aliasing_updates_alongside_readiness_and_residency() {
+    let result = KernelResult::success(KernelInvocationId::new("aliasing-update"))
+        .with_aliasing_update("output", TensorAliasingKind::InputOutputAlias);
+    assert_eq!(
+        result.updated_aliasing.get("output"),
+        Some(&TensorAliasingKind::InputOutputAlias)
+    );
+}
+
+#[test]
+fn tensor_resource_debug_output_never_exposes_raw_pointers_or_handles() {
+    let resource = tensor_resource_for_test("tensor-debug-safety");
+    let text = format!("{resource:?}");
+    assert!(!text.contains("0x"));
+    assert!(!text.contains("handle="));
+}
+
+#[test]
+fn shape_descriptor_symbolic_dimensions_validate_fixed_consistency() {
+    let consistent = ShapeDescriptor::new([2, 8]).with_symbolic_dimensions([
+        SymbolicDimension::Symbolic("batch".into()),
+        SymbolicDimension::Fixed(8),
+    ]);
+    assert!(consistent.validate_symbolic().is_ok());
+
+    let inconsistent = ShapeDescriptor::new([2, 8]).with_symbolic_dimensions([
+        SymbolicDimension::Symbolic("batch".into()),
+        SymbolicDimension::Fixed(16),
+    ]);
+    assert!(inconsistent.validate_symbolic().is_err());
+
+    let wrong_rank =
+        ShapeDescriptor::new([2, 8]).with_symbolic_dimensions([SymbolicDimension::Dynamic]);
+    assert!(wrong_rank.validate_symbolic().is_err());
+}
+
+#[test]
+fn layout_descriptor_paged_tracks_logical_to_physical_and_append_behavior() {
+    let mut logical_to_physical = std::collections::BTreeMap::new();
+    logical_to_physical.insert(0, 3);
+    logical_to_physical.insert(1, 7);
+    let paged = LayoutDescriptor::Paged {
+        page_size_elements: 16,
+        block_size_elements: 4,
+        capacity_pages: Some(8),
+        current_length_elements: Some(64),
+        logical_to_physical: Some(logical_to_physical.clone()),
+        append_behavior: Some(PagedAppendBehavior::GrowOnDemand),
+    };
+    let LayoutDescriptor::Paged {
+        logical_to_physical: stored_map,
+        append_behavior: stored_behavior,
+        ..
+    } = &paged
+    else {
+        unreachable!()
+    };
+    assert_eq!(stored_map.as_ref(), Some(&logical_to_physical));
+    assert_eq!(*stored_behavior, Some(PagedAppendBehavior::GrowOnDemand));
+    assert_eq!(paged.kind(), ComputeLayout::Paged);
+}
+
+#[test]
+fn layout_descriptor_packed_quantized_tracks_dequantization_requirements() {
+    let layout = LayoutDescriptor::PackedQuantized {
+        method: "int4".into(),
+        bits_per_value: 4,
+        group_size: Some(32),
+        scale_dtype: Some(Box::new(DTypeDescriptor::portable(ComputeDType::Float16))),
+        zero_point_dtype: None,
+        packing_order: Some("row-major-blocks".into()),
+        dequantization_requirements: Some("requires dequantize_placeholder before use".into()),
+    };
+    let LayoutDescriptor::PackedQuantized {
+        dequantization_requirements,
+        ..
+    } = &layout
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        dequantization_requirements.as_deref(),
+        Some("requires dequantize_placeholder before use")
+    );
+}
+
+#[test]
+fn reference_cpu_quantize_and_dequantize_placeholders_reject_explicitly() {
+    for error in [dequantize_placeholder(), quantize_placeholder()] {
+        assert_eq!(error.code, ReferenceCpuErrorCode::DTypeUnsupported);
+    }
+}
+
+#[test]
+fn memory_manager_admits_tensor_computed_from_descriptor_size() {
+    let manager = MemoryManager::default();
+    let descriptor = TensorDescriptor::materialized(
+        ShapeDescriptor::new([4, 4]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let decision = manager.admit_tensor(
+        &descriptor,
+        MemoryPlacement::HostOrdinary,
+        MemoryAllocationOwner::Runtime,
+        MemoryPressureSnapshot::default(),
+    );
+    assert!(matches!(decision, MemoryAdmissionDecision::Admit { .. }));
+}
+
+#[test]
+fn memory_manager_rejects_tensor_admission_when_size_is_unknown() {
+    let manager = MemoryManager::default();
+    let descriptor = TensorDescriptor::materialized(
+        ShapeDescriptor::new([u64::MAX, 2]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let decision = manager.admit_tensor(
+        &descriptor,
+        MemoryPlacement::HostOrdinary,
+        MemoryAllocationOwner::Runtime,
+        MemoryPressureSnapshot::default(),
+    );
+    assert!(matches!(decision, MemoryAdmissionDecision::Reject { .. }));
+}
+
+fn permissive_operator_spec(memory: OperatorMemoryBehavior) -> OperatorSpec {
+    OperatorSpec::new(
+        OperatorId::new(
+            OPERATOR_NAMESPACE,
+            "conformance-op",
+            1,
+            OperatorFamily::Tensor,
+        ),
+        1,
+        1,
+    )
+    .with_dtype_contract(OperatorDTypeContract::new(TensorRole::Input, []))
+    .with_memory(memory)
+}
+
+fn contiguous_f32_tensor() -> TensorDescriptor {
+    TensorDescriptor::materialized(
+        ShapeDescriptor::new([2, 2]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    )
+}
+
+#[test]
+fn operator_validate_invocation_rejects_aliasing_intent_without_in_place_support() {
+    let spec = permissive_operator_spec(OperatorMemoryBehavior::pure());
+    let output = contiguous_f32_tensor().with_aliasing_intent(TensorAliasingKind::InputOutputAlias);
+    let error = spec
+        .validate_invocation(&[contiguous_f32_tensor()], &[output], &BTreeMap::new())
+        .unwrap_err();
+    assert!(matches!(error, OperatorError::AliasingUnsupported { .. }));
+}
+
+#[test]
+fn operator_validate_invocation_accepts_aliasing_intent_when_in_place_supported() {
+    let memory = OperatorMemoryBehavior {
+        supports_in_place: true,
+        ..OperatorMemoryBehavior::pure()
+    };
+    let spec = permissive_operator_spec(memory);
+    let output = contiguous_f32_tensor().with_aliasing_intent(TensorAliasingKind::InputOutputAlias);
+    assert!(
+        spec.validate_invocation(&[contiguous_f32_tensor()], &[output], &BTreeMap::new())
+            .is_ok()
+    );
+}
+
+#[test]
+fn operator_validate_invocation_rejects_memory_class_conflict() {
+    let memory = OperatorMemoryBehavior {
+        requires_host_visible: true,
+        ..OperatorMemoryBehavior::pure()
+    };
+    let spec = permissive_operator_spec(memory);
+    let input = contiguous_f32_tensor().with_memory_class_intent(TensorMemoryClass::Device);
+    let error = spec
+        .validate_invocation(&[input], &[contiguous_f32_tensor()], &BTreeMap::new())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OperatorError::MemoryBehaviorUnsupported { .. }
+    ));
+}
+
+#[test]
+fn operator_validate_invocation_rejects_mutation_of_immutable_input() {
+    let memory = OperatorMemoryBehavior {
+        mutates_input: true,
+        ..OperatorMemoryBehavior::pure()
+    };
+    let spec = permissive_operator_spec(memory);
+    let input = contiguous_f32_tensor().with_mutability_intent(TensorMutabilityKind::Immutable);
+    let error = spec
+        .validate_invocation(&[input], &[contiguous_f32_tensor()], &BTreeMap::new())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OperatorError::MemoryBehaviorUnsupported { .. }
+    ));
+}
