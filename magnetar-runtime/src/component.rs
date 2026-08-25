@@ -338,7 +338,7 @@ impl ComponentTrustStore {
             source: Some(source),
         })?;
         let raw: TrustStoreYaml =
-            serde_yaml::from_str(&content).map_err(|source| ComponentError::TrustStore {
+            serde_norway::from_str(&content).map_err(|source| ComponentError::TrustStore {
                 path: path.into(),
                 message: source.to_string(),
                 source: None,
@@ -830,7 +830,7 @@ impl ComponentManifest {
             source: Some(source),
         })?;
         let raw: ComponentManifestYaml =
-            serde_yaml::from_str(&content).map_err(|source| ComponentError::Manifest {
+            serde_norway::from_str(&content).map_err(|source| ComponentError::Manifest {
                 path: path.into(),
                 message: source.to_string(),
                 source: None,

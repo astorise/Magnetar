@@ -1,0 +1,38 @@
+# cargo-deny policy for Magnetar.
+#
+# Run locally with:
+#   cargo deny check
+
+[advisories]
+# Fail on any security advisory or unmaintained/unsound notice affecting the
+# dependency graph. Exceptions belong here, with a reason, never as a silenced
+# CI step.
+yanked = "deny"
+ignore = []
+
+[bans]
+# Several copies of one crate bloat build time and can mean two incompatible
+# versions of a shared type are live at once.
+multiple-versions = "warn"
+wildcards = "deny"
+skip = []
+
+[licenses]
+# Permissive licenses only: the crate itself ships under MIT, and a copyleft
+# dependency would silently change what downstream consumers must comply with.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

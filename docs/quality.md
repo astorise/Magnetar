@@ -2,16 +2,23 @@
 
 Magnetar validates repository changes with the same commands locally and in CI.
 
+Commands are given in shell form first and PowerShell form where the two
+differ. CI runs on Linux, macOS and Windows, so both are supported.
+
 ## Rust Toolchain
 
-The repository pins Rust in `rust-toolchain.toml`.
+The repository pins Rust and its components in `rust-toolchain.toml`. Running
+any cargo command in this directory installs that toolchain automatically:
 
-Install or update the pinned toolchain with:
-
-```powershell
+```bash
 rustup show
-rustup component add rustfmt clippy llvm-tools-preview
 ```
+
+Do not install a different toolchain version to match CI. CI runs `rustup show`
+for the same reason, so the pinned toolchain is the only one in use.
+
+The declared minimum supported Rust version is the `rust-version` field in
+`magnetar-runtime/Cargo.toml`, verified by the `quality / msrv` CI job.
 
 ## Local Commands
 
@@ -23,49 +30,64 @@ cargo fmt --all -- --check
 
 Run compilation checks:
 
-```powershell
-cargo check --workspace --all-targets --all-features
+```bash
+cargo check --locked --workspace --all-targets --all-features
 ```
 
 Run Clippy with repository policy:
 
-```powershell
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+```bash
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
 Run the complete Rust test suite:
 
-```powershell
-cargo test --workspace --all-targets
+```bash
+cargo test --locked --workspace --all-targets
 ```
 
 Run concrete Wasmtime Component Engine tests:
 
-```powershell
-cargo test -p magnetar-runtime --features wasmtime-component-engine
+```bash
+cargo test --locked -p magnetar-runtime --features wasmtime-component-engine
 ```
 
 Run hardware-independent Provider conformance tests:
 
-```powershell
-cargo test -p magnetar-runtime provider_conformance -- --nocapture
+```bash
+cargo test --locked -p magnetar-runtime provider_conformance -- --nocapture
 ```
 
 Build Rust documentation with warnings denied:
 
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
+```
+
+PowerShell:
+
 ```powershell
 $env:RUSTDOCFLAGS="-D warnings"
-cargo doc --workspace --all-features --no-deps
+cargo doc --locked --workspace --all-features --no-deps
 ```
 
 Validate WIT packages:
 
-```powershell
+```bash
 wasm-tools component wit magnetar-runtime/wit/compute.wit
 wasm-tools component wit magnetar-runtime/wit/observability.wit
 ```
 
 Validate Component fixtures:
+
+```bash
+for wat in magnetar-runtime/fixtures/components/*.component.wat; do
+  wasm-tools parse "$wat" -o /tmp/component-fixture.wasm
+  wasm-tools validate /tmp/component-fixture.wasm --features component-model
+done
+```
+
+PowerShell:
 
 ```powershell
 Get-ChildItem magnetar-runtime/fixtures/components/*.component.wat | ForEach-Object {
@@ -76,23 +98,32 @@ Get-ChildItem magnetar-runtime/fixtures/components/*.component.wat | ForEach-Obj
 
 Validate OpenSpec artifacts:
 
-```powershell
+```bash
 openspec validate --all --strict
 ```
 
 Generate coverage JSON and LCOV:
 
-```powershell
-New-Item -ItemType Directory -Force target/llvm-cov | Out-Null
-cargo llvm-cov --workspace --all-targets --all-features --ignore-filename-regex '(^|/)(target|tests?)/' --json --summary-only --output-path target/llvm-cov/coverage.json
+```bash
+mkdir -p target/llvm-cov
+cargo llvm-cov --locked --workspace --all-targets --all-features --ignore-filename-regex '(^|/)(target|tests?)/' --json --summary-only --output-path target/llvm-cov/coverage.json
 cargo llvm-cov report --ignore-filename-regex '(^|/)(target|tests?)/' --lcov --output-path target/llvm-cov/lcov.info
 ```
 
 Check the coverage ratchet:
 
-```powershell
+```bash
 cargo run --manifest-path tools/coverage-ratchet/Cargo.toml -- target/llvm-cov/coverage.json quality/coverage-baseline.json
 ```
+
+Check dependency advisories, bans, licenses and sources:
+
+```bash
+cargo deny --all-features check
+```
+
+The policy lives in `deny.toml`. An exception belongs in that file with a
+reason, never as a skipped CI step.
 
 ## Coverage Policy
 

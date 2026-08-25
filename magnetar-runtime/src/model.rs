@@ -1183,7 +1183,7 @@ struct RawModelManifest {
 
 impl RawModelManifest {
     fn from_yaml_str(value: &str) -> Result<Self, ModelArtifactError> {
-        serde_yaml::from_str(value).map_err(|source| ModelArtifactError::InvalidManifest {
+        serde_norway::from_str(value).map_err(|source| ModelArtifactError::InvalidManifest {
             message: source.to_string(),
         })
     }
