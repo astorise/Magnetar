@@ -23,6 +23,18 @@ so a change touching either compiles and passes locally while still being
 broken. Add `--all-features` when your change goes anywhere near them; CI
 covers this in a dedicated job, but only after you have pushed.
 
+`cargo test` and `cargo clippy` also say nothing about documentation. Intra-doc
+links resolve against what is *in scope*, so removing an import can break a
+`[`Type`]` link that no code references, and CI denies rustdoc warnings:
+
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
+```
+
+Run it whenever you change imports or doc comments. A doc-only reference should
+use a full path (`[`crate::session::SessionPolicy`]`) rather than relying on an
+import that exists for no other reason.
+
 The declared MSRV lives in `magnetar-runtime/Cargo.toml` as `rust-version` and
 is verified by its own CI job. Raising it is a deliberate change, not a side
 effect.

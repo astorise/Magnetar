@@ -869,7 +869,7 @@ pub fn prepare_generation(
 /// Generation request as exposed through the Runtime Inference API. Wraps
 /// the core [`GenerationRequest`] with an explicit privacy/redaction policy
 /// for callers -- such as one-shot inference -- that have no
-/// [`SessionPolicy`] to inherit a redaction policy from.
+/// [`crate::session::SessionPolicy`] to inherit a redaction policy from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationApiRequest {
     pub core: GenerationRequest,
@@ -1208,7 +1208,7 @@ pub fn submit_generation_observed(
 
 /// Opaque handle identifying an open generation event stream. Carries no
 /// Provider/Device/Kernel handle -- only the stable IDs needed to
-/// correlate [`GenerationEvent`]s already produced by
+/// correlate [`crate::generation::GenerationEvent`]s already produced by
 /// [`crate::generation::token_stream_events`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamingHandle {
