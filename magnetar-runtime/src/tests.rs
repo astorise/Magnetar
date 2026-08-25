@@ -6284,6 +6284,23 @@ fn reference_cpu_softmax_rejects_invalid_shape() {
 }
 
 #[test]
+fn reference_cpu_softmax_rejects_fully_masked_row() {
+    // Every entry masked out: subtracting the row max would yield NaN for the
+    // whole row, so the kernel must reject it rather than return Ok(NaN).
+    let input = reference_cpu_host_tensor([1, 3], [f32::NEG_INFINITY; 3]);
+    let error = softmax_rows(&input).expect_err("fully masked row must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ExecutionFailed);
+}
+
+#[test]
+fn reference_cpu_softmax_allows_partially_masked_row() {
+    let input = reference_cpu_host_tensor([1, 3], [f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY]);
+    let result = softmax_rows(&input).unwrap();
+    assert!(result.data.iter().all(|value| value.is_finite()));
+    assert!((result.data[1] - 1.0).abs() < 1e-5);
+}
+
+#[test]
 fn reference_cpu_silu_known_output() {
     let input = reference_cpu_host_tensor([1], [0.0]);
     let result = silu(&input);
@@ -6341,6 +6358,45 @@ fn reference_cpu_attention_window_size_restricts_context() {
     // window_size = 1: each position can only see itself.
     let result = attention(&q, &k, &v, 1, 1, None, Some(1), true).unwrap();
     assert_eq!(result.data, vec![1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn reference_cpu_attention_rejects_zero_window() {
+    let q = reference_cpu_host_tensor([2, 1], [0.0, 0.0]);
+    let k = q.clone();
+    let v = reference_cpu_host_tensor([2, 1], [1.0, 2.0]);
+    // A zero window admits no keys at all; it must not be silently widened to 1.
+    let error =
+        attention(&q, &k, &v, 1, 1, None, Some(0), true).expect_err("zero window must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
+}
+
+#[test]
+fn reference_cpu_attention_rejects_window_without_causal_mask() {
+    let q = reference_cpu_host_tensor([2, 1], [0.0, 0.0]);
+    let k = q.clone();
+    let v = reference_cpu_host_tensor([2, 1], [1.0, 2.0]);
+    // The window is anchored at the query position, which only fully describes
+    // the mask under causal attention.
+    let error = attention(&q, &k, &v, 1, 1, None, Some(1), false)
+        .expect_err("bidirectional sliding window must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
+}
+
+#[test]
+fn reference_cpu_host_tensor_rejects_overflowing_shape() {
+    // The product of these dimensions wraps to 0 under unchecked u64
+    // multiplication, which would let an empty buffer pass the length check.
+    let error = HostTensor::new([1_u64 << 32, 1_u64 << 32], Vec::<f32>::new())
+        .expect_err("overflowing shape must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
+}
+
+#[test]
+fn reference_cpu_host_tensor_rejects_shape_beyond_address_space() {
+    let error = HostTensor::new([u64::MAX], Vec::<f32>::new())
+        .expect_err("shape beyond the address space must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
 }
 
 fn reference_cpu_kernel_by_name<'a>(

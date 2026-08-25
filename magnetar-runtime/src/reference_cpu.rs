@@ -284,7 +284,7 @@ impl HostTensor {
     ) -> Result<Self, ReferenceCpuError> {
         let shape = shape.into();
         let data = data.into();
-        let expected = shape.iter().product::<u64>() as usize;
+        let expected = host_tensor_element_count(&shape)?;
         if expected != data.len() {
             return Err(ReferenceCpuError::new(
                 ReferenceCpuErrorCode::ShapeUnsupported,
@@ -306,6 +306,27 @@ impl HostTensor {
             )),
         }
     }
+}
+
+/// Element count for a Reference CPU host tensor shape.
+///
+/// Uses checked arithmetic throughout: `Iterator::product` wraps silently in
+/// release builds, and the subsequent `usize` narrowing truncates on 32-bit
+/// targets such as `wasm32-unknown-unknown`. A wrapped count would let a
+/// mismatched buffer pass the length check in [`HostTensor::new`] and turn a
+/// structured shape rejection into a slice-index panic inside a kernel.
+fn host_tensor_element_count(shape: &[u64]) -> Result<usize, ReferenceCpuError> {
+    let overflow = || {
+        ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("shape {shape:?} element count overflows the host address space"),
+        )
+    };
+    shape
+        .iter()
+        .try_fold(1_u64, |count, dimension| count.checked_mul(*dimension))
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(overflow)
 }
 
 fn same_shape(a: &HostTensor, b: &HostTensor) -> Result<(), ReferenceCpuError> {
@@ -450,7 +471,7 @@ pub fn rope(
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
             format!(
-                "RoPE dimension {dimension} must be a positive, even divisor of row width {cols}"
+                "RoPE dimension {dimension} must be positive, even, and at most the row width {cols}"
             ),
         ));
     }
@@ -492,6 +513,16 @@ pub fn softmax_rows(input: &HostTensor) -> Result<HostTensor, ReferenceCpuError>
     for row in 0..rows as usize {
         let slice = &input.data[row * cols as usize..(row + 1) * cols as usize];
         let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        // A fully masked row (every entry -inf) would make `value - max`
+        // NaN for every column and silently poison the output with Ok.
+        // Reject it explicitly instead, matching how the other Reference CPU
+        // kernels refuse cases they cannot represent.
+        if !max.is_finite() {
+            return Err(ReferenceCpuError::new(
+                ReferenceCpuErrorCode::ExecutionFailed,
+                format!("softmax row {row} has no finite entry to normalize"),
+            ));
+        }
         let exponentials = slice
             .iter()
             .map(|value| (value - max).exp())
@@ -538,6 +569,23 @@ pub fn attention(
             format!(
                 "head_count {head_count} must be an exact multiple of kv_head_count {kv_head_count}"
             ),
+        ));
+    }
+    if window_size == Some(0) {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "window_size must be positive; a zero window admits no keys",
+        ));
+    }
+    // The sliding window is anchored at the query position and bounds only the
+    // oldest admissible key, which is a complete description of the mask only
+    // when the newest admissible key is already the query itself. Bidirectional
+    // attention has no such anchor, so the combination has no single defined
+    // meaning here and is rejected rather than silently given one.
+    if window_size.is_some() && !causal {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "window_size is only defined for causal attention",
         ));
     }
     let (seq_len, q_model_dim) = q.rows_cols()?;
