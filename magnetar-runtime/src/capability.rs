@@ -1,4 +1,5 @@
-use crate::*;
+use crate::component::WitInterface;
+use crate::provider::ProviderError;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,

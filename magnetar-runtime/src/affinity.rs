@@ -1,5 +1,11 @@
-use crate::compute::redact_backend_diagnostic;
-use crate::*;
+use crate::capability::{Capability, CapabilityId, CapabilityVersion};
+use crate::compute::{
+    ComputeDiagnostic, ComputeError, ComputeErrorCode, ComputeErrorPhase, ComputeErrorSeverity,
+    ComputeOperationFamily, RecoveryHint, redact_backend_diagnostic,
+};
+use crate::device::DeviceId;
+use crate::provider::Provider;
+use crate::resolution::{ResolutionDecision, ResolutionPolicyId};
 use std::{collections::BTreeMap, error::Error, fmt};
 /// Process-local identity of a Runtime execution context.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]

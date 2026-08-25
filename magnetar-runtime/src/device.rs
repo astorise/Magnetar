@@ -1,4 +1,10 @@
-use crate::*;
+use crate::affinity::{
+    DeviceAvailability, DeviceBinding, DeviceHealth, ProviderBinding, ProviderPressureLevel,
+};
+use crate::capability::CapabilityId;
+use crate::compute::ComputeDType;
+use crate::kernel::KernelMemoryClass;
+use crate::operator::TensorLayoutKind;
 use std::{collections::BTreeSet, fmt};
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DeviceId(String);
