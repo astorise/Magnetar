@@ -489,8 +489,8 @@ pub fn select_next_token(request: &SamplingRequest) -> Result<SamplingResult, Sa
     apply_token_constraints(request, &mut candidates)?;
     apply_penalties(request, &mut candidates)?;
     apply_temperature(request, &mut candidates)?;
-    apply_top_k(request, &mut candidates);
-    apply_top_p(request, &mut candidates)?;
+    apply_top_k(request.parameters.top_k, &mut candidates);
+    apply_top_p(request.parameters.top_p, &mut candidates)?;
 
     let eligible = candidates
         .iter()
@@ -853,38 +853,52 @@ fn apply_temperature(
     Ok(())
 }
 
-fn apply_top_k(request: &SamplingRequest, candidates: &mut [Candidate]) {
-    let Some(k) = request.parameters.top_k else {
+/// Ranking order for candidate selection: best first, ties broken by the lower
+/// token id so selection is deterministic for identical scores.
+///
+/// Every candidate cut (top-k, top-p) and the reported rank use this one
+/// ordering, so they cannot drift apart.
+fn candidate_order(left: (f32, TokenId), right: (f32, TokenId)) -> std::cmp::Ordering {
+    compare_f32(right.0, left.0).then(left.1.cmp(&right.1))
+}
+
+fn apply_top_k(top_k: Option<u32>, candidates: &mut [Candidate]) {
+    let Some(k) = top_k else {
         return;
     };
+    let k = k as usize;
     let mut eligible = candidates
         .iter()
         .filter(|candidate| candidate.eligible)
         .copied()
         .collect::<Vec<_>>();
-    if k as usize >= eligible.len() {
+    if k >= eligible.len() {
         return;
     }
-    eligible.sort_by(|left, right| {
-        compare_f32(right.score, left.score).then(left.token_id.cmp(&right.token_id))
+    let Some(nth) = k.checked_sub(1) else {
+        // k == 0 keeps nothing. Rejected by SamplingRequest::validate, so this
+        // is only reachable if apply_top_k is called on an unvalidated request.
+        for candidate in candidates.iter_mut() {
+            candidate.eligible = false;
+        }
+        return;
+    };
+    // Only the k-th best element's position matters, so partition in O(n)
+    // rather than sorting the whole eligible set in O(n log n). Token ids are
+    // unique, so the threshold comparison keeps exactly k candidates.
+    let (_, threshold, _) = eligible.select_nth_unstable_by(nth, |left, right| {
+        candidate_order((left.score, left.token_id), (right.score, right.token_id))
     });
-    let keep = eligible
-        .into_iter()
-        .take(k as usize)
-        .map(|candidate| candidate.token_id)
-        .collect::<BTreeSet<_>>();
-    for candidate in candidates {
-        if candidate.eligible && !keep.contains(&candidate.token_id) {
+    let threshold = (threshold.score, threshold.token_id);
+    for candidate in candidates.iter_mut().filter(|candidate| candidate.eligible) {
+        if candidate_order((candidate.score, candidate.token_id), threshold).is_gt() {
             candidate.eligible = false;
         }
     }
 }
 
-fn apply_top_p(
-    request: &SamplingRequest,
-    candidates: &mut [Candidate],
-) -> Result<(), SamplingError> {
-    let Some(top_p) = request.parameters.top_p else {
+fn apply_top_p(top_p: Option<f32>, candidates: &mut [Candidate]) -> Result<(), SamplingError> {
+    let Some(top_p) = top_p else {
         return Ok(());
     };
     if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
@@ -897,21 +911,30 @@ fn apply_top_p(
         .filter(|candidate| candidate.eligible)
         .copied()
         .collect::<Vec<_>>();
-    eligible.sort_by(|left, right| {
-        compare_f32(right.score, left.score).then(left.token_id.cmp(&right.token_id))
+    // Nucleus selection is inherently ordered: the cut depends on where the
+    // running total crosses top_p, so this sort cannot be reduced to a
+    // partition. When top-k ran first it is a sort of k elements, not of the
+    // whole vocabulary.
+    eligible.sort_unstable_by(|left, right| {
+        candidate_order((left.score, left.token_id), (right.score, right.token_id))
     });
     let probabilities = softmax(&eligible.iter().collect::<Vec<_>>());
     let mut cumulative = 0.0;
-    let mut keep = BTreeSet::new();
+    let mut cutoff = None;
     for candidate in probabilities {
         cumulative += candidate.probability;
-        keep.insert(candidate.token_id);
+        cutoff = Some((candidate.score, candidate.token_id));
         if cumulative >= top_p {
             break;
         }
     }
-    for candidate in candidates {
-        if candidate.eligible && !keep.contains(&candidate.token_id) {
+    // The kept set is a prefix of the ranking, so everything worse than the
+    // last kept candidate is dropped -- no per-candidate set lookup needed.
+    let Some(cutoff) = cutoff else {
+        return Ok(());
+    };
+    for candidate in candidates.iter_mut().filter(|candidate| candidate.eligible) {
+        if candidate_order((candidate.score, candidate.token_id), cutoff).is_gt() {
             candidate.eligible = false;
         }
     }
@@ -937,16 +960,26 @@ fn softmax(candidates: &[&Candidate]) -> Vec<ProbabilityCandidate> {
         .collect()
 }
 
+/// Rank of `token_id` in the candidate ranking, 1 being the highest scoring.
+///
+/// Counting how many candidates outrank the selected one is O(n) and allocates
+/// nothing, where cloning and sorting the whole set to read one position was
+/// O(n log n) plus a full copy on every generated token.
 fn rank_for(token_id: TokenId, probabilities: &[ProbabilityCandidate]) -> usize {
-    let mut ranked = probabilities.to_vec();
-    ranked.sort_by(|left, right| {
-        compare_f32(right.score, left.score).then(left.token_id.cmp(&right.token_id))
-    });
-    ranked
+    let Some(selected) = probabilities
         .iter()
-        .position(|candidate| candidate.token_id == token_id)
-        .map(|index| index + 1)
-        .unwrap_or(1)
+        .find(|candidate| candidate.token_id == token_id)
+    else {
+        return 1;
+    };
+    let selected = (selected.score, selected.token_id);
+    probabilities
+        .iter()
+        .filter(|candidate| {
+            candidate_order((candidate.score, candidate.token_id), selected).is_lt()
+        })
+        .count()
+        + 1
 }
 
 /// Chooses the stream position this step draws from.
@@ -1321,3 +1354,6 @@ impl From<crate::GenerationError> for SamplingError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
