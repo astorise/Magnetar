@@ -49,7 +49,7 @@ cargo test --locked --workspace --all-targets
 Run concrete Wasmtime Component Engine tests:
 
 ```bash
-cargo test --locked -p magnetar-runtime --features wasmtime-component-engine
+cargo test --locked -p magnetar-runtime --all-targets --features wasmtime-component-engine
 ```
 
 Run hardware-independent Provider conformance tests:
@@ -132,6 +132,18 @@ The accepted baseline is stored in `quality/coverage-baseline.json`.
 The baseline records measured production Runtime source coverage. Generated
 build output and test source are excluded through the same coverage scope in
 local and CI commands.
+
+Exclusion works by filename, and cargo-llvm-cov appends its own patterns to the
+one this repository passes -- including `tests.rs` and `*_tests.rs`. A filename
+pattern cannot reach test code embedded in a production file, so an inline
+`#[cfg(test)] mod tests { ... }` block would be measured as Runtime
+implementation source and inflate the result, since test code is executed by
+definition. Unit tests therefore live in a sibling `tests.rs` file
+(`src/adapter.rs` declares `mod tests;`, whose body is `src/adapter/tests.rs`)
+rather than inline.
+
+Coverage is measured with `--all-features` so feature-gated modules
+(`component_wasmtime`, `component_web`) are included.
 
 To raise the baseline, generate a fresh coverage report after tests improve and
 update `line_coverage_percent` to the measured line coverage. Reductions are

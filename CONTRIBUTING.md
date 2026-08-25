@@ -16,6 +16,13 @@ The Rust toolchain is pinned in `rust-toolchain.toml`; rustup installs it
 automatically when you run cargo in this directory. Do not install a different
 version to match CI -- CI uses the same pinned toolchain.
 
+Note that `cargo test --workspace --all-targets` does **not** compile
+feature-gated modules. `component_wasmtime` is behind
+`wasmtime-component-engine` and `component_web` behind `web-component-engine`,
+so a change touching either compiles and passes locally while still being
+broken. Add `--all-features` when your change goes anywhere near them; CI
+covers this in a dedicated job, but only after you have pushed.
+
 The declared MSRV lives in `magnetar-runtime/Cargo.toml` as `rust-version` and
 is verified by its own CI job. Raising it is a deliberate change, not a side
 effect.
