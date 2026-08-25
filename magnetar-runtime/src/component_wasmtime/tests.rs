@@ -23,6 +23,8 @@ const WASI_ENVIRONMENT_COMPONENT: &str =
     include_str!("../../fixtures/components/wasi-environment.component.wat");
 const RESOURCE_IMPORT_COMPONENT: &str =
     include_str!("../../fixtures/components/resource-import.component.wat");
+const BOUNDED_LOOP_COMPONENT: &str =
+    include_str!("../../fixtures/components/bounded-loop.component.wat");
 
 #[test]
 fn wasmtime_engine_reports_component_capabilities() {
@@ -719,4 +721,216 @@ fn wasmtime_engine_normalizes_export_trap() {
     ));
     engine.destroy(instance).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// Builds a running instance of the infinite-loop fixture under `limits`.
+fn looping_instance(
+    engine: &mut WasmtimeComponentEngine,
+    directory: &std::path::Path,
+    definition_id: u64,
+    limits: &ComponentResourceLimits,
+) -> (ComponentEngineInstance, WitInterface) {
+    std::fs::create_dir_all(directory).unwrap();
+    let artifact = directory.join("loop.component.wasm");
+    std::fs::write(&artifact, LOOP_COMPONENT).unwrap();
+
+    let interface = WitInterface::new("example:component/run", "1.0.0");
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(definition_id),
+        metadata: crate::ComponentMetadata::new("loop", "1", "looping component")
+            .with_export(interface.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine.prepare(&definition, limits).unwrap();
+    let instance = engine
+        .instantiate(&prepared, &ComponentLinkPlan::default())
+        .unwrap();
+    (instance, interface)
+}
+
+/// A declared execution budget must stop a Component that never returns.
+///
+/// Fuel is deterministic -- it traps after a fixed number of operations, with
+/// no dependence on timing -- so this test cannot hang even if the deadline
+/// machinery regresses.
+#[test]
+fn wasmtime_engine_stops_a_runaway_component_at_its_execution_budget() {
+    let directory =
+        std::env::temp_dir().join(format!("magnetar-wasmtime-fuel-{}", std::process::id()));
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let limits = ComponentResourceLimits {
+        engine_execution_budget: Some(100_000),
+        ..ComponentResourceLimits::default()
+    };
+    let (instance, interface) = looping_instance(&mut engine, &directory, 40, &limits);
+    let invocation =
+        ComponentInvocation::new(crate::ComponentInstanceId::new(140), interface, "run");
+
+    let result = engine.invoke(&instance, &invocation);
+
+    assert!(
+        matches!(
+            result,
+            Err(ComponentError::Interrupted {
+                reason: ComponentInterruptionReason::ResourcePolicy,
+                ..
+            })
+        ),
+        "expected the execution budget to stop the loop, got {result:?}"
+    );
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// The budget is per invocation: each call starts from the full declared
+/// allowance rather than sharing one tank across the instance's lifetime.
+///
+/// This has to be shown with a Component that *returns* and that costs
+/// measurable fuel. A trapped instance cannot be called again at all --
+/// Wasmtime poisons it -- so repeating a call that exhausts its budget would
+/// only ever observe that poisoning; and an empty export consumes no fuel at
+/// all, so no number of calls to one would ever drain a tank.
+#[test]
+fn wasmtime_engine_execution_budget_is_replenished_per_invocation() {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-fuel-reset-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("bounded.component.wasm");
+    std::fs::write(&artifact, BOUNDED_LOOP_COMPONENT).unwrap();
+
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let interface = WitInterface::new("example:component/run", "1.0.0");
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(41),
+        metadata: crate::ComponentMetadata::new("budget-reset", "1", "returning component")
+            .with_export(interface.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    // The fixture runs 10,000 iterations, so one call costs tens of thousands
+    // of fuel units. This budget covers a single call with room to spare and
+    // would be exhausted within the first few iterations below if the tank
+    // were never refilled.
+    let limits = ComponentResourceLimits {
+        engine_execution_budget: Some(200_000),
+        ..ComponentResourceLimits::default()
+    };
+    let prepared = engine.prepare(&definition, &limits).unwrap();
+    let instance = engine
+        .instantiate(&prepared, &ComponentLinkPlan::default())
+        .unwrap();
+    let invocation =
+        ComponentInvocation::new(crate::ComponentInstanceId::new(141), interface, "run");
+
+    for attempt in 0..200 {
+        let result = engine.invoke(&instance, &invocation);
+        assert!(
+            result.is_ok(),
+            "attempt {attempt}: budget was not replenished, got {result:?}"
+        );
+    }
+
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// A non-zero wall-clock deadline must stop a Component that never returns.
+///
+/// Before the epoch ticker existed, only the sentinel `Some(0)` interrupted
+/// anything: every real deadline took the branch that *disabled* the epoch
+/// deadline, and nothing advanced the epoch, so this call ran forever.
+///
+/// A generous execution budget is declared alongside the deadline purely as a
+/// backstop: if the deadline machinery regresses, the call still terminates on
+/// fuel and this test fails on the wrong interruption reason instead of
+/// hanging CI. The budget is roughly two seconds of execution here, while a
+/// 50ms run needs about 50 million units, so it cannot fire first -- and the
+/// margin only widens on a slower machine, where the wall-clock deadline still
+/// lands at 50ms but fuel is consumed more slowly.
+#[test]
+fn wasmtime_engine_stops_a_runaway_component_at_its_wall_clock_deadline() {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-real-deadline-{}",
+        std::process::id()
+    ));
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let limits = ComponentResourceLimits {
+        execution_deadline_millis: Some(50),
+        engine_execution_budget: Some(2_000_000_000),
+        ..ComponentResourceLimits::default()
+    };
+    let (instance, interface) = looping_instance(&mut engine, &directory, 42, &limits);
+    let invocation =
+        ComponentInvocation::new(crate::ComponentInstanceId::new(142), interface, "run");
+
+    let started = std::time::Instant::now();
+    let result = engine.invoke(&instance, &invocation);
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(
+            result,
+            Err(ComponentError::Interrupted {
+                reason: ComponentInterruptionReason::Deadline,
+                ..
+            })
+        ),
+        "expected the deadline to stop the loop, got {result:?} after {elapsed:?}"
+    );
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// A per-call deadline may tighten the Component's configured limit, never
+/// loosen it.
+#[test]
+fn wasmtime_engine_takes_the_stricter_of_call_and_component_deadlines() {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-deadline-min-{}",
+        std::process::id()
+    ));
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let limits = ComponentResourceLimits {
+        execution_deadline_millis: Some(50),
+        engine_execution_budget: Some(2_000_000_000),
+        ..ComponentResourceLimits::default()
+    };
+    let (instance, interface) = looping_instance(&mut engine, &directory, 43, &limits);
+    let mut invocation =
+        ComponentInvocation::new(crate::ComponentInstanceId::new(143), interface, "run");
+    // A call asking for a far longer deadline must not escape the 50ms limit.
+    invocation.deadline_millis = Some(600_000);
+
+    let result = engine.invoke(&instance, &invocation);
+
+    assert!(
+        matches!(
+            result,
+            Err(ComponentError::Interrupted {
+                reason: ComponentInterruptionReason::Deadline,
+                ..
+            })
+        ),
+        "a longer per-call deadline must not loosen the component limit, got {result:?}"
+    );
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn epoch_deadline_ticks_rounds_up_and_never_expires_immediately() {
+    // 0 ticks would mean "already expired"; a sub-tick deadline must still get
+    // one tick of runway.
+    assert_eq!(epoch_deadline_ticks(Some(1)), 1);
+    assert_eq!(epoch_deadline_ticks(Some(50)), 50);
+    assert_eq!(epoch_deadline_ticks(None), DISABLED_EPOCH_DEADLINE);
 }

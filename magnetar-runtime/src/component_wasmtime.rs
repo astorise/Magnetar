@@ -5,9 +5,19 @@ use crate::{
     ComponentInterruptionReason, ComponentInvocation, ComponentInvocationResult, ComponentLinkPlan,
     ComponentResourceLimits, ComponentTrapKind, ComponentValue, PreparedComponent, WitInterface,
 };
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 use wasmtime::{
-    Config, Engine, Store, StoreLimits, StoreLimitsBuilder,
+    Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap,
     component::{
         Component as WasmtimeComponent, Instance as WasmtimeInstance, Linker as WasmtimeLinker,
         types::{ComponentExtern, ComponentItem},
@@ -17,8 +27,74 @@ use wasmtime::{
 const HOST_ADAPTER_FAILURE_MARKER: &str = "[magnetar host adapter error]";
 const DISABLED_EPOCH_DEADLINE: u64 = 1_000_000_000;
 
+/// Interval at which the ticker advances the engine epoch.
+///
+/// Epoch deadlines are counted in ticks, so this is the resolution of every
+/// execution deadline: a deadline is rounded up to whole ticks and is an upper
+/// bound on how long a Component may run, never an exact time.
+const EPOCH_TICK: Duration = Duration::from_millis(1);
+
+/// Fuel granted when no execution budget is declared.
+///
+/// Fuel metering is enabled engine-wide, so a store must always hold fuel or
+/// it traps immediately. This stands in for "unmeasured".
+const UNMETERED_FUEL: u64 = u64::MAX;
+
+/// Advances the engine epoch on a fixed interval so epoch deadlines actually
+/// expire.
+///
+/// Without something incrementing the epoch, `Store::set_epoch_deadline` never
+/// fires on its own and a Component that does not yield runs until the process
+/// ends. The thread holds only a weak engine reference, so it also stops if the
+/// engine is dropped without running `Drop`.
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: &Engine) -> Result<Self, ComponentError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let engine = engine.weak();
+        let handle = thread::Builder::new()
+            .name("magnetar-epoch-ticker".into())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    thread::sleep(EPOCH_TICK);
+                    let Some(engine) = engine.upgrade() else {
+                        break;
+                    };
+                    engine.increment_epoch();
+                }
+            })
+            .map_err(|source| {
+                ComponentError::EngineFailure(format!(
+                    "could not start the epoch ticker, so execution deadlines could not be \
+                     enforced: {source}"
+                ))
+            })?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 pub struct WasmtimeComponentEngine {
     engine: Engine,
+    // Declared after `engine` only for clarity; the ticker holds a weak
+    // reference, so drop order between them does not matter.
+    _epoch_ticker: EpochTicker,
     prepared: BTreeMap<String, WasmtimePreparedComponent>,
     instances: BTreeMap<String, WasmtimeInstanceState>,
     next_prepared_id: u64,
@@ -28,6 +104,7 @@ pub struct WasmtimeComponentEngine {
 struct WasmtimeInstanceState {
     _store: Store<WasmtimeStoreState>,
     _instance: WasmtimeInstance,
+    limits: ComponentResourceLimits,
 }
 
 struct WasmtimeStoreState {
@@ -47,10 +124,17 @@ impl WasmtimeComponentEngine {
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.epoch_interruption(true);
+        // Fuel is enabled engine-wide because limits are declared per
+        // Component while this setting is per Engine. It costs metering
+        // overhead on every Component, which is the price of being able to
+        // honour a declared execution budget at all.
+        config.consume_fuel(true);
 
         let engine = Engine::new(&config).map_err(map_engine_error)?;
+        let epoch_ticker = EpochTicker::start(&engine)?;
         Ok(Self {
             engine,
+            _epoch_ticker: epoch_ticker,
             prepared: BTreeMap::new(),
             instances: BTreeMap::new(),
             next_prepared_id: 1,
@@ -218,6 +302,14 @@ impl ComponentEngine for WasmtimeComponentEngine {
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(DISABLED_EPOCH_DEADLINE);
         store.epoch_deadline_trap();
+        // Fuel metering is on engine-wide, so instantiation itself would trap
+        // on an empty tank. Per-invocation budgets are applied in `invoke`.
+        store
+            .set_fuel(UNMETERED_FUEL)
+            .map_err(|source| ComponentError::InstantiationFailed {
+                definition: prepared.definition_id(),
+                message: redact_engine_message(source),
+            })?;
         let mut linker = WasmtimeLinker::new(&self.engine);
         configure_linker(
             &self.engine,
@@ -238,6 +330,7 @@ impl ComponentEngine for WasmtimeComponentEngine {
             WasmtimeInstanceState {
                 _store: store,
                 _instance: instance,
+                limits: prepared_state.limits.clone(),
             },
         );
         Ok(ComponentEngineInstance::new(prepared.definition_id(), key))
@@ -252,7 +345,17 @@ impl ComponentEngine for WasmtimeComponentEngine {
             .instances
             .get_mut(instance.engine_key())
             .ok_or(ComponentError::InstanceNotFound(invocation.instance_id))?;
-        let interruption_reason = if invocation.deadline_millis == Some(0) {
+        // A per-call deadline may tighten the Component's configured limit but
+        // never loosen it, so the effective deadline is whichever is smaller.
+        let deadline_millis = match (
+            invocation.deadline_millis,
+            state.limits.execution_deadline_millis,
+        ) {
+            (Some(call), Some(configured)) => Some(call.min(configured)),
+            (Some(call), None) => Some(call),
+            (None, configured) => configured,
+        };
+        let interruption_reason = if deadline_millis == Some(0) {
             state._store.set_epoch_deadline(0);
             state._store.data_mut().pending_interruption =
                 Some(ComponentInterruptionReason::Deadline);
@@ -261,7 +364,9 @@ impl ComponentEngine for WasmtimeComponentEngine {
         } else if let Some(reason) = state._store.data().pending_interruption {
             Some(reason)
         } else {
-            state._store.set_epoch_deadline(DISABLED_EPOCH_DEADLINE);
+            state
+                ._store
+                .set_epoch_deadline(epoch_deadline_ticks(deadline_millis));
             None
         };
         if let Some(reason) = interruption_reason {
@@ -272,6 +377,20 @@ impl ComponentEngine for WasmtimeComponentEngine {
                 reason,
             });
         }
+        // The budget applies per invocation: each call starts from the full
+        // declared allowance rather than sharing one tank across the
+        // instance's lifetime.
+        let fuel = state
+            .limits
+            .engine_execution_budget
+            .unwrap_or(UNMETERED_FUEL);
+        state
+            ._store
+            .set_fuel(fuel)
+            .map_err(|source| ComponentError::InvocationFailed {
+                instance: invocation.instance_id,
+                message: redact_engine_message(source),
+            })?;
         let host_calls_before = state._store.data().host_calls;
         let result = if let Ok(typed) = state
             ._instance
@@ -337,9 +456,31 @@ fn redact_trap_message(_source: wasmtime::Error) -> String {
     "[redacted component trap]".into()
 }
 
+/// Epoch ticks a deadline corresponds to, rounded up so a sub-tick deadline
+/// still gets one tick rather than zero (which means "already expired").
+fn epoch_deadline_ticks(deadline_millis: Option<u64>) -> u64 {
+    let Some(deadline_millis) = deadline_millis else {
+        return DISABLED_EPOCH_DEADLINE;
+    };
+    let tick_millis = EPOCH_TICK.as_millis().max(1) as u64;
+    deadline_millis.div_ceil(tick_millis).max(1)
+}
+
+/// Classifies a trap by its typed cause.
+///
+/// Matching on the message text would also match a Component's own trap
+/// message that happened to contain "deadline", so the typed cause is both
+/// narrower and stable across Wasmtime's wording.
+fn trap_of(source: &wasmtime::Error) -> Option<Trap> {
+    source.downcast_ref::<Trap>().copied()
+}
+
 fn is_epoch_interruption(source: &wasmtime::Error) -> bool {
-    let message = source.to_string();
-    message.contains("epoch") || message.contains("deadline")
+    matches!(trap_of(source), Some(Trap::Interrupt))
+}
+
+fn is_fuel_exhaustion(source: &wasmtime::Error) -> bool {
+    matches!(trap_of(source), Some(Trap::OutOfFuel))
 }
 
 fn is_host_adapter_failure(source: &wasmtime::Error) -> bool {
@@ -355,6 +496,14 @@ fn map_call_error(
         ComponentError::Interrupted {
             instance: invocation.instance_id,
             reason: ComponentInterruptionReason::Deadline,
+        }
+    } else if is_fuel_exhaustion(&source) {
+        // Exhausting a declared budget is the policy working, not a defect in
+        // the Component, so it is reported as an interruption rather than a
+        // trap.
+        ComponentError::Interrupted {
+            instance: invocation.instance_id,
+            reason: ComponentInterruptionReason::ResourcePolicy,
         }
     } else if host_failure || is_host_adapter_failure(&source) {
         ComponentError::InvocationFailed {
