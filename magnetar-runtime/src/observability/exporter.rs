@@ -609,6 +609,10 @@ pub enum ObservabilityPolicyField {
     Endpoint,
 }
 
+/// Upper bound on how much of a bus's configured capacity is preallocated, so
+/// a very large bound does not become a very large allocation up front.
+const OBSERVATION_PREALLOCATION_LIMIT: usize = 4096;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservationBus {
     capacity: usize,
@@ -621,7 +625,10 @@ impl ObservationBus {
     pub fn new(capacity: usize, overflow: ObservationOverflowPolicy) -> Self {
         Self {
             capacity,
-            queue: VecDeque::new(),
+            // try_emit never lets the queue exceed `capacity`, so allocating it
+            // up front costs nothing and avoids growing through repeated
+            // doublings during warm-up.
+            queue: VecDeque::with_capacity(capacity.min(OBSERVATION_PREALLOCATION_LIMIT)),
             dropped: 0,
             overflow,
         }
@@ -666,8 +673,20 @@ impl ObservationBus {
         self.queue.len()
     }
 
+    /// Opens a stream over the records this filter admits.
+    ///
+    /// Filtering happens before cloning, so a selective filter no longer pays
+    /// to clone the whole retained queue first. `max_batch` bounds each
+    /// [`ObservationStream::pull`], not the stream as a whole, so every
+    /// admitted record still reaches the caller across successive pulls.
     pub fn stream(&self, filter: ObservationFilter, max_batch: usize) -> ObservationStream {
-        ObservationStream::new(self.queue.iter().cloned(), filter, max_batch)
+        let admitted = self
+            .queue
+            .iter()
+            .filter(|record| filter.permits(record))
+            .cloned()
+            .collect::<Vec<_>>();
+        ObservationStream::new(admitted, filter, max_batch)
     }
 
     pub fn snapshot(&self) -> RuntimeMetricsSnapshot {
@@ -1048,6 +1067,46 @@ mod tests {
         assert_eq!(bus.queue_depth(), 1);
         assert_eq!(bus.dropped_count(), 1);
         assert_eq!(bus.snapshot().dropped_observation_count, 1);
+    }
+
+    #[test]
+    fn observation_bus_stream_delivers_every_admitted_record_across_pulls() {
+        let mut bus = ObservationBus::new(8, ObservationOverflowPolicy::DropOldest);
+        for index in 0..5 {
+            bus.try_emit(event(&format!("event-{index}"))).unwrap();
+        }
+
+        // max_batch bounds each pull, not the stream: draining in batches of
+        // two must still yield all five records.
+        let mut stream = bus.stream(ObservationFilter::all(), 2);
+        let mut delivered = 0;
+        loop {
+            let batch = stream.pull(128).unwrap();
+            delivered += batch.records.len();
+            if batch.end_of_stream {
+                break;
+            }
+        }
+
+        assert_eq!(delivered, 5);
+    }
+
+    #[test]
+    fn observation_bus_stream_admits_only_filtered_records() {
+        let mut bus = ObservationBus::new(8, ObservationOverflowPolicy::DropOldest);
+        bus.try_emit(event("kept")).unwrap();
+
+        let mut stream = bus.stream(
+            ObservationFilter::all().with_category(ObservationCategory::RuntimeEvent),
+            8,
+        );
+        assert_eq!(stream.pull(128).unwrap().records.len(), 1);
+
+        let mut excluded = bus.stream(
+            ObservationFilter::all().with_category(ObservationCategory::RuntimeMetric),
+            8,
+        );
+        assert!(excluded.pull(128).unwrap().records.is_empty());
     }
 
     #[test]

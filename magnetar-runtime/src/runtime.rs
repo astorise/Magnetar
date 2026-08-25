@@ -10,7 +10,7 @@ use crate::planning::{
 };
 use crate::*;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
 };
 static NEXT_EXECUTION_CONTEXT_ID: std::sync::atomic::AtomicU64 =
@@ -47,10 +47,38 @@ pub(crate) fn next_inference_session_id() -> InferenceSessionId {
     .expect("generated session id is valid")
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Default bound on retained session observations.
+///
+/// Matches `ObservabilityPolicy::internal_buffer_capacity`, so the two
+/// observation buffers in the Runtime hold the same amount of history by
+/// default.
+pub const DEFAULT_SESSION_OBSERVATION_CAPACITY: usize = 1024;
+
+/// Upper bound on how much of the configured capacity is preallocated, so a
+/// very large configured bound does not turn into a very large allocation at
+/// startup.
+const SESSION_OBSERVATION_PREALLOCATION_LIMIT: usize = 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
     pub resolution_policy: BuiltInResolutionPolicy,
     pub memory: MemoryManagerConfig,
+    /// Maximum session observations retained before the oldest are evicted.
+    ///
+    /// Zero retains nothing. Every eviction is counted by
+    /// [`Runtime::dropped_session_observations`], so loss is observable rather
+    /// than silent.
+    pub session_observation_capacity: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            resolution_policy: BuiltInResolutionPolicy::default(),
+            memory: MemoryManagerConfig::default(),
+            session_observation_capacity: DEFAULT_SESSION_OBSERVATION_CAPACITY,
+        }
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionContext {
@@ -148,7 +176,12 @@ impl RuntimeBuilder {
             kernel_registry,
             providers,
             sessions: BTreeMap::new(),
-            session_observations: Vec::new(),
+            session_observations: VecDeque::with_capacity(
+                self.config
+                    .session_observation_capacity
+                    .min(SESSION_OBSERVATION_PREALLOCATION_LIMIT),
+            ),
+            dropped_session_observations: 0,
             startup_diagnostics,
             initialized: true,
         }
@@ -164,7 +197,8 @@ pub struct Runtime {
     kernel_registry: KernelRegistry,
     providers: ProviderLoader,
     sessions: BTreeMap<InferenceSessionId, InferenceSession>,
-    session_observations: Vec<SessionObservation>,
+    session_observations: VecDeque<SessionObservation>,
+    dropped_session_observations: u64,
     startup_diagnostics: Vec<RuntimeDiagnostic>,
     initialized: bool,
 }
@@ -231,8 +265,21 @@ impl Runtime {
     pub fn sessions(&self) -> impl Iterator<Item = &InferenceSession> {
         self.sessions.values()
     }
-    pub fn session_observations(&self) -> &[SessionObservation] {
+    /// Session observations retained so far, oldest first.
+    ///
+    /// This is a bounded ring: once
+    /// [`RuntimeConfig::session_observation_capacity`] is reached, each new
+    /// observation evicts the oldest. Use
+    /// [`Self::dropped_session_observations`] to tell a full history from a
+    /// truncated one.
+    pub fn session_observations(&self) -> &VecDeque<SessionObservation> {
         &self.session_observations
+    }
+
+    /// Number of session observations evicted or refused because the retention
+    /// bound was reached.
+    pub fn dropped_session_observations(&self) -> u64 {
+        self.dropped_session_observations
     }
     pub fn create_inference_session(
         &mut self,
@@ -2264,6 +2311,11 @@ impl Runtime {
         for session in self.sessions.values_mut() {
             let _ = session.drain();
         }
+        // Drained sessions and their observation history are dead weight once
+        // the Runtime is down; keeping them would retain every session ever
+        // created for as long as the Runtime value itself lives.
+        self.sessions.clear();
+        self.session_observations.clear();
         self.initialized = false;
     }
 
@@ -2274,7 +2326,16 @@ impl Runtime {
         message: impl Into<String>,
         correlation_id: Option<CorrelationId>,
     ) {
-        self.session_observations.push(SessionObservation {
+        let capacity = self.context.config.session_observation_capacity;
+        if capacity == 0 {
+            self.dropped_session_observations += 1;
+            return;
+        }
+        if self.session_observations.len() >= capacity {
+            self.session_observations.pop_front();
+            self.dropped_session_observations += 1;
+        }
+        self.session_observations.push_back(SessionObservation {
             kind,
             session,
             message: message.into(),
