@@ -370,28 +370,34 @@ pub fn matmul(
         ));
     }
     let (m, k, n) = (m as usize, k as usize, n as usize);
-    let a_at = |row: usize, col: usize| -> f32 {
-        if transpose_a {
-            a.data[col * (a_cols as usize) + row]
-        } else {
-            a.data[row * (a_cols as usize) + col]
-        }
+    // Both operands are row-major, so a logical transpose is just a swap of
+    // the row and column strides. Hoisting them turns what was a per-element
+    // branch inside the innermost loop into two values computed once.
+    let (a_row_stride, a_inner_stride) = if transpose_a {
+        (1, a_cols as usize)
+    } else {
+        (a_cols as usize, 1)
     };
-    let b_at = |row: usize, col: usize| -> f32 {
-        if transpose_b {
-            b.data[col * (b_cols as usize) + row]
-        } else {
-            b.data[row * (b_cols as usize) + col]
-        }
+    let (b_inner_stride, b_col_stride) = if transpose_b {
+        (1, b_cols as usize)
+    } else {
+        (b_cols as usize, 1)
     };
     let mut out = vec![0.0_f32; m * n];
+    // row -> inner -> col keeps the write row and, when b is untransposed, the
+    // b row contiguous. The classic row -> col -> inner order walks b with
+    // stride n on the innermost loop, which is the cache-hostile direction.
     for row in 0..m {
-        for col in 0..n {
-            let mut accumulator = 0.0_f32;
-            for inner in 0..k {
-                accumulator += a_at(row, inner) * b_at(inner, col);
+        let out_row = &mut out[row * n..(row + 1) * n];
+        for inner in 0..k {
+            // No zero-skip: this kernel is the correctness oracle other
+            // Providers are checked against, and skipping a zero would drop
+            // the NaN that 0.0 * NaN must produce.
+            let a_value = a.data[row * a_row_stride + inner * a_inner_stride];
+            let b_base = inner * b_inner_stride;
+            for (col, out_value) in out_row.iter_mut().enumerate() {
+                *out_value += a_value * b.data[b_base + col * b_col_stride];
             }
-            out[row * n + col] = accumulator;
         }
     }
     HostTensor::new([m as u64, n as u64], out)
@@ -619,6 +625,13 @@ pub fn attention(
     let head_dimension = head_dimension as usize;
     let scale = 1.0 / (head_dimension as f32).sqrt();
     let mut out = vec![0.0_f32; seq_len * q_model_dim];
+    // Both scratch buffers are rewritten from scratch for every (head, query)
+    // pair and carry nothing between iterations, so they are allocated once
+    // here instead of twice per pair. Only the admitted key window is ever
+    // read, so they are sized to the widest window rather than pre-filled with
+    // a sentinel the code never consumes.
+    let mut scores = Vec::with_capacity(seq_len);
+    let mut exponentials = Vec::with_capacity(seq_len);
     for head in 0..head_count as usize {
         let kv_head = head / group_size;
         let q_offset = head * head_dimension;
@@ -629,28 +642,19 @@ pub fn attention(
                 .map(|window| query_index.saturating_sub((window as usize).saturating_sub(1)))
                 .unwrap_or(0)
                 .min(key_upper);
-            let mut scores = vec![f32::NEG_INFINITY; seq_len];
-            for (key_index, score) in scores
-                .iter_mut()
-                .enumerate()
-                .take(key_upper)
-                .skip(key_lower)
-            {
+            let query_base = query_index * q_model_dim + q_offset;
+            scores.clear();
+            for key_index in key_lower..key_upper {
+                let key_base = key_index * kv_model_dim + kv_offset;
                 let mut dot = 0.0_f32;
                 for dim in 0..head_dimension {
-                    dot += q.data[query_index * q_model_dim + q_offset + dim]
-                        * k.data[key_index * kv_model_dim + kv_offset + dim];
+                    dot += q.data[query_base + dim] * k.data[key_base + dim];
                 }
-                *score = dot * scale;
+                scores.push(dot * scale);
             }
-            let max = scores[key_lower..key_upper]
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
-            let exponentials = scores[key_lower..key_upper]
-                .iter()
-                .map(|value| (value - max).exp())
-                .collect::<Vec<_>>();
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            exponentials.clear();
+            exponentials.extend(scores.iter().map(|value| (value - max).exp()));
             let sum: f32 = exponentials.iter().sum();
             for dim in 0..head_dimension {
                 let mut accumulator = 0.0_f32;
@@ -659,7 +663,7 @@ pub fn attention(
                     accumulator +=
                         (weight / sum) * v.data[key_index * kv_model_dim + kv_offset + dim];
                 }
-                out[query_index * q_model_dim + q_offset + dim] = accumulator;
+                out[query_base + dim] = accumulator;
             }
         }
     }
@@ -1859,3 +1863,6 @@ impl Provider for ReferenceCpuProvider {
         Some(self.executor.as_ref())
     }
 }
+
+#[cfg(test)]
+mod tests;
