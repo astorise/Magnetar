@@ -94,7 +94,40 @@
 //! is defined in the error model for future use if a browser-specific limitation
 //! is identified; none is known today.
 
-use crate::*;
+use crate::affinity::{
+    FallbackClass, ProviderBinding, ProviderHealth, ProviderPressureLevel, ProviderStatusSnapshot,
+    ResourceAffinity,
+};
+use crate::capability::{CapabilityId, CapabilityVersion};
+use crate::compute::{
+    ComputeDType, DTypeDescriptor, ShapeDescriptor, TensorDescriptor, TensorDescriptorLimits,
+    TensorResourceDescriptor, TensorResourceId,
+};
+use crate::device::{
+    Device, DeviceDescriptor, DeviceExecutionLimits, DeviceId, DeviceMetadata, DeviceType,
+};
+use crate::kernel::{
+    KernelAdvertisement, KernelCancellationSupport, KernelError, KernelId,
+    KernelImplementationFamily, KernelInvocation, KernelKvCacheMetadata, KernelMemoryClass,
+    KernelObservation, KernelObservationKind, KernelOperatorVersionRange, KernelResult,
+    KernelResultStatus, KernelWorkspaceRequirements,
+};
+use crate::memory::{
+    MemoryAllocationClass, MemoryAllocationId, MemoryAllocationOwner, MemoryAllocationRequest,
+    MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
+};
+use crate::operator::{
+    OperatorAttributeValue, OperatorFamily, OperatorId, OperatorSpec, TensorLayoutKind, TensorRole,
+};
+use crate::provider::{
+    PROVIDER_API_VERSION, Provider, ProviderError, ProviderExecutionApi, ProviderMetadata,
+    ProviderRegistry,
+};
+use crate::scheduler::{
+    ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionHandle,
+    ProviderExecutionRequest, ProviderExecutionResult, ProviderExecutionStatus, SchedulingState,
+};
+use crate::tensor::{TensorLifecycleState, TensorReadiness, TensorResource};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,

@@ -1,6 +1,50 @@
+use crate::affinity::{
+    AffinityConstraints, AffinityError, AffinityGroupId, AffinityResolution, CapabilityBinding,
+    DeviceAvailability, DeviceBinding, ExecutionContextId, ExecutionPhase, FallbackClass,
+    HealthState, ProviderBinding, ProviderHealth, ProviderStatusReason, ResourceAffinity,
+};
+use crate::batching::{
+    BatchAdmission, BatchExecutionStep, BatchId, BatchMemoryEstimate, BatchSlotId, BatchingError,
+    BatchingPolicy, ContinuousBatchingManager,
+};
+use crate::capability::{Capability, CapabilityId};
+use crate::component::WitInterface;
+use crate::compute::{
+    COMPUTE_CAPABILITY_ID, COMPUTE_CAPABILITY_VERSION, ComputeDataMovementDescriptor,
+    ComputeDataMovementKind, ComputeGraph, ComputeGraphValidationReport, ComputeInputValue,
+    ComputeLayout, ComputeOperationDescriptor, ComputeOperationFamily, ComputeOperationRequest,
+    ComputePlacementIntent, ComputeSubmission, ComputeValidationError, ComputeValueRef,
+    DataMovementSupport, HostStagingPolicy, OperationFamilySupport, OperationSchemaSupport,
+    TensorDescriptor, TensorDescriptorLimits, TensorResourceDescriptor, TensorResourceId,
+    compute_capability,
+};
 use crate::compute::{
     effective_compute_advertisement, ensure_non_empty_id, insert_unique,
     resolve_compute_value_descriptor, validate_compute_operation_schema,
+};
+use crate::device::{Device, DeviceId};
+use crate::generation::{GenerationModelReference, GenerationRequest};
+use crate::kernel_registry::KernelRegistry;
+use crate::kv_cache::{
+    KvCache, KvCacheCompatibility, KvCacheError, KvCacheId, KvCacheLifecycleState, KvCacheManager,
+};
+use crate::memory::{
+    MemoryAdmissionDecision, MemoryAdmissionRequest, MemoryAllocationClass, MemoryAllocationId,
+    MemoryAllocationOwner, MemoryAllocationRequest, MemoryManager, MemoryManagerConfig,
+    MemoryPlacement,
+};
+use crate::model_instance::{
+    ModelInstance, ModelInstanceDefinition, ModelInstanceError, ModelInstanceId,
+    ModelInstanceManager, ModelInstanceStatus, ModelInstanceUnloadPolicy,
+    ModelInstanceUnloadReport,
+};
+use crate::model_loading::{LoadedModelContext, ModelArchitectureImplementation};
+use crate::observability::{CorrelationId, RuntimeDiagnostic, RuntimeDiagnosticCode, TraceId};
+use crate::planning::{
+    BufferLifetime, ComputeExecutionPhase, ComputeExecutionPlan, ComputePlanningError,
+    ExecutionConstraint, ExecutionDiagnostic, ExecutionInput, ExecutionOutput, ExecutionStep,
+    ExecutionStepKind, MemoryPlan, MemoryPlanningDecision, MemoryPlanningDiagnostic,
+    MemoryPlanningError, MemoryPressureReport, MemoryRegionKind, MemoryRequirement, TensorLifetime,
 };
 use crate::planning::{
     classify_execution_plan, execution_phase_from_step_kind, execution_plan_id,
@@ -8,7 +52,25 @@ use crate::planning::{
     last_use_for_node_output, memory_bytes, memory_error_from_compute_validation,
     planning_error_from_affinity, planning_error_from_validation, provider_memory_limit,
 };
-use crate::*;
+use crate::prefix_cache::{
+    PrefixCacheEntry, PrefixCacheEntryId, PrefixCacheError, PrefixCacheLookupRequest,
+    PrefixCacheLookupResult, PrefixCacheManager, PrefixCachePolicy,
+};
+use crate::provider::{
+    Provider, ProviderError, ProviderExecutionApi, ProviderLoader, ProviderMetadata,
+};
+use crate::resolution::BuiltInResolutionPolicy;
+use crate::scheduler::{
+    ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionErrorCode,
+    ProviderExecutionHandle, ProviderExecutionPhase, ProviderExecutionRequest,
+    ProviderExecutionResult, ProviderExecutionStatus, ScheduledOperation, ScheduledOperationId,
+    Scheduler, SchedulerError, SchedulingPolicy,
+};
+use crate::session::{
+    InferenceSession, InferenceSessionId, SessionAccessPolicy, SessionCreationRequest,
+    SessionError, SessionObservation, SessionObservationKind, SessionOperationAdmission,
+    SessionStatus, runtime_session_affinity,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,

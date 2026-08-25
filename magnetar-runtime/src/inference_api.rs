@@ -23,7 +23,43 @@
 //! bypass Runtime validation, Model Instance lifecycle, Kernel Registry,
 //! Memory Manager, or Provider contracts.
 
-use crate::*;
+use crate::adapter::{
+    AdapterActivationRequest, AdapterActivationScope, AdapterArtifactId, AdapterBatchCompatibility,
+    AdapterError, AdapterResidency, AdapterSessionPolicy, validate_adapter_activation,
+};
+use crate::affinity::{ProviderBinding, ResourceAffinity};
+use crate::batching::{BatchId, BatchSlotId, BatchedOperationState, BatchingError};
+use crate::generation::{
+    CancellationMetadata, FinishReason, GenerationError, GenerationMemoryEstimate,
+    GenerationModelReference, GenerationOutput, GenerationParameters, GenerationPriority,
+    GenerationRequest, GenerationRequestId, GenerationTokenizerReference, GenerationUsage,
+    StopConditions, StreamingMode, decode_step_from_sampling_with_rng, memory_admission, prefill,
+};
+use crate::kv_cache::KvCacheError;
+use crate::memory::{MemoryAdmissionDecision, MemoryManager, MemoryPressureLevel};
+use crate::model::{ModelArtifactError, ModelArtifactId, ModelManifest, ModelTrustDecision};
+use crate::model_instance::{
+    ModelInstanceError, ModelInstanceId, ModelInstanceReadiness, ModelInstanceReadinessChecks,
+    ModelInstanceStatus, ModelInstanceSuspensionReason, ModelInstanceUnloadPolicy,
+    ModelInstanceUnloadReport, ModelInstanceWarmupPlan,
+};
+use crate::model_loading::{
+    LoadedModelContext, ModelArchitectureImplementation, ModelLoadingCoordinator,
+    ModelLoadingError, ModelLoadingErrorCode, ModelLoadingPhase, ModelLoadingRequest,
+};
+use crate::observability::CorrelationId;
+use crate::operator::TensorLayoutKind;
+use crate::prefix_cache::PrefixCacheError;
+use crate::runtime::Runtime;
+use crate::sampling::{SamplingPolicy, SamplingRngState};
+use crate::session::{
+    InferenceSessionId, SessionAccessPolicy, SessionCreationRequest, SessionError,
+    SessionRedactionPolicy, SessionStatus,
+};
+use crate::tokenizer::{
+    DecodeInput, DecodeOutput, EncodeInput, StreamingDecodeState, TokenId, TokenOffset, Tokenizer,
+    TokenizerCompatibility, TokenizerDiagnostic, TokenizerError, TokenizerId, TruncationPolicy,
+};
 use std::{collections::BTreeMap, error::Error, fmt};
 
 // ---------------------------------------------------------------------
