@@ -9,8 +9,8 @@ use crate::{
     MemoryAllocationClass, MemoryAllocationOwner, MemoryAllocationRequest, MemoryManager,
     MemoryPlacement, ModelArtifactId, ModelInstanceId, ProviderExecutionErrorCode,
     RuntimeTokenizer, SamplingPolicy, SamplingRequest, SamplingRequestId, SamplingResult,
-    SamplingStopMetadata, StreamingDecodeState, TokenId, TokenStopPattern, Tokenizer,
-    TokenizerError, TokenizerId, TokenizerMetadata, TraceId,
+    SamplingRngState, SamplingStopMetadata, StreamingDecodeState, TokenId, TokenStopPattern,
+    Tokenizer, TokenizerError, TokenizerId, TokenizerMetadata, TraceId,
 };
 use std::{error::Error, fmt};
 
@@ -576,6 +576,22 @@ pub fn decode_step_from_sampling(
     logits: Vec<f32>,
     policy: SamplingPolicy,
 ) -> Result<(SamplingResult, DecodeStepOutput), GenerationError> {
+    decode_step_from_sampling_with_rng(request, generated_so_far, logits, policy, None)
+}
+
+/// [`decode_step_from_sampling`] resuming an explicit sampling RNG stream.
+///
+/// Pass the `updated_rng_state` from the previous step's [`SamplingResult`] to
+/// keep one continuous stream across a generation. Passing `None` starts a
+/// stream positioned from the request's seed and step index, which still
+/// advances per step but does not carry the previous step's position.
+pub fn decode_step_from_sampling_with_rng(
+    request: &GenerationRequest,
+    generated_so_far: &[TokenId],
+    logits: Vec<f32>,
+    policy: SamplingPolicy,
+    rng_state: Option<SamplingRngState>,
+) -> Result<(SamplingResult, DecodeStepOutput), GenerationError> {
     let mut sampling_request = SamplingRequest::host_scores(
         SamplingRequestId::new(format!(
             "{}.step{}",
@@ -603,6 +619,7 @@ pub fn decode_step_from_sampling(
         .map(crate::LogitsProcessorConfig::from_generation)
         .collect();
     sampling_request.rng_seed = request.parameters.seed;
+    sampling_request.rng_state = rng_state;
     sampling_request.deterministic = request.parameters.deterministic;
     sampling_request.banned_token_ids = request.parameters.banned_token_ids.clone();
     sampling_request.stop = SamplingStopMetadata {

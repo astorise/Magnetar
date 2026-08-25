@@ -232,3 +232,118 @@ fn sampling_workspace_uses_memory_manager_policy() {
         Err(SamplingError::MemoryAllocationFailed { .. })
     ));
 }
+
+/// Builds a stochastic request over `n` equiprobable tokens.
+///
+/// `step_index` starts at 1 in these tests so BOS suppression is constant
+/// across steps: at step 0 the BOS token is still selectable, which would
+/// otherwise show up as "variation" that has nothing to do with the RNG.
+fn stochastic_request(seed: u64, step_index: usize) -> SamplingRequest {
+    let mut request = request(vec![1.0; 8]);
+    request.parameters = GenerationParameters {
+        temperature: 1.0,
+        greedy: false,
+        sampling_enabled: true,
+        seed: Some(seed),
+        ..GenerationParameters::default()
+    };
+    request.rng_seed = Some(seed);
+    request.step_index = step_index;
+    request
+}
+
+/// Asserts a run of draws looks like sampling rather than a constant.
+///
+/// The fixture's eight tokens are not all selectable: policy masks BOS after
+/// the first step, plus pad, unknown and the additional special token, leaving
+/// four. A working sampler visits all four at roughly even frequency; a
+/// sampler stuck on one CDF quantile returns exactly one token every time.
+/// Both bounds below are far from the expected values (4 distinct, 25% share),
+/// so this stays deterministic rather than flaky.
+fn assert_distribution_is_spread(draws: &[u32], context: &str) {
+    let mut frequency = std::collections::BTreeMap::new();
+    for token_id in draws {
+        *frequency.entry(*token_id).or_insert(0_usize) += 1;
+    }
+    let distinct = frequency.len();
+    let most_common = frequency.values().copied().max().unwrap_or(0);
+
+    assert!(
+        distinct >= 4,
+        "{context}: only {distinct} distinct token(s) over {} draws ({frequency:?})",
+        draws.len()
+    );
+    assert!(
+        most_common * 2 < draws.len(),
+        "{context}: one token took {most_common} of {} draws ({frequency:?})",
+        draws.len()
+    );
+}
+
+/// A fixed seed must not pin every step to the same point in the CDF.
+///
+/// Before the sampling RNG became a stream, the seed resolved to the same
+/// value on every step, so the threshold was constant and every step with the
+/// same logits picked the same token. Over 128 draws from 7 selectable
+/// equiprobable tokens, a working sampler hits essentially all of them; the
+/// old behaviour hit exactly one.
+#[test]
+fn sampling_stochastic_mode_varies_across_steps_under_a_fixed_seed() {
+    let selected = (1..=128)
+        .map(|step_index| {
+            let result = select_next_token(&stochastic_request(7, step_index)).unwrap();
+            assert_eq!(result.selection_mode, SamplingSelectionMode::Stochastic);
+            result.selected_token_id
+        })
+        .collect::<Vec<_>>();
+
+    assert_distribution_is_spread(&selected, "fixed seed did not advance the sampling stream");
+}
+
+/// Threading `updated_rng_state` must resume the stream, not restart it.
+///
+/// `step_index` is held constant here, so the threaded state is the only thing
+/// that can carry the stream forward.
+#[test]
+fn sampling_threaded_rng_state_advances_the_stream() {
+    let mut state = None;
+    let selected = (0..128)
+        .map(|_| {
+            let mut request = stochastic_request(11, 1);
+            request.rng_state = state.take();
+            let result = select_next_token(&request).unwrap();
+            state = result.updated_rng_state.clone();
+            result.selected_token_id
+        })
+        .collect::<Vec<_>>();
+
+    assert_distribution_is_spread(&selected, "threaded rng state did not advance the stream");
+}
+
+/// Advancing the stream must not cost reproducibility: the same seed and the
+/// same step must still yield the same token.
+#[test]
+fn sampling_stochastic_mode_is_reproducible_for_a_given_seed() {
+    for step_index in 1..=32 {
+        let first = select_next_token(&stochastic_request(99, step_index)).unwrap();
+        let second = select_next_token(&stochastic_request(99, step_index)).unwrap();
+        assert_eq!(first.selected_token_id, second.selected_token_id);
+        assert_eq!(first.updated_rng_state, second.updated_rng_state);
+    }
+}
+
+/// Two different seeds must not produce the same stream.
+#[test]
+fn sampling_stochastic_mode_separates_streams_by_seed() {
+    let draw = |seed: u64| {
+        (1..=64)
+            .map(|step_index| {
+                select_next_token(&stochastic_request(seed, step_index))
+                    .unwrap()
+                    .selected_token_id
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_ne!(draw(3), draw(4));
+}

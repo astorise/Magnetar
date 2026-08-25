@@ -1004,6 +1004,7 @@ pub fn run_generation_loop(
     );
 
     let mut generated: Vec<TokenId> = Vec::new();
+    let mut rng_state: Option<SamplingRngState> = None;
     let finish_reason = loop {
         if should_cancel(&generated) {
             observer.observe(
@@ -1024,8 +1025,16 @@ pub fn run_generation_loop(
             correlation_id.clone(),
         );
         let logits = next_logits(&generated);
-        let (_, step) =
-            decode_step_from_sampling(request, &generated, logits, sampling_policy.clone())?;
+        // Carry the sampling RNG position forward so the whole generation
+        // draws from one continuous stream rather than restarting it each step.
+        let (sampling, step) = decode_step_from_sampling_with_rng(
+            request,
+            &generated,
+            logits,
+            sampling_policy.clone(),
+            rng_state.take(),
+        )?;
+        rng_state = sampling.updated_rng_state;
         generated.push(step.token_id);
         observer.observe(
             InferenceApiObservationKind::TokenGenerated,

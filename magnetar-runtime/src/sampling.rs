@@ -346,10 +346,24 @@ impl SamplingRngState {
         self.inspectable.then_some(&self.bytes)
     }
 
-    fn seed(&self) -> u64 {
-        self.bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        })
+    /// Encodes a stream position produced by this module.
+    fn from_stream(state: u64) -> Self {
+        Self::opaque(state.to_le_bytes().to_vec())
+    }
+
+    /// Recovers the stream position.
+    ///
+    /// States this module produced are exactly eight little-endian bytes and
+    /// round-trip losslessly, which is what lets a caller resume a stream
+    /// rather than restart it. A state of any other length came from
+    /// somewhere else, so it is folded down to a starting position instead.
+    fn stream_position(&self) -> u64 {
+        match <[u8; 8]>::try_from(self.bytes.as_slice()) {
+            Ok(bytes) => u64::from_le_bytes(bytes),
+            Err(_) => self.bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            }),
+        }
     }
 }
 
@@ -487,6 +501,7 @@ pub fn select_next_token(request: &SamplingRequest) -> Result<SamplingResult, Sa
     }
 
     let probabilities = softmax(&eligible);
+    let mut stream_state = 0_u64;
     let selection_mode = if request.parameters.greedy
         || !request.parameters.sampling_enabled
         || request.parameters.temperature == 0.0
@@ -503,20 +518,15 @@ pub fn select_next_token(request: &SamplingRequest) -> Result<SamplingResult, Sa
             .map(|(index, _)| index)
             .expect("eligible set is non-empty"),
         SamplingSelectionMode::Stochastic => {
-            let seed = request
-                .rng_state
-                .as_ref()
-                .map(SamplingRngState::seed)
-                .or(request.rng_seed)
-                .unwrap_or_else(|| deterministic_seed_from_scores(&probabilities));
-            sample_index(&probabilities, seed)
+            stream_state = resolve_stream_state(request, &probabilities);
+            sample_index(&probabilities, &mut stream_state)
         }
     };
     let selected = &probabilities[selected_index];
     let rank = rank_for(selected.token_id, &probabilities);
     let probability_allowed = request.policy.allow_probability_metadata;
     let updated_rng_state = matches!(selection_mode, SamplingSelectionMode::Stochastic)
-        .then(|| SamplingRngState::opaque(next_seed_bytes(selected.score, selected.token_id)));
+        .then(|| SamplingRngState::from_stream(stream_state));
 
     Ok(SamplingResult {
         request_id: request.request_id.clone(),
@@ -584,10 +594,7 @@ pub fn sampling_workspace_requests(
         ),
         (
             "rng-state",
-            request
-                .rng_seed
-                .or_else(|| request.rng_state.as_ref().map(SamplingRngState::seed))
-                .map(|_| 32),
+            (request.rng_seed.is_some() || request.rng_state.is_some()).then_some(32),
         ),
         (
             "history",
@@ -942,12 +949,33 @@ fn rank_for(token_id: TokenId, probabilities: &[ProbabilityCandidate]) -> usize 
         .unwrap_or(1)
 }
 
-fn sample_index(candidates: &[ProbabilityCandidate], seed: u64) -> usize {
-    let threshold = (xorshift64(seed) as f64 / u64::MAX as f64) as f32;
+/// Chooses the stream position this step draws from.
+///
+/// A threaded [`SamplingRngState`] resumes exactly where the previous step
+/// left off. Callers that only set a fixed `rng_seed` and never thread the
+/// state back get a position derived from that seed *and* the step index, so
+/// the stream still advances across a generation instead of redrawing the same
+/// number every step.
+fn resolve_stream_state(request: &SamplingRequest, probabilities: &[ProbabilityCandidate]) -> u64 {
+    if let Some(state) = request.rng_state.as_ref() {
+        return state.stream_position();
+    }
+    let origin = request
+        .rng_seed
+        .unwrap_or_else(|| deterministic_seed_from_scores(probabilities));
+    // Distinct steps must start at distinct positions; mixing the counter
+    // through the finalizer keeps consecutive steps uncorrelated.
+    let mut state = origin ^ (request.step_index as u64).wrapping_mul(0x9e3779b97f4a7c15);
+    splitmix64(&mut state);
+    state
+}
+
+fn sample_index(candidates: &[ProbabilityCandidate], state: &mut u64) -> usize {
+    let threshold = unit_interval(splitmix64(state));
     let mut cumulative = 0.0;
     for (index, candidate) in candidates.iter().enumerate() {
         cumulative += candidate.probability;
-        if threshold <= cumulative {
+        if threshold < cumulative {
             return index;
         }
     }
@@ -962,19 +990,22 @@ fn deterministic_seed_from_scores(candidates: &[ProbabilityCandidate]) -> u64 {
         })
 }
 
-fn xorshift64(mut value: u64) -> u64 {
-    if value == 0 {
-        value = 0x9e3779b97f4a7c15;
-    }
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^= value << 17;
-    value
+/// SplitMix64: advances `state` by the golden-gamma increment and returns the
+/// finalized output. Chosen over the previous single-round xorshift because a
+/// counter plus a strong finalizer decorrelates adjacent seeds, which is
+/// exactly the property a per-step sampling stream needs.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
 }
 
-fn next_seed_bytes(score: f32, token_id: TokenId) -> Vec<u8> {
-    let seed = xorshift64((u64::from(score.to_bits()) << 32) ^ u64::from(token_id));
-    seed.to_le_bytes().to_vec()
+/// Maps a draw onto `[0, 1)` using the top 53 bits, the exactly
+/// representable range of an `f64` mantissa.
+fn unit_interval(draw: u64) -> f32 {
+    ((draw >> 11) as f64 / (1_u64 << 53) as f64) as f32
 }
 
 fn finish_hint_for(request: &SamplingRequest, token_id: TokenId) -> Option<SamplingFinishHint> {
