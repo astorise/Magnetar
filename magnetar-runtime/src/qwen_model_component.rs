@@ -920,6 +920,7 @@ pub fn qwen_build_graph(
     phase: ExecutionGraphPhase,
     sequence_length: u64,
     kv_cache_enabled: bool,
+    position_offset: u64,
 ) -> Result<ExecutionGraph, QwenComponentError> {
     if sequence_length == 0 {
         return Err(QwenComponentError::GraphProductionFailed {
@@ -1076,6 +1077,10 @@ pub fn qwen_build_graph(
                 .with_attribute(
                     "position_mode",
                     OperatorAttributeValue::String(config.rope.position_mode.as_str().into()),
+                )
+                .with_attribute(
+                    "position_offset",
+                    OperatorAttributeValue::Integer(position_offset as i64),
                 ),
             )
             .with_edge(f32_edge(
@@ -1098,6 +1103,10 @@ pub fn qwen_build_graph(
                 .with_attribute(
                     "position_mode",
                     OperatorAttributeValue::String(config.rope.position_mode.as_str().into()),
+                )
+                .with_attribute(
+                    "position_offset",
+                    OperatorAttributeValue::Integer(position_offset as i64),
                 ),
             );
 
@@ -1362,6 +1371,8 @@ pub fn qwen_prefill_graph(
         ExecutionGraphPhase::Prefill,
         prompt_length,
         kv_cache_enabled,
+        // A prefill starts the sequence, so its first row is position zero.
+        0,
     )?;
     validate_first_scope_graph(&graph)?;
     GraphProductionResult::validated(graph, &identity.id, &default_graph_catalog())
@@ -1370,11 +1381,25 @@ pub fn qwen_prefill_graph(
 
 /// Produce a validated Qwen decode Execution Graph for a single new token,
 /// consuming prior KV cache.
+///
+/// `cached_token_count` is how many tokens the KV cache already holds, which
+/// is the absolute position of the token being generated. It is required
+/// rather than defaulted: a decode graph built as if the new token were at
+/// position zero produces wrong rotations for every token after the first, and
+/// does so silently.
 pub fn qwen_decode_graph(
     config: &QwenConfig,
     identity: &ModelComponentIdentity,
+    cached_token_count: u64,
 ) -> Result<GraphProductionResult, QwenComponentError> {
-    let graph = qwen_build_graph(config, identity, ExecutionGraphPhase::Decode, 1, true)?;
+    let graph = qwen_build_graph(
+        config,
+        identity,
+        ExecutionGraphPhase::Decode,
+        1,
+        true,
+        cached_token_count,
+    )?;
     validate_first_scope_graph(&graph)?;
     GraphProductionResult::validated(graph, &identity.id, &default_graph_catalog())
         .map_err(QwenComponentError::from)
@@ -1942,7 +1967,10 @@ pub fn qwen_conformance_report(
         detail: prefill_result.err().map(|error| error.to_string()),
     });
 
-    let decode_result = qwen_decode_graph(config, identity);
+    // Decode the 5th token, i.e. against the 4 tokens the prefill above cached,
+    // so the check exercises a non-zero position rather than the degenerate
+    // first-token case.
+    let decode_result = qwen_decode_graph(config, identity, 4);
     checks.push(QwenConformanceCheck {
         name: "decode-graph-production",
         passed: decode_result.is_ok(),

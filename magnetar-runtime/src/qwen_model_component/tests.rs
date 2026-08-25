@@ -132,7 +132,7 @@ fn prefill_graph_production_succeeds() {
 fn decode_graph_production_includes_kv_cache_append() {
     let config = small_config();
     let identity = small_identity();
-    let result = qwen_decode_graph(&config, &identity).unwrap();
+    let result = qwen_decode_graph(&config, &identity, 4).unwrap();
     assert_eq!(result.graph.phase, ExecutionGraphPhase::Decode);
     let appended = result
             .graph

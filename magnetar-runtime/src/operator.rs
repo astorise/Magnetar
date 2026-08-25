@@ -913,6 +913,15 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "position_mode",
                 OperatorAttributeRule::optional(OperatorAttributeKind::String),
+            )
+            // Absolute position of the first row. Absent means the sequence
+            // starts at zero, which is only true for a prefill; a decode step
+            // against a populated cache carries the number of tokens already
+            // there, without which every generated token would be rotated as
+            // if it were the first.
+            .with_rule(
+                "position_offset",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             ),
         "rmsnorm" | "layernorm" => OperatorAttributeSchema::default()
             .with_rule(

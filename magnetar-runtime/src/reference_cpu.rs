@@ -465,12 +465,19 @@ pub fn rmsnorm(
 }
 
 /// Rotary position embedding, rotating consecutive pairs within the first
-/// `dimension` elements of each row using `position = row index`.
+/// `dimension` elements of each row.
+///
+/// The absolute position of row `r` is `position_offset + r`. The offset is an
+/// explicit parameter rather than a default because a decode step passes a
+/// single row whose true position is however many tokens precede it: deriving
+/// position from the row index alone would rotate every generated token as if
+/// it were the first, which is silently wrong rather than an error.
 pub fn rope(
     input: &HostTensor,
     base: f32,
     scale: f32,
     dimension: u64,
+    position_offset: u64,
 ) -> Result<HostTensor, ReferenceCpuError> {
     let (rows, cols) = input.rows_cols()?;
     if dimension == 0 || !dimension.is_multiple_of(2) || dimension > cols {
@@ -496,7 +503,7 @@ pub fn rope(
     let mut out = input.data.clone();
     let half = (dimension / 2) as usize;
     for row in 0..rows as usize {
-        let position = (row as f32) * scale;
+        let position = ((position_offset as usize + row) as f32) * scale;
         let row_start = row * cols as usize;
         for pair in 0..half {
             let frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
@@ -596,10 +603,10 @@ pub fn attention(
     }
     let (seq_len, q_model_dim) = q.rows_cols()?;
     let (kv_seq_len, kv_model_dim) = k.rows_cols()?;
-    if seq_len != kv_seq_len {
+    if seq_len > kv_seq_len {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
-            format!("q sequence length {seq_len} must match k/v sequence length {kv_seq_len}"),
+            format!("q sequence length {seq_len} cannot exceed k/v sequence length {kv_seq_len}"),
         ));
     }
     if head_count * head_dimension != q_model_dim {
@@ -620,10 +627,17 @@ pub fn attention(
     }
     let group_size = (head_count / kv_head_count) as usize;
     let seq_len = seq_len as usize;
+    let kv_seq_len = kv_seq_len as usize;
     let q_model_dim = q_model_dim as usize;
     let kv_model_dim = kv_model_dim as usize;
     let head_dimension = head_dimension as usize;
     let scale = 1.0 / (head_dimension as f32).sqrt();
+    // Queries are the *last* `seq_len` positions of the sequence the keys
+    // cover. For prefill the two lengths match and this offset is zero; for a
+    // decode step against a populated cache it is what places the new token at
+    // its true position, so causal masking and the sliding window bound the
+    // right keys instead of treating the token as if it were at position 0.
+    let query_position_offset = kv_seq_len - seq_len;
     let mut out = vec![0.0_f32; seq_len * q_model_dim];
     // Both scratch buffers are rewritten from scratch for every (head, query)
     // pair and carry nothing between iterations, so they are allocated once
@@ -637,9 +651,14 @@ pub fn attention(
         let q_offset = head * head_dimension;
         let kv_offset = kv_head * head_dimension;
         for query_index in 0..seq_len {
-            let key_upper = if causal { query_index + 1 } else { seq_len };
+            let query_position = query_position_offset + query_index;
+            let key_upper = if causal {
+                query_position + 1
+            } else {
+                kv_seq_len
+            };
             let key_lower = window_size
-                .map(|window| query_index.saturating_sub((window as usize).saturating_sub(1)))
+                .map(|window| query_position.saturating_sub((window as usize).saturating_sub(1)))
                 .unwrap_or(0)
                 .min(key_upper);
             let query_base = query_index * q_model_dim + q_offset;
@@ -1179,6 +1198,7 @@ impl ReferenceCpuExecutor {
             10000.0,
             1.0,
             2,
+            0,
         );
         checks.push(ReferenceCpuConformanceCheck {
             name: "rope-baseline-known-output",
@@ -1549,9 +1569,10 @@ impl ReferenceCpuExecutor {
                     })?;
                 // The portable `rope` Operator's attribute schema defines an
                 // optional `position_mode` string. Reference CPU only
-                // implements the default sequential mode (position = row
-                // index); anything else is explicitly rejected rather than
-                // silently treated as sequential.
+                // implements the default sequential mode (positions advance by
+                // one per row from the offset below); anything else is
+                // explicitly rejected rather than silently treated as
+                // sequential.
                 if let Some(OperatorAttributeValue::String(mode)) =
                     invocation.attributes.get("position_mode")
                     && mode != "sequential"
@@ -1560,7 +1581,29 @@ impl ReferenceCpuExecutor {
                         attribute: format!("position_mode '{mode}' is not implemented"),
                     });
                 }
-                rope(&input, base, scale, dimension).map_err(KernelError::from)?
+                // Absolute position of the first row. Absent for prefill,
+                // where the sequence starts at zero; a decode step carries the
+                // number of tokens already in the cache.
+                // Read raw rather than through `attribute_integer`, which maps a
+                // negative value to `None`. That would make a negative offset
+                // indistinguishable from an absent one and silently rotate at
+                // position zero, which is the exact failure this attribute
+                // exists to prevent.
+                let position_offset = match invocation.attributes.get("position_offset") {
+                    None => 0,
+                    Some(OperatorAttributeValue::Integer(offset)) if *offset >= 0 => *offset as u64,
+                    Some(OperatorAttributeValue::Integer(offset)) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("position_offset {offset} must not be negative"),
+                        });
+                    }
+                    Some(_) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "position_offset must be an integer".into(),
+                        });
+                    }
+                };
+                rope(&input, base, scale, dimension, position_offset).map_err(KernelError::from)?
             }
             "attention" => {
                 if cfg!(target_arch = "wasm32") {

@@ -267,3 +267,133 @@ fn attention_scratch_reuse_does_not_leak_between_queries() {
 
     assert_eq!(actual.data, expected);
 }
+
+// ---------------------------------------------------------------------------
+// Incremental decode
+// ---------------------------------------------------------------------------
+
+/// A decode step against a populated cache must produce exactly what the full
+/// prefill produces for that position.
+///
+/// This is the property incremental decoding rests on, and the one the kernels
+/// could not express before: `attention` required the query and key sequences
+/// to be the same length, so a single new token against N cached keys was
+/// rejected outright.
+#[test]
+fn attention_decode_step_matches_the_corresponding_prefill_row() {
+    let mut rng = Rng(0xdec0);
+    for (head_count, kv_head_count, head_dimension) in [(1_u64, 1_u64, 2_u64), (4, 2, 3)] {
+        for total_len in 1..=6_u64 {
+            let k = rng.tensor(total_len, kv_head_count * head_dimension);
+            let v = rng.tensor(total_len, kv_head_count * head_dimension);
+            let q_full = rng.tensor(total_len, head_count * head_dimension);
+
+            let prefill = attention(
+                &q_full,
+                &k,
+                &v,
+                head_count,
+                head_dimension,
+                Some(kv_head_count),
+                None,
+                true,
+            )
+            .unwrap();
+
+            // The last row of the prefill is the same computation a decode
+            // step performs for that token.
+            let width = (head_count * head_dimension) as usize;
+            let last = (total_len as usize - 1) * width;
+            let expected = &prefill.data[last..last + width];
+
+            let q_step = HostTensor::new(
+                [1, head_count * head_dimension],
+                &q_full.data[last..last + width],
+            )
+            .unwrap();
+            let decode = attention(
+                &q_step,
+                &k,
+                &v,
+                head_count,
+                head_dimension,
+                Some(kv_head_count),
+                None,
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(
+                decode.data, expected,
+                "heads {head_count}/{kv_head_count} dim {head_dimension} len {total_len}"
+            );
+        }
+    }
+}
+
+/// The sliding window must be measured from the query's absolute position, not
+/// from its index within the (length-1) decode query.
+#[test]
+fn attention_decode_step_windows_from_the_absolute_position() {
+    let mut rng = Rng(0x1d05);
+    let total_len = 6_u64;
+    let k = rng.tensor(total_len, 2);
+    let v = rng.tensor(total_len, 2);
+    let q_full = rng.tensor(total_len, 2);
+
+    for window in [1_u64, 2, 3] {
+        let prefill = attention(&q_full, &k, &v, 1, 2, Some(1), Some(window), true).unwrap();
+        let last = (total_len as usize - 1) * 2;
+        let expected = &prefill.data[last..last + 2];
+
+        let q_step = HostTensor::new([1, 2], &q_full.data[last..last + 2]).unwrap();
+        let decode = attention(&q_step, &k, &v, 1, 2, Some(1), Some(window), true).unwrap();
+
+        assert_eq!(decode.data, expected, "window {window}");
+    }
+}
+
+#[test]
+fn attention_rejects_more_queries_than_cached_keys() {
+    let mut rng = Rng(11);
+    let q = rng.tensor(3, 2);
+    let k = rng.tensor(2, 2);
+    let v = rng.tensor(2, 2);
+    let error = attention(&q, &k, &v, 1, 2, Some(1), None, true)
+        .expect_err("more queries than keys must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
+}
+
+/// RoPE for a decode step must rotate by the token's absolute position, which
+/// is what the offset carries. Without it, every generated token would be
+/// rotated as if it were the first.
+#[test]
+fn rope_offset_matches_the_corresponding_prefill_row() {
+    let mut rng = Rng(0x0ffe);
+    let rows = 5_u64;
+    let cols = 4_u64;
+    let full = rng.tensor(rows, cols);
+
+    let prefill = rope(&full, 10000.0, 1.0, cols, 0).unwrap();
+
+    for row in 0..rows as usize {
+        let start = row * cols as usize;
+        let single = HostTensor::new([1, cols], &full.data[start..start + cols as usize]).unwrap();
+        let stepped = rope(&single, 10000.0, 1.0, cols, row as u64).unwrap();
+
+        assert_eq!(
+            stepped.data,
+            &prefill.data[start..start + cols as usize],
+            "row {row}"
+        );
+    }
+}
+
+#[test]
+fn rope_offset_zero_is_the_previous_behaviour() {
+    let mut rng = Rng(0x0ff0);
+    let input = rng.tensor(4, 4);
+    let rotated = rope(&input, 10000.0, 1.0, 4, 0).unwrap();
+    // Position 0 leaves the first row untouched, as before the offset existed.
+    assert_eq!(rotated.data[..4], input.data[..4]);
+}

@@ -6310,7 +6310,7 @@ fn reference_cpu_rmsnorm_rejects_dtype_shape_mismatch() {
 #[test]
 fn reference_cpu_rope_identity_at_position_zero() {
     let input = reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]);
-    let result = rope(&input, 10000.0, 1.0, 2).unwrap();
+    let result = rope(&input, 10000.0, 1.0, 2, 0).unwrap();
     assert!((result.data[0] - 1.0).abs() < 1e-5);
     assert!((result.data[1] - 2.0).abs() < 1e-5);
 }
