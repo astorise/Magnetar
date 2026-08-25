@@ -90,21 +90,52 @@ impl RuntimeBuilder {
         self.providers.push(x);
         self
     }
+    /// Builds the Runtime.
+    ///
+    /// A Provider that fails to register does not abort startup, but the
+    /// failure is not lost either: it is recorded as a
+    /// [`RuntimeDiagnosticCode::ProviderRejected`] diagnostic readable through
+    /// [`Runtime::startup_diagnostics`]. Without that, a Runtime could come up
+    /// silently missing a Provider the caller explicitly registered, and the
+    /// first symptom would be an unrelated `NoCompatibleProvider` at
+    /// resolution time.
     pub fn build(self) -> Result<Runtime, ProviderError> {
+        Ok(self.build_runtime())
+    }
+
+    /// The build itself, which cannot currently fail.
+    ///
+    /// [`Self::build`] keeps a `Result` so a future failure path does not
+    /// break the signature, while [`Runtime::initialize`] goes through here so
+    /// it never has to unwrap a `Result` that has no error case.
+    fn build_runtime(self) -> Runtime {
         let mut providers = ProviderLoader::new();
         let mut kernel_registry = KernelRegistry::new();
-        for x in self.providers {
-            let advertisements = x.kernel_advertisements();
-            let provider_name = x.metadata().name;
-            let provider_binding = ProviderBinding::new(provider_name);
-            providers.register_provider_isolated(x);
+        let mut startup_diagnostics = Vec::new();
+        for provider in self.providers {
+            let advertisements = provider.kernel_advertisements();
+            let provider_name = provider.metadata().name;
+            let provider_binding = ProviderBinding::new(provider_name.clone());
+            if let Err(error) = providers.register_provider(provider) {
+                startup_diagnostics.push(
+                    RuntimeDiagnostic::new(
+                        RuntimeDiagnosticCode::ProviderRejected,
+                        format!("provider '{provider_name}' was not registered: {error}"),
+                    )
+                    .with_provider(provider_binding),
+                );
+                // The Provider is absent from the loader, so registering its
+                // kernels would leave the registry holding candidates that can
+                // never resolve to anything.
+                continue;
+            }
             for advertisement in advertisements {
                 if let Err(error) = kernel_registry.register_provider_advertisement(advertisement) {
                     kernel_registry.invalidate_provider(&provider_binding, error.code());
                 }
             }
         }
-        let runtime = Runtime {
+        Runtime {
             context: ExecutionContext {
                 id: next_execution_context_id(),
                 config: self.config.clone(),
@@ -118,9 +149,9 @@ impl RuntimeBuilder {
             providers,
             sessions: BTreeMap::new(),
             session_observations: Vec::new(),
+            startup_diagnostics,
             initialized: true,
-        };
-        Ok(runtime)
+        }
     }
 }
 pub struct Runtime {
@@ -134,6 +165,7 @@ pub struct Runtime {
     providers: ProviderLoader,
     sessions: BTreeMap<InferenceSessionId, InferenceSession>,
     session_observations: Vec<SessionObservation>,
+    startup_diagnostics: Vec<RuntimeDiagnostic>,
     initialized: bool,
 }
 impl Runtime {
@@ -141,10 +173,15 @@ impl Runtime {
         RuntimeBuilder::new()
     }
     pub fn initialize(config: RuntimeConfig) -> Self {
-        Self::builder()
-            .config(config)
-            .build()
-            .expect("valid configuration")
+        Self::builder().config(config).build_runtime()
+    }
+
+    /// Diagnostics recorded while the Runtime was built.
+    ///
+    /// Currently this is where Providers rejected during registration are
+    /// reported. An empty slice means every registered Provider came up.
+    pub fn startup_diagnostics(&self) -> &[RuntimeDiagnostic] {
+        &self.startup_diagnostics
     }
     pub fn is_initialized(&self) -> bool {
         self.initialized

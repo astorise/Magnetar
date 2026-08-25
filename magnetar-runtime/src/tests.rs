@@ -17,6 +17,7 @@ struct TestProvider {
     capability_health: BTreeMap<CapabilityId, HealthState>,
     devices: Vec<Arc<dyn Device>>,
     execution_api: Option<Arc<dyn ProviderExecutionApi>>,
+    kernel_advertisements: Vec<KernelAdvertisement>,
 }
 impl TestProvider {
     fn new(name: &str) -> Self {
@@ -30,6 +31,7 @@ impl TestProvider {
             capability_health: BTreeMap::new(),
             devices: Vec::new(),
             execution_api: None,
+            kernel_advertisements: Vec::new(),
         }
     }
 }
@@ -74,6 +76,9 @@ fn simple_elementwise_compute_graph(name: &str) -> ComputeGraph {
 impl Provider for TestProvider {
     fn metadata(&self) -> ProviderMetadata {
         self.metadata.clone()
+    }
+    fn kernel_advertisements(&self) -> Vec<KernelAdvertisement> {
+        self.kernel_advertisements.clone()
     }
     fn register(&self, _registry: &mut ProviderRegistry) -> Result<(), ProviderError> {
         Ok(())
@@ -2895,6 +2900,51 @@ fn builder_isolates_failed_provider_initialization() {
         .unwrap();
     assert!(runtime.providers().provider("failed").is_none());
     assert!(runtime.providers().provider("available").is_some());
+}
+#[test]
+fn builder_reports_rejected_provider_instead_of_dropping_it_silently() {
+    let mut failed = TestProvider::new("failed");
+    failed.fail_initialization = true;
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(failed))
+        .register_provider(Arc::new(TestProvider::new("available")))
+        .build()
+        .unwrap();
+
+    let diagnostics = runtime.startup_diagnostics();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, RuntimeDiagnosticCode::ProviderRejected);
+    assert_eq!(
+        diagnostics[0]
+            .provider
+            .as_ref()
+            .map(ProviderBinding::as_str),
+        Some("failed")
+    );
+    assert!(diagnostics[0].message.contains("failed"));
+}
+#[test]
+fn builder_records_no_diagnostics_when_every_provider_registers() {
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(TestProvider::new("available")))
+        .build()
+        .unwrap();
+    assert!(runtime.startup_diagnostics().is_empty());
+}
+#[test]
+fn builder_does_not_register_kernels_for_a_rejected_provider() {
+    let mut failed = TestProvider::new("failed");
+    failed.fail_initialization = true;
+    failed.kernel_advertisements = reference_cpu_kernel_advertisements();
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(failed))
+        .build()
+        .unwrap();
+
+    // The Provider never came up, so its kernels must not be left in the
+    // registry as candidates that can never resolve.
+    assert!(runtime.providers().provider("failed").is_none());
+    assert_eq!(runtime.startup_diagnostics().len(), 1);
 }
 #[test]
 fn reject_incompatible() {
