@@ -25,7 +25,8 @@ use magnetar_runtime::{
     CliBoundaryError, InferenceApiError, MemoryManager, MemoryManagerConfig, ModelArtifactSource,
     ModelInstanceId, ModelInstanceUnloadPolicy, ModelLoadingApiRequest, ModelLoadingCoordinator,
     ModelLoadingRequest, ModelLoadingRequestId, ModelRef, ModelRegistry, ModelResolutionRequest,
-    ModelTrustStore, ReferenceCpuProvider, Runtime, load_model, unload_model_instance,
+    ModelTrustStore, ReferenceCpuProvider, ReleaseVersion, Runtime,
+    build_release_binary_version_report, load_model, unload_model_instance,
 };
 
 use crate::observability::{CliObservationKind, CliObserver};
@@ -72,6 +73,7 @@ pub fn dispatch(args: &[String]) -> Result<(), CliBoundaryError> {
         "devices" => cmd_devices(),
         "sessions" => cmd_sessions(),
         "serve" => cmd_serve(&filtered[1..]),
+        "version" | "--version" | "-V" => cmd_version(),
         other => {
             render::print_usage();
             Err(CliBoundaryError::CliCommandInvalid {
@@ -796,6 +798,42 @@ fn cmd_devices() -> Result<(), CliBoundaryError> {
         println!("no devices registered");
     }
     Ok(())
+}
+
+/// `magnetar version` / `magnetar --version` / `magnetar -V`. Builds and
+/// prints the release binary version report defined by
+/// `magnetar_runtime::release_packaging::build_release_binary_version_report`
+/// (see `openspec/changes/define-release-packaging-and-versioning-policy`).
+/// `magnetar-cli`'s own crate version (`env!("CARGO_PKG_VERSION")`) is the
+/// binary version; the build profile is derived from `debug_assertions`
+/// since this CLI has no separate release-automation step yet; no feature
+/// flags are compiled into this binary today, so the enabled list is empty
+/// rather than fabricated; and the commit hash is only included when
+/// provided at build time via `MAGNETAR_COMMIT_HASH` (unset by default --
+/// honestly `None`, not a fabricated value).
+fn cmd_version() -> Result<(), CliBoundaryError> {
+    let binary_version = parse_release_version(env!("CARGO_PKG_VERSION"));
+    let build_profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let commit_hash = option_env!("MAGNETAR_COMMIT_HASH").map(str::to_string);
+    let report =
+        build_release_binary_version_report(binary_version, Vec::new(), build_profile, commit_hash);
+    render::print_version(&report);
+    Ok(())
+}
+
+/// Parses `env!("CARGO_PKG_VERSION")` (always a valid `major.minor.patch`
+/// semantic version, enforced by Cargo) into a [`ReleaseVersion`].
+fn parse_release_version(raw: &str) -> ReleaseVersion {
+    let mut parts = raw.split('.').map(|part| part.parse::<u64>().unwrap_or(0));
+    ReleaseVersion::new(
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
 }
 
 /// `magnetar sessions`. This minimal CLI does not persist sessions across

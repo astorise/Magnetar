@@ -3163,3 +3163,114 @@ When it advertises Kernels
 
 Then advertisements use Kernel Contract and Tensor Layout metadata.
 
+### Requirement: Provider Release Status
+
+Release metadata SHALL declare Provider support status.
+
+#### Scenario: Provider list
+
+Given `v0.1` release notes are generated
+
+When Provider support is listed
+
+Then Reference CPU is included and CUDA/Metal/OpenVINO/QNN/WebGPU are deferred
+or experimental.
+
+---
+
+### Requirement: Provider ABI Compatibility Status
+
+Release metadata SHALL declare Provider ABI compatibility status.
+
+#### Scenario: ABI status
+
+Given Provider ABI is not stable
+
+When release notes are generated
+
+Then Provider ABI is marked unstable or experimental.
+
+---
+
+### Requirement: Provider Handles Remain Hidden In Release
+
+Release public APIs SHALL not expose raw Provider, Device, Kernel, or native
+framework handles.
+
+#### Scenario: Release docs
+
+Given Provider diagnostics are documented
+
+When examples are inspected
+
+Then raw native handles are absent.
+
+### Requirement: Provider Trust Model Documented
+
+Release SHALL document that Providers are trusted native code.
+
+#### Scenario: Provider release docs
+
+Given release docs describe Provider system
+
+When security notes are inspected
+
+Then trusted native Provider model is explicit.
+
+---
+
+### Requirement: Dynamic Provider Loading Status Documented
+
+Dynamic Provider loading SHALL be disabled, experimental, or explicitly marked
+unstable unless security reviewed.
+
+#### Scenario: Dynamic Provider feature
+
+Given dynamic Provider loading exists
+
+When release metadata is generated
+
+Then support status and security limitations are documented.
+
+---
+
+### Requirement: Provider Native Handles Hidden
+
+Provider native handles SHALL remain hidden in release APIs, diagnostics, and
+reports.
+
+#### Scenario: Provider diagnostic
+
+Given Provider diagnostic is emitted
+
+When redaction gate runs
+
+Then no native handle is present.
+
+### Requirement: Provider Release Gate Coverage
+
+Provider contracts SHALL have release gate coverage.
+
+#### Scenario: Provider health
+
+Given Provider health/readiness/pressure are conflated
+
+When release gate runs
+
+Then release is blocked.
+
+---
+
+### Requirement: Non-Baseline Providers Are Skippable With Reason
+
+A skip SHALL include a structured out-of-scope reason. Non-baseline Providers
+MAY be skipped only with such a reason.
+
+#### Scenario: CUDA skip
+
+Given CUDA is not in `v0.1`
+
+When release report is generated
+
+Then CUDA gate is skipped with reason.
+

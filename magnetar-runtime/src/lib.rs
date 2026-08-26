@@ -41,6 +41,9 @@ pub mod provider;
 pub mod provider_roadmap;
 pub mod qwen_model_component;
 pub mod reference_cpu;
+pub mod release_cutover;
+pub mod release_packaging;
+pub mod release_security;
 pub mod resolution;
 pub mod runtime;
 pub mod sampling;
@@ -414,6 +417,76 @@ pub use reference_cpu::{
     dtype_conversion, embedding_lookup, evaluate_fallback, gelu, layout_conversion, matmul, mul,
     quantize_placeholder, reference_cpu_device, reference_cpu_kernel_advertisements,
     reference_cpu_provider_metadata, residual_add, rmsnorm, rope, silu, softmax_rows,
+};
+pub use release_cutover::{
+    CUTOVER_COMPATIBILITY_DIMENSIONS, CutoverArtifactVerification, CutoverChangelogChecklist,
+    CutoverCompatibilityDimension, CutoverCompatibilityMatrix, CutoverCompatibilityStatus,
+    CutoverException, CutoverReleaseNotesChecklist, CutoverSecurityVerification,
+    CutoverVersionConfirmation, GateSkip, OpenSpecFreezeConfirmation, POST_V0_1_HANDOFF_CANDIDATES,
+    PostPublicationVerification, PostV01HandoffItem, RELEASE_CUTOVER_POLICY_VERSION,
+    ReleaseCutoverConformanceReport, ReleaseCutoverConformanceResult, ReleaseCutoverError,
+    ReleaseCutoverGateInputs, ReleaseCutoverObservation, ReleaseReadinessChecklist,
+    RollbackRetractionNotes, V0_1_FINAL_RELEASE_STATEMENT, V0_1_INCLUDED_SCOPE,
+    WitPackageVersionRecord, cutover_compatibility_dimension_id, cutover_compatibility_status_id,
+    evaluate_release_cutover, record_release_cutover_observation,
+    reject_post_v0_1_item_as_release_claim, reject_semantic_change_after_freeze,
+    reject_status_misrepresentation, reject_undocumented_cutover_exception,
+    run_release_cutover_conformance, validate_cutover_artifacts_generated,
+    validate_cutover_cli_boundary, validate_cutover_exceptions, validate_cutover_feature_flag,
+    validate_cutover_provider_feature_flags, validate_cutover_runtime_scope,
+    validate_final_release_statement, validate_gate_skips, validate_publication_scope_preserved,
+    validate_required_gates_executed, validate_runtime_version_matches_release_tag,
+    validate_tag_after_gates, validate_v0_1_scope_feature, validate_wit_versions_confirmed,
+    verify_cutover_artifact_checksum,
+};
+pub use release_packaging::{
+    ArtifactChecksum, CLI_BOUNDARY_CONFORMANCE_VERSION, COMPATIBILITY_DIMENSIONS, ChangelogEntry,
+    ChangelogEntryKind, ChecksumAlgorithm, CompatibilityDimension, CompatibilityStatus,
+    CrateVersionMetadata, OpenSpecBaselineDeclaration, PublishingBoundaryCategory,
+    RELEASE_ARTIFACT_KINDS, RELEASE_PACKAGING_POLICY_VERSION, REQUIRED_RELEASE_GATES,
+    RUNTIME_INFERENCE_API_CONFORMANCE_VERSION, ReleaseArtifactKind, ReleaseArtifactManifest,
+    ReleaseArtifactStatus, ReleaseBinaryVersionReport, ReleaseBuildMetadata,
+    ReleaseCandidateManifest, ReleaseCandidateTag, ReleaseChangelog, ReleaseCompatibilityMatrix,
+    ReleaseConformanceVersions, ReleaseDocumentationChecklist, ReleaseFeatureFlag,
+    ReleaseFeatureFlagClass, ReleaseFreezeChangeKind, ReleaseFreezeState, ReleaseGate,
+    ReleaseGateResult, ReleasePackagingConformanceReport, ReleasePackagingConformanceResult,
+    ReleasePackagingError, ReleasePlatformTarget, ReleaseSecurityNotes, ReleaseVersion,
+    ReleaseVersionBumpKind, SupportedWitVersionMatrix, WitVersionChangeKind,
+    allow_failed_candidate_as_pre_release, artifact_kind_id, build_release_binary_version_report,
+    classify_publishing_boundary, compatibility_dimension_id, component_engine_feature_flags,
+    evaluate_version_bump, provider_feature_flags, redact_build_metadata,
+    reject_change_after_freeze, reject_experimental_flag_enabled_by_default,
+    reject_release_public_api_handle_exposure, reject_roadmap_feature_as_guarantee,
+    reject_wasmtime_required_for_browser, release_may_publish_stable, release_platform_targets,
+    release_wit_contract_versions, required_wit_version_bump, run_release_packaging_conformance,
+    unsupported_targets, v0_1_compatibility_matrix, validate_crate_dependency_compatibility,
+    validate_provider_feature_flags_for_v0_1, validate_wit_version_bump,
+};
+pub use release_security::{
+    ArtifactIntegrityStatus, BuildScriptReview, DependencyAdvisory, DependencyAdvisorySeverity,
+    DependencyAuditReport, DependencyFeatureCapability, DependencyFeatureReview, DependencyLicense,
+    DynamicProviderLoadingStatus, FixtureModelTrustPolicy, LicenseAuditReport, LicenseAuditStatus,
+    LockfileState, NonTrustCacheSignal, ProviderTrustModel, ProviderTrustSignalSource,
+    REDACTION_CATEGORIES, RELEASE_SECURITY_POLICY_VERSION,
+    RELEASE_SECURITY_SCOPE_EXCLUDED_FROM_HARDENED_CLAIMS, RELEASE_SECURITY_SCOPE_INCLUDED,
+    RedactionCategory, ReleaseProvenance, ReleaseSecurityConformanceReport,
+    ReleaseSecurityConformanceResult, ReleaseSecurityError, ReleaseSecurityGateInputs,
+    ReleaseSecurityObservation, ReleaseSecurityObservationKind, ReproducibilityReport,
+    ReproducibilityStatus, SECRET_SCAN_TARGETS, SbomAvailability, SbomEntry, SbomManifest,
+    SecretScanFinding, SecretScanReport, SecretScanTarget, SecurityException, SecurityReleaseNotes,
+    SignatureStatus, UnsafeCodePolicy, UnsafeCodeReview, VulnerabilityHandlingPolicy,
+    evaluate_release_security_blocking, flag_unexpected_build_script,
+    magnetar_runtime_unsafe_code_inventory, record_release_security_observation,
+    reject_cache_signal_alone_as_trust, reject_component_release_authority_expansion,
+    reject_hardened_security_claim_for_excluded_feature,
+    reject_provider_registration_implies_trust, reject_release_native_handle_exposure,
+    reject_undocumented_security_exception, reject_unexpected_capability_expanding_feature,
+    reject_unreviewed_lockfile_drift, run_release_security_conformance, secret_scan_target_id,
+    validate_cli_authority_not_delegated_to_runtime, validate_component_release_execution_trust,
+    validate_dynamic_provider_loading_status, validate_fixture_model_trust,
+    validate_model_artifact_release_trust, validate_redaction_gate,
+    validate_runtime_inference_api_security, validate_signature_status,
+    validate_source_cache_release_trust, verify_checksum_matches_final_artifact,
 };
 pub use resolution::{
     BuiltInResolutionPolicy, ResolutionCandidate, ResolutionCandidateRejection, ResolutionContext,

@@ -772,3 +772,57 @@ When server validates it
 
 Then request is rejected or converted only through authorized source contract.
 
+### Requirement: Model Loading Enforces Release Trust
+
+Release baseline Model Loading SHALL enforce artifact trust and integrity.
+
+#### Scenario: Integrity failure
+
+Given fixture artifact digest mismatches
+
+When release E2E runs
+
+Then Model Loading fails and release gate fails.
+
+---
+
+### Requirement: Model Loading Rejects Cache Trust Shortcut
+
+Model Loading SHALL not load cached artifact merely because cache entry exists.
+
+#### Scenario: Cached artifact
+
+Given cached artifact lacks valid trust status under current policy
+
+When loading runs
+
+Then loading is denied.
+
+### Requirement: Model Loading Release Gate
+
+Model Loading SHALL have release gate coverage for artifact validation, trust,
+integrity, compatibility, lifecycle, and cleanup.
+
+#### Scenario: Trust bypass
+
+Given artifact loads without trust validation
+
+When release gate runs
+
+Then stable release is blocked.
+
+---
+
+### Requirement: Model Instance Readiness Release Gate
+
+Model Instance readiness SHALL be validated before session/generation release
+tests.
+
+#### Scenario: Not ready instance
+
+Given Model Instance is not ready
+
+When generation test begins
+
+Then release gate fails.
+

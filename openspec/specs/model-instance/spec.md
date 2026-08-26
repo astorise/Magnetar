@@ -630,3 +630,16 @@ Given E2E test completes
 When cleanup runs
 
 Then Model Instance lifecycle follows policy and does not leak active resources.
+
+### Requirement: Model Instance Release Gate
+
+Model Instance lifecycle SHALL have release gate coverage.
+
+#### Scenario: Active unload leak
+
+Given active Model Instance unload leaks resources
+
+When release validation runs
+
+Then stable release is blocked.
+

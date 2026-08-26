@@ -575,3 +575,98 @@ When response is inspected
 Then Provider handles, Device handles, Kernel handles, and memory pointers are
 absent.
 
+### Requirement: Inference API Compatibility Status
+
+Release metadata SHALL declare Runtime Inference API compatibility status.
+
+#### Scenario: API status
+
+Given `v0.1` is released
+
+When compatibility notes are inspected
+
+Then Runtime Inference API is marked stable-for-baseline or unstable as
+appropriate.
+
+---
+
+### Requirement: Inference API Release Safety
+
+Runtime Inference API release SHALL not expose internal handles.
+
+#### Scenario: Release API audit
+
+Given release API docs are generated
+
+When responses are inspected
+
+Then Provider, Device, Kernel, tensor pointer, memory pointer, KV cache, and raw
+weight internals are absent.
+
+### Requirement: Inference API Release Security
+
+Runtime Inference API release SHALL remain inference-only and redacted by
+default.
+
+#### Scenario: Release inference diagnostics
+
+Given diagnostics are requested after inference
+
+When response is returned
+
+Then raw prompt, raw weights, raw tensors, raw KV cache, secrets, credentials,
+handles, and memory pointers are absent by default.
+
+---
+
+### Requirement: Inference API Rejects Non-Inference Authority
+
+Runtime Inference API SHALL reject requests for filesystem, network, secret,
+shell, process, Git, tool, or agent authority.
+
+#### Scenario: Tool execution request
+
+Given inference request asks Runtime to execute tool
+
+When Runtime validates it
+
+Then request is rejected.
+
+### Requirement: Inference API Release Gate Coverage
+
+Runtime Inference API SHALL have release gate coverage for baseline inference.
+
+#### Scenario: One-shot inference
+
+Given one-shot inference is included in `v0.1`
+
+When release gate runs
+
+Then one-shot path is tested through normal Runtime contracts.
+
+### Requirement: Inference API Cutover Status
+
+Cutover SHALL confirm Runtime Inference API status in compatibility matrix.
+
+#### Scenario: Missing status
+
+Given Runtime Inference API has no status
+
+When cutover runs
+
+Then release is blocked.
+
+---
+
+### Requirement: Inference API Baseline Verified Before Tag
+
+Runtime Inference API baseline gates SHALL pass before stable tag creation.
+
+#### Scenario: API gate after tag
+
+Given stable tag is created before API gate passes
+
+When cutover validates sequence
+
+Then release is invalid.
+

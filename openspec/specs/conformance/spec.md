@@ -448,3 +448,139 @@ When server streams them
 
 Then order and redaction are preserved.
 
+### Requirement: Release Conformance Gates
+
+Stable release SHALL pass required conformance gates.
+
+#### Scenario: Provider conformance failure
+
+Given Reference CPU conformance fails
+
+When release is attempted
+
+Then stable release is blocked.
+
+---
+
+### Requirement: Conformance Reports Included In Release
+
+Release artifacts SHALL include conformance reports where applicable, or SHALL
+explicitly mark them not applicable.
+
+#### Scenario: Release artifact check
+
+Given release candidate is prepared
+
+When artifacts are inspected
+
+Then conformance report is present or explicitly not applicable.
+
+---
+
+### Requirement: Conformance Suite Versions In Release
+
+Release metadata SHALL include conformance suite versions.
+
+#### Scenario: Report metadata
+
+Given E2E report is generated
+
+When release metadata is assembled
+
+Then E2E suite version is included.
+
+### Requirement: Release Security Conformance
+
+Conformance SHALL include security release gates for dependency audit status,
+license audit status, secret scanning, redaction, native handle exposure, trust
+boundaries, and artifact integrity.
+
+#### Scenario: Security conformance
+
+Given release candidate is tested
+
+When security conformance runs
+
+Then release-blocking security checks pass.
+
+---
+
+### Requirement: Redaction Conformance Blocks Release
+
+Redaction conformance failure SHALL block stable release.
+
+#### Scenario: Raw KV cache leak
+
+Given diagnostics expose raw KV cache content
+
+When release conformance runs
+
+Then stable release is blocked.
+
+---
+
+### Requirement: Trust Boundary Conformance Blocks Release
+
+Trust boundary conformance failure SHALL block stable release.
+
+#### Scenario: Cache trust bypass
+
+Given cached artifact loads without trust validation
+
+When release conformance runs
+
+Then stable release is blocked.
+
+### Requirement: Conformance Suite Release Mode
+
+Conformance SHALL support release mode for `v0.1` gates.
+
+#### Scenario: Release conformance run
+
+Given release mode is enabled
+
+When conformance executes
+
+Then required baseline suites are run and optional out-of-scope suites are
+skipped with reasons.
+
+---
+
+### Requirement: Conformance Report Redaction
+
+Conformance reports SHALL be redacted by default.
+
+#### Scenario: Failure report
+
+Given conformance failure involves prompt input
+
+When report is generated
+
+Then raw prompt text is absent by default.
+
+### Requirement: Conformance Reports Required For Cutover
+
+Cutover SHALL require conformance reports for required baseline suites.
+
+#### Scenario: Missing E2E report
+
+Given E2E local conformance report is missing
+
+When cutover validates artifacts
+
+Then release is blocked.
+
+---
+
+### Requirement: Cutover Conformance Reports Are Redacted
+
+Cutover conformance reports SHALL be redacted by default.
+
+#### Scenario: Prompt in report
+
+Given failure includes prompt text
+
+When report is generated
+
+Then raw prompt is absent by default.
+

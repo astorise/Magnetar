@@ -449,3 +449,109 @@ When core serve mode handles it
 
 Then it does not execute the tool.
 
+### Requirement: CLI Release Boundary
+
+Release CLI surface SHALL preserve CLI/Runtime boundary.
+
+#### Scenario: CLI command
+
+Given released CLI invokes inference
+
+When execution is traced
+
+Then CLI calls Runtime Inference API.
+
+---
+
+### Requirement: CLI Command Stability Status
+
+Release metadata SHALL declare CLI command surface compatibility status.
+
+#### Scenario: CLI docs
+
+Given `magnetar run` is documented
+
+When release notes are inspected
+
+Then command is marked stable-for-baseline, experimental, or preview.
+
+### Requirement: CLI Release Authority Boundary
+
+Release CLI SHALL not delegate ambient filesystem, Git, network, secret, shell,
+process, tool, workspace, or agent authority to Runtime.
+
+#### Scenario: CLI reads file
+
+Given CLI reads file for prompt
+
+When Runtime request is created
+
+Then Runtime receives explicit prompt/context only.
+
+---
+
+### Requirement: CLI Release Secret Redaction
+
+CLI release diagnostics and observations SHALL redact secrets by default.
+
+#### Scenario: Secret provider error
+
+Given CLI fails to read secret
+
+When diagnostic is emitted
+
+Then secret value is absent.
+
+### Requirement: CLI Boundary Release Gate
+
+CLI boundary conformance SHALL be required for `v0.1`.
+
+#### Scenario: Ambient authority leak
+
+Given CLI filesystem authority is delegated to Runtime
+
+When release gate runs
+
+Then stable release is blocked.
+
+---
+
+### Requirement: CLI Compatibility Status
+
+CLI command surface compatibility status SHALL appear in release matrix.
+
+#### Scenario: CLI matrix
+
+Given `magnetar run` exists
+
+When release notes are generated
+
+Then CLI command status is marked stable-for-v0.1-baseline, preview,
+experimental, unstable, deferred, or unsupported.
+
+### Requirement: CLI Boundary Cutover Verification
+
+Cutover SHALL verify CLI/Runtime boundary gates before publication.
+
+#### Scenario: CLI boundary gate failed
+
+Given Runtime receives ambient CLI filesystem authority
+
+When cutover runs
+
+Then release is blocked.
+
+---
+
+### Requirement: CLI Surface Status In Release Notes
+
+Release notes SHALL declare CLI command surface status.
+
+#### Scenario: CLI preview
+
+Given `magnetar run` exists but is preview
+
+When release notes are published
+
+Then it is marked preview or stable-for-v0.1-baseline accurately.
+

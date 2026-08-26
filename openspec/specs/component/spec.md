@@ -2014,3 +2014,59 @@ When Runtime links the Component
 
 Then the Component is rejected or graph production is disabled.
 
+### Requirement: Component Contract Release Status
+
+Release metadata SHALL declare Component Contract compatibility status.
+
+#### Scenario: Component API status
+
+Given `v0.1` release notes are generated
+
+When Component Contract is listed
+
+Then it is marked baseline, experimental, or deferred as appropriate.
+
+---
+
+### Requirement: Component Engine Feature Status
+
+Release metadata SHALL document Component Engine feature flags and supported
+platforms.
+
+#### Scenario: Wasmtime feature
+
+Given Wasmtime Component Engine is feature-gated
+
+When release docs are generated
+
+Then support status and limitations are documented.
+
+### Requirement: Component Artifact Release Trust
+
+Component Artifacts SHALL be validated before execution in release builds.
+
+#### Scenario: Unsigned component
+
+Given unsigned Component Artifact is loaded under production release policy
+
+When Runtime validates it
+
+Then execution is denied unless explicitly allowed.
+
+---
+
+### Requirement: Component Authority Release Boundary
+
+Component execution in release builds SHALL not gain filesystem, network,
+secret, shell, process, Git, tool, Provider handle, Device handle, Kernel handle,
+or raw tensor pointer authority unless explicitly authorized by inference-scoped
+contracts.
+
+#### Scenario: Component requests network
+
+Given Component requests arbitrary network access
+
+When release Runtime authorizes it
+
+Then access is denied.
+

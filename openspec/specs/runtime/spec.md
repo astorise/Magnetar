@@ -5459,3 +5459,111 @@ When Runtime rejects due to memory pressure
 
 Then request fails.
 
+### Requirement: Runtime Release Version Metadata
+
+Runtime SHALL expose release version metadata where appropriate.
+
+#### Scenario: Runtime diagnostics
+
+Given diagnostics are requested
+
+When version metadata is included
+
+Then Runtime version and OpenSpec baseline version are available.
+
+---
+
+### Requirement: Runtime Release Does Not Expand Scope Silently
+
+Runtime release SHALL not include additional responsibilities such as workspace,
+Git, shell, process, tools, secrets, or agent orchestration.
+
+#### Scenario: Release audit
+
+Given `v0.1` release is audited
+
+When Runtime public API is inspected
+
+Then inference-only scope is preserved.
+
+### Requirement: Runtime Release Security Boundary
+
+Runtime release SHALL preserve inference-only authority and default redaction.
+
+#### Scenario: Release Runtime audit
+
+Given Runtime public API is audited
+
+When authority surface is inspected
+
+Then filesystem, network, secret, shell, process, Git, tool, and agent
+authority are absent.
+
+---
+
+### Requirement: Runtime Rejects Security Boundary Violations
+
+Runtime SHALL reject attempts to use inference APIs for non-inference authority.
+
+#### Scenario: Secret access request
+
+Given inference request asks Runtime to read secret
+
+When validation runs
+
+Then Runtime rejects request.
+
+### Requirement: Runtime Release Gate Coverage
+
+Runtime SHALL have release gate coverage for inference-only authority, boundary
+rejection, error structure, and redaction.
+
+#### Scenario: Runtime file authority
+
+Given Runtime exposes arbitrary file read
+
+When release gate runs
+
+Then release is blocked.
+
+---
+
+### Requirement: Runtime Release Compatibility Status
+
+Runtime release metadata SHALL mark Runtime compatibility status.
+
+#### Scenario: Runtime status
+
+Given release notes are generated
+
+When Runtime status is listed
+
+Then it is marked stable-for-v0.1-baseline, preview, experimental, unstable,
+deferred, or unsupported.
+
+### Requirement: Runtime Cutover Scope Confirmation
+
+Cutover SHALL confirm Runtime remains inference-only in `v0.1`.
+
+#### Scenario: Runtime includes tool execution
+
+Given Runtime API includes tool execution
+
+When cutover validates scope
+
+Then release is blocked.
+
+---
+
+### Requirement: Runtime Version Matches Release
+
+Runtime version metadata SHALL match release tag or documented version mapping.
+
+#### Scenario: Version mismatch
+
+Given Runtime reports `0.1.0-rc.1`
+
+When stable `v0.1.0` release is published
+
+Then cutover verification fails.
+

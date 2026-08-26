@@ -1262,3 +1262,112 @@ When observations are emitted
 
 Then server and Runtime events can be correlated.
 
+### Requirement: Release Observability Redaction
+
+Release builds SHALL preserve default observability redaction.
+
+#### Scenario: Release diagnostics
+
+Given release binary emits diagnostics
+
+When diagnostics are inspected
+
+Then raw prompts, secrets, file contents, model weights, tensor values, KV cache
+contents, handles, and memory pointers are absent by default.
+
+---
+
+### Requirement: Release Build Metadata Observability
+
+Release observability MAY include build metadata, but included metadata SHALL
+exclude secrets and local filesystem paths.
+
+#### Scenario: Version observation
+
+Given Runtime emits version observation
+
+When metadata is inspected
+
+Then version and feature flags may be included without secrets or local paths.
+
+### Requirement: Release Observability Security Redaction
+
+Release observability SHALL be redacted by default.
+
+#### Scenario: Release observation
+
+Given inference request includes prompt and model artifact
+
+When observation is emitted
+
+Then raw prompt, weights, tensors, cache contents, secrets, credentials, handles,
+pointers, and raw file contents are absent.
+
+---
+
+### Requirement: Release Security Event Recording
+
+Release process SHALL record security gate status, and recording SHOULD avoid
+exposing sensitive content.
+
+#### Scenario: Secret scan failed
+
+Given secret scan fails
+
+When release metadata is recorded
+
+Then failure status is recorded without printing the secret.
+
+### Requirement: Observability Release Redaction Gate
+
+Observability redaction gate SHALL be required for `v0.1`.
+
+#### Scenario: Secret logged
+
+Given observation logs secret by default
+
+When release validation runs
+
+Then stable release is blocked.
+
+---
+
+### Requirement: Release Reports Redacted
+
+Release reports SHALL be redacted by default.
+
+#### Scenario: Report failure
+
+Given failure includes prompt text
+
+When release report is generated
+
+Then raw prompt text is absent by default.
+
+### Requirement: Cutover Observability Is Redacted
+
+Cutover observations and reports SHALL be redacted by default.
+
+#### Scenario: Release observation
+
+Given cutover records failed secret scan
+
+When report is emitted
+
+Then secret value is not printed.
+
+---
+
+### Requirement: Cutover Events Are Correlatable
+
+Cutover SHALL record correlation between gates, reports, artifacts, and release
+metadata.
+
+#### Scenario: Gate failure
+
+Given Runtime gate fails
+
+When cutover report is inspected
+
+Then failure can be correlated to gate, target, feature set, and artifact.
+

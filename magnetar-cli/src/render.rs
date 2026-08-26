@@ -14,7 +14,10 @@
 //! function that returns a `String` instead of printing directly, so
 //! redaction can be asserted in tests without capturing real stdout.
 
-use magnetar_runtime::{CliBoundaryError, DeviceMetadata, InferenceApiObserver, ProviderMetadata};
+use magnetar_runtime::{
+    CliBoundaryError, DeviceMetadata, InferenceApiObserver, ProviderMetadata,
+    ReleaseBinaryVersionReport,
+};
 
 /// Prints a [`CliBoundaryError`] to stderr via its `Display` impl only --
 /// never `{:?}`. `Display` is the structured, human-readable rendering that
@@ -140,6 +143,7 @@ USAGE:
     magnetar sessions
     magnetar serve
     magnetar serve --demo-request <model-ref> <prompt text...>
+    magnetar version
     magnetar --help
 
 FLAGS (magnetar run):
@@ -183,6 +187,51 @@ logits -- decoded text is not meaningful model output. See
 openspec/changes/define-magnetar-cli-inference-boundary/proposal.md for the
 CLI/Runtime authority boundary this binary implements."#
     );
+}
+
+/// `magnetar version`. Prints the release binary version report defined by
+/// `magnetar_runtime::release_packaging` (see
+/// `openspec/changes/define-release-packaging-and-versioning-policy`):
+/// binary version, Runtime crate version, OpenSpec baseline version, WIT
+/// contract versions, enabled feature flags, build profile, commit hash
+/// where available, and conformance suite version where available.
+pub fn print_version(report: &ReleaseBinaryVersionReport) {
+    print!("{}", render_version(report));
+}
+
+/// Builds the text `print_version` prints (see its doc comment).
+pub fn render_version(report: &ReleaseBinaryVersionReport) -> String {
+    let mut out = format!(
+        "magnetar {}\n  runtime crate version:  {}\n  openspec baseline:      {}\n  build profile:          {}\n",
+        report.binary_version,
+        report.runtime_crate_version,
+        report.openspec_baseline_version,
+        report.build_profile,
+    );
+    out.push_str(&format!(
+        "  commit hash:            {}\n",
+        report.commit_hash.as_deref().unwrap_or("unavailable")
+    ));
+    out.push_str(&format!(
+        "  conformance suite:      {}\n",
+        report
+            .conformance_suite_version
+            .as_deref()
+            .unwrap_or("unavailable")
+    ));
+    out.push_str("  wit contracts:\n");
+    for interface in &report.wit_contract_versions {
+        out.push_str(&format!("    {}@{}\n", interface.name, interface.version));
+    }
+    out.push_str("  enabled feature flags:\n");
+    if report.enabled_feature_flags.is_empty() {
+        out.push_str("    (none)\n");
+    } else {
+        for flag in &report.enabled_feature_flags {
+            out.push_str(&format!("    {flag}\n"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
