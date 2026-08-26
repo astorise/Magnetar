@@ -567,3 +567,208 @@ Given artifact is untrusted
 When load request is submitted through API
 
 Then Runtime rejects it before ready Model Instance publication.
+
+---
+
+### Requirement: CLI Model Resolution Does Not Bypass Loading
+
+CLI-friendly names, aliases, or paths SHALL not bypass Model Loading validation.
+
+#### Scenario: Alias load
+
+Given CLI alias resolves to model reference
+
+When Runtime loads it
+
+Then Model Loading validates artifact, trust, component, memory, provider, and
+policy.
+
+---
+
+### Requirement: CLI Local Paths Become Authorized Sources
+
+If CLI supports local model paths, it SHALL convert them to authorized artifact
+source references before Runtime loading.
+
+#### Scenario: Local model
+
+Given user provides local path
+
+When CLI calls Runtime
+
+Then Runtime receives client-provided artifact source reference and still
+validates it.
+
+---
+
+### Requirement: E2E Uses Model Loading Contract
+
+E2E conformance SHALL load models through Model Loading Contract.
+
+#### Scenario: Load fixture model
+
+Given E2E fixture model reference is valid
+
+When loading begins
+
+Then Runtime validates artifact, component, memory, provider, and policy before
+ready instance publication.
+
+---
+
+### Requirement: E2E Validates Loading Failure
+
+E2E conformance SHALL validate structured loading failure paths.
+
+#### Scenario: Untrusted fixture
+
+Given fixture artifact trust state is invalid
+
+When loading runs
+
+Then Runtime returns structured model loading failure.
+
+---
+
+### Requirement: Model Loading Implemented Before Inference API Success
+
+Model Loading baseline SHALL be implemented before Runtime Inference API success
+path claims model readiness.
+
+#### Scenario: Load fixture
+
+Given fixture model reference is valid
+
+When inference starts
+
+Then Model Loading validates artifact before Model Instance readiness.
+
+---
+
+### Requirement: Fixture Loading Does Not Bypass Trust
+
+Fixture model loading SHALL still pass through trust and artifact validation.
+
+#### Scenario: Test fixture
+
+Given test fixture is trusted for tests
+
+When loaded
+
+Then trust state is explicit rather than bypassed.
+
+### Requirement: Model Loading Consumes Normalized Artifacts
+
+Model Loading SHALL consume normalized Model Artifact metadata regardless of
+source format.
+
+#### Scenario: GGUF normalized
+
+Given GGUF metadata is normalized into Model Artifact
+
+When loading runs
+
+Then Model Loading uses standard validation flow.
+
+---
+
+### Requirement: Model Loading Does Not Bypass Validation For Formats
+
+Supported formats SHALL not bypass Model Loading validation.
+
+#### Scenario: safetensors shortcut
+
+Given safetensors parser succeeds
+
+When loading runs
+
+Then Model Loading still validates trust, integrity, tensor inventory, memory,
+component compatibility, and policy.
+
+---
+
+### Requirement: Sharded Loading Validates Shards
+
+Model Loading SHALL validate shard index, shard presence, digest, and tensor
+mapping for sharded artifacts.
+
+#### Scenario: Missing shard
+
+Given shard index references missing file
+
+When loading validates artifact
+
+Then loading fails before Model Instance creation.
+
+### Requirement: Model Loading Accepts Authorized Source Candidates
+
+Model Loading SHALL accept authorized source candidates and normalized cached
+artifacts.
+
+#### Scenario: Source candidate
+
+Given source candidate is authorized
+
+When Model Loading starts
+
+Then Runtime normalizes and validates it before creating Model Instance.
+
+---
+
+### Requirement: Model Loading Rejects Invalid Cache Entries
+
+Model Loading SHALL reject corrupt, partial, revoked, untrusted, or incompatible
+cache entries.
+
+#### Scenario: Partial cache
+
+Given cache entry is partial
+
+When loading runs
+
+Then Model Loading fails before Model Instance creation.
+
+---
+
+### Requirement: Model Loading Does Not Treat Cache As Residency
+
+Model Loading SHALL materialize memory through Memory Manager even when artifact
+bytes are cached.
+
+#### Scenario: Cached model load
+
+Given model artifact is cached
+
+When Model Loading runs
+
+Then Memory Manager still creates or reuses proper loaded resources according to
+policy.
+
+### Requirement: Server Model Loading Uses Model Loading Contract
+
+Server model load operations SHALL use Model Loading Contract.
+
+#### Scenario: Server load model
+
+Given server receives model load request
+
+When Runtime processes it
+
+Then artifact trust, integrity, component compatibility, memory, provider, and
+policy validation run.
+
+---
+
+### Requirement: Server Does Not Load From Arbitrary Paths
+
+Server model load operations SHALL not load arbitrary filesystem paths unless
+wrapped in authorized source contracts.
+
+#### Scenario: Arbitrary path
+
+Given request includes raw filesystem path
+
+When server validates it
+
+Then request is rejected or converted only through authorized source contract.
+

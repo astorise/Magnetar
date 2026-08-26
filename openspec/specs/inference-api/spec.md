@@ -370,3 +370,208 @@ When it calls Runtime Inference API
 
 Then Runtime receives prompt input and does not read the workspace file itself.
 
+---
+
+### Requirement: Runtime Inference API Is Called By CLI
+
+`magnetar-cli` SHALL call Runtime Inference API for inference operations.
+
+#### Scenario: CLI run
+
+Given user executes `magnetar run`
+
+When generation is needed
+
+Then CLI calls Runtime Inference API.
+
+---
+
+### Requirement: Runtime Inference API Receives Explicit Context
+
+Runtime Inference API SHALL receive explicit prompt/context data from CLI and
+not CLI authority.
+
+#### Scenario: File context
+
+Given CLI reads a file
+
+When Runtime request is built
+
+Then request contains selected content or references allowed by contract, not
+filesystem authority.
+
+---
+
+### Requirement: Runtime Inference API Does Not Execute CLI Tools
+
+Runtime Inference API SHALL not execute CLI tools or shell commands.
+
+#### Scenario: Tool-like output
+
+Given generated output contains tool syntax
+
+When Runtime returns it
+
+Then Runtime does not execute the tool.
+
+---
+
+### Requirement: E2E Uses Runtime Inference API
+
+End-to-End Local Inference Conformance SHALL enter inference through Runtime
+Inference API.
+
+#### Scenario: E2E request
+
+Given local E2E test starts inference
+
+When request is submitted
+
+Then it uses Runtime Inference API, not internal Provider or Kernel APIs.
+
+---
+
+### Requirement: E2E Validates One-Shot Inference
+
+E2E suite MAY validate one-shot inference, but one-shot SHALL use normal Runtime
+contracts internally.
+
+#### Scenario: One-shot E2E
+
+Given one-shot request runs
+
+When tracing or observations are inspected
+
+Then implicit session, tokenization, generation, and dispatch contracts were
+used.
+
+---
+
+### Requirement: E2E Validates API Errors
+
+E2E suite SHALL validate structured Runtime Inference API errors for failure
+cases.
+
+#### Scenario: Invalid model reference
+
+Given invalid model reference is submitted
+
+When API validates it
+
+Then structured model resolution or invalid reference error is returned.
+
+---
+
+### Requirement: Runtime Inference API Implemented After Core Baseline
+
+Runtime Inference API baseline SHALL be implemented after Tensor, Memory,
+Operators, Reference CPU, Kernel Registry, Model Loading, Tokenizer, Qwen
+baseline, Generation, and Sampling are sufficiently available.
+
+#### Scenario: API success path
+
+Given Runtime Inference API accepts request
+
+When generation completes
+
+Then it uses the implemented core baseline instead of fake responses.
+
+---
+
+### Requirement: Inference API Baseline Is Inference-Only
+
+Runtime Inference API implementation SHALL not add workspace, Git, tool, shell,
+network, secret, or agent responsibilities.
+
+#### Scenario: Tool execution request
+
+Given API request asks Runtime to execute a tool
+
+When validation runs
+
+Then Runtime rejects it.
+
+### Requirement: Inference API Accepts Normalized Model References
+
+Runtime Inference API MAY accept model references that resolve to normalized Model Artifacts from supported formats, and Model Loading SHALL apply standard validation to every such reference.
+
+#### Scenario: safetensors model reference
+
+Given caller references a safetensors-based model
+
+When Runtime resolves it
+
+Then Runtime loads the normalized Model Artifact through standard loading.
+
+---
+
+### Requirement: Inference API Does Not Download Formats Arbitrarily
+
+Runtime Inference API SHALL not perform arbitrary model downloads during
+inference.
+
+#### Scenario: Remote URL inference
+
+Given inference request contains remote model URL
+
+When Runtime validates it
+
+Then Runtime uses authorized source contracts or rejects arbitrary network
+access.
+
+### Requirement: Inference API Uses Source Resolution Safely
+
+Runtime Inference API MAY resolve ModelRefs through authorized source/cache contracts, and resolution SHALL validate the resulting artifact before it is used.
+
+#### Scenario: Cached model reference
+
+Given inference request references cached model
+
+When Runtime resolves it
+
+Then cache entry is validated before loading.
+
+---
+
+### Requirement: Inference API Does Not Gain Download Authority
+
+Runtime Inference API SHALL not perform arbitrary model downloads during
+inference.
+
+#### Scenario: Download requested in inference
+
+Given inference request asks Runtime to download model from arbitrary URL
+
+When validation runs
+
+Then Runtime rejects it or delegates only through authorized source contract.
+
+### Requirement: Server Facade Uses Inference API
+
+Server API SHALL use Runtime Inference API for model, session, generation,
+streaming, cancellation, diagnostics, and usage operations.
+
+#### Scenario: Server generation
+
+Given server receives generation request
+
+When Runtime work is required
+
+Then Runtime Inference API is called.
+
+---
+
+### Requirement: Server Facade Does Not Expose Runtime Internals
+
+Server API SHALL not expose Runtime internal handles through Inference API
+responses.
+
+#### Scenario: Provider diagnostic
+
+Given server returns diagnostics
+
+When response is inspected
+
+Then Provider handles, Device handles, Kernel handles, and memory pointers are
+absent.
+

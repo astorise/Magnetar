@@ -588,3 +588,90 @@ Given Qwen Component declares `cuda.flash_attention_v2`
 When Runtime validates requirements
 
 Then validation fails or marks it non-authoritative invalid metadata.
+
+---
+
+### Requirement: E2E Exercises Required Operators
+
+E2E conformance SHALL exercise required-now Operators for the first decoder
+baseline.
+
+#### Scenario: Operator coverage
+
+Given E2E success path completes
+
+When report is generated
+
+Then required operator coverage is recorded.
+
+---
+
+### Requirement: E2E Fails Missing Operator Coverage
+
+E2E conformance SHALL report missing required operator coverage.
+
+#### Scenario: Missing RoPE coverage
+
+Given fixture path does not exercise RoPE
+
+When operator coverage is required
+
+Then E2E reports missing coverage.
+
+---
+
+### Requirement: First Operator Scope Implemented Before Qwen Baseline
+
+The first operator implementation scope SHALL be implemented before Qwen
+baseline graph execution.
+
+#### Scenario: Qwen graph validates
+
+Given Qwen graph uses attention and RMSNorm
+
+When graph validation runs
+
+Then required-now operator metadata exists.
+
+---
+
+### Requirement: Operator Fixtures Support CPU Baseline
+
+Required-now Operators SHALL have fixtures usable by Reference CPU conformance.
+
+#### Scenario: Softmax fixture
+
+Given softmax is required-now
+
+When CPU conformance runs
+
+Then softmax fixture exists.
+
+---
+
+### Requirement: Optimized Providers Preserve Operator Semantics
+
+Optimized Providers SHALL preserve portable Operator semantics.
+
+#### Scenario: Optimized softmax
+
+Given optimized softmax Kernel is selected
+
+When output is compared to reference fixture
+
+Then output matches within declared tolerance.
+
+---
+
+### Requirement: Advanced Operator Variants Are Explicit
+
+Advanced Operator variants such as flash attention or paged attention SHALL be
+explicit variants or graph fragments, not hidden substitutions.
+
+#### Scenario: Hidden flash attention
+
+Given Provider silently replaces attention with unsupported flash semantics
+
+When conformance validates execution
+
+Then conformance fails.

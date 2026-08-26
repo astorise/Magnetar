@@ -742,3 +742,120 @@ Given model reference looks like a filesystem path
 When Runtime validates it
 
 Then Runtime uses only authorized model source contracts or rejects it.
+
+---
+
+### Requirement: E2E Fixture Model Artifact
+
+E2E conformance SHALL use a fixture Model Artifact that still passes normal
+Model Artifact validation.
+
+#### Scenario: Fixture artifact
+
+Given fixture model artifact is loaded
+
+When validation runs
+
+Then normal artifact identity, manifest, config, tensor inventory, and trust
+checks are applied.
+
+---
+
+### Requirement: E2E Fixture Does Not Bypass Model Artifact Contract
+
+Fixture models SHALL not bypass Model Artifact validation.
+
+#### Scenario: Invalid fixture manifest
+
+Given fixture manifest is invalid
+
+When E2E loading runs
+
+Then Model Loading fails before Model Instance creation.
+
+### Requirement: Normalized Model Artifact Manifest
+
+Model Artifact SHALL support a normalized manifest that can be produced from
+external formats.
+
+#### Scenario: External format normalized
+
+Given safetensors and config metadata are parsed
+
+When normalization completes
+
+Then Model Artifact manifest contains normalized identity, architecture,
+weights, tokenizer, generation, trust, and integrity metadata.
+
+---
+
+### Requirement: Model Format Does Not Grant Trust
+
+A model format SHALL not be trusted merely because it is recognized.
+
+#### Scenario: Recognized untrusted format
+
+Given safetensors file is parseable
+
+But trust policy rejects its source
+
+When Model Loading runs
+
+Then loading fails.
+
+---
+
+### Requirement: Source Metadata Is Not Automatically Runtime Policy
+
+Source metadata such as `torch_dtype` SHALL not silently become Runtime compute
+policy.
+
+#### Scenario: torch_dtype bf16
+
+Given config declares `torch_dtype` as bf16
+
+When Runtime loads model
+
+Then compute dtype follows validated Runtime policy, not silent source metadata.
+
+### Requirement: Model Source Candidate
+
+Model Artifact workflow SHALL support source candidates that normalize into
+Model Artifact metadata.
+
+#### Scenario: Client-provided artifact
+
+Given client provides artifact source
+
+When normalization succeeds
+
+Then Model Artifact metadata is available for loading.
+
+---
+
+### Requirement: Model Artifact Identity Uses Digest
+
+Model Artifact identity SHALL use digest-based identity where possible.
+
+#### Scenario: Name collision
+
+Given two artifacts named `qwen-local`
+
+When their digests differ
+
+Then Runtime treats them as distinct artifacts.
+
+---
+
+### Requirement: Cached Model Still Validates
+
+Cached Model Artifacts SHALL still pass validation before loading.
+
+#### Scenario: Cached untrusted artifact
+
+Given cached artifact is untrusted
+
+When Model Loading runs
+
+Then Runtime rejects it.
+

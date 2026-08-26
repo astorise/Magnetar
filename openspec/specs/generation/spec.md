@@ -877,3 +877,92 @@ Given model output contains a tool-call-like string
 When Runtime emits output
 
 Then Runtime does not execute any tool.
+
+---
+
+### Requirement: CLI Generation Uses Runtime Contract
+
+Generation requested by `magnetar-cli` SHALL use Runtime Generation Contract.
+
+#### Scenario: CLI generate
+
+Given CLI submits prompt input
+
+When Runtime runs generation
+
+Then Generation Contract owns prefill, decode, Sampling, stop conditions, and
+streaming events.
+
+---
+
+### Requirement: Runtime Does Not Act On Generated Commands
+
+Runtime SHALL not execute generated commands, tool calls, shell text, Git
+instructions, or network requests.
+
+#### Scenario: Generated Git command
+
+Given generated output says `git commit`
+
+When Runtime streams it
+
+Then Runtime only emits text.
+
+---
+
+### Requirement: E2E Uses Generation Contract
+
+E2E conformance SHALL execute generation through Generation Contract.
+
+#### Scenario: Generate fixture output
+
+Given tokenized fixture prompt
+
+When generation runs
+
+Then Runtime performs prefill, decode, Sampling, stop handling, and usage
+accounting through Generation Contract.
+
+---
+
+### Requirement: E2E Validates Generation Failure
+
+E2E conformance SHALL validate generation failure paths such as cancellation,
+timeout, policy denial, and unsupported operator.
+
+#### Scenario: Cancel generation
+
+Given generation is active
+
+When cancellation is requested
+
+Then Runtime reports generation cancelled or cancellation limitation according
+to policy.
+
+### Requirement: Server Generation Uses Generation Contract
+
+Server generation endpoint SHALL execute through Runtime Generation Contract.
+
+#### Scenario: Server generate
+
+Given prompt is submitted to server
+
+When generation runs
+
+Then Runtime owns prefill, decode, Sampling, stop conditions, and usage.
+
+---
+
+### Requirement: Server Generation Does Not Execute Side Effects
+
+Core Server generation SHALL not execute tools, shell, Git, network, filesystem,
+or external service side effects from generated output.
+
+#### Scenario: Generated Git instruction
+
+Given generated text says to run Git
+
+When server returns it
+
+Then no Git command is executed.
+

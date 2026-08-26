@@ -674,3 +674,57 @@ When Runtime validates request
 
 Then Runtime rejects it as outside inference scope.
 
+---
+
+### Requirement: E2E Uses Inference Sessions
+
+E2E conformance SHALL create and close Runtime Inference Sessions.
+
+#### Scenario: Session lifecycle
+
+Given fixture model instance is ready
+
+When E2E success path runs
+
+Then a Runtime Inference Session is created, used, and closed.
+
+---
+
+### Requirement: E2E Validates Session Closed Error
+
+E2E conformance SHALL validate closed session behavior.
+
+#### Scenario: Reuse closed session
+
+Given session is closed
+
+When generation is requested
+
+Then Runtime returns structured session closed error.
+
+### Requirement: Server Sessions Are Runtime Inference Sessions
+
+Server session endpoints SHALL create and use Runtime Inference Sessions.
+
+#### Scenario: Server session
+
+Given server creates session
+
+When Runtime records state
+
+Then state remains inference-scoped.
+
+---
+
+### Requirement: Server Connection State Is Separate
+
+Server transport connection state SHALL be separate from Runtime Session state.
+
+#### Scenario: Client disconnects
+
+Given client disconnects from streaming
+
+When server handles disconnect
+
+Then Runtime cancellation or session cleanup follows policy explicitly.
+

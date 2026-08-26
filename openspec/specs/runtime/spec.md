@@ -5285,3 +5285,177 @@ When Runtime executes it
 Then Runtime still creates an implicit session and uses normal inference
 contracts.
 
+---
+
+### Requirement: Runtime Has No CLI Ambient Authority
+
+Runtime SHALL not inherit CLI filesystem, network, Git, secret, shell, process,
+tool, workspace, or agent authority.
+
+#### Scenario: CLI authorized network
+
+Given CLI has network authorization
+
+When Runtime receives inference request
+
+Then Runtime still has no arbitrary network authority.
+
+---
+
+### Requirement: Runtime Rejects CLI Boundary Violations
+
+Runtime SHALL reject requests that attempt to use Runtime as workspace, Git,
+network, secret, tool, process, shell, or agent runtime.
+
+#### Scenario: Workspace scan request
+
+Given request asks Runtime to scan workspace
+
+When Runtime validates request
+
+Then Runtime rejects it as outside inference scope.
+
+---
+
+### Requirement: Runtime Accepts Prepared Prompt Context
+
+Runtime SHALL accept prepared inference input from CLI according to Runtime
+Inference API contracts.
+
+#### Scenario: Prompt context
+
+Given CLI sends prompt/context text
+
+When Runtime validates request
+
+Then Runtime treats it as inference input and not as authority.
+
+---
+
+### Requirement: Runtime Skeleton First
+
+Runtime implementation SHALL begin with compile-safe module skeletons and stable
+public façade before higher-level inference behavior.
+
+#### Scenario: Module skeleton
+
+Given Runtime baseline work begins
+
+When PR 1 is implemented
+
+Then crate modules and public re-exports compile without fake execution paths.
+
+---
+
+### Requirement: Runtime Prevents Baseline Bypass
+
+Runtime SHALL include tests or guards preventing E2E success path from bypassing
+Model Loading, Model Instance, Tokenizer, Memory Manager, Kernel Registry, or
+Runtime Inference API.
+
+#### Scenario: Bypass detected
+
+Given E2E path skips Kernel Registry
+
+When conformance runs
+
+Then test fails.
+
+---
+
+### Requirement: Runtime Owns Optimized Provider Selection
+
+Runtime SHALL own optimized Provider selection through Kernel Registry,
+Resource Affinity, Memory Manager, Provider readiness, and policy.
+
+#### Scenario: User prefers CUDA
+
+Given user preference requests CUDA
+
+When Runtime selects execution
+
+Then CUDA is selected only if compatible and policy allows.
+
+---
+
+### Requirement: Runtime Rejects Native Handle Exposure
+
+Runtime SHALL reject attempts to expose native Provider, Device, Kernel, tensor,
+or memory handles through public APIs.
+
+#### Scenario: Device pointer diagnostic
+
+Given diagnostic path attempts to include Device pointer
+
+When Runtime redaction validates output
+
+Then the pointer is removed or rejected.
+
+---
+
+### Requirement: Runtime Keeps Baseline Compatibility
+
+Post-baseline Provider additions SHALL not break Reference CPU baseline
+conformance.
+
+#### Scenario: CUDA added
+
+Given CUDA Provider is added
+
+When CPU-only baseline conformance runs
+
+Then Reference CPU baseline still passes.
+
+### Requirement: Runtime Source Access Is Authorized
+
+Runtime SHALL only access model sources through explicit authorized contracts.
+
+#### Scenario: Arbitrary path
+
+Given Runtime receives arbitrary path string
+
+When it attempts source resolution
+
+Then it rejects it unless wrapped in authorized source metadata.
+
+---
+
+### Requirement: Runtime Cache Access Is Policy-Controlled
+
+Runtime cache lookup and mutation SHALL be controlled by policy.
+
+#### Scenario: Cache insert denied
+
+Given policy denies cache mutation
+
+When artifact normalization completes
+
+Then Runtime does not insert it into cache.
+
+### Requirement: Runtime Remains Inference-Only Under Server
+
+Runtime SHALL remain inference-only when called from Server API.
+
+#### Scenario: Server asks Runtime to read file
+
+Given server request attempts Runtime file access
+
+When Runtime validates it
+
+Then request is rejected.
+
+---
+
+### Requirement: Runtime Policy Still Applies Under Server
+
+Server authorization SHALL not bypass Runtime admission, memory, model loading,
+session, generation, provider, or policy constraints.
+
+#### Scenario: Server authorized request
+
+Given server authorizes user
+
+When Runtime rejects due to memory pressure
+
+Then request fails.
+

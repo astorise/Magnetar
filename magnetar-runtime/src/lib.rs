@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod affinity;
 pub mod batching;
 pub mod capability;
+pub mod cli_boundary;
 pub mod component;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub mod component_wasmtime;
@@ -16,6 +17,7 @@ pub mod component_web;
 pub mod compute;
 pub mod conformance;
 pub mod device;
+pub mod e2e_conformance;
 pub mod execution_graph;
 pub mod generation;
 pub mod inference_api;
@@ -26,20 +28,24 @@ pub mod kv_cache;
 pub mod memory;
 pub mod model;
 pub mod model_component;
+pub mod model_format_roadmap;
 pub mod model_instance;
 pub mod model_loading;
+pub mod model_source_cache_roadmap;
 pub mod observability;
 pub mod operator;
 pub mod operator_scope;
 pub mod planning;
 pub mod prefix_cache;
 pub mod provider;
+pub mod provider_roadmap;
 pub mod qwen_model_component;
 pub mod reference_cpu;
 pub mod resolution;
 pub mod runtime;
 pub mod sampling;
 pub mod scheduler;
+pub mod server_api_roadmap;
 pub mod session;
 pub mod tensor;
 pub mod tokenizer;
@@ -77,6 +83,10 @@ pub use batching::{
     ContinuousBatch, ContinuousBatchingManager, portable_batch_dtype,
 };
 pub use capability::{Capability, CapabilityDescriptor, CapabilityId, CapabilityVersion};
+pub use cli_boundary::{
+    CliBoundaryConformanceReport, CliBoundaryConformanceResult, CliBoundaryError,
+    reject_cli_owned_authority, run_cli_boundary_conformance,
+};
 pub use component::{
     COMPONENT_ARTIFACT_SCHEMA, COMPONENT_ARTIFACT_SCHEMA_VERSION, COMPONENT_TRUST_SCHEMA,
     ComponentArtifactCache, ComponentArtifactPackage, ComponentArtifactReference,
@@ -131,6 +141,13 @@ pub use conformance::{
 pub use device::{
     Device, DeviceDescriptor, DeviceExecutionLimits, DeviceId, DeviceMetadata, DeviceType,
 };
+pub use e2e_conformance::{
+    E2E_EXERCISED_OPERATORS, E2E_FIXTURE_VERSION, E2E_SUITE_VERSION, E2eConformanceError,
+    E2eConformanceReport, E2eFixture, E2eTestResult, E2eTestStatus, e2e_conformance_report_json,
+    e2e_fixture, e2e_fixture_config, e2e_fixture_identity, e2e_fixture_manifest,
+    e2e_fixture_tokenizer, e2e_fixture_weights, e2e_forward, run_e2e_local_inference_conformance,
+    validate_e2e_no_shortcuts,
+};
 pub use execution_graph::{
     ExecutionGraph, ExecutionGraphId, ExecutionGraphPhase, ExecutionGraphPlan,
     ExecutionGraphProducer, ExecutionGraphVersion, ExecutionNode, ExecutionNodeId,
@@ -173,13 +190,14 @@ pub use inference_api::{
 };
 pub use kernel::{
     KernelAdapterMetadata, KernelAdvertisement, KernelAliasing, KernelBatchMetadata,
-    KernelCancellationSupport, KernelConformanceProfile, KernelDeterminism, KernelError,
-    KernelErrorCode, KernelExecutionMode, KernelFallbackClass, KernelFusionMetadata, KernelId,
-    KernelImplementationFamily, KernelInvocation, KernelInvocationId, KernelKvCacheMetadata,
-    KernelMemoryClass, KernelObservation, KernelObservationKind, KernelOperatorVersionRange,
-    KernelPrecisionMetadata, KernelPrefixCacheMetadata, KernelResource, KernelResult,
-    KernelResultStatus, KernelShapeConstraints, KernelWorkspaceLifetime,
-    KernelWorkspaceRequirements, KernelWorkspaceReuse,
+    KernelCancellationSupport, KernelConformanceProfile, KernelDequantizationBehavior,
+    KernelDeterminism, KernelError, KernelErrorCode, KernelExecutionMode, KernelFallbackClass,
+    KernelFusionMetadata, KernelId, KernelImplementationFamily, KernelInvocation,
+    KernelInvocationId, KernelKvCacheMetadata, KernelMemoryClass, KernelObservation,
+    KernelObservationKind, KernelOperatorVersionRange, KernelPrecisionMetadata,
+    KernelPrefixCacheMetadata, KernelQuantizationMetadata, KernelQuantizationMethod,
+    KernelResource, KernelResult, KernelResultStatus, KernelShapeConstraints,
+    KernelWorkspaceLifetime, KernelWorkspaceRequirements, KernelWorkspaceReuse,
 };
 pub use kernel_dispatch::{
     KernelDispatchError, KernelDispatchLifecycleState, KernelDispatchPlan, KernelDispatchPlanId,
@@ -233,6 +251,25 @@ pub use model_component::{
     provider_owned_resource_access_error, validate_model_component_authority,
     validate_model_component_config_data, validate_model_component_role,
 };
+pub use model_format_roadmap::{
+    ChatTemplateMetadata, ChatTemplateSourceKind, GenerationConfigMetadata, GgufMetadata,
+    GgufTensorEntry, HfConfigMetadata, HfRopeMetadata, LoraAdapterFormatMetadata,
+    MODEL_FORMAT_CONFORMANCE_FIXTURES, MODEL_FORMAT_ROADMAP_PHASES, MODEL_FORMAT_ROADMAP_VERSION,
+    MemoryMappingPolicy, ModelFormatConformanceFixtureKind, ModelFormatQuantizationDeclaration,
+    ModelFormatRoadmapConformanceReport, ModelFormatRoadmapConformanceResult,
+    ModelFormatRoadmapError, ModelFormatRoadmapObservation, ModelFormatRoadmapObservationKind,
+    ModelFormatRoadmapPhase, NormalizedManifestCoverage, PaddingSide, SafetensorsManifest,
+    SafetensorsTensorEntry, SentencePieceMetadata, ShardIndex, TokenizerConfigMetadata,
+    TokenizerJsonMetadata, TruncationSide, apply_generation_override,
+    detect_duplicate_tensor_names, detect_missing_shards, model_format_grants_no_trust,
+    normalize_lora_adapter, normalize_tokenizer_json, redact_chat_template_diagnostic,
+    reject_arbitrary_model_download, reject_format_execution_graph,
+    reject_model_format_provider_name, reject_raw_network_model_reference,
+    reject_silent_tokenizer_config_override, reject_unsupported_sentencepiece_feature,
+    run_model_format_roadmap_conformance, torch_dtype_does_not_force_compute_dtype,
+    validate_chat_template, validate_local_file_boundary, validate_model_format_quantization,
+    validate_shard_loading_order, validate_shard_tensor_shape_consistency,
+};
 pub use model_instance::{
     ModelInstance, ModelInstanceAdapterState, ModelInstanceCreationChecks, ModelInstanceDefinition,
     ModelInstanceError, ModelInstanceId, ModelInstanceInvalidationReport,
@@ -256,6 +293,24 @@ pub use model_loading::{
     ModelStorageHandling, ModelUnloadPolicy, ModelUnloadRequest, allocation_released,
     compute_dtype_supported, invalidates_kv_cache_on_unload, reload_is_new_loading_process,
     storage_to_compute_relation,
+};
+pub use model_source_cache_roadmap::{
+    ArtifactIdentityCoverage, CACHE_LIFECYCLE_STATES, CacheEntryMetadata, CacheEntryRef,
+    CacheIntegrityStatus, CacheKey, CacheLifecycleState, CacheMutationKind, CacheValidationStatus,
+    EvictionCandidate, MODEL_SOURCE_CACHE_ROADMAP_VERSION, MODEL_SOURCE_KINDS, ModelAlias,
+    ModelAliasTable, ModelRefResolutionOutcome, ModelSourceCacheDiagnostic,
+    ModelSourceCacheRoadmapConformanceReport, ModelSourceCacheRoadmapConformanceResult,
+    ModelSourceCacheRoadmapError, ModelSourceCacheRoadmapObservation,
+    ModelSourceCacheRoadmapObservationKind, ModelSourceKind, SourcePolicy,
+    artifacts_are_distinct_despite_same_name, authorize_cache_mutation,
+    cache_entry_ready_for_format_normalization, cache_presence_implies_memory_residency,
+    development_fixture_requires_explicit_trust_evaluation, evaluate_cache_trust, is_evictable,
+    pin_entry, reject_credential_in_metadata, reject_non_ready_cache_entry_for_loading,
+    resolve_model_ref_candidates, run_model_source_cache_roadmap_conformance,
+    select_eviction_candidates, unpin_entry, validate_adapter_cache_entry,
+    validate_cache_integrity, validate_cache_shard_integrity, validate_client_provided_source,
+    validate_development_fixture_source, validate_license_policy, validate_local_directory_source,
+    validate_offline_source, validate_remote_source_policy, validate_tokenizer_cache_entry,
 };
 pub use observability::{
     CorrelationId, CustomEventRecord, CustomLogRecord, CustomMetricKind, CustomMetricRecord,
@@ -318,6 +373,25 @@ pub use provider::{
     ProviderAbiVersion, ProviderDescriptor, ProviderError, ProviderExecutionApi, ProviderLoader,
     ProviderLoadingMode, ProviderLoadingPolicy, ProviderMetadata, ProviderRegistry,
 };
+pub use provider_roadmap::{
+    AdvancedAttentionDeclaration, AdvancedAttentionVariant, FusedKernelDeclaration,
+    POST_BASELINE_LAYOUTS, POST_BASELINE_MEMORY_CLASSES, PROVIDER_ROADMAP_FEATURES,
+    PROVIDER_ROADMAP_FORBIDDEN_API_HANDLE_SCOPES, PROVIDER_ROADMAP_PHASES,
+    PROVIDER_ROADMAP_VERSION, ProviderRoadmapBenchmarkCategory, ProviderRoadmapBenchmarkResult,
+    ProviderRoadmapConformanceReport, ProviderRoadmapConformanceResult, ProviderRoadmapError,
+    ProviderRoadmapFallbackContext, ProviderRoadmapFallbackEdge, ProviderRoadmapFeature,
+    ProviderRoadmapHardwareFamily, ProviderRoadmapObservation, ProviderRoadmapObservationKind,
+    ProviderRoadmapPhase, ProviderRoadmapPolicyPreference, cli_may_pass_policy_preference,
+    cli_redacted_provider_diagnostic, evaluate_provider_roadmap_fallback,
+    evaluate_provider_roadmap_fallback_observed, phase_is_production_ready,
+    provider_roadmap_conformance_profile_ids, provider_roadmap_features_for_phase,
+    reject_cli_raw_provider_handle_selection, reject_hidden_dequantization,
+    reject_model_family_provider_name, reject_native_handle_exposure,
+    reject_provider_specific_handle_capability, reject_unsupported_advanced_attention,
+    require_explicit_layout_conversion, require_memory_manager_tracking,
+    run_provider_roadmap_conformance, validate_advanced_attention_declaration,
+    validate_fused_kernel_declaration, validate_quantization_declaration,
+};
 pub use qwen_model_component::{
     QWEN_ARCHITECTURE_FAMILY, QWEN_BASELINE_CONTRACT_VERSION, QwenComponentError, QwenConfig,
     QwenRopeConfig, QwenRopePositionMode, qwen_adapter_architecture_compatibility,
@@ -364,6 +438,28 @@ pub use scheduler::{
     SchedulingDiagnostic, SchedulingPolicy, SchedulingState, runtime_event_for_device_health,
     runtime_event_for_provider_health, runtime_events_for_provider_status,
     runtime_metrics_for_execution_plan,
+};
+pub use server_api_roadmap::{
+    AuthenticatedServerRequest, ModelEndpointLoadingProof, OpenAiCompatibilityPolicy,
+    SERVER_API_ENDPOINTS, SERVER_API_ROADMAP_VERSION, SERVER_STREAM_FORBIDDEN_PAYLOAD_KINDS,
+    ServerAdmissionLimits, ServerAdmissionState, ServerApiEndpoint,
+    ServerApiRoadmapConformanceReport, ServerApiRoadmapConformanceResult, ServerApiRoadmapError,
+    ServerApiRoadmapObservation, ServerApiRoadmapObservationKind, ServerAuthorizationDecision,
+    ServerAuthorizationScope, ServerConnectionId, ServerConnectionState, ServerDiagnosticsSummary,
+    ServerDisconnectPolicy, ServerGeneratedTextHandling, ServerGenerationRequest,
+    ServerGenerationRuntimeContext, ServerHealthStatus, ServerModelEndpointOperation,
+    ServerModelOrSessionRef, ServerReadinessStatus, ServerSessionRequest, ServerStreamEvent,
+    ServerStreamingTransport, authorize_server_request, build_runtime_generation_request,
+    evaluate_server_admission, handle_openai_unsupported_field,
+    healthy_but_not_ready_is_representable, openai_facade_maps_to_generation_api_request,
+    redact_server_diagnostic, reject_arbitrary_download_during_generation,
+    reject_arbitrary_filesystem_path, reject_credential_in_server_diagnostics,
+    reject_openai_tool_call_execution, reject_raw_stream_payload,
+    reject_server_arbitrary_model_path, reject_server_session_owned_authority,
+    reject_server_tool_shell_git_execution, reject_tool_execution_from_generated_output,
+    run_server_api_roadmap_conformance, server_cancellation_calls_runtime_cancellation,
+    server_diagnostics_summary, server_disconnect_policy, validate_model_endpoint_request,
+    validate_stream_event_ordering,
 };
 pub use session::{
     InferenceSession, InferenceSessionId, SessionAccessPolicy, SessionConcurrencyPolicy,

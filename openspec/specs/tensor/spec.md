@@ -444,3 +444,122 @@ Given usage report includes memory estimate
 When caller receives it
 
 Then it does not include raw tensor values or memory addresses.
+
+---
+
+### Requirement: E2E Validates Tensor Resources
+
+E2E conformance SHALL validate Tensor Resource creation, readiness, dtype,
+layout, no raw pointer exposure, output metadata, and cleanup.
+
+#### Scenario: Tensor resource ready
+
+Given Reference CPU kernel produces operator output
+
+When dispatch completes
+
+Then Tensor Resource metadata is ready and redacted.
+
+---
+
+### Requirement: E2E Validates No Raw Tensor Exposure
+
+E2E conformance SHALL fail if Runtime exposes raw tensor pointers or raw tensor
+values by default.
+
+#### Scenario: Tensor diagnostics
+
+Given diagnostics include tensor metadata
+
+When E2E validates redaction
+
+Then no raw tensor value or pointer is present.
+
+---
+
+### Requirement: Tensor Implementation Precedes Operator Execution
+
+Tensor Resource and Layout baseline SHALL be implemented before executable
+Operator dispatch.
+
+#### Scenario: Operator output
+
+Given matmul Kernel produces output
+
+When execution is implemented
+
+Then Tensor Resource metadata exists to represent the output.
+
+---
+
+### Requirement: Tensor Baseline Is Host Contiguous First
+
+The first Tensor implementation SHALL support host contiguous tensors before
+advanced layouts.
+
+#### Scenario: CPU fixture
+
+Given Reference CPU executes fixture graph
+
+When tensors are allocated
+
+Then host contiguous layout is supported.
+
+---
+
+### Requirement: Post-Baseline Layouts Use Tensor Layout Contract
+
+Blocked, paged, packed-quantized, attention-specific, provider-owned opaque, and WebGPU layouts SHALL be represented through Tensor Layout metadata.
+
+#### Scenario: Paged KV layout
+
+Given Provider uses paged KV cache
+
+When Runtime tracks Tensor Resource
+
+Then layout metadata declares paged layout without raw page pointers.
+
+---
+
+### Requirement: Post-Baseline Tensor Handles Remain Opaque
+
+Post-baseline Providers SHALL not expose native tensor handles through Runtime
+public APIs.
+
+#### Scenario: Metal buffer requested
+
+Given caller requests Metal buffer handle
+
+When Runtime validates request
+
+Then access is denied.
+
+### Requirement: Model Formats Produce Tensor Metadata
+
+Model format parsers SHALL produce Tensor Descriptor-compatible metadata for
+weights and adapter tensors.
+
+#### Scenario: safetensors tensor
+
+Given safetensors tensor has shape and dtype
+
+When normalized
+
+Then Tensor Descriptor metadata can be created without exposing raw storage.
+
+---
+
+### Requirement: Quantized Formats Use Tensor Layout Metadata
+
+Quantized model formats SHALL represent packing and quantization through Tensor
+Layout and quantization metadata.
+
+#### Scenario: GGUF quantized tensor
+
+Given GGUF tensor uses quantized packed layout
+
+When normalized
+
+Then Tensor metadata declares packed quantized layout without hidden
+dequantization.
+

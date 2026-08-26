@@ -51,6 +51,24 @@ Run hardware-independent Provider conformance tests:
 cargo test -p magnetar-runtime provider_conformance -- --nocapture
 ```
 
+Run the End-to-End Local Inference Conformance suite (no GPU required):
+
+```powershell
+cargo test -p magnetar-runtime e2e_conformance -- --nocapture
+```
+
+Run the Post-Baseline Provider Roadmap contract tests:
+
+```powershell
+cargo test -p magnetar-runtime provider_roadmap -- --nocapture
+```
+
+Run the Post-Baseline Server API Roadmap contract tests:
+
+```powershell
+cargo test -p magnetar-runtime server_api_roadmap -- --nocapture
+```
+
 Build Rust documentation with warnings denied:
 
 ```powershell

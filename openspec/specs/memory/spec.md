@@ -1075,3 +1075,116 @@ When Kernel requests write access
 
 Then Memory Manager rejects or reports mutability violation.
 
+---
+
+### Requirement: Memory Baseline Precedes Provider Execution
+
+Memory Manager baseline SHALL be available before Reference CPU Provider writes
+Runtime-visible outputs.
+
+#### Scenario: CPU output allocation
+
+Given CPU matmul dispatches
+
+When output is required
+
+Then Memory Manager tracks allocation and readiness.
+
+---
+
+### Requirement: Memory Baseline Tracks Cleanup
+
+Memory baseline SHALL support cleanup sufficient for E2E conformance.
+
+#### Scenario: Session close cleanup
+
+Given E2E session closes
+
+When cleanup runs
+
+Then inference-scoped resources are released or retained only according to
+policy.
+
+---
+
+### Requirement: Post-Baseline Memory Classes Are Tracked
+
+Device, pinned-host, unified, shared, provider-owned, browser-linear-memory, and WebGPU buffer memory classes SHALL be tracked by Memory Manager when supported.
+
+#### Scenario: CUDA device output
+
+Given CUDA Kernel writes Device output
+
+When dispatch completes
+
+Then Memory Manager tracks memory class, residency, and Resource Affinity.
+
+---
+
+### Requirement: Provider Data Movement Is Explicit
+
+Post-baseline Provider data movement SHALL be explicit and policy-controlled.
+
+#### Scenario: Device to host fallback
+
+Given fallback to CPU requires Device-to-host transfer
+
+When planning runs
+
+Then Runtime inserts explicit movement or rejects fallback.
+
+### Requirement: Model Formats Feed Memory Planning
+
+Normalized model format metadata SHALL provide enough size, dtype, layout, and
+shard metadata for Memory Manager planning.
+
+#### Scenario: Sharded model
+
+Given sharded artifact metadata is normalized
+
+When Memory Manager plans loading
+
+Then it can estimate or compute required memory.
+
+---
+
+### Requirement: Memory Mapping Is Policy-Controlled
+
+If memory mapping is supported for model formats, it SHALL be policy-controlled
+and SHALL not expose raw mmap pointers through public APIs.
+
+#### Scenario: mmap requested
+
+Given safetensors loading uses memory mapping
+
+When Runtime reports metadata
+
+Then no raw memory pointer is exposed.
+
+### Requirement: Cache Storage Is Not Memory Residency
+
+Artifact cache storage SHALL be distinct from Runtime memory residency.
+
+#### Scenario: Cached artifact
+
+Given artifact exists in cache
+
+When Runtime memory is inspected
+
+Then artifact tensors are not resident unless loaded through Memory Manager.
+
+---
+
+### Requirement: Model Loading Materializes From Cache Through Memory Manager
+
+When loading from cache, Model Loading SHALL still materialize Tensor Resources
+through Memory Manager.
+
+#### Scenario: Load cached weights
+
+Given cached weights are valid
+
+When Model Loading materializes weights
+
+Then Memory Manager tracks resulting Tensor Resources.
+

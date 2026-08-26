@@ -496,3 +496,94 @@ When first scope validation runs
 
 Then Runtime reports first-scope-kernel-missing.
 
+---
+
+### Requirement: E2E Uses Kernel Registry
+
+E2E conformance SHALL validate Kernel Registry candidate lookup and selection
+for required operators.
+
+#### Scenario: Matmul kernel selected
+
+Given graph contains matmul
+
+When execution is planned
+
+Then Kernel Registry selects an eligible Reference CPU matmul Kernel.
+
+---
+
+### Requirement: E2E Detects Missing Kernels
+
+E2E conformance SHALL include missing kernel failure cases.
+
+#### Scenario: Missing attention kernel
+
+Given attention Operator has no eligible Kernel
+
+When E2E graph execution is planned
+
+Then Runtime reports structured missing Kernel error.
+
+---
+
+### Requirement: Kernel Registry Precedes E2E Execution
+
+Kernel Registry and Dispatch SHALL be implemented before E2E local inference
+success path.
+
+#### Scenario: E2E matmul
+
+Given E2E graph contains matmul
+
+When execution runs
+
+Then Kernel Registry selects an eligible Reference CPU Kernel.
+
+---
+
+### Requirement: Kernel Dispatch Revalidation Included In Baseline
+
+Kernel Dispatch baseline SHALL revalidate Provider, Device, Memory, Resource
+Affinity, and policy before dispatch.
+
+#### Scenario: Provider unavailable
+
+Given selected Provider becomes unavailable
+
+When dispatch begins
+
+Then dispatch fails closed or replans according to policy.
+
+---
+
+### Requirement: Registry Handles Optimized Provider Candidates
+
+Kernel Registry SHALL support optimized Provider candidates without bypassing
+normal validation and ranking.
+
+#### Scenario: CUDA and CPU candidates
+
+Given CUDA and Reference CPU kernels exist for matmul
+
+When Kernel Registry ranks candidates
+
+Then it validates compatibility, readiness, memory, policy, and Resource
+Affinity before selection.
+
+---
+
+### Requirement: Registry Requires Conformance Metadata For Advanced Features
+
+Kernel Registry SHALL NOT select an advanced-feature Kernel candidate that lacks required conformance metadata.
+Kernel Registry SHOULD consider conformance metadata for advanced Provider
+features.
+
+#### Scenario: Unconformant flash attention
+
+Given flash attention Kernel lacks required conformance
+
+When Registry selects candidates
+
+Then the Kernel is rejected or ranked unavailable according to policy.
+

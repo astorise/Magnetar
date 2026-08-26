@@ -522,3 +522,93 @@ And Reference CPU lacks RoPE kernel
 When Kernel Registry selection runs
 
 Then Runtime returns structured missing kernel error.
+
+---
+
+### Requirement: E2E Executes Through Reference CPU Provider
+
+The first E2E local inference suite SHALL execute supported inference through
+Reference CPU Provider.
+
+#### Scenario: Reference CPU dispatch
+
+Given required operators have Reference CPU Kernels
+
+When E2E generation runs
+
+Then Kernel Dispatch invokes Reference CPU kernels through Runtime.
+
+---
+
+### Requirement: E2E CPU Execution Is Not Hidden Fallback
+
+Reference CPU use in E2E SHALL be explicit and policy-controlled.
+
+#### Scenario: CPU fallback hidden
+
+Given E2E expects explicit CPU policy
+
+When Runtime uses CPU without policy
+
+Then E2E fails with boundary or fallback violation.
+
+---
+
+### Requirement: Reference CPU Provider Implemented Before E2E
+
+Reference CPU Provider baseline SHALL be implemented before E2E local inference
+success path.
+
+#### Scenario: CPU execution
+
+Given required-now operators are used
+
+When E2E runs
+
+Then Reference CPU Provider supplies compatible kernels.
+
+---
+
+### Requirement: Reference CPU Prioritizes Correctness
+
+Reference CPU implementation SHALL prioritize deterministic correctness over
+performance for the baseline.
+
+#### Scenario: Slow attention
+
+Given CPU attention is slow
+
+When output is correct for fixture
+
+Then baseline acceptance may pass.
+
+---
+
+### Requirement: Reference CPU Remains Baseline After Optimized CPU
+
+Optimized CPU Provider SHALL not replace Reference CPU as correctness baseline.
+
+#### Scenario: Optimized CPU added
+
+Given optimized CPU Provider is available
+
+When conformance generates reference outputs
+
+Then Reference CPU remains the baseline unless policy explicitly selects another
+approved reference.
+
+---
+
+### Requirement: Optimized CPU Provider May Add Performance Features
+
+Any performance feature added by optimized CPU Provider SHALL preserve portable Operator semantics.
+Optimized CPU Provider MAY add SIMD, BLAS, thread pools, cache-aware kernels, and
+fused kernels.
+
+#### Scenario: SIMD matmul
+
+Given optimized CPU Provider advertises SIMD matmul
+
+When Runtime validates it
+
+Then it must still implement portable matmul semantics.

@@ -349,6 +349,53 @@ pub struct KernelFusionMetadata {
     pub preserves_graph_semantics: bool,
 }
 
+/// Quantization numeric method a post-baseline Kernel declares, from the
+/// `define-post-baseline-provider-roadmap` change's "Quantized Execution"
+/// section. This does not implement any quantized numerics -- it is metadata
+/// a Kernel advertisement carries so Runtime can validate that quantized
+/// execution is explicit rather than a hidden substitution.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum KernelQuantizationMethod {
+    Int8,
+    Int4,
+    Fp8,
+    NormalFloat4,
+    GroupwiseAffine,
+    Custom,
+}
+
+/// Whether a quantized Kernel dequantizes explicitly (as its own graph step)
+/// or fuses dequantization into the Kernel itself. Either is acceptable, but
+/// one of the two SHALL be declared -- "no hidden quantization or
+/// dequantization SHALL occur".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelDequantizationBehavior {
+    ExplicitBeforeOperator,
+    FusedIntoKernel,
+}
+
+/// Post-baseline quantization declaration for one Kernel: method, storage
+/// dtype, compute dtype, accumulation dtype, scale/zero-point metadata, group
+/// size, packing layout, dequantization behavior, supported Operators, and a
+/// conformance tolerance profile. See `specs/kernel-registry/spec.md` and
+/// `specs/provider-roadmap/spec.md` in
+/// `openspec/changes/define-post-baseline-provider-roadmap` for the
+/// requirements this metadata satisfies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelQuantizationMetadata {
+    pub method: KernelQuantizationMethod,
+    pub storage_dtype: ComputeDType,
+    pub compute_dtype: ComputeDType,
+    pub accumulation_dtype: ComputeDType,
+    pub scale_dtype: ComputeDType,
+    pub zero_point_dtype: Option<ComputeDType>,
+    pub group_size: Option<u64>,
+    pub packing_layout: TensorLayoutKind,
+    pub dequantization: KernelDequantizationBehavior,
+    pub supported_operators: BTreeSet<OperatorId>,
+    pub conformance_tolerance_profile: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelAdapterMetadata {
     pub methods: BTreeSet<String>,

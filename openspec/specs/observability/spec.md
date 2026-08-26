@@ -1132,3 +1132,133 @@ When observability emits error metadata
 
 Then events can be correlated without exposing raw prompt or handles.
 
+---
+
+### Requirement: CLI And Runtime Observability Are Distinct
+
+CLI-side observations and Runtime-side observations SHALL remain distinct.
+
+#### Scenario: Command plus inference
+
+Given CLI runs `magnetar run`
+
+When observations are emitted
+
+Then CLI may observe command parsing while Runtime observes inference execution.
+
+---
+
+### Requirement: CLI Observability Redacts Sensitive Context
+
+CLI observability SHALL redact raw prompts, secrets, file contents, tokens,
+model weights, handles, and memory pointers by default.
+
+#### Scenario: File prompt
+
+Given CLI reads file content for prompt
+
+When CLI emits observations
+
+Then raw file content is not logged by default.
+
+---
+
+### Requirement: Runtime Observability Does Not Log CLI Authority
+
+Runtime observations SHALL not log CLI authority, workspace permissions, secret
+providers, network credentials, or tool capabilities.
+
+#### Scenario: CLI has tool access
+
+Given CLI has tool access
+
+When Runtime emits inference observations
+
+Then Runtime does not log tool capability details unless explicitly included as
+redacted request metadata.
+
+---
+
+### Requirement: E2E Observability Is Redacted
+
+E2E conformance SHALL validate observability redaction for inference events.
+
+#### Scenario: Prompt redaction
+
+Given prompt text is submitted
+
+When observability events are emitted
+
+Then raw prompt text is absent by default.
+
+---
+
+### Requirement: E2E Observability Supports Correlation
+
+E2E observations SHALL include correlation IDs that connect request, model
+loading, session, generation, graph, kernel, and result events without exposing
+raw data.
+
+#### Scenario: Correlated failure
+
+Given generation fails during Kernel dispatch
+
+When observations are inspected
+
+Then failure can be correlated across Runtime subsystems.
+
+### Requirement: Source Cache Observability Is Redacted
+
+Source/cache observations SHALL be redacted by default.
+
+#### Scenario: Cache lookup
+
+Given cache lookup occurs
+
+When observation is emitted
+
+Then raw cache paths, credentials, raw file contents, and raw weights are absent.
+
+---
+
+### Requirement: Source Cache Observability Preserves Correlation
+
+Source/cache observations SHOULD include correlation IDs linking model resolution, cache lookup, normalization, validation, and loading, and correlation identifiers SHALL not themselves expose redacted metadata.
+
+#### Scenario: Cache corrupt
+
+Given cache entry is corrupt
+
+When loading fails
+
+Then observations can correlate source resolution and integrity failure.
+
+### Requirement: Server Observability Is Redacted
+
+Server observations SHALL be redacted by default.
+
+#### Scenario: Request logged
+
+Given generation request contains prompt text
+
+When server emits observation
+
+Then raw prompt text is absent by default.
+
+---
+
+### Requirement: Server Runtime Correlation
+
+Server observations SHALL not expose raw data during correlation.
+
+Server observations SHOULD correlate request, Runtime request, streaming,
+cancellation, diagnostics, and errors.
+
+#### Scenario: Stream interrupted
+
+Given stream is interrupted
+
+When observations are emitted
+
+Then server and Runtime events can be correlated.
+

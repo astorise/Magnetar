@@ -22,6 +22,16 @@ pub enum ProviderConformanceProfile {
     Metal,
     OpenVino,
     Qnn,
+    /// Post-baseline WebGPU hardware profile (`define-post-baseline-provider-roadmap`).
+    WebGpu,
+    /// Post-baseline quantized execution profile.
+    Quantized,
+    /// Post-baseline advanced attention (flash/paged/sliding-window/...) profile.
+    AdvancedAttention,
+    /// Post-baseline fused-kernel profile.
+    FusedKernel,
+    /// Post-baseline browser-execution profile (WebGPU/WASM constraints).
+    Browser,
 }
 
 impl ProviderConformanceProfile {
@@ -37,6 +47,11 @@ impl ProviderConformanceProfile {
             Self::Metal => "provider-hardware-metal",
             Self::OpenVino => "provider-hardware-openvino",
             Self::Qnn => "provider-hardware-qnn",
+            Self::WebGpu => "provider-hardware-webgpu",
+            Self::Quantized => "provider-quantized",
+            Self::AdvancedAttention => "provider-advanced-attention",
+            Self::FusedKernel => "provider-fused-kernel",
+            Self::Browser => "provider-browser",
         }
     }
 
@@ -312,7 +327,8 @@ impl ProviderConformanceSuite {
                 ProviderConformanceProfile::Cuda
                 | ProviderConformanceProfile::Metal
                 | ProviderConformanceProfile::OpenVino
-                | ProviderConformanceProfile::Qnn => {
+                | ProviderConformanceProfile::Qnn
+                | ProviderConformanceProfile::WebGpu => {
                     report
                         .unsupported_optional_features
                         .insert(profile.id().into());
@@ -320,6 +336,24 @@ impl ProviderConformanceSuite {
                         profile,
                         "optional hardware profile",
                         "hardware-specific profiles are opt-in and not part of default CI",
+                    ));
+                }
+                ProviderConformanceProfile::Quantized
+                | ProviderConformanceProfile::AdvancedAttention
+                | ProviderConformanceProfile::FusedKernel
+                | ProviderConformanceProfile::Browser => {
+                    // Post-baseline roadmap profiles (`define-post-baseline-provider-roadmap`):
+                    // declaring them here does not imply a Provider has
+                    // implemented or passed them -- see
+                    // `crate::provider_roadmap::run_provider_roadmap_conformance`
+                    // for the roadmap-level checks these profiles gate.
+                    report
+                        .unsupported_optional_features
+                        .insert(profile.id().into());
+                    report.record(ProviderConformanceTestResult::skipped(
+                        profile,
+                        "optional post-baseline roadmap profile",
+                        "post-baseline roadmap profiles are opt-in and not part of default CI",
                     ));
                 }
             }

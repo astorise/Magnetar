@@ -496,3 +496,89 @@ Given Qwen Component produces decode graph
 When observability records it
 
 Then Runtime emits redacted graph production metadata.
+
+---
+
+### Requirement: E2E Uses Qwen Baseline Component
+
+E2E conformance SHALL use the Qwen-like Model Component baseline or compatible
+native architecture implementation for the first fixture path.
+
+#### Scenario: Qwen fixture
+
+Given fixture declares Qwen-like architecture
+
+When Model Loading resolves architecture
+
+Then Qwen baseline component validates it.
+
+---
+
+### Requirement: E2E Validates Qwen Graph Production
+
+E2E conformance SHALL validate Qwen prefill and decode graph production.
+
+#### Scenario: Decode graph produced
+
+Given fixture Model Instance is ready
+
+When decode is requested
+
+Then Qwen baseline component produces a portable decode graph that Runtime
+validates.
+
+---
+
+### Requirement: Qwen Baseline Implemented After Operator Scope
+
+Qwen baseline implementation SHALL depend on first operator scope metadata.
+
+#### Scenario: Produce graph
+
+Given Qwen baseline produces decode graph
+
+When graph is validated
+
+Then all operator requirements are checked against first scope.
+
+---
+
+### Requirement: Qwen Baseline Does Not Introduce QwenProvider
+
+Implementation SHALL not add QwenProvider.
+
+#### Scenario: Provider registry
+
+Given Qwen baseline is implemented
+
+When Provider registry is inspected
+
+Then no QwenProvider appears.
+
+### Requirement: Qwen Component Uses Normalized Config Metadata
+
+Qwen Model Component SHALL use normalized config metadata from Model Artifact.
+
+#### Scenario: Qwen hidden size
+
+Given config normalization extracts hidden size
+
+When Qwen validation runs
+
+Then Qwen Component validates hidden size through normalized metadata.
+
+---
+
+### Requirement: Qwen Component Does Not Parse Raw Format Files
+
+Qwen Model Component SHALL not parse raw safetensors, GGUF, tokenizer.json, or
+local file structures directly.
+
+#### Scenario: Raw file parse requested
+
+Given Qwen Component attempts to parse raw GGUF file
+
+When Runtime validates authority
+
+Then access is denied or rejected as boundary violation.
+

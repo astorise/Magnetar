@@ -586,3 +586,120 @@ Given tokenization fails
 When diagnostics are emitted
 
 Then raw prompt text is not logged by default.
+
+---
+
+### Requirement: CLI May Send Text Or Chat Messages
+
+Runtime SHALL accept plain text, chat messages, or already-tokenized input from
+`magnetar-cli`.
+
+`magnetar-cli` MAY send plain text, chat messages, or already-tokenized input to
+Runtime.
+
+#### Scenario: Chat input
+
+Given CLI has chat transcript
+
+When generating response
+
+Then CLI sends appropriate chat messages or prompt text through Runtime
+Inference API.
+
+---
+
+### Requirement: Runtime Tokenization Does Not Read CLI Files
+
+Tokenizer execution through Runtime SHALL not read CLI workspace files.
+
+#### Scenario: Template path
+
+Given request attempts to make Runtime read template from workspace path
+
+When Runtime validates it
+
+Then access is denied unless template is already an authorized Model/Tokenizer
+Artifact component.
+
+---
+
+### Requirement: E2E Uses Tokenizer Contract
+
+E2E conformance SHALL use Tokenizer Contract for text prompt encoding and output
+decoding.
+
+#### Scenario: Text prompt
+
+Given fixture text prompt is submitted
+
+When inference runs
+
+Then Runtime tokenizes it through Tokenizer Contract.
+
+---
+
+### Requirement: E2E Validates Tokenizer Failure
+
+E2E conformance SHALL include tokenizer failure cases.
+
+#### Scenario: Incompatible tokenizer
+
+Given tokenizer vocabulary is incompatible with fixture model
+
+When compatibility validation runs
+
+Then Runtime reports structured tokenizer incompatibility.
+
+### Requirement: Tokenizer Formats Normalize Into Tokenizer Artifact
+
+tokenizer.json, tokenizer_config, SentencePiece, and embedded tokenizer metadata SHALL normalize into Tokenizer Artifact metadata.
+
+#### Scenario: tokenizer.json normalized
+
+Given tokenizer.json is parsed
+
+When normalization completes
+
+Then Tokenizer Contract receives normalized Tokenizer Artifact metadata.
+
+---
+
+### Requirement: Generation Config Does Not Override Tokenizer Policy Silently
+
+Tokenizer-related metadata from generation_config or tokenizer_config SHALL not
+silently override Tokenizer or Runtime policy.
+
+#### Scenario: PAD token mismatch
+
+Given tokenizer_config and generation_config disagree on PAD token
+
+When compatibility validation runs
+
+Then Runtime resolves according to policy or reports conflict.
+
+### Requirement: Tokenizer Artifacts May Use Source Cache
+
+Tokenizer Artifacts MAY be resolved through source/cache workflow, and Runtime SHALL validate the tokenizer cache entry before use.
+
+#### Scenario: Cached tokenizer
+
+Given tokenizer artifact is cached
+
+When model loading validates tokenizer compatibility
+
+Then cached tokenizer metadata is validated before use.
+
+---
+
+### Requirement: Tokenizer Cache Does Not Override Compatibility
+
+Tokenizer cache hit SHALL not bypass tokenizer/model compatibility validation.
+
+#### Scenario: Wrong tokenizer cached
+
+Given cached tokenizer is incompatible with model
+
+When loading runs
+
+Then Runtime rejects compatibility.
+

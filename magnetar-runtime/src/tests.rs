@@ -8883,3 +8883,3024 @@ fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
             .any(|observation| observation.kind == InferenceApiObservationKind::KernelUnavailable)
     );
 }
+
+// ---------------------------------------------------------------------
+// cli_boundary
+// ---------------------------------------------------------------------
+
+#[test]
+fn cli_boundary_error_display_is_non_empty_for_every_variant() {
+    let variants = vec![
+        CliBoundaryError::CliCommandInvalid {
+            reason: "bad command".into(),
+        },
+        CliBoundaryError::CliPromptInputInvalid {
+            reason: "bad prompt".into(),
+        },
+        CliBoundaryError::CliFileReadFailed {
+            reason: "file missing".into(),
+        },
+        CliBoundaryError::CliWorkspaceAccessDenied {
+            reason: "policy denied".into(),
+        },
+        CliBoundaryError::CliGitFailed {
+            reason: "git failed".into(),
+        },
+        CliBoundaryError::CliNetworkDenied {
+            reason: "network denied".into(),
+        },
+        CliBoundaryError::CliSecretUnavailable {
+            reason: "secret unavailable".into(),
+        },
+        CliBoundaryError::CliToolFailed {
+            reason: "tool failed".into(),
+        },
+        CliBoundaryError::CliShellDenied {
+            reason: "shell denied".into(),
+        },
+        CliBoundaryError::CliModelAliasNotFound {
+            alias: "my-alias".into(),
+        },
+        CliBoundaryError::CliModelReferenceInvalid {
+            reason: "bad reference".into(),
+        },
+        CliBoundaryError::CliRuntimeUnavailable {
+            reason: "runtime down".into(),
+        },
+        CliBoundaryError::CliRuntimeRequestFailed(InferenceApiError::ModelLoadingFailed {
+            reason: "example".into(),
+        }),
+        CliBoundaryError::CliStreamInterrupted {
+            reason: "stream broke".into(),
+        },
+        CliBoundaryError::CliCancellationRequested,
+        CliBoundaryError::CliDiagnosticsRedacted,
+        CliBoundaryError::CliBoundaryViolation {
+            capability: "workspace".into(),
+        },
+        CliBoundaryError::InternalCliError {
+            reason: "unexpected".into(),
+        },
+    ];
+    for variant in variants {
+        let rendered = variant.to_string();
+        assert!(!rendered.is_empty(), "{variant:?} rendered empty");
+    }
+}
+
+#[test]
+fn cli_boundary_rejects_cli_owned_authority_capabilities() {
+    for capability in [
+        "workspace",
+        "filesystem",
+        "git",
+        "shell",
+        "secrets",
+        "tool-call",
+    ] {
+        let error = reject_cli_owned_authority(capability).unwrap_err();
+        assert!(matches!(
+            error,
+            CliBoundaryError::CliBoundaryViolation { .. }
+        ));
+    }
+}
+
+#[test]
+fn cli_boundary_allows_inference_scoped_capability() {
+    assert!(reject_cli_owned_authority("generation").is_ok());
+}
+
+#[test]
+fn cli_boundary_error_preserves_wrapped_runtime_error_category() {
+    let source = InferenceApiError::SessionNotFound;
+    let wrapped = CliBoundaryError::from(source.clone());
+    assert_eq!(wrapped.runtime_category(), Some(&source));
+}
+
+#[test]
+fn cli_boundary_conformance_report_is_conformant() {
+    let report = run_cli_boundary_conformance();
+    assert!(report.is_conformant());
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// provider_roadmap
+// ---------------------------------------------------------------------
+
+#[test]
+fn provider_roadmap_features_are_all_optional_and_phase_tagged() {
+    assert_eq!(PROVIDER_ROADMAP_FEATURES.len(), 31);
+    for feature in PROVIDER_ROADMAP_FEATURES {
+        assert!(feature.is_optional(), "{feature:?} must be optional");
+    }
+    assert_eq!(
+        provider_roadmap_features_for_phase(ProviderRoadmapPhase::OptimizedCpu),
+        vec![
+            ProviderRoadmapFeature::Simd,
+            ProviderRoadmapFeature::Blas,
+            ProviderRoadmapFeature::ThreadPoolExecution,
+            ProviderRoadmapFeature::CacheAwareKernels,
+            ProviderRoadmapFeature::OptimizedCpuFusedKernels,
+        ]
+    );
+    assert_eq!(
+        provider_roadmap_features_for_phase(ProviderRoadmapPhase::Cuda).len(),
+        8
+    );
+    assert_eq!(
+        provider_roadmap_features_for_phase(ProviderRoadmapPhase::Metal).len(),
+        5
+    );
+    assert_eq!(
+        provider_roadmap_features_for_phase(ProviderRoadmapPhase::OpenVino).len(),
+        4
+    );
+    assert_eq!(
+        provider_roadmap_features_for_phase(ProviderRoadmapPhase::Qnn).len(),
+        4
+    );
+    assert_eq!(
+        provider_roadmap_features_for_phase(ProviderRoadmapPhase::WebGpu).len(),
+        5
+    );
+    for feature in PROVIDER_ROADMAP_FEATURES {
+        assert!(!feature.id().is_empty());
+        assert!(
+            provider_roadmap_features_for_phase(feature.phase()).contains(feature),
+            "{feature:?} must appear under its own phase()"
+        );
+    }
+}
+
+#[test]
+fn provider_roadmap_phases_are_ordered_1_through_9() {
+    let mut ordinals: Vec<u8> = PROVIDER_ROADMAP_PHASES
+        .iter()
+        .map(|phase| phase.ordinal())
+        .collect();
+    ordinals.sort_unstable();
+    assert_eq!(ordinals, (1..=9).collect::<Vec<_>>());
+}
+
+#[test]
+fn provider_roadmap_every_phase_requires_provider_core() {
+    for phase in PROVIDER_ROADMAP_PHASES {
+        assert!(
+            phase
+                .required_conformance_gates()
+                .contains(&ProviderConformanceProfile::ProviderCore),
+            "{phase:?} must require provider-core"
+        );
+    }
+}
+
+#[test]
+fn provider_roadmap_phase_readiness_requires_actually_passed_profiles() {
+    let cuda = ProviderRoadmapPhase::Cuda;
+    let required = cuda.required_conformance_gates();
+    assert!(!phase_is_production_ready(cuda, &BTreeSet::new()));
+    assert!(!phase_is_production_ready(
+        cuda,
+        &BTreeSet::from([ProviderConformanceProfile::ProviderCore])
+    ));
+    assert!(phase_is_production_ready(cuda, &required));
+}
+
+#[test]
+fn provider_roadmap_reference_cpu_remains_correctness_baseline() {
+    // Every post-baseline hardware family's primary fallback edge terminates
+    // at Reference CPU (or an explicit browser-CPU-like path for WebGPU),
+    // never at another hardware Provider -- Reference CPU stays the
+    // correctness baseline the roadmap compares optimized output against.
+    assert_eq!(
+        ProviderRoadmapHardwareFamily::Cuda.primary_fallback_edge(),
+        ProviderRoadmapFallbackEdge::CudaToReferenceCpu
+    );
+    assert_eq!(
+        ProviderRoadmapHardwareFamily::Metal.primary_fallback_edge(),
+        ProviderRoadmapFallbackEdge::MetalToReferenceCpu
+    );
+    assert_eq!(
+        ProviderRoadmapHardwareFamily::OpenVino.primary_fallback_edge(),
+        ProviderRoadmapFallbackEdge::OpenVinoToReferenceCpu
+    );
+    assert_eq!(
+        ProviderRoadmapHardwareFamily::Qnn.primary_fallback_edge(),
+        ProviderRoadmapFallbackEdge::QnnToReferenceCpu
+    );
+    assert_eq!(
+        ProviderRoadmapHardwareFamily::WebGpu.primary_fallback_edge(),
+        ProviderRoadmapFallbackEdge::WebGpuToBrowserCpuLike
+    );
+}
+
+#[test]
+fn provider_roadmap_optimized_provider_does_not_redefine_operator_semantics() {
+    // A fused kernel that does not preserve portable Operator/graph
+    // semantics is rejected outright, regardless of how it declares itself.
+    let non_preserving = KernelFusionMetadata {
+        operator_group: vec![OperatorId::magnetar(
+            "softmax",
+            1,
+            OperatorFamily::Activation,
+        )],
+        preserves_graph_semantics: false,
+    };
+    let precision = KernelPrecisionMetadata {
+        tolerance_profile: Some("operator-default".into()),
+        ..KernelPrecisionMetadata::default()
+    };
+    let fallback_hints = BTreeSet::from([KernelFallbackClass::AlternateKernel]);
+    let outcome = validate_fused_kernel_declaration(FusedKernelDeclaration {
+        fusion: Some(&non_preserving),
+        precision: &precision,
+        fallback_hints: &fallback_hints,
+    });
+    assert!(matches!(
+        outcome,
+        Err(ProviderRoadmapError::ProviderFusionInvalid { .. })
+    ));
+}
+
+#[test]
+fn provider_roadmap_rejects_model_family_provider_names() {
+    for name in [
+        "QwenProvider",
+        "LlamaProvider",
+        "GemmaProvider",
+        "DeepSeekProvider",
+    ] {
+        let outcome = reject_model_family_provider_name(name);
+        assert!(
+            matches!(
+                outcome,
+                Err(ProviderRoadmapError::ProviderRoadmapUnsupported { .. })
+            ),
+            "{name} should have been rejected, got {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn provider_roadmap_allows_hardware_and_optimized_provider_names() {
+    for name in [
+        "CudaProvider",
+        "MetalProvider",
+        "OpenVinoProvider",
+        "QnnProvider",
+        "WebGpuProvider",
+        "OptimizedCpuProvider",
+        "ReferenceCpuProvider",
+    ] {
+        assert!(
+            reject_model_family_provider_name(name).is_ok(),
+            "{name} should have been allowed"
+        );
+    }
+}
+
+#[test]
+fn provider_roadmap_rejects_empty_provider_name() {
+    assert!(matches!(
+        reject_model_family_provider_name("   "),
+        Err(ProviderRoadmapError::InternalProviderRoadmapError { .. })
+    ));
+}
+
+#[test]
+fn provider_roadmap_denies_native_handle_exposure_for_every_hardware_family() {
+    for family in [
+        ProviderRoadmapHardwareFamily::Cuda,
+        ProviderRoadmapHardwareFamily::Metal,
+        ProviderRoadmapHardwareFamily::OpenVino,
+        ProviderRoadmapHardwareFamily::Qnn,
+    ] {
+        assert!(
+            !family.native_handle_kinds().is_empty(),
+            "{family:?} should declare at least one native handle kind"
+        );
+        for handle_kind in family.native_handle_kinds() {
+            let outcome = reject_native_handle_exposure(family, handle_kind);
+            assert!(matches!(
+                outcome,
+                Err(ProviderRoadmapError::ProviderNativeHandleExposureDenied { .. })
+            ));
+        }
+    }
+    // WebGPU has no native-handle boundary of its own (browser sandboxing
+    // constraints apply instead), but it still must not require native
+    // Provider loading.
+    assert!(
+        ProviderRoadmapHardwareFamily::WebGpu
+            .native_handle_kinds()
+            .is_empty()
+    );
+    assert!(ProviderRoadmapHardwareFamily::WebGpu.requires_no_native_provider_loading());
+    assert!(!ProviderRoadmapHardwareFamily::Cuda.requires_no_native_provider_loading());
+}
+
+#[test]
+fn provider_roadmap_fused_kernel_requires_semantic_declaration() {
+    let missing = validate_fused_kernel_declaration(FusedKernelDeclaration {
+        fusion: None,
+        precision: &KernelPrecisionMetadata::default(),
+        fallback_hints: &BTreeSet::new(),
+    });
+    assert!(matches!(
+        missing,
+        Err(ProviderRoadmapError::ProviderFusionInvalid { .. })
+    ));
+
+    let empty_group = KernelFusionMetadata {
+        operator_group: Vec::new(),
+        preserves_graph_semantics: true,
+    };
+    let precision = KernelPrecisionMetadata {
+        tolerance_profile: Some("operator-default".into()),
+        ..KernelPrecisionMetadata::default()
+    };
+    let fallback_hints = BTreeSet::from([KernelFallbackClass::AlternateKernel]);
+    assert!(
+        validate_fused_kernel_declaration(FusedKernelDeclaration {
+            fusion: Some(&empty_group),
+            precision: &precision,
+            fallback_hints: &fallback_hints,
+        })
+        .is_err()
+    );
+
+    let complete = KernelFusionMetadata {
+        operator_group: vec![OperatorId::magnetar(
+            "matmul",
+            1,
+            OperatorFamily::LinearAlgebra,
+        )],
+        preserves_graph_semantics: true,
+    };
+    assert!(
+        validate_fused_kernel_declaration(FusedKernelDeclaration {
+            fusion: Some(&complete),
+            precision: &precision,
+            fallback_hints: &fallback_hints,
+        })
+        .is_ok()
+    );
+}
+
+#[test]
+fn provider_roadmap_quantized_path_requires_explicit_metadata() {
+    let incomplete = KernelQuantizationMetadata {
+        method: KernelQuantizationMethod::Int8,
+        storage_dtype: ComputeDType::SInt8,
+        compute_dtype: ComputeDType::Float32,
+        accumulation_dtype: ComputeDType::Float32,
+        scale_dtype: ComputeDType::Float32,
+        zero_point_dtype: None,
+        group_size: None,
+        packing_layout: TensorLayoutKind::QuantizedPacked,
+        dequantization: KernelDequantizationBehavior::ExplicitBeforeOperator,
+        supported_operators: BTreeSet::new(),
+        conformance_tolerance_profile: String::new(),
+    };
+    assert!(matches!(
+        validate_quantization_declaration(&incomplete),
+        Err(ProviderRoadmapError::ProviderQuantizationUnsupported { .. })
+    ));
+
+    let complete = KernelQuantizationMetadata {
+        supported_operators: BTreeSet::from([OperatorId::magnetar(
+            "matmul",
+            1,
+            OperatorFamily::LinearAlgebra,
+        )]),
+        conformance_tolerance_profile: "quantized-int8-default".into(),
+        ..incomplete
+    };
+    assert!(validate_quantization_declaration(&complete).is_ok());
+}
+
+#[test]
+fn provider_roadmap_rejects_hidden_dequantization() {
+    assert!(matches!(
+        reject_hidden_dequantization(false),
+        Err(ProviderRoadmapError::ProviderQuantizationUnsupported { .. })
+    ));
+    assert!(reject_hidden_dequantization(true).is_ok());
+}
+
+#[test]
+fn provider_roadmap_advanced_attention_unsupported_path_fails_explicitly() {
+    let outcome = reject_unsupported_advanced_attention(AdvancedAttentionVariant::FlashAttention);
+    assert!(matches!(
+        outcome,
+        ProviderRoadmapError::ProviderAdvancedAttentionUnsupported { .. }
+    ));
+}
+
+#[test]
+fn provider_roadmap_advanced_attention_declaration_requires_kv_cache_for_paged() {
+    let operator = OperatorId::magnetar("attention", 1, OperatorFamily::Attention);
+    let layouts = BTreeSet::from([TensorLayoutKind::AttentionSpecific]);
+    let memory_classes = BTreeSet::from([KernelMemoryClass::Device]);
+    let dtypes = BTreeSet::from([ComputeDType::Float32]);
+    let precision = KernelPrecisionMetadata {
+        tolerance_profile: Some("attention-default".into()),
+        ..KernelPrecisionMetadata::default()
+    };
+    let determinism = KernelDeterminism::default();
+    let fallback_hints = BTreeSet::from([KernelFallbackClass::AlternateKernel]);
+
+    let missing_kv_cache = validate_advanced_attention_declaration(AdvancedAttentionDeclaration {
+        variant: AdvancedAttentionVariant::PagedAttention,
+        operator: &operator,
+        layouts: &layouts,
+        memory_classes: &memory_classes,
+        dtypes: &dtypes,
+        kv_cache: None,
+        precision: &precision,
+        determinism: &determinism,
+        fallback_hints: &fallback_hints,
+    });
+    assert!(matches!(
+        missing_kv_cache,
+        Err(ProviderRoadmapError::ProviderAdvancedAttentionUnsupported { .. })
+    ));
+
+    let kv_cache = KernelKvCacheMetadata {
+        layouts: BTreeSet::from(["paged".to_string()]),
+        paged_cache: true,
+        append: true,
+        read: true,
+        dtypes: BTreeSet::from([ComputeDType::Float32]),
+        memory_classes: BTreeSet::from([KernelMemoryClass::Device]),
+        affinity: None,
+    };
+    let complete = validate_advanced_attention_declaration(AdvancedAttentionDeclaration {
+        variant: AdvancedAttentionVariant::PagedAttention,
+        operator: &operator,
+        layouts: &layouts,
+        memory_classes: &memory_classes,
+        dtypes: &dtypes,
+        kv_cache: Some(&kv_cache),
+        precision: &precision,
+        determinism: &determinism,
+        fallback_hints: &fallback_hints,
+    });
+    assert!(complete.is_ok());
+
+    // Flash attention doesn't inherently require KV cache metadata.
+    let flash_without_kv_cache =
+        validate_advanced_attention_declaration(AdvancedAttentionDeclaration {
+            variant: AdvancedAttentionVariant::FlashAttention,
+            operator: &operator,
+            layouts: &layouts,
+            memory_classes: &memory_classes,
+            dtypes: &dtypes,
+            kv_cache: None,
+            precision: &precision,
+            determinism: &determinism,
+            fallback_hints: &fallback_hints,
+        });
+    assert!(flash_without_kv_cache.is_ok());
+}
+
+#[test]
+fn provider_roadmap_fallback_denied_by_default() {
+    let context = ProviderRoadmapFallbackContext::deny_by_default();
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent);
+    let outcome = evaluate_provider_roadmap_fallback(
+        ProviderRoadmapFallbackEdge::CudaToReferenceCpu,
+        &affinity,
+        &context,
+    );
+    assert!(matches!(
+        outcome,
+        Err(ProviderRoadmapError::ProviderFallbackDenied { .. })
+    ));
+}
+
+#[test]
+fn provider_roadmap_fallback_requires_every_gate_open() {
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent);
+    let mut context = ProviderRoadmapFallbackContext {
+        cpu: FallbackPolicyContext::new(true),
+        memory_policy_allows_fallback: true,
+        privacy_policy_allows_fallback: true,
+        precision_policy_allows_fallback: false,
+    };
+    assert!(
+        evaluate_provider_roadmap_fallback(
+            ProviderRoadmapFallbackEdge::MetalToReferenceCpu,
+            &affinity,
+            &context,
+        )
+        .is_err(),
+        "precision gate closed must still deny fallback"
+    );
+    context.precision_policy_allows_fallback = true;
+    assert!(
+        evaluate_provider_roadmap_fallback(
+            ProviderRoadmapFallbackEdge::MetalToReferenceCpu,
+            &affinity,
+            &context,
+        )
+        .is_ok(),
+        "all gates open must allow fallback"
+    );
+    context.memory_policy_allows_fallback = false;
+    assert!(
+        evaluate_provider_roadmap_fallback(
+            ProviderRoadmapFallbackEdge::MetalToReferenceCpu,
+            &affinity,
+            &context,
+        )
+        .is_err(),
+        "memory gate closed must still deny fallback"
+    );
+}
+
+#[test]
+fn provider_roadmap_fallback_denies_provider_pinned_affinity_even_with_open_policy() {
+    let affinity = ResourceAffinity::new(FallbackClass::ProviderPinned);
+    let context = ProviderRoadmapFallbackContext {
+        cpu: FallbackPolicyContext::new(true),
+        memory_policy_allows_fallback: true,
+        privacy_policy_allows_fallback: true,
+        precision_policy_allows_fallback: true,
+    };
+    assert!(
+        evaluate_provider_roadmap_fallback(
+            ProviderRoadmapFallbackEdge::CudaToOptimizedCpu,
+            &affinity,
+            &context,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn provider_roadmap_fallback_observed_emits_considered_then_used_or_denied() {
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent);
+    let denied_context = ProviderRoadmapFallbackContext::deny_by_default();
+    let (observations, outcome) = evaluate_provider_roadmap_fallback_observed(
+        ProviderRoadmapFallbackEdge::WebGpuToBrowserCpuLike,
+        &affinity,
+        &denied_context,
+    );
+    assert!(outcome.is_err());
+    assert_eq!(observations.len(), 2);
+    assert_eq!(
+        observations[0].kind,
+        ProviderRoadmapObservationKind::FallbackConsidered
+    );
+    assert_eq!(
+        observations[1].kind,
+        ProviderRoadmapObservationKind::FallbackDenied
+    );
+
+    let allowed_context = ProviderRoadmapFallbackContext {
+        cpu: FallbackPolicyContext::new(true),
+        memory_policy_allows_fallback: true,
+        privacy_policy_allows_fallback: true,
+        precision_policy_allows_fallback: true,
+    };
+    let (observations, outcome) = evaluate_provider_roadmap_fallback_observed(
+        ProviderRoadmapFallbackEdge::WebGpuToBrowserCpuLike,
+        &affinity,
+        &allowed_context,
+    );
+    assert!(outcome.is_ok());
+    assert_eq!(
+        observations[1].kind,
+        ProviderRoadmapObservationKind::FallbackUsed
+    );
+}
+
+#[test]
+fn provider_roadmap_runtime_api_remains_provider_independent() {
+    for capability in PROVIDER_ROADMAP_FORBIDDEN_API_HANDLE_SCOPES {
+        assert!(
+            reject_provider_specific_handle_capability(capability).is_err(),
+            "{capability} should have been rejected"
+        );
+    }
+    // Ordinary inference scopes remain unaffected.
+    assert!(reject_provider_specific_handle_capability("generation").is_ok());
+    assert!(validate_inference_scope("generation").is_ok());
+}
+
+#[test]
+fn provider_roadmap_cli_receives_redacted_provider_diagnostics_only() {
+    let raw = "provider handle=0xdeadbeef failed on cuda-stream";
+    let redacted = cli_redacted_provider_diagnostic(raw);
+    assert!(!redacted.contains("0xdeadbeef"));
+}
+
+#[test]
+fn provider_roadmap_cli_may_pass_policy_preference_without_authority() {
+    let preference = ProviderRoadmapPolicyPreference {
+        preferred_provider: Some("cuda".into()),
+        allow_optimized_provider_fallback: true,
+    };
+    let echoed = cli_may_pass_policy_preference(&preference);
+    assert_eq!(echoed, preference);
+    assert!(reject_cli_raw_provider_handle_selection("cuda-device-pointer").is_err());
+}
+
+#[test]
+fn provider_roadmap_layout_expansion_requires_explicit_conversion() {
+    for layout in POST_BASELINE_LAYOUTS {
+        assert!(!layout.component_visible() || *layout != TensorLayoutKind::ProviderOpaque);
+    }
+    assert!(
+        require_explicit_layout_conversion(
+            TensorLayoutKind::Paged,
+            TensorLayoutKind::Paged,
+            false,
+        )
+        .is_ok()
+    );
+    assert!(
+        require_explicit_layout_conversion(
+            TensorLayoutKind::Paged,
+            TensorLayoutKind::Blocked,
+            false,
+        )
+        .is_err()
+    );
+    assert!(
+        require_explicit_layout_conversion(
+            TensorLayoutKind::Paged,
+            TensorLayoutKind::Blocked,
+            true,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn provider_roadmap_memory_expansion_requires_manager_tracking() {
+    assert_eq!(POST_BASELINE_MEMORY_CLASSES.len(), 7);
+    for memory_class in POST_BASELINE_MEMORY_CLASSES {
+        assert!(require_memory_manager_tracking(*memory_class, true).is_ok());
+        assert!(matches!(
+            require_memory_manager_tracking(*memory_class, false),
+            Err(ProviderRoadmapError::ProviderMemoryClassUnsupported { .. })
+        ));
+    }
+}
+
+#[test]
+fn provider_roadmap_conformance_profiles_are_declared_without_implying_readiness() {
+    let ids = provider_roadmap_conformance_profile_ids();
+    assert_eq!(ids.len(), 9);
+    assert!(ids.values().all(|required| !required));
+    assert!(ids.contains_key(ProviderConformanceProfile::Quantized.id()));
+    assert!(ids.contains_key(ProviderConformanceProfile::AdvancedAttention.id()));
+    assert!(ids.contains_key(ProviderConformanceProfile::FusedKernel.id()));
+    assert!(ids.contains_key(ProviderConformanceProfile::Browser.id()));
+    assert!(ids.contains_key(ProviderConformanceProfile::WebGpu.id()));
+}
+
+#[test]
+fn provider_roadmap_benchmarks_stay_separate_from_conformance() {
+    // A benchmark result is never accepted anywhere a conformance decision
+    // is made: a report whose only entry is a correctness failure is not
+    // conformant no matter how good a (structurally separate) benchmark
+    // result would look.
+    let fast_but_wrong = ProviderRoadmapConformanceReport {
+        results: vec![ProviderRoadmapConformanceResult {
+            requirement: "optimized matmul matches Reference CPU".into(),
+            passed: false,
+            diagnostic: Some("output differs beyond tolerance".into()),
+        }],
+    };
+    assert!(!fast_but_wrong.is_conformant());
+
+    let benchmark = ProviderRoadmapBenchmarkResult {
+        category: ProviderRoadmapBenchmarkCategory::TokensPerSecond,
+        provider: "cuda".into(),
+        value: 999.0,
+        unit: "tokens/sec".into(),
+    };
+    // The benchmark result exists purely as data; nothing consumes it as
+    // conformance input.
+    assert_eq!(
+        benchmark.category,
+        ProviderRoadmapBenchmarkCategory::TokensPerSecond
+    );
+}
+
+#[test]
+fn provider_roadmap_error_display_is_non_empty_for_every_variant() {
+    let variants = vec![
+        ProviderRoadmapError::ProviderRoadmapUnsupported {
+            reason: "example".into(),
+        },
+        ProviderRoadmapError::OptimizedCpuProviderUnavailable {
+            reason: "example".into(),
+        },
+        ProviderRoadmapError::CudaProviderUnavailable {
+            reason: "example".into(),
+        },
+        ProviderRoadmapError::MetalProviderUnavailable {
+            reason: "example".into(),
+        },
+        ProviderRoadmapError::OpenVinoProviderUnavailable {
+            reason: "example".into(),
+        },
+        ProviderRoadmapError::QnnProviderUnavailable {
+            reason: "example".into(),
+        },
+        ProviderRoadmapError::WebGpuProviderUnavailable {
+            reason: "example".into(),
+        },
+        ProviderRoadmapError::ProviderFeatureUnsupported {
+            feature: "example".into(),
+        },
+        ProviderRoadmapError::ProviderLayoutUnsupported {
+            layout: "example".into(),
+        },
+        ProviderRoadmapError::ProviderDTypeUnsupported {
+            dtype: "example".into(),
+        },
+        ProviderRoadmapError::ProviderMemoryClassUnsupported {
+            memory_class: "example".into(),
+        },
+        ProviderRoadmapError::ProviderAdvancedAttentionUnsupported {
+            variant: "example".into(),
+        },
+        ProviderRoadmapError::ProviderQuantizationUnsupported {
+            reason: "example".into(),
+        },
+        ProviderRoadmapError::ProviderFusionInvalid {
+            reason: "example".into(),
+        },
+        ProviderRoadmapError::ProviderConformanceFailed {
+            report: "example".into(),
+        },
+        ProviderRoadmapError::ProviderBenchmarkFailed {
+            reason: "example".into(),
+        },
+        ProviderRoadmapError::ProviderFallbackDenied {
+            reason: "example".into(),
+        },
+        ProviderRoadmapError::ProviderNativeHandleExposureDenied {
+            handle_kind: "example".into(),
+        },
+        ProviderRoadmapError::InternalProviderRoadmapError {
+            reason: "example".into(),
+        },
+    ];
+    for variant in variants {
+        let rendered = variant.to_string();
+        assert!(!rendered.is_empty(), "{variant:?} rendered empty");
+        assert!(!variant.id().is_empty());
+    }
+}
+
+#[test]
+fn provider_roadmap_observation_redacts_metadata_by_default() {
+    let observation = ProviderRoadmapObservation::new(ProviderRoadmapObservationKind::FallbackUsed)
+        .with_provider("cuda")
+        .with_redacted_metadata("diagnostic", "device pointer handle=0xdeadbeef");
+    let value = observation.redacted_metadata.get("diagnostic").unwrap();
+    assert!(!value.contains("0xdeadbeef"));
+}
+
+#[test]
+fn provider_roadmap_observation_kind_round_trips_through_debug() {
+    let kinds = [
+        ProviderRoadmapObservationKind::RoadmapFeatureDiscovered,
+        ProviderRoadmapObservationKind::CapabilityAdvertised,
+        ProviderRoadmapObservationKind::CapabilityRejected,
+        ProviderRoadmapObservationKind::OptimizedProviderSelected,
+        ProviderRoadmapObservationKind::AdvancedAttentionSelected,
+        ProviderRoadmapObservationKind::QuantizedKernelSelected,
+        ProviderRoadmapObservationKind::FusedKernelSelected,
+        ProviderRoadmapObservationKind::FallbackConsidered,
+        ProviderRoadmapObservationKind::FallbackUsed,
+        ProviderRoadmapObservationKind::FallbackDenied,
+        ProviderRoadmapObservationKind::ConformancePassed,
+        ProviderRoadmapObservationKind::ConformanceFailed,
+        ProviderRoadmapObservationKind::BenchmarkExecuted,
+        ProviderRoadmapObservationKind::BenchmarkSkipped,
+    ];
+    assert_eq!(kinds.len(), 14);
+    for kind in kinds {
+        let observation = ProviderRoadmapObservation::new(kind);
+        assert_eq!(observation.kind, kind);
+    }
+}
+
+#[test]
+fn provider_roadmap_device_metadata_templates_carry_family_memory_classes() {
+    for family in [
+        ProviderRoadmapHardwareFamily::Cuda,
+        ProviderRoadmapHardwareFamily::Metal,
+        ProviderRoadmapHardwareFamily::OpenVino,
+        ProviderRoadmapHardwareFamily::Qnn,
+        ProviderRoadmapHardwareFamily::WebGpu,
+    ] {
+        let device = family.device_metadata_template();
+        assert_eq!(device.memory_class_support, family.memory_classes());
+        assert!(!device.vendor.is_empty());
+        assert!(!device.architecture.is_empty());
+    }
+}
+
+#[test]
+fn provider_roadmap_conformance_report_is_conformant() {
+    let report = run_provider_roadmap_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+// ---------------------------------------------------------------------
+// model_format_roadmap
+// ---------------------------------------------------------------------
+
+#[test]
+fn model_format_roadmap_phases_are_ordered_1_through_12() {
+    let mut ordinals: Vec<u8> = MODEL_FORMAT_ROADMAP_PHASES
+        .iter()
+        .map(|phase| phase.ordinal())
+        .collect();
+    ordinals.sort_unstable();
+    assert_eq!(ordinals, (1..=12).collect::<Vec<_>>());
+    for phase in MODEL_FORMAT_ROADMAP_PHASES {
+        assert!(!phase.id().is_empty());
+        assert!(phase.normalizes_into_existing_contract());
+    }
+}
+
+#[test]
+fn model_format_roadmap_rejects_format_shaped_provider_names() {
+    for name in [
+        "GGUFProvider",
+        "SafetensorsProvider",
+        "QwenSafetensorsProvider",
+        "sentencepiece-provider",
+        "tokenizer-json-provider",
+    ] {
+        assert!(
+            reject_model_format_provider_name(name).is_err(),
+            "{name} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn model_format_roadmap_allows_hardware_and_optimized_provider_names() {
+    for name in [
+        "ReferenceCpuProvider",
+        "CudaProvider",
+        "OptimizedCpuProvider",
+    ] {
+        assert!(
+            reject_model_format_provider_name(name).is_ok(),
+            "{name} must be allowed"
+        );
+    }
+}
+
+#[test]
+fn model_format_roadmap_rejects_empty_provider_name() {
+    assert!(matches!(
+        reject_model_format_provider_name("   "),
+        Err(ModelFormatRoadmapError::InternalModelFormatError { .. })
+    ));
+}
+
+#[test]
+fn model_format_roadmap_format_parsers_cannot_supply_execution_graphs() {
+    assert!(reject_format_execution_graph(true).is_err());
+    assert!(reject_format_execution_graph(false).is_ok());
+}
+
+#[test]
+fn model_format_roadmap_normalized_manifest_coverage_tracks_present_fields() {
+    let mut manifest = fixture_model_manifest();
+    let coverage = NormalizedManifestCoverage::from_manifest(&manifest);
+    assert!(coverage.identity);
+    assert!(coverage.digest);
+    assert!(coverage.architecture_family);
+    assert!(!coverage.tokenizer);
+    assert!(!coverage.license);
+    assert!(coverage.covers_required_fields() || manifest.parts.is_empty());
+
+    manifest.tokenizer = Some("tokenizer.json".into());
+    manifest.license = Some(ModelLicenseMetadata {
+        identifier: "apache-2.0".into(),
+        url: None,
+        usage_restrictions: Vec::new(),
+    });
+    let coverage = NormalizedManifestCoverage::from_manifest(&manifest);
+    assert!(coverage.tokenizer);
+    assert!(coverage.license);
+}
+
+fn fixture_model_manifest() -> ModelManifest {
+    let digest = ModelDigest::parse(format!("sha256:{}", "2".repeat(64))).unwrap();
+    let id = ModelArtifactId::new(
+        ModelArtifactKind::ModelBundle,
+        ModelName::new("fixture-model").unwrap(),
+        ModelRevision::new("v1").unwrap(),
+        digest,
+    );
+    ModelManifest {
+        schema_version: MODEL_ARTIFACT_SCHEMA_VERSION,
+        id,
+        architecture: ModelArchitecture::new("qwen", "qwen2"),
+        parts: BTreeMap::new(),
+        storage_dtype: None,
+        compute_dtype: None,
+        supported_compute_dtypes: BTreeSet::new(),
+        tensors: Vec::new(),
+        tokenizer: None,
+        tokenizer_config: None,
+        chat_template: None,
+        prompt_template: None,
+        generation: None,
+        quantization: None,
+        shards: Vec::new(),
+        runtime_features: BTreeSet::new(),
+        memory_features: BTreeSet::new(),
+        provider_capabilities: Vec::new(),
+        component: None,
+        license: None,
+        provenance: None,
+        signatures: Vec::new(),
+        source: None,
+    }
+}
+
+fn tensor(name: &str, shape: Vec<u64>) -> ModelTensorMetadata {
+    ModelTensorMetadata {
+        name: name.into(),
+        shape,
+        storage_dtype: ModelDType::F32,
+        layout: None,
+        shard: None,
+        offset_bytes: None,
+        size_bytes: None,
+        quantization: None,
+        expected_compute_dtype: None,
+    }
+}
+
+#[test]
+fn model_format_roadmap_safetensors_manifest_validates_and_normalizes() {
+    let manifest = SafetensorsManifest {
+        tensors: vec![SafetensorsTensorEntry {
+            name: "layer.0.weight".into(),
+            shape: vec![4, 4],
+            dtype: ModelDType::F32,
+            byte_offset: 0,
+            byte_length: 64,
+        }],
+        header_metadata: BTreeMap::new(),
+    };
+    assert!(manifest.validate().is_ok());
+    let tensors = manifest.into_tensor_metadata();
+    assert_eq!(tensors.len(), 1);
+    assert_eq!(tensors[0].name, "layer.0.weight");
+    assert_eq!(tensors[0].offset_bytes, Some(0));
+    assert_eq!(tensors[0].size_bytes, Some(64));
+
+    let degenerate = SafetensorsManifest {
+        tensors: vec![SafetensorsTensorEntry {
+            name: "bad".into(),
+            shape: vec![0],
+            dtype: ModelDType::F32,
+            byte_offset: 0,
+            byte_length: 4,
+        }],
+        header_metadata: BTreeMap::new(),
+    };
+    assert!(matches!(
+        degenerate.validate(),
+        Err(ModelFormatRoadmapError::SafetensorsInvalid { .. })
+    ));
+}
+
+#[test]
+fn model_format_roadmap_memory_mapping_policy_rejects_raw_pointer_exposure() {
+    let policy = MemoryMappingPolicy {
+        mapping_allowed: true,
+        streaming_read_allowed: true,
+        exposes_raw_pointer: true,
+    };
+    assert!(policy.validate().is_err());
+    let safe = MemoryMappingPolicy {
+        exposes_raw_pointer: false,
+        ..policy
+    };
+    assert!(safe.validate().is_ok());
+}
+
+#[test]
+fn model_format_roadmap_detects_missing_and_duplicate_shard_tensors() {
+    let mut index = ShardIndex::default();
+    index.shards.push(ModelShard {
+        id: ModelShardId::new("shard-0").unwrap(),
+        digest: ModelDigest::parse(format!("sha256:{}", "3".repeat(64))).unwrap(),
+        size_bytes: 1024,
+        order: 0,
+    });
+    index.tensor_shard_map.insert(
+        "layer.0.weight".into(),
+        ModelShardId::new("shard-0").unwrap(),
+    );
+    assert!(detect_missing_shards(&index).is_ok());
+
+    index.tensor_shard_map.insert(
+        "layer.1.weight".into(),
+        ModelShardId::new("shard-missing").unwrap(),
+    );
+    assert!(matches!(
+        detect_missing_shards(&index),
+        Err(ModelFormatRoadmapError::ShardMissing { .. })
+    ));
+
+    let duplicate = vec![
+        tensor("layer.0.weight", vec![4, 4]),
+        tensor("layer.0.weight", vec![4, 4]),
+    ];
+    assert!(detect_duplicate_tensor_names(&duplicate).is_err());
+
+    let inconsistent = vec![
+        tensor("layer.0.weight", vec![4, 4]),
+        tensor("layer.0.weight", vec![8, 8]),
+    ];
+    assert!(matches!(
+        validate_shard_tensor_shape_consistency(&inconsistent),
+        Err(ModelFormatRoadmapError::ShardIndexInvalid { .. })
+    ));
+
+    let ordered = vec![
+        ModelShard {
+            id: ModelShardId::new("shard-0").unwrap(),
+            digest: ModelDigest::parse(format!("sha256:{}", "4".repeat(64))).unwrap(),
+            size_bytes: 1,
+            order: 0,
+        },
+        ModelShard {
+            id: ModelShardId::new("shard-1").unwrap(),
+            digest: ModelDigest::parse(format!("sha256:{}", "5".repeat(64))).unwrap(),
+            size_bytes: 1,
+            order: 0,
+        },
+    ];
+    assert!(matches!(
+        validate_shard_loading_order(&ordered),
+        Err(ModelFormatRoadmapError::ShardIndexInvalid { .. })
+    ));
+}
+
+#[test]
+fn model_format_roadmap_torch_dtype_never_forces_compute_dtype() {
+    assert_eq!(
+        torch_dtype_does_not_force_compute_dtype(Some("bfloat16"), ModelDType::F32),
+        ModelDType::F32
+    );
+    assert_eq!(
+        torch_dtype_does_not_force_compute_dtype(None, ModelDType::Bf16),
+        ModelDType::Bf16
+    );
+}
+
+#[test]
+fn model_format_roadmap_normalizes_tokenizer_json() {
+    let parsed = TokenizerJsonMetadata {
+        vocabulary_size: 32000,
+        added_tokens: Vec::new(),
+        special_tokens: vec![SpecialToken::new(SpecialTokenKind::Bos, "<s>", 1)],
+        normalizer: Some("nfc".into()),
+        pre_tokenizer: Some("byte-level".into()),
+        decoder: Some("byte-level".into()),
+        supports_offsets: true,
+    };
+    let metadata = normalize_tokenizer_json(
+        TokenizerId::new("tok-1").unwrap(),
+        TokenizerArtifactId::new("tokenizer.json").unwrap(),
+        ModelDigest::parse(format!("sha256:{}", "6".repeat(64))).unwrap(),
+        TokenizerFamily::new("qwen").unwrap(),
+        TokenizerRevision::new("v1").unwrap(),
+        &parsed,
+    )
+    .unwrap();
+    assert_eq!(metadata.vocabulary_size, 32000);
+    assert!(metadata.supports_offsets);
+    assert_eq!(metadata.special_tokens.len(), 1);
+
+    let empty = TokenizerJsonMetadata {
+        vocabulary_size: 0,
+        ..parsed
+    };
+    assert!(matches!(
+        normalize_tokenizer_json(
+            TokenizerId::new("tok-2").unwrap(),
+            TokenizerArtifactId::new("tokenizer.json").unwrap(),
+            ModelDigest::parse(format!("sha256:{}", "7".repeat(64))).unwrap(),
+            TokenizerFamily::new("qwen").unwrap(),
+            TokenizerRevision::new("v1").unwrap(),
+            &empty,
+        ),
+        Err(ModelFormatRoadmapError::TokenizerJsonInvalid { .. })
+    ));
+}
+
+#[test]
+fn model_format_roadmap_tokenizer_config_requires_explicit_runtime_validation() {
+    assert!(reject_silent_tokenizer_config_override(false).is_err());
+    assert!(reject_silent_tokenizer_config_override(true).is_ok());
+}
+
+#[test]
+fn model_format_roadmap_generation_config_as_defaults_and_override() {
+    let parsed = GenerationConfigMetadata {
+        temperature: Some(0.7),
+        max_new_tokens: Some(256),
+        stop_strings: vec!["<eos>".into()],
+        ..Default::default()
+    };
+    let defaults = parsed.as_defaults();
+    assert_eq!(defaults.temperature, Some(0.7));
+    assert_eq!(defaults.max_tokens, Some(256));
+    assert_eq!(defaults.stop_tokens, vec!["<eos>".to_string()]);
+
+    assert_eq!(apply_generation_override(Some(0.7), Some(1.5)), Some(1.5));
+    assert_eq!(apply_generation_override(Some(0.7), None), Some(0.7));
+    assert_eq!(apply_generation_override::<f32>(None, None), None);
+}
+
+#[test]
+fn model_format_roadmap_chat_template_requires_compatibility_and_variables() {
+    let metadata = ChatTemplateMetadata {
+        identity: "qwen-chat".into(),
+        source: ChatTemplateSourceKind::EmbeddedInManifest,
+        tokenizer_compatible: true,
+        model_family_compatible: true,
+        required_variables: BTreeSet::from(["messages".to_string()]),
+        special_token_interaction: BTreeSet::new(),
+    };
+    assert!(validate_chat_template(&metadata, &BTreeSet::new()).is_err());
+    assert!(validate_chat_template(&metadata, &BTreeSet::from(["messages".to_string()])).is_ok());
+
+    let incompatible = ChatTemplateMetadata {
+        tokenizer_compatible: false,
+        ..metadata
+    };
+    assert!(matches!(
+        validate_chat_template(&incompatible, &BTreeSet::new()),
+        Err(ModelFormatRoadmapError::ChatTemplateInvalid { .. })
+    ));
+
+    assert_eq!(
+        redact_chat_template_diagnostic("plain message"),
+        "plain message"
+    );
+}
+
+#[test]
+fn model_format_roadmap_sentencepiece_unsupported_feature_fails_explicitly() {
+    let metadata = SentencePieceMetadata {
+        model_identity: "spm-1".into(),
+        vocabulary_size: 32000,
+        special_tokens: Vec::new(),
+        normalization: None,
+        browser_supported: false,
+        license: None,
+        supported_features: BTreeSet::from(["bpe".to_string()]),
+    };
+    assert!(reject_unsupported_sentencepiece_feature(&metadata, "bpe").is_ok());
+    assert!(matches!(
+        reject_unsupported_sentencepiece_feature(&metadata, "byte-fallback"),
+        Err(ModelFormatRoadmapError::SentencePieceUnsupported { .. })
+    ));
+}
+
+#[test]
+fn model_format_roadmap_gguf_metadata_validates_and_normalizes_quantized_tensors() {
+    let quantization = ModelQuantization {
+        format: ModelQuantizationFormat::GgufQ4K,
+        group_size: Some(32),
+        block_size: None,
+        scale_dtype: Some(ModelDType::F16),
+        zero_point_dtype: None,
+        per_channel: false,
+        workspace_bytes: None,
+        required_capabilities: Vec::new(),
+    };
+    let gguf = GgufMetadata {
+        architecture: "qwen2".into(),
+        alignment: 32,
+        tensors: vec![GgufTensorEntry {
+            name: "layer.0.weight".into(),
+            shape: vec![4, 4],
+            dtype: ModelDType::Q4K,
+            quantization: Some(quantization),
+        }],
+        tokenizer_embedded: None,
+        key_values: BTreeMap::new(),
+    };
+    assert!(gguf.validate().is_ok());
+    let tensors = gguf.into_tensor_metadata();
+    assert_eq!(tensors.len(), 1);
+    assert!(tensors[0].quantization.is_some());
+    assert_eq!(tensors[0].layout.as_deref(), Some("quantized-packed"));
+
+    let empty = GgufMetadata {
+        tensors: Vec::new(),
+        ..gguf
+    };
+    assert!(matches!(
+        empty.validate(),
+        Err(ModelFormatRoadmapError::GgufInvalid { .. })
+    ));
+
+    assert!(reject_model_format_provider_name("GGUFProvider").is_err());
+}
+
+#[test]
+fn model_format_roadmap_normalizes_lora_adapter_without_activating_or_trusting_it() {
+    let base_model = AdapterBaseModelCompatibility {
+        model_name: ModelName::new("qwen").unwrap(),
+        model_revision: ModelRevision::new("v1").unwrap(),
+        model_artifact: None,
+        tokenizer: None,
+        architecture: AdapterArchitectureCompatibility {
+            family: "qwen".into(),
+            implementation: "qwen2".into(),
+            hidden_size: Some(4096),
+            layer_count: Some(32),
+            position_encoding: None,
+            target_modules: BTreeSet::from(["q_proj".to_string()]),
+            supported_storage_dtypes: BTreeSet::from([ModelDType::F16]),
+            supported_compute_dtypes: BTreeSet::from([ComputeDType::Float16]),
+            supported_quantization_formats: BTreeSet::new(),
+        },
+    };
+    let metadata = LoraAdapterFormatMetadata {
+        target_modules: vec!["q_proj".into()],
+        rank: 8,
+        alpha: 16,
+        scaling: Some(2.0),
+        dropout: Some(0.1),
+        base_model,
+        tensors: vec![tensor("q_proj.lora_a", vec![4096, 8])],
+        storage_dtype: ModelDType::F16,
+        compute_dtype: Some(ComputeDType::Float16),
+        quantization: None,
+        required_capabilities: Vec::new(),
+        license: None,
+        provenance: None,
+    };
+    let id = AdapterArtifactId::new(
+        AdapterName::new("support-lora").unwrap(),
+        AdapterRevision::new("r1").unwrap(),
+        AdapterDigest::parse(format!("sha256:{}", "8".repeat(64))).unwrap(),
+    );
+    let artifact = normalize_lora_adapter(id, &metadata);
+    assert_eq!(artifact.method, AdapterMethod::Lora);
+    assert_eq!(artifact.rank, Some(8));
+    assert_eq!(artifact.alpha, Some(16));
+    assert_eq!(artifact.trust, AdapterTrustStatus::Unknown);
+    assert_eq!(artifact.targets.len(), 1);
+}
+
+#[test]
+fn model_format_roadmap_quantization_declaration_requires_scale_dtype_and_rejects_hidden_dequant() {
+    let missing_scale = ModelFormatQuantizationDeclaration {
+        model_quantization: ModelQuantization {
+            format: ModelQuantizationFormat::Gptq,
+            group_size: Some(64),
+            block_size: None,
+            scale_dtype: None,
+            zero_point_dtype: None,
+            per_channel: false,
+            workspace_bytes: None,
+            required_capabilities: Vec::new(),
+        },
+        kernel_compatibility: None,
+    };
+    assert!(matches!(
+        validate_model_format_quantization(&missing_scale, true),
+        Err(ModelFormatRoadmapError::QuantizationMetadataInvalid { .. })
+    ));
+
+    let with_kernel = ModelFormatQuantizationDeclaration {
+        model_quantization: ModelQuantization {
+            scale_dtype: Some(ModelDType::F16),
+            ..missing_scale.model_quantization.clone()
+        },
+        kernel_compatibility: Some(KernelQuantizationMetadata {
+            method: KernelQuantizationMethod::Int8,
+            storage_dtype: ComputeDType::SInt8,
+            compute_dtype: ComputeDType::Float32,
+            accumulation_dtype: ComputeDType::Float32,
+            scale_dtype: ComputeDType::Float32,
+            zero_point_dtype: None,
+            group_size: None,
+            packing_layout: TensorLayoutKind::QuantizedPacked,
+            dequantization: KernelDequantizationBehavior::ExplicitBeforeOperator,
+            supported_operators: BTreeSet::from([OperatorId::magnetar(
+                "matmul",
+                1,
+                OperatorFamily::LinearAlgebra,
+            )]),
+            conformance_tolerance_profile: "operator-default".into(),
+        }),
+    };
+    assert!(validate_model_format_quantization(&with_kernel, true).is_ok());
+    assert!(matches!(
+        validate_model_format_quantization(&with_kernel, false),
+        Err(ModelFormatRoadmapError::QuantizationMetadataInvalid { .. })
+    ));
+}
+
+#[test]
+fn model_format_roadmap_source_and_local_file_and_network_boundaries() {
+    for source in [
+        ModelArtifactSource::LocalPath("/models/qwen".into()),
+        ModelArtifactSource::LocalCache("cache-1".into()),
+        ModelArtifactSource::ClientProvided("client-1".into()),
+        ModelArtifactSource::Registry("registry-1".into()),
+        ModelArtifactSource::HuggingFace("qwen/qwen2".into()),
+        ModelArtifactSource::Oci("oci://image".into()),
+        ModelArtifactSource::Tachyon("tachyon-1".into()),
+    ] {
+        assert!(reject_arbitrary_model_download(&source).is_ok());
+    }
+
+    let local = ModelArtifactSource::LocalPath("/models/qwen".into());
+    assert!(matches!(
+        validate_local_file_boundary(&local, false),
+        Err(ModelFormatRoadmapError::ModelFormatLocalFileDenied { .. })
+    ));
+    assert!(validate_local_file_boundary(&local, true).is_ok());
+
+    assert!(reject_raw_network_model_reference("https://example.com/model.gguf").is_err());
+    assert!(reject_raw_network_model_reference("qwen/qwen2").is_ok());
+}
+
+#[test]
+fn model_format_roadmap_format_alone_does_not_grant_trust() {
+    let store = ModelTrustStore::default();
+    let manifest = fixture_model_manifest();
+    let decision = model_format_grants_no_trust(&store, &manifest);
+    assert_eq!(decision.status, ModelTrustStatus::Unknown);
+
+    let trusted_store = ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone());
+    let trusted_decision = model_format_grants_no_trust(&trusted_store, &manifest);
+    assert_eq!(trusted_decision.status, ModelTrustStatus::Trusted);
+}
+
+#[test]
+fn model_format_roadmap_conformance_fixture_kinds_cover_twelve_categories() {
+    assert_eq!(MODEL_FORMAT_CONFORMANCE_FIXTURES.len(), 12);
+    for fixture in MODEL_FORMAT_CONFORMANCE_FIXTURES {
+        assert!(!fixture.id().is_empty());
+    }
+}
+
+#[test]
+fn model_format_roadmap_observation_redacts_metadata() {
+    let observation =
+        ModelFormatRoadmapObservation::new(ModelFormatRoadmapObservationKind::ManifestNormalized)
+            .with_artifact("fixture-model")
+            .with_redacted_metadata("path", "/etc/secret/model.safetensors");
+    assert_eq!(observation.artifact.as_deref(), Some("fixture-model"));
+    assert!(observation.redacted_metadata.contains_key("path"));
+}
+
+#[test]
+fn model_format_roadmap_conformance_report_is_conformant() {
+    let report = run_model_format_roadmap_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+// ---------------------------------------------------------------------
+// model_source_cache_roadmap
+// ---------------------------------------------------------------------
+
+fn model_source_cache_probe_artifact_id(name: &str) -> ModelArtifactId {
+    let digest = ModelDigest::sha256(name.as_bytes());
+    ModelArtifactId::new(
+        ModelArtifactKind::ModelBundle,
+        ModelName::new(name).unwrap(),
+        ModelRevision::new("v1").unwrap(),
+        digest,
+    )
+}
+
+#[test]
+fn model_source_cache_roadmap_source_kinds_cover_seven_categories() {
+    assert_eq!(MODEL_SOURCE_KINDS.len(), 7);
+    let mut ids: BTreeSet<&str> = BTreeSet::new();
+    for kind in MODEL_SOURCE_KINDS {
+        assert!(
+            ids.insert(kind.id()),
+            "duplicate source kind id {}",
+            kind.id()
+        );
+        assert!(
+            !kind.grants_trust(),
+            "source kind {} must not grant trust",
+            kind.id()
+        );
+    }
+}
+
+#[test]
+fn model_source_cache_roadmap_source_kind_normalizes_from_artifact_source() {
+    assert_eq!(
+        ModelSourceKind::from_artifact_source(&ModelArtifactSource::LocalCache("x".into())),
+        ModelSourceKind::LocalCache
+    );
+    assert_eq!(
+        ModelSourceKind::from_artifact_source(&ModelArtifactSource::ClientProvided("x".into())),
+        ModelSourceKind::ClientProvidedArtifact
+    );
+    assert_eq!(
+        ModelSourceKind::from_artifact_source(&ModelArtifactSource::LocalPath("/models".into())),
+        ModelSourceKind::LocalDirectorySource
+    );
+    assert_eq!(
+        ModelSourceKind::from_artifact_source(&ModelArtifactSource::Registry("x".into())),
+        ModelSourceKind::ExternalRegistrySource
+    );
+    assert_eq!(
+        ModelSourceKind::from_artifact_source(&ModelArtifactSource::Oci("x".into())),
+        ModelSourceKind::ExternalRegistrySource
+    );
+    assert_eq!(
+        ModelSourceKind::from_artifact_source(&ModelArtifactSource::HuggingFace("x".into())),
+        ModelSourceKind::ModelHubSource
+    );
+    assert_eq!(
+        ModelSourceKind::from_artifact_source(&ModelArtifactSource::Tachyon("x".into())),
+        ModelSourceKind::TachyonProvidedSource
+    );
+}
+
+#[test]
+fn model_source_cache_roadmap_source_kind_normalizes_from_resolution_source() {
+    assert_eq!(
+        ModelSourceKind::from_resolution_source(ModelResolutionSource::DevelopmentFixture),
+        Some(ModelSourceKind::DevelopmentFixture)
+    );
+    assert_eq!(
+        ModelSourceKind::from_resolution_source(ModelResolutionSource::ClientProvidedArtifact),
+        Some(ModelSourceKind::ClientProvidedArtifact)
+    );
+    assert_eq!(
+        ModelSourceKind::from_resolution_source(ModelResolutionSource::TrustedCache),
+        Some(ModelSourceKind::LocalCache)
+    );
+    assert_eq!(
+        ModelSourceKind::from_resolution_source(ModelResolutionSource::FutureExternalSource),
+        Some(ModelSourceKind::ExternalRegistrySource)
+    );
+    assert_eq!(
+        ModelSourceKind::from_resolution_source(ModelResolutionSource::FutureTachyonSource),
+        Some(ModelSourceKind::TachyonProvidedSource)
+    );
+    assert_eq!(
+        ModelSourceKind::from_resolution_source(ModelResolutionSource::LocalRegistry),
+        None
+    );
+}
+
+#[test]
+fn model_source_cache_roadmap_development_fixture_denied_in_production_by_default() {
+    assert!(validate_development_fixture_source(true, false).is_err());
+    assert!(validate_development_fixture_source(true, true).is_ok());
+    assert!(validate_development_fixture_source(false, false).is_ok());
+}
+
+#[test]
+fn model_source_cache_roadmap_development_fixture_still_uses_real_trust_store() {
+    let store = ModelTrustStore::default();
+    let manifest = ModelManifest {
+        schema_version: MODEL_ARTIFACT_SCHEMA_VERSION,
+        id: model_source_cache_probe_artifact_id("fixture-probe"),
+        architecture: ModelArchitecture::new("probe", "probe"),
+        parts: BTreeMap::new(),
+        storage_dtype: None,
+        compute_dtype: None,
+        supported_compute_dtypes: BTreeSet::new(),
+        tensors: Vec::new(),
+        tokenizer: None,
+        tokenizer_config: None,
+        chat_template: None,
+        prompt_template: None,
+        generation: None,
+        quantization: None,
+        shards: Vec::new(),
+        runtime_features: BTreeSet::new(),
+        memory_features: BTreeSet::new(),
+        provider_capabilities: Vec::new(),
+        component: None,
+        license: None,
+        provenance: None,
+        signatures: Vec::new(),
+        source: None,
+    };
+    let decision = development_fixture_requires_explicit_trust_evaluation(&store, &manifest);
+    assert_eq!(decision.status, ModelTrustStatus::Unknown);
+}
+
+#[test]
+fn model_source_cache_roadmap_client_provided_source_requires_authorization() {
+    assert!(validate_client_provided_source(false).is_err());
+    assert!(validate_client_provided_source(true).is_ok());
+}
+
+#[test]
+fn model_source_cache_roadmap_cache_key_is_digest_based() {
+    let id = model_source_cache_probe_artifact_id("qwen-local");
+    let key = CacheKey::from_artifact(&id);
+    assert_eq!(key.as_str(), id.digest.value.as_str());
+}
+
+#[test]
+fn model_source_cache_roadmap_cache_entry_ref_redacts_path_by_default() {
+    let key = CacheKey::from_artifact(&model_source_cache_probe_artifact_id("qwen-local"));
+    let entry_ref = CacheEntryRef::new(key, "/var/cache/magnetar/qwen-local");
+    assert_eq!(entry_ref.redacted_path(false), None);
+    assert_eq!(
+        entry_ref.redacted_path(true).as_deref(),
+        Some("/var/cache/magnetar/qwen-local")
+    );
+}
+
+#[test]
+fn model_source_cache_roadmap_local_directory_source_denies_unauthorized_access() {
+    let source = ModelArtifactSource::LocalPath("/models/qwen".into());
+    assert!(validate_local_directory_source(&source, false).is_err());
+    assert!(validate_local_directory_source(&source, true).is_ok());
+}
+
+#[test]
+fn model_source_cache_roadmap_remote_source_policy_denies_by_default() {
+    let policy = SourcePolicy::default();
+    assert!(
+        validate_remote_source_policy(ModelSourceKind::ExternalRegistrySource, &policy).is_err()
+    );
+    assert!(validate_remote_source_policy(ModelSourceKind::ModelHubSource, &policy).is_err());
+    assert!(
+        validate_remote_source_policy(ModelSourceKind::TachyonProvidedSource, &policy).is_err()
+    );
+    assert!(validate_remote_source_policy(ModelSourceKind::LocalCache, &policy).is_ok());
+}
+
+#[test]
+fn model_source_cache_roadmap_tachyon_source_requires_explicit_policy_flag_even_if_listed() {
+    let mut policy = SourcePolicy::default();
+    policy
+        .allowed_kinds
+        .insert(ModelSourceKind::TachyonProvidedSource);
+    assert!(!policy.allow_tachyon_provided_sources);
+    assert!(!policy.allows_kind(ModelSourceKind::TachyonProvidedSource));
+    policy.allow_tachyon_provided_sources = true;
+    assert!(policy.allows_kind(ModelSourceKind::TachyonProvidedSource));
+}
+
+#[test]
+fn model_source_cache_roadmap_model_ref_resolution_rejects_zero_and_multiple_candidates() {
+    let none = resolve_model_ref_candidates("qwen", Vec::new());
+    assert!(matches!(
+        none,
+        Err(ModelSourceCacheRoadmapError::ModelSourceNotFound { .. })
+    ));
+
+    let one = resolve_model_ref_candidates(
+        "qwen",
+        vec![ModelRefResolutionOutcome::SourceCandidate {
+            kind: ModelSourceKind::LocalCache,
+            reference: "qwen".into(),
+        }],
+    );
+    assert!(one.is_ok());
+
+    let many = resolve_model_ref_candidates(
+        "qwen",
+        vec![
+            ModelRefResolutionOutcome::SourceCandidate {
+                kind: ModelSourceKind::LocalCache,
+                reference: "qwen-a".into(),
+            },
+            ModelRefResolutionOutcome::SourceCandidate {
+                kind: ModelSourceKind::DevelopmentFixture,
+                reference: "qwen-b".into(),
+            },
+        ],
+    );
+    assert!(matches!(
+        many,
+        Err(ModelSourceCacheRoadmapError::ModelSourceAmbiguous { .. })
+    ));
+}
+
+#[test]
+fn model_source_cache_roadmap_alias_missing_and_ambiguous_errors() {
+    let alias = ModelAlias::new("qwen").unwrap();
+    let mut table = ModelAliasTable::new();
+    assert!(matches!(
+        table.resolve(&alias),
+        Err(ModelSourceCacheRoadmapError::ModelAliasNotFound { .. })
+    ));
+
+    table.register(alias.clone(), "qwen-a");
+    assert_eq!(table.resolve(&alias).unwrap(), "qwen-a");
+
+    table.register(alias.clone(), "qwen-b");
+    assert!(matches!(
+        table.resolve(&alias),
+        Err(ModelSourceCacheRoadmapError::ModelAliasAmbiguous { .. })
+    ));
+}
+
+#[test]
+fn model_source_cache_roadmap_alias_rejects_empty_name() {
+    assert!(ModelAlias::new("").is_err());
+    assert!(ModelAlias::new("qwen").is_ok());
+}
+
+#[test]
+fn model_source_cache_roadmap_artifact_identity_coverage_tracks_present_fields() {
+    let mut manifest = ModelManifest {
+        schema_version: MODEL_ARTIFACT_SCHEMA_VERSION,
+        id: model_source_cache_probe_artifact_id("qwen-local"),
+        architecture: ModelArchitecture::new("qwen", "qwen"),
+        parts: BTreeMap::new(),
+        storage_dtype: None,
+        compute_dtype: None,
+        supported_compute_dtypes: BTreeSet::new(),
+        tensors: Vec::new(),
+        tokenizer: Some("tokenizer-id".into()),
+        tokenizer_config: None,
+        chat_template: None,
+        prompt_template: None,
+        generation: None,
+        quantization: None,
+        shards: Vec::new(),
+        runtime_features: BTreeSet::new(),
+        memory_features: BTreeSet::new(),
+        provider_capabilities: Vec::new(),
+        component: None,
+        license: None,
+        provenance: None,
+        signatures: Vec::new(),
+        source: Some(ModelArtifactSource::LocalCache("qwen".into())),
+    };
+    let coverage = ArtifactIdentityCoverage::from_manifest(&manifest);
+    assert!(coverage.content_digest);
+    assert!(coverage.tokenizer_reference);
+    assert!(coverage.source_annotation);
+    assert!(coverage.version_metadata);
+    assert!(coverage.covers_required_fields());
+
+    manifest.tokenizer = None;
+    manifest.source = None;
+    let coverage = ArtifactIdentityCoverage::from_manifest(&manifest);
+    assert!(!coverage.tokenizer_reference);
+    assert!(!coverage.source_annotation);
+}
+
+#[test]
+fn model_source_cache_roadmap_same_name_different_digest_remains_distinct() {
+    let left = model_source_cache_probe_artifact_id("qwen-local");
+    let mut right = model_source_cache_probe_artifact_id("qwen-local");
+    right.digest = ModelDigest::sha256(b"a-different-payload");
+    assert!(artifacts_are_distinct_despite_same_name(&left, &right));
+}
+
+#[test]
+fn model_source_cache_roadmap_cache_lifecycle_states_cover_thirteen_categories() {
+    assert_eq!(CACHE_LIFECYCLE_STATES.len(), 13);
+    let mut ready_count = 0;
+    for state in CACHE_LIFECYCLE_STATES {
+        assert!(!state.id().is_empty());
+        if state.is_loadable() {
+            ready_count += 1;
+        }
+    }
+    assert_eq!(ready_count, 1, "exactly Ready should be loadable");
+}
+
+#[test]
+fn model_source_cache_roadmap_rejects_every_non_ready_lifecycle_state_for_loading() {
+    for state in CACHE_LIFECYCLE_STATES {
+        let outcome = reject_non_ready_cache_entry_for_loading(*state);
+        if matches!(state, CacheLifecycleState::Ready) {
+            assert!(outcome.is_ok(), "Ready must be loadable");
+        } else {
+            assert!(outcome.is_err(), "{state:?} must not be loadable");
+        }
+    }
+}
+
+#[test]
+fn model_source_cache_roadmap_partial_and_corrupt_entries_map_to_specific_errors() {
+    assert!(matches!(
+        reject_non_ready_cache_entry_for_loading(CacheLifecycleState::Partial),
+        Err(ModelSourceCacheRoadmapError::ModelCachePartialEntry { .. })
+    ));
+    assert!(matches!(
+        reject_non_ready_cache_entry_for_loading(CacheLifecycleState::Corrupt),
+        Err(ModelSourceCacheRoadmapError::ModelCacheEntryCorrupt { .. })
+    ));
+    assert!(matches!(
+        reject_non_ready_cache_entry_for_loading(CacheLifecycleState::Untrusted),
+        Err(ModelSourceCacheRoadmapError::ModelCacheEntryUntrusted { .. })
+    ));
+    assert!(matches!(
+        reject_non_ready_cache_entry_for_loading(CacheLifecycleState::Revoked),
+        Err(ModelSourceCacheRoadmapError::ModelCacheEntryRevoked { .. })
+    ));
+}
+
+#[test]
+fn model_source_cache_roadmap_cache_entry_metadata_defaults_to_discovered_and_unpinned() {
+    let entry = CacheEntryMetadata::new(
+        model_source_cache_probe_artifact_id("qwen-local"),
+        ModelSourceKind::LocalCache,
+    );
+    assert_eq!(entry.lifecycle, CacheLifecycleState::Discovered);
+    assert!(!entry.pinned);
+    assert_eq!(entry.trust_status, ModelTrustStatus::Unknown);
+    assert_eq!(entry.integrity_status, CacheIntegrityStatus::Unchecked);
+    assert_eq!(entry.validation_status, CacheValidationStatus::Unvalidated);
+    assert_eq!(entry.key(), CacheKey::from_artifact(&entry.identity));
+}
+
+#[test]
+fn model_source_cache_roadmap_cache_trust_re_evaluates_and_revocation_wins() {
+    let digest = ModelDigest::sha256(b"trusted-model");
+    let store = ModelTrustStore::default().trust_digest(digest.value.clone());
+    let mut manifest_id = model_source_cache_probe_artifact_id("trusted-model");
+    manifest_id.digest = digest;
+    let manifest = ModelManifest {
+        schema_version: MODEL_ARTIFACT_SCHEMA_VERSION,
+        id: manifest_id,
+        architecture: ModelArchitecture::new("probe", "probe"),
+        parts: BTreeMap::new(),
+        storage_dtype: None,
+        compute_dtype: None,
+        supported_compute_dtypes: BTreeSet::new(),
+        tensors: Vec::new(),
+        tokenizer: None,
+        tokenizer_config: None,
+        chat_template: None,
+        prompt_template: None,
+        generation: None,
+        quantization: None,
+        shards: Vec::new(),
+        runtime_features: BTreeSet::new(),
+        memory_features: BTreeSet::new(),
+        provider_capabilities: Vec::new(),
+        component: None,
+        license: None,
+        provenance: None,
+        signatures: Vec::new(),
+        source: None,
+    };
+    let trusted = evaluate_cache_trust(&store, &manifest, false);
+    assert_eq!(trusted.status, ModelTrustStatus::Trusted);
+    let revoked = evaluate_cache_trust(&store, &manifest, true);
+    assert_eq!(revoked.status, ModelTrustStatus::Revoked);
+}
+
+#[test]
+fn model_source_cache_roadmap_cache_integrity_detects_digest_mismatch() {
+    let declared = ModelDigest::sha256(b"declared-bytes");
+    let matching = ModelDigest::sha256(b"declared-bytes");
+    let mismatched = ModelDigest::sha256(b"other-bytes");
+    assert!(validate_cache_integrity(&declared, &matching).is_ok());
+    assert!(matches!(
+        validate_cache_integrity(&declared, &mismatched),
+        Err(ModelSourceCacheRoadmapError::ModelCacheIntegrityFailed { .. })
+    ));
+}
+
+#[test]
+fn model_source_cache_roadmap_cache_shard_integrity_composes_shard_verify_bytes() {
+    let bytes = b"shard-bytes";
+    let shard = ModelShard {
+        id: ModelShardId::new("shard-0").unwrap(),
+        digest: ModelDigest::sha256(bytes),
+        size_bytes: bytes.len() as u64,
+        order: 0,
+    };
+    assert!(validate_cache_shard_integrity(&shard, bytes).is_ok());
+    assert!(matches!(
+        validate_cache_shard_integrity(&shard, b"wrong-bytes"),
+        Err(ModelSourceCacheRoadmapError::ModelCacheEntryCorrupt { .. })
+    ));
+}
+
+#[test]
+fn model_source_cache_roadmap_mutation_requires_policy_and_denies_eviction_with_active_reference() {
+    assert!(authorize_cache_mutation(CacheMutationKind::Insert, false, 0).is_err());
+    assert!(authorize_cache_mutation(CacheMutationKind::Insert, true, 0).is_ok());
+    assert!(matches!(
+        authorize_cache_mutation(CacheMutationKind::Evict, true, 1),
+        Err(ModelSourceCacheRoadmapError::ModelCacheActiveReference { .. })
+    ));
+    assert!(matches!(
+        authorize_cache_mutation(CacheMutationKind::Evict, false, 0),
+        Err(ModelSourceCacheRoadmapError::ModelCacheEvictionDenied { .. })
+    ));
+    assert!(authorize_cache_mutation(CacheMutationKind::Evict, true, 0).is_ok());
+}
+
+#[test]
+fn model_source_cache_roadmap_eviction_respects_pin_and_active_reference_and_orders_by_last_used() {
+    let mut old_entry = CacheEntryMetadata::new(
+        model_source_cache_probe_artifact_id("qwen-old"),
+        ModelSourceKind::LocalCache,
+    );
+    old_entry.lifecycle = CacheLifecycleState::Ready;
+    old_entry.last_used_unix_seconds = 10;
+
+    let mut new_entry = CacheEntryMetadata::new(
+        model_source_cache_probe_artifact_id("qwen-new"),
+        ModelSourceKind::LocalCache,
+    );
+    new_entry.lifecycle = CacheLifecycleState::Ready;
+    new_entry.last_used_unix_seconds = 20;
+
+    let mut pinned_entry = CacheEntryMetadata::new(
+        model_source_cache_probe_artifact_id("qwen-pinned"),
+        ModelSourceKind::LocalCache,
+    );
+    pinned_entry.lifecycle = CacheLifecycleState::Ready;
+    pin_entry(&mut pinned_entry);
+
+    let mut active_entry = CacheEntryMetadata::new(
+        model_source_cache_probe_artifact_id("qwen-active"),
+        ModelSourceKind::LocalCache,
+    );
+    active_entry.lifecycle = CacheLifecycleState::Ready;
+
+    let candidates = vec![
+        EvictionCandidate {
+            entry: new_entry,
+            active_instance_refs: 0,
+        },
+        EvictionCandidate {
+            entry: old_entry,
+            active_instance_refs: 0,
+        },
+        EvictionCandidate {
+            entry: pinned_entry,
+            active_instance_refs: 0,
+        },
+        EvictionCandidate {
+            entry: active_entry,
+            active_instance_refs: 1,
+        },
+    ];
+
+    let selected = select_eviction_candidates(&candidates);
+    assert_eq!(selected.len(), 2);
+    assert_eq!(selected[0].identity.name.as_str(), "qwen-old");
+    assert_eq!(selected[1].identity.name.as_str(), "qwen-new");
+}
+
+#[test]
+fn model_source_cache_roadmap_pin_and_unpin_toggle_evictability() {
+    let mut entry = CacheEntryMetadata::new(
+        model_source_cache_probe_artifact_id("qwen-local"),
+        ModelSourceKind::LocalCache,
+    );
+    entry.lifecycle = CacheLifecycleState::Ready;
+    let candidate = EvictionCandidate {
+        entry: entry.clone(),
+        active_instance_refs: 0,
+    };
+    assert!(is_evictable(&candidate));
+
+    pin_entry(&mut entry);
+    let pinned_candidate = EvictionCandidate {
+        entry: entry.clone(),
+        active_instance_refs: 0,
+    };
+    assert!(!is_evictable(&pinned_candidate));
+
+    unpin_entry(&mut entry);
+    let unpinned_candidate = EvictionCandidate {
+        entry,
+        active_instance_refs: 0,
+    };
+    assert!(is_evictable(&unpinned_candidate));
+}
+
+#[test]
+fn model_source_cache_roadmap_in_flight_lifecycle_states_are_never_evictable() {
+    for state in [
+        CacheLifecycleState::Resolving,
+        CacheLifecycleState::Fetching,
+        CacheLifecycleState::Normalizing,
+        CacheLifecycleState::Validating,
+        CacheLifecycleState::Evicting,
+    ] {
+        let mut entry = CacheEntryMetadata::new(
+            model_source_cache_probe_artifact_id("qwen-in-flight"),
+            ModelSourceKind::LocalCache,
+        );
+        entry.lifecycle = state;
+        let candidate = EvictionCandidate {
+            entry,
+            active_instance_refs: 0,
+        };
+        assert!(!is_evictable(&candidate), "{state:?} must not be evictable");
+    }
+}
+
+#[test]
+fn model_source_cache_roadmap_offline_mode_allows_only_local_sources() {
+    assert!(validate_offline_source(ModelSourceKind::LocalCache, true).is_ok());
+    assert!(validate_offline_source(ModelSourceKind::ClientProvidedArtifact, true).is_ok());
+    assert!(validate_offline_source(ModelSourceKind::DevelopmentFixture, true).is_ok());
+    assert!(validate_offline_source(ModelSourceKind::LocalDirectorySource, true).is_err());
+    assert!(validate_offline_source(ModelSourceKind::ExternalRegistrySource, true).is_err());
+    assert!(validate_offline_source(ModelSourceKind::ModelHubSource, true).is_err());
+    assert!(validate_offline_source(ModelSourceKind::TachyonProvidedSource, true).is_err());
+    // Online mode never restricts by source kind.
+    assert!(validate_offline_source(ModelSourceKind::ExternalRegistrySource, false).is_ok());
+}
+
+#[test]
+fn model_source_cache_roadmap_rejects_credential_shaped_metadata_keys() {
+    let mut annotations = BTreeMap::new();
+    annotations.insert("model_family".to_string(), "qwen".to_string());
+    assert!(reject_credential_in_metadata(&annotations).is_ok());
+
+    for key in ["registry_token", "api_key", "auth_secret", "bearer_header"] {
+        let mut annotations = BTreeMap::new();
+        annotations.insert(key.to_string(), "value".to_string());
+        assert!(
+            reject_credential_in_metadata(&annotations).is_err(),
+            "key '{key}' should be rejected"
+        );
+    }
+}
+
+#[test]
+fn model_source_cache_roadmap_source_policy_defaults_deny_remote_and_allow_offline_kinds() {
+    let policy = SourcePolicy::default();
+    for kind in [
+        ModelSourceKind::DevelopmentFixture,
+        ModelSourceKind::ClientProvidedArtifact,
+        ModelSourceKind::LocalCache,
+    ] {
+        assert!(
+            policy.allows_kind(kind),
+            "{kind:?} should be allowed by default"
+        );
+    }
+    for kind in [
+        ModelSourceKind::LocalDirectorySource,
+        ModelSourceKind::ExternalRegistrySource,
+        ModelSourceKind::ModelHubSource,
+        ModelSourceKind::TachyonProvidedSource,
+    ] {
+        assert!(
+            !policy.allows_kind(kind),
+            "{kind:?} should be denied by default"
+        );
+    }
+}
+
+#[test]
+fn model_source_cache_roadmap_source_policy_enforces_size_limit() {
+    let policy = SourcePolicy {
+        max_artifact_size_bytes: Some(1024),
+        ..SourcePolicy::default()
+    };
+    assert!(policy.validate_size(512).is_ok());
+    assert!(policy.validate_size(2048).is_err());
+}
+
+#[test]
+fn model_source_cache_roadmap_license_requires_explicit_policy_validation() {
+    let license = ModelLicenseMetadata {
+        identifier: "apache-2.0".into(),
+        url: None,
+        usage_restrictions: Vec::new(),
+    };
+    assert!(validate_license_policy(&license, false, true).is_err());
+    assert!(validate_license_policy(&license, true, false).is_err());
+    assert!(validate_license_policy(&license, true, true).is_ok());
+}
+
+#[test]
+fn model_source_cache_roadmap_format_normalization_requires_metadata_and_lifecycle() {
+    let mut entry = CacheEntryMetadata::new(
+        model_source_cache_probe_artifact_id("qwen-local"),
+        ModelSourceKind::LocalCache,
+    );
+    assert!(!cache_entry_ready_for_format_normalization(&entry));
+    entry.format_metadata = Some("safetensors".into());
+    assert!(!cache_entry_ready_for_format_normalization(&entry));
+    entry.lifecycle = CacheLifecycleState::Ready;
+    assert!(cache_entry_ready_for_format_normalization(&entry));
+}
+
+#[test]
+fn model_source_cache_roadmap_adapter_cache_entry_requires_reference_and_compatibility() {
+    let mut entry = CacheEntryMetadata::new(
+        model_source_cache_probe_artifact_id("lora-local"),
+        ModelSourceKind::LocalCache,
+    );
+    let compatibility = AdapterBaseModelCompatibility {
+        model_name: ModelName::new("qwen").unwrap(),
+        model_revision: ModelRevision::new("v1").unwrap(),
+        model_artifact: None,
+        tokenizer: None,
+        architecture: AdapterArchitectureCompatibility {
+            family: "qwen".into(),
+            implementation: "qwen".into(),
+            hidden_size: None,
+            layer_count: None,
+            position_encoding: None,
+            target_modules: BTreeSet::new(),
+            supported_storage_dtypes: BTreeSet::new(),
+            supported_compute_dtypes: BTreeSet::new(),
+            supported_quantization_formats: BTreeSet::new(),
+        },
+    };
+    assert!(validate_adapter_cache_entry(&entry, &compatibility).is_err());
+    entry.adapters.push(AdapterArtifactId::new(
+        AdapterName::new("lora").unwrap(),
+        AdapterRevision::new("v1").unwrap(),
+        AdapterDigest::parse(format!("sha256:{}", "1".repeat(64))).unwrap(),
+    ));
+    assert!(validate_adapter_cache_entry(&entry, &compatibility).is_ok());
+}
+
+#[test]
+fn model_source_cache_roadmap_tokenizer_cache_entry_requires_reference_and_compatibility() {
+    let mut entry = CacheEntryMetadata::new(
+        model_source_cache_probe_artifact_id("qwen-local"),
+        ModelSourceKind::LocalCache,
+    );
+    assert!(validate_tokenizer_cache_entry(&entry, true).is_err());
+    entry.tokenizer = Some(TokenizerArtifactId::new("qwen-tokenizer").unwrap());
+    assert!(validate_tokenizer_cache_entry(&entry, false).is_err());
+    assert!(validate_tokenizer_cache_entry(&entry, true).is_ok());
+}
+
+#[test]
+fn model_source_cache_roadmap_cache_presence_never_implies_memory_residency() {
+    assert!(!cache_presence_implies_memory_residency());
+}
+
+#[test]
+fn model_source_cache_roadmap_diagnostic_digest_prefix_is_short_and_never_full() {
+    let digest = ModelDigest::sha256(b"some-model-bytes");
+    let prefix = ModelSourceCacheDiagnostic::digest_prefix_from(&digest);
+    assert!(prefix.len() <= 15);
+    assert_ne!(prefix, digest.value);
+}
+
+#[test]
+fn model_source_cache_roadmap_diagnostic_redacts_policy_denial_reason() {
+    let redacted = ModelSourceCacheDiagnostic::redact_policy_denial_reason(
+        "denied for path /var/cache/magnetar/model",
+    );
+    assert!(!redacted.contains('/'));
+}
+
+#[test]
+fn model_source_cache_roadmap_error_display_is_non_empty_for_every_variant() {
+    let errors = vec![
+        ModelSourceCacheRoadmapError::ModelSourceUnsupported { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelSourceInvalid { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelSourceAmbiguous {
+            reference: "r".into(),
+        },
+        ModelSourceCacheRoadmapError::ModelSourcePolicyDenied { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelSourceNetworkDenied { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelSourceAuthenticationFailed { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelSourceNotFound {
+            reference: "r".into(),
+        },
+        ModelSourceCacheRoadmapError::ModelSourceOfflineUnavailable { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelCacheUnavailable { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelCacheMiss { key: "k".into() },
+        ModelSourceCacheRoadmapError::ModelCacheEntryInvalid { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelCacheEntryCorrupt { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelCacheEntryUntrusted { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelCacheEntryRevoked { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelCacheIntegrityFailed { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelCacheInsertDenied { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelCacheEvictionDenied { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelCacheActiveReference { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelCachePartialEntry { reason: "r".into() },
+        ModelSourceCacheRoadmapError::ModelAliasNotFound { alias: "a".into() },
+        ModelSourceCacheRoadmapError::ModelAliasAmbiguous { alias: "a".into() },
+        ModelSourceCacheRoadmapError::InternalModelSourceCacheError { reason: "r".into() },
+    ];
+    let mut ids: BTreeSet<&str> = BTreeSet::new();
+    for error in &errors {
+        assert!(!error.to_string().is_empty());
+        assert!(ids.insert(error.id()), "duplicate error id {}", error.id());
+    }
+    assert_eq!(ids.len(), 22);
+}
+
+#[test]
+fn model_source_cache_roadmap_observation_redacts_metadata() {
+    let observation =
+        ModelSourceCacheRoadmapObservation::new(ModelSourceCacheRoadmapObservationKind::CacheHit)
+            .with_artifact("qwen-local")
+            .with_redacted_metadata("path", "/var/cache/magnetar/qwen-local");
+    assert_eq!(observation.artifact.as_deref(), Some("qwen-local"));
+    assert!(
+        !observation
+            .redacted_metadata
+            .get("path")
+            .unwrap()
+            .contains('/')
+    );
+}
+
+#[test]
+fn model_source_cache_roadmap_conformance_report_is_conformant() {
+    let report = run_model_source_cache_roadmap_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+// ---------------------------------------------------------------------
+// server_api_roadmap
+// ---------------------------------------------------------------------
+
+fn server_api_roadmap_tokenizer_reference() -> GenerationTokenizerReference {
+    let metadata = TokenizerMetadata {
+        id: TokenizerId::new("server-api-roadmap-test").unwrap(),
+        artifact: TokenizerArtifactId::new("server-api-roadmap-test-artifact").unwrap(),
+        digest: ModelDigest::sha256(b"server-api-roadmap-test"),
+        family: TokenizerFamily::new("fixture").unwrap(),
+        revision: TokenizerRevision::new("1.0.0").unwrap(),
+        vocabulary_size: 256,
+        added_token_count: 2,
+        token_id_range: TokenIdRange::new(1, 300),
+        model_max_length: Some(64),
+        special_tokens: vec![SpecialToken::new(SpecialTokenKind::Eos, "<eos>", 299)],
+        additional_special_tokens: Vec::new(),
+        byte_fallback: false,
+        normalization: None,
+        pre_tokenizer: None,
+        supports_offsets: true,
+        supports_token_type_ids: false,
+        supports_browser: true,
+    };
+    GenerationTokenizerReference {
+        tokenizer_id: metadata.id.clone(),
+        metadata,
+    }
+}
+
+fn server_api_roadmap_generation_request(streaming: bool) -> ServerGenerationRequest {
+    ServerGenerationRequest {
+        model_or_session: ServerModelOrSessionRef::Model(ModelRef::new("fixture-model").unwrap()),
+        prompt: PromptInput::PlainText("hello".into()),
+        parameters: GenerationParameters::greedy(),
+        max_new_tokens: 4,
+        max_total_tokens: Some(32),
+        stop_conditions: StopConditions::default(),
+        streaming,
+        cache_policy: KvCachePolicy {
+            enabled: false,
+            max_cache_tokens: None,
+            max_cache_memory_bytes: None,
+            sharing: KvCacheSharingPolicy::Deny,
+            retention: KvCacheRetentionPolicy::ReleaseOnSessionClose,
+            prefix_reuse_allowed: false,
+            privacy_redaction_required: true,
+        },
+        adapter_policy: None,
+        timeout_millis: Some(5_000),
+        correlation_id: Some(CorrelationId::new("fixture-correlation")),
+    }
+}
+
+fn server_api_roadmap_runtime_context() -> ServerGenerationRuntimeContext {
+    ServerGenerationRuntimeContext {
+        request_id: GenerationRequestId::new("fixture-request").unwrap(),
+        model: GenerationModelReference::LoadedModelContext("fixture-model-context".into()),
+        tokenizer: server_api_roadmap_tokenizer_reference(),
+        input_token_ids: vec![2, 3, 4],
+        model_context_length: Some(64),
+        trace_id: None,
+    }
+}
+
+fn server_api_roadmap_session_creation_request(
+    allowed_capabilities: BTreeSet<String>,
+) -> SessionCreationRequest {
+    let tokenizer = server_api_roadmap_tokenizer_reference();
+    SessionCreationRequest {
+        model: GenerationModelReference::LoadedModelContext("fixture-model-context".into()),
+        tokenizer,
+        generation_defaults: GenerationParameters::default(),
+        policy: SessionPolicy::default(),
+        memory: SessionMemoryBudget::default(),
+        allowed_capabilities,
+        correlation_id: None,
+        created_at_millis: 0,
+    }
+}
+
+// -- Endpoint scope --
+
+#[test]
+fn server_api_roadmap_endpoints_are_illustrative_and_complete() {
+    assert_eq!(SERVER_API_ENDPOINTS.len(), 10);
+    let ids: BTreeSet<&str> = SERVER_API_ENDPOINTS.iter().map(|e| e.id()).collect();
+    for expected in [
+        "health",
+        "readiness",
+        "models-list",
+        "model-inspect",
+        "session-create",
+        "session-close",
+        "generate",
+        "generate-stream",
+        "cancel",
+        "diagnostics",
+    ] {
+        assert!(ids.contains(expected), "missing endpoint id '{expected}'");
+    }
+    for endpoint in SERVER_API_ENDPOINTS {
+        assert!(endpoint.is_illustrative());
+    }
+}
+
+// -- Health and readiness --
+
+#[test]
+fn server_api_roadmap_health_does_not_imply_readiness_or_model_availability() {
+    let health = ServerHealthStatus::alive();
+    let readiness = ServerReadinessStatus::not_ready("no model loaded");
+    assert!(health.alive);
+    assert!(!readiness.ready);
+    assert!(healthy_but_not_ready_is_representable(&health, &readiness));
+}
+
+#[test]
+fn server_api_roadmap_readiness_is_redacted() {
+    let readiness = ServerReadinessStatus::not_ready("provider handle=0xdeadbeef unavailable");
+    let summary = readiness.model_registry_state_summary.unwrap();
+    assert!(!summary.contains("0xdeadbeef"));
+}
+
+#[test]
+fn server_api_roadmap_health_and_readiness_are_structurally_independent_types() {
+    // No conversion exists in either direction; both are constructed
+    // independently.
+    let health = ServerHealthStatus::not_alive("process exiting");
+    let readiness = ServerReadinessStatus::ready();
+    assert!(!health.alive);
+    assert!(readiness.ready);
+}
+
+// -- Model endpoints --
+
+#[test]
+fn server_api_roadmap_model_load_requires_complete_loading_proof() {
+    let incomplete = validate_model_endpoint_request(
+        ServerModelEndpointOperation::RequestModelLoad,
+        &ModelEndpointLoadingProof::deny_by_default(),
+    );
+    assert!(matches!(
+        incomplete,
+        Err(ServerApiRoadmapError::ServerModelLoadFailed { .. })
+    ));
+
+    let complete = validate_model_endpoint_request(
+        ServerModelEndpointOperation::RequestModelLoad,
+        &ModelEndpointLoadingProof {
+            source_validated: true,
+            cache_validated: true,
+            artifact_validated: true,
+            model_loading_validated: true,
+            trust_validated: true,
+            integrity_validated: true,
+            compatibility_validated: true,
+            policy_validated: true,
+        },
+    );
+    assert!(complete.is_ok());
+}
+
+#[test]
+fn server_api_roadmap_model_unload_requires_complete_loading_proof() {
+    let incomplete = validate_model_endpoint_request(
+        ServerModelEndpointOperation::RequestModelUnload,
+        &ModelEndpointLoadingProof::deny_by_default(),
+    );
+    assert!(incomplete.is_err());
+}
+
+#[test]
+fn server_api_roadmap_read_only_model_endpoints_skip_loading_proof() {
+    for operation in [
+        ServerModelEndpointOperation::ListKnownModels,
+        ServerModelEndpointOperation::InspectModelMetadata,
+        ServerModelEndpointOperation::InspectLoadedInstance,
+    ] {
+        assert!(!operation.requires_loading_proof());
+        let outcome = validate_model_endpoint_request(
+            operation,
+            &ModelEndpointLoadingProof::deny_by_default(),
+        );
+        assert!(outcome.is_ok());
+    }
+}
+
+#[test]
+fn server_api_roadmap_rejects_arbitrary_local_model_path() {
+    let source = ModelArtifactSource::LocalPath(std::path::PathBuf::from("/models/qwen"));
+    let outcome = reject_server_arbitrary_model_path(&source, false);
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerSourcePolicyDenied { .. })
+    ));
+}
+
+#[test]
+fn server_api_roadmap_allows_authorized_local_model_path() {
+    let source = ModelArtifactSource::LocalPath(std::path::PathBuf::from("/models/qwen"));
+    assert!(reject_server_arbitrary_model_path(&source, true).is_ok());
+}
+
+// -- Session endpoints --
+
+#[test]
+fn server_api_roadmap_session_rejects_cli_owned_authority_capabilities() {
+    for capability in [
+        "workspace",
+        "git",
+        "shell",
+        "secrets",
+        "tool-call",
+        "filesystem",
+    ] {
+        let outcome = reject_server_session_owned_authority(capability);
+        assert!(
+            matches!(
+                outcome,
+                Err(ServerApiRoadmapError::ServerBoundaryViolation { .. })
+            ),
+            "capability '{capability}' should be rejected"
+        );
+
+        let mut capabilities = BTreeSet::new();
+        capabilities.insert(capability.to_string());
+        let request =
+            ServerSessionRequest::new(server_api_roadmap_session_creation_request(capabilities));
+        assert!(
+            request.is_err(),
+            "capability '{capability}' should reject session creation"
+        );
+    }
+}
+
+#[test]
+fn server_api_roadmap_session_accepts_inference_scoped_capability() {
+    assert!(reject_server_session_owned_authority("generation").is_ok());
+    let mut capabilities = BTreeSet::new();
+    capabilities.insert("generation".to_string());
+    let request =
+        ServerSessionRequest::new(server_api_roadmap_session_creation_request(capabilities));
+    assert!(request.is_ok());
+}
+
+#[test]
+fn server_api_roadmap_connection_state_is_separate_from_session_state() {
+    let session = InferenceSessionId::new("session-1").unwrap();
+    let connection = ServerConnectionState {
+        connection: ServerConnectionId::new("conn-1"),
+        bound_session: Some(session.clone()),
+    };
+    let (connection_id, policy, bound_session) =
+        server_disconnect_policy(&connection, ServerDisconnectPolicy::CancelActiveGeneration);
+    assert_eq!(connection_id.as_str(), "conn-1");
+    assert_eq!(policy, ServerDisconnectPolicy::CancelActiveGeneration);
+    assert_eq!(bound_session, Some(session));
+}
+
+// -- Generation endpoint --
+
+#[test]
+fn server_api_roadmap_generation_request_builds_valid_runtime_generation_request() {
+    let request = server_api_roadmap_generation_request(false);
+    let context = server_api_roadmap_runtime_context();
+    let built = build_runtime_generation_request(&request, context).unwrap();
+    assert_eq!(built.max_new_tokens, 4);
+    assert_eq!(built.streaming, StreamingMode::Disabled);
+    assert!(built.session.is_none());
+}
+
+#[test]
+fn server_api_roadmap_generation_request_targeting_session_omits_model_and_sets_session() {
+    let mut request = server_api_roadmap_generation_request(true);
+    let session = InferenceSessionId::new("session-1").unwrap();
+    request.model_or_session = ServerModelOrSessionRef::Session(session.clone());
+    let context = server_api_roadmap_runtime_context();
+    let built = build_runtime_generation_request(&request, context).unwrap();
+    assert_eq!(built.session, Some(session));
+    assert_eq!(built.streaming, StreamingMode::TokenIds);
+}
+
+#[test]
+fn server_api_roadmap_generation_endpoint_rejects_tool_execution_from_generated_output() {
+    let handling = ServerGeneratedTextHandling {
+        text: "git push --force".into(),
+        executed_as_tool_call: true,
+    };
+    let outcome = reject_tool_execution_from_generated_output(&handling);
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerBoundaryViolation { .. })
+    ));
+}
+
+#[test]
+fn server_api_roadmap_generation_endpoint_allows_generated_text_that_is_not_executed() {
+    let handling = ServerGeneratedTextHandling {
+        text: "rm -rf /".into(),
+        executed_as_tool_call: false,
+    };
+    assert!(reject_tool_execution_from_generated_output(&handling).is_ok());
+}
+
+// -- Streaming endpoint --
+
+#[test]
+fn server_api_roadmap_streaming_preserves_event_ordering() {
+    let source = [
+        GenerationEventKind::PrefillCompleted,
+        GenerationEventKind::DecodeStarted,
+        GenerationEventKind::TokenGenerated,
+    ];
+    let forwarded = [
+        GenerationEventKind::PrefillCompleted,
+        GenerationEventKind::TokenGenerated,
+    ];
+    assert!(validate_stream_event_ordering(&source, &forwarded).is_ok());
+}
+
+#[test]
+fn server_api_roadmap_streaming_rejects_reordered_events() {
+    let source = [
+        GenerationEventKind::PrefillCompleted,
+        GenerationEventKind::TokenGenerated,
+    ];
+    let forwarded = [
+        GenerationEventKind::TokenGenerated,
+        GenerationEventKind::PrefillCompleted,
+    ];
+    let outcome = validate_stream_event_ordering(&source, &forwarded);
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerStreamInterrupted { .. })
+    ));
+}
+
+#[test]
+fn server_api_roadmap_streaming_rejects_raw_payload_kinds_by_default() {
+    for payload_kind in SERVER_STREAM_FORBIDDEN_PAYLOAD_KINDS {
+        let outcome = reject_raw_stream_payload(payload_kind);
+        assert!(
+            matches!(
+                outcome,
+                Err(ServerApiRoadmapError::ServerStreamUnavailable { .. })
+            ),
+            "payload kind '{payload_kind}' should be rejected"
+        );
+    }
+    assert!(reject_raw_stream_payload("token-id").is_ok());
+}
+
+#[test]
+fn server_api_roadmap_stream_event_carries_only_redacted_metadata() {
+    let event = ServerStreamEvent::new(GenerationEventKind::TokenGenerated)
+        .with_redacted_metadata("path", "/var/cache/magnetar/model");
+    assert!(!event.redacted_metadata.get("path").unwrap().contains('/'));
+}
+
+// -- Cancellation endpoint --
+
+#[test]
+fn server_api_roadmap_cancellation_calls_runtime_cancellation() {
+    let token = CancellationToken::new(GenerationRequestId::new("cancel-fixture").unwrap());
+    let outcome =
+        server_cancellation_calls_runtime_cancellation(&token, CancellationStage::Decode, false);
+    assert_eq!(outcome, CancellationOutcome::Cancelled);
+}
+
+#[test]
+fn server_api_roadmap_cancellation_reports_limitation_for_provider_execution_stage() {
+    let token = CancellationToken::new(GenerationRequestId::new("cancel-fixture-2").unwrap());
+    let outcome = server_cancellation_calls_runtime_cancellation(
+        &token,
+        CancellationStage::ProviderExecution,
+        false,
+    );
+    assert!(matches!(
+        outcome,
+        CancellationOutcome::LimitationReported { .. }
+    ));
+}
+
+// -- Diagnostics endpoint --
+
+#[test]
+fn server_api_roadmap_diagnostics_summary_is_redacted() {
+    let runtime_diagnostics = RuntimeDiagnostics {
+        model_instance_count: 1,
+        ready_model_instance_count: 1,
+        active_session_count: 2,
+        provider_count: 1,
+        device_count: 1,
+        kernel_advertisement_count: 3,
+        memory_pressure: MemoryPressureLevel::Low,
+        kv_cache_count: 0,
+        prefix_cache_entry_count: 0,
+        model_resolution_status: None,
+        model_loading_status: None,
+        operator_missing_count: 0,
+        tokenizer_compatible: None,
+        queued_admission_count: 0,
+        redacted: true,
+    };
+    let health = ServerHealthStatus::alive();
+    let readiness = ServerReadinessStatus::ready();
+    let summary = server_diagnostics_summary(
+        &runtime_diagnostics,
+        &health,
+        &readiness,
+        Some("provider handle=0xdeadbeef ready"),
+        4,
+        1,
+        vec!["server-generation-failed".into()],
+    );
+    assert!(summary.redacted);
+    assert!(
+        !summary
+            .provider_readiness_summary
+            .as_deref()
+            .unwrap()
+            .contains("0xdeadbeef")
+    );
+    assert_eq!(summary.active_session_count, 2);
+}
+
+// -- OpenAI-compatible facade placeholder --
+
+#[test]
+fn server_api_roadmap_openai_facade_rejects_unsupported_field_per_policy() {
+    let outcome = handle_openai_unsupported_field(
+        OpenAiCompatibilityPolicy::RejectUnsupportedField,
+        "logprobs",
+    );
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerRequestInvalid { .. })
+    ));
+}
+
+#[test]
+fn server_api_roadmap_openai_facade_ignores_unsupported_field_per_policy() {
+    let outcome = handle_openai_unsupported_field(
+        OpenAiCompatibilityPolicy::IgnoreUnsupportedField,
+        "logprobs",
+    );
+    assert!(outcome.is_ok());
+}
+
+#[test]
+fn server_api_roadmap_openai_facade_rejects_tool_call_execution() {
+    let outcome = reject_openai_tool_call_execution(true, true);
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerBoundaryViolation { .. })
+    ));
+    assert!(reject_openai_tool_call_execution(true, false).is_ok());
+}
+
+#[test]
+fn server_api_roadmap_openai_facade_maps_to_generation_api_request() {
+    let request = server_api_roadmap_generation_request(false);
+    let context = server_api_roadmap_runtime_context();
+    let core = build_runtime_generation_request(&request, context).unwrap();
+    let mapped =
+        openai_facade_maps_to_generation_api_request(core, SessionRedactionPolicy::RedactRawInputs);
+    assert_eq!(mapped.privacy, SessionRedactionPolicy::RedactRawInputs);
+}
+
+// -- Authentication boundary --
+
+#[test]
+fn server_api_roadmap_authenticated_request_carries_no_credential_type() {
+    let authenticated = AuthenticatedServerRequest::from_authenticated(true);
+    assert!(authenticated.is_ok());
+}
+
+#[test]
+fn server_api_roadmap_authentication_required_when_not_authenticated() {
+    let outcome = AuthenticatedServerRequest::from_authenticated(false);
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerAuthenticationRequired)
+    ));
+}
+
+#[test]
+fn server_api_roadmap_rejects_credential_in_diagnostics() {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("api_key".to_string(), "secret-value".to_string());
+    let outcome = reject_credential_in_server_diagnostics(&metadata);
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerAuthenticationFailed { .. })
+    ));
+}
+
+#[test]
+fn server_api_roadmap_redacts_diagnostic_message() {
+    let redacted = redact_server_diagnostic("provider handle=0xdeadbeef failed");
+    assert!(!redacted.contains("0xdeadbeef"));
+}
+
+// -- Authorization boundary --
+
+#[test]
+fn server_api_roadmap_authorization_denied_when_server_denies() {
+    let decision = ServerAuthorizationDecision {
+        scope: ServerAuthorizationScope::GenerationLimits,
+        server_authorized: false,
+    };
+    let outcome = authorize_server_request(&decision, true);
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerAuthorizationDenied { .. })
+    ));
+}
+
+#[test]
+fn server_api_roadmap_authorization_does_not_bypass_runtime_policy() {
+    let decision = ServerAuthorizationDecision {
+        scope: ServerAuthorizationScope::GenerationLimits,
+        server_authorized: true,
+    };
+    let outcome = authorize_server_request(&decision, false);
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerAuthorizationDenied { .. })
+    ));
+}
+
+#[test]
+fn server_api_roadmap_authorization_succeeds_when_both_allow() {
+    let decision = ServerAuthorizationDecision {
+        scope: ServerAuthorizationScope::GenerationLimits,
+        server_authorized: true,
+    };
+    assert!(authorize_server_request(&decision, true).is_ok());
+}
+
+// -- Admission and rate policy --
+
+#[test]
+fn server_api_roadmap_admission_denied_by_default() {
+    let outcome = evaluate_server_admission(
+        &ServerAdmissionLimits::deny_by_default(),
+        &ServerAdmissionState::default(),
+    );
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerAdmissionRejected { .. })
+    ));
+}
+
+#[test]
+fn server_api_roadmap_admission_allows_within_configured_limits() {
+    let limits = ServerAdmissionLimits {
+        max_concurrent_requests: 4,
+        max_queued_requests: 4,
+        max_tokens_per_request: 1024,
+        max_sessions: 4,
+        max_loaded_models: 2,
+        memory_budget_bytes: 1_000_000,
+        max_streaming_connections: 4,
+        max_request_body_bytes: 1_000_000,
+        max_prompt_bytes: 100_000,
+        max_source_cache_operations: 4,
+    };
+    let state = ServerAdmissionState {
+        concurrent_requests: 1,
+        queued_requests: 0,
+        requested_tokens: 128,
+        active_sessions: 1,
+        loaded_models: 1,
+        memory_used_bytes: 1_000,
+        streaming_connections: 0,
+        request_body_bytes: 512,
+        prompt_bytes: 256,
+        source_cache_operations_in_flight: 0,
+    };
+    assert!(evaluate_server_admission(&limits, &state).is_ok());
+}
+
+// -- Source and cache boundary --
+
+#[test]
+fn server_api_roadmap_rejects_arbitrary_download_during_generation() {
+    let outcome = reject_arbitrary_download_during_generation("https://example.com/model.gguf");
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerSourcePolicyDenied { .. })
+    ));
+}
+
+#[test]
+fn server_api_roadmap_allows_non_network_model_reference_during_generation() {
+    assert!(reject_arbitrary_download_during_generation("qwen-local").is_ok());
+}
+
+// -- Filesystem boundary --
+
+#[test]
+fn server_api_roadmap_rejects_arbitrary_filesystem_path() {
+    let outcome = reject_arbitrary_filesystem_path("/etc/passwd", false);
+    assert!(matches!(
+        outcome,
+        Err(ServerApiRoadmapError::ServerBoundaryViolation { .. })
+    ));
+}
+
+#[test]
+fn server_api_roadmap_allows_authorized_filesystem_path() {
+    assert!(reject_arbitrary_filesystem_path("/models/qwen/model.gguf", true).is_ok());
+}
+
+// -- Tool/Shell/Git boundary --
+
+#[test]
+fn server_api_roadmap_rejects_tool_shell_git_capabilities() {
+    for capability in ["tool-call", "shell", "process", "git"] {
+        let outcome = reject_server_tool_shell_git_execution(capability);
+        assert!(
+            matches!(
+                outcome,
+                Err(ServerApiRoadmapError::ServerBoundaryViolation { .. })
+            ),
+            "capability '{capability}' should be rejected"
+        );
+    }
+}
+
+#[test]
+fn server_api_roadmap_allows_ordinary_inference_capability() {
+    assert!(reject_server_tool_shell_git_execution("generation").is_ok());
+}
+
+// -- Error model --
+
+#[test]
+fn server_api_roadmap_error_id_matches_exact_kebab_string_for_every_variant() {
+    let cases: Vec<(ServerApiRoadmapError, &str)> = vec![
+        (
+            ServerApiRoadmapError::ServerApiUnavailable { reason: "x".into() },
+            "server-api-unavailable",
+        ),
+        (
+            ServerApiRoadmapError::ServerRequestInvalid { reason: "x".into() },
+            "server-request-invalid",
+        ),
+        (
+            ServerApiRoadmapError::ServerRequestTooLarge { reason: "x".into() },
+            "server-request-too-large",
+        ),
+        (
+            ServerApiRoadmapError::ServerAuthenticationRequired,
+            "server-authentication-required",
+        ),
+        (
+            ServerApiRoadmapError::ServerAuthenticationFailed { reason: "x".into() },
+            "server-authentication-failed",
+        ),
+        (
+            ServerApiRoadmapError::ServerAuthorizationDenied { scope: "x".into() },
+            "server-authorization-denied",
+        ),
+        (
+            ServerApiRoadmapError::ServerRateLimited { reason: "x".into() },
+            "server-rate-limited",
+        ),
+        (
+            ServerApiRoadmapError::ServerAdmissionRejected { reason: "x".into() },
+            "server-admission-rejected",
+        ),
+        (
+            ServerApiRoadmapError::ServerStreamUnavailable { reason: "x".into() },
+            "server-stream-unavailable",
+        ),
+        (
+            ServerApiRoadmapError::ServerStreamInterrupted { reason: "x".into() },
+            "server-stream-interrupted",
+        ),
+        (
+            ServerApiRoadmapError::ServerCancellationFailed { reason: "x".into() },
+            "server-cancellation-failed",
+        ),
+        (
+            ServerApiRoadmapError::ServerModelNotFound { model: "x".into() },
+            "server-model-not-found",
+        ),
+        (
+            ServerApiRoadmapError::ServerModelLoadFailed {
+                reason: "x".into(),
+                runtime_cause: None,
+            },
+            "server-model-load-failed",
+        ),
+        (
+            ServerApiRoadmapError::ServerSessionNotFound {
+                session: "x".into(),
+            },
+            "server-session-not-found",
+        ),
+        (
+            ServerApiRoadmapError::ServerGenerationFailed {
+                reason: "x".into(),
+                runtime_cause: None,
+            },
+            "server-generation-failed",
+        ),
+        (
+            ServerApiRoadmapError::ServerDiagnosticsRedacted,
+            "server-diagnostics-redacted",
+        ),
+        (
+            ServerApiRoadmapError::ServerSourcePolicyDenied { reason: "x".into() },
+            "server-source-policy-denied",
+        ),
+        (
+            ServerApiRoadmapError::ServerCachePolicyDenied { reason: "x".into() },
+            "server-cache-policy-denied",
+        ),
+        (
+            ServerApiRoadmapError::ServerBoundaryViolation {
+                capability: "x".into(),
+            },
+            "server-boundary-violation",
+        ),
+        (
+            ServerApiRoadmapError::InternalServerApiError { reason: "x".into() },
+            "internal-server-api-error",
+        ),
+    ];
+    assert_eq!(cases.len(), 20, "expected exactly 20 error categories");
+    for (error, expected_id) in cases {
+        assert_eq!(error.id(), expected_id);
+        assert!(
+            !error.to_string().is_empty(),
+            "{expected_id} rendered empty"
+        );
+    }
+}
+
+#[test]
+fn server_api_roadmap_error_preserves_wrapped_runtime_cause() {
+    let source = InferenceApiError::ModelLoadingFailed {
+        reason: "example".into(),
+    };
+    let wrapped = ServerApiRoadmapError::model_load_failed_from_runtime(source.clone());
+    assert_eq!(wrapped.runtime_cause(), Some(&source));
+    assert!(wrapped.to_string().contains("example"));
+}
+
+#[test]
+fn server_api_roadmap_generation_failed_from_runtime_preserves_cause() {
+    let source = InferenceApiError::GenerationFailed {
+        reason: "boom".into(),
+    };
+    let wrapped = ServerApiRoadmapError::generation_failed_from_runtime(source.clone());
+    assert_eq!(wrapped.runtime_cause(), Some(&source));
+    assert_eq!(wrapped.id(), "server-generation-failed");
+}
+
+#[test]
+fn server_api_roadmap_error_without_runtime_cause_returns_none() {
+    let error = ServerApiRoadmapError::ServerRequestInvalid {
+        reason: "bad".into(),
+    };
+    assert_eq!(error.runtime_cause(), None);
+}
+
+// -- Observability --
+
+#[test]
+fn server_api_roadmap_observation_redacts_metadata() {
+    let observation =
+        ServerApiRoadmapObservation::new(ServerApiRoadmapObservationKind::RequestReceived)
+            .with_endpoint("generate")
+            .with_redacted_metadata("path", "/var/cache/magnetar/model");
+    assert_eq!(observation.endpoint.as_deref(), Some("generate"));
+    assert!(
+        !observation
+            .redacted_metadata
+            .get("path")
+            .unwrap()
+            .contains('/')
+    );
+}
+
+#[test]
+fn server_api_roadmap_observation_kinds_cover_all_18_categories() {
+    let kinds = [
+        ServerApiRoadmapObservationKind::ServerStarted,
+        ServerApiRoadmapObservationKind::ServerStopped,
+        ServerApiRoadmapObservationKind::RequestReceived,
+        ServerApiRoadmapObservationKind::RequestRejected,
+        ServerApiRoadmapObservationKind::RequestAuthorized,
+        ServerApiRoadmapObservationKind::RuntimeRequestSubmitted,
+        ServerApiRoadmapObservationKind::StreamOpened,
+        ServerApiRoadmapObservationKind::StreamClosed,
+        ServerApiRoadmapObservationKind::StreamInterrupted,
+        ServerApiRoadmapObservationKind::GenerationCompleted,
+        ServerApiRoadmapObservationKind::GenerationFailed,
+        ServerApiRoadmapObservationKind::CancellationRequested,
+        ServerApiRoadmapObservationKind::DiagnosticsRequested,
+        ServerApiRoadmapObservationKind::ModelEndpointUsed,
+        ServerApiRoadmapObservationKind::SessionEndpointUsed,
+        ServerApiRoadmapObservationKind::RateLimitHit,
+        ServerApiRoadmapObservationKind::AdmissionRejected,
+        ServerApiRoadmapObservationKind::BoundaryViolationDetected,
+    ];
+    assert_eq!(kinds.len(), 18);
+    let unique: BTreeSet<ServerApiRoadmapObservationKind> = kinds.into_iter().collect();
+    assert_eq!(unique.len(), 18, "observation kinds must be distinct");
+}
+
+// -- Conformance --
+
+#[test]
+fn server_api_roadmap_conformance_report_is_conformant() {
+    let report = run_server_api_roadmap_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn server_api_roadmap_version_constant_is_set() {
+    assert_eq!(SERVER_API_ROADMAP_VERSION, "0.1.0");
+}
