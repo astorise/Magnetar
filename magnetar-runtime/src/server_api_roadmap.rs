@@ -69,7 +69,7 @@
 //!   / [`redact_server_diagnostic`][]: implementing "Authentication Is Server
 //!   Boundary" -- an opaque, credential-free authentication marker plus
 //!   reuse of [`crate::model_source_cache_roadmap::reject_credential_in_metadata`]
-//!   and [`crate::compute::redact_backend_diagnostic`].
+//!   and `crate::compute::redact_backend_diagnostic`.
 //! - [`ServerAuthorizationScope`] / [`ServerAuthorizationDecision`] /
 //!   [`authorize_server_request`][]: implementing "Authorization Does Not
 //!   Bypass Runtime Policy" -- server authorization and Runtime policy are
@@ -218,7 +218,7 @@ impl ServerHealthStatus {
 
 /// Whether Runtime can accept inference requests under current policy.
 /// Redacted by default: `model_registry_state_summary` is always passed
-/// through [`redact_backend_diagnostic`] and no field exposes raw handles.
+/// through `redact_backend_diagnostic` and no field exposes raw handles.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerReadinessStatus {
     pub runtime_initialized: bool,
@@ -681,7 +681,7 @@ pub fn reject_raw_stream_payload(payload_kind: &str) -> Result<(), ServerApiRoad
 /// carry raw logits, raw tensor values, raw KV cache contents, or native
 /// handles by default: the only fields are a [`GenerationEventKind`] and a
 /// `redacted_metadata` string map whose values always pass through
-/// [`redact_backend_diagnostic`].
+/// `redact_backend_diagnostic`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerStreamEvent {
     pub kind: GenerationEventKind,
@@ -867,7 +867,7 @@ pub fn reject_credential_in_server_diagnostics(
 }
 
 /// Redacts a server-facing diagnostic message, reusing
-/// [`redact_backend_diagnostic`] rather than a parallel redaction path.
+/// `redact_backend_diagnostic` rather than a parallel redaction path.
 pub fn redact_server_diagnostic(message: &str) -> String {
     redact_backend_diagnostic(message)
 }
@@ -1314,7 +1314,7 @@ pub enum ServerApiRoadmapObservationKind {
 /// secret, credential, raw file content, raw cache path, or native handle
 /// by default: the only fields are an enum `kind`, an optional endpoint
 /// name, and a `redacted_metadata` string map whose values always pass
-/// through [`redact_backend_diagnostic`]. Implements "Server Observability".
+/// through `redact_backend_diagnostic`. Implements "Server Observability".
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerApiRoadmapObservation {
     pub kind: ServerApiRoadmapObservationKind,

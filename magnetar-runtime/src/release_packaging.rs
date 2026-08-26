@@ -7,8 +7,8 @@
 //! functions, the release packaging and versioning **policy** for `v0.1`:
 //!
 //! - [`ReleaseVersion`]: explicit semantic versioning
-//!   ([`ReleaseVersion::breaking_change_policy`] implements the pre-1.0 /
-//!   0.x-minor / patch breaking-change rules).
+//!   ([`evaluate_version_bump`] implements the pre-1.0 / 0.x-minor / patch
+//!   breaking-change rules).
 //! - [`CrateVersionMetadata`]: per-crate version declarations and
 //!   [`validate_crate_dependency_compatibility`].
 //! - [`ReleaseBinaryVersionReport`] / [`build_release_binary_version_report`]:
@@ -27,9 +27,9 @@
 //!   frozen; documentation clarifications remain allowed.
 //! - [`ReleaseFeatureFlagClass`] / [`ReleaseFeatureFlag`]: the six feature
 //!   flag classes, plus [`reject_experimental_flag_enabled_by_default`] and
-//!   the concrete [`PROVIDER_FEATURE_FLAGS`] / [`COMPONENT_ENGINE_FEATURE_FLAGS`]
+//!   the concrete [`provider_feature_flags`] / [`component_engine_feature_flags`]
 //!   catalogs (only `reference-cpu-provider` is required for `v0.1`).
-//! - [`ReleasePlatformTarget`] / [`RELEASE_PLATFORM_TARGETS`]: supported
+//! - [`ReleasePlatformTarget`] / [`release_platform_targets`]: supported
 //!   native targets, the CI target set, and wasm32 check-only status.
 //! - [`ReleaseArtifactKind`] / [`ReleaseArtifactManifest`]: the release
 //!   artifact set and [`ReleaseArtifactManifest::validate`] ("present or
@@ -1124,7 +1124,7 @@ const BUILD_METADATA_SECRET_KEY_FRAGMENTS: &[&str] = &[
 /// "Build metadata SHALL not include secrets or local filesystem paths by
 /// default": redacts `value` when `key` looks secret-shaped or `value` looks
 /// like a local filesystem path or native handle (via
-/// [`redact_backend_diagnostic`]).
+/// `redact_backend_diagnostic`).
 pub fn redact_build_metadata(key: &str, value: &str) -> String {
     let key_lower = key.to_ascii_lowercase();
     if BUILD_METADATA_SECRET_KEY_FRAGMENTS

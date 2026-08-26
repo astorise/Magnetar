@@ -1066,7 +1066,7 @@ impl ModelSourceCacheDiagnostic {
     }
 
     /// Redacts a policy denial reason before it reaches observability,
-    /// reusing the existing [`redact_backend_diagnostic`] path rather than a
+    /// reusing the existing `redact_backend_diagnostic` path rather than a
     /// parallel redaction routine.
     pub fn redact_policy_denial_reason(reason: &str) -> String {
         redact_backend_diagnostic(reason)
@@ -1201,7 +1201,7 @@ pub enum ModelSourceCacheRoadmapObservationKind {
 /// weight, or Provider/Device/Kernel handle by default: the only fields are
 /// an enum `kind`, an optional artifact identity, and a `redacted_metadata`
 /// string map whose values are always passed through
-/// [`redact_backend_diagnostic`].
+/// `redact_backend_diagnostic`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelSourceCacheRoadmapObservation {
     pub kind: ModelSourceCacheRoadmapObservationKind,

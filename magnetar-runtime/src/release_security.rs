@@ -44,7 +44,7 @@
 //! - [`ArtifactIntegrityStatus`]: the "Artifact Integrity" policy.
 //! - [`validate_redaction_gate`] / [`record_release_security_observation`]:
 //!   the "Redaction Gates" and "Observability" policies, composing
-//!   [`crate::compute::redact_backend_diagnostic`] with the additional
+//!   `crate::compute::redact_backend_diagnostic` with the additional
 //!   secret/credential/prompt-shaped content this change's redaction gate
 //!   covers.
 //! - [`ProviderTrustModel`] / [`DynamicProviderLoadingStatus`] /
@@ -730,7 +730,7 @@ fn redact_release_security_detail(raw: &str) -> String {
 }
 
 /// "Stable release SHALL pass redaction gates": rejects a diagnostic that
-/// [`redact_release_security_detail`] would have had to redact, implementing
+/// `redact_release_security_detail` would have had to redact, implementing
 /// every scenario shaped like "Given diagnostics include raw prompt by
 /// default; When release gate runs; Then release is blocked."
 pub fn validate_redaction_gate(diagnostic: &str) -> Result<(), ReleaseSecurityError> {
@@ -1365,7 +1365,7 @@ pub struct ReleaseSecurityObservation {
 /// "Observability SHALL not expose secrets, credentials, raw prompts, raw
 /// weights, raw tensors, raw cache contents, handles, memory pointers, or
 /// local paths by default": always redacts `raw_detail` through
-/// [`redact_release_security_detail`] before recording it.
+/// `redact_release_security_detail` before recording it.
 pub fn record_release_security_observation(
     kind: ReleaseSecurityObservationKind,
     raw_detail: &str,

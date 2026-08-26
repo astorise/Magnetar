@@ -12,7 +12,7 @@
 //!
 //! This module does not implement a new boundary mechanism. It composes the
 //! already Runtime-owned [`crate::inference_api::validate_inference_scope`]
-//! check and [`crate::compute::redact_backend_diagnostic`] redaction utility
+//! check and `crate::compute::redact_backend_diagnostic` redaction utility
 //! behind:
 //!
 //! - [`CliBoundaryError`]: the CLI-side structured error model from the
@@ -206,7 +206,7 @@ const CLI_OWNED_AUTHORITY_CAPABILITIES: &[&str] = &[
 /// comment: Runtime rejects every CLI-owned authority capability, a wrapped
 /// [`InferenceApiError`] round-trips through [`CliBoundaryError::runtime_category`],
 /// and a synthetic handle-like diagnostic is redacted by
-/// [`redact_backend_diagnostic`].
+/// `redact_backend_diagnostic`.
 pub fn run_cli_boundary_conformance() -> CliBoundaryConformanceReport {
     let mut results = Vec::new();
 

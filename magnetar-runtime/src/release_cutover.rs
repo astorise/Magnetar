@@ -116,8 +116,8 @@ pub const RELEASE_CUTOVER_POLICY_VERSION: &str = "0.1.0";
 /// (`proposal.md`). Deliberately documentation-only: enforcement is
 /// [`validate_v0_1_scope_feature`], which composes
 /// [`reject_roadmap_feature_as_guarantee`] rather than a second list of
-/// excluded features -- [`crate::release_packaging::DEFERRED_ROADMAP_FEATURES`]
-/// already owns that.
+/// excluded features -- `crate::release_packaging`'s deferred roadmap feature
+/// list already owns that.
 pub const V0_1_INCLUDED_SCOPE: &[&str] = &[
     "runtime-inference-api-baseline",
     "model-loading-baseline",
@@ -1125,26 +1125,33 @@ pub struct ReleaseCutoverObservation {
     pub security_observation: ReleaseSecurityObservation,
 }
 
+/// Input to [`record_release_cutover_observation`], bundled into a struct
+/// (rather than eight positional parameters) per the recorded fields of
+/// [`ReleaseCutoverObservation`].
+pub struct ReleaseCutoverObservationInput<'a> {
+    pub correlation_id: CorrelationId,
+    pub kind: ReleaseSecurityObservationKind,
+    pub gate: Option<String>,
+    pub target: Option<String>,
+    pub feature_set: Vec<String>,
+    pub artifact: Option<String>,
+    pub release_metadata: Option<String>,
+    pub raw_detail: &'a str,
+}
+
 /// Records a cutover observation, always redacting `raw_detail` through
 /// [`record_release_security_observation`] before attaching it.
 pub fn record_release_cutover_observation(
-    correlation_id: CorrelationId,
-    kind: ReleaseSecurityObservationKind,
-    gate: Option<String>,
-    target: Option<String>,
-    feature_set: Vec<String>,
-    artifact: Option<String>,
-    release_metadata: Option<String>,
-    raw_detail: &str,
+    input: ReleaseCutoverObservationInput<'_>,
 ) -> ReleaseCutoverObservation {
     ReleaseCutoverObservation {
-        correlation_id,
-        gate,
-        target,
-        feature_set,
-        artifact,
-        release_metadata,
-        security_observation: record_release_security_observation(kind, raw_detail),
+        correlation_id: input.correlation_id,
+        gate: input.gate,
+        target: input.target,
+        feature_set: input.feature_set,
+        artifact: input.artifact,
+        release_metadata: input.release_metadata,
+        security_observation: record_release_security_observation(input.kind, input.raw_detail),
     }
 }
 
@@ -1877,8 +1884,10 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
     }
 
     {
-        let mut experimental_as_stable = CutoverReleaseNotesChecklist::default();
-        experimental_as_stable.explains_what_v0_1_is = true;
+        let experimental_as_stable = CutoverReleaseNotesChecklist {
+            explains_what_v0_1_is: true,
+            ..Default::default()
+        };
         record(
             &mut results,
             "incomplete release notes are blocked",
@@ -2080,16 +2089,16 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
     }
 
     {
-        let observation = record_release_cutover_observation(
-            CorrelationId::new("cutover-run-1"),
-            ReleaseSecurityObservationKind::SecretScanCompleted,
-            Some("secret-scan".into()),
-            Some("reference-cpu-provider".into()),
-            vec!["reference-cpu-provider".into()],
-            Some("magnetar-cli".into()),
-            Some("v0.1.0-rc.1".into()),
-            "found credential abc123 in build.env",
-        );
+        let observation = record_release_cutover_observation(ReleaseCutoverObservationInput {
+            correlation_id: CorrelationId::new("cutover-run-1"),
+            kind: ReleaseSecurityObservationKind::SecretScanCompleted,
+            gate: Some("secret-scan".into()),
+            target: Some("reference-cpu-provider".into()),
+            feature_set: vec!["reference-cpu-provider".into()],
+            artifact: Some("magnetar-cli".into()),
+            release_metadata: Some("v0.1.0-rc.1".into()),
+            raw_detail: "found credential abc123 in build.env",
+        });
         record(
             &mut results,
             "a cutover observation is redacted by default",

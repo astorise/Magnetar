@@ -13687,16 +13687,16 @@ fn runtime_tool_execution_blocks_cutover_scope_confirmation() {
 
 #[test]
 fn release_cutover_observation_is_always_redacted() {
-    let observation = record_release_cutover_observation(
-        CorrelationId::new("cutover-run-1"),
-        ReleaseSecurityObservationKind::SecretScanCompleted,
-        Some("secret-scan".into()),
-        Some("reference-cpu-provider".into()),
-        vec!["reference-cpu-provider".into()],
-        Some("magnetar-cli".into()),
-        Some("v0.1.0-rc.1".into()),
-        "found credential abc123 in build.env",
-    );
+    let observation = record_release_cutover_observation(ReleaseCutoverObservationInput {
+        correlation_id: CorrelationId::new("cutover-run-1"),
+        kind: ReleaseSecurityObservationKind::SecretScanCompleted,
+        gate: Some("secret-scan".into()),
+        target: Some("reference-cpu-provider".into()),
+        feature_set: vec!["reference-cpu-provider".into()],
+        artifact: Some("magnetar-cli".into()),
+        release_metadata: Some("v0.1.0-rc.1".into()),
+        raw_detail: "found credential abc123 in build.env",
+    });
     assert!(
         !observation
             .security_observation
