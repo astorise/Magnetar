@@ -6,49 +6,63 @@
     {
       "name": "Dependency audit",
       "status": "documented-limitation",
+      "suite_version": "release-security-policy-0.1.0",
       "target": "workspace lockfile",
+      "feature_set": ["dependency-audit", "cargo-deny-policy"],
       "redaction_status": "redacted",
       "notes": "Policy and deny configuration exist; final advisory evidence must be produced by release CI."
     },
     {
       "name": "License audit",
       "status": "documented-limitation",
+      "suite_version": "release-security-policy-0.1.0",
       "target": "workspace dependency graph",
+      "feature_set": ["license-audit", "cargo-deny-policy"],
       "redaction_status": "redacted",
       "notes": "Final license report is not embedded in this repository evidence bundle."
     },
     {
       "name": "Secret scan",
       "status": "documented-limitation",
+      "suite_version": "release-security-policy-0.1.0",
       "target": "release candidate source tree",
+      "feature_set": ["secret-scan", "release-source-tree"],
       "redaction_status": "redacted",
       "notes": "Final scan must be run by release CI from the release candidate."
     },
     {
       "name": "SBOM",
       "status": "documented-limitation",
+      "suite_version": "release-security-policy-0.1.0",
       "target": "release artifacts",
+      "feature_set": ["sbom", "release-artifacts"],
       "redaction_status": "not-applicable",
       "notes": "SBOM is not generated in this bundle."
     },
     {
       "name": "Signature status",
       "status": "documented-not-implemented",
+      "suite_version": "release-security-policy-0.1.0",
       "target": "release artifacts",
+      "feature_set": ["artifact-signing", "release-artifacts"],
       "redaction_status": "not-applicable",
       "notes": "Cryptographic artifact signing is not implemented; no signing claim is made."
     },
     {
       "name": "Unsafe-code review",
       "status": "policy-covered",
+      "suite_version": "release-security-policy-0.1.0",
       "target": "runtime FFI and raw-handle boundaries",
+      "feature_set": ["unsafe-code-review", "ffi-boundaries", "raw-handle-boundaries"],
       "redaction_status": "redacted",
       "notes": "Unsafe-code policy is covered by executable tests."
     },
     {
       "name": "Artifact integrity",
       "status": "pass-for-repository-evidence",
+      "suite_version": "release-security-policy-0.1.0",
       "target": "release/v0.1 evidence bundle",
+      "feature_set": ["sha256-checksums", "repository-evidence-bundle"],
       "redaction_status": "not-applicable",
       "notes": "Checksums are provided for this evidence bundle in checksums.sha256."
     }

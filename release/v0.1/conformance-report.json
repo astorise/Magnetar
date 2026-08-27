@@ -47,6 +47,15 @@
       "command": "openspec validate --all"
     },
     {
+      "name": "WIT validation",
+      "status": "pass",
+      "suite_version": "wasm-tools component wit",
+      "target": "magnetar-runtime/wit/compute.wit and magnetar-runtime/wit/observability.wit",
+      "feature_set": ["magnetar:compute@2.0.0", "magnetar:observability@1.0.0"],
+      "redaction_status": "not-applicable",
+      "command": "find . -path '*/wit/*.wit' -print0 | while IFS= read -r -d '' wit; do wasm-tools component wit \"$wit\" >/dev/null; done"
+    },
+    {
       "name": "Reference CPU",
       "status": "pass",
       "suite_version": "0.1.0",
