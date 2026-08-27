@@ -970,8 +970,8 @@ mod tests {
             "say hi",
             &[("file context", "FILE_CONTEXT_MARKER_flow_xyz")],
         );
-        let (text, _observer) = pipeline::one_shot(&model_ref, &prompt).unwrap();
-        let _ = text;
+        let error = pipeline::one_shot(&model_ref, &prompt).unwrap_err();
+        assert!(error.runtime_category().is_some());
     }
 
     /// §9/§29 "Test Git stays in CLI": Git access happens through a fixed,
@@ -1107,11 +1107,12 @@ mod tests {
     /// request handling does not bypass Runtime validation.
     #[test]
     fn cmd_serve_demo_request_calls_the_runtime_inference_api() {
-        cmd_serve(&[
+        let error = cmd_serve(&[
             "--demo-request".to_string(),
             "qwen-test".to_string(),
             "hi".to_string(),
         ])
-        .unwrap();
+        .unwrap_err();
+        assert!(error.runtime_category().is_some());
     }
 }

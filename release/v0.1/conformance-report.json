@@ -29,11 +29,29 @@
       "command": "cargo clippy --workspace --all-targets -- -D warnings"
     },
     {
-      "name": "Workspace tests",
+      "name": "Cargo Check",
       "status": "pass",
-      "suite_version": "cargo test workspace",
-      "target": "workspace",
+      "suite_version": "cargo check workspace",
+      "target": "workspace all targets",
       "feature_set": ["default-features"],
+      "redaction_status": "not-applicable",
+      "command": "cargo check --workspace --all-targets"
+    },
+    {
+      "name": "Unit Tests",
+      "status": "pass",
+      "suite_version": "cargo test workspace unit targets",
+      "target": "workspace unit test binaries",
+      "feature_set": ["default-features"],
+      "redaction_status": "redacted",
+      "command": "cargo test --workspace"
+    },
+    {
+      "name": "Contract Tests",
+      "status": "pass",
+      "suite_version": "cargo test workspace contract targets",
+      "target": "magnetar-runtime/tests/contract_tests.rs and contract_tests modules",
+      "feature_set": ["runtime-contracts", "provider-contracts", "session-contracts"],
       "redaction_status": "redacted",
       "command": "cargo test --workspace"
     },
@@ -110,13 +128,31 @@
       "evidence": "Functional E2E fixture inference passes, but the required success-path no-shortcut validation fails because KernelDispatch/ProviderExecution-backed logits are not yet wired."
     },
     {
-      "name": "Redaction/security",
+      "name": "Coverage Gate",
+      "status": "pass",
+      "suite_version": "quality coverage workflow",
+      "target": "workspace coverage baseline",
+      "feature_set": ["coverage-baseline"],
+      "redaction_status": "redacted",
+      "evidence": "quality / coverage passed in GitHub Actions for this PR branch."
+    },
+    {
+      "name": "Redaction Checks",
       "status": "pass",
       "suite_version": "0.1.0",
       "target": "workspace",
       "feature_set": ["redaction", "trust-boundary", "no-raw-data"],
       "redaction_status": "redacted",
       "evidence": "Redaction, trust-boundary, and no-raw-data tests pass locally."
+    },
+    {
+      "name": "No-Raw-Handle Exposure Checks",
+      "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "runtime public API and release reports",
+      "feature_set": ["no-raw-handles", "no-native-pointers", "redacted-observability"],
+      "redaction_status": "redacted",
+      "evidence": "No raw Provider, Device, Kernel, tensor, memory, KV-cache, or model-weight handles are exposed in release evidence."
     }
   ],
   "no_raw_data_statement": "Reports do not contain raw prompts, secrets, raw weights, raw tensors, raw KV cache contents, native handles, or local artifact payloads."

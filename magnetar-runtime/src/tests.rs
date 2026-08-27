@@ -9063,6 +9063,50 @@ fn inference_api_run_generation_loop_cancels_during_decode() {
 }
 
 #[test]
+fn inference_api_run_generation_loop_rejects_incomplete_executor_evidence_before_sampling() {
+    let mut request = generation_request();
+    request.parameters = GenerationParameters::greedy();
+    request.stop_conditions = StopConditions::default();
+    let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
+    let runtime = runtime_with_generation_executor(
+        vocabulary_size,
+        RuntimeGenerationExecutionEvidence {
+            model_instance_ready: true,
+            graph_validated: true,
+            kernel_selected: true,
+            kernel_dispatched: false,
+            provider_executed: false,
+            tensor_resource_used: false,
+        },
+    );
+    let mut observer = InferenceApiObserver::new();
+
+    let error = run_generation_loop(
+        &runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated| false,
+        &mut observer,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, InferenceApiError::KernelUnavailable { .. }));
+    let kinds: Vec<_> = observer
+        .observations()
+        .iter()
+        .map(|observation| observation.kind)
+        .collect();
+    assert!(kinds.contains(&InferenceApiObservationKind::ExecutionGraphValidated));
+    assert!(kinds.contains(&InferenceApiObservationKind::KernelSelected));
+    assert!(kinds.contains(&InferenceApiObservationKind::KernelUnavailable));
+    assert!(kinds.contains(&InferenceApiObservationKind::StreamInterrupted));
+    assert!(!kinds.contains(&InferenceApiObservationKind::TokenGenerated));
+    assert!(!kinds.contains(&InferenceApiObservationKind::GenerationCompleted));
+    assert!(!kinds.contains(&InferenceApiObservationKind::StreamClosed));
+}
+
+#[test]
 fn inference_api_run_generation_loop_observes_executor_failure_before_returning() {
     let mut request = generation_request();
     request.parameters = GenerationParameters::greedy();

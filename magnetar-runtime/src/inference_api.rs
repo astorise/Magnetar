@@ -1025,6 +1025,35 @@ impl GenerationResult {
 /// boundary, then Sampling and streaming observation emission. Logits come from
 /// the [`RuntimeGenerationExecutor`] attached to the [`Runtime`], so callers do
 /// not provide readiness booleans or executable logits callbacks per request.
+fn observe_generation_execution_error(
+    observer: &mut InferenceApiObserver,
+    correlation_id: Option<CorrelationId>,
+    error: &InferenceApiError,
+) {
+    match error {
+        InferenceApiError::ProviderUnavailable { .. } => observer.observe(
+            InferenceApiObservationKind::ProviderUnavailable,
+            "provider unavailable for generation",
+            correlation_id.clone(),
+        ),
+        InferenceApiError::KernelUnavailable { .. } => observer.observe(
+            InferenceApiObservationKind::KernelUnavailable,
+            "kernel unavailable for generation",
+            correlation_id.clone(),
+        ),
+        _ => observer.observe(
+            InferenceApiObservationKind::GenerationFailed,
+            "runtime execution failed",
+            correlation_id.clone(),
+        ),
+    }
+    observer.observe(
+        InferenceApiObservationKind::StreamInterrupted,
+        "stream interrupted by runtime execution failure",
+        correlation_id,
+    );
+}
+
 pub fn run_generation_loop(
     runtime: &Runtime,
     request: &GenerationRequest,
@@ -1150,34 +1179,10 @@ pub fn run_generation_loop(
             format!("decode step {}", generated.len()),
             correlation_id.clone(),
         );
-        let mut observe_execution_error = |error: &InferenceApiError| {
-            match error {
-                InferenceApiError::ProviderUnavailable { .. } => observer.observe(
-                    InferenceApiObservationKind::ProviderUnavailable,
-                    "provider unavailable for generation",
-                    correlation_id.clone(),
-                ),
-                InferenceApiError::KernelUnavailable { .. } => observer.observe(
-                    InferenceApiObservationKind::KernelUnavailable,
-                    "kernel unavailable for generation",
-                    correlation_id.clone(),
-                ),
-                _ => observer.observe(
-                    InferenceApiObservationKind::GenerationFailed,
-                    "runtime execution failed",
-                    correlation_id.clone(),
-                ),
-            }
-            observer.observe(
-                InferenceApiObservationKind::StreamInterrupted,
-                "stream interrupted by runtime execution failure",
-                correlation_id.clone(),
-            );
-        };
         let runtime_step = match executor.execute_generation_step(runtime, request, &generated) {
             Ok(runtime_step) => runtime_step,
             Err(error) => {
-                observe_execution_error(&error);
+                observe_generation_execution_error(observer, correlation_id.clone(), &error);
                 return Err(error);
             }
         };
@@ -1215,6 +1220,10 @@ pub fn run_generation_loop(
                 "Runtime-owned tensor logits produced",
                 correlation_id.clone(),
             );
+        }
+        if let Err(error) = runtime_step.evidence.validate() {
+            observe_generation_execution_error(observer, correlation_id.clone(), &error);
+            return Err(error);
         }
         let (sampling, step) = decode_step_from_sampling_with_rng(
             request,

@@ -460,14 +460,10 @@ mod tests {
     use magnetar_runtime::{ModelInstanceUnloadPolicy, unload_model_instance};
 
     #[test]
-    fn one_shot_pipeline_succeeds_end_to_end_for_a_sample_prompt() {
+    fn one_shot_pipeline_rejects_placeholder_logits_without_runtime_evidence() {
         let model_ref = ModelRef::new("qwen-test").unwrap();
-        let (text, _observer) = one_shot(&model_ref, "hello there").unwrap();
-        // Placeholder logits are all-zero, so decoded text is not
-        // meaningful -- this test only proves the pipeline runs end to end
-        // through the real Runtime Session/Generation/Tokenizer API without
-        // bypassing any of it.
-        let _ = text;
+        let error = one_shot(&model_ref, "hello there").unwrap_err();
+        assert!(error.runtime_category().is_some());
     }
 
     /// Streaming (§18): asserts the observation trail's order and count
@@ -477,38 +473,10 @@ mod tests {
     /// `DEFAULT_MAX_NEW_TOKENS` `TokenGenerated` observations rather than
     /// stopping early.
     #[test]
-    fn one_shot_pipeline_emits_observation_trail_in_runtime_order() {
-        use magnetar_runtime::InferenceApiObservationKind;
-
+    fn one_shot_pipeline_fails_before_certifying_placeholder_observation_trail() {
         let model_ref = ModelRef::new("qwen-test").unwrap();
-        let (_text, observer) = one_shot(&model_ref, "hi").unwrap();
-        let kinds: Vec<_> = observer.observations().iter().map(|o| o.kind).collect();
-
-        assert_eq!(
-            kinds.first(),
-            Some(&InferenceApiObservationKind::GenerationStarted)
-        );
-        assert_eq!(
-            kinds.last(),
-            Some(&InferenceApiObservationKind::StreamClosed)
-        );
-        let token_generated_count = kinds
-            .iter()
-            .filter(|kind| **kind == InferenceApiObservationKind::TokenGenerated)
-            .count();
-        assert_eq!(token_generated_count, DEFAULT_MAX_NEW_TOKENS);
-
-        // Preserve Runtime event order: GenerationCompleted must follow
-        // the final TokenGenerated, and StreamClosed must follow that.
-        let last_token_generated = kinds
-            .iter()
-            .rposition(|kind| *kind == InferenceApiObservationKind::TokenGenerated)
-            .unwrap();
-        let generation_completed = kinds
-            .iter()
-            .position(|kind| *kind == InferenceApiObservationKind::GenerationCompleted)
-            .unwrap();
-        assert!(generation_completed > last_token_generated);
+        let error = one_shot(&model_ref, "hi").unwrap_err();
+        assert!(error.runtime_category().is_some());
     }
 
     /// Chat Template Boundary (§16): turn 1 sends `PromptInput::PlainText`
@@ -528,11 +496,9 @@ mod tests {
     fn chat_session_keeps_transcript_cli_side_and_reuses_one_runtime_session() {
         let model_ref = ModelRef::new("qwen-test").unwrap();
         let mut chat = ChatSession::open(&model_ref).unwrap();
-        chat.turn("first line").unwrap();
-        chat.turn("second line").unwrap();
-        assert_eq!(chat.transcript().len(), 4);
-        assert_eq!(chat.transcript()[0].0, "user");
-        assert_eq!(chat.transcript()[1].0, "assistant");
+        let error = chat.turn("first line").unwrap_err();
+        assert!(error.runtime_category().is_some());
+        assert!(chat.transcript().is_empty());
         chat.close().unwrap();
     }
 
@@ -596,7 +562,6 @@ mod tests {
     fn chat_session_cancel_calls_runtime_cancellation_and_session_becomes_unusable() {
         let model_ref = ModelRef::new("qwen-test").unwrap();
         let mut chat = ChatSession::open(&model_ref).unwrap();
-        chat.turn("first line").unwrap();
         chat.cancel().unwrap();
         let error = chat.turn("after cancel").unwrap_err();
         assert!(error.runtime_category().is_some());

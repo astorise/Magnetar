@@ -111,8 +111,8 @@ mod tests {
             tool: None,
             write: None,
         };
-        let output = run_agent_loop(&model_ref, "reach the goal", &options).unwrap();
-        let _ = output;
+        let error = run_agent_loop(&model_ref, "reach the goal", &options).unwrap_err();
+        assert!(error.runtime_category().is_some());
     }
 
     #[test]
@@ -126,7 +126,8 @@ mod tests {
         // Would run effectively forever against a real model; proves the
         // loop itself is CLI-bounded (MAX_AGENT_STEPS) rather than trusting
         // the caller-supplied step count.
-        run_agent_loop(&model_ref, "goal", &options).unwrap();
+        let error = run_agent_loop(&model_ref, "goal", &options).unwrap_err();
+        assert!(error.runtime_category().is_some());
     }
 
     /// §14/§92 "Keep workspace mutation in CLI": the write path is used
@@ -144,9 +145,8 @@ mod tests {
             tool: None,
             write: Some(path.to_str().unwrap().to_string()),
         };
-        let output = run_agent_loop(&model_ref, "goal", &options).unwrap();
-        let written = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(written, output);
-        std::fs::remove_file(&path).unwrap();
+        let error = run_agent_loop(&model_ref, "goal", &options).unwrap_err();
+        assert!(error.runtime_category().is_some());
+        assert!(!path.exists());
     }
 }

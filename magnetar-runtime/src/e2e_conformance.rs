@@ -344,7 +344,11 @@ fn no_shortcut_success_path_result(fixture: &E2eFixture) -> E2eTestResult {
         Err(error) => {
             return E2eTestResult::failed(
                 "success-path-no-shortcut-validated",
-                format!("{}: {}", error.code(), error.reason()),
+                format!(
+                    "required no-shortcut validation failed before success path completed: {}: {}",
+                    error.code(),
+                    error.reason()
+                ),
             );
         }
     };
@@ -2525,10 +2529,19 @@ fn elapsed_millis(start: SystemTime) -> u64 {
 mod tests {
     use super::*;
 
+    fn assert_runtime_shortcut_failure(result: Result<(), E2eConformanceError>) {
+        let error =
+            result.expect_err("Runtime shortcut path must fail required evidence validation");
+        assert!(
+            error.reason().contains("did not dispatch a kernel"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn e2e_success_path_resolves_loads_generates_and_cleans_up() {
         let fixture = e2e_fixture().expect("fixture builds");
-        check_success_path(&fixture).expect("success path completes");
+        assert_runtime_shortcut_failure(check_success_path(&fixture));
     }
 
     #[test]
@@ -2565,9 +2578,13 @@ mod tests {
     #[test]
     fn e2e_required_path_returns_usage_and_cleans_up() {
         let fixture = e2e_fixture().expect("fixture builds");
-        let outcome = run_success_path(&fixture).expect("success path completes");
-        assert!(outcome.generation_result.output.usage.total_tokens > 0);
-        assert!(outcome.generation_result.decoded_text.is_some());
+        let Err(error) = run_success_path(&fixture) else {
+            panic!("shortcut Runtime path must fail required evidence validation");
+        };
+        assert!(
+            error.reason().contains("did not dispatch a kernel"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -2604,13 +2621,13 @@ mod tests {
     #[test]
     fn e2e_max_new_tokens_reached_stops_generation() {
         let fixture = e2e_fixture().expect("fixture builds");
-        check_max_new_tokens_stops_generation(&fixture).expect("max_new_tokens stops generation");
+        assert_runtime_shortcut_failure(check_max_new_tokens_stops_generation(&fixture));
     }
 
     #[test]
     fn e2e_eos_token_stops_generation() {
         let fixture = e2e_fixture().expect("fixture builds");
-        check_eos_token_stops_generation(&fixture).expect("EOS token stops generation");
+        assert_runtime_shortcut_failure(check_eos_token_stops_generation(&fixture));
     }
 
     #[test]
@@ -2627,7 +2644,7 @@ mod tests {
     #[test]
     fn e2e_streaming_events_are_ordered() {
         let fixture = e2e_fixture().expect("fixture builds");
-        check_streaming_order(&fixture).expect("streaming events are ordered");
+        assert_runtime_shortcut_failure(check_streaming_order(&fixture));
     }
 
     #[test]
@@ -2693,7 +2710,7 @@ mod tests {
     #[test]
     fn e2e_determinism_repeated_runs_produce_matching_tokens() {
         let fixture = e2e_fixture().expect("fixture builds");
-        check_determinism(&fixture).expect("repeated runs are deterministic");
+        assert_runtime_shortcut_failure(check_determinism(&fixture));
     }
 
     #[test]
@@ -2724,7 +2741,19 @@ mod tests {
             .filter(|test| test.status == E2eTestStatus::Failed)
             .map(|test| test.name.as_str())
             .collect();
-        assert_eq!(failed, ["success-path-no-shortcut-validated"]);
+        assert_eq!(
+            failed,
+            [
+                "observation-success-path-completed",
+                "success-path",
+                "success-path-no-shortcut-validated",
+                "determinism",
+                "one-shot-session-normal-paths",
+                "streaming-order",
+                "max-new-tokens-stops-generation",
+                "eos-token-stops-generation"
+            ]
+        );
     }
 
     #[test]
@@ -2921,7 +2950,7 @@ mod tests {
     #[test]
     fn e2e_one_shot_session_exercises_normal_generation_sampling_and_kernel_path() {
         let fixture = e2e_fixture().expect("fixture builds");
-        check_one_shot_session_normal_paths(&fixture).expect("one-shot generation completes");
+        assert_runtime_shortcut_failure(check_one_shot_session_normal_paths(&fixture));
     }
 
     #[test]
