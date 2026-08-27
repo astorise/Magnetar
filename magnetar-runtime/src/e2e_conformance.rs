@@ -653,6 +653,10 @@ fn apply_rope_per_head(
             rope_config.base as f32,
             rope_config.scale.unwrap_or(1.0) as f32,
             rope_config.dimension,
+            // This forward pass computes the whole prompt in one shot: every
+            // row is a distinct token position starting at the sequence's
+            // first token, so there is no prior cache and the offset is zero.
+            0,
         )?;
         for row in 0..rows {
             let dst_base = (row * cols + start_col) as usize;
@@ -1099,13 +1103,19 @@ fn check_invalid_graph_fixture() -> Result<(), E2eConformanceError> {
 }
 
 fn check_graph_production_and_execution(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let prefill = qwen_prefill_graph(&fixture.config, &fixture.identity, 2, false)?;
+    // kv_cache_enabled=true so the prefill graph's K/V edges are actually
+    // marked as cache outputs -- otherwise the decode graph below would
+    // claim 2 cached tokens that this graph never produced.
+    let prefill = qwen_prefill_graph(&fixture.config, &fixture.identity, 2, true)?;
     if prefill.validation.is_none() {
         return Err(E2eConformanceError::GraphValidationFailed {
             reason: "prefill graph was produced without validation".into(),
         });
     }
-    let decode = qwen_decode_graph(&fixture.config, &fixture.identity)?;
+    // The prefill graph above was built for a 2-token prompt with caching
+    // enabled, so the decode graph represents generating the 3rd token
+    // against those 2 cached ones.
+    let decode = qwen_decode_graph(&fixture.config, &fixture.identity, 2)?;
     if decode.validation.is_none() {
         return Err(E2eConformanceError::GraphValidationFailed {
             reason: "decode graph was produced without validation".into(),

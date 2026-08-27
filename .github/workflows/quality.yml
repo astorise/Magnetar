@@ -155,12 +155,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@v2
       - name: Run End-to-End Local Inference Conformance (no GPU required)
-        run: cargo test -p magnetar-runtime e2e_conformance -- --nocapture
+        run: cargo test --locked -p magnetar-runtime e2e_conformance -- --nocapture
 
   docs:
     name: quality / docs

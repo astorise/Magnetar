@@ -15,6 +15,10 @@ ignore = []
 # versions of a shared type are live at once.
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace-internal path dependencies (e.g. magnetar-cli -> magnetar-runtime)
+# have no meaningful external version to pin -- the path itself is the pin --
+# so they are exempt from the wildcard ban. Third-party deps still need one.
+allow-wildcard-paths = true
 skip = []
 
 [licenses]
