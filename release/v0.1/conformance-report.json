@@ -1,60 +1,112 @@
 {
-  "version": "v0.1",
+  "version": "v0.1.0",
   "date": "2026-08-27",
+  "release_candidate": "0.1.0",
+  "target": "repository-evidence-bundle",
+  "feature_set": [
+    "reference-cpu-baseline",
+    "runtime-registered-generation-executor",
+    "local-e2e-fixture",
+    "cli-boundary-placeholder-logits"
+  ],
   "suites": [
     {
       "name": "Formatting",
       "status": "pass",
+      "suite_version": "rustfmt workspace",
+      "target": "workspace",
+      "feature_set": ["all-targets-source-format"],
+      "redaction_status": "not-applicable",
       "command": "cargo fmt --all -- --check"
     },
     {
       "name": "Clippy",
       "status": "pass",
+      "suite_version": "cargo clippy workspace",
+      "target": "workspace all targets",
+      "feature_set": ["default-features"],
+      "redaction_status": "not-applicable",
       "command": "cargo clippy --workspace --all-targets -- -D warnings"
     },
     {
       "name": "Workspace tests",
       "status": "pass",
+      "suite_version": "cargo test workspace",
+      "target": "workspace",
+      "feature_set": ["default-features"],
+      "redaction_status": "redacted",
       "command": "cargo test --workspace"
     },
     {
       "name": "OpenSpec",
       "status": "pass",
+      "suite_version": "openspec repository specs",
+      "target": "48 repository specs",
+      "feature_set": ["spec-baseline"],
+      "redaction_status": "not-applicable",
       "command": "openspec validate --all"
     },
     {
       "name": "Reference CPU",
       "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "magnetar-runtime",
+      "feature_set": ["reference-cpu-baseline"],
+      "redaction_status": "redacted",
       "evidence": "Runtime and contract tests cover Reference CPU baseline semantics."
     },
     {
       "name": "First Operator scope",
       "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "magnetar-runtime",
+      "feature_set": ["first-operator-scope"],
+      "redaction_status": "redacted",
       "evidence": "Operator scope tests pass locally."
     },
     {
       "name": "Runtime contracts",
       "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "magnetar-runtime",
+      "feature_set": ["runtime-contracts", "session-contracts"],
+      "redaction_status": "redacted",
       "evidence": "Runtime unit and contract tests pass locally."
     },
     {
       "name": "Runtime Inference API",
       "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "magnetar-runtime",
+      "feature_set": ["runtime-registered-generation-executor"],
+      "redaction_status": "redacted",
       "evidence": "Generation is driven through a Runtime-registered executor; executor failures emit failure and StreamInterrupted observations."
     },
     {
       "name": "CLI boundary",
       "status": "pass-with-limitations",
+      "suite_version": "0.1.0",
+      "target": "magnetar-cli",
+      "feature_set": ["cli-boundary", "placeholder-logits"],
+      "redaction_status": "redacted",
       "evidence": "CLI boundary tests pass; placeholder logits no longer claim graph/kernel/provider execution evidence."
     },
     {
       "name": "E2E local inference",
       "status": "pass-with-limitations",
-      "evidence": "Functional E2E passes, but full KernelDispatch/ProviderExecution-backed logits remain deferred and tracked outside v0.1 baseline."
+      "suite_version": "0.1.0",
+      "target": "magnetar-runtime local Reference CPU fixture",
+      "feature_set": ["local-e2e-fixture", "reference-cpu-baseline"],
+      "redaction_status": "redacted",
+      "evidence": "Functional E2E passes. The success-path no-shortcut validation runs and reports the missing KernelDispatch/ProviderExecution-backed logits as a v0.1 limitation rather than as passed coverage."
     },
     {
       "name": "Redaction/security",
       "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "workspace",
+      "feature_set": ["redaction", "trust-boundary", "no-raw-data"],
+      "redaction_status": "redacted",
       "evidence": "Redaction, trust-boundary, and no-raw-data tests pass locally."
     }
   ],

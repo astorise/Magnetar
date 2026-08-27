@@ -1,4 +1,4 @@
-# v0.1 Release Evidence
+# v0.1.0 Release Evidence
 
 Date: 2026-08-27
 Status: pre-release evidence snapshot; not a stable release record.

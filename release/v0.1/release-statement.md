@@ -1,6 +1,6 @@
-# v0.1 Release Statement
+# v0.1.0 Release Statement
 
-Magnetar v0.1 is a CPU-local inference runtime baseline.
+Magnetar v0.1.0 is a CPU-local inference runtime baseline.
 
 Included baseline:
 

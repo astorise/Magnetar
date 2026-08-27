@@ -1,8 +1,8 @@
-# SHA-256 checksums for repository v0.1 evidence files.
+# SHA-256 checksums for repository v0.1.0 evidence files.
 # Regenerate after modifying any file in this directory.
-791869ea746e76b0e6f73bd3acc7f4128286e9e3149c7caeb81c71d8f4ccbeb9  release/v0.1/README.md
-39ff5831285379004abc4bcc02534234714654ca53e5934b51787e0ea12f5a55  release/v0.1/compatibility-matrix.json
-18ee296c4203d4fc6ccc73f8f63c4391aaf4c212758fcf58182c0eaf03d6334f  release/v0.1/conformance-report.json
-c6b4a121bfa0ca1461969c3bd34d7f3fe1a7041e906ec623e4d7d415724b9a82  release/v0.1/security-report.json
-13285bd0a3cbe316ca7cd4c7491b0260e7ccc47a03f6c8342a92fd3bac50fe76  release/v0.1/provenance.json
-07f85e1d581aff0c7e969e9cb8a4fffc93667cf23e28550bc743da4a19e32516  release/v0.1/release-statement.md
+db50bce995a45b302726a787a1554d25383ef3a852d293fa31e87917c43675be  release/v0.1/README.md
+8db3a1b3671c9a4f2820a07192c467173f62d12f0c4b0ffe540da42316a65cad  release/v0.1/compatibility-matrix.json
+105bf5075cb8e50eed7cc1c474feb475ddd7ba9808537b4fde0ba102f7b2bf9d  release/v0.1/conformance-report.json
+3e28d413312605e1aacd8588e56f27d03a21d22b0d9326816e9ba9eadf19b64b  release/v0.1/security-report.json
+962839c8cae617ae4e458913c3d92627f8d97394417da9cf192e89a47dd819f6  release/v0.1/provenance.json
+6ec6bb58c976aceb5783ecfd4ad762ff4d46629abed2d72747e07e59cf9012df  release/v0.1/release-statement.md

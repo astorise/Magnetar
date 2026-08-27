@@ -338,6 +338,32 @@ impl E2eTestResult {
     }
 }
 
+fn no_shortcut_success_path_result(fixture: &E2eFixture) -> E2eTestResult {
+    let outcome = match run_success_path(fixture) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return E2eTestResult::failed(
+                "success-path-no-shortcut-validated",
+                format!("{}: {}", error.code(), error.reason()),
+            );
+        }
+    };
+    match validate_e2e_no_shortcuts(
+        outcome.observer.observations(),
+        &reference_cpu_kernel_advertisements(),
+    ) {
+        Ok(()) => E2eTestResult::passed("success-path-no-shortcut-validated"),
+        Err(E2eConformanceError::BoundaryViolation { reason }) => E2eTestResult::skipped(
+            "success-path-no-shortcut-validated",
+            format!("v0.1 limitation: {reason}"),
+        ),
+        Err(error) => E2eTestResult::failed(
+            "success-path-no-shortcut-validated",
+            format!("{}: {}", error.code(), error.reason()),
+        ),
+    }
+}
+
 /// Machine-readable End-to-End Local Inference Conformance report. Never
 /// carries raw prompts, weights, tensor values, cache contents, handles, or
 /// memory pointers -- only redacted summaries and structured test results.
@@ -2187,6 +2213,7 @@ pub fn run_e2e_local_inference_conformance() -> E2eConformanceReport {
         "success-path",
         success_path_result,
     ));
+    report.record(no_shortcut_success_path_result(&fixture));
     report.record(E2eTestResult::from_result(
         "determinism",
         check_determinism(&fixture),
@@ -2674,6 +2701,18 @@ mod tests {
         let report = run_e2e_local_inference_conformance();
         check_report_metadata(&report).expect("report has required metadata");
         assert!(report.redacted);
+        let no_shortcut_success = report
+            .test_cases
+            .iter()
+            .find(|test| test.name == "success-path-no-shortcut-validated")
+            .expect("success-path no-shortcut limitation is reported");
+        assert_eq!(no_shortcut_success.status, E2eTestStatus::Skipped);
+        assert!(
+            no_shortcut_success
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| diagnostic.contains("v0.1 limitation"))
+        );
     }
 
     #[test]
