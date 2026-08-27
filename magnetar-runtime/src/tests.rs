@@ -9126,6 +9126,12 @@ fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
             .any(|observation| observation.kind
                 == InferenceApiObservationKind::ProviderUnavailable)
     );
+    assert!(
+        observer
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == InferenceApiObservationKind::StreamInterrupted)
+    );
 
     request.request_id = GenerationRequestId::new("gen-2").unwrap();
     let mut observer = InferenceApiObserver::new();

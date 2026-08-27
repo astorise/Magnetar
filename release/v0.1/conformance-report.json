@@ -93,12 +93,12 @@
     },
     {
       "name": "E2E local inference",
-      "status": "pass-with-limitations",
+      "status": "fail",
       "suite_version": "0.1.0",
       "target": "magnetar-runtime local Reference CPU fixture",
       "feature_set": ["local-e2e-fixture", "reference-cpu-baseline"],
       "redaction_status": "redacted",
-      "evidence": "Functional E2E passes. The success-path no-shortcut validation runs and reports the missing KernelDispatch/ProviderExecution-backed logits as a v0.1 limitation rather than as passed coverage."
+      "evidence": "Functional E2E fixture inference passes, but the required success-path no-shortcut validation fails because KernelDispatch/ProviderExecution-backed logits are not yet wired."
     },
     {
       "name": "Redaction/security",

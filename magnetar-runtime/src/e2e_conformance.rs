@@ -353,9 +353,9 @@ fn no_shortcut_success_path_result(fixture: &E2eFixture) -> E2eTestResult {
         &reference_cpu_kernel_advertisements(),
     ) {
         Ok(()) => E2eTestResult::passed("success-path-no-shortcut-validated"),
-        Err(E2eConformanceError::BoundaryViolation { reason }) => E2eTestResult::skipped(
+        Err(E2eConformanceError::BoundaryViolation { reason }) => E2eTestResult::failed(
             "success-path-no-shortcut-validated",
-            format!("v0.1 limitation: {reason}"),
+            format!("required no-shortcut validation failed: {reason}"),
         ),
         Err(error) => E2eTestResult::failed(
             "success-path-no-shortcut-validated",
@@ -2705,28 +2705,26 @@ mod tests {
             .test_cases
             .iter()
             .find(|test| test.name == "success-path-no-shortcut-validated")
-            .expect("success-path no-shortcut limitation is reported");
-        assert_eq!(no_shortcut_success.status, E2eTestStatus::Skipped);
+            .expect("success-path no-shortcut failure is reported");
+        assert_eq!(no_shortcut_success.status, E2eTestStatus::Failed);
         assert!(
-            no_shortcut_success
-                .diagnostic
-                .as_deref()
-                .is_some_and(|diagnostic| diagnostic.contains("v0.1 limitation"))
+            no_shortcut_success.diagnostic.as_deref().is_some_and(
+                |diagnostic| diagnostic.contains("required no-shortcut validation failed")
+            )
         );
+        assert!(!report.is_conformant());
     }
 
     #[test]
-    fn e2e_ci_can_run_without_gpu_and_only_skips_optional_cases() {
+    fn e2e_ci_can_run_without_gpu_and_reports_only_expected_required_failure() {
         let report = run_e2e_local_inference_conformance();
-        for test in &report.test_cases {
-            assert_ne!(
-                test.status,
-                E2eTestStatus::Failed,
-                "unexpected failure: {} ({:?})",
-                test.name,
-                test.diagnostic
-            );
-        }
+        let failed: Vec<_> = report
+            .test_cases
+            .iter()
+            .filter(|test| test.status == E2eTestStatus::Failed)
+            .map(|test| test.name.as_str())
+            .collect();
+        assert_eq!(failed, ["success-path-no-shortcut-validated"]);
     }
 
     #[test]

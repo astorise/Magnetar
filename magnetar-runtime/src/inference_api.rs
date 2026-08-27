@@ -1059,6 +1059,11 @@ pub fn run_generation_loop(
                 "provider unavailable for generation",
                 correlation_id.clone(),
             );
+            observer.observe(
+                InferenceApiObservationKind::StreamInterrupted,
+                "stream interrupted because no Runtime generation executor is registered",
+                correlation_id.clone(),
+            );
             return Err(error);
         }
     };

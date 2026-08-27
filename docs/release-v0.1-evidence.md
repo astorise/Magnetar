@@ -34,7 +34,7 @@ Status: pre-release evidence snapshot; not a stable release record.
 | First Operator scope | pass | Included in runtime unit and contract tests. |
 | Runtime Inference API | pass | Boundary tests pass; normal generation uses a Runtime-registered executor rather than caller-supplied logits. |
 | CLI boundary | pass-with-limitations | CLI harness tests pass; production CLI UX is deferred. |
-| E2E local inference | pass-with-limitations | Fixture-backed E2E emits only evidence backed by executed steps. Full KernelDispatch/ProviderExecution-backed logits are deferred from the v0.1 baseline. |
+| E2E local inference | fail | Fixture-backed functional inference passes, but required success-path no-shortcut validation fails because full KernelDispatch/ProviderExecution-backed logits are not yet wired. |
 | Redaction/security | pass | Redaction and trust-boundary tests pass locally. |
 
 ## Security Evidence
