@@ -6,4 +6,4 @@ license = "MIT"
 description = "First-party client/workspace/agent runtime around Magnetar inference (magnetar-cli inference boundary)."
 
 [dependencies]
-magnetar-runtime = { path = "../magnetar-runtime" }
+magnetar-runtime = { path = "../magnetar-runtime", version = "0.1.0" }
