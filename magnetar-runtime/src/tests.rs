@@ -5834,6 +5834,39 @@ fn generation_request() -> GenerationRequest {
     }
 }
 
+#[derive(Clone)]
+struct TestGenerationExecutor {
+    vocabulary_size: usize,
+    evidence: RuntimeGenerationExecutionEvidence,
+}
+
+impl RuntimeGenerationExecutor for TestGenerationExecutor {
+    fn execute_generation_step(
+        &self,
+        _runtime: &Runtime,
+        _request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+        let mut logits = vec![0.0f32; self.vocabulary_size];
+        logits[(11 + generated_tokens.len()) % self.vocabulary_size] = 10.0;
+        Ok(RuntimeGenerationStep::new(logits, self.evidence))
+    }
+}
+
+fn runtime_with_generation_executor(
+    vocabulary_size: usize,
+    evidence: RuntimeGenerationExecutionEvidence,
+) -> Runtime {
+    Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .generation_executor(Arc::new(TestGenerationExecutor {
+            vocabulary_size,
+            evidence,
+        }))
+        .build()
+        .unwrap()
+}
+
 fn generation_runtime_tokenizer() -> RuntimeTokenizer<FixtureTokenizer> {
     let metadata = generation_tokenizer_metadata();
     let digest = metadata.digest.clone();
@@ -8244,7 +8277,12 @@ fn inference_api_tokenize_prompt_input_observed_emits_tokenized_and_failed() {
 
 #[test]
 fn inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contracts() {
-    let mut runtime = Runtime::builder().build().unwrap();
+    let metadata = generation_tokenizer_metadata();
+    let vocabulary_size = metadata.vocabulary_size as usize;
+    let mut runtime = runtime_with_generation_executor(
+        vocabulary_size,
+        RuntimeGenerationExecutionEvidence::complete(),
+    );
     let mut request = session_creation_request();
     request.allowed_capabilities.insert("generation".into());
     let session = create_one_shot_session(&mut runtime, request).unwrap();
@@ -8257,8 +8295,6 @@ fn inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contrac
     )
     .unwrap();
 
-    let metadata = generation_tokenizer_metadata();
-    let vocabulary_size = metadata.vocabulary_size as usize;
     let generation_request = build_generation_request(
         GenerationRequestId::new("one-shot-1").unwrap(),
         Some(session.clone()),
@@ -8292,11 +8328,8 @@ fn inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contrac
     let result = run_generation_loop(
         &runtime,
         &prepared,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated| vec![0.0f32; vocabulary_size],
         |_generated| false,
         &mut observer,
     )
@@ -8754,25 +8787,19 @@ fn inference_api_run_generation_loop_emits_full_streaming_lifecycle_and_complete
     request.max_new_tokens = 2;
     let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
 
-    let runtime = Runtime::builder().build().unwrap();
+    let runtime = runtime_with_generation_executor(
+        vocabulary_size,
+        RuntimeGenerationExecutionEvidence::complete(),
+    );
     let mut observer = InferenceApiObserver::new();
-    let mut step = 0usize;
 
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary {
             kv_cache_hit: Some(true),
             prefix_cache_hit: Some(false),
-        },
-        |_generated| {
-            step += 1;
-            let mut logits = vec![0.0f32; vocabulary_size];
-            logits[(10 + step) % vocabulary_size] = 10.0;
-            logits
         },
         |_generated| false,
         &mut observer,
@@ -8815,17 +8842,17 @@ fn inference_api_run_generation_loop_cancels_during_decode() {
     request.max_new_tokens = 5;
     let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
 
-    let runtime = Runtime::builder().build().unwrap();
+    let runtime = runtime_with_generation_executor(
+        vocabulary_size,
+        RuntimeGenerationExecutionEvidence::complete(),
+    );
     let mut observer = InferenceApiObserver::new();
 
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated| vec![0.0f32; vocabulary_size],
         |generated| !generated.is_empty(),
         &mut observer,
     )
@@ -8848,17 +8875,13 @@ fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
     let mut request = generation_request();
     request.parameters = GenerationParameters::greedy();
     request.stop_conditions = StopConditions::default();
-    let runtime = Runtime::builder().build().unwrap();
-
     let mut observer = InferenceApiObserver::new();
+    let runtime = Runtime::builder().build().unwrap();
     let error = run_generation_loop(
         &runtime,
         &request,
-        false,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated| Vec::new(),
         |_generated| false,
         &mut observer,
     )
@@ -8877,14 +8900,17 @@ fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
 
     request.request_id = GenerationRequestId::new("gen-2").unwrap();
     let mut observer = InferenceApiObserver::new();
+    let mut missing_kernel_evidence = RuntimeGenerationExecutionEvidence::complete();
+    missing_kernel_evidence.kernel_selected = false;
+    let runtime = runtime_with_generation_executor(
+        request.tokenizer.metadata.vocabulary_size as usize,
+        missing_kernel_evidence,
+    );
     let error = run_generation_loop(
         &runtime,
         &request,
-        true,
-        false,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated| Vec::new(),
         |_generated| false,
         &mut observer,
     )

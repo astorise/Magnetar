@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{ProviderError, WitInterface};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,

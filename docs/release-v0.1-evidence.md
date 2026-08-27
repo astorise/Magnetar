@@ -8,7 +8,7 @@ Status: pre-release evidence snapshot; not a stable release record.
 | Dimension | Status | Notes |
 | --- | --- | --- |
 | Rust public API | stable-for-v0.1-baseline | Contract surface compiles and is covered by unit/contract tests. |
-| Runtime Inference API | preview | Boundary exists; Runtime-owned full execution remains incomplete. |
+| Runtime Inference API | stable-for-v0.1-baseline | Normal generation uses a Runtime-registered executor rather than caller-supplied logits. |
 | WIT packages | stable-for-v0.1-baseline | WIT files are present under `magnetar-runtime/wit`. |
 | Provider ABI | unstable | Concrete ABI stabilization is deferred. |
 | Model Artifact metadata | preview | Contracts exist; production parsing/source support is deferred. |
@@ -30,9 +30,9 @@ Status: pre-release evidence snapshot; not a stable release record.
 | Contract tests | pass | `cargo test --workspace` |
 | Reference CPU | pass | Included in runtime unit and contract tests. |
 | First Operator scope | pass | Included in runtime unit and contract tests. |
-| Runtime Inference API | pass-with-limitations | Boundary tests pass; full Runtime-owned execution is still a blocker. |
+| Runtime Inference API | pass | Boundary tests pass; normal generation uses a Runtime-registered executor rather than caller-supplied logits. |
 | CLI boundary | pass-with-limitations | CLI harness tests pass; production CLI UX is deferred. |
-| E2E local inference | pass-with-limitations | Fixture-backed E2E passes; issue #27 remains open for no-shortcut proof. |
+| E2E local inference | pass-with-limitations | Fixture-backed E2E emits execution evidence for graph validation, kernel selection, kernel dispatch, Provider execution, and Runtime-owned logits; #27 remains open until the fixture forward shortcut is removed from the success path. |
 | Redaction/security | pass | Redaction and trust-boundary tests pass locally. |
 
 ## Security Evidence
@@ -56,16 +56,19 @@ recorded by CI.
 
 ## Known Blocking Issues
 
-- #26: normal generation still accepts caller-provided execution/logits inputs.
-- #27: E2E success path still includes direct fixture forward helpers.
 - #28: incremental decode/KV-cache execution remains deferred unless v0.1 marks
   it preview/deferred.
+- #27: E2E success path now enters Runtime generation and validates execution
+  observations, but still uses fixture forward helpers inside the Runtime
+  executor.
 - #30: final release artifacts must be generated from the final release commit.
 
 ## Remaining Non-Release Issues
 
-- #23: crate facade and `use crate::*` imports remain a structural
-  maintainability refactor.
+- #23: crate facade re-exports are reduced to per-module exports; several
+  foundational modules now use explicit imports. Some large implementation
+  modules still use `use crate::*` and should be cleaned up in follow-up
+  mechanical passes.
 - #4: Renovate dependency dashboard remains informational; it currently reports
   no open or pending dependency branches.
 

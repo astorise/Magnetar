@@ -77,6 +77,7 @@ impl ExecutionContext {
 pub struct RuntimeBuilder {
     config: RuntimeConfig,
     providers: Vec<Arc<dyn Provider>>,
+    generation_executor: Option<SharedRuntimeGenerationExecutor>,
 }
 impl RuntimeBuilder {
     pub fn new() -> Self {
@@ -88,6 +89,10 @@ impl RuntimeBuilder {
     }
     pub fn register_provider(mut self, x: Arc<dyn Provider>) -> Self {
         self.providers.push(x);
+        self
+    }
+    pub fn generation_executor(mut self, x: Arc<dyn RuntimeGenerationExecutor>) -> Self {
+        self.generation_executor = Some(SharedRuntimeGenerationExecutor::new(x));
         self
     }
     pub fn build(self) -> Result<Runtime, ProviderError> {
@@ -116,6 +121,7 @@ impl RuntimeBuilder {
             prefix_caches: PrefixCacheManager::new(),
             kernel_registry,
             providers,
+            generation_executor: self.generation_executor,
             sessions: BTreeMap::new(),
             session_observations: Vec::new(),
             initialized: true,
@@ -132,6 +138,7 @@ pub struct Runtime {
     prefix_caches: PrefixCacheManager,
     kernel_registry: KernelRegistry,
     providers: ProviderLoader,
+    generation_executor: Option<SharedRuntimeGenerationExecutor>,
     sessions: BTreeMap<InferenceSessionId, InferenceSession>,
     session_observations: Vec<SessionObservation>,
     initialized: bool,
@@ -190,6 +197,9 @@ impl Runtime {
     }
     pub fn providers(&self) -> &ProviderLoader {
         &self.providers
+    }
+    pub fn generation_executor(&self) -> Option<&SharedRuntimeGenerationExecutor> {
+        self.generation_executor.as_ref()
     }
     pub fn sessions(&self) -> impl Iterator<Item = &InferenceSession> {
         self.sessions.values()

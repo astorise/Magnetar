@@ -24,7 +24,7 @@
 //! Memory Manager, or Provider contracts.
 
 use crate::*;
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
 // ---------------------------------------------------------------------
 // Inference-only scope boundary
@@ -854,6 +854,108 @@ pub struct CacheUsageSummary {
     pub prefix_cache_hit: Option<bool>,
 }
 
+/// Runtime-produced evidence that one generation step used the architectural
+/// execution path instead of a caller-owned logits shortcut.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeGenerationExecutionEvidence {
+    pub model_instance_ready: bool,
+    pub graph_validated: bool,
+    pub kernel_selected: bool,
+    pub kernel_dispatched: bool,
+    pub provider_executed: bool,
+    pub tensor_resource_used: bool,
+}
+
+impl RuntimeGenerationExecutionEvidence {
+    pub const fn complete() -> Self {
+        Self {
+            model_instance_ready: true,
+            graph_validated: true,
+            kernel_selected: true,
+            kernel_dispatched: true,
+            provider_executed: true,
+            tensor_resource_used: true,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), InferenceApiError> {
+        if !self.model_instance_ready {
+            return Err(InferenceApiError::ModelInstanceNotReady {
+                reason: "runtime execution did not prove model instance readiness".into(),
+            });
+        }
+        if !self.graph_validated {
+            return Err(InferenceApiError::GraphPlanningFailed {
+                reason: "runtime execution did not validate the execution graph".into(),
+            });
+        }
+        if !self.kernel_selected {
+            return Err(InferenceApiError::KernelUnavailable {
+                reason: "runtime execution did not select a kernel".into(),
+            });
+        }
+        if !self.kernel_dispatched {
+            return Err(InferenceApiError::KernelUnavailable {
+                reason: "runtime execution did not dispatch a kernel".into(),
+            });
+        }
+        if !self.provider_executed {
+            return Err(InferenceApiError::ProviderUnavailable {
+                reason: "runtime execution did not execute a Provider".into(),
+            });
+        }
+        if !self.tensor_resource_used {
+            return Err(InferenceApiError::GenerationFailed {
+                reason: "runtime execution did not produce Runtime-owned tensor logits".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeGenerationStep {
+    pub logits: Vec<f32>,
+    pub evidence: RuntimeGenerationExecutionEvidence,
+}
+
+impl RuntimeGenerationStep {
+    pub fn new(logits: Vec<f32>, evidence: RuntimeGenerationExecutionEvidence) -> Self {
+        Self { logits, evidence }
+    }
+}
+
+/// Runtime-owned execution hook used by the Runtime Inference API to produce
+/// logits. Callers configure this when constructing a Runtime; normal
+/// generation does not accept per-request callbacks or readiness booleans.
+pub trait RuntimeGenerationExecutor: Send + Sync {
+    fn execute_generation_step(
+        &self,
+        runtime: &Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+    ) -> Result<RuntimeGenerationStep, InferenceApiError>;
+}
+
+#[derive(Clone)]
+pub struct SharedRuntimeGenerationExecutor(Arc<dyn RuntimeGenerationExecutor>);
+
+impl SharedRuntimeGenerationExecutor {
+    pub fn new(executor: Arc<dyn RuntimeGenerationExecutor>) -> Self {
+        Self(executor)
+    }
+
+    pub fn execute_generation_step(
+        &self,
+        runtime: &Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+        self.0
+            .execute_generation_step(runtime, request, generated_tokens)
+    }
+}
+
 /// Generation result exposed through the Runtime Inference API. Wraps the
 /// existing [`GenerationOutput`] contract with decoded text (where
 /// requested), Model Instance metadata, cache usage, redaction status, and
@@ -901,22 +1003,15 @@ impl GenerationResult {
     }
 }
 
-/// Drives a generation request end-to-end through the Generation Contract
-/// (memory admission, prefill, per-token decode via the Sampling Contract,
-/// stop-condition evaluation), emitting the full Streaming API observation
-/// sequence. Runtime never computes logits itself: `next_logits` is the
-/// explicit Provider/Kernel execution boundary -- the loop orchestrates
-/// prefill/decode/stop/Sampling but delegates raw tensor computation to the
-/// caller, matching the rest of this crate's Runtime/Provider separation.
-#[allow(clippy::too_many_arguments)]
+/// Drives a generation request through the Runtime-owned generation execution
+/// boundary, then Sampling and streaming observation emission. Logits come from
+/// the [`RuntimeGenerationExecutor`] attached to the [`Runtime`], so callers do
+/// not provide readiness booleans or executable logits callbacks per request.
 pub fn run_generation_loop(
     runtime: &Runtime,
     request: &GenerationRequest,
-    provider_ready: bool,
-    kernel_ready: bool,
     sampling_policy: SamplingPolicy,
     cache_usage: CacheUsageSummary,
-    mut next_logits: impl FnMut(&[TokenId]) -> Vec<f32>,
     mut should_cancel: impl FnMut(&[TokenId]) -> bool,
     observer: &mut InferenceApiObserver,
 ) -> Result<GenerationResult, InferenceApiError> {
@@ -932,17 +1027,25 @@ pub fn run_generation_loop(
         correlation_id.clone(),
     );
 
-    if !provider_ready {
-        observer.observe(
-            InferenceApiObservationKind::ProviderUnavailable,
-            "provider unavailable for generation",
-            correlation_id.clone(),
-        );
-        return Err(InferenceApiError::ProviderUnavailable {
-            reason: "provider unavailable for generation".into(),
-        });
-    }
-    if !kernel_ready {
+    let executor =
+        runtime
+            .generation_executor()
+            .ok_or_else(|| InferenceApiError::ProviderUnavailable {
+                reason: "no Runtime generation executor is registered".into(),
+            });
+    let executor = match executor {
+        Ok(executor) => executor,
+        Err(error) => {
+            observer.observe(
+                InferenceApiObservationKind::ProviderUnavailable,
+                "provider unavailable for generation",
+                correlation_id.clone(),
+            );
+            return Err(error);
+        }
+    };
+
+    if runtime.kernel_registry().entries().next().is_none() {
         observer.observe(
             InferenceApiObservationKind::KernelUnavailable,
             "kernel unavailable for generation",
@@ -1023,9 +1126,58 @@ pub fn run_generation_loop(
             format!("decode step {}", generated.len()),
             correlation_id.clone(),
         );
-        let logits = next_logits(&generated);
-        let (_, step) =
-            decode_step_from_sampling(request, &generated, logits, sampling_policy.clone())?;
+        let runtime_step = executor.execute_generation_step(runtime, request, &generated)?;
+        if let Err(error) = runtime_step.evidence.validate() {
+            match error {
+                InferenceApiError::ProviderUnavailable { .. } => observer.observe(
+                    InferenceApiObservationKind::ProviderUnavailable,
+                    "provider unavailable for generation",
+                    correlation_id.clone(),
+                ),
+                InferenceApiError::KernelUnavailable { .. } => observer.observe(
+                    InferenceApiObservationKind::KernelUnavailable,
+                    "kernel unavailable for generation",
+                    correlation_id.clone(),
+                ),
+                _ => observer.observe(
+                    InferenceApiObservationKind::GenerationFailed,
+                    "runtime execution evidence incomplete",
+                    correlation_id.clone(),
+                ),
+            }
+            return Err(error);
+        }
+        observer.observe(
+            InferenceApiObservationKind::ExecutionGraphValidated,
+            "execution graph validated",
+            correlation_id.clone(),
+        );
+        observer.observe(
+            InferenceApiObservationKind::KernelSelected,
+            "kernel selected",
+            correlation_id.clone(),
+        );
+        observer.observe(
+            InferenceApiObservationKind::KernelDispatched,
+            "kernel dispatched",
+            correlation_id.clone(),
+        );
+        observer.observe(
+            InferenceApiObservationKind::ProviderExecuted,
+            "provider executed",
+            correlation_id.clone(),
+        );
+        observer.observe(
+            InferenceApiObservationKind::TensorLogitsProduced,
+            "Runtime-owned tensor logits produced",
+            correlation_id.clone(),
+        );
+        let (_, step) = decode_step_from_sampling(
+            request,
+            &generated,
+            runtime_step.logits,
+            sampling_policy.clone(),
+        )?;
         generated.push(step.token_id);
         observer.observe(
             InferenceApiObservationKind::TokenGenerated,
@@ -1560,6 +1712,11 @@ pub enum InferenceApiObservationKind {
     MemoryAdmissionFailed,
     ProviderUnavailable,
     KernelUnavailable,
+    ExecutionGraphValidated,
+    KernelSelected,
+    KernelDispatched,
+    ProviderExecuted,
+    TensorLogitsProduced,
     StreamOpened,
     StreamClosed,
     StreamInterrupted,

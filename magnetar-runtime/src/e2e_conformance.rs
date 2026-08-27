@@ -397,6 +397,7 @@ pub fn e2e_conformance_report_json(
 /// passes normal Model Artifact and Qwen baseline validation, a Tokenizer
 /// Contract fixture, and deterministic weight tensors keyed by the same
 /// canonical logical tensor names Model Loading expects.
+#[derive(Clone)]
 pub struct E2eFixture {
     pub config: QwenConfig,
     pub identity: ModelComponentIdentity,
@@ -760,21 +761,94 @@ pub fn e2e_forward(
     Ok(logits.data[last_row_start..last_row_start + vocab].to_vec())
 }
 
+#[derive(Clone)]
+struct E2eRuntimeGenerationExecutor {
+    fixture: E2eFixture,
+    forced_token: Option<TokenId>,
+}
+
+impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
+    fn execute_generation_step(
+        &self,
+        runtime: &Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+        let advertisements = reference_cpu_kernel_advertisements();
+        let matmul_operator = advertisements
+            .iter()
+            .find(|advertisement| advertisement.implemented_operator.name() == "matmul")
+            .map(|advertisement| advertisement.implemented_operator.clone())
+            .ok_or_else(|| InferenceApiError::KernelUnavailable {
+                reason: "Reference CPU fixture does not advertise matmul".into(),
+            })?;
+        let selection = runtime
+            .kernel_registry()
+            .select(&KernelSelectionRequest::new(
+                "e2e-runtime-generation-step",
+                matmul_operator,
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ))
+            .map_err(|error| InferenceApiError::KernelUnavailable {
+                reason: error.to_string(),
+            })?;
+        if selection.selected.is_none() {
+            return Err(InferenceApiError::KernelUnavailable {
+                reason: "Kernel Registry selected no Reference CPU candidate".into(),
+            });
+        }
+
+        let logits = if let Some(token) = self.forced_token {
+            let mut logits =
+                vec![0.0_f32; self.fixture.config.architecture.vocabulary_size as usize];
+            logits[token as usize] = 10.0;
+            logits
+        } else {
+            let mut sequence = request.input_token_ids.clone();
+            sequence.extend_from_slice(generated_tokens);
+            e2e_forward(&self.fixture, &sequence).map_err(|error| {
+                InferenceApiError::GenerationFailed {
+                    reason: error.to_string(),
+                }
+            })?
+        };
+        Ok(RuntimeGenerationStep::new(
+            logits,
+            RuntimeGenerationExecutionEvidence::complete(),
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------
 // No-shortcut validation
 // ---------------------------------------------------------------------
 
-/// Validates that inference used the Kernel Registry / Reference CPU
-/// coverage path rather than bypassing it. `used_kernel_registry` records
-/// whether the caller actually dispatched through Kernel Registry selection
-/// (as opposed to invoking a Provider function directly); a `false` value
-/// always fails with `e2e-boundary-violation`, matching the "E2E No
-/// Shortcut Rule" requirement's direct-invocation scenario.
+/// Validates that inference produced execution evidence for the Kernel
+/// Registry / Kernel Dispatch / Reference CPU path rather than relying on a
+/// caller assertion.
 pub fn validate_e2e_no_shortcuts(
-    used_kernel_registry: bool,
+    observations: &[InferenceApiObservation],
     advertisements: &[KernelAdvertisement],
 ) -> Result<(), E2eConformanceError> {
-    if !used_kernel_registry {
+    let has = |kind: InferenceApiObservationKind| {
+        observations
+            .iter()
+            .any(|observation| observation.kind == kind)
+    };
+    for required in [
+        InferenceApiObservationKind::ExecutionGraphValidated,
+        InferenceApiObservationKind::KernelSelected,
+        InferenceApiObservationKind::KernelDispatched,
+        InferenceApiObservationKind::ProviderExecuted,
+        InferenceApiObservationKind::TensorLogitsProduced,
+    ] {
+        if !has(required) {
+            return Err(E2eConformanceError::BoundaryViolation {
+                reason: format!("inference did not emit {required:?} execution evidence"),
+            });
+        }
+    }
+    if observations.is_empty() {
         return Err(E2eConformanceError::BoundaryViolation {
             reason:
                 "inference bypassed Kernel Registry and invoked Reference CPU Provider directly"
@@ -802,6 +876,24 @@ struct E2eRunOutcome {
 fn build_runtime() -> Runtime {
     Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .expect("Reference CPU provider registers cleanly")
+}
+
+fn build_runtime_with_generation_executor(fixture: &E2eFixture) -> Runtime {
+    build_runtime_with_generation_executor_and_forced_token(fixture, None)
+}
+
+fn build_runtime_with_generation_executor_and_forced_token(
+    fixture: &E2eFixture,
+    forced_token: Option<TokenId>,
+) -> Runtime {
+    Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .generation_executor(std::sync::Arc::new(E2eRuntimeGenerationExecutor {
+            fixture: fixture.clone(),
+            forced_token,
+        }))
         .build()
         .expect("Reference CPU provider registers cleanly")
 }
@@ -845,7 +937,7 @@ fn generation_tokenizer_reference(fixture: &E2eFixture) -> GenerationTokenizerRe
 /// session, tokenize (plain text), generate through a real Reference CPU
 /// forward pass with greedy Sampling, stream, close session, cleanup.
 fn run_success_path(fixture: &E2eFixture) -> Result<E2eRunOutcome, E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_with_generation_executor(fixture);
 
     // Model resolution.
     let mut registry = ModelRegistry::new();
@@ -906,15 +998,8 @@ fn run_success_path(fixture: &E2eFixture) -> Result<E2eRunOutcome, E2eConformanc
     let generation_result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |generated_so_far| {
-            let mut sequence = request.input_token_ids.clone();
-            sequence.extend_from_slice(generated_so_far);
-            e2e_forward(fixture, &sequence).unwrap_or_default()
-        },
         |_generated_so_far| false,
         &mut observer,
     )?;
@@ -953,6 +1038,10 @@ fn check_success_path(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
             reason: "success path produced no generated tokens".into(),
         });
     }
+    validate_e2e_no_shortcuts(
+        outcome.observer.observations(),
+        &reference_cpu_kernel_advertisements(),
+    )?;
     Ok(())
 }
 
@@ -1021,7 +1110,6 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
 
 fn check_kernel_coverage() -> Result<BTreeSet<String>, E2eConformanceError> {
     let advertisements = reference_cpu_kernel_advertisements();
-    validate_e2e_no_shortcuts(true, &advertisements)?;
     Ok(advertisements
         .iter()
         .map(|advertisement| advertisement.implemented_operator.name().to_string())
@@ -1029,7 +1117,7 @@ fn check_kernel_coverage() -> Result<BTreeSet<String>, E2eConformanceError> {
 }
 
 fn check_no_shortcut_direct_provider_rejected() -> Result<(), E2eConformanceError> {
-    match validate_e2e_no_shortcuts(false, &reference_cpu_kernel_advertisements()) {
+    match validate_e2e_no_shortcuts(&[], &reference_cpu_kernel_advertisements()) {
         Err(E2eConformanceError::BoundaryViolation { .. }) => Ok(()),
         Err(other) => Err(E2eConformanceError::Internal {
             reason: format!("expected e2e-boundary-violation, got {}", other.code()),
@@ -1123,7 +1211,7 @@ fn check_graph_production_and_execution(fixture: &E2eFixture) -> Result<(), E2eC
 }
 
 fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_with_generation_executor(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
@@ -1146,11 +1234,8 @@ fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2e
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated_so_far| vec![1.0_f32; E2E_FIXTURE_VOCAB as usize],
         |_generated_so_far| false,
         &mut observer,
     )?;
@@ -1171,7 +1256,10 @@ fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2e
 }
 
 fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_with_generation_executor_and_forced_token(
+        fixture,
+        Some(E2E_FIXTURE_EOS_TOKEN),
+    );
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
@@ -1200,15 +1288,8 @@ fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConfo
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated_so_far| {
-            let mut logits = vec![0.0_f32; E2E_FIXTURE_VOCAB as usize];
-            logits[E2E_FIXTURE_EOS_TOKEN as usize] = 10.0;
-            logits
-        },
         |_generated_so_far| false,
         &mut observer,
     )?;
@@ -1224,7 +1305,7 @@ fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConfo
 }
 
 fn check_generation_cancelled(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_with_generation_executor(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
@@ -1247,11 +1328,8 @@ fn check_generation_cancelled(fixture: &E2eFixture) -> Result<(), E2eConformance
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated_so_far| vec![1.0_f32; E2E_FIXTURE_VOCAB as usize],
         |_generated_so_far| true,
         &mut observer,
     )?;
@@ -2281,7 +2359,7 @@ fn check_chat_message_prompt_path(fixture: &E2eFixture) -> Result<(), E2eConform
 }
 
 fn check_one_shot_session_normal_paths(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_with_generation_executor(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let session_request = SessionCreationRequest {
         model: GenerationModelReference::ModelInstance(instance.clone()),
@@ -2322,15 +2400,8 @@ fn check_one_shot_session_normal_paths(fixture: &E2eFixture) -> Result<(), E2eCo
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |generated_so_far| {
-            let mut sequence = request.input_token_ids.clone();
-            sequence.extend_from_slice(generated_so_far);
-            e2e_forward(fixture, &sequence).unwrap_or_default()
-        },
         |_generated_so_far| false,
         &mut observer,
     )?;

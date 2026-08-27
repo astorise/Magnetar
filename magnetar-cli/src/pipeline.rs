@@ -20,15 +20,19 @@ use magnetar_runtime::{
     GenerationParameters, GenerationRequestId, GenerationTokenizerReference, InferenceApiError,
     InferenceApiObserver, InferenceSessionId, MODEL_ARTIFACT_SCHEMA_VERSION, ModelArchitecture,
     ModelArtifactId, ModelArtifactKind, ModelManifest, ModelName, ModelRef, ModelRevision,
-    PromptInput, Runtime, SamplingPolicy, SessionCreationRequest, SessionMemoryBudget,
-    SessionPolicy, SpecialToken, SpecialTokenKind, StopConditions, StreamingMode, TokenId,
-    TokenIdRange, TokenizationRequest, TokenizerArtifactId, TokenizerFamily, TokenizerId,
-    TokenizerMetadata, TokenizerRevision, cancel_inference_session, close_inference_session,
-    create_inference_session, create_one_shot_session, decode_tokens, prepare_generation,
-    submit_generation, tokenize_prompt_input,
+    PromptInput, ReferenceCpuProvider, Runtime, RuntimeGenerationExecutionEvidence,
+    RuntimeGenerationExecutor, RuntimeGenerationStep, SamplingPolicy, SessionCreationRequest,
+    SessionMemoryBudget, SessionPolicy, SpecialToken, SpecialTokenKind, StopConditions,
+    StreamingMode, TokenId, TokenIdRange, TokenizationRequest, TokenizerArtifactId,
+    TokenizerFamily, TokenizerId, TokenizerMetadata, TokenizerRevision, cancel_inference_session,
+    close_inference_session, create_inference_session, create_one_shot_session, decode_tokens,
+    prepare_generation, submit_generation, tokenize_prompt_input,
 };
 use magnetar_runtime::{ModelDigest, build_generation_request, run_generation_loop};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 /// Maximum number of decode steps a one-shot `magnetar run`/`chat` turn
 /// requests. Kept small: with placeholder all-zero logits every decode step
@@ -130,6 +134,37 @@ fn placeholder_logits(vocabulary_size: usize) -> Vec<f32> {
     logits
 }
 
+#[derive(Clone)]
+struct CliPlaceholderGenerationExecutor {
+    vocabulary_size: usize,
+}
+
+impl RuntimeGenerationExecutor for CliPlaceholderGenerationExecutor {
+    fn execute_generation_step(
+        &self,
+        _runtime: &Runtime,
+        _request: &magnetar_runtime::GenerationRequest,
+        _generated_tokens: &[TokenId],
+    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+        Ok(RuntimeGenerationStep::new(
+            placeholder_logits(self.vocabulary_size),
+            RuntimeGenerationExecutionEvidence::complete(),
+        ))
+    }
+}
+
+fn build_cli_runtime() -> Result<Runtime, CliBoundaryError> {
+    Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .generation_executor(Arc::new(CliPlaceholderGenerationExecutor {
+            vocabulary_size: fixture_tokenizer_metadata().vocabulary_size as usize,
+        }))
+        .build()
+        .map_err(|error| CliBoundaryError::CliRuntimeUnavailable {
+            reason: error.to_string(),
+        })
+}
+
 /// Builds a [`SessionCreationRequest`] against the fixture tokenizer and a
 /// `LoadedModelContext` reference naming the caller-supplied [`ModelRef`].
 /// No real model is loaded: `magnetar-runtime` has no Provider-backed model
@@ -189,10 +224,10 @@ impl ChatTemplateFormatter for CliChatTemplateFormatter {
 /// through `chat_formatter` first when it is [`PromptInput::ChatMessages`]),
 /// build and prepare a generation request against `session`, admit it into
 /// a fresh Continuous Batch, drive [`run_generation_loop`] to completion
-/// with [`placeholder_logits`] while recording every observation into
-/// `observer`, and decode the resulting token IDs back to text. Every step
-/// calls the real Runtime Inference API function of the same name; nothing
-/// here re-implements tokenization or generation.
+/// through the Runtime-registered placeholder executor while recording every
+/// observation into `observer`, and decode the resulting token IDs back to
+/// text. Every step calls the real Runtime Inference API function of the same
+/// name; nothing here re-implements tokenization or generation.
 fn run_pipeline_turn(
     runtime: &mut Runtime,
     session: &InferenceSessionId,
@@ -202,7 +237,6 @@ fn run_pipeline_turn(
     observer: &mut InferenceApiObserver,
 ) -> Result<String, CliBoundaryError> {
     let metadata = fixture_tokenizer_metadata();
-    let vocabulary_size = metadata.vocabulary_size as usize;
     let tokenizer = FixtureTokenizer::new(metadata.clone());
 
     let tokenized = tokenize_prompt_input(
@@ -251,11 +285,8 @@ fn run_pipeline_turn(
     let result = run_generation_loop(
         runtime,
         &prepared,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated: &[TokenId]| placeholder_logits(vocabulary_size),
         |_generated: &[TokenId]| false,
         observer,
     )?;
@@ -283,12 +314,7 @@ pub fn one_shot(
     model_ref: &ModelRef,
     prompt: &str,
 ) -> Result<(String, InferenceApiObserver), CliBoundaryError> {
-    let mut runtime =
-        Runtime::builder()
-            .build()
-            .map_err(|error| CliBoundaryError::CliRuntimeUnavailable {
-                reason: error.to_string(),
-            })?;
+    let mut runtime = build_cli_runtime()?;
 
     let session = create_one_shot_session(&mut runtime, session_creation_request(model_ref))?;
 
@@ -328,11 +354,7 @@ pub struct ChatSession {
 
 impl ChatSession {
     pub fn open(model_ref: &ModelRef) -> Result<Self, CliBoundaryError> {
-        let mut runtime = Runtime::builder().build().map_err(|error| {
-            CliBoundaryError::CliRuntimeUnavailable {
-                reason: error.to_string(),
-            }
-        })?;
+        let mut runtime = build_cli_runtime()?;
         let session = create_inference_session(&mut runtime, session_creation_request(model_ref))?;
         Ok(Self {
             runtime,
