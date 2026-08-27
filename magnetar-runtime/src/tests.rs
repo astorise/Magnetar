@@ -17,6 +17,7 @@ struct TestProvider {
     capability_health: BTreeMap<CapabilityId, HealthState>,
     devices: Vec<Arc<dyn Device>>,
     execution_api: Option<Arc<dyn ProviderExecutionApi>>,
+    kernel_advertisements: Vec<KernelAdvertisement>,
 }
 impl TestProvider {
     fn new(name: &str) -> Self {
@@ -30,6 +31,7 @@ impl TestProvider {
             capability_health: BTreeMap::new(),
             devices: Vec::new(),
             execution_api: None,
+            kernel_advertisements: Vec::new(),
         }
     }
 }
@@ -74,6 +76,9 @@ fn simple_elementwise_compute_graph(name: &str) -> ComputeGraph {
 impl Provider for TestProvider {
     fn metadata(&self) -> ProviderMetadata {
         self.metadata.clone()
+    }
+    fn kernel_advertisements(&self) -> Vec<KernelAdvertisement> {
+        self.kernel_advertisements.clone()
     }
     fn register(&self, _registry: &mut ProviderRegistry) -> Result<(), ProviderError> {
         Ok(())
@@ -2895,6 +2900,51 @@ fn builder_isolates_failed_provider_initialization() {
         .unwrap();
     assert!(runtime.providers().provider("failed").is_none());
     assert!(runtime.providers().provider("available").is_some());
+}
+#[test]
+fn builder_reports_rejected_provider_instead_of_dropping_it_silently() {
+    let mut failed = TestProvider::new("failed");
+    failed.fail_initialization = true;
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(failed))
+        .register_provider(Arc::new(TestProvider::new("available")))
+        .build()
+        .unwrap();
+
+    let diagnostics = runtime.startup_diagnostics();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, RuntimeDiagnosticCode::ProviderRejected);
+    assert_eq!(
+        diagnostics[0]
+            .provider
+            .as_ref()
+            .map(ProviderBinding::as_str),
+        Some("failed")
+    );
+    assert!(diagnostics[0].message.contains("failed"));
+}
+#[test]
+fn builder_records_no_diagnostics_when_every_provider_registers() {
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(TestProvider::new("available")))
+        .build()
+        .unwrap();
+    assert!(runtime.startup_diagnostics().is_empty());
+}
+#[test]
+fn builder_does_not_register_kernels_for_a_rejected_provider() {
+    let mut failed = TestProvider::new("failed");
+    failed.fail_initialization = true;
+    failed.kernel_advertisements = reference_cpu_kernel_advertisements();
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(failed))
+        .build()
+        .unwrap();
+
+    // The Provider never came up, so its kernels must not be left in the
+    // registry as candidates that can never resolve.
+    assert!(runtime.providers().provider("failed").is_none());
+    assert_eq!(runtime.startup_diagnostics().len(), 1);
 }
 #[test]
 fn reject_incompatible() {
@@ -6260,7 +6310,7 @@ fn reference_cpu_rmsnorm_rejects_dtype_shape_mismatch() {
 #[test]
 fn reference_cpu_rope_identity_at_position_zero() {
     let input = reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]);
-    let result = rope(&input, 10000.0, 1.0, 2).unwrap();
+    let result = rope(&input, 10000.0, 1.0, 2, 0).unwrap();
     assert!((result.data[0] - 1.0).abs() < 1e-5);
     assert!((result.data[1] - 2.0).abs() < 1e-5);
 }
@@ -6281,6 +6331,23 @@ fn reference_cpu_softmax_rejects_invalid_shape() {
         data: vec![1.0, 2.0, 3.0],
     };
     assert!(softmax_rows(&input).is_err());
+}
+
+#[test]
+fn reference_cpu_softmax_rejects_fully_masked_row() {
+    // Every entry masked out: subtracting the row max would yield NaN for the
+    // whole row, so the kernel must reject it rather than return Ok(NaN).
+    let input = reference_cpu_host_tensor([1, 3], [f32::NEG_INFINITY; 3]);
+    let error = softmax_rows(&input).expect_err("fully masked row must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ExecutionFailed);
+}
+
+#[test]
+fn reference_cpu_softmax_allows_partially_masked_row() {
+    let input = reference_cpu_host_tensor([1, 3], [f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY]);
+    let result = softmax_rows(&input).unwrap();
+    assert!(result.data.iter().all(|value| value.is_finite()));
+    assert!((result.data[1] - 1.0).abs() < 1e-5);
 }
 
 #[test]
@@ -6341,6 +6408,45 @@ fn reference_cpu_attention_window_size_restricts_context() {
     // window_size = 1: each position can only see itself.
     let result = attention(&q, &k, &v, 1, 1, None, Some(1), true).unwrap();
     assert_eq!(result.data, vec![1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn reference_cpu_attention_rejects_zero_window() {
+    let q = reference_cpu_host_tensor([2, 1], [0.0, 0.0]);
+    let k = q.clone();
+    let v = reference_cpu_host_tensor([2, 1], [1.0, 2.0]);
+    // A zero window admits no keys at all; it must not be silently widened to 1.
+    let error =
+        attention(&q, &k, &v, 1, 1, None, Some(0), true).expect_err("zero window must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
+}
+
+#[test]
+fn reference_cpu_attention_rejects_window_without_causal_mask() {
+    let q = reference_cpu_host_tensor([2, 1], [0.0, 0.0]);
+    let k = q.clone();
+    let v = reference_cpu_host_tensor([2, 1], [1.0, 2.0]);
+    // The window is anchored at the query position, which only fully describes
+    // the mask under causal attention.
+    let error = attention(&q, &k, &v, 1, 1, None, Some(1), false)
+        .expect_err("bidirectional sliding window must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
+}
+
+#[test]
+fn reference_cpu_host_tensor_rejects_overflowing_shape() {
+    // The product of these dimensions wraps to 0 under unchecked u64
+    // multiplication, which would let an empty buffer pass the length check.
+    let error = HostTensor::new([1_u64 << 32, 1_u64 << 32], Vec::<f32>::new())
+        .expect_err("overflowing shape must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
+}
+
+#[test]
+fn reference_cpu_host_tensor_rejects_shape_beyond_address_space() {
+    let error = HostTensor::new([u64::MAX], Vec::<f32>::new())
+        .expect_err("shape beyond the address space must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
 }
 
 fn reference_cpu_kernel_by_name<'a>(

@@ -1,6 +1,50 @@
+use crate::affinity::{
+    AffinityConstraints, AffinityError, AffinityGroupId, AffinityResolution, CapabilityBinding,
+    DeviceAvailability, DeviceBinding, ExecutionContextId, ExecutionPhase, FallbackClass,
+    HealthState, ProviderBinding, ProviderHealth, ProviderStatusReason, ResourceAffinity,
+};
+use crate::batching::{
+    BatchAdmission, BatchExecutionStep, BatchId, BatchMemoryEstimate, BatchSlotId, BatchingError,
+    BatchingPolicy, ContinuousBatchingManager,
+};
+use crate::capability::{Capability, CapabilityId};
+use crate::component::WitInterface;
+use crate::compute::{
+    COMPUTE_CAPABILITY_ID, COMPUTE_CAPABILITY_VERSION, ComputeDataMovementDescriptor,
+    ComputeDataMovementKind, ComputeGraph, ComputeGraphValidationReport, ComputeInputValue,
+    ComputeLayout, ComputeOperationDescriptor, ComputeOperationFamily, ComputeOperationRequest,
+    ComputePlacementIntent, ComputeSubmission, ComputeValidationError, ComputeValueRef,
+    DataMovementSupport, HostStagingPolicy, OperationFamilySupport, OperationSchemaSupport,
+    TensorDescriptor, TensorDescriptorLimits, TensorResourceDescriptor, TensorResourceId,
+    compute_capability,
+};
 use crate::compute::{
     effective_compute_advertisement, ensure_non_empty_id, insert_unique,
     resolve_compute_value_descriptor, validate_compute_operation_schema,
+};
+use crate::device::{Device, DeviceId};
+use crate::generation::{GenerationModelReference, GenerationRequest};
+use crate::kernel_registry::KernelRegistry;
+use crate::kv_cache::{
+    KvCache, KvCacheCompatibility, KvCacheError, KvCacheId, KvCacheLifecycleState, KvCacheManager,
+};
+use crate::memory::{
+    MemoryAdmissionDecision, MemoryAdmissionRequest, MemoryAllocationClass, MemoryAllocationId,
+    MemoryAllocationOwner, MemoryAllocationRequest, MemoryManager, MemoryManagerConfig,
+    MemoryPlacement,
+};
+use crate::model_instance::{
+    ModelInstance, ModelInstanceDefinition, ModelInstanceError, ModelInstanceId,
+    ModelInstanceManager, ModelInstanceStatus, ModelInstanceUnloadPolicy,
+    ModelInstanceUnloadReport,
+};
+use crate::model_loading::{LoadedModelContext, ModelArchitectureImplementation};
+use crate::observability::{CorrelationId, RuntimeDiagnostic, RuntimeDiagnosticCode, TraceId};
+use crate::planning::{
+    BufferLifetime, ComputeExecutionPhase, ComputeExecutionPlan, ComputePlanningError,
+    ExecutionConstraint, ExecutionDiagnostic, ExecutionInput, ExecutionOutput, ExecutionStep,
+    ExecutionStepKind, MemoryPlan, MemoryPlanningDecision, MemoryPlanningDiagnostic,
+    MemoryPlanningError, MemoryPressureReport, MemoryRegionKind, MemoryRequirement, TensorLifetime,
 };
 use crate::planning::{
     classify_execution_plan, execution_phase_from_step_kind, execution_plan_id,
@@ -8,9 +52,27 @@ use crate::planning::{
     last_use_for_node_output, memory_bytes, memory_error_from_compute_validation,
     planning_error_from_affinity, planning_error_from_validation, provider_memory_limit,
 };
-use crate::*;
+use crate::prefix_cache::{
+    PrefixCacheEntry, PrefixCacheEntryId, PrefixCacheError, PrefixCacheLookupRequest,
+    PrefixCacheLookupResult, PrefixCacheManager, PrefixCachePolicy,
+};
+use crate::provider::{
+    Provider, ProviderError, ProviderExecutionApi, ProviderLoader, ProviderMetadata,
+};
+use crate::resolution::BuiltInResolutionPolicy;
+use crate::scheduler::{
+    ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionErrorCode,
+    ProviderExecutionHandle, ProviderExecutionPhase, ProviderExecutionRequest,
+    ProviderExecutionResult, ProviderExecutionStatus, ScheduledOperation, ScheduledOperationId,
+    Scheduler, SchedulerError, SchedulingPolicy,
+};
+use crate::session::{
+    InferenceSession, InferenceSessionId, SessionAccessPolicy, SessionCreationRequest,
+    SessionError, SessionObservation, SessionObservationKind, SessionOperationAdmission,
+    SessionStatus, runtime_session_affinity,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
 };
 static NEXT_EXECUTION_CONTEXT_ID: std::sync::atomic::AtomicU64 =
@@ -47,10 +109,38 @@ pub(crate) fn next_inference_session_id() -> InferenceSessionId {
     .expect("generated session id is valid")
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Default bound on retained session observations.
+///
+/// Matches `ObservabilityPolicy::internal_buffer_capacity`, so the two
+/// observation buffers in the Runtime hold the same amount of history by
+/// default.
+pub const DEFAULT_SESSION_OBSERVATION_CAPACITY: usize = 1024;
+
+/// Upper bound on how much of the configured capacity is preallocated, so a
+/// very large configured bound does not turn into a very large allocation at
+/// startup.
+const SESSION_OBSERVATION_PREALLOCATION_LIMIT: usize = 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
     pub resolution_policy: BuiltInResolutionPolicy,
     pub memory: MemoryManagerConfig,
+    /// Maximum session observations retained before the oldest are evicted.
+    ///
+    /// Zero retains nothing. Every eviction is counted by
+    /// [`Runtime::dropped_session_observations`], so loss is observable rather
+    /// than silent.
+    pub session_observation_capacity: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            resolution_policy: BuiltInResolutionPolicy::default(),
+            memory: MemoryManagerConfig::default(),
+            session_observation_capacity: DEFAULT_SESSION_OBSERVATION_CAPACITY,
+        }
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionContext {
@@ -90,21 +180,52 @@ impl RuntimeBuilder {
         self.providers.push(x);
         self
     }
+    /// Builds the Runtime.
+    ///
+    /// A Provider that fails to register does not abort startup, but the
+    /// failure is not lost either: it is recorded as a
+    /// [`RuntimeDiagnosticCode::ProviderRejected`] diagnostic readable through
+    /// [`Runtime::startup_diagnostics`]. Without that, a Runtime could come up
+    /// silently missing a Provider the caller explicitly registered, and the
+    /// first symptom would be an unrelated `NoCompatibleProvider` at
+    /// resolution time.
     pub fn build(self) -> Result<Runtime, ProviderError> {
+        Ok(self.build_runtime())
+    }
+
+    /// The build itself, which cannot currently fail.
+    ///
+    /// [`Self::build`] keeps a `Result` so a future failure path does not
+    /// break the signature, while [`Runtime::initialize`] goes through here so
+    /// it never has to unwrap a `Result` that has no error case.
+    fn build_runtime(self) -> Runtime {
         let mut providers = ProviderLoader::new();
         let mut kernel_registry = KernelRegistry::new();
-        for x in self.providers {
-            let advertisements = x.kernel_advertisements();
-            let provider_name = x.metadata().name;
-            let provider_binding = ProviderBinding::new(provider_name);
-            providers.register_provider_isolated(x);
+        let mut startup_diagnostics = Vec::new();
+        for provider in self.providers {
+            let advertisements = provider.kernel_advertisements();
+            let provider_name = provider.metadata().name;
+            let provider_binding = ProviderBinding::new(provider_name.clone());
+            if let Err(error) = providers.register_provider(provider) {
+                startup_diagnostics.push(
+                    RuntimeDiagnostic::new(
+                        RuntimeDiagnosticCode::ProviderRejected,
+                        format!("provider '{provider_name}' was not registered: {error}"),
+                    )
+                    .with_provider(provider_binding),
+                );
+                // The Provider is absent from the loader, so registering its
+                // kernels would leave the registry holding candidates that can
+                // never resolve to anything.
+                continue;
+            }
             for advertisement in advertisements {
                 if let Err(error) = kernel_registry.register_provider_advertisement(advertisement) {
                     kernel_registry.invalidate_provider(&provider_binding, error.code());
                 }
             }
         }
-        let runtime = Runtime {
+        Runtime {
             context: ExecutionContext {
                 id: next_execution_context_id(),
                 config: self.config.clone(),
@@ -117,10 +238,15 @@ impl RuntimeBuilder {
             kernel_registry,
             providers,
             sessions: BTreeMap::new(),
-            session_observations: Vec::new(),
+            session_observations: VecDeque::with_capacity(
+                self.config
+                    .session_observation_capacity
+                    .min(SESSION_OBSERVATION_PREALLOCATION_LIMIT),
+            ),
+            dropped_session_observations: 0,
+            startup_diagnostics,
             initialized: true,
-        };
-        Ok(runtime)
+        }
     }
 }
 pub struct Runtime {
@@ -133,7 +259,9 @@ pub struct Runtime {
     kernel_registry: KernelRegistry,
     providers: ProviderLoader,
     sessions: BTreeMap<InferenceSessionId, InferenceSession>,
-    session_observations: Vec<SessionObservation>,
+    session_observations: VecDeque<SessionObservation>,
+    dropped_session_observations: u64,
+    startup_diagnostics: Vec<RuntimeDiagnostic>,
     initialized: bool,
 }
 impl Runtime {
@@ -141,10 +269,15 @@ impl Runtime {
         RuntimeBuilder::new()
     }
     pub fn initialize(config: RuntimeConfig) -> Self {
-        Self::builder()
-            .config(config)
-            .build()
-            .expect("valid configuration")
+        Self::builder().config(config).build_runtime()
+    }
+
+    /// Diagnostics recorded while the Runtime was built.
+    ///
+    /// Currently this is where Providers rejected during registration are
+    /// reported. An empty slice means every registered Provider came up.
+    pub fn startup_diagnostics(&self) -> &[RuntimeDiagnostic] {
+        &self.startup_diagnostics
     }
     pub fn is_initialized(&self) -> bool {
         self.initialized
@@ -194,8 +327,21 @@ impl Runtime {
     pub fn sessions(&self) -> impl Iterator<Item = &InferenceSession> {
         self.sessions.values()
     }
-    pub fn session_observations(&self) -> &[SessionObservation] {
+    /// Session observations retained so far, oldest first.
+    ///
+    /// This is a bounded ring: once
+    /// [`RuntimeConfig::session_observation_capacity`] is reached, each new
+    /// observation evicts the oldest. Use
+    /// [`Self::dropped_session_observations`] to tell a full history from a
+    /// truncated one.
+    pub fn session_observations(&self) -> &VecDeque<SessionObservation> {
         &self.session_observations
+    }
+
+    /// Number of session observations evicted or refused because the retention
+    /// bound was reached.
+    pub fn dropped_session_observations(&self) -> u64 {
+        self.dropped_session_observations
     }
     pub fn create_inference_session(
         &mut self,
@@ -2227,6 +2373,11 @@ impl Runtime {
         for session in self.sessions.values_mut() {
             let _ = session.drain();
         }
+        // Drained sessions and their observation history are dead weight once
+        // the Runtime is down; keeping them would retain every session ever
+        // created for as long as the Runtime value itself lives.
+        self.sessions.clear();
+        self.session_observations.clear();
         self.initialized = false;
     }
 
@@ -2237,7 +2388,16 @@ impl Runtime {
         message: impl Into<String>,
         correlation_id: Option<CorrelationId>,
     ) {
-        self.session_observations.push(SessionObservation {
+        let capacity = self.context.config.session_observation_capacity;
+        if capacity == 0 {
+            self.dropped_session_observations += 1;
+            return;
+        }
+        if self.session_observations.len() >= capacity {
+            self.session_observations.pop_front();
+            self.dropped_session_observations += 1;
+        }
+        self.session_observations.push_back(SessionObservation {
             kind,
             session,
             message: message.into(),

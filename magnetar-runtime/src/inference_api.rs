@@ -23,7 +23,43 @@
 //! bypass Runtime validation, Model Instance lifecycle, Kernel Registry,
 //! Memory Manager, or Provider contracts.
 
-use crate::*;
+use crate::adapter::{
+    AdapterActivationRequest, AdapterActivationScope, AdapterArtifactId, AdapterBatchCompatibility,
+    AdapterError, AdapterResidency, AdapterSessionPolicy, validate_adapter_activation,
+};
+use crate::affinity::{ProviderBinding, ResourceAffinity};
+use crate::batching::{BatchId, BatchSlotId, BatchedOperationState, BatchingError};
+use crate::generation::{
+    CancellationMetadata, FinishReason, GenerationError, GenerationMemoryEstimate,
+    GenerationModelReference, GenerationOutput, GenerationParameters, GenerationPriority,
+    GenerationRequest, GenerationRequestId, GenerationTokenizerReference, GenerationUsage,
+    StopConditions, StreamingMode, decode_step_from_sampling_with_rng, memory_admission, prefill,
+};
+use crate::kv_cache::KvCacheError;
+use crate::memory::{MemoryAdmissionDecision, MemoryManager, MemoryPressureLevel};
+use crate::model::{ModelArtifactError, ModelArtifactId, ModelManifest, ModelTrustDecision};
+use crate::model_instance::{
+    ModelInstanceError, ModelInstanceId, ModelInstanceReadiness, ModelInstanceReadinessChecks,
+    ModelInstanceStatus, ModelInstanceSuspensionReason, ModelInstanceUnloadPolicy,
+    ModelInstanceUnloadReport, ModelInstanceWarmupPlan,
+};
+use crate::model_loading::{
+    LoadedModelContext, ModelArchitectureImplementation, ModelLoadingCoordinator,
+    ModelLoadingError, ModelLoadingErrorCode, ModelLoadingPhase, ModelLoadingRequest,
+};
+use crate::observability::CorrelationId;
+use crate::operator::TensorLayoutKind;
+use crate::prefix_cache::PrefixCacheError;
+use crate::runtime::Runtime;
+use crate::sampling::{SamplingPolicy, SamplingRngState};
+use crate::session::{
+    InferenceSessionId, SessionAccessPolicy, SessionCreationRequest, SessionError,
+    SessionRedactionPolicy, SessionStatus,
+};
+use crate::tokenizer::{
+    DecodeInput, DecodeOutput, EncodeInput, StreamingDecodeState, TokenId, TokenOffset, Tokenizer,
+    TokenizerCompatibility, TokenizerDiagnostic, TokenizerError, TokenizerId, TruncationPolicy,
+};
 use std::{collections::BTreeMap, error::Error, fmt};
 
 // ---------------------------------------------------------------------
@@ -833,7 +869,7 @@ pub fn prepare_generation(
 /// Generation request as exposed through the Runtime Inference API. Wraps
 /// the core [`GenerationRequest`] with an explicit privacy/redaction policy
 /// for callers -- such as one-shot inference -- that have no
-/// [`SessionPolicy`] to inherit a redaction policy from.
+/// [`crate::session::SessionPolicy`] to inherit a redaction policy from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationApiRequest {
     pub core: GenerationRequest,
@@ -1004,6 +1040,7 @@ pub fn run_generation_loop(
     );
 
     let mut generated: Vec<TokenId> = Vec::new();
+    let mut rng_state: Option<SamplingRngState> = None;
     let finish_reason = loop {
         if should_cancel(&generated) {
             observer.observe(
@@ -1024,8 +1061,16 @@ pub fn run_generation_loop(
             correlation_id.clone(),
         );
         let logits = next_logits(&generated);
-        let (_, step) =
-            decode_step_from_sampling(request, &generated, logits, sampling_policy.clone())?;
+        // Carry the sampling RNG position forward so the whole generation
+        // draws from one continuous stream rather than restarting it each step.
+        let (sampling, step) = decode_step_from_sampling_with_rng(
+            request,
+            &generated,
+            logits,
+            sampling_policy.clone(),
+            rng_state.take(),
+        )?;
+        rng_state = sampling.updated_rng_state;
         generated.push(step.token_id);
         observer.observe(
             InferenceApiObservationKind::TokenGenerated,
@@ -1163,7 +1208,7 @@ pub fn submit_generation_observed(
 
 /// Opaque handle identifying an open generation event stream. Carries no
 /// Provider/Device/Kernel handle -- only the stable IDs needed to
-/// correlate [`GenerationEvent`]s already produced by
+/// correlate [`crate::generation::GenerationEvent`]s already produced by
 /// [`crate::generation::token_stream_events`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamingHandle {

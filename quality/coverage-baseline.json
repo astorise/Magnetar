@@ -1,14 +1,19 @@
 {
-  "line_coverage_percent": 72.75360050093927,
-  "function_coverage_percent": 76.37662883564523,
+  "line_coverage_percent": 73.16295114803961,
+  "function_coverage_percent": 77.55591054313099,
   "branch_coverage_percent": null,
   "scope": "workspace production Rust source; test source and target output are excluded",
   "tool": "cargo-llvm-cov",
-  "measured_at": "2026-08-24",
+  "measured_at": "2026-08-25",
   "exclusions": [
     {
       "pattern": "(^|/)(target|tests?)/",
-      "reason": "Generated build output and Rust test source are not production Runtime implementation source."
+      "reason": "Generated build output and Rust integration test source are not production Runtime implementation source."
+    },
+    {
+      "pattern": "cargo-llvm-cov built-in: (tests\\.rs|[0-9a-zA-Z_-]+[_-]tests\\.rs)$",
+      "reason": "Applied automatically by cargo-llvm-cov in addition to the pattern above. Unit tests therefore live in sibling tests.rs files rather than in inline #[cfg(test)] modules, because a filename pattern cannot exclude test code embedded in a production file."
     }
-  ]
+  ],
+  "notes": "Measured with --all-features so feature-gated modules (component_wasmtime, component_web) are included."
 }

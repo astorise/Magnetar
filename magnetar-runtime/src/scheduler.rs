@@ -1,7 +1,20 @@
-use crate::compute::redact_backend_diagnostic;
-use crate::planning::provider_execution_id;
-use crate::runtime::next_scheduled_operation_id;
-use crate::*;
+use crate::affinity::{
+    DeviceAvailability, DeviceBinding, DeviceHealth, HealthState, HealthTimestamp, ProviderBinding,
+    ProviderHealth, ProviderHealthReport, ProviderLifecycleState, ProviderStatusReason,
+    ProviderStatusSnapshot, ResourceAffinity,
+};
+use crate::compute::{TensorResourceDescriptor, redact_backend_diagnostic};
+use crate::device::Device;
+use crate::memory::MemoryAdmissionDecision;
+use crate::observability::{
+    RuntimeDiagnosticCode, RuntimeEvent, RuntimeEventKind, RuntimeMetric, RuntimeMetricKind,
+    RuntimeObservationPhase, SpanId, TraceId,
+};
+use crate::planning::{
+    ComputeExecutionPlan, ExecutionConstraint, ExecutionDiagnostic, ExecutionOutput,
+    ExecutionPlanId, ExecutionStep, MemoryPlan, MemoryPlanningDecision, provider_execution_id,
+};
+use crate::runtime::{Runtime, next_scheduled_operation_id};
 use std::{
     collections::{BTreeMap, VecDeque},
     error::Error,

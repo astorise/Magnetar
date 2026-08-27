@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Hardware-agnostic execution runtime contracts for magnetar."
+repository = "https://github.com/astorise/Magnetar"
+readme = "../README.md"
+keywords = ["ai", "inference", "runtime", "wasm", "webassembly"]
+categories = ["science", "wasm"]
+rust-version = "1.98"
 
 [features]
 default = []
@@ -13,9 +18,8 @@ web-component-engine = []
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
+serde_norway = "0.9"
 sha2 = "0.11"
-libloading = "0.9"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wasmtime = { version = "48.0.0", optional = true, default-features = false, features = ["anyhow", "runtime", "component-model", "component-model-async", "cranelift", "std", "wat"] }

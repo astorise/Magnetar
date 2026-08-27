@@ -1,4 +1,10 @@
-use crate::*;
+use crate::affinity::{
+    CapabilityBinding, DeviceAvailability, DeviceBinding, ExecutionPhase, FallbackClass,
+    HealthState, ProviderAdmissionDecision, ProviderBinding, ProviderHealth, ProviderHealthState,
+    ProviderLifecycleState, ProviderPressureLevel, ProviderReadinessState, ProviderStatusReason,
+    ProviderStatusSnapshot, ResourceAffinity,
+};
+use crate::capability::{CapabilityId, CapabilityVersion};
 use std::fmt;
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ResolutionPolicyId(String);

@@ -167,8 +167,8 @@ pub use generation::{
     GenerationParameters, GenerationPriority, GenerationRequest, GenerationRequestId,
     GenerationTokenizerReference, GenerationUsage, LogitsProcessorReference, PrefillState,
     Probability, StopConditions, StreamingMode, decode_step, decode_step_from_sampling,
-    finish_reason_from_provider_error, memory_admission, prefill, prepare_stop_sequences,
-    stop_reason_for, streaming_text_chunk, token_stream_events,
+    decode_step_from_sampling_with_rng, finish_reason_from_provider_error, memory_admission,
+    prefill, prepare_stop_sequences, stop_reason_for, streaming_text_chunk, token_stream_events,
 };
 pub use inference_api::{
     AdmissionState, BrowserInferenceCapabilities, CacheUsageSummary, CancellationOutcome,

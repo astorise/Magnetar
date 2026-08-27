@@ -23,8 +23,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      # rust-toolchain.toml pins the toolchain and its components, so rustup
+      # installs exactly that on first use. Installing a different version here
+      # would download a toolchain that the toolchain file then overrides.
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - name: Validate formatting
         run: cargo fmt --all -- --check
 
@@ -38,12 +41,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@v2
       - name: Check workspace
-        run: cargo check --workspace --all-targets --all-features
+        run: cargo check --locked --workspace --all-targets --all-features
 
   clippy:
     name: quality / clippy
@@ -51,12 +54,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@v2
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: quality / test (${{ matrix.os }})
@@ -68,12 +71,42 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@v2
       - name: Run tests
-        run: cargo test --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets
+
+  msrv:
+    name: quality / msrv
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      # The declared rust-version floor is only a real claim if something
+      # builds against it, so this job deliberately overrides the pinned
+      # toolchain instead of using rust-toolchain.toml.
+      - name: Resolve declared MSRV
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' magnetar-runtime/Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - name: Install MSRV toolchain
+        run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+      - name: Check workspace against the declared MSRV
+        run: cargo +${{ steps.msrv.outputs.version }} check --locked --workspace --all-features
+
+  deny:
+    name: quality / cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+      - name: Check advisories, bans, licenses and sources
+        run: cargo deny --all-features check
 
   wasmtime-component-engine:
     name: quality / wasmtime component engine
@@ -81,12 +114,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@v2
       - name: Test Wasmtime Component Engine
-        run: cargo test -p magnetar-runtime --features wasmtime-component-engine
+        run: cargo test --locked -p magnetar-runtime --all-targets --features wasmtime-component-engine
 
   wasm32-component-engine:
     name: quality / wasm32 component engine
@@ -94,12 +127,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.98.0 --profile minimal --target wasm32-unknown-unknown
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@v2
       - name: Check wasm32 Component Runtime
-        run: cargo check -p magnetar-runtime --target wasm32-unknown-unknown --all-features
+        run: cargo check --locked -p magnetar-runtime --target wasm32-unknown-unknown --all-features
 
   provider-conformance:
     name: quality / provider conformance
@@ -107,12 +142,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@v2
       - name: Run hardware-independent Provider conformance
-        run: cargo test -p magnetar-runtime provider_conformance -- --nocapture
+        run: cargo test --locked -p magnetar-runtime provider_conformance -- --nocapture
 
   e2e-conformance:
     name: quality / e2e conformance
@@ -135,12 +170,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@v2
       - name: Build Rust documentation
-        run: cargo doc --workspace --all-features --no-deps
+        run: cargo doc --locked --workspace --all-features --no-deps
 
   wit:
     name: quality / wit
@@ -179,8 +214,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Cache Cargo data
@@ -189,7 +224,7 @@ jobs:
         run: mkdir -p target/llvm-cov
       - name: Generate coverage
         run: >
-          cargo llvm-cov --workspace --all-targets --all-features
+          cargo llvm-cov --locked --workspace --all-targets --all-features
           --ignore-filename-regex '(^|/)(target|tests?)/'
           --json --summary-only --output-path target/llvm-cov/coverage.json
       - name: Generate LCOV artifact

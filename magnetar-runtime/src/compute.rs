@@ -1,5 +1,11 @@
-use crate::planning::memory_pressure_diagnostic;
-use crate::*;
+use crate::affinity::{
+    AffinityError, CapabilityBinding, DeviceBinding, ProviderBinding, ResourceAffinity,
+};
+use crate::capability::{Capability, CapabilityDescriptor, CapabilityId, CapabilityVersion};
+use crate::component::WitInterface;
+use crate::device::DeviceId;
+use crate::planning::{ComputePlanningError, MemoryPlanningError, memory_pressure_diagnostic};
+use crate::provider::ProviderMetadata;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,

@@ -346,10 +346,24 @@ impl SamplingRngState {
         self.inspectable.then_some(&self.bytes)
     }
 
-    fn seed(&self) -> u64 {
-        self.bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        })
+    /// Encodes a stream position produced by this module.
+    fn from_stream(state: u64) -> Self {
+        Self::opaque(state.to_le_bytes().to_vec())
+    }
+
+    /// Recovers the stream position.
+    ///
+    /// States this module produced are exactly eight little-endian bytes and
+    /// round-trip losslessly, which is what lets a caller resume a stream
+    /// rather than restart it. A state of any other length came from
+    /// somewhere else, so it is folded down to a starting position instead.
+    fn stream_position(&self) -> u64 {
+        match <[u8; 8]>::try_from(self.bytes.as_slice()) {
+            Ok(bytes) => u64::from_le_bytes(bytes),
+            Err(_) => self.bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            }),
+        }
     }
 }
 
@@ -475,8 +489,8 @@ pub fn select_next_token(request: &SamplingRequest) -> Result<SamplingResult, Sa
     apply_token_constraints(request, &mut candidates)?;
     apply_penalties(request, &mut candidates)?;
     apply_temperature(request, &mut candidates)?;
-    apply_top_k(request, &mut candidates);
-    apply_top_p(request, &mut candidates)?;
+    apply_top_k(request.parameters.top_k, &mut candidates);
+    apply_top_p(request.parameters.top_p, &mut candidates)?;
 
     let eligible = candidates
         .iter()
@@ -487,6 +501,7 @@ pub fn select_next_token(request: &SamplingRequest) -> Result<SamplingResult, Sa
     }
 
     let probabilities = softmax(&eligible);
+    let mut stream_state = 0_u64;
     let selection_mode = if request.parameters.greedy
         || !request.parameters.sampling_enabled
         || request.parameters.temperature == 0.0
@@ -503,20 +518,15 @@ pub fn select_next_token(request: &SamplingRequest) -> Result<SamplingResult, Sa
             .map(|(index, _)| index)
             .expect("eligible set is non-empty"),
         SamplingSelectionMode::Stochastic => {
-            let seed = request
-                .rng_state
-                .as_ref()
-                .map(SamplingRngState::seed)
-                .or(request.rng_seed)
-                .unwrap_or_else(|| deterministic_seed_from_scores(&probabilities));
-            sample_index(&probabilities, seed)
+            stream_state = resolve_stream_state(request, &probabilities);
+            sample_index(&probabilities, &mut stream_state)
         }
     };
     let selected = &probabilities[selected_index];
     let rank = rank_for(selected.token_id, &probabilities);
     let probability_allowed = request.policy.allow_probability_metadata;
     let updated_rng_state = matches!(selection_mode, SamplingSelectionMode::Stochastic)
-        .then(|| SamplingRngState::opaque(next_seed_bytes(selected.score, selected.token_id)));
+        .then(|| SamplingRngState::from_stream(stream_state));
 
     Ok(SamplingResult {
         request_id: request.request_id.clone(),
@@ -584,10 +594,7 @@ pub fn sampling_workspace_requests(
         ),
         (
             "rng-state",
-            request
-                .rng_seed
-                .or_else(|| request.rng_state.as_ref().map(SamplingRngState::seed))
-                .map(|_| 32),
+            (request.rng_seed.is_some() || request.rng_state.is_some()).then_some(32),
         ),
         (
             "history",
@@ -846,38 +853,52 @@ fn apply_temperature(
     Ok(())
 }
 
-fn apply_top_k(request: &SamplingRequest, candidates: &mut [Candidate]) {
-    let Some(k) = request.parameters.top_k else {
+/// Ranking order for candidate selection: best first, ties broken by the lower
+/// token id so selection is deterministic for identical scores.
+///
+/// Every candidate cut (top-k, top-p) and the reported rank use this one
+/// ordering, so they cannot drift apart.
+fn candidate_order(left: (f32, TokenId), right: (f32, TokenId)) -> std::cmp::Ordering {
+    compare_f32(right.0, left.0).then(left.1.cmp(&right.1))
+}
+
+fn apply_top_k(top_k: Option<u32>, candidates: &mut [Candidate]) {
+    let Some(k) = top_k else {
         return;
     };
+    let k = k as usize;
     let mut eligible = candidates
         .iter()
         .filter(|candidate| candidate.eligible)
         .copied()
         .collect::<Vec<_>>();
-    if k as usize >= eligible.len() {
+    if k >= eligible.len() {
         return;
     }
-    eligible.sort_by(|left, right| {
-        compare_f32(right.score, left.score).then(left.token_id.cmp(&right.token_id))
+    let Some(nth) = k.checked_sub(1) else {
+        // k == 0 keeps nothing. Rejected by SamplingRequest::validate, so this
+        // is only reachable if apply_top_k is called on an unvalidated request.
+        for candidate in candidates.iter_mut() {
+            candidate.eligible = false;
+        }
+        return;
+    };
+    // Only the k-th best element's position matters, so partition in O(n)
+    // rather than sorting the whole eligible set in O(n log n). Token ids are
+    // unique, so the threshold comparison keeps exactly k candidates.
+    let (_, threshold, _) = eligible.select_nth_unstable_by(nth, |left, right| {
+        candidate_order((left.score, left.token_id), (right.score, right.token_id))
     });
-    let keep = eligible
-        .into_iter()
-        .take(k as usize)
-        .map(|candidate| candidate.token_id)
-        .collect::<BTreeSet<_>>();
-    for candidate in candidates {
-        if candidate.eligible && !keep.contains(&candidate.token_id) {
+    let threshold = (threshold.score, threshold.token_id);
+    for candidate in candidates.iter_mut().filter(|candidate| candidate.eligible) {
+        if candidate_order((candidate.score, candidate.token_id), threshold).is_gt() {
             candidate.eligible = false;
         }
     }
 }
 
-fn apply_top_p(
-    request: &SamplingRequest,
-    candidates: &mut [Candidate],
-) -> Result<(), SamplingError> {
-    let Some(top_p) = request.parameters.top_p else {
+fn apply_top_p(top_p: Option<f32>, candidates: &mut [Candidate]) -> Result<(), SamplingError> {
+    let Some(top_p) = top_p else {
         return Ok(());
     };
     if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
@@ -890,21 +911,30 @@ fn apply_top_p(
         .filter(|candidate| candidate.eligible)
         .copied()
         .collect::<Vec<_>>();
-    eligible.sort_by(|left, right| {
-        compare_f32(right.score, left.score).then(left.token_id.cmp(&right.token_id))
+    // Nucleus selection is inherently ordered: the cut depends on where the
+    // running total crosses top_p, so this sort cannot be reduced to a
+    // partition. When top-k ran first it is a sort of k elements, not of the
+    // whole vocabulary.
+    eligible.sort_unstable_by(|left, right| {
+        candidate_order((left.score, left.token_id), (right.score, right.token_id))
     });
     let probabilities = softmax(&eligible.iter().collect::<Vec<_>>());
     let mut cumulative = 0.0;
-    let mut keep = BTreeSet::new();
+    let mut cutoff = None;
     for candidate in probabilities {
         cumulative += candidate.probability;
-        keep.insert(candidate.token_id);
+        cutoff = Some((candidate.score, candidate.token_id));
         if cumulative >= top_p {
             break;
         }
     }
-    for candidate in candidates {
-        if candidate.eligible && !keep.contains(&candidate.token_id) {
+    // The kept set is a prefix of the ranking, so everything worse than the
+    // last kept candidate is dropped -- no per-candidate set lookup needed.
+    let Some(cutoff) = cutoff else {
+        return Ok(());
+    };
+    for candidate in candidates.iter_mut().filter(|candidate| candidate.eligible) {
+        if candidate_order((candidate.score, candidate.token_id), cutoff).is_gt() {
             candidate.eligible = false;
         }
     }
@@ -930,24 +960,55 @@ fn softmax(candidates: &[&Candidate]) -> Vec<ProbabilityCandidate> {
         .collect()
 }
 
+/// Rank of `token_id` in the candidate ranking, 1 being the highest scoring.
+///
+/// Counting how many candidates outrank the selected one is O(n) and allocates
+/// nothing, where cloning and sorting the whole set to read one position was
+/// O(n log n) plus a full copy on every generated token.
 fn rank_for(token_id: TokenId, probabilities: &[ProbabilityCandidate]) -> usize {
-    let mut ranked = probabilities.to_vec();
-    ranked.sort_by(|left, right| {
-        compare_f32(right.score, left.score).then(left.token_id.cmp(&right.token_id))
-    });
-    ranked
+    let Some(selected) = probabilities
         .iter()
-        .position(|candidate| candidate.token_id == token_id)
-        .map(|index| index + 1)
-        .unwrap_or(1)
+        .find(|candidate| candidate.token_id == token_id)
+    else {
+        return 1;
+    };
+    let selected = (selected.score, selected.token_id);
+    probabilities
+        .iter()
+        .filter(|candidate| {
+            candidate_order((candidate.score, candidate.token_id), selected).is_lt()
+        })
+        .count()
+        + 1
 }
 
-fn sample_index(candidates: &[ProbabilityCandidate], seed: u64) -> usize {
-    let threshold = (xorshift64(seed) as f64 / u64::MAX as f64) as f32;
+/// Chooses the stream position this step draws from.
+///
+/// A threaded [`SamplingRngState`] resumes exactly where the previous step
+/// left off. Callers that only set a fixed `rng_seed` and never thread the
+/// state back get a position derived from that seed *and* the step index, so
+/// the stream still advances across a generation instead of redrawing the same
+/// number every step.
+fn resolve_stream_state(request: &SamplingRequest, probabilities: &[ProbabilityCandidate]) -> u64 {
+    if let Some(state) = request.rng_state.as_ref() {
+        return state.stream_position();
+    }
+    let origin = request
+        .rng_seed
+        .unwrap_or_else(|| deterministic_seed_from_scores(probabilities));
+    // Distinct steps must start at distinct positions; mixing the counter
+    // through the finalizer keeps consecutive steps uncorrelated.
+    let mut state = origin ^ (request.step_index as u64).wrapping_mul(0x9e3779b97f4a7c15);
+    splitmix64(&mut state);
+    state
+}
+
+fn sample_index(candidates: &[ProbabilityCandidate], state: &mut u64) -> usize {
+    let threshold = unit_interval(splitmix64(state));
     let mut cumulative = 0.0;
     for (index, candidate) in candidates.iter().enumerate() {
         cumulative += candidate.probability;
-        if threshold <= cumulative {
+        if threshold < cumulative {
             return index;
         }
     }
@@ -962,19 +1023,22 @@ fn deterministic_seed_from_scores(candidates: &[ProbabilityCandidate]) -> u64 {
         })
 }
 
-fn xorshift64(mut value: u64) -> u64 {
-    if value == 0 {
-        value = 0x9e3779b97f4a7c15;
-    }
-    value ^= value << 13;
-    value ^= value >> 7;
-    value ^= value << 17;
-    value
+/// SplitMix64: advances `state` by the golden-gamma increment and returns the
+/// finalized output. Chosen over the previous single-round xorshift because a
+/// counter plus a strong finalizer decorrelates adjacent seeds, which is
+/// exactly the property a per-step sampling stream needs.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
 }
 
-fn next_seed_bytes(score: f32, token_id: TokenId) -> Vec<u8> {
-    let seed = xorshift64((u64::from(score.to_bits()) << 32) ^ u64::from(token_id));
-    seed.to_le_bytes().to_vec()
+/// Maps a draw onto `[0, 1)` using the top 53 bits, the exactly
+/// representable range of an `f64` mantissa.
+fn unit_interval(draw: u64) -> f32 {
+    ((draw >> 11) as f64 / (1_u64 << 53) as f64) as f32
 }
 
 fn finish_hint_for(request: &SamplingRequest, token_id: TokenId) -> Option<SamplingFinishHint> {
@@ -1290,3 +1354,6 @@ impl From<crate::GenerationError> for SamplingError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
