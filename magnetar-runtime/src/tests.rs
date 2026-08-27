@@ -5907,6 +5907,22 @@ impl RuntimeGenerationExecutor for TestGenerationExecutor {
     }
 }
 
+#[derive(Clone)]
+struct FailingGenerationExecutor;
+
+impl RuntimeGenerationExecutor for FailingGenerationExecutor {
+    fn execute_generation_step(
+        &self,
+        _runtime: &Runtime,
+        _request: &GenerationRequest,
+        _generated_tokens: &[TokenId],
+    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+        Err(InferenceApiError::ProviderUnavailable {
+            reason: "provider failed during decode".into(),
+        })
+    }
+}
+
 fn runtime_with_generation_executor(
     vocabulary_size: usize,
     evidence: RuntimeGenerationExecutionEvidence,
@@ -8922,6 +8938,43 @@ fn inference_api_run_generation_loop_cancels_during_decode() {
     assert!(kinds.contains(&InferenceApiObservationKind::GenerationCancelled));
     assert!(kinds.contains(&InferenceApiObservationKind::StreamInterrupted));
     assert!(!kinds.contains(&InferenceApiObservationKind::GenerationCompleted));
+}
+
+#[test]
+fn inference_api_run_generation_loop_observes_executor_failure_before_returning() {
+    let mut request = generation_request();
+    request.parameters = GenerationParameters::greedy();
+    request.stop_conditions = StopConditions::default();
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .generation_executor(Arc::new(FailingGenerationExecutor))
+        .build()
+        .unwrap();
+    let mut observer = InferenceApiObserver::new();
+
+    let error = run_generation_loop(
+        &runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated| false,
+        &mut observer,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        InferenceApiError::ProviderUnavailable { .. }
+    ));
+    let kinds: Vec<_> = observer
+        .observations()
+        .iter()
+        .map(|observation| observation.kind)
+        .collect();
+    assert!(kinds.contains(&InferenceApiObservationKind::DecodeStarted));
+    assert!(kinds.contains(&InferenceApiObservationKind::ProviderUnavailable));
+    assert!(kinds.contains(&InferenceApiObservationKind::StreamInterrupted));
+    assert!(!kinds.contains(&InferenceApiObservationKind::StreamClosed));
 }
 
 #[test]

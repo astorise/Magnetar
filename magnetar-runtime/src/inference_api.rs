@@ -1144,8 +1144,7 @@ pub fn run_generation_loop(
             format!("decode step {}", generated.len()),
             correlation_id.clone(),
         );
-        let runtime_step = executor.execute_generation_step(runtime, request, &generated)?;
-        if let Err(error) = runtime_step.evidence.validate() {
+        let mut observe_execution_error = |error: &InferenceApiError| {
             match error {
                 InferenceApiError::ProviderUnavailable { .. } => observer.observe(
                     InferenceApiObservationKind::ProviderUnavailable,
@@ -1159,10 +1158,25 @@ pub fn run_generation_loop(
                 ),
                 _ => observer.observe(
                     InferenceApiObservationKind::GenerationFailed,
-                    "runtime execution evidence incomplete",
+                    "runtime execution failed",
                     correlation_id.clone(),
                 ),
             }
+            observer.observe(
+                InferenceApiObservationKind::StreamInterrupted,
+                "stream interrupted by runtime execution failure",
+                correlation_id.clone(),
+            );
+        };
+        let runtime_step = match executor.execute_generation_step(runtime, request, &generated) {
+            Ok(runtime_step) => runtime_step,
+            Err(error) => {
+                observe_execution_error(&error);
+                return Err(error);
+            }
+        };
+        if let Err(error) = runtime_step.evidence.validate() {
+            observe_execution_error(&error);
             return Err(error);
         }
         observer.observe(
