@@ -1,7 +1,7 @@
 # model-instance Specification
 
 ## Purpose
-TBD - created by archiving change define-model-instance-lifecycle. Update Purpose after archive.
+This specification defines Model Instance identity, lifecycle, readiness, warmup, adapter/cache interaction, sharing policy, and runtime-owned usage.
 ## Requirements
 ### Requirement: Model Instance
 

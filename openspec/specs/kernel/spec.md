@@ -1,7 +1,7 @@
 # kernel Specification
 
 ## Purpose
-TBD - created by archiving change define-kernel-contract. Update Purpose after archive.
+This specification defines kernel metadata, validation, precision/determinism policy, memory workspace requirements, and Provider execution contracts.
 ## Requirements
 ### Requirement: Kernel
 

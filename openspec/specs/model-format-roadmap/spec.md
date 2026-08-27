@@ -1,7 +1,7 @@
 # model-format-roadmap Specification
 
 ## Purpose
-TBD - created by archiving change define-post-baseline-model-format-roadmap. Update Purpose after archive.
+This specification defines the post-baseline model format roadmap, parser responsibilities, manifest normalization, quantization metadata, and trust boundaries.
 ## Requirements
 ### Requirement: Post-Baseline Model Format Roadmap
 

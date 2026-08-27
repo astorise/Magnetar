@@ -2,10 +2,11 @@
 
 Magnetar is a Rust runtime for portable local AI execution.
 
-The current implementation is intentionally small. The repository contains the
-`magnetar-runtime` crate and the specification history that defines the runtime
-architecture as it grows. Planned crates and AI inference features are roadmap
-items until their dedicated changes are implemented.
+The current implementation is a v0.1 local-runtime baseline. The repository
+contains the `magnetar-runtime` and `magnetar-cli` crates, executable contract
+tests, and the OpenSpec history that defines the architecture as it grows.
+Provider-backed full model execution is still incomplete; the baseline focuses
+on CPU-local contracts, fixtures, and fail-closed boundaries.
 
 ## Architecture
 
@@ -62,27 +63,43 @@ Detailed architecture notes:
 Implemented today:
 
 - `magnetar-runtime`
+- `magnetar-cli`
 - Runtime lifecycle
 - Runtime configuration
-- Provider registration foundations
-- Capability and Provider metadata foundations
+- Capability, Provider, Device, Resource Affinity, and Resolution Policy models
 - WebAssembly Component registration, contract validation, fail-closed import
   authorization, lifecycle management, and a feature-gated Wasmtime Component
   Engine adapter
-- Resource Affinity and Resolution Policy model foundations
+- Memory planning and TensorResource contracts
+- Operator, Kernel, Kernel Registry, Kernel Dispatch, and Reference CPU
+  Provider contracts
+- Model Artifact, Model Loading, Model Instance, Tokenizer, Generation,
+  Sampling, Session, KV Cache, Prefix Cache, Continuous Batching, Runtime
+  Inference API, and E2E conformance contract surfaces
+- Fixture-backed local inference and conformance paths used to validate the
+  runtime boundaries
 - Quality gates documented in [docs/quality.md](docs/quality.md)
 
-Planned, not yet implemented as stable public functionality:
+Implemented as baseline fixture or contract-only:
 
 - complete Component host adapters and end-to-end WIT host-call fixtures
-- native CPU, CUDA, ROCm, Metal, OpenVINO, QNN, Vulkan, and WebGPU Providers
-- model loading and model residency
-- tokenization and prompt formatting
-- generation, streaming, continuous batching, KV cache, prefix cache, adapters,
-  quantization, and multi-device inference
-- agent and tool execution
-- `magnetar-cli`
-- service/API transport
+- Runtime-owned Provider-backed generation through graph validation, Kernel
+  Registry, Kernel Dispatch, TensorResource logits, and Sampling
+- incremental prefill/decode execution using KV cache
+- production model artifact parsing, residency, and hub/source downloads
+- production tokenizer integration beyond deterministic fixtures
+- production continuous batching, prefix cache reuse, adapters, quantization,
+  and multi-device inference
+- `magnetar run`, `magnetar chat`, `magnetar model ...`, `magnetar providers`,
+  `magnetar devices`, and `magnetar serve` as CLI boundary harnesses rather
+  than production service commands
+
+Deferred or unsupported for v0.1:
+
+- CUDA, ROCm, Metal, OpenVINO, QNN, Vulkan, and WebGPU Providers
+- production server/API transport
+- model hub downloads
+- agent and tool execution inside the Runtime
 - concrete Component distribution protocol
 - concrete Provider ABI stabilization
 

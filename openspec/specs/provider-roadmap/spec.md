@@ -1,7 +1,7 @@
 # provider-roadmap Specification
 
 ## Purpose
-TBD - created by archiving change define-post-baseline-provider-roadmap. Update Purpose after archive.
+This specification defines the post-baseline Provider roadmap for CPU optimization, GPU/mobile/Web providers, compatibility, and conformance sequencing.
 ## Requirements
 ### Requirement: Post-Baseline Provider Roadmap
 

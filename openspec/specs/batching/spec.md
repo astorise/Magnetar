@@ -1,7 +1,7 @@
 # batching Specification
 
 ## Purpose
-TBD - created by archiving change define-continuous-batching-contract. Update Purpose after archive.
+This specification defines continuous batching identities, scheduling policy, operation lifecycle, cancellation, memory interaction, and streaming behavior for Magnetar's runtime.
 ## Requirements
 ### Requirement: Continuous Batching
 
@@ -344,4 +344,3 @@ Given caller submits requested batch slot ID
 When Runtime validates request
 
 Then caller-provided batch slot is ignored or rejected.
-

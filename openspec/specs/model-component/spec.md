@@ -1,7 +1,7 @@
 # model-component Specification
 
 ## Purpose
-TBD - created by archiving change define-model-component-contract. Update Purpose after archive.
+This specification defines model Component identity, authority, metadata, graph production, cache compatibility, and Provider-neutral execution constraints.
 ## Requirements
 ### Requirement: Model Component
 

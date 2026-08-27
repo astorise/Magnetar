@@ -1,7 +1,7 @@
 # model Specification
 
 ## Purpose
-TBD - created by archiving change define-model-artifact-model. Update Purpose after archive.
+This specification defines Model Artifact identity, manifests, integrity, trust policy, provenance, parts, shards, tensors, and residency metadata.
 ## Requirements
 ### Requirement: Model Artifact
 

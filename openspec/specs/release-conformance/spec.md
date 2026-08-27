@@ -1,7 +1,7 @@
 # release-conformance Specification
 
 ## Purpose
-TBD - created by archiving change define-first-release-conformance-and-compatibility-gates. Update Purpose after archive.
+This specification defines first-release conformance and compatibility gates, required evidence, skip policy, and release-blocking failures.
 ## Requirements
 ### Requirement: First Release Conformance Gates
 

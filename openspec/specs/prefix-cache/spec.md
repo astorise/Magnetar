@@ -1,7 +1,7 @@
 # prefix-cache Specification
 
 ## Purpose
-TBD - created by archiving change define-prefix-cache-model. Update Purpose after archive.
+This specification defines prefix cache identity, lifecycle, exact/partial matching, KV interaction, memory accounting, affinity, and privacy policy.
 ## Requirements
 ### Requirement: Prefix Cache
 

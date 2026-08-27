@@ -1,0 +1,159 @@
+{
+  "version": "v0.1.0",
+  "date": "2026-08-27",
+  "release_candidate": "0.1.0",
+  "target": "repository-evidence-bundle",
+  "feature_set": [
+    "reference-cpu-baseline",
+    "runtime-registered-generation-executor",
+    "local-e2e-fixture",
+    "cli-boundary-placeholder-logits"
+  ],
+  "suites": [
+    {
+      "name": "Formatting",
+      "status": "pass",
+      "suite_version": "rustfmt workspace",
+      "target": "workspace",
+      "feature_set": ["all-targets-source-format"],
+      "redaction_status": "not-applicable",
+      "command": "cargo fmt --all -- --check"
+    },
+    {
+      "name": "Clippy",
+      "status": "pass",
+      "suite_version": "cargo clippy workspace",
+      "target": "workspace all targets",
+      "feature_set": ["default-features"],
+      "redaction_status": "not-applicable",
+      "command": "cargo clippy --workspace --all-targets -- -D warnings"
+    },
+    {
+      "name": "Cargo Check",
+      "status": "pass",
+      "suite_version": "cargo check workspace",
+      "target": "workspace all targets",
+      "feature_set": ["default-features"],
+      "redaction_status": "not-applicable",
+      "command": "cargo check --workspace --all-targets"
+    },
+    {
+      "name": "Unit Tests",
+      "status": "pass",
+      "suite_version": "cargo test workspace unit targets",
+      "target": "workspace unit test binaries",
+      "feature_set": ["default-features"],
+      "redaction_status": "redacted",
+      "command": "cargo test --workspace"
+    },
+    {
+      "name": "Contract Tests",
+      "status": "pass",
+      "suite_version": "cargo test workspace contract targets",
+      "target": "magnetar-runtime/tests/contract_tests.rs and contract_tests modules",
+      "feature_set": ["runtime-contracts", "provider-contracts", "session-contracts"],
+      "redaction_status": "redacted",
+      "command": "cargo test --workspace"
+    },
+    {
+      "name": "OpenSpec",
+      "status": "pass",
+      "suite_version": "openspec repository specs",
+      "target": "48 repository specs",
+      "feature_set": ["spec-baseline"],
+      "redaction_status": "not-applicable",
+      "command": "openspec validate --all"
+    },
+    {
+      "name": "WIT validation",
+      "status": "pass",
+      "suite_version": "wasm-tools component wit",
+      "target": "magnetar-runtime/wit/compute.wit and magnetar-runtime/wit/observability.wit",
+      "feature_set": ["magnetar:compute@2.0.0", "magnetar:observability@1.0.0"],
+      "redaction_status": "not-applicable",
+      "command": "find . -path '*/wit/*.wit' -print0 | while IFS= read -r -d '' wit; do wasm-tools component wit \"$wit\" >/dev/null; done"
+    },
+    {
+      "name": "Reference CPU",
+      "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "magnetar-runtime",
+      "feature_set": ["reference-cpu-baseline"],
+      "redaction_status": "redacted",
+      "evidence": "Runtime and contract tests cover Reference CPU baseline semantics."
+    },
+    {
+      "name": "First Operator scope",
+      "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "magnetar-runtime",
+      "feature_set": ["first-operator-scope"],
+      "redaction_status": "redacted",
+      "evidence": "Operator scope tests pass locally."
+    },
+    {
+      "name": "Runtime contracts",
+      "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "magnetar-runtime",
+      "feature_set": ["runtime-contracts", "session-contracts"],
+      "redaction_status": "redacted",
+      "evidence": "Runtime unit and contract tests pass locally."
+    },
+    {
+      "name": "Runtime Inference API",
+      "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "magnetar-runtime",
+      "feature_set": ["runtime-registered-generation-executor"],
+      "redaction_status": "redacted",
+      "evidence": "Generation is driven through a Runtime-registered executor; executor failures emit failure and StreamInterrupted observations."
+    },
+    {
+      "name": "CLI boundary",
+      "status": "pass-with-limitations",
+      "suite_version": "0.1.0",
+      "target": "magnetar-cli",
+      "feature_set": ["cli-boundary", "placeholder-logits"],
+      "redaction_status": "redacted",
+      "evidence": "CLI boundary tests pass; placeholder logits no longer claim graph/kernel/provider execution evidence."
+    },
+    {
+      "name": "E2E local inference",
+      "status": "pass-with-limitations",
+      "suite_version": "0.1.0",
+      "target": "magnetar-runtime local Reference CPU fixture",
+      "feature_set": ["local-e2e-fixture", "reference-cpu-baseline"],
+      "redaction_status": "redacted",
+      "evidence": "Functional E2E fixture inference passes with generation evidence issued from Runtime-owned Kernel Registry and Kernel Dispatch state; full provider-backed model execution remains a v0.1 limitation."
+    },
+    {
+      "name": "Coverage Gate",
+      "status": "pass",
+      "suite_version": "quality coverage workflow",
+      "target": "workspace coverage baseline",
+      "feature_set": ["coverage-baseline"],
+      "redaction_status": "redacted",
+      "evidence": "quality / coverage passed in GitHub Actions for this PR branch."
+    },
+    {
+      "name": "Redaction Checks",
+      "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "workspace",
+      "feature_set": ["redaction", "trust-boundary", "no-raw-data"],
+      "redaction_status": "redacted",
+      "evidence": "Redaction, trust-boundary, and no-raw-data tests pass locally."
+    },
+    {
+      "name": "No-Raw-Handle Exposure Checks",
+      "status": "pass",
+      "suite_version": "0.1.0",
+      "target": "runtime public API and release reports",
+      "feature_set": ["no-raw-handles", "no-native-pointers", "redacted-observability"],
+      "redaction_status": "redacted",
+      "evidence": "No raw Provider, Device, Kernel, tensor, memory, KV-cache, or model-weight handles are exposed in release evidence."
+    }
+  ],
+  "no_raw_data_statement": "Reports do not contain raw prompts, secrets, raw weights, raw tensors, raw KV cache contents, native handles, or local artifact payloads."
+}

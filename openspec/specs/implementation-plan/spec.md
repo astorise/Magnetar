@@ -1,7 +1,7 @@
 # implementation-plan Specification
 
 ## Purpose
-TBD - created by archiving change implementation-plan-runtime-baseline. Update Purpose after archive.
+This specification records the implementation-plan baseline tying accepted runtime contracts to v0.1 delivery scope and verification evidence.
 ## Requirements
 ### Requirement: Runtime Baseline Implementation Plan
 

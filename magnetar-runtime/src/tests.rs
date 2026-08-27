@@ -1,4 +1,44 @@
-use crate::*;
+use crate::adapter::*;
+use crate::affinity::*;
+use crate::batching::*;
+use crate::capability::*;
+use crate::cli_boundary::*;
+use crate::component::*;
+use crate::compute::*;
+use crate::conformance::*;
+use crate::device::*;
+use crate::e2e_conformance::*;
+use crate::generation::*;
+use crate::inference_api::*;
+use crate::kernel::*;
+use crate::kernel_registry::*;
+use crate::kv_cache::*;
+use crate::memory::*;
+use crate::model::*;
+use crate::model_format_roadmap::*;
+use crate::model_instance::*;
+use crate::model_loading::*;
+use crate::model_source_cache_roadmap::*;
+use crate::observability::*;
+use crate::operator::*;
+use crate::operator_scope::*;
+use crate::planning::*;
+use crate::prefix_cache::*;
+use crate::provider::*;
+use crate::provider_roadmap::*;
+use crate::qwen_model_component::*;
+use crate::reference_cpu::*;
+use crate::release_cutover::*;
+use crate::release_packaging::*;
+use crate::release_security::*;
+use crate::resolution::*;
+use crate::runtime::*;
+use crate::sampling::*;
+use crate::scheduler::*;
+use crate::server_api_roadmap::*;
+use crate::session::*;
+use crate::tensor::*;
+use crate::tokenizer::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -4723,21 +4763,6 @@ fn component_trust_overrides_do_not_allow_forbidden_authority() {
     for (label, trust_store, source_kind) in [
         ("trusted-digest", ComponentTrustStore::default(), "local"),
         (
-            "trusted-publisher",
-            ComponentTrustStore::default().trust_publisher("local-dev"),
-            "local",
-        ),
-        (
-            "trusted-tachyon-source",
-            ComponentTrustStore::default().trust_source("tachyon"),
-            "tachyon",
-        ),
-        (
-            "trusted-local-source",
-            ComponentTrustStore::default().trust_source("local"),
-            "local",
-        ),
-        (
             "development-mode",
             ComponentTrustStore::default().allow_unsigned_local_development(true),
             "local",
@@ -5151,17 +5176,12 @@ fn component_artifact_rejects_incompatible_capability_versions() {
 }
 
 #[test]
-fn component_publisher_trust_is_only_policy_driven() {
+fn component_publisher_and_source_metadata_do_not_grant_trust() {
     let directory = temp_component_artifact_dir("publisher-policy");
     let artifact = directory.join("hello.component.wasm");
     let bytes = b"component-bytes";
     fs::write(&artifact, bytes).unwrap();
     let digest = ComponentDigest::sha256(bytes);
-    fs::write(
-        directory.join("hello.component.wasm.magnetar-component.yaml"),
-        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
-    )
-    .unwrap();
     let descriptor = || {
         ComponentDescriptor::new(
             ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
@@ -5171,6 +5191,11 @@ fn component_publisher_trust_is_only_policy_driven() {
         )
     };
     let mut untrusted = ComponentManager::new();
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
+    )
+    .unwrap();
     untrusted.register_component(descriptor()).unwrap();
     assert!(matches!(
         untrusted.prepare_component("magnetar.examples.hello"),
@@ -5180,10 +5205,53 @@ fn component_publisher_trust_is_only_policy_driven() {
         })
     ));
 
-    let mut trusted = ComponentManager::new();
-    trusted.set_trust_store(ComponentTrustStore::default().trust_publisher("local-dev"));
-    trusted.register_component(descriptor()).unwrap();
-    trusted
+    let mut publisher_claim = ComponentManager::new();
+    publisher_claim.set_trust_store(ComponentTrustStore::default().trust_publisher("local-dev"));
+    publisher_claim.register_component(descriptor()).unwrap();
+    assert!(matches!(
+        publisher_claim.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Unknown,
+            ..
+        })
+    ));
+
+    let mut explicit_local_development = ComponentManager::new();
+    explicit_local_development.set_trust_store(
+        ComponentTrustStore::default()
+            .trust_publisher("local-dev")
+            .trust_source("local")
+            .allow_unsigned_local_development(true),
+    );
+    explicit_local_development
+        .register_component(descriptor())
+        .unwrap();
+    explicit_local_development
+        .prepare_component("magnetar.examples.hello")
+        .unwrap();
+
+    let tachyon_manifest = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION)
+        .replace("  kind: \"local\"", "  kind: \"tachyon\"");
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        tachyon_manifest,
+    )
+    .unwrap();
+    let mut source_claim = ComponentManager::new();
+    source_claim.set_trust_store(ComponentTrustStore::default().trust_source("tachyon"));
+    source_claim.register_component(descriptor()).unwrap();
+    assert!(matches!(
+        source_claim.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Unknown,
+            ..
+        })
+    ));
+
+    let mut digest_trusted = ComponentManager::new();
+    digest_trusted.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    digest_trusted.register_component(descriptor()).unwrap();
+    digest_trusted
         .prepare_component("magnetar.examples.hello")
         .unwrap();
     fs::remove_dir_all(directory).unwrap();
@@ -5868,6 +5936,71 @@ fn generation_request() -> GenerationRequest {
         correlation_id: Some(CorrelationId::new("corr-1")),
         trace_id: Some(TraceId::new("trace-1")),
     }
+}
+
+#[derive(Clone)]
+struct TestGenerationExecutor {
+    vocabulary_size: usize,
+    evidence: RuntimeGenerationExecutionEvidence,
+}
+
+impl RuntimeGenerationExecutor for TestGenerationExecutor {
+    fn execute_generation_step(
+        &self,
+        _runtime: &Runtime,
+        _request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+        let mut logits = vec![0.0f32; self.vocabulary_size];
+        logits[(11 + generated_tokens.len()) % self.vocabulary_size] = 10.0;
+        Ok(RuntimeGenerationStep::new(logits, self.evidence))
+    }
+}
+
+#[derive(Clone)]
+struct FailingGenerationExecutor;
+
+impl RuntimeGenerationExecutor for FailingGenerationExecutor {
+    fn execute_generation_step(
+        &self,
+        _runtime: &Runtime,
+        _request: &GenerationRequest,
+        _generated_tokens: &[TokenId],
+    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+        Err(InferenceApiError::ProviderUnavailable {
+            reason: "provider failed during decode".into(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct FailingKernelGenerationExecutor;
+
+impl RuntimeGenerationExecutor for FailingKernelGenerationExecutor {
+    fn execute_generation_step(
+        &self,
+        _runtime: &Runtime,
+        _request: &GenerationRequest,
+        _generated_tokens: &[TokenId],
+    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+        Err(InferenceApiError::KernelUnavailable {
+            reason: "kernel failed during decode".into(),
+        })
+    }
+}
+
+fn runtime_with_generation_executor(
+    vocabulary_size: usize,
+    evidence: RuntimeGenerationExecutionEvidence,
+) -> Runtime {
+    Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .generation_executor(Arc::new(TestGenerationExecutor {
+            vocabulary_size,
+            evidence,
+        }))
+        .build()
+        .unwrap()
 }
 
 fn generation_runtime_tokenizer() -> RuntimeTokenizer<FixtureTokenizer> {
@@ -8336,7 +8469,12 @@ fn inference_api_tokenize_prompt_input_observed_emits_tokenized_and_failed() {
 
 #[test]
 fn inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contracts() {
-    let mut runtime = Runtime::builder().build().unwrap();
+    let metadata = generation_tokenizer_metadata();
+    let vocabulary_size = metadata.vocabulary_size as usize;
+    let mut runtime = runtime_with_generation_executor(
+        vocabulary_size,
+        RuntimeGenerationExecutionEvidence::complete(),
+    );
     let mut request = session_creation_request();
     request.allowed_capabilities.insert("generation".into());
     let session = create_one_shot_session(&mut runtime, request).unwrap();
@@ -8349,8 +8487,6 @@ fn inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contrac
     )
     .unwrap();
 
-    let metadata = generation_tokenizer_metadata();
-    let vocabulary_size = metadata.vocabulary_size as usize;
     let generation_request = build_generation_request(
         GenerationRequestId::new("one-shot-1").unwrap(),
         Some(session.clone()),
@@ -8384,11 +8520,8 @@ fn inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contrac
     let result = run_generation_loop(
         &runtime,
         &prepared,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated| vec![0.0f32; vocabulary_size],
         |_generated| false,
         &mut observer,
     )
@@ -8846,25 +8979,19 @@ fn inference_api_run_generation_loop_emits_full_streaming_lifecycle_and_complete
     request.max_new_tokens = 2;
     let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
 
-    let runtime = Runtime::builder().build().unwrap();
+    let runtime = runtime_with_generation_executor(
+        vocabulary_size,
+        RuntimeGenerationExecutionEvidence::complete(),
+    );
     let mut observer = InferenceApiObserver::new();
-    let mut step = 0usize;
 
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary {
             kv_cache_hit: Some(true),
             prefix_cache_hit: Some(false),
-        },
-        |_generated| {
-            step += 1;
-            let mut logits = vec![0.0f32; vocabulary_size];
-            logits[(10 + step) % vocabulary_size] = 10.0;
-            logits
         },
         |_generated| false,
         &mut observer,
@@ -8907,17 +9034,17 @@ fn inference_api_run_generation_loop_cancels_during_decode() {
     request.max_new_tokens = 5;
     let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
 
-    let runtime = Runtime::builder().build().unwrap();
+    let runtime = runtime_with_generation_executor(
+        vocabulary_size,
+        RuntimeGenerationExecutionEvidence::complete(),
+    );
     let mut observer = InferenceApiObserver::new();
 
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated| vec![0.0f32; vocabulary_size],
         |generated| !generated.is_empty(),
         &mut observer,
     )
@@ -8936,21 +9063,98 @@ fn inference_api_run_generation_loop_cancels_during_decode() {
 }
 
 #[test]
+fn inference_api_run_generation_loop_rejects_incomplete_executor_evidence_before_sampling() {
+    let mut request = generation_request();
+    request.parameters = GenerationParameters::greedy();
+    request.stop_conditions = StopConditions::default();
+    let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
+    let runtime = runtime_with_generation_executor(
+        vocabulary_size,
+        RuntimeGenerationExecutionEvidence {
+            model_instance_ready: true,
+            graph_validated: true,
+            kernel_selected: true,
+            kernel_dispatched: false,
+            provider_executed: false,
+            tensor_resource_used: false,
+        },
+    );
+    let mut observer = InferenceApiObserver::new();
+
+    let error = run_generation_loop(
+        &runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated| false,
+        &mut observer,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, InferenceApiError::KernelUnavailable { .. }));
+    let kinds: Vec<_> = observer
+        .observations()
+        .iter()
+        .map(|observation| observation.kind)
+        .collect();
+    assert!(kinds.contains(&InferenceApiObservationKind::ExecutionGraphValidated));
+    assert!(kinds.contains(&InferenceApiObservationKind::KernelSelected));
+    assert!(kinds.contains(&InferenceApiObservationKind::KernelUnavailable));
+    assert!(kinds.contains(&InferenceApiObservationKind::StreamInterrupted));
+    assert!(!kinds.contains(&InferenceApiObservationKind::TokenGenerated));
+    assert!(!kinds.contains(&InferenceApiObservationKind::GenerationCompleted));
+    assert!(!kinds.contains(&InferenceApiObservationKind::StreamClosed));
+}
+
+#[test]
+fn inference_api_run_generation_loop_observes_executor_failure_before_returning() {
+    let mut request = generation_request();
+    request.parameters = GenerationParameters::greedy();
+    request.stop_conditions = StopConditions::default();
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .generation_executor(Arc::new(FailingGenerationExecutor))
+        .build()
+        .unwrap();
+    let mut observer = InferenceApiObserver::new();
+
+    let error = run_generation_loop(
+        &runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated| false,
+        &mut observer,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        InferenceApiError::ProviderUnavailable { .. }
+    ));
+    let kinds: Vec<_> = observer
+        .observations()
+        .iter()
+        .map(|observation| observation.kind)
+        .collect();
+    assert!(kinds.contains(&InferenceApiObservationKind::DecodeStarted));
+    assert!(kinds.contains(&InferenceApiObservationKind::ProviderUnavailable));
+    assert!(kinds.contains(&InferenceApiObservationKind::StreamInterrupted));
+    assert!(!kinds.contains(&InferenceApiObservationKind::StreamClosed));
+}
+
+#[test]
 fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
     let mut request = generation_request();
     request.parameters = GenerationParameters::greedy();
     request.stop_conditions = StopConditions::default();
-    let runtime = Runtime::builder().build().unwrap();
-
     let mut observer = InferenceApiObserver::new();
+    let runtime = Runtime::builder().build().unwrap();
     let error = run_generation_loop(
         &runtime,
         &request,
-        false,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated| Vec::new(),
         |_generated| false,
         &mut observer,
     )
@@ -8966,17 +9170,25 @@ fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
             .any(|observation| observation.kind
                 == InferenceApiObservationKind::ProviderUnavailable)
     );
+    assert!(
+        observer
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == InferenceApiObservationKind::StreamInterrupted)
+    );
 
     request.request_id = GenerationRequestId::new("gen-2").unwrap();
     let mut observer = InferenceApiObserver::new();
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .generation_executor(Arc::new(FailingKernelGenerationExecutor))
+        .build()
+        .unwrap();
     let error = run_generation_loop(
         &runtime,
         &request,
-        true,
-        false,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated| Vec::new(),
         |_generated| false,
         &mut observer,
     )

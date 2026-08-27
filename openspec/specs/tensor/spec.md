@@ -1,7 +1,7 @@
 # tensor Specification
 
 ## Purpose
-TBD - created by archiving change define-tensor-resource-and-layout-contract. Update Purpose after archive.
+This specification defines TensorResource identity, descriptors, shape/dtype/layout, residency, readiness, views, mutability, and pointer redaction.
 ## Requirements
 ### Requirement: Tensor Descriptor
 

@@ -1,7 +1,7 @@
 # adapter Specification
 
 ## Purpose
-TBD - created by archiving change define-adapter-loading-contract. Update Purpose after archive.
+This specification defines adapter artifact loading, trust, compatibility, activation, cache interaction, and observability requirements for Magnetar's inference runtime.
 ## Requirements
 ### Requirement: Adapter Artifact
 
@@ -570,4 +570,3 @@ Given adapter is cached
 When Model Instance is loaded
 
 Then adapter activation remains explicit.
-

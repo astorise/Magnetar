@@ -1,0 +1,8 @@
+# SHA-256 checksums for repository v0.1.0 evidence files.
+# Regenerate after modifying any file in this directory.
+db50bce995a45b302726a787a1554d25383ef3a852d293fa31e87917c43675be  release/v0.1/README.md
+8db3a1b3671c9a4f2820a07192c467173f62d12f0c4b0ffe540da42316a65cad  release/v0.1/compatibility-matrix.json
+4a277af4ff650b0ff1f3fb65e21310abb31e5b6108d83bd009a4559b37fe016a  release/v0.1/conformance-report.json
+af4cff03d38e0e231b19a726656240eebd45329515fcafb3b25e28d07ca30006  release/v0.1/security-report.json
+962839c8cae617ae4e458913c3d92627f8d97394417da9cf192e89a47dd819f6  release/v0.1/provenance.json
+6ec6bb58c976aceb5783ecfd4ad762ff4d46629abed2d72747e07e59cf9012df  release/v0.1/release-statement.md

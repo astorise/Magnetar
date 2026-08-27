@@ -1,7 +1,7 @@
 # v0-1-release-cutover Specification
 
 ## Purpose
-TBD - created by archiving change define-v0-1-release-cutover-checklist. Update Purpose after archive.
+This specification defines the v0.1 release cutover checklist, freeze evidence, compatibility matrix, gates, limitations, and final release decision.
 ## Requirements
 ### Requirement: v0.1 Release Cutover Checklist
 

@@ -1,7 +1,7 @@
 # cpu-provider Specification
 
 ## Purpose
-TBD - created by archiving change define-reference-cpu-provider-and-kernel-baseline. Update Purpose after archive.
+This specification defines the reference CPU Provider and kernel baseline used to prove portable local inference without GPU or external service dependencies.
 ## Requirements
 ### Requirement: Reference CPU Provider
 

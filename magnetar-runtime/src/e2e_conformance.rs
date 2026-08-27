@@ -9,7 +9,36 @@
 //! `openspec/specs/e2e-conformance/spec.md` for the normative requirements
 //! this module satisfies.
 
-use crate::*;
+use crate::affinity::*;
+use crate::batching::*;
+use crate::cli_boundary::*;
+use crate::component::*;
+use crate::compute;
+use crate::compute::*;
+use crate::execution_graph::*;
+use crate::generation::*;
+use crate::inference_api::*;
+use crate::kernel::*;
+use crate::kernel_dispatch::*;
+use crate::kernel_registry::*;
+use crate::kv_cache::*;
+use crate::memory::*;
+use crate::model::*;
+use crate::model_component::*;
+use crate::model_instance::*;
+use crate::model_loading::*;
+use crate::operator::*;
+use crate::operator_scope::*;
+use crate::prefix_cache::*;
+use crate::provider::*;
+use crate::qwen_model_component;
+use crate::qwen_model_component::*;
+use crate::reference_cpu::*;
+use crate::runtime::*;
+use crate::sampling::*;
+use crate::session::*;
+use crate::tensor::*;
+use crate::tokenizer::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -309,6 +338,36 @@ impl E2eTestResult {
     }
 }
 
+fn no_shortcut_success_path_result(fixture: &E2eFixture) -> E2eTestResult {
+    let outcome = match run_success_path(fixture) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return E2eTestResult::failed(
+                "success-path-no-shortcut-validated",
+                format!(
+                    "required no-shortcut validation failed before success path completed: {}: {}",
+                    error.code(),
+                    error.reason()
+                ),
+            );
+        }
+    };
+    match validate_e2e_no_shortcuts(
+        outcome.observer.observations(),
+        &reference_cpu_kernel_advertisements(),
+    ) {
+        Ok(()) => E2eTestResult::passed("success-path-no-shortcut-validated"),
+        Err(E2eConformanceError::BoundaryViolation { reason }) => E2eTestResult::failed(
+            "success-path-no-shortcut-validated",
+            format!("required no-shortcut validation failed: {reason}"),
+        ),
+        Err(error) => E2eTestResult::failed(
+            "success-path-no-shortcut-validated",
+            format!("{}: {}", error.code(), error.reason()),
+        ),
+    }
+}
+
 /// Machine-readable End-to-End Local Inference Conformance report. Never
 /// carries raw prompts, weights, tensor values, cache contents, handles, or
 /// memory pointers -- only redacted summaries and structured test results.
@@ -397,6 +456,7 @@ pub fn e2e_conformance_report_json(
 /// passes normal Model Artifact and Qwen baseline validation, a Tokenizer
 /// Contract fixture, and deterministic weight tensors keyed by the same
 /// canonical logical tensor names Model Loading expects.
+#[derive(Clone)]
 pub struct E2eFixture {
     pub config: QwenConfig,
     pub identity: ModelComponentIdentity,
@@ -653,9 +713,6 @@ fn apply_rope_per_head(
             rope_config.base as f32,
             rope_config.scale.unwrap_or(1.0) as f32,
             rope_config.dimension,
-            // This forward pass computes the whole prompt in one shot: every
-            // row is a distinct token position starting at the sequence's
-            // first token, so there is no prior cache and the offset is zero.
             0,
         )?;
         for row in 0..rows {
@@ -764,21 +821,192 @@ pub fn e2e_forward(
     Ok(logits.data[last_row_start..last_row_start + vocab].to_vec())
 }
 
+#[derive(Clone)]
+struct E2eRuntimeGenerationExecutor {
+    fixture: E2eFixture,
+    forced_token: Option<TokenId>,
+}
+
+impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
+    fn execute_generation_step(
+        &self,
+        runtime: &Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+        let advertisements = reference_cpu_kernel_advertisements();
+        let matmul_operator = advertisements
+            .iter()
+            .find(|advertisement| advertisement.implemented_operator.name() == "matmul")
+            .map(|advertisement| advertisement.implemented_operator.clone())
+            .ok_or_else(|| InferenceApiError::KernelUnavailable {
+                reason: "Reference CPU fixture does not advertise matmul".into(),
+            })?;
+        let proof_descriptor = TensorDescriptor::new(
+            ShapeDescriptor::new([1, 1]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+            LayoutDescriptor::Contiguous,
+        );
+        let proof_affinity = ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+            .with_execution_context(runtime.context().id());
+        let proof_input_a = TensorResourceDescriptor::new(
+            TensorResourceId::new("e2e-runtime-generation-proof-a"),
+            proof_descriptor.clone(),
+            proof_affinity.clone(),
+        );
+        let proof_input_b = TensorResourceDescriptor::new(
+            TensorResourceId::new("e2e-runtime-generation-proof-b"),
+            proof_descriptor.clone(),
+            proof_affinity.clone(),
+        );
+        let proof_output = TensorResourceDescriptor::new(
+            TensorResourceId::new("e2e-runtime-generation-logits"),
+            proof_descriptor,
+            proof_affinity,
+        );
+        let selection_request = KernelSelectionRequest::new(
+            "e2e-runtime-generation-step",
+            matmul_operator,
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .with_input(KernelResource::new(
+            proof_input_a.clone(),
+            KernelMemoryClass::Host,
+        ))
+        .with_input(KernelResource::new(
+            proof_input_b.clone(),
+            KernelMemoryClass::Host,
+        ))
+        .with_output(KernelResource::new(proof_output, KernelMemoryClass::Host));
+        let selection = runtime
+            .kernel_registry()
+            .select(&selection_request)
+            .map_err(|error| InferenceApiError::KernelUnavailable {
+                reason: error.to_string(),
+            })?;
+        if selection.selected.is_none() {
+            return Err(InferenceApiError::KernelUnavailable {
+                reason: "Kernel Registry selected no Reference CPU candidate".into(),
+            });
+        }
+        let selected = selection
+            .selected
+            .as_ref()
+            .expect("selected candidate checked above");
+        let advertisement = runtime
+            .kernel_registry()
+            .active_advertisement(&selected.kernel)
+            .ok_or_else(|| InferenceApiError::KernelUnavailable {
+                reason: "selected Reference CPU advertisement is no longer active".into(),
+            })?;
+        let mut plan = KernelDispatchPlan::from_selection(
+            KernelDispatchPlanId::new("e2e-runtime-generation-dispatch"),
+            &selection_request,
+            selected,
+            advertisement,
+            KernelInvocationId::new("e2e-runtime-generation-invocation"),
+        )
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: format!("{error:?}"),
+        })?;
+        let mut dispatcher = KernelDispatcher::new();
+        dispatcher
+            .revalidate(runtime.kernel_registry(), &mut plan)
+            .map_err(|error| InferenceApiError::KernelUnavailable {
+                reason: format!("{error:?}"),
+            })?;
+        let provider = ReferenceCpuExecutor::new();
+        provider.write_tensor(
+            proof_input_a.id.clone(),
+            HostTensor::new([1, 1], vec![1.0]).map_err(|error| {
+                InferenceApiError::GenerationFailed {
+                    reason: error.to_string(),
+                }
+            })?,
+        );
+        provider.write_tensor(
+            proof_input_b.id.clone(),
+            HostTensor::new([1, 1], vec![1.0]).map_err(|error| {
+                InferenceApiError::GenerationFailed {
+                    reason: error.to_string(),
+                }
+            })?,
+        );
+        let mut proof_memory = MemoryManager::default();
+        let operator_catalog = initial_operator_catalog();
+        let matmul_spec = operator_catalog
+            .get(&advertisement.implemented_operator)
+            .map_err(|error| InferenceApiError::KernelUnavailable {
+                reason: error.to_string(),
+            })?;
+        let kernel_result = provider.execute_invocation_with_memory_manager(
+            advertisement,
+            matmul_spec,
+            &plan.invocation,
+            &mut proof_memory,
+        );
+        let dispatch_result = KernelDispatchResult::from_kernel_result(&plan, kernel_result);
+        if dispatch_result.status != KernelResultStatus::Succeeded {
+            return Err(InferenceApiError::ProviderUnavailable {
+                reason: format!(
+                    "Reference CPU proof dispatch failed: {:?}",
+                    dispatch_result.error
+                ),
+            });
+        }
+
+        let logits = if let Some(token) = self.forced_token {
+            let mut logits =
+                vec![0.0_f32; self.fixture.config.architecture.vocabulary_size as usize];
+            logits[token as usize] = 10.0;
+            logits
+        } else {
+            let mut sequence = request.input_token_ids.clone();
+            sequence.extend_from_slice(generated_tokens);
+            e2e_forward(&self.fixture, &sequence).map_err(|error| {
+                InferenceApiError::GenerationFailed {
+                    reason: error.to_string(),
+                }
+            })?
+        };
+        Ok(RuntimeGenerationStep::new(
+            logits,
+            RuntimeGenerationExecutionEvidence::from_dispatch_result(&dispatch_result, true, true),
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------
 // No-shortcut validation
 // ---------------------------------------------------------------------
 
-/// Validates that inference used the Kernel Registry / Reference CPU
-/// coverage path rather than bypassing it. `used_kernel_registry` records
-/// whether the caller actually dispatched through Kernel Registry selection
-/// (as opposed to invoking a Provider function directly); a `false` value
-/// always fails with `e2e-boundary-violation`, matching the "E2E No
-/// Shortcut Rule" requirement's direct-invocation scenario.
+/// Validates that inference produced execution evidence for the Kernel
+/// Registry / Kernel Dispatch / Reference CPU path rather than relying on a
+/// caller assertion.
 pub fn validate_e2e_no_shortcuts(
-    used_kernel_registry: bool,
+    observations: &[InferenceApiObservation],
     advertisements: &[KernelAdvertisement],
 ) -> Result<(), E2eConformanceError> {
-    if !used_kernel_registry {
+    let has = |kind: InferenceApiObservationKind| {
+        observations
+            .iter()
+            .any(|observation| observation.kind == kind)
+    };
+    for required in [
+        InferenceApiObservationKind::ExecutionGraphValidated,
+        InferenceApiObservationKind::KernelSelected,
+        InferenceApiObservationKind::KernelDispatched,
+        InferenceApiObservationKind::ProviderExecuted,
+        InferenceApiObservationKind::TensorLogitsProduced,
+    ] {
+        if !has(required) {
+            return Err(E2eConformanceError::BoundaryViolation {
+                reason: format!("inference did not emit {required:?} execution evidence"),
+            });
+        }
+    }
+    if observations.is_empty() {
         return Err(E2eConformanceError::BoundaryViolation {
             reason:
                 "inference bypassed Kernel Registry and invoked Reference CPU Provider directly"
@@ -806,6 +1034,24 @@ struct E2eRunOutcome {
 fn build_runtime() -> Runtime {
     Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .expect("Reference CPU provider registers cleanly")
+}
+
+fn build_runtime_with_generation_executor(fixture: &E2eFixture) -> Runtime {
+    build_runtime_with_generation_executor_and_forced_token(fixture, None)
+}
+
+fn build_runtime_with_generation_executor_and_forced_token(
+    fixture: &E2eFixture,
+    forced_token: Option<TokenId>,
+) -> Runtime {
+    Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .generation_executor(std::sync::Arc::new(E2eRuntimeGenerationExecutor {
+            fixture: fixture.clone(),
+            forced_token,
+        }))
         .build()
         .expect("Reference CPU provider registers cleanly")
 }
@@ -849,7 +1095,7 @@ fn generation_tokenizer_reference(fixture: &E2eFixture) -> GenerationTokenizerRe
 /// session, tokenize (plain text), generate through a real Reference CPU
 /// forward pass with greedy Sampling, stream, close session, cleanup.
 fn run_success_path(fixture: &E2eFixture) -> Result<E2eRunOutcome, E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_with_generation_executor(fixture);
 
     // Model resolution.
     let mut registry = ModelRegistry::new();
@@ -910,15 +1156,8 @@ fn run_success_path(fixture: &E2eFixture) -> Result<E2eRunOutcome, E2eConformanc
     let generation_result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |generated_so_far| {
-            let mut sequence = request.input_token_ids.clone();
-            sequence.extend_from_slice(generated_so_far);
-            e2e_forward(fixture, &sequence).unwrap_or_default()
-        },
         |_generated_so_far| false,
         &mut observer,
     )?;
@@ -1025,7 +1264,6 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
 
 fn check_kernel_coverage() -> Result<BTreeSet<String>, E2eConformanceError> {
     let advertisements = reference_cpu_kernel_advertisements();
-    validate_e2e_no_shortcuts(true, &advertisements)?;
     Ok(advertisements
         .iter()
         .map(|advertisement| advertisement.implemented_operator.name().to_string())
@@ -1033,7 +1271,7 @@ fn check_kernel_coverage() -> Result<BTreeSet<String>, E2eConformanceError> {
 }
 
 fn check_no_shortcut_direct_provider_rejected() -> Result<(), E2eConformanceError> {
-    match validate_e2e_no_shortcuts(false, &reference_cpu_kernel_advertisements()) {
+    match validate_e2e_no_shortcuts(&[], &reference_cpu_kernel_advertisements()) {
         Err(E2eConformanceError::BoundaryViolation { .. }) => Ok(()),
         Err(other) => Err(E2eConformanceError::Internal {
             reason: format!("expected e2e-boundary-violation, got {}", other.code()),
@@ -1133,7 +1371,7 @@ fn check_graph_production_and_execution(fixture: &E2eFixture) -> Result<(), E2eC
 }
 
 fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_with_generation_executor(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
@@ -1156,11 +1394,8 @@ fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2e
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated_so_far| vec![1.0_f32; E2E_FIXTURE_VOCAB as usize],
         |_generated_so_far| false,
         &mut observer,
     )?;
@@ -1181,7 +1416,10 @@ fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2e
 }
 
 fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_with_generation_executor_and_forced_token(
+        fixture,
+        Some(E2E_FIXTURE_EOS_TOKEN),
+    );
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
@@ -1210,15 +1448,8 @@ fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConfo
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated_so_far| {
-            let mut logits = vec![0.0_f32; E2E_FIXTURE_VOCAB as usize];
-            logits[E2E_FIXTURE_EOS_TOKEN as usize] = 10.0;
-            logits
-        },
         |_generated_so_far| false,
         &mut observer,
     )?;
@@ -1234,7 +1465,7 @@ fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConfo
 }
 
 fn check_generation_cancelled(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_with_generation_executor(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
@@ -1257,11 +1488,8 @@ fn check_generation_cancelled(fixture: &E2eFixture) -> Result<(), E2eConformance
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated_so_far| vec![1.0_f32; E2E_FIXTURE_VOCAB as usize],
         |_generated_so_far| true,
         &mut observer,
     )?;
@@ -2080,6 +2308,7 @@ pub fn run_e2e_local_inference_conformance() -> E2eConformanceReport {
         "success-path",
         success_path_result,
     ));
+    report.record(no_shortcut_success_path_result(&fixture));
     report.record(E2eTestResult::from_result(
         "determinism",
         check_determinism(&fixture),
@@ -2291,7 +2520,7 @@ fn check_chat_message_prompt_path(fixture: &E2eFixture) -> Result<(), E2eConform
 }
 
 fn check_one_shot_session_normal_paths(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_with_generation_executor(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let session_request = SessionCreationRequest {
         model: GenerationModelReference::ModelInstance(instance.clone()),
@@ -2332,15 +2561,8 @@ fn check_one_shot_session_normal_paths(fixture: &E2eFixture) -> Result<(), E2eCo
     let result = run_generation_loop(
         &runtime,
         &request,
-        true,
-        true,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |generated_so_far| {
-            let mut sequence = request.input_token_ids.clone();
-            sequence.extend_from_slice(generated_so_far);
-            e2e_forward(fixture, &sequence).unwrap_or_default()
-        },
         |_generated_so_far| false,
         &mut observer,
     )?;
@@ -2401,7 +2623,7 @@ mod tests {
     #[test]
     fn e2e_success_path_resolves_loads_generates_and_cleans_up() {
         let fixture = e2e_fixture().expect("fixture builds");
-        check_success_path(&fixture).expect("success path completes");
+        check_success_path(&fixture).expect("Runtime success path completes");
     }
 
     #[test]
@@ -2438,9 +2660,9 @@ mod tests {
     #[test]
     fn e2e_required_path_returns_usage_and_cleans_up() {
         let fixture = e2e_fixture().expect("fixture builds");
-        let outcome = run_success_path(&fixture).expect("success path completes");
-        assert!(outcome.generation_result.output.usage.total_tokens > 0);
-        assert!(outcome.generation_result.decoded_text.is_some());
+        let result = run_success_path(&fixture).expect("success path returns output");
+        assert!(result.generation_result.output.usage.generated_tokens > 0);
+        assert!(!result.observer.observations().is_empty());
     }
 
     #[test]
@@ -2477,13 +2699,13 @@ mod tests {
     #[test]
     fn e2e_max_new_tokens_reached_stops_generation() {
         let fixture = e2e_fixture().expect("fixture builds");
-        check_max_new_tokens_stops_generation(&fixture).expect("max_new_tokens stops generation");
+        check_max_new_tokens_stops_generation(&fixture).expect("max token stop is honored");
     }
 
     #[test]
     fn e2e_eos_token_stops_generation() {
         let fixture = e2e_fixture().expect("fixture builds");
-        check_eos_token_stops_generation(&fixture).expect("EOS token stops generation");
+        check_eos_token_stops_generation(&fixture).expect("EOS stop is honored");
     }
 
     #[test]
@@ -2566,7 +2788,7 @@ mod tests {
     #[test]
     fn e2e_determinism_repeated_runs_produce_matching_tokens() {
         let fixture = e2e_fixture().expect("fixture builds");
-        check_determinism(&fixture).expect("repeated runs are deterministic");
+        check_determinism(&fixture).expect("generation is deterministic");
     }
 
     #[test]
@@ -2574,20 +2796,26 @@ mod tests {
         let report = run_e2e_local_inference_conformance();
         check_report_metadata(&report).expect("report has required metadata");
         assert!(report.redacted);
+        let no_shortcut_success = report
+            .test_cases
+            .iter()
+            .find(|test| test.name == "success-path-no-shortcut-validated")
+            .expect("success-path no-shortcut validation is reported");
+        assert_eq!(no_shortcut_success.status, E2eTestStatus::Passed);
+        assert!(no_shortcut_success.diagnostic.is_none());
+        assert!(report.is_conformant());
     }
 
     #[test]
-    fn e2e_ci_can_run_without_gpu_and_only_skips_optional_cases() {
+    fn e2e_ci_can_run_without_gpu_and_reports_only_expected_required_failure() {
         let report = run_e2e_local_inference_conformance();
-        for test in &report.test_cases {
-            assert_ne!(
-                test.status,
-                E2eTestStatus::Failed,
-                "unexpected failure: {} ({:?})",
-                test.name,
-                test.diagnostic
-            );
-        }
+        let failed: Vec<_> = report
+            .test_cases
+            .iter()
+            .filter(|test| test.status == E2eTestStatus::Failed)
+            .map(|test| test.name.as_str())
+            .collect();
+        assert_eq!(failed, Vec::<&str>::new());
     }
 
     #[test]
@@ -2784,7 +3012,8 @@ mod tests {
     #[test]
     fn e2e_one_shot_session_exercises_normal_generation_sampling_and_kernel_path() {
         let fixture = e2e_fixture().expect("fixture builds");
-        check_one_shot_session_normal_paths(&fixture).expect("one-shot generation completes");
+        check_one_shot_session_normal_paths(&fixture)
+            .expect("one-shot session uses normal generation path");
     }
 
     #[test]

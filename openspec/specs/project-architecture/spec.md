@@ -1,7 +1,7 @@
 # project-architecture Specification
 
 ## Purpose
-TBD - created by archiving change align-project-architecture-and-openspec-context. Update Purpose after archive.
+This specification defines Magnetar's current architecture vocabulary, Runtime/Component/Provider boundaries, and deprecated legacy terminology.
 ## Requirements
 ### Requirement: Canonical Magnetar Architecture
 

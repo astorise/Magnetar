@@ -1,7 +1,7 @@
 # generation Specification
 
 ## Purpose
-TBD - created by archiving change define-generation-contract. Update Purpose after archive.
+This specification defines generation requests, lifecycle, stopping, sampling integration, observations, and failure semantics for runtime-owned inference.
 ## Requirements
 ### Requirement: Generation Contract
 

@@ -1,0 +1,204 @@
+{
+  "version": "v0.1.0",
+  "date": "2026-08-27",
+  "release_candidate": "0.1.0",
+  "gates": [
+    {
+      "name": "Dependency audit",
+      "status": "documented-limitation",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "workspace lockfile",
+      "feature_set": ["dependency-audit", "cargo-deny-policy"],
+      "redaction_status": "redacted",
+      "notes": "Policy and deny configuration exist; final advisory evidence must be produced by release CI."
+    },
+    {
+      "name": "License audit",
+      "status": "documented-limitation",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "workspace dependency graph",
+      "feature_set": ["license-audit", "cargo-deny-policy"],
+      "redaction_status": "redacted",
+      "notes": "Final license report is not embedded in this repository evidence bundle."
+    },
+    {
+      "name": "Secret scan",
+      "status": "documented-limitation",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "release candidate source tree",
+      "feature_set": ["secret-scan", "release-source-tree"],
+      "redaction_status": "redacted",
+      "notes": "Final scan must be run by release CI from the release candidate."
+    },
+    {
+      "name": "SBOM",
+      "status": "documented-limitation",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "release artifacts",
+      "feature_set": ["sbom", "release-artifacts"],
+      "redaction_status": "not-applicable",
+      "notes": "SBOM is not generated in this bundle."
+    },
+    {
+      "name": "Signature status",
+      "status": "documented-not-implemented",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "release artifacts",
+      "feature_set": ["artifact-signing", "release-artifacts"],
+      "redaction_status": "not-applicable",
+      "notes": "Cryptographic artifact signing is not implemented; no signing claim is made."
+    },
+    {
+      "name": "Redaction gate",
+      "status": "pass",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "runtime diagnostics, CLI observations, and release reports",
+      "feature_set": ["redaction", "no-raw-prompts", "no-secrets"],
+      "redaction_status": "redacted",
+      "notes": "Redaction tests pass locally and release reports carry redacted summaries only."
+    },
+    {
+      "name": "Native-handle boundary",
+      "status": "pass",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "runtime public API, diagnostics, observations, and release reports",
+      "feature_set": ["no-native-handles", "no-memory-pointers", "no-raw-runtime-resources"],
+      "redaction_status": "redacted",
+      "notes": "No raw Provider, Device, Kernel, tensor, memory, KV-cache, or model-weight handles are exposed in release evidence."
+    },
+    {
+      "name": "Component Artifact trust boundary",
+      "status": "pass",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "Component Artifact validation policy",
+      "feature_set": ["component-artifact-trust", "unsigned-production-denial"],
+      "redaction_status": "redacted",
+      "notes": "Component Artifact trust tests enforce fail-closed behavior for unsigned production artifacts unless explicit local development policy allows them."
+    },
+    {
+      "name": "Model Artifact trust boundary",
+      "status": "pass",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "Model Artifact trust and integrity validation",
+      "feature_set": ["model-artifact-trust", "source-integrity", "self-asserted-metadata-denial"],
+      "redaction_status": "redacted",
+      "notes": "Model Artifact trust tests reject untrusted or self-asserted source metadata before loading."
+    },
+    {
+      "name": "Source cache trust boundary",
+      "status": "pass",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "model source cache roadmap policy",
+      "feature_set": ["source-cache-trust", "cache-hit-not-trust", "revocation"],
+      "redaction_status": "redacted",
+      "notes": "Source-cache policy tests ensure cache hits, aliases, local files, and fixture status do not imply trust."
+    },
+    {
+      "name": "CLI authority not delegated",
+      "status": "pass",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "CLI boundary and Runtime request surface",
+      "feature_set": ["cli-authority-boundary", "filesystem-not-runtime", "git-not-runtime", "network-not-runtime"],
+      "redaction_status": "redacted",
+      "notes": "CLI boundary tests keep filesystem, Git, network, secret, shell, tool, and agent authority in the CLI process."
+    },
+    {
+      "name": "Runtime Inference API security",
+      "status": "pass",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "Runtime Inference API",
+      "feature_set": ["inference-only-runtime", "no-ambient-authority", "execution-evidence-validation"],
+      "redaction_status": "redacted",
+      "notes": "Runtime Inference API tests reject non-inference authority and require Runtime-owned generation execution evidence before sampling logits."
+    },
+    {
+      "name": "Unsafe-code review",
+      "status": "policy-covered",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "runtime FFI and raw-handle boundaries",
+      "feature_set": ["unsafe-code-review", "ffi-boundaries", "raw-handle-boundaries"],
+      "redaction_status": "redacted",
+      "notes": "Unsafe-code policy is covered by executable tests."
+    },
+    {
+      "name": "Lockfile integrity",
+      "status": "pass-for-repository-evidence",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "Cargo.lock",
+      "feature_set": ["lockfile-reviewed", "workspace-dependencies"],
+      "redaction_status": "not-applicable",
+      "notes": "Cargo.lock is committed in the PR branch and covered by cargo check, clippy, tests, and cargo-deny policy."
+    },
+    {
+      "name": "Dependency feature review",
+      "status": "policy-covered",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "workspace dependency feature set",
+      "feature_set": ["dependency-features", "capability-expansion-review"],
+      "redaction_status": "redacted",
+      "notes": "Dependency feature review policy is documented; final release CI must attach expanded dependency feature evidence before stable publication."
+    },
+    {
+      "name": "Vulnerability handling policy",
+      "status": "policy-covered",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "release security notes and advisory exceptions",
+      "feature_set": ["vulnerability-policy", "advisory-exceptions", "mitigation-tracking"],
+      "redaction_status": "redacted",
+      "notes": "Security exceptions include owner, severity, rationale, mitigation, follow-up, and release-note linkage."
+    },
+    {
+      "name": "Security notes",
+      "status": "pass-for-repository-evidence",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "release/v0.1/release-statement.md and release/v0.1/security-report.json",
+      "feature_set": ["threat-model", "trust-boundaries", "known-risks", "unsupported-security-features"],
+      "redaction_status": "redacted",
+      "notes": "Release statement and security report describe supported scope, unsupported features, limitations, known risks, and reporting follow-ups."
+    },
+    {
+      "name": "Artifact integrity",
+      "status": "pass-for-repository-evidence",
+      "suite_version": "release-security-policy-0.1.0",
+      "target": "release/v0.1 evidence bundle",
+      "feature_set": ["sha256-checksums", "repository-evidence-bundle"],
+      "redaction_status": "not-applicable",
+      "notes": "Checksums are provided for this evidence bundle in checksums.sha256."
+    }
+  ],
+  "security_exceptions": [
+    {
+      "issue": "release-v0.1-sbom-not-generated",
+      "component": "release packaging",
+      "severity": "medium",
+      "rationale": "The repository evidence bundle documents v0.1 release readiness but does not produce final distribution artifacts.",
+      "mitigation": "No SBOM claim is made for v0.1 repository evidence; release CI must generate and attach an SBOM before a distributable release is published.",
+      "owner": "release engineering",
+      "follow_up": "Generate SBOM from the release candidate build in release CI.",
+      "release_note_entry": "release/v0.1/release-statement.md#deferred-or-unsupported",
+      "redaction_status": "not-applicable"
+    },
+    {
+      "issue": "release-v0.1-artifacts-unsigned",
+      "component": "artifact integrity",
+      "severity": "medium",
+      "rationale": "Cryptographic artifact signing is not implemented by this repository evidence bundle.",
+      "mitigation": "The bundle publishes checksums only and explicitly avoids making any signature claim.",
+      "owner": "release engineering",
+      "follow_up": "Add artifact signing to the release pipeline before publishing signed binary artifacts.",
+      "release_note_entry": "release/v0.1/release-statement.md#deferred-or-unsupported",
+      "redaction_status": "not-applicable"
+    },
+    {
+      "issue": "release-v0.1-final-ci-security-reports-not-embedded",
+      "component": "release security gates",
+      "severity": "medium",
+      "rationale": "The repository evidence bundle cannot embed final CI advisory, license, and secret-scan reports before the release candidate workflow completes.",
+      "mitigation": "Security-report gates are marked as documented limitations and must be replaced or supplemented by final CI-produced reports at release cutover.",
+      "owner": "release engineering",
+      "follow_up": "Attach final advisory, license, and secret-scan outputs from release CI.",
+      "release_note_entry": "release/v0.1/release-statement.md#deferred-or-unsupported",
+      "redaction_status": "redacted"
+    }
+  ]
+}

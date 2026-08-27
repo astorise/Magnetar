@@ -775,8 +775,8 @@ impl ModelTrustStore {
             && self.trusted_publishers.contains(publisher)
         {
             return ModelTrustDecision::new(
-                ModelTrustStatus::Trusted,
-                "publisher trusted by policy",
+                ModelTrustStatus::Unknown,
+                "publisher identity is metadata only; no authenticated trust mechanism matched",
             );
         }
         ModelTrustDecision::new(ModelTrustStatus::Unknown, "no model trust policy matched")
