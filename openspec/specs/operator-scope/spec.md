@@ -1,7 +1,7 @@
 # operator-scope Specification
 
 ## Purpose
-TBD - created by archiving change define-first-operator-implementation-scope. Update Purpose after archive.
+This specification defines the first operator implementation scope, required-now coverage, placeholders, unsupported variants, and baseline validation.
 ## Requirements
 ### Requirement: First Operator Implementation Scope
 

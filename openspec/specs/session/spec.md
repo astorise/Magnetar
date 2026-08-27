@@ -1,7 +1,7 @@
 # session Specification
 
 ## Purpose
-TBD - created by archiving change define-inference-session-model. Update Purpose after archive.
+This specification defines inference session identity, lifecycle, policy, memory budget, queued operations, expiration, cancellation, and cleanup.
 ## Requirements
 ### Requirement: Inference Session
 

@@ -1,7 +1,7 @@
 # resolution Specification
 
 ## Purpose
-TBD - created by archiving change refine-provider-health-readiness-pressure-model. Update Purpose after archive.
+This specification defines Provider health, readiness, pressure, resolution behavior, failover, and structured diagnostics for runtime selection.
 ## Requirements
 ### Requirement: Resolution Considers Provider Status
 

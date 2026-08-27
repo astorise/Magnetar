@@ -1,7 +1,7 @@
 # model-source-cache-roadmap Specification
 
 ## Purpose
-TBD - created by archiving change define-post-baseline-model-source-and-cache-roadmap. Update Purpose after archive.
+This specification defines the post-baseline model source/cache roadmap and the rule that cache or source metadata never implies artifact trust.
 ## Requirements
 ### Requirement: Post-Baseline Model Source And Cache Roadmap
 

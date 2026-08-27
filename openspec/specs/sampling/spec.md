@@ -1,7 +1,7 @@
 # sampling Specification
 
 ## Purpose
-TBD - created by archiving change define-sampling-and-logits-processing-contract. Update Purpose after archive.
+This specification defines logits processing, greedy/stochastic sampling, token constraints, penalties, workspace policy, and redacted diagnostics.
 ## Requirements
 ### Requirement: Sampling Contract
 

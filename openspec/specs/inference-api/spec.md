@@ -1,7 +1,7 @@
 # inference-api Specification
 
 ## Purpose
-TBD - created by archiving change define-runtime-inference-api. Update Purpose after archive.
+This specification defines the Runtime Inference API boundary for model loading, sessions, generation, streaming, diagnostics, and CLI/server callers.
 ## Requirements
 ### Requirement: Runtime Inference API
 

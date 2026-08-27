@@ -224,6 +224,18 @@ fn model_trust_is_policy_owned_not_manifest_owned() {
 }
 
 #[test]
+fn model_manifest_publisher_metadata_does_not_grant_trust() {
+    let manifest = ModelManifest::from_yaml_str(&valid_manifest()).unwrap();
+    let mut store = ModelTrustStore::default();
+    store.trusted_publishers.insert("example".into());
+
+    let decision = store.evaluate(&manifest);
+
+    assert_eq!(decision.status, ModelTrustStatus::Unknown);
+    assert!(decision.reason.contains("metadata only"));
+}
+
+#[test]
 fn model_trust_policy_rejects_and_revokes() {
     let manifest = ModelManifest::from_yaml_str(&valid_manifest()).unwrap();
     let rejected = ModelTrustStore::default()

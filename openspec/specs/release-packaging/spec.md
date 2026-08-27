@@ -1,7 +1,7 @@
 # release-packaging Specification
 
 ## Purpose
-TBD - created by archiving change define-release-packaging-and-versioning-policy. Update Purpose after archive.
+This specification defines v0.1 release packaging, versioning, baseline declaration, artifact manifests, checksums, changelog, and release notes.
 ## Requirements
 ### Requirement: Release Packaging Policy
 

@@ -1,7 +1,7 @@
 # runtime Specification
 
 ## Purpose
-TBD - created by archiving change bootstrap-runtime. Update Purpose after archive.
+This specification defines the Runtime core boundary, lifecycle, Provider/Device independence from legacy Backend concepts, memory, sessions, and execution ownership.
 ## Requirements
 ### Requirement: Runtime Initialization
 

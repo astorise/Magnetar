@@ -1,7 +1,7 @@
 # wit Specification
 
 ## Purpose
-TBD - created by archiving change define-release-packaging-and-versioning-policy. Update Purpose after archive.
+This specification defines WIT package/version validation, compatibility, release packaging, and Component interface freeze requirements.
 ## Requirements
 ### Requirement: WIT Package Release Versions
 

@@ -1,7 +1,7 @@
 # conformance Specification
 
 ## Purpose
-TBD - created by archiving change define-reference-cpu-provider-and-kernel-baseline. Update Purpose after archive.
+This specification defines conformance evidence for the reference CPU provider, kernel baseline, local E2E path, release gates, and compatibility reporting.
 ## Requirements
 ### Requirement: Reference CPU Conformance Baseline
 

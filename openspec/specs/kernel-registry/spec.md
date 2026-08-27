@@ -1,7 +1,7 @@
 # kernel-registry Specification
 
 ## Purpose
-TBD - created by archiving change define-kernel-registry-and-dispatch. Update Purpose after archive.
+This specification defines runtime-owned kernel registry selection, dispatch planning, Provider readiness checks, and fail-closed kernel compatibility.
 ## Requirements
 ### Requirement: Kernel Registry
 

@@ -1,7 +1,7 @@
 # model-loading Specification
 
 ## Purpose
-TBD - created by archiving change define-model-loading-contract. Update Purpose after archive.
+This specification defines model loading validation, trust, memory admission, architecture resolution, loaded context creation, and failure behavior.
 ## Requirements
 ### Requirement: Model Loading Contract
 

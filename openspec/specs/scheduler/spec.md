@@ -1,7 +1,7 @@
 # scheduler Specification
 
 ## Purpose
-TBD - created by archiving change define-continuous-batching-contract. Update Purpose after archive.
+This specification defines scheduler identity, queue policy, fairness, capacity, cancellation, batching interaction, and memory admission boundaries.
 ## Requirements
 ### Requirement: Scheduler Owns Continuous Batching Policy
 

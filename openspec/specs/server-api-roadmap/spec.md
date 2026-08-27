@@ -1,7 +1,7 @@
 # server-api-roadmap Specification
 
 ## Purpose
-TBD - created by archiving change define-post-baseline-server-api-roadmap. Update Purpose after archive.
+This specification defines the deferred server API roadmap, including HTTP/OpenAI-facade concepts, streaming policy, authorization, and non-goals.
 ## Requirements
 ### Requirement: Post-Baseline Server API Roadmap
 

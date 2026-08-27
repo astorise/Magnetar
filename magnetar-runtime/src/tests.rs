@@ -4673,21 +4673,6 @@ fn component_trust_overrides_do_not_allow_forbidden_authority() {
     for (label, trust_store, source_kind) in [
         ("trusted-digest", ComponentTrustStore::default(), "local"),
         (
-            "trusted-publisher",
-            ComponentTrustStore::default().trust_publisher("local-dev"),
-            "local",
-        ),
-        (
-            "trusted-tachyon-source",
-            ComponentTrustStore::default().trust_source("tachyon"),
-            "tachyon",
-        ),
-        (
-            "trusted-local-source",
-            ComponentTrustStore::default().trust_source("local"),
-            "local",
-        ),
-        (
             "development-mode",
             ComponentTrustStore::default().allow_unsigned_local_development(true),
             "local",
@@ -5101,17 +5086,12 @@ fn component_artifact_rejects_incompatible_capability_versions() {
 }
 
 #[test]
-fn component_publisher_trust_is_only_policy_driven() {
+fn component_publisher_and_source_metadata_do_not_grant_trust() {
     let directory = temp_component_artifact_dir("publisher-policy");
     let artifact = directory.join("hello.component.wasm");
     let bytes = b"component-bytes";
     fs::write(&artifact, bytes).unwrap();
     let digest = ComponentDigest::sha256(bytes);
-    fs::write(
-        directory.join("hello.component.wasm.magnetar-component.yaml"),
-        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
-    )
-    .unwrap();
     let descriptor = || {
         ComponentDescriptor::new(
             ComponentMetadata::new("magnetar.examples.hello", "0.1.0", "fixture")
@@ -5121,6 +5101,11 @@ fn component_publisher_trust_is_only_policy_driven() {
         )
     };
     let mut untrusted = ComponentManager::new();
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION),
+    )
+    .unwrap();
     untrusted.register_component(descriptor()).unwrap();
     assert!(matches!(
         untrusted.prepare_component("magnetar.examples.hello"),
@@ -5130,10 +5115,39 @@ fn component_publisher_trust_is_only_policy_driven() {
         })
     ));
 
-    let mut trusted = ComponentManager::new();
-    trusted.set_trust_store(ComponentTrustStore::default().trust_publisher("local-dev"));
-    trusted.register_component(descriptor()).unwrap();
-    trusted
+    let mut publisher_claim = ComponentManager::new();
+    publisher_claim.set_trust_store(ComponentTrustStore::default().trust_publisher("local-dev"));
+    publisher_claim.register_component(descriptor()).unwrap();
+    assert!(matches!(
+        publisher_claim.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Unknown,
+            ..
+        })
+    ));
+
+    let tachyon_manifest = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION)
+        .replace("  kind: \"local\"", "  kind: \"tachyon\"");
+    fs::write(
+        directory.join("hello.component.wasm.magnetar-component.yaml"),
+        tachyon_manifest,
+    )
+    .unwrap();
+    let mut source_claim = ComponentManager::new();
+    source_claim.set_trust_store(ComponentTrustStore::default().trust_source("tachyon"));
+    source_claim.register_component(descriptor()).unwrap();
+    assert!(matches!(
+        source_claim.prepare_component("magnetar.examples.hello"),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Unknown,
+            ..
+        })
+    ));
+
+    let mut digest_trusted = ComponentManager::new();
+    digest_trusted.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
+    digest_trusted.register_component(descriptor()).unwrap();
+    digest_trusted
         .prepare_component("magnetar.examples.hello")
         .unwrap();
     fs::remove_dir_all(directory).unwrap();

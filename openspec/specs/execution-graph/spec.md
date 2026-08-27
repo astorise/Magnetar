@@ -1,7 +1,7 @@
 # execution-graph Specification
 
 ## Purpose
-TBD - created by archiving change define-execution-graph-and-operator-contract. Update Purpose after archive.
+This specification defines portable execution graph structure, validation, tensor/resource boundaries, operator usage, and runtime-owned dispatch preparation.
 ## Requirements
 ### Requirement: Execution Graph
 

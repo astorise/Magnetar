@@ -1,7 +1,7 @@
 # kv-cache Specification
 
 ## Purpose
-TBD - created by archiving change define-kv-cache-model. Update Purpose after archive.
+This specification defines KV cache identity, ownership, memory accounting, lifecycle, affinity, reuse, sharing policy, and redacted observability.
 ## Requirements
 ### Requirement: KV Cache
 

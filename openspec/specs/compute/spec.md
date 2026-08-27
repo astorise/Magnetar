@@ -1,7 +1,7 @@
 # compute Specification
 
 ## Purpose
-TBD - created by archiving change define-runtime-memory-manager. Update Purpose after archive.
+This specification defines runtime memory manager and compute-facing resource contracts used to plan, admit, account for, and release inference allocations.
 ## Requirements
 ### Requirement: Compute Describes Tensors, Memory Manager Realizes Memory
 

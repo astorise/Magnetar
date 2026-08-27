@@ -409,14 +409,14 @@ impl ComponentTrustStore {
             && self.trusted_publishers.contains(&publisher.id)
         {
             return ComponentTrustDecision::new(
-                ComponentTrustStatus::Trusted,
-                "publisher trusted by policy",
+                ComponentTrustStatus::Unknown,
+                "publisher identity is metadata only; no authenticated trust mechanism matched",
             );
         }
         if self.trusted_sources.contains(&manifest.source.kind) {
             return ComponentTrustDecision::new(
-                ComponentTrustStatus::Trusted,
-                "source trusted by policy",
+                ComponentTrustStatus::Unknown,
+                "source identity is metadata only; no authenticated trust mechanism matched",
             );
         }
         if self.allow_unsigned_local_development && manifest.source.kind == "local" {

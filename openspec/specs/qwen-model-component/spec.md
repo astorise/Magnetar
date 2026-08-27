@@ -1,7 +1,7 @@
 # qwen-model-component Specification
 
 ## Purpose
-TBD - created by archiving change define-qwen-model-component-baseline. Update Purpose after archive.
+This specification defines the Qwen model Component baseline, metadata validation, graph requirements, operator scope, tokenizer/cache compatibility, and adapter targets.
 ## Requirements
 ### Requirement: Qwen Model Component Baseline
 

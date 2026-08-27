@@ -1,7 +1,7 @@
 # tokenizer Specification
 
 ## Purpose
-TBD - created by archiving change define-tokenizer-contract. Update Purpose after archive.
+This specification defines tokenizer artifact identity, loading, model compatibility, encode/decode behavior, truncation/padding, offsets, and memory policy.
 ## Requirements
 ### Requirement: Tokenizer Contract
 

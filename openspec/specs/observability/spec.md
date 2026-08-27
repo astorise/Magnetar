@@ -1,7 +1,7 @@
 # observability Specification
 
 ## Purpose
-TBD - created by archiving change define-observability-exporter-component-model. Update Purpose after archive.
+This specification defines runtime observability events, redaction, exporters, dynamic debug policy, sink authorization, and report mapping.
 ## Requirements
 ### Requirement: Observability Component Model
 

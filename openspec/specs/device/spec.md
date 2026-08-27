@@ -1,7 +1,7 @@
 # device Specification
 
 ## Purpose
-TBD - created by archiving change define-device-model. Update Purpose after archive.
+This specification defines Device identity, metadata, ownership, status, and Provider association for runtime execution targets.
 ## Requirements
 ### Requirement: Device Discovery
 

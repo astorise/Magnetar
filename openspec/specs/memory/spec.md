@@ -1,7 +1,7 @@
 # memory Specification
 
 ## Purpose
-TBD - created by archiving change define-runtime-memory-manager. Update Purpose after archive.
+This specification defines runtime memory planning, allocation classes, admission, accounting, dtype/layout relationships, and resource lifecycle guarantees.
 ## Requirements
 ### Requirement: Runtime Memory Manager
 

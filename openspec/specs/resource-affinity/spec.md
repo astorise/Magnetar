@@ -1,7 +1,7 @@
 # resource-affinity Specification
 
 ## Purpose
-TBD - created by archiving change define-resource-affinity-model. Update Purpose after archive.
+This specification defines Resource Affinity identities, bindings, conflict handling, fallback precedence, and Provider/Device ownership constraints.
 ## Requirements
 ### Requirement: Runtime-Native Resource Affinity
 

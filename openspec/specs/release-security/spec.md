@@ -1,7 +1,7 @@
 # release-security Specification
 
 ## Purpose
-TBD - created by archiving change define-release-security-and-supply-chain-hardening. Update Purpose after archive.
+This specification defines release security and supply-chain gates, audits, exceptions, provenance, checksum policy, and fail-closed release handling.
 ## Requirements
 ### Requirement: Release Security Hardening
 

@@ -1,7 +1,7 @@
 # operator Specification
 
 ## Purpose
-TBD - created by archiving change define-execution-graph-and-operator-contract. Update Purpose after archive.
+This specification defines portable operator identity, attributes, validation, dtype/layout/shape constraints, and graph compatibility.
 ## Requirements
 ### Requirement: Operator
 
