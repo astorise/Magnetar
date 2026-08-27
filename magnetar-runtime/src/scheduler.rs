@@ -1,7 +1,13 @@
+use crate::affinity::*;
 use crate::compute::redact_backend_diagnostic;
+use crate::compute::*;
+use crate::device::Device;
+use crate::memory::*;
+use crate::observability::*;
 use crate::planning::provider_execution_id;
+use crate::planning::*;
 use crate::runtime::next_scheduled_operation_id;
-use crate::*;
+use crate::runtime::*;
 use std::{
     collections::{BTreeMap, VecDeque},
     error::Error,

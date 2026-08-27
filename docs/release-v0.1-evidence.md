@@ -10,6 +10,8 @@ Status: pre-release evidence snapshot; not a stable release record.
 | Rust public API | stable-for-v0.1-baseline | Contract surface compiles and is covered by unit/contract tests. |
 | Runtime Inference API | stable-for-v0.1-baseline | Normal generation uses a Runtime-registered executor rather than caller-supplied logits. |
 | WIT packages | stable-for-v0.1-baseline | WIT files are present under `magnetar-runtime/wit`. |
+| WIT `magnetar:compute@2.0.0` | stable-for-v0.1-baseline | Supported baseline Compute interface in `magnetar-runtime/wit/compute.wit`. |
+| WIT `magnetar:observability@1.0.0` | stable-for-v0.1-baseline | Supported baseline Observability interface in `magnetar-runtime/wit/observability.wit`. |
 | Provider ABI | unstable | Concrete ABI stabilization is deferred. |
 | Model Artifact metadata | preview | Contracts exist; production parsing/source support is deferred. |
 | Tokenizer Artifact metadata | preview | Fixture and contract paths exist; production tokenizer integration is deferred. |
@@ -65,12 +67,7 @@ recorded by CI.
 
 ## Remaining Non-Release Issues
 
-- #23: crate facade re-exports are reduced to per-module exports; several
-  foundational modules now use explicit imports. Some large implementation
-  modules still use `use crate::*` and should be cleaned up in follow-up
-  mechanical passes.
-- #4: Renovate dependency dashboard remains informational; it currently reports
-  no open or pending dependency branches.
+None currently tracked in this evidence snapshot.
 
 ## No-Raw-Data Statement
 

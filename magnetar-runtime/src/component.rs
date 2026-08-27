@@ -405,24 +405,23 @@ impl ComponentTrustStore {
         if self.trusted_digests.contains(&digest.value) {
             return ComponentTrustDecision::new(ComponentTrustStatus::Trusted, "digest trusted");
         }
-        if let Some(publisher) = &manifest.publisher
+        let matched_unauthenticated_metadata = if let Some(publisher) = &manifest.publisher
             && self.trusted_publishers.contains(&publisher.id)
         {
-            return ComponentTrustDecision::new(
-                ComponentTrustStatus::Unknown,
-                "publisher identity is metadata only; no authenticated trust mechanism matched",
-            );
-        }
-        if self.trusted_sources.contains(&manifest.source.kind) {
-            return ComponentTrustDecision::new(
-                ComponentTrustStatus::Unknown,
-                "source identity is metadata only; no authenticated trust mechanism matched",
-            );
-        }
+            true
+        } else {
+            self.trusted_sources.contains(&manifest.source.kind)
+        };
         if self.allow_unsigned_local_development && manifest.source.kind == "local" {
             return ComponentTrustDecision::new(
                 ComponentTrustStatus::Trusted,
                 "explicit development local trust",
+            );
+        }
+        if matched_unauthenticated_metadata {
+            return ComponentTrustDecision::new(
+                ComponentTrustStatus::Unknown,
+                "publisher/source identity is metadata only; no authenticated trust mechanism matched",
             );
         }
         ComponentTrustDecision::new(ComponentTrustStatus::Unknown, "no trust policy matched")

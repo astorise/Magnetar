@@ -94,7 +94,21 @@
 //! is defined in the error model for future use if a browser-specific limitation
 //! is identified; none is known today.
 
-use crate::*;
+use crate::affinity::*;
+use crate::capability::*;
+use crate::compute::*;
+use crate::device::{
+    Device, DeviceDescriptor, DeviceExecutionLimits, DeviceId, DeviceMetadata, DeviceType,
+};
+use crate::kernel::*;
+use crate::memory::*;
+use crate::operator::*;
+use crate::provider::{
+    PROVIDER_API_VERSION, Provider, ProviderError, ProviderExecutionApi, ProviderMetadata,
+    ProviderRegistry,
+};
+use crate::scheduler::*;
+use crate::tensor::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,

@@ -4,7 +4,12 @@
 //! candidates for Runtime selection. It never exposes native function pointers,
 //! Provider handles, or direct client authority over Provider selection.
 
-use crate::*;
+use crate::affinity::*;
+use crate::compute::*;
+use crate::execution_graph::*;
+use crate::kernel::*;
+use crate::model_instance::*;
+use crate::operator::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, fmt};
 

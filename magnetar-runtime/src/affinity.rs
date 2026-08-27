@@ -1,5 +1,9 @@
+use crate::capability::*;
 use crate::compute::redact_backend_diagnostic;
-use crate::*;
+use crate::compute::*;
+use crate::device::*;
+use crate::provider::*;
+use crate::resolution::*;
 use std::{collections::BTreeMap, error::Error, fmt};
 /// Process-local identity of a Runtime execution context.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]

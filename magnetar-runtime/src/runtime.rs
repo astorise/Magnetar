@@ -1,14 +1,33 @@
+use crate::affinity::*;
+use crate::batching::*;
+use crate::capability::*;
+use crate::component::*;
+use crate::compute::*;
 use crate::compute::{
     effective_compute_advertisement, ensure_non_empty_id, insert_unique,
     resolve_compute_value_descriptor, validate_compute_operation_schema,
 };
+use crate::device::*;
+use crate::generation::*;
+use crate::inference_api::*;
+use crate::kernel_registry::*;
+use crate::kv_cache::*;
+use crate::memory::*;
+use crate::model_instance::*;
+use crate::model_loading::*;
+use crate::observability::*;
+use crate::planning::*;
 use crate::planning::{
     classify_execution_plan, execution_phase_from_step_kind, execution_plan_id,
     execution_step_kind_from_memory_decision, graph_output_uses, last_use_for_input,
     last_use_for_node_output, memory_bytes, memory_error_from_compute_validation,
     planning_error_from_affinity, planning_error_from_validation, provider_memory_limit,
 };
-use crate::*;
+use crate::prefix_cache::*;
+use crate::provider::*;
+use crate::resolution::BuiltInResolutionPolicy;
+use crate::scheduler::*;
+use crate::session::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,

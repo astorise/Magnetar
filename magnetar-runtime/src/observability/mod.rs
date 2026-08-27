@@ -17,7 +17,10 @@ pub use exporter::{
     opentelemetry_exporter_component, prometheus_exposer_component, prometheus_snapshot_lines,
 };
 
-use crate::*;
+use crate::affinity::*;
+use crate::component::*;
+use crate::planning::*;
+use crate::scheduler::*;
 use std::{collections::BTreeSet, fmt};
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CorrelationId(String);

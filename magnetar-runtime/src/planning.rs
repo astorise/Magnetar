@@ -1,6 +1,12 @@
+use crate::affinity::*;
+use crate::capability::*;
 use crate::compute::effective_compute_advertisement;
+use crate::compute::*;
+use crate::observability::*;
+use crate::provider::*;
+use crate::resolution::*;
 use crate::scheduler::runtime_events_for_execution_plan;
-use crate::*;
+use crate::scheduler::*;
 use std::{error::Error, fmt};
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ExecutionPlanId(String);

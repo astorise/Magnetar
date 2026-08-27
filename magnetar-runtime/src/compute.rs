@@ -1,5 +1,10 @@
+use crate::affinity::*;
+use crate::capability::*;
+use crate::component::*;
+use crate::device::*;
 use crate::planning::memory_pressure_diagnostic;
-use crate::*;
+use crate::planning::*;
+use crate::provider::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,

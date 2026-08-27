@@ -9,7 +9,36 @@
 //! `openspec/specs/e2e-conformance/spec.md` for the normative requirements
 //! this module satisfies.
 
-use crate::*;
+use crate::affinity::*;
+use crate::batching::*;
+use crate::cli_boundary::*;
+use crate::component::*;
+use crate::compute;
+use crate::compute::*;
+use crate::execution_graph::*;
+use crate::generation::*;
+use crate::inference_api::*;
+use crate::kernel::*;
+use crate::kernel_dispatch::*;
+use crate::kernel_registry::*;
+use crate::kv_cache::*;
+use crate::memory::*;
+use crate::model::*;
+use crate::model_component::*;
+use crate::model_instance::*;
+use crate::model_loading::*;
+use crate::operator::*;
+use crate::operator_scope::*;
+use crate::prefix_cache::*;
+use crate::provider::*;
+use crate::qwen_model_component;
+use crate::qwen_model_component::*;
+use crate::reference_cpu::*;
+use crate::runtime::*;
+use crate::sampling::*;
+use crate::session::*;
+use crate::tensor::*;
+use crate::tokenizer::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},

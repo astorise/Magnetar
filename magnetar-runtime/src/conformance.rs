@@ -1,5 +1,9 @@
+use crate::affinity::*;
+use crate::component::*;
 use crate::compute::redact_backend_diagnostic;
-use crate::*;
+use crate::compute::*;
+use crate::provider::*;
+use crate::runtime::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},

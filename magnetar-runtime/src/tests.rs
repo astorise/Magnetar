@@ -1,4 +1,44 @@
-use crate::*;
+use crate::adapter::*;
+use crate::affinity::*;
+use crate::batching::*;
+use crate::capability::*;
+use crate::cli_boundary::*;
+use crate::component::*;
+use crate::compute::*;
+use crate::conformance::*;
+use crate::device::*;
+use crate::e2e_conformance::*;
+use crate::generation::*;
+use crate::inference_api::*;
+use crate::kernel::*;
+use crate::kernel_registry::*;
+use crate::kv_cache::*;
+use crate::memory::*;
+use crate::model::*;
+use crate::model_format_roadmap::*;
+use crate::model_instance::*;
+use crate::model_loading::*;
+use crate::model_source_cache_roadmap::*;
+use crate::observability::*;
+use crate::operator::*;
+use crate::operator_scope::*;
+use crate::planning::*;
+use crate::prefix_cache::*;
+use crate::provider::*;
+use crate::provider_roadmap::*;
+use crate::qwen_model_component::*;
+use crate::reference_cpu::*;
+use crate::release_cutover::*;
+use crate::release_packaging::*;
+use crate::release_security::*;
+use crate::resolution::*;
+use crate::runtime::*;
+use crate::sampling::*;
+use crate::scheduler::*;
+use crate::server_api_roadmap::*;
+use crate::session::*;
+use crate::tensor::*;
+use crate::tokenizer::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -5125,6 +5165,20 @@ fn component_publisher_and_source_metadata_do_not_grant_trust() {
             ..
         })
     ));
+
+    let mut explicit_local_development = ComponentManager::new();
+    explicit_local_development.set_trust_store(
+        ComponentTrustStore::default()
+            .trust_publisher("local-dev")
+            .trust_source("local")
+            .allow_unsigned_local_development(true),
+    );
+    explicit_local_development
+        .register_component(descriptor())
+        .unwrap();
+    explicit_local_development
+        .prepare_component("magnetar.examples.hello")
+        .unwrap();
 
     let tachyon_manifest = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION)
         .replace("  kind: \"local\"", "  kind: \"tachyon\"");
