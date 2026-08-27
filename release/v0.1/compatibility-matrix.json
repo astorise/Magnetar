@@ -1,0 +1,78 @@
+{
+  "version": "v0.1",
+  "status_vocabulary": [
+    "stable-for-v0.1-baseline",
+    "preview",
+    "experimental",
+    "unstable",
+    "deferred",
+    "unsupported"
+  ],
+  "dimensions": [
+    {
+      "name": "Rust public API",
+      "status": "stable-for-v0.1-baseline",
+      "notes": "Workspace compiles and public contracts are covered by unit and contract tests."
+    },
+    {
+      "name": "Runtime Inference API",
+      "status": "stable-for-v0.1-baseline",
+      "notes": "Normal generation uses a Runtime-registered executor rather than caller-supplied logits."
+    },
+    {
+      "name": "WIT magnetar:compute@2.0.0",
+      "status": "stable-for-v0.1-baseline",
+      "notes": "Supported baseline Compute WIT package in magnetar-runtime/wit/compute.wit."
+    },
+    {
+      "name": "WIT magnetar:observability@1.0.0",
+      "status": "stable-for-v0.1-baseline",
+      "notes": "Supported baseline Observability WIT package in magnetar-runtime/wit/observability.wit."
+    },
+    {
+      "name": "Provider ABI",
+      "status": "unstable",
+      "notes": "Provider ABI stabilization is not part of v0.1."
+    },
+    {
+      "name": "Model Artifact metadata",
+      "status": "preview",
+      "notes": "Metadata contracts exist; production source integration is deferred."
+    },
+    {
+      "name": "Tokenizer Artifact metadata",
+      "status": "preview",
+      "notes": "Fixture and contract paths exist; production tokenizer integration is deferred."
+    },
+    {
+      "name": "Adapter Artifact metadata",
+      "status": "preview",
+      "notes": "Contracts exist; production execution integration is deferred."
+    },
+    {
+      "name": "CLI command surface",
+      "status": "preview",
+      "notes": "CLI uses boundary harnesses and placeholder logits for local command flow."
+    },
+    {
+      "name": "Conformance report format",
+      "status": "stable-for-v0.1-baseline",
+      "notes": "Executable Rust conformance paths pass locally."
+    },
+    {
+      "name": "OpenSpec baseline",
+      "status": "stable-for-v0.1-baseline",
+      "notes": "openspec validate --all passes for 48 specs."
+    },
+    {
+      "name": "Supported targets",
+      "status": "preview",
+      "notes": "Local Windows validation passed; broader CI matrix evidence is outside this bundle."
+    },
+    {
+      "name": "Feature flags",
+      "status": "preview",
+      "notes": "Reference CPU is baseline; optional Provider/component flags are not stable claims."
+    }
+  ]
+}

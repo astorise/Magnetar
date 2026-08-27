@@ -1,0 +1,62 @@
+{
+  "version": "v0.1",
+  "date": "2026-08-27",
+  "suites": [
+    {
+      "name": "Formatting",
+      "status": "pass",
+      "command": "cargo fmt --all -- --check"
+    },
+    {
+      "name": "Clippy",
+      "status": "pass",
+      "command": "cargo clippy --workspace --all-targets -- -D warnings"
+    },
+    {
+      "name": "Workspace tests",
+      "status": "pass",
+      "command": "cargo test --workspace"
+    },
+    {
+      "name": "OpenSpec",
+      "status": "pass",
+      "command": "openspec validate --all"
+    },
+    {
+      "name": "Reference CPU",
+      "status": "pass",
+      "evidence": "Runtime and contract tests cover Reference CPU baseline semantics."
+    },
+    {
+      "name": "First Operator scope",
+      "status": "pass",
+      "evidence": "Operator scope tests pass locally."
+    },
+    {
+      "name": "Runtime contracts",
+      "status": "pass",
+      "evidence": "Runtime unit and contract tests pass locally."
+    },
+    {
+      "name": "Runtime Inference API",
+      "status": "pass",
+      "evidence": "Generation is driven through a Runtime-registered executor; executor failures emit failure and StreamInterrupted observations."
+    },
+    {
+      "name": "CLI boundary",
+      "status": "pass-with-limitations",
+      "evidence": "CLI boundary tests pass; placeholder logits no longer claim graph/kernel/provider execution evidence."
+    },
+    {
+      "name": "E2E local inference",
+      "status": "pass-with-limitations",
+      "evidence": "Functional E2E passes, but full KernelDispatch/ProviderExecution-backed logits remain deferred and tracked outside v0.1 baseline."
+    },
+    {
+      "name": "Redaction/security",
+      "status": "pass",
+      "evidence": "Redaction, trust-boundary, and no-raw-data tests pass locally."
+    }
+  ],
+  "no_raw_data_statement": "Reports do not contain raw prompts, secrets, raw weights, raw tensors, raw KV cache contents, native handles, or local artifact payloads."
+}

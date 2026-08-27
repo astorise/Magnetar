@@ -1,0 +1,21 @@
+{
+  "version": "v0.1",
+  "date": "2026-08-27",
+  "repository": "astorise/Magnetar",
+  "branch": "codex/build-issues",
+  "pull_request": 33,
+  "release_tag": null,
+  "release_tag_status": "not-created-from-pr-branch",
+  "release_commit_status": "merge-or-tag commit must be recorded by release CI",
+  "source_scope": "repository evidence bundle",
+  "unsupported_claims": [
+    "CUDA",
+    "Metal",
+    "OpenVINO",
+    "QNN",
+    "WebGPU",
+    "production server API",
+    "model hub downloads",
+    "agent/tool Runtime"
+  ]
+}

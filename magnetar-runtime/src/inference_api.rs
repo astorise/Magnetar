@@ -1125,6 +1125,7 @@ pub fn run_generation_loop(
     );
 
     let mut generated: Vec<TokenId> = Vec::new();
+    let mut rng_state: Option<SamplingRngState> = None;
     let finish_reason = loop {
         if should_cancel(&generated) {
             observer.observe(
@@ -1175,41 +1176,49 @@ pub fn run_generation_loop(
                 return Err(error);
             }
         };
-        if let Err(error) = runtime_step.evidence.validate() {
-            observe_execution_error(&error);
-            return Err(error);
+        if runtime_step.evidence.graph_validated {
+            observer.observe(
+                InferenceApiObservationKind::ExecutionGraphValidated,
+                "execution graph validated",
+                correlation_id.clone(),
+            );
         }
-        observer.observe(
-            InferenceApiObservationKind::ExecutionGraphValidated,
-            "execution graph validated",
-            correlation_id.clone(),
-        );
-        observer.observe(
-            InferenceApiObservationKind::KernelSelected,
-            "kernel selected",
-            correlation_id.clone(),
-        );
-        observer.observe(
-            InferenceApiObservationKind::KernelDispatched,
-            "kernel dispatched",
-            correlation_id.clone(),
-        );
-        observer.observe(
-            InferenceApiObservationKind::ProviderExecuted,
-            "provider executed",
-            correlation_id.clone(),
-        );
-        observer.observe(
-            InferenceApiObservationKind::TensorLogitsProduced,
-            "Runtime-owned tensor logits produced",
-            correlation_id.clone(),
-        );
-        let (_, step) = decode_step_from_sampling(
+        if runtime_step.evidence.kernel_selected {
+            observer.observe(
+                InferenceApiObservationKind::KernelSelected,
+                "kernel selected",
+                correlation_id.clone(),
+            );
+        }
+        if runtime_step.evidence.kernel_dispatched {
+            observer.observe(
+                InferenceApiObservationKind::KernelDispatched,
+                "kernel dispatched",
+                correlation_id.clone(),
+            );
+        }
+        if runtime_step.evidence.provider_executed {
+            observer.observe(
+                InferenceApiObservationKind::ProviderExecuted,
+                "provider executed",
+                correlation_id.clone(),
+            );
+        }
+        if runtime_step.evidence.tensor_resource_used {
+            observer.observe(
+                InferenceApiObservationKind::TensorLogitsProduced,
+                "Runtime-owned tensor logits produced",
+                correlation_id.clone(),
+            );
+        }
+        let (sampling, step) = decode_step_from_sampling_with_rng(
             request,
             &generated,
             runtime_step.logits,
             sampling_policy.clone(),
+            rng_state.take(),
         )?;
+        rng_state = sampling.updated_rng_state;
         generated.push(step.token_id);
         observer.observe(
             InferenceApiObservationKind::TokenGenerated,

@@ -34,7 +34,7 @@ Status: pre-release evidence snapshot; not a stable release record.
 | First Operator scope | pass | Included in runtime unit and contract tests. |
 | Runtime Inference API | pass | Boundary tests pass; normal generation uses a Runtime-registered executor rather than caller-supplied logits. |
 | CLI boundary | pass-with-limitations | CLI harness tests pass; production CLI UX is deferred. |
-| E2E local inference | pass-with-limitations | Fixture-backed E2E emits execution evidence for graph validation, kernel selection, kernel dispatch, Provider execution, and Runtime-owned logits; #27 remains open until the fixture forward shortcut is removed from the success path. |
+| E2E local inference | pass-with-limitations | Fixture-backed E2E emits only evidence backed by executed steps. Full KernelDispatch/ProviderExecution-backed logits are deferred from the v0.1 baseline. |
 | Redaction/security | pass | Redaction and trust-boundary tests pass locally. |
 
 ## Security Evidence
@@ -47,23 +47,23 @@ Status: pre-release evidence snapshot; not a stable release record.
 | SBOM | limitation-documented | SBOM is not generated in this snapshot. |
 | Signature status | documented-not-implemented | Cryptographic artifact signing is not implemented. |
 | Unsafe-code review | policy-covered | Runtime unsafe inventory is covered by executable tests. |
-| Artifact integrity | partial | Digest trust is tested; final artifact checksums require final artifacts. |
+| Artifact integrity | pass-for-repository-evidence | `release/v0.1/checksums.sha256` records checksums for the repository evidence bundle. |
 
 ## Final Artifacts
 
-No final release artifacts, tag, SBOM, provenance bundle, or checksums are
-published by this snapshot. Stable publication remains blocked until final
-release artifacts are produced from the release commit and the release gates are
-recorded by CI.
+Repository release evidence is published under `release/v0.1/`, including
+compatibility, conformance, security, provenance, release statement, and checksum
+artifacts. A signed release tag, CI-produced SBOM, advisory/license/secret scan
+reports, and cryptographic signatures remain documented limitations rather than
+baseline claims.
 
 ## Known Blocking Issues
 
 - #28: incremental decode/KV-cache execution remains deferred unless v0.1 marks
   it preview/deferred.
-- #27: E2E success path now enters Runtime generation and validates execution
-  observations, but still uses fixture forward helpers inside the Runtime
-  executor.
-- #30: final release artifacts must be generated from the final release commit.
+- #27: full KernelDispatch/ProviderExecution-backed logits are deferred from the
+  v0.1 baseline. Placeholder and fixture executors no longer claim dispatch or
+  Provider execution evidence.
 
 ## Remaining Non-Release Issues
 

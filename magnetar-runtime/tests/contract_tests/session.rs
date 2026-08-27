@@ -3,10 +3,11 @@ use magnetar_runtime::{
     GenerationParameters, GenerationPriority, GenerationRequest, GenerationRequestId,
     GenerationTokenizerReference, InferenceSessionId, MemoryManagerConfig, MemoryPlacement,
     ModelArtifactId, ModelArtifactKind, ModelDigest, ModelName, ModelRevision, Runtime,
-    SessionAccessPolicy, SessionConcurrencyPolicy, SessionCreationRequest, SessionError,
-    SessionLifecycleState, SessionMemoryBudget, SessionObservationKind, SessionOperationAdmission,
-    SessionPolicy, SpecialToken, SpecialTokenKind, StopConditions, StreamingMode, TokenIdRange,
-    TokenizerArtifactId, TokenizerFamily, TokenizerId, TokenizerMetadata, TokenizerRevision,
+    RuntimeConfig, SessionAccessPolicy, SessionConcurrencyPolicy, SessionCreationRequest,
+    SessionError, SessionLifecycleState, SessionMemoryBudget, SessionObservationKind,
+    SessionOperationAdmission, SessionPolicy, SpecialToken, SpecialTokenKind, StopConditions,
+    StreamingMode, TokenIdRange, TokenizerArtifactId, TokenizerFamily, TokenizerId,
+    TokenizerMetadata, TokenizerRevision,
 };
 
 fn model_reference() -> GenerationModelReference {
@@ -250,4 +251,54 @@ fn session_memory_budget_rejects_oversized_creation() {
         runtime.create_inference_session(request),
         Err(SessionError::MemoryBudgetExceeded { .. })
     ));
+}
+
+#[test]
+fn session_observations_are_bounded_and_report_what_they_dropped() {
+    let mut runtime = Runtime::initialize(RuntimeConfig {
+        session_observation_capacity: 2,
+        ..RuntimeConfig::default()
+    });
+
+    // Each session creation emits at least one observation, so several
+    // sessions overrun a capacity of two.
+    for _ in 0..6 {
+        runtime
+            .create_inference_session(creation_request())
+            .unwrap();
+    }
+
+    assert!(runtime.session_observations().len() <= 2);
+    assert!(
+        runtime.dropped_session_observations() > 0,
+        "eviction must be counted, not silent"
+    );
+}
+
+#[test]
+fn session_observations_can_be_disabled_without_growing() {
+    let mut runtime = Runtime::initialize(RuntimeConfig {
+        session_observation_capacity: 0,
+        ..RuntimeConfig::default()
+    });
+
+    runtime
+        .create_inference_session(creation_request())
+        .unwrap();
+
+    assert!(runtime.session_observations().is_empty());
+    assert!(runtime.dropped_session_observations() > 0);
+}
+
+#[test]
+fn shutdown_releases_sessions_and_their_observation_history() {
+    let mut runtime = Runtime::initialize(Default::default());
+    runtime
+        .create_inference_session(creation_request())
+        .unwrap();
+    assert!(!runtime.session_observations().is_empty());
+
+    runtime.shutdown();
+
+    assert!(runtime.session_observations().is_empty());
 }

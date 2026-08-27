@@ -94,21 +94,40 @@
 //! is defined in the error model for future use if a browser-specific limitation
 //! is identified; none is known today.
 
-use crate::affinity::*;
-use crate::capability::*;
-use crate::compute::*;
+use crate::affinity::{
+    FallbackClass, ProviderBinding, ProviderHealth, ProviderPressureLevel, ProviderStatusSnapshot,
+    ResourceAffinity,
+};
+use crate::capability::{CapabilityId, CapabilityVersion};
+use crate::compute::{
+    ComputeDType, DTypeDescriptor, ShapeDescriptor, TensorDescriptor, TensorDescriptorLimits,
+    TensorResourceDescriptor, TensorResourceId,
+};
 use crate::device::{
     Device, DeviceDescriptor, DeviceExecutionLimits, DeviceId, DeviceMetadata, DeviceType,
 };
-use crate::kernel::*;
-use crate::memory::*;
-use crate::operator::*;
+use crate::kernel::{
+    KernelAdvertisement, KernelCancellationSupport, KernelError, KernelId,
+    KernelImplementationFamily, KernelInvocation, KernelKvCacheMetadata, KernelMemoryClass,
+    KernelObservation, KernelObservationKind, KernelOperatorVersionRange, KernelResult,
+    KernelResultStatus, KernelWorkspaceRequirements,
+};
+use crate::memory::{
+    MemoryAllocationClass, MemoryAllocationId, MemoryAllocationOwner, MemoryAllocationRequest,
+    MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
+};
+use crate::operator::{
+    OperatorAttributeValue, OperatorFamily, OperatorId, OperatorSpec, TensorLayoutKind, TensorRole,
+};
 use crate::provider::{
     PROVIDER_API_VERSION, Provider, ProviderError, ProviderExecutionApi, ProviderMetadata,
     ProviderRegistry,
 };
-use crate::scheduler::*;
-use crate::tensor::*;
+use crate::scheduler::{
+    ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionHandle,
+    ProviderExecutionRequest, ProviderExecutionResult, ProviderExecutionStatus, SchedulingState,
+};
+use crate::tensor::{TensorLifecycleState, TensorReadiness, TensorResource};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -298,7 +317,7 @@ impl HostTensor {
     ) -> Result<Self, ReferenceCpuError> {
         let shape = shape.into();
         let data = data.into();
-        let expected = shape.iter().product::<u64>() as usize;
+        let expected = host_tensor_element_count(&shape)?;
         if expected != data.len() {
             return Err(ReferenceCpuError::new(
                 ReferenceCpuErrorCode::ShapeUnsupported,
@@ -320,6 +339,27 @@ impl HostTensor {
             )),
         }
     }
+}
+
+/// Element count for a Reference CPU host tensor shape.
+///
+/// Uses checked arithmetic throughout: `Iterator::product` wraps silently in
+/// release builds, and the subsequent `usize` narrowing truncates on 32-bit
+/// targets such as `wasm32-unknown-unknown`. A wrapped count would let a
+/// mismatched buffer pass the length check in [`HostTensor::new`] and turn a
+/// structured shape rejection into a slice-index panic inside a kernel.
+fn host_tensor_element_count(shape: &[u64]) -> Result<usize, ReferenceCpuError> {
+    let overflow = || {
+        ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("shape {shape:?} element count overflows the host address space"),
+        )
+    };
+    shape
+        .iter()
+        .try_fold(1_u64, |count, dimension| count.checked_mul(*dimension))
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(overflow)
 }
 
 fn same_shape(a: &HostTensor, b: &HostTensor) -> Result<(), ReferenceCpuError> {
@@ -363,28 +403,34 @@ pub fn matmul(
         ));
     }
     let (m, k, n) = (m as usize, k as usize, n as usize);
-    let a_at = |row: usize, col: usize| -> f32 {
-        if transpose_a {
-            a.data[col * (a_cols as usize) + row]
-        } else {
-            a.data[row * (a_cols as usize) + col]
-        }
+    // Both operands are row-major, so a logical transpose is just a swap of
+    // the row and column strides. Hoisting them turns what was a per-element
+    // branch inside the innermost loop into two values computed once.
+    let (a_row_stride, a_inner_stride) = if transpose_a {
+        (1, a_cols as usize)
+    } else {
+        (a_cols as usize, 1)
     };
-    let b_at = |row: usize, col: usize| -> f32 {
-        if transpose_b {
-            b.data[col * (b_cols as usize) + row]
-        } else {
-            b.data[row * (b_cols as usize) + col]
-        }
+    let (b_inner_stride, b_col_stride) = if transpose_b {
+        (1, b_cols as usize)
+    } else {
+        (b_cols as usize, 1)
     };
     let mut out = vec![0.0_f32; m * n];
+    // row -> inner -> col keeps the write row and, when b is untransposed, the
+    // b row contiguous. The classic row -> col -> inner order walks b with
+    // stride n on the innermost loop, which is the cache-hostile direction.
     for row in 0..m {
-        for col in 0..n {
-            let mut accumulator = 0.0_f32;
-            for inner in 0..k {
-                accumulator += a_at(row, inner) * b_at(inner, col);
+        let out_row = &mut out[row * n..(row + 1) * n];
+        for inner in 0..k {
+            // No zero-skip: this kernel is the correctness oracle other
+            // Providers are checked against, and skipping a zero would drop
+            // the NaN that 0.0 * NaN must produce.
+            let a_value = a.data[row * a_row_stride + inner * a_inner_stride];
+            let b_base = inner * b_inner_stride;
+            for (col, out_value) in out_row.iter_mut().enumerate() {
+                *out_value += a_value * b.data[b_base + col * b_col_stride];
             }
-            out[row * n + col] = accumulator;
         }
     }
     HostTensor::new([m as u64, n as u64], out)
@@ -452,19 +498,26 @@ pub fn rmsnorm(
 }
 
 /// Rotary position embedding, rotating consecutive pairs within the first
-/// `dimension` elements of each row using `position = row index`.
+/// `dimension` elements of each row.
+///
+/// The absolute position of row `r` is `position_offset + r`. The offset is an
+/// explicit parameter rather than a default because a decode step passes a
+/// single row whose true position is however many tokens precede it: deriving
+/// position from the row index alone would rotate every generated token as if
+/// it were the first, which is silently wrong rather than an error.
 pub fn rope(
     input: &HostTensor,
     base: f32,
     scale: f32,
     dimension: u64,
+    position_offset: u64,
 ) -> Result<HostTensor, ReferenceCpuError> {
     let (rows, cols) = input.rows_cols()?;
     if dimension == 0 || !dimension.is_multiple_of(2) || dimension > cols {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
             format!(
-                "RoPE dimension {dimension} must be a positive, even divisor of row width {cols}"
+                "RoPE dimension {dimension} must be positive, even, and at most the row width {cols}"
             ),
         ));
     }
@@ -483,7 +536,7 @@ pub fn rope(
     let mut out = input.data.clone();
     let half = (dimension / 2) as usize;
     for row in 0..rows as usize {
-        let position = (row as f32) * scale;
+        let position = ((position_offset as usize + row) as f32) * scale;
         let row_start = row * cols as usize;
         for pair in 0..half {
             let frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
@@ -506,6 +559,16 @@ pub fn softmax_rows(input: &HostTensor) -> Result<HostTensor, ReferenceCpuError>
     for row in 0..rows as usize {
         let slice = &input.data[row * cols as usize..(row + 1) * cols as usize];
         let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        // A fully masked row (every entry -inf) would make `value - max`
+        // NaN for every column and silently poison the output with Ok.
+        // Reject it explicitly instead, matching how the other Reference CPU
+        // kernels refuse cases they cannot represent.
+        if !max.is_finite() {
+            return Err(ReferenceCpuError::new(
+                ReferenceCpuErrorCode::ExecutionFailed,
+                format!("softmax row {row} has no finite entry to normalize"),
+            ));
+        }
         let exponentials = slice
             .iter()
             .map(|value| (value - max).exp())
@@ -554,12 +617,29 @@ pub fn attention(
             ),
         ));
     }
-    let (seq_len, q_model_dim) = q.rows_cols()?;
-    let (kv_seq_len, kv_model_dim) = k.rows_cols()?;
-    if seq_len != kv_seq_len {
+    if window_size == Some(0) {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
-            format!("q sequence length {seq_len} must match k/v sequence length {kv_seq_len}"),
+            "window_size must be positive; a zero window admits no keys",
+        ));
+    }
+    // The sliding window is anchored at the query position and bounds only the
+    // oldest admissible key, which is a complete description of the mask only
+    // when the newest admissible key is already the query itself. Bidirectional
+    // attention has no such anchor, so the combination has no single defined
+    // meaning here and is rejected rather than silently given one.
+    if window_size.is_some() && !causal {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "window_size is only defined for causal attention",
+        ));
+    }
+    let (seq_len, q_model_dim) = q.rows_cols()?;
+    let (kv_seq_len, kv_model_dim) = k.rows_cols()?;
+    if seq_len > kv_seq_len {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("q sequence length {seq_len} cannot exceed k/v sequence length {kv_seq_len}"),
         ));
     }
     if head_count * head_dimension != q_model_dim {
@@ -580,43 +660,53 @@ pub fn attention(
     }
     let group_size = (head_count / kv_head_count) as usize;
     let seq_len = seq_len as usize;
+    let kv_seq_len = kv_seq_len as usize;
     let q_model_dim = q_model_dim as usize;
     let kv_model_dim = kv_model_dim as usize;
     let head_dimension = head_dimension as usize;
     let scale = 1.0 / (head_dimension as f32).sqrt();
+    // Queries are the *last* `seq_len` positions of the sequence the keys
+    // cover. For prefill the two lengths match and this offset is zero; for a
+    // decode step against a populated cache it is what places the new token at
+    // its true position, so causal masking and the sliding window bound the
+    // right keys instead of treating the token as if it were at position 0.
+    let query_position_offset = kv_seq_len - seq_len;
     let mut out = vec![0.0_f32; seq_len * q_model_dim];
+    // Both scratch buffers are rewritten from scratch for every (head, query)
+    // pair and carry nothing between iterations, so they are allocated once
+    // here instead of twice per pair. Only the admitted key window is ever
+    // read, so they are sized to the widest window rather than pre-filled with
+    // a sentinel the code never consumes.
+    let mut scores = Vec::with_capacity(seq_len);
+    let mut exponentials = Vec::with_capacity(seq_len);
     for head in 0..head_count as usize {
         let kv_head = head / group_size;
         let q_offset = head * head_dimension;
         let kv_offset = kv_head * head_dimension;
         for query_index in 0..seq_len {
-            let key_upper = if causal { query_index + 1 } else { seq_len };
+            let query_position = query_position_offset + query_index;
+            let key_upper = if causal {
+                query_position + 1
+            } else {
+                kv_seq_len
+            };
             let key_lower = window_size
-                .map(|window| query_index.saturating_sub((window as usize).saturating_sub(1)))
+                .map(|window| query_position.saturating_sub((window as usize).saturating_sub(1)))
                 .unwrap_or(0)
                 .min(key_upper);
-            let mut scores = vec![f32::NEG_INFINITY; seq_len];
-            for (key_index, score) in scores
-                .iter_mut()
-                .enumerate()
-                .take(key_upper)
-                .skip(key_lower)
-            {
+            let query_base = query_index * q_model_dim + q_offset;
+            scores.clear();
+            for key_index in key_lower..key_upper {
+                let key_base = key_index * kv_model_dim + kv_offset;
                 let mut dot = 0.0_f32;
                 for dim in 0..head_dimension {
-                    dot += q.data[query_index * q_model_dim + q_offset + dim]
-                        * k.data[key_index * kv_model_dim + kv_offset + dim];
+                    dot += q.data[query_base + dim] * k.data[key_base + dim];
                 }
-                *score = dot * scale;
+                scores.push(dot * scale);
             }
-            let max = scores[key_lower..key_upper]
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
-            let exponentials = scores[key_lower..key_upper]
-                .iter()
-                .map(|value| (value - max).exp())
-                .collect::<Vec<_>>();
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            exponentials.clear();
+            exponentials.extend(scores.iter().map(|value| (value - max).exp()));
             let sum: f32 = exponentials.iter().sum();
             for dim in 0..head_dimension {
                 let mut accumulator = 0.0_f32;
@@ -625,7 +715,7 @@ pub fn attention(
                     accumulator +=
                         (weight / sum) * v.data[key_index * kv_model_dim + kv_offset + dim];
                 }
-                out[query_index * q_model_dim + q_offset + dim] = accumulator;
+                out[query_base + dim] = accumulator;
             }
         }
     }
@@ -1141,6 +1231,7 @@ impl ReferenceCpuExecutor {
             10000.0,
             1.0,
             2,
+            0,
         );
         checks.push(ReferenceCpuConformanceCheck {
             name: "rope-baseline-known-output",
@@ -1511,9 +1602,10 @@ impl ReferenceCpuExecutor {
                     })?;
                 // The portable `rope` Operator's attribute schema defines an
                 // optional `position_mode` string. Reference CPU only
-                // implements the default sequential mode (position = row
-                // index); anything else is explicitly rejected rather than
-                // silently treated as sequential.
+                // implements the default sequential mode (positions advance by
+                // one per row from the offset below); anything else is
+                // explicitly rejected rather than silently treated as
+                // sequential.
                 if let Some(OperatorAttributeValue::String(mode)) =
                     invocation.attributes.get("position_mode")
                     && mode != "sequential"
@@ -1522,7 +1614,29 @@ impl ReferenceCpuExecutor {
                         attribute: format!("position_mode '{mode}' is not implemented"),
                     });
                 }
-                rope(&input, base, scale, dimension).map_err(KernelError::from)?
+                // Absolute position of the first row. Absent for prefill,
+                // where the sequence starts at zero; a decode step carries the
+                // number of tokens already in the cache.
+                // Read raw rather than through `attribute_integer`, which maps a
+                // negative value to `None`. That would make a negative offset
+                // indistinguishable from an absent one and silently rotate at
+                // position zero, which is the exact failure this attribute
+                // exists to prevent.
+                let position_offset = match invocation.attributes.get("position_offset") {
+                    None => 0,
+                    Some(OperatorAttributeValue::Integer(offset)) if *offset >= 0 => *offset as u64,
+                    Some(OperatorAttributeValue::Integer(offset)) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("position_offset {offset} must not be negative"),
+                        });
+                    }
+                    Some(_) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "position_offset must be an integer".into(),
+                        });
+                    }
+                };
+                rope(&input, base, scale, dimension, position_offset).map_err(KernelError::from)?
             }
             "attention" => {
                 if cfg!(target_arch = "wasm32") {
@@ -1825,3 +1939,6 @@ impl Provider for ReferenceCpuProvider {
         Some(self.executor.as_ref())
     }
 }
+
+#[cfg(test)]
+mod tests;

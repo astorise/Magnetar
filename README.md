@@ -131,10 +131,21 @@ current specifications and architecture documents take precedence.
 
 ## Development
 
-```powershell
+```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets
 ```
 
+The Rust toolchain is pinned in `rust-toolchain.toml` and installed
+automatically by rustup. The full set of quality gates, including dependency
+and coverage checks, is documented in [docs/quality.md](docs/quality.md).
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change, and
+[SECURITY.md](SECURITY.md) for the threat model and known gaps.
+
 APIs are unstable until the first stable release.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
