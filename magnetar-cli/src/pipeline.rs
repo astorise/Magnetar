@@ -148,14 +148,7 @@ impl RuntimeGenerationExecutor for CliPlaceholderGenerationExecutor {
     ) -> Result<RuntimeGenerationStep, InferenceApiError> {
         Ok(RuntimeGenerationStep::new(
             placeholder_logits(self.vocabulary_size),
-            RuntimeGenerationExecutionEvidence {
-                model_instance_ready: true,
-                graph_validated: false,
-                kernel_selected: false,
-                kernel_dispatched: false,
-                provider_executed: false,
-                tensor_resource_used: false,
-            },
+            RuntimeGenerationExecutionEvidence::untrusted(),
         ))
     }
 }

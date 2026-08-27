@@ -876,16 +876,28 @@ pub struct CacheUsageSummary {
 /// execution path instead of a caller-owned logits shortcut.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeGenerationExecutionEvidence {
-    pub model_instance_ready: bool,
-    pub graph_validated: bool,
-    pub kernel_selected: bool,
-    pub kernel_dispatched: bool,
-    pub provider_executed: bool,
-    pub tensor_resource_used: bool,
+    pub(crate) model_instance_ready: bool,
+    pub(crate) graph_validated: bool,
+    pub(crate) kernel_selected: bool,
+    pub(crate) kernel_dispatched: bool,
+    pub(crate) provider_executed: bool,
+    pub(crate) tensor_resource_used: bool,
 }
 
 impl RuntimeGenerationExecutionEvidence {
-    pub const fn complete() -> Self {
+    pub const fn untrusted() -> Self {
+        Self {
+            model_instance_ready: false,
+            graph_validated: false,
+            kernel_selected: false,
+            kernel_dispatched: false,
+            provider_executed: false,
+            tensor_resource_used: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn complete() -> Self {
         Self {
             model_instance_ready: true,
             graph_validated: true,
