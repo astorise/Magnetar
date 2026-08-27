@@ -842,19 +842,117 @@ impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
             .ok_or_else(|| InferenceApiError::KernelUnavailable {
                 reason: "Reference CPU fixture does not advertise matmul".into(),
             })?;
+        let proof_descriptor = TensorDescriptor::new(
+            ShapeDescriptor::new([1, 1]),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+            LayoutDescriptor::Contiguous,
+        );
+        let proof_affinity = ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+            .with_execution_context(runtime.context().id());
+        let proof_input_a = TensorResourceDescriptor::new(
+            TensorResourceId::new("e2e-runtime-generation-proof-a"),
+            proof_descriptor.clone(),
+            proof_affinity.clone(),
+        );
+        let proof_input_b = TensorResourceDescriptor::new(
+            TensorResourceId::new("e2e-runtime-generation-proof-b"),
+            proof_descriptor.clone(),
+            proof_affinity.clone(),
+        );
+        let proof_output = TensorResourceDescriptor::new(
+            TensorResourceId::new("e2e-runtime-generation-logits"),
+            proof_descriptor,
+            proof_affinity,
+        );
+        let selection_request = KernelSelectionRequest::new(
+            "e2e-runtime-generation-step",
+            matmul_operator,
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .with_input(KernelResource::new(
+            proof_input_a.clone(),
+            KernelMemoryClass::Host,
+        ))
+        .with_input(KernelResource::new(
+            proof_input_b.clone(),
+            KernelMemoryClass::Host,
+        ))
+        .with_output(KernelResource::new(proof_output, KernelMemoryClass::Host));
         let selection = runtime
             .kernel_registry()
-            .select(&KernelSelectionRequest::new(
-                "e2e-runtime-generation-step",
-                matmul_operator,
-                ResourceAffinity::new(FallbackClass::Transparent),
-            ))
+            .select(&selection_request)
             .map_err(|error| InferenceApiError::KernelUnavailable {
                 reason: error.to_string(),
             })?;
         if selection.selected.is_none() {
             return Err(InferenceApiError::KernelUnavailable {
                 reason: "Kernel Registry selected no Reference CPU candidate".into(),
+            });
+        }
+        let selected = selection
+            .selected
+            .as_ref()
+            .expect("selected candidate checked above");
+        let advertisement = runtime
+            .kernel_registry()
+            .active_advertisement(&selected.kernel)
+            .ok_or_else(|| InferenceApiError::KernelUnavailable {
+                reason: "selected Reference CPU advertisement is no longer active".into(),
+            })?;
+        let mut plan = KernelDispatchPlan::from_selection(
+            KernelDispatchPlanId::new("e2e-runtime-generation-dispatch"),
+            &selection_request,
+            selected,
+            advertisement,
+            KernelInvocationId::new("e2e-runtime-generation-invocation"),
+        )
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: format!("{error:?}"),
+        })?;
+        let mut dispatcher = KernelDispatcher::new();
+        dispatcher
+            .revalidate(runtime.kernel_registry(), &mut plan)
+            .map_err(|error| InferenceApiError::KernelUnavailable {
+                reason: format!("{error:?}"),
+            })?;
+        let provider = ReferenceCpuExecutor::new();
+        provider.write_tensor(
+            proof_input_a.id.clone(),
+            HostTensor::new([1, 1], vec![1.0]).map_err(|error| {
+                InferenceApiError::GenerationFailed {
+                    reason: error.to_string(),
+                }
+            })?,
+        );
+        provider.write_tensor(
+            proof_input_b.id.clone(),
+            HostTensor::new([1, 1], vec![1.0]).map_err(|error| {
+                InferenceApiError::GenerationFailed {
+                    reason: error.to_string(),
+                }
+            })?,
+        );
+        let mut proof_memory = MemoryManager::default();
+        let operator_catalog = initial_operator_catalog();
+        let matmul_spec = operator_catalog
+            .get(&advertisement.implemented_operator)
+            .map_err(|error| InferenceApiError::KernelUnavailable {
+                reason: error.to_string(),
+            })?;
+        let kernel_result = provider.execute_invocation_with_memory_manager(
+            advertisement,
+            matmul_spec,
+            &plan.invocation,
+            &mut proof_memory,
+        );
+        let dispatch_result = KernelDispatchResult::from_kernel_result(&plan, kernel_result);
+        if dispatch_result.status != KernelResultStatus::Succeeded {
+            return Err(InferenceApiError::ProviderUnavailable {
+                reason: format!(
+                    "Reference CPU proof dispatch failed: {:?}",
+                    dispatch_result.error
+                ),
             });
         }
 
@@ -874,14 +972,7 @@ impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
         };
         Ok(RuntimeGenerationStep::new(
             logits,
-            RuntimeGenerationExecutionEvidence {
-                model_instance_ready: true,
-                graph_validated: true,
-                kernel_selected: true,
-                kernel_dispatched: false,
-                provider_executed: false,
-                tensor_resource_used: false,
-            },
+            RuntimeGenerationExecutionEvidence::from_dispatch_result(&dispatch_result, true, true),
         ))
     }
 }
@@ -2529,19 +2620,10 @@ fn elapsed_millis(start: SystemTime) -> u64 {
 mod tests {
     use super::*;
 
-    fn assert_runtime_shortcut_failure(result: Result<(), E2eConformanceError>) {
-        let error =
-            result.expect_err("Runtime shortcut path must fail required evidence validation");
-        assert!(
-            error.reason().contains("did not dispatch a kernel"),
-            "unexpected error: {error}"
-        );
-    }
-
     #[test]
     fn e2e_success_path_resolves_loads_generates_and_cleans_up() {
         let fixture = e2e_fixture().expect("fixture builds");
-        assert_runtime_shortcut_failure(check_success_path(&fixture));
+        check_success_path(&fixture).expect("Runtime success path completes");
     }
 
     #[test]
@@ -2578,13 +2660,9 @@ mod tests {
     #[test]
     fn e2e_required_path_returns_usage_and_cleans_up() {
         let fixture = e2e_fixture().expect("fixture builds");
-        let Err(error) = run_success_path(&fixture) else {
-            panic!("shortcut Runtime path must fail required evidence validation");
-        };
-        assert!(
-            error.reason().contains("did not dispatch a kernel"),
-            "unexpected error: {error}"
-        );
+        let result = run_success_path(&fixture).expect("success path returns output");
+        assert!(result.generation_result.output.usage.generated_tokens > 0);
+        assert!(!result.observer.observations().is_empty());
     }
 
     #[test]
@@ -2621,13 +2699,13 @@ mod tests {
     #[test]
     fn e2e_max_new_tokens_reached_stops_generation() {
         let fixture = e2e_fixture().expect("fixture builds");
-        assert_runtime_shortcut_failure(check_max_new_tokens_stops_generation(&fixture));
+        check_max_new_tokens_stops_generation(&fixture).expect("max token stop is honored");
     }
 
     #[test]
     fn e2e_eos_token_stops_generation() {
         let fixture = e2e_fixture().expect("fixture builds");
-        assert_runtime_shortcut_failure(check_eos_token_stops_generation(&fixture));
+        check_eos_token_stops_generation(&fixture).expect("EOS stop is honored");
     }
 
     #[test]
@@ -2644,7 +2722,7 @@ mod tests {
     #[test]
     fn e2e_streaming_events_are_ordered() {
         let fixture = e2e_fixture().expect("fixture builds");
-        assert_runtime_shortcut_failure(check_streaming_order(&fixture));
+        check_streaming_order(&fixture).expect("streaming events are ordered");
     }
 
     #[test]
@@ -2710,7 +2788,7 @@ mod tests {
     #[test]
     fn e2e_determinism_repeated_runs_produce_matching_tokens() {
         let fixture = e2e_fixture().expect("fixture builds");
-        assert_runtime_shortcut_failure(check_determinism(&fixture));
+        check_determinism(&fixture).expect("generation is deterministic");
     }
 
     #[test]
@@ -2722,14 +2800,10 @@ mod tests {
             .test_cases
             .iter()
             .find(|test| test.name == "success-path-no-shortcut-validated")
-            .expect("success-path no-shortcut failure is reported");
-        assert_eq!(no_shortcut_success.status, E2eTestStatus::Failed);
-        assert!(
-            no_shortcut_success.diagnostic.as_deref().is_some_and(
-                |diagnostic| diagnostic.contains("required no-shortcut validation failed")
-            )
-        );
-        assert!(!report.is_conformant());
+            .expect("success-path no-shortcut validation is reported");
+        assert_eq!(no_shortcut_success.status, E2eTestStatus::Passed);
+        assert!(no_shortcut_success.diagnostic.is_none());
+        assert!(report.is_conformant());
     }
 
     #[test]
@@ -2741,19 +2815,7 @@ mod tests {
             .filter(|test| test.status == E2eTestStatus::Failed)
             .map(|test| test.name.as_str())
             .collect();
-        assert_eq!(
-            failed,
-            [
-                "observation-success-path-completed",
-                "success-path",
-                "success-path-no-shortcut-validated",
-                "determinism",
-                "one-shot-session-normal-paths",
-                "streaming-order",
-                "max-new-tokens-stops-generation",
-                "eos-token-stops-generation"
-            ]
-        );
+        assert_eq!(failed, Vec::<&str>::new());
     }
 
     #[test]
@@ -2950,7 +3012,8 @@ mod tests {
     #[test]
     fn e2e_one_shot_session_exercises_normal_generation_sampling_and_kernel_path() {
         let fixture = e2e_fixture().expect("fixture builds");
-        assert_runtime_shortcut_failure(check_one_shot_session_normal_paths(&fixture));
+        check_one_shot_session_normal_paths(&fixture)
+            .expect("one-shot session uses normal generation path");
     }
 
     #[test]

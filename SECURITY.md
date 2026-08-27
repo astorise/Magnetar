@@ -23,7 +23,9 @@ load.
 These are tracked publicly and do not need a private report:
 
 - Component signatures carry no cryptographic material and are not verified.
-  Trust by publisher or source rests on manifest-declared identity. See
+  Publisher/source metadata alone is treated as `Unknown` and does not satisfy
+  trust policy; acceptance still requires digest pinning or explicit local
+  development policy. See
   [#9](https://github.com/astorise/Magnetar/issues/9).
 - Component execution deadlines and fuel budgets are not enforced, so a
   Component can occupy a host thread indefinitely. See

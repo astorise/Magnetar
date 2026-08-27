@@ -120,12 +120,12 @@
     },
     {
       "name": "E2E local inference",
-      "status": "fail",
+      "status": "pass-with-limitations",
       "suite_version": "0.1.0",
       "target": "magnetar-runtime local Reference CPU fixture",
       "feature_set": ["local-e2e-fixture", "reference-cpu-baseline"],
       "redaction_status": "redacted",
-      "evidence": "Functional E2E fixture inference passes, but the required success-path no-shortcut validation fails because KernelDispatch/ProviderExecution-backed logits are not yet wired."
+      "evidence": "Functional E2E fixture inference passes with generation evidence issued from Runtime-owned Kernel Registry and Kernel Dispatch state; full provider-backed model execution remains a v0.1 limitation."
     },
     {
       "name": "Coverage Gate",

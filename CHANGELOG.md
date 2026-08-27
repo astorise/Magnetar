@@ -33,9 +33,9 @@
 ### Known Limitations
 
 - Runtime-owned Provider-backed full model execution is not yet complete.
-- The current E2E success path still uses fixture helpers and does not prove a
-  complete graph -> Kernel Registry -> Kernel Dispatch -> Provider execution
-  path for normal generation.
+- The current E2E success path still uses fixture helpers for tiny model
+  numerics, while generation evidence is issued from Runtime-owned Kernel
+  Registry and Kernel Dispatch state.
 - Incremental prefill/decode with KV-cache-backed execution remains deferred.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.

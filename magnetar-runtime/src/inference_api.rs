@@ -27,6 +27,8 @@ use crate::adapter::*;
 use crate::affinity::*;
 use crate::batching::*;
 use crate::generation::*;
+use crate::kernel::*;
+use crate::kernel_dispatch::*;
 use crate::kv_cache::*;
 use crate::memory::*;
 use crate::model::*;
@@ -940,6 +942,28 @@ impl RuntimeGenerationExecutionEvidence {
             });
         }
         Ok(())
+    }
+
+    pub fn from_dispatch_result(
+        dispatch: &KernelDispatchResult,
+        model_instance_ready: bool,
+        graph_validated: bool,
+    ) -> Self {
+        let dispatch_succeeded = dispatch.status == KernelResultStatus::Succeeded;
+        let tensor_resource_used = dispatch
+            .updated_resources
+            .iter()
+            .any(|resource| dispatch.output_readiness.get(resource.id.as_str()) == Some(&true))
+            || dispatch.output_readiness.values().any(|ready| *ready);
+
+        Self {
+            model_instance_ready,
+            graph_validated,
+            kernel_selected: true,
+            kernel_dispatched: dispatch_succeeded,
+            provider_executed: dispatch_succeeded,
+            tensor_resource_used,
+        }
     }
 }
 
