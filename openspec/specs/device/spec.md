@@ -180,3 +180,119 @@ When ranking runs
 
 Then Runtime may prefer Device B according to policy.
 
+---
+
+### Requirement: Device Remains Hardware Abstraction
+
+Device SHALL remain a representation of hardware identity, capabilities,
+availability, health, pressure, and execution limits.
+
+#### Scenario: Kernel compilation needed
+
+Given Kernel Source Artifact needs compilation
+
+When architecture assigns responsibility
+
+Then Device is not the compiler.
+
+---
+
+### Requirement: Device Does Not Own Kernel Source
+
+Device SHALL not accept arbitrary kernel source through its public contract.
+
+#### Scenario: Triton source
+
+Given Triton source exists
+
+When Provider prepares it
+
+Then Device receives no source-management responsibility.
+
+---
+
+### Requirement: Device Does Not Expose Executable Pointer
+
+Device SHALL not expose native kernel executable pointers.
+
+#### Scenario: GPU device metadata requested
+
+Given diagnostics inspect Device
+
+When metadata is returned
+
+Then native loaded kernel addresses are absent.
+
+---
+
+### Requirement: Device Trait Remains Compilation-Free
+
+Device public contract SHALL NOT gain arbitrary kernel source compilation
+methods.
+
+#### Scenario: PM proposes Device::compile
+
+Given Provider requires Triton compilation
+
+When architecture is implemented
+
+Then capability is added to Provider, not Device.
+
+---
+
+### Requirement: Device Binding Is Sufficient Target Reference
+
+Runtime SHALL identify compilation target using portable Device binding and
+metadata.
+
+#### Scenario: Native CUDA device exists
+
+Given Provider maps DeviceBinding internally to native CUDA device
+
+When compilation occurs
+
+Then native mapping remains private.
+
+---
+
+### Requirement: Device Pressure May Influence Optimization
+
+Runtime SHALL NOT let device pressure signals override eligibility constraints, though pressure MAY affect ranking among otherwise eligible candidates.
+
+#### Scenario: GPU saturated
+
+Given GPU and CPU candidates are both eligible
+
+And policy allows dynamic pressure-aware selection
+
+When GPU pressure is high
+
+Then CPU may rank higher.
+
+---
+
+### Requirement: Device Unavailability Is Eligibility Constraint
+
+Unavailable Device SHALL not remain eligible merely because benchmark is fast.
+
+#### Scenario: GPU offline
+
+Given GPU Device is unavailable
+
+When ranking occurs
+
+Then GPU candidates are excluded.
+
+---
+
+### Requirement: Device Metadata Does Not Perform Selection
+
+Device SHALL expose state and capabilities but SHALL not select Kernels.
+
+#### Scenario: Device health queried
+
+Given Runtime reads Device health
+
+When Kernel choice is made
+
+Then Runtime policy owns decision.

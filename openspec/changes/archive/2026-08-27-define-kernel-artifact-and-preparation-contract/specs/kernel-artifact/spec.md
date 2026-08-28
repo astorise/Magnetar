@@ -1,0 +1,411 @@
+## ADDED Requirements
+
+### Requirement: Kernel Artifact Lifecycle
+
+Magnetar SHALL distinguish Kernel Source Artifact, Compiled Kernel Artifact,
+and Prepared Kernel.
+
+#### Scenario: Generated kernel lifecycle
+
+Given generated Triton source exists
+
+When it becomes executable by a Provider
+
+Then it transitions through distinct source, compiled, and prepared states.
+
+---
+
+### Requirement: Kernel Source Artifact
+
+Kernel Source Artifact SHALL represent non-prepared kernel source or
+intermediate representation.
+
+#### Scenario: WGSL source
+
+Given WGSL source implements a portable Operator
+
+When stored as a Kernel Source Artifact
+
+Then it is not considered executable Provider state.
+
+---
+
+### Requirement: Extensible Source Format Identity
+
+Kernel Source Format SHALL use an extensible identifier rather than a closed
+language enum.
+
+#### Scenario: Future DSL
+
+Given a future kernel DSL is introduced
+
+When its artifact is registered
+
+Then Magnetar can identify its format without changing a closed enum.
+
+---
+
+### Requirement: Source Artifact Content Identity
+
+Content-addressed Kernel Source Artifact identity SHALL change if and only if
+the immutable source bytes change. Kernel Source Artifact identity SHOULD use
+immutable content-addressed identity.
+
+#### Scenario: Source modified
+
+Given one source byte changes
+
+When digest is recomputed
+
+Then artifact identity changes.
+
+---
+
+### Requirement: Generated Provenance Is Descriptive
+
+Kernel Artifact provenance MAY indicate AI-generated origin but SHALL NOT imply
+trust.
+
+#### Scenario: AI-generated kernel
+
+Given artifact provenance is `ai-generated`
+
+When trust is evaluated
+
+Then the artifact is not trusted solely because of that provenance.
+
+---
+
+### Requirement: Compiled Kernel Artifact
+
+Compiled Kernel Artifact SHALL represent Provider-consumable compiled data
+without exposing executable pointers.
+
+#### Scenario: CUBIN artifact
+
+Given CUDA source has been compiled to CUBIN
+
+When represented by Runtime
+
+Then Runtime stores artifact metadata and bytes but no `CUfunction*`.
+
+---
+
+### Requirement: Compiled Artifact Compatibility Metadata
+
+Compiled Kernel Artifact SHALL carry compatibility metadata sufficient for
+safe preparation decisions.
+
+#### Scenario: Wrong target architecture
+
+Given an artifact targets a different architecture
+
+When preparation is attempted
+
+Then preparation is rejected.
+
+---
+
+### Requirement: Prepared Kernel Is Ephemeral
+
+Prepared Kernel SHALL represent Provider-owned executable state and SHALL NOT be
+treated as a portable artifact.
+
+#### Scenario: Runtime restart
+
+Given Runtime restarts
+
+When previously prepared kernel state is inspected
+
+Then it must be prepared again or reconstructed from a persistent compiled
+artifact.
+
+---
+
+### Requirement: Prepared Kernel Identifier Is Opaque
+
+Runtime MAY use PreparedKernelId but SHALL treat it as opaque.
+
+#### Scenario: Numeric identifier
+
+Given PreparedKernelId is internally represented as integer
+
+When Runtime receives it
+
+Then Runtime does not reinterpret it as a pointer.
+
+---
+
+### Requirement: Provider Owns Native Prepared State
+
+Provider SHALL own native executable state behind PreparedKernelId.
+
+#### Scenario: CUDA prepared kernel
+
+Given PreparedKernelId maps to a CUDA function internally
+
+When Runtime dispatches it
+
+Then only CUDA Provider resolves the native CUDA handle.
+
+---
+
+### Requirement: Device Does Not Compile
+
+Device SHALL not own compilation or preparation APIs.
+
+#### Scenario: Generated PTX requires preparation
+
+Given PTX artifact targets a GPU Device
+
+When preparation occurs
+
+Then Provider performs preparation rather than Device.
+
+---
+
+### Requirement: Scheduler Does Not Compile
+
+Scheduler SHALL not compile or prepare Kernel Artifacts.
+
+#### Scenario: Required kernel missing
+
+Given scheduling encounters an unprepared required kernel
+
+When policy does not allow immediate readiness
+
+Then Scheduler delays/rejects according to policy rather than compiling it.
+
+---
+
+### Requirement: Cold Path Compilation
+
+Compilation and preparation SHALL be cold-path operations.
+
+#### Scenario: Model loading
+
+Given a model requires generated kernel
+
+When model is loaded
+
+Then kernel may be compiled/prepared before Model Instance becomes ready.
+
+---
+
+### Requirement: No Normal Hot-Path Compilation
+
+Normal token decode SHALL NOT synchronously compile Kernel Source Artifacts.
+
+#### Scenario: Decode discovers missing kernel
+
+Given decode requires a kernel that is not prepared
+
+When hot path executes
+
+Then Runtime returns structured readiness/admission failure rather than
+silently compiling it.
+
+---
+
+### Requirement: Kernel Artifact Trust
+
+Kernel Source and Compiled Kernel Artifacts SHALL have explicit trust and
+integrity status.
+
+#### Scenario: Cached generated kernel
+
+Given artifact exists in cache
+
+When trust is evaluated
+
+Then cache presence does not imply trust.
+
+---
+
+### Requirement: Operator Semantic Binding
+
+Kernel Artifact SHALL declare which portable Operator semantics it implements.
+
+#### Scenario: MatMul kernel
+
+Given artifact claims MatMul implementation
+
+When compatibility is validated
+
+Then declared Operator semantics must match the graph requirement.
+
+---
+
+### Requirement: Fused Semantic Binding
+
+Fused Kernel Artifact SHALL declare the Operator group whose semantics it
+preserves.
+
+#### Scenario: RMSNorm MatMul fusion
+
+Given fused kernel replaces RMSNorm followed by MatMul
+
+When Registry evaluates it
+
+Then fusion metadata declares both portable semantics.
+
+---
+
+### Requirement: Explicit Shape Specialization
+
+Shape specialization SHALL be explicit.
+
+#### Scenario: Head dimension 128 only
+
+Given kernel supports attention head dimension 128 only
+
+When graph requires dimension 64
+
+Then kernel is not compatible.
+
+---
+
+### Requirement: Explicit DType Specialization
+
+DType specialization SHALL be explicit.
+
+#### Scenario: FP16 kernel
+
+Given kernel supports FP16 only
+
+When graph requires FP32
+
+Then Runtime does not silently reinterpret FP32 input.
+
+---
+
+### Requirement: Explicit Layout Specialization
+
+Layout specialization SHALL be explicit.
+
+#### Scenario: Contiguous-only kernel
+
+Given artifact requires contiguous tensor layout
+
+When tensor is strided
+
+Then Runtime requires explicit conversion or selects another Kernel.
+
+---
+
+### Requirement: Precision Metadata
+
+Precision metadata, when present, SHALL be visible to compatibility and
+conformance policy evaluation. Kernel Artifact SHOULD expose numerical
+precision behavior.
+
+#### Scenario: Approximate math
+
+Given generated kernel uses approximate math
+
+When registered
+
+Then this is visible in Kernel metadata and compatibility/conformance policy.
+
+---
+
+### Requirement: Provider Lifetime Independent From Kernel Artifact
+
+Replacing a Kernel Artifact SHALL NOT require unloading Provider.
+
+#### Scenario: Kernel v2 installed
+
+Given Provider is active and kernel v1 has in-flight work
+
+When kernel v2 becomes ready
+
+Then Provider stays loaded and both prepared generations may temporarily
+coexist.
+
+---
+
+### Requirement: Prepared Kernel Safe Retirement
+
+Prepared Kernel SHALL NOT be destroyed while active operations reference it.
+
+#### Scenario: Hot replacement
+
+Given old Prepared Kernel has in-flight invocation
+
+When replacement occurs
+
+Then old generation remains alive until reference count reaches zero.
+
+---
+
+### Requirement: Runtime Tensor Ownership Preserved
+
+Kernel preparation SHALL NOT transfer ownership of Runtime Tensor Resources to
+Provider.
+
+#### Scenario: Provider loads executable module
+
+Given Provider allocates executable GPU memory
+
+When inference tensors are used
+
+Then Runtime Memory Manager continues to own tensor allocation/residency policy.
+
+---
+
+### Requirement: Inference API Does Not Expose Kernel Artifacts
+
+Normal inference requests SHALL NOT expose Kernel Source Artifact,
+Compiled Kernel Artifact, PreparedKernelId, or native handles.
+
+#### Scenario: Generation request
+
+Given client submits generation request
+
+When Runtime validates it
+
+Then arbitrary kernel source is outside normal inference request scope.
+
+---
+
+### Requirement: External Generator Independence
+
+Magnetar Runtime SHALL not depend on a specific kernel generator.
+
+#### Scenario: KernelEvolve-like artifact
+
+Given artifact was produced by an external optimization system
+
+When Runtime consumes it
+
+Then Runtime uses generic Kernel Artifact contracts.
+
+---
+
+### Requirement: Kernel Artifact Structured Errors
+
+Kernel Artifact and preparation failures SHALL use structured error categories.
+
+#### Scenario: Unsupported format
+
+Given Provider cannot prepare the artifact format
+
+When preparation occurs
+
+Then Runtime reports `kernel-artifact-format-unsupported` or equivalent
+structured error.
+
+---
+
+### Requirement: Kernel Artifact Observability Redaction
+
+Kernel Artifact observability SHALL redact source and native executable
+internals by default.
+
+#### Scenario: Preparation failure
+
+Given compilation/preparation fails
+
+When diagnostic is emitted
+
+Then raw source, raw binary bytes, and native handles are absent by default.

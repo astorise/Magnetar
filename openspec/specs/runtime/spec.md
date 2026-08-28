@@ -5567,3 +5567,395 @@ When stable `v0.1.0` release is published
 
 Then cutover verification fails.
 
+---
+
+### Requirement: Runtime Coordinates Kernel Preparation
+
+Runtime SHALL NOT mark a Model Instance ready when required Kernel
+preparation has failed. Runtime MAY coordinate Kernel Artifact validation and
+Provider preparation as part of model/execution readiness.
+
+#### Scenario: Model load
+
+Given required Kernel has compiled artifact but is not prepared
+
+When Model Instance is being loaded
+
+Then Runtime may request Provider preparation before marking instance ready.
+
+---
+
+### Requirement: Runtime Does Not Compile On Normal Decode Hot Path
+
+Runtime SHALL NOT synchronously compile Kernel Source Artifact in the normal
+token decode loop.
+
+#### Scenario: Kernel unavailable during decode
+
+Given required Kernel is not prepared
+
+When decode reaches it
+
+Then Runtime returns structured readiness/admission failure according to policy.
+
+---
+
+### Requirement: Runtime Treats Prepared Kernel Id As Opaque
+
+Runtime SHALL treat PreparedKernelId as opaque.
+
+#### Scenario: Dispatch
+
+Given PreparedKernelId is passed to Provider
+
+When Runtime handles it
+
+Then Runtime does not reinterpret its numeric value.
+
+---
+
+### Requirement: Runtime Remains Generator Independent
+
+Runtime SHALL not depend on external AI/kernel generation system APIs.
+
+#### Scenario: Human-authored artifact
+
+Given human-generated compiled kernel is valid
+
+When Runtime prepares it
+
+Then it follows same lifecycle as AI-generated artifact.
+
+---
+
+### Requirement: Runtime Coordinates Compilation Cold Path
+
+Runtime MAY coordinate Provider compilation jobs during loading/preparation, and any such coordination SHALL occur outside the decode hot path.
+
+#### Scenario: Model load requires generated kernel
+
+Given compatible compiled artifact does not exist
+
+And policy allows source compilation
+
+When Model Loading runs
+
+Then Runtime may submit Provider compilation job.
+
+---
+
+### Requirement: Runtime Respects Compilation Capability
+
+Runtime SHALL compile only using Provider-advertised compatible capability.
+
+#### Scenario: Provider lacks source format
+
+Given source format is unsupported
+
+When Runtime plans compilation
+
+Then request is rejected before submit.
+
+---
+
+### Requirement: Runtime Does Not Compile On Decode Hot Path
+
+Normal decode path SHALL not synchronously submit compilation jobs.
+
+#### Scenario: Prepared Kernel lost
+
+Given decode finds kernel not ready
+
+When request executes
+
+Then Runtime surfaces structured readiness failure rather than compiler latency.
+
+---
+
+### Requirement: Runtime Applies Compilation Policy
+
+Runtime SHALL evaluate trust, isolation, resource and target policy before
+submitting compilation.
+
+#### Scenario: Untrusted source requires sandbox
+
+Given Provider only supports unsandboxed in-process compilation
+
+When policy requires sandbox
+
+Then Runtime denies compilation.
+
+---
+
+### Requirement: Runtime Preserves Provider Device Authority Boundary
+
+Runtime SHALL select target; Provider SHALL implement compilation for that
+target.
+
+#### Scenario: Provider receives DeviceBinding
+
+Given Runtime selected Device A
+
+When compilation completes
+
+Then resulting target metadata remains bound to Device A compatibility.
+
+---
+
+### Requirement: Runtime Coordinates Generated Kernel Qualification Policy
+
+Runtime or authorized tooling SHALL evaluate qualification evidence before
+production eligibility.
+
+#### Scenario: Unqualified candidate
+
+Given policy requires qualification
+
+When Runtime plans execution
+
+Then unqualified candidate is excluded.
+
+---
+
+### Requirement: Runtime Separates Correctness From Performance
+
+Runtime SHALL not accept performance evidence as replacement for correctness
+qualification.
+
+#### Scenario: Benchmark winner is incorrect
+
+Given fastest candidate failed differential tests
+
+When selection runs
+
+Then candidate remains rejected.
+
+---
+
+### Requirement: Runtime Coordinates Promotion
+
+Runtime SHALL control candidate promotion according to Registry and policy.
+
+#### Scenario: New qualified candidate
+
+Given candidate is qualified and prepared
+
+When policy approves promotion
+
+Then Runtime atomically publishes new active generation.
+
+---
+
+### Requirement: Runtime Preserves In-Flight Generation
+
+Runtime SHALL preserve acquired Prepared Kernel generation for in-flight
+execution unless explicit safe migration exists.
+
+#### Scenario: Promotion during generation
+
+Given token operation has acquired old generation
+
+When new generation is promoted
+
+Then current operation continues safely on old generation.
+
+---
+
+### Requirement: Runtime Supports Safe Rollback
+
+Rollback SHALL NOT be treated as available for a generation that is no longer retained or compatible.
+
+Runtime SHOULD support rollback to compatible known-good generation when
+available.
+
+#### Scenario: Replacement starts failing
+
+Given new Kernel is active and known-good previous generation exists
+
+When rollback policy triggers
+
+Then new work returns to previous generation.
+
+---
+
+### Requirement: Runtime Applies Revocation
+
+Runtime SHALL prevent new work from using revoked Kernel.
+
+#### Scenario: Qualification revoked
+
+Given active Kernel qualification is revoked
+
+When new invocation begins
+
+Then Runtime does not dispatch it.
+
+---
+
+### Requirement: Runtime Does Not Depend On Kernel Generator
+
+Runtime SHALL consume generic qualification and artifact metadata regardless of
+generator.
+
+#### Scenario: Human kernel and AI kernel
+
+Given both satisfy identical qualification policy
+
+When selected
+
+Then origin alone does not alter execution semantics.
+
+---
+
+### Requirement: Runtime Owns Kernel Selection
+
+Runtime SHALL own final Kernel selection policy across Providers and Devices.
+
+#### Scenario: Multiple Providers
+
+Given CPU and GPU Kernels are eligible
+
+When Runtime executes graph
+
+Then Runtime policy chooses candidate.
+
+---
+
+### Requirement: Runtime Applies Eligibility Before Optimization
+
+Runtime SHALL reject candidates violating hard constraints before ranking.
+
+#### Scenario: Memory rejection
+
+Given Memory Manager rejects candidate workspace
+
+When latency ranking runs
+
+Then candidate is absent from ranked eligible set.
+
+---
+
+### Requirement: Runtime Supports Selection Profiles
+
+Runtime SHALL support policy-selected optimization profiles.
+
+#### Scenario: Throughput workload
+
+Given deployment requests throughput profile
+
+When model executes
+
+Then Runtime uses throughput-oriented ranking.
+
+---
+
+### Requirement: Runtime Supports Reproducible Selection
+
+When a pin is active, Runtime SHALL NOT opportunistically substitute another Kernel; Runtime SHOULD support pinned/reproducible Kernel selection.
+
+#### Scenario: Reproducible deployment
+
+Given Model Instance pins Kernel artifact digest
+
+When compatible environment executes
+
+Then Runtime does not opportunistically switch to another kernel.
+
+---
+
+### Requirement: Runtime Prevents Selection Flapping
+
+Runtime's stability policy SHALL be deterministic given identical inputs; Runtime SHOULD apply hysteresis or an equivalent stability policy.
+
+#### Scenario: Device pressure oscillates
+
+Given two kernels alternate by negligible score difference
+
+When pressure changes slightly
+
+Then Runtime avoids rapid repeated switching.
+
+---
+
+### Requirement: Runtime Selection Is Observable
+
+Emitted candidate selection decision information SHALL exclude native handles and raw tensor data; Runtime SHOULD emit this redacted information.
+
+#### Scenario: Fallback selected
+
+Given preferred candidate is unavailable
+
+When fallback occurs
+
+Then Runtime records reason and selected fallback.
+
+---
+
+### Requirement: Runtime Remains Inference-Only
+
+Magnetar Runtime SHALL not become an AI/kernel optimization-agent host.
+
+#### Scenario: Generator requires network/model API
+
+Given generator needs remote LLM
+
+When Runtime serves inference
+
+Then Runtime does not invoke generator.
+
+---
+
+### Requirement: Runtime Consumes Artifacts And Evidence
+
+Runtime MAY consume validated Kernel Artifacts and Optimization Evidence, but SHALL validate them using existing trust and qualification contracts before use.
+
+#### Scenario: Optimization completed externally
+
+Given candidate artifact/evidence are available
+
+When Runtime considers candidate
+
+Then it validates them using existing contracts.
+
+---
+
+### Requirement: Runtime Does Not Trust External Recommendation
+
+Runtime SHALL treat optimization recommendation as non-authoritative.
+
+#### Scenario: Recommendation says production-ready
+
+Given candidate lacks current trust
+
+When Runtime evaluates it
+
+Then recommendation does not bypass trust.
+
+---
+
+### Requirement: Runtime Does Not Require Optimization Network
+
+Runtime SHALL execute compatible prepared inference without external
+optimization-service connectivity.
+
+#### Scenario: Offline deployment
+
+Given all required artifacts are local
+
+When network is unavailable
+
+Then inference can continue.
+
+---
+
+### Requirement: Runtime Owns Production Promotion Decision
+
+Runtime/deployment policy SHALL remain authoritative for Kernel promotion.
+
+#### Scenario: Optimization campaign ends
+
+Given new candidate is recommended
+
+When production policy denies promotion
+
+Then current active Kernel remains active.

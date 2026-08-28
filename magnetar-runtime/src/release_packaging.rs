@@ -1111,7 +1111,7 @@ pub struct ReleaseBuildMetadata {
 }
 
 /// Key name fragments that mark a build metadata value as secret-shaped,
-/// beyond what [`redact_backend_diagnostic`]'s path/handle heuristics catch.
+/// beyond what `redact_backend_diagnostic`'s path/handle heuristics catch.
 const BUILD_METADATA_SECRET_KEY_FRAGMENTS: &[&str] = &[
     "secret",
     "token",

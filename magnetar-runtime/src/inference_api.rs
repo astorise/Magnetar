@@ -72,6 +72,20 @@ pub const FORBIDDEN_INFERENCE_API_SCOPES: &[&str] = &[
     "agent-orchestration",
     "task-automation",
     "tool-call",
+    // Kernel Optimization Orchestration boundary (see
+    // `crate::kernel_optimization_orchestration` and
+    // `openspec/changes/define-kernel-optimization-orchestration-boundary`):
+    // optimization-agent/tooling authority SHALL NOT become ambient Runtime
+    // Inference API authority.
+    "optimization-agent",
+    "kernel-optimization-orchestration",
+    "kernel-source-injection",
+    "compiler-command",
+    "benchmark-script",
+    "optimization-service-url",
+    "repository-credential",
+    "generator-credential",
+    "agent-prompt",
 ];
 
 /// Rejects a caller-supplied capability/scope string that names a

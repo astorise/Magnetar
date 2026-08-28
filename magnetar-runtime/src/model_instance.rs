@@ -9,7 +9,7 @@
 
 use crate::{
     AdapterSetId, CorrelationId, DeviceBinding, GenerationModelReference, InferenceSessionId,
-    KvCacheId, LoadedModelContext, MemoryAllocationId, MemoryPressureLevel,
+    KernelId, KvCacheId, LoadedModelContext, MemoryAllocationId, MemoryPressureLevel,
     ModelArchitectureImplementation, ModelArtifactId, ModelDType, ModelResidencyId,
     PrefixCacheEntryId, ProviderAdmissionDecision, ProviderBinding, ProviderHealthState,
     ProviderPressureLevel, ProviderReadinessState, ResourceAffinity, TokenizerId,
@@ -278,6 +278,13 @@ pub struct ModelInstanceReadinessChecks {
     pub memory_pressure: MemoryPressureLevel,
     pub runtime_policy_allows: bool,
     pub browser_supported: bool,
+    /// Whether every mandatory Kernel Artifact preparation for this Model
+    /// Instance's execution plan has completed successfully. Implements
+    /// "Model Instance Readiness" (`define-kernel-artifact-and-preparation-contract`):
+    /// "A Model Instance SHALL NOT silently become ready when required
+    /// Kernel preparation has failed." Defaults to `true` so Model Instances
+    /// with no artifact-backed Kernels are unaffected.
+    pub kernel_preparation_ready: bool,
 }
 
 impl Default for ModelInstanceReadinessChecks {
@@ -290,6 +297,7 @@ impl Default for ModelInstanceReadinessChecks {
             memory_pressure: MemoryPressureLevel::Low,
             runtime_policy_allows: true,
             browser_supported: true,
+            kernel_preparation_ready: true,
         }
     }
 }
@@ -300,6 +308,7 @@ impl ModelInstanceReadinessChecks {
             || !self.device_ready
             || !self.adapter_ready
             || !self.runtime_policy_allows
+            || !self.kernel_preparation_ready
         {
             return ModelInstanceReadiness::Failed;
         }
@@ -329,6 +338,9 @@ impl ModelInstanceReadinessChecks {
         }
         if !self.adapter_ready {
             return Err(ModelInstanceError::ModelInstanceAdapterIncompatible);
+        }
+        if !self.kernel_preparation_ready {
+            return Err(ModelInstanceError::ModelInstanceKernelPreparationFailed);
         }
         if matches!(
             self.memory_pressure,
@@ -473,6 +485,13 @@ pub struct ModelInstanceDefinition {
     pub tenant: Option<String>,
     pub owner: Option<String>,
     pub resource_bindings: ModelInstanceResourceBindings,
+    /// Implements "Model Instance Kernel Policy"
+    /// (`define-kernel-optimization-and-selection-policy`): "A Model
+    /// Instance SHALL own or reference an explicit Kernel selection
+    /// policy." References a policy identity rather than embedding the
+    /// full `KernelSelectionPolicy`, mirroring how `tokenizer` references a
+    /// `TokenizerId`.
+    pub kernel_selection_policy: Option<crate::kernel_selection_policy::KernelSelectionPolicyId>,
 }
 
 impl ModelInstanceDefinition {
@@ -499,6 +518,7 @@ impl ModelInstanceDefinition {
             tenant: None,
             owner: None,
             resource_bindings: ModelInstanceResourceBindings::default(),
+            kernel_selection_policy: None,
         }
     }
 }
@@ -1349,6 +1369,7 @@ pub enum ModelInstanceError {
     ModelInstanceMemoryPressure,
     ModelInstanceResidencyMissing,
     ModelInstanceAdapterIncompatible,
+    ModelInstanceKernelPreparationFailed,
     ModelInstanceKvCacheInvalidated,
     ModelInstancePrefixCacheInvalidated,
     ModelInstanceBrowserFeatureUnsupported,
@@ -1396,6 +1417,9 @@ impl fmt::Display for ModelInstanceError {
             Self::ModelInstanceResidencyMissing => f.write_str("model instance residency missing"),
             Self::ModelInstanceAdapterIncompatible => {
                 f.write_str("model instance adapter incompatible")
+            }
+            Self::ModelInstanceKernelPreparationFailed => {
+                f.write_str("model instance required Kernel preparation failed")
             }
             Self::ModelInstanceKvCacheInvalidated => {
                 f.write_str("model instance KV cache invalidated")
@@ -1451,6 +1475,76 @@ pub fn readiness_error(
         ModelInstanceLifecycleState::Removed => ModelInstanceError::ModelInstanceRemoved,
         _ if readiness == ModelInstanceReadiness::Failed => ModelInstanceError::ModelInstanceFailed,
         _ => ModelInstanceError::ModelInstanceNotReady,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Generated Kernel Selection Policy
+// ---------------------------------------------------------------------
+
+/// Implements "Model Instance Interaction" from
+/// `openspec/changes/define-generated-kernel-qualification-cache-and-hot-swap-contract`:
+/// "A Model Instance MAY use dynamic Kernel selection or may pin a Kernel
+/// generation set for reproducibility. The policy SHALL be explicit." The
+/// enum itself makes the choice explicit -- there is no implicit third
+/// state, and [`PinnedKernelSelection`] carries only stable identity
+/// metadata, never a native handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelSelectionPolicy {
+    Dynamic,
+    Pinned(PinnedKernelSelection),
+}
+
+impl KernelSelectionPolicy {
+    pub const fn is_pinned(&self) -> bool {
+        matches!(self, Self::Pinned(_))
+    }
+}
+
+/// Implements "Session Interaction"
+/// (`define-generated-kernel-qualification-cache-and-hot-swap-contract`):
+/// "Inference Sessions SHALL NOT own native Kernel state directly. Sessions
+/// MAY inherit Model Instance Kernel selection policy." A Session resolves
+/// its effective Kernel policy by borrowing its owning Model Instance's
+/// policy through this function rather than storing a competing policy of
+/// its own -- `crate::session::InferenceSession` has no
+/// [`KernelSelectionPolicy`] field, so there is nothing for a Session to
+/// override.
+pub fn session_kernel_policy_is_inherited(
+    model_instance_policy: &KernelSelectionPolicy,
+) -> &KernelSelectionPolicy {
+    model_instance_policy
+}
+
+/// A pinned Kernel selection, implementing "For strict reproducibility, a
+/// Model Instance SHOULD be able to pin: KernelId, artifact digest, Prepared
+/// generation, qualification profile" (proposal).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PinnedKernelSelection {
+    pub kernel: KernelId,
+    pub artifact_digest: String,
+    pub prepared_generation: Option<u64>,
+    pub qualification_profile: Option<String>,
+}
+
+impl PinnedKernelSelection {
+    pub fn new(kernel: KernelId, artifact_digest: impl Into<String>) -> Self {
+        Self {
+            kernel,
+            artifact_digest: artifact_digest.into(),
+            prepared_generation: None,
+            qualification_profile: None,
+        }
+    }
+
+    /// Implements "Record artifact digest for reproducibility" and "Record
+    /// qualification profile" (tasks): a pinned selection SHALL identify
+    /// which artifact and profile it pins, never leaving either implicit.
+    pub fn validate(&self) -> Result<(), ModelInstanceError> {
+        if self.artifact_digest.trim().is_empty() {
+            return Err(ModelInstanceError::ModelInstancePolicyDenied);
+        }
+        Ok(())
     }
 }
 

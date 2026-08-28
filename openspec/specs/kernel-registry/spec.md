@@ -587,3 +587,254 @@ When Registry selects candidates
 
 Then the Kernel is rejected or ranked unavailable according to policy.
 
+---
+
+### Requirement: Registry Tracks Prepared Kernel Readiness
+
+A Kernel candidate without an associated ready PreparedKernel SHALL NOT be
+treated as immediately dispatchable. Kernel Registry MAY associate compatible
+Kernel candidates with PreparedKernel state.
+
+#### Scenario: Kernel not prepared
+
+Given compatible artifact exists but no PreparedKernel is ready
+
+When dispatch selection runs
+
+Then candidate is not treated as immediately executable.
+
+---
+
+### Requirement: Registry Does Not Own Native Handles
+
+Kernel Registry SHALL NOT store or dereference native executable pointers.
+
+#### Scenario: Prepared CUDA Kernel
+
+Given Provider owns native CUDA function
+
+When Registry stores candidate
+
+Then it stores opaque PreparedKernelId only.
+
+---
+
+### Requirement: Registry Supports Multiple Prepared Generations
+
+An older Prepared Kernel generation SHALL remain valid for in-flight requests
+until no active reference remains. Kernel Registry MAY temporarily index
+multiple Prepared Kernel generations for the same logical Kernel.
+
+#### Scenario: Hot replacement
+
+Given generation 18 replaces 17
+
+When new request is dispatched
+
+Then policy may choose 18 while in-flight request continues using 17.
+
+---
+
+### Requirement: Registry Validates Artifact Compatibility
+
+Kernel Registry SHALL use artifact metadata as part of compatibility
+selection where applicable.
+
+#### Scenario: Architecture mismatch
+
+Given compiled artifact targets incompatible architecture
+
+When candidate selection occurs
+
+Then candidate is excluded.
+
+---
+
+### Requirement: Registry Does Not Compile
+
+Kernel Registry SHALL NOT perform source compilation.
+
+#### Scenario: Missing compiled artifact
+
+Given only source artifact exists
+
+When Registry selects candidates
+
+Then it reports preparation unavailable rather than invoking a compiler itself.
+
+---
+
+### Requirement: Registry Considers Qualification Eligibility
+
+Kernel Registry SHALL consider qualification status when policy requires it.
+
+#### Scenario: Faster unqualified Kernel
+
+Given unqualified candidate benchmarks faster
+
+When production selection runs
+
+Then it cannot outrank eligible qualified candidates.
+
+---
+
+### Requirement: Registry Promotion Is Explicit
+
+Candidate Kernel SHALL become active only through explicit promotion.
+
+#### Scenario: Candidate prepared
+
+Given candidate is prepared successfully
+
+When no promotion occurs
+
+Then it does not automatically become active.
+
+---
+
+### Requirement: Atomic Kernel Promotion
+
+Dispatch SHALL NOT observe a partially updated Registry state.
+
+Registry promotion SHOULD be atomic from dispatch perspective.
+
+#### Scenario: Promotion races with dispatch
+
+Given promotion occurs concurrently with new invocation
+
+When dispatch resolves Kernel
+
+Then invocation observes complete old or complete new Registry generation.
+
+---
+
+### Requirement: Multiple Prepared Generations
+
+Each tracked generation SHALL be uniquely identified.
+
+Registry MAY track multiple Prepared Kernel generations.
+
+#### Scenario: Hot swap
+
+Given generation 2 is promoted
+
+When generation 1 has in-flight work
+
+Then both generations may coexist temporarily.
+
+---
+
+### Requirement: Retiring Generation Receives No New Work
+
+After Kernel generation enters retiring state, Registry SHALL stop selecting it
+for new work.
+
+#### Scenario: New request after promotion
+
+Given old Kernel is retiring
+
+When request resolves
+
+Then new active generation is selected where compatible.
+
+---
+
+### Requirement: Revoked Kernel Not Selected
+
+Registry SHALL not select revoked Kernel for new work.
+
+#### Scenario: Security revocation
+
+Given active Kernel is revoked
+
+When next dispatch occurs
+
+Then revoked Kernel is not selected.
+
+---
+
+### Requirement: Performance Ranking Follows Eligibility
+
+Performance ranking SHALL occur after compatibility, qualification, trust and
+policy eligibility.
+
+#### Scenario: Incorrect fastest candidate
+
+Given incorrect candidate has best benchmark
+
+When Registry ranks
+
+Then candidate remains ineligible.
+
+---
+
+### Requirement: Registry Provides Candidate Set
+
+Kernel Registry SHALL expose candidate metadata to Runtime selection policy
+without performing opaque policy ranking itself.
+
+#### Scenario: Multiple MatMul kernels
+
+Given Registry contains four compatible MatMul implementations
+
+When selection begins
+
+Then Runtime policy can evaluate candidates explicitly.
+
+---
+
+### Requirement: Registry Eligibility Metadata
+
+Registry candidate metadata SHALL include information required for eligibility
+evaluation.
+
+#### Scenario: Qualified candidate
+
+Given Registry returns candidate
+
+When Runtime evaluates it
+
+Then qualification, trust, target and preparation state are available.
+
+---
+
+### Requirement: Registry Does Not Make Cross-Provider Optimization Decision
+
+Kernel Registry SHALL not independently choose the globally fastest Provider
+without Runtime selection policy.
+
+#### Scenario: CPU and CUDA candidates
+
+Given both exist
+
+When Kernel is selected
+
+Then Runtime policy decides according to eligibility and objective.
+
+---
+
+### Requirement: Registry Supports Stable Candidate Identity
+
+Candidate identity SHALL be stable enough for deterministic tie-breaking.
+
+#### Scenario: Equal benchmark scores
+
+Given candidates tie
+
+When stable key is compared
+
+Then deterministic ordering is available.
+
+---
+
+### Requirement: Registry Respects Revocation
+
+Revoked candidate SHALL be excluded before optimization ranking.
+
+#### Scenario: Previously fastest Kernel revoked
+
+Given fastest candidate becomes revoked
+
+When Registry candidates are evaluated
+
+Then it cannot be selected.

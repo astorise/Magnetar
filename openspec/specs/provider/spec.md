@@ -3274,3 +3274,290 @@ When release report is generated
 
 Then CUDA gate is skipped with reason.
 
+---
+
+### Requirement: Provider Owns Kernel Preparation
+
+Provider SHALL own transformation from Provider-consumable Kernel Artifact to
+Prepared Kernel state.
+
+#### Scenario: Load compiled kernel
+
+Given Provider receives compatible compiled artifact
+
+When preparation succeeds
+
+Then Provider returns opaque PreparedKernelId.
+
+---
+
+### Requirement: Provider Keeps Native Handles Private
+
+Provider SHALL keep native executable handles private.
+
+#### Scenario: Metal pipeline
+
+Given Metal Provider creates compute pipeline
+
+When Runtime receives PreparedKernelId
+
+Then pipeline pointer/object is not exposed.
+
+---
+
+### Requirement: Provider Kernel Lifecycle Independent From Provider Lifecycle
+
+Provider SHALL support individual Prepared Kernel destruction without requiring
+Provider unload where platform permits.
+
+#### Scenario: Retire kernel
+
+Given prepared kernel is no longer used
+
+When Runtime retires it
+
+Then Provider destroys kernel state while Provider remains active.
+
+---
+
+### Requirement: Provider Compilation Capability Is Separate
+
+Provider compilation capability SHALL be modeled separately from Device.
+
+#### Scenario: CUDA Provider accepts PTX
+
+Given CUDA Provider supports PTX preparation
+
+When capability is advertised
+
+Then Device trait remains unchanged.
+
+---
+
+### Requirement: Provider Rejects Unsupported Artifact
+
+Provider SHALL reject unsupported artifact format or compatibility.
+
+#### Scenario: WGSL sent to CUDA Provider
+
+Given CUDA Provider cannot prepare WGSL
+
+When preparation is attempted
+
+Then structured unsupported format error is returned.
+
+---
+
+### Requirement: Compilation Is Provider Capability
+
+Kernel source compilation SHALL belong to Provider-level capability.
+
+#### Scenario: Device discovered
+
+Given Device metadata is available
+
+When compilation capability is queried
+
+Then capability belongs to Provider rather than Device object.
+
+---
+
+### Requirement: Provider May Support Execution Without Compilation
+
+Provider execution capability SHALL not imply compilation capability.
+
+#### Scenario: Static Provider
+
+Given Provider contains built-in kernels only
+
+When it registers
+
+Then it remains valid without Kernel Compilation Capability.
+
+---
+
+### Requirement: Provider May Support Preparation Without Compilation
+
+A Provider that prepares compatible AOT artifacts SHALL NOT be required to implement source compilation to do so.
+
+#### Scenario: Precompiled binary
+
+Given compatible Compiled Kernel Artifact exists
+
+When Provider prepares it
+
+Then source compiler is not required.
+
+---
+
+### Requirement: Compiler Native State Is Provider Private
+
+Compiler process, compiler objects, driver compiler handles, and native Device handles SHALL remain Provider-private.
+
+#### Scenario: Compilation observation
+
+Given Provider invokes native compiler
+
+When Runtime sees status
+
+Then it sees opaque job metadata rather than native compiler handle.
+
+---
+
+### Requirement: Provider Supports Prepared Kernel Generations
+
+Provider SHALL allow Runtime to distinguish Prepared Kernel generations without
+exposing native handles.
+
+#### Scenario: Kernel replacement
+
+Given Provider prepares replacement kernel
+
+When returned
+
+Then it receives distinct opaque PreparedKernelId/generation state.
+
+---
+
+### Requirement: Provider Safe Kernel Destruction
+
+Provider SHALL not destroy native Prepared Kernel state while active work still
+uses it according to Runtime/Provider lifetime protocol.
+
+#### Scenario: In-flight GPU kernel
+
+Given old generation has active invocation
+
+When Runtime retires it
+
+Then destruction waits for safe state.
+
+---
+
+### Requirement: Provider Remains Loaded During Kernel Hot Swap
+
+Kernel hot swap SHALL NOT require Provider unload.
+
+#### Scenario: New CUBIN promoted
+
+Given CUDA Provider has active context and streams
+
+When replacement kernel is promoted
+
+Then Provider stays loaded.
+
+---
+
+### Requirement: Provider Failure Does Not Corrupt Active Candidate
+
+Failure preparing or destroying one Kernel SHALL not silently invalidate
+unrelated active Prepared Kernels.
+
+#### Scenario: v2 preparation fails
+
+Given v1 is active
+
+When Provider fails to prepare v2
+
+Then v1 remains valid.
+
+---
+
+### Requirement: Provider Supplies Selection-Relevant Metadata
+
+Exposed Kernel and Device metadata SHALL NOT misrepresent Kernel behavior; Provider SHOULD expose accurate metadata needed by Runtime selection.
+
+#### Scenario: Device queue pressure
+
+Given Provider can measure queue pressure
+
+When Runtime ranks eligible candidates
+
+Then pressure may be supplied as optimization input.
+
+---
+
+### Requirement: Provider Does Not Own Global Selection
+
+Provider SHALL NOT choose between competing Providers for Runtime.
+
+#### Scenario: CUDA Provider available
+
+Given CPU is also available
+
+When global selection occurs
+
+Then CUDA Provider cannot force itself as selected.
+
+---
+
+### Requirement: Private Variant Selection Is Limited
+
+Provider SHALL register a distinct Registry entry whenever any Runtime-visible property differs; Provider MAY otherwise privately choose implementation variants when Runtime-visible contract properties are unchanged.
+
+#### Scenario: Two internal launch configurations
+
+Given both preserve semantics, determinism, precision and resource contract
+
+When Provider chooses internally
+
+Then distinct Registry entries are not required.
+
+---
+
+### Requirement: Runtime-Relevant Differences Are Advertised
+
+If private variants differ in Runtime-relevant properties they SHALL be
+separately advertised.
+
+#### Scenario: Different determinism
+
+Given one internal kernel uses nondeterministic atomics
+
+Then it cannot be hidden behind deterministic Kernel advertisement.
+
+---
+
+### Requirement: Optimization Worker Provider State Is Not Portable
+
+Provider-native state created in Optimization Plane SHALL not be transferred as
+portable production artifact.
+
+#### Scenario: Worker prepares CUDA Kernel
+
+Given optimization worker has CUfunction handle
+
+When candidate moves to production
+
+Then compiled artifact is transferred, not CUfunction.
+
+---
+
+### Requirement: Optimization Does Not Mutate Production Provider Implicitly
+
+Optimization Campaign SHALL NOT silently modify active production Provider
+state.
+
+#### Scenario: Benchmark candidate
+
+Given production CUDA Provider serves inference
+
+When campaign benchmarks candidate
+
+Then it uses explicitly authorized environment/provider instance rather than
+replacing active production state.
+
+---
+
+### Requirement: Provider Compilation Remains Existing Capability
+
+Optimization orchestration SHALL compose Provider Kernel Compilation
+Capability instead of adding separate compiler API.
+
+#### Scenario: Candidate needs PTX compilation
+
+Given campaign compiles source
+
+When Provider compiler is used
+
+Then existing compilation contract applies.

@@ -473,6 +473,24 @@ pub trait Provider: Send + Sync {
     fn execution_api(&self) -> Option<&dyn ProviderExecutionApi> {
         None
     }
+    /// Optional Kernel Compilation Capability advertisement, implementing
+    /// "Capability Discovery" (`define-provider-kernel-compilation-capability`):
+    /// "A Provider MAY advertise a Kernel Compilation Capability... Compilation
+    /// support SHALL NOT be assumed merely because the Provider can execute
+    /// Kernels." Defaults to `None` so every existing Provider implementation
+    /// remains valid without change.
+    fn kernel_compilation_capability(
+        &self,
+    ) -> Option<crate::kernel_compilation::KernelCompilationCapabilityDescriptor> {
+        None
+    }
+    /// Optional Runtime-to-Provider Kernel Compilation boundary, mirroring
+    /// [`Self::execution_api`]'s optional-capability shape.
+    fn kernel_compilation_api(
+        &self,
+    ) -> Option<&dyn crate::kernel_compilation::ProviderKernelCompilationApi> {
+        None
+    }
 }
 
 /// Native Runtime-to-Provider execution boundary for validated planned work.

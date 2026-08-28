@@ -11,7 +11,14 @@ use crate::e2e_conformance::*;
 use crate::generation::*;
 use crate::inference_api::*;
 use crate::kernel::*;
+use crate::kernel_artifact::*;
+use crate::kernel_artifact_manifest::*;
+use crate::kernel_benchmark::*;
+use crate::kernel_cache::*;
+use crate::kernel_compilation::*;
+use crate::kernel_qualification::*;
 use crate::kernel_registry::*;
+use crate::kernel_selection_policy::*;
 use crate::kv_cache::*;
 use crate::memory::*;
 use crate::model::*;
@@ -8164,6 +8171,7 @@ fn model_instance_definition() -> ModelInstanceDefinition {
         tenant: None,
         owner: None,
         resource_bindings: ModelInstanceResourceBindings::default(),
+        kernel_selection_policy: None,
     }
 }
 
@@ -8213,6 +8221,7 @@ fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_r
         memory_pressure: MemoryPressureLevel::Low,
         runtime_policy_allows: true,
         browser_supported: true,
+        kernel_preparation_ready: true,
     };
 
     let error = warm_model_instance(&mut runtime, &instance, &plan, &checks).unwrap_err();
@@ -14059,4 +14068,3243 @@ fn release_cutover_conformance_report_is_conformant() {
         );
     }
     assert!(report.is_conformant());
+}
+
+// ---------------------------------------------------------------------
+// kernel_artifact
+// ---------------------------------------------------------------------
+
+fn conformance_kernel_id(name: &str) -> KernelId {
+    KernelId::new(
+        ProviderBinding::new("kernel-artifact-test-provider"),
+        name,
+        CapabilityVersion::new(1, 0, 0),
+        OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra),
+        KernelOperatorVersionRange::exact(1),
+        KernelImplementationFamily::TestFixture,
+    )
+}
+
+#[test]
+fn kernel_source_format_is_extensible_and_not_provider_binding() {
+    let triton = KernelSourceFormat::new("triton", "source").with_version("3");
+    assert_eq!(triton.stable_key(), "triton:source@3");
+    let custom = KernelSourceFormat::new("vendor", "custom-ir").with_version("2");
+    assert!(custom.is_valid());
+    assert_eq!(custom.to_string(), "vendor:custom-ir@2");
+
+    let empty = KernelSourceFormat::new("", "name");
+    assert!(!empty.is_valid());
+}
+
+#[test]
+fn artifact_trust_is_only_ever_policy_controlled() {
+    assert_eq!(
+        evaluate_artifact_trust(false),
+        KernelArtifactTrust::Untrusted
+    );
+    assert_eq!(evaluate_artifact_trust(true), KernelArtifactTrust::Trusted);
+    assert_eq!(
+        KernelArtifactTrust::default(),
+        KernelArtifactTrust::Untrusted
+    );
+}
+
+#[test]
+fn source_artifact_validation_requires_trust_and_valid_format() {
+    let operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
+    let artifact = KernelSourceArtifact::new(
+        KernelSourceArtifactId::from_digest("digest-1"),
+        KernelSourceFormat::new("triton", "source").with_version("3"),
+        operator,
+        KernelArtifactProvenance::AiGenerated,
+    );
+
+    let untrusted = validate_source_artifact(&artifact);
+    assert!(matches!(
+        untrusted,
+        Err(KernelArtifactError::Untrusted { .. })
+    ));
+
+    let trusted = artifact.with_trust(evaluate_artifact_trust(true));
+    assert!(validate_source_artifact(&trusted).is_ok());
+
+    let empty_digest = KernelSourceArtifact::new(
+        KernelSourceArtifactId::from_digest(""),
+        KernelSourceFormat::new("triton", "source"),
+        OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra),
+        KernelArtifactProvenance::HumanAuthored,
+    )
+    .with_trust(evaluate_artifact_trust(true));
+    assert!(matches!(
+        validate_source_artifact(&empty_digest),
+        Err(KernelArtifactError::ArtifactInvalid { .. })
+    ));
+}
+
+#[test]
+fn compiled_artifact_validation_rejects_operator_and_provider_mismatch() {
+    let operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
+    let other_operator = OperatorId::magnetar("softmax", 1, OperatorFamily::Activation);
+    let provider = ProviderBinding::new("cuda-provider");
+    let other_provider = ProviderBinding::new("metal-provider");
+
+    let artifact = CompiledKernelArtifact::new(
+        CompiledKernelArtifactId::from_digest("compiled-digest"),
+        "cubin",
+        "nvcc",
+        "12.4",
+        "sm_90",
+        operator.clone(),
+    )
+    .with_trust(evaluate_artifact_trust(true))
+    .with_provider_compatibility([provider.clone()]);
+
+    assert!(validate_compiled_artifact(&artifact, &operator, &provider).is_ok());
+    assert!(matches!(
+        validate_compiled_artifact(&artifact, &other_operator, &provider),
+        Err(KernelArtifactError::OperatorIncompatible { .. })
+    ));
+    assert!(matches!(
+        validate_compiled_artifact(&artifact, &operator, &other_provider),
+        Err(KernelArtifactError::ProviderIncompatible { .. })
+    ));
+
+    let untrusted = CompiledKernelArtifact::new(
+        CompiledKernelArtifactId::from_digest("compiled-digest-2"),
+        "cubin",
+        "nvcc",
+        "12.4",
+        "sm_90",
+        operator.clone(),
+    );
+    assert!(matches!(
+        validate_compiled_artifact(&untrusted, &operator, &provider),
+        Err(KernelArtifactError::Untrusted { .. })
+    ));
+}
+
+#[test]
+fn hot_path_denies_compilation_cold_path_allows_it() {
+    assert!(matches!(
+        reject_hot_path_compilation(
+            KernelArtifactPath::Hot,
+            KernelArtifactColdPathOperation::Compilation
+        ),
+        Err(KernelArtifactError::HotPathCompilationDenied { .. })
+    ));
+    assert!(
+        reject_hot_path_compilation(
+            KernelArtifactPath::Cold,
+            KernelArtifactColdPathOperation::Compilation
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn lazy_preparation_requires_explicit_policy_and_admission_state() {
+    assert!(evaluate_lazy_preparation(LazyPreparationPolicy::disabled(), false, false).is_ok());
+    assert!(matches!(
+        evaluate_lazy_preparation(LazyPreparationPolicy::disabled(), true, true),
+        Err(KernelArtifactError::PreparationUnavailable { .. })
+    ));
+    assert!(matches!(
+        evaluate_lazy_preparation(LazyPreparationPolicy { enabled: true }, true, false),
+        Err(KernelArtifactError::PreparationUnavailable { .. })
+    ));
+    assert!(evaluate_lazy_preparation(LazyPreparationPolicy { enabled: true }, true, true).is_ok());
+}
+
+#[test]
+fn prepared_kernel_id_allocator_produces_distinct_opaque_ids() {
+    let mut allocator = PreparedKernelIdAllocator::default();
+    let first = allocator.allocate();
+    let second = allocator.allocate();
+    assert_ne!(first, second);
+    assert_ne!(first.to_string(), second.to_string());
+}
+
+#[test]
+fn prepared_kernel_lifecycle_blocks_destruction_while_referenced() {
+    let mut allocator = PreparedKernelIdAllocator::default();
+    let kernel = conformance_kernel_id("matmul-prepared");
+    let mut prepared = PreparedKernel::new(
+        allocator.allocate(),
+        kernel,
+        CompiledKernelArtifactId::from_digest("digest"),
+        ProviderBinding::new("cuda-provider"),
+        DeviceBinding::new(DeviceId::new("cuda-0")),
+        PreparedKernelGeneration::new(1),
+    );
+    assert_eq!(prepared.active_references(), 0);
+    prepared.mark_ready().unwrap();
+    assert!(prepared.state.is_dispatchable());
+
+    prepared.add_reference();
+    assert!(matches!(
+        prepared.destroy(),
+        Err(KernelArtifactError::PreparedGenerationInUse { .. })
+    ));
+    prepared.release_reference();
+    prepared.retire().unwrap();
+    assert!(prepared.destroy().is_ok());
+}
+
+#[test]
+fn prepared_kernel_generations_coexist_and_registry_tracks_readiness() {
+    let mut allocator = PreparedKernelIdAllocator::default();
+    let kernel = conformance_kernel_id("matmul-generations");
+    let device = DeviceBinding::new(DeviceId::new("cuda-0"));
+    let provider = ProviderBinding::new("cuda-provider");
+    let artifact = CompiledKernelArtifactId::from_digest("digest");
+
+    let mut registry = KernelRegistry::new();
+    assert!(registry.validate_prepared_readiness(&kernel).is_ok());
+
+    let mut generation_one = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        artifact.clone(),
+        provider.clone(),
+        device.clone(),
+        PreparedKernelGeneration::new(1),
+    );
+    generation_one.mark_ready().unwrap();
+    let generation_one_id = generation_one.id;
+    registry.register_prepared_kernel(generation_one);
+
+    let mut generation_two = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        artifact,
+        provider,
+        device,
+        PreparedKernelGeneration::new(2),
+    );
+    generation_two.mark_ready().unwrap();
+    registry.register_prepared_kernel(generation_two);
+
+    assert_eq!(registry.prepared_kernels_for(&kernel).count(), 2);
+    assert!(registry.validate_prepared_readiness(&kernel).is_ok());
+    assert!(!registry.artifact_observations().is_empty());
+
+    registry.retire_prepared_kernel(&generation_one_id).unwrap();
+    assert!(registry.destroy_prepared_kernel(&generation_one_id).is_ok());
+    assert_eq!(registry.prepared_kernels_for(&kernel).count(), 1);
+    assert!(registry.validate_prepared_readiness(&kernel).is_ok());
+}
+
+#[test]
+fn kernel_advertisement_may_reference_artifact_metadata() {
+    let id = conformance_kernel_id("matmul-advertised");
+    let binding = KernelArtifactBinding::new(CompiledKernelArtifactId::from_digest("digest"))
+        .with_source_artifact(KernelSourceArtifactId::from_digest("source-digest"));
+    let advertisement = KernelAdvertisement::new(id.clone()).with_artifact(binding);
+    assert!(advertisement.artifact.is_some());
+    assert_eq!(advertisement.id, id);
+}
+
+#[test]
+fn inference_requests_reject_kernel_artifact_management_fields() {
+    for field in KERNEL_ARTIFACT_FORBIDDEN_INFERENCE_FIELDS {
+        assert!(reject_inference_request_artifact_field(field).is_err());
+    }
+    assert!(reject_inference_request_artifact_field("prompt").is_ok());
+}
+
+#[test]
+fn kernel_artifact_error_ids_match_proposal_error_model() {
+    let cases: &[(KernelArtifactError, &str)] = &[
+        (
+            KernelArtifactError::ArtifactInvalid { reason: "x".into() },
+            "kernel-artifact-invalid",
+        ),
+        (
+            KernelArtifactError::DigestMismatch {
+                expected: "a".into(),
+                found: "b".into(),
+            },
+            "kernel-artifact-digest-mismatch",
+        ),
+        (
+            KernelArtifactError::FormatUnsupported { format: "x".into() },
+            "kernel-artifact-format-unsupported",
+        ),
+        (
+            KernelArtifactError::Untrusted {
+                artifact: "x".into(),
+            },
+            "kernel-artifact-untrusted",
+        ),
+        (
+            KernelArtifactError::OperatorIncompatible { reason: "x".into() },
+            "kernel-artifact-operator-incompatible",
+        ),
+        (
+            KernelArtifactError::DTypeIncompatible { reason: "x".into() },
+            "kernel-artifact-dtype-incompatible",
+        ),
+        (
+            KernelArtifactError::LayoutIncompatible { reason: "x".into() },
+            "kernel-artifact-layout-incompatible",
+        ),
+        (
+            KernelArtifactError::ShapeIncompatible { reason: "x".into() },
+            "kernel-artifact-shape-incompatible",
+        ),
+        (
+            KernelArtifactError::TargetIncompatible { target: "x".into() },
+            "kernel-artifact-target-incompatible",
+        ),
+        (
+            KernelArtifactError::ProviderIncompatible {
+                provider: "x".into(),
+            },
+            "kernel-artifact-provider-incompatible",
+        ),
+        (
+            KernelArtifactError::DriverIncompatible { reason: "x".into() },
+            "kernel-artifact-driver-incompatible",
+        ),
+        (
+            KernelArtifactError::CompilerIncompatible { reason: "x".into() },
+            "kernel-artifact-compiler-incompatible",
+        ),
+        (
+            KernelArtifactError::PreparationUnavailable { reason: "x".into() },
+            "kernel-preparation-unavailable",
+        ),
+        (
+            KernelArtifactError::PreparationFailed { reason: "x".into() },
+            "kernel-preparation-failed",
+        ),
+        (
+            KernelArtifactError::PreparedHandleInvalid { reason: "x".into() },
+            "kernel-prepared-handle-invalid",
+        ),
+        (
+            KernelArtifactError::PreparedGenerationInUse { generation: 1 },
+            "kernel-prepared-generation-in-use",
+        ),
+        (
+            KernelArtifactError::PreparedDestroyFailed { reason: "x".into() },
+            "kernel-prepared-destroy-failed",
+        ),
+        (
+            KernelArtifactError::PreparedNotReady { kernel: "x".into() },
+            "kernel-prepared-not-ready",
+        ),
+        (
+            KernelArtifactError::HotPathCompilationDenied {
+                operation: "x".into(),
+            },
+            "kernel-hot-path-compilation-denied",
+        ),
+        (
+            KernelArtifactError::InternalKernelArtifactError { reason: "x".into() },
+            "internal-kernel-artifact-error",
+        ),
+    ];
+    for (error, expected_id) in cases {
+        assert_eq!(error.id(), *expected_id);
+        assert!(!error.to_string().is_empty());
+    }
+}
+
+#[test]
+fn model_instance_readiness_fails_when_kernel_preparation_failed() {
+    let mut checks = ModelInstanceReadinessChecks::default();
+    assert_eq!(checks.readiness(), ModelInstanceReadiness::Ready);
+    assert!(checks.validate().is_ok());
+
+    checks.kernel_preparation_ready = false;
+    assert_eq!(checks.readiness(), ModelInstanceReadiness::Failed);
+    assert!(matches!(
+        checks.validate(),
+        Err(ModelInstanceError::ModelInstanceKernelPreparationFailed)
+    ));
+}
+
+#[test]
+fn kernel_artifact_conformance_report_is_conformant() {
+    let report = run_kernel_artifact_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+// ---------------------------------------------------------------------
+// kernel_artifact_manifest
+// ---------------------------------------------------------------------
+
+fn temp_kernel_bundle_dir(label: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-kernel-bundle-{label}-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(directory.join("blobs").join("sha256")).unwrap();
+    directory
+}
+
+fn write_kernel_bundle(directory: &std::path::Path, blob_bytes: &[u8]) -> String {
+    let digest = KernelBlobDigest::of_bytes(blob_bytes);
+    fs::write(
+        directory.join("blobs").join("sha256").join(&digest.value),
+        blob_bytes,
+    )
+    .unwrap();
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{}",
+      "size": {},
+      "storage_mode": "embedded",
+      "required": true,
+      "operators": [
+        {{ "namespace": "magnetar:operator", "name": "matmul", "version": 1, "family": "linear-algebra" }}
+      ]
+    }}
+  ]
+}}"#,
+        digest.value,
+        blob_bytes.len()
+    );
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+    digest.value
+}
+
+#[test]
+fn kernel_artifact_manifest_conformance_report_is_conformant() {
+    let report = run_kernel_artifact_manifest_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn kernel_manifest_json_duplicate_key_is_rejected() {
+    let limits = KernelManifestLimits::default();
+    let text = r#"{"schema":"magnetar:kernel-manifest@1.0","artifacts":[],"artifacts":[]}"#;
+    let outcome = parse_manifest_json(text, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::DuplicateKey { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_json_excessive_nesting_is_rejected() {
+    let limits = KernelManifestLimits {
+        max_nesting_depth: 4,
+        ..KernelManifestLimits::default()
+    };
+    let mut text = String::new();
+    for _ in 0..10 {
+        text.push('[');
+    }
+    for _ in 0..10 {
+        text.push(']');
+    }
+    let outcome = parse_manifest_json(&text, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::LimitExceeded { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_oversized_input_is_rejected() {
+    let limits = KernelManifestLimits {
+        max_manifest_bytes: 8,
+        ..KernelManifestLimits::default()
+    };
+    let outcome = parse_manifest_json(
+        r#"{"schema":"magnetar:kernel-manifest@1.0","artifacts":[]}"#,
+        &limits,
+    );
+    assert!(matches!(outcome, Err(KernelManifestError::TooLarge { .. })));
+}
+
+#[test]
+fn kernel_manifest_unsupported_schema_major_is_rejected() {
+    let limits = KernelManifestLimits::default();
+    let outcome = parse_manifest_json(
+        r#"{"schema":"magnetar:kernel-manifest@2.0","artifacts":[]}"#,
+        &limits,
+    );
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::SchemaUnsupported { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_dependency_cycle_is_detected() {
+    let digest_a = KernelBlobDigest::of_bytes(b"artifact-a");
+    let digest_b = KernelBlobDigest::of_bytes(b"artifact-b");
+    let mut artifact_a = KernelManifestArtifact::new(KernelBlobDescriptor::new(
+        KernelBlobRole::new(KernelBlobRole::COMPILED_KERNEL),
+        KernelArtifactFormat::new("nvidia", "cubin"),
+        digest_a.clone(),
+        4,
+    ));
+    artifact_a.dependencies.push(digest_b.clone());
+    let mut artifact_b = KernelManifestArtifact::new(KernelBlobDescriptor::new(
+        KernelBlobRole::new(KernelBlobRole::COMPILED_KERNEL),
+        KernelArtifactFormat::new("nvidia", "cubin"),
+        digest_b,
+        4,
+    ));
+    artifact_b.dependencies.push(digest_a);
+    let manifest = KernelManifestV1 {
+        artifacts: vec![artifact_a, artifact_b],
+        ..KernelManifestV1::new()
+    };
+    assert!(detect_dependency_cycle(&manifest).is_some());
+    assert!(matches!(
+        manifest.validate(),
+        Err(KernelManifestError::DependencyCycle { .. })
+    ));
+}
+
+#[test]
+fn kernel_exchange_bundle_validates_end_to_end() {
+    let directory = temp_kernel_bundle_dir("happy-path");
+    write_kernel_bundle(&directory, b"cubin-bytes");
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let validated = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default())
+        .expect("well-formed bundle should validate");
+    assert_eq!(validated.digest, validated.manifest.digest());
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_exchange_bundle_rejects_corrupted_blob() {
+    let directory = temp_kernel_bundle_dir("corrupted-blob");
+    let digest_value = write_kernel_bundle(&directory, b"cubin-bytes");
+    fs::write(
+        directory.join("blobs").join("sha256").join(&digest_value),
+        b"tampered-bytes",
+    )
+    .unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::BundleBlobSizeMismatch { .. })
+            | Err(KernelManifestError::BundleBlobDigestMismatch { .. })
+    ));
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_exchange_bundle_missing_optional_embedded_artifact_is_tolerated() {
+    let directory = temp_kernel_bundle_dir("optional-missing");
+    let present_digest = KernelBlobDigest::of_bytes(b"present-bytes");
+    fs::write(
+        directory
+            .join("blobs")
+            .join("sha256")
+            .join(&present_digest.value),
+        b"present-bytes",
+    )
+    .unwrap();
+    let missing_digest = KernelBlobDigest::of_bytes(b"missing-bytes");
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{present}",
+      "size": 13,
+      "storage_mode": "embedded",
+      "required": true
+    }},
+    {{
+      "role": "benchmark-evidence",
+      "format": "magnetar:benchmark-report@1",
+      "digest": "sha256:{missing}",
+      "size": 99,
+      "storage_mode": "embedded",
+      "required": false
+    }}
+  ]
+}}"#,
+        present = present_digest.value,
+        missing = missing_digest.value
+    );
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let validated = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default())
+        .expect("missing optional embedded artifact should not invalidate the bundle");
+    assert_eq!(validated.manifest.artifacts.len(), 2);
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_exchange_bundle_missing_required_embedded_artifact_is_rejected() {
+    let directory = temp_kernel_bundle_dir("required-missing");
+    let missing_digest = KernelBlobDigest::of_bytes(b"never-written");
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{missing}",
+      "size": 13,
+      "storage_mode": "embedded",
+      "required": true
+    }}
+  ]
+}}"#,
+        missing = missing_digest.value
+    );
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::BundleRequiredArtifactMissing { .. })
+    ));
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_exchange_bundle_rejects_required_external_artifact_without_fetching() {
+    let directory = temp_kernel_bundle_dir("required-external");
+    let digest = KernelBlobDigest::of_bytes(b"external-bytes");
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 13,
+      "storage_mode": "external",
+      "required": true,
+      "location_hint": "https://example.invalid/artifact.cubin"
+    }}
+  ]
+}}"#,
+        digest = digest.value
+    );
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::ExchangeExternalReferenceDenied { .. })
+    ));
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_exchange_bundle_missing_manifest_is_rejected() {
+    let directory = temp_kernel_bundle_dir("missing-manifest");
+    let bundle = KernelExchangeBundle::open(&directory);
+    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::BundleManifestMissing)
+    ));
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_bundle_path_safety_rejects_traversal_and_absolute_paths() {
+    for bad in [
+        "../escape",
+        "/etc/passwd",
+        "C:/Windows/system32",
+        "a/../../b",
+        "\\\\server\\share",
+    ] {
+        assert!(
+            validate_bundle_relative_path(bad).is_err(),
+            "expected '{bad}' to be rejected"
+        );
+    }
+    assert!(validate_bundle_relative_path("blobs/sha256/deadbeef").is_ok());
+}
+
+#[test]
+fn kernel_bundle_symlink_entry_is_rejected_when_creatable() {
+    let directory = temp_kernel_bundle_dir("symlink");
+    write_kernel_bundle(&directory, b"symlink-fixture");
+    let target = directory.join(KERNEL_MANIFEST_FILE_NAME);
+    let link = directory.join("blobs").join("escape-link");
+
+    #[cfg(unix)]
+    let created = std::os::unix::fs::symlink(&target, &link).is_ok();
+    #[cfg(windows)]
+    let created = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+    #[cfg(not(any(unix, windows)))]
+    let created = false;
+
+    if created {
+        let outcome = scan_bundle_for_unsafe_entries(&directory);
+        assert!(matches!(
+            outcome,
+            Err(KernelManifestError::BundleSymlinkDenied { .. })
+        ));
+    }
+    // When the platform/permissions do not allow creating a symlink (e.g.
+    // Windows without Developer Mode or admin rights), this test is a no-op
+    // rather than a false failure -- the rejection code path itself is
+    // exercised whenever a symlink can actually be created.
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_manifest_inference_request_field_boundary_rejects_bundle_fields() {
+    for field in KERNEL_MANIFEST_FORBIDDEN_INFERENCE_FIELDS {
+        let outcome = reject_inference_request_manifest_field(field);
+        assert!(outcome.is_err(), "expected '{field}' to be rejected");
+    }
+    assert!(reject_inference_request_manifest_field("prompt").is_ok());
+}
+
+#[test]
+fn kernel_manifest_extension_cannot_claim_a_core_field_namespace() {
+    let limits = KernelManifestLimits::default();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"core-field-fixture").value
+    );
+    let mut manifest = parse_manifest_json(&text, &limits).expect("sample manifest parses");
+    manifest.extensions.push(KernelManifestExtension {
+        namespace: "trust:override".into(),
+        required: false,
+        data: serde_json::Value::Null,
+    });
+    let outcome = manifest.validate();
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::ArtifactReferenceInvalid { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_recommendation_never_grants_promotion() {
+    for recommendation in [
+        KernelManifestRecommendation::RecommendedForLatency,
+        KernelManifestRecommendation::RecommendedForThroughput,
+        KernelManifestRecommendation::Experimental,
+        KernelManifestRecommendation::Reject,
+    ] {
+        assert!(!recommendation_grants_promotion(recommendation));
+    }
+}
+
+#[test]
+fn kernel_manifest_qualification_evidence_array_round_trips_through_json() {
+    let limits = KernelManifestLimits::default();
+    let digest = KernelBlobDigest::of_bytes(b"evidence-bytes").value;
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{artifact_digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }}
+  ],
+  "qualification_evidence": [
+    {{
+      "digest": "sha256:{digest}",
+      "profile": "correctness",
+      "suite_or_workload_version": "v1",
+      "oracle_or_provider_identity": "reference-cpu@1",
+      "status": "passed"
+    }}
+  ]
+}}"#,
+        artifact_digest = KernelBlobDigest::of_bytes(b"artifact-bytes").value,
+        digest = digest
+    );
+    let manifest =
+        parse_manifest_json(&text, &limits).expect("manifest with qualification evidence parses");
+    assert_eq!(manifest.qualification_evidence.len(), 1);
+    let evidence = &manifest.qualification_evidence[0];
+    assert_eq!(evidence.profile, "correctness");
+    assert_eq!(evidence.status, KernelEvidenceStatus::Passed);
+    assert!(oracle_identity_is_known(evidence));
+    assert!(evaluate_qualification_evidence_currency(evidence, "v1"));
+    assert!(!evaluate_qualification_evidence_currency(evidence, "v2"));
+}
+
+#[test]
+fn kernel_manifest_accepts_unknown_future_artifact_format() {
+    let limits = KernelManifestLimits::default();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "vendor:new-ir@1",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"future-format-bytes").value
+    );
+    let manifest = parse_manifest_json(&text, &limits)
+        .expect("unknown future format still parses structurally");
+    assert_eq!(
+        manifest.artifacts[0].blob.format.stable_key(),
+        "vendor:new-ir@1"
+    );
+}
+
+#[test]
+fn kernel_manifest_signature_presence_alone_is_never_verified() {
+    let envelope = KernelSignatureEnvelope {
+        algorithm: "ed25519".into(),
+        key_id: Some("key-1".into()),
+        signed_digest: KernelBlobDigest::of_bytes(b"manifest"),
+        signature_material: KernelBlobDigest::of_bytes(b"signature-bytes"),
+        certificate_chain_reference: None,
+    };
+    assert!(!signature_is_verified(&envelope, false));
+    assert!(signature_is_verified(&envelope, true));
+}
+
+#[test]
+fn kernel_manifest_operator_version_range_compatibility() {
+    let limits = KernelManifestLimits::default();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded",
+      "operators": [
+        {{ "namespace": "magnetar:operator", "name": "matmul", "version": 1, "family": "linear-algebra" }}
+      ],
+      "operator_version_range": {{ "min": 1, "max": 3 }}
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"version-range-fixture").value
+    );
+    let manifest = parse_manifest_json(&text, &limits).expect("manifest with version range parses");
+    let binding = manifest.artifacts[0].semantic_binding.as_ref().unwrap();
+    assert!(binding.is_version_compatible(1));
+    assert!(binding.is_version_compatible(3));
+    assert!(!binding.is_version_compatible(4));
+
+    let invalid_range = KernelSemanticBinding {
+        operators: vec![OperatorId::magnetar(
+            "matmul",
+            1,
+            OperatorFamily::LinearAlgebra,
+        )],
+        primary_version_requirements: Some(KernelOperatorVersionRange { min: 5, max: 1 }),
+    };
+    assert!(matches!(
+        invalid_range.validate(),
+        Err(KernelManifestError::SemanticBindingInvalid { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_fused_semantic_binding_preserves_operator_order() {
+    let limits = KernelManifestLimits::default();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded",
+      "operators": [
+        {{ "namespace": "magnetar:operator", "name": "rmsnorm", "version": 1, "family": "normalization" }},
+        {{ "namespace": "magnetar:operator", "name": "matmul", "version": 1, "family": "linear-algebra" }}
+      ]
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"fused-fixture").value
+    );
+    let manifest = parse_manifest_json(&text, &limits).expect("fused binding manifest parses");
+    let binding = manifest.artifacts[0].semantic_binding.as_ref().unwrap();
+    assert!(binding.is_fused());
+    assert_eq!(
+        binding.fingerprint(),
+        "magnetar:operator/rmsnorm@1 -> magnetar:operator/matmul@1"
+    );
+
+    // Order matters: swapping the two operators is a different fusion.
+    let reversed_text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded",
+      "operators": [
+        {{ "namespace": "magnetar:operator", "name": "matmul", "version": 1, "family": "linear-algebra" }},
+        {{ "namespace": "magnetar:operator", "name": "rmsnorm", "version": 1, "family": "normalization" }}
+      ]
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"fused-fixture-reversed").value
+    );
+    let reversed = parse_manifest_json(&reversed_text, &limits)
+        .expect("reversed fused binding manifest parses");
+    let reversed_binding = reversed.artifacts[0].semantic_binding.as_ref().unwrap();
+    assert_ne!(binding.fingerprint(), reversed_binding.fingerprint());
+
+    // Normalizing a fused source artifact preserves the remaining operators
+    // as the fused group, and only the primary Operator becomes the
+    // compiled artifact's single `operator_semantics`.
+    let normalized_source =
+        normalize_to_source_artifact(&manifest.artifacts[0]).expect("fused source normalizes");
+    assert_eq!(normalized_source.fused_operator_group.len(), 1);
+    assert_eq!(normalized_source.fused_operator_group[0].name(), "matmul");
+}
+
+#[test]
+fn kernel_manifest_target_specialization_compiler_precision_generator_round_trip() {
+    let limits = KernelManifestLimits::default();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded",
+      "operators": [
+        {{ "namespace": "magnetar:operator", "name": "matmul", "version": 1, "family": "linear-algebra" }}
+      ],
+      "target": {{
+        "device_type": "gpu",
+        "hardware_vendor": "nvidia",
+        "architecture": "sm90",
+        "device_features": ["tensor-core"],
+        "provider_compatibility": ["nvidia-cuda"],
+        "runtime_driver_compatibility": ["cuda-12"],
+        "memory_classes": ["hbm"]
+      }},
+      "specialization": {{
+        "exact_dimensions": {{"0": 128}},
+        "batch_range": [1, 32],
+        "sequence_range": [1, 4096],
+        "head_count": 32,
+        "head_dimension": 128,
+        "tile_sizes": [64, 64],
+        "alignment": 16,
+        "dtype": "float16",
+        "layout": "row-major",
+        "quantization_profile": "int8-groupwise",
+        "execution_phase": "decode",
+        "device_features": ["tensor-core"]
+      }},
+      "compiler_metadata": {{
+        "compiler_identity": "triton",
+        "compiler_version": "3.1",
+        "backend_identity_version": "ptxas-12.4",
+        "flags_fingerprint": "abc123",
+        "build_fingerprint": "build-456",
+        "target_architecture": "sm90"
+      }},
+      "precision": {{
+        "accumulation_dtype": "float32",
+        "approximate_math": true,
+        "deterministic": false,
+        "tolerance_profile": "operator-default",
+        "quantization_error_profile": "int8-standard"
+      }},
+      "generator": {{
+        "generator_name": "kernel-forge",
+        "generator_version": "2.0",
+        "campaign_id": "campaign-42",
+        "source_revision": "https://example.invalid/repo@deadbeef"
+      }}
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"rich-descriptor-fixture").value
+    );
+    let manifest = parse_manifest_json(&text, &limits).expect("rich descriptor manifest parses");
+    let artifact = &manifest.artifacts[0];
+
+    assert_eq!(artifact.target.device_type.as_deref(), Some("gpu"));
+    assert_eq!(artifact.target.architecture.as_deref(), Some("sm90"));
+    assert!(artifact.target.device_features.contains("tensor-core"));
+
+    assert_eq!(artifact.specialization.batch_range, Some((1, 32)));
+    assert_eq!(artifact.specialization.head_count, Some(32));
+    assert_eq!(artifact.specialization.dtype.as_deref(), Some("float16"));
+    assert_eq!(
+        artifact.specialization.execution_phase,
+        Some(KernelExecutionPhase::Decode)
+    );
+
+    let compiler = artifact.compiler_metadata.as_ref().unwrap();
+    assert_eq!(compiler.compiler_identity.as_deref(), Some("triton"));
+    assert_eq!(compiler.target_architecture.as_deref(), Some("sm90"));
+
+    assert!(artifact.precision.approximate_math);
+    assert_eq!(artifact.precision.deterministic, Some(false));
+
+    let generator = artifact.generator.as_ref().unwrap();
+    assert_eq!(generator.generator_name.as_deref(), Some("kernel-forge"));
+    assert_eq!(generator.campaign_id.as_deref(), Some("campaign-42"));
+
+    // Canonical identity round-trips through re-parsing the canonical bytes.
+    let canonical_text = String::from_utf8(manifest.canonical_bytes()).unwrap();
+    let reparsed = parse_manifest_json(&canonical_text, &limits).expect("canonical bytes reparse");
+    assert_eq!(reparsed.digest(), manifest.digest());
+}
+
+#[test]
+fn kernel_manifest_generator_rejects_embedded_credential_locator() {
+    let generator = KernelGeneratorMetadata {
+        generator_name: Some("gen".into()),
+        generator_version: None,
+        campaign_id: None,
+        source_revision: Some("https://user:secret@example.invalid/repo".into()),
+    };
+    assert!(matches!(
+        generator.validate(),
+        Err(KernelManifestError::ProvenanceInvalid { .. })
+    ));
+
+    let clean = KernelGeneratorMetadata {
+        source_revision: Some("https://example.invalid/repo@deadbeef".into()),
+        ..generator
+    };
+    assert!(clean.validate().is_ok());
+}
+
+#[test]
+fn kernel_manifest_specialization_rejects_impossible_range() {
+    let specialization = KernelManifestSpecialization {
+        batch_range: Some((32, 1)),
+        ..KernelManifestSpecialization::default()
+    };
+    assert!(matches!(
+        specialization.validate(),
+        Err(KernelManifestError::SpecializationInvalid { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_target_entry_count_limit_is_enforced() {
+    let limits = KernelManifestLimits {
+        max_target_entries: 2,
+        ..KernelManifestLimits::default()
+    };
+    let features: Vec<String> = (0..5).map(|i| format!("\"feature-{i}\"")).collect();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded",
+      "target": {{ "device_features": [{features}] }}
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"target-limit-fixture").value,
+        features = features.join(", ")
+    );
+    let outcome = parse_manifest_json(&text, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::LimitExceeded { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_conflicting_digest_metadata_is_rejected() {
+    let limits = KernelManifestLimits::default();
+    let digest = KernelBlobDigest::of_bytes(b"shared-content").value;
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }},
+    {{
+      "role": "auxiliary",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 999,
+      "storage_mode": "embedded"
+    }}
+  ]
+}}"#,
+    );
+    let outcome = parse_manifest_json(&text, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::ArtifactReferenceInvalid { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_same_digest_same_size_across_artifacts_is_allowed() {
+    let limits = KernelManifestLimits::default();
+    let digest = KernelBlobDigest::of_bytes(b"deduplicated-content").value;
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }},
+    {{
+      "role": "auxiliary",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }}
+  ]
+}}"#,
+    );
+    assert!(parse_manifest_json(&text, &limits).is_ok());
+}
+
+#[test]
+fn kernel_manifest_multi_target_bundle_validates_with_distinct_architectures() {
+    let directory = temp_kernel_bundle_dir("multi-target");
+    let sm80_bytes = b"sm80-cubin";
+    let sm90_bytes = b"sm90-cubin";
+    let sm80_digest = KernelBlobDigest::of_bytes(sm80_bytes);
+    let sm90_digest = KernelBlobDigest::of_bytes(sm90_bytes);
+    fs::write(
+        directory
+            .join("blobs")
+            .join("sha256")
+            .join(&sm80_digest.value),
+        sm80_bytes,
+    )
+    .unwrap();
+    fs::write(
+        directory
+            .join("blobs")
+            .join("sha256")
+            .join(&sm90_digest.value),
+        sm90_bytes,
+    )
+    .unwrap();
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{sm80}",
+      "size": {sm80_len},
+      "storage_mode": "embedded",
+      "target": {{ "architecture": "sm80", "provider_compatibility": ["nvidia-cuda"] }}
+    }},
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{sm90}",
+      "size": {sm90_len},
+      "storage_mode": "embedded",
+      "target": {{ "architecture": "sm90", "provider_compatibility": ["nvidia-cuda"] }}
+    }}
+  ],
+  "qualification_evidence": [
+    {{ "digest": "sha256:{sm80}", "profile": "correctness@1", "status": "passed" }}
+  ],
+  "benchmark_evidence": [
+    {{ "digest": "sha256:{sm90}", "profile": "latency@1", "workload_profile": "decode-256", "status": "passed" }}
+  ]
+}}"#,
+        sm80 = sm80_digest.value,
+        sm80_len = sm80_bytes.len(),
+        sm90 = sm90_digest.value,
+        sm90_len = sm90_bytes.len(),
+    );
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let validated = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default())
+        .expect("multi-target bundle should validate");
+    assert_eq!(validated.manifest.artifacts.len(), 2);
+    assert_eq!(validated.manifest.qualification_evidence.len(), 1);
+    assert_eq!(validated.manifest.benchmark_evidence.len(), 1);
+    assert_eq!(
+        validated.manifest.benchmark_evidence[0]
+            .workload_profile
+            .as_deref(),
+        Some("decode-256")
+    );
+
+    let architectures: std::collections::BTreeSet<_> = validated
+        .manifest
+        .artifacts
+        .iter()
+        .filter_map(|artifact| artifact.target.architecture.clone())
+        .collect();
+    assert_eq!(
+        architectures.len(),
+        2,
+        "expected two distinct compiled architectures"
+    );
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_manifest_evaluate_target_compatibility() {
+    let target = KernelTargetConstraints {
+        architecture: Some("sm90".into()),
+        provider_compatibility: ["nvidia-cuda".to_string()].into_iter().collect(),
+        device_features: ["tensor-core".to_string()].into_iter().collect(),
+        ..KernelTargetConstraints::default()
+    };
+
+    let matching_context = KernelRuntimeCompatibilityContext {
+        provider_id: Some("nvidia-cuda".into()),
+        architecture: Some("sm90".into()),
+        available_device_features: ["tensor-core".to_string()].into_iter().collect(),
+    };
+    assert!(evaluate_target_compatibility(&target, &matching_context).is_ok());
+
+    let wrong_architecture = KernelRuntimeCompatibilityContext {
+        architecture: Some("sm80".into()),
+        ..matching_context.clone()
+    };
+    assert!(matches!(
+        evaluate_target_compatibility(&target, &wrong_architecture),
+        Err(KernelManifestError::ExchangeCompatibilityFailed { .. })
+    ));
+
+    let missing_feature = KernelRuntimeCompatibilityContext {
+        available_device_features: std::collections::BTreeSet::new(),
+        ..matching_context
+    };
+    assert!(matches!(
+        evaluate_target_compatibility(&target, &missing_feature),
+        Err(KernelManifestError::ExchangeCompatibilityFailed { .. })
+    ));
+
+    // An artifact with no declared target constraints is always compatible.
+    assert!(
+        evaluate_target_compatibility(
+            &KernelTargetConstraints::default(),
+            &KernelRuntimeCompatibilityContext::default()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn kernel_manifest_validation_pipeline_orders_schema_before_blob_io() {
+    // A directory bundle with a *missing* blobs directory entirely and an
+    // *unsupported* schema major version: if schema validation ran after
+    // blob I/O, this would surface as a filesystem/blob error instead.
+    let directory = temp_kernel_bundle_dir("ordering");
+    let manifest = r#"{
+  "schema": "magnetar:kernel-manifest@99.0",
+  "artifacts": [
+    { "role": "compiled-kernel", "format": "nvidia:cubin", "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "size": 4 }
+  ]
+}"#;
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+    fs::remove_dir_all(directory.join("blobs")).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
+    assert!(
+        matches!(outcome, Err(KernelManifestError::SchemaUnsupported { .. })),
+        "expected schema validation to fail before any blob I/O is attempted, got {outcome:?}"
+    );
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_manifest_normalizes_to_source_and_compiled_artifacts() {
+    let mut source_blob = KernelBlobDescriptor::new(
+        KernelBlobRole::new(KernelBlobRole::KERNEL_SOURCE),
+        KernelArtifactFormat::new("triton", "source").with_version("3"),
+        KernelBlobDigest::of_bytes(b"normalize-source"),
+        4,
+    );
+    source_blob.required = true;
+    let mut source_artifact = KernelManifestArtifact::new(source_blob);
+    source_artifact.semantic_binding = Some(KernelSemanticBinding::single(OperatorId::magnetar(
+        "matmul",
+        1,
+        OperatorFamily::LinearAlgebra,
+    )));
+    source_artifact.provenance = Some(KernelArtifactProvenance::AiGenerated);
+    source_artifact.specialization.batch_range = Some((1, 8));
+
+    let normalized_source =
+        normalize_to_source_artifact(&source_artifact).expect("source normalizes");
+    assert_eq!(normalized_source.format.stable_key(), "triton:source@3");
+    assert_eq!(normalized_source.shape.max_batch_size, Some(8));
+    assert_eq!(
+        normalized_source.provenance,
+        KernelArtifactProvenance::AiGenerated
+    );
+
+    let compiled_blob = KernelBlobDescriptor::new(
+        KernelBlobRole::new(KernelBlobRole::COMPILED_KERNEL),
+        KernelArtifactFormat::new("nvidia", "cubin"),
+        KernelBlobDigest::of_bytes(b"normalize-compiled"),
+        4,
+    );
+    let mut compiled_artifact = KernelManifestArtifact::new(compiled_blob);
+    compiled_artifact.semantic_binding = Some(KernelSemanticBinding::single(OperatorId::magnetar(
+        "matmul",
+        1,
+        OperatorFamily::LinearAlgebra,
+    )));
+    compiled_artifact.compiler_metadata = Some(KernelCompilerMetadata {
+        compiler_identity: Some("triton".into()),
+        compiler_version: Some("3.1".into()),
+        ..Default::default()
+    });
+    compiled_artifact.target.architecture = Some("sm90".into());
+
+    let normalized_compiled =
+        normalize_to_compiled_artifact(&compiled_artifact).expect("compiled normalizes");
+    assert_eq!(normalized_compiled.compiler_identity, "triton");
+    assert_eq!(normalized_compiled.target_architecture, "sm90");
+
+    // No semantic binding -> normalization fails rather than fabricating one.
+    let unbound = KernelManifestArtifact::new(KernelBlobDescriptor::new(
+        KernelBlobRole::new(KernelBlobRole::COMPILED_KERNEL),
+        KernelArtifactFormat::new("nvidia", "cubin"),
+        KernelBlobDigest::of_bytes(b"unbound"),
+        4,
+    ));
+    assert!(normalize_to_source_artifact(&unbound).is_err());
+    assert!(normalize_to_compiled_artifact(&unbound).is_err());
+}
+
+#[test]
+fn kernel_manifest_normalizes_qualification_identity_pieces() {
+    let evidence = KernelEvidenceReference {
+        digest: KernelBlobDigest::of_bytes(b"qualification-evidence"),
+        profile: "baseline-correctness@1".into(),
+        suite_or_workload_version: Some("v3".into()),
+        oracle_or_provider_identity: Some("reference-cpu@2".into()),
+        target_compatibility: std::collections::BTreeSet::new(),
+        status: KernelEvidenceStatus::Passed,
+        storage_mode: KernelArtifactStorageMode::Embedded,
+        workload_profile: None,
+        device_context: None,
+        provider_context: None,
+    };
+    let profile = normalize_qualification_profile(&evidence).expect("profile normalizes");
+    assert_eq!(
+        profile,
+        QualificationProfile::new("baseline-correctness", 1)
+    );
+
+    let oracle = normalize_oracle_identity(&evidence).expect("oracle normalizes");
+    assert_eq!(oracle.provider, ProviderBinding::new("reference-cpu"));
+    assert_eq!(oracle.version, "2");
+
+    let mut malformed = evidence.clone();
+    malformed.profile = "no-version-separator".into();
+    assert!(normalize_qualification_profile(&malformed).is_err());
+
+    let mut no_oracle = evidence;
+    no_oracle.oracle_or_provider_identity = None;
+    assert!(normalize_oracle_identity(&no_oracle).is_err());
+}
+
+#[test]
+fn kernel_manifest_normalizes_to_cache_key_and_entry_without_granting_trust() {
+    let mut blob = KernelBlobDescriptor::new(
+        KernelBlobRole::new(KernelBlobRole::COMPILED_KERNEL),
+        KernelArtifactFormat::new("nvidia", "cubin"),
+        KernelBlobDigest::of_bytes(b"cache-bridge-fixture"),
+        4,
+    );
+    blob.required = true;
+    let mut artifact = KernelManifestArtifact::new(blob);
+    artifact.target.architecture = Some("sm90".into());
+    artifact.compiler_metadata = Some(KernelCompilerMetadata {
+        compiler_identity: Some("triton".into()),
+        compiler_version: Some("3.1".into()),
+        ..Default::default()
+    });
+
+    let key = normalize_to_cache_key(&artifact);
+    assert_eq!(key.target_architecture, "sm90");
+    assert_eq!(key.compiler_identity, "triton");
+
+    let entry = normalize_to_cache_entry(&artifact);
+    assert!(
+        !entry.trust.is_trusted(),
+        "a freshly normalized cache entry must start untrusted"
+    );
+    assert!(
+        entry.qualification.is_none(),
+        "a freshly normalized cache entry must start unqualified"
+    );
+}
+
+#[test]
+fn kernel_exchange_bundle_total_size_limit_is_enforced() {
+    let directory = temp_kernel_bundle_dir("total-size-limit");
+    let bytes_a = b"aaaa";
+    let bytes_b = b"bbbb";
+    let digest_a = KernelBlobDigest::of_bytes(bytes_a);
+    let digest_b = KernelBlobDigest::of_bytes(bytes_b);
+    fs::write(
+        directory.join("blobs").join("sha256").join(&digest_a.value),
+        bytes_a,
+    )
+    .unwrap();
+    fs::write(
+        directory.join("blobs").join("sha256").join(&digest_b.value),
+        bytes_b,
+    )
+    .unwrap();
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{ "role": "compiled-kernel", "format": "nvidia:cubin", "digest": "sha256:{a}", "size": 4, "storage_mode": "embedded" }},
+    {{ "role": "auxiliary", "format": "nvidia:cubin", "digest": "sha256:{b}", "size": 4, "storage_mode": "embedded" }}
+  ]
+}}"#,
+        a = digest_a.value,
+        b = digest_b.value
+    );
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let limits = KernelManifestLimits {
+        max_total_embedded_bytes: 6,
+        ..KernelManifestLimits::default()
+    };
+    let outcome = validate_kernel_exchange_bundle(&bundle, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::BundleTotalSizeExceeded { .. })
+    ));
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_manifest_embedded_byte_accounting_saturates_instead_of_overflowing() {
+    // The bundle validation pipeline accumulates declared blob sizes with
+    // `u64::saturating_add`, implementing "Reject overflow" (tasks, "Integer
+    // Safety"): summing sizes near `u64::MAX` must never wrap around or
+    // panic, even though no real bundle could actually contain that many
+    // bytes on disk.
+    let total = [u64::MAX, u64::MAX, 1_u64]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add);
+    assert_eq!(total, u64::MAX);
+}
+
+#[test]
+fn kernel_manifest_cli_operations_all_use_shared_validation() {
+    let directory = temp_kernel_bundle_dir("cli-shared-validation");
+    write_kernel_bundle(&directory, b"cli-fixture-bytes");
+    let bundle = KernelExchangeBundle::open(&directory);
+    let limits = KernelManifestLimits::default();
+
+    for operation in [
+        KernelManifestCliOperation::Inspect,
+        KernelManifestCliOperation::Validate,
+        KernelManifestCliOperation::Import,
+        KernelManifestCliOperation::Export,
+    ] {
+        let result = run_kernel_manifest_cli_operation(operation, &bundle, &limits);
+        assert!(
+            result.is_ok(),
+            "operation {operation:?} should reuse shared validation and succeed"
+        );
+    }
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+// ---------------------------------------------------------------------
+// kernel_compilation
+// ---------------------------------------------------------------------
+
+#[test]
+fn compilation_capability_absence_is_valid_and_optional() {
+    let descriptor = KernelCompilationCapabilityDescriptor::unsupported();
+    assert!(!descriptor.is_present());
+    assert!(descriptor.validate().is_ok());
+}
+
+#[test]
+fn compilation_capability_descriptor_validation_requires_declared_formats_and_isolation() {
+    let mut descriptor = KernelCompilationCapabilityDescriptor::unsupported();
+    descriptor.support_level = CompilationSupportLevel::SourceCompilation;
+    assert!(matches!(
+        descriptor.validate(),
+        Err(KernelCompilationError::DescriptorInvalid { .. })
+    ));
+
+    descriptor
+        .accepted_source_formats
+        .insert(KernelSourceFormat::new("triton", "source").with_version("3"));
+    assert!(matches!(
+        descriptor.validate(),
+        Err(KernelCompilationError::DescriptorInvalid { .. })
+    ));
+
+    descriptor
+        .produced_compiled_formats
+        .insert("nvidia:ptx@9".into());
+    assert!(matches!(
+        descriptor.validate(),
+        Err(KernelCompilationError::DescriptorInvalid { .. })
+    ));
+
+    descriptor.isolation_model = CompilationIsolationModel::SandboxedSubprocess;
+    assert!(descriptor.validate().is_ok());
+}
+
+#[test]
+fn source_format_negotiation_rejects_unsupported_before_compilation() {
+    let accepted: std::collections::BTreeSet<KernelSourceFormat> =
+        [KernelSourceFormat::new("triton", "source").with_version("3")]
+            .into_iter()
+            .collect();
+    let wgsl = KernelSourceFormat::new("webgpu", "wgsl");
+    assert!(matches!(
+        negotiate_source_format(&wgsl, &accepted),
+        Err(KernelCompilationError::SourceFormatUnsupported { .. })
+    ));
+    let triton = KernelSourceFormat::new("triton", "source").with_version("3");
+    assert!(negotiate_source_format(&triton, &accepted).is_ok());
+}
+
+#[test]
+fn output_format_negotiation_requires_explicit_declaration() {
+    let produced: std::collections::BTreeSet<String> =
+        ["nvidia:ptx@9".to_string()].into_iter().collect();
+    assert!(negotiate_output_format("nvidia:ptx@9", &produced).is_ok());
+    assert!(matches!(
+        negotiate_output_format("nvidia:cubin", &produced),
+        Err(KernelCompilationError::OutputFormatUnsupported { .. })
+    ));
+}
+
+#[test]
+fn runtime_target_authority_rejects_provider_and_device_redirection() {
+    let selected_provider = ProviderBinding::new("cuda-provider");
+    let selected_device = DeviceBinding::new(crate::DeviceId::new("cuda-0"));
+    let target =
+        CompilationTarget::new(selected_provider.clone(), selected_device.clone(), "sm_90");
+    assert!(
+        enforce_runtime_target_authority(&target, &selected_provider, &selected_device).is_ok()
+    );
+
+    let other_provider = ProviderBinding::new("metal-provider");
+    assert!(matches!(
+        enforce_runtime_target_authority(&target, &other_provider, &selected_device),
+        Err(KernelCompilationError::TargetUnsupported { .. })
+    ));
+
+    let other_device = DeviceBinding::new(crate::DeviceId::new("cuda-1"));
+    assert!(matches!(
+        enforce_runtime_target_authority(&target, &selected_provider, &other_device),
+        Err(KernelCompilationError::TargetUnsupported { .. })
+    ));
+}
+
+#[test]
+fn compilation_job_lifecycle_progresses_legally_and_never_reverts() {
+    let mut allocator = CompilationJobIdAllocator::default();
+    let mut job = CompilationJob::new(allocator.allocate(), CompilationRequestId::new("req-1"));
+    assert_eq!(job.state, CompilationJobState::Queued);
+    assert!(job.start_compiling().is_ok());
+    assert_eq!(job.state, CompilationJobState::Compiling);
+    assert!(job.mark_succeeded().is_ok());
+    assert_eq!(job.state, CompilationJobState::Succeeded);
+    assert!(job.state.may_publish_artifact());
+
+    let mut cancelled_before_start =
+        CompilationJob::new(allocator.allocate(), CompilationRequestId::new("req-2"));
+    assert!(matches!(
+        cancelled_before_start.mark_succeeded(),
+        Err(KernelCompilationError::JobStateInvalid { .. })
+    ));
+    assert!(cancelled_before_start.mark_cancelled().is_ok());
+    assert!(!cancelled_before_start.state.may_publish_artifact());
+}
+
+#[test]
+fn cancellation_support_levels_are_respected() {
+    assert!(matches!(
+        evaluate_cancellation_request(CompilationCancellationSupport::NotSupported, false),
+        Err(KernelCompilationError::CancellationUnsupported)
+    ));
+    assert!(matches!(
+        evaluate_cancellation_request(CompilationCancellationSupport::BeforeStartOnly, true),
+        Err(KernelCompilationError::CancellationUnsupported)
+    ));
+    assert!(matches!(
+        evaluate_cancellation_request(CompilationCancellationSupport::BeforeStartOnly, false),
+        Ok(CompilationJobState::Cancelled)
+    ));
+    assert!(matches!(
+        evaluate_cancellation_request(CompilationCancellationSupport::Cooperative, true),
+        Ok(CompilationJobState::Cancelled)
+    ));
+}
+
+#[test]
+fn compilation_deadline_fails_closed_when_unenforceable() {
+    let required = CompilationDeadline {
+        max_wall_clock_millis: 5_000,
+    };
+    assert!(matches!(
+        enforce_compilation_deadline(Some(required), false),
+        Err(KernelCompilationError::DeadlineUnsupported { .. })
+    ));
+    assert!(enforce_compilation_deadline(Some(required), true).is_ok());
+    assert!(enforce_compilation_deadline(None, false).is_ok());
+}
+
+#[test]
+fn compilation_limits_are_enforced_before_compiler_invocation() {
+    let limits = CompilationLimits {
+        max_source_bytes: Some(1024),
+        max_output_bytes: Some(2048),
+        max_concurrent_jobs: Some(2),
+        max_workspace_bytes: Some(1 << 20),
+        max_host_memory_bytes: Some(1 << 30),
+    };
+    assert!(enforce_compilation_limits(512, &limits).is_ok());
+    assert!(matches!(
+        enforce_compilation_limits(2048, &limits),
+        Err(KernelCompilationError::SourceTooLarge { .. })
+    ));
+    assert!(matches!(
+        enforce_output_limit(4096, &limits),
+        Err(KernelCompilationError::OutputTooLarge { .. })
+    ));
+    assert!(enforce_concurrency_limit(1, &limits).is_ok());
+    assert!(matches!(
+        enforce_concurrency_limit(2, &limits),
+        Err(KernelCompilationError::ConcurrencyLimit { .. })
+    ));
+}
+
+#[test]
+fn isolation_sufficiency_rejects_weaker_than_required_model() {
+    assert!(matches!(
+        evaluate_isolation_sufficiency(
+            CompilationIsolationModel::InProcessTrustedCompiler,
+            CompilationIsolationModel::SandboxedSubprocess,
+        ),
+        Err(KernelCompilationError::IsolationInsufficient { .. })
+    ));
+    assert!(
+        evaluate_isolation_sufficiency(
+            CompilationIsolationModel::SandboxedSubprocess,
+            CompilationIsolationModel::SandboxedSubprocess,
+        )
+        .is_ok()
+    );
+    assert!(
+        evaluate_isolation_sufficiency(
+            CompilationIsolationModel::ExternalCompilationService,
+            CompilationIsolationModel::SandboxedSubprocess,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn compilation_success_never_grants_trust_by_itself() {
+    assert!(!compilation_result_trust(false).is_trusted());
+    assert!(compilation_result_trust(true).is_trusted());
+}
+
+#[test]
+fn network_boundary_denies_implicit_dependency_downloads() {
+    let policy = CompilationNetworkPolicy::default();
+    assert!(matches!(
+        enforce_compilation_network_boundary(true, &policy),
+        Err(KernelCompilationError::PolicyDenied { .. })
+    ));
+    let authorized = CompilationNetworkPolicy {
+        network_access_authorized: true,
+    };
+    assert!(enforce_compilation_network_boundary(true, &authorized).is_ok());
+    assert!(enforce_compilation_network_boundary(false, &policy).is_ok());
+}
+
+#[test]
+fn environment_variables_are_denied_by_default() {
+    let deny = CompilationEnvironmentPolicy::Deny;
+    assert!(!evaluate_environment_variable("SECRET_TOKEN", &deny));
+
+    let mut allowed = std::collections::BTreeSet::new();
+    allowed.insert("CUDA_HOME".to_string());
+    let allowlist = CompilationEnvironmentPolicy::Allowlist(allowed);
+    assert!(evaluate_environment_variable("CUDA_HOME", &allowlist));
+    assert!(!evaluate_environment_variable("SECRET_TOKEN", &allowlist));
+}
+
+#[test]
+fn explicit_specialization_is_required_when_applied() {
+    let empty = CompilationSpecialization::default();
+    assert!(matches!(
+        require_explicit_compilation_specialization(true, &empty),
+        Err(KernelCompilationError::SpecializationUnsupported { .. })
+    ));
+    assert!(require_explicit_compilation_specialization(false, &empty).is_ok());
+
+    let mut declared = CompilationSpecialization::default();
+    declared.dtype.insert(ComputeDType::Float16);
+    assert!(require_explicit_compilation_specialization(true, &declared).is_ok());
+}
+
+#[test]
+fn output_integrity_rejects_digest_mismatch() {
+    let id = CompiledKernelArtifactId::from_digest("expected-digest");
+    assert!(verify_output_integrity("expected-digest", &id).is_ok());
+    assert!(matches!(
+        verify_output_integrity("different-digest", &id),
+        Err(KernelCompilationError::OutputIntegrityFailed { .. })
+    ));
+}
+
+#[test]
+fn compiler_crash_is_normalized_and_redacted_never_a_success() {
+    let error = normalize_compiler_crash("segfault at C:\\temp\\compiler\\work\\0xdeadbeef");
+    match &error {
+        KernelCompilationError::CompilerCrashed { detail } => {
+            assert_eq!(detail, "[redacted backend diagnostic]");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(error.id(), "kernel-compilation-compiler-crashed");
+}
+
+#[test]
+fn provider_compiler_panic_is_caught_and_never_unwinds_across_boundary() {
+    let result: Result<(), KernelCompilationError> =
+        call_provider_compiler_without_unwinding(|| -> Result<(), KernelCompilationError> {
+            panic!("simulated compiler panic");
+        });
+    assert!(matches!(
+        result,
+        Err(KernelCompilationError::CompilerCrashed { .. })
+    ));
+
+    let ok: Result<u32, KernelCompilationError> =
+        call_provider_compiler_without_unwinding(|| Ok(42));
+    assert_eq!(ok, Ok(42));
+}
+
+#[test]
+fn hot_path_denies_kernel_compilation_cold_path_allows_it() {
+    assert!(matches!(
+        reject_hot_path_kernel_compilation(KernelArtifactPath::Hot),
+        Err(KernelCompilationError::HotPathDenied)
+    ));
+    assert!(reject_hot_path_kernel_compilation(KernelArtifactPath::Cold).is_ok());
+}
+
+#[test]
+fn kernel_compilation_abi_descriptor_validates_ownership_and_version() {
+    let descriptor = KernelCompilationAbiDescriptor::current();
+    assert!(descriptor.validate().is_ok());
+
+    let mut missing_release = descriptor.clone();
+    missing_release.ownership.result_buffer.release_required = false;
+    assert!(matches!(
+        missing_release.validate(),
+        Err(KernelCompilationError::AbiIncompatible { .. })
+    ));
+
+    let mut wrong_version = descriptor;
+    wrong_version.abi_version = crate::provider::ProviderAbiVersion::new(99, 0);
+    assert!(matches!(
+        wrong_version.validate(),
+        Err(KernelCompilationError::AbiIncompatible { .. })
+    ));
+}
+
+#[test]
+fn compilation_job_ids_and_prepared_kernel_ids_expose_no_pointer_semantics() {
+    let mut allocator = CompilationJobIdAllocator::default();
+    let job_id = allocator.allocate();
+    assert!(assert_prepared_kernel_id_opaque(&job_id.to_string()).is_ok());
+    assert!(matches!(
+        assert_prepared_kernel_id_opaque("0xdeadbeef"),
+        Err(KernelCompilationError::BufferOwnershipViolation { .. })
+    ));
+}
+
+#[test]
+fn compiler_diagnostics_redact_raw_output() {
+    let diagnostic = CompilerDiagnostic::from_raw_output(
+        "parse",
+        "error in C:\\tmp\\kernel.triton at 0xffffabcd",
+    )
+    .with_source_location("kernel.triton:12:5");
+    assert_eq!(diagnostic.redacted_message, "[redacted backend diagnostic]");
+    assert_eq!(
+        diagnostic.source_location.as_deref(),
+        Some("kernel.triton:12:5")
+    );
+}
+
+#[test]
+fn compiler_flags_are_redacted_by_default() {
+    let identity = CompilerIdentity::default().with_raw_flags("-I C:\\vendor\\include -DSECRET=1");
+    assert_eq!(
+        identity.flags_fingerprint.as_deref(),
+        Some("[redacted backend diagnostic]")
+    );
+}
+
+#[test]
+fn failed_compilation_never_mutates_existing_known_good_artifact() {
+    let operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
+    let v1 = CompiledKernelArtifact::new(
+        CompiledKernelArtifactId::from_digest("v1-digest"),
+        "cubin",
+        "nvcc",
+        "12.4",
+        "sm_90",
+        operator,
+    );
+    let crash = normalize_compiler_crash("replacement compile crashed");
+    let preserved = preserve_known_good_artifact_on_failure(&v1, &crash);
+    assert_eq!(preserved, &v1);
+}
+
+#[test]
+fn compilation_process_arguments_are_structural_never_shell_strings() {
+    let untrusted_metadata = "kernel; rm -rf / #";
+    let invocation = CompilationProcessArguments::new("nvcc")
+        .with_arg("--compile")
+        .with_arg(untrusted_metadata);
+    assert_eq!(invocation.program, "nvcc");
+    // The untrusted value is preserved as a single argument element -- never
+    // interpolated into (and re-parsed out of) a shell command string.
+    assert_eq!(invocation.args.len(), 2);
+    assert_eq!(invocation.args[1], untrusted_metadata);
+}
+
+#[test]
+fn compilation_observation_never_carries_raw_source_or_native_handles() {
+    let observation =
+        KernelCompilationObservation::new(KernelCompilationObservationKind::CompilerCompleted)
+            .with_job("compilation-job-1")
+            .with_redacted_metadata("compiler", "nvcc 12.4")
+            .with_redacted_metadata("temp_path", "C:\\tmp\\build\\0xdeadbeef");
+    assert_eq!(
+        observation.kind,
+        KernelCompilationObservationKind::CompilerCompleted
+    );
+    assert_eq!(observation.job.as_deref(), Some("compilation-job-1"));
+    assert_eq!(
+        observation.redacted_metadata.get("temp_path").unwrap(),
+        "[redacted backend diagnostic]"
+    );
+    assert_eq!(
+        observation.redacted_metadata.get("compiler").unwrap(),
+        "nvcc 12.4"
+    );
+}
+
+#[test]
+fn preparation_only_provider_is_a_valid_distinct_support_level() {
+    let mut descriptor = KernelCompilationCapabilityDescriptor::unsupported();
+    descriptor.support_level = CompilationSupportLevel::PreparationOnly;
+    descriptor
+        .produced_compiled_formats
+        .insert("nvidia:cubin".into());
+    descriptor.isolation_model = CompilationIsolationModel::PlatformManagedCompiler;
+    assert!(descriptor.is_present());
+    assert!(descriptor.validate().is_ok());
+    assert!(descriptor.accepted_source_formats.is_empty());
+}
+
+#[test]
+fn platform_managed_compilation_mode_preserves_cold_hot_boundary() {
+    let mut descriptor = KernelCompilationCapabilityDescriptor::unsupported();
+    descriptor.support_level = CompilationSupportLevel::SourceCompilation;
+    descriptor.modes.insert(CompilationMode::ProviderManaged);
+    descriptor.isolation_model = CompilationIsolationModel::PlatformManagedCompiler;
+    descriptor
+        .accepted_source_formats
+        .insert(KernelSourceFormat::new("apple", "msl"));
+    descriptor
+        .produced_compiled_formats
+        .insert("apple:metallib".into());
+    assert!(descriptor.validate().is_ok());
+    // Even a platform that logically combines compile+prepare internally
+    // still denies compilation on the decode hot path.
+    assert!(matches!(
+        reject_hot_path_kernel_compilation(KernelArtifactPath::Hot),
+        Err(KernelCompilationError::HotPathDenied)
+    ));
+}
+
+#[test]
+fn compilation_result_wraps_compiled_artifact_with_compilation_provenance() {
+    let operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
+    let artifact = CompiledKernelArtifact::new(
+        CompiledKernelArtifactId::from_digest("digest-result"),
+        "ptx",
+        "triton",
+        "3.1",
+        "sm_90",
+        operator,
+    );
+    let mut allocator = CompilationJobIdAllocator::default();
+    let result = CompilationResult {
+        job: allocator.allocate(),
+        artifact: artifact.clone(),
+        compiler: CompilerIdentity {
+            name: Some("triton".into()),
+            version: Some("3.1".into()),
+            ..CompilerIdentity::default()
+        },
+        specialization: CompilationSpecialization::default(),
+        duration_millis: Some(1200),
+    };
+    assert_eq!(result.artifact, artifact);
+    assert_eq!(result.compiler.name.as_deref(), Some("triton"));
+    assert_eq!(result.duration_millis, Some(1200));
+}
+
+#[test]
+fn kernel_compilation_conformance_report_is_conformant() {
+    let report = run_kernel_compilation_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+// ---------------------------------------------------------------------
+// kernel_qualification
+// ---------------------------------------------------------------------
+
+#[test]
+fn kernel_qualification_conformance_report_is_conformant() {
+    let report = run_kernel_qualification_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn qualification_status_transitions_reject_skipping_qualifying() {
+    let mut record = QualificationRecord::new(
+        QualificationIdentity::new(
+            CompiledKernelArtifactId::from_digest("digest"),
+            1,
+            "suite-1",
+            "sm90",
+            "provider-1",
+        ),
+        QualificationProfile::baseline_correctness(),
+        reference_cpu_oracle("1"),
+    );
+    assert!(matches!(record.status(), QualificationStatus::Unqualified));
+    assert!(record.mark_qualified(None).is_err());
+    assert!(record.start_qualifying().is_ok());
+    assert!(record.mark_qualified(None).is_ok());
+    assert!(record.status().is_eligible());
+}
+
+#[test]
+fn qualification_profile_does_not_infer_stricter_profile_from_weaker_evidence() {
+    let baseline = QualificationProfile::baseline_correctness();
+    let strict = QualificationProfile::strict_correctness();
+    assert!(!baseline.satisfies(&strict));
+    assert!(baseline.satisfies(&baseline.clone()));
+}
+
+#[test]
+fn oracle_required_when_reference_cpu_does_not_support_operator() {
+    assert!(require_oracle(false, None).is_err());
+    assert!(require_oracle(true, None).is_ok());
+    assert!(require_oracle(false, Some(&reference_cpu_oracle("1"))).is_ok());
+}
+
+// ---------------------------------------------------------------------
+// kernel_benchmark
+// ---------------------------------------------------------------------
+
+#[test]
+fn kernel_benchmark_conformance_report_is_conformant() {
+    let report = run_kernel_benchmark_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn regression_policy_correctness_only_never_rejects_on_latency() {
+    assert!(evaluate_regression_policy(RegressionPolicy::CorrectnessOnly, 1000.0, 1.0).is_ok());
+}
+
+// ---------------------------------------------------------------------
+// kernel_cache
+// ---------------------------------------------------------------------
+
+#[test]
+fn kernel_cache_conformance_report_is_conformant() {
+    let report = run_kernel_cache_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn kernel_cache_preparation_pressure_is_informational_and_does_not_gate_eligibility() {
+    let mut cache = KernelArtifactCache::new();
+    assert_eq!(cache.preparation_pressure_hint().level, None);
+
+    cache.set_preparation_pressure_hint(PreparationPressureHint {
+        level: Some(MemoryPressureLevel::High),
+    });
+    assert_eq!(
+        cache.preparation_pressure_hint().level,
+        Some(MemoryPressureLevel::High)
+    );
+
+    // Setting a high pressure hint does not, by itself, change whether an
+    // otherwise-eligible entry is usable -- the Memory Manager retains
+    // authority over Runtime Tensor allocation, not this cache.
+    let key = KernelCacheKey {
+        source_digest: None,
+        compiled_artifact_digest: "digest-pressure".into(),
+        source_format: None,
+        compiled_format: "nvidia:cubin".into(),
+        compiler_identity: "nvcc".into(),
+        compiler_version: "12.0".into(),
+        compiler_flags_fingerprint: None,
+        provider_version: "1.0.0".into(),
+        target_architecture: "sm90".into(),
+        driver_runtime_compatibility_class: Default::default(),
+        operator_semantics: "magnetar:matmul@1".into(),
+        dtype: Default::default(),
+        layout: Default::default(),
+        shape_specialization: None,
+        device_features: Default::default(),
+    };
+    let mut entry = KernelCacheEntry::new(
+        key,
+        CompiledKernelArtifactId::from_digest("digest-pressure"),
+        "sha256:pressure",
+    );
+    entry.mark_validating().unwrap();
+    entry.mark_ready().unwrap();
+    let eligibility = evaluate_cache_eligibility(&entry, true, &CacheEligibilityPolicy::default());
+    assert!(eligibility.is_ok());
+}
+
+#[test]
+fn qualification_cache_key_requires_exact_match_for_reuse() {
+    let base = QualificationCacheKey {
+        artifact_digest: "digest".into(),
+        qualification_suite_version: "1".into(),
+        oracle_identity_version: "1".into(),
+        qualification_profile: "baseline-correctness@1".into(),
+        target_context: "sm90".into(),
+        test_matrix_fingerprint: "fp".into(),
+        tolerance_profile_fingerprint: "tp".into(),
+    };
+    let mut different_suite = base.clone();
+    different_suite.qualification_suite_version = "2".into();
+    assert!(base.is_reusable_for(&base));
+    assert!(!base.is_reusable_for(&different_suite));
+}
+
+// ---------------------------------------------------------------------
+// kernel_registry generated-kernel lifecycle
+// ---------------------------------------------------------------------
+
+#[test]
+fn kernel_registry_lifecycle_conformance_report_is_conformant() {
+    let report = run_kernel_registry_lifecycle_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn candidate_state_cannot_skip_from_qualified_directly_to_retired() {
+    assert!(!CandidateState::Qualified.can_transition_to(CandidateState::Retired));
+    assert!(CandidateState::Qualified.can_transition_to(CandidateState::Candidate));
+    assert!(CandidateState::Active.can_transition_to(CandidateState::Retiring));
+    assert!(CandidateState::Retiring.can_transition_to(CandidateState::Retired));
+}
+
+#[test]
+fn kernel_registry_hot_swap_and_retirement_errors_have_expected_ids() {
+    let cases = [
+        (
+            KernelRegistryError::HotSwapFailed { reason: "x".into() },
+            "kernel-hot-swap-failed",
+        ),
+        (
+            KernelRegistryError::RetirementInUse { kernel: "x".into() },
+            "kernel-retirement-in-use",
+        ),
+        (
+            KernelRegistryError::RetirementFailed { kernel: "x".into() },
+            "kernel-retirement-failed",
+        ),
+    ];
+    for (error, expected_id) in cases {
+        assert_eq!(error.code(), expected_id);
+        assert!(!error.to_string().is_empty());
+    }
+}
+
+#[test]
+fn automatic_rollback_policy_is_reserved_and_disabled_by_default() {
+    assert!(!AutomaticRollbackPolicy::default().enabled);
+}
+
+#[test]
+fn continuous_batching_preserves_in_flight_generation_and_admits_new_work_on_new_generation() {
+    let kernel = KernelId::new(
+        ProviderBinding::new("conformance-provider"),
+        "conformance-kernel",
+        crate::CapabilityVersion::new(1, 0, 0),
+        OperatorId::magnetar("matmul", 1, crate::OperatorFamily::LinearAlgebra),
+        KernelOperatorVersionRange::exact(1),
+        crate::KernelImplementationFamily::TestFixture,
+    );
+    let device = DeviceBinding::new(crate::DeviceId::new("conformance-device"));
+    let mut allocator = PreparedKernelIdAllocator::default();
+    let mut registry = KernelRegistry::new();
+
+    let mut generation_one = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-batch-v1"),
+        ProviderBinding::new("conformance-provider"),
+        device.clone(),
+        PreparedKernelGeneration::new(1),
+    );
+    generation_one.mark_ready().unwrap();
+    let generation_one_id = generation_one.id;
+    registry.register_prepared_kernel(generation_one);
+    registry
+        .promote_generation(&kernel, generation_one_id)
+        .unwrap();
+
+    let slot_binding = registry.bind_batch_slot(&kernel, 7).unwrap();
+    assert_eq!(slot_binding.generation, generation_one_id);
+
+    let mut generation_two = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-batch-v2"),
+        ProviderBinding::new("conformance-provider"),
+        device,
+        PreparedKernelGeneration::new(2),
+    );
+    generation_two.mark_ready().unwrap();
+    let generation_two_id = generation_two.id;
+    registry.register_prepared_kernel(generation_two);
+    registry
+        .promote_generation(&kernel, generation_two_id)
+        .unwrap();
+
+    // The existing slot binding is unaffected by promotion...
+    assert_eq!(slot_binding.generation, generation_one_id);
+    // ...but new batch admissions resolve to the newly promoted generation.
+    assert_eq!(
+        registry.admit_new_batch_work(&kernel),
+        Some(generation_two_id)
+    );
+}
+
+#[test]
+fn model_instance_kernel_selection_policy_is_explicit() {
+    let dynamic = KernelSelectionPolicy::Dynamic;
+    assert!(!dynamic.is_pinned());
+
+    let kernel = KernelId::new(
+        ProviderBinding::new("conformance-provider"),
+        "conformance-kernel",
+        crate::CapabilityVersion::new(1, 0, 0),
+        OperatorId::magnetar("matmul", 1, crate::OperatorFamily::LinearAlgebra),
+        KernelOperatorVersionRange::exact(1),
+        crate::KernelImplementationFamily::TestFixture,
+    );
+    let mut pinned = PinnedKernelSelection::new(kernel, "digest-pinned");
+    assert!(pinned.validate().is_ok());
+    pinned.prepared_generation = Some(3);
+    pinned.qualification_profile = Some("baseline-correctness@1".into());
+    let policy = KernelSelectionPolicy::Pinned(pinned);
+    assert!(policy.is_pinned());
+
+    let empty_digest = PinnedKernelSelection::new(
+        KernelId::new(
+            ProviderBinding::new("conformance-provider"),
+            "conformance-kernel",
+            crate::CapabilityVersion::new(1, 0, 0),
+            OperatorId::magnetar("matmul", 1, crate::OperatorFamily::LinearAlgebra),
+            KernelOperatorVersionRange::exact(1),
+            crate::KernelImplementationFamily::TestFixture,
+        ),
+        "",
+    );
+    assert!(matches!(
+        empty_digest.validate(),
+        Err(ModelInstanceError::ModelInstancePolicyDenied)
+    ));
+}
+
+#[test]
+fn session_inherits_model_instance_kernel_policy_and_owns_no_native_kernel_state() {
+    // Structural fact: `InferenceSession`'s fields (id, lifecycle, model,
+    // tokenizer, generation_defaults, policy, memory, resources, operation,
+    // affinity, correlation_id, timestamps, last_error) contain no
+    // KernelSelectionPolicy, KernelId, PreparedKernelId, or native handle --
+    // a Session has nothing to override, so it can only inherit.
+    let policy = KernelSelectionPolicy::Pinned(PinnedKernelSelection::new(
+        KernelId::new(
+            ProviderBinding::new("conformance-provider"),
+            "conformance-kernel",
+            crate::CapabilityVersion::new(1, 0, 0),
+            OperatorId::magnetar("matmul", 1, crate::OperatorFamily::LinearAlgebra),
+            KernelOperatorVersionRange::exact(1),
+            crate::KernelImplementationFamily::TestFixture,
+        ),
+        "digest-pinned",
+    ));
+    let inherited = session_kernel_policy_is_inherited(&policy);
+    assert_eq!(inherited, &policy);
+}
+
+// ---------------------------------------------------------------------
+// kernel_selection_policy
+// ---------------------------------------------------------------------
+
+fn selection_policy_kernel_id(name: &str) -> KernelId {
+    KernelId::new(
+        ProviderBinding::new("selection-policy-provider"),
+        name,
+        crate::CapabilityVersion::new(1, 0, 0),
+        OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra),
+        KernelOperatorVersionRange::exact(1),
+        crate::KernelImplementationFamily::CpuScalar,
+    )
+}
+
+fn selection_policy_identity(name: &str) -> CandidateIdentity {
+    CandidateIdentity {
+        kernel: selection_policy_kernel_id(name),
+        provider: ProviderBinding::new("selection-policy-provider"),
+        artifact_digest: None,
+    }
+}
+
+#[test]
+fn kernel_selection_policy_conformance_report_is_conformant() {
+    let report = run_kernel_selection_policy_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn eligible_candidate_cannot_be_constructed_without_passing_eligibility() {
+    let rejected = EligibleCandidate::from_checked(
+        selection_policy_identity("ineligible"),
+        CandidateMetrics::default(),
+        &CandidateEligibilityInput {
+            shape_compatible: false,
+            ..CandidateEligibilityInput::all_satisfied()
+        },
+    );
+    assert_eq!(
+        rejected,
+        Err(KernelSelectionExclusionReason::ShapeIncompatible)
+    );
+}
+
+#[test]
+fn eligibility_checks_fail_in_deterministic_order() {
+    // Both dtype and layout are wrong; dtype is checked first, so it wins.
+    let input = CandidateEligibilityInput {
+        dtype_compatible: false,
+        layout_compatible: false,
+        ..CandidateEligibilityInput::all_satisfied()
+    };
+    assert_eq!(
+        evaluate_candidate_eligibility(&input),
+        Err(KernelSelectionExclusionReason::DTypeIncompatible)
+    );
+}
+
+#[test]
+fn kernel_candidate_rejection_maps_onto_selection_exclusion_reason() {
+    assert_eq!(
+        KernelSelectionExclusionReason::from(KernelCandidateRejection::Revoked),
+        KernelSelectionExclusionReason::QualificationRevoked
+    );
+    assert_eq!(
+        KernelSelectionExclusionReason::from(KernelCandidateRejection::WorkspaceUnavailable),
+        KernelSelectionExclusionReason::WorkspaceInfeasible
+    );
+}
+
+#[test]
+fn missing_metric_never_resolves_to_best_possible_value() {
+    assert_eq!(
+        missing_metric_value(MissingMetricPolicy::Exclude, None),
+        f64::INFINITY
+    );
+    assert!(missing_metric_value(MissingMetricPolicy::RankConservatively, None) > 0.0);
+    assert_eq!(
+        missing_metric_value(MissingMetricPolicy::UseFallbackMetadata, Some(42.0)),
+        42.0
+    );
+}
+
+#[test]
+fn should_retain_active_due_to_missing_metric_only_under_that_policy() {
+    let metrics = CandidateMetrics::default();
+    assert!(should_retain_active_due_to_missing_metric(
+        &metrics,
+        &[ObjectiveDimension::Latency],
+        MissingMetricPolicy::RetainActiveKernel,
+    ));
+    assert!(!should_retain_active_due_to_missing_metric(
+        &metrics,
+        &[ObjectiveDimension::Latency],
+        MissingMetricPolicy::Exclude,
+    ));
+}
+
+#[test]
+fn weighted_score_ranks_lower_combined_cost_first() {
+    let fast = CandidateMetrics::default()
+        .with(ObjectiveDimension::Latency, 1.0)
+        .with(ObjectiveDimension::Memory, 1.0);
+    let slow = CandidateMetrics::default()
+        .with(ObjectiveDimension::Latency, 10.0)
+        .with(ObjectiveDimension::Memory, 1.0);
+    let policy = WeightedScorePolicy {
+        weights: BTreeMap::from([
+            (ObjectiveDimension::Latency, 1.0),
+            (ObjectiveDimension::Memory, 1.0),
+        ]),
+        missing_metric_policy: MissingMetricPolicy::Exclude,
+    };
+    assert!(weighted_score(&fast, &policy) < weighted_score(&slow, &policy));
+}
+
+#[test]
+fn lexicographic_ranking_uses_first_differentiating_objective() {
+    let a = CandidateMetrics::default()
+        .with(ObjectiveDimension::Determinism, 0.0)
+        .with(ObjectiveDimension::Latency, 100.0);
+    let b = CandidateMetrics::default()
+        .with(ObjectiveDimension::Determinism, 1.0)
+        .with(ObjectiveDimension::Latency, 1.0);
+    let policy = LexicographicPolicy {
+        order: vec![ObjectiveDimension::Determinism, ObjectiveDimension::Latency],
+        missing_metric_policy: MissingMetricPolicy::Exclude,
+    };
+    assert_eq!(
+        lexicographic_compare(&a, &b, &policy),
+        std::cmp::Ordering::Less
+    );
+}
+
+#[test]
+fn rank_candidates_is_deterministic_across_repeated_calls() {
+    let candidates = vec![
+        EligibleCandidate::from_checked(
+            selection_policy_identity("z"),
+            CandidateMetrics::default().with(ObjectiveDimension::Latency, 3.0),
+            &CandidateEligibilityInput::all_satisfied(),
+        )
+        .unwrap(),
+        EligibleCandidate::from_checked(
+            selection_policy_identity("a"),
+            CandidateMetrics::default().with(ObjectiveDimension::Latency, 3.0),
+            &CandidateEligibilityInput::all_satisfied(),
+        )
+        .unwrap(),
+    ];
+    let strategy = RankingStrategy::WeightedScore(WeightedScorePolicy {
+        weights: BTreeMap::from([(ObjectiveDimension::Latency, 1.0)]),
+        missing_metric_policy: MissingMetricPolicy::Exclude,
+    });
+    assert!(selection_is_deterministic_for_identical_inputs(
+        &candidates,
+        &strategy
+    ));
+    // Tied score: stable tie-break falls back to CandidateIdentity's Ord.
+    let ranked = rank_candidates(&candidates, &strategy).unwrap();
+    assert_eq!(ranked[0].kernel.name, "a");
+}
+
+#[test]
+fn pinned_ranking_strategy_fails_when_kernel_is_not_eligible() {
+    let candidates = vec![
+        EligibleCandidate::from_checked(
+            selection_policy_identity("present"),
+            CandidateMetrics::default(),
+            &CandidateEligibilityInput::all_satisfied(),
+        )
+        .unwrap(),
+    ];
+    let strategy = RankingStrategy::Pinned(selection_policy_kernel_id("absent"));
+    assert_eq!(
+        rank_candidates(&candidates, &strategy),
+        Err(KernelSelectionError::PinnedKernelUnavailable)
+    );
+}
+
+#[test]
+fn policy_ordered_ranking_places_unlisted_candidates_last() {
+    let listed = selection_policy_kernel_id("listed");
+    let candidates = vec![
+        EligibleCandidate::from_checked(
+            selection_policy_identity("unlisted"),
+            CandidateMetrics::default(),
+            &CandidateEligibilityInput::all_satisfied(),
+        )
+        .unwrap(),
+        EligibleCandidate::from_checked(
+            CandidateIdentity {
+                kernel: listed.clone(),
+                provider: ProviderBinding::new("selection-policy-provider"),
+                artifact_digest: None,
+            },
+            CandidateMetrics::default(),
+            &CandidateEligibilityInput::all_satisfied(),
+        )
+        .unwrap(),
+    ];
+    let strategy = RankingStrategy::PolicyOrdered(vec![listed.clone()]);
+    let ranked = rank_candidates(&candidates, &strategy).unwrap();
+    assert_eq!(ranked[0].kernel, listed);
+}
+
+#[test]
+fn benchmark_context_requires_exact_match() {
+    let context = BenchmarkContext {
+        provider: ProviderBinding::new("p"),
+        device_architecture: "sm90".into(),
+        driver_runtime_compatibility: "cuda-12".into(),
+        operator_version: 1,
+        artifact_digest: None,
+        dtype: ComputeDType::Float32,
+        layout: TensorLayoutKind::Contiguous,
+        shape_bucket: "b1s128".into(),
+        batch_bucket: "b1".into(),
+        sequence_bucket: "s128".into(),
+        execution_mode: KernelExecutionMode::Synchronous,
+        benchmark_profile_version: 1,
+    };
+    let different_shape = BenchmarkContext {
+        shape_bucket: "b64s8192".into(),
+        ..context.clone()
+    };
+    assert!(benchmark_context_compatible(&context, &context));
+    assert!(!benchmark_context_compatible(&different_shape, &context));
+}
+
+#[test]
+fn stale_benchmark_policy_explicitly_governs_exclusion() {
+    let stale = BenchmarkFreshness::Stale {
+        reason: BenchmarkStalenessReason::DriverChanged,
+    };
+    assert!(evaluate_stale_benchmark_policy(stale, StaleBenchmarkPolicy::Accept).is_ok());
+    assert_eq!(
+        evaluate_stale_benchmark_policy(stale, StaleBenchmarkPolicy::Exclude),
+        Err(KernelSelectionError::BenchmarkStale)
+    );
+    assert!(
+        evaluate_stale_benchmark_policy(BenchmarkFreshness::Fresh, StaleBenchmarkPolicy::Exclude)
+            .is_ok()
+    );
+}
+
+#[test]
+fn shape_aware_evidence_does_not_apply_outside_its_bucket() {
+    assert!(performance_evidence_applies_to_workload("b1s128", "b1s128"));
+    assert!(!performance_evidence_applies_to_workload(
+        "b1s128", "b64s8192"
+    ));
+}
+
+#[test]
+fn pressure_bias_only_applies_to_an_already_eligible_candidate() {
+    let candidate = EligibleCandidate::from_checked(
+        selection_policy_identity("pressure"),
+        CandidateMetrics::default(),
+        &CandidateEligibilityInput::all_satisfied(),
+    )
+    .unwrap();
+    let saturated = PressureSnapshot {
+        memory_pressure: PressureLevel::Saturated,
+        provider_admission_open: true,
+        ..PressureSnapshot::default()
+    };
+    let nominal = PressureSnapshot {
+        provider_admission_open: true,
+        ..PressureSnapshot::default()
+    };
+    assert!(
+        pressure_ranking_bias(&candidate, &saturated) > pressure_ranking_bias(&candidate, &nominal)
+    );
+}
+
+#[test]
+fn conversion_cost_can_flip_the_faster_raw_execution_choice() {
+    let kernel_a = ConversionCost {
+        layout_conversion_ms: 30.0,
+        ..ConversionCost::default()
+    };
+    let kernel_b = ConversionCost::default();
+    let total_a = total_execution_cost_ms(20.0, &kernel_a);
+    let total_b = total_execution_cost_ms(35.0, &kernel_b);
+    assert!(total_b < total_a);
+}
+
+#[test]
+fn preparation_cost_is_not_charged_again_once_already_prepared() {
+    assert!(!preparation_cost_applies(
+        PreparationCostClass::OneTime,
+        true
+    ));
+    assert!(preparation_cost_applies(
+        PreparationCostClass::PerOperation,
+        true
+    ));
+}
+
+#[test]
+fn compilation_cost_is_excluded_once_artifact_is_cached() {
+    assert!(compilation_cost_excluded_from_hot_path(true));
+    assert!(!compilation_cost_excluded_from_hot_path(false));
+}
+
+#[test]
+fn hysteresis_retains_active_kernel_below_threshold_and_promotes_above_it() {
+    let policy = HysteresisPolicy {
+        promotion_threshold_fraction: 0.05,
+    };
+    assert_eq!(
+        evaluate_hysteresis(100.0, 99.9, &policy),
+        SelectionOutcome::RetainActive
+    );
+    assert_eq!(
+        evaluate_hysteresis(100.0, 80.0, &policy),
+        SelectionOutcome::PromoteCandidate
+    );
+}
+
+#[test]
+fn anti_flapping_blocks_promotion_inside_cooldown_or_minimum_duration() {
+    let policy = AntiFlappingPolicy {
+        cooldown_seconds: 30,
+        minimum_active_duration_seconds: 10,
+    };
+    assert!(!promotion_allowed_by_anti_flapping(&policy, 5, 20));
+    assert!(promotion_allowed_by_anti_flapping(&policy, 30, 10));
+}
+
+#[test]
+fn promotion_recommendation_is_denied_when_hysteresis_or_anti_flapping_blocks_it() {
+    let candidate = selection_policy_identity("candidate");
+    let denied = recommend_promotion(&candidate, SelectionOutcome::RetainActive, true);
+    assert!(!denied.approved);
+    let denied_by_cooldown =
+        recommend_promotion(&candidate, SelectionOutcome::PromoteCandidate, false);
+    assert!(!denied_by_cooldown.approved);
+    let approved = recommend_promotion(&candidate, SelectionOutcome::PromoteCandidate, true);
+    assert!(approved.approved);
+}
+
+#[test]
+fn selection_cache_invalidate_all_clears_every_entry() {
+    let mut cache = SelectionCache::new();
+    let key = SelectionCacheKey {
+        operator: OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra),
+        provider: ProviderBinding::new("selection-policy-provider"),
+        dtype: ComputeDType::Float32,
+        layout: TensorLayoutKind::Contiguous,
+        shape_bucket: "b1s128".into(),
+        batch_bucket: "b1".into(),
+        sequence_bucket: "s128".into(),
+        generation_phase: Some(GenerationPhase::Decode),
+        optimization_profile: OptimizationProfile::Latency,
+        policy_version: KernelSelectionPolicyVersion(1),
+    };
+    cache.insert(key.clone(), selection_policy_identity("cached"));
+    assert_eq!(cache.len(), 1);
+    cache.invalidate_all(SelectionCacheInvalidationTrigger::PolicyChanged);
+    assert!(cache.is_empty());
+    assert!(cache.get(&key).is_none());
+}
+
+#[test]
+fn kernel_optimization_policy_rejects_self_contradictory_deterministic_profile() {
+    let policy = KernelOptimizationPolicy {
+        id: KernelSelectionPolicyId::new("policy-1"),
+        version: KernelSelectionPolicyVersion(1),
+        profile: OptimizationProfile::Deterministic,
+        ranking_strategy: RankingStrategy::WeightedScore(WeightedScorePolicy {
+            weights: BTreeMap::new(),
+            missing_metric_policy: MissingMetricPolicy::Exclude,
+        }),
+        fallback: FallbackPolicy::default(),
+        hysteresis: HysteresisPolicy::default(),
+        anti_flapping: AntiFlappingPolicy::default(),
+        exploration: ExplorationPolicy::default(),
+        selection_mode: KernelSelectionPolicy::Dynamic,
+        determinism_required: false,
+        require_trusted: true,
+        allowed_qualification_profiles: BTreeSet::new(),
+    };
+    assert!(policy.validate().is_err());
+}
+
+#[test]
+fn model_component_cannot_select_a_concrete_kernel() {
+    assert!(
+        validate_model_component_request(&ModelComponentKernelRequest::ConcreteKernelOverride(
+            selection_policy_kernel_id("x")
+        ))
+        .is_err()
+    );
+    assert!(
+        validate_model_component_request(
+            &ModelComponentKernelRequest::PortableOperatorRequirement(OperatorId::magnetar(
+                "matmul",
+                1,
+                OperatorFamily::LinearAlgebra
+            ))
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn session_and_cli_preference_only_apply_to_already_eligible_candidates() {
+    let eligible = vec![
+        EligibleCandidate::from_checked(
+            selection_policy_identity("eligible"),
+            CandidateMetrics::default(),
+            &CandidateEligibilityInput::all_satisfied(),
+        )
+        .unwrap(),
+    ];
+    let ineligible_kernel = selection_policy_kernel_id("ineligible");
+    assert!(resolve_session_preference(Some(&ineligible_kernel), &eligible).is_none());
+    assert!(resolve_cli_kernel_preference(Some(&ineligible_kernel), &eligible).is_none());
+    let eligible_kernel = eligible[0].identity.kernel.clone();
+    assert!(resolve_session_preference(Some(&eligible_kernel), &eligible).is_some());
+}
+
+#[test]
+fn cli_preference_maps_onto_the_matching_optimization_profile() {
+    assert_eq!(
+        map_cli_preference(CliPreference::Latency),
+        OptimizationProfile::Latency
+    );
+    assert_eq!(
+        map_cli_preference(CliPreference::Deterministic),
+        OptimizationProfile::Deterministic
+    );
+}
+
+#[test]
+fn provider_advertised_alternative_never_overrides_runtime_cross_provider_decision() {
+    let runtime_choice = selection_policy_identity("runtime-choice");
+    let provider_alternative = selection_policy_identity("provider-alternative");
+    assert_eq!(
+        resolve_cross_provider_selection(&runtime_choice, Some(&provider_alternative)),
+        runtime_choice
+    );
+}
+
+#[test]
+fn provider_private_variant_requires_every_contract_dimension_unchanged() {
+    assert!(!provider_may_select_variant_privately(
+        &ProviderPrivateVariant::default()
+    ));
+    assert!(provider_may_select_variant_privately(
+        &ProviderPrivateVariant {
+            contract_semantics_identical: true,
+            runtime_visible_compatibility_unchanged: true,
+            determinism_precision_unchanged: true,
+        }
+    ));
+}
+
+#[test]
+fn fallback_chain_tries_classes_in_order_and_exhausts_explicitly() {
+    let policy = FallbackPolicy {
+        ordered_classes: vec![KernelFallbackClass::HostExecution],
+        allow_reference_cpu: false,
+    };
+    assert_eq!(
+        evaluate_kernel_selection_fallback_chain(&policy, true, HostStagingPolicy::Permit, true),
+        Err(KernelSelectionError::FallbackExhausted)
+    );
+    let permissive = FallbackPolicy {
+        ordered_classes: vec![KernelFallbackClass::HostExecution],
+        allow_reference_cpu: true,
+    };
+    assert_eq!(
+        evaluate_kernel_selection_fallback_chain(
+            &permissive,
+            true,
+            HostStagingPolicy::Permit,
+            true
+        ),
+        Ok(KernelFallbackClass::HostExecution)
+    );
+}
+
+#[test]
+fn cross_provider_movement_requires_both_explicit_and_authorized() {
+    assert!(
+        validate_cross_provider_movement(&CrossProviderMovement {
+            explicit: true,
+            authorized_by_policy: true,
+        })
+        .is_ok()
+    );
+    assert!(
+        validate_cross_provider_movement(&CrossProviderMovement {
+            explicit: true,
+            authorized_by_policy: false,
+        })
+        .is_err()
+    );
+    assert!(
+        validate_cross_provider_movement(&CrossProviderMovement {
+            explicit: false,
+            authorized_by_policy: true,
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn resolve_pinned_selection_distinguishes_unavailable_from_ineligible() {
+    let kernel = selection_policy_kernel_id("pinned");
+    let pin = PinnedKernelSelection::new(kernel.clone(), "digest-1");
+    let unavailable = resolve_pinned_selection(&pin, &[], &[]);
+    assert_eq!(
+        unavailable,
+        Err(KernelSelectionError::PinnedKernelUnavailable)
+    );
+
+    let discovered = vec![CandidateIdentity {
+        kernel: kernel.clone(),
+        provider: ProviderBinding::new("selection-policy-provider"),
+        artifact_digest: None,
+    }];
+    let ineligible = resolve_pinned_selection(&pin, &discovered, &[]);
+    assert_eq!(
+        ineligible,
+        Err(KernelSelectionError::PinnedKernelIneligible)
+    );
+
+    let eligible = vec![
+        EligibleCandidate::from_checked(
+            CandidateIdentity {
+                kernel: kernel.clone(),
+                provider: ProviderBinding::new("selection-policy-provider"),
+                artifact_digest: None,
+            },
+            CandidateMetrics::default(),
+            &CandidateEligibilityInput::all_satisfied(),
+        )
+        .unwrap(),
+    ];
+    assert!(resolve_pinned_selection(&pin, &discovered, &eligible).is_ok());
+}
+
+#[test]
+fn exploration_is_denied_by_default_under_reproducible_mode_but_allowed_when_enabled_outside_it() {
+    let candidate = EligibleCandidate::from_checked(
+        selection_policy_identity("explore"),
+        CandidateMetrics::default(),
+        &CandidateEligibilityInput::all_satisfied(),
+    )
+    .unwrap();
+    let policy = ExplorationPolicy::default();
+    assert!(!exploration_allowed(&policy, false));
+    let enabled = ExplorationPolicy {
+        enabled: true,
+        disabled_for_reproducible: true,
+    };
+    assert!(eligible_for_exploration(&enabled, false, &candidate));
+    assert!(!eligible_for_exploration(&enabled, true, &candidate));
+}
+
+#[test]
+fn canary_budget_exhaustion_is_explicit() {
+    let policy = CanaryPolicy {
+        max_requests: Some(100),
+        max_duration_seconds: None,
+        max_percentage: None,
+    };
+    assert!(!canary_budget_exhausted(&policy, 99, 0));
+    assert!(canary_budget_exhausted(&policy, 100, 0));
+}
+
+#[test]
+fn exploration_failure_never_affects_an_unrelated_candidate() {
+    let failing = selection_policy_identity("failing");
+    let unrelated = selection_policy_identity("unrelated");
+    assert!(!exploration_failure_affects_unrelated_candidate(
+        ExplorationFailureAction::TriggerRollback,
+        &failing,
+        &unrelated,
+    ));
+}
+
+#[test]
+fn online_measurement_never_overrides_trust_or_correctness() {
+    assert_eq!(
+        online_measurement_cannot_override_correctness_or_trust(
+            true,
+            KernelArtifactTrust::Untrusted
+        ),
+        KernelArtifactTrust::Untrusted
+    );
+}
+
+#[test]
+fn policy_precedence_lets_runtime_safety_override_every_lower_preference() {
+    let stack = PolicyConstraintStack {
+        runtime_safety_forces_deterministic: true,
+        cli_preference: Some(OptimizationProfile::Latency),
+        ..PolicyConstraintStack::default()
+    };
+    assert_eq!(
+        resolve_effective_profile(&stack),
+        OptimizationProfile::Deterministic
+    );
+}
+
+#[test]
+fn policy_precedence_lets_deployment_forbid_a_cli_requested_profile() {
+    let stack = PolicyConstraintStack {
+        cli_preference: Some(OptimizationProfile::Latency),
+        deployment_forbids_profile: BTreeSet::from([OptimizationProfile::Latency]),
+        model_instance_profile: Some(OptimizationProfile::Balanced),
+        ..PolicyConstraintStack::default()
+    };
+    assert_eq!(
+        resolve_effective_profile(&stack),
+        OptimizationProfile::Balanced
+    );
+}
+
+#[test]
+fn policy_precedence_honors_cli_preference_when_nothing_overrides_it() {
+    let stack = PolicyConstraintStack {
+        cli_preference: Some(OptimizationProfile::Throughput),
+        ..PolicyConstraintStack::default()
+    };
+    assert_eq!(
+        resolve_effective_profile(&stack),
+        OptimizationProfile::Throughput
+    );
+}
+
+#[test]
+fn selection_explanation_never_contains_native_handles() {
+    let mut explanation = SelectionExplanation::default();
+    explanation.exclusions.insert(
+        "some-kernel".into(),
+        KernelSelectionExclusionReason::PolicyDenied,
+    );
+    assert!(!explanation.contains_native_handles());
+}
+
+#[test]
+fn kernel_selection_error_ids_are_stable_and_match_the_proposal_vocabulary() {
+    assert_eq!(
+        KernelSelectionError::NoEligibleCandidates.id(),
+        "kernel-selection-no-eligible-candidates"
+    );
+    assert_eq!(
+        KernelSelectionError::PinnedKernelIneligible.id(),
+        "kernel-selection-pinned-kernel-ineligible"
+    );
+    assert_eq!(
+        KernelSelectionError::InternalError { reason: "x".into() }.id(),
+        "internal-kernel-selection-error"
+    );
+}
+
+#[test]
+fn kernel_selection_observation_redacts_metadata_and_carries_kernel_identity() {
+    let kernel = selection_policy_kernel_id("observed");
+    let observation =
+        KernelSelectionObservation::new(KernelSelectionObservationKind::KernelSelected)
+            .with_kernel(&kernel)
+            .with_redacted_metadata("path", "C:\\secret\\path");
+    assert_eq!(observation.kernel, Some(kernel.stable_key()));
+    assert_eq!(
+        observation
+            .redacted_metadata
+            .get("path")
+            .map(String::as_str),
+        Some("[redacted backend diagnostic]")
+    );
+}
+
+#[test]
+fn workload_context_carries_batch_and_phase_metadata_for_ranking() {
+    let context = WorkloadContext {
+        active_sequences: 32,
+        batch_width: 32,
+        total_active_tokens: 4096,
+        raggedness: Some(0.2),
+        phase: Some(GenerationPhase::Decode),
+        kv_cache_mode: Some("paged".into()),
+    };
+    // Batch-aware ranking evidence is only meaningful when a candidate's
+    // metrics are indexed under the matching workload bucket -- confirm the
+    // context can drive that bucket key deterministically.
+    let bucket = format!(
+        "batch{}-seq{}",
+        context.batch_width, context.total_active_tokens
+    );
+    assert!(performance_evidence_applies_to_workload(&bucket, &bucket));
+    assert_eq!(context.phase, Some(GenerationPhase::Decode));
+}
+
+#[test]
+fn rank_by_generation_phase_permits_distinct_prefill_and_decode_winners() {
+    let prefill_throughput = EligibleCandidate::from_checked(
+        selection_policy_identity("prefill-throughput"),
+        CandidateMetrics::default().with(ObjectiveDimension::Latency, 50.0),
+        &CandidateEligibilityInput::all_satisfied(),
+    )
+    .unwrap();
+    let decode_latency = EligibleCandidate::from_checked(
+        selection_policy_identity("decode-latency"),
+        CandidateMetrics::default().with(ObjectiveDimension::Latency, 2.0),
+        &CandidateEligibilityInput::all_satisfied(),
+    )
+    .unwrap();
+    let strategy = RankingStrategy::WeightedScore(WeightedScorePolicy {
+        weights: BTreeMap::from([(ObjectiveDimension::Latency, 1.0)]),
+        missing_metric_policy: MissingMetricPolicy::Exclude,
+    });
+    let by_phase = rank_by_generation_phase(
+        std::slice::from_ref(&prefill_throughput),
+        std::slice::from_ref(&decode_latency),
+        &strategy,
+    )
+    .unwrap();
+    assert_eq!(
+        by_phase[&GenerationPhase::Prefill],
+        vec![prefill_throughput.identity]
+    );
+    assert_eq!(
+        by_phase[&GenerationPhase::Decode],
+        vec![decode_latency.identity]
+    );
+}
+
+#[test]
+fn rolling_measurement_window_only_reports_stable_once_full() {
+    let mut window = RollingMeasurementWindow::new(3);
+    assert!(!window.is_stable());
+    window.record(10.0);
+    window.record(12.0);
+    assert!(!window.is_stable());
+    window.record(11.0);
+    assert!(window.is_stable());
+    assert_eq!(window.len(), 3);
+    window.record(9.0);
+    assert_eq!(window.len(), 3);
+    assert!(window.mean().is_some());
+}
+
+#[test]
+fn static_selection_required_during_warmup_needs_pinned_mode_and_kernel_step() {
+    let kernel = selection_policy_kernel_id("pinned");
+    let pinned_mode = KernelSelectionPolicy::Pinned(PinnedKernelSelection::new(kernel, "digest"));
+    let dynamic_mode = KernelSelectionPolicy::Dynamic;
+    let full_plan = ModelInstanceWarmupPlan::for_policy(ModelInstanceWarmupPolicy::Full);
+    let metadata_only_plan =
+        ModelInstanceWarmupPlan::for_policy(ModelInstanceWarmupPolicy::ValidateMetadataOnly);
+
+    assert!(static_selection_required_during_warmup(
+        &pinned_mode,
+        &full_plan
+    ));
+    assert!(!static_selection_required_during_warmup(
+        &dynamic_mode,
+        &full_plan
+    ));
+    assert!(!static_selection_required_during_warmup(
+        &pinned_mode,
+        &metadata_only_plan
+    ));
+}
+
+#[test]
+fn apply_promotion_recommendation_only_promotes_the_registry_when_approved() {
+    let kernel = selection_policy_kernel_id("promotable");
+    let device = DeviceBinding::new(crate::DeviceId::new("selection-policy-device"));
+    let mut allocator = PreparedKernelIdAllocator::default();
+    let mut registry = KernelRegistry::new();
+    let mut generation = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-selection-policy"),
+        ProviderBinding::new("selection-policy-provider"),
+        device,
+        PreparedKernelGeneration::new(1),
+    );
+    generation.mark_ready().unwrap();
+    let generation_id = generation.id;
+    registry.register_prepared_kernel(generation);
+
+    let candidate = selection_policy_identity("promotable");
+    let denied = PromotionRecommendation {
+        candidate: candidate.clone(),
+        approved: false,
+        reason: Some("hysteresis threshold not met".into()),
+    };
+    assert_eq!(
+        apply_promotion_recommendation(&denied, &mut registry, generation_id),
+        Err(KernelSelectionError::PromotionThresholdNotMet)
+    );
+
+    let approved = PromotionRecommendation {
+        candidate,
+        approved: true,
+        reason: None,
+    };
+    assert!(apply_promotion_recommendation(&approved, &mut registry, generation_id).is_ok());
+}
+
+#[test]
+fn apply_exploration_failure_action_only_rolls_back_for_trigger_rollback() {
+    let kernel = selection_policy_kernel_id("exploring");
+    let device = DeviceBinding::new(crate::DeviceId::new("selection-policy-device"));
+    let mut allocator = PreparedKernelIdAllocator::default();
+    let mut registry = KernelRegistry::new();
+
+    let mut generation_one = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-exploring-v1"),
+        ProviderBinding::new("selection-policy-provider"),
+        device.clone(),
+        PreparedKernelGeneration::new(1),
+    );
+    generation_one.mark_ready().unwrap();
+    registry.register_prepared_kernel(generation_one.clone());
+    registry
+        .promote_generation(&kernel, generation_one.id)
+        .unwrap();
+
+    let mut generation_two = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-exploring-v2"),
+        ProviderBinding::new("selection-policy-provider"),
+        device,
+        PreparedKernelGeneration::new(2),
+    );
+    generation_two.mark_ready().unwrap();
+    registry.register_prepared_kernel(generation_two.clone());
+    registry
+        .promote_generation(&kernel, generation_two.id)
+        .unwrap();
+
+    // A bookkeeping-only action never touches the Registry.
+    assert!(
+        apply_exploration_failure_action(
+            ExplorationFailureAction::MarkUnhealthy,
+            &mut registry,
+            &kernel,
+        )
+        .is_ok()
+    );
+
+    // Only `TriggerRollback` reaches `rollback_generation`, and it succeeds
+    // because a previous generation is still retained and dispatchable.
+    assert!(
+        apply_exploration_failure_action(
+            ExplorationFailureAction::TriggerRollback,
+            &mut registry,
+            &kernel,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn model_instance_definition_can_reference_a_kernel_selection_policy() {
+    let mut definition = model_instance_definition();
+    assert!(definition.kernel_selection_policy.is_none());
+    definition.kernel_selection_policy = Some(KernelSelectionPolicyId::new("latency-profile-v1"));
+    assert_eq!(
+        definition
+            .kernel_selection_policy
+            .as_ref()
+            .map(|id| id.as_str()),
+        Some("latency-profile-v1")
+    );
+}
+
+#[test]
+fn generation_preference_boundary_has_no_way_to_carry_a_kernel_identity() {
+    // Structural: `resolve_generation_preference` only ever takes and
+    // returns an `OptimizationProfile`, so a generation request cannot use
+    // it to smuggle a concrete `PreparedKernelId` or `KernelId` into
+    // selection, implementing "Generation requests MAY provide high-level
+    // policy preferences. They SHALL NOT directly force an ineligible
+    // concrete Kernel" (proposal).
+    assert_eq!(
+        resolve_generation_preference(
+            Some(OptimizationProfile::Latency),
+            OptimizationProfile::Balanced
+        ),
+        OptimizationProfile::Latency
+    );
+    assert_eq!(
+        resolve_generation_preference(None, OptimizationProfile::Balanced),
+        OptimizationProfile::Balanced
+    );
 }

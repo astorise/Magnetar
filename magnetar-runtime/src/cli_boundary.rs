@@ -200,6 +200,12 @@ const CLI_OWNED_AUTHORITY_CAPABILITIES: &[&str] = &[
     "agent-orchestration",
     "external-service",
     "source-editing",
+    // Kernel Optimization Orchestration boundary: "kernel optimize" and
+    // similar future tooling commands belong to CLI/tooling authority, not
+    // Runtime Inference API authority (see
+    // `crate::kernel_optimization_orchestration`).
+    "kernel-optimization-orchestration",
+    "generator-credential",
 ];
 
 /// Runs the CLI boundary conformance checks described in this module's doc

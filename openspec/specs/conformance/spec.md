@@ -584,3 +584,919 @@ When report is generated
 
 Then raw prompt is absent by default.
 
+---
+
+### Requirement: Kernel Artifact Conformance
+
+Conformance SHALL validate Kernel Source Artifact, Compiled Kernel Artifact,
+and Prepared Kernel lifecycle separation.
+
+#### Scenario: Lifecycle test
+
+Given source artifact is compiled and prepared
+
+When conformance runs
+
+Then each stage has distinct identity and ownership.
+
+---
+
+### Requirement: Device Compilation Boundary Conformance
+
+Conformance SHALL validate Device does not perform compilation.
+
+#### Scenario: Device API audit
+
+Given Device public contract is inspected
+
+When conformance runs
+
+Then arbitrary source compilation capability is absent.
+
+---
+
+### Requirement: Scheduler Compilation Boundary Conformance
+
+Conformance SHALL validate Scheduler does not compile kernels.
+
+#### Scenario: Scheduler API audit
+
+Given Scheduler is inspected
+
+When conformance runs
+
+Then compiler ownership is absent.
+
+---
+
+### Requirement: Native Handle Conformance
+
+Conformance SHALL validate native kernel handles remain Provider-private.
+
+#### Scenario: Public API audit
+
+Given Runtime, WIT, Registry, Device, and diagnostics are inspected
+
+When conformance runs
+
+Then no native kernel pointer or Provider executable handle is exposed.
+
+---
+
+### Requirement: Hot Path Compilation Conformance
+
+Conformance SHALL validate normal decode path does not perform synchronous
+kernel compilation.
+
+#### Scenario: Unprepared kernel during decode
+
+Given decode requires unprepared kernel
+
+When conformance runs
+
+Then structured readiness/admission error occurs rather than compilation.
+
+---
+
+### Requirement: Artifact Trust Conformance
+
+Conformance SHALL validate artifact origin, format, AI provenance, local
+location, and cache presence do not imply trust.
+
+#### Scenario: AI-generated cached artifact
+
+Given artifact is AI-generated and cached
+
+When trust policy has not approved it
+
+Then it remains untrusted.
+
+---
+
+### Requirement: Operator Semantics Conformance
+
+Conformance SHALL validate Kernel Artifact semantics against portable Operator
+semantics.
+
+#### Scenario: Invalid generated MatMul
+
+Given generated Kernel does not preserve MatMul semantics
+
+When qualification/conformance evaluates it
+
+Then it cannot become an eligible Kernel.
+
+---
+
+### Requirement: Prepared Generation Coexistence Conformance
+
+Conformance SHALL validate multiple Prepared Kernel generations can coexist
+without destroying in-flight kernel state.
+
+#### Scenario: Replacement during execution
+
+Given generation 1 has active invocation
+
+When generation 2 becomes current
+
+Then generation 1 remains valid until active references reach zero.
+
+---
+
+### Requirement: Provider Compilation Capability Conformance
+
+Conformance SHALL validate optional Provider Kernel Compilation Capability.
+
+#### Scenario: Provider without compiler
+
+Given Provider has no compilation capability
+
+When conformance core profile runs
+
+Then Provider can still pass non-compilation conformance.
+
+---
+
+### Requirement: Source Format Negotiation Conformance
+
+Conformance SHALL validate unsupported source formats are rejected before
+compiler invocation.
+
+#### Scenario: WGSL to CPU Provider
+
+Given Provider does not accept WGSL
+
+When compile is requested
+
+Then structured unsupported format error is returned.
+
+---
+
+### Requirement: Compilation Job Lifecycle Conformance
+
+Conformance SHALL validate compilation job state transitions.
+
+#### Scenario: Successful async job
+
+Given compilation is asynchronous
+
+When polled
+
+Then states progress legally to succeeded and cannot revert to compiling.
+
+---
+
+### Requirement: Compilation Cancellation Conformance
+
+Conformance SHALL validate declared cancellation behavior.
+
+#### Scenario: Cancelled compilation
+
+Given Provider declares cooperative cancellation
+
+When cancel is requested
+
+Then job does not publish valid partial output.
+
+---
+
+### Requirement: Compilation Deadline Conformance
+
+Conformance SHALL validate declared deadline behavior.
+
+#### Scenario: Compiler exceeds deadline
+
+Given deadline is enforceable
+
+When compiler exceeds it
+
+Then job ends timed-out without ready artifact.
+
+---
+
+### Requirement: Compilation Isolation Conformance
+
+Conformance SHALL validate Runtime policy can reject insufficient isolation.
+
+#### Scenario: Untrusted source
+
+Given policy requires sandboxed compilation
+
+When Provider advertises in-process compiler only
+
+Then compilation is denied.
+
+---
+
+### Requirement: Compilation Trust Separation Conformance
+
+Conformance SHALL validate compilation success does not imply trust or
+qualification.
+
+#### Scenario: Compilable untrusted source
+
+Given untrusted source compiles
+
+When output is created
+
+Then output remains untrusted/unqualified according to policy.
+
+---
+
+### Requirement: Provider Kernel Compilation Hot Path Conformance
+
+Conformance SHALL validate Kernel execution cannot silently invoke compiler.
+
+#### Scenario: Missing Prepared Kernel
+
+Given execution begins without PreparedKernel
+
+When dispatch occurs
+
+Then structured failure happens instead of compilation.
+
+---
+
+### Requirement: ABI Ownership Conformance
+
+Conformance SHALL validate all compilation ABI buffers use declared ownership
+and release paths.
+
+#### Scenario: Result buffer
+
+Given Provider allocates result buffer
+
+When Runtime consumes result
+
+Then required release callback is invoked exactly according to contract.
+
+---
+
+### Requirement: ABI Handle Opacity Conformance
+
+Conformance SHALL validate job IDs and PreparedKernelIds are opaque.
+
+#### Scenario: Numeric handle
+
+Given handle is represented as integer
+
+When public API/diagnostics inspect it
+
+Then no native pointer semantics are exposed.
+
+---
+
+### Requirement: Compiler Failure Atomicity Conformance
+
+Conformance SHALL validate compiler failure leaves existing known-good Kernel
+state intact.
+
+#### Scenario: Replacement compile fails
+
+Given Kernel v1 is prepared
+
+And compilation of v2 crashes
+
+When job fails
+
+Then v1 remains usable and v2 is not published.
+
+---
+
+### Requirement: Compilation Does Not Imply Qualification
+
+Conformance SHALL prove successful compilation alone does not make candidate
+eligible when qualification is required.
+
+#### Scenario: Compiled-only candidate
+
+Given artifact compiles but has no qualification
+
+When production selection runs
+
+Then candidate is rejected.
+
+---
+
+### Requirement: Qualification Does Not Imply Trust
+
+Conformance SHALL prove qualified but untrusted Kernel is rejected where
+production policy requires trust.
+
+#### Scenario: Unknown source
+
+Given candidate passes correctness tests but trust fails
+
+When production policy requires both
+
+Then candidate is ineligible.
+
+---
+
+### Requirement: Differential Mismatch Rejects Kernel
+
+Conformance SHALL validate incorrect generated Kernel fails qualification.
+
+#### Scenario: Broken MatMul
+
+Given generated MatMul changes one result
+
+When differential suite runs
+
+Then candidate is rejected.
+
+---
+
+### Requirement: Explicit Tolerance Conformance
+
+Conformance SHALL validate tolerance profile is explicit and enforced.
+
+#### Scenario: Error outside tolerance
+
+Given candidate exceeds declared tolerance
+
+When compared
+
+Then qualification fails.
+
+---
+
+### Requirement: Shape Envelope Conformance
+
+Qualification SHALL not silently exceed tested compatibility envelope.
+
+#### Scenario: Untested sequence length
+
+Given qualification covers <=4096
+
+When execution requests 8192
+
+Then candidate is not considered qualified by that evidence.
+
+---
+
+### Requirement: Determinism Claim Conformance
+
+Conformance SHALL reject Kernel that falsely advertises deterministic behavior.
+
+#### Scenario: Repeated output differs
+
+Given deterministic flag is true
+
+When repeated runs differ unexpectedly
+
+Then qualification fails.
+
+---
+
+### Requirement: Performance Cannot Override Correctness
+
+Conformance SHALL validate faster incorrect Kernel never wins selection.
+
+#### Scenario: Fastest candidate wrong
+
+Given candidate A is incorrect but fastest and B is correct
+
+When selection runs
+
+Then B remains preferred/eligible.
+
+---
+
+### Requirement: Cache Hit Does Not Grant Eligibility
+
+Conformance SHALL validate cached artifact is re-evaluated according to current
+trust, qualification and compatibility policy.
+
+#### Scenario: Revoked cache hit
+
+Given revoked artifact is cached
+
+When resolved
+
+Then it is rejected.
+
+---
+
+### Requirement: Cache Corruption Fails Closed
+
+Conformance SHALL validate corrupt cache entry is never prepared.
+
+#### Scenario: Digest mismatch
+
+Given cached bytes are modified
+
+When read
+
+Then integrity error occurs.
+
+---
+
+### Requirement: Atomic Promotion Conformance
+
+Conformance SHALL validate dispatch never observes partially promoted Registry
+state.
+
+#### Scenario: Concurrent dispatch
+
+Given promotion races with request
+
+When Kernel resolves
+
+Then request uses complete old or complete new generation.
+
+---
+
+### Requirement: In-Flight Generation Safety
+
+Conformance SHALL validate old Prepared Kernel remains valid for in-flight work
+after new generation promotion.
+
+#### Scenario: Promotion during invocation
+
+Given old generation is executing
+
+When new one is promoted
+
+Then old invocation completes safely.
+
+---
+
+### Requirement: Safe Retirement Conformance
+
+Conformance SHALL validate retiring Kernel is destroyed only after quiescence.
+
+#### Scenario: Active references
+
+Given retiring Kernel has reference count greater than zero
+
+When cleanup runs
+
+Then Provider destruction does not occur.
+
+---
+
+### Requirement: Rollback Conformance
+
+Conformance SHALL validate rollback can restore known-good eligible generation.
+
+#### Scenario: New candidate fails after promotion
+
+Given previous generation remains available
+
+When rollback occurs
+
+Then new dispatches use previous generation.
+
+---
+
+### Requirement: Revocation Conformance
+
+Conformance SHALL validate revoked Kernel receives no new work.
+
+#### Scenario: Active Kernel revoked
+
+Given Kernel is revoked
+
+When next dispatch occurs
+
+Then another eligible Kernel is selected or structured failure is returned.
+
+---
+
+### Requirement: Provider Lifetime Independence Conformance
+
+Conformance SHALL validate Kernel hot swap does not unload Provider.
+
+#### Scenario: CUDA kernel replacement
+
+Given new PreparedKernel generation is installed
+
+When swap completes
+
+Then CUDA Provider instance remains active.
+
+---
+
+### Requirement: Candidate Failure Atomicity
+
+Conformance SHALL validate failure of candidate qualification, benchmark,
+preparation or promotion leaves current active Kernel intact.
+
+#### Scenario: Candidate preparation crashes
+
+Given v1 active and v2 preparation fails
+
+When failure completes
+
+Then v1 remains active.
+
+---
+
+### Requirement: Eligibility Precedes Ranking
+
+Conformance SHALL prove ineligible candidates are removed before performance
+ranking.
+
+#### Scenario: Fast untrusted Kernel
+
+Given untrusted Kernel is fastest
+
+When conformance runs
+
+Then it is never selected.
+
+---
+
+### Requirement: Memory Feasibility Precedes Ranking
+
+Conformance SHALL prove Memory Manager rejection cannot be overridden.
+
+#### Scenario: Workspace too large
+
+Given fastest Kernel is infeasible
+
+When selection runs
+
+Then feasible slower candidate wins or selection fails.
+
+---
+
+### Requirement: Affinity Precedes Ranking
+
+Conformance SHALL prove Resource Affinity cannot be bypassed by performance.
+
+#### Scenario: Cross-Provider candidate faster
+
+Given movement is forbidden
+
+When ranking runs
+
+Then faster cross-Provider candidate is excluded.
+
+---
+
+### Requirement: Determinism Policy Conformance
+
+Conformance SHALL prove deterministic profile excludes candidates failing
+determinism.
+
+#### Scenario: Nondeterministic fastest candidate
+
+Given deterministic mode
+
+When selection runs
+
+Then candidate is not selected.
+
+---
+
+### Requirement: Stable Tie-Break Conformance
+
+Conformance SHALL prove identical selection input yields identical tie result.
+
+#### Scenario: Equal scores
+
+Given candidates have identical score
+
+When selection runs repeatedly
+
+Then selected Kernel remains stable.
+
+---
+
+### Requirement: Benchmark Context Conformance
+
+Conformance SHALL prove incompatible benchmark evidence is not authoritative.
+
+#### Scenario: Different architecture
+
+Given benchmark from sm90
+
+When candidate targets different incompatible architecture
+
+Then evidence is ignored/rejected.
+
+---
+
+### Requirement: Hysteresis Conformance
+
+Conformance SHALL prove insignificant benefit does not force promotion.
+
+#### Scenario: 0.1 percent improvement
+
+Given threshold is higher
+
+When candidate ranks slightly above active
+
+Then active Kernel remains preferred.
+
+---
+
+### Requirement: Explicit Fallback Conformance
+
+Conformance SHALL prove fallback only occurs according to policy.
+
+#### Scenario: Fallback disabled
+
+Given selected Provider unavailable
+
+When policy says fail
+
+Then Runtime fails instead of silently using CPU.
+
+---
+
+### Requirement: No Hidden Data Movement Conformance
+
+Conformance SHALL prove cross-Provider selection respects explicit movement and
+host staging rules.
+
+#### Scenario: Host staging forbidden
+
+Given CPU fallback requires staging
+
+When policy forbids it
+
+Then fallback fails.
+
+---
+
+### Requirement: Model Component Independence Conformance
+
+Conformance SHALL prove Model Component cannot force Kernel implementation.
+
+#### Scenario: Component attempts concrete selection
+
+Given Component requests a specific Provider Kernel
+
+When graph is validated
+
+Then request is rejected/ignored according to portable contract.
+
+---
+
+### Requirement: User Preference Is Non-Authoritative
+
+Conformance SHALL prove user/CLI preferences cannot force an ineligible Kernel.
+
+#### Scenario: CLI requests latency
+
+Given fastest candidate is revoked
+
+When latency mode is requested
+
+Then revoked candidate remains excluded.
+
+---
+
+### Requirement: Exploration Eligibility Conformance
+
+Conformance SHALL prove exploration only includes already eligible candidates.
+
+#### Scenario: Unqualified candidate
+
+Given exploration enabled
+
+When candidate lacks required qualification
+
+Then it is not explored.
+
+---
+
+### Requirement: Provider Global Selection Boundary Conformance
+
+Conformance SHALL prove Provider cannot decide cross-Provider selection.
+
+#### Scenario: Provider advertises high score
+
+Given Runtime policy rejects it
+
+When selection runs
+
+Then Provider cannot override decision.
+
+---
+
+### Requirement: Selection Explainability Conformance
+
+Conformance SHALL validate selection reasoning is available and redacted.
+
+#### Scenario: No eligible candidates
+
+Given every candidate is excluded
+
+When diagnostics are produced
+
+Then structured exclusion reasons are available without native handles.
+
+---
+
+### Requirement: Optimization Plane Separation Conformance
+
+Conformance SHALL validate optimization orchestration remains outside Runtime
+inference authority.
+
+#### Scenario: Runtime API audit
+
+Given public Runtime Inference API is inspected
+
+When conformance runs
+
+Then arbitrary generator/optimization execution capability is absent.
+
+---
+
+### Requirement: No Hot-Path Optimization Conformance
+
+Conformance SHALL prove token decode cannot synchronously launch optimization
+campaign.
+
+#### Scenario: Kernel unavailable
+
+Given required optimized Kernel is missing
+
+When decode runs
+
+Then structured fallback/failure occurs rather than agent search.
+
+---
+
+### Requirement: Recommendation Does Not Promote Conformance
+
+Conformance SHALL validate external recommendation cannot directly change
+active Kernel.
+
+#### Scenario: Recommended candidate
+
+Given recommendation exists
+
+When normal promotion validation has not run
+
+Then active Registry state remains unchanged.
+
+---
+
+### Requirement: Runtime Revalidation Conformance
+
+Conformance SHALL validate candidate is re-evaluated using current production
+state.
+
+#### Scenario: Qualification expired
+
+Given campaign evidence was once valid
+
+But qualification is now expired
+
+When promotion is attempted
+
+Then candidate is rejected.
+
+---
+
+### Requirement: Native Handle Boundary Conformance
+
+Conformance SHALL prove Optimization Plane cannot transport Provider native
+handles as artifacts.
+
+#### Scenario: Worker-local PreparedKernelId
+
+Given worker prepares candidate
+
+When result is exported
+
+Then production does not reuse worker-local native handle mapping.
+
+---
+
+### Requirement: Offline Inference Conformance
+
+Conformance SHALL prove already prepared baseline inference can operate without
+optimization-service connectivity.
+
+#### Scenario: Network disabled
+
+Given compatible Kernel artifacts are local
+
+When inference runs
+
+Then external optimizer is not contacted.
+
+---
+
+### Requirement: Credential Boundary Conformance
+
+Conformance SHALL prove optimization credentials do not enter Runtime
+Inference Session.
+
+#### Scenario: Generator token configured
+
+Given CLI/CI owns token
+
+When Runtime session is created
+
+Then token is absent.
+
+---
+
+### Requirement: Workload Privacy Conformance
+
+Conformance SHALL validate default Optimization Workload Profile contains no raw
+prompt/user content.
+
+#### Scenario: Profile generated
+
+Given production statistics are summarized
+
+When profile is inspected
+
+Then aggregate shape/sequence metadata may exist while raw prompts are absent.
+
+---
+
+### Requirement: Generator Identity Does Not Grant Trust Conformance
+
+Conformance SHALL prove known generator identity alone cannot trust artifact.
+
+#### Scenario: Trusted-name generator
+
+Given artifact provenance says approved generator
+
+When no authenticated trust mechanism exists
+
+Then provenance alone is insufficient.
+
+---
+
+### Requirement: Campaign Failure Isolation Conformance
+
+Conformance SHALL prove failed campaign does not disturb active known-good
+Kernel.
+
+#### Scenario: All candidate builds fail
+
+Given production Kernel generation 8 is active
+
+When optimization campaign fails
+
+Then generation 8 remains active.
+
+---
+
+### Requirement: Tachyon Independence Conformance
+
+Conformance SHALL validate Magnetar Runtime has no required direct Tachyon
+dependency for Kernel optimization.
+
+#### Scenario: Standalone deployment
+
+Given Tachyon is absent
+
+When local/CI-produced artifacts are supplied
+
+Then Magnetar can validate and execute them.
+
+---
+
+### Requirement: Tooling Authority Boundary Conformance
+
+Conformance SHALL validate CLI/external tooling authority is not ambiently
+delegated to Runtime.
+
+#### Scenario: Optimization CLI has repository access
+
+Given CLI reads source repository
+
+When Kernel Artifact enters Runtime
+
+Then Runtime gains artifact data but not repository authority.
+
+---
+
+### Requirement: Selection Policy Still Authoritative Conformance
+
+Conformance SHALL prove optimization ranking cannot override production Kernel
+Selection Policy.
+
+#### Scenario: Campaign says candidate fastest
+
+Given current memory policy makes candidate infeasible
+
+When Runtime selects Kernel
+
+Then candidate remains excluded.
+
+---
+
+### Requirement: Optimization Observability Redaction Conformance
+
+Conformance SHALL validate optimization events redact raw user data, secrets,
+native handles and model internals by default.
+
+#### Scenario: Campaign error
+
+Given failure context contains sensitive data
+
+When observation is exported
+
+Then sensitive values are absent.

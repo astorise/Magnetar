@@ -687,3 +687,138 @@ When Kernel metadata is inspected
 
 Then required layout, dtype, memory class, and precision tolerance are explicit.
 
+---
+
+### Requirement: Kernel May Be Artifact-Backed
+
+An artifact-backed Kernel SHALL implement the same portable Operator
+semantics as a statically defined Kernel. A Kernel implementation MAY be
+backed by a Kernel Artifact lifecycle.
+
+#### Scenario: Generated MatMul
+
+Given generated MatMul artifact is prepared
+
+When Kernel Registry advertises it
+
+Then the prepared implementation remains a Kernel implementing portable
+MatMul semantics.
+
+---
+
+### Requirement: Kernel Identity Is Separate From Prepared State
+
+KernelId SHALL remain logical implementation identity and SHALL NOT be the
+native prepared handle.
+
+#### Scenario: Same Kernel prepared twice
+
+Given same KernelId is prepared for two Devices
+
+When Registry tracks them
+
+Then each PreparedKernelId is distinct while KernelId semantics remain the
+same.
+
+---
+
+### Requirement: Kernel Advertisement May Reference Artifact Metadata
+
+Artifact metadata referenced by KernelAdvertisement SHALL NOT replace
+KernelId as the authoritative logical identity. KernelAdvertisement MAY
+reference artifact identity and preparation metadata.
+
+#### Scenario: Generated kernel advertisement
+
+Given generated kernel is advertised
+
+When Registry evaluates it
+
+Then artifact identity and build fingerprint may participate in selection.
+
+---
+
+### Requirement: Kernel Native State Remains Provider Private
+
+Kernel contracts SHALL not expose Provider-native executable pointers.
+
+#### Scenario: CUDA Kernel
+
+Given CUDA Provider owns CUfunction
+
+When Kernel metadata is returned
+
+Then CUfunction address is absent.
+
+---
+
+### Requirement: Executable Kernel Uses Prepared State
+
+Artifact-backed Kernel SHALL execute only through previously prepared Provider
+state.
+
+#### Scenario: Kernel dispatch
+
+Given compatible Kernel has no PreparedKernelId
+
+When dispatch runs
+
+Then Runtime does not invoke source compilation through execution path.
+
+---
+
+### Requirement: Compilation Capability Is Not Kernel Semantics
+
+Kernel compilation mechanism SHALL NOT change portable Operator semantics.
+
+#### Scenario: Triton MatMul
+
+Given MatMul is implemented through generated Triton
+
+When Kernel is registered
+
+Then it still implements the existing portable MatMul Operator contract.
+
+---
+
+### Requirement: Kernel Exposes Selection Metadata
+
+Any KernelAdvertisement metadata SHALL accurately describe the Kernel's actual behavior, and MAY expose policy-relevant metadata such as performance, workspace, determinism and specialization.
+
+#### Scenario: High-workspace Kernel
+
+Given Kernel needs 128 MiB workspace
+
+When selection evaluates memory profile
+
+Then workspace requirement participates in decision.
+
+---
+
+### Requirement: Performance Metadata Does Not Define Semantics
+
+Kernel performance metadata SHALL NOT change Operator semantics.
+
+#### Scenario: Faster approximate kernel
+
+Given approximation changes numerical contract
+
+When semantics do not allow approximation
+
+Then Kernel is incompatible regardless of benchmark.
+
+---
+
+### Requirement: Runtime-Relevant Variant Differences Require Distinct Candidate
+
+Provider variants differing in Runtime-relevant semantics or constraints SHALL
+be separately represented.
+
+#### Scenario: Deterministic and nondeterministic implementations
+
+Given Provider has both variants
+
+When determinism differs
+
+Then they SHALL be distinguishable candidates rather than invisible private
+switch.

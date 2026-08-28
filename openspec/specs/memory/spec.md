@@ -1214,3 +1214,165 @@ When Memory Manager is inspected
 
 Then model tensors are not resident.
 
+---
+
+### Requirement: Kernel Executable Memory Is Distinct From Tensor Memory
+
+Provider-owned executable kernel memory SHALL remain distinct from Runtime
+Tensor Resource memory.
+
+#### Scenario: CUDA module loaded
+
+Given Provider allocates executable device memory
+
+When tensor residency is inspected
+
+Then executable allocation is not treated as model tensor allocation.
+
+---
+
+### Requirement: Kernel Preparation Does Not Transfer Tensor Ownership
+
+Kernel preparation SHALL NOT transfer Runtime Tensor Resource ownership to
+Provider.
+
+#### Scenario: Prepared kernel references buffers at invocation
+
+Given kernel executes using Runtime tensors
+
+When invocation completes
+
+Then tensor lifecycle remains controlled by Memory Manager.
+
+---
+
+### Requirement: Compilation Workspace Is Distinct From Inference Tensor Memory
+
+Compiler temporary/workspace memory SHALL not be confused with Runtime Tensor
+Resource residency.
+
+#### Scenario: Compiler uses 2 GiB host memory
+
+Given compilation is active
+
+When inference tensor accounting is inspected
+
+Then compiler workspace is classified separately.
+
+---
+
+### Requirement: Compilation Resource Pressure May Affect Admission
+
+Runtime SHALL account for compilation resource pressure when deciding whether to start additional cold-path work.
+
+#### Scenario: Host pressure high
+
+Given compilation would exceed configured resource policy
+
+When job is submitted
+
+Then Runtime queues or rejects cold-path compilation.
+
+---
+
+### Requirement: Compilation Never Owns Runtime Tensor Resources
+
+Compiler SHALL NOT obtain ownership of inference Tensor Resources as part of
+normal compilation.
+
+#### Scenario: Shape specialization
+
+Given compiler needs tensor shapes
+
+When request is built
+
+Then metadata is provided rather than mutable inference tensor ownership.
+
+---
+
+### Requirement: Kernel Cache Is Not Tensor Residency
+
+Persistent Kernel Artifact cache SHALL remain distinct from Runtime Tensor
+residency.
+
+#### Scenario: Cached CUBIN
+
+Given CUBIN is stored on disk
+
+When Memory Manager reports model tensor residency
+
+Then CUBIN cache storage is not counted as resident inference tensor.
+
+---
+
+### Requirement: Prepared Kernel Executable Memory Is Distinct
+
+Prepared Kernel executable memory SHALL remain logically distinct from Runtime
+Tensor Resource memory.
+
+#### Scenario: GPU module loaded
+
+Given Provider allocates module memory
+
+When tensor memory accounting runs
+
+Then executable module memory is not treated as model tensor ownership.
+
+---
+
+### Requirement: Kernel Retirement Does Not Free Runtime Tensor Memory
+
+Destroying Prepared Kernel SHALL NOT implicitly free Runtime-owned tensor
+allocations.
+
+#### Scenario: Hot swap
+
+Given old kernel is retired
+
+When Provider destroys native kernel state
+
+Then model weights/KV/tensor resources remain governed by Memory Manager.
+
+---
+
+### Requirement: Memory Manager Is Authoritative For Feasibility
+
+Kernel selection SHALL respect Memory Manager feasibility decisions.
+
+#### Scenario: Fast Kernel workspace exceeds capacity
+
+Given Kernel A is faster
+
+But its workspace cannot be admitted
+
+When selection runs
+
+Then Kernel A is excluded.
+
+---
+
+### Requirement: Memory Cost May Influence Ranking
+
+Runtime SHALL NOT use memory cost to override Memory Manager feasibility decisions, though among feasible candidates memory/workspace cost MAY influence optimization.
+
+#### Scenario: Memory profile
+
+Given two feasible Kernels
+
+When memory profile is active
+
+Then lower memory candidate may rank higher.
+
+---
+
+### Requirement: Selection Does Not Allocate Hidden Memory
+
+Kernel ranking SHALL NOT perform hidden inference allocations.
+
+#### Scenario: Candidate evaluated
+
+Given candidate requires workspace
+
+When eligibility is evaluated
+
+Then feasibility is checked without silently committing unmanaged allocation.

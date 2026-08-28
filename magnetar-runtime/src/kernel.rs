@@ -460,6 +460,9 @@ pub struct KernelAdvertisement {
     pub prefix_cache: Option<KernelPrefixCacheMetadata>,
     pub batching: Option<KernelBatchMetadata>,
     pub browser_compatible: bool,
+    /// Optional link to the Kernel Artifact lifecycle backing this Kernel.
+    /// See `crate::kernel_artifact::KernelArtifactBinding`.
+    pub artifact: Option<crate::kernel_artifact::KernelArtifactBinding>,
 }
 
 impl KernelAdvertisement {
@@ -489,7 +492,16 @@ impl KernelAdvertisement {
             prefix_cache: None,
             batching: None,
             browser_compatible: false,
+            artifact: None,
         }
+    }
+
+    pub fn with_artifact(
+        mut self,
+        artifact: crate::kernel_artifact::KernelArtifactBinding,
+    ) -> Self {
+        self.artifact = Some(artifact);
+        self
     }
 
     pub fn with_dtypes(
@@ -944,6 +956,12 @@ pub enum KernelObservationKind {
     KernelResourceAffinityConflict,
     KernelDeterminismLimitation,
     KernelPrecisionDiagnostic,
+    KernelGenerationPromoted,
+    KernelGenerationRolledBack,
+    KernelRevoked,
+    KernelRetiring,
+    KernelRetired,
+    KernelCandidateCreated,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -20,6 +20,7 @@ use crate::generation::*;
 use crate::inference_api::*;
 use crate::kernel::*;
 use crate::kernel_dispatch::*;
+use crate::kernel_optimization_orchestration::run_kernel_optimization_orchestration_conformance;
 use crate::kernel_registry::*;
 use crate::kv_cache::*;
 use crate::memory::*;
@@ -725,16 +726,18 @@ fn apply_rope_per_head(
     HostTensor::new(tensor.shape.clone(), out).map_err(E2eConformanceError::from)
 }
 
-/// Runs a genuine (if tiny) decoder forward pass over `token_ids` using the
-/// real Reference CPU numeric kernels -- embedding lookup, RMSNorm, matmul,
-/// RoPE, attention, SiLU, elementwise mul/add, residual-add, and a tied
-/// softmax-normalized read-out -- returning raw logits (length =
-/// vocabulary size) for the final position. This is what makes the E2E
-/// success path genuinely deterministic rather than a canned-output stub.
-pub fn e2e_forward(
+/// Runs the decoder stack -- embedding lookup through every layer to the
+/// final RMSNorm -- using the real Reference CPU numeric kernels, returning
+/// the normed final hidden states rather than the tied-embedding logits
+/// projection itself. Split out from [`e2e_forward`] so a caller that needs
+/// the logits projection to be a genuine, evidence-bearing Kernel Dispatch
+/// (see `E2eRuntimeGenerationExecutor::execute_generation_step`) can perform
+/// that final matmul itself, instead of the returned logits being computed
+/// independently of the dispatch whose evidence is meant to certify them.
+fn e2e_forward_hidden_states(
     fixture: &E2eFixture,
     token_ids: &[TokenId],
-) -> Result<Vec<f32>, E2eConformanceError> {
+) -> Result<HostTensor, E2eConformanceError> {
     if token_ids.is_empty() {
         return Err(E2eConformanceError::GenerationFailed {
             reason: "forward pass requires at least one token".into(),
@@ -809,15 +812,29 @@ pub fn e2e_forward(
     }
 
     let final_norm = fixture_tensor_by_name(&fixture.weights, "final_norm")?;
-    let normed_final = rmsnorm(&hidden_states, final_norm, epsilon)?;
+    rmsnorm(&hidden_states, final_norm, epsilon).map_err(E2eConformanceError::from)
+}
+
+/// Runs a genuine (if tiny) decoder forward pass over `token_ids` using the
+/// real Reference CPU numeric kernels -- embedding lookup, RMSNorm, matmul,
+/// RoPE, attention, SiLU, elementwise mul/add, residual-add, and a tied
+/// softmax-normalized read-out -- returning raw logits (length =
+/// vocabulary size) for the final position. This is what makes the E2E
+/// success path genuinely deterministic rather than a canned-output stub.
+pub fn e2e_forward(
+    fixture: &E2eFixture,
+    token_ids: &[TokenId],
+) -> Result<Vec<f32>, E2eConformanceError> {
+    let normed_final = e2e_forward_hidden_states(fixture, token_ids)?;
+    let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")?;
     // Tied embeddings: logits = normed_final @ token_embedding^T.
     let logits = matmul(&normed_final, token_embedding, false, true)?;
     // Exercise the softmax kernel for operator-coverage/report purposes;
     // Sampling owns the authoritative distribution derived from raw logits.
     let _distribution = softmax_rows(&logits)?;
 
-    let vocab = architecture.vocabulary_size as usize;
-    let last_row_start = ((seq_len - 1) as usize) * vocab;
+    let vocab = fixture.config.architecture.vocabulary_size as usize;
+    let last_row_start = (token_ids.len() - 1) * vocab;
     Ok(logits.data[last_row_start..last_row_start + vocab].to_vec())
 }
 
@@ -827,6 +844,175 @@ struct E2eRuntimeGenerationExecutor {
     forced_token: Option<TokenId>,
 }
 
+/// Physically transposes a rank-2 [`HostTensor`], returning a `[cols, rows]`
+/// tensor whose `[j, i]` entry is `tensor[i, j]`. [`dispatch_matmul`] always
+/// runs an untransposed `a @ b` (matching what the portable `matmul`
+/// Operator's shape rule validates -- `a[-1] == b[-2]` -- which does not
+/// consult a `transpose_b` execution attribute), so a caller that needs
+/// `a @ b^T` transposes `b` itself before dispatching.
+fn transpose_rows_cols(tensor: &HostTensor) -> Result<HostTensor, E2eConformanceError> {
+    let (rows, cols) = tensor.rows_cols()?;
+    let mut out = vec![0.0_f32; tensor.data.len()];
+    for row in 0..rows {
+        for col in 0..cols {
+            out[(col * rows + row) as usize] = tensor.data[(row * cols + col) as usize];
+        }
+    }
+    HostTensor::new([cols, rows], out).map_err(E2eConformanceError::from)
+}
+
+/// Dispatches a genuine Kernel Registry -> Kernel Dispatch -> Reference CPU
+/// Provider matmul computing `a @ b`, returning both the
+/// [`KernelDispatchResult`] (used to build [`RuntimeGenerationExecutionEvidence`])
+/// and the actual output tensor the Provider computed and wrote back.
+///
+/// This exists so evidence is always drawn from the dispatch that produced
+/// the data a caller returns, rather than from an unrelated "proof"
+/// computation whose result is discarded: the caller reads the returned
+/// output tensor -- not a value it computed independently -- so a dispatch
+/// that never ran, or that ran over different data, cannot produce evidence
+/// for logits it did not causally produce.
+fn dispatch_matmul(
+    runtime: &Runtime,
+    a: &HostTensor,
+    b: &HostTensor,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let advertisements = reference_cpu_kernel_advertisements();
+    let matmul_operator = advertisements
+        .iter()
+        .find(|advertisement| advertisement.implemented_operator.name() == "matmul")
+        .map(|advertisement| advertisement.implemented_operator.clone())
+        .ok_or_else(|| InferenceApiError::KernelUnavailable {
+            reason: "Reference CPU fixture does not advertise matmul".into(),
+        })?;
+    let to_generation_failed = |error: ReferenceCpuError| InferenceApiError::GenerationFailed {
+        reason: error.to_string(),
+    };
+    let (a_rows, a_cols) = a.rows_cols().map_err(to_generation_failed)?;
+    let (b_rows, b_cols) = b.rows_cols().map_err(to_generation_failed)?;
+    let out_rows = a_rows;
+    let out_cols = b_cols;
+
+    let dtype = DTypeDescriptor::portable(ComputeDType::Float32);
+    let a_descriptor = TensorDescriptor::new(
+        ShapeDescriptor::new([a_rows, a_cols]),
+        dtype.clone(),
+        LayoutDescriptor::Contiguous,
+    );
+    let b_descriptor = TensorDescriptor::new(
+        ShapeDescriptor::new([b_rows, b_cols]),
+        dtype.clone(),
+        LayoutDescriptor::Contiguous,
+    );
+    let output_descriptor = TensorDescriptor::new(
+        ShapeDescriptor::new([out_rows, out_cols]),
+        dtype,
+        LayoutDescriptor::Contiguous,
+    );
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+        .with_execution_context(runtime.context().id());
+
+    let input_a = TensorResourceDescriptor::new(
+        TensorResourceId::new("e2e-runtime-generation-a"),
+        a_descriptor,
+        affinity.clone(),
+    );
+    let input_b = TensorResourceDescriptor::new(
+        TensorResourceId::new("e2e-runtime-generation-b"),
+        b_descriptor,
+        affinity.clone(),
+    );
+    let output = TensorResourceDescriptor::new(
+        TensorResourceId::new("e2e-runtime-generation-logits"),
+        output_descriptor,
+        affinity,
+    );
+    let selection_request = KernelSelectionRequest::new(
+        "e2e-runtime-generation-step",
+        matmul_operator,
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(KernelResource::new(
+        input_a.clone(),
+        KernelMemoryClass::Host,
+    ))
+    .with_input(KernelResource::new(
+        input_b.clone(),
+        KernelMemoryClass::Host,
+    ))
+    .with_output(KernelResource::new(output.clone(), KernelMemoryClass::Host));
+    let selection = runtime
+        .kernel_registry()
+        .select(&selection_request)
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: error.to_string(),
+        })?;
+    if selection.selected.is_none() {
+        return Err(InferenceApiError::KernelUnavailable {
+            reason: "Kernel Registry selected no Reference CPU candidate".into(),
+        });
+    }
+    let selected = selection
+        .selected
+        .as_ref()
+        .expect("selected candidate checked above");
+    let advertisement = runtime
+        .kernel_registry()
+        .active_advertisement(&selected.kernel)
+        .ok_or_else(|| InferenceApiError::KernelUnavailable {
+            reason: "selected Reference CPU advertisement is no longer active".into(),
+        })?;
+    let mut plan = KernelDispatchPlan::from_selection(
+        KernelDispatchPlanId::new("e2e-runtime-generation-dispatch"),
+        &selection_request,
+        selected,
+        advertisement,
+        KernelInvocationId::new("e2e-runtime-generation-invocation"),
+    )
+    .map_err(|error| InferenceApiError::KernelUnavailable {
+        reason: format!("{error:?}"),
+    })?;
+    let mut dispatcher = KernelDispatcher::new();
+    dispatcher
+        .revalidate(runtime.kernel_registry(), &mut plan)
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: format!("{error:?}"),
+        })?;
+    let provider = ReferenceCpuExecutor::new();
+    provider.write_tensor(input_a.id.clone(), a.clone());
+    provider.write_tensor(input_b.id.clone(), b.clone());
+    let mut memory = MemoryManager::default();
+    let operator_catalog = initial_operator_catalog();
+    let matmul_spec = operator_catalog
+        .get(&advertisement.implemented_operator)
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: error.to_string(),
+        })?;
+    let kernel_result = provider.execute_invocation_with_memory_manager(
+        advertisement,
+        matmul_spec,
+        &plan.invocation,
+        &mut memory,
+    );
+    let dispatch_result = KernelDispatchResult::from_kernel_result(&plan, kernel_result);
+    if dispatch_result.status != KernelResultStatus::Succeeded {
+        return Err(InferenceApiError::ProviderUnavailable {
+            reason: format!(
+                "Reference CPU matmul dispatch failed: {:?}",
+                dispatch_result.error
+            ),
+        });
+    }
+    let output_tensor =
+        provider
+            .read_tensor(&output.id)
+            .ok_or_else(|| InferenceApiError::GenerationFailed {
+                reason: "Reference CPU matmul dispatch produced no output tensor".into(),
+            })?;
+    Ok((dispatch_result, output_tensor))
+}
+
 impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
     fn execute_generation_step(
         &self,
@@ -834,141 +1020,61 @@ impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
     ) -> Result<RuntimeGenerationStep, InferenceApiError> {
-        let advertisements = reference_cpu_kernel_advertisements();
-        let matmul_operator = advertisements
-            .iter()
-            .find(|advertisement| advertisement.implemented_operator.name() == "matmul")
-            .map(|advertisement| advertisement.implemented_operator.clone())
-            .ok_or_else(|| InferenceApiError::KernelUnavailable {
-                reason: "Reference CPU fixture does not advertise matmul".into(),
-            })?;
-        let proof_descriptor = TensorDescriptor::new(
-            ShapeDescriptor::new([1, 1]),
-            DTypeDescriptor::portable(ComputeDType::Float32),
-            LayoutDescriptor::Contiguous,
-        );
-        let proof_affinity = ResourceAffinity::new(FallbackClass::Transparent)
-            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
-            .with_execution_context(runtime.context().id());
-        let proof_input_a = TensorResourceDescriptor::new(
-            TensorResourceId::new("e2e-runtime-generation-proof-a"),
-            proof_descriptor.clone(),
-            proof_affinity.clone(),
-        );
-        let proof_input_b = TensorResourceDescriptor::new(
-            TensorResourceId::new("e2e-runtime-generation-proof-b"),
-            proof_descriptor.clone(),
-            proof_affinity.clone(),
-        );
-        let proof_output = TensorResourceDescriptor::new(
-            TensorResourceId::new("e2e-runtime-generation-logits"),
-            proof_descriptor,
-            proof_affinity,
-        );
-        let selection_request = KernelSelectionRequest::new(
-            "e2e-runtime-generation-step",
-            matmul_operator,
-            ResourceAffinity::new(FallbackClass::Transparent),
-        )
-        .with_input(KernelResource::new(
-            proof_input_a.clone(),
-            KernelMemoryClass::Host,
-        ))
-        .with_input(KernelResource::new(
-            proof_input_b.clone(),
-            KernelMemoryClass::Host,
-        ))
-        .with_output(KernelResource::new(proof_output, KernelMemoryClass::Host));
-        let selection = runtime
-            .kernel_registry()
-            .select(&selection_request)
-            .map_err(|error| InferenceApiError::KernelUnavailable {
-                reason: error.to_string(),
-            })?;
-        if selection.selected.is_none() {
-            return Err(InferenceApiError::KernelUnavailable {
-                reason: "Kernel Registry selected no Reference CPU candidate".into(),
-            });
-        }
-        let selected = selection
-            .selected
-            .as_ref()
-            .expect("selected candidate checked above");
-        let advertisement = runtime
-            .kernel_registry()
-            .active_advertisement(&selected.kernel)
-            .ok_or_else(|| InferenceApiError::KernelUnavailable {
-                reason: "selected Reference CPU advertisement is no longer active".into(),
-            })?;
-        let mut plan = KernelDispatchPlan::from_selection(
-            KernelDispatchPlanId::new("e2e-runtime-generation-dispatch"),
-            &selection_request,
-            selected,
-            advertisement,
-            KernelInvocationId::new("e2e-runtime-generation-invocation"),
-        )
-        .map_err(|error| InferenceApiError::KernelUnavailable {
-            reason: format!("{error:?}"),
-        })?;
-        let mut dispatcher = KernelDispatcher::new();
-        dispatcher
-            .revalidate(runtime.kernel_registry(), &mut plan)
-            .map_err(|error| InferenceApiError::KernelUnavailable {
-                reason: format!("{error:?}"),
-            })?;
-        let provider = ReferenceCpuExecutor::new();
-        provider.write_tensor(
-            proof_input_a.id.clone(),
-            HostTensor::new([1, 1], vec![1.0]).map_err(|error| {
+        let vocab = self.fixture.config.architecture.vocabulary_size as usize;
+        let (dispatch_result, logits) = if let Some(token) = self.forced_token {
+            // Test-only deterministic shortcut, never exercised by
+            // `validate_e2e_no_shortcuts` (the success path this gate
+            // checks is always built without a forced token -- see
+            // `build_runtime_with_generation_executor`). The returned
+            // logits are synthetic by construction; a trivial matmul is
+            // still dispatched so the Provider/observability path is
+            // exercised, but its output is deliberately not what is
+            // returned.
+            let one = HostTensor::new([1, 1], vec![1.0]).map_err(|error| {
                 InferenceApiError::GenerationFailed {
                     reason: error.to_string(),
                 }
-            })?,
-        );
-        provider.write_tensor(
-            proof_input_b.id.clone(),
-            HostTensor::new([1, 1], vec![1.0]).map_err(|error| {
-                InferenceApiError::GenerationFailed {
-                    reason: error.to_string(),
-                }
-            })?,
-        );
-        let mut proof_memory = MemoryManager::default();
-        let operator_catalog = initial_operator_catalog();
-        let matmul_spec = operator_catalog
-            .get(&advertisement.implemented_operator)
-            .map_err(|error| InferenceApiError::KernelUnavailable {
-                reason: error.to_string(),
             })?;
-        let kernel_result = provider.execute_invocation_with_memory_manager(
-            advertisement,
-            matmul_spec,
-            &plan.invocation,
-            &mut proof_memory,
-        );
-        let dispatch_result = KernelDispatchResult::from_kernel_result(&plan, kernel_result);
-        if dispatch_result.status != KernelResultStatus::Succeeded {
-            return Err(InferenceApiError::ProviderUnavailable {
-                reason: format!(
-                    "Reference CPU proof dispatch failed: {:?}",
-                    dispatch_result.error
-                ),
-            });
-        }
-
-        let logits = if let Some(token) = self.forced_token {
-            let mut logits =
-                vec![0.0_f32; self.fixture.config.architecture.vocabulary_size as usize];
+            let (dispatch_result, _proof_output) = dispatch_matmul(runtime, &one, &one)?;
+            let mut logits = vec![0.0_f32; vocab];
             logits[token as usize] = 10.0;
-            logits
+            (dispatch_result, logits)
         } else {
             let mut sequence = request.input_token_ids.clone();
             sequence.extend_from_slice(generated_tokens);
-            e2e_forward(&self.fixture, &sequence).map_err(|error| {
-                InferenceApiError::GenerationFailed {
+            let normed_final =
+                e2e_forward_hidden_states(&self.fixture, &sequence).map_err(|error| {
+                    InferenceApiError::GenerationFailed {
+                        reason: error.to_string(),
+                    }
+                })?;
+            let token_embedding = fixture_tensor_by_name(&self.fixture.weights, "token_embedding")
+                .map_err(|error| InferenceApiError::GenerationFailed {
                     reason: error.to_string(),
-                }
-            })?
+                })?;
+            // Tied embeddings: logits = normed_final @ token_embedding^T.
+            // The portable `matmul` Operator's shape rule validates a plain
+            // `a @ b` (it does not consult a `transpose_b` attribute), so
+            // `token_embedding` is physically transposed here rather than
+            // passed with a transpose flag.
+            let token_embedding_transposed =
+                transpose_rows_cols(token_embedding).map_err(|error| {
+                    InferenceApiError::GenerationFailed {
+                        reason: error.to_string(),
+                    }
+                })?;
+            // The tied-embedding logits projection, dispatched for real:
+            // the output tensor read back here is exactly what is returned
+            // below, so the evidence this dispatch produces is causally
+            // tied to the returned logits rather than to an unrelated proof
+            // computation.
+            let (dispatch_result, output) =
+                dispatch_matmul(runtime, &normed_final, &token_embedding_transposed)?;
+            let last_row_start = (sequence.len() - 1) * vocab;
+            (
+                dispatch_result,
+                output.data[last_row_start..last_row_start + vocab].to_vec(),
+            )
         };
         Ok(RuntimeGenerationStep::new(
             logits,
@@ -1759,6 +1865,24 @@ fn check_cli_boundary_denials() -> Result<(), E2eConformanceError> {
     Ok(())
 }
 
+fn check_kernel_optimization_orchestration_boundary() -> Result<(), E2eConformanceError> {
+    let report = run_kernel_optimization_orchestration_conformance();
+    if !report.is_conformant() {
+        let failures: Vec<String> = report
+            .results
+            .into_iter()
+            .filter(|result| !result.passed)
+            .map(|result| result.requirement)
+            .collect();
+        return Err(E2eConformanceError::BoundaryViolation {
+            reason: format!(
+                "kernel optimization orchestration conformance report is not conformant: {failures:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn check_kv_cache_diagnostics_redacted() -> Result<(), E2eConformanceError> {
     // The first E2E suite does not wire a live KV Cache into generation;
     // `CacheUsageSummary` structurally carries only hit/miss booleans, so
@@ -2482,6 +2606,10 @@ pub fn run_e2e_local_inference_conformance() -> E2eConformanceReport {
         "kv-cache-diagnostics-redacted",
         check_kv_cache_diagnostics_redacted(),
     ));
+    report.record(E2eTestResult::from_result(
+        "kernel-optimization-orchestration-boundary",
+        check_kernel_optimization_orchestration_boundary(),
+    ));
 
     report.duration_millis = elapsed_millis(start);
     let metadata_check = check_report_metadata(&report);
@@ -2668,6 +2796,55 @@ mod tests {
     #[test]
     fn e2e_no_shortcut_direct_provider_invocation_is_rejected() {
         check_no_shortcut_direct_provider_rejected().expect("direct-invocation shortcut rejected");
+    }
+
+    #[test]
+    fn e2e_generation_step_logits_are_produced_by_the_evidence_bearing_dispatch() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        let runtime = build_runtime();
+        let sequence = vec![1u32, 2u32];
+
+        let normed_final =
+            e2e_forward_hidden_states(&fixture, &sequence).expect("hidden states computed");
+        let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")
+            .expect("token embedding present");
+        let token_embedding_transposed =
+            transpose_rows_cols(token_embedding).expect("token embedding transposes");
+
+        let (dispatch_result, dispatched_output) =
+            dispatch_matmul(&runtime, &normed_final, &token_embedding_transposed)
+                .expect("real matmul dispatch succeeds");
+        assert_eq!(dispatch_result.status, KernelResultStatus::Succeeded);
+
+        let vocab = fixture.config.architecture.vocabulary_size as usize;
+        let last_row_start = (sequence.len() - 1) * vocab;
+        let dispatched_logits = &dispatched_output.data[last_row_start..last_row_start + vocab];
+
+        // What `E2eRuntimeGenerationExecutor::execute_generation_step` returns
+        // for this sequence must equal the dispatch's own output exactly --
+        // it is read directly from `dispatched_output`, never recomputed
+        // separately -- so this also confirms the dispatch path is numerically
+        // correct against the independent `e2e_forward` ground truth.
+        let expected = e2e_forward(&fixture, &sequence).expect("forward pass produces logits");
+        assert_eq!(dispatched_logits, expected.as_slice());
+
+        // Tampering with the dispatch's actual input changes its output,
+        // proving the returned data is causally produced by this dispatch --
+        // not decorated onto an unrelated proof computation whose result is
+        // discarded, which is the shortcut this test guards against.
+        let corrupted_embedding = HostTensor::new(
+            token_embedding_transposed.shape.clone(),
+            vec![0.0_f32; token_embedding_transposed.data.len()],
+        )
+        .expect("zeroed tensor constructs");
+        let (corrupted_result, corrupted_output) =
+            dispatch_matmul(&runtime, &normed_final, &corrupted_embedding)
+                .expect("corrupted dispatch still succeeds");
+        assert_eq!(corrupted_result.status, KernelResultStatus::Succeeded);
+        assert_ne!(
+            &corrupted_output.data[last_row_start..last_row_start + vocab],
+            dispatched_logits
+        );
     }
 
     #[test]

@@ -155,6 +155,11 @@ pub const RELEASE_SECURITY_SCOPE_EXCLUDED_FROM_HARDENED_CLAIMS: &[&str] = &[
     "production-sandboxing",
     "agent-tool-runtime",
     "large-third-party-model-execution",
+    // Kernel Optimization Orchestration boundary: Magnetar's security
+    // boundary does not claim control over arbitrary external optimization
+    // infrastructure (see "Optimization Authority Is Outside Runtime
+    // Security Claim", `specs/release-security/spec.md`).
+    "kernel-optimization-orchestration",
 ];
 
 /// "CUDA is not claimed as hardened" (`specs/release-security/spec.md`,
@@ -690,7 +695,7 @@ pub const REDACTION_CATEGORIES: &[RedactionCategory] = &[
     RedactionCategory::RawCachePath,
 ];
 
-/// Textual fragments [`redact_backend_diagnostic`] does not already cover
+/// Textual fragments `redact_backend_diagnostic` does not already cover
 /// (it only recognizes `0x`/`handle=`-shaped native handles and `\`/`/`-
 /// shaped paths): prompt-, secret-, credential-, weight-, tensor-, KV-cache-,
 /// and file-content-shaped diagnostic text.
@@ -710,7 +715,7 @@ const RELEASE_SECURITY_SENSITIVE_CONTENT_FRAGMENTS: &[&str] = &[
 ];
 
 /// Redacts `raw` for release security observability/diagnostics: first
-/// applies [`redact_backend_diagnostic`] (native handles, local paths), then
+/// applies `redact_backend_diagnostic` (native handles, local paths), then
 /// checks the additional sensitive-content fragments this change's
 /// redaction gate covers.
 fn redact_release_security_detail(raw: &str) -> String {

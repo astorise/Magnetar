@@ -3,11 +3,23 @@
 //! The registry stores validated Kernel advertisements and produces metadata
 //! candidates for Runtime selection. It never exposes native function pointers,
 //! Provider handles, or direct client authority over Provider selection.
+//!
+//! [`CandidateState`], [`KernelRegistry::promote_generation`],
+//! [`KernelRegistry::rollback_generation`], and [`KernelRegistry::revoke_kernel`]
+//! implement the Registry-side lifecycle contract from
+//! `openspec/changes/define-generated-kernel-qualification-cache-and-hot-swap-contract`:
+//! atomic promotion, in-flight generation stability, safe retirement (see
+//! [`KernelRegistry::retire_prepared_kernel`] /
+//! [`KernelRegistry::destroy_prepared_kernel`] in
+//! `kernel_artifact.rs`-backed state), rollback, and revocation. See
+//! [`run_kernel_registry_lifecycle_conformance`] for the exercised
+//! guarantees.
 
 use crate::affinity::*;
 use crate::compute::*;
 use crate::execution_graph::*;
 use crate::kernel::*;
+use crate::kernel_artifact::*;
 use crate::model_instance::*;
 use crate::operator::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,6 +65,10 @@ pub enum KernelCandidateRejection {
     ConformanceFailed,
     PolicyDenied,
     StaleRegistryEntry,
+    /// Implements "Revoked Kernel Not Selected"
+    /// (`define-generated-kernel-qualification-cache-and-hot-swap-contract`):
+    /// a revoked Kernel SHALL NOT receive new work.
+    Revoked,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,23 +76,79 @@ pub enum KernelRegistryError {
     RegistryUnavailable,
     AdvertisementInvalid(String),
     RegistrationDenied(KernelRegistrationAuthority),
-    CandidateNotFound { operator: OperatorId },
-    CandidateIncompatible { reason: KernelCandidateRejection },
+    CandidateNotFound {
+        operator: OperatorId,
+    },
+    CandidateIncompatible {
+        reason: KernelCandidateRejection,
+    },
     SelectionFailed(String),
     PolicyDenied(String),
     ConformanceRequired,
-    ConformanceMissing { kernel: String },
-    ConformanceFailed { kernel: String },
-    ProviderUnavailable { provider: ProviderBinding },
-    ProviderNotReady { provider: ProviderBinding },
-    ProviderSaturated { provider: ProviderBinding },
-    DeviceUnavailable { device: DeviceBinding },
-    DeviceIncompatible { device: DeviceBinding },
+    ConformanceMissing {
+        kernel: String,
+    },
+    ConformanceFailed {
+        kernel: String,
+    },
+    ProviderUnavailable {
+        provider: ProviderBinding,
+    },
+    ProviderNotReady {
+        provider: ProviderBinding,
+    },
+    ProviderSaturated {
+        provider: ProviderBinding,
+    },
+    DeviceUnavailable {
+        device: DeviceBinding,
+    },
+    DeviceIncompatible {
+        device: DeviceBinding,
+    },
     MemoryInfeasible(String),
     WorkspaceUnavailable,
     ResourceAffinityConflict(String),
     BrowserFeatureUnsupported(String),
     Internal(String),
+    /// Implements "Registry Promotion Is Explicit" and "Atomic Kernel
+    /// Promotion"
+    /// (`define-generated-kernel-qualification-cache-and-hot-swap-contract`):
+    /// promotion requires a `Ready` Prepared Kernel generation for the
+    /// target Kernel.
+    PromotionNotEligible {
+        kernel: String,
+    },
+    /// Implements "Rollback"
+    /// (`define-generated-kernel-qualification-cache-and-hot-swap-contract`):
+    /// no retained previous generation is available to roll back to.
+    RollbackUnavailable {
+        kernel: String,
+    },
+    /// Implements "Revoked Kernel Not Selected"
+    /// (`define-generated-kernel-qualification-cache-and-hot-swap-contract`):
+    /// a revoked Kernel SHALL NOT receive new work.
+    KernelRevoked {
+        kernel: String,
+    },
+    /// Implements "Add hot-swap errors" (tasks): the `kernel-hot-swap-failed`
+    /// error category from the proposal's "Error Model" section.
+    HotSwapFailed {
+        reason: String,
+    },
+    /// Implements "Add retirement errors" (tasks): the
+    /// `kernel-retirement-in-use` error category -- retirement/destruction
+    /// was attempted while the generation is still referenced by active
+    /// work.
+    RetirementInUse {
+        kernel: String,
+    },
+    /// Implements "Add retirement errors" (tasks): the
+    /// `kernel-retirement-failed` error category -- retirement failed for a
+    /// reason other than active references.
+    RetirementFailed {
+        kernel: String,
+    },
 }
 
 impl KernelRegistryError {
@@ -102,6 +174,12 @@ impl KernelRegistryError {
             Self::ResourceAffinityConflict(_) => "kernel-resource-affinity-conflict",
             Self::BrowserFeatureUnsupported(_) => "kernel-browser-feature-unsupported",
             Self::Internal(_) => "internal-kernel-registry",
+            Self::PromotionNotEligible { .. } => "kernel-promotion-not-eligible",
+            Self::RollbackUnavailable { .. } => "kernel-rollback-unavailable",
+            Self::KernelRevoked { .. } => "kernel-revoked",
+            Self::HotSwapFailed { .. } => "kernel-hot-swap-failed",
+            Self::RetirementInUse { .. } => "kernel-retirement-in-use",
+            Self::RetirementFailed { .. } => "kernel-retirement-failed",
         }
     }
 }
@@ -155,11 +233,114 @@ impl fmt::Display for KernelRegistryError {
                 write!(f, "Kernel browser feature unsupported: {feature}")
             }
             Self::Internal(reason) => write!(f, "internal Kernel Registry error: {reason}"),
+            Self::PromotionNotEligible { kernel } => {
+                write!(
+                    f,
+                    "Kernel '{kernel}' has no Ready candidate generation to promote"
+                )
+            }
+            Self::RollbackUnavailable { kernel } => {
+                write!(f, "no rollback generation retained for Kernel '{kernel}'")
+            }
+            Self::KernelRevoked { kernel } => write!(f, "Kernel '{kernel}' is revoked"),
+            Self::HotSwapFailed { reason } => write!(f, "Kernel hot swap failed: {reason}"),
+            Self::RetirementInUse { kernel } => {
+                write!(
+                    f,
+                    "Kernel '{kernel}' retirement is blocked while still in use"
+                )
+            }
+            Self::RetirementFailed { kernel } => {
+                write!(f, "Kernel '{kernel}' retirement failed")
+            }
         }
     }
 }
 
 impl Error for KernelRegistryError {}
+
+/// Logical Registry candidate lifecycle state, implementing "Candidate
+/// State"
+/// (`define-generated-kernel-qualification-cache-and-hot-swap-contract`).
+/// This is distinct from [`crate::kernel_artifact::PreparedKernelState`]
+/// (the Provider-owned prepared-object state): this enum describes the
+/// Registry's own view of a logical Kernel generation's eligibility for
+/// dispatch, independent of the underlying native handle's lifecycle.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CandidateState {
+    Qualified,
+    Candidate,
+    Canary,
+    Active,
+    Retiring,
+    Retired,
+    Revoked,
+}
+
+impl CandidateState {
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Qualified, Self::Candidate)
+                | (Self::Candidate, Self::Canary)
+                | (Self::Candidate, Self::Active)
+                | (Self::Canary, Self::Active)
+                | (Self::Canary, Self::Retiring)
+                | (Self::Active, Self::Retiring)
+                | (Self::Retiring, Self::Retired)
+                | (Self::Qualified, Self::Revoked)
+                | (Self::Candidate, Self::Revoked)
+                | (Self::Canary, Self::Revoked)
+                | (Self::Active, Self::Revoked)
+        )
+    }
+
+    pub const fn is_dispatchable(self) -> bool {
+        matches!(self, Self::Active | Self::Canary)
+    }
+}
+
+/// Reserved for future automatic rollback triggering, implementing "Reserve
+/// automatic rollback" (proposal): "Automatic rollback MAY be supported. If
+/// enabled, trigger policy SHALL be explicit." This change does not
+/// implement any automatic trigger logic -- `enabled` defaults to `false`,
+/// and nothing in this Registry consults this policy yet.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AutomaticRollbackPolicy {
+    pub enabled: bool,
+}
+
+/// Governs [`KernelRegistry::destroy_prepared_kernel_with_rollback_window`],
+/// implementing "Rollback Window" (proposal).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RollbackWindowPolicy {
+    pub retain_previous_generation: bool,
+}
+
+/// Implements "Define in-flight revocation policy" (proposal): "Existing
+/// invocations SHALL follow policy: allow-to-complete, cancel-if-safe,
+/// fail-closed, Provider-specific." See
+/// [`KernelRegistry::revoke_kernel_with_policy`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RevocationInFlightPolicy {
+    AllowToComplete,
+    CancelIfSafe,
+    FailClosed,
+    ProviderSpecific,
+}
+
+/// A continuous-batching slot's binding to a specific Prepared Kernel
+/// generation, implementing "Continuous Batching" (proposal): "A batch
+/// slot/in-flight operation SHALL retain a valid Kernel generation for the
+/// duration required by execution semantics. New batch work MAY use the
+/// newly promoted generation." See
+/// [`KernelRegistry::bind_batch_slot`] and
+/// [`KernelRegistry::admit_new_batch_work`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BatchSlotKernelBinding {
+    pub slot: u64,
+    pub generation: PreparedKernelId,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct KernelRegistryEntry {
@@ -326,6 +507,29 @@ pub struct KernelRegistry {
     revoked_conformance_profiles: BTreeSet<String>,
     policy_generation: u64,
     observations: Vec<KernelObservation>,
+    /// Prepared Kernel state associated with compatible Kernel candidates.
+    /// Implements "Registry Tracks Prepared Kernel Readiness" and "Registry
+    /// Supports Multiple Prepared Generations"
+    /// (`define-kernel-artifact-and-preparation-contract`). Never holds a
+    /// native executable pointer -- only opaque `PreparedKernelId`s.
+    prepared_kernels: BTreeMap<PreparedKernelId, PreparedKernel>,
+    artifact_observations: Vec<KernelArtifactObservation>,
+    /// The currently active Prepared Kernel generation per logical Kernel,
+    /// implementing "Atomic Registry Promotion"
+    /// (`define-generated-kernel-qualification-cache-and-hot-swap-contract`):
+    /// a single `BTreeMap` write is the one publication point new dispatches
+    /// observe, so a lookup during promotion always sees either the
+    /// complete old value or the complete new value, never a partially
+    /// updated one.
+    active_generations: BTreeMap<String, PreparedKernelId>,
+    /// The single previously active generation retained per Kernel,
+    /// implementing "Rollback Candidate": "A previously active Kernel
+    /// SHOULD be retained long enough to support rollback."
+    previous_generations: BTreeMap<String, PreparedKernelId>,
+    /// Kernels whose qualification has been revoked, implementing
+    /// "Revocation Of Active Kernel": "Runtime SHALL stop new dispatches to
+    /// it."
+    revoked_kernels: BTreeSet<String>,
 }
 
 impl KernelRegistry {
@@ -339,6 +543,363 @@ impl KernelRegistry {
 
     pub fn observations(&self) -> &[KernelObservation] {
         &self.observations
+    }
+
+    pub fn artifact_observations(&self) -> &[KernelArtifactObservation] {
+        &self.artifact_observations
+    }
+
+    /// Associates a compatible Kernel candidate with Prepared Kernel state,
+    /// implementing "Registry Tracks Prepared Kernel Readiness". The
+    /// Registry stores only `prepared.id`, `prepared.kernel`, and
+    /// `prepared.generation` bookkeeping -- it never gains a native
+    /// executable pointer through this call, implementing "Registry Does
+    /// Not Own Native Handles".
+    pub fn register_prepared_kernel(&mut self, prepared: PreparedKernel) {
+        self.artifact_observations.push(
+            KernelArtifactObservation::new(KernelArtifactObservationKind::PreparedKernelRegistered)
+                .with_artifact(prepared.kernel.stable_key())
+                .with_redacted_metadata("generation", prepared.generation.value().to_string()),
+        );
+        // Implements "Observe candidate creation" (tasks): a newly
+        // registered Prepared Kernel is a Registry candidate the moment it
+        // exists, independent of whether it is ever promoted.
+        self.observations.push(
+            KernelObservation::new(KernelObservationKind::KernelCandidateCreated)
+                .with_kernel(&prepared.kernel)
+                .with_redacted_metadata("generation", prepared.generation.value().to_string()),
+        );
+        self.prepared_kernels.insert(prepared.id, prepared);
+    }
+
+    pub fn prepared_kernel(&self, id: &PreparedKernelId) -> Option<&PreparedKernel> {
+        self.prepared_kernels.get(id)
+    }
+
+    pub fn prepared_kernels_for<'a>(
+        &'a self,
+        kernel: &'a KernelId,
+    ) -> impl Iterator<Item = &'a PreparedKernel> {
+        self.prepared_kernels
+            .values()
+            .filter(move |prepared| &prepared.kernel == kernel)
+    }
+
+    /// Whether `kernel` has at least one dispatchable (`Ready`) Prepared
+    /// Kernel. A `KernelId` with no registered Prepared Kernel entries at
+    /// all is not artifact-backed and is therefore not gated by this check
+    /// -- "Kernel implementation MAY be backed by a Kernel Artifact
+    /// lifecycle" (proposal): this is opt-in, not retroactively required for
+    /// every existing Kernel.
+    pub fn validate_prepared_readiness(
+        &self,
+        kernel: &KernelId,
+    ) -> Result<(), KernelArtifactError> {
+        let mut candidates = self.prepared_kernels_for(kernel).peekable();
+        if candidates.peek().is_none() {
+            return Ok(());
+        }
+        if candidates.any(|prepared| prepared.state.is_dispatchable()) {
+            Ok(())
+        } else {
+            Err(KernelArtifactError::PreparedNotReady {
+                kernel: kernel.stable_key(),
+            })
+        }
+    }
+
+    /// Retires a Prepared Kernel generation ahead of destruction.
+    pub fn retire_prepared_kernel(
+        &mut self,
+        id: &PreparedKernelId,
+    ) -> Result<(), KernelArtifactError> {
+        let prepared = self.prepared_kernels.get_mut(id).ok_or_else(|| {
+            KernelArtifactError::PreparedHandleInvalid {
+                reason: format!("unknown Prepared Kernel {id}"),
+            }
+        })?;
+        prepared.retire()?;
+        self.artifact_observations.push(
+            KernelArtifactObservation::new(KernelArtifactObservationKind::PreparedKernelRetired)
+                .with_artifact(prepared.kernel.stable_key()),
+        );
+        Ok(())
+    }
+
+    /// Destroys a Prepared Kernel generation, implementing "Older Prepared
+    /// Kernels MAY be destroyed only after no active operation references
+    /// them" -- destruction fails while `active_references() > 0`.
+    pub fn destroy_prepared_kernel(
+        &mut self,
+        id: &PreparedKernelId,
+    ) -> Result<(), KernelArtifactError> {
+        let prepared = self.prepared_kernels.get_mut(id).ok_or_else(|| {
+            KernelArtifactError::PreparedHandleInvalid {
+                reason: format!("unknown Prepared Kernel {id}"),
+            }
+        })?;
+        prepared.destroy()?;
+        let kernel = prepared.kernel.stable_key();
+        self.prepared_kernels.remove(id);
+        self.artifact_observations.push(
+            KernelArtifactObservation::new(KernelArtifactObservationKind::PreparedKernelDestroyed)
+                .with_artifact(kernel),
+        );
+        Ok(())
+    }
+
+    /// Guards [`Self::destroy_prepared_kernel`] with an explicit rollback
+    /// window, implementing "Rollback Window" (proposal): "Allow retention
+    /// period for previous generation" and "Prevent immediate destruction
+    /// when rollback required." While `policy.retain_previous_generation` is
+    /// set, destroying the generation still recorded as any Kernel's
+    /// rollback candidate (see [`Self::rollback_generation`]) is denied.
+    pub fn destroy_prepared_kernel_with_rollback_window(
+        &mut self,
+        id: &PreparedKernelId,
+        policy: RollbackWindowPolicy,
+    ) -> Result<(), KernelArtifactError> {
+        if policy.retain_previous_generation
+            && self
+                .previous_generations
+                .values()
+                .any(|previous| previous == id)
+        {
+            let generation = self
+                .prepared_kernels
+                .get(id)
+                .map(|prepared| prepared.generation.value())
+                .unwrap_or_default();
+            return Err(KernelArtifactError::PreparedGenerationInUse { generation });
+        }
+        self.destroy_prepared_kernel(id)
+    }
+
+    /// Returns the currently active Prepared Kernel for `kernel`, implementing
+    /// "Multiple Prepared Generations": Registry tracks at most one active
+    /// generation per logical Kernel at a time.
+    pub fn active_prepared_kernel(&self, kernel: &KernelId) -> Option<&PreparedKernel> {
+        self.active_generations
+            .get(&kernel.stable_key())
+            .and_then(|id| self.prepared_kernels.get(id))
+    }
+
+    /// Binds a continuous-batching slot to the Kernel generation it
+    /// currently acquires, implementing "Continuous Batching" (proposal):
+    /// "Preserve Kernel generation for in-flight batch work" (tasks). The
+    /// returned [`BatchSlotKernelBinding`] is a plain value snapshot -- it
+    /// stays valid for the slot's lifetime even after a later promotion
+    /// changes [`Self::active_prepared_kernel`].
+    pub fn bind_batch_slot(&self, kernel: &KernelId, slot: u64) -> Option<BatchSlotKernelBinding> {
+        self.active_prepared_kernel(kernel)
+            .map(|prepared| BatchSlotKernelBinding {
+                slot,
+                generation: prepared.id,
+            })
+    }
+
+    /// Implements "Allow new batch work to use new generation" (tasks): new
+    /// batch admissions always resolve against the *current* active
+    /// generation, independent of any existing [`BatchSlotKernelBinding`].
+    pub fn admit_new_batch_work(&self, kernel: &KernelId) -> Option<PreparedKernelId> {
+        self.active_prepared_kernel(kernel)
+            .map(|prepared| prepared.id)
+    }
+
+    /// Promotes `candidate` to be the active Prepared Kernel generation for
+    /// `kernel`, implementing "Registry Promotion Is Explicit" and "Atomic
+    /// Kernel Promotion"
+    /// (`define-generated-kernel-qualification-cache-and-hot-swap-contract`):
+    /// promotion never happens implicitly (it is the only path that writes
+    /// `active_generations`), requires the candidate to already be `Ready`
+    /// (implementing "Registry Promotion Is Explicit": preparation-without-
+    /// promotion SHALL NOT become active on its own), retires the previous
+    /// generation via [`Self::retire_prepared_kernel`] rather than
+    /// destroying it outright (implementing "In-Flight Stability": an
+    /// invocation holding the old generation keeps using it), and retains
+    /// the previous generation as the rollback candidate (implementing
+    /// "Rollback Candidate").
+    pub fn promote_generation(
+        &mut self,
+        kernel: &KernelId,
+        candidate: PreparedKernelId,
+    ) -> Result<(), KernelRegistryError> {
+        if self.revoked_kernels.contains(&kernel.stable_key()) {
+            return Err(KernelRegistryError::KernelRevoked {
+                kernel: kernel.stable_key(),
+            });
+        }
+        let is_ready = self
+            .prepared_kernels
+            .get(&candidate)
+            .is_some_and(|prepared| prepared.state.is_dispatchable());
+        if !is_ready {
+            return Err(KernelRegistryError::PromotionNotEligible {
+                kernel: kernel.stable_key(),
+            });
+        }
+        let key = kernel.stable_key();
+        if let Some(previous) = self.active_generations.get(&key).copied() {
+            // Retiring (rather than destroying) preserves in-flight safety:
+            // an invocation that already acquired `previous` keeps a valid
+            // reference until it releases it (see
+            // `crate::kernel_artifact::PreparedKernel::destroy`).
+            let _ = self.retire_prepared_kernel(&previous);
+            self.previous_generations.insert(key.clone(), previous);
+        }
+        // The single map write below is the atomic publication point: a
+        // concurrent lookup via `active_prepared_kernel` observes either the
+        // pre-promotion value or this one, never an intermediate state.
+        self.active_generations.insert(key.clone(), candidate);
+        let generation = self
+            .prepared_kernels
+            .get(&candidate)
+            .map(|prepared| prepared.generation.value())
+            .unwrap_or_default();
+        self.artifact_observations.push(
+            KernelArtifactObservation::new(
+                KernelArtifactObservationKind::ArtifactReplacementOccurred,
+            )
+            .with_artifact(key.clone())
+            // Implements "Record generation" (tasks): the promotion
+            // observation identifies which generation became active.
+            .with_redacted_metadata("generation", generation.to_string()),
+        );
+        self.observations.push(
+            KernelObservation::new(KernelObservationKind::KernelGenerationPromoted)
+                .with_kernel(kernel)
+                .with_redacted_metadata("generation", generation.to_string()),
+        );
+        Ok(())
+    }
+
+    /// Validates trust/qualification eligibility before delegating to
+    /// [`Self::promote_generation`], implementing "Validate eligibility
+    /// before promotion" (tasks): promotion SHALL NOT proceed for a
+    /// candidate that fails
+    /// [`crate::kernel_qualification::evaluate_eligibility`], independent of
+    /// the Prepared Kernel readiness check `promote_generation` already
+    /// performs on its own.
+    pub fn promote_generation_with_eligibility(
+        &mut self,
+        kernel: &KernelId,
+        candidate: PreparedKernelId,
+        trust: crate::kernel_artifact::KernelArtifactTrust,
+        qualification_status: crate::kernel_qualification::QualificationStatus,
+        policy: &crate::kernel_qualification::KernelEligibilityPolicy,
+    ) -> Result<(), KernelRegistryError> {
+        crate::kernel_qualification::evaluate_eligibility(trust, qualification_status, policy)
+            .map_err(|error| KernelRegistryError::PromotionNotEligible {
+                kernel: format!("{}: {error}", kernel.stable_key()),
+            })?;
+        self.promote_generation(kernel, candidate)
+    }
+
+    /// Implements "Resource Affinity" (proposal) at promotion time:
+    /// "Validate candidate Device affinity before promotion" and "Reject
+    /// incompatible prepared target." Tensor residency constraints are
+    /// preserved because a candidate is never promoted onto a Device other
+    /// than the one its Prepared Kernel state actually resides on.
+    pub fn promote_generation_with_affinity(
+        &mut self,
+        kernel: &KernelId,
+        candidate: PreparedKernelId,
+        required_device: &DeviceBinding,
+    ) -> Result<(), KernelRegistryError> {
+        let device_matches = self
+            .prepared_kernels
+            .get(&candidate)
+            .is_some_and(|prepared| &prepared.device == required_device);
+        if !device_matches {
+            return Err(KernelRegistryError::ResourceAffinityConflict(format!(
+                "candidate Prepared Kernel Device does not match required Device '{required_device}'"
+            )));
+        }
+        self.promote_generation(kernel, candidate)
+    }
+
+    /// Rolls back `kernel` to its previously active generation, implementing
+    /// "Rollback"
+    /// (`define-generated-kernel-qualification-cache-and-hot-swap-contract`):
+    /// available only while a retained previous generation still exists and
+    /// remains dispatchable.
+    pub fn rollback_generation(&mut self, kernel: &KernelId) -> Result<(), KernelRegistryError> {
+        let key = kernel.stable_key();
+        let previous = self
+            .previous_generations
+            .get(&key)
+            .copied()
+            .ok_or_else(|| KernelRegistryError::RollbackUnavailable {
+                kernel: key.clone(),
+            })?;
+        let still_dispatchable = self
+            .prepared_kernels
+            .get(&previous)
+            .is_some_and(|prepared| {
+                matches!(
+                    prepared.state,
+                    crate::kernel_artifact::PreparedKernelState::Ready
+                        | crate::kernel_artifact::PreparedKernelState::Retiring
+                )
+            });
+        if !still_dispatchable {
+            return Err(KernelRegistryError::RollbackUnavailable { kernel: key });
+        }
+        if let Some(prepared) = self.prepared_kernels.get_mut(&previous) {
+            // Undo the retirement so the rolled-back generation accepts new
+            // dispatches again.
+            prepared.state = crate::kernel_artifact::PreparedKernelState::Ready;
+        }
+        self.active_generations.insert(key.clone(), previous);
+        self.previous_generations.remove(&key);
+        self.artifact_observations.push(
+            KernelArtifactObservation::new(
+                KernelArtifactObservationKind::ArtifactReplacementOccurred,
+            )
+            .with_artifact(key)
+            .with_redacted_metadata("event", "rollback"),
+        );
+        Ok(())
+    }
+
+    /// Marks `kernel` revoked, implementing "Revocation Of Active Kernel"
+    /// (`define-generated-kernel-qualification-cache-and-hot-swap-contract`):
+    /// "Runtime SHALL stop new dispatches to it." Existing in-flight
+    /// invocations are unaffected -- this only stops new candidate lookups
+    /// (see `candidate_for_entry`) from selecting it.
+    pub fn revoke_kernel(&mut self, kernel: &KernelId, reason: impl Into<String>) {
+        self.revoke_kernel_with_policy(kernel, reason, RevocationInFlightPolicy::AllowToComplete);
+    }
+
+    /// Implements "Define in-flight revocation policy" (proposal): "Existing
+    /// invocations SHALL follow policy: allow-to-complete, cancel-if-safe,
+    /// fail-closed, Provider-specific." Recorded alongside the revocation
+    /// observation; enforcing cancellation/fail-closed behavior against a
+    /// live invocation is a Provider/execution-layer concern outside this
+    /// Registry's scope -- this Registry only stops *new* dispatches (see
+    /// `candidate_for_entry`) and records which policy governs the
+    /// in-flight ones.
+    pub fn revoke_kernel_with_policy(
+        &mut self,
+        kernel: &KernelId,
+        reason: impl Into<String>,
+        in_flight_policy: RevocationInFlightPolicy,
+    ) {
+        let key = kernel.stable_key();
+        self.revoked_kernels.insert(key.clone());
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.active = false;
+            entry.invalidation_reason = Some(reason.into());
+        }
+        self.observations.push(
+            KernelObservation::new(KernelObservationKind::KernelRevoked)
+                .with_kernel(kernel)
+                .with_redacted_metadata("in-flight-policy", format!("{in_flight_policy:?}")),
+        );
+    }
+
+    pub fn is_kernel_revoked(&self, kernel: &KernelId) -> bool {
+        self.revoked_kernels.contains(&kernel.stable_key())
     }
 
     pub fn set_provider_status(&mut self, status: ProviderStatusSnapshot) {
@@ -605,6 +1166,12 @@ impl KernelRegistry {
         request: &KernelSelectionRequest,
     ) -> KernelCandidate {
         let advertisement = &entry.advertisement;
+        if self
+            .revoked_kernels
+            .contains(&advertisement.id.stable_key())
+        {
+            return KernelCandidate::rejected(advertisement, KernelCandidateRejection::Revoked);
+        }
         if !entry.active {
             return KernelCandidate::rejected(
                 advertisement,
@@ -1077,4 +1644,376 @@ fn prefix_cache_compatible(
         && (!required.supports_adjusted_context_length
             || supported.supports_adjusted_context_length)
         && (!required.supports_reused_prefix_boundary || supported.supports_reused_prefix_boundary)
+}
+
+// ---------------------------------------------------------------------
+// Generated Kernel lifecycle conformance
+// ---------------------------------------------------------------------
+
+/// A single Registry lifecycle conformance check result, mirroring
+/// [`crate::kernel_artifact::KernelArtifactConformanceResult`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelRegistryLifecycleConformanceResult {
+    pub requirement: String,
+    pub passed: bool,
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelRegistryLifecycleConformanceReport {
+    pub results: Vec<KernelRegistryLifecycleConformanceResult>,
+}
+
+impl KernelRegistryLifecycleConformanceReport {
+    pub fn is_conformant(&self) -> bool {
+        self.results.iter().all(|result| result.passed)
+    }
+}
+
+fn lifecycle_record(
+    results: &mut Vec<KernelRegistryLifecycleConformanceResult>,
+    requirement: impl Into<String>,
+    passed: bool,
+    diagnostic: impl Into<String>,
+) {
+    let diagnostic = diagnostic.into();
+    results.push(KernelRegistryLifecycleConformanceResult {
+        requirement: requirement.into(),
+        passed,
+        diagnostic: (!passed).then_some(diagnostic),
+    });
+}
+
+/// Runs the Registry-side generated-Kernel lifecycle conformance checks
+/// required by
+/// `openspec/changes/define-generated-kernel-qualification-cache-and-hot-swap-contract/specs/kernel-registry/spec.md`
+/// and the corresponding requirements of `specs/conformance/spec.md`:
+/// atomic promotion, in-flight generation safety, safe retirement, rollback,
+/// and revocation.
+pub fn run_kernel_registry_lifecycle_conformance() -> KernelRegistryLifecycleConformanceReport {
+    let mut results = Vec::new();
+
+    let kernel = KernelId::new(
+        ProviderBinding::new("conformance-provider"),
+        "conformance-kernel",
+        crate::CapabilityVersion::new(1, 0, 0),
+        OperatorId::magnetar("matmul", 1, crate::OperatorFamily::LinearAlgebra),
+        KernelOperatorVersionRange::exact(1),
+        crate::KernelImplementationFamily::TestFixture,
+    );
+    let device = DeviceBinding::new(crate::DeviceId::new("conformance-device"));
+    let mut allocator = PreparedKernelIdAllocator::default();
+    let mut registry = KernelRegistry::new();
+    registry
+        .register_fixture_advertisement(KernelAdvertisement::new(kernel.clone()))
+        .ok();
+
+    let mut generation_one = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-v1"),
+        ProviderBinding::new("conformance-provider"),
+        device.clone(),
+        PreparedKernelGeneration::new(1),
+    );
+    generation_one.mark_ready().ok();
+    let generation_one_id = generation_one.id;
+    registry.register_prepared_kernel(generation_one);
+
+    let promote_first = registry.promote_generation(&kernel, generation_one_id);
+    lifecycle_record(
+        &mut results,
+        "promotion requires an explicit call and is not implicit on registration",
+        promote_first.is_ok()
+            && registry
+                .active_prepared_kernel(&kernel)
+                .is_some_and(|prepared| prepared.id == generation_one_id),
+        format!("unexpected outcome: {promote_first:?}"),
+    );
+
+    let mut generation_two = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-v2"),
+        ProviderBinding::new("conformance-provider"),
+        device.clone(),
+        PreparedKernelGeneration::new(2),
+    );
+    generation_two.mark_ready().ok();
+    let generation_two_id = generation_two.id;
+    registry.register_prepared_kernel(generation_two);
+
+    // Simulate an in-flight invocation holding generation one before
+    // promoting generation two.
+    registry
+        .prepared_kernels
+        .get_mut(&generation_one_id)
+        .unwrap()
+        .add_reference();
+
+    let promote_second = registry.promote_generation(&kernel, generation_two_id);
+    lifecycle_record(
+        &mut results,
+        "atomic promotion: active generation observes complete new value",
+        promote_second.is_ok()
+            && registry
+                .active_prepared_kernel(&kernel)
+                .is_some_and(|prepared| prepared.id == generation_two_id),
+        format!("unexpected outcome: {promote_second:?}"),
+    );
+
+    lifecycle_record(
+        &mut results,
+        "in-flight invocation retains a valid old generation after promotion",
+        registry
+            .prepared_kernel(&generation_one_id)
+            .is_some_and(|prepared| {
+                prepared.state == crate::kernel_artifact::PreparedKernelState::Retiring
+                    && prepared.active_references() > 0
+            }),
+        "expected old generation to be Retiring but still referenced",
+    );
+
+    let destroy_while_referenced = registry.destroy_prepared_kernel(&generation_one_id);
+    lifecycle_record(
+        &mut results,
+        "safe retirement: destruction is blocked while old generation is referenced",
+        destroy_while_referenced.is_err(),
+        format!("unexpected outcome: {destroy_while_referenced:?}"),
+    );
+
+    let rollback = registry.rollback_generation(&kernel);
+    lifecycle_record(
+        &mut results,
+        "rollback restores the previously active generation",
+        rollback.is_ok()
+            && registry
+                .active_prepared_kernel(&kernel)
+                .is_some_and(|prepared| prepared.id == generation_one_id),
+        format!("unexpected outcome: {rollback:?}"),
+    );
+
+    // Rollback window: a dedicated scenario where a retained rollback
+    // candidate has zero active references (so an ordinary
+    // `destroy_prepared_kernel` would otherwise succeed) is still protected
+    // while the window policy requires retention, and destroyable once the
+    // policy is relaxed.
+    {
+        let window_kernel = KernelId::new(
+            ProviderBinding::new("conformance-provider"),
+            "conformance-window-kernel",
+            crate::CapabilityVersion::new(1, 0, 0),
+            OperatorId::magnetar("matmul", 1, crate::OperatorFamily::LinearAlgebra),
+            KernelOperatorVersionRange::exact(1),
+            crate::KernelImplementationFamily::TestFixture,
+        );
+        let mut window_registry = KernelRegistry::new();
+        let mut window_gen_one = PreparedKernel::new(
+            allocator.allocate(),
+            window_kernel.clone(),
+            CompiledKernelArtifactId::from_digest("digest-window-v1"),
+            ProviderBinding::new("conformance-provider"),
+            device.clone(),
+            PreparedKernelGeneration::new(1),
+        );
+        window_gen_one.mark_ready().ok();
+        let window_gen_one_id = window_gen_one.id;
+        window_registry.register_prepared_kernel(window_gen_one);
+        window_registry
+            .promote_generation(&window_kernel, window_gen_one_id)
+            .ok();
+
+        let mut window_gen_two = PreparedKernel::new(
+            allocator.allocate(),
+            window_kernel.clone(),
+            CompiledKernelArtifactId::from_digest("digest-window-v2"),
+            ProviderBinding::new("conformance-provider"),
+            device.clone(),
+            PreparedKernelGeneration::new(2),
+        );
+        window_gen_two.mark_ready().ok();
+        let window_gen_two_id = window_gen_two.id;
+        window_registry.register_prepared_kernel(window_gen_two);
+        // Promoting generation two retires generation one (zero active
+        // references) and records it as the rollback candidate.
+        window_registry
+            .promote_generation(&window_kernel, window_gen_two_id)
+            .ok();
+
+        let retained = window_registry
+            .previous_generations
+            .get(&window_kernel.stable_key())
+            == Some(&window_gen_one_id);
+        let blocked_destroy = window_registry.destroy_prepared_kernel_with_rollback_window(
+            &window_gen_one_id,
+            RollbackWindowPolicy {
+                retain_previous_generation: true,
+            },
+        );
+        lifecycle_record(
+            &mut results,
+            "rollback window blocks destroying the retained rollback candidate",
+            retained
+                && matches!(
+                    blocked_destroy,
+                    Err(KernelArtifactError::PreparedGenerationInUse { .. })
+                ),
+            format!("unexpected outcome: {blocked_destroy:?}"),
+        );
+
+        let allowed_destroy = window_registry.destroy_prepared_kernel_with_rollback_window(
+            &window_gen_one_id,
+            RollbackWindowPolicy {
+                retain_previous_generation: false,
+            },
+        );
+        lifecycle_record(
+            &mut results,
+            "destruction proceeds once the rollback window policy is relaxed",
+            allowed_destroy.is_ok(),
+            format!("unexpected outcome: {allowed_destroy:?}"),
+        );
+    }
+
+    // Failure atomicity: promoting a not-yet-ready candidate leaves the
+    // active generation untouched.
+    let mut unready_candidate = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-v3"),
+        ProviderBinding::new("conformance-provider"),
+        device.clone(),
+        PreparedKernelGeneration::new(3),
+    );
+    let unready_candidate_id = unready_candidate.id;
+    // Never marked ready -- simulates a preparation failure.
+    let _ = unready_candidate.mark_failed("simulated preparation failure");
+    registry.register_prepared_kernel(unready_candidate);
+    let active_before_failed_promotion = registry
+        .active_prepared_kernel(&kernel)
+        .map(|prepared| prepared.id);
+    let failed_promotion = registry.promote_generation(&kernel, unready_candidate_id);
+    lifecycle_record(
+        &mut results,
+        "failed promotion leaves the active generation intact",
+        matches!(
+            failed_promotion,
+            Err(KernelRegistryError::PromotionNotEligible { .. })
+        ) && registry
+            .active_prepared_kernel(&kernel)
+            .map(|prepared| prepared.id)
+            == active_before_failed_promotion,
+        format!("unexpected outcome: {failed_promotion:?}"),
+    );
+
+    // Resource Affinity: promotion is rejected when the candidate's Device
+    // does not match the required Device, and accepted when it does. Uses a
+    // dedicated fresh generation so it does not disturb the generation-one/
+    // generation-two bookkeeping exercised above.
+    let mut generation_affinity = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-v4"),
+        ProviderBinding::new("conformance-provider"),
+        device.clone(),
+        PreparedKernelGeneration::new(4),
+    );
+    generation_affinity.mark_ready().ok();
+    let generation_affinity_id = generation_affinity.id;
+    registry.register_prepared_kernel(generation_affinity);
+
+    let other_device = DeviceBinding::new(crate::DeviceId::new("other-conformance-device"));
+    let affinity_mismatch =
+        registry.promote_generation_with_affinity(&kernel, generation_affinity_id, &other_device);
+    lifecycle_record(
+        &mut results,
+        "promotion is rejected when candidate Device does not match required affinity",
+        matches!(
+            affinity_mismatch,
+            Err(KernelRegistryError::ResourceAffinityConflict(_))
+        ),
+        format!("unexpected outcome: {affinity_mismatch:?}"),
+    );
+    let affinity_match =
+        registry.promote_generation_with_affinity(&kernel, generation_affinity_id, &device);
+    lifecycle_record(
+        &mut results,
+        "promotion succeeds when candidate Device matches required affinity",
+        affinity_match.is_ok(),
+        format!("unexpected outcome: {affinity_match:?}"),
+    );
+
+    // Eligibility gate: promotion is rejected for an unqualified candidate
+    // even though it is Ready, and accepted once eligible. Uses its own
+    // fresh generation for the same reason as the affinity check above.
+    let mut generation_eligibility = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-v5"),
+        ProviderBinding::new("conformance-provider"),
+        device.clone(),
+        PreparedKernelGeneration::new(5),
+    );
+    generation_eligibility.mark_ready().ok();
+    let generation_eligibility_id = generation_eligibility.id;
+    registry.register_prepared_kernel(generation_eligibility);
+
+    let ineligible_policy = crate::kernel_qualification::KernelEligibilityPolicy {
+        require_trusted: false,
+        require_qualified: true,
+    };
+    let eligibility_rejected = registry.promote_generation_with_eligibility(
+        &kernel,
+        generation_eligibility_id,
+        crate::kernel_artifact::KernelArtifactTrust::Untrusted,
+        crate::kernel_qualification::QualificationStatus::Unqualified,
+        &ineligible_policy,
+    );
+    lifecycle_record(
+        &mut results,
+        "promotion is rejected for an unqualified candidate when policy requires qualification",
+        matches!(
+            eligibility_rejected,
+            Err(KernelRegistryError::PromotionNotEligible { .. })
+        ),
+        format!("unexpected outcome: {eligibility_rejected:?}"),
+    );
+    let eligibility_accepted = registry.promote_generation_with_eligibility(
+        &kernel,
+        generation_eligibility_id,
+        crate::kernel_artifact::KernelArtifactTrust::Untrusted,
+        crate::kernel_qualification::QualificationStatus::Qualified,
+        &ineligible_policy,
+    );
+    lifecycle_record(
+        &mut results,
+        "promotion succeeds for a qualified candidate meeting policy",
+        eligibility_accepted.is_ok(),
+        format!("unexpected outcome: {eligibility_accepted:?}"),
+    );
+
+    registry.revoke_kernel_with_policy(
+        &kernel,
+        "qualification suite defect",
+        RevocationInFlightPolicy::CancelIfSafe,
+    );
+    let request = KernelSelectionRequest::new(
+        "conformance-request",
+        OperatorId::magnetar("matmul", 1, crate::OperatorFamily::LinearAlgebra),
+        crate::ResourceAffinity::new(crate::FallbackClass::Transparent),
+    );
+    let selection = registry.select(&request);
+    lifecycle_record(
+        &mut results,
+        "revoked Kernel receives no new work",
+        matches!(
+            selection,
+            Err(KernelRegistryError::CandidateIncompatible {
+                reason: KernelCandidateRejection::Revoked
+            })
+        ),
+        format!("unexpected outcome: {selection:?}"),
+    );
+
+    KernelRegistryLifecycleConformanceReport { results }
 }

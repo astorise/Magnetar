@@ -1371,3 +1371,352 @@ When cutover report is inspected
 
 Then failure can be correlated to gate, target, feature set, and artifact.
 
+---
+
+### Requirement: Kernel Artifact Observations
+
+Kernel Artifact lifecycle observations SHALL redact raw kernel source and
+native handles by default. Runtime MAY emit observations for Kernel Artifact
+lifecycle.
+
+#### Scenario: Preparation completed
+
+Given Provider successfully prepares compiled kernel
+
+When observation is emitted
+
+Then artifact identity and redacted preparation metadata may be included.
+
+---
+
+### Requirement: Raw Kernel Source Redacted
+
+Raw Kernel Source Artifact contents SHALL be redacted by default.
+
+#### Scenario: Compilation failure
+
+Given source compilation fails
+
+When diagnostic is emitted
+
+Then complete kernel source is not logged by default.
+
+---
+
+### Requirement: Compiled Binary Redacted
+
+Raw compiled binary bytes SHALL not be logged by default.
+
+#### Scenario: Binary validation failure
+
+Given compiled artifact is malformed
+
+When error is observed
+
+Then digest/format may be reported but raw binary bytes are absent.
+
+---
+
+### Requirement: Prepared Native Handle Redacted
+
+Native Provider execution handles SHALL not appear in observability.
+
+#### Scenario: Prepared kernel selected
+
+Given Provider uses native function pointer internally
+
+When selection is observed
+
+Then only opaque stable metadata is reported.
+
+---
+
+### Requirement: Compilation Lifecycle Observability
+
+Runtime SHALL make Provider compilation lifecycle observable through structured events.
+
+#### Scenario: Compilation completes
+
+Given Provider finishes compilation
+
+When observation is emitted
+
+Then request ID, artifact digest, compiler identity and duration may be
+reported.
+
+---
+
+### Requirement: Source Contents Redacted
+
+Raw kernel source SHALL be redacted by default.
+
+#### Scenario: Compiler syntax error
+
+Given compiler reports offending line
+
+When diagnostic is exported
+
+Then policy controls source excerpt and full source is not logged automatically.
+
+---
+
+### Requirement: Compiler Paths Redacted
+
+Provider compiler temporary paths SHALL be redacted by default.
+
+#### Scenario: NVCC reports temp file
+
+Given compiler output contains `/tmp/...`
+
+When diagnostic is exported
+
+Then path is removed or normalized.
+
+---
+
+### Requirement: Compiler Environment Redacted
+
+Environment variables and secrets SHALL not be emitted in compilation
+observability.
+
+#### Scenario: Compiler process inherits environment
+
+Given Provider records compiler failure
+
+When observation is emitted
+
+Then environment contents are absent.
+
+---
+
+### Requirement: Native Compiler Handles Redacted
+
+Native compiler/driver objects SHALL remain absent from diagnostics.
+
+#### Scenario: Shader compiler object exists
+
+Given Provider tracks native object internally
+
+When diagnostic is emitted
+
+Then only opaque Runtime metadata is exposed.
+
+---
+
+### Requirement: Qualification Lifecycle Observability
+
+Observability SHALL NOT expose raw kernel source, compiled binaries, or test tensors by default.
+
+Runtime SHOULD emit redacted qualification lifecycle observations.
+
+#### Scenario: Differential mismatch
+
+Given candidate output exceeds tolerance
+
+When qualification fails
+
+Then observation identifies Kernel/artifact/profile and mismatch category
+without dumping raw tensor data by default.
+
+---
+
+### Requirement: Benchmark Observability
+
+A benchmark summary without workload/context metadata SHALL NOT be treated as authoritative ranking evidence.
+
+Runtime MAY emit benchmark summaries without exposing sensitive inputs.
+
+#### Scenario: Candidate benchmark
+
+Given benchmark completes
+
+When observation is emitted
+
+Then latency/throughput/profile metadata may be included.
+
+---
+
+### Requirement: Promotion Observability
+
+Kernel promotion SHALL be observable.
+
+#### Scenario: Generation 42 promoted
+
+Given candidate becomes active
+
+When promotion completes
+
+Then event records logical Kernel, old generation, new generation and policy
+decision.
+
+---
+
+### Requirement: Rollback Observability
+
+Rollback SHALL be observable.
+
+#### Scenario: Regression rollback
+
+Given active kernel is rolled back
+
+When event is emitted
+
+Then reason and resulting active generation are recorded.
+
+---
+
+### Requirement: Revocation Observability
+
+Revocation SHALL be observable without exposing executable internals.
+
+#### Scenario: Kernel revoked
+
+Given qualification is revoked
+
+When event is emitted
+
+Then artifact digest and reason may be reported without native handles.
+
+---
+
+### Requirement: Generated Kernel Observability Redaction
+
+Observability SHALL redact raw source, compiled binaries, raw qualification
+tensors and native handles by default.
+
+#### Scenario: Qualification crash
+
+Given Provider fails during generated kernel test
+
+When diagnostic is emitted
+
+Then sensitive artifact/tensor contents are absent by default.
+
+---
+
+### Requirement: Kernel Selection Observability
+
+Recorded Kernel selection lifecycle events SHALL exclude native handles and raw tensor data; Runtime SHOULD record this redacted lifecycle.
+
+#### Scenario: Candidate selected
+
+Given five candidates are evaluated
+
+When selection completes
+
+Then selected Kernel and policy profile may be observed.
+
+---
+
+### Requirement: Candidate Exclusion Is Observable
+
+Exposed exclusion reasons SHALL identify the specific constraint that excluded the candidate; Runtime SHOULD expose such structured reasons.
+
+#### Scenario: Candidate excluded by affinity
+
+Given candidate fails Resource Affinity
+
+When diagnostics are requested
+
+Then affinity incompatibility is reported.
+
+---
+
+### Requirement: Ranking Metadata Is Redacted
+
+Selection observations SHALL not expose native handles or model data.
+
+#### Scenario: Ranking report
+
+Given candidates are ranked
+
+When report is exported
+
+Then it may contain score, KernelId and artifact digest but no tensor values or
+native addresses.
+
+---
+
+### Requirement: Hysteresis Is Observable
+
+The record of a hysteresis-retained active Kernel SHALL include the comparison that was suppressed; Runtime SHOULD record such retention events.
+
+#### Scenario: Marginal improvement
+
+Given new candidate is slightly faster but below promotion threshold
+
+When active Kernel remains
+
+Then decision reason is observable.
+
+---
+
+### Requirement: Fallback Is Observable
+
+Explicit fallback SHALL record original failure class and selected fallback.
+
+#### Scenario: GPU unavailable
+
+Given Runtime falls back to Reference CPU
+
+When observation is emitted
+
+Then fallback policy and reason are included.
+
+---
+
+### Requirement: Optimization Observability Is Distinguishable
+
+Optimization Campaign observations SHALL be distinguishable from inference
+execution observations.
+
+#### Scenario: Candidate benchmark starts
+
+Given benchmark begins
+
+When observation is emitted
+
+Then event is classified as optimization-plane activity.
+
+---
+
+### Requirement: Campaign Correlation
+
+Optimization events SHALL support correlation by campaign/candidate/artifact.
+
+#### Scenario: Candidate promoted later
+
+Given campaign created candidate
+
+When Runtime promotes it
+
+Then promotion may retain campaign/evidence correlation metadata.
+
+---
+
+### Requirement: Optimization Data Is Redacted
+
+Optimization observations SHALL redact sensitive source/inference information
+according to policy.
+
+#### Scenario: Workload profile emitted
+
+Given profile was derived from production workloads
+
+When observation is exported
+
+Then raw prompts and raw user documents are absent.
+
+---
+
+### Requirement: Generator Credentials Are Redacted
+
+Observability SHALL never expose generator or artifact-registry credentials.
+
+#### Scenario: External service authentication fails
+
+Given API key is present internally
+
+When error is logged
+
+Then key value is absent.
