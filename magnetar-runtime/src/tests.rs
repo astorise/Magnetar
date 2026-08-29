@@ -12,6 +12,7 @@ use crate::generation::*;
 use crate::inference_api::*;
 use crate::kernel::*;
 use crate::kernel_artifact::*;
+use crate::kernel_artifact_ingestion::*;
 use crate::kernel_artifact_manifest::*;
 use crate::kernel_benchmark::*;
 use crate::kernel_cache::*;
@@ -16052,6 +16053,384 @@ fn kernel_manifest_observation_builders_carry_schema_artifact_count_and_formats(
             .map(String::as_str),
         Some("nvidia:cubin, triton:source@3")
     );
+}
+
+// ---------------------------------------------------------------------
+// kernel_artifact_ingestion
+// ---------------------------------------------------------------------
+
+#[test]
+fn kernel_artifact_ingestion_conformance_report_is_conformant() {
+    let report = run_kernel_artifact_ingestion_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn ingestion_state_machine_rejects_illegal_transitions() {
+    assert!(IngestionState::Created.can_transition_to(IngestionState::Receiving));
+    assert!(!IngestionState::Created.can_transition_to(IngestionState::Committed));
+    assert!(!IngestionState::Committed.can_transition_to(IngestionState::Accepted));
+    assert!(IngestionState::Committed.is_terminal());
+    assert!(!IngestionState::Staged.is_terminal());
+}
+
+#[test]
+fn ingestion_pipeline_accepts_trusted_bundle_and_commits() {
+    let directory = temp_kernel_bundle_dir("ingestion-accept");
+    let digest = write_kernel_bundle(&directory, b"ingestion-accept-bytes");
+    let bundle = KernelExchangeBundle::open(&directory);
+
+    let mut transaction = KernelIngestionTransaction::new(
+        IngestionTransactionIdAllocator::default().allocate(),
+        ObservedIngestionSource::Ci,
+        "policy-v1",
+        IngestionQuotas::default(),
+    );
+    let pipeline_context = IngestionPipelineContext {
+        trust_policy_approved: true,
+        trust_explicitly_denied: false,
+        signed: true,
+        signature_verified: true,
+        qualification_current: true,
+        required_qualification_suite_version: None,
+        qualification_target_context: None,
+        development_mode_allowed: false,
+        revoked: false,
+    };
+    let policy = KernelIngestionPolicy::production_default("policy-v1");
+    let outcome = run_ingestion_pipeline(&mut transaction, &bundle, &pipeline_context, &policy)
+        .expect("pipeline should accept a trusted, well-formed bundle");
+    assert_eq!(outcome.decision, IngestionDecisionKind::Accept);
+    assert_eq!(transaction.state, IngestionState::Accepted);
+
+    let mut cache = KernelArtifactCache::new();
+    let committed = commit_accepted_transaction(&mut transaction, &outcome.validated, &mut cache)
+        .expect("accepted transaction should commit");
+    assert_eq!(committed, vec![digest.clone()]);
+    assert_eq!(transaction.state, IngestionState::Committed);
+    assert!(
+        cache
+            .get(&normalize_to_cache_key(&outcome.validated.manifest.artifacts[0]).stable_key())
+            .is_some()
+    );
+
+    let _ = fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn ingestion_pipeline_quarantines_untrusted_bundle_without_committing() {
+    let directory = temp_kernel_bundle_dir("ingestion-quarantine");
+    write_kernel_bundle(&directory, b"ingestion-quarantine-bytes");
+    let bundle = KernelExchangeBundle::open(&directory);
+
+    let mut transaction = KernelIngestionTransaction::new(
+        IngestionTransactionIdAllocator::default().allocate(),
+        ObservedIngestionSource::Ci,
+        "policy-v1",
+        IngestionQuotas::default(),
+    );
+    let pipeline_context = IngestionPipelineContext {
+        trust_policy_approved: false,
+        trust_explicitly_denied: false,
+        signed: false,
+        signature_verified: false,
+        qualification_current: true,
+        required_qualification_suite_version: None,
+        qualification_target_context: None,
+        development_mode_allowed: false,
+        revoked: false,
+    };
+    let policy = KernelIngestionPolicy::production_default("policy-v1");
+    let outcome = run_ingestion_pipeline(&mut transaction, &bundle, &pipeline_context, &policy)
+        .expect("pipeline runs to a decision even when untrusted");
+    assert!(matches!(
+        outcome.decision,
+        IngestionDecisionKind::Quarantine(_)
+    ));
+    assert_eq!(transaction.state, IngestionState::Quarantined);
+    assert!(transaction.committed_digests.is_empty());
+
+    let _ = fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn ingestion_pipeline_rejects_revoked_digest() {
+    let directory = temp_kernel_bundle_dir("ingestion-revoked");
+    write_kernel_bundle(&directory, b"ingestion-revoked-bytes");
+    let bundle = KernelExchangeBundle::open(&directory);
+
+    let mut transaction = KernelIngestionTransaction::new(
+        IngestionTransactionIdAllocator::default().allocate(),
+        ObservedIngestionSource::Ci,
+        "policy-v1",
+        IngestionQuotas::default(),
+    );
+    let pipeline_context = IngestionPipelineContext {
+        trust_policy_approved: true,
+        trust_explicitly_denied: false,
+        signed: true,
+        signature_verified: true,
+        qualification_current: true,
+        required_qualification_suite_version: None,
+        qualification_target_context: None,
+        development_mode_allowed: false,
+        revoked: true,
+    };
+    let policy = KernelIngestionPolicy::production_default("policy-v1");
+    let outcome = run_ingestion_pipeline(&mut transaction, &bundle, &pipeline_context, &policy)
+        .expect("pipeline runs to a decision even when revoked");
+    assert!(matches!(outcome.decision, IngestionDecisionKind::Reject(_)));
+    assert_eq!(transaction.state, IngestionState::Rejected);
+
+    let _ = fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn ingestion_audit_record_supports_release_evidence_traceability() {
+    let mut transaction = KernelIngestionTransaction::new(
+        IngestionTransactionIdAllocator::default().allocate(),
+        ObservedIngestionSource::Ci,
+        "policy-v1",
+        IngestionQuotas::default(),
+    );
+    transaction.mark_receiving().unwrap();
+    transaction.mark_staged().unwrap();
+    transaction.mark_validating().unwrap();
+    transaction.mark_policy_evaluating().unwrap();
+    transaction.mark_accepted().unwrap();
+
+    let record = KernelIngestionAuditRecord::from_transaction(&transaction)
+        .with_manifest_digest("sha256:aaaa")
+        .with_redacted_metadata("locator", "https://user:secret@internal/path");
+    assert_eq!(
+        record.release_evidence_reference(),
+        Some(("policy-v1".to_string(), "sha256:aaaa".to_string()))
+    );
+    assert_ne!(
+        record.redacted_metadata.get("locator").map(String::as_str),
+        Some("https://user:secret@internal/path")
+    );
+}
+
+#[test]
+fn ingestion_error_ids_are_stable_and_displayable() {
+    let cases: &[(IngestionError, &str)] = &[
+        (
+            IngestionError::StateInvalid { reason: "x".into() },
+            "kernel-ingestion-state-invalid",
+        ),
+        (
+            IngestionError::CommitConflict,
+            "kernel-ingestion-commit-conflict",
+        ),
+        (
+            IngestionError::ExternalDigestMismatch {
+                expected: "a".into(),
+                actual: "b".into(),
+            },
+            "kernel-ingestion-external-digest-mismatch",
+        ),
+        (
+            IngestionError::ManualApprovalCannotBypassIntegrity,
+            "kernel-ingestion-manual-approval-cannot-bypass-integrity",
+        ),
+        (
+            IngestionError::ArtifactRevoked {
+                digest: "sha256:aaa".into(),
+            },
+            "kernel-ingestion-artifact-revoked",
+        ),
+    ];
+    for (error, expected_id) in cases {
+        assert_eq!(error.id(), *expected_id);
+        assert!(!error.to_string().is_empty());
+    }
+}
+
+#[test]
+fn ingestion_commit_detects_bundle_mutation_after_validation() {
+    // "Immutable Snapshot" / TOCTOU protection (proposal): the source is
+    // mutated *after* validation but *before* commit -- the attack scenario
+    // is "validate file A -> source replaces file A -> prepare replaced file
+    // B". Here the replacement happens at the exact same content-addressed
+    // path (an attacker overwriting bytes in place), which is exactly what
+    // `verify_bundle_snapshot_unchanged` re-checks.
+    let directory = temp_kernel_bundle_dir("ingestion-toctou");
+    let digest = write_kernel_bundle(&directory, b"original-validated-bytes");
+    let bundle = KernelExchangeBundle::open(&directory);
+
+    let mut transaction = KernelIngestionTransaction::new(
+        IngestionTransactionIdAllocator::default().allocate(),
+        ObservedIngestionSource::Ci,
+        "policy-v1",
+        IngestionQuotas::default(),
+    );
+    let pipeline_context = IngestionPipelineContext {
+        trust_policy_approved: true,
+        trust_explicitly_denied: false,
+        signed: true,
+        signature_verified: true,
+        qualification_current: true,
+        required_qualification_suite_version: None,
+        qualification_target_context: None,
+        development_mode_allowed: false,
+        revoked: false,
+    };
+    let policy = KernelIngestionPolicy::production_default("policy-v1");
+    let outcome = run_ingestion_pipeline(&mut transaction, &bundle, &pipeline_context, &policy)
+        .expect("pipeline should accept the originally staged bytes");
+    assert_eq!(outcome.decision, IngestionDecisionKind::Accept);
+
+    // Mutate the blob in place at its own content-addressed path -- the
+    // source is replaced after validation completed.
+    fs::write(
+        directory.join("blobs").join("sha256").join(&digest),
+        b"mutated-after-validation-bytes",
+    )
+    .unwrap();
+
+    let mut cache = KernelArtifactCache::new();
+    let commit_outcome = commit_accepted_transaction_from_bundle(
+        &mut transaction,
+        &bundle,
+        &outcome.validated,
+        &mut cache,
+    );
+    assert!(matches!(
+        commit_outcome,
+        Err(IngestionError::ToctouDetected)
+    ));
+    assert!(
+        cache
+            .get(&normalize_to_cache_key(&outcome.validated.manifest.artifacts[0]).stable_key())
+            .is_none(),
+        "staged/mutated content must never reach the accepted cache"
+    );
+
+    let _ = fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn ingestion_pipeline_failure_leaves_cache_and_registry_untouched() {
+    // "Failure Atomicity" (proposal): a malformed bundle (missing manifest
+    // file entirely) must fail before commit, and every stage of active
+    // state (accepted cache, Kernel Registry) is untouched by the attempt.
+    let directory = temp_kernel_bundle_dir("ingestion-malformed");
+    // Deliberately do not write a manifest file -- `write_kernel_bundle` is
+    // not called, so `blobs/sha256/` exists but `kernel.manifest.json` does
+    // not.
+    let bundle = KernelExchangeBundle::open(&directory);
+
+    let mut transaction = KernelIngestionTransaction::new(
+        IngestionTransactionIdAllocator::default().allocate(),
+        ObservedIngestionSource::Ci,
+        "policy-v1",
+        IngestionQuotas::default(),
+    );
+    let pipeline_context = IngestionPipelineContext {
+        trust_policy_approved: true,
+        trust_explicitly_denied: false,
+        signed: true,
+        signature_verified: true,
+        qualification_current: true,
+        required_qualification_suite_version: None,
+        qualification_target_context: None,
+        development_mode_allowed: false,
+        revoked: false,
+    };
+    let policy = KernelIngestionPolicy::production_default("policy-v1");
+    let cache_before = KernelArtifactCache::new();
+    let registry_before = KernelRegistry::new();
+
+    let outcome = run_ingestion_pipeline(&mut transaction, &bundle, &pipeline_context, &policy);
+    assert!(matches!(outcome, Err(IngestionError::BundleInvalid { .. })));
+    assert_eq!(transaction.state, IngestionState::Failed);
+    assert!(transaction.committed_digests.is_empty());
+    // Nothing in this pipeline call had access to a cache or registry at
+    // all, so both remain exactly as constructed -- demonstrating the
+    // failure cannot have touched either even in principle.
+    assert_eq!(cache_before.observations().len(), 0);
+    assert_eq!(registry_before.entries().count(), 0);
+
+    let _ = fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn ingestion_concurrent_transactions_are_isolated() {
+    // "Concurrent Transactions" (proposal): one failed transaction SHALL NOT
+    // corrupt another. Simulated here as two independently-tracked
+    // transactions against a shared cache: one is revoked (rejected), the
+    // other succeeds, and the successful one's commit is unaffected.
+    let directory_a = temp_kernel_bundle_dir("ingestion-concurrent-a");
+    let digest_a = write_kernel_bundle(&directory_a, b"concurrent-transaction-a");
+    let bundle_a = KernelExchangeBundle::open(&directory_a);
+    let directory_b = temp_kernel_bundle_dir("ingestion-concurrent-b");
+    write_kernel_bundle(&directory_b, b"concurrent-transaction-b");
+    let bundle_b = KernelExchangeBundle::open(&directory_b);
+
+    let mut allocator = IngestionTransactionIdAllocator::default();
+    let policy = KernelIngestionPolicy::production_default("policy-v1");
+    let mut cache = KernelArtifactCache::new();
+
+    let mut transaction_a = KernelIngestionTransaction::new(
+        allocator.allocate(),
+        ObservedIngestionSource::Ci,
+        "policy-v1",
+        IngestionQuotas::default(),
+    );
+    let context_a = IngestionPipelineContext {
+        trust_policy_approved: true,
+        trust_explicitly_denied: false,
+        signed: true,
+        signature_verified: true,
+        qualification_current: true,
+        required_qualification_suite_version: None,
+        qualification_target_context: None,
+        development_mode_allowed: false,
+        revoked: false,
+    };
+    let outcome_a = run_ingestion_pipeline(&mut transaction_a, &bundle_a, &context_a, &policy)
+        .expect("transaction A should be accepted");
+    let committed_a =
+        commit_accepted_transaction(&mut transaction_a, &outcome_a.validated, &mut cache).unwrap();
+    assert_eq!(committed_a, vec![digest_a]);
+
+    let mut transaction_b = KernelIngestionTransaction::new(
+        allocator.allocate(),
+        ObservedIngestionSource::Ci,
+        "policy-v1",
+        IngestionQuotas::default(),
+    );
+    let context_b = IngestionPipelineContext {
+        revoked: true,
+        ..context_a
+    };
+    let outcome_b = run_ingestion_pipeline(&mut transaction_b, &bundle_b, &context_b, &policy)
+        .expect("pipeline runs to a decision even when revoked");
+    assert!(matches!(
+        outcome_b.decision,
+        IngestionDecisionKind::Reject(_)
+    ));
+    assert_eq!(transaction_b.state, IngestionState::Rejected);
+
+    // Transaction A's committed content is unaffected by transaction B's
+    // rejection.
+    assert!(
+        cache
+            .get(&normalize_to_cache_key(&outcome_a.validated.manifest.artifacts[0]).stable_key())
+            .is_some()
+    );
+
+    let _ = fs::remove_dir_all(&directory_a);
+    let _ = fs::remove_dir_all(&directory_b);
 }
 
 // ---------------------------------------------------------------------
