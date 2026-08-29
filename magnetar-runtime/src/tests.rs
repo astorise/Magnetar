@@ -15477,6 +15477,7 @@ fn kernel_manifest_normalizes_qualification_identity_pieces() {
         workload_profile: None,
         device_context: None,
         provider_context: None,
+        workload_metadata: None,
     };
     let profile = normalize_qualification_profile(&evidence).expect("profile normalizes");
     assert_eq!(
@@ -15607,6 +15608,450 @@ fn kernel_manifest_cli_operations_all_use_shared_validation() {
     }
 
     fs::remove_dir_all(&directory).unwrap();
+}
+
+fn build_kernel_bundle_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (path, data) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder.append_data(&mut header, *path, *data).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+fn gzip_compress(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn kernel_bundle_tar_entries(blob_bytes: &[u8]) -> (Vec<(&'static str, Vec<u8>)>, String) {
+    let digest = KernelBlobDigest::of_bytes(blob_bytes);
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": {size},
+      "storage_mode": "embedded",
+      "required": true,
+      "operators": [
+        {{ "namespace": "magnetar:operator", "name": "matmul", "version": 1, "family": "linear-algebra" }}
+      ]
+    }}
+  ]
+}}"#,
+        digest = digest.value,
+        size = blob_bytes.len()
+    );
+    (
+        vec![
+            (KERNEL_MANIFEST_FILE_NAME, manifest.into_bytes()),
+            (
+                Box::leak(format!("blobs/sha256/{}", digest.value).into_boxed_str()),
+                blob_bytes.to_vec(),
+            ),
+        ],
+        digest.value,
+    )
+}
+
+#[test]
+fn kernel_exchange_tar_archive_validates_to_identical_digest_as_directory_bundle() {
+    let directory = temp_kernel_bundle_dir("archive-directory-parity");
+    write_kernel_bundle(&directory, b"tar-parity-bytes");
+    let directory_bundle = KernelExchangeBundle::open(&directory);
+    let directory_validated =
+        validate_kernel_exchange_bundle(&directory_bundle, &KernelManifestLimits::default())
+            .expect("directory bundle validates");
+
+    let (entries, _digest) = kernel_bundle_tar_entries(b"tar-parity-bytes");
+    let entry_refs: Vec<(&str, &[u8])> = entries.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+    let tar_bytes = build_kernel_bundle_tar(&entry_refs);
+
+    let extract_dir = temp_kernel_bundle_dir("archive-directory-parity-extracted");
+    let archive_bundle = extract_kernel_exchange_archive(
+        std::io::Cursor::new(&tar_bytes),
+        false,
+        &extract_dir,
+        &KernelExchangeArchiveLimits::default(),
+    )
+    .expect("tar archive extracts");
+    let archive_validated =
+        validate_kernel_exchange_bundle(&archive_bundle, &KernelManifestLimits::default())
+            .expect("extracted archive bundle validates");
+
+    assert_eq!(directory_validated.digest, archive_validated.digest);
+
+    // The archive checksum is a distinct, transport-level concept: it is
+    // *not* the manifest digest, and never claimed to be.
+    let archive_checksum = archive_diagnostic_checksum(&tar_bytes);
+    assert_ne!(archive_checksum, directory_validated.digest.value);
+
+    fs::remove_dir_all(&directory).unwrap();
+    fs::remove_dir_all(&extract_dir).unwrap();
+}
+
+#[test]
+fn kernel_exchange_tar_gz_archive_produces_the_same_manifest_digest_as_plain_tar() {
+    let (entries, _digest) = kernel_bundle_tar_entries(b"gzip-parity-bytes");
+    let entry_refs: Vec<(&str, &[u8])> = entries.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+    let tar_bytes = build_kernel_bundle_tar(&entry_refs);
+    let gz_bytes = gzip_compress(&tar_bytes);
+
+    let plain_dir = temp_kernel_bundle_dir("gzip-parity-plain");
+    let plain_bundle = extract_kernel_exchange_archive(
+        std::io::Cursor::new(&tar_bytes),
+        false,
+        &plain_dir,
+        &KernelExchangeArchiveLimits::default(),
+    )
+    .expect("plain tar extracts");
+    let plain_validated =
+        validate_kernel_exchange_bundle(&plain_bundle, &KernelManifestLimits::default())
+            .expect("plain tar bundle validates");
+
+    let gz_dir = temp_kernel_bundle_dir("gzip-parity-compressed");
+    let gz_bundle = extract_kernel_exchange_archive(
+        std::io::Cursor::new(&gz_bytes),
+        true,
+        &gz_dir,
+        &KernelExchangeArchiveLimits::default(),
+    )
+    .expect("gzip tar extracts");
+    let gz_validated =
+        validate_kernel_exchange_bundle(&gz_bundle, &KernelManifestLimits::default())
+            .expect("gzip tar bundle validates");
+
+    assert_eq!(plain_validated.digest, gz_validated.digest);
+    // Compressing the exact same logical content changes the raw archive
+    // bytes (and therefore the transport-level diagnostic checksum) without
+    // touching logical identity.
+    assert_ne!(
+        archive_diagnostic_checksum(&tar_bytes),
+        archive_diagnostic_checksum(&gz_bytes)
+    );
+
+    fs::remove_dir_all(&plain_dir).unwrap();
+    fs::remove_dir_all(&gz_dir).unwrap();
+}
+
+#[test]
+fn kernel_exchange_archive_ignores_ownership_timestamp_and_mode_for_identity() {
+    let (entries, _digest) = kernel_bundle_tar_entries(b"metadata-irrelevant-bytes");
+
+    let mut builder_a = tar::Builder::new(Vec::new());
+    let mut builder_b = tar::Builder::new(Vec::new());
+    for (path, data) in &entries {
+        let mut header_a = tar::Header::new_gnu();
+        header_a.set_size(data.len() as u64);
+        header_a.set_mode(0o644);
+        header_a.set_mtime(1_000);
+        header_a.set_uid(0);
+        header_a.set_gid(0);
+        header_a.set_cksum();
+        builder_a
+            .append_data(&mut header_a, *path, data.as_slice())
+            .unwrap();
+
+        let mut header_b = tar::Header::new_gnu();
+        header_b.set_size(data.len() as u64);
+        header_b.set_mode(0o755);
+        header_b.set_mtime(999_999_999);
+        header_b.set_uid(1000);
+        header_b.set_gid(1000);
+        header_b.set_cksum();
+        builder_b
+            .append_data(&mut header_b, *path, data.as_slice())
+            .unwrap();
+    }
+    let tar_a = builder_a.into_inner().unwrap();
+    let tar_b = builder_b.into_inner().unwrap();
+    assert_ne!(
+        archive_diagnostic_checksum(&tar_a),
+        archive_diagnostic_checksum(&tar_b),
+        "sanity check: the two archives really do differ at the byte level"
+    );
+
+    let dir_a = temp_kernel_bundle_dir("archive-metadata-a");
+    let dir_b = temp_kernel_bundle_dir("archive-metadata-b");
+    let bundle_a = extract_kernel_exchange_archive(
+        std::io::Cursor::new(&tar_a),
+        false,
+        &dir_a,
+        &KernelExchangeArchiveLimits::default(),
+    )
+    .unwrap();
+    let bundle_b = extract_kernel_exchange_archive(
+        std::io::Cursor::new(&tar_b),
+        false,
+        &dir_b,
+        &KernelExchangeArchiveLimits::default(),
+    )
+    .unwrap();
+    let validated_a =
+        validate_kernel_exchange_bundle(&bundle_a, &KernelManifestLimits::default()).unwrap();
+    let validated_b =
+        validate_kernel_exchange_bundle(&bundle_b, &KernelManifestLimits::default()).unwrap();
+    assert_eq!(
+        validated_a.digest, validated_b.digest,
+        "ownership/timestamp/mode differences must not affect logical bundle identity"
+    );
+
+    fs::remove_dir_all(&dir_a).unwrap();
+    fs::remove_dir_all(&dir_b).unwrap();
+}
+
+fn build_tar_with_raw_path_entry(path: &str, data: &[u8]) -> Vec<u8> {
+    // `tar::Header::set_path` (used by `append_data`) refuses `..` itself,
+    // which is correct behavior for a well-behaved writer but means it
+    // cannot be used to construct the maliciously-crafted archive this test
+    // needs. Writing directly into the raw GNU header name bytes bypasses
+    // that writer-side check, simulating an archive from an attacker who
+    // does not go through this safe API.
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(data.len() as u64);
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    {
+        let gnu = header.as_gnu_mut().expect("gnu header");
+        let name_bytes = path.as_bytes();
+        gnu.name[..name_bytes.len()].copy_from_slice(name_bytes);
+    }
+    header.set_cksum();
+    builder.append(&header, data).unwrap();
+    builder.into_inner().unwrap()
+}
+
+#[test]
+fn kernel_exchange_archive_rejects_path_traversal_entry() {
+    let tar_bytes = build_tar_with_raw_path_entry("../escape.txt", b"malicious");
+    let dir = temp_kernel_bundle_dir("archive-traversal");
+    let outcome = extract_kernel_exchange_archive(
+        std::io::Cursor::new(&tar_bytes),
+        false,
+        &dir,
+        &KernelExchangeArchiveLimits::default(),
+    );
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::BundlePathInvalid { .. })
+    ));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn kernel_exchange_archive_rejects_symlink_entry() {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_size(0);
+    header.set_cksum();
+    builder
+        .append_link(&mut header, "blobs/escape-link", "/etc/passwd")
+        .unwrap();
+    let tar_bytes = builder.into_inner().unwrap();
+
+    let dir = temp_kernel_bundle_dir("archive-symlink");
+    let outcome = extract_kernel_exchange_archive(
+        std::io::Cursor::new(&tar_bytes),
+        false,
+        &dir,
+        &KernelExchangeArchiveLimits::default(),
+    );
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::BundleSymlinkDenied { .. })
+    ));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn kernel_exchange_archive_rejects_hardlink_and_device_entries() {
+    for entry_type in [
+        tar::EntryType::Link,
+        tar::EntryType::Char,
+        tar::EntryType::Fifo,
+    ] {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        if entry_type == tar::EntryType::Char {
+            header.set_device_major(1).unwrap();
+            header.set_device_minor(3).unwrap();
+        }
+        if entry_type == tar::EntryType::Link {
+            // `append_link` sets the path/link-name and writes the header's
+            // checksum itself, so no manual `set_cksum` call here.
+            builder
+                .append_link(&mut header, "blobs/hardlink", "blobs/sha256/target")
+                .unwrap();
+        } else {
+            // The raw `append` method does not recompute the checksum, so
+            // the path must be set *before* `set_cksum` here.
+            header.set_path("special-entry").unwrap();
+            header.set_cksum();
+            builder.append(&header, std::io::empty()).unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let dir = temp_kernel_bundle_dir(&format!("archive-special-{entry_type:?}"));
+        let outcome = extract_kernel_exchange_archive(
+            std::io::Cursor::new(&tar_bytes),
+            false,
+            &dir,
+            &KernelExchangeArchiveLimits::default(),
+        );
+        assert!(
+            matches!(outcome, Err(KernelManifestError::BundlePathInvalid { .. })),
+            "expected {entry_type:?} to be rejected, got {outcome:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn kernel_exchange_archive_enforces_per_entry_decompressed_size_limit() {
+    let oversized = vec![0u8; 1024];
+    let tar_bytes = build_kernel_bundle_tar(&[("blobs/sha256/oversized", &oversized)]);
+    let dir = temp_kernel_bundle_dir("archive-entry-limit");
+    let limits = KernelExchangeArchiveLimits {
+        max_entry_decompressed_bytes: 100,
+        ..KernelExchangeArchiveLimits::default()
+    };
+    let outcome =
+        extract_kernel_exchange_archive(std::io::Cursor::new(&tar_bytes), false, &dir, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::LimitExceeded { .. })
+    ));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn kernel_exchange_archive_enforces_entry_count_limit() {
+    let entries: Vec<(&str, &[u8])> = vec![("a", b"1"), ("b", b"2"), ("c", b"3")];
+    let tar_bytes = build_kernel_bundle_tar(&entries);
+    let dir = temp_kernel_bundle_dir("archive-entry-count-limit");
+    let limits = KernelExchangeArchiveLimits {
+        max_entries: 2,
+        ..KernelExchangeArchiveLimits::default()
+    };
+    let outcome =
+        extract_kernel_exchange_archive(std::io::Cursor::new(&tar_bytes), false, &dir, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::LimitExceeded { .. })
+    ));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn kernel_bundle_transport_reservation_marks_only_directory_and_tar_as_implemented() {
+    assert!(KernelBundleTransport::Directory.is_implemented());
+    assert!(KernelBundleTransport::TarArchive.is_implemented());
+    assert!(!KernelBundleTransport::ObjectStore.is_implemented());
+    assert!(!KernelBundleTransport::OciLike.is_implemented());
+    assert!(!KernelBundleTransport::Registry.is_implemented());
+}
+
+#[test]
+fn kernel_manifest_evaluate_trust_pipeline_stage_delegates_to_sole_authority() {
+    assert_eq!(
+        evaluate_manifest_trust(true),
+        crate::evaluate_artifact_trust(true)
+    );
+    assert_eq!(
+        evaluate_manifest_trust(false),
+        crate::evaluate_artifact_trust(false)
+    );
+    assert!(!evaluate_manifest_trust(false).is_trusted());
+}
+
+#[test]
+fn kernel_manifest_normalizes_benchmark_profile() {
+    let evidence = KernelEvidenceReference {
+        digest: KernelBlobDigest::of_bytes(b"benchmark-evidence"),
+        profile: "latency@1".into(),
+        suite_or_workload_version: Some("v2".into()),
+        oracle_or_provider_identity: None,
+        target_compatibility: std::collections::BTreeSet::new(),
+        status: KernelEvidenceStatus::Passed,
+        storage_mode: KernelArtifactStorageMode::Embedded,
+        workload_profile: Some("decode-256".into()),
+        device_context: Some("h100".into()),
+        provider_context: Some("nvidia-cuda@12.4".into()),
+        workload_metadata: Some(KernelBenchmarkWorkloadMetadata {
+            input_shapes: Some("[1,256,4096]".into()),
+            dtype_layout: Some("fp16-row-major".into()),
+            batch_size: Some(1),
+            sequence_length: Some(256),
+            warmup_count: Some(10),
+            measurement_count: Some(100),
+            synchronization_policy: Some("device-sync".into()),
+            driver_runtime_version: Some("cuda-12.4".into()),
+            benchmark_version: Some("bench-1".into()),
+        }),
+    };
+
+    let profile =
+        normalize_benchmark_profile(&evidence, "sm90").expect("benchmark profile normalizes");
+    assert_eq!(profile.target_device, "h100");
+    assert_eq!(profile.hardware_architecture, "sm90");
+    assert_eq!(profile.provider_version, "nvidia-cuda@12.4");
+    assert_eq!(profile.measurement_count, 100);
+    assert!(profile.is_authoritative());
+
+    let mut missing_workload = evidence.clone();
+    missing_workload.workload_metadata = None;
+    assert!(normalize_benchmark_profile(&missing_workload, "sm90").is_err());
+}
+
+#[test]
+fn kernel_manifest_observation_builders_carry_schema_artifact_count_and_formats() {
+    let schema = KernelManifestSchemaVersion::current();
+    let formats = vec![
+        KernelArtifactFormat::new("nvidia", "cubin"),
+        KernelArtifactFormat::new("triton", "source").with_version("3"),
+    ];
+    let observation = KernelManifestObservation::new(KernelManifestObservationKind::ManifestParsed)
+        .with_schema_version(&schema)
+        .with_artifact_count(2)
+        .with_formats(formats);
+
+    assert_eq!(
+        observation
+            .redacted_metadata
+            .get("schema-version")
+            .map(String::as_str),
+        Some("magnetar:kernel-manifest@1.0")
+    );
+    assert_eq!(
+        observation
+            .redacted_metadata
+            .get("artifact-count")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        observation
+            .redacted_metadata
+            .get("formats")
+            .map(String::as_str),
+        Some("nvidia:cubin, triton:source@3")
+    );
 }
 
 // ---------------------------------------------------------------------

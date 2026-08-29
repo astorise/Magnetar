@@ -42,13 +42,13 @@ conformance report), not just a defined struct field.
 - [x] Define logical bundle.
 - [x] Require `kernel.manifest.json`.
 - [x] Define `blobs/sha256/<digest>` layout.
-- [ ] Keep physical transport independent. (only the directory transport is implemented; archive/object-store/OCI-like are not -- see groups 26/28/29)
+- [x] Keep physical transport independent. (directory and tar/tar.gz both validate to the identical manifest digest for equivalent content -- `kernel_exchange_tar_archive_validates_to_identical_digest_as_directory_bundle`)
 - [x] Add bundle validation tests.
 
 ## 5. Bundle Identity
 
 - [x] Define logical bundle identity.
-- [ ] Keep archive checksum separate. (no archive transport exists yet)
+- [x] Keep archive checksum separate. (`archive_diagnostic_checksum` hashes raw archive bytes as an explicitly non-identity diagnostic, distinct from `KernelManifestV1::digest`)
 - [x] Ensure repacking does not change logical artifact identity.
 - [x] Add deterministic repack tests.
 
@@ -260,16 +260,11 @@ conformance report), not just a defined struct field.
 ## 26. Distribution Neutrality
 
 - [x] Support local directory.
-- [ ] Support archive representation.
-- [ ] Reserve object-store transport.
-- [ ] Reserve OCI-like transport.
-- [ ] Reserve registry transport.
+- [x] Support archive representation. (`extract_kernel_exchange_archive`: tar and tar.gz, via the `tar`/`flate2` crates, gated `#[cfg(not(target_arch = "wasm32"))]`)
+- [ ] Reserve object-store transport. (`KernelBundleTransport::ObjectStore` -- named reservation only, per the proposal's own "Non-Goals": this change does not define an object-store/S3 API)
+- [ ] Reserve OCI-like transport. (`KernelBundleTransport::OciLike` -- named reservation only, per "Non-Goals": this change does not define an OCI profile)
+- [ ] Reserve registry transport. (`KernelBundleTransport::Registry` -- named reservation only, per "Non-Goals": this change does not define one artifact registry)
 - [x] Keep core manifest transport-neutral.
-
-Archive/object-store/OCI/registry transports are intentionally out of scope
-for this pass: they need new external dependencies (zip/tar-equivalent) and
-their own security review (path/zip-slip handling, decompression limits)
-rather than a rushed add-on. See groups 28/29.
 
 ## 27. Path Safety
 
@@ -277,34 +272,32 @@ rather than a rushed add-on. See groups 28/29.
 - [x] Reject absolute paths.
 - [x] Reject Windows drive escape paths.
 - [x] Reject symlinks.
-- [ ] Reject hard-link escape.
-- [ ] Reject device files.
-- [ ] Reject special entries.
+- [x] Reject hard-link escape. (archive transport: `reject_unsafe_tar_entry_type` rejects `tar::EntryType::Link`)
+- [x] Reject device files. (archive transport: rejects `Char`/`Block`)
+- [x] Reject special entries. (archive transport: rejects `Fifo` and any other non-regular/non-directory entry type)
 - [x] Add traversal tests.
 
-(Hard-link/device-file/special-entry detection needs platform-specific
-`stat`-level metadata beyond `std::fs::symlink_metadata`'s portable surface
--- follow-up work.)
+The directory transport still has no equivalent hard-link/device-file check
+(these concepts are not portably detectable via `std::fs` metadata alone
+across Windows/macOS/Linux), but the archive transport's tar entry-type byte
+makes every one of these explicit and checkable before any bytes are
+extracted, so the underlying capability now exists and is tested.
 
 ## 28. Archive Normalization
 
-- [ ] Ignore ownership metadata for logical identity.
-- [ ] Ignore timestamps.
-- [ ] Ignore executable mode for semantics.
-- [ ] Keep archive checksum optional/separate.
-- [ ] Add repack tests.
-
-(No archive transport exists yet -- follow-up work.)
+- [x] Ignore ownership metadata for logical identity. (`kernel_exchange_archive_ignores_ownership_timestamp_and_mode_for_identity`: differing uid/gid across two archives still validates to the identical manifest digest)
+- [x] Ignore timestamps. (same test: differing mtime does not affect identity)
+- [x] Ignore executable mode for semantics. (same test: differing mode bits do not affect identity)
+- [x] Keep archive checksum optional/separate. (`archive_diagnostic_checksum`)
+- [x] Add repack tests.
 
 ## 29. Compression
 
-- [ ] Digest logical uncompressed blob bytes.
-- [ ] Allow transport compression.
-- [ ] Verify decompressed size limits.
-- [ ] Prevent decompression bomb beyond configured limits.
-- [ ] Add compressed bundle tests.
-
-(No compression support exists yet -- follow-up work.)
+- [x] Digest logical uncompressed blob bytes. (extraction fully decompresses to disk before any digest computation runs; digests never see compression framing)
+- [x] Allow transport compression. (`extract_kernel_exchange_archive(..., gzip_compressed: true, ...)` via `flate2`)
+- [x] Verify decompressed size limits. (`KernelExchangeArchiveLimits::max_entry_decompressed_bytes` / `max_total_decompressed_bytes`)
+- [x] Prevent decompression bomb beyond configured limits. (bounded read via `Read::take(limit + 1)`, so an oversized entry is detected and rejected without fully materializing it)
+- [x] Add compressed bundle tests.
 
 ## 30. Duplicate Protection
 
@@ -380,7 +373,7 @@ rather than a rushed add-on. See groups 28/29.
 - [x] Normalize manifest to KernelSourceArtifact. (`normalize_to_source_artifact`)
 - [x] Normalize compiled descriptors. (`normalize_to_compiled_artifact`; known limitation -- fused bindings keep only the primary Operator in `CompiledKernelArtifact.operator_semantics`, since that type models a single `OperatorId`)
 - [x] Normalize qualification references. (`normalize_qualification_profile` / `normalize_oracle_identity` -- identity data only, never a fabricated `QualificationRecord` status)
-- [ ] Normalize benchmark references. (`crate::BenchmarkProfile` requires workload/sync-policy granularity -- warmup/measurement counts, sync policy, input shapes -- that the v1 portable evidence schema does not yet carry; fabricating those fields would be dishonest, so this needs a schema extension first)
+- [x] Normalize benchmark references. (`normalize_benchmark_profile`, backed by the new `KernelBenchmarkWorkloadMetadata` evidence field; `hardware_architecture` is an explicit caller-supplied parameter since the evidence reference itself does not carry artifact linkage)
 - [x] Keep portable types separate from Provider native types.
 - [x] Add normalization tests.
 
@@ -402,7 +395,7 @@ rather than a rushed add-on. See groups 28/29.
 - [x] Validate manifest identity.
 - [x] Validate blob integrity.
 - [x] Validate semantic binding.
-- [ ] Evaluate trust. (deliberately left to the caller/policy layer; see `crate::evaluate_artifact_trust`)
+- [x] Evaluate trust. (`evaluate_manifest_trust`, a nameable pipeline-stage wrapper that still delegates unchanged to `crate::evaluate_artifact_trust` -- deliberately not called automatically by `validate_kernel_exchange_bundle`, since trust needs Runtime policy context that function does not have)
 - [x] Validate evidence. (structural validation; currency revalidation is the caller's responsibility)
 - [x] Evaluate compatibility. (`evaluate_target_compatibility`, run separately from `validate_kernel_exchange_bundle` since it needs Runtime-observed context)
 - [x] Add ordering tests. (`kernel_manifest_validation_pipeline_orders_schema_before_blob_io`)
@@ -460,10 +453,10 @@ with no corresponding spec delta in this change.
 ## 46. Observability
 
 - [x] Observe discovery.
-- [ ] Observe schema version. (no dedicated field/variant)
+- [x] Observe schema version. (`KernelManifestObservation::with_schema_version`)
 - [x] Observe manifest digest.
-- [ ] Observe artifact counts. (no dedicated field/variant)
-- [ ] Observe formats. (no dedicated field/variant)
+- [x] Observe artifact counts. (`KernelManifestObservation::with_artifact_count`)
+- [x] Observe formats. (`KernelManifestObservation::with_formats`)
 - [x] Observe integrity failures.
 - [x] Observe semantic binding.
 - [x] Observe evidence references.
@@ -515,7 +508,7 @@ documents its contracts.
 - [x] Run OpenSpec validation.
 - [x] Verify format is generator-neutral.
 - [x] Verify format is Provider-neutral.
-- [ ] Verify format is transport-neutral. (manifest *identity* is transport-neutral by construction, but only the directory transport is actually implemented -- see groups 4/26)
+- [x] Verify format is transport-neutral. (directory and tar/tar.gz archives both validate to the identical manifest digest for equivalent content)
 - [x] Verify manifest cannot grant trust.
 - [x] Verify native handles cannot cross boundary.
 - [x] Verify Runtime remains network-authority-free by default.

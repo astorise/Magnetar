@@ -791,6 +791,32 @@ pub struct KernelEvidenceReference {
     /// Benchmark-specific Provider binding context ("Add Provider context",
     /// tasks). Descriptive only, never a native Provider handle.
     pub provider_context: Option<String>,
+    /// Benchmark-specific workload/environment detail, present only when
+    /// this reference describes benchmark (not qualification) evidence,
+    /// sufficient to normalize into [`crate::BenchmarkProfile`] -- see
+    /// [`normalize_benchmark_profile`].
+    pub workload_metadata: Option<KernelBenchmarkWorkloadMetadata>,
+}
+
+/// Benchmark workload/environment metadata, implementing "Normalize
+/// benchmark references" (tasks): [`crate::BenchmarkProfile`] requires this
+/// level of detail (workload shape, warmup/measurement counts,
+/// synchronization policy) to be usable as ranking evidence at all --
+/// `crate::BenchmarkProfile::is_authoritative` already enforces that
+/// downstream. Every field here is optional at the portable-manifest level;
+/// [`normalize_benchmark_profile`] fills gaps with explicit, honest defaults
+/// rather than fabricating plausible-looking values.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KernelBenchmarkWorkloadMetadata {
+    pub input_shapes: Option<String>,
+    pub dtype_layout: Option<String>,
+    pub batch_size: Option<u64>,
+    pub sequence_length: Option<u64>,
+    pub warmup_count: Option<u32>,
+    pub measurement_count: Option<u32>,
+    pub synchronization_policy: Option<String>,
+    pub driver_runtime_version: Option<String>,
+    pub benchmark_version: Option<String>,
 }
 
 impl KernelEvidenceReference {
@@ -1457,6 +1483,73 @@ fn evidence_to_canonical_value(evidence: &KernelEvidenceReference) -> serde_json
         entry.insert(
             "provider_context".into(),
             serde_json::Value::String(provider_context.clone()),
+        );
+    }
+    if let Some(workload) = &evidence.workload_metadata {
+        entry.insert(
+            "workload_metadata".into(),
+            workload_metadata_to_canonical_value(workload),
+        );
+    }
+    serde_json::Value::Object(entry)
+}
+
+fn workload_metadata_to_canonical_value(
+    workload: &KernelBenchmarkWorkloadMetadata,
+) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    if let Some(input_shapes) = &workload.input_shapes {
+        entry.insert(
+            "input_shapes".into(),
+            serde_json::Value::String(input_shapes.clone()),
+        );
+    }
+    if let Some(dtype_layout) = &workload.dtype_layout {
+        entry.insert(
+            "dtype_layout".into(),
+            serde_json::Value::String(dtype_layout.clone()),
+        );
+    }
+    if let Some(batch_size) = workload.batch_size {
+        entry.insert(
+            "batch_size".into(),
+            serde_json::Value::Number(batch_size.into()),
+        );
+    }
+    if let Some(sequence_length) = workload.sequence_length {
+        entry.insert(
+            "sequence_length".into(),
+            serde_json::Value::Number(sequence_length.into()),
+        );
+    }
+    if let Some(warmup_count) = workload.warmup_count {
+        entry.insert(
+            "warmup_count".into(),
+            serde_json::Value::Number(warmup_count.into()),
+        );
+    }
+    if let Some(measurement_count) = workload.measurement_count {
+        entry.insert(
+            "measurement_count".into(),
+            serde_json::Value::Number(measurement_count.into()),
+        );
+    }
+    if let Some(synchronization_policy) = &workload.synchronization_policy {
+        entry.insert(
+            "synchronization_policy".into(),
+            serde_json::Value::String(synchronization_policy.clone()),
+        );
+    }
+    if let Some(driver_runtime_version) = &workload.driver_runtime_version {
+        entry.insert(
+            "driver_runtime_version".into(),
+            serde_json::Value::String(driver_runtime_version.clone()),
+        );
+    }
+    if let Some(benchmark_version) = &workload.benchmark_version {
+        entry.insert(
+            "benchmark_version".into(),
+            serde_json::Value::String(benchmark_version.clone()),
         );
     }
     serde_json::Value::Object(entry)
@@ -2197,6 +2290,10 @@ fn parse_evidence(
         .map(|value| as_str(value, "evidence.provider_context"))
         .transpose()?
         .map(str::to_string);
+    let workload_metadata = object
+        .get("workload_metadata")
+        .map(parse_benchmark_workload_metadata)
+        .transpose()?;
     Ok(KernelEvidenceReference {
         digest,
         profile,
@@ -2208,6 +2305,39 @@ fn parse_evidence(
         workload_profile,
         device_context,
         provider_context,
+        workload_metadata,
+    })
+}
+
+fn parse_benchmark_workload_metadata(
+    value: &serde_json::Value,
+) -> Result<KernelBenchmarkWorkloadMetadata, KernelManifestError> {
+    let object = as_object(value, "evidence.workload_metadata")?;
+    let field = |key: &str| -> Result<Option<String>, KernelManifestError> {
+        object
+            .get(key)
+            .map(|value| as_str(value, "workload_metadata field"))
+            .transpose()
+            .map(|value| value.map(str::to_string))
+    };
+    Ok(KernelBenchmarkWorkloadMetadata {
+        input_shapes: field("input_shapes")?,
+        dtype_layout: field("dtype_layout")?,
+        batch_size: object.get("batch_size").and_then(serde_json::Value::as_u64),
+        sequence_length: object
+            .get("sequence_length")
+            .and_then(serde_json::Value::as_u64),
+        warmup_count: object
+            .get("warmup_count")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as u32),
+        measurement_count: object
+            .get("measurement_count")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as u32),
+        synchronization_policy: field("synchronization_policy")?,
+        driver_runtime_version: field("driver_runtime_version")?,
+        benchmark_version: field("benchmark_version")?,
     })
 }
 
@@ -2926,6 +3056,214 @@ impl KernelExchangeBundle {
 }
 
 // ---------------------------------------------------------------------
+// Distribution neutrality: named transports
+// ---------------------------------------------------------------------
+
+/// Physical Kernel Exchange Bundle transports, implementing "Distribution
+/// Neutrality" (spec): "Transport representation SHALL NOT change Kernel
+/// Artifact identity." [`Self::Directory`] and [`Self::TarArchive`] are
+/// implemented by this module; [`Self::ObjectStore`], [`Self::OciLike`], and
+/// [`Self::Registry`] are named reservations only -- the proposal's
+/// "Non-Goals" section explicitly excludes this change from defining one
+/// artifact registry, an OCI profile, or object-store/HTTP APIs, so those
+/// three variants intentionally have no supporting code, matching "Reserve
+/// object-store/OCI-like/registry transport" (tasks) rather than
+/// implementing them.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelBundleTransport {
+    Directory,
+    TarArchive,
+    ObjectStore,
+    OciLike,
+    Registry,
+}
+
+impl KernelBundleTransport {
+    pub const fn is_implemented(self) -> bool {
+        matches!(self, Self::Directory | Self::TarArchive)
+    }
+}
+
+// ---------------------------------------------------------------------
+// Archive representation (tar / tar.gz)
+// ---------------------------------------------------------------------
+
+/// Not part of Kernel Artifact identity -- see "Bundle Identity" (spec): "An
+/// archive checksum MAY additionally exist, but it SHALL NOT replace logical
+/// artifact identity." This hashes the *raw, possibly-compressed* archive
+/// bytes purely as an optional transport-level diagnostic (e.g. for a
+/// download integrity check), implementing "Keep archive checksum
+/// optional/separate" (tasks). Two archives with different compression or
+/// timestamps produce different values here while still unpacking to a
+/// bundle with an identical [`KernelManifestV1::digest`].
+pub fn archive_diagnostic_checksum(archive_bytes: &[u8]) -> String {
+    sha256_hex(archive_bytes)
+}
+
+/// Defensive limits for archive extraction, implementing "Verify
+/// decompressed size limits" / "Prevent decompression bomb beyond configured
+/// limits" (tasks).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelExchangeArchiveLimits {
+    pub max_entries: usize,
+    pub max_entry_decompressed_bytes: u64,
+    pub max_total_decompressed_bytes: u64,
+}
+
+impl Default for KernelExchangeArchiveLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 4096,
+            max_entry_decompressed_bytes: 1024 * 1024 * 1024,
+            max_total_decompressed_bytes: 16 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn reject_unsafe_tar_entry_type(
+    entry_type: tar::EntryType,
+    path: &str,
+) -> Result<(), KernelManifestError> {
+    use tar::EntryType;
+    match entry_type {
+        EntryType::Regular | EntryType::Directory | EntryType::GNUSparse => Ok(()),
+        EntryType::Symlink => Err(KernelManifestError::BundleSymlinkDenied { path: path.into() }),
+        // Hard links, device files, FIFOs, and other special entries are not
+        // portable Kernel Exchange Bundle content -- "Reject hard-link
+        // escape" / "Reject device files" / "Reject special entries" (tasks,
+        // "Path Safety"). Unlike the directory transport (where these
+        // concepts are not portably detectable via `std::fs` metadata alone
+        // across Windows/macOS/Linux), tar's entry-type byte makes every one
+        // of these explicit and detectable before any bytes are extracted.
+        _ => Err(KernelManifestError::BundlePathInvalid { path: path.into() }),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_tar_entry_bounded(
+    entry: &mut tar::Entry<'_, impl std::io::Read>,
+    per_entry_limit: u64,
+) -> Result<Vec<u8>, KernelManifestError> {
+    use std::io::Read as _;
+    // Reads at most `per_entry_limit + 1` bytes: if that many are actually
+    // available, the true entry is over limit, and it is rejected *without*
+    // ever allocating or fully materializing the oversized (potentially
+    // bomb-decompressed) content.
+    let mut limited = entry.take(per_entry_limit.saturating_add(1));
+    let mut buffer = Vec::new();
+    limited
+        .read_to_end(&mut buffer)
+        .map_err(|error| KernelManifestError::InternalError {
+            reason: error.to_string(),
+        })?;
+    if buffer.len() as u64 > per_entry_limit {
+        return Err(KernelManifestError::LimitExceeded {
+            limit: "archive-entry-decompressed-bytes".into(),
+        });
+    }
+    Ok(buffer)
+}
+
+/// Extracts a tar (optionally gzip-compressed) Kernel Exchange Bundle
+/// archive into `destination`, implementing "Support archive
+/// representation" and "Allow transport compression" (tasks). Every entry's
+/// path is checked with [`validate_bundle_relative_path`] and every entry's
+/// type is checked with `reject_unsafe_tar_entry_type` *before* any bytes
+/// are written to disk -- path traversal and unsafe entry types fail closed
+/// rather than partially extracting. Returns a [`KernelExchangeBundle`]
+/// rooted at `destination`; callers run it through
+/// [`validate_kernel_exchange_bundle`] exactly as they would a
+/// directory-transport bundle -- "Digest logical uncompressed blob bytes"
+/// (tasks) falls out naturally, since digest computation only ever sees the
+/// fully-extracted plain bytes on disk, never archive/compression framing.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn extract_kernel_exchange_archive(
+    reader: impl std::io::Read,
+    gzip_compressed: bool,
+    destination: &Path,
+    limits: &KernelExchangeArchiveLimits,
+) -> Result<KernelExchangeBundle, KernelManifestError> {
+    fn extract_entries(
+        mut archive: tar::Archive<impl std::io::Read>,
+        destination: &Path,
+        limits: &KernelExchangeArchiveLimits,
+    ) -> Result<(), KernelManifestError> {
+        let entries = archive
+            .entries()
+            .map_err(|error| KernelManifestError::InternalError {
+                reason: error.to_string(),
+            })?;
+        let mut entry_count = 0usize;
+        let mut total_bytes: u64 = 0;
+        for entry in entries {
+            let mut entry = entry.map_err(|error| KernelManifestError::InternalError {
+                reason: error.to_string(),
+            })?;
+            entry_count += 1;
+            if entry_count > limits.max_entries {
+                return Err(KernelManifestError::LimitExceeded {
+                    limit: "archive-entry-count".into(),
+                });
+            }
+            let entry_type = entry.header().entry_type();
+            let path_buf = entry
+                .path()
+                .map_err(|error| KernelManifestError::InternalError {
+                    reason: error.to_string(),
+                })?
+                .into_owned();
+            let path_text = path_buf.to_string_lossy().replace('\\', "/");
+            reject_unsafe_tar_entry_type(entry_type, &path_text)?;
+            validate_bundle_relative_path(&path_text)?;
+
+            if entry_type == tar::EntryType::Directory {
+                fs::create_dir_all(destination.join(&path_text)).map_err(|error| {
+                    KernelManifestError::InternalError {
+                        reason: error.to_string(),
+                    }
+                })?;
+                continue;
+            }
+
+            let bytes = read_tar_entry_bounded(&mut entry, limits.max_entry_decompressed_bytes)?;
+            total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+            if total_bytes > limits.max_total_decompressed_bytes {
+                return Err(KernelManifestError::LimitExceeded {
+                    limit: "archive-total-decompressed-bytes".into(),
+                });
+            }
+
+            let target_path = destination.join(&path_text);
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent).map_err(|error| KernelManifestError::InternalError {
+                    reason: error.to_string(),
+                })?;
+            }
+            fs::write(&target_path, &bytes).map_err(|error| {
+                KernelManifestError::InternalError {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    fs::create_dir_all(destination).map_err(|error| KernelManifestError::InternalError {
+        reason: error.to_string(),
+    })?;
+
+    if gzip_compressed {
+        let decoder = flate2::read::GzDecoder::new(reader);
+        extract_entries(tar::Archive::new(decoder), destination, limits)?;
+    } else {
+        extract_entries(tar::Archive::new(reader), destination, limits)?;
+    }
+
+    Ok(KernelExchangeBundle::open(destination.to_path_buf()))
+}
+
+// ---------------------------------------------------------------------
 // Compatibility evaluation
 // ---------------------------------------------------------------------
 
@@ -2989,6 +3327,17 @@ pub fn evaluate_target_compatibility(
         }
     }
     Ok(())
+}
+
+/// The "Evaluate trust" pipeline stage, implementing "Validation Pipeline"
+/// (tasks). Deliberately takes only `policy_approved` -- no manifest,
+/// publisher claim, source claim, or signature envelope -- so this function
+/// is a nameable, testable pipeline stage without becoming a second way for
+/// manifest content to influence trust. It delegates unchanged to
+/// [`crate::evaluate_artifact_trust`], the sole authority for
+/// [`crate::KernelArtifactTrust::Trusted`].
+pub fn evaluate_manifest_trust(policy_approved: bool) -> crate::KernelArtifactTrust {
+    crate::evaluate_artifact_trust(policy_approved)
 }
 
 /// A manifest that has passed structural, schema, canonical-identity, blob
@@ -3266,6 +3615,46 @@ pub fn normalize_oracle_identity(
     Ok(CorrectnessOracleIdentity {
         provider: ProviderBinding::new(provider),
         version: version.to_string(),
+    })
+}
+
+/// Normalizes a benchmark evidence reference into the internal
+/// [`crate::BenchmarkProfile`] contract, implementing "Normalize benchmark
+/// references" (tasks). `hardware_architecture` is an explicit parameter
+/// rather than an evidence field: this reference identifies the *evidence*
+/// blob's digest, not which compiled artifact/architecture it was measured
+/// against, so the caller (which already knows that linkage from its own
+/// manifest traversal) supplies it rather than this function guessing.
+/// Missing optional fields become honest defaults (empty string / zero),
+/// never fabricated plausible-looking values --
+/// `crate::BenchmarkProfile::is_authoritative` then correctly reports
+/// whether the result is complete enough to use as ranking evidence.
+pub fn normalize_benchmark_profile(
+    evidence: &KernelEvidenceReference,
+    hardware_architecture: &str,
+) -> Result<crate::BenchmarkProfile, KernelManifestError> {
+    let workload = evidence.workload_metadata.as_ref().ok_or_else(|| {
+        KernelManifestError::ExchangeBenchmarkEvidenceInvalid {
+            reason: "evidence has no workload metadata to normalize into a BenchmarkProfile".into(),
+        }
+    })?;
+    Ok(crate::BenchmarkProfile {
+        target_device: evidence.device_context.clone().unwrap_or_default(),
+        hardware_architecture: hardware_architecture.to_string(),
+        provider_version: evidence.provider_context.clone().unwrap_or_default(),
+        driver_runtime_version: workload.driver_runtime_version.clone(),
+        input_shapes: workload.input_shapes.clone().unwrap_or_default(),
+        dtype_layout: workload.dtype_layout.clone().unwrap_or_default(),
+        batch_size: workload.batch_size,
+        sequence_length: workload.sequence_length,
+        warmup_count: workload.warmup_count.unwrap_or(0),
+        measurement_count: workload.measurement_count.unwrap_or(0),
+        synchronization_policy: workload.synchronization_policy.clone().unwrap_or_default(),
+        benchmark_version: workload
+            .benchmark_version
+            .clone()
+            .or_else(|| evidence.suite_or_workload_version.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -3683,6 +4072,31 @@ impl KernelManifestObservation {
             .insert(key.into(), redact_backend_diagnostic(value.as_ref()));
         self
     }
+
+    /// Implements "Observe schema version" (tasks). The schema string
+    /// (`magnetar:kernel-manifest@1.0`) is never sensitive, but is still
+    /// routed through the same redaction path as every other observation
+    /// field for a single, uniform guarantee.
+    pub fn with_schema_version(self, schema: &KernelManifestSchemaVersion) -> Self {
+        self.with_redacted_metadata("schema-version", schema.schema_string())
+    }
+
+    /// Implements "Observe artifact counts" (tasks): a bare count, never the
+    /// artifacts themselves.
+    pub fn with_artifact_count(self, count: usize) -> Self {
+        self.with_redacted_metadata("artifact-count", count.to_string())
+    }
+
+    /// Implements "Observe formats" (tasks): the declared format
+    /// identities (e.g. `nvidia:cubin`), never blob content.
+    pub fn with_formats(self, formats: impl IntoIterator<Item = KernelArtifactFormat>) -> Self {
+        let joined = formats
+            .into_iter()
+            .map(|format| format.stable_key())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.with_redacted_metadata("formats", joined)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -3930,6 +4344,7 @@ pub fn run_kernel_artifact_manifest_conformance() -> KernelManifestConformanceRe
             workload_profile: None,
             device_context: None,
             provider_context: None,
+            workload_metadata: None,
         };
         let current = evaluate_qualification_evidence_currency(&reference, "v1");
         let obsolete = evaluate_qualification_evidence_currency(&reference, "v2");
