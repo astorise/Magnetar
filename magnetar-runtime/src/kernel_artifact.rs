@@ -61,7 +61,8 @@
 use crate::compute::redact_backend_diagnostic;
 use crate::{
     ComputeDType, DeviceBinding, KernelDeterminism, KernelId, KernelOperatorVersionRange,
-    KernelPrecisionMetadata, KernelShapeConstraints, OperatorId, ProviderBinding, TensorLayoutKind,
+    KernelPrecisionMetadata, KernelShapeConstraints, KernelSpecializationTemplateId, OperatorId,
+    ProviderBinding, TensorLayoutKind,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -353,6 +354,12 @@ pub struct CompiledKernelArtifact {
     pub precision: KernelPrecisionMetadata,
     pub determinism: KernelDeterminism,
     pub trust: KernelArtifactTrust,
+    /// Implements "Kernel Artifact May Declare Specialization Template"
+    /// (`define-kernel-runtime-autotuning-and-specialization-contract`):
+    /// an accepted artifact MAY expose the bounded specialization space
+    /// Runtime Autotuning is allowed to evaluate. `None` means the artifact
+    /// exposes no tunable specialization.
+    pub specialization_template: Option<KernelSpecializationTemplateId>,
 }
 
 impl CompiledKernelArtifact {
@@ -382,6 +389,7 @@ impl CompiledKernelArtifact {
             precision: KernelPrecisionMetadata::default(),
             determinism: KernelDeterminism::default(),
             trust: KernelArtifactTrust::Untrusted,
+            specialization_template: None,
         }
     }
 
@@ -395,6 +403,14 @@ impl CompiledKernelArtifact {
         providers: impl IntoIterator<Item = ProviderBinding>,
     ) -> Self {
         self.provider_compatibility.extend(providers);
+        self
+    }
+
+    pub fn with_specialization_template(
+        mut self,
+        template: KernelSpecializationTemplateId,
+    ) -> Self {
+        self.specialization_template = Some(template);
         self
     }
 }

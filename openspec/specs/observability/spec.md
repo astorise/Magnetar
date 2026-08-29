@@ -1848,3 +1848,117 @@ When error is emitted
 
 Then tokens/passwords are absent.
 
+---
+
+### Requirement: Autotuning Lifecycle Is Observable
+
+Runtime MAY emit redacted observations for tuning planning, preparation, measurement and result, and emitted observations SHALL be redacted per Autotuning Payloads Are Redacted.
+
+#### Scenario: Winner selected
+
+Given tuning session completes
+
+When observations are exported
+
+Then winning specialization, workload bucket and policy may be reported.
+
+---
+
+### Requirement: Tuning Versus Production Execution Is Distinguishable
+
+Observability SHALL distinguish benchmark/tuning execution from inference
+execution.
+
+#### Scenario: Kernel invocation during benchmark
+
+Given candidate runs as tuning fixture
+
+When observed
+
+Then invocation is classified as autotuning activity.
+
+---
+
+### Requirement: Autotuning Payloads Are Redacted
+
+Observability SHALL not expose raw tuning tensors or native handles by default.
+
+#### Scenario: Candidate benchmark fails
+
+Given diagnostic exists
+
+When exported
+
+Then stable IDs and failure category may appear while raw fixture data does not.
+
+---
+
+### Requirement: Adaptive Performance Observability
+
+Runtime MAY expose redacted aggregate Kernel performance state, and exposed state SHALL be redacted of raw model and user content.
+
+#### Scenario: Kernel regressed
+
+Given sufficient evidence confirms regression
+
+When observability is queried
+
+Then Kernel/workload bucket/regression reason may be reported.
+
+---
+
+### Requirement: Online And Offline Evidence Distinguished
+
+Observability SHOULD identify evidence source. Observability output SHALL
+label each metric with its evidence source (online or offline).
+
+#### Scenario: Benchmark and production differ
+
+Given both values exist
+
+When diagnostics are emitted
+
+Then offline benchmark and online observation are not conflated.
+
+---
+
+### Requirement: Re-Tuning Request Is Observable
+
+Adaptive re-tuning request SHOULD be observable, and when emitted, Runtime SHALL include re-tuning reason and target workload bucket in the observable record.
+
+#### Scenario: Drift triggers tuning
+
+Given workload changes materially
+
+When re-tuning is requested
+
+Then reason, bucket and policy version may be logged.
+
+---
+
+### Requirement: External Optimization Escalation Is Observable
+
+Runtime SHOULD report when bounded Runtime adaptation cannot solve a performance problem, and when escalation occurs, Runtime SHALL record it distinctly from routine Runtime Autotuning events.
+
+#### Scenario: No specialization meets SLO
+
+Given external optimization request is emitted
+
+When observation is recorded
+
+Then escalation is distinguishable from Runtime autotuning.
+
+---
+
+### Requirement: Performance Telemetry Redaction
+
+Performance observability SHALL exclude raw prompts, model weights, KV contents,
+native handles and secrets by default.
+
+#### Scenario: Telemetry export
+
+Given metrics are exported
+
+When payload is inspected
+
+Then only aggregate workload/performance metadata is present.

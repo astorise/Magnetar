@@ -881,3 +881,76 @@ When transaction rejects
 
 Then Registry state is unchanged.
 
+---
+
+### Requirement: Registry Can Distinguish Specialization Instances
+
+Kernel Registry SHALL retain enough identity to distinguish Runtime-relevant
+specializations.
+
+#### Scenario: Two Attention variants
+
+Given two prepared variants have different tile specialization
+
+When candidates are evaluated
+
+Then each may carry distinct performance evidence.
+
+---
+
+### Requirement: Registry Does Not Tune Automatically
+
+Kernel Registry SHALL not start benchmarks or compilation as a side effect of
+candidate lookup.
+
+#### Scenario: Candidate lookup
+
+Given tuning record is absent
+
+When Registry returns candidates
+
+Then no autotuning session is implicitly started.
+
+---
+
+### Requirement: Registry Selection Uses Normal Policy After Tuning
+
+Autotuning evidence MAY inform ranking but SHALL not bypass Registry/Runtime
+eligibility.
+
+#### Scenario: Winner revoked
+
+Given tuning record names fastest candidate
+
+But Registry marks it revoked
+
+Then it is excluded.
+
+---
+
+### Requirement: Registry Preserves Performance Evidence Identity
+
+Registry SHALL associate performance evidence with the correct Kernel Artifact,
+specialization, and generation context.
+
+#### Scenario: New Kernel generation
+
+Given generation N+1 replaces N
+
+When performance evidence is queried
+
+Then N observations do not silently become N+1 observations.
+
+---
+
+### Requirement: Registry Does Not Generate Performance Evidence
+
+Kernel Registry SHALL not fabricate missing benchmark or online metrics.
+
+#### Scenario: No online samples
+
+Given candidate lacks observations
+
+When ranking occurs
+
+Then evidence remains missing rather than inferred from another candidate.

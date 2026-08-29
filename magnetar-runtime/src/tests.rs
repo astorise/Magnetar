@@ -14,9 +14,11 @@ use crate::kernel::*;
 use crate::kernel_artifact::*;
 use crate::kernel_artifact_ingestion::*;
 use crate::kernel_artifact_manifest::*;
+use crate::kernel_autotuning::*;
 use crate::kernel_benchmark::*;
 use crate::kernel_cache::*;
 use crate::kernel_compilation::*;
+use crate::kernel_performance_model::*;
 use crate::kernel_qualification::*;
 use crate::kernel_registry::*;
 use crate::kernel_selection_policy::*;
@@ -8223,6 +8225,7 @@ fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_r
         runtime_policy_allows: true,
         browser_supported: true,
         kernel_preparation_ready: true,
+        autotuning_ready: true,
     };
 
     let error = warm_model_instance(&mut runtime, &instance, &plan, &checks).unwrap_err();
@@ -16977,6 +16980,82 @@ fn regression_policy_correctness_only_never_rejects_on_latency() {
 }
 
 // ---------------------------------------------------------------------
+// kernel_autotuning
+// ---------------------------------------------------------------------
+
+#[test]
+fn kernel_autotuning_conformance_report_is_conformant() {
+    let report = run_kernel_autotuning_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn kernel_autotuning_policy_enforces_single_active_policy() {
+    assert!(!KernelAutotuningPolicy::Disabled.permits_live_tuning());
+    assert!(KernelAutotuningPolicy::Optional.permits_live_tuning());
+    assert!(KernelAutotuningPolicy::Required.permits_live_tuning());
+    assert!(
+        !KernelAutotuningPolicy::Pinned {
+            record_fingerprint: "r".into(),
+        }
+        .permits_live_tuning()
+    );
+    assert!(require_autotuning_enabled(&KernelAutotuningPolicy::Disabled).is_err());
+    assert!(require_autotuning_enabled(&KernelAutotuningPolicy::Optional).is_ok());
+}
+
+#[test]
+fn kernel_autotuning_qualification_coverage_never_implicitly_inherits() {
+    let exact = QualificationCoverage::ExactInstance {
+        fingerprint: "instance-a".into(),
+    };
+    assert!(exact.covers("instance-a"));
+    assert!(!exact.covers("instance-b"));
+
+    let enumerated = QualificationCoverage::EnumeratedInstances {
+        fingerprints: BTreeSet::from(["instance-a".to_string(), "instance-b".to_string()]),
+    };
+    assert!(enumerated.covers("instance-b"));
+    assert!(!enumerated.covers("instance-c"));
+
+    let unauthorized_envelope = QualificationCoverage::DeclaredEnvelope { authorized: false };
+    assert!(!unauthorized_envelope.covers("any-instance"));
+    let authorized_envelope = QualificationCoverage::DeclaredEnvelope { authorized: true };
+    assert!(authorized_envelope.covers("any-instance"));
+
+    assert!(!QualificationCoverage::RequiresPerInstanceQualification.covers("any-instance"));
+}
+
+#[test]
+fn kernel_autotuning_workload_bucket_requires_exact_match() {
+    let bucket = KernelAutotuningWorkloadBucket {
+        operator: OperatorId::magnetar("attention", 1, OperatorFamily::Attention),
+        shape_bucket: "batch=1/seq=4096".into(),
+        batch_bucket: Some("1".into()),
+        sequence_bucket: Some("4096".into()),
+        phase: KernelAutotuningExecutionPhase::Prefill,
+        dtype: ComputeDType::Float16,
+        layout: TensorLayoutKind::Contiguous,
+        quantization: None,
+        provider: ProviderBinding::new("cuda"),
+        device_architecture: "sm90".into(),
+        device_features: BTreeSet::new(),
+    };
+    let mut decode_bucket = bucket.clone();
+    decode_bucket.phase = KernelAutotuningExecutionPhase::Decode;
+    assert!(bucket.is_compatible_with(&bucket.clone()));
+    assert!(!bucket.is_compatible_with(&decode_bucket));
+}
+
+// ---------------------------------------------------------------------
 // kernel_cache
 // ---------------------------------------------------------------------
 
@@ -18130,5 +18209,59 @@ fn generation_preference_boundary_has_no_way_to_carry_a_kernel_identity() {
     assert_eq!(
         resolve_generation_preference(None, OptimizationProfile::Balanced),
         OptimizationProfile::Balanced
+    );
+}
+
+#[test]
+fn reproducible_kernel_selection_forces_pinned_performance_feedback() {
+    // Implements "Reproducible Mode Prevents Adaptation" (proposal, define-
+    // kernel-performance-model-and-adaptive-feedback-contract): a pinned
+    // Kernel selection always yields Pinned feedback mode regardless of the
+    // Model Instance's requested mode, and dynamic selection leaves the
+    // requested mode untouched.
+    let mut policy = ModelInstancePolicy::default();
+    policy.performance_feedback = KernelPerformanceFeedbackMode::Adaptive;
+
+    assert_eq!(
+        effective_performance_feedback_mode(&policy, &KernelSelectionPolicy::Dynamic),
+        KernelPerformanceFeedbackMode::Adaptive
+    );
+
+    let pinned = KernelSelectionPolicy::Pinned(PinnedKernelSelection::new(
+        conformance_kernel_id("attn"),
+        "digest-a",
+    ));
+    assert_eq!(
+        effective_performance_feedback_mode(&policy, &pinned),
+        KernelPerformanceFeedbackMode::Pinned
+    );
+}
+
+#[test]
+fn registry_performance_evidence_is_keyed_by_generation_and_never_fabricated() {
+    // Implements "Registry Preserves Performance Evidence Identity" and
+    // "Registry Does Not Generate Performance Evidence" (proposal, define-
+    // kernel-performance-model-and-adaptive-feedback-contract): a new
+    // Prepared Kernel generation never inherits a prior generation's
+    // evidence, and a candidate with no recorded evidence resolves to
+    // `None` rather than another candidate's summary.
+    let artifact = CompiledKernelArtifactId::from_digest("digest-a");
+    let mut allocator = PreparedKernelIdAllocator::default();
+    let generation_n = allocator.allocate();
+    let generation_n_plus_1 = allocator.allocate();
+
+    let mut evidence = BTreeMap::new();
+    evidence.insert(
+        performance_evidence_key(&artifact, generation_n),
+        KernelPerformanceMetricSummary {
+            count: 100,
+            ..KernelPerformanceMetricSummary::default()
+        },
+    );
+
+    assert!(lookup_performance_evidence(&evidence, &artifact, generation_n).is_some());
+    assert!(
+        lookup_performance_evidence(&evidence, &artifact, generation_n_plus_1).is_none(),
+        "a new generation must not silently inherit the prior generation's evidence"
     );
 }

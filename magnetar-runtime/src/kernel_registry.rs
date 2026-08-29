@@ -1647,6 +1647,38 @@ fn prefix_cache_compatible(
 }
 
 // ---------------------------------------------------------------------
+// Performance Evidence Identity
+// (define-kernel-performance-model-and-adaptive-feedback-contract)
+// ---------------------------------------------------------------------
+
+/// Implements "Registry Preserves Performance Evidence Identity" (proposal):
+/// "Registry SHALL associate performance evidence with the correct Kernel
+/// Artifact, specialization, and generation context." Keying on the opaque
+/// [`PreparedKernelId`] as well as the artifact digest means a new Prepared
+/// Kernel generation -- which always allocates a fresh, distinct id via
+/// [`PreparedKernelIdAllocator`] -- can never collide with a prior
+/// generation's evidence key, so "N observations do not silently become N+1
+/// observations."
+pub fn performance_evidence_key(
+    artifact: &CompiledKernelArtifactId,
+    generation: PreparedKernelId,
+) -> String {
+    format!("{artifact}|{generation}")
+}
+
+/// Implements "Registry Does Not Generate Performance Evidence" (proposal):
+/// "Kernel Registry SHALL not fabricate missing benchmark or online
+/// metrics." A missing entry resolves to `None` -- never to another
+/// candidate's evidence, and never to a synthesized value.
+pub fn lookup_performance_evidence<'a>(
+    evidence: &'a BTreeMap<String, crate::kernel_performance_model::KernelPerformanceMetricSummary>,
+    artifact: &CompiledKernelArtifactId,
+    generation: PreparedKernelId,
+) -> Option<&'a crate::kernel_performance_model::KernelPerformanceMetricSummary> {
+    evidence.get(&performance_evidence_key(artifact, generation))
+}
+
+// ---------------------------------------------------------------------
 // Generated Kernel lifecycle conformance
 // ---------------------------------------------------------------------
 

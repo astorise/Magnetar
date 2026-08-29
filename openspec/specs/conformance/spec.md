@@ -1964,3 +1964,385 @@ When exported
 
 Then sensitive payloads remain redacted.
 
+---
+
+### Requirement: Bounded Autotuning Conformance
+
+Conformance SHALL prove Runtime Autotuning cannot evaluate an unbounded
+specialization space.
+
+#### Scenario: Unbounded template
+
+Given tuning axis lacks explicit bound
+
+When plan validates
+
+Then it is rejected.
+
+---
+
+### Requirement: No Arbitrary Generation Conformance
+
+Conformance SHALL prove Runtime Autotuning cannot invoke arbitrary Kernel source
+generation.
+
+#### Scenario: Candidate set exhausted
+
+Given no candidate meets objective
+
+When tuning ends
+
+Then no external AI generator is invoked by Runtime.
+
+---
+
+### Requirement: No Arbitrary Compiler Flag Conformance
+
+Conformance SHALL reject arbitrary free-form compiler arguments as tuning axes.
+
+#### Scenario: Manifest exposes arbitrary flags
+
+Given specialization contains unrestricted compiler command string
+
+When validated
+
+Then template is rejected.
+
+---
+
+### Requirement: No Hot-Path Tuning Conformance
+
+Conformance SHALL prove token decode does not block on autotuning.
+
+#### Scenario: Missing tuning cache
+
+Given tuning record absent
+
+When token generated
+
+Then benchmark is not synchronously launched.
+
+---
+
+### Requirement: Accepted Artifact Requirement Conformance
+
+Conformance SHALL prove quarantined/rejected artifacts cannot participate in
+Runtime Autotuning.
+
+#### Scenario: Quarantined Kernel
+
+Given specialization template exists
+
+When tuning candidates enumerate
+
+Then Kernel is absent.
+
+---
+
+### Requirement: Qualification Coverage Conformance
+
+Conformance SHALL prove specialization uses only appropriate qualification
+evidence.
+
+#### Scenario: Qualified exact instance differs
+
+Given variant A is qualified and variant B is not covered
+
+When tuning ranks both
+
+Then B cannot become production-eligible solely from benchmark.
+
+---
+
+### Requirement: Tuning Cache Context Conformance
+
+Conformance SHALL prove incompatible workload/target context invalidates tuning
+reuse.
+
+#### Scenario: Different GPU architecture
+
+Given record came from sm90
+
+When incompatible target uses cache
+
+Then record is rejected/stale.
+
+---
+
+### Requirement: Memory Authority Conformance
+
+Conformance SHALL prove Memory Manager may reject a tuning candidate regardless
+of benchmark potential.
+
+#### Scenario: Workspace infeasible
+
+Given candidate would be fastest
+
+When workspace fails admission
+
+Then it is not benchmarked/selected as production candidate.
+
+---
+
+### Requirement: Known-Good Preservation Conformance
+
+Conformance SHALL prove tuning failure cannot remove active known-good Kernel.
+
+#### Scenario: Every candidate crashes during benchmark
+
+Given current Kernel is healthy
+
+When tuning fails
+
+Then current Kernel remains active.
+
+---
+
+### Requirement: Tuning Winner Selection Boundary Conformance
+
+Conformance SHALL prove tuning winner cannot bypass Kernel Selection Policy.
+
+#### Scenario: Winner later untrusted
+
+Given tuning identifies fastest variant
+
+When trust policy rejects it
+
+Then Runtime does not execute it.
+
+---
+
+### Requirement: Reproducible Mode Conformance
+
+Conformance SHALL prove reproducible Model Instance cannot silently change
+specialization through live tuning.
+
+#### Scenario: Faster specialization discovered
+
+Given Model Instance is pinned
+
+When background tuning produces new winner
+
+Then pinned instance remains unchanged.
+
+---
+
+### Requirement: Prepared State Persistence Conformance
+
+Conformance SHALL prove Autotuning Record does not persist native
+PreparedKernelId as portable tuning identity.
+
+#### Scenario: Runtime restart
+
+Given cached tuning record exists
+
+When Runtime restarts
+
+Then required Kernel is prepared again and native handle is not restored from
+record.
+
+---
+
+### Requirement: Performance Evidence Cannot Grant Trust
+
+Conformance SHALL prove fast Kernel remains untrusted if trust policy denies it.
+
+#### Scenario: Untrusted fastest Kernel
+
+Given production observations are excellent
+
+When selection runs
+
+Then trust denial remains authoritative.
+
+---
+
+### Requirement: Performance Evidence Cannot Grant Qualification
+
+Conformance SHALL prove observations do not substitute for qualification.
+
+#### Scenario: Unqualified specialization performs correctly in sampled runs
+
+Given no valid qualification evidence exists
+
+When Performance Model updates
+
+Then candidate remains unqualified.
+
+---
+
+### Requirement: Performance Context Isolation
+
+Conformance SHALL prove observations do not leak across incompatible
+artifact/specialization contexts.
+
+#### Scenario: New binary
+
+Given artifact digest changes
+
+When new generation executes
+
+Then historical metrics are not automatically attributed to it.
+
+---
+
+### Requirement: Sample Sufficiency Conformance
+
+Conformance SHALL prove isolated outlier cannot trigger confirmed regression
+when policy requires more evidence.
+
+#### Scenario: One slow sample
+
+Given minimum sample count is 100
+
+When one sample is slow
+
+Then regression remains unconfirmed.
+
+---
+
+### Requirement: Drift Detection Conformance
+
+Conformance SHALL detect sustained compatible difference from benchmark
+baseline.
+
+#### Scenario: Online latency increases materially
+
+Given enough samples exceed threshold
+
+When model updates
+
+Then drift state is produced.
+
+---
+
+### Requirement: Workload Drift Conformance
+
+Conformance SHALL identify substantial workload bucket distribution change.
+
+#### Scenario: Production moves to larger batches
+
+Given original tuning workload differs
+
+When distribution crosses policy threshold
+
+Then workload-drift event is emitted.
+
+---
+
+### Requirement: Bounded Re-Tuning Conformance
+
+Conformance SHALL prove feedback-triggered tuning remains inside declared
+specialization domain.
+
+#### Scenario: Better code needed
+
+Given no bounded variant meets goal
+
+When retuning ends
+
+Then Runtime does not invent source.
+
+---
+
+### Requirement: No Hot-Path Adaptive Benchmarking
+
+Conformance SHALL prove active decode does not benchmark alternatives
+synchronously.
+
+#### Scenario: Regression during decode
+
+Given regression is detected
+
+When token loop continues
+
+Then background retuning/fallback occurs according to policy.
+
+---
+
+### Requirement: External Escalation Boundary
+
+Conformance SHALL prove unresolved Runtime tuning produces external optimization
+signal, not direct AI generation.
+
+#### Scenario: All specializations poor
+
+Given policy permits external optimization
+
+When Runtime escalates
+
+Then no generator is invoked inside Runtime.
+
+---
+
+### Requirement: Adaptive Feedback Hysteresis Conformance
+
+Conformance SHALL prove small measurement noise does not create repeated Kernel
+switching.
+
+#### Scenario: Ranking alternates slightly
+
+Given difference stays below threshold
+
+When observations update
+
+Then active Kernel remains stable.
+
+---
+
+### Requirement: Adaptive Feedback Reproducible Mode Conformance
+
+Conformance SHALL prove online evidence does not alter pinned Kernel choice.
+
+#### Scenario: Another Kernel becomes faster
+
+Given instance is pinned
+
+When model recommends alternate Kernel
+
+Then selection remains pinned.
+
+---
+
+### Requirement: Bounded Retention Conformance
+
+Conformance SHALL prove continuous inference does not produce unbounded
+performance telemetry memory growth.
+
+#### Scenario: Million observations
+
+Given retention limits exist
+
+When traffic continues
+
+Then old raw samples are aggregated/expired.
+
+---
+
+### Requirement: Feedback Failure Isolation
+
+Conformance SHALL prove failure of Performance Model does not corrupt active
+known-good Kernel.
+
+#### Scenario: Aggregator fails
+
+Given active Kernel remains healthy
+
+When feedback subsystem errors
+
+Then active execution remains valid.
+
+---
+
+### Requirement: Telemetry Redaction Conformance
+
+Conformance SHALL prove exported performance evidence contains no raw prompt,
+weight, KV, native handle, secret or credential.
+
+#### Scenario: Export generated
+
+Given aggregate telemetry exists
+
+When inspected
+
+Then sensitive inference content is absent.

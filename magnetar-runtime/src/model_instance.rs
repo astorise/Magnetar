@@ -9,10 +9,11 @@
 
 use crate::{
     AdapterSetId, CorrelationId, DeviceBinding, GenerationModelReference, InferenceSessionId,
-    KernelId, KvCacheId, LoadedModelContext, MemoryAllocationId, MemoryPressureLevel,
-    ModelArchitectureImplementation, ModelArtifactId, ModelDType, ModelResidencyId,
-    PrefixCacheEntryId, ProviderAdmissionDecision, ProviderBinding, ProviderHealthState,
-    ProviderPressureLevel, ProviderReadinessState, ResourceAffinity, TokenizerId,
+    KernelAutotuningPolicy, KernelId, KernelPerformanceFeedbackMode, KvCacheId, LoadedModelContext,
+    MemoryAllocationId, MemoryPressureLevel, ModelArchitectureImplementation, ModelArtifactId,
+    ModelDType, ModelResidencyId, PrefixCacheEntryId, ProviderAdmissionDecision, ProviderBinding,
+    ProviderHealthState, ProviderPressureLevel, ProviderReadinessState, ResourceAffinity,
+    TokenizerId, reproducible_mode_blocks_adaptation,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -190,6 +191,18 @@ pub struct ModelInstancePolicy {
     pub raw_handle_exposure_allowed: bool,
     pub tenant_isolation_required: bool,
     pub browser_linear_memory_limit_bytes: Option<u64>,
+    /// Implements "Model Instance May Have Autotuning Policy"
+    /// (`define-kernel-runtime-autotuning-and-specialization-contract`):
+    /// disabled, optional, required, or pinned Kernel Autotuning behavior.
+    pub autotuning: KernelAutotuningPolicy,
+    /// Implements "Model Instance Interaction" / "Reproducible Mode"
+    /// (`define-kernel-performance-model-and-adaptive-feedback-contract`):
+    /// "A Model Instance MAY: consume adaptive performance evidence / use
+    /// dynamic selection policy / remain pinned/reproducible and ignore
+    /// adaptive changes. Policy SHALL be explicit." The *effective* mode
+    /// also depends on whether Kernel selection is pinned -- see
+    /// [`effective_performance_feedback_mode`].
+    pub performance_feedback: KernelPerformanceFeedbackMode,
 }
 
 impl Default for ModelInstancePolicy {
@@ -203,6 +216,8 @@ impl Default for ModelInstancePolicy {
             raw_handle_exposure_allowed: false,
             tenant_isolation_required: false,
             browser_linear_memory_limit_bytes: None,
+            autotuning: KernelAutotuningPolicy::Disabled,
+            performance_feedback: KernelPerformanceFeedbackMode::Disabled,
         }
     }
 }
@@ -285,6 +300,15 @@ pub struct ModelInstanceReadinessChecks {
     /// Kernel preparation has failed." Defaults to `true` so Model Instances
     /// with no artifact-backed Kernels are unaffected.
     pub kernel_preparation_ready: bool,
+    /// Whether required Kernel Autotuning has completed, implementing "The
+    /// Model Instance SHALL remain in a non-ready or explicitly warming
+    /// state until mandatory tuning is complete if deployment policy
+    /// requires tuning" (`define-kernel-runtime-autotuning-and-specialization-contract`).
+    /// Defaults to `true` so Model Instances with
+    /// [`KernelAutotuningPolicy::Required`] unset are unaffected; callers
+    /// SHALL set this to the actual completion state when policy requires
+    /// tuning (see [`crate::model_instance_autotuning_ready`]).
+    pub autotuning_ready: bool,
 }
 
 impl Default for ModelInstanceReadinessChecks {
@@ -298,6 +322,7 @@ impl Default for ModelInstanceReadinessChecks {
             runtime_policy_allows: true,
             browser_supported: true,
             kernel_preparation_ready: true,
+            autotuning_ready: true,
         }
     }
 }
@@ -309,6 +334,7 @@ impl ModelInstanceReadinessChecks {
             || !self.adapter_ready
             || !self.runtime_policy_allows
             || !self.kernel_preparation_ready
+            || !self.autotuning_ready
         {
             return ModelInstanceReadiness::Failed;
         }
@@ -341,6 +367,9 @@ impl ModelInstanceReadinessChecks {
         }
         if !self.kernel_preparation_ready {
             return Err(ModelInstanceError::ModelInstanceKernelPreparationFailed);
+        }
+        if !self.autotuning_ready {
+            return Err(ModelInstanceError::ModelInstanceAutotuningIncomplete);
         }
         if matches!(
             self.memory_pressure,
@@ -1370,6 +1399,7 @@ pub enum ModelInstanceError {
     ModelInstanceResidencyMissing,
     ModelInstanceAdapterIncompatible,
     ModelInstanceKernelPreparationFailed,
+    ModelInstanceAutotuningIncomplete,
     ModelInstanceKvCacheInvalidated,
     ModelInstancePrefixCacheInvalidated,
     ModelInstanceBrowserFeatureUnsupported,
@@ -1420,6 +1450,9 @@ impl fmt::Display for ModelInstanceError {
             }
             Self::ModelInstanceKernelPreparationFailed => {
                 f.write_str("model instance required Kernel preparation failed")
+            }
+            Self::ModelInstanceAutotuningIncomplete => {
+                f.write_str("model instance required Kernel Autotuning incomplete")
             }
             Self::ModelInstanceKvCacheInvalidated => {
                 f.write_str("model instance KV cache invalidated")
@@ -1516,6 +1549,20 @@ pub fn session_kernel_policy_is_inherited(
     model_instance_policy
 }
 
+/// Implements "Reproducible Mode" / "Reproducible Mode Prevents Adaptation"
+/// (`define-kernel-performance-model-and-adaptive-feedback-contract`):
+/// "Pinned reproducible execution SHALL not change Kernel from live
+/// performance feedback." A pinned [`KernelSelectionPolicy`] always forces
+/// [`KernelPerformanceFeedbackMode::Pinned`], overriding
+/// [`ModelInstancePolicy::performance_feedback`] regardless of what it
+/// requested.
+pub fn effective_performance_feedback_mode(
+    policy: &ModelInstancePolicy,
+    kernel_selection: &KernelSelectionPolicy,
+) -> KernelPerformanceFeedbackMode {
+    reproducible_mode_blocks_adaptation(kernel_selection.is_pinned(), policy.performance_feedback)
+}
+
 /// A pinned Kernel selection, implementing "For strict reproducibility, a
 /// Model Instance SHOULD be able to pin: KernelId, artifact digest, Prepared
 /// generation, qualification profile" (proposal).
@@ -1525,6 +1572,12 @@ pub struct PinnedKernelSelection {
     pub artifact_digest: String,
     pub prepared_generation: Option<u64>,
     pub qualification_profile: Option<String>,
+    /// Implements "Reproducible Model Instance May Pin Tuning Record"
+    /// (`define-kernel-runtime-autotuning-and-specialization-contract`): a
+    /// pinned `KernelAutotuningRecord` fingerprint the Model Instance
+    /// consumes instead of live tuning. Live re-tuning SHALL NOT change this
+    /// value.
+    pub autotuning_record_fingerprint: Option<String>,
 }
 
 impl PinnedKernelSelection {
@@ -1534,7 +1587,13 @@ impl PinnedKernelSelection {
             artifact_digest: artifact_digest.into(),
             prepared_generation: None,
             qualification_profile: None,
+            autotuning_record_fingerprint: None,
         }
+    }
+
+    pub fn with_autotuning_record_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.autotuning_record_fingerprint = Some(fingerprint.into());
+        self
     }
 
     /// Implements "Record artifact digest for reproducibility" and "Record
