@@ -261,9 +261,9 @@ conformance report), not just a defined struct field.
 
 - [x] Support local directory.
 - [x] Support archive representation. (`extract_kernel_exchange_archive`: tar and tar.gz, via the `tar`/`flate2` crates, gated `#[cfg(not(target_arch = "wasm32"))]`)
-- [ ] Reserve object-store transport. (`KernelBundleTransport::ObjectStore` -- named reservation only, per the proposal's own "Non-Goals": this change does not define an object-store/S3 API)
-- [ ] Reserve OCI-like transport. (`KernelBundleTransport::OciLike` -- named reservation only, per "Non-Goals": this change does not define an OCI profile)
-- [ ] Reserve registry transport. (`KernelBundleTransport::Registry` -- named reservation only, per "Non-Goals": this change does not define one artifact registry)
+- [x] Reserve object-store transport. (`KernelBundleTransport::ObjectStore` -- named, type-checked reservation, not an implementation: `is_implemented()` returns `false` for it, tested by `kernel_bundle_transport_reservation_marks_only_directory_and_tar_as_implemented`. Building the object-store/S3 API itself is out of scope per the proposal's own "Non-Goals".)
+- [x] Reserve OCI-like transport. (`KernelBundleTransport::OciLike`, same reservation pattern; an OCI profile is explicitly a "Non-Goal".)
+- [x] Reserve registry transport. (`KernelBundleTransport::Registry`, same reservation pattern; one artifact registry is explicitly a "Non-Goal".)
 - [x] Keep core manifest transport-neutral.
 
 ## 27. Path Safety
