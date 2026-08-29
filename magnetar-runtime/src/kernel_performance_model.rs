@@ -605,10 +605,11 @@ pub fn resolve_evidence_precedence(
     online_sample_count: u64,
 ) -> KernelPerformanceEvidenceSource {
     match policy {
-        OnlineOfflinePrecedencePolicy::OfflineOnly | OnlineOfflinePrecedencePolicy::PinnedOffline => {
-            KernelPerformanceEvidenceSource::Offline
-        }
-        OnlineOfflinePrecedencePolicy::OnlinePreferredAfterSufficientSamples { minimum_samples } => {
+        OnlineOfflinePrecedencePolicy::OfflineOnly
+        | OnlineOfflinePrecedencePolicy::PinnedOffline => KernelPerformanceEvidenceSource::Offline,
+        OnlineOfflinePrecedencePolicy::OnlinePreferredAfterSufficientSamples {
+            minimum_samples,
+        } => {
             if online_sample_count >= *minimum_samples {
                 KernelPerformanceEvidenceSource::Online
             } else {
@@ -1145,9 +1146,12 @@ pub fn classify_memory_anomaly(
     severe_ratio: f64,
 ) -> PerformanceOrContractIssue {
     if anomaly.advertised_workspace_bytes > 0 {
-        let ratio = anomaly.observed_workspace_bytes as f64 / anomaly.advertised_workspace_bytes as f64;
+        let ratio =
+            anomaly.observed_workspace_bytes as f64 / anomaly.advertised_workspace_bytes as f64;
         if ratio > 1.0 + severe_ratio {
-            return PerformanceOrContractIssue::ContractViolation(ContractViolationSeverity::Severe);
+            return PerformanceOrContractIssue::ContractViolation(
+                ContractViolationSeverity::Severe,
+            );
         }
     }
     if anomaly.exceeds(tolerance_ratio) {
@@ -1200,7 +1204,11 @@ pub enum AgingMechanism {
 
 /// Returns a weight in `[0.0, 1.0]`: `0.0` means the evidence is expired and
 /// SHALL NOT participate in current evidence.
-pub fn observation_weight(mechanism: &AgingMechanism, age_millis: u64, generations_since: u32) -> f64 {
+pub fn observation_weight(
+    mechanism: &AgingMechanism,
+    age_millis: u64,
+    generations_since: u32,
+) -> f64 {
     match mechanism {
         AgingMechanism::TimeWindow { max_age_millis } => {
             if age_millis > *max_age_millis {
@@ -1606,7 +1614,7 @@ pub struct KernelPerformanceExportSummary {
 
 impl KernelPerformanceExportSummary {
     /// Implements "Runtime SHALL not expose ... by default" (Observability
-    /// section): every value passes through [`redact_backend_diagnostic`]
+    /// section): every value passes through `redact_backend_diagnostic`
     /// before leaving the process, mirroring
     /// [`crate::kernel_autotuning::KernelAutotuningObservation`]'s export
     /// pattern.
@@ -1701,7 +1709,9 @@ impl KernelPerformanceError {
             Self::RetuningRateLimited => "kernel-performance-retuning-rate-limited",
             Self::RetuningDenied => "kernel-performance-retuning-denied",
             Self::RetuningRequestFailed { .. } => "kernel-performance-retuning-request-failed",
-            Self::OptimizationEscalationRequired => "kernel-performance-optimization-escalation-required",
+            Self::OptimizationEscalationRequired => {
+                "kernel-performance-optimization-escalation-required"
+            }
 
             Self::FeedbackDisabled => "kernel-performance-feedback-disabled",
             Self::FeedbackPolicyInvalid { .. } => "kernel-performance-feedback-policy-invalid",
@@ -1753,7 +1763,7 @@ pub enum KernelPerformanceObservationKind {
 /// A single adaptive-feedback observability event. Implements "Observability
 /// SHALL NOT expose by default: raw prompts, raw tensor values, model
 /// weights, KV contents, native handles, secrets, credentials" (proposal):
-/// every metadata value passes through [`redact_backend_diagnostic`] before
+/// every metadata value passes through `redact_backend_diagnostic` before
 /// storage, mirroring [`crate::kernel_autotuning::KernelAutotuningObservation`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelPerformanceObservabilityEvent {
@@ -1890,10 +1900,8 @@ pub fn run_kernel_performance_conformance() -> KernelPerformanceConformanceRepor
 
     // 1. Performance Evidence Cannot Grant Trust.
     let trust_before = KernelArtifactTrust::Untrusted;
-    let trust_after = crate::online_measurement_cannot_override_correctness_or_trust(
-        true,
-        trust_before,
-    );
+    let trust_after =
+        crate::online_measurement_cannot_override_correctness_or_trust(true, trust_before);
     record(
         &mut results,
         "Performance Evidence Cannot Grant Trust",
@@ -1917,7 +1925,9 @@ pub fn run_kernel_performance_conformance() -> KernelPerformanceConformanceRepor
     );
     let observation_wrong_artifact =
         conformance_observation(CompiledKernelArtifactId::from_digest("digest-b"), 100, 1);
-    let isolated = model.record_observation(&observation_wrong_artifact).is_err();
+    let isolated = model
+        .record_observation(&observation_wrong_artifact)
+        .is_err();
     record(
         &mut results,
         "Performance Context Isolation",
@@ -1936,11 +1946,7 @@ pub fn run_kernel_performance_conformance() -> KernelPerformanceConformanceRepor
         5_000,
         1,
     ));
-    let quality = evaluate_sample_sufficiency(
-        &one_sample_summary.summary(),
-        10_000,
-        &sufficiency,
-    );
+    let quality = evaluate_sample_sufficiency(&one_sample_summary.summary(), 10_000, &sufficiency);
     let regression_confirmation_policy = RegressionConfirmationPolicy {
         sufficiency,
         minimum_sustained_duration_millis: 1_000,
@@ -2204,7 +2210,8 @@ mod tests {
     #[test]
     fn aggregator_tracks_failure_and_timeout_counts() {
         let mut aggregator = KernelPerformanceAggregator::new();
-        let mut success = conformance_observation(CompiledKernelArtifactId::from_digest("d"), 10, 1);
+        let mut success =
+            conformance_observation(CompiledKernelArtifactId::from_digest("d"), 10, 1);
         aggregator.record(&success);
         success.completion = KernelExecutionCompletion::Failed {
             category: "provider-error".into(),
@@ -2226,7 +2233,8 @@ mod tests {
             conformance_bucket(),
             1,
         );
-        let matching = conformance_observation(CompiledKernelArtifactId::from_digest("digest-a"), 10, 1);
+        let matching =
+            conformance_observation(CompiledKernelArtifactId::from_digest("digest-a"), 10, 1);
         assert!(model.record_observation(&matching).is_ok());
 
         let mismatched_artifact =
@@ -2253,7 +2261,11 @@ mod tests {
         );
         summary.count = policy.minimum_samples - 1;
         assert_eq!(
-            evaluate_sample_sufficiency(&summary, policy.minimum_observation_duration_millis, &policy),
+            evaluate_sample_sufficiency(
+                &summary,
+                policy.minimum_observation_duration_millis,
+                &policy
+            ),
             EvidenceQuality::Insufficient,
         );
     }
@@ -2276,11 +2288,17 @@ mod tests {
             absolute_micros: 1,
         };
         assert!(
-            detect_benchmark_drift(&baseline, &observed, &threshold, EvidenceQuality::Insufficient)
-                .is_none()
+            detect_benchmark_drift(
+                &baseline,
+                &observed,
+                &threshold,
+                EvidenceQuality::Insufficient
+            )
+            .is_none()
         );
         assert!(
-            detect_benchmark_drift(&baseline, &observed, &threshold, EvidenceQuality::High).is_some()
+            detect_benchmark_drift(&baseline, &observed, &threshold, EvidenceQuality::High)
+                .is_some()
         );
     }
 
@@ -2302,21 +2320,23 @@ mod tests {
             p99_relative_increase: 0.5,
             timeout_rate_increase: 10.0,
         };
-        let signal =
-            detect_regression(&baseline, &current, RegressionBaselineKind::PriorGeneration, &thresholds);
+        let signal = detect_regression(
+            &baseline,
+            &current,
+            RegressionBaselineKind::PriorGeneration,
+            &thresholds,
+        );
         assert!(signal.is_some());
     }
 
     #[test]
     fn outlier_policy_never_silently_drops_samples() {
         let latencies = vec![10, 20, 30, 1_000];
-        let (retained, tail) =
-            apply_outlier_policy(&latencies, OutlierPolicy::RetainInTail, 100);
+        let (retained, tail) = apply_outlier_policy(&latencies, OutlierPolicy::RetainInTail, 100);
         assert_eq!(retained.len(), latencies.len());
         assert!(tail.is_empty());
 
-        let (retained, tail) =
-            apply_outlier_policy(&latencies, OutlierPolicy::MarkSeparately, 100);
+        let (retained, tail) = apply_outlier_policy(&latencies, OutlierPolicy::MarkSeparately, 100);
         assert_eq!(retained.len() + tail.len(), latencies.len());
         assert!(tail.contains(&1_000));
     }
@@ -2350,7 +2370,10 @@ mod tests {
         };
         assert!(cooldown.admit(&request));
         request.requested_at_millis = 5_000;
-        assert!(!cooldown.admit(&request), "expected the same request inside the cooldown to be rate-limited");
+        assert!(
+            !cooldown.admit(&request),
+            "expected the same request inside the cooldown to be rate-limited"
+        );
         request.requested_at_millis = 11_000;
         assert!(cooldown.admit(&request));
     }
@@ -2369,15 +2392,29 @@ mod tests {
     #[test]
     fn aging_mechanisms_expire_or_decay_evidence() {
         assert_eq!(
-            observation_weight(&AgingMechanism::TimeWindow { max_age_millis: 1000 }, 2000, 0),
+            observation_weight(
+                &AgingMechanism::TimeWindow {
+                    max_age_millis: 1000
+                },
+                2000,
+                0
+            ),
             0.0
         );
         assert_eq!(
-            observation_weight(&AgingMechanism::TimeWindow { max_age_millis: 1000 }, 500, 0),
+            observation_weight(
+                &AgingMechanism::TimeWindow {
+                    max_age_millis: 1000
+                },
+                500,
+                0
+            ),
             1.0
         );
         let decayed = observation_weight(
-            &AgingMechanism::WeightedDecay { half_life_millis: 1000 },
+            &AgingMechanism::WeightedDecay {
+                half_life_millis: 1000,
+            },
             1000,
             0,
         );
@@ -2399,7 +2436,8 @@ mod tests {
     #[test]
     fn export_summary_redacts_pointer_shaped_metadata() {
         let mut export = KernelPerformanceExportSummary {
-            kernel: conformance_observation(CompiledKernelArtifactId::from_digest("d"), 1, 1).kernel,
+            kernel: conformance_observation(CompiledKernelArtifactId::from_digest("d"), 1, 1)
+                .kernel,
             workload_bucket: "handle=0xdeadbeef".into(),
             metric_summary: KernelPerformanceMetricSummary::default(),
             evidence_source: KernelPerformanceEvidenceSource::Online,

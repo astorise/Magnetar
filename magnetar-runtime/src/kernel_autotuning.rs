@@ -2326,7 +2326,7 @@ pub enum KernelAutotuningObservationKind {
 /// expose: raw Kernel source, native handles, raw tensor fixtures by
 /// default, model weights, prompts, KV contents, secrets, credentials"
 /// (proposal): every metadata value passes through
-/// [`redact_backend_diagnostic`] before storage, and the struct has no field
+/// `redact_backend_diagnostic` before storage, and the struct has no field
 /// shaped like a source blob, pointer, or tensor buffer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelAutotuningObservation {

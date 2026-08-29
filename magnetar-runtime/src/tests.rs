@@ -18219,8 +18219,10 @@ fn reproducible_kernel_selection_forces_pinned_performance_feedback() {
     // Kernel selection always yields Pinned feedback mode regardless of the
     // Model Instance's requested mode, and dynamic selection leaves the
     // requested mode untouched.
-    let mut policy = ModelInstancePolicy::default();
-    policy.performance_feedback = KernelPerformanceFeedbackMode::Adaptive;
+    let policy = ModelInstancePolicy {
+        performance_feedback: KernelPerformanceFeedbackMode::Adaptive,
+        ..ModelInstancePolicy::default()
+    };
 
     assert_eq!(
         effective_performance_feedback_mode(&policy, &KernelSelectionPolicy::Dynamic),
