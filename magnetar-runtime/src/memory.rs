@@ -1626,7 +1626,7 @@ impl AllocationLease {
                 reason: "allocation lease alignment must be a non-zero power of two".into(),
             });
         }
-        if offset % alignment_bytes != 0 {
+        if !offset.is_multiple_of(alignment_bytes) {
             return Err(MemoryError::AllocationDenied {
                 reason: "allocation lease offset violates alignment".into(),
             });
@@ -1713,7 +1713,7 @@ impl AllocationBlock {
                 reason: "allocation region alignment must be a non-zero power of two".into(),
             });
         }
-        if region.range.start % region.alignment_bytes != 0 {
+        if !region.range.start.is_multiple_of(region.alignment_bytes) {
             return Err(MemoryError::AllocationDenied {
                 reason: "allocation region violates alignment".into(),
             });
@@ -2466,19 +2466,14 @@ impl PreparedPlanMemoryBinding {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PoolOvercommitPolicy {
+    #[default]
     Disabled,
     Enabled {
         max_bytes: u64,
         max_ratio_percent: u16,
     },
-}
-
-impl Default for PoolOvercommitPolicy {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 impl PoolOvercommitPolicy {
@@ -2941,17 +2936,9 @@ pub struct MemoryPerformanceFeedback {
     pub pressure: MemoryPressureLevel,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AllocationPlanCache {
     entries: BTreeMap<String, AllocationPlan>,
-}
-
-impl Default for AllocationPlanCache {
-    fn default() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-        }
-    }
 }
 
 impl AllocationPlanCache {
