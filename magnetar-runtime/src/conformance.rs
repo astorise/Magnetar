@@ -2,7 +2,9 @@ use crate::affinity::*;
 use crate::component::*;
 use crate::compute::redact_backend_diagnostic;
 use crate::compute::*;
+use crate::device::DeviceType;
 use crate::provider::*;
+use crate::reference_cpu::{REFERENCE_CPU_DEVICE_ID, REFERENCE_CPU_PROVIDER_NAME};
 use crate::runtime::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,6 +15,316 @@ use std::{
 };
 
 pub const PROVIDER_CONFORMANCE_SUITE_VERSION: &str = "0.1.0";
+pub const FIRST_NATIVE_MODEL_EXECUTION_PROFILE_VERSION: &str = "0.1.0";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+pub enum FirstNativeProfileCapability {
+    LocalRuntime,
+    PlatformComponentEngine,
+    WasmtimeComponentEngine,
+    QwenWasmModelComponent,
+    ModelArtifact,
+    Tokenizer,
+    OperatorCatalog,
+    ExecutionGraph,
+    PreparedExecutionPlan,
+    KernelRegistry,
+    ReferenceCpuProvider,
+    LogicalCpuDevice,
+    F32Execution,
+    TensorResource,
+    RuntimeMemoryManager,
+    KvCache,
+    IncrementalDecode,
+    GreedySampling,
+    StreamingOutput,
+    ObservabilityRedaction,
+}
+
+impl FirstNativeProfileCapability {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::LocalRuntime => "local-runtime",
+            Self::PlatformComponentEngine => "platform-component-engine",
+            Self::WasmtimeComponentEngine => "wasmtime-component-engine",
+            Self::QwenWasmModelComponent => "qwen-wasm-model-component",
+            Self::ModelArtifact => "model-artifact",
+            Self::Tokenizer => "tokenizer",
+            Self::OperatorCatalog => "operator-catalog",
+            Self::ExecutionGraph => "execution-graph",
+            Self::PreparedExecutionPlan => "prepared-execution-plan",
+            Self::KernelRegistry => "kernel-registry",
+            Self::ReferenceCpuProvider => "reference-cpu-provider",
+            Self::LogicalCpuDevice => "logical-cpu-device",
+            Self::F32Execution => "f32-execution",
+            Self::TensorResource => "tensor-resource",
+            Self::RuntimeMemoryManager => "runtime-memory-manager",
+            Self::KvCache => "kv-cache",
+            Self::IncrementalDecode => "incremental-decode",
+            Self::GreedySampling => "greedy-sampling",
+            Self::StreamingOutput => "streaming-output",
+            Self::ObservabilityRedaction => "observability-redaction",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+pub enum FirstNativeDeferredCapability {
+    MultiDevicePlacement,
+    TensorParallel,
+    Collectives,
+    GeneratedKernels,
+    ProviderRuntimeCompilation,
+    KernelArtifactIngestion,
+    HotSwap,
+    RuntimeAutotuning,
+    AdaptivePerformanceFeedback,
+    PerformanceModelReplacement,
+    AcceleratedProviders,
+    ReducedPrecision,
+    Quantization,
+    CrossProviderZeroCopy,
+    AdvancedMemoryPools,
+    PagedKvCache,
+    PrefixCacheOptimization,
+    ProductionContinuousBatching,
+    AdvancedAsyncExecutionStreams,
+}
+
+impl FirstNativeDeferredCapability {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::MultiDevicePlacement => "multi-device-placement",
+            Self::TensorParallel => "tensor-parallel",
+            Self::Collectives => "collectives",
+            Self::GeneratedKernels => "generated-kernels",
+            Self::ProviderRuntimeCompilation => "provider-runtime-compilation",
+            Self::KernelArtifactIngestion => "kernel-artifact-ingestion",
+            Self::HotSwap => "hot-swap",
+            Self::RuntimeAutotuning => "runtime-autotuning",
+            Self::AdaptivePerformanceFeedback => "adaptive-performance-feedback",
+            Self::PerformanceModelReplacement => "performance-model-replacement",
+            Self::AcceleratedProviders => "accelerated-providers",
+            Self::ReducedPrecision => "reduced-precision",
+            Self::Quantization => "quantization",
+            Self::CrossProviderZeroCopy => "cross-provider-zero-copy",
+            Self::AdvancedMemoryPools => "advanced-memory-pools",
+            Self::PagedKvCache => "paged-kv-cache",
+            Self::PrefixCacheOptimization => "prefix-cache-optimization",
+            Self::ProductionContinuousBatching => "production-continuous-batching",
+            Self::AdvancedAsyncExecutionStreams => "advanced-async-execution-streams",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct FirstNativeModelExecutionProfile {
+    pub version: String,
+    pub mandatory_capabilities: BTreeSet<FirstNativeProfileCapability>,
+    pub deferred_capabilities: BTreeSet<FirstNativeDeferredCapability>,
+}
+
+impl Default for FirstNativeModelExecutionProfile {
+    fn default() -> Self {
+        first_native_model_execution_profile()
+    }
+}
+
+impl FirstNativeModelExecutionProfile {
+    pub fn validate(&self) -> Result<(), FirstNativeModelExecutionProfileError> {
+        if self.version.trim().is_empty() {
+            return Err(FirstNativeModelExecutionProfileError::MissingVersion);
+        }
+        let missing_mandatory = first_native_mandatory_capabilities()
+            .difference(&self.mandatory_capabilities)
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing_mandatory.is_empty() {
+            return Err(
+                FirstNativeModelExecutionProfileError::MissingMandatoryCapability(
+                    missing_mandatory[0],
+                ),
+            );
+        }
+        let missing_deferred = first_native_deferred_capabilities()
+            .difference(&self.deferred_capabilities)
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing_deferred.is_empty() {
+            return Err(
+                FirstNativeModelExecutionProfileError::MissingDeferredCapability(
+                    missing_deferred[0],
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn mandatory_ids(&self) -> BTreeSet<&'static str> {
+        self.mandatory_capabilities
+            .iter()
+            .map(|capability| capability.id())
+            .collect()
+    }
+
+    pub fn deferred_ids(&self) -> BTreeSet<&'static str> {
+        self.deferred_capabilities
+            .iter()
+            .map(|capability| capability.id())
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FirstNativeModelExecutionProfileError {
+    MissingVersion,
+    MissingMandatoryCapability(FirstNativeProfileCapability),
+    MissingDeferredCapability(FirstNativeDeferredCapability),
+    RuntimeNotInitialized,
+    ReferenceCpuProviderMissing,
+    LogicalCpuDeviceMissing,
+    LogicalCpuDeviceNotCpu,
+    ComponentEngineProfileMismatch,
+    ComponentEngineFeatureMissing(ComponentEngineFeature),
+}
+
+impl std::fmt::Display for FirstNativeModelExecutionProfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingVersion => write!(f, "first native profile version is missing"),
+            Self::MissingMandatoryCapability(capability) => {
+                write!(f, "mandatory capability '{}' is missing", capability.id())
+            }
+            Self::MissingDeferredCapability(capability) => {
+                write!(f, "deferred capability '{}' is missing", capability.id())
+            }
+            Self::RuntimeNotInitialized => write!(f, "runtime is not initialized"),
+            Self::ReferenceCpuProviderMissing => {
+                write!(f, "Reference CPU Provider is missing from runtime")
+            }
+            Self::LogicalCpuDeviceMissing => {
+                write!(f, "Reference CPU logical Device is missing from runtime")
+            }
+            Self::LogicalCpuDeviceNotCpu => {
+                write!(f, "Reference CPU logical Device is not a CPU Device")
+            }
+            Self::ComponentEngineProfileMismatch => {
+                write!(f, "Component Engine is not using the native profile")
+            }
+            Self::ComponentEngineFeatureMissing(feature) => {
+                write!(
+                    f,
+                    "Component Engine feature '{}' is missing",
+                    feature.as_str()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FirstNativeModelExecutionProfileError {}
+
+pub fn first_native_mandatory_capabilities() -> BTreeSet<FirstNativeProfileCapability> {
+    BTreeSet::from([
+        FirstNativeProfileCapability::LocalRuntime,
+        FirstNativeProfileCapability::PlatformComponentEngine,
+        FirstNativeProfileCapability::WasmtimeComponentEngine,
+        FirstNativeProfileCapability::QwenWasmModelComponent,
+        FirstNativeProfileCapability::ModelArtifact,
+        FirstNativeProfileCapability::Tokenizer,
+        FirstNativeProfileCapability::OperatorCatalog,
+        FirstNativeProfileCapability::ExecutionGraph,
+        FirstNativeProfileCapability::PreparedExecutionPlan,
+        FirstNativeProfileCapability::KernelRegistry,
+        FirstNativeProfileCapability::ReferenceCpuProvider,
+        FirstNativeProfileCapability::LogicalCpuDevice,
+        FirstNativeProfileCapability::F32Execution,
+        FirstNativeProfileCapability::TensorResource,
+        FirstNativeProfileCapability::RuntimeMemoryManager,
+        FirstNativeProfileCapability::KvCache,
+        FirstNativeProfileCapability::IncrementalDecode,
+        FirstNativeProfileCapability::GreedySampling,
+        FirstNativeProfileCapability::StreamingOutput,
+        FirstNativeProfileCapability::ObservabilityRedaction,
+    ])
+}
+
+pub fn first_native_deferred_capabilities() -> BTreeSet<FirstNativeDeferredCapability> {
+    BTreeSet::from([
+        FirstNativeDeferredCapability::MultiDevicePlacement,
+        FirstNativeDeferredCapability::TensorParallel,
+        FirstNativeDeferredCapability::Collectives,
+        FirstNativeDeferredCapability::GeneratedKernels,
+        FirstNativeDeferredCapability::ProviderRuntimeCompilation,
+        FirstNativeDeferredCapability::KernelArtifactIngestion,
+        FirstNativeDeferredCapability::HotSwap,
+        FirstNativeDeferredCapability::RuntimeAutotuning,
+        FirstNativeDeferredCapability::AdaptivePerformanceFeedback,
+        FirstNativeDeferredCapability::PerformanceModelReplacement,
+        FirstNativeDeferredCapability::AcceleratedProviders,
+        FirstNativeDeferredCapability::ReducedPrecision,
+        FirstNativeDeferredCapability::Quantization,
+        FirstNativeDeferredCapability::CrossProviderZeroCopy,
+        FirstNativeDeferredCapability::AdvancedMemoryPools,
+        FirstNativeDeferredCapability::PagedKvCache,
+        FirstNativeDeferredCapability::PrefixCacheOptimization,
+        FirstNativeDeferredCapability::ProductionContinuousBatching,
+        FirstNativeDeferredCapability::AdvancedAsyncExecutionStreams,
+    ])
+}
+
+pub fn first_native_model_execution_profile() -> FirstNativeModelExecutionProfile {
+    FirstNativeModelExecutionProfile {
+        version: FIRST_NATIVE_MODEL_EXECUTION_PROFILE_VERSION.into(),
+        mandatory_capabilities: first_native_mandatory_capabilities(),
+        deferred_capabilities: first_native_deferred_capabilities(),
+    }
+}
+
+pub fn validate_first_native_single_host_topology(
+    runtime: &Runtime,
+) -> Result<(), FirstNativeModelExecutionProfileError> {
+    first_native_model_execution_profile().validate()?;
+    if !runtime.is_initialized() {
+        return Err(FirstNativeModelExecutionProfileError::RuntimeNotInitialized);
+    }
+    if runtime
+        .providers()
+        .provider(REFERENCE_CPU_PROVIDER_NAME)
+        .is_none()
+    {
+        return Err(FirstNativeModelExecutionProfileError::ReferenceCpuProviderMissing);
+    }
+    let device = runtime
+        .device(&crate::DeviceId::new(REFERENCE_CPU_DEVICE_ID))
+        .ok_or(FirstNativeModelExecutionProfileError::LogicalCpuDeviceMissing)?;
+    if device.metadata().device_type != DeviceType::Cpu {
+        return Err(FirstNativeModelExecutionProfileError::LogicalCpuDeviceNotCpu);
+    }
+    Ok(())
+}
+
+pub fn validate_first_native_component_engine_capabilities(
+    capabilities: &ComponentEngineCapabilities,
+) -> Result<(), FirstNativeModelExecutionProfileError> {
+    first_native_model_execution_profile().validate()?;
+    if capabilities.profile != ComponentEngineProfile::Native {
+        return Err(FirstNativeModelExecutionProfileError::ComponentEngineProfileMismatch);
+    }
+    for feature in [
+        ComponentEngineFeature::ComponentModel,
+        ComponentEngineFeature::ResourceLimits,
+        ComponentEngineFeature::NativeProviderEndpoints,
+        ComponentEngineFeature::ControlledWasi,
+    ] {
+        if !capabilities.supports(feature) {
+            return Err(
+                FirstNativeModelExecutionProfileError::ComponentEngineFeatureMissing(feature),
+            );
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 pub enum ProviderConformanceProfile {

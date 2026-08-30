@@ -15,6 +15,7 @@ use crate::cli_boundary::*;
 use crate::component::*;
 use crate::compute;
 use crate::compute::*;
+use crate::conformance::first_native_model_execution_profile;
 use crate::execution_graph::*;
 use crate::generation::*;
 use crate::inference_api::*;
@@ -41,6 +42,7 @@ use crate::session::*;
 use crate::tensor::*;
 use crate::tokenizer::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as ShaDigest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -49,6 +51,9 @@ use std::{
 
 pub const E2E_SUITE_VERSION: &str = "0.1.0";
 pub const E2E_FIXTURE_VERSION: &str = "0.1.0";
+pub const E2E_FIXTURE_WEIGHT_DIGEST_VERSION: &str = "e2e-qwen-fixture-weights-v1";
+pub const E2E_FIXTURE_WEIGHT_DIGEST: &str =
+    "sha256:ed7d3a310ae30e08f170ed61cd73f9053e498ae9a17dd7dc980fd61a3152ed90";
 
 const E2E_FIXTURE_EOS_TOKEN: TokenId = 0;
 const E2E_FIXTURE_BOS_TOKEN: TokenId = 257;
@@ -442,6 +447,60 @@ impl E2eConformanceReport {
     }
 }
 
+pub fn validate_first_native_native_execution_evidence(
+    report: &E2eConformanceReport,
+) -> Result<(), E2eConformanceError> {
+    first_native_model_execution_profile()
+        .validate()
+        .map_err(|error| E2eConformanceError::Internal {
+            reason: error.to_string(),
+        })?;
+    if !report.is_conformant() {
+        return Err(E2eConformanceError::BoundaryViolation {
+            reason: "first native profile requires a conformant E2E report".into(),
+        });
+    }
+    if report.provider_summary != REFERENCE_CPU_PROVIDER_NAME {
+        return Err(E2eConformanceError::BoundaryViolation {
+            reason: "first native profile requires Reference CPU Provider evidence".into(),
+        });
+    }
+    if !report.model_component_summary.contains("e2e-qwen-fixture") {
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "first native profile requires Qwen Model Component evidence".into(),
+        });
+    }
+    if report.operator_coverage.is_empty() {
+        return Err(E2eConformanceError::OperatorCoverageMissing {
+            reason: "first native profile requires Operator execution evidence".into(),
+        });
+    }
+    if report.kernel_coverage.is_empty() {
+        return Err(E2eConformanceError::KernelCoverageMissing {
+            reason: "first native profile requires Kernel execution evidence".into(),
+        });
+    }
+    for required in [
+        "success-path-no-shortcut-validated",
+        "operator-coverage",
+        "kernel-coverage",
+        "reference-cpu-selected-through-kernel-registry",
+        "no-shortcut-direct-provider-rejected",
+        "no-shortcut-direct-kernel-invocation-rejected",
+    ] {
+        if !report
+            .test_cases
+            .iter()
+            .any(|test| test.name == required && test.status == E2eTestStatus::Passed)
+        {
+            return Err(E2eConformanceError::BoundaryViolation {
+                reason: format!("missing first native structural evidence '{required}'"),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn e2e_conformance_report_json(
     report: &E2eConformanceReport,
 ) -> Result<String, serde_json::Error> {
@@ -487,7 +546,7 @@ pub fn e2e_fixture_identity() -> ModelComponentIdentity {
     qwen_component_identity(
         ModelComponentId::new("e2e-qwen-fixture").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
-        ModelComponentImplementationKind::RuntimeNative,
+        ModelComponentImplementationKind::WebAssemblyComponent,
     )
 }
 
@@ -606,6 +665,13 @@ fn fixture_seed(name: &str, offset: u64) -> u64 {
     hash.wrapping_add(offset)
 }
 
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
 fn fixture_tensor(name: &str, shape: &[u64]) -> Result<HostTensor, E2eConformanceError> {
     let len = shape.iter().product::<u64>();
     let is_norm_weight = shape.len() == 1;
@@ -620,6 +686,25 @@ fn fixture_tensor(name: &str, shape: &[u64]) -> Result<HostTensor, E2eConformanc
         })
         .collect();
     HostTensor::new(shape.to_vec(), data).map_err(E2eConformanceError::from)
+}
+
+pub fn e2e_fixture_weight_digest(weights: &BTreeMap<String, HostTensor>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(E2E_FIXTURE_WEIGHT_DIGEST_VERSION.as_bytes());
+    for (name, tensor) in weights {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        for dimension in &tensor.shape {
+            hasher.update(dimension.to_le_bytes());
+        }
+        hasher.update([0xff]);
+        for value in &tensor.data {
+            hasher.update(value.to_bits().to_le_bytes());
+        }
+        hasher.update([0xfe]);
+    }
+    let digest = hasher.finalize();
+    format!("sha256:{}", hex_digest(&digest))
 }
 
 pub fn e2e_fixture_weights(
@@ -2766,6 +2851,24 @@ mod tests {
     fn e2e_fixture_model_passes_validation() {
         let fixture = e2e_fixture().expect("fixture builds and validates");
         fixture.manifest.validate().expect("manifest re-validates");
+        assert_eq!(
+            fixture.identity.implementation,
+            ModelComponentImplementationKind::WebAssemblyComponent
+        );
+        assert_eq!(
+            fixture.config.architecture.vocabulary_size,
+            E2E_FIXTURE_VOCAB
+        );
+        assert_eq!(fixture.config.architecture.hidden_size, E2E_FIXTURE_HIDDEN);
+        assert_eq!(fixture.config.architecture.layer_count, E2E_FIXTURE_LAYERS);
+    }
+
+    #[test]
+    fn e2e_fixture_weight_digest_is_stable() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        let digest = e2e_fixture_weight_digest(&fixture.weights);
+        assert_eq!(digest, E2E_FIXTURE_WEIGHT_DIGEST);
+        assert_eq!(digest, e2e_fixture_weight_digest(&fixture.weights));
     }
 
     #[test]

@@ -566,6 +566,233 @@ fn provider_conformance_profile_ids_mark_hardware_profiles_optional() {
     assert!(!profile_ids["provider-hardware-openvino"]);
     assert!(!profile_ids["provider-hardware-qnn"]);
 }
+
+#[test]
+fn first_native_model_execution_profile_declares_versioned_mandatory_capabilities() {
+    let profile = first_native_model_execution_profile();
+
+    assert_eq!(
+        profile.version,
+        FIRST_NATIVE_MODEL_EXECUTION_PROFILE_VERSION
+    );
+    assert!(profile.validate().is_ok());
+
+    let mandatory = profile.mandatory_ids();
+    for expected in [
+        "local-runtime",
+        "platform-component-engine",
+        "wasmtime-component-engine",
+        "qwen-wasm-model-component",
+        "model-artifact",
+        "tokenizer",
+        "operator-catalog",
+        "execution-graph",
+        "prepared-execution-plan",
+        "kernel-registry",
+        "reference-cpu-provider",
+        "logical-cpu-device",
+        "f32-execution",
+        "tensor-resource",
+        "runtime-memory-manager",
+        "kv-cache",
+        "incremental-decode",
+        "greedy-sampling",
+        "streaming-output",
+        "observability-redaction",
+    ] {
+        assert!(
+            mandatory.contains(expected),
+            "missing mandatory capability {expected}"
+        );
+    }
+}
+
+#[test]
+fn first_native_model_execution_profile_defers_advanced_capabilities() {
+    let profile = first_native_model_execution_profile();
+    let deferred = profile.deferred_ids();
+
+    for expected in [
+        "multi-device-placement",
+        "tensor-parallel",
+        "collectives",
+        "generated-kernels",
+        "provider-runtime-compilation",
+        "kernel-artifact-ingestion",
+        "hot-swap",
+        "runtime-autotuning",
+        "adaptive-performance-feedback",
+        "performance-model-replacement",
+        "accelerated-providers",
+        "reduced-precision",
+        "quantization",
+        "cross-provider-zero-copy",
+        "advanced-memory-pools",
+        "paged-kv-cache",
+        "prefix-cache-optimization",
+        "production-continuous-batching",
+        "advanced-async-execution-streams",
+    ] {
+        assert!(
+            deferred.contains(expected),
+            "missing deferred capability {expected}"
+        );
+        assert!(
+            !profile.mandatory_ids().contains(expected),
+            "deferred capability {expected} must not be mandatory"
+        );
+    }
+}
+
+#[test]
+fn first_native_model_execution_profile_validation_rejects_incomplete_profiles() {
+    let mut profile = first_native_model_execution_profile();
+    profile.version.clear();
+    assert!(matches!(
+        profile.validate(),
+        Err(FirstNativeModelExecutionProfileError::MissingVersion)
+    ));
+
+    let mut profile = first_native_model_execution_profile();
+    profile
+        .mandatory_capabilities
+        .remove(&FirstNativeProfileCapability::KernelRegistry);
+    assert!(matches!(
+        profile.validate(),
+        Err(
+            FirstNativeModelExecutionProfileError::MissingMandatoryCapability(
+                FirstNativeProfileCapability::KernelRegistry
+            )
+        )
+    ));
+
+    let mut profile = first_native_model_execution_profile();
+    profile
+        .deferred_capabilities
+        .remove(&FirstNativeDeferredCapability::TensorParallel);
+    assert!(matches!(
+        profile.validate(),
+        Err(
+            FirstNativeModelExecutionProfileError::MissingDeferredCapability(
+                FirstNativeDeferredCapability::TensorParallel
+            )
+        )
+    ));
+}
+
+fn first_native_report_fixture(provider_summary: &str) -> E2eConformanceReport {
+    E2eConformanceReport {
+        suite_version: E2E_SUITE_VERSION.into(),
+        fixture_version: E2E_FIXTURE_VERSION.into(),
+        runtime_version: MAGNETAR_RUNTIME_VERSION.into(),
+        provider_summary: provider_summary.into(),
+        device_summary: REFERENCE_CPU_DEVICE_ID.into(),
+        model_component_summary: "e2e-qwen-fixture@1.0.0".into(),
+        operator_coverage: ["matmul".into(), "rmsnorm".into()].into_iter().collect(),
+        kernel_coverage: [
+            "reference-cpu/matmul".into(),
+            "reference-cpu/rmsnorm".into(),
+        ]
+        .into_iter()
+        .collect(),
+        test_cases: [
+            "success-path-no-shortcut-validated",
+            "operator-coverage",
+            "kernel-coverage",
+            "reference-cpu-selected-through-kernel-registry",
+            "no-shortcut-direct-provider-rejected",
+            "no-shortcut-direct-kernel-invocation-rejected",
+        ]
+        .into_iter()
+        .map(E2eTestResult::passed)
+        .collect(),
+        redacted: true,
+        duration_millis: 1,
+        timestamp_unix_seconds: 0,
+    }
+}
+
+#[test]
+fn first_native_native_execution_evidence_requires_registry_kernel_and_reference_cpu_path() {
+    let report = first_native_report_fixture(REFERENCE_CPU_PROVIDER_NAME);
+    assert!(validate_first_native_native_execution_evidence(&report).is_ok());
+
+    let mut missing_kernel_evidence = report.clone();
+    missing_kernel_evidence.kernel_coverage.clear();
+    assert!(matches!(
+        validate_first_native_native_execution_evidence(&missing_kernel_evidence),
+        Err(E2eConformanceError::KernelCoverageMissing { .. })
+    ));
+
+    let non_reference_provider = first_native_report_fixture("candle-provider");
+    assert!(matches!(
+        validate_first_native_native_execution_evidence(&non_reference_provider),
+        Err(E2eConformanceError::BoundaryViolation { .. })
+    ));
+}
+
+#[test]
+fn first_native_native_execution_evidence_rejects_shortcut_reports() {
+    let mut report = first_native_report_fixture(REFERENCE_CPU_PROVIDER_NAME);
+    report
+        .test_cases
+        .retain(|test| test.name != "success-path-no-shortcut-validated");
+
+    assert!(matches!(
+        validate_first_native_native_execution_evidence(&report),
+        Err(E2eConformanceError::BoundaryViolation { .. })
+    ));
+}
+
+#[test]
+fn first_native_single_host_topology_accepts_one_reference_cpu_runtime() {
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+
+    assert!(validate_first_native_single_host_topology(&runtime).is_ok());
+}
+
+#[test]
+fn first_native_single_host_topology_requires_reference_cpu_provider_and_device() {
+    let runtime = Runtime::builder().build().unwrap();
+    assert!(matches!(
+        validate_first_native_single_host_topology(&runtime),
+        Err(FirstNativeModelExecutionProfileError::ReferenceCpuProviderMissing)
+    ));
+}
+
+#[test]
+fn first_native_component_engine_accepts_native_controlled_wasi_capabilities() {
+    let capabilities = ComponentEngineCapabilities::native();
+
+    assert!(validate_first_native_component_engine_capabilities(&capabilities).is_ok());
+    assert!(capabilities.supports(ComponentEngineFeature::ComponentModel));
+    assert!(capabilities.supports(ComponentEngineFeature::ControlledWasi));
+}
+
+#[test]
+fn first_native_component_engine_rejects_non_native_or_ambient_test_profile() {
+    let capabilities = ComponentEngineCapabilities::test();
+
+    assert!(matches!(
+        validate_first_native_component_engine_capabilities(&capabilities),
+        Err(FirstNativeModelExecutionProfileError::ComponentEngineProfileMismatch)
+    ));
+
+    let mut capabilities = ComponentEngineCapabilities::native();
+    capabilities.controlled_wasi = false;
+    assert!(matches!(
+        validate_first_native_component_engine_capabilities(&capabilities),
+        Err(
+            FirstNativeModelExecutionProfileError::ComponentEngineFeatureMissing(
+                ComponentEngineFeature::ControlledWasi
+            )
+        )
+    ));
+}
+
 #[test]
 fn compute_v1_import_is_not_satisfied_by_compute_v2_provider() {
     let provider = provider_with_capabilities("portable-compute", [compute_capability()]);
