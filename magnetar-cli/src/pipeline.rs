@@ -200,10 +200,10 @@ impl ChatSession {
     /// [`InferenceApiObserver`] recorded during it.
     ///
     /// Chat Template Boundary (§16): the first turn sends
-    /// [`PromptInput::PlainText`] directly -- the same "CLI pre-renders"
+    /// `PromptInput::PlainText` directly -- the same "CLI pre-renders"
     /// path `pipeline::one_shot` uses for `run`. Every turn after the
     /// first instead sends the CLI-owned transcript (plus this turn's
-    /// line) as [`PromptInput::ChatMessages`] through
+    /// line) as `PromptInput::ChatMessages` through
     /// [`CliChatTemplateFormatter`], so Runtime applies the authorized
     /// chat template via `tokenize_prompt_input` rather than the CLI
     /// joining strings itself -- the concrete "Runtime applies authorized
