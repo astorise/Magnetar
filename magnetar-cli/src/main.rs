@@ -16,13 +16,11 @@
 //! needs to call directly because it never asks Runtime to perform a
 //! CLI-owned capability in the first place).
 //!
-//! Honesty note: `magnetar-runtime` is a contracts/validation layer today,
-//! not an end-to-end inference engine (see `pipeline.rs`'s module doc
-//! comment for the specifics: placeholder tokenizer, placeholder
-//! all-zero logits). This CLI is built honestly against what the Runtime
-//! actually offers today; it does not fake real text generation quality,
-//! and it does not bypass Runtime validation to fabricate a successful
-//! model load, resolution, or unload.
+//! Honesty note: `magnetar-runtime` now exposes a tiny first-native fixture
+//! generation path. This CLI is built honestly against what the Runtime
+//! actually offers today; it does not fake production model quality, and it
+//! does not bypass Runtime validation to fabricate a successful model load,
+//! resolution, generation, or unload.
 //!
 //! This increment adds opt-in file (`--file`), Git (`--git-diff`), and
 //! environment-secret (`--env-secret`) context collection to `magnetar

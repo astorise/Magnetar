@@ -33,8 +33,7 @@ use crate::{pipeline, render, tools};
 
 /// Bounds the number of Runtime Inference API calls one `magnetar agent`
 /// invocation can make, so a caller cannot accidentally start an unbounded
-/// loop against a placeholder pipeline (see `pipeline.rs`'s module doc
-/// comment on why the CLI's own generation is placeholder text today).
+/// loop against the tiny deterministic fixture path.
 pub const MAX_AGENT_STEPS: usize = 4;
 
 /// CLI-parsed options for one `magnetar agent` invocation. Assembled by
@@ -111,8 +110,8 @@ mod tests {
             tool: None,
             write: None,
         };
-        let error = run_agent_loop(&model_ref, "reach the goal", &options).unwrap_err();
-        assert!(error.runtime_category().is_some());
+        let output = run_agent_loop(&model_ref, "reach the goal", &options).unwrap();
+        assert!(!output.is_empty());
     }
 
     #[test]
@@ -145,8 +144,10 @@ mod tests {
             tool: None,
             write: Some(path.to_str().unwrap().to_string()),
         };
-        let error = run_agent_loop(&model_ref, "goal", &options).unwrap_err();
-        assert!(error.runtime_category().is_some());
-        assert!(!path.exists());
+        let output = run_agent_loop(&model_ref, "goal", &options).unwrap();
+        assert!(!output.is_empty());
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), output);
+        std::fs::remove_file(&path).unwrap();
     }
 }

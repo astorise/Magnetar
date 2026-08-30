@@ -371,9 +371,7 @@ fn cmd_chat(args: &[String], observer: &mut CliObserver) -> Result<(), CliBounda
     };
     let model_ref = ModelRef::new(aliases::resolve_alias(model_ref_arg))?;
     let mut chat = pipeline::ChatSession::open(&model_ref)?;
-    println!(
-        "magnetar chat -- placeholder inference (see `magnetar --help`); type 'exit', 'cancel', or Ctrl-D to quit"
-    );
+    println!("magnetar chat -- native fixture inference; type 'exit', 'cancel', or Ctrl-D to quit");
 
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -966,12 +964,10 @@ mod tests {
     #[test]
     fn assembled_file_context_prompt_flows_through_pipeline_as_plain_text() {
         let model_ref = ModelRef::new("qwen-test").unwrap();
-        let prompt = assemble_prompt(
-            "say hi",
-            &[("file context", "FILE_CONTEXT_MARKER_flow_xyz")],
-        );
-        let error = pipeline::one_shot(&model_ref, &prompt).unwrap_err();
-        assert!(error.runtime_category().is_some());
+        let prompt = assemble_prompt("hi", &[("file context", "x")]);
+        let (text, observer) = pipeline::one_shot(&model_ref, &prompt).unwrap();
+        assert!(!text.is_empty());
+        assert!(!observer.observations().is_empty());
     }
 
     /// §9/§29 "Test Git stays in CLI": Git access happens through a fixed,
@@ -1107,12 +1103,11 @@ mod tests {
     /// request handling does not bypass Runtime validation.
     #[test]
     fn cmd_serve_demo_request_calls_the_runtime_inference_api() {
-        let error = cmd_serve(&[
+        cmd_serve(&[
             "--demo-request".to_string(),
             "qwen-test".to_string(),
             "hi".to_string(),
         ])
-        .unwrap_err();
-        assert!(error.runtime_category().is_some());
+        .unwrap();
     }
 }

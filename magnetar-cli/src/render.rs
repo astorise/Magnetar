@@ -179,11 +179,11 @@ FLAGS (magnetar agent):
                           path (CLI-owned workspace mutation; Runtime never
                           touches the filesystem).
 
-NOTE: magnetar-runtime is a contracts/validation layer today, not an
-end-to-end inference engine. `run`/`chat`/`agent` exercise the real Runtime
-Session/Generation/Tokenizer API end to end, but generation uses a
-placeholder byte-based tokenizer and caller-supplied placeholder (all-zero)
-logits -- decoded text is not meaningful model output. See
+NOTE: `run`/`chat`/`agent` exercise the Runtime first-native fixture path:
+prompt text is tokenized by Runtime, logits come from Runtime-owned model
+execution evidence, and sampling/streaming run through the normal Runtime API.
+The bundled fixture is intentionally tiny and deterministic, so decoded text
+is a conformance signal rather than production-quality model output. See
 openspec/changes/define-magnetar-cli-inference-boundary/proposal.md for the
 CLI/Runtime authority boundary this binary implements."#
     );

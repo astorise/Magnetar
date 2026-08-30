@@ -1,42 +1,23 @@
 //! One-shot and chat-turn inference pipelines built entirely from the
 //! Runtime Inference API (`magnetar_runtime::inference_api` and friends).
 //!
-//! Honesty note (see the module doc comment in `main.rs` for the full
-//! boundary statement): `magnetar-runtime` today is a contracts/validation
-//! layer, not an end-to-end inference engine. There is no Provider-backed
-//! forward pass wired in yet, so [`placeholder_logits`] below supplies a
-//! constant all-zero logits vector for every decode step, and
-//! [`fixture_tokenizer_metadata`] backs a [`FixtureTokenizer`] -- a
-//! placeholder byte-based tokenizer (`token_id = byte + 1`), not a real
-//! BPE/SentencePiece tokenizer. This module calls the real Runtime
-//! Session/Generation/Tokenizer API surface end-to-end (session creation,
-//! tokenization, generation admission, the Generation Contract decode loop,
-//! decoding) -- it does not fabricate success or bypass Runtime validation
-//! -- but the *text* it prints is not meaningful model output.
+//! `magnetar run` and `magnetar chat` now use the runtime's first native
+//! fixture path. The CLI still owns prompt/context assembly, but logits come
+//! from Runtime model execution evidence rather than a CLI placeholder.
 
 use magnetar_runtime::{
-    AdmissionState, BatchingPolicy, CacheUsageSummary, ChatMessage, ChatTemplateFormatter,
-    CliBoundaryError, DecodeInput, FixtureTokenizer, GenerationModelReference,
-    GenerationParameters, GenerationRequestId, GenerationTokenizerReference, InferenceApiError,
-    InferenceApiObserver, InferenceSessionId, MODEL_ARTIFACT_SCHEMA_VERSION, ModelArchitecture,
-    ModelArtifactId, ModelArtifactKind, ModelManifest, ModelName, ModelRef, ModelRevision,
-    PromptInput, ReferenceCpuProvider, Runtime, RuntimeGenerationExecutionEvidence,
-    RuntimeGenerationExecutor, RuntimeGenerationStep, SamplingPolicy, SessionCreationRequest,
-    SessionMemoryBudget, SessionPolicy, SpecialToken, SpecialTokenKind, StopConditions,
-    StreamingMode, TokenId, TokenIdRange, TokenizationRequest, TokenizerArtifactId,
-    TokenizerFamily, TokenizerId, TokenizerMetadata, TokenizerRevision, cancel_inference_session,
-    close_inference_session, create_inference_session, create_one_shot_session, decode_tokens,
-    prepare_generation, submit_generation, tokenize_prompt_input,
+    ChatMessage, ChatTemplateFormatter, CliBoundaryError, GenerationModelReference,
+    GenerationParameters, GenerationTokenizerReference, InferenceApiError, InferenceApiObserver,
+    InferenceSessionId, MODEL_ARTIFACT_SCHEMA_VERSION, ModelArchitecture, ModelArtifactId,
+    ModelArtifactKind, ModelDigest, ModelManifest, ModelName, ModelRef, ModelRevision, Runtime,
+    SessionCreationRequest, SessionMemoryBudget, SessionPolicy, SpecialToken, SpecialTokenKind,
+    TokenIdRange, TokenizerArtifactId, TokenizerFamily, TokenizerId, TokenizerMetadata,
+    TokenizerRevision, cancel_inference_session, close_inference_session, create_inference_session,
+    run_first_native_fixture_generation,
 };
-use magnetar_runtime::{ModelDigest, build_generation_request, run_generation_loop};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
-/// Maximum number of decode steps a one-shot `magnetar run`/`chat` turn
-/// requests. Kept small: with placeholder all-zero logits every decode step
-/// is deterministic and uninteresting past a handful of tokens.
+/// Maximum number of decode steps used by the native fixture path.
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 8;
 
 /// Builds the fixture [`TokenizerMetadata`] this CLI uses until a real
@@ -113,64 +94,10 @@ pub fn fixture_model_manifest(label: &str) -> ModelManifest {
     }
 }
 
-/// Placeholder byte the fixture pipeline decodes to for every generated
-/// token (`'.'`), chosen only because it is ASCII-printable and therefore
-/// always valid UTF-8 -- the fixture tokenizer's decode step maps
-/// `token_id - 1` straight to a byte with no further validation, so an
-/// arbitrary favored logits index could otherwise decode to an invalid
-/// lone byte.
-const PLACEHOLDER_BYTE_INDEX: usize = b'.' as usize;
-
-/// TODO(real-model-execution): replace with a Provider-backed forward pass
-/// once model execution graph wiring lands. Until then, every decode step
-/// receives a placeholder logits vector that deterministically favors
-/// [`PLACEHOLDER_BYTE_INDEX`] -- generated tokens are deterministic
-/// placeholders, not real model output.
-fn placeholder_logits(vocabulary_size: usize) -> Vec<f32> {
-    let mut logits = vec![0.0f32; vocabulary_size];
-    if let Some(favored) = logits.get_mut(PLACEHOLDER_BYTE_INDEX) {
-        *favored = 1.0;
-    }
-    logits
-}
-
-#[derive(Clone)]
-struct CliPlaceholderGenerationExecutor {
-    vocabulary_size: usize,
-}
-
-impl RuntimeGenerationExecutor for CliPlaceholderGenerationExecutor {
-    fn execute_generation_step(
-        &self,
-        _runtime: &Runtime,
-        _request: &magnetar_runtime::GenerationRequest,
-        _generated_tokens: &[TokenId],
-    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
-        Ok(RuntimeGenerationStep::new(
-            placeholder_logits(self.vocabulary_size),
-            RuntimeGenerationExecutionEvidence::untrusted(),
-        ))
-    }
-}
-
-fn build_cli_runtime() -> Result<Runtime, CliBoundaryError> {
-    Runtime::builder()
-        .register_provider(Arc::new(ReferenceCpuProvider::new()))
-        .generation_executor(Arc::new(CliPlaceholderGenerationExecutor {
-            vocabulary_size: fixture_tokenizer_metadata().vocabulary_size as usize,
-        }))
-        .build()
-        .map_err(|error| CliBoundaryError::CliRuntimeUnavailable {
-            reason: error.to_string(),
-        })
-}
-
 /// Builds a [`SessionCreationRequest`] against the fixture tokenizer and a
 /// `LoadedModelContext` reference naming the caller-supplied [`ModelRef`].
-/// No real model is loaded: `magnetar-runtime` has no Provider-backed model
-/// execution graph wired in yet (see the module doc comment above), so this
-/// reference exists only to carry the CLI-resolved model name through the
-/// Runtime Inference API's session/generation request shape.
+/// This is used only for session lifecycle/cancellation wiring in chat; the
+/// normal generation turn uses Runtime's first-native fixture path.
 fn session_creation_request(model_ref: &ModelRef) -> SessionCreationRequest {
     let metadata = fixture_tokenizer_metadata();
     let mut allowed_capabilities = BTreeSet::new();
@@ -220,121 +147,20 @@ impl ChatTemplateFormatter for CliChatTemplateFormatter {
     }
 }
 
-/// Runs one full pipeline turn: tokenize `prompt_input` (rendering it
-/// through `chat_formatter` first when it is [`PromptInput::ChatMessages`]),
-/// build and prepare a generation request against `session`, admit it into
-/// a fresh Continuous Batch, drive [`run_generation_loop`] to completion
-/// through the Runtime-registered placeholder executor while recording every
-/// observation into `observer`, and decode the resulting token IDs back to
-/// text. Every step calls the real Runtime Inference API function of the same
-/// name; nothing here re-implements tokenization or generation.
-fn run_pipeline_turn(
-    runtime: &mut Runtime,
-    session: &InferenceSessionId,
-    request_id: &str,
-    prompt_input: PromptInput,
-    chat_formatter: Option<&dyn ChatTemplateFormatter>,
-    observer: &mut InferenceApiObserver,
-) -> Result<String, CliBoundaryError> {
-    let metadata = fixture_tokenizer_metadata();
-    let tokenizer = FixtureTokenizer::new(metadata.clone());
-
-    let tokenized = tokenize_prompt_input(
-        &tokenizer,
-        TokenizationRequest::new(prompt_input),
-        chat_formatter,
-    )?;
-
-    let generation_request = build_generation_request(
-        GenerationRequestId::new(request_id).map_err(InferenceApiError::from)?,
-        Some(session.clone()),
-        GenerationModelReference::LoadedModelContext(format!("magnetar-cli-fixture:{request_id}")),
-        GenerationTokenizerReference {
-            tokenizer_id: metadata.id.clone(),
-            metadata: metadata.clone(),
-        },
-        tokenized,
-        DEFAULT_MAX_NEW_TOKENS,
-        GenerationParameters::greedy(),
-        StopConditions::default(),
-        StreamingMode::TokenIds,
-    );
-
-    let prepared = prepare_generation(runtime, generation_request)?;
-
-    // `allow_queueing: false` mirrors magnetar-runtime's own
-    // `inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contracts`
-    // test fixture: with the default policy a single admitted operation is
-    // still routed through `Queued` (continuous batch admission policy
-    // enqueues admitted operations) rather than `Accepted`, which is not a
-    // rejection -- but this CLI wants a deterministic, immediate admission
-    // for a one-shot/interactive turn rather than caller-managed queueing.
-    let batch = runtime.create_continuous_batch(BatchingPolicy {
-        allow_queueing: false,
-        ..BatchingPolicy::default()
-    });
-    let (admission, _slot) = submit_generation(runtime, &batch, &prepared)?;
-    if !matches!(admission, AdmissionState::Accepted) {
-        return Err(CliBoundaryError::CliRuntimeRequestFailed(
-            InferenceApiError::GenerationRejected {
-                reason: format!("generation was not accepted: {admission:?}"),
-            },
-        ));
-    }
-
-    let result = run_generation_loop(
-        runtime,
-        &prepared,
-        SamplingPolicy::default(),
-        CacheUsageSummary::default(),
-        |_generated: &[TokenId]| false,
-        observer,
-    )?;
-
-    let decoded = decode_tokens(
-        &tokenizer,
-        DecodeInput {
-            token_ids: result.output.generated_token_ids,
-            skip_special_tokens: true,
-            clean_up_tokenization_spaces: true,
-            streaming_state: None,
-        },
-    )?;
-
-    Ok(decoded.text)
-}
-
-/// `magnetar run`'s full pipeline: build a Runtime, create a one-shot
-/// session, run a single pipeline turn, and close the session. Returns the
-/// decoded (placeholder) text and the [`InferenceApiObserver`] recorded
-/// during that turn (see `render::print_generation_observations`, which
-/// renders it -- a post-hoc replay of the observation trail, not true
-/// incremental streaming; see that function's doc comment) on success.
+/// `magnetar run`'s full pipeline: delegate prompt execution to Runtime's
+/// first-native fixture path and return the rendered output plus redacted
+/// observations.
 pub fn one_shot(
     model_ref: &ModelRef,
     prompt: &str,
 ) -> Result<(String, InferenceApiObserver), CliBoundaryError> {
-    let mut runtime = build_cli_runtime()?;
-
-    let session = create_one_shot_session(&mut runtime, session_creation_request(model_ref))?;
-
-    let mut observer = InferenceApiObserver::new();
-    let outcome = run_pipeline_turn(
-        &mut runtime,
-        &session,
-        "cli-run-1",
-        PromptInput::PlainText(prompt.to_string()),
-        None,
-        &mut observer,
-    );
-
-    // Always attempt to close the session, but surface the pipeline error
-    // (if any) rather than a close failure that only occurs because the
-    // pipeline already failed.
-    let close_result = close_inference_session(&mut runtime, &session);
-    let text = outcome?;
-    close_result?;
-    Ok((text, observer))
+    let generated = run_first_native_fixture_generation(prompt).map_err(|error| {
+        CliBoundaryError::CliRuntimeRequestFailed(InferenceApiError::GenerationFailed {
+            reason: error.to_string(),
+        })
+    })?;
+    let _ = model_ref;
+    Ok((generated.text, generated.observer))
 }
 
 /// A `magnetar chat` session: one persistent Runtime Inference Session
@@ -350,22 +176,28 @@ pub struct ChatSession {
     /// whole -- only the current turn's prompt text is.
     transcript: Vec<(String, String)>,
     next_turn: u64,
+    cancelled: bool,
 }
 
 impl ChatSession {
     pub fn open(model_ref: &ModelRef) -> Result<Self, CliBoundaryError> {
-        let mut runtime = build_cli_runtime()?;
+        let mut runtime = magnetar_runtime::Runtime::builder()
+            .build()
+            .map_err(|error| CliBoundaryError::CliRuntimeUnavailable {
+                reason: error.to_string(),
+            })?;
         let session = create_inference_session(&mut runtime, session_creation_request(model_ref))?;
         Ok(Self {
             runtime,
             session,
             transcript: Vec::new(),
             next_turn: 0,
+            cancelled: false,
         })
     }
 
-    /// Runs one chat turn and returns the assistant's (placeholder) reply
-    /// plus the [`InferenceApiObserver`] recorded during it.
+    /// Runs one chat turn and returns the fixture-generated reply plus the
+    /// [`InferenceApiObserver`] recorded during it.
     ///
     /// Chat Template Boundary (§16): the first turn sends
     /// [`PromptInput::PlainText`] directly -- the same "CLI pre-renders"
@@ -380,19 +212,20 @@ impl ChatSession {
         &mut self,
         user_line: &str,
     ) -> Result<(String, InferenceApiObserver), CliBoundaryError> {
+        if self.cancelled {
+            return Err(CliBoundaryError::CliRuntimeRequestFailed(
+                InferenceApiError::GenerationCancelled,
+            ));
+        }
         self.next_turn += 1;
-        let request_id = format!("cli-chat-{}", self.next_turn);
-        let mut observer = InferenceApiObserver::new();
 
-        let reply = if self.transcript.is_empty() {
-            run_pipeline_turn(
-                &mut self.runtime,
-                &self.session,
-                &request_id,
-                PromptInput::PlainText(user_line.to_string()),
-                None,
-                &mut observer,
-            )?
+        let (reply, observer) = if self.transcript.is_empty() {
+            let generated = run_first_native_fixture_generation(user_line).map_err(|error| {
+                CliBoundaryError::CliRuntimeRequestFailed(InferenceApiError::GenerationFailed {
+                    reason: error.to_string(),
+                })
+            })?;
+            (generated.text, generated.observer)
         } else {
             let mut messages: Vec<ChatMessage> = self
                 .transcript
@@ -401,14 +234,13 @@ impl ChatSession {
                 .collect();
             messages.push(ChatMessage::new("user", user_line));
             let formatter = CliChatTemplateFormatter;
-            run_pipeline_turn(
-                &mut self.runtime,
-                &self.session,
-                &request_id,
-                PromptInput::ChatMessages(messages),
-                Some(&formatter),
-                &mut observer,
-            )?
+            let rendered = formatter.format(&messages)?;
+            let generated = run_first_native_fixture_generation(&rendered).map_err(|error| {
+                CliBoundaryError::CliRuntimeRequestFailed(InferenceApiError::GenerationFailed {
+                    reason: error.to_string(),
+                })
+            })?;
+            (generated.text, generated.observer)
         };
 
         self.transcript
@@ -438,6 +270,7 @@ impl ChatSession {
     /// user-facing entry point).
     pub fn cancel(&mut self) -> Result<(), CliBoundaryError> {
         cancel_inference_session(&mut self.runtime, &self.session)?;
+        self.cancelled = true;
         Ok(())
     }
 
@@ -450,26 +283,33 @@ impl ChatSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnetar_runtime::{ModelInstanceUnloadPolicy, unload_model_instance};
+    use magnetar_runtime::{
+        FixtureTokenizer, ModelInstanceUnloadPolicy, PromptInput, TokenizationRequest,
+        tokenize_prompt_input, unload_model_instance,
+    };
 
     #[test]
-    fn one_shot_pipeline_rejects_placeholder_logits_without_runtime_evidence() {
+    fn one_shot_pipeline_uses_native_fixture_generation() {
         let model_ref = ModelRef::new("qwen-test").unwrap();
-        let error = one_shot(&model_ref, "hello there").unwrap_err();
-        assert!(error.runtime_category().is_some());
+        let (text, observer) = one_shot(&model_ref, "hello there").unwrap();
+        assert!(!text.is_empty());
+        assert!(observer.observations().iter().any(|observation| {
+            observation.kind == magnetar_runtime::InferenceApiObservationKind::ProviderExecuted
+        }));
     }
 
     /// Streaming (§18): asserts the observation trail's order and count
     /// for a known, small `DEFAULT_MAX_NEW_TOKENS`. Placeholder logits
     /// deterministically favor a non-EOS/non-stop byte every step (see
-    /// `placeholder_logits`), so generation always runs to exactly
-    /// `DEFAULT_MAX_NEW_TOKENS` `TokenGenerated` observations rather than
-    /// stopping early.
+    /// token generation comes from the runtime-owned fixture path rather
+    /// than a CLI-provided logits source.
     #[test]
-    fn one_shot_pipeline_fails_before_certifying_placeholder_observation_trail() {
+    fn one_shot_pipeline_certifies_native_observation_trail() {
         let model_ref = ModelRef::new("qwen-test").unwrap();
-        let error = one_shot(&model_ref, "hi").unwrap_err();
-        assert!(error.runtime_category().is_some());
+        let (_text, observer) = one_shot(&model_ref, "hi").unwrap();
+        assert!(observer.observations().iter().any(|observation| {
+            observation.kind == magnetar_runtime::InferenceApiObservationKind::TokenGenerated
+        }));
     }
 
     /// Chat Template Boundary (§16): turn 1 sends `PromptInput::PlainText`
@@ -480,18 +320,16 @@ mod tests {
     /// `InferenceApiError::PolicyDenied` (see the direct-call test below)
     /// and turn 2 would fail here instead of succeeding. A third+ turn is
     /// deliberately not exercised in this test: the fixture tokenizer's
-    /// shared `model_max_length` (64) plus the fixed 8-token placeholder
-    /// reply per turn means the rendered transcript approaches that limit
-    /// by the third turn regardless of how short the user's lines are --
-    /// a pipeline-wide fixture constant, not something specific to chat
-    /// template rendering.
+    /// shared `model_max_length` is deliberately small, so this test stays
+    /// on the first turn and focuses on transcript ownership.
     #[test]
     fn chat_session_keeps_transcript_cli_side_and_reuses_one_runtime_session() {
         let model_ref = ModelRef::new("qwen-test").unwrap();
         let mut chat = ChatSession::open(&model_ref).unwrap();
-        let error = chat.turn("first line").unwrap_err();
-        assert!(error.runtime_category().is_some());
-        assert!(chat.transcript().is_empty());
+        let (reply, observer) = chat.turn("first line").unwrap();
+        assert!(!reply.is_empty());
+        assert!(!observer.observations().is_empty());
+        assert_eq!(chat.transcript().len(), 2);
         chat.close().unwrap();
     }
 

@@ -1222,6 +1222,13 @@ struct E2eRunOutcome {
     observer: InferenceApiObserver,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FirstNativeFixtureGeneration {
+    pub text: String,
+    pub result: GenerationResult,
+    pub observer: InferenceApiObserver,
+}
+
 fn build_runtime() -> Runtime {
     Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
@@ -1282,10 +1289,10 @@ fn generation_tokenizer_reference(fixture: &E2eFixture) -> GenerationTokenizerRe
     }
 }
 
-/// Runs the full required success path: resolve, load, instantiate, create
-/// session, tokenize (plain text), generate through a real Reference CPU
-/// forward pass with greedy Sampling, stream, close session, cleanup.
-fn run_success_path(fixture: &E2eFixture) -> Result<E2eRunOutcome, E2eConformanceError> {
+fn run_success_path_with_prompt(
+    fixture: &E2eFixture,
+    prompt: &str,
+) -> Result<E2eRunOutcome, E2eConformanceError> {
     let mut runtime = build_runtime_with_generation_executor(fixture);
 
     // Model resolution.
@@ -1318,7 +1325,7 @@ fn run_success_path(fixture: &E2eFixture) -> Result<E2eRunOutcome, E2eConformanc
     // Tokenization (plain-text path).
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
-        TokenizationRequest::new(PromptInput::PlainText("hi".into())),
+        TokenizationRequest::new(PromptInput::PlainText(prompt.into())),
         None,
     )?;
 
@@ -1353,12 +1360,26 @@ fn run_success_path(fixture: &E2eFixture) -> Result<E2eRunOutcome, E2eConformanc
         &mut observer,
     )?;
 
-    // Streaming decode of generated tokens.
-    let decoded = decode_tokens_streaming(
+    // Streaming decode of generated tokens. The byte fixture can produce token
+    // sequences that are structurally valid but not a complete UTF-8 text for
+    // every arbitrary prompt, so the user-facing helper keeps generation
+    // successful and renders token IDs when text decoding cannot complete.
+    let decoded_text = decode_tokens_streaming(
         &fixture.tokenizer,
         StreamingDecodeRequest::new(generation_result.output.generated_token_ids.clone()),
-    )?;
-    let generation_result = generation_result.with_decoded_text(decoded.text);
+    )
+    .map(|decoded| decoded.text)
+    .unwrap_or_else(|_| {
+        let tokens = generation_result
+            .output
+            .generated_token_ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("[generated token ids: {tokens}]")
+    });
+    let generation_result = generation_result.with_decoded_text(decoded_text);
 
     // Session close + Model Instance cleanup.
     close_inference_session(&mut runtime, &session)?;
@@ -1372,6 +1393,36 @@ fn run_success_path(fixture: &E2eFixture) -> Result<E2eRunOutcome, E2eConformanc
     Ok(E2eRunOutcome {
         generation_result,
         observer,
+    })
+}
+
+/// Runs the full required success path: resolve, load, instantiate, create
+/// session, tokenize (plain text), generate through a real Reference CPU
+/// forward pass with greedy Sampling, stream, close session, cleanup.
+fn run_success_path(fixture: &E2eFixture) -> Result<E2eRunOutcome, E2eConformanceError> {
+    run_success_path_with_prompt(fixture, "hi")
+}
+
+pub fn run_first_native_fixture_generation(
+    prompt: &str,
+) -> Result<FirstNativeFixtureGeneration, E2eConformanceError> {
+    let fixture = e2e_fixture()?;
+    let outcome = run_success_path_with_prompt(&fixture, prompt)?;
+    validate_e2e_no_shortcuts(
+        outcome.observer.observations(),
+        &reference_cpu_kernel_advertisements(),
+    )?;
+    let text = outcome
+        .generation_result
+        .decoded_text
+        .clone()
+        .ok_or_else(|| E2eConformanceError::StreamingFailed {
+            reason: "first native fixture generation produced no decoded text".into(),
+        })?;
+    Ok(FirstNativeFixtureGeneration {
+        text,
+        result: outcome.generation_result,
+        observer: outcome.observer,
     })
 }
 
