@@ -2573,3 +2573,742 @@ When report is exported
 
 Then only safe logical identifiers are present.
 
+### Requirement: Native Synchronization Isolation Conformance
+
+Conformance SHALL prove Runtime public state contains no Provider-native
+synchronization handles.
+
+#### Scenario: GPU Provider inspection
+
+Given Provider uses native stream/event objects
+
+When Runtime Plan and diagnostics are inspected
+
+Then native handles are absent.
+
+### Requirement: Same-Stream Ordering Conformance
+
+Conformance SHALL prove ordered submissions preserve required same-stream
+effects.
+
+#### Scenario: Write then read
+
+Given A writes Tensor and B reads it on same ordered stream
+
+When both execute
+
+Then B observes completed/logically ordered A output.
+
+### Requirement: Cross-Stream Dependency Conformance
+
+Conformance SHALL prove cross-stream ordering occurs only through explicit
+dependency or equivalent resource readiness edge.
+
+#### Scenario: Producer and consumer streams
+
+Given consumer depends on producer
+
+When dependency exists
+
+Then consumer does not race producer.
+
+### Requirement: No Global Synchronization Requirement Conformance
+
+Conformance SHALL prove independent streams may overlap without mandatory
+Device-global wait.
+
+#### Scenario: Independent Kernels
+
+Given no shared resource dependency
+
+When both execute
+
+Then implementation may run concurrently.
+
+### Requirement: Resource Readiness Conformance
+
+Conformance SHALL prove unfinished output cannot be consumed improperly.
+
+#### Scenario: Pending MatMul output
+
+Given consumer uses different stream
+
+When producer completion pending
+
+Then consumer is dependency-ordered.
+
+### Requirement: Host Readiness Conformance
+
+Conformance SHALL prove host does not read Device output before required
+completion.
+
+#### Scenario: Final output transfer
+
+Given transfer pending
+
+When host wants logits
+
+Then host waits or receives not-ready state.
+
+### Requirement: Memory Reuse Fence Conformance
+
+Conformance SHALL prove allocation cannot be reused while asynchronous work
+references it.
+
+#### Scenario: Temporary Tensor logically dropped
+
+Given GPU work remains pending
+
+When allocator wants same storage
+
+Then storage remains unavailable.
+
+### Requirement: Aliasing Synchronization Conformance
+
+Conformance SHALL prove aliased resources cannot bypass synchronization.
+
+#### Scenario: Tensor view
+
+Given view overlaps source storage
+
+When conflicting work executes
+
+Then required hazard ordering exists.
+
+### Requirement: Transfer Overlap Conformance
+
+Conformance SHALL prove explicit dependencies do not unnecessarily serialize
+independent transfer and compute.
+
+#### Scenario: Unrelated transfer
+
+Given transfer has no dependency on compute Kernel
+
+When Provider supports overlap
+
+Then contract permits concurrent execution.
+
+### Requirement: Cross-Provider Mediation Conformance
+
+Conformance SHALL prove Core does not exchange Provider-native events between
+Providers.
+
+#### Scenario: GPU to CPU dependency
+
+Given Providers differ
+
+When dependency resolves
+
+Then Runtime mediates through logical completion/data movement.
+
+### Requirement: KV Ordering Conformance
+
+Conformance SHALL prove incremental decode cannot read incomplete KV mutation.
+
+#### Scenario: Step N+1
+
+Given step N KV append pending
+
+When N+1 Attention is scheduled
+
+Then required dependency prevents early read.
+
+### Requirement: KV Page Lifetime Conformance
+
+Conformance SHALL prove paged KV storage is not reused while in-flight access
+exists.
+
+#### Scenario: Cancelled sequence
+
+Given page is still read by pending Kernel
+
+When allocator reclaims sequence
+
+Then page reuse waits for completion.
+
+### Requirement: Continuous Batch Slot Lifetime Conformance
+
+Conformance SHALL prove slot reuse respects asynchronous completion.
+
+#### Scenario: Slot removed
+
+Given previous batch still references slot
+
+When new sequence arrives
+
+Then slot is not reassigned unsafely.
+
+### Requirement: Cancellation Completion Separation Conformance
+
+Conformance SHALL prove logical cancellation does not imply physical
+quiescence.
+
+#### Scenario: Non-interruptible GPU Kernel
+
+Given request cancelled
+
+When Kernel remains running
+
+Then CompletionToken stays pending and resources remain retained.
+
+### Requirement: Deadline Safety Conformance
+
+Conformance SHALL prove deadline expiration cannot cause premature resource
+reuse.
+
+#### Scenario: Timeout
+
+Given request times out while Device work pending
+
+When Runtime reports timeout
+
+Then physical resources remain alive until safe.
+
+### Requirement: Dependency Failure Conformance
+
+Conformance SHALL prove failed predecessor prevents normal dependent execution.
+
+#### Scenario: Producer fails
+
+Given consumer requires producer output
+
+When producer completion fails
+
+Then consumer is not executed as successful path.
+
+### Requirement: Device Loss Conformance
+
+Conformance SHALL prove Device loss does not mark unfinished resources ready.
+
+#### Scenario: Device reset
+
+Given pending write existed
+
+When Device becomes unavailable
+
+Then output readiness becomes failed/lost rather than completed.
+
+### Requirement: Stream Retirement Conformance
+
+Conformance SHALL prove stream/native state is not destroyed prematurely.
+
+#### Scenario: Stream draining
+
+Given pending submissions exist
+
+When Runtime retires stream
+
+Then destruction waits for required completion/quiescence.
+
+### Requirement: Synchronous Provider Conformance
+
+Conformance SHALL prove Provider without asynchronous primitives can implement
+logical model safely.
+
+#### Scenario: Reference CPU immediate execution
+
+Given submit executes synchronously
+
+When returned
+
+Then CompletionToken is terminal-completed and dependencies remain valid.
+
+### Requirement: Prepared Plan Synchronization Conformance
+
+Conformance SHALL prove Prepared Plan contains logical dependency information
+without native synchronization state.
+
+#### Scenario: Plan cached
+
+Given Plan describes stream assignments
+
+When inspected
+
+Then no CUDA/Metal/Vulkan native queue/event object is serialized.
+
+### Requirement: Observability Redaction Conformance
+
+Conformance SHALL prove execution traces contain no native stream/event handles,
+Tensor addresses, model weights, KV contents, prompts, secrets, or credentials.
+
+#### Scenario: Failed synchronization trace
+
+Given detailed internal Provider context exists
+
+When trace is exported
+
+Then only safe logical identities remain.
+
+### Requirement: Same Device Residency Conformance
+
+Conformance SHALL prove consecutive compatible Kernels can consume Device
+Resource without host round-trip.
+
+#### Scenario: MatMul then RMSNorm
+
+Given both execute on same Device
+
+When pipeline runs
+
+Then intermediate is not required to materialize on host.
+
+### Requirement: Persistent Weight Residency Conformance
+
+Conformance SHALL prove Model weights may remain Device-resident across
+inference requests.
+
+#### Scenario: Two requests
+
+Given same Model Instance remains loaded
+
+When second request begins
+
+Then normal execution does not require re-uploading unchanged weights.
+
+### Requirement: Device Resident KV Conformance
+
+Conformance SHALL prove incremental decode can retain KV on Device.
+
+#### Scenario: Multiple decode steps
+
+Given GPU memory capacity remains sufficient
+
+When tokens are generated
+
+Then KV remains Device-resident.
+
+### Requirement: Zero Copy Compatibility Conformance
+
+Conformance SHALL prove zero-copy cannot bypass dtype/layout/alignment
+requirements.
+
+#### Scenario: Wrong layout
+
+Given Resource is directly addressable
+
+But Kernel layout requirement differs
+
+When candidate is bound
+
+Then direct access is rejected/materialized explicitly.
+
+### Requirement: Resource View Conformance
+
+Conformance SHALL prove compatible View creation performs no byte-copy.
+
+#### Scenario: Slice View
+
+Given View is created
+
+When allocation accounting is inspected
+
+Then no mandatory new payload allocation exists.
+
+### Requirement: View Bounds Conformance
+
+Conformance SHALL reject invalid or overflowing View ranges.
+
+#### Scenario: Overflow
+
+Given malicious offset/size
+
+When View is created
+
+Then operation fails before native access.
+
+### Requirement: Aliasing Conformance
+
+Conformance SHALL prove overlapping Views preserve dependency and lifetime
+safety.
+
+#### Scenario: View write races parent read
+
+Given overlap exists
+
+When operations are submitted asynchronously
+
+Then hazard is detected/ordered.
+
+### Requirement: Mapping Readiness Conformance
+
+Conformance SHALL prove host mapping cannot read incomplete Device writes.
+
+#### Scenario: GPU write pending
+
+Given host requests read mapping
+
+When completion is pending
+
+Then mapping is not made readable prematurely.
+
+### Requirement: Mapping Lifetime Conformance
+
+Conformance SHALL prove mapped Resource cannot be physically evicted/reused.
+
+#### Scenario: Active host mapping
+
+Given pressure requests eviction
+
+When mapping remains active
+
+Then storage remains valid or mapping transition is safely coordinated.
+
+### Requirement: Coherency Conformance
+
+Conformance SHALL prove required visibility transitions occur for non-coherent
+mapping.
+
+#### Scenario: Host writes then GPU reads
+
+Given mapping is non-coherent
+
+When mapping ends
+
+Then Provider establishes required Device-visible state before execution.
+
+### Requirement: Native Pointer Isolation Conformance
+
+Conformance SHALL prove native addresses are absent from portable/public
+Resource contracts.
+
+#### Scenario: CUDA Tensor
+
+Given Device pointer exists internally
+
+When Runtime/WIT/diagnostics are inspected
+
+Then native pointer is absent.
+
+### Requirement: Explicit Movement Conformance
+
+Conformance SHALL prove residency-changing copies are represented explicitly.
+
+#### Scenario: GPU to CPU
+
+Given no shared mapping exists
+
+When CPU consumes Tensor
+
+Then explicit movement operation exists.
+
+### Requirement: Host Staging Denial Conformance
+
+Conformance SHALL prove hidden host staging cannot bypass policy.
+
+#### Scenario: GPU-to-GPU fallback
+
+Given Provider needs host staging
+
+And policy forbids it
+
+When movement is requested
+
+Then operation fails or alternate path is selected.
+
+### Requirement: Async Transfer Lifetime Conformance
+
+Conformance SHALL prove source/destination storage remains valid around
+asynchronous transfer.
+
+#### Scenario: Source released early
+
+Given transfer pending
+
+When owner drops source Resource
+
+Then underlying storage remains until completion.
+
+### Requirement: Peer Capability Conformance
+
+Conformance SHALL prove peer access is not inferred from Device similarity.
+
+#### Scenario: Same vendor GPUs without peer capability
+
+Given direct peer read unsupported
+
+When Runtime plans access
+
+Then zero-copy peer route is denied.
+
+### Requirement: Cross Provider Zero Copy Conformance
+
+Conformance SHALL prove direct shared Resource access across Providers requires
+explicit interoperability capability.
+
+#### Scenario: CUDA Provider to CPU Provider
+
+Given no interop capability exists
+
+When direct native memory access is requested
+
+Then Runtime uses explicit movement or rejects it.
+
+### Requirement: Memory Manager Authority Conformance
+
+Conformance SHALL prove Provider cannot silently relocate/spill logical Resource
+against Runtime policy where such movement is Runtime-visible.
+
+#### Scenario: Host staging forbidden
+
+Given Provider faces memory pressure
+
+When spill would require host staging
+
+Then it cannot silently violate policy.
+
+### Requirement: Prepared Plan Native Memory Isolation Conformance
+
+Conformance SHALL prove Prepared Plan stores logical Resource bindings rather
+than native memory addresses.
+
+#### Scenario: Plan cached
+
+Given Resource native pointer changes after restart
+
+When Plan metadata is restored
+
+Then native pointer was not persisted.
+
+### Requirement: Eviction Safety Conformance
+
+Conformance SHALL prove in-flight Resource cannot be evicted unsafely.
+
+#### Scenario: Pending Kernel
+
+Given Device work references Tensor
+
+When eviction is requested
+
+Then physical storage remains until completion/quiescence.
+
+### Requirement: Memory Authority Separation Conformance
+
+Conformance SHALL prove Memory Manager owns pool/allocation policy while
+Provider owns native realization.
+
+#### Scenario: Provider native pool
+
+Given Provider supports native memory pool
+
+When Runtime policy reserves KV capacity
+
+Then Provider cannot override reservation.
+
+### Requirement: Device Allocation Boundary Conformance
+
+Conformance SHALL prove Device abstraction exposes no native allocation API.
+
+#### Scenario: Device API inspection
+
+Given GPU Device exists
+
+When public Device contract is inspected
+
+Then allocate/free/compact methods are absent.
+
+### Requirement: Memory Pool Native Pointer Isolation Conformance
+
+Conformance SHALL prove pools, blocks, leases, and Plans contain no native
+pointer semantics.
+
+#### Scenario: Allocation lease logged
+
+Given Device allocation exists internally
+
+When logical state is inspected
+
+Then native address is absent.
+
+### Requirement: Temporal Reuse Conformance
+
+Conformance SHALL prove non-overlapping Tensor lifetimes SHALL share storage.
+
+#### Scenario: A then C
+
+Given A completion precedes C start
+
+When AllocationPlan executes
+
+Then same slot SHALL back both safely.
+
+### Requirement: Asynchronous Reuse Safety Conformance
+
+Conformance SHALL prove logical lifetime analysis does not free/reuse storage
+before actual asynchronous completion.
+
+#### Scenario: A graph node logically ended
+
+Given Device execution still pending
+
+When C wants same slot
+
+Then reuse waits for CompletionToken.
+
+### Requirement: Alignment Conformance
+
+Conformance SHALL reject slot binding that violates Kernel/Provider alignment.
+
+#### Scenario: 256-byte requirement
+
+Given slot only guarantees 64-byte alignment
+
+When Plan binds it
+
+Then binding fails.
+
+### Requirement: Hard Reservation Conformance
+
+Conformance SHALL prove hard-reserved memory cannot be silently borrowed.
+
+#### Scenario: KV reservation
+
+Given optional tuning needs protected bytes
+
+When pool is full outside reservation
+
+Then tuning allocation fails.
+
+### Requirement: Soft Borrowing Conformance
+
+Conformance SHALL prove soft borrowing occurs only according to policy and
+remains accounted.
+
+#### Scenario: Borrowed workspace capacity
+
+Given KV borrows soft capacity
+
+When accounting is queried
+
+Then borrowed amount is represented.
+
+### Requirement: Watermark Reclamation Conformance
+
+Conformance SHALL prove high-watermark policy can trigger reclamation without
+freeing active memory.
+
+#### Scenario: Pressure
+
+Given pool exceeds high watermark
+
+When reclamation runs
+
+Then only eligible Resources are reclaimed.
+
+### Requirement: Pending Reclaim Accounting Conformance
+
+Conformance SHALL prove in-flight released memory is not counted as free.
+
+#### Scenario: 1 GiB pending
+
+Given Kernel still references released Resource
+
+When admission checks capacity
+
+Then 1 GiB is unavailable.
+
+### Requirement: Fragmentation Classification Conformance
+
+Conformance SHALL distinguish inability to realize large allocation from simple
+aggregate free-byte exhaustion when allocator reports fragmentation.
+
+#### Scenario: Fragmented pool
+
+Given total free >= requested bytes
+
+But no compatible region exists
+
+When allocation fails
+
+Then fragmentation error SHALL be emitted.
+
+### Requirement: Compaction Safety Conformance
+
+Conformance SHALL prove compaction does not relocate pinned, mapped, or
+in-flight Resource unsafely.
+
+#### Scenario: Active graph buffer
+
+Given Resource requires stable address
+
+When compaction runs
+
+Then Resource is not moved.
+
+### Requirement: Prepared Plan Memory Reservation Conformance
+
+Conformance SHALL prove Plan cannot become ready under policy requiring
+reservation when mandatory memory is unavailable.
+
+#### Scenario: Workspace reservation fails
+
+Given no compatible capacity
+
+When Plan preparation completes
+
+Then Plan is not marked ready.
+
+### Requirement: KV Page Recycle Conformance
+
+Conformance SHALL prove KV page is not recycled while any in-flight or shared
+reference exists.
+
+#### Scenario: Cancelled sequence
+
+Given final Kernel still reads page
+
+When Session ends
+
+Then page remains pending reclaim.
+
+### Requirement: Batch Memory Isolation Conformance
+
+Conformance SHALL prove batch workspace cannot violate protected KV/weight pool
+policy.
+
+#### Scenario: Large batch spike
+
+Given workspace request exceeds unreserved capacity
+
+When batch is admitted
+
+Then protected allocation class remains safe.
+
+### Requirement: OOM Fallback Conformance
+
+Conformance SHALL prove OOM fallback still obeys hard policy.
+
+#### Scenario: Host spill forbidden
+
+Given Device memory exhausted
+
+When fallback evaluates spill
+
+Then host-staging prohibition is respected.
+
+### Requirement: Allocation Plan Cache Revalidation Conformance
+
+Conformance SHALL prove cached AllocationPlan cannot bypass current pool
+capacity/reservation/compatibility.
+
+#### Scenario: Pool policy changed
+
+Given cached Plan assumes old capacity
+
+When reused
+
+Then current policy is checked.
+
+### Requirement: Memory Pool Observability Redaction Conformance
+
+Conformance SHALL prove allocation diagnostics contain no native pointers,
+native allocator handles, Tensor payloads, weights, KV contents, prompts,
+secrets, or credentials.
+
+#### Scenario: Pool OOM trace
+
+Given Provider exposes native allocator details internally
+
+When trace is exported
+
+Then only safe logical/aggregate metadata remains.
+

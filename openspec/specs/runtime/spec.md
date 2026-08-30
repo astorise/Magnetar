@@ -6332,3 +6332,271 @@ When Runtime reconstructs it
 
 Then Provider-native prepared state is re-established.
 
+### Requirement: Runtime Owns Logical Execution Dependency Graph
+
+Runtime SHALL own portable dependency ordering between prepared execution
+operations.
+
+#### Scenario: Plan contains cross-stream edge
+
+Given Kernel B depends on A
+
+When Runtime submits Plan
+
+Then it establishes dependency without exposing native Provider event.
+
+### Requirement: Runtime Maps Plan Bindings To Execution Streams
+
+Runtime SHALL resolve Prepared Execution Plan logical stream assignments into
+active Provider/Device-bound ExecutionStreams.
+
+#### Scenario: Decode Plan reused
+
+Given compute stream is ready
+
+When Plan executes
+
+Then node bindings reuse compatible logical execution lane.
+
+### Requirement: Runtime Updates Resource Readiness
+
+Runtime SHALL associate asynchronous writes with completion state required by
+future consumers.
+
+#### Scenario: Kernel output pending
+
+Given Kernel returns CompletionToken
+
+When submission succeeds
+
+Then output Tensor readiness references that completion.
+
+### Requirement: Runtime Avoids Global Synchronization By Default
+
+Runtime SHALL preserve asynchronous concurrency rather than waiting for whole
+Device after every operation.
+
+#### Scenario: Two independent branches
+
+Given no data dependency exists
+
+When Plan executes
+
+Then Runtime may overlap them.
+
+### Requirement: Runtime Handles Cross-Provider Dependency
+
+Cross-Provider dependency SHALL be mediated through Runtime unless explicit
+portable interop capability exists.
+
+#### Scenario: GPU Provider output feeds CPU Provider
+
+Given host staging is authorized
+
+When GPU work completes
+
+Then Runtime coordinates explicit movement/readiness before CPU execution.
+
+### Requirement: Runtime Fail-Closes Lost Completion
+
+Runtime SHALL not publish uncertain output as valid after completion state is
+lost.
+
+#### Scenario: GPU reset during Kernel
+
+Given Runtime cannot know whether write completed
+
+When result is evaluated
+
+Then output is not treated as successful Tensor result.
+
+### Requirement: Runtime Cancellation Preserves Physical Lifetime
+
+Logical request cancellation SHALL not prematurely release execution resources.
+
+#### Scenario: Cancel during Attention
+
+Given Provider cannot stop Kernel
+
+When request returns cancellation
+
+Then Runtime retains resources until associated CompletionToken terminates.
+
+### Requirement: Runtime Hot Path Uses Prepared Synchronization
+
+Ready Plan execution SHALL use precomputed stream/dependency information.
+
+#### Scenario: Repeated token decode
+
+Given same Plan guards pass
+
+When next token executes
+
+Then Runtime does not rebuild dependency graph from all Operator metadata.
+
+### Requirement: Runtime Preserves Device Residency Across Compatible Operators
+
+Runtime SHALL keep Resources resident while successive Kernel bindings remain
+compatible with current Provider/Device placement.
+
+#### Scenario: Transformer block
+
+Given all block Kernels execute on GPU0
+
+When block runs
+
+Then intermediates stay GPU0-resident unless explicit movement is required.
+
+### Requirement: Runtime Makes Movement Explicit
+
+Runtime SHALL represent actual residency-changing copies as data-movement
+operations.
+
+#### Scenario: CPU sampling
+
+Given logits are Device-resident and CPU needs them
+
+When sampling boundary is reached
+
+Then explicit host mapping/transfer occurs.
+
+### Requirement: Runtime Evaluates Zero-Copy Eligibility
+
+Runtime SHALL not rely solely on Provider claims or Device type.
+
+#### Scenario: Host-visible Device Tensor
+
+Given Tensor is host-visible but write is pending
+
+When host asks to read
+
+Then zero-copy access waits for readiness.
+
+### Requirement: Runtime Enforces Host-Staging Policy
+
+Runtime SHALL deny a movement path that requires forbidden host staging.
+
+#### Scenario: Cross-GPU movement
+
+Given only host-staged route exists
+
+And policy forbids host staging
+
+When execution is planned
+
+Then another path or failure is chosen.
+
+### Requirement: Runtime Does Not Expose Native Memory Handles
+
+Runtime Inference API SHALL not expose native Device pointer or interop handle.
+
+#### Scenario: Client asks for Tensor result
+
+Given Tensor is GPU-resident
+
+When API responds
+
+Then API returns supported logical/high-level data rather than CUDA pointer.
+
+### Requirement: Runtime Can Replan After Residency Change
+
+A residency transition SHALL invalidate Prepared Plan assumptions when the
+transition violates those assumptions.
+
+#### Scenario: Weight replica evicted
+
+Given active Plan expects GPU1 copy
+
+When copy is evicted
+
+Then new execution rebinds, transfers, falls back, or replans before use.
+
+### Requirement: Runtime Coordinates Allocation Planning
+
+Runtime Memory Manager SHALL coordinate logical AllocationPlan construction for
+Prepared execution.
+
+#### Scenario: Model Instance preparation
+
+Given graph, Kernels, and workspace requirements are known
+
+When Runtime prepares Plan
+
+Then compatible allocation slots and reservations SHALL be computed.
+
+### Requirement: Runtime Avoids Native Allocate Free On Normal Hot Path
+
+Where compatible pool-backed slots exist, normal token execution SHALL reuse
+them rather than repeatedly invoking Provider native allocation/free.
+
+#### Scenario: Decode loop
+
+Given decode Plan remains stable
+
+When 100 tokens execute
+
+Then transient/workspace resources SHALL reuse pool storage.
+
+### Requirement: Runtime Applies Memory Admission Before Unsafe Partial Work
+
+Predictable memory infeasibility SHALL be detected before starting work that
+cannot complete safely.
+
+#### Scenario: KV growth impossible
+
+Given required KV page cannot be reserved
+
+When next decode step is admitted
+
+Then Runtime SHALL fail/backpressure before launching dependent Kernel.
+
+### Requirement: Runtime Handles Pool Pressure Explicitly
+
+Runtime SHALL react to pool pressure through reclaim, fallback, or admission.
+
+#### Scenario: High watermark
+
+Given transient pool exceeds high watermark
+
+When pressure policy runs
+
+Then reclaimable Resources SHALL be trimmed.
+
+### Requirement: Runtime Does Not Treat Pending Reclaim As Free
+
+Asynchronously released memory SHALL remain unavailable until physically safe
+for reuse.
+
+#### Scenario: Cancelled generation
+
+Given 256 MiB becomes pending reclaim
+
+When another request arrives
+
+Then Runtime capacity accounting does not promise those bytes immediately.
+
+### Requirement: Runtime SHALL Choose Lower Workspace Kernel
+
+Memory pressure SHALL affect Kernel selection among otherwise eligible candidates.
+
+#### Scenario: Fast Kernel needs 1 GiB workspace
+
+Given only 256 MiB compatible workspace remains
+
+When alternative Kernel needs 128 MiB
+
+Then selection SHALL choose the feasible candidate.
+
+### Requirement: Runtime Keeps Pool Policy Outside Inference Request
+
+Normal generation request SHALL not choose allocator implementation or native
+pool.
+
+#### Scenario: Client requests CUDA pool handle
+
+Given request reaches Runtime Inference API
+
+When validated
+
+Then such native memory authority is outside API scope.
+

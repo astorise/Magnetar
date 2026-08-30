@@ -325,3 +325,142 @@ When latency increases
 
 Then Performance Model may mark degraded performance without changing
 qualification state.
+
+### Requirement: Device Does Not Own Synchronization API
+
+Device abstraction SHALL remain descriptive/status-oriented and SHALL NOT expose
+native synchronization creation or waiting methods.
+
+#### Scenario: CUDA Device
+
+Given Runtime sees CUDA-capable Device
+
+When Device API is inspected
+
+Then no `create_cuda_stream`, native-event, or queue-pointer operation exists.
+
+### Requirement: Device Advertises Synchronization-Relevant Capabilities Through Provider Metadata
+
+Provider/Device capability metadata SHALL describe properties relevant to
+execution concurrency.
+
+#### Scenario: Transfer overlap
+
+Given hardware supports compute/transfer overlap
+
+When capability discovery occurs
+
+Then Runtime may learn this without receiving native transfer queue.
+
+### Requirement: Device Loss Invalidates Bound Streams
+
+Hard Device loss SHALL make bound ExecutionStreams unavailable for new work.
+
+#### Scenario: GPU reset
+
+Given logical streams target GPU
+
+When Device becomes lost
+
+Then Runtime prevents new submissions through those streams.
+
+### Requirement: Device Remains Descriptive
+
+Device SHALL describe memory and peer-access capabilities without becoming
+allocation/mapping API.
+
+#### Scenario: GPU memory capability
+
+Given Runtime inspects Device
+
+When metadata is queried
+
+Then Device may report memory classes/capacity but exposes no native allocator.
+
+### Requirement: Device Does Not Expose Native Pointer
+
+Device API SHALL not expose native memory address.
+
+#### Scenario: Device Resource exists
+
+Given Tensor is GPU-resident
+
+When Device metadata is inspected
+
+Then allocation pointer is absent.
+
+### Requirement: Device Describes Memory Capacity
+
+Device status SHALL expose memory capacity/pressure metadata useful to Memory
+Manager.
+
+#### Scenario: GPU nearly full
+
+Given Provider observes memory pressure
+
+When Runtime evaluates residency
+
+Then Device/Provider status can inform eviction/admission policy.
+
+### Requirement: Device Peer Capability Is Descriptive
+
+Device relationship metadata SHALL indicate peer-access capability when direct
+peer access is available.
+
+#### Scenario: Two GPUs
+
+Given direct peer access unsupported
+
+When Runtime plans zero-copy
+
+Then it does not assume access solely from common vendor.
+
+### Requirement: Device Exposes Capacity Not Allocation Authority
+
+Device SHALL expose memory capacity/status but SHALL NOT expose allocation API.
+
+#### Scenario: GPU memory metadata
+
+Given GPU has 24 GiB memory
+
+When Runtime inspects Device
+
+Then capacity information is available without `allocate()` method.
+
+### Requirement: Device SHALL Expose Pressure Estimate
+
+Device/Provider status SHALL expose memory pressure useful to pool policy.
+
+#### Scenario: External process uses GPU memory
+
+Given available memory drops
+
+When status refreshes
+
+Then Runtime SHALL reduce pool-growth/admission accordingly.
+
+### Requirement: Device SHALL Describe Allocation Granularity
+
+Device capability metadata SHALL include logical allocation granularity or
+alignment constraints.
+
+#### Scenario: Memory-domain alignment
+
+Given Device memory requires 64 KiB allocation granularity
+
+When Memory Manager plans pool blocks
+
+Then it can account for requirement without native heap handle.
+
+### Requirement: Device Does Not Own Compaction
+
+Device abstraction SHALL NOT expose compaction or pool-rebalancing operations.
+
+#### Scenario: Fragmentation
+
+Given pool needs compaction
+
+When Runtime reacts
+
+Then Memory Manager/Provider perform operation, not Device API.
+

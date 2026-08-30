@@ -236,3 +236,227 @@ When Runtime adapts
 
 Then a new Plan generation is prepared and safely published.
 
+### Requirement: Plan May Precompute Stream Assignment
+
+Prepared Execution Plan SHALL be able to bind nodes or segments to logical execution stream
+classes.
+
+#### Scenario: Attention decode
+
+Given Plan uses compute and transfer operations
+
+When Plan is built
+
+Then stream assignments may be determined before token execution.
+
+### Requirement: Plan May Precompute Dependency Edges
+
+Static execution dependencies SHALL be materializable in Prepared Execution Plan.
+
+#### Scenario: MatMul feeds RMSNorm
+
+Given graph topology establishes dependency
+
+When Plan is prepared
+
+Then dependency does not need full rediscovery on every execution.
+
+### Requirement: Plan Does Not Store Native Streams
+
+Prepared Execution Plan SHALL not contain Provider-native synchronization
+objects.
+
+#### Scenario: CUDA stream exists
+
+Given Provider created native stream
+
+When Plan is serialized or inspected
+
+Then only logical ExecutionStream binding is present.
+
+### Requirement: Plan Supports Dynamic Dependency Slots
+
+Prepared Plan SHALL be able to expose dynamic dependency slots for
+Session/invocation state.
+
+#### Scenario: Prior KV update
+
+Given decode Plan is reused across Sessions
+
+When Session executes next step
+
+Then its current KV CompletionToken can be bound dynamically.
+
+### Requirement: Prepared Segment Has Logical Completion
+
+Provider-prepared segment SHALL expose logical CompletionToken after
+submission.
+
+#### Scenario: CUDA Graph launch
+
+Given Provider launches captured graph
+
+When submitted
+
+Then Runtime receives one logical completion scope without observing internal
+CUDA events.
+
+### Requirement: Plan Generation Retirement Includes Stream Work
+
+Prepared Plan SHALL remain alive while submissions using its stream/segment
+bindings remain in-flight.
+
+#### Scenario: Plan replacement
+
+Given generation 10 is retiring
+
+And one submission remains pending
+
+When generation 11 becomes active
+
+Then generation 10 resources are not destroyed prematurely.
+
+### Requirement: Prepared Plan May Encode Residency Assumptions
+
+Prepared Execution Plan SHALL be able to bind Kernel inputs/outputs to required or preferred
+MemoryDomains.
+
+#### Scenario: Decode Plan
+
+Given all decode Kernels run on GPU0
+
+When Plan is built
+
+Then weights, KV, intermediates, and workspace may be planned as GPU0 resident.
+
+### Requirement: Prepared Plan May Elide Redundant Transfers
+
+Plan construction SHALL remove movement that is unnecessary under validated
+residency.
+
+#### Scenario: Already-resident Tensor
+
+Given previous node output is GPU0-local
+
+And next Kernel executes on GPU0
+
+When Plan is prepared
+
+Then no GPU0-to-GPU0 staging copy is emitted.
+
+### Requirement: Residency Guard
+
+Prepared Plan SHALL not execute against Resources violating hard residency
+assumptions.
+
+#### Scenario: KV spilled to host
+
+Given Plan requires GPU-resident KV
+
+When decode starts
+
+Then Runtime rebinds/transfers/replans according to policy before Kernel
+execution.
+
+### Requirement: Prepared Plan Does Not Store Native Addresses
+
+Plan SHALL refer to logical Resource bindings rather than Device pointers.
+
+#### Scenario: CUDA graph-related Plan
+
+Given Provider has native addresses internally
+
+When Plan metadata is inspected
+
+Then raw addresses are absent.
+
+### Requirement: Host Mapping Is An Explicit Boundary
+
+Prepared Plan SHALL designate host-visible output boundary when host access is
+required.
+
+#### Scenario: Final logits
+
+Given sampler executes on host
+
+When Plan completes Device logits
+
+Then explicit map/transfer step makes required data host-visible.
+
+### Requirement: Prepared Execution Plan SHALL Reference Allocation Plan
+
+PreparedExecutionPlan SHALL reference a validated AllocationPlan generation.
+
+#### Scenario: Decode plan
+
+Given Kernel bindings and memory lifetimes are known
+
+When Plan becomes ready
+
+Then it SHALL reference precomputed Device allocation slots.
+
+### Requirement: Plan Readiness SHALL Require Memory Reservation
+
+A Plan SHALL NOT be marked READY if mandatory memory reservation cannot be
+satisfied when policy requires pre-reservation.
+
+#### Scenario: Required attention workspace unavailable
+
+Given Plan requires 512 MiB protected workspace
+
+When reservation fails
+
+Then Plan remains not-ready or fails preparation.
+
+### Requirement: Plan Resource Slot Is Logical
+
+Prepared Plan SHALL refer to logical allocation slots rather than native
+addresses.
+
+#### Scenario: Runtime restart
+
+Given Provider backing addresses change
+
+When Plan is reconstructed
+
+Then logical slot relationships can remain while native backing is recreated.
+
+### Requirement: Allocation Plan Change SHALL Stale Plan
+
+A compatible optimization of allocation strategy SHALL mark Prepared Plan stale
+without changing semantics.
+
+#### Scenario: Better reuse plan available
+
+Given current Plan remains memory-safe
+
+When new AllocationPlan reduces workspace
+
+Then Runtime SHALL build replacement Plan generation.
+
+### Requirement: Hard Memory Incompatibility Invalidates Plan
+
+A Plan whose mandatory memory assumptions cannot be satisfied SHALL not accept
+new work.
+
+#### Scenario: Required pool removed
+
+Given decode Plan requires dedicated Device-local KV pool
+
+When pool becomes unavailable
+
+Then Plan is invalidated or rebuilt before execution.
+
+### Requirement: Address-Stable Prepared Segment Pins Required Slots
+
+If Provider-prepared segment requires stable native addresses, Plan SHALL
+declare corresponding logical slots non-relocatable for segment lifetime.
+
+#### Scenario: Native graph capture
+
+Given Provider says buffers must retain address
+
+When AllocationPlan is generated
+
+Then those slots are pinned.
+

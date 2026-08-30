@@ -1477,3 +1477,298 @@ When executed
 
 Then each binds its own KV Tensor Resources.
 
+### Requirement: Allocation Reuse Waits For Completion
+
+Memory Manager SHALL not reuse storage while unfinished execution may access it.
+
+#### Scenario: Temporary buffer released logically
+
+Given GPU Kernel still uses buffer
+
+When logical Tensor lifetime ends
+
+Then physical storage remains unavailable for reuse until completion.
+
+### Requirement: Completion Fences Resource Lifetime
+
+Memory Manager SHALL be able to associate allocation lifetime with one or more
+CompletionTokens.
+
+#### Scenario: Two readers
+
+Given two streams read shared allocation
+
+When one completes
+
+Then allocation remains retained until second relevant completion occurs.
+
+### Requirement: Workspace Reuse Is Synchronization-Aware
+
+Prepared Plan workspace reuse SHALL honor asynchronous completion.
+
+#### Scenario: Attention workspace reused next step
+
+Given previous Attention execution still pending
+
+When next step requests same workspace
+
+Then reuse is ordered or separate workspace is provided.
+
+### Requirement: Cancellation Does Not Release Memory Early
+
+Cancelled request SHALL retain memory needed by in-flight Provider work.
+
+#### Scenario: User cancels generation
+
+Given current GPU Kernel cannot be interrupted
+
+When request result is cancelled
+
+Then its resources remain alive until Device work completes.
+
+### Requirement: Lost Completion Fails Safe
+
+Memory Manager SHALL not assume storage is safely reusable if completion state
+cannot be determined after Provider/Device failure.
+
+#### Scenario: Device disappears
+
+Given Tensor write was pending
+
+When completion becomes lost
+
+Then allocation follows Device/Provider recovery or invalidation policy rather
+than immediate reuse.
+
+### Requirement: Memory Manager Owns Residency Policy
+
+Memory Manager SHALL remain authoritative for logical Resource placement,
+residency, replication, eviction, and movement authorization.
+
+#### Scenario: Provider prefers host-visible allocation
+
+Given Runtime policy requires Device-local latency-critical weights
+
+When allocation is planned
+
+Then Provider preference does not override Memory Manager policy.
+
+### Requirement: Provider Realizes Native Allocation
+
+Memory Manager SHALL request logical memory capability while Provider realizes the
+native allocation.
+
+#### Scenario: Device-local allocation
+
+Given Runtime needs GPU-local storage
+
+When allocation occurs
+
+Then Provider may use native Device allocator privately.
+
+### Requirement: Memory Manager Tracks Replicas
+
+Multiple physical copies SHALL have explicit validity state.
+
+#### Scenario: GPU0 and GPU1 weights
+
+Given immutable weight is replicated
+
+When either Device reads
+
+Then Runtime knows both copies are current.
+
+### Requirement: Memory Manager Tracks Mapping Lifetime
+
+Mapped Resource SHALL remain allocated and compatible for mapping duration.
+
+#### Scenario: Host read mapping
+
+Given Device Resource is mapped
+
+When eviction occurs concurrently
+
+Then eviction is delayed or mapping fails safely.
+
+### Requirement: Eviction Is Completion-Aware
+
+Resource SHALL not be evicted while in-flight Device access exists.
+
+#### Scenario: Pending Attention
+
+Given KV page is active
+
+When Device pressure triggers eviction
+
+Then eviction waits for completion.
+
+### Requirement: Spill Is Explicit
+
+Moving Resource to lower-priority memory domain SHALL be represented as explicit
+residency transition/data movement.
+
+#### Scenario: Device pressure
+
+Given inactive cache entry spills to host
+
+When spill occurs
+
+Then host staging policy and transfer completion are enforced.
+
+### Requirement: Residency Pinning Is Bounded
+
+Memory Manager SHALL support pinning Resources according to policy.
+
+#### Scenario: Active KV cache
+
+Given low-latency session pins KV to GPU
+
+When capacity is exhausted
+
+Then new admission may fail rather than silently violating pin.
+
+### Requirement: Allocation Reuse Preserves Aliasing And Mapping
+
+Underlying storage SHALL not be recycled while Views, mappings, or in-flight
+operations require it.
+
+#### Scenario: Parent Tensor dropped
+
+Given live View still exists
+
+When Memory Manager evaluates storage
+
+Then allocation remains alive.
+
+### Requirement: Memory Manager Owns Pool Policy
+
+Memory Manager SHALL decide logical pool classes, capacity, reservations,
+borrowing, pressure, reclaim, and allocation policy.
+
+#### Scenario: Provider has native allocator
+
+Given Provider offers native memory-pool API
+
+When Runtime configures memory policy
+
+Then Provider API does not become the policy authority.
+
+### Requirement: Allocation Request Is Logical
+
+Memory allocation SHALL begin from logical requirements rather than native
+allocator arguments.
+
+#### Scenario: Attention workspace
+
+Given Prepared Kernel requires 32 MiB aligned to 256 bytes
+
+When Runtime requests storage
+
+Then Memory Manager expresses bytes/alignment/domain/class rather than native
+CUDA allocation flags.
+
+### Requirement: Allocation Lease Has No Pointer Semantics
+
+AllocationLease SHALL refer to pool-backed storage without exposing Device
+pointer.
+
+#### Scenario: Lease created
+
+Given Provider realizes backing
+
+When Runtime stores lease
+
+Then identity remains logical and opaque.
+
+### Requirement: Temporal Reuse Is Lifetime Safe
+
+Storage SHALL be reused by distinct Tensor Resources whose lifetimes do not
+overlap.
+
+#### Scenario: Intermediate A ends before C begins
+
+Given asynchronous completion confirms A is no longer used
+
+When C is allocated
+
+Then C SHALL reuse A's backing region.
+
+### Requirement: Asynchronous Completion Governs Reuse
+
+Graph topology alone SHALL NOT authorize storage reuse where work remains
+in-flight.
+
+#### Scenario: Node A logically passed
+
+Given its Kernel is still executing
+
+When planner considers storage reuse
+
+Then AllocationLease remains unavailable until completion.
+
+### Requirement: Fragmentation Is Distinct From Capacity Exhaustion
+
+Runtime SHALL distinguish fragmented free memory from true total-capacity
+exhaustion.
+
+#### Scenario: Large contiguous requirement
+
+Given 512 MiB total free exists in small regions
+
+But 256 MiB compatible contiguous block cannot be realized
+
+When allocation fails
+
+Then failure SHALL be classified as fragmentation.
+
+### Requirement: Compaction Is Policy Controlled
+
+Memory relocation/compaction SHALL occur only under Memory Manager control.
+
+#### Scenario: Fragmented transient pool
+
+Given enough movable idle Resources exist
+
+When policy allows compaction
+
+Then Runtime SHALL relocate them safely.
+
+### Requirement: In-Flight Resource Is Not Movable
+
+Resource referenced by unfinished Device work SHALL not be relocated
+incompatibly.
+
+#### Scenario: Kernel pending
+
+Given Tensor lease is active in Device execution
+
+When compaction runs
+
+Then Resource is skipped/pinned until completion.
+
+### Requirement: Active Mapping Pins Backing
+
+Resource with active host mapping SHALL not be relocated or reused
+incompatibly.
+
+#### Scenario: Host reads mapped logits
+
+Given mapping remains open
+
+When compaction occurs
+
+Then backing remains valid.
+
+### Requirement: Fixed Address Requirement Is Honored
+
+A Provider-prepared artifact requiring stable address SHALL cause relevant
+allocation to remain pinned for that lifetime.
+
+#### Scenario: Captured graph binds fixed buffer
+
+Given Provider declares address stability requirement
+
+When Memory Manager plans buffers
+
+Then backing is not relocated while capture is active.
+

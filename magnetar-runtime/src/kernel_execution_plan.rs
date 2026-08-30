@@ -2757,8 +2757,10 @@ mod tests {
 
         let mut restart_cache = PreparedExecutionPlanCache::default();
         restart_cache.insert(ready_plan("restart-plan", "attention", 1));
-        let mut hard = PlanHardDependencyStatus::default();
-        hard.revocation_clear = false;
+        let hard = PlanHardDependencyStatus {
+            revocation_clear: false,
+            ..PlanHardDependencyStatus::default()
+        };
         let restart_id = PreparedExecutionPlanId::new("restart-plan").unwrap();
         assert!(matches!(
             restart_cache.revalidate_cached_plan(&restart_id, &hard),

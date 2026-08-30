@@ -5,10 +5,13 @@ mod contract_tests {
     mod artifact;
     mod batching;
     mod component;
+    mod device_resident_resource;
     mod distribution;
+    mod execution_stream;
     mod kernel;
     mod kernel_registry_dispatch;
     mod kv_cache;
+    mod memory_pool;
     mod model;
     mod model_component;
     mod model_instance;

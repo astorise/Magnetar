@@ -2034,3 +2034,216 @@ When diagnostic is emitted
 
 Then only opaque stable Plan/segment identifiers are reported.
 
+### Requirement: Execution Stream Lifecycle Is Observable
+
+Runtime SHALL expose logical stream lifecycle observations.
+
+#### Scenario: Stream drains
+
+Given Runtime retires Model Instance
+
+When stream begins draining
+
+Then logical stream identifier/state may be observed.
+
+### Requirement: Completion Lifecycle Is Observable
+
+Runtime SHALL be able to expose sampled/redacted CompletionToken state
+transitions.
+
+#### Scenario: Kernel finishes asynchronously
+
+Given token moves pending to completed
+
+When instrumentation enabled
+
+Then completion duration may be observed.
+
+### Requirement: Dependency Wait Is Observable
+
+Runtime SHALL permit diagnosis of dependency-related latency.
+
+#### Scenario: Transfer waits for compute
+
+Given transfer submission depends on pending compute
+
+When diagnostics run
+
+Then logical dependency wait may be recorded.
+
+### Requirement: Cancellation State Is Observable
+
+Observability SHALL distinguish request cancellation from physical completion.
+
+#### Scenario: Kernel continues after cancellation
+
+Given Provider cannot interrupt Kernel
+
+When diagnostics are viewed
+
+Then cancellation may be recorded while completion remains pending.
+
+### Requirement: Resource Reuse Delay Is Observable
+
+Runtime SHALL be able to expose that resource reuse was delayed by in-flight
+completion.
+
+#### Scenario: Workspace pressure
+
+Given workspace remains fenced
+
+When new allocation is required
+
+Then observability may identify synchronization-related retention.
+
+### Requirement: Native Synchronization Is Redacted
+
+Observability SHALL NOT expose native stream, event, semaphore, fence, command
+queue, Tensor address, model weight, KV content, prompt, secret, or credential.
+
+#### Scenario: CUDA diagnostic
+
+Given native CUDA event exists
+
+When trace is exported
+
+Then only logical token/stream identifiers are exposed.
+
+### Requirement: Resource Residency Is Observable
+
+Runtime SHALL expose redacted Resource residency diagnostics when diagnostics
+are requested.
+
+#### Scenario: KV on GPU
+
+Given KV page is Device-resident
+
+When diagnostics are requested
+
+Then ResourceId, memory-domain class and Device stable identity may be shown.
+
+### Requirement: Zero-Copy Decision Is Observable
+
+Runtime SHALL record whether Resource binding used zero-copy or explicit
+movement when residency diagnostics are enabled.
+
+#### Scenario: Shared-memory input
+
+Given no copy is required
+
+When Plan executes
+
+Then zero-copy-selected event may be emitted.
+
+### Requirement: Transfer Elision Is Observable
+
+Runtime SHALL report redundant movement elimination when residency diagnostics
+are enabled.
+
+#### Scenario: Tensor already on target Device
+
+Given Plan initially considered transfer
+
+When Runtime detects compatible residency
+
+Then transfer-elided reason may be observed.
+
+### Requirement: Mapping Lifecycle Is Observable
+
+Logical mapping creation/release SHALL be traced when residency diagnostics are
+enabled.
+
+#### Scenario: Final output mapping
+
+Given host mapping occurs
+
+When diagnostics enabled
+
+Then mapping lifetime can be observed without revealing pointer.
+
+### Requirement: Native Memory State Is Redacted
+
+Observability SHALL NOT expose native addresses or external-memory handles.
+
+#### Scenario: CUDA allocation
+
+Given Tensor has Device pointer
+
+When trace is emitted
+
+Then pointer value is absent.
+
+### Requirement: Pool Capacity Is Observable
+
+Runtime SHALL expose redacted logical memory-pool capacity and pressure.
+
+#### Scenario: KV pressure
+
+Given KV pool approaches high watermark
+
+When diagnostics are requested
+
+Then configured/leased/reclaimable/pending-reclaim summaries SHALL be shown.
+
+### Requirement: Allocation Reuse Is Observable
+
+Runtime SHALL expose when planned storage is reused.
+
+#### Scenario: Workspace reuse
+
+Given same slot backs successive non-overlapping workspaces
+
+When tracing is enabled
+
+Then reuse SHALL be observed without native address.
+
+### Requirement: Fragmentation Is Observable
+
+Runtime SHALL permit distinguishing fragmentation from total-capacity OOM.
+
+#### Scenario: Large block allocation fails
+
+Given total free bytes remain substantial
+
+When allocator reports fragmentation
+
+Then diagnostic category reflects that reason.
+
+### Requirement: Reservation Conflicts Are Observable
+
+Runtime SHALL report when allocation fails due to protected capacity.
+
+#### Scenario: Autotuning blocked
+
+Given protected decode reservation prevents tuning workspace
+
+When request denied
+
+Then reason SHALL be reported as reservation conflict.
+
+### Requirement: Pending Reclaim Is Observable
+
+Logical release waiting on CompletionToken SHALL be observable.
+
+#### Scenario: Cancellation retention
+
+Given Device work remains in flight
+
+When memory pressure exists
+
+Then diagnostics SHALL report bytes pending reclaim.
+
+### Requirement: Native Allocator State Is Redacted
+
+Observability SHALL not expose native pool handles, Device pointers, mapped
+addresses, Tensor contents, weights, KV contents, prompts, secrets, or
+credentials.
+
+#### Scenario: CUDA pool backing
+
+Given Provider has native memory-pool handle
+
+When trace is exported
+
+Then only logical DeviceMemoryPoolId and aggregate metadata appear.
+

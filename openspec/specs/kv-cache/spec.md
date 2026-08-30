@@ -602,3 +602,210 @@ Given caller requests direct KV cache write
 When Runtime validates API request
 
 Then request is denied.
+
+### Requirement: KV Append Produces Readiness Dependency
+
+Asynchronous KV-cache mutation SHALL establish completion before dependent
+decode reads.
+
+#### Scenario: Decode step N+1
+
+Given step N appended new K/V entries
+
+When N+1 Attention begins
+
+Then required KV writes are complete or dependency-ordered.
+
+### Requirement: Sequence KV Ordering Is Preserved
+
+Updates for one logical sequence SHALL preserve required decode order.
+
+#### Scenario: Two decode steps
+
+Given step N+1 depends on N state
+
+When execution uses multiple streams
+
+Then Runtime does not permit N+1 to observe partially updated KV cache.
+
+### Requirement: Independent Sequence Concurrency Is Allowed
+
+KV synchronization SHALL not force unrelated sequences to serialize when their
+resources are independent.
+
+#### Scenario: Sequences A and B
+
+Given separate KV pages/resources
+
+When continuous batch executes
+
+Then their independent updates may overlap.
+
+### Requirement: KV Page Reuse Waits For Completion
+
+Paged KV-cache page SHALL not be reassigned while in-flight work can access it.
+
+#### Scenario: Sequence removed
+
+Given cancellation removes sequence from Scheduler
+
+But Device Kernel still reads its page
+
+When allocator considers page reuse
+
+Then page remains retained until completion.
+
+### Requirement: KV Cancellation Is Resource Safe
+
+Cancelling Session SHALL not invalidate KV storage still referenced by
+in-flight work.
+
+#### Scenario: User ends Session
+
+Given decode Kernel is pending
+
+When Session is cancelled
+
+Then KV physical resources retire after execution quiescence.
+
+### Requirement: KV Cache Supports Device Residency
+
+KV-cache entries/pages SHALL support remaining resident on execution Device
+across decode steps.
+
+#### Scenario: Long decode
+
+Given Session performs 1000 decode steps on GPU0
+
+When capacity permits
+
+Then KV does not require host round-trip between steps.
+
+### Requirement: KV Residency Preserves Completion Ordering
+
+Device-resident KV SHALL still follow asynchronous write/read readiness.
+
+#### Scenario: Append followed by Attention
+
+Given K/V append is pending
+
+When next decode step starts
+
+Then ResourceReadiness orders use correctly.
+
+### Requirement: KV Spill Is Explicit
+
+Moving KV page from Device to another memory domain SHALL be explicit and
+policy-controlled.
+
+#### Scenario: Memory pressure
+
+Given inactive sequence may spill
+
+When host staging is permitted
+
+Then transfer is visible and completion-safe.
+
+### Requirement: Active KV Cannot Be Evicted Unsafely
+
+KV page referenced by in-flight Kernel SHALL not be physically reused or moved
+incompatibly.
+
+#### Scenario: Cancelled Session
+
+Given Attention still reads page
+
+When Session is cancelled
+
+Then page remains until quiescence.
+
+### Requirement: Peer KV Access Is Capability-Gated
+
+A Device SHALL consume KV owned by another Device directly only when explicit
+peer capability and policy permit it.
+
+#### Scenario: GPU1 reads GPU0 KV
+
+Given peer-read unsupported
+
+When Plan attempts direct access
+
+Then zero-copy peer path is denied.
+
+### Requirement: KV Cache SHALL Use Dedicated Page Pool
+
+KV-cache implementation SHALL support logically dedicated page-pool
+allocation.
+
+#### Scenario: Long-running server
+
+Given many Sessions create and retire KV pages
+
+When decode operates
+
+Then pages can be leased/recycled without one native allocation per token.
+
+### Requirement: KV Page Size Is Runtime Defined
+
+KV page geometry SHALL follow KV-cache format and model execution requirements.
+
+#### Scenario: Paged Attention
+
+Given page represents fixed token block
+
+When KVPagePool initializes
+
+Then page size derives from dtype/head/layout requirements, not arbitrary native
+allocator bucket.
+
+### Requirement: KV Page Lease Is Session Or Sequence Scoped
+
+Leased pages SHALL have explicit ownership.
+
+#### Scenario: Sequence A
+
+Given A grows context
+
+When pages are allocated
+
+Then leases are associated with A/session state.
+
+### Requirement: KV Page Recycle Is Completion Safe
+
+A page SHALL return to free list only after no in-flight execution can access
+it.
+
+#### Scenario: Sequence cancelled
+
+Given last Attention Kernel still reads page
+
+When Session ownership ends
+
+Then page becomes pending reclaim until completion.
+
+### Requirement: KV Pool Exhaustion Is Structured
+
+Failure to acquire KV page SHALL not silently corrupt or overwrite another
+Session's cache.
+
+#### Scenario: No free pages
+
+Given pool has no reclaimable page
+
+When decode needs growth
+
+Then Runtime applies backpressure/spill/failure policy explicitly.
+
+### Requirement: Prefix Cache SHALL Retain KV Page Ownership
+
+A page shared by Prefix Cache SHALL not recycle merely because original Session
+ended.
+
+#### Scenario: Prefix retained
+
+Given shared prefix references pages
+
+When source Session closes
+
+Then pages remain leased until Prefix Cache releases them.
+

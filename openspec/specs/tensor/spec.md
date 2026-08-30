@@ -575,3 +575,235 @@ When release validation runs
 
 Then stable release is blocked.
 
+### Requirement: Tensor Resource Has Logical Readiness
+
+Tensor Resource SHALL not be considered readable before required asynchronous
+writes are complete or properly dependency-ordered.
+
+#### Scenario: MatMul output
+
+Given MatMul writes Tensor asynchronously
+
+When another stream wants to read Tensor
+
+Then consumer depends on writer completion.
+
+### Requirement: Host Read Requires Readiness
+
+Host access SHALL wait for Device writes and required visibility.
+
+#### Scenario: Logits copied asynchronously
+
+Given host code attempts read before transfer completion
+
+When Runtime validates access
+
+Then read is delayed/rejected until readiness.
+
+### Requirement: Read-After-Write Hazard Is Tracked
+
+Runtime SHALL preserve RAW dependency semantics.
+
+#### Scenario: RMSNorm consumes MatMul output
+
+Given operations are on different logical streams
+
+When Plan executes
+
+Then RMSNorm cannot read incomplete MatMul result.
+
+### Requirement: Write-After-Read Hazard Is Tracked
+
+Runtime/Memory Manager SHALL prevent conflicting overwrite while prior reader
+still uses Resource.
+
+#### Scenario: Buffer reuse
+
+Given Kernel A reads buffer asynchronously
+
+When Kernel B wants to overwrite same aliased storage
+
+Then B waits until A no longer requires it.
+
+### Requirement: Write-After-Write Hazard Is Tracked
+
+Conflicting asynchronous writes SHALL have explicit ordering.
+
+#### Scenario: Two updates to same Tensor
+
+Given both write same resource
+
+When execution occurs
+
+Then ordering is explicit and deterministic according to graph semantics.
+
+### Requirement: Aliased Tensor Resources Preserve Synchronization
+
+Distinct Resource IDs SHALL not imply independence when they alias overlapping
+storage.
+
+#### Scenario: View aliases parent Tensor
+
+Given parent write remains pending
+
+When view is consumed incompatibly
+
+Then dependency is preserved.
+
+### Requirement: Tensor Resource May Be Device Resident
+
+Tensor Resource SHALL support residency outside host memory.
+
+#### Scenario: KV Tensor
+
+Given Tensor lives on GPU
+
+When descriptor is inspected
+
+Then logical shape/dtype/layout remain available without copying bytes to host.
+
+### Requirement: Resource View Is Zero Copy By Default
+
+Creating a compatible ResourceView SHALL reference existing storage rather than
+copying bytes.
+
+#### Scenario: Slice
+
+Given Tensor has shape `[8, 4096]`
+
+When Runtime creates View of rows 2..4
+
+Then View references same underlying allocation.
+
+### Requirement: View Bounds Are Validated
+
+ResourceView SHALL reject offsets/extents outside underlying storage.
+
+#### Scenario: Overflowed offset
+
+Given offset arithmetic overflows
+
+When View is created
+
+Then operation fails structurally.
+
+### Requirement: View Preserves Residency
+
+A zero-copy View SHALL inherit the residency constraints of underlying storage.
+
+#### Scenario: GPU Tensor View
+
+Given parent Tensor is GPU0-local
+
+When View is created
+
+Then View does not become host-accessible automatically.
+
+### Requirement: Non-Contiguous View Is Explicit
+
+Tensor Resource SHALL describe non-contiguous View through strides/layout when
+the View is non-contiguous.
+
+#### Scenario: Transposed View
+
+Given Kernel supports strided input
+
+When View is passed
+
+Then no materialization is required.
+
+#### Scenario: Kernel requires contiguous input
+
+Given Kernel rejects strided input
+
+When Runtime prepares execution
+
+Then it chooses another Kernel or explicit materialization.
+
+### Requirement: View Aliasing Is Preserved
+
+Runtime SHALL know when Views overlap underlying storage.
+
+#### Scenario: Two overlapping slices
+
+Given both reference same allocation region
+
+When asynchronous reads/writes occur
+
+Then hazard tracking treats them as aliases.
+
+### Requirement: Tensor Descriptor Does Not Contain Native Pointer
+
+Logical Tensor descriptor SHALL remain independent from underlying native
+address.
+
+#### Scenario: Resource migrates
+
+Given managed memory moves physically
+
+When descriptor is inspected
+
+Then logical Tensor semantics remain unchanged.
+
+### Requirement: Tensor Resource Uses Logical Allocation Backing
+
+Tensor Resource SHALL reference an AllocationLease rather than owning a dedicated
+native allocation.
+
+#### Scenario: Intermediate Tensor
+
+Given Tensor needs 8 MiB transient Device storage
+
+When created
+
+Then it SHALL bind to sub-region of transient DeviceMemoryPool.
+
+### Requirement: Tensor Logical Size Is Independent From Allocator Padding
+
+Allocator alignment/padding SHALL not change Tensor byte-length semantics.
+
+#### Scenario: 1000-byte Tensor in 1024-byte slot
+
+Given allocator rounds storage upward
+
+When Tensor descriptor is inspected
+
+Then logical payload remains 1000 bytes.
+
+### Requirement: Tensor Reuse Does Not Merge Resource Identity
+
+Two Tensors using same physical bytes at different times SHALL remain distinct
+logical Tensor Resources.
+
+#### Scenario: A then C reuse slot
+
+Given C reuses A's released storage
+
+When diagnostics inspect Resources
+
+Then A and C retain distinct Resource IDs.
+
+### Requirement: Tensor Views Preserve Underlying Lease Lifetime
+
+A live ResourceView SHALL keep the underlying AllocationLease valid.
+
+#### Scenario: Parent Tensor released
+
+Given View remains live
+
+When lease reclamation runs
+
+Then backing remains allocated.
+
+### Requirement: Tensor Alignment Is Validated Against Planned Slot
+
+A Tensor SHALL not bind to a slot violating its required alignment.
+
+#### Scenario: Kernel needs 256-byte alignment
+
+Given candidate slot only guarantees 64 bytes
+
+When binding occurs
+
+Then slot is rejected.
+

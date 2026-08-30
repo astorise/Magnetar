@@ -3789,3 +3789,281 @@ When Runtime tries to use/revalidate it
 
 Then structured failure causes Plan invalidation/rebuild.
 
+### Requirement: Provider Owns Native Synchronization
+
+Provider SHALL own native streams, queues, events, semaphores, fences, and
+equivalent synchronization objects.
+
+#### Scenario: Metal Provider
+
+Given Runtime creates logical compute stream
+
+When Provider realizes it
+
+Then MTLCommandQueue remains Provider-private.
+
+### Requirement: Provider Advertises Async Capability
+
+Provider SHALL advertise supported asynchronous execution features.
+
+#### Scenario: GPU Provider discovery
+
+Given Provider supports Device-side events and transfer overlap
+
+When capability descriptor is read
+
+Then these capabilities are explicitly discoverable.
+
+### Requirement: Provider Preserves Logical Ordering
+
+Provider SHALL preserve advertised ExecutionStream ordering semantics regardless
+of internal implementation.
+
+#### Scenario: Internal task pool
+
+Given Provider maps one logical stream to multiple workers
+
+When ordered submissions execute
+
+Then observable dependencies remain equivalent to ordered stream contract.
+
+### Requirement: Provider May Optimize Dependencies Device-Side
+
+Provider SHALL be allowed to implement logical dependencies using native Device-side
+synchronization.
+
+#### Scenario: CUDA event
+
+Given stream B depends on stream A
+
+When CUDA Provider supports event wait
+
+Then Provider may implement dependency without blocking host.
+
+### Requirement: Provider Does Not Expose Native Event
+
+Provider SHALL NOT return native synchronization pointer through Runtime public
+contracts.
+
+#### Scenario: Completion generated
+
+Given native event exists
+
+When Runtime receives completion identity
+
+Then it receives opaque token only.
+
+### Requirement: Provider Supports Structured Completion Failure
+
+Provider SHALL report asynchronous execution failure through CompletionToken or
+equivalent structured completion state.
+
+#### Scenario: Kernel launch failure detected asynchronously
+
+Given failure occurs after submission
+
+When completion is polled
+
+Then structured failed state is returned.
+
+### Requirement: Provider Advertises Cancellation Semantics
+
+Provider SHALL accurately describe cancellation capability.
+
+#### Scenario: CUDA work already submitted
+
+Given Provider cannot interrupt running Kernel
+
+When cancellation capability is queried
+
+Then it SHALL NOT advertise interruptible cancellation.
+
+### Requirement: Provider Stream Failure Is Contained
+
+Failure of one logical stream SHALL NOT silently mark unrelated completed
+resources invalid unless Device/Provider failure scope requires it.
+
+#### Scenario: One queued submission fails
+
+Given Device remains healthy
+
+When failure is reported
+
+Then unrelated streams follow Provider's declared failure scope.
+
+### Requirement: Provider Native Graph Completion Is Opaque
+
+Provider-prepared execution segment SHALL expose only logical completion to
+Runtime.
+
+#### Scenario: OpenVINO async request
+
+Given Provider uses native request object
+
+When segment completes
+
+Then native request object remains private.
+
+### Requirement: Provider Advertises Memory Capabilities
+
+Provider SHALL advertise supported logical memory capabilities.
+
+#### Scenario: Integrated GPU
+
+Given Provider supports shared coherent host/Device allocation
+
+When capabilities are queried
+
+Then Runtime can evaluate zero-copy eligibility.
+
+### Requirement: Provider Owns Native Mapping
+
+Provider SHALL implement native mapping mechanics privately.
+
+#### Scenario: Vulkan memory map
+
+Given Resource is host-visible
+
+When Runtime requests logical mapping
+
+Then Vulkan memory handles/pointers remain Provider-private.
+
+### Requirement: Provider Reports Coherency Semantics
+
+Provider SHALL accurately describe whether mapped memory requires visibility
+maintenance.
+
+#### Scenario: Non-coherent memory
+
+Given host mapping is non-coherent
+
+When host/Device ownership changes
+
+Then Provider performs required native flush/invalidate semantics.
+
+### Requirement: Provider Advertises Peer Access
+
+Provider SHALL expose Device-pair peer-access capabilities when direct peer
+access is available.
+
+#### Scenario: GPU0 and GPU1
+
+Given GPU0 can directly read GPU1 memory
+
+When capabilities are queried
+
+Then peer-read is explicit.
+
+### Requirement: Provider Does Not Invent Host Staging
+
+Provider SHALL report when an operation requires host staging rather than
+silently hiding it from Runtime policy.
+
+#### Scenario: Unsupported peer transfer
+
+Given Device-to-Device copy internally requires host temporary
+
+When policy forbids staging
+
+Then Provider cannot perform hidden fallback.
+
+### Requirement: Provider Resolves Native Resource Handle
+
+Runtime SHALL pass logical/opaque Resource identity into Provider-controlled
+execution boundary.
+
+#### Scenario: Kernel submit
+
+Given Tensor Resource is Device-resident
+
+When Provider launches Kernel
+
+Then Provider resolves its own native pointer internally.
+
+### Requirement: Provider Does Not Export Native Memory By Default
+
+Native memory handles SHALL remain private absent explicit interoperability
+capability.
+
+#### Scenario: CUDA allocation
+
+Given Runtime asks Resource metadata
+
+Then CUDA IPC handle is not returned.
+
+### Requirement: Provider Realizes Memory Pool Backing
+
+Provider SHALL allocate native blocks or use native memory-pool facilities to
+realize Runtime logical DeviceMemoryPools.
+
+#### Scenario: CUDA Provider
+
+Given Runtime requests Device-local pool backing
+
+When Provider realizes it
+
+Then CUDA-specific pool/allocation state remains Provider-private.
+
+### Requirement: Provider Advertises Allocation Capabilities
+
+Provider SHALL advertise allocation characteristics relevant to Runtime
+planning.
+
+#### Scenario: Alignment capability
+
+Given Device allocation requires minimum granularity
+
+When capabilities are queried
+
+Then Runtime can plan compatible slots.
+
+### Requirement: Provider Does Not Decide Pool Reservations
+
+Provider SHALL NOT override Runtime hard/soft pool reservations.
+
+#### Scenario: Provider has spare memory
+
+Given Runtime protects KV reservation
+
+When Provider receives optional workspace request
+
+Then it cannot silently consume reserved capacity outside Runtime decision.
+
+### Requirement: Provider Supports Opaque Block Realization
+
+Provider-backed AllocationBlock identity SHALL remain opaque to Runtime.
+
+#### Scenario: Native block created
+
+Given Provider allocates large Device region
+
+When Runtime receives block token
+
+Then token has no pointer semantics.
+
+### Requirement: Provider Reports Native Allocation Failure Structurally
+
+Native allocation failure SHALL be normalized into structured Provider/Memory
+error.
+
+#### Scenario: Driver allocation fails
+
+Given pool growth requests new block
+
+When driver rejects allocation
+
+Then Runtime receives provider-allocation-failed or equivalent structured state.
+
+### Requirement: Provider Advertises Address Stability Constraints
+
+Provider SHALL report when prepared Kernel/segment requires stable backing
+addresses.
+
+#### Scenario: Native graph capture
+
+Given graph cannot tolerate relocated buffers
+
+When Plan is prepared
+
+Then Memory Manager receives explicit non-movable requirement.
+
