@@ -80,8 +80,9 @@
 
 The change is validated and partially implemented. The 16 remaining unchecked tasks are
 intentionally left open because they require the production Runtime cutover that
-is still absent from the codebase: Qwen WASM Component output wired into graph
-construction in the SUT, full Provider-dispatched Qwen operator execution as the
-logits source, incremental KV decode owned by Runtime Session/ModelInstance
-state, and replacement of the remaining crate-internal RuntimeGenerationExecutor
-execution path.
+is still absent from the codebase: Qwen WASM Component output exposed as an
+execution graph rather than only scalar graph counters, incremental KV decode
+owned by Runtime Session/ModelInstance state, replacement of the remaining
+crate-internal RuntimeGenerationExecutor execution path, CLI model_ref
+resolution/load/session cutover through production RuntimeInferenceApi, and
+runtime-owned observation/correlation evidence.
