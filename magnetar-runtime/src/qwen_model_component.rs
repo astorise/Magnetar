@@ -928,7 +928,6 @@ pub fn qwen_build_graph(
         });
     }
     let a = &config.architecture;
-    let batch = 1u64;
     let q_dim = a.attention_head_count * a.head_dimension;
     let kv_dim = a.kv_head_count * a.head_dimension;
 
@@ -950,18 +949,12 @@ pub fn qwen_build_graph(
     graph.fingerprint = Some(qwen_component_compatibility_key(identity));
 
     graph = graph
-        .with_edge(token_id_edge(
-            "input.token_ids",
-            vec![batch, sequence_length],
-        ))
+        .with_edge(token_id_edge("input.token_ids", vec![sequence_length]))
         .with_edge(f32_edge(
             "weight.token_embedding",
             vec![a.vocabulary_size, a.hidden_size],
         ))
-        .with_edge(f32_edge(
-            "hidden.0",
-            vec![batch, sequence_length, a.hidden_size],
-        ))
+        .with_edge(f32_edge("hidden.0", vec![sequence_length, a.hidden_size]))
         .with_node(
             op_node("embedding", "embedding", OperatorFamily::Tensor)
                 .with_input(TensorEdgeId::new("input.token_ids"))
@@ -983,11 +976,11 @@ pub fn qwen_build_graph(
         graph = graph
             .with_edge(f32_edge(
                 format!("weight.{prefix}.input_norm"),
-                vec![batch, sequence_length, a.hidden_size],
+                vec![a.hidden_size],
             ))
             .with_edge(f32_edge(
                 normed.clone(),
-                vec![batch, sequence_length, a.hidden_size],
+                vec![sequence_length, a.hidden_size],
             ))
             .with_node(
                 op_node(
@@ -1012,7 +1005,7 @@ pub fn qwen_build_graph(
                 format!("weight.{prefix}.q_proj"),
                 vec![a.hidden_size, q_dim],
             ))
-            .with_edge(f32_edge(q.clone(), vec![batch, sequence_length, q_dim]))
+            .with_edge(f32_edge(q.clone(), vec![sequence_length, q_dim]))
             .with_node(
                 op_node(
                     format!("{prefix}.q_proj"),
@@ -1027,7 +1020,7 @@ pub fn qwen_build_graph(
                 format!("weight.{prefix}.k_proj"),
                 vec![a.hidden_size, kv_dim],
             ))
-            .with_edge(f32_edge(k.clone(), vec![batch, sequence_length, kv_dim]))
+            .with_edge(f32_edge(k.clone(), vec![sequence_length, kv_dim]))
             .with_node(
                 op_node(
                     format!("{prefix}.k_proj"),
@@ -1042,7 +1035,7 @@ pub fn qwen_build_graph(
                 format!("weight.{prefix}.v_proj"),
                 vec![a.hidden_size, kv_dim],
             ))
-            .with_edge(f32_edge(v.clone(), vec![batch, sequence_length, kv_dim]))
+            .with_edge(f32_edge(v.clone(), vec![sequence_length, kv_dim]))
             .with_node(
                 op_node(
                     format!("{prefix}.v_proj"),
@@ -1057,10 +1050,7 @@ pub fn qwen_build_graph(
         let q_rope = format!("{prefix}.q_rope");
         let k_rope = format!("{prefix}.k_rope");
         graph = graph
-            .with_edge(f32_edge(
-                q_rope.clone(),
-                vec![batch, sequence_length, q_dim],
-            ))
+            .with_edge(f32_edge(q_rope.clone(), vec![sequence_length, q_dim]))
             .with_node(
                 op_node(
                     format!("{prefix}.rope_q"),
@@ -1083,10 +1073,7 @@ pub fn qwen_build_graph(
                     OperatorAttributeValue::Integer(position_offset as i64),
                 ),
             )
-            .with_edge(f32_edge(
-                k_rope.clone(),
-                vec![batch, sequence_length, kv_dim],
-            ))
+            .with_edge(f32_edge(k_rope.clone(), vec![sequence_length, kv_dim]))
             .with_node(
                 op_node(
                     format!("{prefix}.rope_k"),
@@ -1127,10 +1114,7 @@ pub fn qwen_build_graph(
 
         let attn_out = format!("{prefix}.attn_out");
         graph = graph
-            .with_edge(f32_edge(
-                attn_out.clone(),
-                vec![batch, sequence_length, q_dim],
-            ))
+            .with_edge(f32_edge(attn_out.clone(), vec![sequence_length, q_dim]))
             .with_node(
                 op_node(
                     format!("{prefix}.attention"),
@@ -1168,7 +1152,7 @@ pub fn qwen_build_graph(
             ))
             .with_edge(f32_edge(
                 attn_proj.clone(),
-                vec![batch, sequence_length, a.hidden_size],
+                vec![sequence_length, a.hidden_size],
             ))
             .with_node(
                 op_node(
@@ -1185,7 +1169,7 @@ pub fn qwen_build_graph(
         graph = graph
             .with_edge(f32_edge(
                 post_attn.clone(),
-                vec![batch, sequence_length, a.hidden_size],
+                vec![sequence_length, a.hidden_size],
             ))
             .with_node(
                 op_node(
@@ -1202,11 +1186,11 @@ pub fn qwen_build_graph(
         graph = graph
             .with_edge(f32_edge(
                 format!("weight.{prefix}.post_attn_norm"),
-                vec![batch, sequence_length, a.hidden_size],
+                vec![a.hidden_size],
             ))
             .with_edge(f32_edge(
                 mlp_normed.clone(),
-                vec![batch, sequence_length, a.hidden_size],
+                vec![sequence_length, a.hidden_size],
             ))
             .with_node(
                 op_node(
@@ -1235,7 +1219,7 @@ pub fn qwen_build_graph(
             ))
             .with_edge(f32_edge(
                 gate.clone(),
-                vec![batch, sequence_length, a.intermediate_size],
+                vec![sequence_length, a.intermediate_size],
             ))
             .with_node(
                 op_node(
@@ -1253,7 +1237,7 @@ pub fn qwen_build_graph(
             ))
             .with_edge(f32_edge(
                 up.clone(),
-                vec![batch, sequence_length, a.intermediate_size],
+                vec![sequence_length, a.intermediate_size],
             ))
             .with_node(
                 op_node(
@@ -1267,7 +1251,7 @@ pub fn qwen_build_graph(
             )
             .with_edge(f32_edge(
                 activated.clone(),
-                vec![batch, sequence_length, a.intermediate_size],
+                vec![sequence_length, a.intermediate_size],
             ))
             .with_node(
                 op_node(format!("{prefix}.silu"), "silu", OperatorFamily::Activation)
@@ -1276,7 +1260,7 @@ pub fn qwen_build_graph(
             )
             .with_edge(f32_edge(
                 mlp_hidden.clone(),
-                vec![batch, sequence_length, a.intermediate_size],
+                vec![sequence_length, a.intermediate_size],
             ))
             .with_node(
                 op_node(format!("{prefix}.mul"), "mul", OperatorFamily::Tensor)
@@ -1290,7 +1274,7 @@ pub fn qwen_build_graph(
             ))
             .with_edge(f32_edge(
                 mlp_out.clone(),
-                vec![batch, sequence_length, a.hidden_size],
+                vec![sequence_length, a.hidden_size],
             ))
             .with_node(
                 op_node(
@@ -1307,7 +1291,7 @@ pub fn qwen_build_graph(
         graph = graph
             .with_edge(f32_edge(
                 layer_out.clone(),
-                vec![batch, sequence_length, a.hidden_size],
+                vec![sequence_length, a.hidden_size],
             ))
             .with_node(
                 op_node(
@@ -1324,13 +1308,10 @@ pub fn qwen_build_graph(
     }
 
     graph = graph
-        .with_edge(f32_edge(
-            "weight.final_norm",
-            vec![batch, sequence_length, a.hidden_size],
-        ))
+        .with_edge(f32_edge("weight.final_norm", vec![a.hidden_size]))
         .with_edge(f32_edge(
             "hidden.final",
-            vec![batch, sequence_length, a.hidden_size],
+            vec![sequence_length, a.hidden_size],
         ))
         .with_node(
             op_node("final_norm", "rmsnorm", OperatorFamily::Normalization)
@@ -1343,10 +1324,7 @@ pub fn qwen_build_graph(
                 ),
         )
         .with_edge(qwen_lm_head_weight_edge(config))
-        .with_edge(f32_edge(
-            "logits",
-            vec![batch, sequence_length, a.vocabulary_size],
-        ))
+        .with_edge(f32_edge("logits", vec![sequence_length, a.vocabulary_size]))
         .with_node(
             op_node("lm_head", "matmul", OperatorFamily::LinearAlgebra)
                 .with_input(TensorEdgeId::new("hidden.final"))

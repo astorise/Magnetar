@@ -1021,10 +1021,7 @@ fn baseline_advertisement(name: &str, family: OperatorFamily) -> KernelAdvertise
     // (e.g. embedding's rank-1 ids against its rank-2 table) or accept
     // arbitrary rank (elementwise, activations, conversions) are left
     // unconstrained.
-    if matches!(
-        name,
-        "matmul" | "rmsnorm" | "rope" | "attention" | "softmax"
-    ) {
+    if matches!(name, "matmul" | "rope" | "attention" | "softmax") {
         advertisement.shape.rank = Some(2);
     }
     advertisement
@@ -1055,10 +1052,12 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         memory_classes: BTreeSet::new(),
         affinity: None,
     });
+    let embedding = baseline_advertisement("embedding", OperatorFamily::Tensor)
+        .with_dtypes(TensorRole::Input, [ComputeDType::SInt32]);
 
     vec![
         baseline_advertisement("matmul", OperatorFamily::LinearAlgebra),
-        baseline_advertisement("embedding", OperatorFamily::Tensor),
+        embedding,
         baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
         baseline_advertisement("rope", OperatorFamily::PositionEncoding),
         attention,

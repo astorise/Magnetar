@@ -1974,27 +1974,43 @@ impl ComponentManager {
         &mut self,
         name: &str,
     ) -> Result<ComponentInstanceId, ComponentError> {
+        let definition_id = self.prepare_component(name)?;
+        self.instantiate_prepared_component(definition_id)
+    }
+
+    pub fn instantiate_prepared_component(
+        &mut self,
+        definition_id: ComponentDefinitionId,
+    ) -> Result<ComponentInstanceId, ComponentError> {
         if self.shutdown {
             return Err(ComponentError::RuntimeShutdown);
+        }
+        let definition = self
+            .definitions
+            .values()
+            .find(|definition| definition.id == definition_id)
+            .ok_or(ComponentError::MissingPreparedDefinition(definition_id))?;
+        let name = definition.metadata.name.clone();
+        if definition.state != ComponentDefinitionState::Prepared {
+            return Err(ComponentError::MissingPreparedDefinition(definition_id));
         }
         if let Some(max_instances) = self.limits.max_instances
             && self.instances.len() >= max_instances as usize
         {
             let error = ComponentError::ResourceLimitExceeded {
-                component: name.into(),
+                component: name.clone(),
                 limit: "instances",
             };
             self.observe_error(None, &error);
             return Err(error);
         }
-        let link_plan = self.link_plan(name)?;
+        let link_plan = self.build_link_plan(definition)?;
         self.observations.push(ComponentObservation::new(
             ComponentObservationKind::LinkPlan,
-            Some(name.into()),
+            Some(name.clone()),
             None,
             "runtime-owned link plan built",
         ));
-        let definition_id = self.prepare_component(name)?;
         let prepared = self
             .prepared
             .get(&definition_id)
@@ -2012,7 +2028,7 @@ impl ComponentManager {
         );
         self.observations.push(ComponentObservation::new(
             ComponentObservationKind::Instantiation,
-            Some(name.into()),
+            Some(name),
             Some(id),
             "component instance ready",
         ));

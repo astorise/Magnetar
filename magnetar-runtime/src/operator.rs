@@ -185,6 +185,7 @@ pub enum ShapeRule {
     SameRank,
     SameShape,
     Matmul,
+    RmsNorm,
     Rank(u64),
 }
 
@@ -726,7 +727,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             OperatorFamily::Normalization,
             2,
             1,
-            ShapeRule::SameShape,
+            ShapeRule::RmsNorm,
         ),
         (
             "layernorm",
@@ -1014,6 +1015,41 @@ fn validate_shape_rule(
             if a.len() < 2 || b.len() < 2 || a[a.len() - 1] != b[b.len() - 2] {
                 return Err(OperatorError::ShapeMismatch {
                     reason: "matmul inner dimensions differ".into(),
+                });
+            }
+            Ok(())
+        }
+        ShapeRule::RmsNorm => {
+            if inputs.len() < 2 {
+                return Err(OperatorError::InputArityInvalid {
+                    expected: 2,
+                    actual: inputs.len(),
+                });
+            }
+            if outputs.is_empty() {
+                return Err(OperatorError::OutputArityInvalid {
+                    expected: 1,
+                    actual: outputs.len(),
+                });
+            }
+            let input = &inputs[0].shape.dimensions;
+            let weight = &inputs[1].shape.dimensions;
+            let output = &outputs[0].shape.dimensions;
+            if output != input {
+                return Err(OperatorError::ShapeMismatch {
+                    reason: "RMSNorm output shape must match input".into(),
+                });
+            }
+            let Some(cols) = input.last() else {
+                return Err(OperatorError::ShapeUnsupported {
+                    reason: "RMSNorm input must have at least one dimension".into(),
+                });
+            };
+            let row_broadcast_weight = weight.len() == 2 && weight[0] == 1 && weight[1] == *cols;
+            if weight.as_slice() != [*cols] && weight != input && !row_broadcast_weight {
+                return Err(OperatorError::ShapeMismatch {
+                    reason: "RMSNorm weight shape must be [cols], [1, cols], or input-shaped"
+                        .into(),
                 });
             }
             Ok(())

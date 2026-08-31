@@ -15,11 +15,14 @@ use crate::component::*;
 use crate::compute;
 use crate::compute::*;
 use crate::conformance::first_native_model_execution_profile;
+use crate::device::DeviceId;
 use crate::execution_graph::*;
 use crate::generation::*;
 use crate::inference_api::*;
 use crate::kernel::*;
-use crate::kernel_artifact::{PreparedKernelGeneration, PreparedKernelIdAllocator};
+use crate::kernel_artifact::{
+    CompiledKernelArtifactId, PreparedKernel, PreparedKernelGeneration, PreparedKernelIdAllocator,
+};
 use crate::kernel_dispatch::*;
 use crate::kernel_execution_plan::{
     PlanGuard, PlanGuardContext, PlanMemoryRequirements, PlanNodeBinding, PreparedExecutionPhase,
@@ -1970,14 +1973,16 @@ pub struct FirstNativeFixtureGeneration {
 }
 
 fn build_runtime() -> Runtime {
-    Runtime::builder()
+    let mut runtime = Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
         .build()
-        .expect("Reference CPU provider registers cleanly")
+        .expect("Reference CPU provider registers cleanly");
+    register_reference_cpu_prepared_kernels(&mut runtime);
+    runtime
 }
 
 fn build_runtime_with_generation_executor(fixture: &E2eFixture) -> Runtime {
-    Runtime::builder()
+    let mut runtime = Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
         .generation_executor(std::sync::Arc::new(E2eRuntimeGenerationExecutor {
             fixture: fixture.clone(),
@@ -1985,7 +1990,9 @@ fn build_runtime_with_generation_executor(fixture: &E2eFixture) -> Runtime {
             forced_token: None,
         }))
         .build()
-        .expect("Reference CPU provider registers cleanly")
+        .expect("Reference CPU provider registers cleanly");
+    register_reference_cpu_prepared_kernels(&mut runtime);
+    runtime
 }
 
 #[cfg(test)]
@@ -1993,14 +2000,44 @@ fn build_runtime_with_generation_executor_and_forced_token(
     fixture: &E2eFixture,
     forced_token: Option<TokenId>,
 ) -> Runtime {
-    Runtime::builder()
+    let mut runtime = Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
         .generation_executor(std::sync::Arc::new(E2eRuntimeGenerationExecutor {
             fixture: fixture.clone(),
             forced_token,
         }))
         .build()
-        .expect("Reference CPU provider registers cleanly")
+        .expect("Reference CPU provider registers cleanly");
+    register_reference_cpu_prepared_kernels(&mut runtime);
+    runtime
+}
+
+fn register_reference_cpu_prepared_kernels(runtime: &mut Runtime) {
+    let mut prepared_ids = PreparedKernelIdAllocator::default();
+    for advertisement in reference_cpu_kernel_advertisements() {
+        let id = prepared_ids.allocate();
+        let mut prepared = PreparedKernel::new(
+            id,
+            advertisement.id.clone(),
+            CompiledKernelArtifactId::from_digest(format!(
+                "builtin:{}",
+                advertisement.id.stable_key()
+            )),
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            DeviceBinding::new(DeviceId::new(REFERENCE_CPU_DEVICE_ID)),
+            PreparedKernelGeneration::new(1),
+        );
+        prepared
+            .mark_ready()
+            .expect("Reference CPU prepared kernel fixture can become ready");
+        runtime
+            .kernel_registry_mut()
+            .register_prepared_kernel(prepared);
+        runtime
+            .kernel_registry_mut()
+            .promote_generation(&advertisement.id, id)
+            .expect("Reference CPU prepared kernel fixture promotes cleanly");
+    }
 }
 
 fn load_fixture_instance(
@@ -2078,11 +2115,24 @@ fn require_compatible_first_native_plan(
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-fn qwen_graph_component_artifact_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures")
-        .join("components")
-        .join("qwen-graph.component.wat")
+const QWEN_GRAPH_COMPONENT_BYTES: &[u8] =
+    include_bytes!("../fixtures/components/qwen-graph.component.wat");
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+const QWEN_GRAPH_COMPONENT_MANIFEST_BYTES: &[u8] =
+    include_bytes!("../fixtures/components/qwen-graph.component.wat.magnetar-component.yaml");
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn qwen_graph_component_package() -> ComponentArtifactPackage {
+    ComponentArtifactPackage::new(
+        QWEN_GRAPH_COMPONENT_BYTES.to_vec(),
+        QWEN_GRAPH_COMPONENT_MANIFEST_BYTES.to_vec(),
+        ComponentDigest::parse("sha256", QWEN_GRAPH_COMPONENT_DIGEST),
+        ComponentDistributionSource::new(
+            ComponentDistributionSourceKind::DevelopmentFixture,
+            QWEN_GRAPH_COMPONENT_NAME,
+        ),
+    )
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -2142,8 +2192,7 @@ fn qwen_component_runtime_limits() -> ComponentResourceLimits {
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 struct QwenComponentPreflightRequest {
-    artifact_path: std::path::PathBuf,
-    manifest_path: Option<std::path::PathBuf>,
+    component_package: ComponentArtifactPackage,
     trust_store: ComponentTrustStore,
     limits: ComponentResourceLimits,
 }
@@ -2151,12 +2200,8 @@ struct QwenComponentPreflightRequest {
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 impl QwenComponentPreflightRequest {
     fn default_trusted() -> Self {
-        let artifact_path = qwen_graph_component_artifact_path();
         Self {
-            manifest_path: Some(
-                artifact_path.with_file_name("qwen-graph.component.wat.magnetar-component.yaml"),
-            ),
-            artifact_path,
+            component_package: qwen_graph_component_package(),
             trust_store: ComponentTrustStore::default().trust_digest(QWEN_GRAPH_COMPONENT_DIGEST),
             limits: qwen_component_runtime_limits(),
         }
@@ -2202,30 +2247,13 @@ fn validate_and_instantiate_qwen_component_before_first_native_planning(
     ));
     manager.set_resource_limits(request.limits);
     manager.set_trust_store(request.trust_store);
-    let mut descriptor = ComponentDescriptor::new(
-        ComponentMetadata::new(
-            QWEN_GRAPH_COMPONENT_NAME,
-            "0.1.0",
-            "Executable Qwen graph fixture component",
-        )
-        .with_export(WitInterface::new("magnetar:qwen/graph-fixture", "1.0.0")),
-        request.artifact_path,
-    );
-    if let Some(manifest_path) = request.manifest_path {
-        descriptor = descriptor.with_manifest_path(manifest_path);
-    }
-    manager.register_component(descriptor).map_err(|error| {
-        E2eConformanceError::ModelComponentFailed {
-            reason: error.to_string(),
-        }
-    })?;
     let definition = manager
-        .prepare_component(QWEN_GRAPH_COMPONENT_NAME)
+        .prepare_pushed_package(request.component_package)
         .map_err(|error| E2eConformanceError::ModelComponentFailed {
             reason: error.to_string(),
         })?;
     let instance = manager
-        .instantiate_component(QWEN_GRAPH_COMPONENT_NAME)
+        .instantiate_prepared_component(definition)
         .map_err(|error| E2eConformanceError::ModelComponentFailed {
             reason: error.to_string(),
         })?;
@@ -2291,20 +2319,60 @@ fn prepare_first_native_plan_for_graph(
         semantic_graph_fingerprint(graph),
         scope,
     )?;
-    let mut prepared_ids = PreparedKernelIdAllocator::default();
     let affinity = ResourceAffinity::new(FallbackClass::Transparent)
         .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
         .with_execution_context(runtime.context().id());
 
     for (node_id, node) in &graph.nodes {
+        let node_affinity = node
+            .resource_affinity
+            .clone()
+            .unwrap_or_else(|| affinity.clone());
+        let mut selection_request = KernelSelectionRequest::new(
+            format!("first-native-plan-{phase:?}-{}", node_id.as_str()),
+            node.operator.clone(),
+            node_affinity.clone(),
+        );
+        selection_request.graph_plan = Some(graph.id.clone());
+        selection_request.model_instance = Some(instance.clone());
+        selection_request.observability_correlation =
+            Some(format!("first-native-plan:{phase:?}:{node_id}"));
+        for input in &node.inputs {
+            let resource = graph_kernel_resource(graph, input, &node_affinity)?;
+            merge_graph_edge_requirements(&mut selection_request, &resource);
+            if let Some(kv) = graph
+                .edges
+                .get(input)
+                .and_then(|edge| edge.kv_cache.as_ref())
+            {
+                note_graph_kv_requirement(&mut selection_request, kv);
+                if matches!(kv.behavior, GraphKvCacheBehavior::Input) {
+                    merge_kernel_managed_kv_requirement(&mut selection_request, kv, &resource);
+                }
+            }
+            selection_request = selection_request.with_input(resource);
+        }
+        for output in &node.outputs {
+            let resource = graph_kernel_resource(graph, output, &node_affinity)?;
+            merge_graph_edge_requirements(&mut selection_request, &resource);
+            if let Some(kv) = graph
+                .edges
+                .get(output)
+                .and_then(|edge| edge.kv_cache.as_ref())
+            {
+                note_graph_kv_requirement(&mut selection_request, kv);
+            }
+            selection_request = selection_request.with_output(resource);
+        }
         let selection = runtime
             .kernel_registry()
-            .select(&KernelSelectionRequest::new(
-                format!("first-native-plan-{phase:?}-{}", node_id.as_str()),
-                node.operator.clone(),
-                affinity.clone(),
-            ))
-            .map_err(E2eConformanceError::from)?;
+            .select(&selection_request)
+            .map_err(|error| E2eConformanceError::KernelCoverageMissing {
+                reason: format!(
+                    "Kernel Registry selection failed for node {node_id} ({operator}): {error}",
+                    operator = node.operator,
+                ),
+            })?;
         let candidate =
             selection
                 .selected
@@ -2317,8 +2385,14 @@ fn prepare_first_native_plan_for_graph(
             candidate.kernel.clone(),
             candidate.provider.clone(),
         )?
-        .with_specialization(format!("first-native-{phase:?}-{}", node_id.as_str()))
-        .with_prepared_kernel(prepared_ids.allocate(), PreparedKernelGeneration::new(1));
+        .with_specialization(format!("first-native-{phase:?}-{}", node_id.as_str()));
+        let prepared_kernel = runtime
+            .kernel_registry()
+            .active_prepared_kernel(&candidate.kernel)
+            .ok_or_else(|| E2eConformanceError::KernelCoverageMissing {
+                reason: format!("no active PreparedKernel registered for node {node_id}"),
+            })?;
+        binding = binding.with_prepared_kernel(prepared_kernel.id, prepared_kernel.generation);
         if let Some(device) = candidate.device {
             binding = binding.with_device(device);
         }
@@ -2344,6 +2418,114 @@ fn prepare_first_native_plan_for_graph(
     let context = first_native_plan_context(phase, token_count);
     require_compatible_first_native_plan(Some(&mut plan_for_validation), &context)?;
     Ok(plan)
+}
+
+fn kernel_memory_class_for_edge(edge: &TensorEdge) -> KernelMemoryClass {
+    match edge.residency {
+        TensorResidencyConstraint::Device => KernelMemoryClass::Device,
+        TensorResidencyConstraint::BrowserLinearMemory => KernelMemoryClass::BrowserLinearMemory,
+        TensorResidencyConstraint::ProviderOwnedOpaque => KernelMemoryClass::ProviderOwned,
+        TensorResidencyConstraint::Host => match edge.memory_class {
+            MemoryAllocationClass::HostPinned | MemoryAllocationClass::TransferStaging => {
+                KernelMemoryClass::PinnedHost
+            }
+            MemoryAllocationClass::BrowserLinearMemory => KernelMemoryClass::BrowserLinearMemory,
+            _ => KernelMemoryClass::Host,
+        },
+    }
+}
+
+fn layout_kind_for_descriptor(descriptor: &TensorDescriptor) -> TensorLayoutKind {
+    match descriptor.layout {
+        LayoutDescriptor::Contiguous => TensorLayoutKind::Contiguous,
+        LayoutDescriptor::Strided { .. } => TensorLayoutKind::Strided,
+        LayoutDescriptor::Blocked { .. } => TensorLayoutKind::Blocked,
+        LayoutDescriptor::Paged { .. } => TensorLayoutKind::Paged,
+        LayoutDescriptor::PackedQuantized { .. } => TensorLayoutKind::QuantizedPacked,
+        LayoutDescriptor::AttentionSpecific { .. } => TensorLayoutKind::AttentionSpecific,
+        LayoutDescriptor::BrowserCompatible { .. } => TensorLayoutKind::BrowserCompatible,
+        LayoutDescriptor::ProviderOpaque { .. } => TensorLayoutKind::ProviderOpaque,
+    }
+}
+
+fn graph_kernel_resource(
+    graph: &ExecutionGraph,
+    edge_id: &TensorEdgeId,
+    default_affinity: &ResourceAffinity,
+) -> Result<KernelResource, E2eConformanceError> {
+    let edge =
+        graph
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| E2eConformanceError::GraphValidationFailed {
+                reason: format!("graph node references missing tensor edge '{edge_id}'"),
+            })?;
+    let affinity = edge
+        .affinity
+        .clone()
+        .unwrap_or_else(|| default_affinity.clone());
+    Ok(KernelResource::new(
+        TensorResourceDescriptor::new(
+            TensorResourceId::new(edge.id.as_str()),
+            edge.descriptor.clone(),
+            affinity,
+        ),
+        kernel_memory_class_for_edge(edge),
+    ))
+}
+
+fn merge_graph_edge_requirements(request: &mut KernelSelectionRequest, resource: &KernelResource) {
+    if let DTypeDescriptor::Portable(dtype) = &resource.resource.descriptor.dtype {
+        request.dtype_requirements.insert(*dtype);
+    }
+    request
+        .layout_requirements
+        .insert(layout_kind_for_descriptor(&resource.resource.descriptor));
+    request
+        .memory_class_requirements
+        .insert(resource.memory_class);
+}
+
+fn note_graph_kv_requirement(request: &mut KernelSelectionRequest, kv: &GraphKvCacheMetadata) {
+    let behavior = match kv.behavior {
+        GraphKvCacheBehavior::Input => "input",
+        GraphKvCacheBehavior::Output => "output",
+        GraphKvCacheBehavior::Append => "append",
+    };
+    let cache_kind = if kv.paged { "paged" } else { "contiguous" };
+    request.policy.insert(
+        format!("graph-kv-cache:{}", kv.cache_id),
+        format!("{behavior}:{cache_kind}"),
+    );
+}
+
+fn merge_kernel_managed_kv_requirement(
+    request: &mut KernelSelectionRequest,
+    kv: &GraphKvCacheMetadata,
+    resource: &KernelResource,
+) {
+    let metadata = request
+        .kv_cache
+        .get_or_insert_with(|| KernelKvCacheMetadata {
+            layouts: BTreeSet::new(),
+            paged_cache: kv.paged,
+            append: false,
+            read: false,
+            dtypes: BTreeSet::new(),
+            memory_classes: BTreeSet::new(),
+            affinity: Some(resource.resource.affinity.clone()),
+        });
+    metadata.paged_cache |= kv.paged;
+    metadata.read = true;
+    metadata.layouts.insert(if kv.paged {
+        "paged".into()
+    } else {
+        "contiguous".into()
+    });
+    if let DTypeDescriptor::Portable(dtype) = &resource.resource.descriptor.dtype {
+        metadata.dtypes.insert(*dtype);
+    }
+    metadata.memory_classes.insert(resource.memory_class);
 }
 
 fn prepare_first_native_execution_plans(
@@ -2455,7 +2637,7 @@ fn run_success_path_with_prompt(
     };
     #[cfg(not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")))]
     let component_graph_semantics = None;
-    let prepared_plans = prepare_first_native_execution_plans(
+    let mut prepared_plans = prepare_first_native_execution_plans(
         &runtime,
         fixture,
         &instance,
@@ -2491,13 +2673,18 @@ fn run_success_path_with_prompt(
 
     // Prefill/decode/sample/stream through the real forward pass.
     let mut observer = InferenceApiObserver::new();
-    let generation_result = run_generation_loop(
+    let mut execution_plans = RuntimeGenerationExecutionPlans {
+        prefill: &mut prepared_plans.prefill,
+        decode: &mut prepared_plans.decode,
+    };
+    let generation_result = run_generation_loop_with_execution_plans(
         &runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
         |_generated_so_far| false,
         &mut observer,
+        &mut execution_plans,
     )?;
 
     // Streaming decode of generated tokens. The byte fixture can produce token
@@ -4286,37 +4473,30 @@ signatures: []
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-    fn write_qwen_component_preflight_fixture(
-        name: &str,
+    fn qwen_component_preflight_package(
         wat: &str,
         manifest_digest: Option<&str>,
-    ) -> (std::path::PathBuf, std::path::PathBuf, String) {
-        let directory = std::env::temp_dir().join(format!(
-            "magnetar-qwen-component-{name}-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).expect("temp directory created");
-        let artifact_path = directory.join("qwen-graph.component.wat");
-        std::fs::write(&artifact_path, wat).expect("component WAT written");
+    ) -> (ComponentArtifactPackage, String) {
         let digest = sha256_component_digest(wat.as_bytes());
-        let manifest_path = directory.join("qwen-graph.component.wat.magnetar-component.yaml");
-        std::fs::write(
-            &manifest_path,
-            qwen_component_manifest(manifest_digest.unwrap_or(&digest)),
-        )
-        .expect("component manifest written");
-        (artifact_path, manifest_path, digest)
+        let package = ComponentArtifactPackage::new(
+            wat.as_bytes().to_vec(),
+            qwen_component_manifest(manifest_digest.unwrap_or(&digest)).into_bytes(),
+            ComponentDigest::parse("sha256", manifest_digest.unwrap_or(&digest)),
+            ComponentDistributionSource::new(
+                ComponentDistributionSourceKind::DevelopmentFixture,
+                QWEN_GRAPH_COMPONENT_NAME,
+            ),
+        );
+        (package, digest)
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
     fn trusted_preflight_request_for_temp_component(
-        artifact_path: std::path::PathBuf,
-        manifest_path: std::path::PathBuf,
+        component_package: ComponentArtifactPackage,
         digest: &str,
     ) -> QwenComponentPreflightRequest {
         QwenComponentPreflightRequest {
-            artifact_path,
-            manifest_path: Some(manifest_path),
+            component_package,
             trust_store: ComponentTrustStore::default().trust_digest(digest),
             limits: qwen_component_runtime_limits(),
         }
@@ -4582,15 +4762,10 @@ signatures: []
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
     #[test]
     fn e2e_qwen_component_missing_artifact_fails_before_planning() {
-        let directory = std::env::temp_dir().join(format!(
-            "magnetar-qwen-component-missing-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).expect("temp directory created");
+        let (component_package, digest) = qwen_component_preflight_package("", None);
         let request = QwenComponentPreflightRequest {
-            artifact_path: directory.join("missing.component.wat"),
-            manifest_path: None,
-            trust_store: ComponentTrustStore::default(),
+            component_package,
+            trust_store: ComponentTrustStore::default().trust_digest(&digest),
             limits: qwen_component_runtime_limits(),
         };
 
@@ -4603,7 +4778,6 @@ signatures: []
             ),
             "missing Qwen Component artifact was not rejected: {result:?}"
         );
-        std::fs::remove_dir_all(directory).expect("temp directory removed");
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -4612,17 +4786,9 @@ signatures: []
         let wat = qwen_component_count_fixture_wat(19, 19, 0);
         let wrong_digest =
             "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-        let (artifact_path, manifest_path, _digest) =
-            write_qwen_component_preflight_fixture("digest-mismatch", &wat, Some(wrong_digest));
-        let directory = artifact_path
-            .parent()
-            .expect("artifact has parent")
-            .to_path_buf();
-        let request = trusted_preflight_request_for_temp_component(
-            artifact_path,
-            manifest_path,
-            wrong_digest,
-        );
+        let (component_package, _digest) =
+            qwen_component_preflight_package(&wat, Some(wrong_digest));
+        let request = trusted_preflight_request_for_temp_component(component_package, wrong_digest);
 
         let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
 
@@ -4633,7 +4799,6 @@ signatures: []
             ),
             "digest-mismatched Qwen Component artifact was not rejected: {result:?}"
         );
-        std::fs::remove_dir_all(directory).expect("temp directory removed");
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -4646,14 +4811,8 @@ signatures: []
             r#"(func (export "decode-node-count") (result i32) i32.const 19)"#,
             r#"(func (export "provider-authority-count") (result i32) i32.const 0)"#,
         );
-        let (artifact_path, manifest_path, digest) =
-            write_qwen_component_preflight_fixture("fuel", &wat, None);
-        let directory = artifact_path
-            .parent()
-            .expect("artifact has parent")
-            .to_path_buf();
-        let mut request =
-            trusted_preflight_request_for_temp_component(artifact_path, manifest_path, &digest);
+        let (component_package, digest) = qwen_component_preflight_package(&wat, None);
+        let mut request = trusted_preflight_request_for_temp_component(component_package, &digest);
         request.limits.engine_execution_budget = Some(1_000);
 
         let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
@@ -4665,21 +4824,14 @@ signatures: []
             ),
             "runaway Qwen Component was not stopped by fuel: {result:?}"
         );
-        std::fs::remove_dir_all(directory).expect("temp directory removed");
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
     #[test]
     fn e2e_qwen_component_deadline_fails_before_planning() {
         let wat = qwen_component_count_fixture_wat(19, 19, 0);
-        let (artifact_path, manifest_path, digest) =
-            write_qwen_component_preflight_fixture("deadline", &wat, None);
-        let directory = artifact_path
-            .parent()
-            .expect("artifact has parent")
-            .to_path_buf();
-        let mut request =
-            trusted_preflight_request_for_temp_component(artifact_path, manifest_path, &digest);
+        let (component_package, digest) = qwen_component_preflight_package(&wat, None);
+        let mut request = trusted_preflight_request_for_temp_component(component_package, &digest);
         request.limits.execution_deadline_millis = Some(0);
 
         let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
@@ -4691,7 +4843,6 @@ signatures: []
             ),
             "expired Qwen Component deadline was not rejected: {result:?}"
         );
-        std::fs::remove_dir_all(directory).expect("temp directory removed");
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -4721,14 +4872,8 @@ signatures: []
         (export "provider-authority-count" (func $provider-authority-count)))
     (export "magnetar:qwen/graph-fixture@1.0.0" (instance $qwen-graph-fixture)))
 "#;
-        let (artifact_path, manifest_path, digest) =
-            write_qwen_component_preflight_fixture("invalid-output", wat, None);
-        let directory = artifact_path
-            .parent()
-            .expect("artifact has parent")
-            .to_path_buf();
-        let request =
-            trusted_preflight_request_for_temp_component(artifact_path, manifest_path, &digest);
+        let (component_package, digest) = qwen_component_preflight_package(wat, None);
+        let request = trusted_preflight_request_for_temp_component(component_package, &digest);
 
         let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
 
@@ -4739,7 +4884,6 @@ signatures: []
             ),
             "Qwen Component invalid output was not rejected: {result:?}"
         );
-        std::fs::remove_dir_all(directory).expect("temp directory removed");
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -4775,14 +4919,8 @@ signatures: []
     #[test]
     fn e2e_qwen_component_provider_authority_fails_before_planning() {
         let wat = qwen_component_count_fixture_wat(19, 19, 1);
-        let (artifact_path, manifest_path, digest) =
-            write_qwen_component_preflight_fixture("provider-authority", &wat, None);
-        let directory = artifact_path
-            .parent()
-            .expect("artifact has parent")
-            .to_path_buf();
-        let request =
-            trusted_preflight_request_for_temp_component(artifact_path, manifest_path, &digest);
+        let (component_package, digest) = qwen_component_preflight_package(&wat, None);
+        let request = trusted_preflight_request_for_temp_component(component_package, &digest);
 
         let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
 
@@ -4790,7 +4928,6 @@ signatures: []
             matches!(result, Err(E2eConformanceError::BoundaryViolation { .. })),
             "Qwen Component Provider authority was not rejected: {result:?}"
         );
-        std::fs::remove_dir_all(directory).expect("temp directory removed");
     }
 
     #[test]

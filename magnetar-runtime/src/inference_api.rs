@@ -29,6 +29,9 @@ use crate::batching::*;
 use crate::generation::*;
 use crate::kernel::*;
 use crate::kernel_dispatch::*;
+use crate::kernel_execution_plan::{
+    PlanGuardContext, PreparedExecutionPhase, PreparedExecutionPlan, PreparedExecutionPlanError,
+};
 use crate::kv_cache::*;
 use crate::memory::*;
 use crate::model::*;
@@ -993,6 +996,48 @@ impl RuntimeGenerationStep {
     }
 }
 
+pub(crate) struct RuntimeGenerationExecutionPlans<'a> {
+    pub(crate) prefill: &'a mut PreparedExecutionPlan,
+    pub(crate) decode: &'a mut PreparedExecutionPlan,
+}
+
+fn runtime_generation_plan_error(error: PreparedExecutionPlanError) -> InferenceApiError {
+    InferenceApiError::KernelUnavailable {
+        reason: format!("prepared execution plan unavailable: {error}"),
+    }
+}
+
+fn runtime_generation_plan_context(
+    phase: PreparedExecutionPhase,
+    request: &GenerationRequest,
+    generated_tokens: &[TokenId],
+) -> PlanGuardContext {
+    let token_count = match phase {
+        PreparedExecutionPhase::Prefill => request.input_token_ids.len() as u64,
+        PreparedExecutionPhase::Decode => 1,
+        _ => request
+            .input_token_ids
+            .len()
+            .saturating_add(generated_tokens.len())
+            .max(1) as u64,
+    };
+    let mut context = PlanGuardContext::for_phase(phase);
+    context.sequence_length = Some(token_count.max(1));
+    context.total_tokens = Some(
+        request
+            .input_token_ids
+            .len()
+            .saturating_add(generated_tokens.len())
+            .saturating_add(1)
+            .max(1) as u64,
+    );
+    context.affinity = Some(ResourceAffinity::new(FallbackClass::Transparent));
+    context.provider_ready = true;
+    context.device_ready = true;
+    context.memory_feasible = true;
+    context
+}
+
 /// Runtime-owned execution hook used by the Runtime Inference API to produce
 /// logits. Callers configure this when constructing a Runtime; normal
 /// generation does not accept per-request callbacks or readiness booleans.
@@ -1112,6 +1157,46 @@ pub fn run_generation_loop(
     mut should_cancel: impl FnMut(&[TokenId]) -> bool,
     observer: &mut InferenceApiObserver,
 ) -> Result<GenerationResult, InferenceApiError> {
+    run_generation_loop_inner(
+        runtime,
+        request,
+        sampling_policy,
+        cache_usage,
+        &mut should_cancel,
+        observer,
+        None,
+    )
+}
+
+pub(crate) fn run_generation_loop_with_execution_plans(
+    runtime: &Runtime,
+    request: &GenerationRequest,
+    sampling_policy: SamplingPolicy,
+    cache_usage: CacheUsageSummary,
+    mut should_cancel: impl FnMut(&[TokenId]) -> bool,
+    observer: &mut InferenceApiObserver,
+    execution_plans: &mut RuntimeGenerationExecutionPlans<'_>,
+) -> Result<GenerationResult, InferenceApiError> {
+    run_generation_loop_inner(
+        runtime,
+        request,
+        sampling_policy,
+        cache_usage,
+        &mut should_cancel,
+        observer,
+        Some(execution_plans),
+    )
+}
+
+fn run_generation_loop_inner(
+    runtime: &Runtime,
+    request: &GenerationRequest,
+    sampling_policy: SamplingPolicy,
+    cache_usage: CacheUsageSummary,
+    should_cancel: &mut impl FnMut(&[TokenId]) -> bool,
+    observer: &mut InferenceApiObserver,
+    mut execution_plans: Option<&mut RuntimeGenerationExecutionPlans<'_>>,
+) -> Result<GenerationResult, InferenceApiError> {
     let correlation_id = request.correlation_id.clone();
     observer.observe(
         InferenceApiObservationKind::GenerationStarted,
@@ -1196,6 +1281,14 @@ pub fn run_generation_loop(
         None => {}
     }
 
+    if let Some(plans) = execution_plans.as_deref_mut() {
+        let context =
+            runtime_generation_plan_context(PreparedExecutionPhase::Prefill, request, &[]);
+        plans
+            .prefill
+            .execute_ready_path(&context)
+            .map_err(runtime_generation_plan_error)?;
+    }
     prefill(request)?;
     observer.observe(
         InferenceApiObservationKind::PrefillStarted,
@@ -1229,6 +1322,17 @@ pub fn run_generation_loop(
             format!("decode step {}", generated.len()),
             correlation_id.clone(),
         );
+        if let Some(plans) = execution_plans.as_deref_mut() {
+            let context = runtime_generation_plan_context(
+                PreparedExecutionPhase::Decode,
+                request,
+                &generated,
+            );
+            plans
+                .decode
+                .execute_ready_path(&context)
+                .map_err(runtime_generation_plan_error)?;
+        }
         let runtime_step = match executor.execute_generation_step(runtime, request, &generated) {
             Ok(runtime_step) => runtime_step,
             Err(error) => {
