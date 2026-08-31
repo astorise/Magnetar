@@ -28,6 +28,7 @@ use crate::inference_api::{RuntimeModelExecutionEngine, SharedRuntimeModelExecut
 use crate::kernel_registry::KernelRegistry;
 use crate::kv_cache::{
     KvCache, KvCacheCompatibility, KvCacheError, KvCacheId, KvCacheLifecycleState, KvCacheManager,
+    KvCacheRetentionPolicy,
 };
 use crate::memory::{
     MemoryAdmissionDecision, MemoryAdmissionRequest, MemoryAllocationClass, MemoryAllocationId,
@@ -469,19 +470,13 @@ impl Runtime {
         session: &InferenceSessionId,
     ) -> Result<(), SessionError> {
         self.inference_session_mut(session)?.cancel()?;
-        let cache_ids = self.session_kv_cache_ids(session);
+        let cache_ids = self.releasable_session_kv_cache_ids(session);
         for cache in &cache_ids {
-            self.release_kv_cache_memory(cache).map_err(|error| {
-                SessionError::ResourceCleanupFailed {
+            self.release_kv_cache(cache)
+                .map_err(|error| SessionError::ResourceCleanupFailed {
                     reason: error.to_string(),
-                }
-            })?;
+                })?;
         }
-        self.kv_caches
-            .release_session_caches(session)
-            .map_err(|error| SessionError::ResourceCleanupFailed {
-                reason: error.to_string(),
-            })?;
         self.observe_session(
             SessionObservationKind::Cancelled,
             Some(session.clone()),
@@ -508,19 +503,13 @@ impl Runtime {
         session: &InferenceSessionId,
     ) -> Result<(), SessionError> {
         self.inference_session_mut(session)?.close()?;
-        let cache_ids = self.session_kv_cache_ids(session);
+        let cache_ids = self.releasable_session_kv_cache_ids(session);
         for cache in &cache_ids {
-            self.release_kv_cache_memory(cache).map_err(|error| {
-                SessionError::ResourceCleanupFailed {
+            self.release_kv_cache(cache)
+                .map_err(|error| SessionError::ResourceCleanupFailed {
                     reason: error.to_string(),
-                }
-            })?;
+                })?;
         }
-        self.kv_caches
-            .release_session_caches(session)
-            .map_err(|error| SessionError::ResourceCleanupFailed {
-                reason: error.to_string(),
-            })?;
         let persist_prefix_entries = self.inference_session(session)?.policy.prefix_cache_allowed;
         self.prefix_caches
             .release_session_entries(session, persist_prefix_entries);
@@ -539,10 +528,9 @@ impl Runtime {
             .filter_map(|(id, session)| session.expire_if_needed(now_millis).then_some(id.clone()))
             .collect::<Vec<_>>();
         for session in &expired {
-            for cache in self.session_kv_cache_ids(session) {
-                let _ = self.release_kv_cache_memory(&cache);
+            for cache in self.releasable_session_kv_cache_ids(session) {
+                let _ = self.release_kv_cache(&cache);
             }
-            let _ = self.kv_caches.release_session_caches(session);
             self.prefix_caches.release_session_entries(session, false);
             self.observe_session(
                 SessionObservationKind::Expired,
@@ -643,19 +631,15 @@ impl Runtime {
             })
             .map(|cache| cache.id.clone())
             .collect::<Vec<_>>();
+        let report = self.model_instances.unload(instance, policy)?;
         for cache in &cache_ids {
-            self.release_kv_cache_memory(cache).map_err(|error| {
+            self.release_kv_cache(cache).map_err(|error| {
                 ModelInstanceError::InternalModelInstance {
                     reason: format!("failed to release model instance KV cache memory: {error}"),
                 }
             })?;
         }
-        self.kv_caches
-            .release_model_instance_caches(instance)
-            .map_err(|error| ModelInstanceError::InternalModelInstance {
-                reason: format!("failed to release model instance KV caches: {error}"),
-            })?;
-        self.model_instances.unload(instance, policy)
+        Ok(report)
     }
     pub fn admit_generation_to_batch(
         &mut self,
@@ -817,10 +801,17 @@ impl Runtime {
         }
         Ok(())
     }
-    fn session_kv_cache_ids(&self, session: &InferenceSessionId) -> Vec<KvCacheId> {
+    fn releasable_session_kv_cache_ids(&self, session: &InferenceSessionId) -> Vec<KvCacheId> {
         self.kv_caches
             .caches()
             .filter(|cache| cache.session.as_ref() == Some(session))
+            .filter(|cache| {
+                matches!(
+                    cache.policy.retention,
+                    KvCacheRetentionPolicy::ReleaseOnOperationEnd
+                        | KvCacheRetentionPolicy::ReleaseOnSessionClose
+                )
+            })
             .map(|cache| cache.id.clone())
             .collect()
     }

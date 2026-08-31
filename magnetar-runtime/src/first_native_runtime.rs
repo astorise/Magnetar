@@ -1054,6 +1054,7 @@ pub fn e2e_forward(
 struct E2eRuntimeModelExecutionEngine {
     fixture: E2eFixture,
     kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
+    pending_kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
     #[cfg(test)]
     forced_token: Option<TokenId>,
 }
@@ -1101,12 +1102,15 @@ impl E2eRuntimeModelExecutionEngine {
             cache = cache.with_session(session.clone());
         }
         let cache_id = runtime.create_kv_cache(cache)?;
-        runtime.prefill_kv_cache_completed(&cache_id, request.prompt_token_count as u32)?;
         Ok(FirstNativeExecutionKvState {
             cache: cache_id,
             compatibility,
             layer_kv: Vec::new(),
         })
+    }
+
+    fn kv_state_key(request: &GenerationRequest) -> String {
+        request.request_id.as_str().to_string()
     }
 
     fn store_kv_state(
@@ -1119,7 +1123,49 @@ impl E2eRuntimeModelExecutionEngine {
             .map_err(|_| InferenceApiError::KvCacheUnavailable {
                 reason: "first-native KV state lock poisoned".into(),
             })?
-            .insert(request.request_id.as_str().to_string(), state);
+            .insert(Self::kv_state_key(request), state);
+        Ok(())
+    }
+
+    fn store_pending_kv_state(
+        &self,
+        request: &GenerationRequest,
+        state: FirstNativeExecutionKvState,
+    ) -> Result<(), InferenceApiError> {
+        self.pending_kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native pending KV state lock poisoned".into(),
+            })?
+            .insert(Self::kv_state_key(request), state);
+        Ok(())
+    }
+
+    fn take_pending_kv_state(
+        &self,
+        request: &GenerationRequest,
+    ) -> Result<FirstNativeExecutionKvState, InferenceApiError> {
+        self.pending_kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native pending KV state lock poisoned".into(),
+            })?
+            .remove(&Self::kv_state_key(request))
+            .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                reason: "generation step has no pending first-native KV state to commit".into(),
+            })
+    }
+
+    fn discard_pending_kv_state(
+        &self,
+        request: &GenerationRequest,
+    ) -> Result<(), InferenceApiError> {
+        self.pending_kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native pending KV state lock poisoned".into(),
+            })?
+            .remove(&Self::kv_state_key(request));
         Ok(())
     }
 
@@ -1134,7 +1180,7 @@ impl E2eRuntimeModelExecutionEngine {
             .map_err(|_| InferenceApiError::KvCacheUnavailable {
                 reason: "first-native KV state lock poisoned".into(),
             })?
-            .get(request.request_id.as_str())
+            .get(&Self::kv_state_key(request))
             .cloned()
             .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                 reason: "decode requires existing first-native KV state".into(),
@@ -2258,6 +2304,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             1
         };
         let absolute_position = request.input_token_ids.len() + generated_tokens.len();
+        self.discard_pending_kv_state(request)?;
         let (dispatch_result, logits) = if let Some(token) = forced_token {
             // Test-only deterministic shortcut, never exercised by
             // `validate_e2e_no_shortcuts` (the success path this gate
@@ -2301,7 +2348,6 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                         absolute_position as u64,
                     )?;
                 kv_state.layer_kv = layer_kv;
-                runtime.append_decode_kv_cache(&kv_state.cache, 1)?;
                 (dispatch, normed_final)
             };
             // The tied-embedding logits projection, dispatched for real:
@@ -2311,7 +2357,18 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // computation.
             dispatch_qwen_logits_projection(runtime, &self.fixture, &normed_final)?
         };
-        self.store_kv_state(request, kv_state.clone())?;
+        let kv_commit = if generated_tokens.is_empty() {
+            RuntimeKvCacheCommit::PrefillCompleted {
+                cache: kv_state.cache.clone(),
+                tokens: request.prompt_token_count as u32,
+            }
+        } else {
+            RuntimeKvCacheCommit::DecodeAppended {
+                cache: kv_state.cache.clone(),
+                tokens: 1,
+            }
+        };
+        self.store_pending_kv_state(request, kv_state.clone())?;
         let mut evidence =
             RuntimeGenerationExecutionEvidence::from_dispatch_result(&dispatch_result, true, true)
                 .with_context(format!("request={}", request.request_id))
@@ -2325,7 +2382,24 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         if let Some(session) = &request.session {
             evidence = evidence.with_context(format!("session={session}"));
         }
-        Ok(RuntimeModelExecutionStep::new(logits, evidence))
+        Ok(RuntimeModelExecutionStep::new(logits, evidence).with_kv_commit(kv_commit))
+    }
+
+    fn commit_generation_step(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens_before_step: &[TokenId],
+        _accepted_token: TokenId,
+        _step: &RuntimeModelExecutionStep,
+    ) -> Result<(), InferenceApiError> {
+        let state = self.take_pending_kv_state(request)?;
+        if generated_tokens_before_step.is_empty() {
+            runtime.prefill_kv_cache_completed(&state.cache, request.prompt_token_count as u32)?;
+        } else {
+            runtime.append_decode_kv_cache(&state.cache, 1)?;
+        }
+        self.store_kv_state(request, state)
     }
 }
 
@@ -2406,6 +2480,7 @@ fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
         .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
             fixture: fixture.clone(),
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
             forced_token: None,
         }))
@@ -2425,6 +2500,7 @@ fn build_runtime_with_model_execution_engine_and_forced_token(
         .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
             fixture: fixture.clone(),
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             forced_token,
         }))
         .build()
@@ -3337,11 +3413,182 @@ fn check_streaming_order(fixture: &E2eFixture) -> Result<(), E2eConformanceError
     Ok(())
 }
 
-fn check_operator_coverage(_fixture: &E2eFixture) -> Result<BTreeSet<String>, E2eConformanceError> {
-    Ok(E2E_EXERCISED_OPERATORS
-        .iter()
-        .map(|op| op.to_string())
-        .collect())
+fn record_operator_dispatch(
+    covered: &mut BTreeSet<String>,
+    name: &str,
+    result: Result<(KernelDispatchResult, HostTensor), InferenceApiError>,
+) -> Result<(), E2eConformanceError> {
+    result.map_err(E2eConformanceError::from)?;
+    covered.insert(name.to_string());
+    Ok(())
+}
+
+fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2eConformanceError> {
+    let runtime = build_runtime();
+    let provider = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime: &runtime,
+        provider: &provider,
+        memory: &mut memory,
+    };
+    let architecture = &fixture.config.architecture;
+    let mut covered = BTreeSet::new();
+    let hidden = HostTensor::new(
+        [2, architecture.hidden_size],
+        vec![0.25; (2 * architecture.hidden_size) as usize],
+    )?;
+    let one_row_hidden = HostTensor::new(
+        [1, architecture.hidden_size],
+        vec![0.5; architecture.hidden_size as usize],
+    )?;
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let embedding_table = fixture_tensor_by_name(&fixture.weights, "token_embedding")?.clone();
+    record_operator_dispatch(
+        &mut covered,
+        "embedding",
+        dispatch_reference_cpu_operator(
+            &mut dispatch_ctx,
+            "coverage.embedding",
+            dispatch_operator_id("embedding", OperatorFamily::Tensor),
+            vec![
+                (
+                    TensorResourceId::new("coverage.embedding.table"),
+                    f32_tensor_descriptor(&embedding_table),
+                    embedding_table,
+                ),
+                (
+                    TensorResourceId::new("coverage.embedding.ids"),
+                    f32_tensor_descriptor(&ids),
+                    ids,
+                ),
+            ],
+            (
+                TensorResourceId::new("coverage.embedding.out"),
+                TensorDescriptor::new(
+                    ShapeDescriptor::new([2, architecture.hidden_size]),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                    LayoutDescriptor::Contiguous,
+                ),
+            ),
+            BTreeMap::new(),
+        ),
+    )?;
+    let weight = HostTensor::new(
+        [2, architecture.hidden_size],
+        vec![1.0; (2 * architecture.hidden_size) as usize],
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "rmsnorm",
+        dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            "coverage.rmsnorm",
+            hidden.clone(),
+            weight,
+            fixture.config.rmsnorm_epsilon,
+        ),
+    )?;
+    let matmul_b = HostTensor::new(
+        [architecture.hidden_size, architecture.hidden_size],
+        vec![0.125; (architecture.hidden_size * architecture.hidden_size) as usize],
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "matmul",
+        dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            "coverage.matmul",
+            one_row_hidden.clone(),
+            matmul_b,
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "rope",
+        dispatch_qwen_rope_per_head(
+            &mut dispatch_ctx,
+            "coverage.rope",
+            &one_row_hidden,
+            architecture.attention_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+            0,
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "attention",
+        dispatch_qwen_attention(
+            &mut dispatch_ctx,
+            "coverage.attention",
+            one_row_hidden.clone(),
+            one_row_hidden.clone(),
+            one_row_hidden.clone(),
+            architecture,
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "softmax",
+        dispatch_qwen_unary(
+            &mut dispatch_ctx,
+            "coverage.softmax",
+            "softmax",
+            OperatorFamily::Activation,
+            one_row_hidden.clone(),
+            BTreeMap::new(),
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "silu",
+        dispatch_qwen_unary(
+            &mut dispatch_ctx,
+            "coverage.silu",
+            "silu",
+            OperatorFamily::Activation,
+            one_row_hidden.clone(),
+            BTreeMap::new(),
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "mul",
+        dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            "coverage.mul",
+            "mul",
+            OperatorFamily::Tensor,
+            one_row_hidden.clone(),
+            one_row_hidden.clone(),
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "add",
+        dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            "coverage.add",
+            "add",
+            OperatorFamily::Tensor,
+            one_row_hidden.clone(),
+            one_row_hidden.clone(),
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "residual-add",
+        dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            "coverage.residual_add",
+            "residual-add",
+            OperatorFamily::Tensor,
+            one_row_hidden.clone(),
+            one_row_hidden,
+        ),
+    )?;
+    Ok(covered)
 }
 
 fn check_kernel_coverage() -> Result<BTreeSet<String>, E2eConformanceError> {
@@ -5966,6 +6213,7 @@ signatures: []
             InferenceApiObservationKind::KernelPrepared,
             InferenceApiObservationKind::ProviderSubmitted,
             InferenceApiObservationKind::ProviderCompleted,
+            InferenceApiObservationKind::KvCacheCommitted,
             InferenceApiObservationKind::LogitsProduced,
             InferenceApiObservationKind::SamplingCompleted,
             InferenceApiObservationKind::TokenCommitted,

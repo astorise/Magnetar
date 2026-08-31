@@ -1003,12 +1003,28 @@ impl RuntimeGenerationExecutionEvidence {
 pub(crate) struct RuntimeModelExecutionStep {
     pub(crate) logits: Vec<f32>,
     pub(crate) evidence: RuntimeGenerationExecutionEvidence,
+    pub(crate) kv_commit: Option<RuntimeKvCacheCommit>,
 }
 
 impl RuntimeModelExecutionStep {
     pub(crate) fn new(logits: Vec<f32>, evidence: RuntimeGenerationExecutionEvidence) -> Self {
-        Self { logits, evidence }
+        Self {
+            logits,
+            evidence,
+            kv_commit: None,
+        }
     }
+
+    pub(crate) fn with_kv_commit(mut self, commit: RuntimeKvCacheCommit) -> Self {
+        self.kv_commit = Some(commit);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeKvCacheCommit {
+    PrefillCompleted { cache: KvCacheId, tokens: u32 },
+    DecodeAppended { cache: KvCacheId, tokens: u32 },
 }
 
 pub(crate) struct RuntimeGenerationExecutionPlans<'a> {
@@ -1063,6 +1079,17 @@ pub(crate) trait RuntimeModelExecutionEngine: Send + Sync {
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError>;
+
+    fn commit_generation_step(
+        &self,
+        _runtime: &mut Runtime,
+        _request: &GenerationRequest,
+        _generated_tokens_before_step: &[TokenId],
+        _accepted_token: TokenId,
+        _step: &RuntimeModelExecutionStep,
+    ) -> Result<(), InferenceApiError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -1081,6 +1108,23 @@ impl SharedRuntimeModelExecutionEngine {
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         self.0
             .execute_generation_step(runtime, request, generated_tokens)
+    }
+
+    pub(crate) fn commit_generation_step(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens_before_step: &[TokenId],
+        accepted_token: TokenId,
+        step: &RuntimeModelExecutionStep,
+    ) -> Result<(), InferenceApiError> {
+        self.0.commit_generation_step(
+            runtime,
+            request,
+            generated_tokens_before_step,
+            accepted_token,
+            step,
+        )
     }
 }
 
@@ -1311,10 +1355,14 @@ fn run_generation_loop_inner(
     if let Some(plans) = execution_plans.as_deref_mut() {
         let context =
             runtime_generation_plan_context(PreparedExecutionPhase::Prefill, request, &[]);
-        plans
+        if let Err(error) = plans
             .prefill
             .execute_ready_path(&context)
-            .map_err(runtime_generation_plan_error)?;
+            .map_err(runtime_generation_plan_error)
+        {
+            observe_generation_execution_error(observer, correlation_id.clone(), &error);
+            return Err(error);
+        }
         let plan_context = vec![
             format!("request={}", request.request_id),
             format!("plan={}", plans.prefill.id),
@@ -1371,10 +1419,14 @@ fn run_generation_loop_inner(
                 request,
                 &generated,
             );
-            plans
+            if let Err(error) = plans
                 .decode
                 .execute_ready_path(&context)
-                .map_err(runtime_generation_plan_error)?;
+                .map_err(runtime_generation_plan_error)
+            {
+                observe_generation_execution_error(observer, correlation_id.clone(), &error);
+                return Err(error);
+            }
             let plan_context = vec![
                 format!("request={}", request.request_id),
                 format!("plan={}", plans.decode.id),
@@ -1487,17 +1539,57 @@ fn run_generation_loop_inner(
                 correlation_id.clone(),
             );
         }
-        if let Err(error) = runtime_step.evidence.validate() {
+        if let Err(error) = runtime_step.evidence.clone().validate() {
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
             return Err(error);
         }
         let (sampling, step) = decode_step_from_sampling_with_rng(
             request,
             &generated,
-            runtime_step.logits,
+            runtime_step.logits.clone(),
             sampling_policy.clone(),
             rng_state.take(),
-        )?;
+        )
+        .map_err(|error| {
+            let error = InferenceApiError::from(error);
+            observe_generation_execution_error(observer, correlation_id.clone(), &error);
+            error
+        })?;
+        if let Err(error) = executor.commit_generation_step(
+            runtime,
+            request,
+            &generated,
+            step.token_id,
+            &runtime_step,
+        ) {
+            observe_generation_execution_error(observer, correlation_id.clone(), &error);
+            return Err(error);
+        }
+        if let Some(commit) = &runtime_step.kv_commit {
+            let commit_context = match commit {
+                RuntimeKvCacheCommit::PrefillCompleted { cache, tokens } => vec![
+                    format!("request={}", request.request_id),
+                    format!("kv_cache={cache}"),
+                    format!("tokens={tokens}"),
+                    "phase=prefill".to_string(),
+                ],
+                RuntimeKvCacheCommit::DecodeAppended { cache, tokens } => vec![
+                    format!("request={}", request.request_id),
+                    format!("kv_cache={cache}"),
+                    format!("tokens={tokens}"),
+                    format!(
+                        "kv_position={}",
+                        request.input_token_ids.len() + generated.len()
+                    ),
+                    "phase=decode".to_string(),
+                ],
+            };
+            observer.observe(
+                InferenceApiObservationKind::KvCacheCommitted,
+                observation_message("kv cache committed", &commit_context),
+                correlation_id.clone(),
+            );
+        }
         rng_state = sampling.updated_rng_state;
         generated.push(step.token_id);
         let token_context = vec![

@@ -883,7 +883,7 @@ fn token_id_edge(id: impl Into<String>, dims: Vec<u64>) -> TensorEdge {
         id,
         TensorDescriptor::new(
             ShapeDescriptor::new(dims),
-            DTypeDescriptor::portable(ComputeDType::SInt32),
+            DTypeDescriptor::portable(ComputeDType::Float32),
             LayoutDescriptor::Contiguous,
         ),
     )

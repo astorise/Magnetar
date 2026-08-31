@@ -307,6 +307,7 @@ mod tests {
         }
         assert!(source.contains("execute_qwen_decode_hidden_states_through_dispatch"));
         assert!(source.contains("model_input_tokens={model_input_token_count}"));
-        assert!(source.contains("runtime.append_decode_kv_cache(&kv_state.cache, 1)"));
+        assert!(source.contains("fn commit_generation_step"));
+        assert!(source.contains("runtime.append_decode_kv_cache(&state.cache, 1)"));
     }
 }

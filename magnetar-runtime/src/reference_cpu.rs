@@ -470,10 +470,10 @@ pub fn rmsnorm(
     epsilon: f32,
 ) -> Result<HostTensor, ReferenceCpuError> {
     let (rows, cols) = input.rows_cols()?;
-    let weight_values = if weight.shape == [cols] || weight.shape == [1, cols] {
-        &weight.data
+    let row_weight_stride = if weight.shape == [cols] || weight.shape == [1, cols] {
+        0
     } else if weight.shape == [rows, cols] {
-        &weight.data[..cols as usize]
+        cols as usize
     } else {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
@@ -492,6 +492,8 @@ pub fn rmsnorm(
     let mut out = vec![0.0_f32; input.data.len()];
     for row in 0..rows as usize {
         let slice = &input.data[row * cols as usize..(row + 1) * cols as usize];
+        let weight_base = row * row_weight_stride;
+        let weight_values = &weight.data[weight_base..weight_base + cols as usize];
         let mean_square = slice.iter().map(|value| value * value).sum::<f32>() / cols as f32;
         let scale = 1.0 / (mean_square + epsilon).sqrt();
         for (col, value) in slice.iter().enumerate() {
@@ -1018,7 +1020,8 @@ fn baseline_advertisement(name: &str, family: OperatorFamily) -> KernelAdvertise
     advertisement.cancellation = KernelCancellationSupport::TimeoutOnly;
     // Kernels whose tensors are always rank-2 in this implementation advertise
     // that constraint explicitly; kernels that mix ranks across resources
-    // (e.g. embedding's rank-1 ids against its rank-2 table) or accept
+    // (e.g. embedding's rank-1 ids against its rank-2 table, or RMSNorm's
+    // vector/full-shape weights against rank-2 activations) or accept
     // arbitrary rank (elementwise, activations, conversions) are left
     // unconstrained.
     if matches!(name, "matmul" | "rope" | "attention" | "softmax") {
@@ -1052,8 +1055,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         memory_classes: BTreeSet::new(),
         affinity: None,
     });
-    let embedding = baseline_advertisement("embedding", OperatorFamily::Tensor)
-        .with_dtypes(TensorRole::Input, [ComputeDType::SInt32]);
+    let embedding = baseline_advertisement("embedding", OperatorFamily::Tensor);
 
     vec![
         baseline_advertisement("matmul", OperatorFamily::LinearAlgebra),

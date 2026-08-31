@@ -6674,6 +6674,19 @@ fn reference_cpu_rmsnorm_known_output() {
 }
 
 #[test]
+fn reference_cpu_rmsnorm_full_shape_weights_apply_per_row() {
+    let input = reference_cpu_host_tensor([2, 2], [3.0, 4.0, 3.0, 4.0]);
+    let weight = reference_cpu_host_tensor([2, 2], [1.0, 1.0, 2.0, 3.0]);
+    let result = rmsnorm(&input, &weight, 1e-6).unwrap();
+    let scale = 1.0 / (((9.0_f32 + 16.0) / 2.0) + 1e-6).sqrt();
+
+    assert!((result.data[0] - 3.0 * scale).abs() < 1e-5);
+    assert!((result.data[1] - 4.0 * scale).abs() < 1e-5);
+    assert!((result.data[2] - 3.0 * scale * 2.0).abs() < 1e-5);
+    assert!((result.data[3] - 4.0 * scale * 3.0).abs() < 1e-5);
+}
+
+#[test]
 fn reference_cpu_rmsnorm_rejects_dtype_shape_mismatch() {
     let input = reference_cpu_host_tensor([1, 4], vec![1.0; 4]);
     let weight = reference_cpu_host_tensor([3], vec![1.0; 3]);
@@ -6898,6 +6911,21 @@ fn reference_cpu_generic_activation_kernel_rejects_unknown_kind() {
 
     let result = executor.execute_invocation(advertisement, operator, &invocation);
     assert_eq!(result.status, KernelResultStatus::Failed);
+}
+
+#[test]
+fn reference_cpu_advertisements_match_numeric_storage_constraints() {
+    let advertisements = reference_cpu_kernel_advertisements();
+    let rmsnorm = reference_cpu_kernel_by_name(&advertisements, "rmsnorm");
+    assert_eq!(rmsnorm.shape.rank, None);
+
+    let embedding = reference_cpu_kernel_by_name(&advertisements, "embedding");
+    let input_dtypes = embedding
+        .supported_dtypes
+        .get(&TensorRole::Input)
+        .expect("embedding advertises input dtypes");
+    assert!(!input_dtypes.contains(&ComputeDType::SInt32));
+    assert!(input_dtypes.contains(&ComputeDType::Float32));
 }
 
 #[test]

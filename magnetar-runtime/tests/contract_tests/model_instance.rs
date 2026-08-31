@@ -317,6 +317,42 @@ fn runtime_unload_releases_model_instance_kv_caches() {
 }
 
 #[test]
+fn runtime_rejected_unload_preserves_model_instance_kv_caches() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let loaded = loaded_context();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            implementation(),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+    let cache = KvCache::new(
+        KvCacheId::new("temporary-cache-id").unwrap(),
+        KvCacheScope::ModelInstance,
+        KvCacheCompatibility::new(
+            GenerationModelReference::ModelInstance(instance.clone()),
+            TokenizerId::new("instance-tokenizer").unwrap(),
+        ),
+        KvCacheLayoutMetadata::contiguous(1, 1, 1, 8, ComputeDType::Float16),
+    );
+    let cache_id = runtime.create_kv_cache(cache).unwrap();
+    runtime.prefill_kv_cache_completed(&cache_id, 1).unwrap();
+    runtime.acquire_model_instance_usage(&instance, 0).unwrap();
+
+    assert_eq!(
+        runtime.unload_model_instance(&instance, ModelInstanceUnloadPolicy::RejectActiveUse),
+        Err(ModelInstanceError::ModelInstanceActive)
+    );
+
+    assert_eq!(
+        runtime.kv_cache(&cache_id).unwrap().lifecycle,
+        KvCacheLifecycleState::Ready
+    );
+    runtime.release_model_instance_usage(&instance).unwrap();
+}
+
+#[test]
 fn creation_and_readiness_checks_gate_ready_state() {
     let mut manager = ModelInstanceManager::new();
     let denied = ModelInstanceCreationChecks {

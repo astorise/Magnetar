@@ -5,10 +5,12 @@ use magnetar_runtime::{
     KvCachePageMetadata, KvCachePolicy, KvCacheResidency, KvCacheRetentionPolicy, KvCacheScope,
     KvCacheSharingPolicy, MemoryAllocationClass, MemoryAllocationState, MemoryManagerConfig,
     MemoryPlacement, ModelArtifactId, ModelArtifactKind, ModelDigest, ModelInstanceId, ModelName,
-    ModelRevision, PrefixFingerprint, ProviderBinding, ResourceAffinity, Runtime, RuntimeConfig,
-    SessionCreationRequest, SessionMemoryBudget, SessionPolicy, SpecialToken, SpecialTokenKind,
-    TokenIdRange, TokenizerArtifactId, TokenizerFamily, TokenizerId, TokenizerMetadata,
-    TokenizerRevision,
+    ModelRevision, PrefixCacheBackingKvCache, PrefixCacheCompatibility, PrefixCacheEntry,
+    PrefixCacheEntryId, PrefixCacheFingerprint, PrefixCacheLifecycleState, PrefixCachePolicy,
+    PrefixCacheSharingPolicy, PrefixFingerprint, ProviderBinding, ResourceAffinity, Runtime,
+    RuntimeConfig, SessionCreationRequest, SessionMemoryBudget, SessionPolicy, SpecialToken,
+    SpecialTokenKind, TokenIdRange, TokenizerArtifactId, TokenizerFamily, TokenizerId,
+    TokenizerMetadata, TokenizerRevision,
 };
 use std::collections::BTreeSet;
 
@@ -85,6 +87,39 @@ fn cache(scope: KvCacheScope) -> KvCache {
         compatibility(),
         KvCacheLayoutMetadata::contiguous(2, 4, 8, 16, ComputeDType::Float16),
     )
+}
+
+fn prefix_cache_compatibility() -> PrefixCacheCompatibility {
+    PrefixCacheCompatibility::new(
+        model_reference("kv-model"),
+        TokenizerId::new("kv-tokenizer").unwrap(),
+    )
+}
+
+fn prefix_cache_fingerprint(tokens: &[u32]) -> PrefixCacheFingerprint {
+    PrefixCacheFingerprint::from_validated_tokens(
+        tokens,
+        "kv-model-r1",
+        &TokenizerId::new("kv-tokenizer").unwrap(),
+    )
+}
+
+fn session_prefix_entry(
+    runtime: &Runtime,
+    cache: &KvCacheId,
+    session: magnetar_runtime::InferenceSessionId,
+) -> PrefixCacheEntry {
+    let mut entry = PrefixCacheEntry::new(
+        PrefixCacheEntryId::new("placeholder").unwrap(),
+        prefix_cache_fingerprint(&[1, 2, 3]),
+        prefix_cache_compatibility(),
+        PrefixCacheBackingKvCache::from_kv_cache(runtime.kv_cache(cache).unwrap()),
+    )
+    .with_session(session);
+    entry.owner = Some("owner-a".into());
+    entry.sharing = PrefixCacheSharingPolicy::SessionLocal;
+    entry.position_end_exclusive = 3;
+    entry
 }
 
 #[test]
@@ -298,6 +333,78 @@ fn kv_cache_releases_session_state_on_cancel() {
     assert_eq!(
         runtime.kv_cache(&cache_id).unwrap().lifecycle,
         KvCacheLifecycleState::Released
+    );
+}
+
+#[test]
+fn kv_cache_cancel_respects_retention_and_marks_released_prefix_backings() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let session = runtime
+        .create_inference_session(session_creation_request())
+        .unwrap();
+    let mut releasable_cache = cache(KvCacheScope::Session).with_session(session.clone());
+    releasable_cache.policy = KvCachePolicy {
+        retention: KvCacheRetentionPolicy::ReleaseOnSessionClose,
+        sharing: KvCacheSharingPolicy::AllowReadOnlySealed,
+        ..KvCachePolicy::default()
+    };
+    let releasable = runtime.create_kv_cache(releasable_cache).unwrap();
+    runtime.prefill_kv_cache_completed(&releasable, 3).unwrap();
+    runtime.seal_kv_cache(&releasable).unwrap();
+    let releasable_prefix = runtime
+        .create_prefix_cache_entry(
+            session_prefix_entry(&runtime, &releasable, session.clone()),
+            &PrefixCachePolicy::default(),
+        )
+        .unwrap();
+    let mut retained_cache = cache(KvCacheScope::Session).with_session(session.clone());
+    retained_cache.policy = KvCachePolicy {
+        retention: KvCacheRetentionPolicy::RetainForPrefixReuse,
+        sharing: KvCacheSharingPolicy::AllowReadOnlySealed,
+        ..KvCachePolicy::default()
+    };
+    let retained = runtime.create_kv_cache(retained_cache).unwrap();
+    runtime.prefill_kv_cache_completed(&retained, 3).unwrap();
+    runtime.seal_kv_cache(&retained).unwrap();
+    let retained_prefix = runtime
+        .create_prefix_cache_entry(
+            session_prefix_entry(&runtime, &retained, session.clone()),
+            &PrefixCachePolicy::default(),
+        )
+        .unwrap();
+
+    runtime.cancel_inference_session(&session).unwrap();
+
+    assert_eq!(
+        runtime.kv_cache(&releasable).unwrap().lifecycle,
+        KvCacheLifecycleState::Released
+    );
+    assert_eq!(
+        runtime
+            .prefix_cache_entry(&releasable_prefix)
+            .unwrap()
+            .backing_kv_cache
+            .lifecycle,
+        KvCacheLifecycleState::Released
+    );
+    assert_eq!(
+        runtime.kv_cache(&retained).unwrap().lifecycle,
+        KvCacheLifecycleState::Sealed
+    );
+    assert_eq!(
+        runtime
+            .prefix_cache_entry(&retained_prefix)
+            .unwrap()
+            .lifecycle,
+        PrefixCacheLifecycleState::Ready
+    );
+    assert_eq!(
+        runtime
+            .prefix_cache_entry(&retained_prefix)
+            .unwrap()
+            .backing_kv_cache
+            .lifecycle,
+        KvCacheLifecycleState::Sealed
     );
 }
 
