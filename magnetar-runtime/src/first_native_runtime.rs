@@ -19,8 +19,14 @@ use crate::execution_graph::*;
 use crate::generation::*;
 use crate::inference_api::*;
 use crate::kernel::*;
+use crate::kernel_artifact::{PreparedKernelGeneration, PreparedKernelIdAllocator};
 use crate::kernel_dispatch::*;
-use crate::kernel_execution_plan::{PreparedExecutionPlan, PreparedExecutionPlanGeneration};
+use crate::kernel_execution_plan::{
+    PlanGuard, PlanGuardContext, PlanMemoryRequirements, PlanNodeBinding, PreparedExecutionPhase,
+    PreparedExecutionPlan, PreparedExecutionPlanError, PreparedExecutionPlanGeneration,
+    PreparedExecutionPlanId, PreparedExecutionPlanScope, ResourceBindingPlan,
+    semantic_graph_fingerprint,
+};
 use crate::kernel_optimization_orchestration::run_kernel_optimization_orchestration_conformance;
 use crate::kernel_registry::*;
 use crate::kv_cache::*;
@@ -64,6 +70,11 @@ const E2E_FIXTURE_HEAD_DIM: u64 = 2;
 const E2E_FIXTURE_INTERMEDIATE: u64 = 8;
 const E2E_FIXTURE_CONTEXT: u64 = 32;
 const E2E_FIXTURE_LAYERS: u64 = 1;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+const QWEN_GRAPH_COMPONENT_NAME: &str = "magnetar.qwen.graph-fixture";
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+const QWEN_GRAPH_COMPONENT_DIGEST: &str =
+    "sha256:f192183d92f874b23027fa20be47739508ab5f0e57e56a7f8278dccf336d4acf";
 
 // ---------------------------------------------------------------------
 // Error model
@@ -334,6 +345,14 @@ impl From<SessionError> for E2eConformanceError {
 impl From<ModelInstanceError> for E2eConformanceError {
     fn from(error: ModelInstanceError) -> Self {
         Self::ModelComponentFailed {
+            reason: error.to_string(),
+        }
+    }
+}
+
+impl From<PreparedExecutionPlanError> for E2eConformanceError {
+    fn from(error: PreparedExecutionPlanError) -> Self {
+        Self::GenerationFailed {
             reason: error.to_string(),
         }
     }
@@ -1407,6 +1426,263 @@ fn load_fixture_instance(
     Ok((instance, memory))
 }
 
+fn require_ready_first_native_instance<'a>(
+    runtime: &'a Runtime,
+    instance: &ModelInstanceId,
+) -> Result<&'a ModelInstance, InferenceApiError> {
+    let model_instance = runtime
+        .model_instance(instance)
+        .map_err(InferenceApiError::from)?;
+    let status = model_instance.status();
+    if !status.readiness.accepts_generation() {
+        return Err(InferenceApiError::ModelInstanceNotReady {
+            reason: format!(
+                "first-native generation requires ready ModelInstance '{instance}', got lifecycle {:?} / readiness {:?}",
+                status.lifecycle, status.readiness
+            ),
+        });
+    }
+    Ok(model_instance)
+}
+
+struct FirstNativePreparedPlans {
+    prefill: PreparedExecutionPlan,
+    prefill_node_count: usize,
+    decode: PreparedExecutionPlan,
+    decode_node_count: usize,
+}
+
+fn first_native_plan_context(phase: PreparedExecutionPhase, token_count: u64) -> PlanGuardContext {
+    let mut context = PlanGuardContext::for_phase(phase);
+    context.sequence_length = Some(token_count.max(1));
+    context.total_tokens = Some(token_count.max(1));
+    context.affinity = Some(ResourceAffinity::new(FallbackClass::Transparent));
+    context.provider_ready = true;
+    context.device_ready = true;
+    context.memory_feasible = true;
+    context
+}
+
+fn require_compatible_first_native_plan(
+    plan: Option<&mut PreparedExecutionPlan>,
+    context: &PlanGuardContext,
+) -> Result<PreparedExecutionPlanGeneration, PreparedExecutionPlanError> {
+    let plan = plan.ok_or(PreparedExecutionPlanError::PlanNotFound)?;
+    plan.execute_ready_path(context)?;
+    Ok(plan.generation)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn qwen_graph_component_artifact_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("components")
+        .join("qwen-graph.component.wat")
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+struct QwenComponentPreflight {
+    definition: ComponentDefinitionId,
+    instance: ComponentInstanceId,
+    observations: Vec<ComponentObservation>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn qwen_component_runtime_limits() -> ComponentResourceLimits {
+    ComponentResourceLimits {
+        max_memory_bytes: Some(1 << 20),
+        execution_deadline_millis: Some(1_000),
+        max_concurrent_invocations: Some(1),
+        max_instances: Some(1),
+        engine_execution_budget: Some(100_000),
+        require_memory_limit: true,
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
+    trust_store: ComponentTrustStore,
+) -> Result<QwenComponentPreflight, E2eConformanceError> {
+    let artifact_path = qwen_graph_component_artifact_path();
+    let mut manager = ComponentManager::with_engine(Box::new(
+        crate::component_wasmtime::WasmtimeComponentEngine::new().map_err(|error| {
+            E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            }
+        })?,
+    ));
+    manager.set_resource_limits(qwen_component_runtime_limits());
+    manager.set_trust_store(trust_store);
+    manager
+        .register_component(
+            ComponentDescriptor::new(
+                ComponentMetadata::new(
+                    QWEN_GRAPH_COMPONENT_NAME,
+                    "0.1.0",
+                    "Executable Qwen graph fixture component",
+                )
+                .with_export(WitInterface::new("magnetar:qwen/graph-fixture", "1.0.0")),
+                artifact_path,
+            )
+            .with_manifest_path(
+                qwen_graph_component_artifact_path()
+                    .with_file_name("qwen-graph.component.wat.magnetar-component.yaml"),
+            ),
+        )
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let definition = manager
+        .prepare_component(QWEN_GRAPH_COMPONENT_NAME)
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let instance = manager
+        .instantiate_component(QWEN_GRAPH_COMPONENT_NAME)
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let interface = WitInterface::new("magnetar:qwen/graph-fixture", "1.0.0");
+    let authority = manager
+        .invoke(ComponentInvocation::new(
+            instance,
+            interface,
+            "provider-authority-count",
+        ))
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    if authority != ComponentInvocationResult::single(ComponentValue::U32(0)) {
+        return Err(E2eConformanceError::BoundaryViolation {
+            reason: "Qwen Component fixture requested Provider authority".into(),
+        });
+    }
+    Ok(QwenComponentPreflight {
+        definition,
+        instance,
+        observations: manager.observations().to_vec(),
+    })
+}
+
+fn prepare_first_native_plan_for_graph(
+    runtime: &Runtime,
+    graph: &ExecutionGraph,
+    instance: &ModelInstanceId,
+    model_instance_revision: u64,
+    token_count: u64,
+    generation: PreparedExecutionPlanGeneration,
+) -> Result<PreparedExecutionPlan, E2eConformanceError> {
+    let phase = PreparedExecutionPhase::from(graph.phase);
+    let mut scope = PreparedExecutionPlanScope::for_phase(phase)
+        .with_model_instance(instance.clone(), model_instance_revision)
+        .with_workload_bucket(format!("{:?}-{}-tokens", phase, token_count.max(1)));
+    scope.provider = Some(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+
+    let mut plan = PreparedExecutionPlan::new(
+        PreparedExecutionPlanId::new(format!("first-native-{phase:?}-plan"))?,
+        generation,
+        semantic_graph_fingerprint(graph),
+        scope,
+    )?;
+    let mut prepared_ids = PreparedKernelIdAllocator::default();
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+        .with_execution_context(runtime.context().id());
+
+    for (node_id, node) in &graph.nodes {
+        let selection = runtime
+            .kernel_registry()
+            .select(&KernelSelectionRequest::new(
+                format!("first-native-plan-{phase:?}-{}", node_id.as_str()),
+                node.operator.clone(),
+                affinity.clone(),
+            ))
+            .map_err(E2eConformanceError::from)?;
+        let candidate =
+            selection
+                .selected
+                .ok_or_else(|| E2eConformanceError::KernelCoverageMissing {
+                    reason: format!("no Kernel Registry candidate selected for node {node_id}"),
+                })?;
+
+        let mut binding = PlanNodeBinding::new(
+            [node_id.clone()],
+            candidate.kernel.clone(),
+            candidate.provider.clone(),
+        )?
+        .with_specialization(format!("first-native-{phase:?}-{}", node_id.as_str()))
+        .with_prepared_kernel(prepared_ids.allocate(), PreparedKernelGeneration::new(1));
+        if let Some(device) = candidate.device {
+            binding = binding.with_device(device);
+        }
+        if let Some(profile) = candidate.kernel.conformance_profile {
+            binding = binding.with_qualification_profile(profile);
+        }
+        plan.add_node_binding(binding)?;
+    }
+
+    plan.set_resource_plan(ResourceBindingPlan::default())?;
+    plan.set_memory_requirements(PlanMemoryRequirements::default())?;
+    plan.add_guard(PlanGuard::Phase(phase));
+    plan.add_guard(PlanGuard::SequenceRange {
+        min: 1,
+        max: E2E_FIXTURE_CONTEXT,
+    });
+    plan.add_guard(PlanGuard::Readiness);
+    plan.add_guard(PlanGuard::AffinityRequired);
+    plan.add_guard(PlanGuard::MemoryFeasible);
+    plan.mark_ready_atomically()?;
+
+    let mut plan_for_validation = plan.clone();
+    let context = first_native_plan_context(phase, token_count);
+    require_compatible_first_native_plan(Some(&mut plan_for_validation), &context)?;
+    Ok(plan)
+}
+
+fn prepare_first_native_execution_plans(
+    runtime: &Runtime,
+    fixture: &E2eFixture,
+    instance: &ModelInstanceId,
+    prompt_token_count: u64,
+) -> Result<FirstNativePreparedPlans, E2eConformanceError> {
+    let status = require_ready_first_native_instance(runtime, instance)?;
+    let mutation_version = status.status().mutation_version;
+    let prefill = qwen_prefill_graph(
+        &fixture.config,
+        &fixture.identity,
+        prompt_token_count.max(1),
+        true,
+    )?;
+    let decode = qwen_decode_graph(
+        &fixture.config,
+        &fixture.identity,
+        prompt_token_count.max(1),
+    )?;
+
+    let prefill_node_count = prefill.graph.nodes.len();
+    let decode_node_count = decode.graph.nodes.len();
+    Ok(FirstNativePreparedPlans {
+        prefill: prepare_first_native_plan_for_graph(
+            runtime,
+            &prefill.graph,
+            instance,
+            mutation_version,
+            prompt_token_count,
+            PreparedExecutionPlanGeneration::new(1),
+        )?,
+        prefill_node_count,
+        decode: prepare_first_native_plan_for_graph(
+            runtime,
+            &decode.graph,
+            instance,
+            mutation_version,
+            1,
+            PreparedExecutionPlanGeneration::new(1),
+        )?,
+        decode_node_count,
+    })
+}
+
 fn generation_tokenizer_reference(fixture: &E2eFixture) -> GenerationTokenizerReference {
     GenerationTokenizerReference {
         tokenizer_id: fixture.tokenizer.metadata().id.clone(),
@@ -1433,6 +1709,7 @@ fn run_success_path_with_prompt(
 
     // Model Loading + Model Instance.
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    require_ready_first_native_instance(&runtime, &instance)?;
 
     // Session creation.
     let session_request = SessionCreationRequest {
@@ -1453,6 +1730,30 @@ fn run_success_path_with_prompt(
         TokenizationRequest::new(PromptInput::PlainText(prompt.into())),
         None,
     )?;
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    {
+        let preflight =
+            validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
+                ComponentTrustStore::default().trust_digest(QWEN_GRAPH_COMPONENT_DIGEST),
+            )?;
+        let _component_preflight = (
+            preflight.definition,
+            preflight.instance,
+            preflight.observations.len(),
+        );
+    }
+    let prepared_plans = prepare_first_native_execution_plans(
+        &runtime,
+        fixture,
+        &instance,
+        tokenized.token_ids.len() as u64,
+    )?;
+    let _plan_generations = (
+        prepared_plans.prefill.generation,
+        prepared_plans.prefill_node_count,
+        prepared_plans.decode.generation,
+        prepared_plans.decode_node_count,
+    );
 
     // Generation request build + validate.
     let request = build_generation_request(
@@ -1957,6 +2258,129 @@ fn check_closed_session_rejects_generation(
             reason: "closed session was still reported usable".into(),
         }),
     }
+}
+
+#[cfg(test)]
+fn check_first_native_generation_requires_ready_model_instance(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime();
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    suspend_model_instance(
+        &mut runtime,
+        &instance,
+        ModelInstanceSuspensionReason::AdministrativePolicy,
+    )?;
+
+    match require_ready_first_native_instance(&runtime, &instance) {
+        Err(InferenceApiError::ModelInstanceNotReady { reason })
+            if reason.contains("requires ready ModelInstance") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected readiness error: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "first-native generation accepted a non-ready ModelInstance".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_missing_prepared_plan_fails_closed() -> Result<(), E2eConformanceError> {
+    let context = first_native_plan_context(PreparedExecutionPhase::Prefill, 1);
+    match require_compatible_first_native_plan(None, &context) {
+        Err(PreparedExecutionPlanError::PlanNotFound) => Ok(()),
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected missing-plan error: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "first-native execution accepted missing PreparedExecutionPlan".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_invalidated_prepared_plan_rejects_new_work(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime();
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let mut plans = prepare_first_native_execution_plans(&runtime, fixture, &instance, 2)?;
+    plans
+        .decode
+        .hard_invalidate(crate::kernel_execution_plan::PlanRebuildReason::KernelRevoked)?;
+    let context = first_native_plan_context(PreparedExecutionPhase::Decode, 1);
+    match require_compatible_first_native_plan(Some(&mut plans.decode), &context) {
+        Err(PreparedExecutionPlanError::PlanNotReadyForExecution) => Ok(()),
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected invalidated-plan error: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "first-native execution accepted invalidated PreparedExecutionPlan".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_qwen_graph_nodes_have_prepared_kernel_bindings(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime();
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let plans = prepare_first_native_execution_plans(&runtime, fixture, &instance, 2)?;
+
+    for (plan, expected_node_count) in [
+        (&plans.prefill, plans.prefill_node_count),
+        (&plans.decode, plans.decode_node_count),
+    ] {
+        if plan.node_bindings.len() != expected_node_count {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "prepared plan has {} bindings for {expected_node_count} graph nodes",
+                    plan.node_bindings.len()
+                ),
+            });
+        }
+        for binding in &plan.node_bindings {
+            if binding.graph_nodes.is_empty() {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan contains a binding without graph nodes".into(),
+                });
+            }
+            if binding.kernel.provider.as_str() != REFERENCE_CPU_PROVIDER_NAME {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan selected a non-Reference CPU provider".into(),
+                });
+            }
+            if binding.provider.as_str() != REFERENCE_CPU_PROVIDER_NAME {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding provider is not Reference CPU".into(),
+                });
+            }
+            if binding.device.as_ref().map(ToString::to_string).as_deref()
+                != Some(REFERENCE_CPU_DEVICE_ID)
+            {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding did not record Reference CPU device identity"
+                        .into(),
+                });
+            }
+            if binding.prepared_kernel.is_none() || binding.prepared_kernel_generation.is_none() {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding lacks PreparedKernelId or generation".into(),
+                });
+            }
+            if binding.qualification_profile.as_deref() != Some(REFERENCE_CPU_CONFORMANCE_PROFILE) {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding lacks implementation conformance identity"
+                        .into(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_memory_admission_failure() -> Result<(), E2eConformanceError> {
@@ -3229,6 +3653,82 @@ mod tests {
     }
 
     #[test]
+    fn e2e_first_native_generation_requires_ready_model_instance() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        check_first_native_generation_requires_ready_model_instance(&fixture)
+            .expect("non-ready model instance is rejected");
+    }
+
+    #[test]
+    fn e2e_missing_prepared_plan_fails_closed() {
+        check_missing_prepared_plan_fails_closed().expect("missing prepared plan is rejected");
+    }
+
+    #[test]
+    fn e2e_invalidated_prepared_plan_rejects_new_work() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        check_invalidated_prepared_plan_rejects_new_work(&fixture)
+            .expect("invalidated prepared plan is rejected");
+    }
+
+    #[test]
+    fn e2e_qwen_graph_nodes_have_prepared_kernel_bindings() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        check_qwen_graph_nodes_have_prepared_kernel_bindings(&fixture)
+            .expect("Qwen graph nodes are bound to prepared kernels");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_artifact_trust_is_validated_before_planning() {
+        validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
+            ComponentTrustStore::default().trust_digest(QWEN_GRAPH_COMPONENT_DIGEST),
+        )
+        .expect("trusted Qwen Component fixture validates before planning");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_instantiates_with_wasmtime_limits_before_planning() {
+        let preflight =
+            validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
+                ComponentTrustStore::default().trust_digest(QWEN_GRAPH_COMPONENT_DIGEST),
+            )
+            .expect("trusted Qwen Component fixture instantiates before planning");
+        assert!(preflight.definition.get() > 0);
+        assert!(preflight.instance.get() > 0);
+        assert!(preflight.observations.iter().any(|observation| {
+            observation.kind == ComponentObservationKind::Instantiation
+                && observation.message.contains("component instance ready")
+        }));
+        assert!(preflight.observations.iter().any(|observation| {
+            observation.kind == ComponentObservationKind::Invocation
+                && observation
+                    .message
+                    .contains("component invocation completed")
+        }));
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_artifact_trust_rejection_fails_before_planning() {
+        match validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
+            ComponentTrustStore::default(),
+        ) {
+            Err(E2eConformanceError::ModelComponentFailed { reason })
+                if reason.contains("artifact rejected") || reason.contains("no trust policy") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+            Ok(_) => Err(E2eConformanceError::ModelComponentFailed {
+                reason: "untrusted Qwen Component fixture was accepted".into(),
+            }),
+        }
+        .expect("untrusted Qwen Component fixture is rejected before planning");
+    }
+
+    #[test]
     fn e2e_kv_cache_diagnostics_redact_raw_contents() {
         check_kv_cache_diagnostics_redacted().expect("cache usage carries no raw contents");
     }
@@ -3279,6 +3779,13 @@ mod tests {
         check_memory_admission_failure().expect("memory admission failure rejected");
         check_closed_session_rejects_generation(&e2e_fixture().unwrap())
             .expect("closed session rejected");
+        check_first_native_generation_requires_ready_model_instance(&e2e_fixture().unwrap())
+            .expect("non-ready model instance rejected");
+        check_missing_prepared_plan_fails_closed().expect("missing prepared plan rejected");
+        check_invalidated_prepared_plan_rejects_new_work(&e2e_fixture().unwrap())
+            .expect("invalidated prepared plan rejected");
+        check_qwen_graph_nodes_have_prepared_kernel_bindings(&e2e_fixture().unwrap())
+            .expect("Qwen graph nodes bound to prepared kernels");
         check_generation_cancelled(&e2e_fixture().unwrap()).expect("cancellation reported");
         check_cli_boundary_denials().expect("policy denial reported");
         check_raw_handle_access_denied().expect("raw handle access denied");

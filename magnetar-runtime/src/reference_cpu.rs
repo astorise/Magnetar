@@ -95,8 +95,8 @@
 //! is identified; none is known today.
 
 use crate::affinity::{
-    FallbackClass, ProviderBinding, ProviderHealth, ProviderPressureLevel, ProviderStatusSnapshot,
-    ResourceAffinity,
+    DeviceBinding, FallbackClass, ProviderBinding, ProviderHealth, ProviderPressureLevel,
+    ProviderStatusSnapshot, ResourceAffinity,
 };
 use crate::capability::{CapabilityId, CapabilityVersion};
 use crate::compute::{
@@ -1006,7 +1006,8 @@ fn baseline_advertisement(name: &str, family: OperatorFamily) -> KernelAdvertise
         .with_dtypes(TensorRole::Input, [ComputeDType::Float32])
         .with_dtypes(TensorRole::Output, [ComputeDType::Float32])
         .with_layouts([TensorLayoutKind::Contiguous])
-        .with_memory_classes([KernelMemoryClass::Host]);
+        .with_memory_classes([KernelMemoryClass::Host])
+        .with_devices([DeviceBinding::new(DeviceId::new(REFERENCE_CPU_DEVICE_ID))]);
     // Reference CPU executes synchronously and cannot cooperatively cancel
     // mid-kernel, but it does honor a deadline that has already elapsed
     // before dispatch starts (see `execute_invocation`).

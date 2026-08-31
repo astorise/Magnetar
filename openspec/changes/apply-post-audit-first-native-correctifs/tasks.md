@@ -9,23 +9,23 @@
 - [x] 2.1 Add a production-facing `first_native_runtime` facade and switch CLI callers away from direct `e2e_conformance` helpers.
 - [x] 2.2 Move first-native success-path implementation out of `e2e_conformance` into runtime-owned modules.
 - [x] 2.3 Introduce a Runtime model execution engine with `execute_prefill` and `execute_decode_step` responsibilities.
-- [ ] 2.4 Require a ready `ModelInstance` for first-native generation and fail without one.
-- [ ] 2.5 Require a compatible `PreparedExecutionPlan` for each prefill/decode step and fail without one.
-- [ ] 2.6 Reject invalidated plans for new first-native work.
+- [x] 2.4 Require a ready `ModelInstance` for first-native generation and fail without one.
+- [x] 2.5 Require a compatible `PreparedExecutionPlan` for each prefill/decode step and fail without one.
+- [x] 2.6 Reject invalidated plans for new first-native work.
 
 ## 3. Kernel Registry And Provider Dispatch
 
 - [x] 3.1 Register every first-native Qwen required operator kernel in the Kernel Registry.
-- [ ] 3.2 Bind each Qwen graph node to KernelId, implementation identity, Provider, Device, and PreparedKernelId.
+- [x] 3.2 Bind each Qwen graph node to KernelId, implementation identity, Provider, Device, and PreparedKernelId.
 - [ ] 3.3 Execute Qwen E2E model operators only through Registry and Provider dispatch.
 - [x] 3.4 Add a regression test that disabling a required kernel fails planning/execution instead of bypassing.
 - [ ] 3.5 Restrict direct Reference CPU function calls to unit, qualification, oracle, or differential tests.
 
 ## 4. Qwen WASM Component Authority
 
-- [ ] 4.1 Add or generate an executable Qwen WASM Component Artifact fixture.
-- [ ] 4.2 Validate Component Artifact trust before first-native planning.
-- [ ] 4.3 Instantiate the Qwen Component through the configured Component Runtime with Wasmtime limits active.
+- [x] 4.1 Add or generate an executable Qwen WASM Component Artifact fixture.
+- [x] 4.2 Validate Component Artifact trust before first-native planning.
+- [x] 4.3 Instantiate the Qwen Component through the configured Component Runtime with Wasmtime limits active.
 - [ ] 4.4 Build the executed graph from the Component output and validate it before planning.
 - [ ] 4.5 Add failure tests for missing artifact, digest mismatch, trust rejection, fuel exhaustion, deadline, invalid output, incompatible graph, and no Provider authority.
 
@@ -78,10 +78,10 @@
 
 ## Implementation Pause Note
 
-The change is validated and partially implemented. The 26 remaining unchecked tasks are
+The change is validated and partially implemented. The 19 remaining unchecked tasks are
 intentionally left open because they require the production Runtime cutover that
-is still absent from the codebase: ready ModelInstance resolution for
-first-native work, PreparedExecutionPlan-backed Qwen graph execution, an
-executable trusted Qwen WASM Component Artifact in the SUT, incremental KV
-decode owned by Runtime Session/ModelInstance state, and replacement of the
-remaining crate-internal RuntimeGenerationExecutor execution path.
+is still absent from the codebase: Qwen WASM Component output wired into graph
+construction in the SUT, full Provider-dispatched Qwen operator execution as the
+logits source, incremental KV decode owned by Runtime Session/ModelInstance
+state, and replacement of the remaining crate-internal RuntimeGenerationExecutor
+execution path.
