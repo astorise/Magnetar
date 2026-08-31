@@ -83,34 +83,34 @@ pub const fn phase_0_migration_inventory() -> &'static [MigrationBypassInventory
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::CliPlaceholderLogits,
             path: "magnetar-cli/src/pipeline.rs",
-            symbol: "removed; normal path calls run_first_native_fixture_generation",
+            symbol: "removed; normal path calls run_first_native_generation",
             disposition: MigrationBypassDisposition::Deprecated,
             final_cut_removal_required: false,
         },
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::CallerForwardCallback,
             path: "magnetar-runtime/src/inference_api.rs",
-            symbol: "RuntimeGenerationExecutor",
-            disposition: MigrationBypassDisposition::NonConformantMigrationPath,
+            symbol: "crate-internal RuntimeGenerationExecutor",
+            disposition: MigrationBypassDisposition::TrackedForRemovalBeforeFinalCut,
             final_cut_removal_required: true,
         },
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::CallerProvidedLogits,
             path: "magnetar-runtime/src/inference_api.rs",
-            symbol: "RuntimeGenerationStep::new(logits, evidence)",
-            disposition: MigrationBypassDisposition::NonConformantMigrationPath,
+            symbol: "crate-internal RuntimeGenerationStep::new(logits, evidence)",
+            disposition: MigrationBypassDisposition::TrackedForRemovalBeforeFinalCut,
             final_cut_removal_required: true,
         },
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::DirectReferenceCpuExecution,
-            path: "magnetar-runtime/src/e2e_conformance.rs",
+            path: "magnetar-runtime/src/first_native_runtime.rs",
             symbol: "e2e_forward_hidden_states / dispatch_matmul",
             disposition: MigrationBypassDisposition::IsolatedTestOnly,
             final_cut_removal_required: false,
         },
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::FullSequenceDecodeShortcut,
-            path: "magnetar-runtime/src/e2e_conformance.rs",
+            path: "magnetar-runtime/src/first_native_runtime.rs",
             symbol: "E2eRuntimeGenerationExecutor::execute_generation_step",
             disposition: MigrationBypassDisposition::TrackedForRemovalBeforeFinalCut,
             final_cut_removal_required: true,
@@ -151,6 +151,19 @@ pub fn validate_phase_0_migration_inventory() -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("runtime crate has workspace parent")
+            .to_path_buf()
+    }
+
+    fn read_workspace_file(path: &str) -> String {
+        std::fs::read_to_string(workspace_root().join(path))
+            .unwrap_or_else(|error| panic!("read {path}: {error}"))
+    }
 
     #[test]
     fn architecture_freeze_reopens_only_for_blockers() {
@@ -180,5 +193,110 @@ mod tests {
         assert_eq!(entry.disposition, MigrationBypassDisposition::Deprecated);
         assert!(!entry.final_cut_removal_required);
         assert!(!entry.is_final_conformance_allowed());
+    }
+
+    #[test]
+    fn cli_and_public_runtime_surface_do_not_export_e2e_harness_generation() {
+        let cli_pipeline = read_workspace_file("magnetar-cli/src/pipeline.rs");
+        assert!(!cli_pipeline.contains("e2e_conformance"));
+        assert!(!cli_pipeline.contains("run_first_native_fixture_generation"));
+        assert!(cli_pipeline.contains("run_first_native_generation"));
+
+        let runtime_lib = read_workspace_file("magnetar-runtime/src/lib.rs");
+        assert!(!runtime_lib.contains("pub mod e2e_conformance"));
+        assert!(!runtime_lib.contains("pub use e2e_conformance::*"));
+
+        let inference_api = read_workspace_file("magnetar-runtime/src/inference_api.rs");
+        assert!(!inference_api.contains("pub struct RuntimeGenerationStep"));
+        assert!(!inference_api.contains("pub trait RuntimeGenerationExecutor"));
+        assert!(!inference_api.contains("pub struct SharedRuntimeGenerationExecutor"));
+
+        let runtime = read_workspace_file("magnetar-runtime/src/runtime.rs");
+        assert!(!runtime.contains("pub fn generation_executor"));
+    }
+
+    #[test]
+    fn public_logits_bypass_inventory_is_downgraded_after_visibility_removal() {
+        let inventory = phase_0_migration_inventory();
+        for kind in [
+            MigrationBypassKind::CallerForwardCallback,
+            MigrationBypassKind::CallerProvidedLogits,
+        ] {
+            let entry = inventory
+                .iter()
+                .find(|entry| entry.kind == kind)
+                .expect("public logits bypass entry present");
+            assert_eq!(
+                entry.disposition,
+                MigrationBypassDisposition::TrackedForRemovalBeforeFinalCut
+            );
+            assert!(entry.final_cut_removal_required);
+            assert!(!entry.is_final_conformance_allowed());
+        }
+
+        let inference_api = read_workspace_file("magnetar-runtime/src/inference_api.rs");
+        for needle in [
+            "pub struct RuntimeGenerationStep",
+            "pub trait RuntimeGenerationExecutor",
+            "pub struct SharedRuntimeGenerationExecutor",
+            "pub fn new(logits: Vec<f32>",
+            "pub fn execute_generation_step",
+        ] {
+            assert!(
+                !inference_api.contains(needle),
+                "{needle} must stay removed from the public inference API"
+            );
+        }
+
+        let runtime = read_workspace_file("magnetar-runtime/src/runtime.rs");
+        for needle in ["pub fn generation_executor", "pub fn generation_executor("] {
+            assert!(
+                !runtime.contains(needle),
+                "{needle} must stay removed from the public Runtime surface"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_logits_seam_is_confined_to_tracked_migration_locations() {
+        let allowed = [
+            "magnetar-runtime/src/first_native_runtime.rs",
+            "magnetar-runtime/src/inference_api.rs",
+            "magnetar-runtime/src/runtime.rs",
+            "magnetar-runtime/src/tests.rs",
+            "magnetar-runtime/src/first_native_implementation_cut.rs",
+        ];
+        let forbidden = [
+            "magnetar-cli/src/agent.rs",
+            "magnetar-cli/src/commands.rs",
+            "magnetar-cli/src/main.rs",
+            "magnetar-cli/src/pipeline.rs",
+            "magnetar-cli/src/serve.rs",
+        ];
+
+        for path in forbidden {
+            let source = read_workspace_file(path);
+            for needle in [
+                "RuntimeGenerationExecutor",
+                "RuntimeGenerationStep::new",
+                ".generation_executor(",
+            ] {
+                assert!(
+                    !source.contains(needle),
+                    "{needle} must not appear in {path}"
+                );
+            }
+        }
+
+        for path in allowed {
+            let source = read_workspace_file(path);
+            let contains_legacy = source.contains("RuntimeGenerationExecutor")
+                || source.contains("RuntimeGenerationStep::new")
+                || source.contains(".generation_executor(");
+            assert!(
+                contains_legacy,
+                "allowed migration location {path} should stay explicit while bypass inventory tracks it"
+            );
+        }
     }
 }

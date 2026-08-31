@@ -159,8 +159,8 @@ jobs:
         run: rustup show
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@v2
-      - name: Run End-to-End Local Inference Conformance (no GPU required)
-        run: cargo test --locked -p magnetar-runtime e2e_conformance -- --nocapture
+      - name: Run First-Native Runtime Conformance (no GPU required)
+        run: cargo test --locked -p magnetar-runtime first_native_runtime -- --nocapture
 
   docs:
     name: quality / docs
@@ -174,8 +174,10 @@ jobs:
         run: rustup show
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@v2
-      - name: Build Rust documentation
-        run: cargo doc --locked --workspace --all-features --no-deps
+      - name: Build workspace documentation
+        run: cargo doc --locked --workspace --no-deps
+      - name: Build Wasmtime Component Engine documentation
+        run: cargo doc --locked -p magnetar-runtime --no-deps --features wasmtime-component-engine
 
   wit:
     name: quality / wit

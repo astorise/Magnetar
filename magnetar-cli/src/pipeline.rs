@@ -6,19 +6,37 @@
 //! from Runtime model execution evidence rather than a CLI placeholder.
 
 use magnetar_runtime::{
-    ChatMessage, ChatTemplateFormatter, CliBoundaryError, GenerationModelReference,
-    GenerationParameters, GenerationTokenizerReference, InferenceApiError, InferenceApiObserver,
-    InferenceSessionId, MODEL_ARTIFACT_SCHEMA_VERSION, ModelArchitecture, ModelArtifactId,
-    ModelArtifactKind, ModelDigest, ModelManifest, ModelName, ModelRef, ModelRevision, Runtime,
-    SessionCreationRequest, SessionMemoryBudget, SessionPolicy, SpecialToken, SpecialTokenKind,
-    TokenIdRange, TokenizerArtifactId, TokenizerFamily, TokenizerId, TokenizerMetadata,
-    TokenizerRevision, cancel_inference_session, close_inference_session, create_inference_session,
-    run_first_native_fixture_generation,
+    ChatMessage, ChatTemplateFormatter, CliBoundaryError, FirstNativeRuntimeError,
+    GenerationModelReference, GenerationParameters, GenerationTokenizerReference,
+    InferenceApiError, InferenceApiObserver, InferenceSessionId, MODEL_ARTIFACT_SCHEMA_VERSION,
+    ModelArchitecture, ModelArtifactId, ModelArtifactKind, ModelDigest, ModelManifest, ModelName,
+    ModelRef, ModelRevision, Runtime, SessionCreationRequest, SessionMemoryBudget, SessionPolicy,
+    SpecialToken, SpecialTokenKind, TokenIdRange, TokenizerArtifactId, TokenizerFamily,
+    TokenizerId, TokenizerMetadata, TokenizerRevision, cancel_inference_session,
+    close_inference_session, create_inference_session, run_first_native_generation,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Maximum number of decode steps used by the native fixture path.
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 8;
+
+fn first_native_runtime_error_to_api_error(error: FirstNativeRuntimeError) -> InferenceApiError {
+    let reason = error.reason().to_string();
+    match error.code() {
+        "model-not-found" => InferenceApiError::ModelResolutionFailed { reason },
+        "artifact-invalid" => InferenceApiError::ModelLoadingFailed { reason },
+        "trust-rejected" => InferenceApiError::PolicyDenied { reason },
+        "load-failed" => InferenceApiError::ModelLoadingFailed { reason },
+        "component-load-failed" => InferenceApiError::ModelComponentUnavailable { reason },
+        "plan-unavailable" => InferenceApiError::GraphPlanningFailed { reason },
+        "provider-unavailable" => InferenceApiError::ProviderUnavailable { reason },
+        "generation-failed" => InferenceApiError::GenerationFailed { reason },
+        "generation-cancelled" => InferenceApiError::GenerationCancelled,
+        _ => InferenceApiError::GenerationFailed {
+            reason: format!("{}: {reason}", error.code()),
+        },
+    }
+}
 
 /// Builds the fixture [`TokenizerMetadata`] this CLI uses until a real
 /// Tokenizer artifact pipeline exists. Mirrors
@@ -154,12 +172,9 @@ pub fn one_shot(
     model_ref: &ModelRef,
     prompt: &str,
 ) -> Result<(String, InferenceApiObserver), CliBoundaryError> {
-    let generated = run_first_native_fixture_generation(prompt).map_err(|error| {
-        CliBoundaryError::CliRuntimeRequestFailed(InferenceApiError::GenerationFailed {
-            reason: error.to_string(),
-        })
+    let generated = run_first_native_generation(model_ref, prompt).map_err(|error| {
+        CliBoundaryError::CliRuntimeRequestFailed(first_native_runtime_error_to_api_error(error))
     })?;
-    let _ = model_ref;
     Ok((generated.text, generated.observer))
 }
 
@@ -172,6 +187,7 @@ pub fn one_shot(
 pub struct ChatSession {
     runtime: Runtime,
     session: InferenceSessionId,
+    model_ref: ModelRef,
     /// CLI-owned transcript: (role, text) pairs. Never sent to Runtime as a
     /// whole -- only the current turn's prompt text is.
     transcript: Vec<(String, String)>,
@@ -190,6 +206,7 @@ impl ChatSession {
         Ok(Self {
             runtime,
             session,
+            model_ref: model_ref.clone(),
             transcript: Vec::new(),
             next_turn: 0,
             cancelled: false,
@@ -220,11 +237,12 @@ impl ChatSession {
         self.next_turn += 1;
 
         let (reply, observer) = if self.transcript.is_empty() {
-            let generated = run_first_native_fixture_generation(user_line).map_err(|error| {
-                CliBoundaryError::CliRuntimeRequestFailed(InferenceApiError::GenerationFailed {
-                    reason: error.to_string(),
-                })
-            })?;
+            let generated =
+                run_first_native_generation(&self.model_ref, user_line).map_err(|error| {
+                    CliBoundaryError::CliRuntimeRequestFailed(
+                        first_native_runtime_error_to_api_error(error),
+                    )
+                })?;
             (generated.text, generated.observer)
         } else {
             let mut messages: Vec<ChatMessage> = self
@@ -235,11 +253,12 @@ impl ChatSession {
             messages.push(ChatMessage::new("user", user_line));
             let formatter = CliChatTemplateFormatter;
             let rendered = formatter.format(&messages)?;
-            let generated = run_first_native_fixture_generation(&rendered).map_err(|error| {
-                CliBoundaryError::CliRuntimeRequestFailed(InferenceApiError::GenerationFailed {
-                    reason: error.to_string(),
-                })
-            })?;
+            let generated =
+                run_first_native_generation(&self.model_ref, &rendered).map_err(|error| {
+                    CliBoundaryError::CliRuntimeRequestFailed(
+                        first_native_runtime_error_to_api_error(error),
+                    )
+                })?;
             (generated.text, generated.observer)
         };
 
@@ -298,11 +317,96 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn one_shot_rejects_unknown_model_ref_instead_of_ignoring_it() {
+        let model_ref = ModelRef::new("different-model").unwrap();
+        let error = one_shot(&model_ref, "hello").unwrap_err();
+        assert!(matches!(
+            error.runtime_category(),
+            Some(InferenceApiError::ModelResolutionFailed { reason })
+                if reason.contains("different-model")
+        ));
+    }
+
     /// Streaming (§18): asserts the observation trail's order and count
     /// for a known, small `DEFAULT_MAX_NEW_TOKENS`. Placeholder logits
     /// deterministically favor a non-EOS/non-stop byte every step (see
     /// token generation comes from the runtime-owned fixture path rather
     /// than a CLI-provided logits source.
+    #[test]
+    fn first_native_errors_map_to_structured_runtime_categories() {
+        let cases = [
+            (
+                "model-not-found",
+                "missing model",
+                InferenceApiError::ModelResolutionFailed {
+                    reason: "missing model".into(),
+                },
+            ),
+            (
+                "artifact-invalid",
+                "bad artifact",
+                InferenceApiError::ModelLoadingFailed {
+                    reason: "bad artifact".into(),
+                },
+            ),
+            (
+                "trust-rejected",
+                "untrusted",
+                InferenceApiError::PolicyDenied {
+                    reason: "untrusted".into(),
+                },
+            ),
+            (
+                "load-failed",
+                "load failed",
+                InferenceApiError::ModelLoadingFailed {
+                    reason: "load failed".into(),
+                },
+            ),
+            (
+                "component-load-failed",
+                "component failed",
+                InferenceApiError::ModelComponentUnavailable {
+                    reason: "component failed".into(),
+                },
+            ),
+            (
+                "provider-unavailable",
+                "no provider",
+                InferenceApiError::ProviderUnavailable {
+                    reason: "no provider".into(),
+                },
+            ),
+            (
+                "plan-unavailable",
+                "no plan",
+                InferenceApiError::GraphPlanningFailed {
+                    reason: "no plan".into(),
+                },
+            ),
+            (
+                "generation-failed",
+                "bad generation",
+                InferenceApiError::GenerationFailed {
+                    reason: "bad generation".into(),
+                },
+            ),
+            (
+                "generation-cancelled",
+                "cancelled",
+                InferenceApiError::GenerationCancelled,
+            ),
+        ];
+
+        for (code, reason, expected) in cases {
+            assert_eq!(
+                first_native_runtime_error_to_api_error(FirstNativeRuntimeError::new(code, reason)),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn one_shot_pipeline_certifies_native_observation_trail() {
         let model_ref = ModelRef::new("qwen-test").unwrap();
@@ -330,6 +434,19 @@ mod tests {
         assert!(!reply.is_empty());
         assert!(!observer.observations().is_empty());
         assert_eq!(chat.transcript().len(), 2);
+        chat.close().unwrap();
+    }
+
+    #[test]
+    fn chat_session_rejects_unknown_model_ref_instead_of_ignoring_it() {
+        let model_ref = ModelRef::new("different-model").unwrap();
+        let mut chat = ChatSession::open(&model_ref).unwrap();
+        let error = chat.turn("first line").unwrap_err();
+        assert!(matches!(
+            error.runtime_category(),
+            Some(InferenceApiError::ModelResolutionFailed { reason })
+                if reason.contains("different-model")
+        ));
         chat.close().unwrap();
     }
 

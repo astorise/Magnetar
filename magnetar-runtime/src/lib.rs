@@ -17,10 +17,12 @@ pub mod component_web;
 pub mod compute;
 pub mod conformance;
 pub mod device;
-pub mod e2e_conformance;
+#[allow(dead_code)]
+mod e2e_conformance;
 pub mod execution_graph;
 pub mod execution_stream;
 pub mod first_native_implementation_cut;
+pub mod first_native_runtime;
 pub mod generation;
 pub mod inference_api;
 pub mod kernel;
@@ -81,10 +83,14 @@ pub use component_web::*;
 pub use compute::*;
 pub use conformance::*;
 pub use device::*;
-pub use e2e_conformance::*;
+pub use e2e_conformance::{
+    E2E_EXERCISED_OPERATORS, E2E_FIXTURE_VERSION, E2E_FIXTURE_WEIGHT_DIGEST,
+    E2E_FIXTURE_WEIGHT_DIGEST_VERSION, E2E_SUITE_VERSION,
+};
 pub use execution_graph::*;
 pub use execution_stream::*;
 pub use first_native_implementation_cut::*;
+pub use first_native_runtime::*;
 pub use generation::*;
 pub use inference_api::*;
 pub use kernel::*;

@@ -18,6 +18,22 @@ Providers are trusted native code by architectural definition. A malicious
 Provider is outside the threat model; the operator chooses which Providers to
 load.
 
+## Implemented controls
+
+The native Wasmtime Component engine is configured to run Components without
+ambient WASI authority. Filesystem, environment, network, process, and runtime
+resource imports are rejected unless Magnetar explicitly maps an allowed host
+capability.
+
+Wasmtime execution uses fuel metering and epoch-based interruption for
+deadlines. Component resource limits, including memory limits, are part of the
+Runtime Component policy surface and are enforced when the Wasmtime engine is
+available.
+
+Component artifact trust is still policy-driven: digest pinning or an explicit
+local development policy may allow an artifact, while publisher/source metadata
+alone is not treated as cryptographic proof.
+
 ## Known gaps
 
 These are tracked publicly and do not need a private report:
@@ -27,9 +43,9 @@ These are tracked publicly and do not need a private report:
   trust policy; acceptance still requires digest pinning or explicit local
   development policy. See
   [#9](https://github.com/astorise/Magnetar/issues/9).
-- Component execution deadlines and fuel budgets are not enforced, so a
-  Component can occupy a host thread indefinitely. See
-  [#8](https://github.com/astorise/Magnetar/issues/8).
+- Non-Wasmtime or future Component engines must provide equivalent fuel,
+  deadline/interruption, resource-limit, and no-ambient-authority guarantees
+  before they can satisfy the same native security profile.
 
 ## Reporting
 

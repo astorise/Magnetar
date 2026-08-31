@@ -132,3 +132,11 @@ advanced asynchronous ExecutionStreams
 
 Missing deferred features must not fail First Native Model Execution Profile
 conformance.
+
+## Implementation Ownership
+
+The runtime-owned implementation entry point lives in
+`magnetar-runtime/src/first_native_runtime.rs`. The historical
+`e2e_conformance` module remains only as an internal compatibility namespace
+for conformance filters and tests; production clients should use the
+first-native runtime API surface instead of importing E2E helpers.

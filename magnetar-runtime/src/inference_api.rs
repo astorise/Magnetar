@@ -982,13 +982,13 @@ impl RuntimeGenerationExecutionEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RuntimeGenerationStep {
-    pub logits: Vec<f32>,
-    pub evidence: RuntimeGenerationExecutionEvidence,
+pub(crate) struct RuntimeGenerationStep {
+    pub(crate) logits: Vec<f32>,
+    pub(crate) evidence: RuntimeGenerationExecutionEvidence,
 }
 
 impl RuntimeGenerationStep {
-    pub fn new(logits: Vec<f32>, evidence: RuntimeGenerationExecutionEvidence) -> Self {
+    pub(crate) fn new(logits: Vec<f32>, evidence: RuntimeGenerationExecutionEvidence) -> Self {
         Self { logits, evidence }
     }
 }
@@ -996,7 +996,7 @@ impl RuntimeGenerationStep {
 /// Runtime-owned execution hook used by the Runtime Inference API to produce
 /// logits. Callers configure this when constructing a Runtime; normal
 /// generation does not accept per-request callbacks or readiness booleans.
-pub trait RuntimeGenerationExecutor: Send + Sync {
+pub(crate) trait RuntimeGenerationExecutor: Send + Sync {
     fn execute_generation_step(
         &self,
         runtime: &Runtime,
@@ -1006,14 +1006,14 @@ pub trait RuntimeGenerationExecutor: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct SharedRuntimeGenerationExecutor(Arc<dyn RuntimeGenerationExecutor>);
+pub(crate) struct SharedRuntimeGenerationExecutor(Arc<dyn RuntimeGenerationExecutor>);
 
 impl SharedRuntimeGenerationExecutor {
-    pub fn new(executor: Arc<dyn RuntimeGenerationExecutor>) -> Self {
+    pub(crate) fn new(executor: Arc<dyn RuntimeGenerationExecutor>) -> Self {
         Self(executor)
     }
 
-    pub fn execute_generation_step(
+    pub(crate) fn execute_generation_step(
         &self,
         runtime: &Runtime,
         request: &GenerationRequest,

@@ -61,7 +61,7 @@ cargo test --locked -p magnetar-runtime provider_conformance -- --nocapture
 Run the End-to-End Local Inference Conformance suite (no GPU required):
 
 ```powershell
-cargo test -p magnetar-runtime e2e_conformance -- --nocapture
+cargo test -p magnetar-runtime first_native_runtime -- --nocapture
 ```
 
 Run the Post-Baseline Provider Roadmap contract tests:
@@ -76,17 +76,20 @@ Run the Post-Baseline Server API Roadmap contract tests:
 cargo test -p magnetar-runtime server_api_roadmap -- --nocapture
 ```
 
-Build Rust documentation with warnings denied:
+Build Rust documentation with warnings denied. The docs gate covers the default
+workspace surface and the Wasmtime Component Engine surface separately:
 
 ```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --locked -p magnetar-runtime --no-deps --features wasmtime-component-engine
 ```
 
 PowerShell:
 
 ```powershell
 $env:RUSTDOCFLAGS="-D warnings"
-cargo doc --locked --workspace --all-features --no-deps
+cargo doc --locked --workspace --no-deps
+cargo doc --locked -p magnetar-runtime --no-deps --features wasmtime-component-engine
 ```
 
 Validate WIT packages:

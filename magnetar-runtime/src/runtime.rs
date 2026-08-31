@@ -182,7 +182,7 @@ impl RuntimeBuilder {
         self.providers.push(x);
         self
     }
-    pub fn generation_executor(mut self, x: Arc<dyn RuntimeGenerationExecutor>) -> Self {
+    pub(crate) fn generation_executor(mut self, x: Arc<dyn RuntimeGenerationExecutor>) -> Self {
         self.generation_executor = Some(SharedRuntimeGenerationExecutor::new(x));
         self
     }
@@ -332,7 +332,7 @@ impl Runtime {
     pub fn providers(&self) -> &ProviderLoader {
         &self.providers
     }
-    pub fn generation_executor(&self) -> Option<&SharedRuntimeGenerationExecutor> {
+    pub(crate) fn generation_executor(&self) -> Option<&SharedRuntimeGenerationExecutor> {
         self.generation_executor.as_ref()
     }
     pub fn sessions(&self) -> impl Iterator<Item = &InferenceSession> {
