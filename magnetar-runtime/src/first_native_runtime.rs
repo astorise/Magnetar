@@ -74,7 +74,7 @@ const E2E_FIXTURE_LAYERS: u64 = 1;
 const QWEN_GRAPH_COMPONENT_NAME: &str = "magnetar.qwen.graph-fixture";
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_GRAPH_COMPONENT_DIGEST: &str =
-    "sha256:f192183d92f874b23027fa20be47739508ab5f0e57e56a7f8278dccf336d4acf";
+    "sha256:e376dedc5059e0e46233fe783fab49c8d9752aa68a3a967876118d13fa5c9d85";
 
 // ---------------------------------------------------------------------
 // Error model
@@ -1481,10 +1481,46 @@ fn qwen_graph_component_artifact_path() -> std::path::PathBuf {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[derive(Debug)]
 struct QwenComponentPreflight {
     definition: ComponentDefinitionId,
     instance: ComponentInstanceId,
+    graph_semantics: QwenComponentGraphSemantics,
     observations: Vec<ComponentObservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QwenComponentGraphSemantics {
+    prefill_node_count: usize,
+    decode_node_count: usize,
+}
+
+impl QwenComponentGraphSemantics {
+    fn validate_against_graphs(
+        self,
+        prefill: &ExecutionGraph,
+        decode: &ExecutionGraph,
+    ) -> Result<(), E2eConformanceError> {
+        if self.prefill_node_count != prefill.nodes.len() {
+            return Err(E2eConformanceError::GraphValidationFailed {
+                reason: format!(
+                    "Qwen Component prefill graph declared {} node(s), runtime graph has {}",
+                    self.prefill_node_count,
+                    prefill.nodes.len()
+                ),
+            });
+        }
+        if self.decode_node_count != decode.nodes.len() {
+            return Err(E2eConformanceError::GraphValidationFailed {
+                reason: format!(
+                    "Qwen Component decode graph declared {} node(s), runtime graph has {}",
+                    self.decode_node_count,
+                    decode.nodes.len()
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -1500,10 +1536,58 @@ fn qwen_component_runtime_limits() -> ComponentResourceLimits {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-fn validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
+struct QwenComponentPreflightRequest {
+    artifact_path: std::path::PathBuf,
+    manifest_path: Option<std::path::PathBuf>,
     trust_store: ComponentTrustStore,
+    limits: ComponentResourceLimits,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+impl QwenComponentPreflightRequest {
+    fn default_trusted() -> Self {
+        let artifact_path = qwen_graph_component_artifact_path();
+        Self {
+            manifest_path: Some(
+                artifact_path.with_file_name("qwen-graph.component.wat.magnetar-component.yaml"),
+            ),
+            artifact_path,
+            trust_store: ComponentTrustStore::default().trust_digest(QWEN_GRAPH_COMPONENT_DIGEST),
+            limits: qwen_component_runtime_limits(),
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn invoke_qwen_component_u32(
+    manager: &mut ComponentManager,
+    instance: ComponentInstanceId,
+    interface: &WitInterface,
+    operation: &str,
+) -> Result<u32, E2eConformanceError> {
+    let result = manager
+        .invoke(ComponentInvocation::new(
+            instance,
+            interface.clone(),
+            operation,
+        ))
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    match result.values.as_slice() {
+        [ComponentValue::U32(value)] => Ok(*value),
+        values => Err(E2eConformanceError::GraphValidationFailed {
+            reason: format!(
+                "Qwen Component export '{operation}' returned {values:?}, expected u32"
+            ),
+        }),
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn validate_and_instantiate_qwen_component_before_first_native_planning(
+    request: QwenComponentPreflightRequest,
 ) -> Result<QwenComponentPreflight, E2eConformanceError> {
-    let artifact_path = qwen_graph_component_artifact_path();
     let mut manager = ComponentManager::with_engine(Box::new(
         crate::component_wasmtime::WasmtimeComponentEngine::new().map_err(|error| {
             E2eConformanceError::ModelComponentFailed {
@@ -1511,27 +1595,25 @@ fn validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
             }
         })?,
     ));
-    manager.set_resource_limits(qwen_component_runtime_limits());
-    manager.set_trust_store(trust_store);
-    manager
-        .register_component(
-            ComponentDescriptor::new(
-                ComponentMetadata::new(
-                    QWEN_GRAPH_COMPONENT_NAME,
-                    "0.1.0",
-                    "Executable Qwen graph fixture component",
-                )
-                .with_export(WitInterface::new("magnetar:qwen/graph-fixture", "1.0.0")),
-                artifact_path,
-            )
-            .with_manifest_path(
-                qwen_graph_component_artifact_path()
-                    .with_file_name("qwen-graph.component.wat.magnetar-component.yaml"),
-            ),
+    manager.set_resource_limits(request.limits);
+    manager.set_trust_store(request.trust_store);
+    let mut descriptor = ComponentDescriptor::new(
+        ComponentMetadata::new(
+            QWEN_GRAPH_COMPONENT_NAME,
+            "0.1.0",
+            "Executable Qwen graph fixture component",
         )
-        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+        .with_export(WitInterface::new("magnetar:qwen/graph-fixture", "1.0.0")),
+        request.artifact_path,
+    );
+    if let Some(manifest_path) = request.manifest_path {
+        descriptor = descriptor.with_manifest_path(manifest_path);
+    }
+    manager.register_component(descriptor).map_err(|error| {
+        E2eConformanceError::ModelComponentFailed {
             reason: error.to_string(),
-        })?;
+        }
+    })?;
     let definition = manager
         .prepare_component(QWEN_GRAPH_COMPONENT_NAME)
         .map_err(|error| E2eConformanceError::ModelComponentFailed {
@@ -1543,25 +1625,45 @@ fn validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
             reason: error.to_string(),
         })?;
     let interface = WitInterface::new("magnetar:qwen/graph-fixture", "1.0.0");
-    let authority = manager
-        .invoke(ComponentInvocation::new(
-            instance,
-            interface,
-            "provider-authority-count",
-        ))
-        .map_err(|error| E2eConformanceError::ModelComponentFailed {
-            reason: error.to_string(),
-        })?;
-    if authority != ComponentInvocationResult::single(ComponentValue::U32(0)) {
+    let authority = invoke_qwen_component_u32(
+        &mut manager,
+        instance,
+        &interface,
+        "provider-authority-count",
+    )?;
+    if authority != 0 {
         return Err(E2eConformanceError::BoundaryViolation {
             reason: "Qwen Component fixture requested Provider authority".into(),
         });
     }
+    let graph_semantics = QwenComponentGraphSemantics {
+        prefill_node_count: invoke_qwen_component_u32(
+            &mut manager,
+            instance,
+            &interface,
+            "prefill-node-count",
+        )? as usize,
+        decode_node_count: invoke_qwen_component_u32(
+            &mut manager,
+            instance,
+            &interface,
+            "decode-node-count",
+        )? as usize,
+    };
     Ok(QwenComponentPreflight {
         definition,
         instance,
+        graph_semantics,
         observations: manager.observations().to_vec(),
     })
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn validate_and_instantiate_trusted_qwen_component_before_first_native_planning()
+-> Result<QwenComponentPreflight, E2eConformanceError> {
+    validate_and_instantiate_qwen_component_before_first_native_planning(
+        QwenComponentPreflightRequest::default_trusted(),
+    )
 }
 
 fn prepare_first_native_plan_for_graph(
@@ -1644,6 +1746,7 @@ fn prepare_first_native_execution_plans(
     fixture: &E2eFixture,
     instance: &ModelInstanceId,
     prompt_token_count: u64,
+    component_graph_semantics: Option<QwenComponentGraphSemantics>,
 ) -> Result<FirstNativePreparedPlans, E2eConformanceError> {
     let status = require_ready_first_native_instance(runtime, instance)?;
     let mutation_version = status.status().mutation_version;
@@ -1661,6 +1764,9 @@ fn prepare_first_native_execution_plans(
 
     let prefill_node_count = prefill.graph.nodes.len();
     let decode_node_count = decode.graph.nodes.len();
+    if let Some(component_graph_semantics) = component_graph_semantics {
+        component_graph_semantics.validate_against_graphs(&prefill.graph, &decode.graph)?;
+    }
     Ok(FirstNativePreparedPlans {
         prefill: prepare_first_native_plan_for_graph(
             runtime,
@@ -1731,22 +1837,25 @@ fn run_success_path_with_prompt(
         None,
     )?;
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-    {
+    let component_graph_semantics = {
         let preflight =
-            validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
-                ComponentTrustStore::default().trust_digest(QWEN_GRAPH_COMPONENT_DIGEST),
-            )?;
+            validate_and_instantiate_trusted_qwen_component_before_first_native_planning()?;
+        let graph_semantics = preflight.graph_semantics;
         let _component_preflight = (
             preflight.definition,
             preflight.instance,
             preflight.observations.len(),
         );
-    }
+        Some(graph_semantics)
+    };
+    #[cfg(not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")))]
+    let component_graph_semantics = None;
     let prepared_plans = prepare_first_native_execution_plans(
         &runtime,
         fixture,
         &instance,
         tokenized.token_ids.len() as u64,
+        component_graph_semantics,
     )?;
     let _plan_generations = (
         prepared_plans.prefill.generation,
@@ -2307,7 +2416,7 @@ fn check_invalidated_prepared_plan_rejects_new_work(
 ) -> Result<(), E2eConformanceError> {
     let mut runtime = build_runtime();
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
-    let mut plans = prepare_first_native_execution_plans(&runtime, fixture, &instance, 2)?;
+    let mut plans = prepare_first_native_execution_plans(&runtime, fixture, &instance, 2, None)?;
     plans
         .decode
         .hard_invalidate(crate::kernel_execution_plan::PlanRebuildReason::KernelRevoked)?;
@@ -2329,7 +2438,7 @@ fn check_qwen_graph_nodes_have_prepared_kernel_bindings(
 ) -> Result<(), E2eConformanceError> {
     let mut runtime = build_runtime();
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
-    let plans = prepare_first_native_execution_plans(&runtime, fixture, &instance, 2)?;
+    let plans = prepare_first_native_execution_plans(&runtime, fixture, &instance, 2, None)?;
 
     for (plan, expected_node_count) in [
         (&plans.prefill, plans.prefill_node_count),
@@ -3474,6 +3583,144 @@ fn elapsed_millis(start: SystemTime) -> u64 {
 mod tests {
     use super::*;
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn qwen_component_fixture_wat(
+        prefill_export: &str,
+        decode_export: &str,
+        authority_export: &str,
+    ) -> String {
+        format!(
+            r#"(component
+    (core module $m
+        {prefill_export}
+        {decode_export}
+        {authority_export})
+    (core instance $i (instantiate $m))
+    (func (export "prefill-node-count") (result u32)
+        (canon lift (core func $i "prefill-node-count")))
+    (func (export "decode-node-count") (result u32)
+        (canon lift (core func $i "decode-node-count")))
+    (func (export "provider-authority-count") (result u32)
+        (canon lift (core func $i "provider-authority-count")))
+    (func $prefill-node-count (result u32)
+        (canon lift (core func $i "prefill-node-count")))
+    (func $decode-node-count (result u32)
+        (canon lift (core func $i "decode-node-count")))
+    (func $provider-authority-count (result u32)
+        (canon lift (core func $i "provider-authority-count")))
+    (instance $qwen-graph-fixture
+        (export "prefill-node-count" (func $prefill-node-count))
+        (export "decode-node-count" (func $decode-node-count))
+        (export "provider-authority-count" (func $provider-authority-count)))
+    (export "magnetar:qwen/graph-fixture@1.0.0" (instance $qwen-graph-fixture)))
+"#
+        )
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn qwen_component_count_fixture_wat(prefill: u32, decode: u32, authority: u32) -> String {
+        qwen_component_fixture_wat(
+            &format!(r#"(func (export "prefill-node-count") (result i32) i32.const {prefill})"#),
+            &format!(r#"(func (export "decode-node-count") (result i32) i32.const {decode})"#),
+            &format!(
+                r#"(func (export "provider-authority-count") (result i32) i32.const {authority})"#
+            ),
+        )
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn qwen_component_manifest(digest: &str) -> String {
+        format!(
+            r#"schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "{digest}"
+component:
+  name: "magnetar.qwen.graph-fixture"
+  version: "0.1.0"
+  description: "Executable Qwen graph fixture component"
+  role: "qwen-graph-fixture"
+runtime:
+  magnetar:
+    min_version: "0.1.0"
+wit:
+  imports: []
+  exports:
+    - package: "magnetar:qwen"
+      interface: "graph-fixture"
+      version: "1.0.0"
+capabilities:
+  requires: []
+authority:
+  requires: []
+engine:
+  profile: "native"
+  features:
+    - component-model
+    - resource-limits
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./qwen-graph.component.wat"
+signatures: []
+"#
+        )
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn sha256_component_digest(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        let mut encoded = String::from("sha256:");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in digest {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn write_qwen_component_preflight_fixture(
+        name: &str,
+        wat: &str,
+        manifest_digest: Option<&str>,
+    ) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let directory = std::env::temp_dir().join(format!(
+            "magnetar-qwen-component-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp directory created");
+        let artifact_path = directory.join("qwen-graph.component.wat");
+        std::fs::write(&artifact_path, wat).expect("component WAT written");
+        let digest = sha256_component_digest(wat.as_bytes());
+        let manifest_path = directory.join("qwen-graph.component.wat.magnetar-component.yaml");
+        std::fs::write(
+            &manifest_path,
+            qwen_component_manifest(manifest_digest.unwrap_or(&digest)),
+        )
+        .expect("component manifest written");
+        (artifact_path, manifest_path, digest)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn trusted_preflight_request_for_temp_component(
+        artifact_path: std::path::PathBuf,
+        manifest_path: std::path::PathBuf,
+        digest: &str,
+    ) -> QwenComponentPreflightRequest {
+        QwenComponentPreflightRequest {
+            artifact_path,
+            manifest_path: Some(manifest_path),
+            trust_store: ComponentTrustStore::default().trust_digest(digest),
+            limits: qwen_component_runtime_limits(),
+        }
+    }
+
     #[test]
     fn e2e_success_path_resolves_loads_generates_and_cleans_up() {
         let fixture = e2e_fixture().expect("fixture builds");
@@ -3681,22 +3928,25 @@ mod tests {
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
     #[test]
     fn e2e_qwen_component_artifact_trust_is_validated_before_planning() {
-        validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
-            ComponentTrustStore::default().trust_digest(QWEN_GRAPH_COMPONENT_DIGEST),
-        )
-        .expect("trusted Qwen Component fixture validates before planning");
+        validate_and_instantiate_trusted_qwen_component_before_first_native_planning()
+            .expect("trusted Qwen Component fixture validates before planning");
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
     #[test]
     fn e2e_qwen_component_instantiates_with_wasmtime_limits_before_planning() {
         let preflight =
-            validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
-                ComponentTrustStore::default().trust_digest(QWEN_GRAPH_COMPONENT_DIGEST),
-            )
-            .expect("trusted Qwen Component fixture instantiates before planning");
+            validate_and_instantiate_trusted_qwen_component_before_first_native_planning()
+                .expect("trusted Qwen Component fixture instantiates before planning");
         assert!(preflight.definition.get() > 0);
         assert!(preflight.instance.get() > 0);
+        assert_eq!(
+            preflight.graph_semantics,
+            QwenComponentGraphSemantics {
+                prefill_node_count: 19,
+                decode_node_count: 19,
+            }
+        );
         assert!(preflight.observations.iter().any(|observation| {
             observation.kind == ComponentObservationKind::Instantiation
                 && observation.message.contains("component instance ready")
@@ -3712,9 +3962,9 @@ mod tests {
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
     #[test]
     fn e2e_qwen_component_artifact_trust_rejection_fails_before_planning() {
-        match validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
-            ComponentTrustStore::default(),
-        ) {
+        let mut request = QwenComponentPreflightRequest::default_trusted();
+        request.trust_store = ComponentTrustStore::default();
+        match validate_and_instantiate_qwen_component_before_first_native_planning(request) {
             Err(E2eConformanceError::ModelComponentFailed { reason })
                 if reason.contains("artifact rejected") || reason.contains("no trust policy") =>
             {
@@ -3726,6 +3976,220 @@ mod tests {
             }),
         }
         .expect("untrusted Qwen Component fixture is rejected before planning");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_missing_artifact_fails_before_planning() {
+        let directory = std::env::temp_dir().join(format!(
+            "magnetar-qwen-component-missing-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp directory created");
+        let request = QwenComponentPreflightRequest {
+            artifact_path: directory.join("missing.component.wat"),
+            manifest_path: None,
+            trust_store: ComponentTrustStore::default(),
+            limits: qwen_component_runtime_limits(),
+        };
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::ModelComponentFailed { .. })
+            ),
+            "missing Qwen Component artifact was not rejected: {result:?}"
+        );
+        std::fs::remove_dir_all(directory).expect("temp directory removed");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_digest_mismatch_fails_before_planning() {
+        let wat = qwen_component_count_fixture_wat(19, 19, 0);
+        let wrong_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let (artifact_path, manifest_path, _digest) =
+            write_qwen_component_preflight_fixture("digest-mismatch", &wat, Some(wrong_digest));
+        let directory = artifact_path
+            .parent()
+            .expect("artifact has parent")
+            .to_path_buf();
+        let request = trusted_preflight_request_for_temp_component(
+            artifact_path,
+            manifest_path,
+            wrong_digest,
+        );
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::ModelComponentFailed { .. })
+            ),
+            "digest-mismatched Qwen Component artifact was not rejected: {result:?}"
+        );
+        std::fs::remove_dir_all(directory).expect("temp directory removed");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_fuel_exhaustion_fails_before_planning() {
+        let wat = qwen_component_fixture_wat(
+            r#"(func (export "prefill-node-count") (result i32)
+                (loop $again br $again)
+                i32.const 13)"#,
+            r#"(func (export "decode-node-count") (result i32) i32.const 19)"#,
+            r#"(func (export "provider-authority-count") (result i32) i32.const 0)"#,
+        );
+        let (artifact_path, manifest_path, digest) =
+            write_qwen_component_preflight_fixture("fuel", &wat, None);
+        let directory = artifact_path
+            .parent()
+            .expect("artifact has parent")
+            .to_path_buf();
+        let mut request =
+            trusted_preflight_request_for_temp_component(artifact_path, manifest_path, &digest);
+        request.limits.engine_execution_budget = Some(1_000);
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::ModelComponentFailed { .. })
+            ),
+            "runaway Qwen Component was not stopped by fuel: {result:?}"
+        );
+        std::fs::remove_dir_all(directory).expect("temp directory removed");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_deadline_fails_before_planning() {
+        let wat = qwen_component_count_fixture_wat(19, 19, 0);
+        let (artifact_path, manifest_path, digest) =
+            write_qwen_component_preflight_fixture("deadline", &wat, None);
+        let directory = artifact_path
+            .parent()
+            .expect("artifact has parent")
+            .to_path_buf();
+        let mut request =
+            trusted_preflight_request_for_temp_component(artifact_path, manifest_path, &digest);
+        request.limits.execution_deadline_millis = Some(0);
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::ModelComponentFailed { .. })
+            ),
+            "expired Qwen Component deadline was not rejected: {result:?}"
+        );
+        std::fs::remove_dir_all(directory).expect("temp directory removed");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_invalid_output_fails_before_planning() {
+        let wat = r#"(component
+    (core module $m
+        (func (export "prefill-node-count"))
+        (func (export "decode-node-count") (result i32) i32.const 12)
+        (func (export "provider-authority-count") (result i32) i32.const 0))
+    (core instance $i (instantiate $m))
+    (func (export "prefill-node-count")
+        (canon lift (core func $i "prefill-node-count")))
+    (func (export "decode-node-count") (result u32)
+        (canon lift (core func $i "decode-node-count")))
+    (func (export "provider-authority-count") (result u32)
+        (canon lift (core func $i "provider-authority-count")))
+    (func $prefill-node-count
+        (canon lift (core func $i "prefill-node-count")))
+    (func $decode-node-count (result u32)
+        (canon lift (core func $i "decode-node-count")))
+    (func $provider-authority-count (result u32)
+        (canon lift (core func $i "provider-authority-count")))
+    (instance $qwen-graph-fixture
+        (export "prefill-node-count" (func $prefill-node-count))
+        (export "decode-node-count" (func $decode-node-count))
+        (export "provider-authority-count" (func $provider-authority-count)))
+    (export "magnetar:qwen/graph-fixture@1.0.0" (instance $qwen-graph-fixture)))
+"#;
+        let (artifact_path, manifest_path, digest) =
+            write_qwen_component_preflight_fixture("invalid-output", wat, None);
+        let directory = artifact_path
+            .parent()
+            .expect("artifact has parent")
+            .to_path_buf();
+        let request =
+            trusted_preflight_request_for_temp_component(artifact_path, manifest_path, &digest);
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::GraphValidationFailed { .. })
+            ),
+            "Qwen Component invalid output was not rejected: {result:?}"
+        );
+        std::fs::remove_dir_all(directory).expect("temp directory removed");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_incompatible_graph_fails_before_planning() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        let mut runtime = build_runtime_with_generation_executor(&fixture);
+        let (instance, _memory) =
+            load_fixture_instance(&fixture, &mut runtime).expect("fixture instance loads");
+        let component_graph_semantics = QwenComponentGraphSemantics {
+            prefill_node_count: 99,
+            decode_node_count: 19,
+        };
+
+        let result = prepare_first_native_execution_plans(
+            &runtime,
+            &fixture,
+            &instance,
+            2,
+            Some(component_graph_semantics),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::GraphValidationFailed { .. })
+            ),
+            "Qwen Component/runtime graph mismatch was not rejected"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_provider_authority_fails_before_planning() {
+        let wat = qwen_component_count_fixture_wat(19, 19, 1);
+        let (artifact_path, manifest_path, digest) =
+            write_qwen_component_preflight_fixture("provider-authority", &wat, None);
+        let directory = artifact_path
+            .parent()
+            .expect("artifact has parent")
+            .to_path_buf();
+        let request =
+            trusted_preflight_request_for_temp_component(artifact_path, manifest_path, &digest);
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(result, Err(E2eConformanceError::BoundaryViolation { .. })),
+            "Qwen Component Provider authority was not rejected: {result:?}"
+        );
+        std::fs::remove_dir_all(directory).expect("temp directory removed");
     }
 
     #[test]

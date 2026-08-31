@@ -1,9 +1,9 @@
 (component
     (core module $m
         (func (export "prefill-node-count") (result i32)
-            i32.const 13)
+            i32.const 19)
         (func (export "decode-node-count") (result i32)
-            i32.const 12)
+            i32.const 19)
         (func (export "provider-authority-count") (result i32)
             i32.const 0))
     (core instance $i (instantiate $m))

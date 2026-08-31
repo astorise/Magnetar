@@ -27,7 +27,7 @@
 - [x] 4.2 Validate Component Artifact trust before first-native planning.
 - [x] 4.3 Instantiate the Qwen Component through the configured Component Runtime with Wasmtime limits active.
 - [ ] 4.4 Build the executed graph from the Component output and validate it before planning.
-- [ ] 4.5 Add failure tests for missing artifact, digest mismatch, trust rejection, fuel exhaustion, deadline, invalid output, incompatible graph, and no Provider authority.
+- [x] 4.5 Add failure tests for missing artifact, digest mismatch, trust rejection, fuel exhaustion, deadline, invalid output, incompatible graph, and no Provider authority.
 
 ## 5. Incremental KV Decode
 
@@ -78,7 +78,7 @@
 
 ## Implementation Pause Note
 
-The change is validated and partially implemented. The 19 remaining unchecked tasks are
+The change is validated and partially implemented. The 18 remaining unchecked tasks are
 intentionally left open because they require the production Runtime cutover that
 is still absent from the codebase: Qwen WASM Component output wired into graph
 construction in the SUT, full Provider-dispatched Qwen operator execution as the
