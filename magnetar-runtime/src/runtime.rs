@@ -24,7 +24,7 @@ use crate::compute::{
 };
 use crate::device::{Device, DeviceId};
 use crate::generation::{GenerationModelReference, GenerationRequest};
-use crate::inference_api::{RuntimeGenerationExecutor, SharedRuntimeGenerationExecutor};
+use crate::inference_api::{RuntimeModelExecutionEngine, SharedRuntimeModelExecutionEngine};
 use crate::kernel_registry::KernelRegistry;
 use crate::kv_cache::{
     KvCache, KvCacheCompatibility, KvCacheError, KvCacheId, KvCacheLifecycleState, KvCacheManager,
@@ -168,7 +168,7 @@ impl ExecutionContext {
 pub struct RuntimeBuilder {
     config: RuntimeConfig,
     providers: Vec<Arc<dyn Provider>>,
-    generation_executor: Option<SharedRuntimeGenerationExecutor>,
+    model_execution_engine: Option<SharedRuntimeModelExecutionEngine>,
 }
 impl RuntimeBuilder {
     pub fn new() -> Self {
@@ -182,8 +182,11 @@ impl RuntimeBuilder {
         self.providers.push(x);
         self
     }
-    pub(crate) fn generation_executor(mut self, x: Arc<dyn RuntimeGenerationExecutor>) -> Self {
-        self.generation_executor = Some(SharedRuntimeGenerationExecutor::new(x));
+    pub(crate) fn model_execution_engine(
+        mut self,
+        x: Arc<dyn RuntimeModelExecutionEngine>,
+    ) -> Self {
+        self.model_execution_engine = Some(SharedRuntimeModelExecutionEngine::new(x));
         self
     }
     /// Builds the Runtime.
@@ -243,7 +246,7 @@ impl RuntimeBuilder {
             prefix_caches: PrefixCacheManager::new(),
             kernel_registry,
             providers,
-            generation_executor: self.generation_executor,
+            model_execution_engine: self.model_execution_engine,
             sessions: BTreeMap::new(),
             session_observations: VecDeque::with_capacity(
                 self.config
@@ -265,7 +268,7 @@ pub struct Runtime {
     prefix_caches: PrefixCacheManager,
     kernel_registry: KernelRegistry,
     providers: ProviderLoader,
-    generation_executor: Option<SharedRuntimeGenerationExecutor>,
+    model_execution_engine: Option<SharedRuntimeModelExecutionEngine>,
     sessions: BTreeMap<InferenceSessionId, InferenceSession>,
     session_observations: VecDeque<SessionObservation>,
     dropped_session_observations: u64,
@@ -332,8 +335,8 @@ impl Runtime {
     pub fn providers(&self) -> &ProviderLoader {
         &self.providers
     }
-    pub(crate) fn generation_executor(&self) -> Option<&SharedRuntimeGenerationExecutor> {
-        self.generation_executor.as_ref()
+    pub(crate) fn model_execution_engine(&self) -> Option<&SharedRuntimeModelExecutionEngine> {
+        self.model_execution_engine.as_ref()
     }
     pub fn sessions(&self) -> impl Iterator<Item = &InferenceSession> {
         self.sessions.values()

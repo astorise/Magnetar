@@ -1051,7 +1051,7 @@ pub fn e2e_forward(
 }
 
 #[derive(Clone)]
-struct E2eRuntimeGenerationExecutor {
+struct E2eRuntimeModelExecutionEngine {
     fixture: E2eFixture,
     kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
     #[cfg(test)]
@@ -1062,68 +1062,84 @@ struct E2eRuntimeGenerationExecutor {
 struct FirstNativeExecutionKvState {
     cache: KvCacheId,
     compatibility: KvCacheCompatibility,
+    layer_kv: Vec<FirstNativeLayerKvState>,
 }
 
-impl E2eRuntimeGenerationExecutor {
-    fn request_kv_state(
+#[derive(Clone, Debug)]
+struct FirstNativeLayerKvState {
+    k: HostTensor,
+    v: HostTensor,
+}
+
+impl E2eRuntimeModelExecutionEngine {
+    fn create_prefill_kv_state(
         &self,
         runtime: &mut Runtime,
         request: &GenerationRequest,
-        generated_tokens: &[TokenId],
     ) -> Result<FirstNativeExecutionKvState, InferenceApiError> {
-        let key = request.request_id.as_str().to_string();
-        if generated_tokens.is_empty() {
-            let compatibility = self.kv_compatibility(request);
-            let mut cache = KvCache::new(
-                KvCacheId::new("first-native-temporary-kv").map_err(InferenceApiError::from)?,
-                if request.session.is_some() {
-                    KvCacheScope::Session
-                } else {
-                    KvCacheScope::Operation
-                },
-                compatibility.clone(),
-                KvCacheLayoutMetadata::contiguous(
-                    self.fixture.config.architecture.layer_count as u32,
-                    self.fixture.config.architecture.kv_head_count as u32,
-                    self.fixture.config.architecture.head_dimension as u32,
-                    request
-                        .prompt_token_count
-                        .saturating_add(request.max_new_tokens)
-                        .max(1) as u32,
-                    ComputeDType::Float32,
-                ),
-            );
-            if let Some(session) = &request.session {
-                cache = cache.with_session(session.clone());
-            }
-            let cache_id = runtime.create_kv_cache(cache)?;
-            runtime.prefill_kv_cache_completed(&cache_id, request.prompt_token_count as u32)?;
-            let state = FirstNativeExecutionKvState {
-                cache: cache_id,
-                compatibility,
-            };
-            self.kv_states
-                .lock()
-                .map_err(|_| InferenceApiError::KvCacheUnavailable {
-                    reason: "first-native KV state lock poisoned".into(),
-                })?
-                .insert(key, state.clone());
-            return Ok(state);
+        let compatibility = self.kv_compatibility(request);
+        let mut cache = KvCache::new(
+            KvCacheId::new("first-native-temporary-kv").map_err(InferenceApiError::from)?,
+            if request.session.is_some() {
+                KvCacheScope::Session
+            } else {
+                KvCacheScope::Operation
+            },
+            compatibility.clone(),
+            KvCacheLayoutMetadata::contiguous(
+                self.fixture.config.architecture.layer_count as u32,
+                self.fixture.config.architecture.kv_head_count as u32,
+                self.fixture.config.architecture.head_dimension as u32,
+                request
+                    .prompt_token_count
+                    .saturating_add(request.max_new_tokens)
+                    .max(1) as u32,
+                ComputeDType::Float32,
+            ),
+        );
+        if let Some(session) = &request.session {
+            cache = cache.with_session(session.clone());
         }
+        let cache_id = runtime.create_kv_cache(cache)?;
+        runtime.prefill_kv_cache_completed(&cache_id, request.prompt_token_count as u32)?;
+        Ok(FirstNativeExecutionKvState {
+            cache: cache_id,
+            compatibility,
+            layer_kv: Vec::new(),
+        })
+    }
 
+    fn store_kv_state(
+        &self,
+        request: &GenerationRequest,
+        state: FirstNativeExecutionKvState,
+    ) -> Result<(), InferenceApiError> {
+        self.kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native KV state lock poisoned".into(),
+            })?
+            .insert(request.request_id.as_str().to_string(), state);
+        Ok(())
+    }
+
+    fn decode_kv_state(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+    ) -> Result<FirstNativeExecutionKvState, InferenceApiError> {
         let state = self
             .kv_states
             .lock()
             .map_err(|_| InferenceApiError::KvCacheUnavailable {
                 reason: "first-native KV state lock poisoned".into(),
             })?
-            .get(&key)
+            .get(request.request_id.as_str())
             .cloned()
             .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                 reason: "decode requires existing first-native KV state".into(),
             })?;
         runtime.validate_kv_cache_reuse(&state.cache, &state.compatibility, None)?;
-        runtime.append_decode_kv_cache(&state.cache, 1)?;
         Ok(state)
     }
 
@@ -1701,11 +1717,32 @@ fn dispatch_qwen_attention(
     )
 }
 
-fn execute_qwen_hidden_states_through_dispatch(
+fn concat_rows(a: &HostTensor, b: &HostTensor) -> Result<HostTensor, InferenceApiError> {
+    let (a_rows, a_cols) = a.rows_cols().map_err(runtime_generation_failed)?;
+    let (b_rows, b_cols) = b.rows_cols().map_err(runtime_generation_failed)?;
+    if a_cols != b_cols {
+        return Err(InferenceApiError::GenerationFailed {
+            reason: format!("cannot concatenate tensors with widths {a_cols} and {b_cols}"),
+        });
+    }
+    let mut data = Vec::with_capacity(a.data.len() + b.data.len());
+    data.extend_from_slice(&a.data);
+    data.extend_from_slice(&b.data);
+    HostTensor::new([a_rows + b_rows, a_cols], data).map_err(runtime_generation_failed)
+}
+
+fn execute_qwen_prefill_hidden_states_through_dispatch(
     runtime: &Runtime,
     fixture: &E2eFixture,
     token_ids: &[TokenId],
-) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+) -> Result<
+    (
+        KernelDispatchResult,
+        HostTensor,
+        Vec<FirstNativeLayerKvState>,
+    ),
+    InferenceApiError,
+> {
     if token_ids.is_empty() {
         return Err(InferenceApiError::GenerationFailed {
             reason: "forward pass requires at least one token".into(),
@@ -1757,6 +1794,7 @@ fn execute_qwen_hidden_states_through_dispatch(
         BTreeMap::new(),
     )?;
 
+    let mut layer_kv = Vec::with_capacity(architecture.layer_count as usize);
     for layer in 0..architecture.layer_count {
         let prefix = format!("layers.{layer}.");
         let input_norm = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}input_norm"))
@@ -1838,6 +1876,10 @@ fn execute_qwen_hidden_states_through_dispatch(
             &fixture.config.rope,
             0,
         )?;
+        layer_kv.push(FirstNativeLayerKvState {
+            k: k.clone(),
+            v: v.clone(),
+        });
         let (_dispatch, attention_out) = dispatch_qwen_attention(
             &mut dispatch_ctx,
             &format!("{layer_id}.attention"),
@@ -1915,34 +1957,312 @@ fn execute_qwen_hidden_states_through_dispatch(
     let final_norm = fixture_tensor_by_name(&fixture.weights, "final_norm")
         .map_err(runtime_generation_failed)?
         .clone();
-    dispatch_qwen_rmsnorm(
+    let (dispatch, hidden_states) = dispatch_qwen_rmsnorm(
         &mut dispatch_ctx,
         "final_norm",
         hidden_states,
         final_norm,
         epsilon,
-    )
+    )?;
+    Ok((dispatch, hidden_states, layer_kv))
 }
 
-impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
+fn execute_qwen_decode_hidden_states_through_dispatch(
+    runtime: &Runtime,
+    fixture: &E2eFixture,
+    token_id: TokenId,
+    kv_state: &FirstNativeExecutionKvState,
+    absolute_position: u64,
+) -> Result<
+    (
+        KernelDispatchResult,
+        HostTensor,
+        Vec<FirstNativeLayerKvState>,
+    ),
+    InferenceApiError,
+> {
+    let provider = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime,
+        provider: &provider,
+        memory: &mut memory,
+    };
+    let architecture = &fixture.config.architecture;
+    if kv_state.layer_kv.len() != architecture.layer_count as usize {
+        return Err(InferenceApiError::KvCacheUnavailable {
+            reason: format!(
+                "decode requires {} layer KV entries, found {}",
+                architecture.layer_count,
+                kv_state.layer_kv.len()
+            ),
+        });
+    }
+    let epsilon = fixture.config.rmsnorm_epsilon;
+    let ids_tensor =
+        HostTensor::new([1], vec![token_id as f32]).map_err(runtime_generation_failed)?;
+    let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (_embedding_dispatch, mut hidden_states) = dispatch_reference_cpu_operator(
+        &mut dispatch_ctx,
+        "decode.embedding",
+        dispatch_operator_id("embedding", OperatorFamily::Tensor),
+        vec![
+            (
+                TensorResourceId::new("decode.embedding.table"),
+                f32_tensor_descriptor(&token_embedding),
+                token_embedding,
+            ),
+            (
+                TensorResourceId::new("decode.embedding.ids"),
+                f32_tensor_descriptor(&ids_tensor),
+                ids_tensor,
+            ),
+        ],
+        (
+            TensorResourceId::new("decode.embedding.out"),
+            TensorDescriptor::new(
+                ShapeDescriptor::new([1, architecture.hidden_size]),
+                DTypeDescriptor::portable(ComputeDType::Float32),
+                LayoutDescriptor::Contiguous,
+            ),
+        ),
+        BTreeMap::new(),
+    )?;
+
+    let mut updated_layer_kv = Vec::with_capacity(architecture.layer_count as usize);
+    for layer in 0..architecture.layer_count {
+        let prefix = format!("layers.{layer}.");
+        let input_norm = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}input_norm"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+        let q_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.q_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let k_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.k_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let v_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.v_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let o_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.o_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let post_attn_norm =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}post_attn_norm"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let gate_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.gate_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let up_weight = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.up_proj"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+        let down_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.down_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+
+        let layer_id = format!("decode.layer{layer}");
+        let (_dispatch, normed) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.input_norm"),
+            hidden_states.clone(),
+            input_norm,
+            epsilon,
+        )?;
+        let (_dispatch, q) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.q_proj"),
+            normed.clone(),
+            q_weight,
+        )?;
+        let (_dispatch, k_new) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.k_proj"),
+            normed.clone(),
+            k_weight,
+        )?;
+        let (_dispatch, v_new) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.v_proj"),
+            normed,
+            v_weight,
+        )?;
+        let (_dispatch, q) = dispatch_qwen_rope_per_head(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_q"),
+            &q,
+            architecture.attention_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+            absolute_position,
+        )?;
+        let (_dispatch, k_new) = dispatch_qwen_rope_per_head(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_k"),
+            &k_new,
+            architecture.kv_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+            absolute_position,
+        )?;
+        let historical = &kv_state.layer_kv[layer as usize];
+        let k = concat_rows(&historical.k, &k_new)?;
+        let v = concat_rows(&historical.v, &v_new)?;
+        updated_layer_kv.push(FirstNativeLayerKvState {
+            k: k.clone(),
+            v: v.clone(),
+        });
+        let (_dispatch, attention_out) = dispatch_qwen_attention(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.attention"),
+            q,
+            k,
+            v,
+            architecture,
+        )?;
+        let (_dispatch, attention_proj) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.o_proj"),
+            attention_out,
+            o_weight,
+        )?;
+        let (_dispatch, post_attention) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual1"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            attention_proj,
+            hidden_states,
+        )?;
+        let (_dispatch, normed_mlp) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.post_attn_norm"),
+            post_attention.clone(),
+            post_attn_norm,
+            epsilon,
+        )?;
+        let (_dispatch, gate) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.gate_proj"),
+            normed_mlp.clone(),
+            gate_weight,
+        )?;
+        let (_dispatch, up) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.up_proj"),
+            normed_mlp,
+            up_weight,
+        )?;
+        let (_dispatch, activated) = dispatch_qwen_unary(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.silu"),
+            "silu",
+            OperatorFamily::Activation,
+            gate,
+            BTreeMap::new(),
+        )?;
+        let (_dispatch, gated) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.mul"),
+            "mul",
+            OperatorFamily::Tensor,
+            activated,
+            up,
+        )?;
+        let (_dispatch, mlp_out) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.down_proj"),
+            gated,
+            down_weight,
+        )?;
+        let (_dispatch, layer_out) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual2"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            mlp_out,
+            post_attention,
+        )?;
+        hidden_states = layer_out;
+    }
+
+    let final_norm = fixture_tensor_by_name(&fixture.weights, "final_norm")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (dispatch, hidden_states) = dispatch_qwen_rmsnorm(
+        &mut dispatch_ctx,
+        "decode.final_norm",
+        hidden_states,
+        final_norm,
+        epsilon,
+    )?;
+    Ok((dispatch, hidden_states, updated_layer_kv))
+}
+
+fn dispatch_qwen_logits_projection(
+    runtime: &Runtime,
+    fixture: &E2eFixture,
+    hidden_states: &HostTensor,
+) -> Result<(KernelDispatchResult, Vec<f32>), InferenceApiError> {
+    let token_embedding =
+        fixture_tensor_by_name(&fixture.weights, "token_embedding").map_err(|error| {
+            InferenceApiError::GenerationFailed {
+                reason: error.to_string(),
+            }
+        })?;
+    let token_embedding_transposed = transpose_rows_cols(token_embedding).map_err(|error| {
+        InferenceApiError::GenerationFailed {
+            reason: error.to_string(),
+        }
+    })?;
+    let (dispatch_result, output) =
+        dispatch_matmul(runtime, hidden_states, &token_embedding_transposed)?;
+    let vocab = fixture.config.architecture.vocabulary_size as usize;
+    let output_rows = output.data.len() / vocab;
+    let last_row_start = output_rows.saturating_sub(1) * vocab;
+    Ok((
+        dispatch_result,
+        output.data[last_row_start..last_row_start + vocab].to_vec(),
+    ))
+}
+
+impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
     fn execute_generation_step(
         &self,
         runtime: &mut Runtime,
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
-    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         #[cfg(test)]
         let forced_token = self.forced_token;
         #[cfg(not(test))]
         let forced_token: Option<TokenId> = None;
 
-        let kv_state = self.request_kv_state(runtime, request, generated_tokens)?;
         let vocab = self.fixture.config.architecture.vocabulary_size as usize;
+        let mut kv_state = if generated_tokens.is_empty() {
+            self.create_prefill_kv_state(runtime, request)?
+        } else {
+            self.decode_kv_state(runtime, request)?
+        };
+        let model_input_token_count = if generated_tokens.is_empty() {
+            request.input_token_ids.len()
+        } else {
+            1
+        };
+        let absolute_position = request.input_token_ids.len() + generated_tokens.len();
         let (dispatch_result, logits) = if let Some(token) = forced_token {
             // Test-only deterministic shortcut, never exercised by
             // `validate_e2e_no_shortcuts` (the success path this gate
             // checks is always built without a forced token -- see
-            // `build_runtime_with_generation_executor`). The returned
+            // `build_runtime_with_model_execution_engine`). The returned
             // logits are synthetic by construction; a trivial matmul is
             // still dispatched so the Provider/observability path is
             // exercised, but its output is deliberately not what is
@@ -1957,54 +2277,55 @@ impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
             logits[token as usize] = 10.0;
             (dispatch_result, logits)
         } else {
-            let mut sequence = request.input_token_ids.clone();
-            sequence.extend_from_slice(generated_tokens);
-            let (_hidden_dispatch, normed_final) =
-                execute_qwen_hidden_states_through_dispatch(runtime, &self.fixture, &sequence)?;
-            let token_embedding = fixture_tensor_by_name(&self.fixture.weights, "token_embedding")
-                .map_err(|error| InferenceApiError::GenerationFailed {
-                    reason: error.to_string(),
-                })?;
-            // Tied embeddings: logits = normed_final @ token_embedding^T.
-            // The portable `matmul` Operator's shape rule validates a plain
-            // `a @ b` (it does not consult a `transpose_b` attribute), so
-            // `token_embedding` is physically transposed here rather than
-            // passed with a transpose flag.
-            let token_embedding_transposed =
-                transpose_rows_cols(token_embedding).map_err(|error| {
+            let (_hidden_dispatch, normed_final) = if generated_tokens.is_empty() {
+                let (dispatch, normed_final, layer_kv) =
+                    execute_qwen_prefill_hidden_states_through_dispatch(
+                        runtime,
+                        &self.fixture,
+                        &request.input_token_ids,
+                    )?;
+                kv_state.layer_kv = layer_kv;
+                (dispatch, normed_final)
+            } else {
+                let token = *generated_tokens.last().ok_or_else(|| {
                     InferenceApiError::GenerationFailed {
-                        reason: error.to_string(),
+                        reason: "decode requires a newly admitted token".into(),
                     }
                 })?;
+                let (dispatch, normed_final, layer_kv) =
+                    execute_qwen_decode_hidden_states_through_dispatch(
+                        runtime,
+                        &self.fixture,
+                        token,
+                        &kv_state,
+                        absolute_position as u64,
+                    )?;
+                kv_state.layer_kv = layer_kv;
+                runtime.append_decode_kv_cache(&kv_state.cache, 1)?;
+                (dispatch, normed_final)
+            };
             // The tied-embedding logits projection, dispatched for real:
             // the output tensor read back here is exactly what is returned
             // below, so the evidence this dispatch produces is causally
             // tied to the returned logits rather than to an unrelated proof
             // computation.
-            let (dispatch_result, output) =
-                dispatch_matmul(runtime, &normed_final, &token_embedding_transposed)?;
-            let last_row_start = (sequence.len() - 1) * vocab;
-            (
-                dispatch_result,
-                output.data[last_row_start..last_row_start + vocab].to_vec(),
-            )
+            dispatch_qwen_logits_projection(runtime, &self.fixture, &normed_final)?
         };
+        self.store_kv_state(request, kv_state.clone())?;
         let mut evidence =
             RuntimeGenerationExecutionEvidence::from_dispatch_result(&dispatch_result, true, true)
                 .with_context(format!("request={}", request.request_id))
                 .with_context(format!("decode_step={}", generated_tokens.len()))
+                .with_context(format!("model_input_tokens={model_input_token_count}"))
                 .with_context(format!("kv_cache={}", kv_state.cache))
-                .with_context(format!(
-                    "absolute_position={}",
-                    request.input_token_ids.len() + generated_tokens.len()
-                ));
-        if let Some(session) = &request.session {
-            evidence = evidence.with_context(format!("session={session}"));
-        }
+                .with_context(format!("absolute_position={absolute_position}"));
         if let GenerationModelReference::ModelInstance(instance) = &request.model {
             evidence = evidence.with_context(format!("model_instance={instance}"));
         }
-        Ok(RuntimeGenerationStep::new(logits, evidence))
+        if let Some(session) = &request.session {
+            evidence = evidence.with_context(format!("session={session}"));
+        }
+        Ok(RuntimeModelExecutionStep::new(logits, evidence))
     }
 }
 
@@ -2079,10 +2400,10 @@ fn build_runtime() -> Runtime {
     runtime
 }
 
-fn build_runtime_with_generation_executor(fixture: &E2eFixture) -> Runtime {
+fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
     let mut runtime = Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .generation_executor(std::sync::Arc::new(E2eRuntimeGenerationExecutor {
+        .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
             fixture: fixture.clone(),
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
@@ -2095,13 +2416,13 @@ fn build_runtime_with_generation_executor(fixture: &E2eFixture) -> Runtime {
 }
 
 #[cfg(test)]
-fn build_runtime_with_generation_executor_and_forced_token(
+fn build_runtime_with_model_execution_engine_and_forced_token(
     fixture: &E2eFixture,
     forced_token: Option<TokenId>,
 ) -> Runtime {
     let mut runtime = Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .generation_executor(std::sync::Arc::new(E2eRuntimeGenerationExecutor {
+        .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
             fixture: fixture.clone(),
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             forced_token,
@@ -2704,7 +3025,7 @@ fn run_success_path_with_prompt(
     model_ref: &ModelRef,
     prompt: &str,
 ) -> Result<E2eRunOutcome, E2eConformanceError> {
-    let mut runtime = build_runtime_with_generation_executor(fixture);
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
 
     // Model resolution.
     let mut registry = ModelRegistry::new();
@@ -2794,7 +3115,7 @@ fn run_success_path_with_prompt(
         )?
     };
     let mut prepared_plans = prepare_first_native_execution_plans(
-        &mut runtime,
+        &runtime,
         &instance,
         component_graphs,
         tokenized.token_ids.len() as u64,
@@ -3132,7 +3453,7 @@ fn check_graph_production_and_execution(fixture: &E2eFixture) -> Result<(), E2eC
 }
 
 fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime_with_generation_executor(fixture);
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
@@ -3178,7 +3499,7 @@ fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2e
 
 #[cfg(test)]
 fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime_with_generation_executor_and_forced_token(
+    let mut runtime = build_runtime_with_model_execution_engine_and_forced_token(
         fixture,
         Some(E2E_FIXTURE_EOS_TOKEN),
     );
@@ -3227,7 +3548,7 @@ fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConfo
 }
 
 fn check_generation_cancelled(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime_with_generation_executor(fixture);
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
@@ -3717,6 +4038,86 @@ fn check_kv_cache_diagnostics_redacted() -> Result<(), E2eConformanceError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn check_incremental_decode_matches_full_sequence_oracle(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let runtime = build_runtime();
+    let prompt = vec![1, 2];
+    let admitted = 3;
+    let (_prefill_dispatch, _prefill_hidden, layer_kv) =
+        execute_qwen_prefill_hidden_states_through_dispatch(&runtime, fixture, &prompt)?;
+    let kv_state = FirstNativeExecutionKvState {
+        cache: KvCacheId::new("first-native-oracle-kv").map_err(E2eConformanceError::from)?,
+        compatibility: KvCacheCompatibility::new(
+            GenerationModelReference::LoadedModelContext("qwen-test".into()),
+            TokenizerId::new("qwen-test-tokenizer")?,
+        ),
+        layer_kv,
+    };
+
+    let (_decode_dispatch, decode_hidden, updated_layer_kv) =
+        execute_qwen_decode_hidden_states_through_dispatch(
+            &runtime,
+            fixture,
+            admitted,
+            &kv_state,
+            prompt.len() as u64,
+        )?;
+    let (_logits_dispatch, incremental_logits) =
+        dispatch_qwen_logits_projection(&runtime, fixture, &decode_hidden)?;
+
+    let mut full_sequence = prompt;
+    full_sequence.push(admitted);
+    let oracle_logits = e2e_forward(fixture, &full_sequence)?;
+    for (index, (actual, expected)) in incremental_logits
+        .iter()
+        .zip(oracle_logits.iter())
+        .enumerate()
+    {
+        if (actual - expected).abs() > 1e-4 {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "incremental decode logits diverged at {index}: {actual} != {expected}"
+                ),
+            });
+        }
+    }
+
+    for layer in updated_layer_kv {
+        let (k_rows, _) = layer.k.rows_cols()?;
+        let (v_rows, _) = layer.v.rows_cols()?;
+        if k_rows != full_sequence.len() as u64 || v_rows != full_sequence.len() as u64 {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: "decode did not append exactly one K/V row per layer".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_incremental_decode_rejects_missing_layer_kv(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let runtime = build_runtime();
+    let kv_state = FirstNativeExecutionKvState {
+        cache: KvCacheId::new("first-native-empty-kv").map_err(E2eConformanceError::from)?,
+        compatibility: KvCacheCompatibility::new(
+            GenerationModelReference::LoadedModelContext("qwen-test".into()),
+            TokenizerId::new("qwen-test-tokenizer")?,
+        ),
+        layer_kv: Vec::new(),
+    };
+    match execute_qwen_decode_hidden_states_through_dispatch(&runtime, fixture, 3, &kv_state, 2) {
+        Err(InferenceApiError::KvCacheUnavailable { .. }) => Ok(()),
+        Err(error) => Err(E2eConformanceError::from(error)),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "decode accepted missing layer KV state".into(),
+        }),
+    }
 }
 
 fn check_diagnostics_redaction_on_failure() -> Result<(), E2eConformanceError> {
@@ -4473,7 +4874,7 @@ fn check_chat_message_prompt_path(fixture: &E2eFixture) -> Result<(), E2eConform
 }
 
 fn check_one_shot_session_normal_paths(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime_with_generation_executor(fixture);
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let session_request = SessionCreationRequest {
         model: GenerationModelReference::ModelInstance(instance.clone()),
@@ -4794,7 +5195,7 @@ signatures: []
         let last_row_start = (sequence.len() - 1) * vocab;
         let dispatched_logits = &dispatched_output.data[last_row_start..last_row_start + vocab];
 
-        // What `E2eRuntimeGenerationExecutor::execute_generation_step` returns
+        // What `E2eRuntimeModelExecutionEngine::execute_generation_step` returns
         // for this sequence must equal the dispatch's own output exactly --
         // it is read directly from `dispatched_output`, never recomputed
         // separately -- so this also confirms the dispatch path is numerically
@@ -5092,7 +5493,7 @@ signatures: []
     #[test]
     fn e2e_qwen_component_incompatible_graph_fails_before_planning() {
         let fixture = e2e_fixture().expect("fixture builds");
-        let mut runtime = build_runtime_with_generation_executor(&fixture);
+        let mut runtime = build_runtime_with_model_execution_engine(&fixture);
         let (instance, _memory) =
             load_fixture_instance(&fixture, &mut runtime).expect("fixture instance loads");
         let component_graph_semantics = QwenComponentGraphSemantics {
@@ -5133,6 +5534,20 @@ signatures: []
     #[test]
     fn e2e_kv_cache_diagnostics_redact_raw_contents() {
         check_kv_cache_diagnostics_redacted().expect("cache usage carries no raw contents");
+    }
+
+    #[test]
+    fn e2e_incremental_decode_uses_existing_kv_and_matches_full_sequence_oracle() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        check_incremental_decode_matches_full_sequence_oracle(&fixture)
+            .expect("incremental decode matches full-sequence oracle");
+    }
+
+    #[test]
+    fn e2e_incremental_decode_rejects_missing_layer_kv() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        check_incremental_decode_rejects_missing_layer_kv(&fixture)
+            .expect("decode requires existing layer KV state");
     }
 
     #[test]

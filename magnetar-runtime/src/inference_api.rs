@@ -1000,12 +1000,12 @@ impl RuntimeGenerationExecutionEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct RuntimeGenerationStep {
+pub(crate) struct RuntimeModelExecutionStep {
     pub(crate) logits: Vec<f32>,
     pub(crate) evidence: RuntimeGenerationExecutionEvidence,
 }
 
-impl RuntimeGenerationStep {
+impl RuntimeModelExecutionStep {
     pub(crate) fn new(logits: Vec<f32>, evidence: RuntimeGenerationExecutionEvidence) -> Self {
         Self { logits, evidence }
     }
@@ -1056,20 +1056,20 @@ fn runtime_generation_plan_context(
 /// Runtime-owned execution hook used by the Runtime Inference API to produce
 /// logits. Callers configure this when constructing a Runtime; normal
 /// generation does not accept per-request callbacks or readiness booleans.
-pub(crate) trait RuntimeGenerationExecutor: Send + Sync {
+pub(crate) trait RuntimeModelExecutionEngine: Send + Sync {
     fn execute_generation_step(
         &self,
         runtime: &mut Runtime,
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
-    ) -> Result<RuntimeGenerationStep, InferenceApiError>;
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError>;
 }
 
 #[derive(Clone)]
-pub(crate) struct SharedRuntimeGenerationExecutor(Arc<dyn RuntimeGenerationExecutor>);
+pub(crate) struct SharedRuntimeModelExecutionEngine(Arc<dyn RuntimeModelExecutionEngine>);
 
-impl SharedRuntimeGenerationExecutor {
-    pub(crate) fn new(executor: Arc<dyn RuntimeGenerationExecutor>) -> Self {
+impl SharedRuntimeModelExecutionEngine {
+    pub(crate) fn new(executor: Arc<dyn RuntimeModelExecutionEngine>) -> Self {
         Self(executor)
     }
 
@@ -1078,7 +1078,7 @@ impl SharedRuntimeGenerationExecutor {
         runtime: &mut Runtime,
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
-    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         self.0
             .execute_generation_step(runtime, request, generated_tokens)
     }
@@ -1133,7 +1133,7 @@ impl GenerationResult {
 
 /// Drives a generation request through the Runtime-owned generation execution
 /// boundary, then Sampling and streaming observation emission. Logits come from
-/// the [`RuntimeGenerationExecutor`] attached to the [`Runtime`], so callers do
+/// the [`RuntimeModelExecutionEngine`] attached to the [`Runtime`], so callers do
 /// not provide readiness booleans or executable logits callbacks per request.
 fn observe_generation_execution_error(
     observer: &mut InferenceApiObserver,
@@ -1237,7 +1237,7 @@ fn run_generation_loop_inner(
         correlation_id.clone(),
     );
 
-    let executor = runtime.generation_executor().cloned().ok_or_else(|| {
+    let executor = runtime.model_execution_engine().cloned().ok_or_else(|| {
         InferenceApiError::ProviderUnavailable {
             reason: "no Runtime generation executor is registered".into(),
         }

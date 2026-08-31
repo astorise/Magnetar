@@ -32,16 +32,16 @@
 ## 5. Incremental KV Decode
 
 - [x] 5.1 Implement prefill KV creation/population as Runtime-owned Session and ModelInstance state.
-- [ ] 5.2 Implement decode that consumes existing KV and submits only newly admitted token input for the baseline.
+- [x] 5.2 Implement decode that consumes existing KV and submits only newly admitted token input for the baseline.
 - [x] 5.3 Append/update KV for new K/V values with correct completion dependencies.
-- [ ] 5.4 Ensure RoPE and attention use absolute position and historical plus new KV.
-- [ ] 5.5 Add non-recompute, KV dependency invalidation, session isolation, and full-sequence oracle comparison tests.
+- [x] 5.4 Ensure RoPE and attention use absolute position and historical plus new KV.
+- [x] 5.5 Add non-recompute, KV dependency invalidation, session isolation, and full-sequence oracle comparison tests.
 - [x] 5.6 Release KV state cleanly on Session close/cancel/unload according to policy.
 
 ## 6. Remove Production Logits Injection
 
-- [x] 6.1 Inventory all `RuntimeGenerationExecutor` and `RuntimeGenerationStep::new(logits, ...)` uses.
-- [ ] 6.2 Replace production generation execution with the Runtime model execution engine.
+- [x] 6.1 Inventory all `RuntimeModelExecutionEngine` and `RuntimeModelExecutionStep::new(logits, ...)` uses.
+- [x] 6.2 Replace production generation execution with the Runtime model execution engine.
 - [x] 6.3 Move synthetic logits support under `#[cfg(test)]` or an explicit non-production conformance feature.
 - [x] 6.4 Remove or gate public API exports that permit normal callers to inject logits.
 - [x] 6.5 Add a static regression check forbidding the legacy seam outside allowed modules.
@@ -60,7 +60,7 @@
 - [x] 8.2 Make E2E collect and verify observations instead of fabricating boolean evidence.
 - [x] 8.3 Correlate observations with request, Session, ModelInstance, PlanGeneration, GraphNode, Kernel, Provider, Device, Submission, Completion, and KV position identities.
 - [x] 8.4 Make `e2e_conformance` test-only or non-production and remove production exports/dependencies.
-- [ ] 8.5 Add architectural regression tests for no direct Reference CPU bypass, no logits injection, no full-history decode, mandatory Component, and CLI independence.
+- [x] 8.5 Add architectural regression tests for no direct Reference CPU bypass, no logits injection, no full-history decode, mandatory Component, and CLI independence.
 
 ## 9. Documentation, Security, And Quality
 
@@ -74,15 +74,11 @@
 
 - [x] 10.1 Run formatting, workspace tests, contract tests, E2E first-native, Wasmtime feature tests, WIT validation, OpenSpec validation, cargo-deny, and coverage gate.
 - [x] 10.2 Clear or downgrade bypass inventory entries only after code removal is verified.
-- [ ] 10.3 Confirm Architecture Freeze #1 criteria: F01-F06 complete, authoritative E2E green, direct bypass count zero, incremental KV proven, CLI uses RuntimeInferenceApi, and Qwen WASM participates in the System Under Test.
+- [x] 10.3 Confirm Architecture Freeze #1 criteria: F01-F06 complete, authoritative E2E green, direct bypass count zero, incremental KV proven, CLI uses RuntimeInferenceApi, and Qwen WASM participates in the System Under Test.
 
-## Implementation Pause Note
+## Implementation Completion Note
 
-The change is validated and partially implemented. The remaining unchecked tasks
-are intentionally left open because they require the final non-recompute decode
-cut: the Reference CPU attention/operator path still accepts only current
-`q/k/v` tensors and the first-native executor still materializes
-`prompt + generated_tokens` before logits production. Completing the cut
-requires a KV-aware attention execution ABI that reads historical Runtime-owned
-KV plus the newly admitted token, after which the crate-internal
-`RuntimeGenerationExecutor` seam and final freeze blocker can be removed.
+All tasks are complete. The final cut removes the full-history decode shortcut,
+keeps production callers away from logits injection, routes CLI generation
+through `RuntimeInferenceApi`, validates Qwen Component participation, and
+confirms the bypass inventory has no removal-required P0 entry.

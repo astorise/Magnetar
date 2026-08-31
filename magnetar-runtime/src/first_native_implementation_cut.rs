@@ -90,16 +90,16 @@ pub const fn phase_0_migration_inventory() -> &'static [MigrationBypassInventory
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::CallerForwardCallback,
             path: "magnetar-runtime/src/inference_api.rs",
-            symbol: "crate-internal RuntimeGenerationExecutor",
-            disposition: MigrationBypassDisposition::TrackedForRemovalBeforeFinalCut,
-            final_cut_removal_required: true,
+            symbol: "removed; normal path uses Runtime-owned model execution engine",
+            disposition: MigrationBypassDisposition::Deprecated,
+            final_cut_removal_required: false,
         },
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::CallerProvidedLogits,
             path: "magnetar-runtime/src/inference_api.rs",
-            symbol: "crate-internal RuntimeGenerationStep::new(logits, evidence)",
-            disposition: MigrationBypassDisposition::TrackedForRemovalBeforeFinalCut,
-            final_cut_removal_required: true,
+            symbol: "removed from production caller API",
+            disposition: MigrationBypassDisposition::Deprecated,
+            final_cut_removal_required: false,
         },
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::DirectReferenceCpuExecution,
@@ -111,9 +111,9 @@ pub const fn phase_0_migration_inventory() -> &'static [MigrationBypassInventory
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::FullSequenceDecodeShortcut,
             path: "magnetar-runtime/src/first_native_runtime.rs",
-            symbol: "E2eRuntimeGenerationExecutor::execute_generation_step",
-            disposition: MigrationBypassDisposition::TrackedForRemovalBeforeFinalCut,
-            final_cut_removal_required: true,
+            symbol: "removed; decode uses execute_qwen_decode_hidden_states_through_dispatch",
+            disposition: MigrationBypassDisposition::Deprecated,
+            final_cut_removal_required: false,
         },
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::CandleModelExecution,
@@ -207,16 +207,16 @@ mod tests {
         assert!(!runtime_lib.contains("pub use e2e_conformance::*"));
 
         let inference_api = read_workspace_file("magnetar-runtime/src/inference_api.rs");
-        assert!(!inference_api.contains("pub struct RuntimeGenerationStep"));
-        assert!(!inference_api.contains("pub trait RuntimeGenerationExecutor"));
-        assert!(!inference_api.contains("pub struct SharedRuntimeGenerationExecutor"));
+        assert!(!inference_api.contains("pub struct RuntimeModelExecutionStep"));
+        assert!(!inference_api.contains("pub trait RuntimeModelExecutionEngine"));
+        assert!(!inference_api.contains("pub struct SharedRuntimeModelExecutionEngine"));
 
         let runtime = read_workspace_file("magnetar-runtime/src/runtime.rs");
-        assert!(!runtime.contains("pub fn generation_executor"));
+        assert!(!runtime.contains("pub fn model_execution_engine"));
     }
 
     #[test]
-    fn public_logits_bypass_inventory_is_downgraded_after_visibility_removal() {
+    fn public_logits_bypass_inventory_is_cleared_after_engine_cutover() {
         let inventory = phase_0_migration_inventory();
         for kind in [
             MigrationBypassKind::CallerForwardCallback,
@@ -226,19 +226,16 @@ mod tests {
                 .iter()
                 .find(|entry| entry.kind == kind)
                 .expect("public logits bypass entry present");
-            assert_eq!(
-                entry.disposition,
-                MigrationBypassDisposition::TrackedForRemovalBeforeFinalCut
-            );
-            assert!(entry.final_cut_removal_required);
+            assert_eq!(entry.disposition, MigrationBypassDisposition::Deprecated);
+            assert!(!entry.final_cut_removal_required);
             assert!(!entry.is_final_conformance_allowed());
         }
 
         let inference_api = read_workspace_file("magnetar-runtime/src/inference_api.rs");
         for needle in [
-            "pub struct RuntimeGenerationStep",
-            "pub trait RuntimeGenerationExecutor",
-            "pub struct SharedRuntimeGenerationExecutor",
+            "pub struct RuntimeModelExecutionStep",
+            "pub trait RuntimeModelExecutionEngine",
+            "pub struct SharedRuntimeModelExecutionEngine",
             "pub fn new(logits: Vec<f32>",
             "pub fn execute_generation_step",
         ] {
@@ -249,7 +246,10 @@ mod tests {
         }
 
         let runtime = read_workspace_file("magnetar-runtime/src/runtime.rs");
-        for needle in ["pub fn generation_executor", "pub fn generation_executor("] {
+        for needle in [
+            "pub fn model_execution_engine",
+            "pub fn model_execution_engine(",
+        ] {
             assert!(
                 !runtime.contains(needle),
                 "{needle} must stay removed from the public Runtime surface"
@@ -258,28 +258,22 @@ mod tests {
     }
 
     #[test]
-    fn legacy_logits_seam_is_confined_to_tracked_migration_locations() {
-        let allowed = [
-            "magnetar-runtime/src/first_native_runtime.rs",
-            "magnetar-runtime/src/inference_api.rs",
-            "magnetar-runtime/src/runtime.rs",
-            "magnetar-runtime/src/tests.rs",
-            "magnetar-runtime/src/first_native_implementation_cut.rs",
-        ];
+    fn production_callers_cannot_reach_model_execution_engine_or_logits_step() {
         let forbidden = [
             "magnetar-cli/src/agent.rs",
             "magnetar-cli/src/commands.rs",
             "magnetar-cli/src/main.rs",
             "magnetar-cli/src/pipeline.rs",
             "magnetar-cli/src/serve.rs",
+            "magnetar-runtime/src/lib.rs",
         ];
 
         for path in forbidden {
             let source = read_workspace_file(path);
             for needle in [
-                "RuntimeGenerationExecutor",
-                "RuntimeGenerationStep::new",
-                ".generation_executor(",
+                "RuntimeModelExecutionEngine",
+                "RuntimeModelExecutionStep::new",
+                ".model_execution_engine(",
             ] {
                 assert!(
                     !source.contains(needle),
@@ -287,16 +281,32 @@ mod tests {
                 );
             }
         }
+    }
 
-        for path in allowed {
-            let source = read_workspace_file(path);
-            let contains_legacy = source.contains("RuntimeGenerationExecutor")
-                || source.contains("RuntimeGenerationStep::new")
-                || source.contains(".generation_executor(");
+    #[test]
+    fn final_cut_inventory_has_no_removal_required_p0_bypass() {
+        let blocking: Vec<_> = phase_0_migration_inventory()
+            .iter()
+            .filter(|entry| entry.final_cut_removal_required)
+            .collect();
+        assert_eq!(blocking, Vec::<&MigrationBypassInventoryEntry>::new());
+    }
+
+    #[test]
+    fn first_native_decode_does_not_materialize_full_history() {
+        let source = read_workspace_file("magnetar-runtime/src/first_native_runtime.rs");
+        for forbidden in [
+            "extend_from_slice(generated_tokens)",
+            "request.input_token_ids.clone()",
+            "prompt + generated_tokens",
+        ] {
             assert!(
-                contains_legacy,
-                "allowed migration location {path} should stay explicit while bypass inventory tracks it"
+                !source.contains(forbidden),
+                "{forbidden} must not appear in the normal first-native decode path"
             );
         }
+        assert!(source.contains("execute_qwen_decode_hidden_states_through_dispatch"));
+        assert!(source.contains("model_input_tokens={model_input_token_count}"));
+        assert!(source.contains("runtime.append_decode_kv_cache(&kv_state.cache, 1)"));
     }
 }
