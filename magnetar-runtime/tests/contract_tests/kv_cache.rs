@@ -1,12 +1,16 @@
 use magnetar_runtime::{
-    ComputeDType, DeviceBinding, DeviceId, FallbackClass, GenerationModelReference, KvCache,
-    KvCacheCompatibility, KvCacheError, KvCacheId, KvCacheLayoutMetadata, KvCacheLifecycleState,
-    KvCacheObservationKind, KvCachePageMetadata, KvCachePolicy, KvCacheResidency,
-    KvCacheRetentionPolicy, KvCacheScope, KvCacheSharingPolicy, MemoryAllocationClass,
-    MemoryAllocationState, MemoryManagerConfig, MemoryPlacement, ModelArtifactId,
-    ModelArtifactKind, ModelDigest, ModelName, ModelRevision, PrefixFingerprint, ProviderBinding,
-    ResourceAffinity, Runtime, RuntimeConfig, TokenizerId,
+    ComputeDType, DeviceBinding, DeviceId, FallbackClass, GenerationModelReference,
+    GenerationParameters, GenerationTokenizerReference, KvCache, KvCacheCompatibility,
+    KvCacheError, KvCacheId, KvCacheLayoutMetadata, KvCacheLifecycleState, KvCacheObservationKind,
+    KvCachePageMetadata, KvCachePolicy, KvCacheResidency, KvCacheRetentionPolicy, KvCacheScope,
+    KvCacheSharingPolicy, MemoryAllocationClass, MemoryAllocationState, MemoryManagerConfig,
+    MemoryPlacement, ModelArtifactId, ModelArtifactKind, ModelDigest, ModelInstanceId, ModelName,
+    ModelRevision, PrefixFingerprint, ProviderBinding, ResourceAffinity, Runtime, RuntimeConfig,
+    SessionCreationRequest, SessionMemoryBudget, SessionPolicy, SpecialToken, SpecialTokenKind,
+    TokenIdRange, TokenizerArtifactId, TokenizerFamily, TokenizerId, TokenizerMetadata,
+    TokenizerRevision,
 };
+use std::collections::BTreeSet;
 
 fn model_reference(name: &str) -> GenerationModelReference {
     GenerationModelReference::ModelArtifact(ModelArtifactId::new(
@@ -28,6 +32,50 @@ fn compatibility() -> KvCacheCompatibility {
             "kv-model-r1",
             &tokenizer,
         ))
+}
+
+fn tokenizer_reference() -> GenerationTokenizerReference {
+    GenerationTokenizerReference {
+        tokenizer_id: TokenizerId::new("kv-tokenizer").unwrap(),
+        metadata: TokenizerMetadata {
+            id: TokenizerId::new("kv-tokenizer").unwrap(),
+            artifact: TokenizerArtifactId::new("kv-tokenizer-artifact").unwrap(),
+            digest: ModelDigest::parse(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+            )
+            .unwrap(),
+            revision: TokenizerRevision::new("r1").unwrap(),
+            family: TokenizerFamily::new("fixture").unwrap(),
+            vocabulary_size: 512,
+            added_token_count: 2,
+            token_id_range: TokenIdRange::new(0, 1024),
+            model_max_length: Some(256),
+            special_tokens: vec![
+                SpecialToken::new(SpecialTokenKind::Bos, "<s>", 0),
+                SpecialToken::new(SpecialTokenKind::Eos, "</s>", 256),
+            ],
+            additional_special_tokens: Vec::new(),
+            byte_fallback: true,
+            normalization: Some("identity".into()),
+            pre_tokenizer: Some("bytes".into()),
+            supports_offsets: true,
+            supports_token_type_ids: true,
+            supports_browser: true,
+        },
+    }
+}
+
+fn session_creation_request() -> SessionCreationRequest {
+    SessionCreationRequest {
+        model: model_reference("kv-model"),
+        tokenizer: tokenizer_reference(),
+        generation_defaults: GenerationParameters::default(),
+        policy: SessionPolicy::default(),
+        memory: SessionMemoryBudget::default(),
+        allowed_capabilities: BTreeSet::new(),
+        correlation_id: None,
+        created_at_millis: 0,
+    }
 }
 
 fn cache(scope: KvCacheScope) -> KvCache {
@@ -231,6 +279,45 @@ fn kv_cache_session_policy_can_release_or_retain_on_close() {
     assert_eq!(
         cache.policy.retention,
         KvCacheRetentionPolicy::ReleaseOnSessionClose
+    );
+}
+
+#[test]
+fn kv_cache_releases_session_state_on_cancel() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let session = runtime
+        .create_inference_session(session_creation_request())
+        .unwrap();
+    let cache_id = runtime
+        .create_kv_cache(cache(KvCacheScope::Session).with_session(session.clone()))
+        .unwrap();
+    runtime.prefill_kv_cache_completed(&cache_id, 1).unwrap();
+
+    runtime.cancel_inference_session(&session).unwrap();
+
+    assert_eq!(
+        runtime.kv_cache(&cache_id).unwrap().lifecycle,
+        KvCacheLifecycleState::Released
+    );
+}
+
+#[test]
+fn kv_cache_releases_model_instance_state_on_unload() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let instance = ModelInstanceId::new("kv-model-instance").unwrap();
+    let mut model_cache = cache(KvCacheScope::ModelInstance);
+    model_cache.compatibility.model = GenerationModelReference::ModelInstance(instance.clone());
+    let cache_id = runtime.create_kv_cache(model_cache).unwrap();
+    runtime.prefill_kv_cache_completed(&cache_id, 1).unwrap();
+
+    runtime
+        .kv_caches_mut()
+        .release_model_instance_caches(&instance)
+        .unwrap();
+
+    assert_eq!(
+        runtime.kv_cache(&cache_id).unwrap().lifecycle,
+        KvCacheLifecycleState::Released
     );
 }
 

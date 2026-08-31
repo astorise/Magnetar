@@ -466,6 +466,19 @@ impl Runtime {
         session: &InferenceSessionId,
     ) -> Result<(), SessionError> {
         self.inference_session_mut(session)?.cancel()?;
+        let cache_ids = self.session_kv_cache_ids(session);
+        for cache in &cache_ids {
+            self.release_kv_cache_memory(cache).map_err(|error| {
+                SessionError::ResourceCleanupFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+        }
+        self.kv_caches
+            .release_session_caches(session)
+            .map_err(|error| SessionError::ResourceCleanupFailed {
+                reason: error.to_string(),
+            })?;
         self.observe_session(
             SessionObservationKind::Cancelled,
             Some(session.clone()),
@@ -617,6 +630,28 @@ impl Runtime {
         instance: &ModelInstanceId,
         policy: ModelInstanceUnloadPolicy,
     ) -> Result<ModelInstanceUnloadReport, ModelInstanceError> {
+        self.model_instance(instance)?;
+        let cache_ids = self
+            .kv_caches
+            .caches()
+            .filter(|cache| {
+                cache.compatibility.model
+                    == GenerationModelReference::ModelInstance(instance.clone())
+            })
+            .map(|cache| cache.id.clone())
+            .collect::<Vec<_>>();
+        for cache in &cache_ids {
+            self.release_kv_cache_memory(cache).map_err(|error| {
+                ModelInstanceError::InternalModelInstance {
+                    reason: format!("failed to release model instance KV cache memory: {error}"),
+                }
+            })?;
+        }
+        self.kv_caches
+            .release_model_instance_caches(instance)
+            .map_err(|error| ModelInstanceError::InternalModelInstance {
+                reason: format!("failed to release model instance KV caches: {error}"),
+            })?;
         self.model_instances.unload(instance, policy)
     }
     pub fn admit_generation_to_batch(

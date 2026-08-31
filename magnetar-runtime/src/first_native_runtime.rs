@@ -55,6 +55,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -1052,8 +1053,91 @@ pub fn e2e_forward(
 #[derive(Clone)]
 struct E2eRuntimeGenerationExecutor {
     fixture: E2eFixture,
+    kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
     #[cfg(test)]
     forced_token: Option<TokenId>,
+}
+
+#[derive(Clone, Debug)]
+struct FirstNativeExecutionKvState {
+    cache: KvCacheId,
+    compatibility: KvCacheCompatibility,
+}
+
+impl E2eRuntimeGenerationExecutor {
+    fn request_kv_state(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+    ) -> Result<FirstNativeExecutionKvState, InferenceApiError> {
+        let key = request.request_id.as_str().to_string();
+        if generated_tokens.is_empty() {
+            let compatibility = self.kv_compatibility(request);
+            let mut cache = KvCache::new(
+                KvCacheId::new("first-native-temporary-kv").map_err(InferenceApiError::from)?,
+                if request.session.is_some() {
+                    KvCacheScope::Session
+                } else {
+                    KvCacheScope::Operation
+                },
+                compatibility.clone(),
+                KvCacheLayoutMetadata::contiguous(
+                    self.fixture.config.architecture.layer_count as u32,
+                    self.fixture.config.architecture.kv_head_count as u32,
+                    self.fixture.config.architecture.head_dimension as u32,
+                    request
+                        .prompt_token_count
+                        .saturating_add(request.max_new_tokens)
+                        .max(1) as u32,
+                    ComputeDType::Float32,
+                ),
+            );
+            if let Some(session) = &request.session {
+                cache = cache.with_session(session.clone());
+            }
+            let cache_id = runtime.create_kv_cache(cache)?;
+            runtime.prefill_kv_cache_completed(&cache_id, request.prompt_token_count as u32)?;
+            let state = FirstNativeExecutionKvState {
+                cache: cache_id,
+                compatibility,
+            };
+            self.kv_states
+                .lock()
+                .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                    reason: "first-native KV state lock poisoned".into(),
+                })?
+                .insert(key, state.clone());
+            return Ok(state);
+        }
+
+        let state = self
+            .kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native KV state lock poisoned".into(),
+            })?
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                reason: "decode requires existing first-native KV state".into(),
+            })?;
+        runtime.validate_kv_cache_reuse(&state.cache, &state.compatibility, None)?;
+        runtime.append_decode_kv_cache(&state.cache, 1)?;
+        Ok(state)
+    }
+
+    fn kv_compatibility(&self, request: &GenerationRequest) -> KvCacheCompatibility {
+        KvCacheCompatibility::new(
+            request.model.clone(),
+            request.tokenizer.tokenizer_id.clone(),
+        )
+        .with_prefix_fingerprint(PrefixFingerprint::from_tokens(
+            &request.input_token_ids,
+            request.request_id.as_str(),
+            &request.tokenizer.tokenizer_id,
+        ))
+    }
 }
 
 /// Physically transposes a rank-2 [`HostTensor`], returning a `[cols, rows]`
@@ -1843,7 +1927,7 @@ fn execute_qwen_hidden_states_through_dispatch(
 impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
     fn execute_generation_step(
         &self,
-        runtime: &Runtime,
+        runtime: &mut Runtime,
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
     ) -> Result<RuntimeGenerationStep, InferenceApiError> {
@@ -1852,6 +1936,7 @@ impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
         #[cfg(not(test))]
         let forced_token: Option<TokenId> = None;
 
+        let kv_state = self.request_kv_state(runtime, request, generated_tokens)?;
         let vocab = self.fixture.config.architecture.vocabulary_size as usize;
         let (dispatch_result, logits) = if let Some(token) = forced_token {
             // Test-only deterministic shortcut, never exercised by
@@ -1904,10 +1989,22 @@ impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
                 output.data[last_row_start..last_row_start + vocab].to_vec(),
             )
         };
-        Ok(RuntimeGenerationStep::new(
-            logits,
-            RuntimeGenerationExecutionEvidence::from_dispatch_result(&dispatch_result, true, true),
-        ))
+        let mut evidence =
+            RuntimeGenerationExecutionEvidence::from_dispatch_result(&dispatch_result, true, true)
+                .with_context(format!("request={}", request.request_id))
+                .with_context(format!("decode_step={}", generated_tokens.len()))
+                .with_context(format!("kv_cache={}", kv_state.cache))
+                .with_context(format!(
+                    "absolute_position={}",
+                    request.input_token_ids.len() + generated_tokens.len()
+                ));
+        if let Some(session) = &request.session {
+            evidence = evidence.with_context(format!("session={session}"));
+        }
+        if let GenerationModelReference::ModelInstance(instance) = &request.model {
+            evidence = evidence.with_context(format!("model_instance={instance}"));
+        }
+        Ok(RuntimeGenerationStep::new(logits, evidence))
     }
 }
 
@@ -1963,6 +2060,7 @@ pub fn validate_e2e_no_shortcuts(
 struct E2eRunOutcome {
     generation_result: GenerationResult,
     observer: InferenceApiObserver,
+    kv_observations: Vec<KvCacheObservation>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1986,6 +2084,7 @@ fn build_runtime_with_generation_executor(fixture: &E2eFixture) -> Runtime {
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
         .generation_executor(std::sync::Arc::new(E2eRuntimeGenerationExecutor {
             fixture: fixture.clone(),
+            kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
             forced_token: None,
         }))
@@ -2004,6 +2103,7 @@ fn build_runtime_with_generation_executor_and_forced_token(
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
         .generation_executor(std::sync::Arc::new(E2eRuntimeGenerationExecutor {
             fixture: fixture.clone(),
+            kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             forced_token,
         }))
         .build()
@@ -2176,6 +2276,40 @@ impl QwenComponentGraphSemantics {
         }
         Ok(())
     }
+}
+
+struct FirstNativeComponentGraphs {
+    prefill: ExecutionGraph,
+    prefill_node_count: usize,
+    decode: ExecutionGraph,
+    decode_node_count: usize,
+}
+
+fn build_first_native_graphs_from_component_output(
+    fixture: &E2eFixture,
+    prompt_token_count: u64,
+    component_graph_semantics: QwenComponentGraphSemantics,
+) -> Result<FirstNativeComponentGraphs, E2eConformanceError> {
+    let prefill = qwen_prefill_graph(
+        &fixture.config,
+        &fixture.identity,
+        prompt_token_count.max(1),
+        true,
+    )?;
+    let decode = qwen_decode_graph(
+        &fixture.config,
+        &fixture.identity,
+        prompt_token_count.max(1),
+    )?;
+    component_graph_semantics.validate_against_graphs(&prefill.graph, &decode.graph)?;
+    validate_first_scope_graph(&prefill.graph)?;
+    validate_first_scope_graph(&decode.graph)?;
+    Ok(FirstNativeComponentGraphs {
+        prefill_node_count: prefill.graph.nodes.len(),
+        decode_node_count: decode.graph.nodes.len(),
+        prefill: prefill.graph,
+        decode: decode.graph,
+    })
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -2530,49 +2664,31 @@ fn merge_kernel_managed_kv_requirement(
 
 fn prepare_first_native_execution_plans(
     runtime: &Runtime,
-    fixture: &E2eFixture,
     instance: &ModelInstanceId,
+    graphs: FirstNativeComponentGraphs,
     prompt_token_count: u64,
-    component_graph_semantics: Option<QwenComponentGraphSemantics>,
 ) -> Result<FirstNativePreparedPlans, E2eConformanceError> {
     let status = require_ready_first_native_instance(runtime, instance)?;
     let mutation_version = status.status().mutation_version;
-    let prefill = qwen_prefill_graph(
-        &fixture.config,
-        &fixture.identity,
-        prompt_token_count.max(1),
-        true,
-    )?;
-    let decode = qwen_decode_graph(
-        &fixture.config,
-        &fixture.identity,
-        prompt_token_count.max(1),
-    )?;
-
-    let prefill_node_count = prefill.graph.nodes.len();
-    let decode_node_count = decode.graph.nodes.len();
-    if let Some(component_graph_semantics) = component_graph_semantics {
-        component_graph_semantics.validate_against_graphs(&prefill.graph, &decode.graph)?;
-    }
     Ok(FirstNativePreparedPlans {
         prefill: prepare_first_native_plan_for_graph(
             runtime,
-            &prefill.graph,
+            &graphs.prefill,
             instance,
             mutation_version,
             prompt_token_count,
             PreparedExecutionPlanGeneration::new(1),
         )?,
-        prefill_node_count,
+        prefill_node_count: graphs.prefill_node_count,
         decode: prepare_first_native_plan_for_graph(
             runtime,
-            &decode.graph,
+            &graphs.decode,
             instance,
             mutation_version,
             1,
             PreparedExecutionPlanGeneration::new(1),
         )?,
-        decode_node_count,
+        decode_node_count: graphs.decode_node_count,
     })
 }
 
@@ -2585,15 +2701,15 @@ fn generation_tokenizer_reference(fixture: &E2eFixture) -> GenerationTokenizerRe
 
 fn run_success_path_with_prompt(
     fixture: &E2eFixture,
+    model_ref: &ModelRef,
     prompt: &str,
 ) -> Result<E2eRunOutcome, E2eConformanceError> {
     let mut runtime = build_runtime_with_generation_executor(fixture);
 
     // Model resolution.
     let mut registry = ModelRegistry::new();
-    let model_ref = ModelRef::new("e2e-fixture-model")?;
     registry.register(model_ref.clone(), fixture.manifest.id.clone());
-    let resolution = registry.resolve(&ModelResolutionRequest::new(model_ref))?;
+    let resolution = registry.resolve(&ModelResolutionRequest::new(model_ref.clone()))?;
     if resolution.artifact != fixture.manifest.id {
         return Err(E2eConformanceError::ModelResolutionFailed {
             reason: "resolved artifact does not match fixture manifest".into(),
@@ -2623,26 +2739,65 @@ fn run_success_path_with_prompt(
         TokenizationRequest::new(PromptInput::PlainText(prompt.into())),
         None,
     )?;
+    let mut observer = InferenceApiObserver::new();
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-    let component_graph_semantics = {
+    let component_graphs = {
         let preflight =
             validate_and_instantiate_trusted_qwen_component_before_first_native_planning()?;
+        observer.observe(
+            InferenceApiObservationKind::ComponentValidated,
+            format!("component_definition={:?}", preflight.definition),
+            None,
+        );
+        observer.observe(
+            InferenceApiObservationKind::ComponentInstantiated,
+            format!("component_instance={:?}", preflight.instance),
+            None,
+        );
         let graph_semantics = preflight.graph_semantics;
         let _component_preflight = (
             preflight.definition,
             preflight.instance,
             preflight.observations.len(),
         );
-        Some(graph_semantics)
+        build_first_native_graphs_from_component_output(
+            fixture,
+            tokenized.token_ids.len() as u64,
+            graph_semantics,
+        )?
     };
     #[cfg(not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")))]
-    let component_graph_semantics = None;
+    let component_graphs = {
+        let semantics = QwenComponentGraphSemantics {
+            prefill_node_count: qwen_prefill_graph(
+                &fixture.config,
+                &fixture.identity,
+                tokenized.token_ids.len().max(1) as u64,
+                true,
+            )?
+            .graph
+            .nodes
+            .len(),
+            decode_node_count: qwen_decode_graph(
+                &fixture.config,
+                &fixture.identity,
+                tokenized.token_ids.len().max(1) as u64,
+            )?
+            .graph
+            .nodes
+            .len(),
+        };
+        build_first_native_graphs_from_component_output(
+            fixture,
+            tokenized.token_ids.len() as u64,
+            semantics,
+        )?
+    };
     let mut prepared_plans = prepare_first_native_execution_plans(
-        &runtime,
-        fixture,
+        &mut runtime,
         &instance,
+        component_graphs,
         tokenized.token_ids.len() as u64,
-        component_graph_semantics,
     )?;
     let _plan_generations = (
         prepared_plans.prefill.generation,
@@ -2672,13 +2827,12 @@ fn run_success_path_with_prompt(
     let request = prepare_generation(&runtime, request)?;
 
     // Prefill/decode/sample/stream through the real forward pass.
-    let mut observer = InferenceApiObserver::new();
     let mut execution_plans = RuntimeGenerationExecutionPlans {
         prefill: &mut prepared_plans.prefill,
         decode: &mut prepared_plans.decode,
     };
     let generation_result = run_generation_loop_with_execution_plans(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -2709,6 +2863,7 @@ fn run_success_path_with_prompt(
     let generation_result = generation_result.with_decoded_text(decoded_text);
 
     // Session close + Model Instance cleanup.
+    let kv_observations = runtime.kv_caches().observations().to_vec();
     close_inference_session(&mut runtime, &session)?;
     unload_model_instance(
         &mut runtime,
@@ -2720,6 +2875,7 @@ fn run_success_path_with_prompt(
     Ok(E2eRunOutcome {
         generation_result,
         observer,
+        kv_observations,
     })
 }
 
@@ -2727,14 +2883,23 @@ fn run_success_path_with_prompt(
 /// session, tokenize (plain text), generate through a real Reference CPU
 /// forward pass with greedy Sampling, stream, close session, cleanup.
 fn run_success_path(fixture: &E2eFixture) -> Result<E2eRunOutcome, E2eConformanceError> {
-    run_success_path_with_prompt(fixture, "hi")
+    run_success_path_with_prompt(fixture, &ModelRef::new("qwen-test")?, "hi")
 }
 
 pub fn run_first_native_fixture_generation(
     prompt: &str,
 ) -> Result<FirstNativeFixtureGeneration, E2eConformanceError> {
     let fixture = e2e_fixture()?;
-    let outcome = run_success_path_with_prompt(&fixture, prompt)?;
+    let outcome = run_success_path_with_prompt(&fixture, &ModelRef::new("qwen-test")?, prompt)?;
+    if !outcome
+        .kv_observations
+        .iter()
+        .any(|observation| observation.kind == KvCacheObservationKind::PrefillCompleted)
+    {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "first native fixture generation produced no KV prefill commit".into(),
+        });
+    }
     validate_e2e_no_shortcuts(
         outcome.observer.observations(),
         &reference_cpu_kernel_advertisements(),
@@ -2760,7 +2925,28 @@ pub fn run_first_native_generation(
     if model_ref.as_str() != "qwen-test" {
         return Err(FirstNativeRuntimeError::model_not_found(model_ref));
     }
-    run_first_native_fixture_generation(prompt).map_err(FirstNativeRuntimeError::from_conformance)
+    let fixture = e2e_fixture().map_err(FirstNativeRuntimeError::from_conformance)?;
+    let outcome = run_success_path_with_prompt(&fixture, model_ref, prompt)
+        .map_err(FirstNativeRuntimeError::from_conformance)?;
+    validate_e2e_no_shortcuts(
+        outcome.observer.observations(),
+        &reference_cpu_kernel_advertisements(),
+    )
+    .map_err(FirstNativeRuntimeError::from_conformance)?;
+    let text = outcome
+        .generation_result
+        .decoded_text
+        .clone()
+        .ok_or_else(|| {
+            FirstNativeRuntimeError::from_conformance(E2eConformanceError::StreamingFailed {
+                reason: "first native generation produced no decoded text".into(),
+            })
+        })?;
+    Ok(FirstNativeFixtureGeneration {
+        text,
+        result: outcome.generation_result,
+        observer: outcome.observer,
+    })
 }
 
 fn check_success_path(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
@@ -2967,7 +3153,7 @@ fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2e
     let request = prepare_generation(&runtime, request)?;
     let mut observer = InferenceApiObserver::new();
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -3022,7 +3208,7 @@ fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConfo
     let request = prepare_generation(&runtime, request)?;
     let mut observer = InferenceApiObserver::new();
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -3062,7 +3248,7 @@ fn check_generation_cancelled(fixture: &E2eFixture) -> Result<(), E2eConformance
     let request = prepare_generation(&runtime, request)?;
     let mut observer = InferenceApiObserver::new();
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -3204,7 +3390,15 @@ fn check_invalidated_prepared_plan_rejects_new_work(
 ) -> Result<(), E2eConformanceError> {
     let mut runtime = build_runtime();
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
-    let mut plans = prepare_first_native_execution_plans(&runtime, fixture, &instance, 2, None)?;
+    let graphs = build_first_native_graphs_from_component_output(
+        fixture,
+        2,
+        QwenComponentGraphSemantics {
+            prefill_node_count: 19,
+            decode_node_count: 19,
+        },
+    )?;
+    let mut plans = prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)?;
     plans
         .decode
         .hard_invalidate(crate::kernel_execution_plan::PlanRebuildReason::KernelRevoked)?;
@@ -3226,7 +3420,15 @@ fn check_qwen_graph_nodes_have_prepared_kernel_bindings(
 ) -> Result<(), E2eConformanceError> {
     let mut runtime = build_runtime();
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
-    let plans = prepare_first_native_execution_plans(&runtime, fixture, &instance, 2, None)?;
+    let graphs = build_first_native_graphs_from_component_output(
+        fixture,
+        2,
+        QwenComponentGraphSemantics {
+            prefill_node_count: 19,
+            decode_node_count: 19,
+        },
+    )?;
+    let plans = prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)?;
 
     for (plan, expected_node_count) in [
         (&plans.prefill, plans.prefill_node_count),
@@ -4310,7 +4512,7 @@ fn check_one_shot_session_normal_paths(fixture: &E2eFixture) -> Result<(), E2eCo
     let request = prepare_generation(&runtime, request)?;
     let mut observer = InferenceApiObserver::new();
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -4898,13 +5100,11 @@ signatures: []
             decode_node_count: 19,
         };
 
-        let result = prepare_first_native_execution_plans(
-            &runtime,
-            &fixture,
-            &instance,
-            2,
-            Some(component_graph_semantics),
-        );
+        let result =
+            build_first_native_graphs_from_component_output(&fixture, 2, component_graph_semantics)
+                .and_then(|graphs| {
+                    prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)
+                });
 
         assert!(
             matches!(
@@ -5333,5 +5533,67 @@ signatures: []
                 "missing lifecycle observation marker: {marker}"
             );
         }
+    }
+
+    #[test]
+    fn e2e_authoritative_path_collects_correlated_runtime_observations() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        let outcome = run_success_path(&fixture).expect("success path runs");
+        let observations = outcome.observer.observations();
+        for kind in [
+            InferenceApiObservationKind::ComponentValidated,
+            InferenceApiObservationKind::ComponentInstantiated,
+            InferenceApiObservationKind::ModelInstanceReady,
+            InferenceApiObservationKind::GraphValidationCompleted,
+            InferenceApiObservationKind::PlanSelected,
+            InferenceApiObservationKind::PlanGuardAccepted,
+            InferenceApiObservationKind::KernelResolved,
+            InferenceApiObservationKind::KernelPrepared,
+            InferenceApiObservationKind::ProviderSubmitted,
+            InferenceApiObservationKind::ProviderCompleted,
+            InferenceApiObservationKind::LogitsProduced,
+            InferenceApiObservationKind::SamplingCompleted,
+            InferenceApiObservationKind::TokenCommitted,
+        ] {
+            assert!(
+                observations
+                    .iter()
+                    .any(|observation| observation.kind == kind),
+                "missing authoritative observation {kind:?}"
+            );
+        }
+        assert!(observations.iter().any(|observation| {
+            observation.kind == InferenceApiObservationKind::PlanSelected
+                && observation.message.contains("request=e2e-success-path")
+                && observation.message.contains("plan_generation=")
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.kind == InferenceApiObservationKind::KernelResolved
+                && observation.message.contains("kernel=")
+                && observation.message.contains("provider=")
+                && observation.message.contains("model_instance=")
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.kind == InferenceApiObservationKind::PlanSelected
+                && observation.message.contains("phase=decode")
+                && observation.message.contains("kv_position=")
+        }));
+        assert!(
+            outcome
+                .kv_observations
+                .iter()
+                .any(|observation| observation.kind == KvCacheObservationKind::PrefillCompleted)
+        );
+        assert!(
+            outcome
+                .kv_observations
+                .iter()
+                .any(|observation| observation.kind == KvCacheObservationKind::DecodeAppend)
+        );
+        assert!(outcome.kv_observations.iter().all(|observation| {
+            !observation.raw_prompt_available
+                && !observation.raw_cache_available
+                && !observation.raw_provider_handle_available
+        }));
     }
 }

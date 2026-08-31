@@ -26,17 +26,17 @@
 - [x] 4.1 Add or generate an executable Qwen WASM Component Artifact fixture.
 - [x] 4.2 Validate Component Artifact trust before first-native planning.
 - [x] 4.3 Instantiate the Qwen Component through the configured Component Runtime with Wasmtime limits active.
-- [ ] 4.4 Build the executed graph from the Component output and validate it before planning.
+- [x] 4.4 Build the executed graph from the Component output and validate it before planning.
 - [x] 4.5 Add failure tests for missing artifact, digest mismatch, trust rejection, fuel exhaustion, deadline, invalid output, incompatible graph, and no Provider authority.
 
 ## 5. Incremental KV Decode
 
-- [ ] 5.1 Implement prefill KV creation/population as Runtime-owned Session and ModelInstance state.
+- [x] 5.1 Implement prefill KV creation/population as Runtime-owned Session and ModelInstance state.
 - [ ] 5.2 Implement decode that consumes existing KV and submits only newly admitted token input for the baseline.
-- [ ] 5.3 Append/update KV for new K/V values with correct completion dependencies.
+- [x] 5.3 Append/update KV for new K/V values with correct completion dependencies.
 - [ ] 5.4 Ensure RoPE and attention use absolute position and historical plus new KV.
 - [ ] 5.5 Add non-recompute, KV dependency invalidation, session isolation, and full-sequence oracle comparison tests.
-- [ ] 5.6 Release KV state cleanly on Session close/cancel/unload according to policy.
+- [x] 5.6 Release KV state cleanly on Session close/cancel/unload according to policy.
 
 ## 6. Remove Production Logits Injection
 
@@ -48,17 +48,17 @@
 
 ## 7. CLI Runtime Cutover
 
-- [ ] 7.1 Resolve `model_ref` through production model resolution for `run`, `chat`, `serve`, and agent generation.
-- [ ] 7.2 Load or reuse the resolved Model Artifact and create/reuse a ready ModelInstance.
-- [ ] 7.3 Create Runtime Inference Sessions and submit prompt/generation requests through RuntimeInferenceApi only.
+- [x] 7.1 Resolve `model_ref` through production model resolution for `run`, `chat`, `serve`, and agent generation.
+- [x] 7.2 Load or reuse the resolved Model Artifact and create/reuse a ready ModelInstance.
+- [x] 7.3 Create Runtime Inference Sessions and submit prompt/generation requests through RuntimeInferenceApi only.
 - [x] 7.4 Map model-not-found, artifact-invalid, trust-rejected, load-failed, component-load-failed, provider-unavailable, plan-unavailable, generation-failed, and generation-cancelled errors.
 - [x] 7.5 Add CLI tests proving distinct model_ref values are not ignored and no CLI code calls Provider/Kernel/Reference CPU APIs.
 
 ## 8. Runtime-Owned Evidence And E2E Isolation
 
-- [ ] 8.1 Emit bounded observations from Component validation, Component instantiation, ModelInstance readiness, graph validation, plan selection, guard acceptance, Kernel resolution, Kernel preparation, Provider submission/completion, KV commits, logits production, Sampling, and token commit.
-- [ ] 8.2 Make E2E collect and verify observations instead of fabricating boolean evidence.
-- [ ] 8.3 Correlate observations with request, Session, ModelInstance, PlanGeneration, GraphNode, Kernel, Provider, Device, Submission, Completion, and KV position identities.
+- [x] 8.1 Emit bounded observations from Component validation, Component instantiation, ModelInstance readiness, graph validation, plan selection, guard acceptance, Kernel resolution, Kernel preparation, Provider submission/completion, KV commits, logits production, Sampling, and token commit.
+- [x] 8.2 Make E2E collect and verify observations instead of fabricating boolean evidence.
+- [x] 8.3 Correlate observations with request, Session, ModelInstance, PlanGeneration, GraphNode, Kernel, Provider, Device, Submission, Completion, and KV position identities.
 - [x] 8.4 Make `e2e_conformance` test-only or non-production and remove production exports/dependencies.
 - [ ] 8.5 Add architectural regression tests for no direct Reference CPU bypass, no logits injection, no full-history decode, mandatory Component, and CLI independence.
 
@@ -78,11 +78,11 @@
 
 ## Implementation Pause Note
 
-The change is validated and partially implemented. The 16 remaining unchecked tasks are
-intentionally left open because they require the production Runtime cutover that
-is still absent from the codebase: Qwen WASM Component output exposed as an
-execution graph rather than only scalar graph counters, incremental KV decode
-owned by Runtime Session/ModelInstance state, replacement of the remaining
-crate-internal RuntimeGenerationExecutor execution path, CLI model_ref
-resolution/load/session cutover through production RuntimeInferenceApi, and
-runtime-owned observation/correlation evidence.
+The change is validated and partially implemented. The remaining unchecked tasks
+are intentionally left open because they require the final non-recompute decode
+cut: the Reference CPU attention/operator path still accepts only current
+`q/k/v` tensors and the first-native executor still materializes
+`prompt + generated_tokens` before logits production. Completing the cut
+requires a KV-aware attention execution ABI that reads historical Runtime-owned
+KV plus the newly admitted token, after which the crate-internal
+`RuntimeGenerationExecutor` seam and final freeze blocker can be removed.

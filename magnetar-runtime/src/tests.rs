@@ -6184,13 +6184,13 @@ struct TestGenerationExecutor {
 impl RuntimeGenerationExecutor for TestGenerationExecutor {
     fn execute_generation_step(
         &self,
-        _runtime: &Runtime,
+        _runtime: &mut Runtime,
         _request: &GenerationRequest,
         generated_tokens: &[TokenId],
     ) -> Result<RuntimeGenerationStep, InferenceApiError> {
         let mut logits = vec![0.0f32; self.vocabulary_size];
         logits[(11 + generated_tokens.len()) % self.vocabulary_size] = 10.0;
-        Ok(RuntimeGenerationStep::new(logits, self.evidence))
+        Ok(RuntimeGenerationStep::new(logits, self.evidence.clone()))
     }
 }
 
@@ -6200,7 +6200,7 @@ struct FailingGenerationExecutor;
 impl RuntimeGenerationExecutor for FailingGenerationExecutor {
     fn execute_generation_step(
         &self,
-        _runtime: &Runtime,
+        _runtime: &mut Runtime,
         _request: &GenerationRequest,
         _generated_tokens: &[TokenId],
     ) -> Result<RuntimeGenerationStep, InferenceApiError> {
@@ -6216,7 +6216,7 @@ struct FailingKernelGenerationExecutor;
 impl RuntimeGenerationExecutor for FailingKernelGenerationExecutor {
     fn execute_generation_step(
         &self,
-        _runtime: &Runtime,
+        _runtime: &mut Runtime,
         _request: &GenerationRequest,
         _generated_tokens: &[TokenId],
     ) -> Result<RuntimeGenerationStep, InferenceApiError> {
@@ -8670,7 +8670,7 @@ fn inference_api_session_close_transitions_lifecycle_to_closed() {
     close_inference_session(&mut runtime, &session).unwrap();
 
     let status = session_status(
-        &runtime,
+        &mut runtime,
         &session,
         &SessionAccessPolicy::authorize(session.clone()),
     )
@@ -8758,7 +8758,7 @@ fn inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contrac
     // session-bound generation would use.
     let mut observer = InferenceApiObserver::new();
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &prepared,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -9219,14 +9219,14 @@ fn inference_api_run_generation_loop_emits_full_streaming_lifecycle_and_complete
     request.max_new_tokens = 2;
     let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
 
-    let runtime = runtime_with_generation_executor(
+    let mut runtime = runtime_with_generation_executor(
         vocabulary_size,
         RuntimeGenerationExecutionEvidence::complete(),
     );
     let mut observer = InferenceApiObserver::new();
 
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary {
@@ -9274,14 +9274,14 @@ fn inference_api_run_generation_loop_cancels_during_decode() {
     request.max_new_tokens = 5;
     let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
 
-    let runtime = runtime_with_generation_executor(
+    let mut runtime = runtime_with_generation_executor(
         vocabulary_size,
         RuntimeGenerationExecutionEvidence::complete(),
     );
     let mut observer = InferenceApiObserver::new();
 
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -9308,7 +9308,7 @@ fn inference_api_run_generation_loop_rejects_incomplete_executor_evidence_before
     request.parameters = GenerationParameters::greedy();
     request.stop_conditions = StopConditions::default();
     let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
-    let runtime = runtime_with_generation_executor(
+    let mut runtime = runtime_with_generation_executor(
         vocabulary_size,
         RuntimeGenerationExecutionEvidence {
             model_instance_ready: true,
@@ -9317,12 +9317,13 @@ fn inference_api_run_generation_loop_rejects_incomplete_executor_evidence_before
             kernel_dispatched: false,
             provider_executed: false,
             tensor_resource_used: false,
+            context: Vec::new(),
         },
     );
     let mut observer = InferenceApiObserver::new();
 
     let error = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -9351,7 +9352,7 @@ fn inference_api_run_generation_loop_observes_executor_failure_before_returning(
     let mut request = generation_request();
     request.parameters = GenerationParameters::greedy();
     request.stop_conditions = StopConditions::default();
-    let runtime = Runtime::builder()
+    let mut runtime = Runtime::builder()
         .register_provider(Arc::new(ReferenceCpuProvider::new()))
         .generation_executor(Arc::new(FailingGenerationExecutor))
         .build()
@@ -9359,7 +9360,7 @@ fn inference_api_run_generation_loop_observes_executor_failure_before_returning(
     let mut observer = InferenceApiObserver::new();
 
     let error = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -9389,9 +9390,9 @@ fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
     request.parameters = GenerationParameters::greedy();
     request.stop_conditions = StopConditions::default();
     let mut observer = InferenceApiObserver::new();
-    let runtime = Runtime::builder().build().unwrap();
+    let mut runtime = Runtime::builder().build().unwrap();
     let error = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -9419,13 +9420,13 @@ fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
 
     request.request_id = GenerationRequestId::new("gen-2").unwrap();
     let mut observer = InferenceApiObserver::new();
-    let runtime = Runtime::builder()
+    let mut runtime = Runtime::builder()
         .register_provider(Arc::new(ReferenceCpuProvider::new()))
         .generation_executor(Arc::new(FailingKernelGenerationExecutor))
         .build()
         .unwrap();
     let error = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),

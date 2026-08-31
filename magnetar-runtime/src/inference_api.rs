@@ -893,7 +893,7 @@ pub struct CacheUsageSummary {
 
 /// Runtime-produced evidence that one generation step used the architectural
 /// execution path instead of a caller-owned logits shortcut.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeGenerationExecutionEvidence {
     pub(crate) model_instance_ready: bool,
     pub(crate) graph_validated: bool,
@@ -901,10 +901,11 @@ pub struct RuntimeGenerationExecutionEvidence {
     pub(crate) kernel_dispatched: bool,
     pub(crate) provider_executed: bool,
     pub(crate) tensor_resource_used: bool,
+    pub(crate) context: Vec<String>,
 }
 
 impl RuntimeGenerationExecutionEvidence {
-    pub const fn untrusted() -> Self {
+    pub fn untrusted() -> Self {
         Self {
             model_instance_ready: false,
             graph_validated: false,
@@ -912,11 +913,12 @@ impl RuntimeGenerationExecutionEvidence {
             kernel_dispatched: false,
             provider_executed: false,
             tensor_resource_used: false,
+            context: Vec::new(),
         }
     }
 
     #[cfg(test)]
-    pub(crate) const fn complete() -> Self {
+    pub(crate) fn complete() -> Self {
         Self {
             model_instance_ready: true,
             graph_validated: true,
@@ -924,6 +926,7 @@ impl RuntimeGenerationExecutionEvidence {
             kernel_dispatched: true,
             provider_executed: true,
             tensor_resource_used: true,
+            context: Vec::new(),
         }
     }
 
@@ -980,7 +983,19 @@ impl RuntimeGenerationExecutionEvidence {
             kernel_dispatched: dispatch_succeeded,
             provider_executed: dispatch_succeeded,
             tensor_resource_used,
+            context: vec![
+                format!("kernel={}", dispatch.selected_kernel.stable_key()),
+                format!("provider={}", dispatch.provider),
+            ],
         }
+    }
+
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        let context = context.into();
+        if !context.is_empty() && self.context.len() < 16 {
+            self.context.push(context);
+        }
+        self
     }
 }
 
@@ -1044,7 +1059,7 @@ fn runtime_generation_plan_context(
 pub(crate) trait RuntimeGenerationExecutor: Send + Sync {
     fn execute_generation_step(
         &self,
-        runtime: &Runtime,
+        runtime: &mut Runtime,
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
     ) -> Result<RuntimeGenerationStep, InferenceApiError>;
@@ -1060,7 +1075,7 @@ impl SharedRuntimeGenerationExecutor {
 
     pub(crate) fn execute_generation_step(
         &self,
-        runtime: &Runtime,
+        runtime: &mut Runtime,
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
     ) -> Result<RuntimeGenerationStep, InferenceApiError> {
@@ -1149,8 +1164,21 @@ fn observe_generation_execution_error(
     );
 }
 
+fn observation_message(base: &str, context: &[String]) -> String {
+    if context.is_empty() {
+        return base.to_string();
+    }
+    let bounded = context
+        .iter()
+        .take(8)
+        .map(|item| item.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{base}; {bounded}")
+}
+
 pub fn run_generation_loop(
-    runtime: &Runtime,
+    runtime: &mut Runtime,
     request: &GenerationRequest,
     sampling_policy: SamplingPolicy,
     cache_usage: CacheUsageSummary,
@@ -1169,7 +1197,7 @@ pub fn run_generation_loop(
 }
 
 pub(crate) fn run_generation_loop_with_execution_plans(
-    runtime: &Runtime,
+    runtime: &mut Runtime,
     request: &GenerationRequest,
     sampling_policy: SamplingPolicy,
     cache_usage: CacheUsageSummary,
@@ -1189,7 +1217,7 @@ pub(crate) fn run_generation_loop_with_execution_plans(
 }
 
 fn run_generation_loop_inner(
-    runtime: &Runtime,
+    runtime: &mut Runtime,
     request: &GenerationRequest,
     sampling_policy: SamplingPolicy,
     cache_usage: CacheUsageSummary,
@@ -1209,12 +1237,11 @@ fn run_generation_loop_inner(
         correlation_id.clone(),
     );
 
-    let executor =
-        runtime
-            .generation_executor()
-            .ok_or_else(|| InferenceApiError::ProviderUnavailable {
-                reason: "no Runtime generation executor is registered".into(),
-            });
+    let executor = runtime.generation_executor().cloned().ok_or_else(|| {
+        InferenceApiError::ProviderUnavailable {
+            reason: "no Runtime generation executor is registered".into(),
+        }
+    });
     let executor = match executor {
         Ok(executor) => executor,
         Err(error) => {
@@ -1288,6 +1315,22 @@ fn run_generation_loop_inner(
             .prefill
             .execute_ready_path(&context)
             .map_err(runtime_generation_plan_error)?;
+        let plan_context = vec![
+            format!("request={}", request.request_id),
+            format!("plan={}", plans.prefill.id),
+            format!("plan_generation={}", plans.prefill.generation.value()),
+            "phase=prefill".to_string(),
+        ];
+        observer.observe(
+            InferenceApiObservationKind::PlanSelected,
+            observation_message("prepared execution plan selected", &plan_context),
+            correlation_id.clone(),
+        );
+        observer.observe(
+            InferenceApiObservationKind::PlanGuardAccepted,
+            observation_message("prepared execution plan guard accepted", &plan_context),
+            correlation_id.clone(),
+        );
     }
     prefill(request)?;
     observer.observe(
@@ -1332,6 +1375,26 @@ fn run_generation_loop_inner(
                 .decode
                 .execute_ready_path(&context)
                 .map_err(runtime_generation_plan_error)?;
+            let plan_context = vec![
+                format!("request={}", request.request_id),
+                format!("plan={}", plans.decode.id),
+                format!("plan_generation={}", plans.decode.generation.value()),
+                "phase=decode".to_string(),
+                format!(
+                    "kv_position={}",
+                    request.input_token_ids.len() + generated.len()
+                ),
+            ];
+            observer.observe(
+                InferenceApiObservationKind::PlanSelected,
+                observation_message("prepared execution plan selected", &plan_context),
+                correlation_id.clone(),
+            );
+            observer.observe(
+                InferenceApiObservationKind::PlanGuardAccepted,
+                observation_message("prepared execution plan guard accepted", &plan_context),
+                correlation_id.clone(),
+            );
         }
         let runtime_step = match executor.execute_generation_step(runtime, request, &generated) {
             Ok(runtime_step) => runtime_step,
@@ -1340,38 +1403,87 @@ fn run_generation_loop_inner(
                 return Err(error);
             }
         };
+        if runtime_step.evidence.model_instance_ready {
+            observer.observe(
+                InferenceApiObservationKind::ModelInstanceReady,
+                observation_message("model instance ready", &runtime_step.evidence.context),
+                correlation_id.clone(),
+            );
+        }
         if runtime_step.evidence.graph_validated {
             observer.observe(
                 InferenceApiObservationKind::ExecutionGraphValidated,
-                "execution graph validated",
+                observation_message("execution graph validated", &runtime_step.evidence.context),
+                correlation_id.clone(),
+            );
+            observer.observe(
+                InferenceApiObservationKind::GraphValidationCompleted,
+                observation_message("graph validation completed", &runtime_step.evidence.context),
                 correlation_id.clone(),
             );
         }
         if runtime_step.evidence.kernel_selected {
             observer.observe(
                 InferenceApiObservationKind::KernelSelected,
-                "kernel selected",
+                observation_message("kernel selected", &runtime_step.evidence.context),
+                correlation_id.clone(),
+            );
+            observer.observe(
+                InferenceApiObservationKind::KernelResolved,
+                observation_message(
+                    "kernel registry resolved candidate",
+                    &runtime_step.evidence.context,
+                ),
+                correlation_id.clone(),
+            );
+            observer.observe(
+                InferenceApiObservationKind::KernelPrepared,
+                observation_message("prepared kernel accepted", &runtime_step.evidence.context),
                 correlation_id.clone(),
             );
         }
         if runtime_step.evidence.kernel_dispatched {
             observer.observe(
                 InferenceApiObservationKind::KernelDispatched,
-                "kernel dispatched",
+                observation_message("kernel dispatched", &runtime_step.evidence.context),
+                correlation_id.clone(),
+            );
+            observer.observe(
+                InferenceApiObservationKind::ProviderSubmitted,
+                observation_message(
+                    "provider submission accepted",
+                    &runtime_step.evidence.context,
+                ),
                 correlation_id.clone(),
             );
         }
         if runtime_step.evidence.provider_executed {
             observer.observe(
                 InferenceApiObservationKind::ProviderExecuted,
-                "provider executed",
+                observation_message("provider executed", &runtime_step.evidence.context),
+                correlation_id.clone(),
+            );
+            observer.observe(
+                InferenceApiObservationKind::ProviderCompleted,
+                observation_message(
+                    "provider completion observed",
+                    &runtime_step.evidence.context,
+                ),
                 correlation_id.clone(),
             );
         }
         if runtime_step.evidence.tensor_resource_used {
             observer.observe(
                 InferenceApiObservationKind::TensorLogitsProduced,
-                "Runtime-owned tensor logits produced",
+                observation_message(
+                    "Runtime-owned tensor logits produced",
+                    &runtime_step.evidence.context,
+                ),
+                correlation_id.clone(),
+            );
+            observer.observe(
+                InferenceApiObservationKind::LogitsProduced,
+                observation_message("logits produced", &runtime_step.evidence.context),
                 correlation_id.clone(),
             );
         }
@@ -1388,9 +1500,23 @@ fn run_generation_loop_inner(
         )?;
         rng_state = sampling.updated_rng_state;
         generated.push(step.token_id);
+        let token_context = vec![
+            format!("request={}", request.request_id),
+            format!("token_index={}", step.token_index),
+        ];
+        observer.observe(
+            InferenceApiObservationKind::SamplingCompleted,
+            observation_message("sampling completed", &token_context),
+            correlation_id.clone(),
+        );
         observer.observe(
             InferenceApiObservationKind::TokenGenerated,
             format!("token index {} generated", step.token_index),
+            correlation_id.clone(),
+        );
+        observer.observe(
+            InferenceApiObservationKind::TokenCommitted,
+            observation_message("token committed", &token_context),
             correlation_id.clone(),
         );
         if let Some(reason) = step.finish_reason {
@@ -1900,6 +2026,9 @@ pub enum InferenceApiObservationKind {
     ModelLoaded,
     ModelLoadingFailed,
     ModelInstanceSelected,
+    ModelInstanceReady,
+    ComponentValidated,
+    ComponentInstantiated,
     SessionCreated,
     SessionClosed,
     PromptTokenized,
@@ -1922,13 +2051,24 @@ pub enum InferenceApiObservationKind {
     ProviderUnavailable,
     KernelUnavailable,
     ExecutionGraphValidated,
+    GraphValidationCompleted,
+    PlanSelected,
+    PlanGuardAccepted,
     KernelSelected,
+    KernelResolved,
+    KernelPrepared,
     KernelDispatched,
+    ProviderSubmitted,
     ProviderExecuted,
+    ProviderCompleted,
     TensorLogitsProduced,
+    LogitsProduced,
+    SamplingCompleted,
     StreamOpened,
     StreamClosed,
     StreamInterrupted,
+    KvCacheCommitted,
+    TokenCommitted,
 }
 
 /// A redacted-by-default observation. `message` MUST NOT contain raw

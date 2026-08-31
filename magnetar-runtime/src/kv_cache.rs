@@ -6,6 +6,7 @@
 //! compatibility, memory accounting, policy, affinity, and redacted
 //! observability for this state.
 
+use crate::model_instance::ModelInstanceId;
 use crate::{
     ComputeDType, DTypeDescriptor, DeviceBinding, FallbackClass, GenerationModelReference,
     InferenceSessionId, MemoryAllocationClass, MemoryAllocationId, MemoryAllocationLifetime,
@@ -794,6 +795,23 @@ impl KvCacheManager {
             .caches
             .values()
             .filter(|cache| cache.session.as_ref() == Some(session))
+            .map(|cache| cache.id.clone())
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.release(id)?;
+        }
+        Ok(ids)
+    }
+
+    pub fn release_model_instance_caches(
+        &mut self,
+        instance: &ModelInstanceId,
+    ) -> Result<Vec<KvCacheId>, KvCacheError> {
+        let model = GenerationModelReference::ModelInstance(instance.clone());
+        let ids = self
+            .caches
+            .values()
+            .filter(|cache| cache.compatibility.model == model)
             .map(|cache| cache.id.clone())
             .collect::<Vec<_>>();
         for id in &ids {
