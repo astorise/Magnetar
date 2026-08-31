@@ -11,7 +11,7 @@ categories = ["science", "wasm"]
 rust-version = "1.98"
 
 [features]
-default = []
+default = ["wasmtime-component-engine"]
 wasmtime-component-engine = ["dep:wasmtime"]
 web-component-engine = []
 

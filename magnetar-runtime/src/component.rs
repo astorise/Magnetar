@@ -1739,6 +1739,7 @@ pub struct ComponentManager {
     observations: Vec<ComponentObservation>,
     limits: ComponentResourceLimits,
     trust_store: ComponentTrustStore,
+    owned_distributed_package_dirs: Vec<PathBuf>,
     shutdown: bool,
 }
 
@@ -1767,6 +1768,7 @@ impl ComponentManager {
             observations: Vec::new(),
             limits: ComponentResourceLimits::default(),
             trust_store: ComponentTrustStore::default(),
+            owned_distributed_package_dirs: Vec::new(),
             shutdown: false,
         }
     }
@@ -1974,27 +1976,43 @@ impl ComponentManager {
         &mut self,
         name: &str,
     ) -> Result<ComponentInstanceId, ComponentError> {
+        let definition_id = self.prepare_component(name)?;
+        self.instantiate_prepared_component(definition_id)
+    }
+
+    pub fn instantiate_prepared_component(
+        &mut self,
+        definition_id: ComponentDefinitionId,
+    ) -> Result<ComponentInstanceId, ComponentError> {
         if self.shutdown {
             return Err(ComponentError::RuntimeShutdown);
+        }
+        let definition = self
+            .definitions
+            .values()
+            .find(|definition| definition.id == definition_id)
+            .ok_or(ComponentError::MissingPreparedDefinition(definition_id))?;
+        let name = definition.metadata.name.clone();
+        if definition.state != ComponentDefinitionState::Prepared {
+            return Err(ComponentError::MissingPreparedDefinition(definition_id));
         }
         if let Some(max_instances) = self.limits.max_instances
             && self.instances.len() >= max_instances as usize
         {
             let error = ComponentError::ResourceLimitExceeded {
-                component: name.into(),
+                component: name.clone(),
                 limit: "instances",
             };
             self.observe_error(None, &error);
             return Err(error);
         }
-        let link_plan = self.link_plan(name)?;
+        let link_plan = self.build_link_plan(definition)?;
         self.observations.push(ComponentObservation::new(
             ComponentObservationKind::LinkPlan,
-            Some(name.into()),
+            Some(name.clone()),
             None,
             "runtime-owned link plan built",
         ));
-        let definition_id = self.prepare_component(name)?;
         let prepared = self
             .prepared
             .get(&definition_id)
@@ -2012,7 +2030,7 @@ impl ComponentManager {
         );
         self.observations.push(ComponentObservation::new(
             ComponentObservationKind::Instantiation,
-            Some(name.into()),
+            Some(name),
             Some(id),
             "component instance ready",
         ));
@@ -2229,14 +2247,19 @@ impl ComponentManager {
         let descriptor = ComponentDescriptor::new(manifest.component.clone(), artifact_path)
             .with_manifest_path(manifest_path);
         if self.definitions.contains_key(&descriptor.metadata.name) {
+            let _ = fs::remove_dir_all(&distribution_dir);
             return Err(ComponentError::AlreadyRegistered(descriptor.metadata.name));
         }
         let name = descriptor.metadata.name.clone();
         self.register_component(descriptor)?;
         match self.prepare_component(&name) {
-            Ok(id) => Ok(id),
+            Ok(id) => {
+                self.owned_distributed_package_dirs.push(distribution_dir);
+                Ok(id)
+            }
             Err(error) => {
                 self.definitions.remove(&name);
+                let _ = fs::remove_dir_all(&distribution_dir);
                 Err(error)
             }
         }
@@ -2339,6 +2362,14 @@ impl ComponentManager {
                 None,
                 message,
             ));
+        }
+    }
+}
+
+impl Drop for ComponentManager {
+    fn drop(&mut self) {
+        for directory in self.owned_distributed_package_dirs.drain(..) {
+            let _ = fs::remove_dir_all(directory);
         }
     }
 }

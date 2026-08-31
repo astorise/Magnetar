@@ -95,8 +95,8 @@
 //! is identified; none is known today.
 
 use crate::affinity::{
-    FallbackClass, ProviderBinding, ProviderHealth, ProviderPressureLevel, ProviderStatusSnapshot,
-    ResourceAffinity,
+    DeviceBinding, FallbackClass, ProviderBinding, ProviderHealth, ProviderPressureLevel,
+    ProviderStatusSnapshot, ResourceAffinity,
 };
 use crate::capability::{CapabilityId, CapabilityVersion};
 use crate::compute::{
@@ -469,16 +469,41 @@ pub fn rmsnorm(
     weight: &HostTensor,
     epsilon: f32,
 ) -> Result<HostTensor, ReferenceCpuError> {
-    let (rows, cols) = input.rows_cols()?;
-    if weight.shape != [cols] {
+    let cols = *input.shape.last().ok_or_else(|| {
+        ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "RMSNorm expects at least one dimension",
+        )
+    })?;
+    if cols == 0 {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "RMSNorm hidden dimension must be non-zero",
+        ));
+    }
+    if !input.data.len().is_multiple_of(cols as usize) {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
             format!(
-                "RMSNorm weight shape must be [{cols}], got {:?}",
-                weight.shape
+                "RMSNorm data length {} is not divisible by hidden dimension {cols}",
+                input.data.len()
             ),
         ));
     }
+    let rows = input.data.len() / cols as usize;
+    let row_weight_stride = if weight.shape == [cols] || weight.shape == [1, cols] {
+        0
+    } else if weight.shape == input.shape || weight.shape == [rows as u64, cols] {
+        cols as usize
+    } else {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "RMSNorm weight shape must be [{cols}], [1, {cols}], input shape {:?}, or [{rows}, {cols}], got {:?}",
+                input.shape, weight.shape
+            ),
+        ));
+    };
     if epsilon <= 0.0 {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
@@ -486,12 +511,14 @@ pub fn rmsnorm(
         ));
     }
     let mut out = vec![0.0_f32; input.data.len()];
-    for row in 0..rows as usize {
+    for row in 0..rows {
         let slice = &input.data[row * cols as usize..(row + 1) * cols as usize];
+        let weight_base = row * row_weight_stride;
+        let weight_values = &weight.data[weight_base..weight_base + cols as usize];
         let mean_square = slice.iter().map(|value| value * value).sum::<f32>() / cols as f32;
         let scale = 1.0 / (mean_square + epsilon).sqrt();
         for (col, value) in slice.iter().enumerate() {
-            out[row * cols as usize + col] = value * scale * weight.data[col];
+            out[row * cols as usize + col] = value * scale * weight_values[col];
         }
     }
     HostTensor::new(input.shape.clone(), out)
@@ -1006,20 +1033,19 @@ fn baseline_advertisement(name: &str, family: OperatorFamily) -> KernelAdvertise
         .with_dtypes(TensorRole::Input, [ComputeDType::Float32])
         .with_dtypes(TensorRole::Output, [ComputeDType::Float32])
         .with_layouts([TensorLayoutKind::Contiguous])
-        .with_memory_classes([KernelMemoryClass::Host]);
+        .with_memory_classes([KernelMemoryClass::Host])
+        .with_devices([DeviceBinding::new(DeviceId::new(REFERENCE_CPU_DEVICE_ID))]);
     // Reference CPU executes synchronously and cannot cooperatively cancel
     // mid-kernel, but it does honor a deadline that has already elapsed
     // before dispatch starts (see `execute_invocation`).
     advertisement.cancellation = KernelCancellationSupport::TimeoutOnly;
     // Kernels whose tensors are always rank-2 in this implementation advertise
     // that constraint explicitly; kernels that mix ranks across resources
-    // (e.g. embedding's rank-1 ids against its rank-2 table) or accept
+    // (e.g. embedding's rank-1 ids against its rank-2 table, or RMSNorm's
+    // vector/full-shape weights against rank-2 activations) or accept
     // arbitrary rank (elementwise, activations, conversions) are left
     // unconstrained.
-    if matches!(
-        name,
-        "matmul" | "rmsnorm" | "rope" | "attention" | "softmax"
-    ) {
+    if matches!(name, "matmul" | "rope" | "attention" | "softmax") {
         advertisement.shape.rank = Some(2);
     }
     advertisement
@@ -1050,10 +1076,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         memory_classes: BTreeSet::new(),
         affinity: None,
     });
+    let embedding = baseline_advertisement("embedding", OperatorFamily::Tensor);
 
     vec![
         baseline_advertisement("matmul", OperatorFamily::LinearAlgebra),
-        baseline_advertisement("embedding", OperatorFamily::Tensor),
+        embedding,
         baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
         baseline_advertisement("rope", OperatorFamily::PositionEncoding),
         attention,

@@ -1,6 +1,7 @@
 use magnetar_runtime::{
-    AdapterSetId, BatchCompatibility, DeviceBinding, DeviceId, FallbackClass,
-    GenerationModelReference, KvCacheId, MemoryAllocationId, MemoryManager, MemoryPressureLevel,
+    AdapterSetId, BatchCompatibility, ComputeDType, DeviceBinding, DeviceId, FallbackClass,
+    GenerationModelReference, KvCache, KvCacheCompatibility, KvCacheId, KvCacheLayoutMetadata,
+    KvCacheLifecycleState, KvCacheScope, MemoryAllocationId, MemoryManager, MemoryPressureLevel,
     ModelArchitecture, ModelArchitectureImplementation, ModelArchitectureImplementationKind,
     ModelInstanceCreationChecks, ModelInstanceDefinition, ModelInstanceError, ModelInstanceId,
     ModelInstanceLifecycleState, ModelInstanceManager, ModelInstanceObservationKind,
@@ -12,6 +13,7 @@ use magnetar_runtime::{
     ModelResidencyId, ModelTrustDecision, ModelTrustStatus, PrefixCacheEntryId,
     ProviderAdmissionDecision, ProviderBinding, ProviderHealthState, ProviderModelResource,
     ProviderPressureLevel, ProviderReadinessState, ResourceAffinity, Runtime, RuntimeConfig,
+    TokenizerId,
 };
 
 fn digest() -> String {
@@ -278,6 +280,156 @@ fn runtime_owns_model_instance_registry_and_usage() {
     assert_eq!(
         runtime.model_instance(&id).unwrap().lifecycle,
         ModelInstanceLifecycleState::Unloaded
+    );
+}
+
+#[test]
+fn runtime_unload_releases_model_instance_kv_caches() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let loaded = loaded_context();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            implementation(),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+    let cache = KvCache::new(
+        KvCacheId::new("temporary-cache-id").unwrap(),
+        KvCacheScope::ModelInstance,
+        KvCacheCompatibility::new(
+            GenerationModelReference::ModelInstance(instance.clone()),
+            TokenizerId::new("instance-tokenizer").unwrap(),
+        ),
+        KvCacheLayoutMetadata::contiguous(1, 1, 1, 8, ComputeDType::Float16),
+    );
+    let cache_id = runtime.create_kv_cache(cache).unwrap();
+    runtime.prefill_kv_cache_completed(&cache_id, 1).unwrap();
+
+    runtime
+        .unload_model_instance(&instance, ModelInstanceUnloadPolicy::DrainActiveUse)
+        .unwrap();
+
+    assert_eq!(
+        runtime.kv_cache(&cache_id).unwrap().lifecycle,
+        KvCacheLifecycleState::Released
+    );
+}
+
+#[test]
+fn runtime_rejected_unload_preserves_model_instance_kv_caches() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let loaded = loaded_context();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            implementation(),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+    let cache = KvCache::new(
+        KvCacheId::new("temporary-cache-id").unwrap(),
+        KvCacheScope::ModelInstance,
+        KvCacheCompatibility::new(
+            GenerationModelReference::ModelInstance(instance.clone()),
+            TokenizerId::new("instance-tokenizer").unwrap(),
+        ),
+        KvCacheLayoutMetadata::contiguous(1, 1, 1, 8, ComputeDType::Float16),
+    );
+    let cache_id = runtime.create_kv_cache(cache).unwrap();
+    runtime.prefill_kv_cache_completed(&cache_id, 1).unwrap();
+    runtime.acquire_model_instance_usage(&instance, 0).unwrap();
+
+    assert_eq!(
+        runtime.unload_model_instance(&instance, ModelInstanceUnloadPolicy::RejectActiveUse),
+        Err(ModelInstanceError::ModelInstanceActive)
+    );
+
+    assert_eq!(
+        runtime.kv_cache(&cache_id).unwrap().lifecycle,
+        KvCacheLifecycleState::Ready
+    );
+    runtime.release_model_instance_usage(&instance).unwrap();
+}
+
+#[test]
+fn runtime_close_then_unload_skips_already_released_session_kv_cache_memory() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let loaded = loaded_context();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            implementation(),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+    let session = runtime
+        .create_inference_session(magnetar_runtime::SessionCreationRequest {
+            model: GenerationModelReference::ModelInstance(instance.clone()),
+            tokenizer: magnetar_runtime::GenerationTokenizerReference {
+                tokenizer_id: TokenizerId::new("instance-tokenizer").unwrap(),
+                metadata: magnetar_runtime::TokenizerMetadata {
+                    id: TokenizerId::new("instance-tokenizer").unwrap(),
+                    artifact: magnetar_runtime::TokenizerArtifactId::new(
+                        "instance-tokenizer-artifact",
+                    )
+                    .unwrap(),
+                    digest: magnetar_runtime::ModelDigest::parse(digest()).unwrap(),
+                    revision: magnetar_runtime::TokenizerRevision::new("r1").unwrap(),
+                    family: magnetar_runtime::TokenizerFamily::new("fixture").unwrap(),
+                    vocabulary_size: 16,
+                    added_token_count: 0,
+                    token_id_range: magnetar_runtime::TokenIdRange::new(0, 16),
+                    model_max_length: Some(16),
+                    special_tokens: Vec::new(),
+                    additional_special_tokens: Vec::new(),
+                    byte_fallback: false,
+                    normalization: None,
+                    pre_tokenizer: None,
+                    supports_offsets: false,
+                    supports_token_type_ids: false,
+                    supports_browser: true,
+                },
+            },
+            generation_defaults: magnetar_runtime::GenerationParameters::default(),
+            policy: magnetar_runtime::SessionPolicy::default(),
+            memory: magnetar_runtime::SessionMemoryBudget::default(),
+            allowed_capabilities: std::collections::BTreeSet::new(),
+            correlation_id: None,
+            created_at_millis: 0,
+        })
+        .unwrap();
+    let cache = KvCache::new(
+        KvCacheId::new("temporary-cache-id").unwrap(),
+        KvCacheScope::Session,
+        KvCacheCompatibility::new(
+            GenerationModelReference::ModelInstance(instance.clone()),
+            TokenizerId::new("instance-tokenizer").unwrap(),
+        ),
+        KvCacheLayoutMetadata::contiguous(1, 1, 1, 8, ComputeDType::Float16),
+    )
+    .with_session(session.clone());
+    let cache_id = runtime.create_kv_cache(cache).unwrap();
+    let allocation = runtime.allocate_kv_cache_memory(&cache_id).unwrap();
+    runtime.prefill_kv_cache_completed(&cache_id, 1).unwrap();
+
+    runtime.close_inference_session(&session).unwrap();
+    assert_eq!(
+        runtime.kv_cache(&cache_id).unwrap().lifecycle,
+        KvCacheLifecycleState::Released
+    );
+
+    runtime
+        .unload_model_instance(&instance, ModelInstanceUnloadPolicy::DrainActiveUse)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .memory()
+            .allocations()
+            .find(|item| item.id == allocation)
+            .unwrap()
+            .state,
+        magnetar_runtime::MemoryAllocationState::Released
     );
 }
 

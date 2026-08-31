@@ -25,6 +25,8 @@ const RESOURCE_IMPORT_COMPONENT: &str =
     include_str!("../../fixtures/components/resource-import.component.wat");
 const BOUNDED_LOOP_COMPONENT: &str =
     include_str!("../../fixtures/components/bounded-loop.component.wat");
+const QWEN_GRAPH_COMPONENT: &str =
+    include_str!("../../fixtures/components/qwen-graph.component.wat");
 
 #[test]
 fn wasmtime_engine_reports_component_capabilities() {
@@ -262,6 +264,61 @@ fn wasmtime_engine_returns_primitive_value() {
         result,
         ComponentInvocationResult::single(ComponentValue::U32(42))
     );
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn wasmtime_engine_executes_qwen_graph_component_fixture() {
+    let directory =
+        std::env::temp_dir().join(format!("magnetar-wasmtime-qwen-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("qwen-graph.component.wasm");
+    std::fs::write(&artifact, QWEN_GRAPH_COMPONENT).unwrap();
+
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let interface = WitInterface::new("magnetar:qwen/graph-fixture", "1.0.0");
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(18),
+        metadata: crate::ComponentMetadata::new(
+            "qwen-graph-fixture",
+            "1",
+            "executable Qwen graph fixture component",
+        )
+        .with_export(interface.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let instance = engine
+        .instantiate(&prepared, &ComponentLinkPlan::default())
+        .unwrap();
+
+    for (operation, expected) in [
+        ("prefill-node-count", 19),
+        ("decode-node-count", 19),
+        ("provider-authority-count", 0),
+    ] {
+        let result = engine
+            .invoke(
+                &instance,
+                &ComponentInvocation::new(
+                    crate::ComponentInstanceId::new(180),
+                    interface.clone(),
+                    operation,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            ComponentInvocationResult::single(ComponentValue::U32(expected))
+        );
+    }
     engine.destroy(instance).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }

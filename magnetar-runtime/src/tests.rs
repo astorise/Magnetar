@@ -4747,6 +4747,43 @@ fn pushed_component_package_is_validated_before_preparation() {
 }
 
 #[test]
+fn pushed_component_package_temp_materialization_is_removed_with_manager() {
+    let before = std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("magnetar-distributed-component-"))
+        })
+        .collect::<BTreeSet<_>>();
+    let bytes = b"component-bytes-cleanup";
+    let digest = ComponentDigest::sha256(bytes);
+    let package =
+        component_artifact_package(bytes, ComponentDistributionSourceKind::ClientProvided);
+    let materialized = {
+        let mut manager = ComponentManager::new();
+        manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value.clone()));
+        manager.prepare_pushed_package(package).unwrap();
+        std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                !before.contains(path)
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("magnetar-distributed-component-"))
+            })
+            .expect("distributed component package materialized")
+    };
+
+    assert!(!materialized.exists());
+}
+
+#[test]
 fn pushed_component_package_rejects_source_digest_mismatch() {
     let mut package =
         component_artifact_package(b"component-bytes", ComponentDistributionSourceKind::Tachyon);
@@ -6181,29 +6218,32 @@ struct TestGenerationExecutor {
     evidence: RuntimeGenerationExecutionEvidence,
 }
 
-impl RuntimeGenerationExecutor for TestGenerationExecutor {
+impl RuntimeModelExecutionEngine for TestGenerationExecutor {
     fn execute_generation_step(
         &self,
-        _runtime: &Runtime,
+        _runtime: &mut Runtime,
         _request: &GenerationRequest,
         generated_tokens: &[TokenId],
-    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         let mut logits = vec![0.0f32; self.vocabulary_size];
         logits[(11 + generated_tokens.len()) % self.vocabulary_size] = 10.0;
-        Ok(RuntimeGenerationStep::new(logits, self.evidence))
+        Ok(RuntimeModelExecutionStep::new(
+            logits,
+            self.evidence.clone(),
+        ))
     }
 }
 
 #[derive(Clone)]
 struct FailingGenerationExecutor;
 
-impl RuntimeGenerationExecutor for FailingGenerationExecutor {
+impl RuntimeModelExecutionEngine for FailingGenerationExecutor {
     fn execute_generation_step(
         &self,
-        _runtime: &Runtime,
+        _runtime: &mut Runtime,
         _request: &GenerationRequest,
         _generated_tokens: &[TokenId],
-    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         Err(InferenceApiError::ProviderUnavailable {
             reason: "provider failed during decode".into(),
         })
@@ -6213,26 +6253,26 @@ impl RuntimeGenerationExecutor for FailingGenerationExecutor {
 #[derive(Clone)]
 struct FailingKernelGenerationExecutor;
 
-impl RuntimeGenerationExecutor for FailingKernelGenerationExecutor {
+impl RuntimeModelExecutionEngine for FailingKernelGenerationExecutor {
     fn execute_generation_step(
         &self,
-        _runtime: &Runtime,
+        _runtime: &mut Runtime,
         _request: &GenerationRequest,
         _generated_tokens: &[TokenId],
-    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         Err(InferenceApiError::KernelUnavailable {
             reason: "kernel failed during decode".into(),
         })
     }
 }
 
-fn runtime_with_generation_executor(
+fn runtime_with_model_execution_engine(
     vocabulary_size: usize,
     evidence: RuntimeGenerationExecutionEvidence,
 ) -> Runtime {
     Runtime::builder()
         .register_provider(Arc::new(ReferenceCpuProvider::new()))
-        .generation_executor(Arc::new(TestGenerationExecutor {
+        .model_execution_engine(Arc::new(TestGenerationExecutor {
             vocabulary_size,
             evidence,
         }))
@@ -6671,6 +6711,34 @@ fn reference_cpu_rmsnorm_known_output() {
 }
 
 #[test]
+fn reference_cpu_rmsnorm_full_shape_weights_apply_per_row() {
+    let input = reference_cpu_host_tensor([2, 2], [3.0, 4.0, 3.0, 4.0]);
+    let weight = reference_cpu_host_tensor([2, 2], [1.0, 1.0, 2.0, 3.0]);
+    let result = rmsnorm(&input, &weight, 1e-6).unwrap();
+    let scale = 1.0 / (((9.0_f32 + 16.0) / 2.0) + 1e-6).sqrt();
+
+    assert!((result.data[0] - 3.0 * scale).abs() < 1e-5);
+    assert!((result.data[1] - 4.0 * scale).abs() < 1e-5);
+    assert!((result.data[2] - 3.0 * scale * 2.0).abs() < 1e-5);
+    assert!((result.data[3] - 4.0 * scale * 3.0).abs() < 1e-5);
+}
+
+#[test]
+fn reference_cpu_rmsnorm_flattens_leading_dimensions() {
+    let input = reference_cpu_host_tensor([1, 2, 2], [3.0, 4.0, 5.0, 12.0]);
+    let weight = reference_cpu_host_tensor([1, 2, 2], [1.0, 2.0, 3.0, 4.0]);
+    let result = rmsnorm(&input, &weight, 1e-6).unwrap();
+    let row0_scale = 1.0 / (((9.0_f32 + 16.0) / 2.0) + 1e-6).sqrt();
+    let row1_scale = 1.0 / (((25.0_f32 + 144.0) / 2.0) + 1e-6).sqrt();
+
+    assert_eq!(result.shape, vec![1, 2, 2]);
+    assert!((result.data[0] - 3.0 * row0_scale).abs() < 1e-5);
+    assert!((result.data[1] - 4.0 * row0_scale * 2.0).abs() < 1e-5);
+    assert!((result.data[2] - 5.0 * row1_scale * 3.0).abs() < 1e-5);
+    assert!((result.data[3] - 12.0 * row1_scale * 4.0).abs() < 1e-5);
+}
+
+#[test]
 fn reference_cpu_rmsnorm_rejects_dtype_shape_mismatch() {
     let input = reference_cpu_host_tensor([1, 4], vec![1.0; 4]);
     let weight = reference_cpu_host_tensor([3], vec![1.0; 3]);
@@ -6895,6 +6963,21 @@ fn reference_cpu_generic_activation_kernel_rejects_unknown_kind() {
 
     let result = executor.execute_invocation(advertisement, operator, &invocation);
     assert_eq!(result.status, KernelResultStatus::Failed);
+}
+
+#[test]
+fn reference_cpu_advertisements_match_numeric_storage_constraints() {
+    let advertisements = reference_cpu_kernel_advertisements();
+    let rmsnorm = reference_cpu_kernel_by_name(&advertisements, "rmsnorm");
+    assert_eq!(rmsnorm.shape.rank, None);
+
+    let embedding = reference_cpu_kernel_by_name(&advertisements, "embedding");
+    let input_dtypes = embedding
+        .supported_dtypes
+        .get(&TensorRole::Input)
+        .expect("embedding advertises input dtypes");
+    assert!(!input_dtypes.contains(&ComputeDType::SInt32));
+    assert!(input_dtypes.contains(&ComputeDType::Float32));
 }
 
 #[test]
@@ -8711,7 +8794,7 @@ fn inference_api_tokenize_prompt_input_observed_emits_tokenized_and_failed() {
 fn inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contracts() {
     let metadata = generation_tokenizer_metadata();
     let vocabulary_size = metadata.vocabulary_size as usize;
-    let mut runtime = runtime_with_generation_executor(
+    let mut runtime = runtime_with_model_execution_engine(
         vocabulary_size,
         RuntimeGenerationExecutionEvidence::complete(),
     );
@@ -8758,7 +8841,7 @@ fn inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contrac
     // session-bound generation would use.
     let mut observer = InferenceApiObserver::new();
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &prepared,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -9219,14 +9302,14 @@ fn inference_api_run_generation_loop_emits_full_streaming_lifecycle_and_complete
     request.max_new_tokens = 2;
     let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
 
-    let runtime = runtime_with_generation_executor(
+    let mut runtime = runtime_with_model_execution_engine(
         vocabulary_size,
         RuntimeGenerationExecutionEvidence::complete(),
     );
     let mut observer = InferenceApiObserver::new();
 
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary {
@@ -9274,14 +9357,14 @@ fn inference_api_run_generation_loop_cancels_during_decode() {
     request.max_new_tokens = 5;
     let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
 
-    let runtime = runtime_with_generation_executor(
+    let mut runtime = runtime_with_model_execution_engine(
         vocabulary_size,
         RuntimeGenerationExecutionEvidence::complete(),
     );
     let mut observer = InferenceApiObserver::new();
 
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -9308,7 +9391,7 @@ fn inference_api_run_generation_loop_rejects_incomplete_executor_evidence_before
     request.parameters = GenerationParameters::greedy();
     request.stop_conditions = StopConditions::default();
     let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
-    let runtime = runtime_with_generation_executor(
+    let mut runtime = runtime_with_model_execution_engine(
         vocabulary_size,
         RuntimeGenerationExecutionEvidence {
             model_instance_ready: true,
@@ -9317,12 +9400,13 @@ fn inference_api_run_generation_loop_rejects_incomplete_executor_evidence_before
             kernel_dispatched: false,
             provider_executed: false,
             tensor_resource_used: false,
+            context: Vec::new(),
         },
     );
     let mut observer = InferenceApiObserver::new();
 
     let error = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -9351,15 +9435,15 @@ fn inference_api_run_generation_loop_observes_executor_failure_before_returning(
     let mut request = generation_request();
     request.parameters = GenerationParameters::greedy();
     request.stop_conditions = StopConditions::default();
-    let runtime = Runtime::builder()
+    let mut runtime = Runtime::builder()
         .register_provider(Arc::new(ReferenceCpuProvider::new()))
-        .generation_executor(Arc::new(FailingGenerationExecutor))
+        .model_execution_engine(Arc::new(FailingGenerationExecutor))
         .build()
         .unwrap();
     let mut observer = InferenceApiObserver::new();
 
     let error = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -9389,9 +9473,9 @@ fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
     request.parameters = GenerationParameters::greedy();
     request.stop_conditions = StopConditions::default();
     let mut observer = InferenceApiObserver::new();
-    let runtime = Runtime::builder().build().unwrap();
+    let mut runtime = Runtime::builder().build().unwrap();
     let error = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -9419,13 +9503,13 @@ fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
 
     request.request_id = GenerationRequestId::new("gen-2").unwrap();
     let mut observer = InferenceApiObserver::new();
-    let runtime = Runtime::builder()
+    let mut runtime = Runtime::builder()
         .register_provider(Arc::new(ReferenceCpuProvider::new()))
-        .generation_executor(Arc::new(FailingKernelGenerationExecutor))
+        .model_execution_engine(Arc::new(FailingKernelGenerationExecutor))
         .build()
         .unwrap();
     let error = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),

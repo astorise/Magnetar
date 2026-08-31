@@ -1,0 +1,37 @@
+schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "sha256:e376dedc5059e0e46233fe783fab49c8d9752aa68a3a967876118d13fa5c9d85"
+component:
+  name: "magnetar.qwen.graph-fixture"
+  version: "0.1.0"
+  description: "Executable Qwen graph fixture component"
+  role: "qwen-graph-fixture"
+runtime:
+  magnetar:
+    min_version: "0.1.0"
+wit:
+  imports: []
+  exports:
+    - package: "magnetar:qwen"
+      interface: "graph-fixture"
+      version: "1.0.0"
+capabilities:
+  requires: []
+authority:
+  requires: []
+engine:
+  profile: "native"
+  features:
+    - component-model
+    - resource-limits
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./fixtures/components/qwen-graph.component.wat"
+signatures: []

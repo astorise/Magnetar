@@ -24,15 +24,16 @@ use crate::compute::{
 };
 use crate::device::{Device, DeviceId};
 use crate::generation::{GenerationModelReference, GenerationRequest};
-use crate::inference_api::{RuntimeGenerationExecutor, SharedRuntimeGenerationExecutor};
+use crate::inference_api::{RuntimeModelExecutionEngine, SharedRuntimeModelExecutionEngine};
 use crate::kernel_registry::KernelRegistry;
 use crate::kv_cache::{
     KvCache, KvCacheCompatibility, KvCacheError, KvCacheId, KvCacheLifecycleState, KvCacheManager,
+    KvCacheRetentionPolicy,
 };
 use crate::memory::{
     MemoryAdmissionDecision, MemoryAdmissionRequest, MemoryAllocationClass, MemoryAllocationId,
-    MemoryAllocationOwner, MemoryAllocationRequest, MemoryManager, MemoryManagerConfig,
-    MemoryPlacement,
+    MemoryAllocationOwner, MemoryAllocationRequest, MemoryAllocationState, MemoryManager,
+    MemoryManagerConfig, MemoryPlacement,
 };
 use crate::model_instance::{
     ModelInstance, ModelInstanceDefinition, ModelInstanceError, ModelInstanceId,
@@ -168,7 +169,7 @@ impl ExecutionContext {
 pub struct RuntimeBuilder {
     config: RuntimeConfig,
     providers: Vec<Arc<dyn Provider>>,
-    generation_executor: Option<SharedRuntimeGenerationExecutor>,
+    model_execution_engine: Option<SharedRuntimeModelExecutionEngine>,
 }
 impl RuntimeBuilder {
     pub fn new() -> Self {
@@ -182,8 +183,11 @@ impl RuntimeBuilder {
         self.providers.push(x);
         self
     }
-    pub(crate) fn generation_executor(mut self, x: Arc<dyn RuntimeGenerationExecutor>) -> Self {
-        self.generation_executor = Some(SharedRuntimeGenerationExecutor::new(x));
+    pub(crate) fn model_execution_engine(
+        mut self,
+        x: Arc<dyn RuntimeModelExecutionEngine>,
+    ) -> Self {
+        self.model_execution_engine = Some(SharedRuntimeModelExecutionEngine::new(x));
         self
     }
     /// Builds the Runtime.
@@ -243,7 +247,7 @@ impl RuntimeBuilder {
             prefix_caches: PrefixCacheManager::new(),
             kernel_registry,
             providers,
-            generation_executor: self.generation_executor,
+            model_execution_engine: self.model_execution_engine,
             sessions: BTreeMap::new(),
             session_observations: VecDeque::with_capacity(
                 self.config
@@ -265,7 +269,7 @@ pub struct Runtime {
     prefix_caches: PrefixCacheManager,
     kernel_registry: KernelRegistry,
     providers: ProviderLoader,
-    generation_executor: Option<SharedRuntimeGenerationExecutor>,
+    model_execution_engine: Option<SharedRuntimeModelExecutionEngine>,
     sessions: BTreeMap<InferenceSessionId, InferenceSession>,
     session_observations: VecDeque<SessionObservation>,
     dropped_session_observations: u64,
@@ -332,8 +336,8 @@ impl Runtime {
     pub fn providers(&self) -> &ProviderLoader {
         &self.providers
     }
-    pub(crate) fn generation_executor(&self) -> Option<&SharedRuntimeGenerationExecutor> {
-        self.generation_executor.as_ref()
+    pub(crate) fn model_execution_engine(&self) -> Option<&SharedRuntimeModelExecutionEngine> {
+        self.model_execution_engine.as_ref()
     }
     pub fn sessions(&self) -> impl Iterator<Item = &InferenceSession> {
         self.sessions.values()
@@ -466,6 +470,13 @@ impl Runtime {
         session: &InferenceSessionId,
     ) -> Result<(), SessionError> {
         self.inference_session_mut(session)?.cancel()?;
+        let cache_ids = self.releasable_session_kv_cache_ids(session);
+        for cache in &cache_ids {
+            self.release_kv_cache(cache)
+                .map_err(|error| SessionError::ResourceCleanupFailed {
+                    reason: error.to_string(),
+                })?;
+        }
         self.observe_session(
             SessionObservationKind::Cancelled,
             Some(session.clone()),
@@ -492,19 +503,13 @@ impl Runtime {
         session: &InferenceSessionId,
     ) -> Result<(), SessionError> {
         self.inference_session_mut(session)?.close()?;
-        let cache_ids = self.session_kv_cache_ids(session);
+        let cache_ids = self.releasable_session_kv_cache_ids(session);
         for cache in &cache_ids {
-            self.release_kv_cache_memory(cache).map_err(|error| {
-                SessionError::ResourceCleanupFailed {
+            self.release_kv_cache(cache)
+                .map_err(|error| SessionError::ResourceCleanupFailed {
                     reason: error.to_string(),
-                }
-            })?;
+                })?;
         }
-        self.kv_caches
-            .release_session_caches(session)
-            .map_err(|error| SessionError::ResourceCleanupFailed {
-                reason: error.to_string(),
-            })?;
         let persist_prefix_entries = self.inference_session(session)?.policy.prefix_cache_allowed;
         self.prefix_caches
             .release_session_entries(session, persist_prefix_entries);
@@ -523,10 +528,9 @@ impl Runtime {
             .filter_map(|(id, session)| session.expire_if_needed(now_millis).then_some(id.clone()))
             .collect::<Vec<_>>();
         for session in &expired {
-            for cache in self.session_kv_cache_ids(session) {
-                let _ = self.release_kv_cache_memory(&cache);
+            for cache in self.releasable_session_kv_cache_ids(session) {
+                let _ = self.release_kv_cache(&cache);
             }
-            let _ = self.kv_caches.release_session_caches(session);
             self.prefix_caches.release_session_entries(session, false);
             self.observe_session(
                 SessionObservationKind::Expired,
@@ -617,7 +621,26 @@ impl Runtime {
         instance: &ModelInstanceId,
         policy: ModelInstanceUnloadPolicy,
     ) -> Result<ModelInstanceUnloadReport, ModelInstanceError> {
-        self.model_instances.unload(instance, policy)
+        self.model_instance(instance)?;
+        let cache_ids = self
+            .kv_caches
+            .caches()
+            .filter(|cache| {
+                cache.compatibility.model
+                    == GenerationModelReference::ModelInstance(instance.clone())
+            })
+            .filter(|cache| cache.lifecycle != KvCacheLifecycleState::Released)
+            .map(|cache| cache.id.clone())
+            .collect::<Vec<_>>();
+        let report = self.model_instances.unload(instance, policy)?;
+        for cache in &cache_ids {
+            self.release_kv_cache(cache).map_err(|error| {
+                ModelInstanceError::InternalModelInstance {
+                    reason: format!("failed to release model instance KV cache memory: {error}"),
+                }
+            })?;
+        }
+        Ok(report)
     }
     pub fn admit_generation_to_batch(
         &mut self,
@@ -762,6 +785,13 @@ impl Runtime {
     }
     fn release_kv_cache_memory(&mut self, cache: &KvCacheId) -> Result<(), KvCacheError> {
         if let Some(allocation) = self.kv_cache(cache)?.residency.memory_allocation {
+            if self
+                .memory
+                .allocations()
+                .any(|item| item.id == allocation && item.state == MemoryAllocationState::Released)
+            {
+                return Ok(());
+            }
             self.memory
                 .release(allocation)
                 .map_err(|_| KvCacheError::CacheReleased)?;
@@ -779,10 +809,17 @@ impl Runtime {
         }
         Ok(())
     }
-    fn session_kv_cache_ids(&self, session: &InferenceSessionId) -> Vec<KvCacheId> {
+    fn releasable_session_kv_cache_ids(&self, session: &InferenceSessionId) -> Vec<KvCacheId> {
         self.kv_caches
             .caches()
             .filter(|cache| cache.session.as_ref() == Some(session))
+            .filter(|cache| {
+                matches!(
+                    cache.policy.retention,
+                    KvCacheRetentionPolicy::ReleaseOnOperationEnd
+                        | KvCacheRetentionPolicy::ReleaseOnSessionClose
+                )
+            })
             .map(|cache| cache.id.clone())
             .collect()
     }

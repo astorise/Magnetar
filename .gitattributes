@@ -1,0 +1,3 @@
+.gitattributes text eol=lf
+magnetar-runtime/fixtures/components/*.wat text eol=lf
+magnetar-runtime/fixtures/components/*.yaml text eol=lf

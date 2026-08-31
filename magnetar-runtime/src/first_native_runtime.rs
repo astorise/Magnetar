@@ -15,12 +15,21 @@ use crate::component::*;
 use crate::compute;
 use crate::compute::*;
 use crate::conformance::first_native_model_execution_profile;
+use crate::device::DeviceId;
 use crate::execution_graph::*;
 use crate::generation::*;
 use crate::inference_api::*;
 use crate::kernel::*;
+use crate::kernel_artifact::{
+    CompiledKernelArtifactId, PreparedKernel, PreparedKernelGeneration, PreparedKernelIdAllocator,
+};
 use crate::kernel_dispatch::*;
-use crate::kernel_execution_plan::{PreparedExecutionPlan, PreparedExecutionPlanGeneration};
+use crate::kernel_execution_plan::{
+    PlanGuard, PlanGuardContext, PlanMemoryRequirements, PlanNodeBinding, PreparedExecutionPhase,
+    PreparedExecutionPlan, PreparedExecutionPlanError, PreparedExecutionPlanGeneration,
+    PreparedExecutionPlanId, PreparedExecutionPlanScope, ResourceBindingPlan,
+    semantic_graph_fingerprint,
+};
 use crate::kernel_optimization_orchestration::run_kernel_optimization_orchestration_conformance;
 use crate::kernel_registry::*;
 use crate::kv_cache::*;
@@ -46,6 +55,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -64,6 +74,11 @@ const E2E_FIXTURE_HEAD_DIM: u64 = 2;
 const E2E_FIXTURE_INTERMEDIATE: u64 = 8;
 const E2E_FIXTURE_CONTEXT: u64 = 32;
 const E2E_FIXTURE_LAYERS: u64 = 1;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+const QWEN_GRAPH_COMPONENT_NAME: &str = "magnetar.qwen.graph-fixture";
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+const QWEN_GRAPH_COMPONENT_DIGEST: &str =
+    "sha256:e376dedc5059e0e46233fe783fab49c8d9752aa68a3a967876118d13fa5c9d85";
 
 // ---------------------------------------------------------------------
 // Error model
@@ -334,6 +349,14 @@ impl From<SessionError> for E2eConformanceError {
 impl From<ModelInstanceError> for E2eConformanceError {
     fn from(error: ModelInstanceError) -> Self {
         Self::ModelComponentFailed {
+            reason: error.to_string(),
+        }
+    }
+}
+
+impl From<PreparedExecutionPlanError> for E2eConformanceError {
+    fn from(error: PreparedExecutionPlanError) -> Self {
+        Self::GenerationFailed {
             reason: error.to_string(),
         }
     }
@@ -888,6 +911,7 @@ fn fixture_tensor_by_name<'a>(
         })
 }
 
+#[cfg(test)]
 fn apply_rope_per_head(
     tensor: &HostTensor,
     head_count: u64,
@@ -921,14 +945,9 @@ fn apply_rope_per_head(
     HostTensor::new(tensor.shape.clone(), out).map_err(E2eConformanceError::from)
 }
 
-/// Runs the decoder stack -- embedding lookup through every layer to the
-/// final RMSNorm -- using the real Reference CPU numeric kernels, returning
-/// the normed final hidden states rather than the tied-embedding logits
-/// projection itself. Split out from [`e2e_forward`] so a caller that needs
-/// the logits projection to be a genuine, evidence-bearing Kernel Dispatch
-/// (see `E2eRuntimeGenerationExecutor::execute_generation_step`) can perform
-/// that final matmul itself, instead of the returned logits being computed
-/// independently of the dispatch whose evidence is meant to certify them.
+/// Test oracle for the decoder stack. Production first-native generation uses
+/// `execute_qwen_hidden_states_through_dispatch` instead.
+#[cfg(test)]
 fn e2e_forward_hidden_states(
     fixture: &E2eFixture,
     token_ids: &[TokenId],
@@ -1010,12 +1029,10 @@ fn e2e_forward_hidden_states(
     rmsnorm(&hidden_states, final_norm, epsilon).map_err(E2eConformanceError::from)
 }
 
-/// Runs a genuine (if tiny) decoder forward pass over `token_ids` using the
-/// real Reference CPU numeric kernels -- embedding lookup, RMSNorm, matmul,
-/// RoPE, attention, SiLU, elementwise mul/add, residual-add, and a tied
-/// softmax-normalized read-out -- returning raw logits (length =
-/// vocabulary size) for the final position. This is what makes the E2E
-/// success path genuinely deterministic rather than a canned-output stub.
+/// Test oracle for a deterministic Qwen-like forward pass. This is deliberately
+/// not compiled into the production runtime path; the runtime path executes
+/// operators through Kernel Registry selection and Provider dispatch.
+#[cfg(test)]
 pub fn e2e_forward(
     fixture: &E2eFixture,
     token_ids: &[TokenId],
@@ -1034,10 +1051,155 @@ pub fn e2e_forward(
 }
 
 #[derive(Clone)]
-struct E2eRuntimeGenerationExecutor {
+struct E2eRuntimeModelExecutionEngine {
     fixture: E2eFixture,
+    kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
+    pending_kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
     #[cfg(test)]
     forced_token: Option<TokenId>,
+}
+
+#[derive(Clone, Debug)]
+struct FirstNativeExecutionKvState {
+    cache: KvCacheId,
+    compatibility: KvCacheCompatibility,
+    layer_kv: Vec<FirstNativeLayerKvState>,
+}
+
+#[derive(Clone, Debug)]
+struct FirstNativeLayerKvState {
+    k: HostTensor,
+    v: HostTensor,
+}
+
+impl E2eRuntimeModelExecutionEngine {
+    fn create_prefill_kv_state(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+    ) -> Result<FirstNativeExecutionKvState, InferenceApiError> {
+        let compatibility = self.kv_compatibility(request);
+        let mut cache = KvCache::new(
+            KvCacheId::new("first-native-temporary-kv").map_err(InferenceApiError::from)?,
+            if request.session.is_some() {
+                KvCacheScope::Session
+            } else {
+                KvCacheScope::Operation
+            },
+            compatibility.clone(),
+            KvCacheLayoutMetadata::contiguous(
+                self.fixture.config.architecture.layer_count as u32,
+                self.fixture.config.architecture.kv_head_count as u32,
+                self.fixture.config.architecture.head_dimension as u32,
+                request
+                    .prompt_token_count
+                    .saturating_add(request.max_new_tokens)
+                    .max(1) as u32,
+                ComputeDType::Float32,
+            ),
+        );
+        if let Some(session) = &request.session {
+            cache = cache.with_session(session.clone());
+        }
+        let cache_id = runtime.create_kv_cache(cache)?;
+        Ok(FirstNativeExecutionKvState {
+            cache: cache_id,
+            compatibility,
+            layer_kv: Vec::new(),
+        })
+    }
+
+    fn kv_state_key(request: &GenerationRequest) -> String {
+        request.request_id.as_str().to_string()
+    }
+
+    fn store_kv_state(
+        &self,
+        request: &GenerationRequest,
+        state: FirstNativeExecutionKvState,
+    ) -> Result<(), InferenceApiError> {
+        self.kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native KV state lock poisoned".into(),
+            })?
+            .insert(Self::kv_state_key(request), state);
+        Ok(())
+    }
+
+    fn store_pending_kv_state(
+        &self,
+        request: &GenerationRequest,
+        state: FirstNativeExecutionKvState,
+    ) -> Result<(), InferenceApiError> {
+        self.pending_kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native pending KV state lock poisoned".into(),
+            })?
+            .insert(Self::kv_state_key(request), state);
+        Ok(())
+    }
+
+    fn take_pending_kv_state(
+        &self,
+        request: &GenerationRequest,
+    ) -> Result<FirstNativeExecutionKvState, InferenceApiError> {
+        self.pending_kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native pending KV state lock poisoned".into(),
+            })?
+            .remove(&Self::kv_state_key(request))
+            .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                reason: "generation step has no pending first-native KV state to commit".into(),
+            })
+    }
+
+    fn discard_pending_kv_state(
+        &self,
+        request: &GenerationRequest,
+    ) -> Result<(), InferenceApiError> {
+        self.pending_kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native pending KV state lock poisoned".into(),
+            })?
+            .remove(&Self::kv_state_key(request));
+        Ok(())
+    }
+
+    fn decode_kv_state(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+    ) -> Result<FirstNativeExecutionKvState, InferenceApiError> {
+        let state = self
+            .kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native KV state lock poisoned".into(),
+            })?
+            .get(&Self::kv_state_key(request))
+            .cloned()
+            .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                reason: "decode requires existing first-native KV state".into(),
+            })?;
+        runtime.validate_kv_cache_reuse(&state.cache, &state.compatibility, None)?;
+        Ok(state)
+    }
+
+    fn kv_compatibility(&self, request: &GenerationRequest) -> KvCacheCompatibility {
+        KvCacheCompatibility::new(
+            request.model.clone(),
+            request.tokenizer.tokenizer_id.clone(),
+        )
+        .with_prefix_fingerprint(PrefixFingerprint::from_tokens(
+            &request.input_token_ids,
+            request.request_id.as_str(),
+            &request.tokenizer.tokenizer_id,
+        ))
+    }
 }
 
 /// Physically transposes a rank-2 [`HostTensor`], returning a `[cols, rows]`
@@ -1209,24 +1371,945 @@ fn dispatch_matmul(
     Ok((dispatch_result, output_tensor))
 }
 
-impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
+fn f32_tensor_descriptor(tensor: &HostTensor) -> TensorDescriptor {
+    TensorDescriptor::new(
+        ShapeDescriptor::new(tensor.shape.clone()),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+        LayoutDescriptor::Contiguous,
+    )
+}
+
+struct QwenDispatchContext<'a> {
+    runtime: &'a Runtime,
+    provider: &'a ReferenceCpuExecutor,
+    memory: &'a mut MemoryManager,
+}
+
+fn dispatch_reference_cpu_operator(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    operator: OperatorId,
+    inputs: Vec<(TensorResourceId, TensorDescriptor, HostTensor)>,
+    output: (TensorResourceId, TensorDescriptor),
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+        .with_execution_context(ctx.runtime.context().id());
+    let output_resource =
+        TensorResourceDescriptor::new(output.0.clone(), output.1, affinity.clone());
+    let mut selection_request = KernelSelectionRequest::new(
+        format!("e2e-runtime-{operation_id}"),
+        operator,
+        affinity.clone(),
+    )
+    .with_output(KernelResource::new(
+        output_resource.clone(),
+        KernelMemoryClass::Host,
+    ));
+    for (id, descriptor, tensor) in inputs {
+        let resource = TensorResourceDescriptor::new(id.clone(), descriptor, affinity.clone());
+        ctx.provider.write_tensor(id, tensor);
+        selection_request =
+            selection_request.with_input(KernelResource::new(resource, KernelMemoryClass::Host));
+    }
+    let selection = ctx
+        .runtime
+        .kernel_registry()
+        .select(&selection_request)
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: format!("{operation_id}: {error}"),
+        })?;
+    let selected =
+        selection
+            .selected
+            .as_ref()
+            .ok_or_else(|| InferenceApiError::KernelUnavailable {
+                reason: format!("Kernel Registry selected no candidate for {operation_id}"),
+            })?;
+    let advertisement = ctx
+        .runtime
+        .kernel_registry()
+        .active_advertisement(&selected.kernel)
+        .ok_or_else(|| InferenceApiError::KernelUnavailable {
+            reason: format!("selected advertisement for {operation_id} is no longer active"),
+        })?;
+    let mut plan = KernelDispatchPlan::from_selection(
+        KernelDispatchPlanId::new(format!("e2e-runtime-{operation_id}-dispatch")),
+        &selection_request,
+        selected,
+        advertisement,
+        KernelInvocationId::new(format!("e2e-runtime-{operation_id}-invocation")),
+    )
+    .map_err(|error| InferenceApiError::KernelUnavailable {
+        reason: format!("{error:?}"),
+    })?;
+    plan.invocation.attributes = attributes;
+    if advertisement.workspace.required {
+        let workspace = ctx
+            .provider
+            .allocate_workspace(
+                ctx.memory,
+                advertisement.workspace.size_bytes_upper_bound.unwrap_or(1),
+            )
+            .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
+                reason: error.to_string(),
+            })?;
+        plan.invocation.workspace = Some(workspace);
+        plan.workspace_reservation = Some(workspace);
+    }
+    let mut dispatcher = KernelDispatcher::new();
+    dispatcher
+        .revalidate(ctx.runtime.kernel_registry(), &mut plan)
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: format!("{error:?}"),
+        })?;
+    let operator_catalog = initial_operator_catalog();
+    let operator_spec = operator_catalog
+        .get(&advertisement.implemented_operator)
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: error.to_string(),
+        })?;
+    let kernel_result = ctx.provider.execute_invocation_with_memory_manager(
+        advertisement,
+        operator_spec,
+        &plan.invocation,
+        ctx.memory,
+    );
+    let dispatch_result = KernelDispatchResult::from_kernel_result(&plan, kernel_result);
+    if dispatch_result.status != KernelResultStatus::Succeeded {
+        return Err(InferenceApiError::ProviderUnavailable {
+            reason: format!(
+                "Reference CPU dispatch for {operation_id} failed: {:?}",
+                dispatch_result.error
+            ),
+        });
+    }
+    let output_tensor = ctx
+        .provider
+        .read_tensor(&output_resource.id)
+        .ok_or_else(|| InferenceApiError::GenerationFailed {
+            reason: format!("Reference CPU dispatch for {operation_id} produced no output"),
+        })?;
+    Ok((dispatch_result, output_tensor))
+}
+
+fn runtime_generation_failed(error: impl std::fmt::Display) -> InferenceApiError {
+    InferenceApiError::GenerationFailed {
+        reason: error.to_string(),
+    }
+}
+
+fn dispatch_operator_id(name: &str, family: OperatorFamily) -> OperatorId {
+    OperatorId::magnetar(name, 1, family)
+}
+
+fn dispatch_qwen_matmul(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    a: HostTensor,
+    b: HostTensor,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let (rows, _) = a.rows_cols().map_err(runtime_generation_failed)?;
+    let (_, cols) = b.rows_cols().map_err(runtime_generation_failed)?;
+    dispatch_reference_cpu_operator(
+        ctx,
+        operation_id,
+        dispatch_operator_id("matmul", OperatorFamily::LinearAlgebra),
+        vec![
+            (
+                TensorResourceId::new(format!("{operation_id}.a")),
+                f32_tensor_descriptor(&a),
+                a,
+            ),
+            (
+                TensorResourceId::new(format!("{operation_id}.b")),
+                f32_tensor_descriptor(&b),
+                b,
+            ),
+        ],
+        (
+            TensorResourceId::new(format!("{operation_id}.out")),
+            TensorDescriptor::new(
+                ShapeDescriptor::new([rows, cols]),
+                DTypeDescriptor::portable(ComputeDType::Float32),
+                LayoutDescriptor::Contiguous,
+            ),
+        ),
+        BTreeMap::new(),
+    )
+}
+
+fn dispatch_qwen_unary(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    name: &str,
+    family: OperatorFamily,
+    input: HostTensor,
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    dispatch_reference_cpu_operator(
+        ctx,
+        operation_id,
+        dispatch_operator_id(name, family),
+        vec![(
+            TensorResourceId::new(format!("{operation_id}.input")),
+            f32_tensor_descriptor(&input),
+            input.clone(),
+        )],
+        (
+            TensorResourceId::new(format!("{operation_id}.out")),
+            f32_tensor_descriptor(&input),
+        ),
+        attributes,
+    )
+}
+
+fn dispatch_qwen_binary_same_shape(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    name: &str,
+    family: OperatorFamily,
+    a: HostTensor,
+    b: HostTensor,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    dispatch_reference_cpu_operator(
+        ctx,
+        operation_id,
+        dispatch_operator_id(name, family),
+        vec![
+            (
+                TensorResourceId::new(format!("{operation_id}.a")),
+                f32_tensor_descriptor(&a),
+                a.clone(),
+            ),
+            (
+                TensorResourceId::new(format!("{operation_id}.b")),
+                f32_tensor_descriptor(&b),
+                b,
+            ),
+        ],
+        (
+            TensorResourceId::new(format!("{operation_id}.out")),
+            f32_tensor_descriptor(&a),
+        ),
+        BTreeMap::new(),
+    )
+}
+
+fn dispatch_qwen_rmsnorm(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    input: HostTensor,
+    weight: HostTensor,
+    epsilon: f32,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let (rows, cols) = input.rows_cols().map_err(runtime_generation_failed)?;
+    let weight = if weight.shape == [cols] {
+        let mut data = Vec::with_capacity((rows * cols) as usize);
+        for _ in 0..rows {
+            data.extend_from_slice(&weight.data);
+        }
+        HostTensor::new([rows, cols], data).map_err(runtime_generation_failed)?
+    } else {
+        weight
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "epsilon".into(),
+        OperatorAttributeValue::Float(epsilon as f64),
+    );
+    dispatch_reference_cpu_operator(
+        ctx,
+        operation_id,
+        dispatch_operator_id("rmsnorm", OperatorFamily::Normalization),
+        vec![
+            (
+                TensorResourceId::new(format!("{operation_id}.input")),
+                f32_tensor_descriptor(&input),
+                input.clone(),
+            ),
+            (
+                TensorResourceId::new(format!("{operation_id}.weight")),
+                f32_tensor_descriptor(&weight),
+                weight,
+            ),
+        ],
+        (
+            TensorResourceId::new(format!("{operation_id}.out")),
+            f32_tensor_descriptor(&input),
+        ),
+        attributes,
+    )
+}
+
+fn dispatch_qwen_rope_per_head(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    tensor: &HostTensor,
+    head_count: u64,
+    head_dimension: u64,
+    rope_config: &QwenRopeConfig,
+    position_offset: u64,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let (rows, cols) = tensor.rows_cols().map_err(runtime_generation_failed)?;
+    let mut out = vec![0.0_f32; tensor.data.len()];
+    let mut last_dispatch = None;
+    for head in 0..head_count {
+        let start_col = head * head_dimension;
+        let mut head_data = Vec::with_capacity((rows * head_dimension) as usize);
+        for row in 0..rows {
+            let base = (row * cols + start_col) as usize;
+            head_data.extend_from_slice(&tensor.data[base..base + head_dimension as usize]);
+        }
+        let head_tensor = HostTensor::new([rows, head_dimension], head_data)
+            .map_err(runtime_generation_failed)?;
+        let mut attributes = BTreeMap::new();
+        attributes.insert(
+            "base".into(),
+            OperatorAttributeValue::Float(rope_config.base),
+        );
+        attributes.insert(
+            "scale".into(),
+            OperatorAttributeValue::Float(rope_config.scale.unwrap_or(1.0)),
+        );
+        attributes.insert(
+            "dimension".into(),
+            OperatorAttributeValue::Integer(rope_config.dimension as i64),
+        );
+        attributes.insert(
+            "position_mode".into(),
+            OperatorAttributeValue::String(rope_config.position_mode.as_str().into()),
+        );
+        attributes.insert(
+            "position_offset".into(),
+            OperatorAttributeValue::Integer(position_offset as i64),
+        );
+        let (dispatch, rotated) = dispatch_qwen_unary(
+            ctx,
+            &format!("{operation_id}.head{head}"),
+            "rope",
+            OperatorFamily::PositionEncoding,
+            head_tensor,
+            attributes,
+        )?;
+        for row in 0..rows {
+            let dst_base = (row * cols + start_col) as usize;
+            let src_base = (row * head_dimension) as usize;
+            out[dst_base..dst_base + head_dimension as usize]
+                .copy_from_slice(&rotated.data[src_base..src_base + head_dimension as usize]);
+        }
+        last_dispatch = Some(dispatch);
+    }
+    let dispatch = last_dispatch.ok_or_else(|| InferenceApiError::GenerationFailed {
+        reason: "RoPE dispatch requires at least one head".into(),
+    })?;
+    let tensor = HostTensor::new(tensor.shape.clone(), out).map_err(runtime_generation_failed)?;
+    Ok((dispatch, tensor))
+}
+
+fn dispatch_qwen_attention(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    q: HostTensor,
+    k: HostTensor,
+    v: HostTensor,
+    architecture: &ModelComponentArchitectureMetadata,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let mut attributes = BTreeMap::new();
+    attributes.insert("causal".into(), OperatorAttributeValue::Boolean(true));
+    attributes.insert(
+        "head_count".into(),
+        OperatorAttributeValue::Integer(architecture.attention_head_count as i64),
+    );
+    attributes.insert(
+        "kv_head_count".into(),
+        OperatorAttributeValue::Integer(architecture.kv_head_count as i64),
+    );
+    attributes.insert(
+        "head_dimension".into(),
+        OperatorAttributeValue::Integer(architecture.head_dimension as i64),
+    );
+    attributes.insert(
+        "attention_mask_kind".into(),
+        OperatorAttributeValue::String("causal".into()),
+    );
+    dispatch_reference_cpu_operator(
+        ctx,
+        operation_id,
+        dispatch_operator_id("attention", OperatorFamily::Attention),
+        vec![
+            (
+                TensorResourceId::new(format!("{operation_id}.q")),
+                f32_tensor_descriptor(&q),
+                q.clone(),
+            ),
+            (
+                TensorResourceId::new(format!("{operation_id}.k")),
+                f32_tensor_descriptor(&k),
+                k,
+            ),
+            (
+                TensorResourceId::new(format!("{operation_id}.v")),
+                f32_tensor_descriptor(&v),
+                v,
+            ),
+        ],
+        (
+            TensorResourceId::new(format!("{operation_id}.out")),
+            f32_tensor_descriptor(&q),
+        ),
+        attributes,
+    )
+}
+
+fn concat_rows(a: &HostTensor, b: &HostTensor) -> Result<HostTensor, InferenceApiError> {
+    let (a_rows, a_cols) = a.rows_cols().map_err(runtime_generation_failed)?;
+    let (b_rows, b_cols) = b.rows_cols().map_err(runtime_generation_failed)?;
+    if a_cols != b_cols {
+        return Err(InferenceApiError::GenerationFailed {
+            reason: format!("cannot concatenate tensors with widths {a_cols} and {b_cols}"),
+        });
+    }
+    let mut data = Vec::with_capacity(a.data.len() + b.data.len());
+    data.extend_from_slice(&a.data);
+    data.extend_from_slice(&b.data);
+    HostTensor::new([a_rows + b_rows, a_cols], data).map_err(runtime_generation_failed)
+}
+
+fn execute_qwen_prefill_hidden_states_through_dispatch(
+    runtime: &Runtime,
+    fixture: &E2eFixture,
+    token_ids: &[TokenId],
+) -> Result<
+    (
+        KernelDispatchResult,
+        HostTensor,
+        Vec<FirstNativeLayerKvState>,
+    ),
+    InferenceApiError,
+> {
+    if token_ids.is_empty() {
+        return Err(InferenceApiError::GenerationFailed {
+            reason: "forward pass requires at least one token".into(),
+        });
+    }
+    let provider = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime,
+        provider: &provider,
+        memory: &mut memory,
+    };
+    let architecture = &fixture.config.architecture;
+    let seq_len = token_ids.len() as u64;
+    let epsilon = fixture.config.rmsnorm_epsilon;
+
+    let ids_tensor = HostTensor::new(
+        [seq_len],
+        token_ids.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+    )
+    .map_err(runtime_generation_failed)?;
+    let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (_embedding_dispatch, mut hidden_states) = dispatch_reference_cpu_operator(
+        &mut dispatch_ctx,
+        "embedding",
+        dispatch_operator_id("embedding", OperatorFamily::Tensor),
+        vec![
+            (
+                TensorResourceId::new("embedding.table"),
+                f32_tensor_descriptor(&token_embedding),
+                token_embedding,
+            ),
+            (
+                TensorResourceId::new("embedding.ids"),
+                f32_tensor_descriptor(&ids_tensor),
+                ids_tensor,
+            ),
+        ],
+        (
+            TensorResourceId::new("embedding.out"),
+            TensorDescriptor::new(
+                ShapeDescriptor::new([seq_len, architecture.hidden_size]),
+                DTypeDescriptor::portable(ComputeDType::Float32),
+                LayoutDescriptor::Contiguous,
+            ),
+        ),
+        BTreeMap::new(),
+    )?;
+
+    let mut layer_kv = Vec::with_capacity(architecture.layer_count as usize);
+    for layer in 0..architecture.layer_count {
+        let prefix = format!("layers.{layer}.");
+        let input_norm = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}input_norm"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+        let q_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.q_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let k_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.k_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let v_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.v_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let o_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.o_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let post_attn_norm =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}post_attn_norm"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let gate_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.gate_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let up_weight = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.up_proj"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+        let down_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.down_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+
+        let layer_id = format!("layer{layer}");
+        let (_dispatch, normed) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.input_norm"),
+            hidden_states.clone(),
+            input_norm,
+            epsilon,
+        )?;
+        let (_dispatch, q) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.q_proj"),
+            normed.clone(),
+            q_weight,
+        )?;
+        let (_dispatch, k) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.k_proj"),
+            normed.clone(),
+            k_weight,
+        )?;
+        let (_dispatch, v) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.v_proj"),
+            normed,
+            v_weight,
+        )?;
+        let (_dispatch, q) = dispatch_qwen_rope_per_head(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_q"),
+            &q,
+            architecture.attention_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+            0,
+        )?;
+        let (_dispatch, k) = dispatch_qwen_rope_per_head(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_k"),
+            &k,
+            architecture.kv_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+            0,
+        )?;
+        layer_kv.push(FirstNativeLayerKvState {
+            k: k.clone(),
+            v: v.clone(),
+        });
+        let (_dispatch, attention_out) = dispatch_qwen_attention(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.attention"),
+            q,
+            k,
+            v,
+            architecture,
+        )?;
+        let (_dispatch, attention_proj) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.o_proj"),
+            attention_out,
+            o_weight,
+        )?;
+        let (_dispatch, post_attention) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual1"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            attention_proj,
+            hidden_states,
+        )?;
+        let (_dispatch, normed_mlp) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.post_attn_norm"),
+            post_attention.clone(),
+            post_attn_norm,
+            epsilon,
+        )?;
+        let (_dispatch, gate) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.gate_proj"),
+            normed_mlp.clone(),
+            gate_weight,
+        )?;
+        let (_dispatch, up) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.up_proj"),
+            normed_mlp,
+            up_weight,
+        )?;
+        let (_dispatch, activated) = dispatch_qwen_unary(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.silu"),
+            "silu",
+            OperatorFamily::Activation,
+            gate,
+            BTreeMap::new(),
+        )?;
+        let (_dispatch, gated) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.mul"),
+            "mul",
+            OperatorFamily::Tensor,
+            activated,
+            up,
+        )?;
+        let (_dispatch, mlp_out) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.down_proj"),
+            gated,
+            down_weight,
+        )?;
+        let (_dispatch, layer_out) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual2"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            mlp_out,
+            post_attention,
+        )?;
+        hidden_states = layer_out;
+    }
+
+    let final_norm = fixture_tensor_by_name(&fixture.weights, "final_norm")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (dispatch, hidden_states) = dispatch_qwen_rmsnorm(
+        &mut dispatch_ctx,
+        "final_norm",
+        hidden_states,
+        final_norm,
+        epsilon,
+    )?;
+    Ok((dispatch, hidden_states, layer_kv))
+}
+
+fn execute_qwen_decode_hidden_states_through_dispatch(
+    runtime: &Runtime,
+    fixture: &E2eFixture,
+    token_id: TokenId,
+    kv_state: &FirstNativeExecutionKvState,
+    absolute_position: u64,
+) -> Result<
+    (
+        KernelDispatchResult,
+        HostTensor,
+        Vec<FirstNativeLayerKvState>,
+    ),
+    InferenceApiError,
+> {
+    let provider = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime,
+        provider: &provider,
+        memory: &mut memory,
+    };
+    let architecture = &fixture.config.architecture;
+    if kv_state.layer_kv.len() != architecture.layer_count as usize {
+        return Err(InferenceApiError::KvCacheUnavailable {
+            reason: format!(
+                "decode requires {} layer KV entries, found {}",
+                architecture.layer_count,
+                kv_state.layer_kv.len()
+            ),
+        });
+    }
+    let epsilon = fixture.config.rmsnorm_epsilon;
+    let ids_tensor =
+        HostTensor::new([1], vec![token_id as f32]).map_err(runtime_generation_failed)?;
+    let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (_embedding_dispatch, mut hidden_states) = dispatch_reference_cpu_operator(
+        &mut dispatch_ctx,
+        "decode.embedding",
+        dispatch_operator_id("embedding", OperatorFamily::Tensor),
+        vec![
+            (
+                TensorResourceId::new("decode.embedding.table"),
+                f32_tensor_descriptor(&token_embedding),
+                token_embedding,
+            ),
+            (
+                TensorResourceId::new("decode.embedding.ids"),
+                f32_tensor_descriptor(&ids_tensor),
+                ids_tensor,
+            ),
+        ],
+        (
+            TensorResourceId::new("decode.embedding.out"),
+            TensorDescriptor::new(
+                ShapeDescriptor::new([1, architecture.hidden_size]),
+                DTypeDescriptor::portable(ComputeDType::Float32),
+                LayoutDescriptor::Contiguous,
+            ),
+        ),
+        BTreeMap::new(),
+    )?;
+
+    let mut updated_layer_kv = Vec::with_capacity(architecture.layer_count as usize);
+    for layer in 0..architecture.layer_count {
+        let prefix = format!("layers.{layer}.");
+        let input_norm = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}input_norm"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+        let q_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.q_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let k_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.k_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let v_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.v_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let o_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.o_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let post_attn_norm =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}post_attn_norm"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let gate_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.gate_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let up_weight = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.up_proj"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+        let down_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.down_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+
+        let layer_id = format!("decode.layer{layer}");
+        let (_dispatch, normed) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.input_norm"),
+            hidden_states.clone(),
+            input_norm,
+            epsilon,
+        )?;
+        let (_dispatch, q) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.q_proj"),
+            normed.clone(),
+            q_weight,
+        )?;
+        let (_dispatch, k_new) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.k_proj"),
+            normed.clone(),
+            k_weight,
+        )?;
+        let (_dispatch, v_new) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.v_proj"),
+            normed,
+            v_weight,
+        )?;
+        let (_dispatch, q) = dispatch_qwen_rope_per_head(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_q"),
+            &q,
+            architecture.attention_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+            absolute_position,
+        )?;
+        let (_dispatch, k_new) = dispatch_qwen_rope_per_head(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_k"),
+            &k_new,
+            architecture.kv_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+            absolute_position,
+        )?;
+        let historical = &kv_state.layer_kv[layer as usize];
+        let k = concat_rows(&historical.k, &k_new)?;
+        let v = concat_rows(&historical.v, &v_new)?;
+        updated_layer_kv.push(FirstNativeLayerKvState {
+            k: k.clone(),
+            v: v.clone(),
+        });
+        let (_dispatch, attention_out) = dispatch_qwen_attention(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.attention"),
+            q,
+            k,
+            v,
+            architecture,
+        )?;
+        let (_dispatch, attention_proj) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.o_proj"),
+            attention_out,
+            o_weight,
+        )?;
+        let (_dispatch, post_attention) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual1"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            attention_proj,
+            hidden_states,
+        )?;
+        let (_dispatch, normed_mlp) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.post_attn_norm"),
+            post_attention.clone(),
+            post_attn_norm,
+            epsilon,
+        )?;
+        let (_dispatch, gate) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.gate_proj"),
+            normed_mlp.clone(),
+            gate_weight,
+        )?;
+        let (_dispatch, up) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.up_proj"),
+            normed_mlp,
+            up_weight,
+        )?;
+        let (_dispatch, activated) = dispatch_qwen_unary(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.silu"),
+            "silu",
+            OperatorFamily::Activation,
+            gate,
+            BTreeMap::new(),
+        )?;
+        let (_dispatch, gated) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.mul"),
+            "mul",
+            OperatorFamily::Tensor,
+            activated,
+            up,
+        )?;
+        let (_dispatch, mlp_out) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.down_proj"),
+            gated,
+            down_weight,
+        )?;
+        let (_dispatch, layer_out) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual2"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            mlp_out,
+            post_attention,
+        )?;
+        hidden_states = layer_out;
+    }
+
+    let final_norm = fixture_tensor_by_name(&fixture.weights, "final_norm")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (dispatch, hidden_states) = dispatch_qwen_rmsnorm(
+        &mut dispatch_ctx,
+        "decode.final_norm",
+        hidden_states,
+        final_norm,
+        epsilon,
+    )?;
+    Ok((dispatch, hidden_states, updated_layer_kv))
+}
+
+fn dispatch_qwen_logits_projection(
+    runtime: &Runtime,
+    fixture: &E2eFixture,
+    hidden_states: &HostTensor,
+) -> Result<(KernelDispatchResult, Vec<f32>), InferenceApiError> {
+    let token_embedding =
+        fixture_tensor_by_name(&fixture.weights, "token_embedding").map_err(|error| {
+            InferenceApiError::GenerationFailed {
+                reason: error.to_string(),
+            }
+        })?;
+    let token_embedding_transposed = transpose_rows_cols(token_embedding).map_err(|error| {
+        InferenceApiError::GenerationFailed {
+            reason: error.to_string(),
+        }
+    })?;
+    let (dispatch_result, output) =
+        dispatch_matmul(runtime, hidden_states, &token_embedding_transposed)?;
+    let vocab = fixture.config.architecture.vocabulary_size as usize;
+    let output_rows = output.data.len() / vocab;
+    let last_row_start = output_rows.saturating_sub(1) * vocab;
+    Ok((
+        dispatch_result,
+        output.data[last_row_start..last_row_start + vocab].to_vec(),
+    ))
+}
+
+impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
     fn execute_generation_step(
         &self,
-        runtime: &Runtime,
+        runtime: &mut Runtime,
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
-    ) -> Result<RuntimeGenerationStep, InferenceApiError> {
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         #[cfg(test)]
         let forced_token = self.forced_token;
         #[cfg(not(test))]
         let forced_token: Option<TokenId> = None;
 
         let vocab = self.fixture.config.architecture.vocabulary_size as usize;
+        let mut kv_state = if generated_tokens.is_empty() {
+            self.create_prefill_kv_state(runtime, request)?
+        } else {
+            self.decode_kv_state(runtime, request)?
+        };
+        let model_input_token_count = if generated_tokens.is_empty() {
+            request.input_token_ids.len()
+        } else {
+            1
+        };
+        let absolute_position = request.input_token_ids.len() + generated_tokens.len();
+        self.discard_pending_kv_state(request)?;
         let (dispatch_result, logits) = if let Some(token) = forced_token {
             // Test-only deterministic shortcut, never exercised by
             // `validate_e2e_no_shortcuts` (the success path this gate
             // checks is always built without a forced token -- see
-            // `build_runtime_with_generation_executor`). The returned
+            // `build_runtime_with_model_execution_engine`). The returned
             // logits are synthetic by construction; a trivial matmul is
             // still dispatched so the Provider/observability path is
             // exercised, but its output is deliberately not what is
@@ -1241,46 +2324,82 @@ impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
             logits[token as usize] = 10.0;
             (dispatch_result, logits)
         } else {
-            let mut sequence = request.input_token_ids.clone();
-            sequence.extend_from_slice(generated_tokens);
-            let normed_final =
-                e2e_forward_hidden_states(&self.fixture, &sequence).map_err(|error| {
+            let (_hidden_dispatch, normed_final) = if generated_tokens.is_empty() {
+                let (dispatch, normed_final, layer_kv) =
+                    execute_qwen_prefill_hidden_states_through_dispatch(
+                        runtime,
+                        &self.fixture,
+                        &request.input_token_ids,
+                    )?;
+                kv_state.layer_kv = layer_kv;
+                (dispatch, normed_final)
+            } else {
+                let token = *generated_tokens.last().ok_or_else(|| {
                     InferenceApiError::GenerationFailed {
-                        reason: error.to_string(),
+                        reason: "decode requires a newly admitted token".into(),
                     }
                 })?;
-            let token_embedding = fixture_tensor_by_name(&self.fixture.weights, "token_embedding")
-                .map_err(|error| InferenceApiError::GenerationFailed {
-                    reason: error.to_string(),
-                })?;
-            // Tied embeddings: logits = normed_final @ token_embedding^T.
-            // The portable `matmul` Operator's shape rule validates a plain
-            // `a @ b` (it does not consult a `transpose_b` attribute), so
-            // `token_embedding` is physically transposed here rather than
-            // passed with a transpose flag.
-            let token_embedding_transposed =
-                transpose_rows_cols(token_embedding).map_err(|error| {
-                    InferenceApiError::GenerationFailed {
-                        reason: error.to_string(),
-                    }
-                })?;
+                let (dispatch, normed_final, layer_kv) =
+                    execute_qwen_decode_hidden_states_through_dispatch(
+                        runtime,
+                        &self.fixture,
+                        token,
+                        &kv_state,
+                        absolute_position as u64,
+                    )?;
+                kv_state.layer_kv = layer_kv;
+                (dispatch, normed_final)
+            };
             // The tied-embedding logits projection, dispatched for real:
             // the output tensor read back here is exactly what is returned
             // below, so the evidence this dispatch produces is causally
             // tied to the returned logits rather than to an unrelated proof
             // computation.
-            let (dispatch_result, output) =
-                dispatch_matmul(runtime, &normed_final, &token_embedding_transposed)?;
-            let last_row_start = (sequence.len() - 1) * vocab;
-            (
-                dispatch_result,
-                output.data[last_row_start..last_row_start + vocab].to_vec(),
-            )
+            dispatch_qwen_logits_projection(runtime, &self.fixture, &normed_final)?
         };
-        Ok(RuntimeGenerationStep::new(
-            logits,
-            RuntimeGenerationExecutionEvidence::from_dispatch_result(&dispatch_result, true, true),
-        ))
+        let kv_commit = if generated_tokens.is_empty() {
+            RuntimeKvCacheCommit::PrefillCompleted {
+                cache: kv_state.cache.clone(),
+                tokens: request.prompt_token_count as u32,
+            }
+        } else {
+            RuntimeKvCacheCommit::DecodeAppended {
+                cache: kv_state.cache.clone(),
+                tokens: 1,
+            }
+        };
+        self.store_pending_kv_state(request, kv_state.clone())?;
+        let mut evidence =
+            RuntimeGenerationExecutionEvidence::from_dispatch_result(&dispatch_result, true, true)
+                .with_context(format!("request={}", request.request_id))
+                .with_context(format!("decode_step={}", generated_tokens.len()))
+                .with_context(format!("model_input_tokens={model_input_token_count}"))
+                .with_context(format!("kv_cache={}", kv_state.cache))
+                .with_context(format!("absolute_position={absolute_position}"));
+        if let GenerationModelReference::ModelInstance(instance) = &request.model {
+            evidence = evidence.with_context(format!("model_instance={instance}"));
+        }
+        if let Some(session) = &request.session {
+            evidence = evidence.with_context(format!("session={session}"));
+        }
+        Ok(RuntimeModelExecutionStep::new(logits, evidence).with_kv_commit(kv_commit))
+    }
+
+    fn commit_generation_step(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens_before_step: &[TokenId],
+        _accepted_token: TokenId,
+        _step: &RuntimeModelExecutionStep,
+    ) -> Result<(), InferenceApiError> {
+        let state = self.take_pending_kv_state(request)?;
+        if generated_tokens_before_step.is_empty() {
+            runtime.prefill_kv_cache_completed(&state.cache, request.prompt_token_count as u32)?;
+        } else {
+            runtime.append_decode_kv_cache(&state.cache, 1)?;
+        }
+        self.store_kv_state(request, state)
     }
 }
 
@@ -1336,6 +2455,7 @@ pub fn validate_e2e_no_shortcuts(
 struct E2eRunOutcome {
     generation_result: GenerationResult,
     observer: InferenceApiObserver,
+    kv_observations: Vec<KvCacheObservation>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1346,37 +2466,75 @@ pub struct FirstNativeFixtureGeneration {
 }
 
 fn build_runtime() -> Runtime {
-    Runtime::builder()
+    let mut runtime = Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
         .build()
-        .expect("Reference CPU provider registers cleanly")
+        .expect("Reference CPU provider registers cleanly");
+    register_reference_cpu_prepared_kernels(&mut runtime);
+    runtime
 }
 
-fn build_runtime_with_generation_executor(fixture: &E2eFixture) -> Runtime {
-    Runtime::builder()
+fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
+    let mut runtime = Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .generation_executor(std::sync::Arc::new(E2eRuntimeGenerationExecutor {
+        .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
             fixture: fixture.clone(),
+            kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
             forced_token: None,
         }))
         .build()
-        .expect("Reference CPU provider registers cleanly")
+        .expect("Reference CPU provider registers cleanly");
+    register_reference_cpu_prepared_kernels(&mut runtime);
+    runtime
 }
 
 #[cfg(test)]
-fn build_runtime_with_generation_executor_and_forced_token(
+fn build_runtime_with_model_execution_engine_and_forced_token(
     fixture: &E2eFixture,
     forced_token: Option<TokenId>,
 ) -> Runtime {
-    Runtime::builder()
+    let mut runtime = Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .generation_executor(std::sync::Arc::new(E2eRuntimeGenerationExecutor {
+        .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
             fixture: fixture.clone(),
+            kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             forced_token,
         }))
         .build()
-        .expect("Reference CPU provider registers cleanly")
+        .expect("Reference CPU provider registers cleanly");
+    register_reference_cpu_prepared_kernels(&mut runtime);
+    runtime
+}
+
+fn register_reference_cpu_prepared_kernels(runtime: &mut Runtime) {
+    let mut prepared_ids = PreparedKernelIdAllocator::default();
+    for advertisement in reference_cpu_kernel_advertisements() {
+        let id = prepared_ids.allocate();
+        let mut prepared = PreparedKernel::new(
+            id,
+            advertisement.id.clone(),
+            CompiledKernelArtifactId::from_digest(format!(
+                "builtin:{}",
+                advertisement.id.stable_key()
+            )),
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            DeviceBinding::new(DeviceId::new(REFERENCE_CPU_DEVICE_ID)),
+            PreparedKernelGeneration::new(1),
+        );
+        prepared
+            .mark_ready()
+            .expect("Reference CPU prepared kernel fixture can become ready");
+        runtime
+            .kernel_registry_mut()
+            .register_prepared_kernel(prepared);
+        runtime
+            .kernel_registry_mut()
+            .promote_generation(&advertisement.id, id)
+            .expect("Reference CPU prepared kernel fixture promotes cleanly");
+    }
 }
 
 fn load_fixture_instance(
@@ -1407,6 +2565,530 @@ fn load_fixture_instance(
     Ok((instance, memory))
 }
 
+fn require_ready_first_native_instance<'a>(
+    runtime: &'a Runtime,
+    instance: &ModelInstanceId,
+) -> Result<&'a ModelInstance, InferenceApiError> {
+    let model_instance = runtime
+        .model_instance(instance)
+        .map_err(InferenceApiError::from)?;
+    let status = model_instance.status();
+    if !status.readiness.accepts_generation() {
+        return Err(InferenceApiError::ModelInstanceNotReady {
+            reason: format!(
+                "first-native generation requires ready ModelInstance '{instance}', got lifecycle {:?} / readiness {:?}",
+                status.lifecycle, status.readiness
+            ),
+        });
+    }
+    Ok(model_instance)
+}
+
+struct FirstNativePreparedPlans {
+    prefill: PreparedExecutionPlan,
+    prefill_node_count: usize,
+    decode: PreparedExecutionPlan,
+    decode_node_count: usize,
+}
+
+fn first_native_plan_context(phase: PreparedExecutionPhase, token_count: u64) -> PlanGuardContext {
+    let mut context = PlanGuardContext::for_phase(phase);
+    context.sequence_length = Some(token_count.max(1));
+    context.total_tokens = Some(token_count.max(1));
+    context.affinity = Some(ResourceAffinity::new(FallbackClass::Transparent));
+    context.provider_ready = true;
+    context.device_ready = true;
+    context.memory_feasible = true;
+    context
+}
+
+fn require_compatible_first_native_plan(
+    plan: Option<&mut PreparedExecutionPlan>,
+    context: &PlanGuardContext,
+) -> Result<PreparedExecutionPlanGeneration, PreparedExecutionPlanError> {
+    let plan = plan.ok_or(PreparedExecutionPlanError::PlanNotFound)?;
+    plan.execute_ready_path(context)?;
+    Ok(plan.generation)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+const QWEN_GRAPH_COMPONENT_BYTES: &[u8] =
+    include_bytes!("../fixtures/components/qwen-graph.component.wat");
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+const QWEN_GRAPH_COMPONENT_MANIFEST_BYTES: &[u8] =
+    include_bytes!("../fixtures/components/qwen-graph.component.wat.magnetar-component.yaml");
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn qwen_graph_component_package() -> ComponentArtifactPackage {
+    ComponentArtifactPackage::new(
+        QWEN_GRAPH_COMPONENT_BYTES.to_vec(),
+        QWEN_GRAPH_COMPONENT_MANIFEST_BYTES.to_vec(),
+        ComponentDigest::parse("sha256", QWEN_GRAPH_COMPONENT_DIGEST),
+        ComponentDistributionSource::new(
+            ComponentDistributionSourceKind::DevelopmentFixture,
+            QWEN_GRAPH_COMPONENT_NAME,
+        ),
+    )
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[derive(Debug)]
+struct QwenComponentPreflight {
+    definition: ComponentDefinitionId,
+    instance: ComponentInstanceId,
+    graph_semantics: QwenComponentGraphSemantics,
+    observations: Vec<ComponentObservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QwenComponentGraphSemantics {
+    prefill_node_count: usize,
+    decode_node_count: usize,
+}
+
+impl QwenComponentGraphSemantics {
+    fn validate_against_graphs(
+        self,
+        prefill: &ExecutionGraph,
+        decode: &ExecutionGraph,
+    ) -> Result<(), E2eConformanceError> {
+        if self.prefill_node_count != prefill.nodes.len() {
+            return Err(E2eConformanceError::GraphValidationFailed {
+                reason: format!(
+                    "Qwen Component prefill graph declared {} node(s), runtime graph has {}",
+                    self.prefill_node_count,
+                    prefill.nodes.len()
+                ),
+            });
+        }
+        if self.decode_node_count != decode.nodes.len() {
+            return Err(E2eConformanceError::GraphValidationFailed {
+                reason: format!(
+                    "Qwen Component decode graph declared {} node(s), runtime graph has {}",
+                    self.decode_node_count,
+                    decode.nodes.len()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+struct FirstNativeComponentGraphs {
+    prefill: ExecutionGraph,
+    prefill_node_count: usize,
+    decode: ExecutionGraph,
+    decode_node_count: usize,
+}
+
+fn build_first_native_graphs_from_component_output(
+    fixture: &E2eFixture,
+    prompt_token_count: u64,
+    component_graph_semantics: QwenComponentGraphSemantics,
+) -> Result<FirstNativeComponentGraphs, E2eConformanceError> {
+    let prefill = qwen_prefill_graph(
+        &fixture.config,
+        &fixture.identity,
+        prompt_token_count.max(1),
+        true,
+    )?;
+    let decode = qwen_decode_graph(
+        &fixture.config,
+        &fixture.identity,
+        prompt_token_count.max(1),
+    )?;
+    component_graph_semantics.validate_against_graphs(&prefill.graph, &decode.graph)?;
+    validate_first_scope_graph(&prefill.graph)?;
+    validate_first_scope_graph(&decode.graph)?;
+    Ok(FirstNativeComponentGraphs {
+        prefill_node_count: prefill.graph.nodes.len(),
+        decode_node_count: decode.graph.nodes.len(),
+        prefill: prefill.graph,
+        decode: decode.graph,
+    })
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn qwen_component_runtime_limits() -> ComponentResourceLimits {
+    ComponentResourceLimits {
+        max_memory_bytes: Some(1 << 20),
+        execution_deadline_millis: Some(1_000),
+        max_concurrent_invocations: Some(1),
+        max_instances: Some(1),
+        engine_execution_budget: Some(100_000),
+        require_memory_limit: true,
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+struct QwenComponentPreflightRequest {
+    component_package: ComponentArtifactPackage,
+    trust_store: ComponentTrustStore,
+    limits: ComponentResourceLimits,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+impl QwenComponentPreflightRequest {
+    fn default_trusted() -> Self {
+        Self {
+            component_package: qwen_graph_component_package(),
+            trust_store: ComponentTrustStore::default().trust_digest(QWEN_GRAPH_COMPONENT_DIGEST),
+            limits: qwen_component_runtime_limits(),
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn invoke_qwen_component_u32(
+    manager: &mut ComponentManager,
+    instance: ComponentInstanceId,
+    interface: &WitInterface,
+    operation: &str,
+) -> Result<u32, E2eConformanceError> {
+    let result = manager
+        .invoke(ComponentInvocation::new(
+            instance,
+            interface.clone(),
+            operation,
+        ))
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    match result.values.as_slice() {
+        [ComponentValue::U32(value)] => Ok(*value),
+        values => Err(E2eConformanceError::GraphValidationFailed {
+            reason: format!(
+                "Qwen Component export '{operation}' returned {values:?}, expected u32"
+            ),
+        }),
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn validate_and_instantiate_qwen_component_before_first_native_planning(
+    request: QwenComponentPreflightRequest,
+) -> Result<QwenComponentPreflight, E2eConformanceError> {
+    let mut manager = ComponentManager::with_engine(Box::new(
+        crate::component_wasmtime::WasmtimeComponentEngine::new().map_err(|error| {
+            E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            }
+        })?,
+    ));
+    manager.set_resource_limits(request.limits);
+    manager.set_trust_store(request.trust_store);
+    let definition = manager
+        .prepare_pushed_package(request.component_package)
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let instance = manager
+        .instantiate_prepared_component(definition)
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let interface = WitInterface::new("magnetar:qwen/graph-fixture", "1.0.0");
+    let authority = invoke_qwen_component_u32(
+        &mut manager,
+        instance,
+        &interface,
+        "provider-authority-count",
+    )?;
+    if authority != 0 {
+        return Err(E2eConformanceError::BoundaryViolation {
+            reason: "Qwen Component fixture requested Provider authority".into(),
+        });
+    }
+    let graph_semantics = QwenComponentGraphSemantics {
+        prefill_node_count: invoke_qwen_component_u32(
+            &mut manager,
+            instance,
+            &interface,
+            "prefill-node-count",
+        )? as usize,
+        decode_node_count: invoke_qwen_component_u32(
+            &mut manager,
+            instance,
+            &interface,
+            "decode-node-count",
+        )? as usize,
+    };
+    Ok(QwenComponentPreflight {
+        definition,
+        instance,
+        graph_semantics,
+        observations: manager.observations().to_vec(),
+    })
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn validate_and_instantiate_trusted_qwen_component_before_first_native_planning()
+-> Result<QwenComponentPreflight, E2eConformanceError> {
+    validate_and_instantiate_qwen_component_before_first_native_planning(
+        QwenComponentPreflightRequest::default_trusted(),
+    )
+}
+
+fn prepare_first_native_plan_for_graph(
+    runtime: &Runtime,
+    graph: &ExecutionGraph,
+    instance: &ModelInstanceId,
+    model_instance_revision: u64,
+    token_count: u64,
+    generation: PreparedExecutionPlanGeneration,
+) -> Result<PreparedExecutionPlan, E2eConformanceError> {
+    let phase = PreparedExecutionPhase::from(graph.phase);
+    let mut scope = PreparedExecutionPlanScope::for_phase(phase)
+        .with_model_instance(instance.clone(), model_instance_revision)
+        .with_workload_bucket(format!("{:?}-{}-tokens", phase, token_count.max(1)));
+    scope.provider = Some(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+
+    let mut plan = PreparedExecutionPlan::new(
+        PreparedExecutionPlanId::new(format!("first-native-{phase:?}-plan"))?,
+        generation,
+        semantic_graph_fingerprint(graph),
+        scope,
+    )?;
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+        .with_execution_context(runtime.context().id());
+
+    for (node_id, node) in &graph.nodes {
+        let node_affinity = node
+            .resource_affinity
+            .clone()
+            .unwrap_or_else(|| affinity.clone());
+        let mut selection_request = KernelSelectionRequest::new(
+            format!("first-native-plan-{phase:?}-{}", node_id.as_str()),
+            node.operator.clone(),
+            node_affinity.clone(),
+        );
+        selection_request.graph_plan = Some(graph.id.clone());
+        selection_request.model_instance = Some(instance.clone());
+        selection_request.observability_correlation =
+            Some(format!("first-native-plan:{phase:?}:{node_id}"));
+        for input in &node.inputs {
+            let resource = graph_kernel_resource(graph, input, &node_affinity)?;
+            merge_graph_edge_requirements(&mut selection_request, &resource);
+            if let Some(kv) = graph
+                .edges
+                .get(input)
+                .and_then(|edge| edge.kv_cache.as_ref())
+            {
+                note_graph_kv_requirement(&mut selection_request, kv);
+                if matches!(kv.behavior, GraphKvCacheBehavior::Input) {
+                    merge_kernel_managed_kv_requirement(&mut selection_request, kv, &resource);
+                }
+            }
+            selection_request = selection_request.with_input(resource);
+        }
+        for output in &node.outputs {
+            let resource = graph_kernel_resource(graph, output, &node_affinity)?;
+            merge_graph_edge_requirements(&mut selection_request, &resource);
+            if let Some(kv) = graph
+                .edges
+                .get(output)
+                .and_then(|edge| edge.kv_cache.as_ref())
+            {
+                note_graph_kv_requirement(&mut selection_request, kv);
+            }
+            selection_request = selection_request.with_output(resource);
+        }
+        let selection = runtime
+            .kernel_registry()
+            .select(&selection_request)
+            .map_err(|error| E2eConformanceError::KernelCoverageMissing {
+                reason: format!(
+                    "Kernel Registry selection failed for node {node_id} ({operator}): {error}",
+                    operator = node.operator,
+                ),
+            })?;
+        let candidate =
+            selection
+                .selected
+                .ok_or_else(|| E2eConformanceError::KernelCoverageMissing {
+                    reason: format!("no Kernel Registry candidate selected for node {node_id}"),
+                })?;
+
+        let mut binding = PlanNodeBinding::new(
+            [node_id.clone()],
+            candidate.kernel.clone(),
+            candidate.provider.clone(),
+        )?
+        .with_specialization(format!("first-native-{phase:?}-{}", node_id.as_str()));
+        let prepared_kernel = runtime
+            .kernel_registry()
+            .active_prepared_kernel(&candidate.kernel)
+            .ok_or_else(|| E2eConformanceError::KernelCoverageMissing {
+                reason: format!("no active PreparedKernel registered for node {node_id}"),
+            })?;
+        binding = binding.with_prepared_kernel(prepared_kernel.id, prepared_kernel.generation);
+        if let Some(device) = candidate.device {
+            binding = binding.with_device(device);
+        }
+        if let Some(profile) = candidate.kernel.conformance_profile {
+            binding = binding.with_qualification_profile(profile);
+        }
+        plan.add_node_binding(binding)?;
+    }
+
+    plan.set_resource_plan(ResourceBindingPlan::default())?;
+    plan.set_memory_requirements(PlanMemoryRequirements::default())?;
+    plan.add_guard(PlanGuard::Phase(phase));
+    plan.add_guard(PlanGuard::SequenceRange {
+        min: 1,
+        max: E2E_FIXTURE_CONTEXT,
+    });
+    plan.add_guard(PlanGuard::Readiness);
+    plan.add_guard(PlanGuard::AffinityRequired);
+    plan.add_guard(PlanGuard::MemoryFeasible);
+    plan.mark_ready_atomically()?;
+
+    let mut plan_for_validation = plan.clone();
+    let context = first_native_plan_context(phase, token_count);
+    require_compatible_first_native_plan(Some(&mut plan_for_validation), &context)?;
+    Ok(plan)
+}
+
+fn kernel_memory_class_for_edge(edge: &TensorEdge) -> KernelMemoryClass {
+    match edge.residency {
+        TensorResidencyConstraint::Device => KernelMemoryClass::Device,
+        TensorResidencyConstraint::BrowserLinearMemory => KernelMemoryClass::BrowserLinearMemory,
+        TensorResidencyConstraint::ProviderOwnedOpaque => KernelMemoryClass::ProviderOwned,
+        TensorResidencyConstraint::Host => match edge.memory_class {
+            MemoryAllocationClass::HostPinned | MemoryAllocationClass::TransferStaging => {
+                KernelMemoryClass::PinnedHost
+            }
+            MemoryAllocationClass::BrowserLinearMemory => KernelMemoryClass::BrowserLinearMemory,
+            _ => KernelMemoryClass::Host,
+        },
+    }
+}
+
+fn layout_kind_for_descriptor(descriptor: &TensorDescriptor) -> TensorLayoutKind {
+    match descriptor.layout {
+        LayoutDescriptor::Contiguous => TensorLayoutKind::Contiguous,
+        LayoutDescriptor::Strided { .. } => TensorLayoutKind::Strided,
+        LayoutDescriptor::Blocked { .. } => TensorLayoutKind::Blocked,
+        LayoutDescriptor::Paged { .. } => TensorLayoutKind::Paged,
+        LayoutDescriptor::PackedQuantized { .. } => TensorLayoutKind::QuantizedPacked,
+        LayoutDescriptor::AttentionSpecific { .. } => TensorLayoutKind::AttentionSpecific,
+        LayoutDescriptor::BrowserCompatible { .. } => TensorLayoutKind::BrowserCompatible,
+        LayoutDescriptor::ProviderOpaque { .. } => TensorLayoutKind::ProviderOpaque,
+    }
+}
+
+fn graph_kernel_resource(
+    graph: &ExecutionGraph,
+    edge_id: &TensorEdgeId,
+    default_affinity: &ResourceAffinity,
+) -> Result<KernelResource, E2eConformanceError> {
+    let edge =
+        graph
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| E2eConformanceError::GraphValidationFailed {
+                reason: format!("graph node references missing tensor edge '{edge_id}'"),
+            })?;
+    let affinity = edge
+        .affinity
+        .clone()
+        .unwrap_or_else(|| default_affinity.clone());
+    Ok(KernelResource::new(
+        TensorResourceDescriptor::new(
+            TensorResourceId::new(edge.id.as_str()),
+            edge.descriptor.clone(),
+            affinity,
+        ),
+        kernel_memory_class_for_edge(edge),
+    ))
+}
+
+fn merge_graph_edge_requirements(request: &mut KernelSelectionRequest, resource: &KernelResource) {
+    if let DTypeDescriptor::Portable(dtype) = &resource.resource.descriptor.dtype {
+        request.dtype_requirements.insert(*dtype);
+    }
+    request
+        .layout_requirements
+        .insert(layout_kind_for_descriptor(&resource.resource.descriptor));
+    request
+        .memory_class_requirements
+        .insert(resource.memory_class);
+}
+
+fn note_graph_kv_requirement(request: &mut KernelSelectionRequest, kv: &GraphKvCacheMetadata) {
+    let behavior = match kv.behavior {
+        GraphKvCacheBehavior::Input => "input",
+        GraphKvCacheBehavior::Output => "output",
+        GraphKvCacheBehavior::Append => "append",
+    };
+    let cache_kind = if kv.paged { "paged" } else { "contiguous" };
+    request.policy.insert(
+        format!("graph-kv-cache:{}", kv.cache_id),
+        format!("{behavior}:{cache_kind}"),
+    );
+}
+
+fn merge_kernel_managed_kv_requirement(
+    request: &mut KernelSelectionRequest,
+    kv: &GraphKvCacheMetadata,
+    resource: &KernelResource,
+) {
+    let metadata = request
+        .kv_cache
+        .get_or_insert_with(|| KernelKvCacheMetadata {
+            layouts: BTreeSet::new(),
+            paged_cache: kv.paged,
+            append: false,
+            read: false,
+            dtypes: BTreeSet::new(),
+            memory_classes: BTreeSet::new(),
+            affinity: Some(resource.resource.affinity.clone()),
+        });
+    metadata.paged_cache |= kv.paged;
+    metadata.read = true;
+    metadata.layouts.insert(if kv.paged {
+        "paged".into()
+    } else {
+        "contiguous".into()
+    });
+    if let DTypeDescriptor::Portable(dtype) = &resource.resource.descriptor.dtype {
+        metadata.dtypes.insert(*dtype);
+    }
+    metadata.memory_classes.insert(resource.memory_class);
+}
+
+fn prepare_first_native_execution_plans(
+    runtime: &Runtime,
+    instance: &ModelInstanceId,
+    graphs: FirstNativeComponentGraphs,
+    prompt_token_count: u64,
+) -> Result<FirstNativePreparedPlans, E2eConformanceError> {
+    let status = require_ready_first_native_instance(runtime, instance)?;
+    let mutation_version = status.status().mutation_version;
+    Ok(FirstNativePreparedPlans {
+        prefill: prepare_first_native_plan_for_graph(
+            runtime,
+            &graphs.prefill,
+            instance,
+            mutation_version,
+            prompt_token_count,
+            PreparedExecutionPlanGeneration::new(1),
+        )?,
+        prefill_node_count: graphs.prefill_node_count,
+        decode: prepare_first_native_plan_for_graph(
+            runtime,
+            &graphs.decode,
+            instance,
+            mutation_version,
+            1,
+            PreparedExecutionPlanGeneration::new(1),
+        )?,
+        decode_node_count: graphs.decode_node_count,
+    })
+}
+
 fn generation_tokenizer_reference(fixture: &E2eFixture) -> GenerationTokenizerReference {
     GenerationTokenizerReference {
         tokenizer_id: fixture.tokenizer.metadata().id.clone(),
@@ -1416,15 +3098,15 @@ fn generation_tokenizer_reference(fixture: &E2eFixture) -> GenerationTokenizerRe
 
 fn run_success_path_with_prompt(
     fixture: &E2eFixture,
+    model_ref: &ModelRef,
     prompt: &str,
 ) -> Result<E2eRunOutcome, E2eConformanceError> {
-    let mut runtime = build_runtime_with_generation_executor(fixture);
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
 
     // Model resolution.
     let mut registry = ModelRegistry::new();
-    let model_ref = ModelRef::new("e2e-fixture-model")?;
     registry.register(model_ref.clone(), fixture.manifest.id.clone());
-    let resolution = registry.resolve(&ModelResolutionRequest::new(model_ref))?;
+    let resolution = registry.resolve(&ModelResolutionRequest::new(model_ref.clone()))?;
     if resolution.artifact != fixture.manifest.id {
         return Err(E2eConformanceError::ModelResolutionFailed {
             reason: "resolved artifact does not match fixture manifest".into(),
@@ -1433,6 +3115,7 @@ fn run_success_path_with_prompt(
 
     // Model Loading + Model Instance.
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    require_ready_first_native_instance(&runtime, &instance)?;
 
     // Session creation.
     let session_request = SessionCreationRequest {
@@ -1453,6 +3136,72 @@ fn run_success_path_with_prompt(
         TokenizationRequest::new(PromptInput::PlainText(prompt.into())),
         None,
     )?;
+    let mut observer = InferenceApiObserver::new();
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    let component_graphs = {
+        let preflight =
+            validate_and_instantiate_trusted_qwen_component_before_first_native_planning()?;
+        observer.observe(
+            InferenceApiObservationKind::ComponentValidated,
+            format!("component_definition={:?}", preflight.definition),
+            None,
+        );
+        observer.observe(
+            InferenceApiObservationKind::ComponentInstantiated,
+            format!("component_instance={:?}", preflight.instance),
+            None,
+        );
+        let graph_semantics = preflight.graph_semantics;
+        let _component_preflight = (
+            preflight.definition,
+            preflight.instance,
+            preflight.observations.len(),
+        );
+        build_first_native_graphs_from_component_output(
+            fixture,
+            tokenized.token_ids.len() as u64,
+            graph_semantics,
+        )?
+    };
+    #[cfg(not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")))]
+    let component_graphs = {
+        let semantics = QwenComponentGraphSemantics {
+            prefill_node_count: qwen_prefill_graph(
+                &fixture.config,
+                &fixture.identity,
+                tokenized.token_ids.len().max(1) as u64,
+                true,
+            )?
+            .graph
+            .nodes
+            .len(),
+            decode_node_count: qwen_decode_graph(
+                &fixture.config,
+                &fixture.identity,
+                tokenized.token_ids.len().max(1) as u64,
+            )?
+            .graph
+            .nodes
+            .len(),
+        };
+        build_first_native_graphs_from_component_output(
+            fixture,
+            tokenized.token_ids.len() as u64,
+            semantics,
+        )?
+    };
+    let mut prepared_plans = prepare_first_native_execution_plans(
+        &runtime,
+        &instance,
+        component_graphs,
+        tokenized.token_ids.len() as u64,
+    )?;
+    let _plan_generations = (
+        prepared_plans.prefill.generation,
+        prepared_plans.prefill_node_count,
+        prepared_plans.decode.generation,
+        prepared_plans.decode_node_count,
+    );
 
     // Generation request build + validate.
     let request = build_generation_request(
@@ -1475,14 +3224,18 @@ fn run_success_path_with_prompt(
     let request = prepare_generation(&runtime, request)?;
 
     // Prefill/decode/sample/stream through the real forward pass.
-    let mut observer = InferenceApiObserver::new();
-    let generation_result = run_generation_loop(
-        &runtime,
+    let mut execution_plans = RuntimeGenerationExecutionPlans {
+        prefill: &mut prepared_plans.prefill,
+        decode: &mut prepared_plans.decode,
+    };
+    let generation_result = run_generation_loop_with_execution_plans(
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
         |_generated_so_far| false,
         &mut observer,
+        &mut execution_plans,
     )?;
 
     // Streaming decode of generated tokens. The byte fixture can produce token
@@ -1507,6 +3260,7 @@ fn run_success_path_with_prompt(
     let generation_result = generation_result.with_decoded_text(decoded_text);
 
     // Session close + Model Instance cleanup.
+    let kv_observations = runtime.kv_caches().observations().to_vec();
     close_inference_session(&mut runtime, &session)?;
     unload_model_instance(
         &mut runtime,
@@ -1518,6 +3272,7 @@ fn run_success_path_with_prompt(
     Ok(E2eRunOutcome {
         generation_result,
         observer,
+        kv_observations,
     })
 }
 
@@ -1525,14 +3280,23 @@ fn run_success_path_with_prompt(
 /// session, tokenize (plain text), generate through a real Reference CPU
 /// forward pass with greedy Sampling, stream, close session, cleanup.
 fn run_success_path(fixture: &E2eFixture) -> Result<E2eRunOutcome, E2eConformanceError> {
-    run_success_path_with_prompt(fixture, "hi")
+    run_success_path_with_prompt(fixture, &ModelRef::new("qwen-test")?, "hi")
 }
 
 pub fn run_first_native_fixture_generation(
     prompt: &str,
 ) -> Result<FirstNativeFixtureGeneration, E2eConformanceError> {
     let fixture = e2e_fixture()?;
-    let outcome = run_success_path_with_prompt(&fixture, prompt)?;
+    let outcome = run_success_path_with_prompt(&fixture, &ModelRef::new("qwen-test")?, prompt)?;
+    if !outcome
+        .kv_observations
+        .iter()
+        .any(|observation| observation.kind == KvCacheObservationKind::PrefillCompleted)
+    {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "first native fixture generation produced no KV prefill commit".into(),
+        });
+    }
     validate_e2e_no_shortcuts(
         outcome.observer.observations(),
         &reference_cpu_kernel_advertisements(),
@@ -1558,7 +3322,28 @@ pub fn run_first_native_generation(
     if model_ref.as_str() != "qwen-test" {
         return Err(FirstNativeRuntimeError::model_not_found(model_ref));
     }
-    run_first_native_fixture_generation(prompt).map_err(FirstNativeRuntimeError::from_conformance)
+    let fixture = e2e_fixture().map_err(FirstNativeRuntimeError::from_conformance)?;
+    let outcome = run_success_path_with_prompt(&fixture, model_ref, prompt)
+        .map_err(FirstNativeRuntimeError::from_conformance)?;
+    validate_e2e_no_shortcuts(
+        outcome.observer.observations(),
+        &reference_cpu_kernel_advertisements(),
+    )
+    .map_err(FirstNativeRuntimeError::from_conformance)?;
+    let text = outcome
+        .generation_result
+        .decoded_text
+        .clone()
+        .ok_or_else(|| {
+            FirstNativeRuntimeError::from_conformance(E2eConformanceError::StreamingFailed {
+                reason: "first native generation produced no decoded text".into(),
+            })
+        })?;
+    Ok(FirstNativeFixtureGeneration {
+        text,
+        result: outcome.generation_result,
+        observer: outcome.observer,
+    })
 }
 
 fn check_success_path(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
@@ -1628,15 +3413,182 @@ fn check_streaming_order(fixture: &E2eFixture) -> Result<(), E2eConformanceError
     Ok(())
 }
 
+fn record_operator_dispatch(
+    covered: &mut BTreeSet<String>,
+    name: &str,
+    result: Result<(KernelDispatchResult, HostTensor), InferenceApiError>,
+) -> Result<(), E2eConformanceError> {
+    result.map_err(E2eConformanceError::from)?;
+    covered.insert(name.to_string());
+    Ok(())
+}
+
 fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2eConformanceError> {
-    // Exercising the forward pass over the prompt already calls every
-    // required-now kernel once; run it once more here so this check is
-    // independently verifiable even if the success path check is skipped.
-    e2e_forward(fixture, &[1, 2])?;
-    Ok(E2E_EXERCISED_OPERATORS
-        .iter()
-        .map(|op| op.to_string())
-        .collect())
+    let runtime = build_runtime();
+    let provider = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime: &runtime,
+        provider: &provider,
+        memory: &mut memory,
+    };
+    let architecture = &fixture.config.architecture;
+    let mut covered = BTreeSet::new();
+    let hidden = HostTensor::new(
+        [2, architecture.hidden_size],
+        vec![0.25; (2 * architecture.hidden_size) as usize],
+    )?;
+    let one_row_hidden = HostTensor::new(
+        [1, architecture.hidden_size],
+        vec![0.5; architecture.hidden_size as usize],
+    )?;
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let embedding_table = fixture_tensor_by_name(&fixture.weights, "token_embedding")?.clone();
+    record_operator_dispatch(
+        &mut covered,
+        "embedding",
+        dispatch_reference_cpu_operator(
+            &mut dispatch_ctx,
+            "coverage.embedding",
+            dispatch_operator_id("embedding", OperatorFamily::Tensor),
+            vec![
+                (
+                    TensorResourceId::new("coverage.embedding.table"),
+                    f32_tensor_descriptor(&embedding_table),
+                    embedding_table,
+                ),
+                (
+                    TensorResourceId::new("coverage.embedding.ids"),
+                    f32_tensor_descriptor(&ids),
+                    ids,
+                ),
+            ],
+            (
+                TensorResourceId::new("coverage.embedding.out"),
+                TensorDescriptor::new(
+                    ShapeDescriptor::new([2, architecture.hidden_size]),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                    LayoutDescriptor::Contiguous,
+                ),
+            ),
+            BTreeMap::new(),
+        ),
+    )?;
+    let weight = HostTensor::new(
+        [2, architecture.hidden_size],
+        vec![1.0; (2 * architecture.hidden_size) as usize],
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "rmsnorm",
+        dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            "coverage.rmsnorm",
+            hidden.clone(),
+            weight,
+            fixture.config.rmsnorm_epsilon,
+        ),
+    )?;
+    let matmul_b = HostTensor::new(
+        [architecture.hidden_size, architecture.hidden_size],
+        vec![0.125; (architecture.hidden_size * architecture.hidden_size) as usize],
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "matmul",
+        dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            "coverage.matmul",
+            one_row_hidden.clone(),
+            matmul_b,
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "rope",
+        dispatch_qwen_rope_per_head(
+            &mut dispatch_ctx,
+            "coverage.rope",
+            &one_row_hidden,
+            architecture.attention_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+            0,
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "attention",
+        dispatch_qwen_attention(
+            &mut dispatch_ctx,
+            "coverage.attention",
+            one_row_hidden.clone(),
+            one_row_hidden.clone(),
+            one_row_hidden.clone(),
+            architecture,
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "softmax",
+        dispatch_qwen_unary(
+            &mut dispatch_ctx,
+            "coverage.softmax",
+            "softmax",
+            OperatorFamily::Activation,
+            one_row_hidden.clone(),
+            BTreeMap::new(),
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "silu",
+        dispatch_qwen_unary(
+            &mut dispatch_ctx,
+            "coverage.silu",
+            "silu",
+            OperatorFamily::Activation,
+            one_row_hidden.clone(),
+            BTreeMap::new(),
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "mul",
+        dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            "coverage.mul",
+            "mul",
+            OperatorFamily::Tensor,
+            one_row_hidden.clone(),
+            one_row_hidden.clone(),
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "add",
+        dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            "coverage.add",
+            "add",
+            OperatorFamily::Tensor,
+            one_row_hidden.clone(),
+            one_row_hidden.clone(),
+        ),
+    )?;
+    record_operator_dispatch(
+        &mut covered,
+        "residual-add",
+        dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            "coverage.residual_add",
+            "residual-add",
+            OperatorFamily::Tensor,
+            one_row_hidden.clone(),
+            one_row_hidden,
+        ),
+    )?;
+    Ok(covered)
 }
 
 fn check_kernel_coverage() -> Result<BTreeSet<String>, E2eConformanceError> {
@@ -1748,7 +3700,7 @@ fn check_graph_production_and_execution(fixture: &E2eFixture) -> Result<(), E2eC
 }
 
 fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime_with_generation_executor(fixture);
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
@@ -1769,7 +3721,7 @@ fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2e
     let request = prepare_generation(&runtime, request)?;
     let mut observer = InferenceApiObserver::new();
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -1794,7 +3746,7 @@ fn check_max_new_tokens_stops_generation(fixture: &E2eFixture) -> Result<(), E2e
 
 #[cfg(test)]
 fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime_with_generation_executor_and_forced_token(
+    let mut runtime = build_runtime_with_model_execution_engine_and_forced_token(
         fixture,
         Some(E2E_FIXTURE_EOS_TOKEN),
     );
@@ -1824,7 +3776,7 @@ fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConfo
     let request = prepare_generation(&runtime, request)?;
     let mut observer = InferenceApiObserver::new();
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -1843,7 +3795,7 @@ fn check_eos_token_stops_generation(fixture: &E2eFixture) -> Result<(), E2eConfo
 }
 
 fn check_generation_cancelled(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime_with_generation_executor(fixture);
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
@@ -1864,7 +3816,7 @@ fn check_generation_cancelled(fixture: &E2eFixture) -> Result<(), E2eConformance
     let request = prepare_generation(&runtime, request)?;
     let mut observer = InferenceApiObserver::new();
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -1957,6 +3909,145 @@ fn check_closed_session_rejects_generation(
             reason: "closed session was still reported usable".into(),
         }),
     }
+}
+
+#[cfg(test)]
+fn check_first_native_generation_requires_ready_model_instance(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime();
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    suspend_model_instance(
+        &mut runtime,
+        &instance,
+        ModelInstanceSuspensionReason::AdministrativePolicy,
+    )?;
+
+    match require_ready_first_native_instance(&runtime, &instance) {
+        Err(InferenceApiError::ModelInstanceNotReady { reason })
+            if reason.contains("requires ready ModelInstance") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected readiness error: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "first-native generation accepted a non-ready ModelInstance".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_missing_prepared_plan_fails_closed() -> Result<(), E2eConformanceError> {
+    let context = first_native_plan_context(PreparedExecutionPhase::Prefill, 1);
+    match require_compatible_first_native_plan(None, &context) {
+        Err(PreparedExecutionPlanError::PlanNotFound) => Ok(()),
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected missing-plan error: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "first-native execution accepted missing PreparedExecutionPlan".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_invalidated_prepared_plan_rejects_new_work(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime();
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let graphs = build_first_native_graphs_from_component_output(
+        fixture,
+        2,
+        QwenComponentGraphSemantics {
+            prefill_node_count: 19,
+            decode_node_count: 19,
+        },
+    )?;
+    let mut plans = prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)?;
+    plans
+        .decode
+        .hard_invalidate(crate::kernel_execution_plan::PlanRebuildReason::KernelRevoked)?;
+    let context = first_native_plan_context(PreparedExecutionPhase::Decode, 1);
+    match require_compatible_first_native_plan(Some(&mut plans.decode), &context) {
+        Err(PreparedExecutionPlanError::PlanNotReadyForExecution) => Ok(()),
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected invalidated-plan error: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "first-native execution accepted invalidated PreparedExecutionPlan".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_qwen_graph_nodes_have_prepared_kernel_bindings(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime();
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let graphs = build_first_native_graphs_from_component_output(
+        fixture,
+        2,
+        QwenComponentGraphSemantics {
+            prefill_node_count: 19,
+            decode_node_count: 19,
+        },
+    )?;
+    let plans = prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)?;
+
+    for (plan, expected_node_count) in [
+        (&plans.prefill, plans.prefill_node_count),
+        (&plans.decode, plans.decode_node_count),
+    ] {
+        if plan.node_bindings.len() != expected_node_count {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "prepared plan has {} bindings for {expected_node_count} graph nodes",
+                    plan.node_bindings.len()
+                ),
+            });
+        }
+        for binding in &plan.node_bindings {
+            if binding.graph_nodes.is_empty() {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan contains a binding without graph nodes".into(),
+                });
+            }
+            if binding.kernel.provider.as_str() != REFERENCE_CPU_PROVIDER_NAME {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan selected a non-Reference CPU provider".into(),
+                });
+            }
+            if binding.provider.as_str() != REFERENCE_CPU_PROVIDER_NAME {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding provider is not Reference CPU".into(),
+                });
+            }
+            if binding.device.as_ref().map(ToString::to_string).as_deref()
+                != Some(REFERENCE_CPU_DEVICE_ID)
+            {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding did not record Reference CPU device identity"
+                        .into(),
+                });
+            }
+            if binding.prepared_kernel.is_none() || binding.prepared_kernel_generation.is_none() {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding lacks PreparedKernelId or generation".into(),
+                });
+            }
+            if binding.qualification_profile.as_deref() != Some(REFERENCE_CPU_CONFORMANCE_PROFILE) {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding lacks implementation conformance identity"
+                        .into(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_memory_admission_failure() -> Result<(), E2eConformanceError> {
@@ -2194,6 +4285,86 @@ fn check_kv_cache_diagnostics_redacted() -> Result<(), E2eConformanceError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn check_incremental_decode_matches_full_sequence_oracle(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let runtime = build_runtime();
+    let prompt = vec![1, 2];
+    let admitted = 3;
+    let (_prefill_dispatch, _prefill_hidden, layer_kv) =
+        execute_qwen_prefill_hidden_states_through_dispatch(&runtime, fixture, &prompt)?;
+    let kv_state = FirstNativeExecutionKvState {
+        cache: KvCacheId::new("first-native-oracle-kv").map_err(E2eConformanceError::from)?,
+        compatibility: KvCacheCompatibility::new(
+            GenerationModelReference::LoadedModelContext("qwen-test".into()),
+            TokenizerId::new("qwen-test-tokenizer")?,
+        ),
+        layer_kv,
+    };
+
+    let (_decode_dispatch, decode_hidden, updated_layer_kv) =
+        execute_qwen_decode_hidden_states_through_dispatch(
+            &runtime,
+            fixture,
+            admitted,
+            &kv_state,
+            prompt.len() as u64,
+        )?;
+    let (_logits_dispatch, incremental_logits) =
+        dispatch_qwen_logits_projection(&runtime, fixture, &decode_hidden)?;
+
+    let mut full_sequence = prompt;
+    full_sequence.push(admitted);
+    let oracle_logits = e2e_forward(fixture, &full_sequence)?;
+    for (index, (actual, expected)) in incremental_logits
+        .iter()
+        .zip(oracle_logits.iter())
+        .enumerate()
+    {
+        if (actual - expected).abs() > 1e-4 {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "incremental decode logits diverged at {index}: {actual} != {expected}"
+                ),
+            });
+        }
+    }
+
+    for layer in updated_layer_kv {
+        let (k_rows, _) = layer.k.rows_cols()?;
+        let (v_rows, _) = layer.v.rows_cols()?;
+        if k_rows != full_sequence.len() as u64 || v_rows != full_sequence.len() as u64 {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: "decode did not append exactly one K/V row per layer".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_incremental_decode_rejects_missing_layer_kv(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let runtime = build_runtime();
+    let kv_state = FirstNativeExecutionKvState {
+        cache: KvCacheId::new("first-native-empty-kv").map_err(E2eConformanceError::from)?,
+        compatibility: KvCacheCompatibility::new(
+            GenerationModelReference::LoadedModelContext("qwen-test".into()),
+            TokenizerId::new("qwen-test-tokenizer")?,
+        ),
+        layer_kv: Vec::new(),
+    };
+    match execute_qwen_decode_hidden_states_through_dispatch(&runtime, fixture, 3, &kv_state, 2) {
+        Err(InferenceApiError::KvCacheUnavailable { .. }) => Ok(()),
+        Err(error) => Err(E2eConformanceError::from(error)),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "decode accepted missing layer KV state".into(),
+        }),
+    }
 }
 
 fn check_diagnostics_redaction_on_failure() -> Result<(), E2eConformanceError> {
@@ -2950,7 +5121,7 @@ fn check_chat_message_prompt_path(fixture: &E2eFixture) -> Result<(), E2eConform
 }
 
 fn check_one_shot_session_normal_paths(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime_with_generation_executor(fixture);
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let session_request = SessionCreationRequest {
         model: GenerationModelReference::ModelInstance(instance.clone()),
@@ -2989,7 +5160,7 @@ fn check_one_shot_session_normal_paths(fixture: &E2eFixture) -> Result<(), E2eCo
     let request = prepare_generation(&runtime, request)?;
     let mut observer = InferenceApiObserver::new();
     let result = run_generation_loop(
-        &runtime,
+        &mut runtime,
         &request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
@@ -3049,6 +5220,137 @@ fn elapsed_millis(start: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn qwen_component_fixture_wat(
+        prefill_export: &str,
+        decode_export: &str,
+        authority_export: &str,
+    ) -> String {
+        format!(
+            r#"(component
+    (core module $m
+        {prefill_export}
+        {decode_export}
+        {authority_export})
+    (core instance $i (instantiate $m))
+    (func (export "prefill-node-count") (result u32)
+        (canon lift (core func $i "prefill-node-count")))
+    (func (export "decode-node-count") (result u32)
+        (canon lift (core func $i "decode-node-count")))
+    (func (export "provider-authority-count") (result u32)
+        (canon lift (core func $i "provider-authority-count")))
+    (func $prefill-node-count (result u32)
+        (canon lift (core func $i "prefill-node-count")))
+    (func $decode-node-count (result u32)
+        (canon lift (core func $i "decode-node-count")))
+    (func $provider-authority-count (result u32)
+        (canon lift (core func $i "provider-authority-count")))
+    (instance $qwen-graph-fixture
+        (export "prefill-node-count" (func $prefill-node-count))
+        (export "decode-node-count" (func $decode-node-count))
+        (export "provider-authority-count" (func $provider-authority-count)))
+    (export "magnetar:qwen/graph-fixture@1.0.0" (instance $qwen-graph-fixture)))
+"#
+        )
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn qwen_component_count_fixture_wat(prefill: u32, decode: u32, authority: u32) -> String {
+        qwen_component_fixture_wat(
+            &format!(r#"(func (export "prefill-node-count") (result i32) i32.const {prefill})"#),
+            &format!(r#"(func (export "decode-node-count") (result i32) i32.const {decode})"#),
+            &format!(
+                r#"(func (export "provider-authority-count") (result i32) i32.const {authority})"#
+            ),
+        )
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn qwen_component_manifest(digest: &str) -> String {
+        format!(
+            r#"schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "{digest}"
+component:
+  name: "magnetar.qwen.graph-fixture"
+  version: "0.1.0"
+  description: "Executable Qwen graph fixture component"
+  role: "qwen-graph-fixture"
+runtime:
+  magnetar:
+    min_version: "0.1.0"
+wit:
+  imports: []
+  exports:
+    - package: "magnetar:qwen"
+      interface: "graph-fixture"
+      version: "1.0.0"
+capabilities:
+  requires: []
+authority:
+  requires: []
+engine:
+  profile: "native"
+  features:
+    - component-model
+    - resource-limits
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./qwen-graph.component.wat"
+signatures: []
+"#
+        )
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn sha256_component_digest(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        let mut encoded = String::from("sha256:");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in digest {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn qwen_component_preflight_package(
+        wat: &str,
+        manifest_digest: Option<&str>,
+    ) -> (ComponentArtifactPackage, String) {
+        let digest = sha256_component_digest(wat.as_bytes());
+        let package = ComponentArtifactPackage::new(
+            wat.as_bytes().to_vec(),
+            qwen_component_manifest(manifest_digest.unwrap_or(&digest)).into_bytes(),
+            ComponentDigest::parse("sha256", manifest_digest.unwrap_or(&digest)),
+            ComponentDistributionSource::new(
+                ComponentDistributionSourceKind::DevelopmentFixture,
+                QWEN_GRAPH_COMPONENT_NAME,
+            ),
+        );
+        (package, digest)
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    fn trusted_preflight_request_for_temp_component(
+        component_package: ComponentArtifactPackage,
+        digest: &str,
+    ) -> QwenComponentPreflightRequest {
+        QwenComponentPreflightRequest {
+            component_package,
+            trust_store: ComponentTrustStore::default().trust_digest(digest),
+            limits: qwen_component_runtime_limits(),
+        }
+    }
 
     #[test]
     fn e2e_success_path_resolves_loads_generates_and_cleans_up() {
@@ -3140,7 +5442,7 @@ mod tests {
         let last_row_start = (sequence.len() - 1) * vocab;
         let dispatched_logits = &dispatched_output.data[last_row_start..last_row_start + vocab];
 
-        // What `E2eRuntimeGenerationExecutor::execute_generation_step` returns
+        // What `E2eRuntimeModelExecutionEngine::execute_generation_step` returns
         // for this sequence must equal the dispatch's own output exactly --
         // it is read directly from `dispatched_output`, never recomputed
         // separately -- so this also confirms the dispatch path is numerically
@@ -3229,8 +5531,270 @@ mod tests {
     }
 
     #[test]
+    fn e2e_first_native_generation_requires_ready_model_instance() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        check_first_native_generation_requires_ready_model_instance(&fixture)
+            .expect("non-ready model instance is rejected");
+    }
+
+    #[test]
+    fn e2e_missing_prepared_plan_fails_closed() {
+        check_missing_prepared_plan_fails_closed().expect("missing prepared plan is rejected");
+    }
+
+    #[test]
+    fn e2e_invalidated_prepared_plan_rejects_new_work() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        check_invalidated_prepared_plan_rejects_new_work(&fixture)
+            .expect("invalidated prepared plan is rejected");
+    }
+
+    #[test]
+    fn e2e_qwen_graph_nodes_have_prepared_kernel_bindings() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        check_qwen_graph_nodes_have_prepared_kernel_bindings(&fixture)
+            .expect("Qwen graph nodes are bound to prepared kernels");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_artifact_trust_is_validated_before_planning() {
+        validate_and_instantiate_trusted_qwen_component_before_first_native_planning()
+            .expect("trusted Qwen Component fixture validates before planning");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_instantiates_with_wasmtime_limits_before_planning() {
+        let preflight =
+            validate_and_instantiate_trusted_qwen_component_before_first_native_planning()
+                .expect("trusted Qwen Component fixture instantiates before planning");
+        assert!(preflight.definition.get() > 0);
+        assert!(preflight.instance.get() > 0);
+        assert_eq!(
+            preflight.graph_semantics,
+            QwenComponentGraphSemantics {
+                prefill_node_count: 19,
+                decode_node_count: 19,
+            }
+        );
+        assert!(preflight.observations.iter().any(|observation| {
+            observation.kind == ComponentObservationKind::Instantiation
+                && observation.message.contains("component instance ready")
+        }));
+        assert!(preflight.observations.iter().any(|observation| {
+            observation.kind == ComponentObservationKind::Invocation
+                && observation
+                    .message
+                    .contains("component invocation completed")
+        }));
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_artifact_trust_rejection_fails_before_planning() {
+        let mut request = QwenComponentPreflightRequest::default_trusted();
+        request.trust_store = ComponentTrustStore::default();
+        match validate_and_instantiate_qwen_component_before_first_native_planning(request) {
+            Err(E2eConformanceError::ModelComponentFailed { reason })
+                if reason.contains("artifact rejected") || reason.contains("no trust policy") =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+            Ok(_) => Err(E2eConformanceError::ModelComponentFailed {
+                reason: "untrusted Qwen Component fixture was accepted".into(),
+            }),
+        }
+        .expect("untrusted Qwen Component fixture is rejected before planning");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_missing_artifact_fails_before_planning() {
+        let (component_package, digest) = qwen_component_preflight_package("", None);
+        let request = QwenComponentPreflightRequest {
+            component_package,
+            trust_store: ComponentTrustStore::default().trust_digest(&digest),
+            limits: qwen_component_runtime_limits(),
+        };
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::ModelComponentFailed { .. })
+            ),
+            "missing Qwen Component artifact was not rejected: {result:?}"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_digest_mismatch_fails_before_planning() {
+        let wat = qwen_component_count_fixture_wat(19, 19, 0);
+        let wrong_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let (component_package, _digest) =
+            qwen_component_preflight_package(&wat, Some(wrong_digest));
+        let request = trusted_preflight_request_for_temp_component(component_package, wrong_digest);
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::ModelComponentFailed { .. })
+            ),
+            "digest-mismatched Qwen Component artifact was not rejected: {result:?}"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_fuel_exhaustion_fails_before_planning() {
+        let wat = qwen_component_fixture_wat(
+            r#"(func (export "prefill-node-count") (result i32)
+                (loop $again br $again)
+                i32.const 13)"#,
+            r#"(func (export "decode-node-count") (result i32) i32.const 19)"#,
+            r#"(func (export "provider-authority-count") (result i32) i32.const 0)"#,
+        );
+        let (component_package, digest) = qwen_component_preflight_package(&wat, None);
+        let mut request = trusted_preflight_request_for_temp_component(component_package, &digest);
+        request.limits.engine_execution_budget = Some(1_000);
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::ModelComponentFailed { .. })
+            ),
+            "runaway Qwen Component was not stopped by fuel: {result:?}"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_deadline_fails_before_planning() {
+        let wat = qwen_component_count_fixture_wat(19, 19, 0);
+        let (component_package, digest) = qwen_component_preflight_package(&wat, None);
+        let mut request = trusted_preflight_request_for_temp_component(component_package, &digest);
+        request.limits.execution_deadline_millis = Some(0);
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::ModelComponentFailed { .. })
+            ),
+            "expired Qwen Component deadline was not rejected: {result:?}"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_invalid_output_fails_before_planning() {
+        let wat = r#"(component
+    (core module $m
+        (func (export "prefill-node-count"))
+        (func (export "decode-node-count") (result i32) i32.const 12)
+        (func (export "provider-authority-count") (result i32) i32.const 0))
+    (core instance $i (instantiate $m))
+    (func (export "prefill-node-count")
+        (canon lift (core func $i "prefill-node-count")))
+    (func (export "decode-node-count") (result u32)
+        (canon lift (core func $i "decode-node-count")))
+    (func (export "provider-authority-count") (result u32)
+        (canon lift (core func $i "provider-authority-count")))
+    (func $prefill-node-count
+        (canon lift (core func $i "prefill-node-count")))
+    (func $decode-node-count (result u32)
+        (canon lift (core func $i "decode-node-count")))
+    (func $provider-authority-count (result u32)
+        (canon lift (core func $i "provider-authority-count")))
+    (instance $qwen-graph-fixture
+        (export "prefill-node-count" (func $prefill-node-count))
+        (export "decode-node-count" (func $decode-node-count))
+        (export "provider-authority-count" (func $provider-authority-count)))
+    (export "magnetar:qwen/graph-fixture@1.0.0" (instance $qwen-graph-fixture)))
+"#;
+        let (component_package, digest) = qwen_component_preflight_package(wat, None);
+        let request = trusted_preflight_request_for_temp_component(component_package, &digest);
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::GraphValidationFailed { .. })
+            ),
+            "Qwen Component invalid output was not rejected: {result:?}"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_incompatible_graph_fails_before_planning() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+        let (instance, _memory) =
+            load_fixture_instance(&fixture, &mut runtime).expect("fixture instance loads");
+        let component_graph_semantics = QwenComponentGraphSemantics {
+            prefill_node_count: 99,
+            decode_node_count: 19,
+        };
+
+        let result =
+            build_first_native_graphs_from_component_output(&fixture, 2, component_graph_semantics)
+                .and_then(|graphs| {
+                    prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)
+                });
+
+        assert!(
+            matches!(
+                result,
+                Err(E2eConformanceError::GraphValidationFailed { .. })
+            ),
+            "Qwen Component/runtime graph mismatch was not rejected"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+    #[test]
+    fn e2e_qwen_component_provider_authority_fails_before_planning() {
+        let wat = qwen_component_count_fixture_wat(19, 19, 1);
+        let (component_package, digest) = qwen_component_preflight_package(&wat, None);
+        let request = trusted_preflight_request_for_temp_component(component_package, &digest);
+
+        let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
+
+        assert!(
+            matches!(result, Err(E2eConformanceError::BoundaryViolation { .. })),
+            "Qwen Component Provider authority was not rejected: {result:?}"
+        );
+    }
+
+    #[test]
     fn e2e_kv_cache_diagnostics_redact_raw_contents() {
         check_kv_cache_diagnostics_redacted().expect("cache usage carries no raw contents");
+    }
+
+    #[test]
+    fn e2e_incremental_decode_uses_existing_kv_and_matches_full_sequence_oracle() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        check_incremental_decode_matches_full_sequence_oracle(&fixture)
+            .expect("incremental decode matches full-sequence oracle");
+    }
+
+    #[test]
+    fn e2e_incremental_decode_rejects_missing_layer_kv() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        check_incremental_decode_rejects_missing_layer_kv(&fixture)
+            .expect("decode requires existing layer KV state");
     }
 
     #[test]
@@ -3279,6 +5843,13 @@ mod tests {
         check_memory_admission_failure().expect("memory admission failure rejected");
         check_closed_session_rejects_generation(&e2e_fixture().unwrap())
             .expect("closed session rejected");
+        check_first_native_generation_requires_ready_model_instance(&e2e_fixture().unwrap())
+            .expect("non-ready model instance rejected");
+        check_missing_prepared_plan_fails_closed().expect("missing prepared plan rejected");
+        check_invalidated_prepared_plan_rejects_new_work(&e2e_fixture().unwrap())
+            .expect("invalidated prepared plan rejected");
+        check_qwen_graph_nodes_have_prepared_kernel_bindings(&e2e_fixture().unwrap())
+            .expect("Qwen graph nodes bound to prepared kernels");
         check_generation_cancelled(&e2e_fixture().unwrap()).expect("cancellation reported");
         check_cli_boundary_denials().expect("policy denial reported");
         check_raw_handle_access_denied().expect("raw handle access denied");
@@ -3624,5 +6195,68 @@ mod tests {
                 "missing lifecycle observation marker: {marker}"
             );
         }
+    }
+
+    #[test]
+    fn e2e_authoritative_path_collects_correlated_runtime_observations() {
+        let fixture = e2e_fixture().expect("fixture builds");
+        let outcome = run_success_path(&fixture).expect("success path runs");
+        let observations = outcome.observer.observations();
+        for kind in [
+            InferenceApiObservationKind::ComponentValidated,
+            InferenceApiObservationKind::ComponentInstantiated,
+            InferenceApiObservationKind::ModelInstanceReady,
+            InferenceApiObservationKind::GraphValidationCompleted,
+            InferenceApiObservationKind::PlanSelected,
+            InferenceApiObservationKind::PlanGuardAccepted,
+            InferenceApiObservationKind::KernelResolved,
+            InferenceApiObservationKind::KernelPrepared,
+            InferenceApiObservationKind::ProviderSubmitted,
+            InferenceApiObservationKind::ProviderCompleted,
+            InferenceApiObservationKind::KvCacheCommitted,
+            InferenceApiObservationKind::LogitsProduced,
+            InferenceApiObservationKind::SamplingCompleted,
+            InferenceApiObservationKind::TokenCommitted,
+        ] {
+            assert!(
+                observations
+                    .iter()
+                    .any(|observation| observation.kind == kind),
+                "missing authoritative observation {kind:?}"
+            );
+        }
+        assert!(observations.iter().any(|observation| {
+            observation.kind == InferenceApiObservationKind::PlanSelected
+                && observation.message.contains("request=e2e-success-path")
+                && observation.message.contains("plan_generation=")
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.kind == InferenceApiObservationKind::KernelResolved
+                && observation.message.contains("kernel=")
+                && observation.message.contains("provider=")
+                && observation.message.contains("model_instance=")
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.kind == InferenceApiObservationKind::PlanSelected
+                && observation.message.contains("phase=decode")
+                && observation.message.contains("kv_position=")
+        }));
+        assert!(
+            outcome
+                .kv_observations
+                .iter()
+                .any(|observation| observation.kind == KvCacheObservationKind::PrefillCompleted)
+        );
+        assert!(
+            outcome
+                .kv_observations
+                .iter()
+                .any(|observation| observation.kind == KvCacheObservationKind::DecodeAppend)
+        );
+        assert!(outcome.kv_observations.iter().all(|observation| {
+            !observation.raw_prompt_available
+                && !observation.raw_cache_available
+                && !observation.raw_provider_handle_available
+        }));
     }
 }
