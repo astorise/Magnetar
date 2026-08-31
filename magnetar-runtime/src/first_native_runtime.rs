@@ -907,6 +907,7 @@ fn fixture_tensor_by_name<'a>(
         })
 }
 
+#[cfg(test)]
 fn apply_rope_per_head(
     tensor: &HostTensor,
     head_count: u64,
@@ -940,14 +941,9 @@ fn apply_rope_per_head(
     HostTensor::new(tensor.shape.clone(), out).map_err(E2eConformanceError::from)
 }
 
-/// Runs the decoder stack -- embedding lookup through every layer to the
-/// final RMSNorm -- using the real Reference CPU numeric kernels, returning
-/// the normed final hidden states rather than the tied-embedding logits
-/// projection itself. Split out from [`e2e_forward`] so a caller that needs
-/// the logits projection to be a genuine, evidence-bearing Kernel Dispatch
-/// (see `E2eRuntimeGenerationExecutor::execute_generation_step`) can perform
-/// that final matmul itself, instead of the returned logits being computed
-/// independently of the dispatch whose evidence is meant to certify them.
+/// Test oracle for the decoder stack. Production first-native generation uses
+/// `execute_qwen_hidden_states_through_dispatch` instead.
+#[cfg(test)]
 fn e2e_forward_hidden_states(
     fixture: &E2eFixture,
     token_ids: &[TokenId],
@@ -1029,12 +1025,10 @@ fn e2e_forward_hidden_states(
     rmsnorm(&hidden_states, final_norm, epsilon).map_err(E2eConformanceError::from)
 }
 
-/// Runs a genuine (if tiny) decoder forward pass over `token_ids` using the
-/// real Reference CPU numeric kernels -- embedding lookup, RMSNorm, matmul,
-/// RoPE, attention, SiLU, elementwise mul/add, residual-add, and a tied
-/// softmax-normalized read-out -- returning raw logits (length =
-/// vocabulary size) for the final position. This is what makes the E2E
-/// success path genuinely deterministic rather than a canned-output stub.
+/// Test oracle for a deterministic Qwen-like forward pass. This is deliberately
+/// not compiled into the production runtime path; the runtime path executes
+/// operators through Kernel Registry selection and Provider dispatch.
+#[cfg(test)]
 pub fn e2e_forward(
     fixture: &E2eFixture,
     token_ids: &[TokenId],
@@ -1228,6 +1222,621 @@ fn dispatch_matmul(
     Ok((dispatch_result, output_tensor))
 }
 
+fn f32_tensor_descriptor(tensor: &HostTensor) -> TensorDescriptor {
+    TensorDescriptor::new(
+        ShapeDescriptor::new(tensor.shape.clone()),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+        LayoutDescriptor::Contiguous,
+    )
+}
+
+struct QwenDispatchContext<'a> {
+    runtime: &'a Runtime,
+    provider: &'a ReferenceCpuExecutor,
+    memory: &'a mut MemoryManager,
+}
+
+fn dispatch_reference_cpu_operator(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    operator: OperatorId,
+    inputs: Vec<(TensorResourceId, TensorDescriptor, HostTensor)>,
+    output: (TensorResourceId, TensorDescriptor),
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+        .with_execution_context(ctx.runtime.context().id());
+    let output_resource =
+        TensorResourceDescriptor::new(output.0.clone(), output.1, affinity.clone());
+    let mut selection_request = KernelSelectionRequest::new(
+        format!("e2e-runtime-{operation_id}"),
+        operator,
+        affinity.clone(),
+    )
+    .with_output(KernelResource::new(
+        output_resource.clone(),
+        KernelMemoryClass::Host,
+    ));
+    for (id, descriptor, tensor) in inputs {
+        let resource = TensorResourceDescriptor::new(id.clone(), descriptor, affinity.clone());
+        ctx.provider.write_tensor(id, tensor);
+        selection_request =
+            selection_request.with_input(KernelResource::new(resource, KernelMemoryClass::Host));
+    }
+    let selection = ctx
+        .runtime
+        .kernel_registry()
+        .select(&selection_request)
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: format!("{operation_id}: {error}"),
+        })?;
+    let selected =
+        selection
+            .selected
+            .as_ref()
+            .ok_or_else(|| InferenceApiError::KernelUnavailable {
+                reason: format!("Kernel Registry selected no candidate for {operation_id}"),
+            })?;
+    let advertisement = ctx
+        .runtime
+        .kernel_registry()
+        .active_advertisement(&selected.kernel)
+        .ok_or_else(|| InferenceApiError::KernelUnavailable {
+            reason: format!("selected advertisement for {operation_id} is no longer active"),
+        })?;
+    let mut plan = KernelDispatchPlan::from_selection(
+        KernelDispatchPlanId::new(format!("e2e-runtime-{operation_id}-dispatch")),
+        &selection_request,
+        selected,
+        advertisement,
+        KernelInvocationId::new(format!("e2e-runtime-{operation_id}-invocation")),
+    )
+    .map_err(|error| InferenceApiError::KernelUnavailable {
+        reason: format!("{error:?}"),
+    })?;
+    plan.invocation.attributes = attributes;
+    if advertisement.workspace.required {
+        let workspace = ctx
+            .provider
+            .allocate_workspace(
+                ctx.memory,
+                advertisement.workspace.size_bytes_upper_bound.unwrap_or(1),
+            )
+            .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
+                reason: error.to_string(),
+            })?;
+        plan.invocation.workspace = Some(workspace);
+        plan.workspace_reservation = Some(workspace);
+    }
+    let mut dispatcher = KernelDispatcher::new();
+    dispatcher
+        .revalidate(ctx.runtime.kernel_registry(), &mut plan)
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: format!("{error:?}"),
+        })?;
+    let operator_catalog = initial_operator_catalog();
+    let operator_spec = operator_catalog
+        .get(&advertisement.implemented_operator)
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: error.to_string(),
+        })?;
+    let kernel_result = ctx.provider.execute_invocation_with_memory_manager(
+        advertisement,
+        operator_spec,
+        &plan.invocation,
+        ctx.memory,
+    );
+    let dispatch_result = KernelDispatchResult::from_kernel_result(&plan, kernel_result);
+    if dispatch_result.status != KernelResultStatus::Succeeded {
+        return Err(InferenceApiError::ProviderUnavailable {
+            reason: format!(
+                "Reference CPU dispatch for {operation_id} failed: {:?}",
+                dispatch_result.error
+            ),
+        });
+    }
+    let output_tensor = ctx
+        .provider
+        .read_tensor(&output_resource.id)
+        .ok_or_else(|| InferenceApiError::GenerationFailed {
+            reason: format!("Reference CPU dispatch for {operation_id} produced no output"),
+        })?;
+    Ok((dispatch_result, output_tensor))
+}
+
+fn runtime_generation_failed(error: impl std::fmt::Display) -> InferenceApiError {
+    InferenceApiError::GenerationFailed {
+        reason: error.to_string(),
+    }
+}
+
+fn dispatch_operator_id(name: &str, family: OperatorFamily) -> OperatorId {
+    OperatorId::magnetar(name, 1, family)
+}
+
+fn dispatch_qwen_matmul(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    a: HostTensor,
+    b: HostTensor,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let (rows, _) = a.rows_cols().map_err(runtime_generation_failed)?;
+    let (_, cols) = b.rows_cols().map_err(runtime_generation_failed)?;
+    dispatch_reference_cpu_operator(
+        ctx,
+        operation_id,
+        dispatch_operator_id("matmul", OperatorFamily::LinearAlgebra),
+        vec![
+            (
+                TensorResourceId::new(format!("{operation_id}.a")),
+                f32_tensor_descriptor(&a),
+                a,
+            ),
+            (
+                TensorResourceId::new(format!("{operation_id}.b")),
+                f32_tensor_descriptor(&b),
+                b,
+            ),
+        ],
+        (
+            TensorResourceId::new(format!("{operation_id}.out")),
+            TensorDescriptor::new(
+                ShapeDescriptor::new([rows, cols]),
+                DTypeDescriptor::portable(ComputeDType::Float32),
+                LayoutDescriptor::Contiguous,
+            ),
+        ),
+        BTreeMap::new(),
+    )
+}
+
+fn dispatch_qwen_unary(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    name: &str,
+    family: OperatorFamily,
+    input: HostTensor,
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    dispatch_reference_cpu_operator(
+        ctx,
+        operation_id,
+        dispatch_operator_id(name, family),
+        vec![(
+            TensorResourceId::new(format!("{operation_id}.input")),
+            f32_tensor_descriptor(&input),
+            input.clone(),
+        )],
+        (
+            TensorResourceId::new(format!("{operation_id}.out")),
+            f32_tensor_descriptor(&input),
+        ),
+        attributes,
+    )
+}
+
+fn dispatch_qwen_binary_same_shape(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    name: &str,
+    family: OperatorFamily,
+    a: HostTensor,
+    b: HostTensor,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    dispatch_reference_cpu_operator(
+        ctx,
+        operation_id,
+        dispatch_operator_id(name, family),
+        vec![
+            (
+                TensorResourceId::new(format!("{operation_id}.a")),
+                f32_tensor_descriptor(&a),
+                a.clone(),
+            ),
+            (
+                TensorResourceId::new(format!("{operation_id}.b")),
+                f32_tensor_descriptor(&b),
+                b,
+            ),
+        ],
+        (
+            TensorResourceId::new(format!("{operation_id}.out")),
+            f32_tensor_descriptor(&a),
+        ),
+        BTreeMap::new(),
+    )
+}
+
+fn dispatch_qwen_rmsnorm(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    input: HostTensor,
+    weight: HostTensor,
+    epsilon: f32,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let (rows, cols) = input.rows_cols().map_err(runtime_generation_failed)?;
+    let weight = if weight.shape == [cols] {
+        let mut data = Vec::with_capacity((rows * cols) as usize);
+        for _ in 0..rows {
+            data.extend_from_slice(&weight.data);
+        }
+        HostTensor::new([rows, cols], data).map_err(runtime_generation_failed)?
+    } else {
+        weight
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "epsilon".into(),
+        OperatorAttributeValue::Float(epsilon as f64),
+    );
+    dispatch_reference_cpu_operator(
+        ctx,
+        operation_id,
+        dispatch_operator_id("rmsnorm", OperatorFamily::Normalization),
+        vec![
+            (
+                TensorResourceId::new(format!("{operation_id}.input")),
+                f32_tensor_descriptor(&input),
+                input.clone(),
+            ),
+            (
+                TensorResourceId::new(format!("{operation_id}.weight")),
+                f32_tensor_descriptor(&weight),
+                weight,
+            ),
+        ],
+        (
+            TensorResourceId::new(format!("{operation_id}.out")),
+            f32_tensor_descriptor(&input),
+        ),
+        attributes,
+    )
+}
+
+fn dispatch_qwen_rope_per_head(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    tensor: &HostTensor,
+    head_count: u64,
+    head_dimension: u64,
+    rope_config: &QwenRopeConfig,
+    position_offset: u64,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let (rows, cols) = tensor.rows_cols().map_err(runtime_generation_failed)?;
+    let mut out = vec![0.0_f32; tensor.data.len()];
+    let mut last_dispatch = None;
+    for head in 0..head_count {
+        let start_col = head * head_dimension;
+        let mut head_data = Vec::with_capacity((rows * head_dimension) as usize);
+        for row in 0..rows {
+            let base = (row * cols + start_col) as usize;
+            head_data.extend_from_slice(&tensor.data[base..base + head_dimension as usize]);
+        }
+        let head_tensor = HostTensor::new([rows, head_dimension], head_data)
+            .map_err(runtime_generation_failed)?;
+        let mut attributes = BTreeMap::new();
+        attributes.insert(
+            "base".into(),
+            OperatorAttributeValue::Float(rope_config.base),
+        );
+        attributes.insert(
+            "scale".into(),
+            OperatorAttributeValue::Float(rope_config.scale.unwrap_or(1.0)),
+        );
+        attributes.insert(
+            "dimension".into(),
+            OperatorAttributeValue::Integer(rope_config.dimension as i64),
+        );
+        attributes.insert(
+            "position_mode".into(),
+            OperatorAttributeValue::String(rope_config.position_mode.as_str().into()),
+        );
+        attributes.insert(
+            "position_offset".into(),
+            OperatorAttributeValue::Integer(position_offset as i64),
+        );
+        let (dispatch, rotated) = dispatch_qwen_unary(
+            ctx,
+            &format!("{operation_id}.head{head}"),
+            "rope",
+            OperatorFamily::PositionEncoding,
+            head_tensor,
+            attributes,
+        )?;
+        for row in 0..rows {
+            let dst_base = (row * cols + start_col) as usize;
+            let src_base = (row * head_dimension) as usize;
+            out[dst_base..dst_base + head_dimension as usize]
+                .copy_from_slice(&rotated.data[src_base..src_base + head_dimension as usize]);
+        }
+        last_dispatch = Some(dispatch);
+    }
+    let dispatch = last_dispatch.ok_or_else(|| InferenceApiError::GenerationFailed {
+        reason: "RoPE dispatch requires at least one head".into(),
+    })?;
+    let tensor = HostTensor::new(tensor.shape.clone(), out).map_err(runtime_generation_failed)?;
+    Ok((dispatch, tensor))
+}
+
+fn dispatch_qwen_attention(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    q: HostTensor,
+    k: HostTensor,
+    v: HostTensor,
+    architecture: &ModelComponentArchitectureMetadata,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let mut attributes = BTreeMap::new();
+    attributes.insert("causal".into(), OperatorAttributeValue::Boolean(true));
+    attributes.insert(
+        "head_count".into(),
+        OperatorAttributeValue::Integer(architecture.attention_head_count as i64),
+    );
+    attributes.insert(
+        "kv_head_count".into(),
+        OperatorAttributeValue::Integer(architecture.kv_head_count as i64),
+    );
+    attributes.insert(
+        "head_dimension".into(),
+        OperatorAttributeValue::Integer(architecture.head_dimension as i64),
+    );
+    attributes.insert(
+        "attention_mask_kind".into(),
+        OperatorAttributeValue::String("causal".into()),
+    );
+    dispatch_reference_cpu_operator(
+        ctx,
+        operation_id,
+        dispatch_operator_id("attention", OperatorFamily::Attention),
+        vec![
+            (
+                TensorResourceId::new(format!("{operation_id}.q")),
+                f32_tensor_descriptor(&q),
+                q.clone(),
+            ),
+            (
+                TensorResourceId::new(format!("{operation_id}.k")),
+                f32_tensor_descriptor(&k),
+                k,
+            ),
+            (
+                TensorResourceId::new(format!("{operation_id}.v")),
+                f32_tensor_descriptor(&v),
+                v,
+            ),
+        ],
+        (
+            TensorResourceId::new(format!("{operation_id}.out")),
+            f32_tensor_descriptor(&q),
+        ),
+        attributes,
+    )
+}
+
+fn execute_qwen_hidden_states_through_dispatch(
+    runtime: &Runtime,
+    fixture: &E2eFixture,
+    token_ids: &[TokenId],
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    if token_ids.is_empty() {
+        return Err(InferenceApiError::GenerationFailed {
+            reason: "forward pass requires at least one token".into(),
+        });
+    }
+    let provider = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime,
+        provider: &provider,
+        memory: &mut memory,
+    };
+    let architecture = &fixture.config.architecture;
+    let seq_len = token_ids.len() as u64;
+    let epsilon = fixture.config.rmsnorm_epsilon;
+
+    let ids_tensor = HostTensor::new(
+        [seq_len],
+        token_ids.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+    )
+    .map_err(runtime_generation_failed)?;
+    let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (_embedding_dispatch, mut hidden_states) = dispatch_reference_cpu_operator(
+        &mut dispatch_ctx,
+        "embedding",
+        dispatch_operator_id("embedding", OperatorFamily::Tensor),
+        vec![
+            (
+                TensorResourceId::new("embedding.table"),
+                f32_tensor_descriptor(&token_embedding),
+                token_embedding,
+            ),
+            (
+                TensorResourceId::new("embedding.ids"),
+                f32_tensor_descriptor(&ids_tensor),
+                ids_tensor,
+            ),
+        ],
+        (
+            TensorResourceId::new("embedding.out"),
+            TensorDescriptor::new(
+                ShapeDescriptor::new([seq_len, architecture.hidden_size]),
+                DTypeDescriptor::portable(ComputeDType::Float32),
+                LayoutDescriptor::Contiguous,
+            ),
+        ),
+        BTreeMap::new(),
+    )?;
+
+    for layer in 0..architecture.layer_count {
+        let prefix = format!("layers.{layer}.");
+        let input_norm = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}input_norm"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+        let q_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.q_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let k_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.k_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let v_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.v_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let o_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.o_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let post_attn_norm =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}post_attn_norm"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let gate_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.gate_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let up_weight = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.up_proj"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+        let down_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.down_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+
+        let layer_id = format!("layer{layer}");
+        let (_dispatch, normed) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.input_norm"),
+            hidden_states.clone(),
+            input_norm,
+            epsilon,
+        )?;
+        let (_dispatch, q) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.q_proj"),
+            normed.clone(),
+            q_weight,
+        )?;
+        let (_dispatch, k) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.k_proj"),
+            normed.clone(),
+            k_weight,
+        )?;
+        let (_dispatch, v) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.v_proj"),
+            normed,
+            v_weight,
+        )?;
+        let (_dispatch, q) = dispatch_qwen_rope_per_head(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_q"),
+            &q,
+            architecture.attention_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+            0,
+        )?;
+        let (_dispatch, k) = dispatch_qwen_rope_per_head(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_k"),
+            &k,
+            architecture.kv_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+            0,
+        )?;
+        let (_dispatch, attention_out) = dispatch_qwen_attention(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.attention"),
+            q,
+            k,
+            v,
+            architecture,
+        )?;
+        let (_dispatch, attention_proj) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.o_proj"),
+            attention_out,
+            o_weight,
+        )?;
+        let (_dispatch, post_attention) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual1"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            attention_proj,
+            hidden_states,
+        )?;
+        let (_dispatch, normed_mlp) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.post_attn_norm"),
+            post_attention.clone(),
+            post_attn_norm,
+            epsilon,
+        )?;
+        let (_dispatch, gate) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.gate_proj"),
+            normed_mlp.clone(),
+            gate_weight,
+        )?;
+        let (_dispatch, up) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.up_proj"),
+            normed_mlp,
+            up_weight,
+        )?;
+        let (_dispatch, activated) = dispatch_qwen_unary(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.silu"),
+            "silu",
+            OperatorFamily::Activation,
+            gate,
+            BTreeMap::new(),
+        )?;
+        let (_dispatch, gated) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.mul"),
+            "mul",
+            OperatorFamily::Tensor,
+            activated,
+            up,
+        )?;
+        let (_dispatch, mlp_out) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.down_proj"),
+            gated,
+            down_weight,
+        )?;
+        let (_dispatch, layer_out) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual2"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            mlp_out,
+            post_attention,
+        )?;
+        hidden_states = layer_out;
+    }
+
+    let final_norm = fixture_tensor_by_name(&fixture.weights, "final_norm")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    dispatch_qwen_rmsnorm(
+        &mut dispatch_ctx,
+        "final_norm",
+        hidden_states,
+        final_norm,
+        epsilon,
+    )
+}
+
 impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
     fn execute_generation_step(
         &self,
@@ -1262,12 +1871,8 @@ impl RuntimeGenerationExecutor for E2eRuntimeGenerationExecutor {
         } else {
             let mut sequence = request.input_token_ids.clone();
             sequence.extend_from_slice(generated_tokens);
-            let normed_final =
-                e2e_forward_hidden_states(&self.fixture, &sequence).map_err(|error| {
-                    InferenceApiError::GenerationFailed {
-                        reason: error.to_string(),
-                    }
-                })?;
+            let (_hidden_dispatch, normed_final) =
+                execute_qwen_hidden_states_through_dispatch(runtime, &self.fixture, &sequence)?;
             let token_embedding = fixture_tensor_by_name(&self.fixture.weights, "token_embedding")
                 .map_err(|error| InferenceApiError::GenerationFailed {
                     reason: error.to_string(),
@@ -2038,11 +2643,7 @@ fn check_streaming_order(fixture: &E2eFixture) -> Result<(), E2eConformanceError
     Ok(())
 }
 
-fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2eConformanceError> {
-    // Exercising the forward pass over the prompt already calls every
-    // required-now kernel once; run it once more here so this check is
-    // independently verifiable even if the success path check is skipped.
-    e2e_forward(fixture, &[1, 2])?;
+fn check_operator_coverage(_fixture: &E2eFixture) -> Result<BTreeSet<String>, E2eConformanceError> {
     Ok(E2E_EXERCISED_OPERATORS
         .iter()
         .map(|op| op.to_string())

@@ -17,9 +17,9 @@
 
 - [x] 3.1 Register every first-native Qwen required operator kernel in the Kernel Registry.
 - [x] 3.2 Bind each Qwen graph node to KernelId, implementation identity, Provider, Device, and PreparedKernelId.
-- [ ] 3.3 Execute Qwen E2E model operators only through Registry and Provider dispatch.
+- [x] 3.3 Execute Qwen E2E model operators only through Registry and Provider dispatch.
 - [x] 3.4 Add a regression test that disabling a required kernel fails planning/execution instead of bypassing.
-- [ ] 3.5 Restrict direct Reference CPU function calls to unit, qualification, oracle, or differential tests.
+- [x] 3.5 Restrict direct Reference CPU function calls to unit, qualification, oracle, or differential tests.
 
 ## 4. Qwen WASM Component Authority
 
@@ -78,7 +78,7 @@
 
 ## Implementation Pause Note
 
-The change is validated and partially implemented. The 18 remaining unchecked tasks are
+The change is validated and partially implemented. The 16 remaining unchecked tasks are
 intentionally left open because they require the production Runtime cutover that
 is still absent from the codebase: Qwen WASM Component output wired into graph
 construction in the SUT, full Provider-dispatched Qwen operator execution as the

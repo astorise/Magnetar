@@ -470,15 +470,19 @@ pub fn rmsnorm(
     epsilon: f32,
 ) -> Result<HostTensor, ReferenceCpuError> {
     let (rows, cols) = input.rows_cols()?;
-    if weight.shape != [cols] {
+    let weight_values = if weight.shape == [cols] || weight.shape == [1, cols] {
+        &weight.data
+    } else if weight.shape == [rows, cols] {
+        &weight.data[..cols as usize]
+    } else {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
             format!(
-                "RMSNorm weight shape must be [{cols}], got {:?}",
+                "RMSNorm weight shape must be [{cols}], [1, {cols}], or [{rows}, {cols}], got {:?}",
                 weight.shape
             ),
         ));
-    }
+    };
     if epsilon <= 0.0 {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
@@ -491,7 +495,7 @@ pub fn rmsnorm(
         let mean_square = slice.iter().map(|value| value * value).sum::<f32>() / cols as f32;
         let scale = 1.0 / (mean_square + epsilon).sqrt();
         for (col, value) in slice.iter().enumerate() {
-            out[row * cols as usize + col] = value * scale * weight.data[col];
+            out[row * cols as usize + col] = value * scale * weight_values[col];
         }
     }
     HostTensor::new(input.shape.clone(), out)
