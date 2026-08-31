@@ -32,8 +32,8 @@ use crate::kv_cache::{
 };
 use crate::memory::{
     MemoryAdmissionDecision, MemoryAdmissionRequest, MemoryAllocationClass, MemoryAllocationId,
-    MemoryAllocationOwner, MemoryAllocationRequest, MemoryManager, MemoryManagerConfig,
-    MemoryPlacement,
+    MemoryAllocationOwner, MemoryAllocationRequest, MemoryAllocationState, MemoryManager,
+    MemoryManagerConfig, MemoryPlacement,
 };
 use crate::model_instance::{
     ModelInstance, ModelInstanceDefinition, ModelInstanceError, ModelInstanceId,
@@ -629,6 +629,7 @@ impl Runtime {
                 cache.compatibility.model
                     == GenerationModelReference::ModelInstance(instance.clone())
             })
+            .filter(|cache| cache.lifecycle != KvCacheLifecycleState::Released)
             .map(|cache| cache.id.clone())
             .collect::<Vec<_>>();
         let report = self.model_instances.unload(instance, policy)?;
@@ -784,6 +785,13 @@ impl Runtime {
     }
     fn release_kv_cache_memory(&mut self, cache: &KvCacheId) -> Result<(), KvCacheError> {
         if let Some(allocation) = self.kv_cache(cache)?.residency.memory_allocation {
+            if self
+                .memory
+                .allocations()
+                .any(|item| item.id == allocation && item.state == MemoryAllocationState::Released)
+            {
+                return Ok(());
+            }
             self.memory
                 .release(allocation)
                 .map_err(|_| KvCacheError::CacheReleased)?;

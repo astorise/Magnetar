@@ -469,17 +469,38 @@ pub fn rmsnorm(
     weight: &HostTensor,
     epsilon: f32,
 ) -> Result<HostTensor, ReferenceCpuError> {
-    let (rows, cols) = input.rows_cols()?;
+    let cols = *input.shape.last().ok_or_else(|| {
+        ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "RMSNorm expects at least one dimension",
+        )
+    })?;
+    if cols == 0 {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "RMSNorm hidden dimension must be non-zero",
+        ));
+    }
+    if !input.data.len().is_multiple_of(cols as usize) {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "RMSNorm data length {} is not divisible by hidden dimension {cols}",
+                input.data.len()
+            ),
+        ));
+    }
+    let rows = input.data.len() / cols as usize;
     let row_weight_stride = if weight.shape == [cols] || weight.shape == [1, cols] {
         0
-    } else if weight.shape == [rows, cols] {
+    } else if weight.shape == input.shape || weight.shape == [rows as u64, cols] {
         cols as usize
     } else {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
             format!(
-                "RMSNorm weight shape must be [{cols}], [1, {cols}], or [{rows}, {cols}], got {:?}",
-                weight.shape
+                "RMSNorm weight shape must be [{cols}], [1, {cols}], input shape {:?}, or [{rows}, {cols}], got {:?}",
+                input.shape, weight.shape
             ),
         ));
     };
@@ -490,7 +511,7 @@ pub fn rmsnorm(
         ));
     }
     let mut out = vec![0.0_f32; input.data.len()];
-    for row in 0..rows as usize {
+    for row in 0..rows {
         let slice = &input.data[row * cols as usize..(row + 1) * cols as usize];
         let weight_base = row * row_weight_stride;
         let weight_values = &weight.data[weight_base..weight_base + cols as usize];

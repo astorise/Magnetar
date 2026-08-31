@@ -4747,6 +4747,43 @@ fn pushed_component_package_is_validated_before_preparation() {
 }
 
 #[test]
+fn pushed_component_package_temp_materialization_is_removed_with_manager() {
+    let before = std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("magnetar-distributed-component-"))
+        })
+        .collect::<BTreeSet<_>>();
+    let bytes = b"component-bytes-cleanup";
+    let digest = ComponentDigest::sha256(bytes);
+    let package =
+        component_artifact_package(bytes, ComponentDistributionSourceKind::ClientProvided);
+    let materialized = {
+        let mut manager = ComponentManager::new();
+        manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value.clone()));
+        manager.prepare_pushed_package(package).unwrap();
+        std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                !before.contains(path)
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("magnetar-distributed-component-"))
+            })
+            .expect("distributed component package materialized")
+    };
+
+    assert!(!materialized.exists());
+}
+
+#[test]
 fn pushed_component_package_rejects_source_digest_mismatch() {
     let mut package =
         component_artifact_package(b"component-bytes", ComponentDistributionSourceKind::Tachyon);
@@ -6684,6 +6721,21 @@ fn reference_cpu_rmsnorm_full_shape_weights_apply_per_row() {
     assert!((result.data[1] - 4.0 * scale).abs() < 1e-5);
     assert!((result.data[2] - 3.0 * scale * 2.0).abs() < 1e-5);
     assert!((result.data[3] - 4.0 * scale * 3.0).abs() < 1e-5);
+}
+
+#[test]
+fn reference_cpu_rmsnorm_flattens_leading_dimensions() {
+    let input = reference_cpu_host_tensor([1, 2, 2], [3.0, 4.0, 5.0, 12.0]);
+    let weight = reference_cpu_host_tensor([1, 2, 2], [1.0, 2.0, 3.0, 4.0]);
+    let result = rmsnorm(&input, &weight, 1e-6).unwrap();
+    let row0_scale = 1.0 / (((9.0_f32 + 16.0) / 2.0) + 1e-6).sqrt();
+    let row1_scale = 1.0 / (((25.0_f32 + 144.0) / 2.0) + 1e-6).sqrt();
+
+    assert_eq!(result.shape, vec![1, 2, 2]);
+    assert!((result.data[0] - 3.0 * row0_scale).abs() < 1e-5);
+    assert!((result.data[1] - 4.0 * row0_scale * 2.0).abs() < 1e-5);
+    assert!((result.data[2] - 5.0 * row1_scale * 3.0).abs() < 1e-5);
+    assert!((result.data[3] - 12.0 * row1_scale * 4.0).abs() < 1e-5);
 }
 
 #[test]
