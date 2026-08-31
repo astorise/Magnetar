@@ -300,8 +300,8 @@ fn wasmtime_engine_executes_qwen_graph_component_fixture() {
         .unwrap();
 
     for (operation, expected) in [
-        ("prefill-node-count", 13),
-        ("decode-node-count", 12),
+        ("prefill-node-count", 19),
+        ("decode-node-count", 19),
         ("provider-authority-count", 0),
     ] {
         let result = engine
