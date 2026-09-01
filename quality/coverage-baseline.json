@@ -1,5 +1,5 @@
 {
-  "line_coverage_percent": 78.9061991803812,
+  "line_coverage_percent": 78.88656314397443,
   "function_coverage_percent": 79.25202029693668,
   "branch_coverage_percent": null,
   "scope": "workspace production Rust source; test source and target output are excluded",
@@ -15,5 +15,5 @@
       "reason": "Applied automatically by cargo-llvm-cov in addition to the pattern above. Unit tests therefore live in sibling tests.rs files rather than in inline #[cfg(test)] modules, because a filename pattern cannot exclude test code embedded in a production file."
     }
   ],
-  "notes": "Measured with --all-features so feature-gated modules (component_wasmtime, component_web) are included. Re-measured after moving magnetar-runtime/src/first_native_runtime.rs's large inline #[cfg(test)] mod tests block into a sibling magnetar-runtime/src/first_native_runtime/tests.rs file (matching the existing qwen_model_component/tests.rs convention), so that module's ~1350 lines of unit test source are now excluded from production coverage the same way every other module's tests already are (task 9.1)."
+  "notes": "Measured with --all-features so feature-gated modules (component_wasmtime, component_web) are included. Re-measured after moving magnetar-runtime/src/first_native_runtime.rs's large inline #[cfg(test)] mod tests block into a sibling magnetar-runtime/src/first_native_runtime/tests.rs file (matching the existing qwen_model_component/tests.rs convention), so that module's ~1350 lines of unit test source are now excluded from production coverage the same way every other module's tests already are (task 9.1). line_coverage_percent is taken from the CI quality/coverage job's own ubuntu-latest run (github.com/astorise/Magnetar/actions/runs/33483559528), not a local measurement: a local Windows run of the identical command reported a slightly different total line count (61492 vs CI's 61629) and thus a slightly higher percentage, so the CI-measured figure is the one this ratchet must accept to avoid a platform-dependent false failure. function_coverage_percent was identical on both platforms."
 }
