@@ -6,14 +6,15 @@
 //! from Runtime model execution evidence rather than a CLI placeholder.
 
 use magnetar_runtime::{
-    ChatMessage, ChatTemplateFormatter, CliBoundaryError, FirstNativeRuntimeError,
-    GenerationModelReference, GenerationParameters, GenerationTokenizerReference,
-    InferenceApiError, InferenceApiObserver, InferenceSessionId, MODEL_ARTIFACT_SCHEMA_VERSION,
-    ModelArchitecture, ModelArtifactId, ModelArtifactKind, ModelDigest, ModelManifest, ModelName,
-    ModelRef, ModelRevision, Runtime, SessionCreationRequest, SessionMemoryBudget, SessionPolicy,
+    ChatMessage, ChatTemplateFormatter, CliBoundaryError, FirstNativeChatSession,
+    FirstNativeRuntimeError, InferenceApiError, InferenceApiObserver, InferenceSessionId,
+    MODEL_ARTIFACT_SCHEMA_VERSION, ModelArchitecture, ModelArtifactId, ModelArtifactKind,
+    ModelDigest, ModelManifest, ModelName, ModelRef, ModelRevision, run_first_native_generation,
+};
+#[cfg(test)]
+use magnetar_runtime::{
     SpecialToken, SpecialTokenKind, TokenIdRange, TokenizerArtifactId, TokenizerFamily,
-    TokenizerId, TokenizerMetadata, TokenizerRevision, cancel_inference_session,
-    close_inference_session, create_inference_session, run_first_native_generation,
+    TokenizerId, TokenizerMetadata, TokenizerRevision,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,6 +45,13 @@ fn first_native_runtime_error_to_api_error(error: FirstNativeRuntimeError) -> In
 /// (`generation_tokenizer_metadata` in `magnetar-runtime/src/tests.rs`) but
 /// is written independently here since that helper is `#[cfg(test)]`-gated
 /// and not part of the public API.
+///
+/// Test-only: `FirstNativeChatSession::open` (task 8.3) now builds its own
+/// session against the `E2eFixture`'s own tokenizer metadata directly,
+/// so this CLI-local fixture no longer has a production caller -- only the
+/// `tokenize_chat_messages_without_formatter_is_policy_denied` test below
+/// still exercises it.
+#[cfg(test)]
 pub fn fixture_tokenizer_metadata() -> TokenizerMetadata {
     TokenizerMetadata {
         id: TokenizerId::new("magnetar-cli-fixture").expect("valid fixture tokenizer id"),
@@ -112,31 +120,6 @@ pub fn fixture_model_manifest(label: &str) -> ModelManifest {
     }
 }
 
-/// Builds a [`SessionCreationRequest`] against the fixture tokenizer and a
-/// `LoadedModelContext` reference naming the caller-supplied [`ModelRef`].
-/// This is used only for session lifecycle/cancellation wiring in chat; the
-/// normal generation turn uses Runtime's first-native fixture path.
-fn session_creation_request(model_ref: &ModelRef) -> SessionCreationRequest {
-    let metadata = fixture_tokenizer_metadata();
-    let mut allowed_capabilities = BTreeSet::new();
-    allowed_capabilities.insert("generation".to_string());
-    SessionCreationRequest {
-        model: GenerationModelReference::LoadedModelContext(format!(
-            "magnetar-cli-fixture:{model_ref}"
-        )),
-        tokenizer: GenerationTokenizerReference {
-            tokenizer_id: metadata.id.clone(),
-            metadata,
-        },
-        generation_defaults: GenerationParameters::greedy(),
-        policy: SessionPolicy::default(),
-        memory: SessionMemoryBudget::default(),
-        allowed_capabilities,
-        correlation_id: None,
-        created_at_millis: 0,
-    }
-}
-
 /// Minimal CLI-owned chat template formatter, satisfying the Runtime's
 /// authorized [`ChatTemplateFormatter`] contract for `magnetar chat`'s
 /// multi-turn `PromptInput::ChatMessages` path (see
@@ -179,15 +162,15 @@ pub fn one_shot(
 }
 
 /// A `magnetar chat` session: one persistent Runtime Inference Session
-/// reused across turns, plus a CLI-owned transcript kept entirely outside
-/// the Runtime session. This is the concrete implementation of "CLI Session
-/// Metadata Is Separate From Runtime Session State"
-/// (`specs/cli-boundary/spec.md`): the Runtime session never sees the
-/// transcript, only per-turn prompt/generation requests.
+/// reused across turns (task 8.3: every turn executes through this same
+/// persistent [`FirstNativeChatSession`], not a fresh one-shot Runtime per
+/// turn), plus a CLI-owned transcript kept entirely outside the Runtime
+/// session. This is the concrete implementation of "CLI Session Metadata Is
+/// Separate From Runtime Session State" (`specs/cli-boundary/spec.md`): the
+/// Runtime session never sees the transcript, only per-turn prompt/
+/// generation requests.
 pub struct ChatSession {
-    runtime: Runtime,
-    session: InferenceSessionId,
-    model_ref: ModelRef,
+    chat: FirstNativeChatSession,
     /// CLI-owned transcript: (role, text) pairs. Never sent to Runtime as a
     /// whole -- only the current turn's prompt text is.
     transcript: Vec<(String, String)>,
@@ -197,20 +180,23 @@ pub struct ChatSession {
 
 impl ChatSession {
     pub fn open(model_ref: &ModelRef) -> Result<Self, CliBoundaryError> {
-        let mut runtime = magnetar_runtime::Runtime::builder()
-            .build()
-            .map_err(|error| CliBoundaryError::CliRuntimeUnavailable {
-                reason: error.to_string(),
-            })?;
-        let session = create_inference_session(&mut runtime, session_creation_request(model_ref))?;
+        let chat = FirstNativeChatSession::open(model_ref).map_err(|error| {
+            CliBoundaryError::CliRuntimeRequestFailed(first_native_runtime_error_to_api_error(
+                error,
+            ))
+        })?;
         Ok(Self {
-            runtime,
-            session,
-            model_ref: model_ref.clone(),
+            chat,
             transcript: Vec::new(),
             next_turn: 0,
             cancelled: false,
         })
+    }
+
+    /// The persistent Runtime `InferenceSessionId` every turn of this chat
+    /// session executes through -- stable across the whole session.
+    pub fn session_id(&self) -> &InferenceSessionId {
+        self.chat.session_id()
     }
 
     /// Runs one chat turn and returns the fixture-generated reply plus the
@@ -225,6 +211,11 @@ impl ChatSession {
     /// chat template via `tokenize_prompt_input` rather than the CLI
     /// joining strings itself -- the concrete "Runtime applies authorized
     /// chat template" half of the boundary, made explicit by this branch.
+    ///
+    /// Every branch executes through `self.chat` -- this chat session's one
+    /// persistent Runtime, Model Instance, and `InferenceSessionId` -- so
+    /// two turns of the same `ChatSession` share Runtime session identity
+    /// (task 8.3), rather than each turn building and tearing down its own.
     pub fn turn(
         &mut self,
         user_line: &str,
@@ -237,8 +228,10 @@ impl ChatSession {
         self.next_turn += 1;
 
         let (reply, observer) = if self.transcript.is_empty() {
-            let generated =
-                run_first_native_generation(&self.model_ref, user_line).map_err(|error| {
+            let generated = self
+                .chat
+                .turn(user_line, DEFAULT_MAX_NEW_TOKENS)
+                .map_err(|error| {
                     CliBoundaryError::CliRuntimeRequestFailed(
                         first_native_runtime_error_to_api_error(error),
                     )
@@ -253,8 +246,10 @@ impl ChatSession {
             messages.push(ChatMessage::new("user", user_line));
             let formatter = CliChatTemplateFormatter;
             let rendered = formatter.format(&messages)?;
-            let generated =
-                run_first_native_generation(&self.model_ref, &rendered).map_err(|error| {
+            let generated = self
+                .chat
+                .turn(&rendered, DEFAULT_MAX_NEW_TOKENS)
+                .map_err(|error| {
                     CliBoundaryError::CliRuntimeRequestFailed(
                         first_native_runtime_error_to_api_error(error),
                     )
@@ -275,27 +270,37 @@ impl ChatSession {
     }
 
     /// Cancellation (§19 "CLI Cancellation Calls Runtime Cancellation"):
-    /// calls the real `magnetar_runtime::cancel_inference_session`. After
-    /// this returns `Ok(())` the underlying Runtime session is in
-    /// `SessionLifecycleState::Cancelled` and rejects further
-    /// [`Self::turn`] calls -- callers should stop the interactive loop
-    /// afterward rather than calling [`Self::close`] (a cancelled session
-    /// does not need a separate close). This is the CLI's cancellation call
-    /// path for Runtime-owned (inference) work; CLI-owned file/Git/network/
-    /// tool work is not tracked by `ChatSession` and has nothing to cancel
-    /// here since every such call in this synchronous CLI already runs to
-    /// completion or structured failure before control returns to the
-    /// caller (see `commands::cmd_chat`'s "cancel" REPL command for the
-    /// user-facing entry point).
+    /// calls the real `magnetar_runtime::cancel_inference_session` against
+    /// this chat session's persistent `InferenceSessionId` -- the same
+    /// session [`Self::turn`] executes every generation through (task 8.3),
+    /// not an orphan session no turn ever touches. After this returns
+    /// `Ok(())` the underlying Runtime session is in
+    /// `SessionLifecycleState::Cancelled` and `self.cancelled` rejects
+    /// further [`Self::turn`] calls -- callers should stop the interactive
+    /// loop afterward rather than calling [`Self::close`] (a cancelled
+    /// session does not need a separate close). This is the CLI's
+    /// cancellation call path for Runtime-owned (inference) work; CLI-owned
+    /// file/Git/network/tool work is not tracked by `ChatSession` and has
+    /// nothing to cancel here since every such call in this synchronous CLI
+    /// already runs to completion or structured failure before control
+    /// returns to the caller (see `commands::cmd_chat`'s "cancel" REPL
+    /// command for the user-facing entry point).
     pub fn cancel(&mut self) -> Result<(), CliBoundaryError> {
-        cancel_inference_session(&mut self.runtime, &self.session)?;
+        self.chat.cancel().map_err(|error| {
+            CliBoundaryError::CliRuntimeRequestFailed(first_native_runtime_error_to_api_error(
+                error,
+            ))
+        })?;
         self.cancelled = true;
         Ok(())
     }
 
-    pub fn close(mut self) -> Result<(), CliBoundaryError> {
-        close_inference_session(&mut self.runtime, &self.session)?;
-        Ok(())
+    pub fn close(self) -> Result<(), CliBoundaryError> {
+        self.chat.close().map_err(|error| {
+            CliBoundaryError::CliRuntimeRequestFailed(first_native_runtime_error_to_api_error(
+                error,
+            ))
+        })
     }
 }
 
@@ -303,7 +308,7 @@ impl ChatSession {
 mod tests {
     use super::*;
     use magnetar_runtime::{
-        FixtureTokenizer, ModelInstanceUnloadPolicy, PromptInput, TokenizationRequest,
+        FixtureTokenizer, ModelInstanceUnloadPolicy, PromptInput, Runtime, TokenizationRequest,
         tokenize_prompt_input, unload_model_instance,
     };
 
@@ -437,17 +442,39 @@ mod tests {
         chat.close().unwrap();
     }
 
+    /// Task 8.3's literal spec scenario: "two chat turns execute" through
+    /// one `ChatSession` "use the same Runtime InferenceSession
+    /// identifier." Before the fix this covers, `ChatSession::turn` called
+    /// `run_first_native_generation`, which built and closed an entirely
+    /// separate throwaway Runtime and session on every call -- the session
+    /// id this test captures before a turn would have had no relationship
+    /// at all to what that turn actually executed through.
+    #[test]
+    fn chat_session_turns_share_the_same_runtime_session_identifier() {
+        let model_ref = ModelRef::new("qwen-test").unwrap();
+        let mut chat = ChatSession::open(&model_ref).unwrap();
+        let session_id_before = chat.session_id().clone();
+        chat.turn("first line").unwrap();
+        assert_eq!(chat.session_id(), &session_id_before);
+        chat.close().unwrap();
+    }
+
     #[test]
     fn chat_session_rejects_unknown_model_ref_instead_of_ignoring_it() {
+        // `open` now itself loads the Model Instance into this chat
+        // session's persistent Runtime (task 8.3) rather than deferring
+        // that to the first `turn` call, so an unknown model ref fails
+        // closed here already instead of producing a session whose first
+        // turn is guaranteed to fail.
         let model_ref = ModelRef::new("different-model").unwrap();
-        let mut chat = ChatSession::open(&model_ref).unwrap();
-        let error = chat.turn("first line").unwrap_err();
+        let Err(error) = ChatSession::open(&model_ref) else {
+            panic!("expected an unknown model ref to fail ChatSession::open");
+        };
         assert!(matches!(
             error.runtime_category(),
             Some(InferenceApiError::ModelResolutionFailed { reason })
                 if reason.contains("different-model")
         ));
-        chat.close().unwrap();
     }
 
     #[test]

@@ -78,14 +78,20 @@ Implemented today:
   Inference API, and E2E conformance contract surfaces
 - Fixture-backed local inference and conformance paths used to validate the
   runtime boundaries
+- First-native fixture-model prefill/decode causally driven by
+  `ExecutionGraph` + published `PreparedExecutionPlan` bindings, with
+  Provider execution and memory allocation resolved through Runtime-owned
+  registries, weights bound to Model Instance resources, and KV cache state
+  held as a Runtime-owned resource with transactional prepare/commit/abort
+  semantics -- not just contract-validated alongside a parallel bypass path
+- `magnetar chat` executing every turn of a chat session through one
+  persistent Runtime `InferenceSessionId`, with cancellation and close
+  acting on that same session
 - Quality gates documented in [docs/quality.md](docs/quality.md)
 
 Implemented as baseline fixture or contract-only:
 
 - complete Component host adapters and end-to-end WIT host-call fixtures
-- Runtime-owned Provider-backed generation through graph validation, Kernel
-  Registry, Kernel Dispatch, TensorResource logits, and Sampling
-- incremental prefill/decode execution using KV cache
 - production model artifact parsing, residency, and hub/source downloads
 - production tokenizer integration beyond deterministic fixtures
 - production continuous batching, prefix cache reuse, adapters, quantization,

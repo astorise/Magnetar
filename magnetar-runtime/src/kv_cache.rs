@@ -11,7 +11,7 @@ use crate::{
     ComputeDType, DTypeDescriptor, DeviceBinding, FallbackClass, GenerationModelReference,
     InferenceSessionId, MemoryAllocationClass, MemoryAllocationId, MemoryAllocationLifetime,
     MemoryAllocationOwner, MemoryAllocationRequest, MemoryDTypeRelation, MemoryManager,
-    MemoryPlacement, ProviderBinding, ResourceAffinity, TokenId, TokenizerId,
+    MemoryPlacement, ProviderBinding, ResourceAffinity, TensorResourceId, TokenId, TokenizerId,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, error::Error, fmt};
@@ -439,6 +439,24 @@ pub struct KvCache {
     pub last_access_millis: u64,
     pub idle_ttl_millis: Option<u64>,
     pub total_ttl_millis: Option<u64>,
+    /// Per-layer K/V tensor resource bindings for this cache's *committed*
+    /// data (see `KvLayerResourceBinding`), keyed by layer index. Runtime-
+    /// owned: the actual bytes live in the bound Provider's storage,
+    /// addressed by `TensorResourceId`, not in any executor-private map.
+    /// Empty until the first successful prefill commit.
+    pub layer_resources: BTreeMap<u32, KvLayerResourceBinding>,
+}
+
+/// One layer's committed K/V tensor resource identities plus the
+/// `MemoryManager` allocations accounting for their current byte size, so a
+/// later commit (decode append) or cache release can find and release the
+/// allocation it is about to replace or free.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvLayerResourceBinding {
+    pub k: TensorResourceId,
+    pub v: TensorResourceId,
+    pub k_allocation: MemoryAllocationId,
+    pub v_allocation: MemoryAllocationId,
 }
 
 impl KvCache {
@@ -461,6 +479,7 @@ impl KvCache {
             last_access_millis: 0,
             idle_ttl_millis: None,
             total_ttl_millis: None,
+            layer_resources: BTreeMap::new(),
         }
     }
 

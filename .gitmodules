@@ -1,0 +1,18 @@
+[submodule "formats/gguf"]
+	path = formats/gguf
+	url = https://github.com/astorise/Magnetar-format-GGUF.git
+[submodule "components/llama"]
+	path = components/llama
+	url = https://github.com/astorise/Magnetar-component-Llama.git
+[submodule "formats/safetensors"]
+	path = formats/safetensors
+	url = https://github.com/astorise/Magnetar-format-safetensors.git
+[submodule "components/qwen"]
+	path = components/qwen
+	url = https://github.com/astorise/Magnetar-component-Qwen.git
+[submodule "providers/cuda"]
+	path = providers/cuda
+	url = https://github.com/astorise/Magnetar-provider-CUDA.git
+[submodule "providers/cpu"]
+	path = providers/cpu
+	url = https://github.com/astorise/Magnetar-provider-CPU.git
