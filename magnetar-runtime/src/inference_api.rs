@@ -1078,6 +1078,7 @@ pub(crate) trait RuntimeModelExecutionEngine: Send + Sync {
         runtime: &mut Runtime,
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
+        execution_plan: Option<&mut PreparedExecutionPlan>,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError>;
 
     fn commit_generation_step(
@@ -1105,9 +1106,10 @@ impl SharedRuntimeModelExecutionEngine {
         runtime: &mut Runtime,
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
+        execution_plan: Option<&mut PreparedExecutionPlan>,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         self.0
-            .execute_generation_step(runtime, request, generated_tokens)
+            .execute_generation_step(runtime, request, generated_tokens, execution_plan)
     }
 
     pub(crate) fn commit_generation_step(
@@ -1219,6 +1221,15 @@ fn observation_message(base: &str, context: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!("{base}; {bounded}")
+}
+
+pub(crate) fn generation_decode_absolute_position(
+    prompt_token_count: usize,
+    generated_token_count: usize,
+) -> Option<usize> {
+    generated_token_count
+        .checked_sub(1)
+        .map(|generated_index| prompt_token_count + generated_index)
 }
 
 pub fn run_generation_loop(
@@ -1434,7 +1445,11 @@ fn run_generation_loop_inner(
                 "phase=decode".to_string(),
                 format!(
                     "kv_position={}",
-                    request.input_token_ids.len() + generated.len()
+                    generation_decode_absolute_position(
+                        request.input_token_ids.len(),
+                        generated.len()
+                    )
+                    .unwrap_or(request.input_token_ids.len())
                 ),
             ];
             observer.observe(
@@ -1448,13 +1463,21 @@ fn run_generation_loop_inner(
                 correlation_id.clone(),
             );
         }
-        let runtime_step = match executor.execute_generation_step(runtime, request, &generated) {
-            Ok(runtime_step) => runtime_step,
-            Err(error) => {
-                observe_generation_execution_error(observer, correlation_id.clone(), &error);
-                return Err(error);
+        let execution_plan = execution_plans.as_deref_mut().map(|plans| {
+            if generated.is_empty() {
+                &mut *plans.prefill
+            } else {
+                &mut *plans.decode
             }
-        };
+        });
+        let runtime_step =
+            match executor.execute_generation_step(runtime, request, &generated, execution_plan) {
+                Ok(runtime_step) => runtime_step,
+                Err(error) => {
+                    observe_generation_execution_error(observer, correlation_id.clone(), &error);
+                    return Err(error);
+                }
+            };
         if runtime_step.evidence.model_instance_ready {
             observer.observe(
                 InferenceApiObservationKind::ModelInstanceReady,
@@ -1579,7 +1602,11 @@ fn run_generation_loop_inner(
                     format!("tokens={tokens}"),
                     format!(
                         "kv_position={}",
-                        request.input_token_ids.len() + generated.len()
+                        generation_decode_absolute_position(
+                            request.input_token_ids.len(),
+                            generated.len()
+                        )
+                        .unwrap_or(request.input_token_ids.len())
                     ),
                     "phase=decode".to_string(),
                 ],
@@ -2188,6 +2215,12 @@ impl InferenceApiObservation {
     }
 }
 
+/// Maximum [`InferenceApiObservation`]s an [`InferenceApiObserver`] retains.
+/// A long-running or many-step generation must not grow this buffer without
+/// bound; once full, the oldest observation is dropped to admit the newest
+/// one, so the buffer always reflects the most recent causal evidence.
+pub(crate) const INFERENCE_API_OBSERVATION_BUFFER_CAPACITY: usize = 4096;
+
 /// Collects [`InferenceApiObservation`]s emitted by the `*_observed`
 /// variants of the Runtime Inference API functions. Mirrors
 /// [`crate::tokenizer::TokenizerObserver`]'s pattern of a caller-owned,
@@ -2208,6 +2241,9 @@ impl InferenceApiObserver {
         message: impl Into<String>,
         correlation_id: Option<CorrelationId>,
     ) {
+        if self.observations.len() >= INFERENCE_API_OBSERVATION_BUFFER_CAPACITY {
+            self.observations.remove(0);
+        }
         self.observations
             .push(InferenceApiObservation::new(kind, message, correlation_id));
     }

@@ -4,7 +4,7 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:e376dedc5059e0e46233fe783fab49c8d9752aa68a3a967876118d13fa5c9d85"
+    value: "sha256:c95f5ac5c7843991c03543da5d521ee5a2aec14ad6031f6e7cd55d7e2b18078c"
 component:
   name: "magnetar.qwen.graph-fixture"
   version: "0.1.0"

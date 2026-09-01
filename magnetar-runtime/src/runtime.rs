@@ -640,6 +640,14 @@ impl Runtime {
                 }
             })?;
         }
+        // Release this instance's own MemoryManager allocations (weight/
+        // constant tensor resources and any other Runtime-owned allocation
+        // bound to it) now that unload has moved them into
+        // `released_memory_allocations` -- unloading an instance frees the
+        // resources it owns, not just its KV caches.
+        for allocation in &report.released_memory_allocations {
+            let _ = self.memory.release(*allocation);
+        }
         Ok(report)
     }
     pub fn admit_generation_to_batch(
@@ -795,6 +803,19 @@ impl Runtime {
             self.memory
                 .release(allocation)
                 .map_err(|_| KvCacheError::CacheReleased)?;
+        }
+        // Release every layer's committed K/V tensor resource allocation
+        // (task 7.1/7.4 cleanup) -- these are separate, per-layer
+        // allocations created as decode commits replace earlier ones, not
+        // covered by the single coarse `residency.memory_allocation` above.
+        let layer_allocations: Vec<MemoryAllocationId> = self
+            .kv_cache(cache)?
+            .layer_resources
+            .values()
+            .flat_map(|binding| [binding.k_allocation, binding.v_allocation])
+            .collect();
+        for allocation in layer_allocations {
+            let _ = self.memory.release(allocation);
         }
         Ok(())
     }

@@ -18,6 +18,7 @@ use crate::kernel_autotuning::*;
 use crate::kernel_benchmark::*;
 use crate::kernel_cache::*;
 use crate::kernel_compilation::*;
+use crate::kernel_execution_plan::*;
 use crate::kernel_performance_model::*;
 use crate::kernel_qualification::*;
 use crate::kernel_registry::*;
@@ -6224,6 +6225,7 @@ impl RuntimeModelExecutionEngine for TestGenerationExecutor {
         _runtime: &mut Runtime,
         _request: &GenerationRequest,
         generated_tokens: &[TokenId],
+        _execution_plan: Option<&mut PreparedExecutionPlan>,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         let mut logits = vec![0.0f32; self.vocabulary_size];
         logits[(11 + generated_tokens.len()) % self.vocabulary_size] = 10.0;
@@ -6243,6 +6245,7 @@ impl RuntimeModelExecutionEngine for FailingGenerationExecutor {
         _runtime: &mut Runtime,
         _request: &GenerationRequest,
         _generated_tokens: &[TokenId],
+        _execution_plan: Option<&mut PreparedExecutionPlan>,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         Err(InferenceApiError::ProviderUnavailable {
             reason: "provider failed during decode".into(),
@@ -6259,6 +6262,7 @@ impl RuntimeModelExecutionEngine for FailingKernelGenerationExecutor {
         _runtime: &mut Runtime,
         _request: &GenerationRequest,
         _generated_tokens: &[TokenId],
+        _execution_plan: Option<&mut PreparedExecutionPlan>,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         Err(InferenceApiError::KernelUnavailable {
             reason: "kernel failed during decode".into(),
@@ -9074,6 +9078,39 @@ fn inference_api_cancellation_stage_observed_emits_generation_cancelled() {
             .iter()
             .any(|observation| observation.kind
                 == InferenceApiObservationKind::GenerationCancelled)
+    );
+}
+
+#[test]
+fn inference_api_observer_buffer_stays_bounded_and_retains_most_recent() {
+    let mut observer = InferenceApiObserver::new();
+    let total = INFERENCE_API_OBSERVATION_BUFFER_CAPACITY + 128;
+    for index in 0..total {
+        observer.observe(
+            InferenceApiObservationKind::TokenCommitted,
+            format!("observation-{index}"),
+            None,
+        );
+    }
+    assert_eq!(
+        observer.observations().len(),
+        INFERENCE_API_OBSERVATION_BUFFER_CAPACITY
+    );
+    // The oldest observations were evicted to admit the newest ones -- the
+    // buffer reflects the most recent causal evidence, not whatever
+    // happened to be observed first.
+    assert!(
+        !observer
+            .observations()
+            .iter()
+            .any(|observation| observation.message == "observation-0")
+    );
+    assert_eq!(
+        observer
+            .observations()
+            .last()
+            .map(|observation| observation.message.as_str()),
+        Some(format!("observation-{}", total - 1)).as_deref()
     );
 }
 

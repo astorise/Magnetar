@@ -5,6 +5,7 @@
 //! stable logical identifiers and metadata only; Provider-native executable
 //! state remains behind opaque Provider-owned IDs.
 
+use crate::kernel_registry::KernelRegistry;
 use crate::{
     AdapterRevision, DTypeDescriptor, DeviceBinding, ExecutionGraph, ExecutionGraphPhase,
     ExecutionNodeId, KernelExecutionMode, KernelId, ModelInstanceId, PreparedKernelGeneration,
@@ -1475,6 +1476,14 @@ pub struct PreparedExecutionPlan {
     pub guards: Vec<PlanGuard>,
     pub observations: Vec<PreparedExecutionPlanObservation>,
     active_leases: u64,
+    /// Set by [`Self::mark_stale`] to the urgency of the rebuild that made
+    /// this plan stale. A [`PlanRebuildUrgency::RequiredBeforeNewWork`] plan
+    /// remains in [`PreparedExecutionPlanState::Stale`] (so
+    /// [`Self::accepts_new_work`] still reports it as structurally usable)
+    /// but [`Self::execute_ready_path`] refuses to execute it -- staleness
+    /// alone does not block new work, but staleness the rebuild policy marks
+    /// mandatory does.
+    stale_urgency: Option<PlanRebuildUrgency>,
 }
 
 impl PreparedExecutionPlan {
@@ -1508,6 +1517,7 @@ impl PreparedExecutionPlan {
                 generation,
             )],
             active_leases: 0,
+            stale_urgency: None,
         })
     }
 
@@ -1692,11 +1702,22 @@ impl PreparedExecutionPlan {
     pub fn mark_stale(
         &mut self,
         _reason: PlanRebuildReason,
+        urgency: PlanRebuildUrgency,
     ) -> Result<(), PreparedExecutionPlanError> {
         if self.state == PreparedExecutionPlanState::Ready {
             self.transition_to(PreparedExecutionPlanState::Stale)?;
         }
+        self.stale_urgency = Some(urgency);
         Ok(())
+    }
+
+    /// Whether a [`PreparedExecutionPlanState::Stale`] plan's rebuild is
+    /// mandatory before it may execute more work. `false` for every other
+    /// state (staleness is the only state [`Self::accepts_new_work`] allows
+    /// that can still be rejected here).
+    pub fn is_stale_outside_policy(&self) -> bool {
+        self.state == PreparedExecutionPlanState::Stale
+            && self.stale_urgency == Some(PlanRebuildUrgency::RequiredBeforeNewWork)
     }
 
     pub fn hard_invalidate(
@@ -1721,6 +1742,9 @@ impl PreparedExecutionPlan {
     ) -> Result<PlanExecutionReport, PreparedExecutionPlanError> {
         if !self.accepts_new_work() {
             return Err(PreparedExecutionPlanError::PlanNotReadyForExecution);
+        }
+        if self.is_stale_outside_policy() {
+            return Err(PreparedExecutionPlanError::PlanStaleOutsidePolicy);
         }
         let guard_report = evaluate_plan_guards(&self.guards, context).inspect_err(|_| {
             self.observations
@@ -1780,6 +1804,86 @@ impl PlanExecutionReport {
             && self.autotuning_benchmarks == 0
             && self.memory_plan_rebuilds == 0
             && self.guard_report.is_hot_path_bounded()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedPlanNodeExecution {
+    pub graph_node: ExecutionNodeId,
+    pub kernel: KernelId,
+    pub prepared_kernel: PreparedKernelId,
+    pub prepared_kernel_generation: PreparedKernelGeneration,
+    pub provider: ProviderBinding,
+    pub device: Option<DeviceBinding>,
+    pub plan: PreparedExecutionPlanId,
+    pub plan_generation: PreparedExecutionPlanGeneration,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreparedExecutionPlanExecutor;
+
+impl PreparedExecutionPlanExecutor {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn prepare_node_execution(
+        &self,
+        graph: &ExecutionGraph,
+        plan: &mut PreparedExecutionPlan,
+        registry: &KernelRegistry,
+        context: &PlanGuardContext,
+        node: &ExecutionNodeId,
+    ) -> Result<PreparedPlanNodeExecution, PreparedExecutionPlanError> {
+        if !graph.nodes.contains_key(node) {
+            return Err(PreparedExecutionPlanError::PlanNodeBindingMissing);
+        }
+        if semantic_graph_fingerprint(graph) != plan.graph_fingerprint {
+            return Err(PreparedExecutionPlanError::PlanValidationFailed);
+        }
+        plan.execute_ready_path(context)?;
+        let binding = plan
+            .node_bindings
+            .iter()
+            .find(|binding| binding.graph_nodes.contains(node))
+            .ok_or(PreparedExecutionPlanError::PlanNodeBindingMissing)?;
+        binding.validate()?;
+        let prepared_kernel_id = binding
+            .prepared_kernel
+            .ok_or(PreparedExecutionPlanError::PlanPreparedKernelMissing)?;
+        let prepared_kernel_generation = binding
+            .prepared_kernel_generation
+            .ok_or(PreparedExecutionPlanError::PlanPreparedKernelMissing)?;
+        let prepared = registry
+            .prepared_kernel(&prepared_kernel_id)
+            .ok_or(PreparedExecutionPlanError::PlanPreparedKernelMissing)?;
+        if !prepared.state.is_dispatchable() {
+            return Err(PreparedExecutionPlanError::PlanKernelRevoked);
+        }
+        if prepared.kernel != binding.kernel {
+            return Err(PreparedExecutionPlanError::KernelBindingMismatch);
+        }
+        if prepared.provider != binding.provider {
+            return Err(PreparedExecutionPlanError::PlanProviderUnavailable);
+        }
+        if prepared.generation != prepared_kernel_generation {
+            return Err(PreparedExecutionPlanError::PreparedKernelGenerationMismatch);
+        }
+        if let Some(device) = &binding.device
+            && &prepared.device != device
+        {
+            return Err(PreparedExecutionPlanError::PlanDeviceUnavailable);
+        }
+        Ok(PreparedPlanNodeExecution {
+            graph_node: node.clone(),
+            kernel: binding.kernel.clone(),
+            prepared_kernel: prepared_kernel_id,
+            prepared_kernel_generation,
+            provider: binding.provider.clone(),
+            device: binding.device.clone(),
+            plan: plan.id.clone(),
+            plan_generation: plan.generation,
+        })
     }
 }
 
@@ -1920,9 +2024,11 @@ pub enum PreparedExecutionPlanError {
     PlanAdapterRevisionMismatch,
     PlanAffinityInvalid,
     PlanNotReadyForExecution,
+    PlanStaleOutsidePolicy,
     PlanMemoryInvalid,
     PlanValidationFailed,
     PlanGuardMissing,
+    PlanNodeBindingMissing,
     PlanReplacementNotReady,
     PlanNotFound,
     PlanKernelRevoked,
@@ -2041,11 +2147,17 @@ impl fmt::Display for PreparedExecutionPlanError {
             Self::PlanNotReadyForExecution => {
                 f.write_str("Prepared Execution Plan is not ready for execution")
             }
+            Self::PlanStaleOutsidePolicy => f.write_str(
+                "Prepared Execution Plan is stale outside its rebuild policy and must be replaced before executing more work",
+            ),
             Self::PlanMemoryInvalid => {
                 f.write_str("Prepared Execution Plan memory assumptions are invalid")
             }
             Self::PlanValidationFailed => f.write_str("Prepared Execution Plan validation failed"),
             Self::PlanGuardMissing => f.write_str("Prepared Execution Plan hard guard is missing"),
+            Self::PlanNodeBindingMissing => {
+                f.write_str("Prepared Execution Plan node binding is missing")
+            }
             Self::PlanReplacementNotReady => {
                 f.write_str("replacement Prepared Execution Plan is not ready")
             }
@@ -2080,9 +2192,11 @@ impl PreparedExecutionPlanError {
             Self::PlanNotReady { .. } | Self::PlanNotReadyForExecution => {
                 PreparedExecutionPlanErrorCode::PlanNotReady
             }
+            Self::PlanStaleOutsidePolicy => PreparedExecutionPlanErrorCode::PlanStale,
             Self::PlanValidationFailed
             | Self::PlanGuardMissing
             | Self::PlanNodeBindingEmpty
+            | Self::PlanNodeBindingMissing
             | Self::InvalidShapeEnvelope => PreparedExecutionPlanErrorCode::PlanValidationFailed,
             Self::PlanShapeIncompatible => PreparedExecutionPlanErrorCode::PlanShapeIncompatible,
             Self::PlanDTypeIncompatible => PreparedExecutionPlanErrorCode::PlanDTypeIncompatible,
@@ -2261,10 +2375,10 @@ fn validate_slot_identity(
 mod tests {
     use super::*;
     use crate::{
-        CapabilityVersion, ComputeDType, DTypeDescriptor, DeviceId, ExecutionGraphId,
-        ExecutionNode, KernelImplementationFamily, KernelOperatorVersionRange, LayoutDescriptor,
-        OperatorAttributeValue, OperatorFamily, OperatorId, PreparedKernelIdAllocator,
-        ShapeDescriptor, TensorDescriptor, TensorEdge, TensorEdgeId,
+        CapabilityVersion, CompiledKernelArtifactId, ComputeDType, DTypeDescriptor, DeviceId,
+        ExecutionGraphId, ExecutionNode, KernelImplementationFamily, KernelOperatorVersionRange,
+        LayoutDescriptor, OperatorAttributeValue, OperatorFamily, OperatorId, PreparedKernel,
+        PreparedKernelIdAllocator, ShapeDescriptor, TensorDescriptor, TensorEdge, TensorEdgeId,
     };
 
     #[test]
@@ -2720,9 +2834,80 @@ mod tests {
     }
 
     #[test]
+    fn prepared_plan_executor_resolves_node_binding_without_registry_selection() {
+        let graph = test_graph(1);
+        let mut plan = ready_graph_plan(&graph, "matmul", 1);
+        let registry = registry_with_prepared_binding(&plan.node_bindings[0]);
+        let mut context = PlanGuardContext::for_phase(PreparedExecutionPhase::Decode);
+        context.shape = vec![1, 128];
+
+        let execution = PreparedExecutionPlanExecutor::new()
+            .prepare_node_execution(
+                &graph,
+                &mut plan,
+                &registry,
+                &context,
+                &ExecutionNodeId::new("matmul"),
+            )
+            .unwrap();
+
+        assert_eq!(execution.graph_node, ExecutionNodeId::new("matmul"));
+        assert_eq!(execution.kernel, plan.node_bindings[0].kernel);
+        assert_eq!(
+            execution.prepared_kernel,
+            plan.node_bindings[0].prepared_kernel.unwrap()
+        );
+        assert_eq!(execution.provider, ProviderBinding::new("reference-cpu"));
+        assert_eq!(plan.active_leases(), 0);
+    }
+
+    #[test]
+    fn prepared_plan_executor_rejects_missing_graph_node_binding() {
+        let graph = test_graph(1);
+        let mut plan = ready_graph_plan(&graph, "matmul", 1);
+        let registry = registry_with_prepared_binding(&plan.node_bindings[0]);
+        let context = PlanGuardContext::for_phase(PreparedExecutionPhase::Decode);
+
+        assert!(matches!(
+            PreparedExecutionPlanExecutor::new().prepare_node_execution(
+                &graph,
+                &mut plan,
+                &registry,
+                &context,
+                &ExecutionNodeId::new("absent-node"),
+            ),
+            Err(PreparedExecutionPlanError::PlanNodeBindingMissing)
+        ));
+    }
+
+    #[test]
+    fn prepared_plan_executor_rejects_missing_prepared_kernel() {
+        let graph = test_graph(1);
+        let mut plan = ready_graph_plan(&graph, "matmul", 1);
+        let registry = KernelRegistry::new();
+        let mut context = PlanGuardContext::for_phase(PreparedExecutionPhase::Decode);
+        context.shape = vec![1, 128];
+
+        assert!(matches!(
+            PreparedExecutionPlanExecutor::new().prepare_node_execution(
+                &graph,
+                &mut plan,
+                &registry,
+                &context,
+                &ExecutionNodeId::new("matmul"),
+            ),
+            Err(PreparedExecutionPlanError::PlanPreparedKernelMissing)
+        ));
+    }
+
+    #[test]
     fn stale_plan_remains_distinct_from_invalidated_new_work_policy() {
         let mut plan = ready_plan("stale-plan", "attention", 1);
-        plan.mark_stale(PlanRebuildReason::KernelPromotion).unwrap();
+        plan.mark_stale(
+            PlanRebuildReason::KernelPromotion,
+            PlanRebuildUrgency::Background,
+        )
+        .unwrap();
         assert_eq!(plan.state, PreparedExecutionPlanState::Stale);
         assert!(plan.accepts_new_work());
 
@@ -2731,6 +2916,29 @@ mod tests {
         assert_eq!(plan.state, PreparedExecutionPlanState::Invalidated);
         assert!(!plan.accepts_new_work());
         assert!(plan.state.requires_replacement_for_new_work());
+    }
+
+    #[test]
+    fn stale_plan_outside_rebuild_policy_refuses_execution_but_still_accepts_new_work() {
+        let mut plan = ready_plan("stale-outside-policy-plan", "attention", 1);
+        plan.mark_stale(
+            PlanRebuildReason::KernelRevoked,
+            PlanRebuildUrgency::RequiredBeforeNewWork,
+        )
+        .unwrap();
+        assert_eq!(plan.state, PreparedExecutionPlanState::Stale);
+        // `accepts_new_work` is a coarse state check (Ready|Stale) used by
+        // plan-cache lookups; it does not by itself guarantee execution is
+        // allowed -- `execute_ready_path` enforces the finer-grained rebuild
+        // policy.
+        assert!(plan.accepts_new_work());
+        assert!(plan.is_stale_outside_policy());
+
+        let context = PlanGuardContext::for_phase(PreparedExecutionPhase::Decode);
+        assert!(matches!(
+            plan.execute_ready_path(&context),
+            Err(PreparedExecutionPlanError::PlanStaleOutsidePolicy)
+        ));
     }
 
     #[test]
@@ -2766,6 +2974,103 @@ mod tests {
             restart_cache.revalidate_cached_plan(&restart_id, &hard),
             Err(PreparedExecutionPlanError::PlanKernelRevoked)
         ));
+    }
+
+    #[test]
+    fn registry_preference_change_after_publication_does_not_alter_plan_execution() {
+        let graph = test_graph(1);
+        let mut plan = ready_graph_plan(&graph, "matmul", 1);
+        let bound_kernel = plan.node_bindings[0].kernel.clone();
+        let mut registry = registry_with_prepared_binding(&plan.node_bindings[0]);
+        let mut context = PlanGuardContext::for_phase(PreparedExecutionPhase::Decode);
+        context.shape = vec![1, 128];
+        let executor = PreparedExecutionPlanExecutor::new();
+        let node = ExecutionNodeId::new("matmul");
+
+        let before = executor
+            .prepare_node_execution(&graph, &mut plan, &registry, &context, &node)
+            .unwrap();
+        assert_eq!(before.kernel, bound_kernel);
+
+        // A registry preference change after the plan was published: a newer
+        // generation of the same logical Kernel becomes the registry's
+        // active/preferred one for *new* selection.
+        let newer = test_kernel("matmul", 2);
+        let mut allocator = PreparedKernelIdAllocator::default();
+        // Skip the id `prepared_binding` would have allocated first for its
+        // own fresh allocator (both start the same deterministic sequence),
+        // so this registration cannot collide with the plan's own
+        // `PreparedKernelId`.
+        let _ = allocator.allocate();
+        let newer_id = allocator.allocate();
+        let mut newer_prepared = PreparedKernel::new(
+            newer_id,
+            newer.clone(),
+            CompiledKernelArtifactId::from_digest("test:matmul-newer"),
+            newer.provider.clone(),
+            DeviceBinding::new(DeviceId::new("cpu-0")),
+            PreparedKernelGeneration::new(2),
+        );
+        newer_prepared.mark_ready().unwrap();
+        registry.register_prepared_kernel(newer_prepared);
+        registry.promote_generation(&newer, newer_id).unwrap();
+        assert_eq!(
+            registry.active_prepared_kernel(&newer).unwrap().id,
+            newer_id
+        );
+
+        // Execution of the already-published plan must still resolve
+        // through its own `PlanNodeBinding`/`PreparedKernelId`, not the
+        // registry's newly promoted preference.
+        let after = executor
+            .prepare_node_execution(&graph, &mut plan, &registry, &context, &node)
+            .unwrap();
+        assert_eq!(after.kernel, bound_kernel);
+        assert_ne!(bound_kernel, newer);
+    }
+
+    #[test]
+    fn kernel_revocation_blocks_new_work_while_in_flight_lease_still_completes() {
+        let graph = test_graph(1);
+        let mut plan = ready_graph_plan(&graph, "matmul", 1);
+        let registry = registry_with_prepared_binding(&plan.node_bindings[0]);
+        let mut context = PlanGuardContext::for_phase(PreparedExecutionPhase::Decode);
+        context.shape = vec![1, 128];
+        let executor = PreparedExecutionPlanExecutor::new();
+        let node = ExecutionNodeId::new("matmul");
+        let prepared_kernel_id = plan.node_bindings[0].prepared_kernel.unwrap();
+
+        // Work admitted before revocation acquires a plan-level lease --
+        // this is the "in-flight" work the revocation policy must not break.
+        let in_flight_lease = plan.acquire_lease().unwrap();
+
+        // Kernel revocation: the Prepared Kernel this plan's binding
+        // resolves to is retired (no longer dispatchable for new work), the
+        // same transition `promote_generation` uses ahead of destroying a
+        // superseded generation.
+        let mut registry = registry;
+        registry
+            .retire_prepared_kernel(&prepared_kernel_id)
+            .unwrap();
+        assert!(
+            !registry
+                .prepared_kernel(&prepared_kernel_id)
+                .unwrap()
+                .state
+                .is_dispatchable()
+        );
+
+        // New work is blocked: preparing this node's execution again now
+        // fails because the bound Prepared Kernel is no longer dispatchable.
+        assert!(matches!(
+            executor.prepare_node_execution(&graph, &mut plan, &registry, &context, &node),
+            Err(PreparedExecutionPlanError::PlanKernelRevoked)
+        ));
+
+        // The lease acquired before revocation is still valid and completes
+        // normally -- releasing it only checks plan/generation identity, not
+        // current Kernel dispatchability.
+        plan.release_lease(in_flight_lease).unwrap();
     }
 
     #[test]
@@ -2905,8 +3210,11 @@ mod tests {
         assert!(persisted.node_bindings[0].prepared_kernel.is_none());
         assert!(plan.memory_requirements.preserves_memory_manager_authority);
 
-        plan.mark_stale(PlanRebuildReason::PerformanceRegression)
-            .unwrap();
+        plan.mark_stale(
+            PlanRebuildReason::PerformanceRegression,
+            PlanRebuildUrgency::Background,
+        )
+        .unwrap();
         assert_eq!(plan.node_bindings[0], original_binding);
         plan.hard_invalidate(PlanRebuildReason::TrustDenied)
             .unwrap();
@@ -2979,6 +3287,48 @@ mod tests {
         ])));
         plan.mark_ready_atomically().unwrap();
         plan
+    }
+
+    fn ready_graph_plan(
+        graph: &ExecutionGraph,
+        kernel_name: &str,
+        kernel_patch: u64,
+    ) -> PreparedExecutionPlan {
+        let mut plan = PreparedExecutionPlan::new(
+            PreparedExecutionPlanId::new(format!("graph-{kernel_name}-plan")).unwrap(),
+            PreparedExecutionPlanGeneration::new(kernel_patch),
+            semantic_graph_fingerprint(graph),
+            PreparedExecutionPlanScope::for_phase(PreparedExecutionPhase::Decode)
+                .with_workload_bucket("decode"),
+        )
+        .unwrap();
+        plan.add_node_binding(prepared_binding(kernel_name, kernel_patch))
+            .unwrap();
+        plan.add_guard(PlanGuard::Phase(PreparedExecutionPhase::Decode));
+        plan.add_guard(PlanGuard::Shape(PlanShapeEnvelope::new([
+            ShapeDimensionEnvelope::Range { min: 1, max: 8 },
+            ShapeDimensionEnvelope::Exact(128),
+        ])));
+        plan.mark_ready_atomically().unwrap();
+        plan
+    }
+
+    fn registry_with_prepared_binding(binding: &PlanNodeBinding) -> KernelRegistry {
+        let mut registry = KernelRegistry::new();
+        let mut prepared = PreparedKernel::new(
+            binding.prepared_kernel.unwrap(),
+            binding.kernel.clone(),
+            CompiledKernelArtifactId::from_digest(format!("test:{}", binding.kernel.stable_key())),
+            binding.provider.clone(),
+            binding
+                .device
+                .clone()
+                .unwrap_or_else(|| DeviceBinding::new(DeviceId::new("cpu-0"))),
+            binding.prepared_kernel_generation.unwrap(),
+        );
+        prepared.mark_ready().unwrap();
+        registry.register_prepared_kernel(prepared);
+        registry
     }
 
     fn prepared_binding(kernel_name: &str, kernel_patch: u64) -> PlanNodeBinding {

@@ -430,7 +430,15 @@ pub struct ProviderDescriptor {
 
 /// A globally unique, package-qualified capability identifier.
 /// Trusted native extension contract for provider-owned execution capabilities.
-pub trait Provider: Send + Sync {
+///
+/// `Any` is a supertrait so a caller holding `&dyn Provider` from Runtime
+/// provider registration can recover the concrete registered instance (e.g.
+/// resolving the registered `ReferenceCpuProvider` so first-native dispatch
+/// executes through the same executor Runtime holds, rather than an
+/// unregistered throwaway) via `(provider as &dyn std::any::Any)
+/// .downcast_ref::<T>()`. `Any`'s blanket `impl<T: 'static> Any for T` means
+/// no existing `impl Provider for _` needs updating.
+pub trait Provider: Send + Sync + std::any::Any {
     fn metadata(&self) -> ProviderMetadata;
     fn register(&self, registry: &mut ProviderRegistry) -> Result<(), ProviderError>;
     fn health(&self) -> ProviderHealth {

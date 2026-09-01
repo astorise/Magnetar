@@ -371,6 +371,14 @@ fn cmd_chat(args: &[String], observer: &mut CliObserver) -> Result<(), CliBounda
     };
     let model_ref = ModelRef::new(aliases::resolve_alias(model_ref_arg))?;
     let mut chat = pipeline::ChatSession::open(&model_ref)?;
+    // Records that this chat's turns are bound to one persistent Runtime
+    // session (task 8.3) -- the id itself, not any prompt or transcript
+    // content, so it stays within the redaction rules this module's
+    // `CliObservation.message` doc comment requires.
+    observer.observe(
+        CliObservationKind::RuntimeRequestSubmitted,
+        format!("chat session opened: session={}", chat.session_id()),
+    );
     println!("magnetar chat -- native fixture inference; type 'exit', 'cancel', or Ctrl-D to quit");
 
     let stdin = io::stdin();

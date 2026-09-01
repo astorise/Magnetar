@@ -1,10 +1,10 @@
 {
-  "line_coverage_percent": 73.16295114803961,
-  "function_coverage_percent": 77.55591054313099,
+  "line_coverage_percent": 78.9061991803812,
+  "function_coverage_percent": 79.25202029693668,
   "branch_coverage_percent": null,
   "scope": "workspace production Rust source; test source and target output are excluded",
   "tool": "cargo-llvm-cov",
-  "measured_at": "2026-08-25",
+  "measured_at": "2026-09-01",
   "exclusions": [
     {
       "pattern": "(^|/)(target|tests?)/",
@@ -15,5 +15,5 @@
       "reason": "Applied automatically by cargo-llvm-cov in addition to the pattern above. Unit tests therefore live in sibling tests.rs files rather than in inline #[cfg(test)] modules, because a filename pattern cannot exclude test code embedded in a production file."
     }
   ],
-  "notes": "Measured with --all-features so feature-gated modules (component_wasmtime, component_web) are included."
+  "notes": "Measured with --all-features so feature-gated modules (component_wasmtime, component_web) are included. Re-measured after moving magnetar-runtime/src/first_native_runtime.rs's large inline #[cfg(test)] mod tests block into a sibling magnetar-runtime/src/first_native_runtime/tests.rs file (matching the existing qwen_model_component/tests.rs convention), so that module's ~1350 lines of unit test source are now excluded from production coverage the same way every other module's tests already are (task 9.1)."
 }

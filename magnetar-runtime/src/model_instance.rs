@@ -13,7 +13,7 @@ use crate::{
     MemoryAllocationId, MemoryPressureLevel, ModelArchitectureImplementation, ModelArtifactId,
     ModelDType, ModelResidencyId, PrefixCacheEntryId, ProviderAdmissionDecision, ProviderBinding,
     ProviderHealthState, ProviderPressureLevel, ProviderReadinessState, ResourceAffinity,
-    TokenizerId, reproducible_mode_blocks_adaptation,
+    TensorResourceId, TokenizerId, reproducible_mode_blocks_adaptation,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -470,6 +470,12 @@ pub struct ProviderModelResource {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ModelInstanceResourceBindings {
+    /// Canonical model tensor name (matching `ModelManifest`'s declared
+    /// tensor names) to the stable `TensorResourceId` Runtime created for it
+    /// during model loading, so graph execution can look weights up by name
+    /// through this Model Instance rather than a private side-channel
+    /// keeping its own copy of tensor bytes.
+    pub weights: BTreeMap<String, TensorResourceId>,
     pub memory_allocations: BTreeSet<MemoryAllocationId>,
     pub released_memory_allocations: BTreeSet<MemoryAllocationId>,
     pub released_provider_resources: BTreeSet<ProviderBinding>,
