@@ -2228,13 +2228,26 @@ fn resolve_qwen_weight_edge(
                     "active Model Instance has no weight resource bound for '{lookup_name}'"
                 ),
             })?;
-    let tensor = provider.read_tensor(resource_id).ok_or_else(|| {
+    // Reference CPU Kernel input boundary (`define-provider-prepared-kernel-execution-contract`
+    // task 5.2): weight edges feed straight into `dispatch_qwen_*` compute,
+    // which needs real host bytes, so this is one of the points that
+    // explicitly materializes through `TensorValue::into_host` rather than
+    // carrying an opaque value further.
+    let value = provider.read_tensor_value(resource_id).ok_or_else(|| {
         InferenceApiError::ModelLoadingFailed {
             reason: format!(
                 "weight resource '{resource_id}' bound for '{lookup_name}' has no materialized data"
             ),
         }
     })?;
+    let tensor =
+        value
+            .into_host(resource_id)
+            .map_err(|error| InferenceApiError::ModelLoadingFailed {
+                reason: format!(
+                    "weight resource '{resource_id}' bound for '{lookup_name}': {error}"
+                ),
+            })?;
     if name == "lm_head" && tied_embeddings {
         return transpose_rows_cols(&tensor).map_err(runtime_generation_failed);
     }
@@ -2741,10 +2754,10 @@ fn execute_qwen_graph_nodes(
         let resource_id = TensorResourceId::new(edge_id.as_str());
         dispatch_ctx
             .provider
-            .write_tensor_admitted(
+            .write_tensor_value_admitted(
                 dispatch_ctx.runtime.memory_mut(),
                 resource_id.clone(),
-                tensor,
+                TensorValue::Host(tensor),
                 MemoryAllocationClass::Tensor,
                 MemoryAllocationOwner::Session(kv_cache_id.to_string()),
             )
@@ -2768,13 +2781,27 @@ fn execute_qwen_graph_nodes(
         let mut inputs = Vec::with_capacity(node.inputs.len());
         for edge_id in &node.inputs {
             let tensor = match bindings.get(edge_id) {
-                Some(resource_id) => dispatch_ctx.provider.read_tensor(resource_id).ok_or_else(
-                    || InferenceApiError::GraphPlanningFailed {
-                        reason: format!(
-                            "no materialized data for graph edge '{edge_id}' (resource '{resource_id}')"
-                        ),
-                    },
-                )?,
+                // Reference CPU Kernel input boundary: this edge's value
+                // feeds `dispatch_qwen_graph_node`'s compute directly, so it
+                // is materialized to host bytes here rather than carried as
+                // an opaque `TensorValue` further into the generic loop.
+                Some(resource_id) => {
+                    let value = dispatch_ctx
+                        .provider
+                        .read_tensor_value(resource_id)
+                        .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "no materialized data for graph edge '{edge_id}' (resource '{resource_id}')"
+                            ),
+                        })?;
+                    value.into_host(resource_id).map_err(|error| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!(
+                                "graph edge '{edge_id}' (resource '{resource_id}'): {error}"
+                            ),
+                        }
+                    })?
+                }
                 None => resolve_qwen_weight_edge(
                     executor,
                     weight_bindings,
@@ -2831,11 +2858,21 @@ fn execute_qwen_graph_nodes(
                 // Historical KV data is read back from the registered
                 // Provider's storage by resource id (task 7.2/7.3), not from
                 // a raw tensor an executor-private map handed the caller.
-                let historical_tensor = dispatch_ctx
+                // KV-history concatenation boundary: `concat_rows` is plain
+                // Rust over `Vec<f32>`, so this materializes to host bytes
+                // explicitly here rather than carrying an opaque value in.
+                let historical_value = dispatch_ctx
                     .provider
-                    .read_tensor(historical_resource)
+                    .read_tensor_value(historical_resource)
                     .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                         reason: format!("no materialized historical KV data for layer {layer}"),
+                    })?;
+                let historical_tensor = historical_value
+                    .into_host(historical_resource)
+                    .map_err(|error| InferenceApiError::KvCacheUnavailable {
+                        reason: format!(
+                            "historical KV data for layer {layer} (resource '{historical_resource}'): {error}"
+                        ),
                     })?;
                 output_tensor = concat_rows(&historical_tensor, &output_tensor)?;
             }
@@ -2860,10 +2897,10 @@ fn execute_qwen_graph_nodes(
             // fails before commit.
             dispatch_ctx
                 .provider
-                .write_tensor_admitted(
+                .write_tensor_value_admitted(
                     dispatch_ctx.runtime.memory_mut(),
                     pending_resource.clone(),
-                    output_tensor.clone(),
+                    TensorValue::Host(output_tensor.clone()),
                     MemoryAllocationClass::Tensor,
                     MemoryAllocationOwner::Session(kv_cache_id.to_string()),
                 )
@@ -2895,10 +2932,10 @@ fn execute_qwen_graph_nodes(
         let output_resource_id = TensorResourceId::new(format!("edge.{output_edge_id}"));
         dispatch_ctx
             .provider
-            .write_tensor_admitted(
+            .write_tensor_value_admitted(
                 dispatch_ctx.runtime.memory_mut(),
                 output_resource_id.clone(),
-                output_tensor,
+                TensorValue::Host(output_tensor),
                 MemoryAllocationClass::Tensor,
                 MemoryAllocationOwner::Session(kv_cache_id.to_string()),
             )
@@ -2933,19 +2970,103 @@ fn execute_qwen_graph_nodes(
     // unchanged. Only this function's *internal* node-to-node transport is
     // Resource-based; the final materialization back to `HostTensor` happens
     // exactly once, here, not per-node.
+    // Final logits extraction boundary: this is the one point where every
+    // remaining live edge (including "output.logits") crosses back into the
+    // caller-facing `HostTensor` contract; everywhere above this in the loop
+    // carries `TensorValue` instead of assuming every Tensor Resource is
+    // host-visible.
     let mut materialized_bindings = BTreeMap::new();
     for (edge_id, resource_id) in &bindings {
-        let tensor = dispatch_ctx
+        let value = dispatch_ctx
             .provider
-            .read_tensor(resource_id)
+            .read_tensor_value(resource_id)
             .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
                 reason: format!(
                     "no materialized data for graph edge '{edge_id}' (resource '{resource_id}')"
                 ),
             })?;
+        let tensor = value.into_host(resource_id).map_err(|error| {
+            InferenceApiError::GraphPlanningFailed {
+                reason: format!("graph edge '{edge_id}' (resource '{resource_id}'): {error}"),
+            }
+        })?;
         materialized_bindings.insert(edge_id.clone(), tensor);
     }
     Ok((dispatch_result, materialized_bindings, updated_layer_kv))
+}
+
+/// Static guard (`define-provider-prepared-kernel-execution-contract` task
+/// 2.3): [`execute_qwen_graph_nodes`]'s per-node transport migrated fully off
+/// the `HostTensor`-typed [`ProviderExecutionApi`] methods (that Change's
+/// task group 5) -- every read/write in its per-node loop goes through
+/// `read_tensor_value`/`write_tensor_value_admitted` instead, materializing
+/// to `HostTensor` only at the explicit host-materialization boundaries via
+/// `TensorValue::into_host` (weight binding, KV-history concatenation, final
+/// logits extraction, plus each node's own Kernel-input resolution). This
+/// scans the function's own source text so a future edit that reintroduces a
+/// direct `.read_tensor(`/`.write_tensor(`/`.write_tensor_admitted(` call
+/// into that loop fails a test immediately, rather than the two pathways
+/// (`HostTensor`-typed and `TensorValue`-typed) silently coexisting
+/// indefinitely -- design.md's stated risk for that Change. Test-only: this
+/// is a source-level build invariant, not runtime behavior
+/// `run_e2e_local_inference_conformance` needs to check in production.
+#[cfg(test)]
+fn check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls()
+-> Result<(), E2eConformanceError> {
+    const SOURCE: &str = include_str!("first_native_runtime.rs");
+    let start = SOURCE.find("fn execute_qwen_graph_nodes(").ok_or_else(|| {
+        E2eConformanceError::Internal {
+            reason: "execute_qwen_graph_nodes not found in first_native_runtime.rs source".into(),
+        }
+    })?;
+    let body_start = SOURCE[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .ok_or_else(|| E2eConformanceError::Internal {
+            reason: "execute_qwen_graph_nodes has no function body in source".into(),
+        })?;
+    let mut depth = 0i32;
+    let mut body_end = body_start;
+    for (offset, ch) in SOURCE[body_start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    body_end = body_start + offset + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if body_end == body_start {
+        return Err(E2eConformanceError::Internal {
+            reason: "execute_qwen_graph_nodes's function body braces did not balance".into(),
+        });
+    }
+    let body = &SOURCE[body_start..body_end];
+    // Exact-name matches only (immediate `(` after the method name), so the
+    // intended replacements -- `.read_tensor_value(`, `.write_tensor_value(`,
+    // `.write_tensor_value_admitted(` -- do not themselves trip this guard.
+    let host_tensor_typed_call_count =
+        [".read_tensor(", ".write_tensor(", ".write_tensor_admitted("]
+            .iter()
+            .map(|needle| body.matches(needle).count())
+            .sum::<usize>();
+    if host_tensor_typed_call_count != 0 {
+        return Err(E2eConformanceError::Internal {
+            reason: format!(
+                "execute_qwen_graph_nodes's per-node transport has \
+                 {host_tensor_typed_call_count} direct HostTensor-typed \
+                 ProviderExecutionApi call(s); it must read/write through \
+                 TensorValue (read_tensor_value/write_tensor_value_admitted) \
+                 and materialize only at explicit host-materialization \
+                 boundaries via TensorValue::into_host"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Test-only oracle: a hand-written, hard-coded prefill dispatch sequence

@@ -65,6 +65,42 @@ bodies.
   *selection* semantics. This is about the value Kernels exchange once
   selected and dispatched, not how they are chosen.
 
+## Status / Definition of Done
+
+Per the post-freeze équipe review (`magnetar-pr36-decisions-equipe-2026-09-02.md`,
+decisions 7-10): this Change's Goals section above states intent, not
+completion, and multi-output specifically has landed only at the type level.
+The actual Definition of Done for this Change is narrower than "every Goal
+fully wired end to end":
+
+- **Done:** a Provider-agnostic `TensorValue` contract exists on
+  `ProviderExecutionApi` (`read_tensor_value`/`write_tensor_value`/
+  `write_tensor_value_admitted`), a device-resident-only Provider can
+  implement it without ever exposing `HostTensor` (proven by
+  `DeviceResidentOnlyExecutor`, task 4.3), and `execute_qwen_graph_nodes`'s
+  generic per-node transport reads/writes through it exclusively, with
+  `TensorValue::into_host` as the explicit, structured-error boundary at
+  every point that genuinely needs host bytes (weight binding, KV-history
+  concatenation, final logits extraction, each node's own Kernel-input
+  resolution) -- task group 5, closed.
+- **Done, type-level only:** multi-output readiness. `KernelResult
+  .updated_resources: Vec<TensorResourceDescriptor>` already carries an
+  output-index -> `TensorResourceId` shape (task 3.1) -- the contract does
+  not need to change again to support a real multi-output Kernel later.
+- **Not done, deliberately deferred (task group 3, 3.2-3.5):** a real
+  two-output Reference CPU Kernel, `execute_qwen_graph_nodes` resolving
+  `node.outputs` plural, and an E2E multi-output test. No real Qwen operator
+  produces more than one output today, so building this now would mean
+  exercising invented plumbing against a synthetic Kernel rather than a real
+  one -- acceptable follow-up work once a real multi-output operator exists,
+  not a blocker for this Change or for `reach-architecture-freeze-1`.
+
+So: **Provider-agnostic `TensorValue` contract + a Provider API able to
+represent device-resident values + type-level readiness for future
+multi-output** is this Change's actual Definition of Done. Full multi-output
+*wiring* is out of scope here and tracked as `reach-architecture-freeze-1`
+follow-up instead (see that change's tasks 5.4/5.5).
+
 ## Decisions
 
 ### Decision 1: Additive new methods, not a breaking signature change

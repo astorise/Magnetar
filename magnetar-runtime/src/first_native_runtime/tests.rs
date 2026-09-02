@@ -213,6 +213,13 @@ fn e2e_fixture_tokenizer_produces_deterministic_tokens() {
 }
 
 #[test]
+fn e2e_graph_nodes_transport_stays_tensor_value_typed() {
+    check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls().expect(
+        "execute_qwen_graph_nodes's per-node transport has no direct HostTensor-typed calls",
+    );
+}
+
+#[test]
 fn e2e_already_tokenized_prompt_path_bypasses_text_tokenization() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_already_tokenized_prompt_path(&fixture).expect("already-tokenized path is preserved");
