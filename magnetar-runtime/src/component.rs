@@ -2424,7 +2424,8 @@ impl ComponentManager {
             }
             ComponentError::HostBindingFailed { .. } => ComponentObservationKind::Instantiation,
             ComponentError::InstantiationFailed { .. } => ComponentObservationKind::Instantiation,
-            ComponentError::InvocationFailed { .. } => ComponentObservationKind::Invocation,
+            ComponentError::InvocationFailed { .. }
+            | ComponentError::CapabilityCallRejected { .. } => ComponentObservationKind::Invocation,
             ComponentError::PreparationFailed { .. }
             | ComponentError::ComponentLoadFailed { .. } => ComponentObservationKind::Preparation,
             ComponentError::UnauthorizedImport { .. }
@@ -3151,6 +3152,16 @@ pub enum ComponentError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A registered [`HostCapability`] rejected a call
+    /// (`model-component-graph-contract`). Distinct from `InvocationFailed`
+    /// (which needs a [`ComponentInstanceId`] the manager assigns, not
+    /// visible to a `HostCapability` -- it only sees the calling engine
+    /// instance's own key, see [`HostCapability::call`]'s `instance_key`).
+    CapabilityCallRejected {
+        capability: String,
+        instance_key: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3340,6 +3351,14 @@ impl fmt::Display for ComponentError {
                 f,
                 "could not discover components in '{}': {source}",
                 path.display()
+            ),
+            Self::CapabilityCallRejected {
+                capability,
+                instance_key,
+                message,
+            } => write!(
+                f,
+                "capability '{capability}' rejected a call from instance '{instance_key}': {message}"
             ),
         }
     }
