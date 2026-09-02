@@ -39,9 +39,11 @@ struct AddOneCapability;
 impl HostCapability for AddOneCapability {
     fn call(
         &self,
+        instance_key: &str,
         operation: &str,
         arguments: &[ComponentValue],
     ) -> Result<Vec<ComponentValue>, ComponentError> {
+        assert!(!instance_key.is_empty());
         assert_eq!(operation, "echo");
         let [ComponentValue::U32(x)] = arguments else {
             panic!("expected exactly one u32 argument, got {arguments:?}");

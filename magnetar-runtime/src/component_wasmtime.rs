@@ -319,6 +319,12 @@ impl ComponentEngine for WasmtimeComponentEngine {
                 definition: prepared.definition_id(),
                 message: redact_engine_message(source),
             })?;
+        // Computed before the linker so `configure_linker` can capture it
+        // into each capability-backed host-import closure: `HostCapability`
+        // needs to know which Component instance is calling (per-instance
+        // state, e.g. a graph-builder session under construction), and this
+        // is that instance's identity from the moment it exists.
+        let key = self.next_instance_key(prepared.definition_id());
         let mut linker = WasmtimeLinker::new(&self.engine);
         configure_linker(
             &self.engine,
@@ -327,6 +333,7 @@ impl ComponentEngine for WasmtimeComponentEngine {
             link_plan,
             prepared.definition_id(),
             &self.capabilities,
+            &key,
         )?;
         let instance = linker
             .instantiate(&mut store, &prepared_state.component)
@@ -334,7 +341,6 @@ impl ComponentEngine for WasmtimeComponentEngine {
                 definition: prepared.definition_id(),
                 message: redact_engine_message(source),
             })?;
-        let key = self.next_instance_key(prepared.definition_id());
         self.instances.insert(
             key.clone(),
             WasmtimeInstanceState {
@@ -561,6 +567,7 @@ fn configure_linker(
     link_plan: &ComponentLinkPlan,
     definition: ComponentDefinitionId,
     capabilities: &BTreeMap<WitInterface, Arc<dyn HostCapability>>,
+    instance_key: &str,
 ) -> Result<(), ComponentError> {
     for (import_name, item) in component.component_type().imports(engine) {
         let interface = wit_interface_from_component_name(import_name);
@@ -591,6 +598,7 @@ fn configure_linker(
                         ComponentItem::ComponentFunc(func) => {
                             if let Some(capability) = capability.clone() {
                                 let operation = export_name.to_string();
+                                let instance_key = instance_key.to_string();
                                 linker_instance
                                     .func_new(export_name, move |mut store, func_ty, params, results| {
                                         store.data_mut().host_calls += 1;
@@ -604,14 +612,13 @@ fn configure_linker(
                                                 },
                                             )?);
                                         }
-                                        let returned =
-                                            capability.call(&operation, &arguments).map_err(
-                                                |error| {
-                                                    wasmtime::Error::msg(format!(
-                                                        "{HOST_ADAPTER_FAILURE_MARKER} {error}"
-                                                    ))
-                                                },
-                                            )?;
+                                        let returned = capability
+                                            .call(&instance_key, &operation, &arguments)
+                                            .map_err(|error| {
+                                                wasmtime::Error::msg(format!(
+                                                    "{HOST_ADAPTER_FAILURE_MARKER} {error}"
+                                                ))
+                                            })?;
                                         let result_types: Vec<Type> = func_ty.results().collect();
                                         if returned.len() != result_types.len() {
                                             return Err(wasmtime::Error::msg(format!(

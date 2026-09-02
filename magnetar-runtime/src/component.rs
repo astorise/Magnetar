@@ -1615,18 +1615,24 @@ impl ComponentInvocationResult {
 
 /// A Runtime-provided capability a Component calls into as a host import
 /// (`model-component-graph-contract`): the counterpart to a Component
-/// *export* the Runtime calls (`ComponentEngine::invoke`). `operation` is
-/// the WIT function name within the imported interface; `arguments` are
-/// already the callee's declared parameters, in order, converted from the
-/// Component's own typed call. A capability that rejects a call (invalid
-/// arguments, a semantic violation the capability itself is responsible for
-/// validating) returns `Err`, which the calling engine surfaces to the
-/// Component as a trapped/failed host call -- never a silent default value,
-/// matching this crate's fail-closed posture for every other Provider/Kernel
-/// boundary.
+/// *export* the Runtime calls (`ComponentEngine::invoke`). `instance_key` is
+/// the calling Component instance's own [`ComponentEngineInstance::engine_key`]
+/// -- a single `HostCapability` is registered once and shared across every
+/// Component instance that imports its interface, so a capability that needs
+/// per-instance state (a graph-builder session under construction, for
+/// example) uses this to key it; a capability with no such state can ignore
+/// it. `operation` is the WIT function name within the imported interface;
+/// `arguments` are already the callee's declared parameters, in order,
+/// converted from the Component's own typed call. A capability that rejects
+/// a call (invalid arguments, a semantic violation the capability itself is
+/// responsible for validating) returns `Err`, which the calling engine
+/// surfaces to the Component as a trapped/failed host call -- never a silent
+/// default value, matching this crate's fail-closed posture for every other
+/// Provider/Kernel boundary.
 pub trait HostCapability: Send + Sync {
     fn call(
         &self,
+        instance_key: &str,
         operation: &str,
         arguments: &[ComponentValue],
     ) -> Result<Vec<ComponentValue>, ComponentError>;
