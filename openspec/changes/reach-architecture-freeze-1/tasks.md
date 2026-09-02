@@ -117,19 +117,23 @@ read, no `TensorResourceId` created, and no Provider interaction at all --
 for *any* artifact type, not just Qwen's fixture. Two real blockers, not
 one: (a) there is no byte-level Model Artifact format anywhere in this repo
 yet (`fixture.weights` is a pure in-memory `BTreeMap<String, HostTensor>`,
-never serialized), consistent with `formats/gguf`/`formats/safetensors`
-still being empty `cargo new` templates; and (b) `load()`'s signature takes
-`memory: &mut MemoryManager` but no Provider reference at all, so it
-structurally cannot call `write_tensor` even if it had bytes to write.
+never serialized) -- **this half is now resolved**: `implement-model-format-parsers`
+gave `formats/gguf`/`formats/safetensors` real parsers producing
+`ModelTensorMetadata`, so a byte-level Model Artifact format now exists and
+is parseable; and (b) `load()`'s signature takes `memory: &mut MemoryManager`
+but no Provider reference at all, so it structurally cannot call
+`write_tensor` even if it had bytes to write -- **this half remains open.**
 Fixing this for real means extending `ModelLoadingCoordinator::load()`'s
 public contract (used by `inference_api::load_model`, itself governed by
 the `model-loading` and `inference-api` OpenSpec capabilities) to accept a
 Provider and per-tensor byte data -- a spec-level API change, not an
 implementation-only fix, and a decision (does materialization become a
 phase inside `load()`, or a strictly-sequenced follow-on call within one
-loading transaction?) better made deliberately than folded into this pass.
-The API-redesign part is not attempted here, but see 8.3-8.6 below for a
-smaller, safe step that was.
+loading transaction?) better made deliberately than folded into this pass,
+and deliberately left open by `implement-model-format-parsers`'s own
+non-goals (a real parser existing and `Model Loading` consuming one are
+kept as separate decisions). The API-redesign part is not attempted here,
+but see 8.3-8.6 below for a smaller, safe step that was.
 
 - [ ] 8.1 Build a real minimal `Model Artifact` containing the payloads currently supplied by the fixture.
 - [ ] 8.2 Parse/read those bytes through `Model Loading`.
@@ -428,25 +432,24 @@ otherwise modified — only a doc comment added explaining this split.
 
 ## 16. Prepare external formats without type leakage
 
-**Status: scoped into its own OpenSpec Change, not attempted here.**
-Verified `formats/gguf` and `formats/safetensors` (submodules already
-gitlinked on this branch) each contain nothing but the default `cargo new
---lib` template (`pub fn add(left: u64, right: u64) -> u64` and its test) —
-no real parser exists to check for type leakage, overflow handling, or
-panic-freedom. Per explicit user decision, real GGUF/Safetensors parsing —
-large enough to warrant its own OpenSpec Change given the safety
-requirements involved — is now proposed as
-`implement-model-format-parsers` (proposal/design/specs/tasks all written;
-implementation not started). That change's own non-goals section is
-explicit that it does not by itself complete task group 8's remaining
-8.1/8.2 (wiring a real parser into `Model Loading` itself) — a real parser
-existing and `Model Loading` consuming one are deliberately kept as
-separate decisions.
+**Status: done, via `implement-model-format-parsers`.** Per explicit user
+decision, real GGUF/Safetensors parsing — large enough to warrant its own
+OpenSpec Change given the safety requirements involved — was scoped and
+implemented as `implement-model-format-parsers` (proposal/design/specs/
+tasks, then real code, all complete). `formats/gguf` and `formats/safetensors`
+are no longer empty templates: each parses its real binary format into
+`magnetar-runtime`'s existing generic `ModelTensorMetadata`/`ModelDType`/
+`ModelQuantization` types, with checked-arithmetic overflow/bounds safety
+and a checked-in malformed-input corpus proving structured-error-not-panic
+behavior (`formats/gguf` at commit `88ae910`, `formats/safetensors` at
+`7492a04`). That change's own non-goals section remains explicit that this
+does not by itself complete task group 8's remaining 8.1/8.2 (wiring a real
+parser into `Model Loading` itself) — see that group's note.
 
-- [ ] 16.1 Verify GGUF/Safetensors parsers produce only generic types (`ModelArtifact`, `TensorDescriptor`, `QuantizationDescriptor`, normalized tokenizer/model metadata) across the boundary into `magnetar-runtime`. (N/A: no parser exists yet.)
-- [ ] 16.2 Add arithmetic-overflow checks, bounded allocations, checked offsets/tensor sizes, and rejection of overlapping/invalid ranges and absurd dimensions in format parsers. (N/A: no parser exists yet.)
-- [ ] 16.3 Verify no panic occurs on malformed input; add fuzzing and a corpus regression suite. (N/A: no parser exists yet.)
-- [x] 16.4 Add a static check that `magnetar-runtime` has zero dependency on a concrete GGUF/Safetensors crate. (Trivially true today: `magnetar-runtime/Cargo.toml` has no `gguf`/`safetensors` dependency, and neither submodule is wired into the Cargo workspace at all. Worth re-verifying with an actual guard once a real parser and workspace wiring exist.)
+- [x] 16.1 Verify GGUF/Safetensors parsers produce only generic types (`ModelArtifact`, `TensorDescriptor`, `QuantizationDescriptor`, normalized tokenizer/model metadata) across the boundary into `magnetar-runtime`. (Both parsers return a crate-local artifact type (`GgufArtifact`/`SafetensorsArtifact`, not a `magnetar-runtime` type) wrapping a `Vec<ModelTensorMetadata>` plus a metadata map — no GGUF/Safetensors-specific type describing tensor data crosses into `magnetar-runtime`. See `implement-model-format-parsers`'s design.md "Decisions" for why a narrower artifact type, not a fabricated `ModelManifest`, is the honest contract here.)
+- [x] 16.2 Add arithmetic-overflow checks, bounded allocations, checked offsets/tensor sizes, and rejection of overlapping/invalid ranges and absurd dimensions in format parsers. (Checked arithmetic throughout both parsers for every offset/size computation derived from file bytes; every declared tensor byte range validated against the actual file length before any data is read; overlapping ranges rejected outright in both (matching upstream `safetensors`' own post-CVE hardening); GGUF additionally validates offset alignment, block-size-aligned element counts, and rejects duplicate tensor names. No collection is pre-allocated to an attacker-declared capacity before that many bytes are confirmed present.)
+- [x] 16.3 Verify no panic occurs on malformed input; add fuzzing and a corpus regression suite. (20-entry (`formats/safetensors`) and 22-entry (`formats/gguf`) checked-in malformed-input corpora, each replayed by a `#[test]` using `std::panic::catch_unwind` to prove no panic in addition to asserting a structured `Err`. A `cargo-fuzz` target per crate exercises the same entry point; both verified to build cleanly with `cargo +nightly fuzz build`. Live fuzz execution was attempted on this session's Windows development machine and failed with `STATUS_DLL_NOT_FOUND` — the nightly toolchain's sysroot has no sanitizer runtime DLLs installed there, a real, honestly-documented environment gap, not a defect in the fuzz targets themselves.)
+- [x] 16.4 Add a static check that `magnetar-runtime` has zero dependency on a concrete GGUF/Safetensors crate. (Superseded by a real, automated guard now that both parsers have real content: a new step in `.github/workflows/quality.yml`'s `submodule-integration` job greps `magnetar-runtime/Cargo.toml` directly, then checks the full resolved `cargo tree --all-features` output for either format crate's package name. Verified locally to pass; not yet exercised against live GitHub Actions.)
 
 ## 17. Per-node causal execution evidence
 

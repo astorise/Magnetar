@@ -11,11 +11,11 @@ task 15.3) and the current Magnetar-to-module compatibility matrix (task
 
 | Path | Repository | Status |
 | --- | --- | --- |
-| `components/qwen` | [Magnetar-component-Qwen](https://github.com/astorise/Magnetar-component-Qwen) | Real: implements `magnetar:model-component-graph@1.0.0` for the fixed E2E fixture architecture (see its own README) |
+| `components/qwen` | [Magnetar-component-Qwen](https://github.com/astorise/Magnetar-component-Qwen) | Real: implements `magnetar:model-component-graph@1.0.0` for the fixed E2E fixture architecture, and is the exclusive production graph source under the strict path (`reach-architecture-freeze-1` task 11.5) -- see its own README |
 | `components/llama` | [Magnetar-component-Llama](https://github.com/astorise/Magnetar-component-Llama) | Empty `cargo new --lib` template |
-| `formats/gguf` | [Magnetar-format-GGUF](https://github.com/astorise/Magnetar-format-GGUF) | Empty `cargo new --lib` template |
-| `formats/safetensors` | [Magnetar-format-safetensors](https://github.com/astorise/Magnetar-format-safetensors) | Empty `cargo new --lib` template |
-| `providers/cpu` | [Magnetar-provider-CPU](https://github.com/astorise/Magnetar-provider-CPU) | Empty `cargo new --lib` template; the real Reference CPU Provider implementation still lives in `magnetar-runtime` pending extraction (`reach-architecture-freeze-1` task group 14) |
+| `formats/gguf` | [Magnetar-format-GGUF](https://github.com/astorise/Magnetar-format-GGUF) | Real: parses the full GGUF container into generic `ModelTensorMetadata`, for the `F32`/`F16`/`BF16`/`I8`/`I16`/`I32`/`I64`/`F64`/`Q4_K`/`Q5_K`/`Q8_0` subset (`implement-model-format-parsers`) -- see its own README |
+| `formats/safetensors` | [Magnetar-format-safetensors](https://github.com/astorise/Magnetar-format-safetensors) | Real: parses Safetensors files into generic `ModelTensorMetadata`, covering every standard Safetensors dtype (`implement-model-format-parsers`) -- see its own README |
+| `providers/cpu` | [Magnetar-provider-CPU](https://github.com/astorise/Magnetar-provider-CPU) | Real: independent extraction of `ReferenceCpuExecutor`/kernels/SIMD detection (`reach-architecture-freeze-1` task group 14) -- see its own README |
 | `providers/cuda` | [Magnetar-provider-CUDA](https://github.com/astorise/Magnetar-provider-CUDA) | Empty `cargo new --lib` template |
 
 ## Versioning and release ownership
@@ -41,21 +41,25 @@ task 15.3) and the current Magnetar-to-module compatibility matrix (task
   `.github/workflows/quality.yml`) at the pinned commit, not by any
   version-number contract the module declares. A module bumping its own
   `Cargo.toml` version is not itself a compatibility claim.
-- **No compatibility range pinning yet.** Because every module except
-  `components/qwen` is still a template, there is nothing yet to define a
-  meaningful version *range* against (a `^0.1` style constraint would be
-  vacuous). Once a module has more than one real, meaningfully different
-  release, this section should be extended with actual compatible-version
-  ranges per module rather than the current one-pinned-commit-at-a-time
-  model.
+- **No compatibility range pinning yet.** `components/llama` and
+  `providers/cuda` are still templates; the other four modules are real but
+  each still has exactly one real release, so there is nothing yet to
+  define a meaningful version *range* against (a `^0.1` style constraint
+  would be vacuous). Once a module has more than one real, meaningfully
+  different release, this section should be extended with actual
+  compatible-version ranges per module rather than the current
+  one-pinned-commit-at-a-time model.
 
 ## Compatibility matrix
 
-| `magnetar-runtime` | `components/qwen` | Notes |
-| --- | --- | --- |
-| This branch (`make-first-native-datapath-authoritative`) | `1a9bca7` or later | Requires `magnetar:model-component-graph@1.0.0`; not yet wired into the production generation path (`reach-architecture-freeze-1` task 11.5) |
+| `magnetar-runtime` | Module | Commit | Notes |
+| --- | --- | --- | --- |
+| This branch (`make-first-native-datapath-authoritative`) | `components/qwen` | `e5422c7` or later | Requires `magnetar:model-component-graph@1.0.0`; is the exclusive production graph source under the strict path (`reach-architecture-freeze-1` task 11.5) |
+| This branch | `formats/gguf` | `88ae910` or later | Requires `magnetar-runtime`'s `model` module (`ModelTensorMetadata`, `ModelDType`, `ModelQuantization`/`ModelQuantizationFormat`, including the `GgufQ8` variant this parser's development added); not yet wired into `Model Loading` (`implement-model-format-parsers`'s explicit non-goal) |
+| This branch | `formats/safetensors` | `7492a04` or later | Requires `magnetar-runtime`'s `model` module; not yet wired into `Model Loading` (same non-goal as above) |
+| This branch | `providers/cpu` | `751a139` or later | Requires `magnetar-runtime`'s Provider/Device/Kernel/Tensor contracts, plus (uniquely among these modules) `HostTensor`/`ReferenceCpuError`/`ReferenceCpuErrorCode` specifically, imported rather than redefined (`reach-architecture-freeze-1` task group 14); never referenced by `magnetar-runtime` |
 
-Every other module has no real content yet, so no compatibility claim is
-meaningful for it beyond "the empty template builds" (verified by
-`submodule-integration`). This table should gain a row per module once
-that module has real content to be compatible (or not) with.
+`components/llama` and `providers/cuda` have no real content yet, so no
+compatibility claim is meaningful for either beyond "the empty template
+builds" (verified by `submodule-integration`). This table should gain a row
+for each once it has real content to be compatible (or not) with.

@@ -397,6 +397,13 @@ impl ModelDType {
 pub enum ModelQuantizationFormat {
     GgufQ4K,
     GgufQ5K,
+    /// GGUF's `Q8_0` block quantization (`ggml_type` 8): 32 elements per
+    /// 34-byte block (2-byte `f16` scale + 32 `i8` quants). Paired with
+    /// [`ModelDType::Q8`], which `ModelDType::parse` already accepts under
+    /// `"q8"`/`"q8_0"`; this variant was missing even though that dtype
+    /// existed, found while implementing `formats/gguf`'s real parser
+    /// (`implement-model-format-parsers`).
+    GgufQ8,
     Gptq,
     Awq,
     BitsAndBytes,
@@ -407,6 +414,7 @@ impl ModelQuantizationFormat {
         match value.to_ascii_lowercase().as_str() {
             "gguf-q4-k" | "q4_k" => Some(Self::GgufQ4K),
             "gguf-q5-k" | "q5_k" => Some(Self::GgufQ5K),
+            "gguf-q8-0" | "q8_0" => Some(Self::GgufQ8),
             "gptq" => Some(Self::Gptq),
             "awq" => Some(Self::Awq),
             "bitsandbytes" | "bnb" => Some(Self::BitsAndBytes),

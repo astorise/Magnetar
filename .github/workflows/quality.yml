@@ -305,6 +305,25 @@ jobs:
             cargo test --locked --manifest-path "$manifest"
             echo "::endgroup::"
           done
+      # `implement-model-format-parsers` task 5.1/5.2, extending the
+      # previously-trivial "magnetar-runtime has no GGUF/Safetensors
+      # dependency" check (reach-architecture-freeze-1 task 16.4) into a
+      # real, automated one now that both format crates have real content:
+      # neither the manifest nor the resolved dependency graph may name
+      # either crate, checked directly rather than assumed.
+      - name: Verify magnetar-runtime has no format-crate dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -qE 'magnetar-format-(gguf|safetensors)' magnetar-runtime/Cargo.toml; then
+            echo "::error file=magnetar-runtime/Cargo.toml::magnetar-runtime must not depend on a format crate"
+            exit 1
+          fi
+          tree_output="$(cargo tree --manifest-path magnetar-runtime/Cargo.toml --all-features)"
+          if grep -qE 'magnetar-format-(gguf|safetensors)' <<< "$tree_output"; then
+            echo "::error file=magnetar-runtime/Cargo.toml::magnetar-runtime's resolved dependency graph includes a format crate"
+            exit 1
+          fi
 
   coverage:
     name: quality / coverage
