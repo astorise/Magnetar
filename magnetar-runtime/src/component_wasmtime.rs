@@ -671,6 +671,14 @@ fn configure_linker(
                                 });
                             }
                         }
+                        ComponentItem::Type(_) => {
+                            // A type declaration (e.g. an `enum`/`record`/
+                            // `variant` from the WIT interface) needs no
+                            // linker wiring -- Wasmtime resolves it
+                            // structurally from the Component's own
+                            // embedded type information, not from anything
+                            // the host provides at instantiation time.
+                        }
                         _ => {
                             return Err(ComponentError::InstantiationFailed {
                                 definition,
