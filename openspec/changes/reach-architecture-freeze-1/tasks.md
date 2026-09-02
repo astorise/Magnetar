@@ -218,7 +218,7 @@ non-strict mode?), which is a real design decision, not a mechanical fix.
 
 ## 11. Implement `model-component-graph-contract` (see specs/model-component-graph-contract/spec.md)
 
-**Status: engine prerequisite landed; WIT interface design not yet started.**
+**Status: engine prerequisite and WIT interface design landed; Runtime-side implementation not yet started.**
 design.md's own Non-Goals section excludes implementing this contract from
 this change — it defines the *spec* for the new capability but leaves
 implementation (a real WIT interface, Runtime-side builder, and Qwen
@@ -297,11 +297,8 @@ item, so it is recorded here rather than silently folded into 11.1's note.
   `option`), whose own round-trip tests (11.8) will exercise them for real.
   Tracked here explicitly so it is not forgotten before 11.8 closes.
 
-**Still open:** 11.1's actual WIT interface design has not started; the
-above is the engine capability it needs, not the interface itself.
-
-- [ ] 11.1 Design the WIT interface for the Runtime-owned graph-builder Capability (node/edge/output construction operations, per design.md's Option B decision).
-- [ ] 11.2 Define Capability versioning for the contract per `capability`'s `Capability Versioning` requirement.
+- [x] 11.1 Design the WIT interface for the Runtime-owned graph-builder Capability (node/edge/output construction operations, per design.md's Option B decision). (`magnetar-runtime/wit/model-component-graph.wit`, package `magnetar:model-component-graph@1.0.0`, validated with `wasm-tools component wit`. `interface graph-builder`: `begin-graph`/`declare-input`/`weight-edge`/`alias-weight-edge`/`kv-resource`/`add-node`/`finish-graph`, an incremental builder per Option B -- no full-graph value ever crosses the boundary in one call. Checked against every requirement in `specs/model-component-graph-contract/spec.md`: node/operator identity is `operator`/`family` strings, never a Provider-specific Kernel name (no field exists for one); every tensor reference is an edge id returned by a prior call, never a raw buffer; `kv-resource` issues the KV logical resource identity Runtime-side -- the Component cannot invent one, satisfying "Graph Builder KV Logical Resources" (this changed the design from an earlier draft where the Component supplied its own `cache-id` string); no Provider/Device field exists anywhere in the interface, satisfying "Does Not Grant Provider or Device Authority"; single-output per node only, consistent with `define-provider-prepared-kernel-execution-contract`'s own deferred multi-output scope, not a narrower promise. `world model-component-graph-producer` exports `build-prefill-graph`/`build-decode-graph`, matching `execution-graph`'s Prefill/Decode phases exactly (no other phase is buildable through this contract, intentionally -- ModelLoad/Warmup/AdapterActivation/etc. stay Runtime-internal).)
+- [ ] 11.2 Define Capability versioning for the contract per `capability`'s `Capability Versioning` requirement. (Partially covered by the existing generic mechanism: `configure_linker` already rejects a Component whose declared `WitInterface` (name+version, e.g. `magnetar:model-component-graph/graph-builder@2.0.0`) does not exactly match an entry in the approved Link Plan -- a version the Runtime does not implement already fails linking before any graph-builder call happens. Not fully closed: the failure message is the generic "absent from the approved Link Plan" wording, not the spec's named `capability-version-mismatch` error code -- distinguishing "this interface name is unknown at any version" from "this interface name is known, but not at this version" would need the link-plan rejection path to search by name before failing, which it does not do today. Left open to decide alongside 11.3's validation-error shape work rather than in isolation.)
 - [ ] 11.3 Implement Runtime-side validation of Component-built graphs (topology, Operator identity/version, Tensor descriptors, weight references, KV logical resources).
 - [ ] 11.4 Implement the Qwen Component's use of the new contract for prefill and decode graphs, replacing the in-repo Rust graph builder.
 - [ ] 11.5 Remove `qwen_prefill_graph(...)` / `qwen_decode_graph(...)` calls from the `magnetar-runtime` production path.
