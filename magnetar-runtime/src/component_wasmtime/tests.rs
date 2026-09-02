@@ -27,6 +27,28 @@ const BOUNDED_LOOP_COMPONENT: &str =
     include_str!("../../fixtures/components/bounded-loop.component.wat");
 const QWEN_GRAPH_COMPONENT: &str =
     include_str!("../../fixtures/components/qwen-graph.component.wat");
+const CAPABILITY_ECHO_COMPONENT: &str =
+    include_str!("../../fixtures/components/capability-echo.component.wat");
+
+/// Test-only [`HostCapability`] (`model-component-graph-contract`): answers
+/// `echo(x: u32) -> u32` with `x + 1`, real enough to prove the dynamic
+/// argument/result marshaling actually round-trips a value through a real
+/// Component's own core-wasm call, not just that linking succeeds.
+struct AddOneCapability;
+
+impl HostCapability for AddOneCapability {
+    fn call(
+        &self,
+        operation: &str,
+        arguments: &[ComponentValue],
+    ) -> Result<Vec<ComponentValue>, ComponentError> {
+        assert_eq!(operation, "echo");
+        let [ComponentValue::U32(x)] = arguments else {
+            panic!("expected exactly one u32 argument, got {arguments:?}");
+        };
+        Ok(vec![ComponentValue::U32(x + 1)])
+    }
+}
 
 #[test]
 fn wasmtime_engine_reports_component_capabilities() {
@@ -186,6 +208,64 @@ fn wasmtime_engine_links_authorized_unit_host_import() {
     link_plan.insert_for_test(crate::ComponentEndpoint::Capability { interface });
 
     let instance = engine.instantiate(&prepared, &link_plan).unwrap();
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn wasmtime_engine_dispatches_registered_capability_with_real_arguments() {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-capability-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("capability-echo.component.wasm");
+    std::fs::write(&artifact, CAPABILITY_ECHO_COMPONENT).unwrap();
+
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let interface = WitInterface::new("example:test/capability", "1.0.0");
+    engine.register_capability(interface.clone(), Arc::new(AddOneCapability));
+    let export_interface = WitInterface::new("example:test/capability-echo", "1.0.0");
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(19),
+        metadata: crate::ComponentMetadata::new(
+            "capability-echo",
+            "1",
+            "capability echo component",
+        )
+        .with_import(interface.clone())
+        .with_export(export_interface.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let mut link_plan = ComponentLinkPlan::default();
+    link_plan.insert_for_test(crate::ComponentEndpoint::Capability { interface });
+
+    let instance = engine.instantiate(&prepared, &link_plan).unwrap();
+    let result = engine
+        .invoke(
+            &instance,
+            &ComponentInvocation::new(
+                crate::ComponentInstanceId::new(190),
+                export_interface,
+                "run",
+            ),
+        )
+        .unwrap();
+    // The Component calls the registered capability with a fixed `41` and
+    // returns whatever it got back (`AddOneCapability` answers `x + 1`) --
+    // `42` here proves the value actually crossed the real host-import
+    // boundary and back, not merely that linking succeeded.
+    assert_eq!(
+        result,
+        ComponentInvocationResult::single(ComponentValue::U32(42))
+    );
     engine.destroy(instance).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }

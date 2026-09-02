@@ -218,15 +218,87 @@ non-strict mode?), which is a real design decision, not a mechanical fix.
 
 ## 11. Implement `model-component-graph-contract` (see specs/model-component-graph-contract/spec.md)
 
-**Status: intentionally not started.** design.md's own Non-Goals section
-excludes implementing this contract from this change — it defines the
-*spec* for the new capability but leaves implementation (a real WIT
-interface, Runtime-side builder, and Qwen Component's use of it) to
-follow-through work, since it is a genuinely new capability surface, not a
-conformance fix against an already-correct spec. Task group 12
-(removing Qwen semantics from the Core) and the deeper parts of task group
-10 (removing the Rust graph fallback) are both blocked on this landing
-first.
+**Status: engine prerequisite landed; WIT interface design not yet started.**
+design.md's own Non-Goals section excludes implementing this contract from
+this change — it defines the *spec* for the new capability but leaves
+implementation (a real WIT interface, Runtime-side builder, and Qwen
+Component's use of it) to follow-through work, since it is a genuinely new
+capability surface, not a conformance fix against an already-correct spec.
+Task group 12 (removing Qwen semantics from the Core) and the deeper parts
+of task group 10 (removing the Rust graph fallback) are both blocked on this
+landing first.
+
+Per the post-freeze équipe review's explicit direction to implement the
+first real, minimal Qwen WASM Component in this pass (not defer it), work on
+this group has started. The first concrete finding: the
+`wasmtime-component-engine` backend (`component_wasmtime.rs`) could not
+actually support a "Component calls a Runtime-owned Capability" pattern at
+all -- host-import functions a Component could call were hard-restricted to
+zero-argument/zero-result stubs used only for linking conformance tests, and
+`ComponentInvocation`/`ComponentValue` had no way to carry real call
+arguments (`ComponentValue` was a single-variant `U32(u32)` enum; nothing
+resembling `wasmtime::component::Val`'s record/variant/list/option/string
+shapes existed). No `.wit` file or `wasmtime::component::bindgen!` usage
+existed anywhere in the crate either -- every component-model interaction
+went through a hand-rolled generic `ComponentManager`/`ComponentValue`
+abstraction with no structured-value marshaling. This is a real prerequisite
+for 11.1-11.4 that the original task breakdown did not anticipate as its own
+item, so it is recorded here rather than silently folded into 11.1's note.
+
+**Landed** (`component.rs`, `component_wasmtime.rs`):
+- `ComponentValue` extended to `Bool`/`U32`/`S64`/`F64`/`String`/`List`/
+  `Record`/`Variant`/`Enum`/`Option` (deliberately not a 1:1 mirror of every
+  `Val` case -- no `map`/`tuple`/`flags`/`resource`/`future`/`stream`/
+  `error-context`, since nothing in this repo's WIT interfaces uses those).
+- `ComponentInvocation.arguments: Vec<ComponentValue>` (+ `with_arguments`
+  builder), additive -- every existing zero-arg call site is unaffected.
+- A new `HostCapability` trait (`fn call(&self, operation: &str, arguments:
+  &[ComponentValue]) -> Result<Vec<ComponentValue>, ComponentError>`): a
+  Runtime-provided capability a Component calls into as a host import,
+  registered via `ComponentManager::provide_capability` / the additive,
+  defaulted `ComponentEngine::register_capability` (a no-op default for
+  `MockComponentEngine`/`WebComponentEngine`, matching the
+  `ProviderExecutionApi` additive-defaulted-method precedent).
+- `WasmtimeComponentEngine`'s `configure_linker` now wires a Component's
+  import of any interface with a registered `HostCapability` to real,
+  arbitrary-arity host functions (via Wasmtime's dynamic `func_new`/`Val`
+  API, not `bindgen!` -- kept consistent with this crate's existing
+  plugin-style, not-known-at-compile-time Component linking, matching the
+  same reasoning `ProviderExecutionApi`/`KernelRegistry` already use
+  elsewhere for Provider/Kernel pluggability). An interface with no
+  registered capability keeps the exact prior zero-arg stub behavior,
+  unchanged.
+- `invoke`'s export-call path gained a dynamic-argument fallback
+  (`invoke_with_arguments`, only reached when `invocation.arguments` is
+  non-empty) alongside the untouched legacy `get_typed_func::<(), ()>` /
+  `get_typed_func::<(), (u32,)>` fast paths.
+- Two new marshaling functions, `val_to_component_value`/
+  `component_value_to_val`, converting between `ComponentValue` and
+  `wasmtime::component::Val`, the latter guided by the callee's declared
+  `Type` (needed to disambiguate e.g. an `enum` case from a payload-less
+  `variant` case, which `ComponentValue` alone cannot).
+- New test `wasmtime_engine_dispatches_registered_capability_with_real_arguments`
+  (`component_wasmtime/tests.rs`) proves the full path end to end: a real
+  Component (`fixtures/components/capability-echo.component.wat`) calls a
+  registered `HostCapability` with a real `u32` argument, gets a real `u32`
+  result back, consumed by the Component's own core-wasm and returned
+  through its export -- not merely that linking succeeds.
+- **Known, deliberate gap:** the `List`/`Record`/`Variant`/`Enum`/`Option`
+  marshaling paths are implemented but only unit-reachable through a real
+  Component whose function signatures declare those WIT shapes (Wasmtime's
+  `Type`/`Record`/`Variant`/`Enum`/`OptionType` wrappers cannot be
+  constructed by hand outside a real compiled component's type reflection,
+  so a synthetic Rust-only unit test isn't possible without one). Rather
+  than hand-craft additional synthetic `.wat` fixtures purely to exercise
+  otherwise-untested code (the same "don't build plumbing nothing real
+  exercises yet" judgment used repeatedly elsewhere in this tracker), these
+  paths are left to be proven by the graph-builder WIT interface itself
+  (11.1's actual functions genuinely need `record`/`variant`/`list`/
+  `option`), whose own round-trip tests (11.8) will exercise them for real.
+  Tracked here explicitly so it is not forgotten before 11.8 closes.
+
+**Still open:** 11.1's actual WIT interface design has not started; the
+above is the engine capability it needs, not the interface itself.
 
 - [ ] 11.1 Design the WIT interface for the Runtime-owned graph-builder Capability (node/edge/output construction operations, per design.md's Option B decision).
 - [ ] 11.2 Define Capability versioning for the contract per `capability`'s `Capability Versioning` requirement.

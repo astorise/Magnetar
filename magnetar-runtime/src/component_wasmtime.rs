@@ -3,7 +3,8 @@ use crate::{
     ComponentEngineCapabilities, ComponentEngineInstance, ComponentError,
     ComponentExportDescription, ComponentImportRequirement, ComponentInterfaceShape,
     ComponentInterruptionReason, ComponentInvocation, ComponentInvocationResult, ComponentLinkPlan,
-    ComponentResourceLimits, ComponentTrapKind, ComponentValue, PreparedComponent, WitInterface,
+    ComponentResourceLimits, ComponentTrapKind, ComponentValue, HostCapability, PreparedComponent,
+    WitInterface,
 };
 use std::{
     collections::BTreeMap,
@@ -20,7 +21,8 @@ use wasmtime::{
     Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap,
     component::{
         Component as WasmtimeComponent, Instance as WasmtimeInstance, Linker as WasmtimeLinker,
-        types::{ComponentExtern, ComponentItem},
+        Val,
+        types::{ComponentExtern, ComponentItem, Type},
     },
 };
 
@@ -99,6 +101,12 @@ pub struct WasmtimeComponentEngine {
     instances: BTreeMap<String, WasmtimeInstanceState>,
     next_prepared_id: u64,
     next_instance_id: u64,
+    /// Real host-capability implementations registered through
+    /// [`ComponentEngine::register_capability`], consulted by
+    /// `configure_linker` so a Component importing one of these interfaces
+    /// links against real Runtime behavior instead of a generic conformance
+    /// stub. See [`HostCapability`].
+    capabilities: BTreeMap<WitInterface, Arc<dyn HostCapability>>,
 }
 
 struct WasmtimeInstanceState {
@@ -139,6 +147,7 @@ impl WasmtimeComponentEngine {
             instances: BTreeMap::new(),
             next_prepared_id: 1,
             next_instance_id: 1,
+            capabilities: BTreeMap::new(),
         })
     }
 
@@ -317,6 +326,7 @@ impl ComponentEngine for WasmtimeComponentEngine {
             &prepared_state.component,
             link_plan,
             prepared.definition_id(),
+            &self.capabilities,
         )?;
         let instance = linker
             .instantiate(&mut store, &prepared_state.component)
@@ -392,7 +402,16 @@ impl ComponentEngine for WasmtimeComponentEngine {
                 message: redact_engine_message(source),
             })?;
         let host_calls_before = state._store.data().host_calls;
-        let result = if let Ok(typed) = state
+        // Arguments present (`model-component-graph-contract`): the caller
+        // wants the dynamic, structured-value call path, not the legacy
+        // zero-arg/`u32`-result shapes below. Kept as a strictly additive
+        // fork -- the `arguments.is_empty()` branch is untouched, byte for
+        // byte, so every existing zero-arg invocation keeps its exact prior
+        // behavior (including the early-return-without-cleanup quirk on an
+        // unmatched operation name, which no test relies on changing).
+        let result = if !invocation.arguments.is_empty() {
+            invoke_with_arguments(&mut state._store, &state._instance, invocation)
+        } else if let Ok(typed) = state
             ._instance
             .get_typed_func::<(), ()>(&mut state._store, invocation.operation.as_str())
         {
@@ -436,6 +455,14 @@ impl ComponentEngine for WasmtimeComponentEngine {
     fn destroy(&mut self, instance: ComponentEngineInstance) -> Result<(), ComponentError> {
         self.instances.remove(instance.engine_key());
         Ok(())
+    }
+
+    fn register_capability(
+        &mut self,
+        interface: WitInterface,
+        capability: Arc<dyn HostCapability>,
+    ) {
+        self.capabilities.insert(interface, capability);
     }
 }
 
@@ -533,6 +560,7 @@ fn configure_linker(
     component: &WasmtimeComponent,
     link_plan: &ComponentLinkPlan,
     definition: ComponentDefinitionId,
+    capabilities: &BTreeMap<WitInterface, Arc<dyn HostCapability>>,
 ) -> Result<(), ComponentError> {
     for (import_name, item) in component.component_type().imports(engine) {
         let interface = wit_interface_from_component_name(import_name);
@@ -547,6 +575,11 @@ fn configure_linker(
         }
         match item.ty {
             ComponentItem::ComponentInstance(instance) => {
+                // A registered `HostCapability` (`model-component-graph-contract`)
+                // means every function this instance exports wires to real
+                // Runtime behavior, not the generic zero-arg conformance
+                // stub -- see the `Some(capability)` branch below.
+                let capability = capabilities.get(&interface).cloned();
                 let mut linker_instance = linker.instance(import_name).map_err(|source| {
                     ComponentError::InstantiationFailed {
                         definition,
@@ -555,32 +588,81 @@ fn configure_linker(
                 })?;
                 for (export_name, export) in instance.exports(engine) {
                     match export.ty {
-                        ComponentItem::ComponentFunc(func)
-                            if func.params().len() == 0 && func.results().len() == 0 =>
-                        {
-                            let fails_for_test = export_name == "fail";
-                            linker_instance
-                                .func_wrap(export_name, move |mut store, _params: ()| {
-                                    store.data_mut().host_calls += 1;
-                                    if fails_for_test {
-                                        return Err(wasmtime::Error::msg(
-                                            HOST_ADAPTER_FAILURE_MARKER,
-                                        ));
-                                    }
-                                    Ok(())
-                                })
-                                .map_err(|source| ComponentError::InstantiationFailed {
+                        ComponentItem::ComponentFunc(func) => {
+                            if let Some(capability) = capability.clone() {
+                                let operation = export_name.to_string();
+                                linker_instance
+                                    .func_new(export_name, move |mut store, func_ty, params, results| {
+                                        store.data_mut().host_calls += 1;
+                                        let mut arguments = Vec::with_capacity(params.len());
+                                        for param in params {
+                                            arguments.push(val_to_component_value(param).map_err(
+                                                |message| {
+                                                    wasmtime::Error::msg(format!(
+                                                        "{HOST_ADAPTER_FAILURE_MARKER} {message}"
+                                                    ))
+                                                },
+                                            )?);
+                                        }
+                                        let returned =
+                                            capability.call(&operation, &arguments).map_err(
+                                                |error| {
+                                                    wasmtime::Error::msg(format!(
+                                                        "{HOST_ADAPTER_FAILURE_MARKER} {error}"
+                                                    ))
+                                                },
+                                            )?;
+                                        let result_types: Vec<Type> = func_ty.results().collect();
+                                        if returned.len() != result_types.len() {
+                                            return Err(wasmtime::Error::msg(format!(
+                                                "{HOST_ADAPTER_FAILURE_MARKER} capability '{operation}' returned {} value(s), expected {}",
+                                                returned.len(),
+                                                result_types.len()
+                                            )));
+                                        }
+                                        for ((value, ty), slot) in returned
+                                            .iter()
+                                            .zip(&result_types)
+                                            .zip(results.iter_mut())
+                                        {
+                                            *slot = component_value_to_val(value, ty).map_err(
+                                                |message| {
+                                                    wasmtime::Error::msg(format!(
+                                                        "{HOST_ADAPTER_FAILURE_MARKER} {message}"
+                                                    ))
+                                                },
+                                            )?;
+                                        }
+                                        Ok(())
+                                    })
+                                    .map_err(|source| ComponentError::InstantiationFailed {
+                                        definition,
+                                        message: redact_engine_message(source),
+                                    })?;
+                            } else if func.params().len() == 0 && func.results().len() == 0 {
+                                let fails_for_test = export_name == "fail";
+                                linker_instance
+                                    .func_wrap(export_name, move |mut store, _params: ()| {
+                                        store.data_mut().host_calls += 1;
+                                        if fails_for_test {
+                                            return Err(wasmtime::Error::msg(
+                                                HOST_ADAPTER_FAILURE_MARKER,
+                                            ));
+                                        }
+                                        Ok(())
+                                    })
+                                    .map_err(|source| ComponentError::InstantiationFailed {
+                                        definition,
+                                        message: redact_engine_message(source),
+                                    })?;
+                            } else {
+                                return Err(ComponentError::InstantiationFailed {
                                     definition,
-                                    message: redact_engine_message(source),
-                                })?;
-                        }
-                        ComponentItem::ComponentFunc(_) => {
-                            return Err(ComponentError::InstantiationFailed {
-                                definition,
-                                message: format!(
-                                    "unsupported host import function signature for '{import_name}.{export_name}'"
-                                ),
-                            });
+                                    message: format!(
+                                        "unsupported host import function signature for '{import_name}.{export_name}'"
+                                    ),
+                                });
+                            }
                         }
                         _ => {
                             return Err(ComponentError::InstantiationFailed {
@@ -629,6 +711,220 @@ fn configure_linker(
         }
     }
     Ok(())
+}
+
+/// Converts a Component's own already-typed `Val` into this crate's
+/// engine-agnostic [`ComponentValue`] (`model-component-graph-contract`).
+/// `Val` is self-describing (it already carries its own WIT shape, unlike
+/// the reverse direction -- see [`component_value_to_val`]), so this never
+/// needs a target type, only a value to walk. Infallible for every WIT shape
+/// this crate's own interfaces use; anything else (`map`/`tuple`/`flags`/
+/// `resource`/`future`/`stream`/`error-context`/`fixed-length-list`) is
+/// reported rather than silently dropped, since `Val` here always comes from
+/// data a Component produced and this crate never trusts Component data
+/// implicitly.
+fn val_to_component_value(val: &Val) -> Result<ComponentValue, String> {
+    Ok(match val {
+        Val::Bool(v) => ComponentValue::Bool(*v),
+        Val::S8(v) => ComponentValue::S64(i64::from(*v)),
+        Val::U8(v) => ComponentValue::U32(u32::from(*v)),
+        Val::S16(v) => ComponentValue::S64(i64::from(*v)),
+        Val::U16(v) => ComponentValue::U32(u32::from(*v)),
+        Val::S32(v) => ComponentValue::S64(i64::from(*v)),
+        Val::U32(v) => ComponentValue::U32(*v),
+        Val::S64(v) => ComponentValue::S64(*v),
+        Val::U64(v) => ComponentValue::S64(
+            i64::try_from(*v).map_err(|_| format!("u64 value {v} does not fit in a s64"))?,
+        ),
+        Val::Float32(v) => ComponentValue::F64(f64::from(*v)),
+        Val::Float64(v) => ComponentValue::F64(*v),
+        Val::Char(v) => ComponentValue::String(v.to_string()),
+        Val::String(v) => ComponentValue::String(v.clone()),
+        Val::List(items) => {
+            let mut converted = Vec::with_capacity(items.len());
+            for item in items {
+                converted.push(val_to_component_value(item)?);
+            }
+            ComponentValue::List(converted)
+        }
+        Val::Record(fields) => {
+            let mut converted = Vec::with_capacity(fields.len());
+            for (name, value) in fields {
+                converted.push((name.clone(), val_to_component_value(value)?));
+            }
+            ComponentValue::Record(converted)
+        }
+        Val::Variant(name, payload) => ComponentValue::Variant(
+            name.clone(),
+            match payload {
+                Some(inner) => Some(Box::new(val_to_component_value(inner)?)),
+                None => None,
+            },
+        ),
+        Val::Enum(name) => ComponentValue::Enum(name.clone()),
+        Val::Option(inner) => ComponentValue::Option(match inner {
+            Some(value) => Some(Box::new(val_to_component_value(value)?)),
+            None => None,
+        }),
+        other => return Err(format!("unsupported WIT value shape: {other:?}")),
+    })
+}
+
+/// Converts this crate's engine-agnostic [`ComponentValue`] into a `Val`
+/// shaped for `ty` (`model-component-graph-contract`). Unlike
+/// [`val_to_component_value`], this direction needs the target WIT `Type` --
+/// `ComponentValue` alone cannot disambiguate an `enum` case from a
+/// payload-less `variant` case, or tell a `u8`-typed field from a
+/// `u32`-typed one, since it deliberately carries less shape information
+/// than `Val`/`Type` do. A value that does not match `ty` (wrong case name,
+/// a numeric value that overflows the target width, a missing record field)
+/// is reported rather than coerced or truncated silently.
+fn component_value_to_val(value: &ComponentValue, ty: &Type) -> Result<Val, String> {
+    Ok(match (value, ty) {
+        (ComponentValue::Bool(v), Type::Bool) => Val::Bool(*v),
+        (ComponentValue::U32(v), Type::U8) => {
+            Val::U8(u8::try_from(*v).map_err(|_| format!("value {v} does not fit in a u8"))?)
+        }
+        (ComponentValue::U32(v), Type::U16) => {
+            Val::U16(u16::try_from(*v).map_err(|_| format!("value {v} does not fit in a u16"))?)
+        }
+        (ComponentValue::U32(v), Type::U32) => Val::U32(*v),
+        (ComponentValue::U32(v), Type::U64) => Val::U64(u64::from(*v)),
+        (ComponentValue::S64(v), Type::S8) => {
+            Val::S8(i8::try_from(*v).map_err(|_| format!("value {v} does not fit in a s8"))?)
+        }
+        (ComponentValue::S64(v), Type::S16) => {
+            Val::S16(i16::try_from(*v).map_err(|_| format!("value {v} does not fit in a s16"))?)
+        }
+        (ComponentValue::S64(v), Type::S32) => {
+            Val::S32(i32::try_from(*v).map_err(|_| format!("value {v} does not fit in a s32"))?)
+        }
+        (ComponentValue::S64(v), Type::S64) => Val::S64(*v),
+        (ComponentValue::S64(v), Type::U64) => {
+            Val::U64(u64::try_from(*v).map_err(|_| format!("value {v} does not fit in a u64"))?)
+        }
+        (ComponentValue::F64(v), Type::Float32) => Val::Float32(*v as f32),
+        (ComponentValue::F64(v), Type::Float64) => Val::Float64(*v),
+        (ComponentValue::String(v), Type::String) => Val::String(v.clone()),
+        (ComponentValue::String(v), Type::Char) => {
+            let mut chars = v.chars();
+            let ch = chars
+                .next()
+                .ok_or_else(|| "empty string cannot convert to a char".to_string())?;
+            if chars.next().is_some() {
+                return Err(format!("string '{v}' has more than one char"));
+            }
+            Val::Char(ch)
+        }
+        (ComponentValue::List(items), Type::List(list_ty)) => {
+            let element_ty = list_ty.ty();
+            let mut converted = Vec::with_capacity(items.len());
+            for item in items {
+                converted.push(component_value_to_val(item, &element_ty)?);
+            }
+            Val::List(converted)
+        }
+        (ComponentValue::Record(fields), Type::Record(record_ty)) => {
+            let mut converted = Vec::with_capacity(fields.len());
+            for field in record_ty.fields() {
+                let (_, value) = fields
+                    .iter()
+                    .find(|(name, _)| name == field.name)
+                    .ok_or_else(|| format!("record is missing field '{}'", field.name))?;
+                converted.push((
+                    field.name.to_string(),
+                    component_value_to_val(value, &field.ty)?,
+                ));
+            }
+            Val::Record(converted)
+        }
+        (ComponentValue::Variant(name, payload), Type::Variant(variant_ty)) => {
+            let case = variant_ty
+                .cases()
+                .find(|case| case.name == name)
+                .ok_or_else(|| format!("variant has no case named '{name}'"))?;
+            let converted_payload = match (payload, case.ty) {
+                (Some(value), Some(case_ty)) => {
+                    Some(Box::new(component_value_to_val(value, &case_ty)?))
+                }
+                (None, None) => None,
+                (Some(_), None) => {
+                    return Err(format!(
+                        "variant case '{name}' takes no payload but one was supplied"
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(format!("variant case '{name}' requires a payload"));
+                }
+            };
+            Val::Variant(name.clone(), converted_payload)
+        }
+        (ComponentValue::Enum(name), Type::Enum(enum_ty)) => {
+            if enum_ty.names().any(|case_name| case_name == name) {
+                Val::Enum(name.clone())
+            } else {
+                return Err(format!("enum has no case named '{name}'"));
+            }
+        }
+        (ComponentValue::Option(inner), Type::Option(option_ty)) => {
+            let payload_ty = option_ty.ty();
+            Val::Option(match inner {
+                Some(value) => Some(Box::new(component_value_to_val(value, &payload_ty)?)),
+                None => None,
+            })
+        }
+        (value, ty) => {
+            return Err(format!(
+                "value {value:?} does not match expected WIT type {ty:?}"
+            ));
+        }
+    })
+}
+
+/// The dynamic-argument counterpart to `invoke`'s legacy
+/// `get_typed_func::<(), ()>` / `get_typed_func::<(), (u32,)>` fast paths
+/// (`model-component-graph-contract`): looks up `invocation.operation` by
+/// name, converts `invocation.arguments` into `Val`s shaped for the callee's
+/// declared parameter types, calls it, and converts the results back. Only
+/// reached when `invocation.arguments` is non-empty -- see the call site.
+fn invoke_with_arguments(
+    store: &mut Store<WasmtimeStoreState>,
+    instance: &WasmtimeInstance,
+    invocation: &ComponentInvocation,
+) -> Result<ComponentInvocationResult, wasmtime::Error> {
+    let func = instance
+        .get_func(&mut *store, invocation.operation.as_str())
+        .ok_or_else(|| {
+            wasmtime::Error::msg(format!(
+                "no exported function named '{}'",
+                invocation.operation
+            ))
+        })?;
+    let func_ty = func.ty(&*store);
+    let param_types: Vec<Type> = func_ty.params().map(|(_, ty)| ty).collect();
+    if param_types.len() != invocation.arguments.len() {
+        return Err(wasmtime::Error::msg(format!(
+            "'{}' expects {} argument(s), got {}",
+            invocation.operation,
+            param_types.len(),
+            invocation.arguments.len()
+        )));
+    }
+    let mut params = Vec::with_capacity(param_types.len());
+    for (argument, ty) in invocation.arguments.iter().zip(&param_types) {
+        params.push(component_value_to_val(argument, ty).map_err(wasmtime::Error::msg)?);
+    }
+    let result_types: Vec<Type> = func_ty.results().collect();
+    // Placeholder content is irrelevant: `Func::call` only validates the
+    // slice's *length* against the callee's declared result arity before
+    // overwriting every entry with the real lifted value.
+    let mut results: Vec<Val> = result_types.iter().map(|_| Val::Bool(false)).collect();
+    func.call(&mut *store, &params, &mut results)?;
+    let mut values = Vec::with_capacity(results.len());
+    for result in &results {
+        values.push(val_to_component_value(result).map_err(wasmtime::Error::msg)?);
+    }
+    Ok(ComponentInvocationResult { values })
 }
 
 fn wit_interface_from_component_name(name: &str) -> WitInterface {

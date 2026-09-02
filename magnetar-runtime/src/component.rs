@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use serde::Deserialize;
@@ -1526,12 +1527,16 @@ pub enum ComponentInterruptionReason {
     Administrative,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+// Not `Eq`: `arguments` can carry `ComponentValue::F64`, and `f64` has no
+// total order/equality, so `ComponentValue` (and everything embedding it)
+// is `PartialEq`-only from here down.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ComponentInvocation {
     pub instance_id: ComponentInstanceId,
     pub interface: WitInterface,
     pub operation: String,
     pub deadline_millis: Option<u64>,
+    pub arguments: Vec<ComponentValue>,
 }
 
 impl ComponentInvocation {
@@ -1545,16 +1550,53 @@ impl ComponentInvocation {
             interface,
             operation: operation.into(),
             deadline_millis: None,
+            arguments: Vec::new(),
         }
+    }
+
+    /// Attaches call arguments (`model-component-graph-contract`): a caller
+    /// invoking a Component export that takes real parameters (not just the
+    /// legacy zero-arg/`u32`-result shape) supplies them here instead of
+    /// mutating `arguments` directly, matching `WitInterface::new`'s
+    /// builder-free-function style.
+    pub fn with_arguments(mut self, arguments: Vec<ComponentValue>) -> Self {
+        self.arguments = arguments;
+        self
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A dynamically-typed WIT value (`model-component-graph-contract`): the
+/// value shape [`ComponentInvocation::arguments`]/[`ComponentInvocationResult`]
+/// carry across the native Component Model boundary, and what a
+/// [`HostCapability`] exchanges with a calling Component. Deliberately not a
+/// 1:1 mirror of every `wasmtime::component::Val` case -- only the shapes
+/// this repo's WIT interfaces (`compute.wit`, `observability.wit`, and the
+/// forthcoming graph-builder interface) actually need: no `map`, `tuple`,
+/// `flags`, `resource`, `future`, `stream`, or `error-context` case, since
+/// nothing here uses those WIT constructs. `Enum` and `Variant` are kept
+/// distinct (rather than collapsing `Enum` into a payload-less `Variant`)
+/// because a Wasmtime `Type::Enum` and `Type::Variant` are different target
+/// shapes when converting back to `wasmtime::component::Val` -- collapsing
+/// them would lose the information needed to pick the right one.
+#[derive(Clone, Debug, PartialEq)]
 pub enum ComponentValue {
+    Bool(bool),
     U32(u32),
+    S64(i64),
+    F64(f64),
+    String(String),
+    List(Vec<ComponentValue>),
+    /// A WIT `record`: field name/value pairs in declaration order.
+    Record(Vec<(String, ComponentValue)>),
+    /// A WIT `variant` case: its name and optional payload.
+    Variant(String, Option<Box<ComponentValue>>),
+    /// A WIT `enum` case: its name (no payload -- an `enum` case never
+    /// carries one; a case that does is a `variant`, represented above).
+    Enum(String),
+    Option(Option<Box<ComponentValue>>),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ComponentInvocationResult {
     pub values: Vec<ComponentValue>,
 }
@@ -1569,6 +1611,25 @@ impl ComponentInvocationResult {
             values: vec![value],
         }
     }
+}
+
+/// A Runtime-provided capability a Component calls into as a host import
+/// (`model-component-graph-contract`): the counterpart to a Component
+/// *export* the Runtime calls (`ComponentEngine::invoke`). `operation` is
+/// the WIT function name within the imported interface; `arguments` are
+/// already the callee's declared parameters, in order, converted from the
+/// Component's own typed call. A capability that rejects a call (invalid
+/// arguments, a semantic violation the capability itself is responsible for
+/// validating) returns `Err`, which the calling engine surfaces to the
+/// Component as a trapped/failed host call -- never a silent default value,
+/// matching this crate's fail-closed posture for every other Provider/Kernel
+/// boundary.
+pub trait HostCapability: Send + Sync {
+    fn call(
+        &self,
+        operation: &str,
+        arguments: &[ComponentValue],
+    ) -> Result<Vec<ComponentValue>, ComponentError>;
 }
 
 pub trait ComponentEngine: Send {
@@ -1598,6 +1659,23 @@ pub trait ComponentEngine: Send {
         reason: ComponentInterruptionReason,
     ) -> Result<(), ComponentError>;
     fn destroy(&mut self, instance: ComponentEngineInstance) -> Result<(), ComponentError>;
+
+    /// Registers a real implementation for a host-provided `WitInterface`
+    /// (`model-component-graph-contract`), so an engine backend that
+    /// actually links Components (`WasmtimeComponentEngine`) can wire a
+    /// Component's import of that interface to `capability`'s real behavior
+    /// instead of a generic conformance stub. Additive and optional, like
+    /// `ProviderExecutionApi`'s defaulted methods: an engine backend that
+    /// never links real Components (`MockComponentEngine`, `WebComponentEngine`)
+    /// has no meaningful behavior to add here, so the default is a no-op
+    /// rather than a required override.
+    fn register_capability(
+        &mut self,
+        interface: WitInterface,
+        capability: Arc<dyn HostCapability>,
+    ) {
+        let _ = (interface, capability);
+    }
 }
 
 #[derive(Default)]
@@ -1776,6 +1854,21 @@ impl ComponentManager {
     pub fn provide_interface(&mut self, interface: WitInterface) {
         self.host_interfaces.insert(interface.clone());
         self.authorized_interfaces.insert(interface);
+    }
+
+    /// Declares `interface` provided (same bookkeeping as
+    /// [`Self::provide_interface`]) *and* wires `capability` as its real
+    /// implementation on the underlying engine backend, so a Component
+    /// importing `interface` calls into real Runtime behavior rather than a
+    /// generic conformance stub. See [`HostCapability`] and
+    /// [`ComponentEngine::register_capability`].
+    pub fn provide_capability(
+        &mut self,
+        interface: WitInterface,
+        capability: Arc<dyn HostCapability>,
+    ) {
+        self.provide_interface(interface.clone());
+        self.engine.register_capability(interface, capability);
     }
 
     pub fn authorize_interface(&mut self, interface: WitInterface) {
