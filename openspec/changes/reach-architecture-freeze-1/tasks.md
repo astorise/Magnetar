@@ -439,15 +439,28 @@ New regression coverage beyond the three tasks above: `tests::e2e_authoritative_
 
 ## 19. Architecture Freeze #1 gate verification
 
-**Status: blocked.** Updated as task groups closed this session: 9 of 19
-groups are now fully done (1, 2, 4, 6, 7, 9, 10, 13, 17), but this gate
-cannot honestly be closed while task groups 5 (partially), 8 (partially),
-11, 12, and 14 remain open — several of `first-native-implementation-cut`'s
+**Status: blocked, but materially closer.** 11 of 19 groups are now fully
+done (1, 2, 4, 6, 7, 9, 10, 13, 15, 17, 18); group 11 is 8/9 (only the
+production cutover and its dependent fail-closed wiring remain). This gate
+still cannot honestly be closed while groups 8 (partially), 11 (partially),
+12, 14, and 16 remain open — several of `first-native-implementation-cut`'s
 `Architecture Freeze #1` AND-conditions (Component supplies real graph
-semantics; Reference CPU and Qwen run from external modules) are not yet
-true, and closing them requires either external submodule-repo content this
-session cannot author, or a new OpenSpec Change (`design.md`'s Change B)
-for the Provider-agnostic tensor value type question. Not attempted.
+semantics *in production*, not just proven in isolation; Reference CPU and
+Qwen run from external modules; a real byte-level Model Artifact format
+exists) are not yet true. Unlike the picture at the start of this session's
+`reach-architecture-freeze-1` work, the remaining gaps are no longer
+"blocked on external content this session cannot author" -- the first real
+Qwen Component now exists and is proven correct, and every submodule
+actually builds under CI. What remains is genuinely large, high-blast-radius
+work each deliberately deferred rather than rushed alongside everything
+else in this pass: wiring the proven Component into the production
+generation path (11.5, touching every one of `first_native_runtime.rs`'s
+graph-production call sites), extracting Reference CPU into `providers/cpu`
+without breaking the ~200 E2E tests that currently obtain their Kernel
+backend from it directly (group 14), and a real byte-level Model Artifact
+format plus GGUF/Safetensors parsers (groups 8's remaining half and 16) --
+the audit's own text already flagged the latter as "arguably large enough
+to warrant its own OpenSpec Change."
 
 - [ ] 19.1 Re-run `magnetar run qwen-test "Hello"` and confirm it exercises every link in the causal chain from CLI through `RuntimeInferenceApi`, Model Loading, `ModelInstance`, the Qwen Component (via the new graph contract), `PreparedExecutionPlan`/`PreparedExecutionPlanExecutor`, `ProviderExecutionApi.submit`, the external CPU Provider, admitted Tensor Resources, Runtime-owned KV Resources, incremental decode, Sampling, and token commit.
 - [ ] 19.2 Confirm every AND-condition in `first-native-implementation-cut`'s `Architecture Freeze #1` requirement holds before flipping that requirement's status from `candidate` to `accepted`.
