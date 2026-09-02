@@ -25,7 +25,9 @@ use crate::execution_graph::{
     ExecutionNodeId, GraphKvCacheBehavior, GraphKvCacheMetadata, GraphModelCompatibility,
     TensorAliasing, TensorEdge, TensorEdgeId,
 };
-use crate::operator::{OperatorAttributeValue, OperatorFamily, OperatorId};
+use crate::operator::{
+    OperatorAttributeValue, OperatorFamily, OperatorId, initial_operator_catalog,
+};
 
 const CAPABILITY_NAME: &str = "magnetar:model-component-graph/graph-builder";
 
@@ -665,6 +667,23 @@ impl GraphBuilderCapability {
             edge.id = output_name.clone();
         }
         graph.edges.insert(output_name, edge);
+        // Component-produced graphs remain untrusted until validated
+        // (Requirement "Component-Produced Graphs Remain Untrusted Until
+        // Validated"): this capability's own per-call checks above catch
+        // structural problems (a missing edge, a duplicate node id) as
+        // they happen, but never checked the *finished* graph against the
+        // portable Operator catalog -- topology, Operator identity/arity,
+        // and attribute schema compliance. `initial_operator_catalog` is
+        // the same generic, Qwen-agnostic catalog `magnetar-runtime`'s own
+        // graph execution already validates against elsewhere.
+        let catalog = initial_operator_catalog();
+        graph.validate(&catalog).map_err(|error| {
+            rejected(
+                CAPABILITY_NAME,
+                instance_key,
+                format!("finish-graph: graph failed Runtime validation: {error}"),
+            )
+        })?;
         let handle = format!("{instance_key}#{}", session.next_handle);
         session.next_handle += 1;
         session.finished.insert(handle.clone(), graph);

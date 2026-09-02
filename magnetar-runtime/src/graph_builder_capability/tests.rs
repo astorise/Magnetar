@@ -269,3 +269,68 @@ fn tied_embeddings_alias_the_lm_head_weight_edge() {
         TensorAliasing::MayAlias(TensorEdgeId::new("weight.token_embedding"))
     );
 }
+
+/// Requirement "Component-Produced Graphs Remain Untrusted Until
+/// Validated": a Component naming an Operator the portable catalog does
+/// not recognize passes every one of this capability's own per-call
+/// structural checks (the edges and node id are all otherwise
+/// well-formed) but must still be rejected by `finish-graph`'s Runtime
+/// validation pass against `initial_operator_catalog`.
+#[test]
+fn finish_graph_rejects_a_graph_using_an_unknown_operator() {
+    let capability = GraphBuilderCapability::new();
+    capability.prepare_session("instance-7", context());
+    capability
+        .call(
+            "instance-7",
+            "begin-graph",
+            &[
+                ComponentValue::Enum("prefill".to_string()),
+                ComponentValue::S64(4),
+                ComponentValue::S64(0),
+            ],
+        )
+        .expect("begin-graph succeeds");
+    let input_edge = capability
+        .call(
+            "instance-7",
+            "declare-input",
+            &[
+                ComponentValue::String("token_ids".to_string()),
+                shape(vec![4]),
+            ],
+        )
+        .expect("declare-input succeeds");
+    let ComponentValue::String(input_edge) = &input_edge[0] else {
+        panic!("expected a string edge id");
+    };
+
+    let node_output = capability
+        .call(
+            "instance-7",
+            "add-node",
+            &[
+                ComponentValue::String("bogus".to_string()),
+                ComponentValue::String("not-a-real-operator".to_string()),
+                ComponentValue::String("Tensor".to_string()),
+                ComponentValue::List(vec![]),
+                ComponentValue::List(vec![ComponentValue::String(input_edge.clone())]),
+                shape(vec![4]),
+                ComponentValue::Option(None),
+            ],
+        )
+        .expect("add-node itself succeeds -- this capability's own structural checks do not know about the Operator catalog");
+    let ComponentValue::String(node_output) = &node_output[0] else {
+        panic!("expected a string edge id");
+    };
+
+    let result = capability.call(
+        "instance-7",
+        "finish-graph",
+        &[ComponentValue::String(node_output.clone())],
+    );
+    assert!(matches!(
+        result,
+        Err(ComponentError::CapabilityCallRejected { .. })
+    ));
+}
