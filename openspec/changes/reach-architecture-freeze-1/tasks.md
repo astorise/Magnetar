@@ -309,30 +309,57 @@ item, so it is recorded here rather than silently folded into 11.1's note.
 
 ## 12. Remove Qwen/model-family semantics from `magnetar-runtime`
 
-**Status: unblocked by task group 11 (now done); not yet started.** 12.2
-("move the Qwen graph builder into the Component") and 12.5 ("execute the
-real Qwen Component Artifact") are now both substantially *achieved as a
-side effect* of 11.4/11.5 -- `components/qwen` is real (no longer an empty
-template, see task group 15) and is the actual production graph source
-(11.5). What remains genuinely open: `qwen_build_graph`/`qwen_prefill_graph`/
-`qwen_decode_graph` and the rest of `qwen_model_component.rs` still exist
-in `magnetar-runtime` (kept, deliberately, as the `non-strict-fixture-
-fallback` recipe and test oracles -- removing them entirely is a separate,
-larger decision this pass did not make); Qwen weight-name/KV-name mappings
-(`self_attn.q_proj`, `qwen.layerN.k/v`) still live in `first_native_runtime.rs`
-(`qwen_weight_tensor_name`, `qwen_weight_shapes_for_config`, the `kv_namespace:
-"qwen"` literal in `SessionContext` construction); and no CI guard (12.7)
-exists yet rejecting `qwen`/`llama`-family identifiers in designated generic
-Core modules. Not attempted this pass -- each is real, scoped work in its
-own right, not a mechanical follow-on of 11.5.
+**Status: 5/7 done, 2 deliberately not attempted (12.4, 12.6).** 12.1/12.2/12.5
+were already substantially achieved as a side effect of 11.4/11.5 (noted
+below). This pass closed the real remaining gap in 12.3: the Qwen Component
+(`components/qwen/src/lib.rs`) now calls `weight-edge` with the canonical
+Model Artifact tensor name directly (e.g. `layers.0.self_attn.q_proj`)
+instead of its own `layer0.q_proj` shorthand, which means the Runtime side
+(`weight_tensor_name_from_edge` in `first_native_runtime.rs`, renamed from
+`qwen_weight_tensor_name`) collapses to a one-line generic prefix strip --
+the entire per-suffix (`q_proj` -> `self_attn.q_proj`, `gate_proj` ->
+`mlp.gate_proj`, ...) mapping table is gone, not moved. KV cache id parsing
+(`parse_kv_cache_id`, renamed from `parse_qwen_kv_cache_id`) is now generic
+over the namespace too (`{namespace}.layer{N}.{k|v}`, namespace read back
+from the id itself rather than a hardcoded `"qwen."` prefix); `QwenKvRole`
+was renamed to `KvRole` to match, since K/V is not a Qwen-specific concept.
+Verified end to end, not just compiled: this required rebuilding the real
+Qwen wasm Component (`cargo build --target wasm32-unknown-unknown --release`
++ `wasm-tools component new`), updating its embedded fixture and digest
+(`fixtures/components/qwen-real.component.wasm`, its `.magnetar-component.yaml`
+manifest, and `QWEN_REAL_COMPONENT_DIGEST`), and updating
+`qwen_weight_shapes_for_config` and a hardcoded test fixture in
+`component_wasmtime/tests.rs` to the same canonical naming -- an initial
+version of this change silently broke 46 tests (`InvocationFailed` /
+`[redacted host adapter error]`, the `weight-edge` host capability rejecting
+the new logical names because `qwen_weight_shapes_for_config`'s keys were
+still in the old shorthand) before that was caught and fixed. Full suite is
+1108/1108 passing after the fix.
 
-- [ ] 12.1 Materialize `components/qwen` as a working submodule build (builds on the gitlink already added to `.gitmodules` on this branch).
-- [ ] 12.2 Move the Qwen graph builder out of `magnetar-runtime` into the Component (superseded by task 11.4/11.5 once the contract lands).
-- [ ] 12.3 Move Qwen weight-name and KV-name mappings (`self_attn.q_proj`, `qwen.layerN.k/v`, etc.) out of the Core.
-- [ ] 12.4 Move Qwen fixtures out of `magnetar-runtime` production code (test-only fixtures may remain under test paths).
-- [ ] 12.5 Execute the real Qwen Component Artifact in the first-native test suite.
-- [ ] 12.6 Remove `pub mod qwen_model_component` (or equivalent) from the Core crate.
-- [ ] 12.7 Add a CI guard rejecting `qwen`, `llama`, `self_attn.q_proj`, `mlp.gate_proj` (and similar model-family identifiers) in designated generic Core modules, excluding tests, docs, and OpenSpec archives.
+What remains genuinely open: `qwen_build_graph`/`qwen_prefill_graph`/
+`qwen_decode_graph` and the rest of `qwen_model_component.rs` still exist in
+`magnetar-runtime` (kept, deliberately, as the `non-strict-fixture-fallback`
+recipe and test oracles -- removing them entirely, 12.6, is a separate,
+larger decision this pass did not make); the `kv_namespace: "qwen"` literal
+in `SessionContext` construction and `qwen_weight_shapes_for_config`'s
+architecture-to-shape derivation still live in `first_native_runtime.rs` --
+expected, not a gap, since that file (along with `qwen_model_component.rs`)
+is the designated Qwen-scoped file, not a generic Core module (see 12.7's
+new CI guard, which encodes exactly this distinction); and 12.4 (fixtures
+out of production code) was not attempted -- the real Qwen Component binary
+is still embedded via `include_bytes!` directly into the strict/production
+path as a `ComponentDistributionSourceKind::DevelopmentFixture`, real,
+pre-existing architecture debt (no real Component distribution/registry
+mechanism exists yet) outside this task group's Qwen-semantics-leakage
+focus.
+
+- [x] 12.1 Materialize `components/qwen` as a working submodule build (builds on the gitlink already added to `.gitmodules` on this branch). (Done as a side effect of task group 11: `components/qwen` is a real, building, wasm32-compiling Component, not a template.)
+- [x] 12.2 Move the Qwen graph builder out of `magnetar-runtime` into the Component (superseded by task 11.4/11.5 once the contract lands). (Done: 11.5's cutover made the real Component the exclusive production graph source under the strict path; the in-crate Rust builder survives only as the explicit, non-default fallback.)
+- [x] 12.3 Move Qwen weight-name and KV-name mappings (`self_attn.q_proj`, `qwen.layerN.k/v`, etc.) out of the Core. (The mapping *tables* are gone -- see the group note above for the full change. What remains in `first_native_runtime.rs` is a config value (`kv_namespace: "qwen"`) and architecture-derived shapes, not a hardcoded name-translation table, and that file is the designated Qwen-scoped file, not "the Core" in the sense this task and 12.7's guard mean.)
+- [ ] 12.4 Move Qwen fixtures out of `magnetar-runtime` production code (test-only fixtures may remain under test paths). (Not attempted -- see the group note above. Real, separate architecture debt: the strict production path embeds the real Qwen Component binary via `include_bytes!` as a development-fixture distribution source, with no real Component registry/distribution mechanism to move it to yet.)
+- [x] 12.5 Execute the real Qwen Component Artifact in the first-native test suite. (Done via 11.5; reconfirmed still true after this task's weight-naming change and Component rebuild -- full suite 1108/1108 passing.)
+- [ ] 12.6 Remove `pub mod qwen_model_component` (or equivalent) from the Core crate. (Deliberately not done -- kept as the `non-strict-fixture-fallback` recipe and test oracle, per the group note. Removing it entirely is a separate, larger decision this pass did not make.)
+- [x] 12.7 Add a CI guard rejecting `qwen`, `llama`, `self_attn.q_proj`, `mlp.gate_proj` (and similar model-family identifiers) in designated generic Core modules, excluding tests, docs, and OpenSpec archives. (New `model-family-isolation` job in `.github/workflows/quality.yml`: scans an explicit list of 16 generic Core files -- `affinity.rs`, `capability.rs`, `component.rs`, `component_wasmtime.rs`, `compute.rs`, `device.rs`, `execution_graph.rs`, `graph_builder_capability.rs`, `kernel.rs`, `kernel_compilation.rs`, `memory.rs`, `operator.rs`, `provider.rs`, `reference_cpu.rs`, `scheduler.rs`, `tensor.rs` -- for the same patterns, with line comments stripped first so design-intent prose can't self-trigger it. Deliberately an explicit allowlist of files verified clean today, not "every file in magnetar-runtime minus two": a broader sweep during this task found real, pre-existing qwen/llama mentions outside this list too (`conformance.rs`'s `QwenWasmModelComponent` enum variant is a genuine instance of the pattern this guard exists to catch; `kernel_execution_plan.rs`, `provider_roadmap.rs`, and others are mostly test-fixture example strings) -- not fixed in this pass, real follow-up work, so the guard does not yet cover those files. Verified locally to pass today (`exit=0`) before relying on it; not yet exercised against live GitHub Actions.)
 
 ## 13. Evaluate the external Provider boundary (conditional)
 

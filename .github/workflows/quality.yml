@@ -210,15 +210,73 @@ jobs:
       - name: Validate OpenSpec artifacts
         run: openspec validate --all --strict
 
+  # Model-family isolation (task group 12 / Correctif 9, task 12.7): the
+  # Provider/Kernel/Device/Memory/Tensor/Component contract files listed
+  # below are the generic Core magnetar-runtime itself depends on for every
+  # model family, not just Qwen -- they must never encode Qwen- or
+  # Llama-specific knowledge (a weight-name suffix table, a hardcoded KV
+  # namespace, an enum variant naming one model family by name). This is a
+  # narrower, explicit allowlist of files verified clean today, not "every
+  # file in magnetar-runtime": a broader sweep during this task found real,
+  # pre-existing qwen/llama mentions in conformance.rs, kernel_execution_plan.rs,
+  # provider_roadmap.rs, and other files outside this list (mostly test-fixture
+  # example strings, but conformance.rs's `QwenWasmModelComponent` enum
+  # variant is a genuine, real instance of the pattern this guard exists to
+  # catch) -- deliberately not fixed in this pass, real follow-up work, so
+  # this guard does not yet cover those files. `first_native_runtime.rs` and
+  # `qwen_model_component.rs` are the two files designated to legitimately
+  # carry Qwen-specific knowledge (see their own doc comments) and are never
+  # in scope for this guard.
+  model-family-isolation:
+    name: quality / model-family isolation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Reject model-family identifiers in generic Core modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='(qwen|llama|self_attn\.[a-z]+_proj|mlp\.(gate|up|down)_proj)'
+          modules=(
+            magnetar-runtime/src/affinity.rs
+            magnetar-runtime/src/capability.rs
+            magnetar-runtime/src/component.rs
+            magnetar-runtime/src/component_wasmtime.rs
+            magnetar-runtime/src/compute.rs
+            magnetar-runtime/src/device.rs
+            magnetar-runtime/src/execution_graph.rs
+            magnetar-runtime/src/graph_builder_capability.rs
+            magnetar-runtime/src/kernel.rs
+            magnetar-runtime/src/kernel_compilation.rs
+            magnetar-runtime/src/memory.rs
+            magnetar-runtime/src/operator.rs
+            magnetar-runtime/src/provider.rs
+            magnetar-runtime/src/reference_cpu.rs
+            magnetar-runtime/src/scheduler.rs
+            magnetar-runtime/src/tensor.rs
+          )
+          fail=0
+          for module in "${modules[@]}"; do
+            # Strip line comments first, so prose explaining genericness
+            # (e.g. "nothing here names Qwen or Llama") cannot itself trip
+            # the guard -- only live code is checked.
+            if sed -E 's#//.*$##' "$module" | grep -nEi "$pattern"; then
+              echo "::error file=$module::model-family identifier found in a designated generic Core module"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
   # Submodule integration (task group 15): checks out components/, formats/,
   # and providers/ submodules and sanity-builds each one independently. Every
   # job above this one checks out without `submodules:`, so the Core clone
-  # and Core CI stay submodule-free by construction, not by convention. Each
-  # submodule is still the default `cargo new --lib` template today (no real
-  # Component/Format/Provider content yet), so this is one consolidated job
-  # rather than the audit's full Component/Format/Provider/Full-conformance
-  # tiers -- split it once each submodule has real, independently meaningful
-  # conformance to run.
+  # and Core CI stay submodule-free by construction, not by convention.
+  # `components/qwen` and `providers/cpu` are real implementations now (task
+  # groups 11 and 14); the rest are still the default `cargo new --lib`
+  # template. This is one consolidated job rather than the audit's full
+  # Component/Format/Provider/Full-conformance tiers -- split it once every
+  # submodule has real, independently meaningful conformance to run.
   submodule-integration:
     name: quality / submodule integration
     runs-on: ubuntu-latest

@@ -333,15 +333,15 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
 
     let mut weight_shapes = BTreeMap::new();
     for (name, dims) in [
-        ("layer0.input_norm", vec![4]),
-        ("layer0.q_proj", vec![4, 4]),
-        ("layer0.k_proj", vec![4, 4]),
-        ("layer0.v_proj", vec![4, 4]),
-        ("layer0.o_proj", vec![4, 4]),
-        ("layer0.post_attn_norm", vec![4]),
-        ("layer0.gate_proj", vec![4, 8]),
-        ("layer0.up_proj", vec![4, 8]),
-        ("layer0.down_proj", vec![8, 4]),
+        ("layers.0.input_norm", vec![4]),
+        ("layers.0.self_attn.q_proj", vec![4, 4]),
+        ("layers.0.self_attn.k_proj", vec![4, 4]),
+        ("layers.0.self_attn.v_proj", vec![4, 4]),
+        ("layers.0.self_attn.o_proj", vec![4, 4]),
+        ("layers.0.post_attn_norm", vec![4]),
+        ("layers.0.mlp.gate_proj", vec![4, 8]),
+        ("layers.0.mlp.up_proj", vec![4, 8]),
+        ("layers.0.mlp.down_proj", vec![8, 4]),
         ("token_embedding", vec![258, 4]),
         ("final_norm", vec![4]),
         ("lm_head", vec![4, 258]),
@@ -403,8 +403,8 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
         crate::TensorAliasing::MayAlias(crate::TensorEdgeId::new("weight.token_embedding"))
     );
     // The K/V edges carry KV cache metadata under the qwen.layer0.{k,v}
-    // namespace `parse_qwen_kv_cache_id` (the existing, still-Qwen-specific
-    // execution path) expects.
+    // namespace `parse_kv_cache_id` (the existing execution path, generic
+    // over the namespace) expects.
     let k_edge = graph
         .edges
         .values()

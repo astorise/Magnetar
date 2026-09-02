@@ -2161,55 +2161,45 @@ fn concat_rows(a: &HostTensor, b: &HostTensor) -> Result<HostTensor, InferenceAp
 // ---------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QwenKvRole {
+enum KvRole {
     K,
     V,
 }
 
-/// Parses a Qwen KV cache identity (`qwen.layer{N}.{k|v}`, see
-/// `qwen_build_graph`'s `cache_metadata` closure) back into a layer index and
-/// K/V role.
-fn parse_qwen_kv_cache_id(cache_id: &str) -> Result<(usize, QwenKvRole), InferenceApiError> {
+/// Parses a KV cache identity (`{namespace}.layer{N}.{k|v}`, produced by
+/// `GraphBuilderCapability::kv_resource` -- see that method's documentation)
+/// back into a layer index and K/V role. Generic over `namespace` rather
+/// than hardcoding one: the Runtime-side `graph-builder` Capability accepts
+/// whatever `kv_namespace` the caller supplies in `SessionContext` (today
+/// always `"qwen"`, since that is the only Model Component that exists),
+/// and this parser only needs to know that a namespace precedes `.layer`,
+/// not which model family chose it.
+fn parse_kv_cache_id(cache_id: &str) -> Result<(usize, KvRole), InferenceApiError> {
     let malformed = || InferenceApiError::GraphPlanningFailed {
         reason: format!("malformed graph KV cache id '{cache_id}'"),
     };
-    let rest = cache_id.strip_prefix("qwen.layer").ok_or_else(malformed)?;
+    let (_namespace, rest) = cache_id.split_once(".layer").ok_or_else(malformed)?;
     let (layer, role) = rest.split_once('.').ok_or_else(malformed)?;
     let layer = layer.parse::<usize>().map_err(|_| malformed())?;
     let role = match role {
-        "k" => QwenKvRole::K,
-        "v" => QwenKvRole::V,
+        "k" => KvRole::K,
+        "v" => KvRole::V,
         _ => return Err(malformed()),
     };
     Ok((layer, role))
 }
 
 /// Maps an execution-graph weight edge id to the canonical Model Loading
-/// tensor name `fixture.weights` is keyed by (see `qwen_expected_tensor_names`),
-/// since the execution graph's edge-id namespace (`weight.layer0.q_proj`) and
-/// the Model Artifact's canonical tensor-name namespace
-/// (`layers.0.self_attn.q_proj`) are declared independently. Returns `None`
-/// for a non-weight edge id.
-fn qwen_weight_tensor_name(edge_id: &str) -> Option<String> {
-    let rest = edge_id.strip_prefix("weight.")?;
-    if rest == "token_embedding" || rest == "final_norm" || rest == "lm_head" {
-        return Some(rest.to_string());
-    }
-    let rest = rest.strip_prefix("layer")?;
-    let (layer, suffix) = rest.split_once('.')?;
-    layer.parse::<u64>().ok()?;
-    let mapped_suffix = match suffix {
-        "input_norm" | "post_attn_norm" => suffix,
-        "q_proj" => "self_attn.q_proj",
-        "k_proj" => "self_attn.k_proj",
-        "v_proj" => "self_attn.v_proj",
-        "o_proj" => "self_attn.o_proj",
-        "gate_proj" => "mlp.gate_proj",
-        "up_proj" => "mlp.up_proj",
-        "down_proj" => "mlp.down_proj",
-        _ => return None,
-    };
-    Some(format!("layers.{layer}.{mapped_suffix}"))
+/// tensor name `fixture.weights` is keyed by (see `qwen_expected_tensor_names`).
+/// A weight edge id is always `weight.{logical_name}` (see
+/// `GraphBuilderCapability::weight_edge`), and the Model Component -- not
+/// the Runtime -- is the one that chooses `logical_name`; the Qwen
+/// Component supplies it already equal to the canonical Model Artifact
+/// tensor name (e.g. `layers.0.self_attn.q_proj`, `token_embedding`), so
+/// this is a plain prefix strip, not a per-model suffix-mapping table.
+/// Returns `None` for a non-weight edge id.
+fn weight_tensor_name_from_edge(edge_id: &str) -> Option<String> {
+    edge_id.strip_prefix("weight.").map(str::to_string)
 }
 
 /// Resolves a graph weight edge to its tensor value by looking up its
@@ -2226,10 +2216,11 @@ fn resolve_qwen_weight_edge(
     tied_embeddings: bool,
     edge_id: &str,
 ) -> Result<HostTensor, InferenceApiError> {
-    let name =
-        qwen_weight_tensor_name(edge_id).ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+    let name = weight_tensor_name_from_edge(edge_id).ok_or_else(|| {
+        InferenceApiError::GraphPlanningFailed {
             reason: format!("graph edge '{edge_id}' is neither a bound input nor a known weight"),
-        })?;
+        }
+    })?;
     let lookup_name = if name == "lm_head" && tied_embeddings {
         "token_embedding"
     } else {
@@ -2855,7 +2846,7 @@ fn execute_qwen_graph_nodes(
             }
         })?;
         if let Some(kv_meta) = &output_edge.kv_cache {
-            let (layer, role) = parse_qwen_kv_cache_id(&kv_meta.cache_id)?;
+            let (layer, role) = parse_kv_cache_id(&kv_meta.cache_id)?;
             if layer >= layer_count {
                 return Err(InferenceApiError::GraphPlanningFailed {
                     reason: format!(
@@ -2877,8 +2868,8 @@ fn execute_qwen_graph_nodes(
                             ),
                         })?;
                 let historical_resource = match role {
-                    QwenKvRole::K => &historical.k,
-                    QwenKvRole::V => &historical.v,
+                    KvRole::K => &historical.k,
+                    KvRole::V => &historical.v,
                 };
                 // Historical KV data is read back from the registered
                 // Provider's storage by resource id (task 7.2/7.3), not from
@@ -2907,8 +2898,8 @@ fn execute_qwen_graph_nodes(
             // token commit succeed; a failure or cancellation before then
             // simply leaves this pending write unpromoted.
             let role_str = match role {
-                QwenKvRole::K => "k",
-                QwenKvRole::V => "v",
+                KvRole::K => "k",
+                KvRole::V => "v",
             };
             let pending_resource =
                 TensorResourceId::new(format!("kv.{kv_cache_id}.layer{layer}.{role_str}.pending"));
@@ -2942,8 +2933,8 @@ fn execute_qwen_graph_nodes(
                 .with_resource(pending_resource.clone()),
             );
             match role {
-                QwenKvRole::K => layer_k[layer] = Some(pending_resource),
-                QwenKvRole::V => layer_v[layer] = Some(pending_resource),
+                KvRole::K => layer_k[layer] = Some(pending_resource),
+                KvRole::V => layer_v[layer] = Some(pending_resource),
             }
         }
         // Written under a resource id derived from the edge itself, not the
@@ -4674,7 +4665,7 @@ const QWEN_GRAPH_COMPONENT_MANIFEST_BYTES: &[u8] =
 const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:b32680777eeec7c055498157dc6a0a554b902dffeacbd7e9f5f82bff9f644f26";
+    "sha256:552bb114838c10f742a1b6b6afade7c3044116826bb31cb33e21b16a2a422feb";
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_BYTES: &[u8] =
     include_bytes!("../fixtures/components/qwen-real.component.wasm");
@@ -4696,13 +4687,16 @@ fn qwen_real_component_package() -> ComponentArtifactPackage {
 }
 
 /// Real per-weight dimensions for `config`'s architecture, keyed by the
-/// same logical name convention `qwen_build_graph` uses internally
-/// (`"layer{N}.q_proj"`, `"token_embedding"`, ...) and the real Qwen
-/// Component's `weight-edge` calls supply. Derived purely from `config`
-/// (the same static architecture metadata `qwen_build_graph` itself reads
-/// to size these edges), not from any bound `TensorResourceId` -- weight
-/// *shape* is architecture metadata, resolving the real bytes behind a
-/// weight edge happens later, at execution time
+/// canonical Model Artifact tensor name (`"layers.{N}.self_attn.q_proj"`,
+/// `"token_embedding"`, ...) -- the same names `fixture.weights` is keyed
+/// by, and what the real Qwen Component's `weight-edge` calls now supply
+/// directly as their logical name (see `components/qwen/src/lib.rs`'s
+/// `weight_tensor_name`), rather than a Component-internal shorthand the
+/// Runtime would need its own mapping table to translate. Derived purely
+/// from `config` (the same static architecture metadata `qwen_build_graph`
+/// itself reads to size these edges), not from any bound `TensorResourceId`
+/// -- weight *shape* is architecture metadata, resolving the real bytes
+/// behind a weight edge happens later, at execution time
 /// (`resolve_qwen_weight_edge`), unaffected by this function.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn qwen_weight_shapes_for_config(config: &QwenConfig) -> BTreeMap<String, Vec<u64>> {
@@ -4720,23 +4714,35 @@ fn qwen_weight_shapes_for_config(config: &QwenConfig) -> BTreeMap<String, Vec<u6
         vec![a.hidden_size, a.vocabulary_size],
     );
     for layer in 0..a.layer_count {
-        let prefix = format!("layer{layer}");
+        let prefix = format!("layers.{layer}");
         shapes.insert(format!("{prefix}.input_norm"), vec![a.hidden_size]);
-        shapes.insert(format!("{prefix}.q_proj"), vec![a.hidden_size, q_dim]);
-        shapes.insert(format!("{prefix}.k_proj"), vec![a.hidden_size, kv_dim]);
-        shapes.insert(format!("{prefix}.v_proj"), vec![a.hidden_size, kv_dim]);
-        shapes.insert(format!("{prefix}.o_proj"), vec![q_dim, a.hidden_size]);
+        shapes.insert(
+            format!("{prefix}.self_attn.q_proj"),
+            vec![a.hidden_size, q_dim],
+        );
+        shapes.insert(
+            format!("{prefix}.self_attn.k_proj"),
+            vec![a.hidden_size, kv_dim],
+        );
+        shapes.insert(
+            format!("{prefix}.self_attn.v_proj"),
+            vec![a.hidden_size, kv_dim],
+        );
+        shapes.insert(
+            format!("{prefix}.self_attn.o_proj"),
+            vec![q_dim, a.hidden_size],
+        );
         shapes.insert(format!("{prefix}.post_attn_norm"), vec![a.hidden_size]);
         shapes.insert(
-            format!("{prefix}.gate_proj"),
+            format!("{prefix}.mlp.gate_proj"),
             vec![a.hidden_size, a.intermediate_size],
         );
         shapes.insert(
-            format!("{prefix}.up_proj"),
+            format!("{prefix}.mlp.up_proj"),
             vec![a.hidden_size, a.intermediate_size],
         );
         shapes.insert(
-            format!("{prefix}.down_proj"),
+            format!("{prefix}.mlp.down_proj"),
             vec![a.intermediate_size, a.hidden_size],
         );
     }
