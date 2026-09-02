@@ -1955,6 +1955,19 @@ impl ComponentManager {
         self.instances.get(&id).map(|instance| instance.state)
     }
 
+    /// The underlying engine instance's own key for `id`
+    /// (`model-component-graph-contract`): needed by a caller that must
+    /// call a [`HostCapability`]'s concrete methods (e.g.
+    /// `GraphBuilderCapability::prepare_session`) directly, keyed the same
+    /// way [`HostCapability::call`] itself is -- the manager-level
+    /// [`ComponentInstanceId`] this method takes is never the key a
+    /// capability sees, only this engine key is.
+    pub fn engine_instance_key(&self, id: ComponentInstanceId) -> Option<&str> {
+        self.instances
+            .get(&id)
+            .map(|instance| instance.engine_instance().engine_key())
+    }
+
     pub fn link_plan(&self, name: &str) -> Result<ComponentLinkPlan, ComponentError> {
         let definition = self
             .definitions

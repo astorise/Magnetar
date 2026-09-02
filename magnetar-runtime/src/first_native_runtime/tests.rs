@@ -763,17 +763,33 @@ fn first_native_dispatch_source_contains_no_provider_downcast() {
     );
 }
 
-/// Static guard (Correctif 7 / task group 10): the Rust-synthesized,
-/// unattested Qwen graph fallback (`qwen_component_graph_semantics_for_prompt`,
-/// used when no real Component engine is available) must only be reachable
-/// from production dispatch entry points when the crate was explicitly
+/// Static guard (Correctif 7 / task group 10; recount at task 11.5): the
+/// Rust-synthesized, unattested Qwen graph fallback (`qwen_component_graph_
+/// semantics_for_prompt`/`build_first_native_graphs_from_component_output`
+/// and the helpers only they use, plus every dispatch entry point's own
+/// fallback branch) must only be reachable when the crate was explicitly
 /// built with `non-strict-fixture-fallback` -- verified by `cargo check
 /// --no-default-features` failing to compile without that feature (see
 /// `Cargo.toml`'s doc comment on it). This guard catches a *weakening* of
 /// that gate (e.g. someone deleting the `feature = "non-strict-fixture-
-/// fallback"` clause from one of the two `#[cfg(...)]` attributes) that
-/// would not itself cause a compile failure under default features, so it
-/// would otherwise go unnoticed by the normal build/test cycle.
+/// fallback"` clause from one of these `#[cfg(...)]` attributes) that would
+/// not itself cause a compile failure under default features, so it would
+/// otherwise go unnoticed by the normal build/test cycle.
+///
+/// 10, not 2, since task 11.5 (the real Qwen Component became the strict,
+/// default graph source) grew this list two ways: one genuine new fallback
+/// *call site* (`first_native_component_graphs_for_prompt`'s own fallback
+/// branch, alongside the original two in `run_success_path_with_prompt` and
+/// `FirstNativeChatSession::turn`), and seven now-fallback-only *helper*
+/// declarations (`qwen_operator_kind_code`, `qwen_graph_operator_codes`,
+/// `qwen_operator_sequence_hash`, `QwenComponentGraphSemantics`'s struct and
+/// impl, `build_first_native_graphs_from_component_output`,
+/// `qwen_component_graph_semantics_for_prompt`) that the strict path no
+/// longer calls at all, so they need `#[cfg(any(test, feature =
+/// "non-strict-fixture-fallback"))]` themselves to avoid being dead code in
+/// a plain (non-test) strict build. Both kinds matter equally to this
+/// guard's actual purpose (nothing here reachable without the explicit
+/// feature or a test), so both are counted together.
 #[test]
 fn first_native_dispatch_fallback_requires_non_strict_fixture_fallback_feature() {
     let source = include_str!("../first_native_runtime.rs");
@@ -781,12 +797,14 @@ fn first_native_dispatch_fallback_requires_non_strict_fixture_fallback_feature()
         .matches("feature = \"non-strict-fixture-fallback\"")
         .count();
     assert_eq!(
-        occurrences, 2,
-        "expected exactly the two documented #[cfg(...)] sites (in \
-         run_success_path_with_prompt and FirstNativeChatSession::turn) to require \
-         `feature = \"non-strict-fixture-fallback\"` alongside the unattested Qwen graph \
-         fallback; found {occurrences}. If a new fallback call site was added, it must be \
-         gated the same way; if one was intentionally removed, lower this count."
+        occurrences, 10,
+        "expected exactly the ten documented #[cfg(...)] sites (three real fallback call \
+         sites in run_success_path_with_prompt, FirstNativeChatSession::turn, and \
+         first_native_component_graphs_for_prompt, plus seven now-fallback-only helper \
+         declarations) to require `feature = \"non-strict-fixture-fallback\"` alongside the \
+         unattested Qwen graph fallback; found {occurrences}. If a new fallback call site or \
+         fallback-only helper was added, it must be gated the same way; if one was \
+         intentionally removed, lower this count."
     );
 }
 

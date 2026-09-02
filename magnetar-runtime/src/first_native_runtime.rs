@@ -19,6 +19,8 @@ use crate::conformance::first_native_model_execution_profile;
 use crate::device::DeviceId;
 use crate::execution_graph::*;
 use crate::generation::*;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+use crate::graph_builder_capability::*;
 use crate::inference_api::*;
 use crate::kernel::*;
 use crate::kernel_artifact::{
@@ -75,9 +77,22 @@ const E2E_FIXTURE_HEAD_DIM: u64 = 2;
 const E2E_FIXTURE_INTERMEDIATE: u64 = 8;
 const E2E_FIXTURE_CONTEXT: u64 = 32;
 const E2E_FIXTURE_LAYERS: u64 = 1;
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+// Task 11.5: the checksum-fixture Component (and everything below tied to
+// it -- QwenComponentPreflight and friends) is no longer part of the
+// production graph-production path, only of tests exercising Component-
+// loading conformance generically. `#[cfg(test)]` reflects that; without it
+// these items are genuinely dead code in a non-test build.
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
 const QWEN_GRAPH_COMPONENT_NAME: &str = "magnetar.qwen.graph-fixture";
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
 const QWEN_GRAPH_COMPONENT_DIGEST: &str =
     "sha256:c95f5ac5c7843991c03543da5d521ee5a2aec14ad6031f6e7cd55d7e2b18078c";
 
@@ -2357,6 +2372,14 @@ fn qwen_rope_head_count(
 /// `prefill-operator-code`/`decode-operator-code` exports). A plain
 /// name-to-code table rather than `OperatorId` equality: the Component
 /// boundary exchanges scalar `u32`s, not portable Operator identities.
+// Task 11.5: this whole checksum-hash family (through
+// `qwen_component_graph_semantics_for_prompt`/`QwenComponentGraphSemantics`/
+// `build_first_native_graphs_from_component_output`) is only reachable from
+// tests and the explicit `non-strict-fixture-fallback` build now -- the
+// strict, default production path gets its graph directly from the real
+// Component instead of cross-checking a Rust-synthesized one against a
+// declared checksum.
+#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
 fn qwen_operator_kind_code(name: &str) -> Option<u32> {
     match name {
         "embedding" => Some(0),
@@ -2375,6 +2398,7 @@ fn qwen_operator_kind_code(name: &str) -> Option<u32> {
 /// dependency order `execute_qwen_graph` executes it in: the semantic
 /// content a Qwen Model Component is expected to reproduce when describing
 /// its own graph (see `qwen_operator_kind_code`).
+#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
 fn qwen_graph_operator_codes(graph: &ExecutionGraph) -> Result<Vec<u32>, E2eConformanceError> {
     let order = qwen_graph_execution_order(graph)?;
     order
@@ -2406,6 +2430,7 @@ fn qwen_graph_operator_codes(graph: &ExecutionGraph) -> Result<Vec<u32>, E2eConf
 /// identical unrolled XOR/multiply steps over its own hard-coded sequence)
 /// and Runtime compares hashes -- a proof over the actual ordered semantic
 /// content, not just a count.
+#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
 fn qwen_operator_sequence_hash(codes: &[u32]) -> u32 {
     const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
     const FNV_PRIME: u32 = 0x0100_0193;
@@ -3719,6 +3744,20 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             let execution_plan = execution_plan.ok_or_else(|| InferenceApiError::GraphPlanningFailed {
                 reason: "first-native execution requires a published prepared execution plan; none was bound for this generation step".into(),
             })?;
+            // Task 11.5: must be the exact same graph-production recipe
+            // `prepare_first_native_execution_plans` used to compute
+            // `execution_plan`'s `graph_fingerprint` -- a graph built any
+            // other way (even one that is logically equivalent to a human
+            // reader) fails `PreparedExecutionPlanExecutor::
+            // prepare_node_execution`'s fingerprint check below with
+            // `PlanValidationFailed`, since that check is deliberately
+            // exact-match, not semantic.
+            // `first_native_component_graphs_for_prompt` is that same
+            // recipe (real Qwen Component under the strict, default build;
+            // the explicit `non-strict-fixture-fallback` recipe otherwise)
+            // -- both are fully deterministic for a given `(fixture,
+            // prompt_token_count)`, so calling it again here reproduces the
+            // identical graph the plan was prepared against.
             let component_graphs = first_native_component_graphs_for_prompt(
                 &self.fixture,
                 request.input_token_ids.len() as u64,
@@ -4604,15 +4643,290 @@ fn require_compatible_first_native_plan(
     Ok(plan.generation)
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
 const QWEN_GRAPH_COMPONENT_BYTES: &[u8] =
     include_bytes!("../fixtures/components/qwen-graph.component.wat");
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
 const QWEN_GRAPH_COMPONENT_MANIFEST_BYTES: &[u8] =
     include_bytes!("../fixtures/components/qwen-graph.component.wat.magnetar-component.yaml");
 
+/// The first real, minimal Qwen Model Component (task 11.4/11.5,
+/// `model-component-graph-contract`): a compiled `components/qwen`
+/// Component binary, built via `cargo build --target wasm32-unknown-unknown
+/// --release` then `wasm-tools component new`. Unlike
+/// [`QWEN_GRAPH_COMPONENT_BYTES`] (a hand-written, imports-free checksum
+/// fixture), this Component genuinely imports `graph-builder` and produces
+/// its graphs through it -- this is what the strict, default production
+/// path (`build_first_native_graphs_from_real_qwen_component`) actually
+/// loads; `QWEN_GRAPH_COMPONENT_BYTES` remains in use only by tests
+/// exercising Component-loading conformance generically (trust, digest,
+/// resource limits), not by anything claiming to produce a real graph.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+const QWEN_REAL_COMPONENT_DIGEST: &str =
+    "sha256:b32680777eeec7c055498157dc6a0a554b902dffeacbd7e9f5f82bff9f644f26";
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+const QWEN_REAL_COMPONENT_BYTES: &[u8] =
+    include_bytes!("../fixtures/components/qwen-real.component.wasm");
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+const QWEN_REAL_COMPONENT_MANIFEST_BYTES: &[u8] =
+    include_bytes!("../fixtures/components/qwen-real.component.wasm.magnetar-component.yaml");
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn qwen_real_component_package() -> ComponentArtifactPackage {
+    ComponentArtifactPackage::new(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        ComponentDigest::parse("sha256", QWEN_REAL_COMPONENT_DIGEST),
+        ComponentDistributionSource::new(
+            ComponentDistributionSourceKind::DevelopmentFixture,
+            QWEN_REAL_COMPONENT_NAME,
+        ),
+    )
+}
+
+/// Real per-weight dimensions for `config`'s architecture, keyed by the
+/// same logical name convention `qwen_build_graph` uses internally
+/// (`"layer{N}.q_proj"`, `"token_embedding"`, ...) and the real Qwen
+/// Component's `weight-edge` calls supply. Derived purely from `config`
+/// (the same static architecture metadata `qwen_build_graph` itself reads
+/// to size these edges), not from any bound `TensorResourceId` -- weight
+/// *shape* is architecture metadata, resolving the real bytes behind a
+/// weight edge happens later, at execution time
+/// (`resolve_qwen_weight_edge`), unaffected by this function.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn qwen_weight_shapes_for_config(config: &QwenConfig) -> BTreeMap<String, Vec<u64>> {
+    let a = &config.architecture;
+    let q_dim = a.attention_head_count * a.head_dimension;
+    let kv_dim = a.kv_head_count * a.head_dimension;
+    let mut shapes = BTreeMap::new();
+    shapes.insert(
+        "token_embedding".to_string(),
+        vec![a.vocabulary_size, a.hidden_size],
+    );
+    shapes.insert("final_norm".to_string(), vec![a.hidden_size]);
+    shapes.insert(
+        "lm_head".to_string(),
+        vec![a.hidden_size, a.vocabulary_size],
+    );
+    for layer in 0..a.layer_count {
+        let prefix = format!("layer{layer}");
+        shapes.insert(format!("{prefix}.input_norm"), vec![a.hidden_size]);
+        shapes.insert(format!("{prefix}.q_proj"), vec![a.hidden_size, q_dim]);
+        shapes.insert(format!("{prefix}.k_proj"), vec![a.hidden_size, kv_dim]);
+        shapes.insert(format!("{prefix}.v_proj"), vec![a.hidden_size, kv_dim]);
+        shapes.insert(format!("{prefix}.o_proj"), vec![q_dim, a.hidden_size]);
+        shapes.insert(format!("{prefix}.post_attn_norm"), vec![a.hidden_size]);
+        shapes.insert(
+            format!("{prefix}.gate_proj"),
+            vec![a.hidden_size, a.intermediate_size],
+        );
+        shapes.insert(
+            format!("{prefix}.up_proj"),
+            vec![a.hidden_size, a.intermediate_size],
+        );
+        shapes.insert(
+            format!("{prefix}.down_proj"),
+            vec![a.intermediate_size, a.hidden_size],
+        );
+    }
+    shapes
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn expect_single_string_invocation_result(
+    result: &ComponentInvocationResult,
+    operation: &str,
+) -> Result<String, E2eConformanceError> {
+    match result.values.as_slice() {
+        [ComponentValue::String(value)] => Ok(value.clone()),
+        values => Err(E2eConformanceError::GraphValidationFailed {
+            reason: format!(
+                "Qwen Component export '{operation}' returned {values:?}, expected a single string"
+            ),
+        }),
+    }
+}
+
+/// Holds the real Qwen Component's compiled artifact and its registered
+/// [`GraphBuilderCapability`], built exactly once per process
+/// (`qwen_real_component_runtime`) and reused across every call to
+/// [`build_first_native_graphs_from_real_qwen_component`] -- compiling a
+/// real (non-trivial) wasm Component is expensive (real, measured cost:
+/// low seconds), while instantiating an already-compiled one and running
+/// it is cheap. Without this cache, every dispatch call in
+/// `execute_generation_step` -- once per generation *step*, not once per
+/// generation -- would recompile the Component from scratch, which was
+/// measured to take a single E2E test from milliseconds to ~28 seconds.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+struct QwenRealComponentRuntime {
+    manager: Mutex<ComponentManager>,
+    capability: Arc<GraphBuilderCapability>,
+    definition: ComponentDefinitionId,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2eConformanceError> {
+    static RUNTIME: std::sync::OnceLock<QwenRealComponentRuntime> = std::sync::OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let capability = Arc::new(GraphBuilderCapability::new());
+    let mut manager = ComponentManager::with_engine(Box::new(
+        crate::component_wasmtime::WasmtimeComponentEngine::new().map_err(|error| {
+            E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            }
+        })?,
+    ));
+    manager.set_resource_limits(qwen_component_runtime_limits());
+    manager
+        .set_trust_store(ComponentTrustStore::default().trust_digest(QWEN_REAL_COMPONENT_DIGEST));
+    let graph_builder_interface =
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.0.0");
+    manager.provide_capability(
+        graph_builder_interface,
+        capability.clone() as Arc<dyn HostCapability>,
+    );
+    let definition = manager
+        .prepare_pushed_package(qwen_real_component_package())
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    // `OnceLock::set` losing a race is not an error here: the losing
+    // thread's freshly-built `manager`/`capability` are simply dropped,
+    // and every caller (winner and losers alike) reads back through
+    // `RUNTIME.get()` afterwards, so they all observe the same instance.
+    let _ = RUNTIME.set(QwenRealComponentRuntime {
+        manager: Mutex::new(manager),
+        capability,
+        definition,
+    });
+    Ok(RUNTIME.get().expect("just set or set by a racing caller"))
+}
+
+/// Builds prefill and decode Execution Graphs by instantiating the real
+/// Qwen Model Component (`QWEN_REAL_COMPONENT_BYTES`, compiled once and
+/// cached -- see [`qwen_real_component_runtime`]) and calling its
+/// `build-prefill-graph`/`build-decode-graph` exports, which produce the
+/// graph through real `graph-builder` host calls into a
+/// [`GraphBuilderCapability`] -- not `qwen_prefill_graph`/`qwen_decode_graph`
+/// (task 11.5: this is the strict, default production path's graph source;
+/// those Rust functions remain only for the explicit, non-default
+/// `non-strict-fixture-fallback` path and test oracles). Returns the
+/// component's own `ComponentDefinitionId`/`ComponentInstanceId` alongside
+/// the graphs so the caller can still emit the same
+/// `ComponentValidated`/`ComponentInstantiated` observations the prior
+/// fixture-checksum path did. Destroys the fresh instance this call
+/// creates before returning -- only the compiled artifact is cached, not
+/// instance state, so nothing accumulates across repeated calls.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn build_first_native_graphs_from_real_qwen_component(
+    fixture: &E2eFixture,
+    prompt_token_count: u64,
+) -> Result<
+    (
+        FirstNativeComponentGraphs,
+        ComponentDefinitionId,
+        ComponentInstanceId,
+    ),
+    E2eConformanceError,
+> {
+    let runtime = qwen_real_component_runtime()?;
+    let mut manager = runtime.manager.lock().unwrap();
+    let capability = &runtime.capability;
+    let definition = runtime.definition;
+
+    let instance = manager
+        .instantiate_prepared_component(definition)
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let result = (|| {
+        let engine_key = manager
+            .engine_instance_key(instance)
+            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
+                reason: "component instance has no engine key".into(),
+            })?
+            .to_string();
+
+        let export_interface = WitInterface::new(
+            "magnetar:model-component-graph/model-component-graph-producer",
+            "1.0.0",
+        );
+        let weight_shapes = qwen_weight_shapes_for_config(&fixture.config);
+        let compatibility_key = qwen_component_compatibility_key(&fixture.identity);
+        let session_context = |weight_shapes: BTreeMap<String, Vec<u64>>| SessionContext {
+            component_id: fixture.identity.id.as_str().to_string(),
+            compatibility_key: compatibility_key.clone(),
+            kv_namespace: "qwen".to_string(),
+            weight_shapes,
+            output_edge_name: "logits".to_string(),
+        };
+
+        capability.prepare_session(&engine_key, session_context(weight_shapes.clone()));
+        let prefill_result = manager
+            .invoke(
+                ComponentInvocation::new(instance, export_interface.clone(), "build-prefill-graph")
+                    .with_arguments(vec![ComponentValue::S64(prompt_token_count.max(1) as i64)]),
+            )
+            .map_err(|error| E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            })?;
+        let prefill_handle =
+            expect_single_string_invocation_result(&prefill_result, "build-prefill-graph")?;
+        let prefill = capability
+            .take_graph(&engine_key, &prefill_handle)
+            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
+                reason: "build-prefill-graph handle did not resolve to a finished graph".into(),
+            })?;
+
+        capability.prepare_session(&engine_key, session_context(weight_shapes));
+        let decode_result = manager
+            .invoke(
+                ComponentInvocation::new(instance, export_interface, "build-decode-graph")
+                    .with_arguments(vec![ComponentValue::S64(prompt_token_count.max(1) as i64)]),
+            )
+            .map_err(|error| E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            })?;
+        let decode_handle =
+            expect_single_string_invocation_result(&decode_result, "build-decode-graph")?;
+        let decode = capability
+            .take_graph(&engine_key, &decode_handle)
+            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
+                reason: "build-decode-graph handle did not resolve to a finished graph".into(),
+            })?;
+
+        validate_first_scope_graph(&prefill)?;
+        validate_first_scope_graph(&decode)?;
+        capability.clear_session(&engine_key);
+        Ok(FirstNativeComponentGraphs {
+            prefill_node_count: prefill.nodes.len(),
+            decode_node_count: decode.nodes.len(),
+            prefill,
+            decode,
+        })
+    })();
+    let _ = manager.destroy_instance(instance);
+    result.map(|graphs| (graphs, definition, instance))
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
 fn qwen_graph_component_package() -> ComponentArtifactPackage {
     ComponentArtifactPackage::new(
         QWEN_GRAPH_COMPONENT_BYTES.to_vec(),
@@ -4625,7 +4939,11 @@ fn qwen_graph_component_package() -> ComponentArtifactPackage {
     )
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
 #[derive(Debug)]
 struct QwenComponentPreflight {
     definition: ComponentDefinitionId,
@@ -4641,6 +4959,7 @@ struct QwenComponentPreflight {
 /// `validate_against_graphs` performs genuine semantic comparison against
 /// the Runtime-built graph rather than proving only that the two graphs
 /// happen to be the same size.
+#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QwenComponentGraphSemantics {
     prefill_node_count: usize,
@@ -4649,6 +4968,7 @@ struct QwenComponentGraphSemantics {
     decode_operator_hash: u32,
 }
 
+#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
 impl QwenComponentGraphSemantics {
     fn validate_against_graphs(
         &self,
@@ -4703,6 +5023,7 @@ struct FirstNativeComponentGraphs {
     decode_node_count: usize,
 }
 
+#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
 fn build_first_native_graphs_from_component_output(
     fixture: &E2eFixture,
     prompt_token_count: u64,
@@ -4733,23 +5054,38 @@ fn build_first_native_graphs_from_component_output(
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn qwen_component_runtime_limits() -> ComponentResourceLimits {
     ComponentResourceLimits {
-        max_memory_bytes: Some(1 << 20),
+        // 8 MiB: the checksum-only fixture Component fit in 1 MiB, but the
+        // real Qwen Component's wit-bindgen-generated glue (String/Vec
+        // allocations across ~19 real graph-builder calls per graph) needs
+        // more just to instantiate (a real minimum-memory requirement, not
+        // this budget being too tight) -- confirmed by running the real
+        // component and observing its actual instantiation requirement
+        // (17 wasm pages, ~1.1 MiB) before choosing this headroom.
+        max_memory_bytes: Some(1 << 23),
         execution_deadline_millis: Some(1_000),
         max_concurrent_invocations: Some(1),
         max_instances: Some(1),
-        engine_execution_budget: Some(100_000),
+        engine_execution_budget: Some(1_000_000),
         require_memory_limit: true,
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
 struct QwenComponentPreflightRequest {
     component_package: ComponentArtifactPackage,
     trust_store: ComponentTrustStore,
     limits: ComponentResourceLimits,
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
 impl QwenComponentPreflightRequest {
     fn default_trusted() -> Self {
         Self {
@@ -4760,7 +5096,11 @@ impl QwenComponentPreflightRequest {
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
 fn invoke_qwen_component_u32(
     manager: &mut ComponentManager,
     instance: ComponentInstanceId,
@@ -4786,7 +5126,11 @@ fn invoke_qwen_component_u32(
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
 fn validate_and_instantiate_qwen_component_before_first_native_planning(
     request: QwenComponentPreflightRequest,
 ) -> Result<QwenComponentPreflight, E2eConformanceError> {
@@ -4855,7 +5199,11 @@ fn validate_and_instantiate_qwen_component_before_first_native_planning(
     })
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
 fn validate_and_instantiate_trusted_qwen_component_before_first_native_planning()
 -> Result<QwenComponentPreflight, E2eConformanceError> {
     validate_and_instantiate_qwen_component_before_first_native_planning(
@@ -5130,6 +5478,7 @@ fn prepare_first_native_execution_plans(
 /// one queried across the Component boundary (the non-component fallback
 /// build, and tests not themselves exercising component/graph mismatch
 /// detection).
+#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
 fn qwen_component_graph_semantics_for_prompt(
     config: &QwenConfig,
     identity: &ModelComponentIdentity,
@@ -5145,12 +5494,29 @@ fn qwen_component_graph_semantics_for_prompt(
     })
 }
 
-/// Builds portable graph semantics for `fixture` at `prompt_token_count`,
-/// the same recipe [`run_success_path_with_prompt`] uses for the
-/// non-component-engine build. Kept separate from that function's
-/// `#[cfg(feature = "wasmtime-component-engine")]` branch so callers that
-/// need plans without a token-bound generation request (conformance checks,
-/// tests) do not depend on that optional feature.
+/// Builds the graphs `execute_generation_step` will dispatch against for
+/// `fixture` at `prompt_token_count` -- the same graph *source* as that
+/// method, not just a semantically-equivalent one, since callers (many
+/// conformance checks and tests) use this to build a
+/// [`PreparedExecutionPlan`] (via [`first_native_plans_for_prompt`]) that
+/// must fingerprint-match whatever graph actually gets dispatched. Task
+/// 11.5: under the strict, default build this is the real Qwen Component
+/// (matching `execute_generation_step`'s own strict branch); the
+/// Rust-synthesized recipe survives only behind the same explicit
+/// `non-strict-fixture-fallback` gate every other fallback site uses.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn first_native_component_graphs_for_prompt(
+    fixture: &E2eFixture,
+    prompt_token_count: u64,
+) -> Result<FirstNativeComponentGraphs, E2eConformanceError> {
+    build_first_native_graphs_from_real_qwen_component(fixture, prompt_token_count)
+        .map(|(graphs, _definition, _instance)| graphs)
+}
+
+#[cfg(all(
+    not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
+    feature = "non-strict-fixture-fallback"
+))]
 fn first_native_component_graphs_for_prompt(
     fixture: &E2eFixture,
     prompt_token_count: u64,
@@ -5265,31 +5631,26 @@ fn run_success_path_with_prompt(
         None,
     )?;
     let mut observer = InferenceApiObserver::new();
+    // Task 11.5: the strict, default path now builds its graphs by calling
+    // the real Qwen Component's `graph-builder` host imports, not
+    // `qwen_prefill_graph`/`qwen_decode_graph`.
     #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
     let component_graphs = {
-        let preflight =
-            validate_and_instantiate_trusted_qwen_component_before_first_native_planning()?;
+        let (graphs, definition, instance) = build_first_native_graphs_from_real_qwen_component(
+            fixture,
+            tokenized.token_ids.len() as u64,
+        )?;
         observer.observe(
             InferenceApiObservationKind::ComponentValidated,
-            format!("component_definition={:?}", preflight.definition),
+            format!("component_definition={definition:?}"),
             None,
         );
         observer.observe(
             InferenceApiObservationKind::ComponentInstantiated,
-            format!("component_instance={:?}", preflight.instance),
+            format!("component_instance={instance:?}"),
             None,
         );
-        let graph_semantics = preflight.graph_semantics;
-        let _component_preflight = (
-            preflight.definition,
-            preflight.instance,
-            preflight.observations.len(),
-        );
-        build_first_native_graphs_from_component_output(
-            fixture,
-            tokenized.token_ids.len() as u64,
-            graph_semantics,
-        )?
+        graphs
     };
     // Correctif 7 / task group 10: this fallback only compiles at all with
     // `non-strict-fixture-fallback` explicitly enabled -- without it, a
@@ -5562,33 +5923,28 @@ impl FirstNativeChatSession {
         .map_err(|error| FirstNativeRuntimeError::from_conformance(error.into()))?;
 
         let mut observer = InferenceApiObserver::new();
+        // Task 11.5: the strict, default path now builds its graphs by
+        // calling the real Qwen Component's `graph-builder` host imports,
+        // not `qwen_prefill_graph`/`qwen_decode_graph`.
         #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
         let component_graphs = {
-            let preflight =
-                validate_and_instantiate_trusted_qwen_component_before_first_native_planning()
-                    .map_err(FirstNativeRuntimeError::from_conformance)?;
+            let (graphs, definition, instance) =
+                build_first_native_graphs_from_real_qwen_component(
+                    &self.fixture,
+                    tokenized.token_ids.len() as u64,
+                )
+                .map_err(FirstNativeRuntimeError::from_conformance)?;
             observer.observe(
                 InferenceApiObservationKind::ComponentValidated,
-                format!("component_definition={:?}", preflight.definition),
+                format!("component_definition={definition:?}"),
                 None,
             );
             observer.observe(
                 InferenceApiObservationKind::ComponentInstantiated,
-                format!("component_instance={:?}", preflight.instance),
+                format!("component_instance={instance:?}"),
                 None,
             );
-            let graph_semantics = preflight.graph_semantics;
-            let _component_preflight = (
-                preflight.definition,
-                preflight.instance,
-                preflight.observations.len(),
-            );
-            build_first_native_graphs_from_component_output(
-                &self.fixture,
-                tokenized.token_ids.len() as u64,
-                graph_semantics,
-            )
-            .map_err(FirstNativeRuntimeError::from_conformance)?
+            graphs
         };
         // Correctif 7 / task group 10: see the sibling fallback in
         // `run_success_path_with_prompt` -- this compiles only with
@@ -8092,14 +8448,13 @@ fn check_generation_loop_executes_published_plan_bindings(
         TokenizationRequest::new(PromptInput::TokenIds(prompt.clone())),
         None,
     )?;
-    let component_graphs = {
-        let semantics = qwen_component_graph_semantics_for_prompt(
-            &fixture.config,
-            &fixture.identity,
-            prompt.len() as u64,
-        )?;
-        build_first_native_graphs_from_component_output(fixture, prompt.len() as u64, semantics)?
-    };
+    // Must be the same graph source `execute_generation_step` itself will
+    // dispatch against (see that function's own doc comment on this exact
+    // requirement) -- this test only cares about the *binding removal*
+    // below producing the expected failure, not which recipe built the
+    // graph, so it uses the same helper every real dispatch path uses
+    // rather than calling the Rust-synthesized recipe directly.
+    let component_graphs = first_native_component_graphs_for_prompt(fixture, prompt.len() as u64)?;
     let mut prepared_plans = prepare_first_native_execution_plans(
         &runtime,
         &instance,
