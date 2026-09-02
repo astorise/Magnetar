@@ -428,13 +428,20 @@ otherwise modified — only a doc comment added explaining this split.
 
 ## 16. Prepare external formats without type leakage
 
-**Status: not applicable yet.** Verified `formats/gguf` and `formats/safetensors`
-(submodules already gitlinked on this branch) each contain nothing but the
-default `cargo new --lib` template (`pub fn add(left: u64, right: u64) -> u64`
-and its test) — no real parser exists to check for type leakage, overflow
-handling, or panic-freedom. Real GGUF/Safetensors parsing is its own,
-separate undertaking (arguably large enough to warrant its own OpenSpec
-Change given the safety requirements involved), not attempted here.
+**Status: scoped into its own OpenSpec Change, not attempted here.**
+Verified `formats/gguf` and `formats/safetensors` (submodules already
+gitlinked on this branch) each contain nothing but the default `cargo new
+--lib` template (`pub fn add(left: u64, right: u64) -> u64` and its test) —
+no real parser exists to check for type leakage, overflow handling, or
+panic-freedom. Per explicit user decision, real GGUF/Safetensors parsing —
+large enough to warrant its own OpenSpec Change given the safety
+requirements involved — is now proposed as
+`implement-model-format-parsers` (proposal/design/specs/tasks all written;
+implementation not started). That change's own non-goals section is
+explicit that it does not by itself complete task group 8's remaining
+8.1/8.2 (wiring a real parser into `Model Loading` itself) — a real parser
+existing and `Model Loading` consuming one are deliberately kept as
+separate decisions.
 
 - [ ] 16.1 Verify GGUF/Safetensors parsers produce only generic types (`ModelArtifact`, `TensorDescriptor`, `QuantizationDescriptor`, normalized tokenizer/model metadata) across the boundary into `magnetar-runtime`. (N/A: no parser exists yet.)
 - [ ] 16.2 Add arithmetic-overflow checks, bounded allocations, checked offsets/tensor sizes, and rejection of overlapping/invalid ranges and absurd dimensions in format parsers. (N/A: no parser exists yet.)
