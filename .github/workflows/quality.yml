@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # rust-toolchain.toml pins the toolchain and its components, so rustup
       # installs exactly that on first use. Installing a different version here
       # would download a toolchain that the toolchain file then overrides.
@@ -40,11 +40,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Check workspace
         run: cargo check --locked --workspace --all-targets --all-features
 
@@ -53,11 +53,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
@@ -70,11 +70,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Run tests
         run: cargo test --locked --workspace --all-targets
 
@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # The declared rust-version floor is only a real claim if something
       # builds against it, so this job deliberately overrides the pinned
       # toolchain instead of using rust-toolchain.toml.
@@ -93,7 +93,7 @@ jobs:
       - name: Install MSRV toolchain
         run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Check workspace against the declared MSRV
         run: cargo +${{ steps.msrv.outputs.version }} check --locked --workspace --all-features
 
@@ -102,9 +102,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install cargo-deny
-        uses: taiki-e/install-action@cargo-deny
+        uses: taiki-e/install-action@04aca1d9d6d82c63188ba3f33b7f820ea39a9197 # cargo-deny
       - name: Check advisories, bans, licenses and sources
         run: cargo deny --all-features check
 
@@ -113,11 +113,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Test Wasmtime Component Engine
         run: cargo test --locked -p magnetar-runtime --all-targets --features wasmtime-component-engine
 
@@ -126,13 +126,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Check wasm32 Component Runtime
         run: cargo check --locked -p magnetar-runtime --target wasm32-unknown-unknown --all-features
 
@@ -141,11 +141,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Run hardware-independent Provider conformance
         run: cargo test --locked -p magnetar-runtime provider_conformance -- --nocapture
 
@@ -154,11 +154,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Run First-Native Runtime Conformance (no GPU required)
         run: cargo test --locked -p magnetar-runtime first_native_runtime -- --nocapture
 
@@ -169,11 +169,11 @@ jobs:
       RUSTDOCFLAGS: -D warnings
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Build workspace documentation
         run: cargo doc --locked --workspace --no-deps
       - name: Build Wasmtime Component Engine documentation
@@ -184,9 +184,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install wasm-tools
-        uses: taiki-e/install-action@wasm-tools
+        uses: taiki-e/install-action@5bc80b59ba0c072ba9c9b28d94f1b8edd87f5138 # wasm-tools
       - name: Validate WIT packages
         shell: bash
         run: |
@@ -204,7 +204,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install OpenSpec
         run: npm install -g @fission-ai/openspec@1.2.0
       - name: Validate OpenSpec artifacts
@@ -224,13 +224,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout with submodules
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Build and test each submodule crate independently
         shell: bash
         run: |
@@ -253,13 +253,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@b1d53d4d726d74b5a950a5b3798a3c6ede4e0f64 # cargo-llvm-cov
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Prepare coverage output
         run: mkdir -p target/llvm-cov
       - name: Generate coverage
@@ -279,7 +279,7 @@ jobs:
         run: cargo run --manifest-path tools/coverage-ratchet/Cargo.toml -- --summary target/llvm-cov/coverage.json quality/coverage-baseline.json >> "$GITHUB_STEP_SUMMARY"
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage
           path: target/llvm-cov/
