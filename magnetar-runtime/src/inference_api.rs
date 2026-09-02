@@ -1004,6 +1004,11 @@ pub(crate) struct RuntimeModelExecutionStep {
     pub(crate) logits: Vec<f32>,
     pub(crate) evidence: RuntimeGenerationExecutionEvidence,
     pub(crate) kv_commit: Option<RuntimeKvCacheCommit>,
+    /// Per-node causal-chain events (Correctif 17 / task group 17) captured
+    /// during this step's graph dispatch, turned into redacted
+    /// `InferenceApiObservation`s by the generation loop that calls
+    /// `execute_generation_step`.
+    pub(crate) node_events: Vec<crate::first_native_runtime::PerNodeCausalEvent>,
 }
 
 impl RuntimeModelExecutionStep {
@@ -1012,11 +1017,20 @@ impl RuntimeModelExecutionStep {
             logits,
             evidence,
             kv_commit: None,
+            node_events: Vec::new(),
         }
     }
 
     pub(crate) fn with_kv_commit(mut self, commit: RuntimeKvCacheCommit) -> Self {
         self.kv_commit = Some(commit);
+        self
+    }
+
+    pub(crate) fn with_node_events(
+        mut self,
+        node_events: Vec<crate::first_native_runtime::PerNodeCausalEvent>,
+    ) -> Self {
+        self.node_events = node_events;
         self
     }
 }
@@ -1562,6 +1576,27 @@ fn run_generation_loop_inner(
                 correlation_id.clone(),
             );
         }
+        // Correctif 17 / task group 17: one real `InferenceApiObservation`
+        // per captured per-node causal event, correlated by `node=...`
+        // (and `resource=...` where the event produces one) in the message
+        // -- not just the five global evidence-category booleans above.
+        // Emitted even on a later failure (the `?`s above only run once
+        // `execute_generation_step` already returned `Ok`, so every event
+        // it did capture before any internal failure is still here).
+        for event in &runtime_step.node_events {
+            let mut context = vec![
+                format!("request={}", request.request_id),
+                format!("node={}", event.node),
+            ];
+            if let Some(resource) = &event.resource {
+                context.push(format!("resource={resource}"));
+            }
+            observer.observe(
+                event.kind,
+                observation_message("per-node causal event", &context),
+                correlation_id.clone(),
+            );
+        }
         if let Err(error) = runtime_step.evidence.clone().validate() {
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
             return Err(error);
@@ -1616,6 +1651,40 @@ fn run_generation_loop_inner(
                 observation_message("kv cache committed", &commit_context),
                 correlation_id.clone(),
             );
+            // Correctif 17 / task group 17: one `KvUpdateCommitted` event
+            // per committed layer/role resource, not just the one aggregate
+            // `KvCacheCommitted` above -- `promote_pending_kv_resources`
+            // (task group 9's `KvUpdateTransaction`) already published these
+            // bindings to `runtime`'s KV cache by the time this runs, so
+            // reading them back here needs no new plumbing through the
+            // commit call itself. Correlated by `TensorResourceId`, not
+            // `ExecutionNodeId`: by commit time (after sampling, a separate
+            // phase from graph dispatch) the specific graph node that
+            // originally produced a given layer's pending write is no
+            // longer tracked, only the resource it left behind.
+            let cache_id = match commit {
+                RuntimeKvCacheCommit::PrefillCompleted { cache, .. }
+                | RuntimeKvCacheCommit::DecodeAppended { cache, .. } => cache,
+            };
+            if let Ok(kv_cache) = runtime.kv_cache(cache_id) {
+                for (layer, binding) in &kv_cache.layer_resources {
+                    for (role, resource) in [("k", &binding.k), ("v", &binding.v)] {
+                        observer.observe(
+                            InferenceApiObservationKind::KvUpdateCommitted,
+                            observation_message(
+                                "kv update committed",
+                                &[
+                                    format!("kv_cache={cache_id}"),
+                                    format!("layer={layer}"),
+                                    format!("role={role}"),
+                                    format!("resource={resource}"),
+                                ],
+                            ),
+                            correlation_id.clone(),
+                        );
+                    }
+                }
+            }
         }
         rng_state = sampling.updated_rng_state;
         generated.push(step.token_id);
@@ -2188,6 +2257,26 @@ pub enum InferenceApiObservationKind {
     StreamInterrupted,
     KvCacheCommitted,
     TokenCommitted,
+    /// Correctif 17 / task group 17: a graph node's inputs are all resolved
+    /// (from `bindings` or a weight edge) and it is about to be dispatched.
+    /// The first per-node event in a node's causal chain.
+    GraphNodeReady,
+    /// The node's `PlanNodeBinding` was resolved from a published
+    /// `PreparedExecutionPlan` via `PreparedExecutionPlanExecutor::prepare_node_execution`.
+    PlanBindingResolved,
+    /// The node's bound `PreparedKernelId` resolved to a currently-active
+    /// `KernelAdvertisement` in the Kernel Registry.
+    PreparedKernelResolved,
+    /// The node's Kernel output was produced and written into the
+    /// registered Provider's storage under a `TensorResourceId`. The last
+    /// per-node event in a node's causal chain.
+    TensorResourceProduced,
+    /// A node's KV-cache-bearing output was written under a *pending*
+    /// resource id (not yet Runtime-owned).
+    KvUpdatePrepared,
+    /// A pending KV update was promoted to the KV cache's committed,
+    /// Runtime-owned state.
+    KvUpdateCommitted,
 }
 
 /// A redacted-by-default observation. `message` MUST NOT contain raw

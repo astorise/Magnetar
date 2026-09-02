@@ -166,8 +166,8 @@ impl Provider for TestProvider {
         self.shut_down.store(true, Ordering::SeqCst);
         Ok(())
     }
-    fn execution_api(&self) -> Option<&dyn ProviderExecutionApi> {
-        self.execution_api.as_deref()
+    fn execution_api(&self) -> Option<Arc<dyn ProviderExecutionApi>> {
+        self.execution_api.clone()
     }
 }
 struct TestProviderExecutionApi {
@@ -7359,7 +7359,7 @@ fn reference_cpu_execution_tracks_output_through_memory_manager() {
 }
 
 #[test]
-fn reference_cpu_emits_memory_feasibility_failed_observation_on_allocation_rejection() {
+fn reference_cpu_denies_dispatch_when_output_admission_is_rejected() {
     let provider = ReferenceCpuProvider::new();
     let executor = provider.executor();
     let advertisements = provider.kernel_advertisements();
@@ -7377,9 +7377,15 @@ fn reference_cpu_emits_memory_feasibility_failed_observation_on_allocation_rejec
 
     let (a_id, a_resource) = reference_cpu_resource("mem-fail-a", [2, 2]);
     let (b_id, b_resource) = reference_cpu_resource("mem-fail-b", [2, 2]);
-    let (_out_id, out_resource) = reference_cpu_resource("mem-fail-out", [2, 2]);
-    executor.write_tensor(a_id, reference_cpu_host_tensor([2, 2], vec![0.0; 4]));
-    executor.write_tensor(b_id, reference_cpu_host_tensor([2, 2], vec![0.0; 4]));
+    let (out_id, out_resource) = reference_cpu_resource("mem-fail-out", [2, 2]);
+    executor.write_tensor(
+        a_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+    );
+    executor.write_tensor(
+        b_id,
+        reference_cpu_host_tensor([2, 2], [5.0, 6.0, 7.0, 8.0]),
+    );
 
     let invocation = KernelInvocation::new(
         KernelInvocationId::new("invocation-memory-fail"),
@@ -7398,12 +7404,344 @@ fn reference_cpu_emits_memory_feasibility_failed_observation_on_allocation_rejec
         &invocation,
         &mut memory,
     );
-    // Kernel execution itself still succeeds (opaque storage is independent);
-    // only the Memory Manager accounting request is rejected.
-    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    // Memory Admission Precedes Provider Materialization: when the declared
+    // output cannot be admitted, the Kernel is never dispatched to the
+    // Provider at all (no numerical work runs, no bytes are written).
+    assert_eq!(result.status, KernelResultStatus::Failed);
+    assert!(executor.read_tensor(&out_id).is_none());
     assert!(executor.observations().iter().any(
         |observation| observation.kind == KernelObservationKind::KernelMemoryFeasibilityFailed
     ));
+    assert!(
+        !executor
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == KernelObservationKind::KernelDispatchStarted)
+    );
+    assert!(memory.allocations().next().is_none());
+}
+
+/// Correctif 1: `write_tensor_admitted` (unlike plain `write_tensor`, which
+/// takes no `MemoryManager` at all) SHALL reject a write whose byte size
+/// cannot be admitted, before the Provider's storage is touched.
+#[test]
+fn reference_cpu_write_tensor_admitted_rejects_write_when_budget_exhausted() {
+    let executor = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::new(MemoryManagerConfig {
+        max_runtime_bytes: Some(1),
+        ..MemoryManagerConfig::default()
+    });
+    let id = TensorResourceId::new("admitted-write-oom");
+    let result = executor.write_tensor_admitted(
+        &mut memory,
+        id.clone(),
+        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+        MemoryAllocationClass::Tensor,
+        MemoryAllocationOwner::Session("test-session".into()),
+    );
+    assert!(
+        result.is_err(),
+        "write must be rejected under an exhausted budget"
+    );
+    assert!(
+        executor.read_tensor(&id).is_none(),
+        "a rejected admission must not materialize the tensor into Provider storage"
+    );
+    assert!(memory.allocations().next().is_none());
+}
+
+/// Correctif 1: writing to the *same* resource id twice through
+/// `write_tensor_admitted` SHALL release the allocation the first write
+/// admitted, not accumulate a second, independent one -- otherwise a
+/// resource id a caller rewrites every generation step (first-native graph
+/// edges, KV-pending writes) would grow the memory ledger unboundedly over
+/// a long-running session even though Provider storage itself does not
+/// grow (each write overwrites the same entry).
+#[test]
+fn reference_cpu_write_tensor_admitted_releases_previous_allocation_for_same_resource_id() {
+    let executor = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let id = TensorResourceId::new("admitted-write-replaced");
+    let owner = || MemoryAllocationOwner::Session("test-session".into());
+
+    executor
+        .write_tensor_admitted(
+            &mut memory,
+            id.clone(),
+            reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+            MemoryAllocationClass::Tensor,
+            owner(),
+        )
+        .expect("first admitted write succeeds");
+    let active_after_first = memory
+        .allocations()
+        .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+        .count();
+    assert_eq!(active_after_first, 1);
+
+    executor
+        .write_tensor_admitted(
+            &mut memory,
+            id.clone(),
+            reference_cpu_host_tensor([2, 2], [5.0, 6.0, 7.0, 8.0]),
+            MemoryAllocationClass::Tensor,
+            owner(),
+        )
+        .expect("second admitted write to the same resource id succeeds");
+    let active_after_second = memory
+        .allocations()
+        .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+        .count();
+    assert_eq!(
+        active_after_second, 1,
+        "the first write's allocation must be released when the second replaces it, \
+         not left active alongside the new one"
+    );
+    assert_eq!(
+        executor
+            .read_tensor(&id)
+            .expect("resource is still present")
+            .data,
+        vec![5.0, 6.0, 7.0, 8.0],
+        "Provider storage must reflect the second write's value"
+    );
+}
+
+#[test]
+fn reference_cpu_releases_admitted_output_reservation_when_kernel_execution_fails() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+
+    let (_a_id, a_resource) = reference_cpu_resource("mem-release-a", [2, 2]);
+    let (_b_id, b_resource) = reference_cpu_resource("mem-release-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("mem-release-out", [2, 2]);
+    // Inputs are intentionally left unwritten so the Kernel itself fails
+    // (`input_tensor` finds no materialized data) after admission already
+    // succeeded, exercising the rollback path rather than the admission
+    // rejection path.
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-memory-release"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource);
+
+    let result = executor.execute_invocation_with_memory_manager(
+        advertisement,
+        operator,
+        &invocation,
+        &mut memory,
+    );
+    assert_eq!(result.status, KernelResultStatus::Failed);
+    assert!(
+        !memory
+            .allocations()
+            .any(|allocation| allocation.state == MemoryAllocationState::Active),
+        "the output reservation admitted before dispatch must be released when the Kernel itself fails"
+    );
+}
+
+#[test]
+fn reference_cpu_kernel_submission_is_causal_and_single_consumption() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+
+    let (a_id, a_resource) = reference_cpu_resource("submit-a", [2, 2]);
+    let (b_id, b_resource) = reference_cpu_resource("submit-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("submit-out", [2, 2]);
+    executor.write_tensor(
+        a_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 0.0, 0.0, 1.0]),
+    );
+    executor.write_tensor(
+        b_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+    );
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-submit"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource);
+
+    assert!(
+        executor.observations().is_empty(),
+        "no dispatch should have happened before submission"
+    );
+
+    // submit_kernel_invocation is what causally triggers the numerical
+    // work; Reference CPU is synchronous, so it has already run by the time
+    // this call returns.
+    let handle =
+        executor.submit_kernel_invocation(advertisement, operator, &invocation, &mut memory);
+    assert!(
+        executor
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == KernelObservationKind::KernelDispatchStarted)
+    );
+
+    let result = executor
+        .complete_kernel_invocation(&handle)
+        .expect("work submitted above is completable exactly once");
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    assert_eq!(result.updated_resources.len(), 1);
+
+    // Single consumption: completing the same handle a second time fails
+    // rather than silently re-reporting the same result.
+    assert!(executor.complete_kernel_invocation(&handle).is_err());
+}
+
+#[test]
+fn reference_cpu_kernel_completion_reports_real_failure_not_false_success() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+
+    let (_a_id, a_resource) = reference_cpu_resource("submit-fail-a", [2, 2]);
+    let (_b_id, b_resource) = reference_cpu_resource("submit-fail-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("submit-fail-out", [2, 2]);
+    // Inputs are intentionally left unwritten so the Kernel itself fails.
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-submit-fail"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource);
+
+    let handle =
+        executor.submit_kernel_invocation(advertisement, operator, &invocation, &mut memory);
+    let result = executor
+        .complete_kernel_invocation(&handle)
+        .expect("a submitted invocation is completable even when the Kernel itself failed");
+    assert_eq!(
+        result.status,
+        KernelResultStatus::Failed,
+        "completion must report the real Kernel failure, not fabricate a success"
+    );
+    assert!(result.error.is_some());
+}
+
+#[test]
+fn reference_cpu_rejects_completion_of_a_handle_that_was_never_submitted() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let fabricated_handle = ProviderExecutionHandle::new(
+        ScheduledOperationId::new(0xDEAD_BEEF),
+        ExecutionPlanId::new("never-submitted-plan"),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        None,
+    );
+    assert!(
+        executor
+            .complete_kernel_invocation(&fabricated_handle)
+            .is_err()
+    );
+    // The generic ProviderExecutionApi surface rejects the same fabricated
+    // handle for the same reason: no submission is associated with it.
+    assert!(ProviderExecutionApi::complete(executor.as_ref(), &fabricated_handle).is_err());
+    assert!(ProviderExecutionApi::status(executor.as_ref(), &fabricated_handle).is_err());
+}
+
+#[test]
+fn reference_cpu_cancellation_is_explicitly_unsupported_not_silently_ignored() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let handle = ProviderExecutionHandle::new(
+        ScheduledOperationId::new(1),
+        ExecutionPlanId::new("cancel-probe-plan"),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        None,
+    );
+    let outcome = ProviderExecutionApi::cancel(executor.as_ref(), &handle).unwrap();
+    assert_eq!(outcome, ProviderCancellationOutcome::Unsupported);
+}
+
+#[test]
+fn reference_cpu_generic_provider_execution_api_completes_exactly_once() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let provider_binding = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+    let plan = ComputeExecutionPlan {
+        id: ExecutionPlanId::new("generic-submit-plan"),
+        trace_id: TraceId::new("trace-generic-submit"),
+        graph: ComputeGraphId::new("generic-submit-graph"),
+        provider: provider_binding.clone(),
+        device: None,
+        capability: CapabilityBinding::new(
+            CapabilityId::new(COMPUTE_CAPABILITY_ID),
+            COMPUTE_CAPABILITY_VERSION,
+        ),
+        policy: ResolutionPolicyId::new("generic-submit-policy"),
+        classification: ComputeExecutionClassification::Transparent,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        constraints: Vec::new(),
+        steps: Vec::new(),
+        memory_plan: MemoryPlan::new(provider_binding.clone(), None, ExecutionContextId::new(0)),
+        diagnostics: Vec::new(),
+        validated: true,
+    };
+    let request = ProviderExecutionRequest {
+        operation: ScheduledOperationId::new(1),
+        plan,
+        provider: provider_binding.clone(),
+        device: None,
+        affinity: ResourceAffinity::new(FallbackClass::Transparent),
+        memory_plan: MemoryPlan::new(provider_binding, None, ExecutionContextId::new(0)),
+        steps: Vec::new(),
+        constraints: Vec::new(),
+    };
+
+    let handle = ProviderExecutionApi::submit(executor.as_ref(), request).unwrap();
+    let status = ProviderExecutionApi::status(executor.as_ref(), &handle).unwrap();
+    assert_eq!(status.state, SchedulingState::Completed);
+    let result = ProviderExecutionApi::complete(executor.as_ref(), &handle).unwrap();
+    assert_eq!(result.state, SchedulingState::Completed);
+    ProviderExecutionApi::release(executor.as_ref(), handle.clone()).unwrap();
+
+    // submit -> status -> complete -> release is now exhausted: neither
+    // status nor a second complete succeeds against the same handle.
+    assert!(ProviderExecutionApi::status(executor.as_ref(), &handle).is_err());
+    assert!(ProviderExecutionApi::complete(executor.as_ref(), &handle).is_err());
 }
 
 #[test]
@@ -8540,6 +8878,7 @@ fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_r
         browser_supported: true,
         kernel_preparation_ready: true,
         autotuning_ready: true,
+        weights_materialized: true,
     };
 
     let error = warm_model_instance(&mut runtime, &instance, &plan, &checks).unwrap_err();

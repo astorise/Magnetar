@@ -309,6 +309,16 @@ pub struct ModelInstanceReadinessChecks {
     /// SHALL set this to the actual completion state when policy requires
     /// tuning (see [`crate::model_instance_autotuning_ready`]).
     pub autotuning_ready: bool,
+    /// Whether this Model Instance's declared weights were successfully
+    /// materialized into Provider-owned Tensor Resources
+    /// (`model-loading-materializes-weight-resources`: "Model Instance
+    /// Readiness" SHALL consider weight materialization state, alongside
+    /// residency/Provider/Device/adapter/memory-pressure/policy/architecture
+    /// readiness). Defaults to `true` so a Model Instance whose caller never
+    /// materializes weights through the generic phase (or has none to
+    /// materialize) is unaffected; a caller that does materialize weights
+    /// SHALL set this from the real success/failure outcome.
+    pub weights_materialized: bool,
 }
 
 impl Default for ModelInstanceReadinessChecks {
@@ -323,6 +333,7 @@ impl Default for ModelInstanceReadinessChecks {
             browser_supported: true,
             kernel_preparation_ready: true,
             autotuning_ready: true,
+            weights_materialized: true,
         }
     }
 }
@@ -335,6 +346,7 @@ impl ModelInstanceReadinessChecks {
             || !self.runtime_policy_allows
             || !self.kernel_preparation_ready
             || !self.autotuning_ready
+            || !self.weights_materialized
         {
             return ModelInstanceReadiness::Failed;
         }
@@ -370,6 +382,9 @@ impl ModelInstanceReadinessChecks {
         }
         if !self.autotuning_ready {
             return Err(ModelInstanceError::ModelInstanceAutotuningIncomplete);
+        }
+        if !self.weights_materialized {
+            return Err(ModelInstanceError::ModelInstanceWeightsNotMaterialized);
         }
         if matches!(
             self.memory_pressure,
@@ -1406,6 +1421,7 @@ pub enum ModelInstanceError {
     ModelInstanceAdapterIncompatible,
     ModelInstanceKernelPreparationFailed,
     ModelInstanceAutotuningIncomplete,
+    ModelInstanceWeightsNotMaterialized,
     ModelInstanceKvCacheInvalidated,
     ModelInstancePrefixCacheInvalidated,
     ModelInstanceBrowserFeatureUnsupported,
@@ -1459,6 +1475,9 @@ impl fmt::Display for ModelInstanceError {
             }
             Self::ModelInstanceAutotuningIncomplete => {
                 f.write_str("model instance required Kernel Autotuning incomplete")
+            }
+            Self::ModelInstanceWeightsNotMaterialized => {
+                f.write_str("model instance weights not materialized")
             }
             Self::ModelInstanceKvCacheInvalidated => {
                 f.write_str("model instance KV cache invalidated")

@@ -4,6 +4,8 @@
 //! rather than Runtime implementation source (task 9.1).
 
 use super::*;
+use crate::planning::*;
+use crate::scheduler::*;
 
 /// The correct prefill/decode Operator-sequence hash for the E2E fixture
 /// architecture (see `qwen_operator_sequence_hash`), computed once and
@@ -235,6 +237,12 @@ fn e2e_no_shortcut_direct_provider_invocation_is_rejected() {
 }
 
 #[test]
+fn e2e_no_shortcuts_rejects_incomplete_per_node_causal_chain() {
+    check_e2e_no_shortcuts_rejects_incomplete_per_node_causal_chain()
+        .expect("incomplete per-node causal chain is rejected");
+}
+
+#[test]
 fn e2e_generation_step_logits_are_produced_by_the_evidence_bearing_dispatch() {
     let fixture = e2e_fixture().expect("fixture builds");
     let runtime = build_runtime();
@@ -392,10 +400,425 @@ fn e2e_graph_dispatch_uses_registered_provider_instance() {
 }
 
 #[test]
+fn e2e_graph_dispatch_rejects_revoked_prepared_kernel() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_graph_dispatch_rejects_revoked_prepared_kernel(&fixture)
+        .expect("graph dispatch refuses a revoked PreparedKernel");
+}
+
+#[test]
+fn e2e_graph_dispatch_ignores_kernel_registry_preference_change_after_plan_publication() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_graph_dispatch_ignores_kernel_registry_preference_change_after_plan_publication(&fixture)
+        .expect(
+            "a Kernel Registry preference change after Plan publication does not affect an \
+             already-published, ready Plan",
+        );
+}
+
+#[test]
+fn e2e_graph_dispatch_rejects_stale_prepared_kernel_generation() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_graph_dispatch_rejects_stale_prepared_kernel_generation(&fixture)
+        .expect("graph dispatch refuses a stale PreparedKernel generation");
+}
+
+#[test]
+fn e2e_graph_dispatch_rejects_provider_binding_mismatch() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_graph_dispatch_rejects_provider_binding_mismatch(&fixture)
+        .expect("graph dispatch refuses a Provider binding mismatch");
+}
+
+/// Non-Reference-CPU Kernel-level `ProviderExecutionApi` implementation used
+/// only to prove that generic resolution (Correctif 3) reaches whatever
+/// Provider Runtime has registered, not specifically `ReferenceCpuExecutor`.
+/// Its "kernel" is a minimal, deterministic copy of the sole input resource
+/// to the sole output resource -- not a real Kernel catalog implementation.
+struct MockKernelExecutor {
+    storage: Mutex<BTreeMap<TensorResourceId, HostTensor>>,
+}
+impl MockKernelExecutor {
+    fn new() -> Self {
+        Self {
+            storage: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+impl ProviderExecutionApi for MockKernelExecutor {
+    fn submit(
+        &self,
+        request: ProviderExecutionRequest,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        Ok(ProviderExecutionHandle::new(
+            request.operation,
+            request.plan.id.clone(),
+            request.provider.clone(),
+            request.device.clone(),
+        ))
+    }
+    fn status(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+        Ok(ProviderExecutionStatus::new(
+            handle.clone(),
+            SchedulingState::Completed,
+        ))
+    }
+    fn cancel(
+        &self,
+        _handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderCancellationOutcome, ProviderExecutionError> {
+        Ok(ProviderCancellationOutcome::Unsupported)
+    }
+    fn complete(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        Ok(ProviderExecutionResult::completed(
+            handle.clone(),
+            Vec::new(),
+        ))
+    }
+    fn release(&self, _handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+        Ok(())
+    }
+    fn submit_kernel(
+        &self,
+        _advertisement: &KernelAdvertisement,
+        _operator: &OperatorSpec,
+        invocation: &KernelInvocation,
+        _memory: &mut MemoryManager,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        if let (Some(input), Some(output)) = (invocation.inputs.first(), invocation.outputs.first())
+        {
+            let tensor = self
+                .storage
+                .lock()
+                .unwrap()
+                .get(&input.resource.id)
+                .cloned();
+            if let Some(tensor) = tensor {
+                self.storage
+                    .lock()
+                    .unwrap()
+                    .insert(output.resource.id.clone(), tensor);
+            }
+        }
+        Ok(ProviderExecutionHandle::new(
+            ScheduledOperationId::new(1),
+            ExecutionPlanId::new(invocation.id.as_str().to_string()),
+            ProviderBinding::new("magnetar:provider/mock-kernel"),
+            None,
+        ))
+    }
+    fn complete_kernel(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<KernelResult, ProviderExecutionError> {
+        Ok(KernelResult::success(KernelInvocationId::new(
+            handle.plan.as_str(),
+        )))
+    }
+    fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) {
+        self.storage.lock().unwrap().insert(id, tensor);
+    }
+    fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
+        self.storage.lock().unwrap().get(id).cloned()
+    }
+    fn write_tensor_value(&self, id: TensorResourceId, value: TensorValue) {
+        if let TensorValue::Host(tensor) = value {
+            self.write_tensor(id, tensor);
+        }
+    }
+    fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
+        self.read_tensor(id).map(TensorValue::Host)
+    }
+}
+
+/// A minimal, non-Reference-CPU Provider execution API implementation that
+/// never exposes host-visible bytes for any resource
+/// (`define-provider-prepared-kernel-execution-contract`): every
+/// `read_tensor_value` answers [`TensorValue::Opaque`], and the
+/// `HostTensor`-typed `read_tensor`/`write_tensor` pair (which this
+/// contract deliberately leaves in place for callers that want it, see
+/// that trait's documentation) is simply never implemented, defaulting to
+/// "nothing". Exists to prove [`TensorValue::into_host`]'s
+/// residency-unavailable error fires against a real, independent
+/// implementation of the Provider-agnostic contract, not only against
+/// Reference CPU (which never produces `Opaque`).
+struct DeviceResidentOnlyExecutor {
+    resources: Mutex<BTreeSet<TensorResourceId>>,
+}
+impl DeviceResidentOnlyExecutor {
+    fn new() -> Self {
+        Self {
+            resources: Mutex::new(BTreeSet::new()),
+        }
+    }
+}
+impl ProviderExecutionApi for DeviceResidentOnlyExecutor {
+    fn submit(
+        &self,
+        request: ProviderExecutionRequest,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        Ok(ProviderExecutionHandle::new(
+            request.operation,
+            request.plan.id.clone(),
+            request.provider.clone(),
+            request.device.clone(),
+        ))
+    }
+    fn status(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+        Ok(ProviderExecutionStatus::new(
+            handle.clone(),
+            SchedulingState::Completed,
+        ))
+    }
+    fn cancel(
+        &self,
+        _handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderCancellationOutcome, ProviderExecutionError> {
+        Ok(ProviderCancellationOutcome::Unsupported)
+    }
+    fn complete(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        Ok(ProviderExecutionResult::completed(
+            handle.clone(),
+            Vec::new(),
+        ))
+    }
+    fn release(&self, _handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+        Ok(())
+    }
+    fn write_tensor_value(&self, id: TensorResourceId, _value: TensorValue) {
+        self.resources.lock().unwrap().insert(id);
+    }
+    fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
+        if self.resources.lock().unwrap().contains(id) {
+            Some(TensorValue::Opaque)
+        } else {
+            None
+        }
+    }
+}
+
+struct MockKernelProvider {
+    executor: Arc<MockKernelExecutor>,
+}
+impl MockKernelProvider {
+    fn new() -> Self {
+        Self {
+            executor: Arc::new(MockKernelExecutor::new()),
+        }
+    }
+}
+impl Provider for MockKernelProvider {
+    fn metadata(&self) -> ProviderMetadata {
+        ProviderMetadata::new(
+            "magnetar:provider/mock-kernel",
+            "0.0.0",
+            "test",
+            "Non-Reference-CPU mock Provider proving generic Kernel dispatch (Correctif 3)",
+        )
+    }
+    fn register(&self, _registry: &mut ProviderRegistry) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    fn execution_api(&self) -> Option<Arc<dyn ProviderExecutionApi>> {
+        Some(self.executor.clone())
+    }
+}
+
+#[test]
+fn provider_execution_generic_resolution_reaches_non_reference_cpu_provider() {
+    let provider_binding = ProviderBinding::new("magnetar:provider/mock-kernel");
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(MockKernelProvider::new()))
+        .build()
+        .expect("mock provider registers cleanly");
+
+    let api = resolve_kernel_execution_provider(&runtime, &provider_binding).expect(
+        "generic resolution finds the registered mock provider without downcasting to a \
+         concrete Provider type",
+    );
+
+    // Borrow an arbitrary, valid advertisement/operator pair from Reference
+    // CPU purely as inert filler: the mock ignores their content entirely,
+    // and constructing one from scratch is not the point of this test.
+    let reference_cpu = ReferenceCpuProvider::new();
+    let advertisement = reference_cpu
+        .kernel_advertisements()
+        .into_iter()
+        .next()
+        .expect("Reference CPU advertises at least one Kernel");
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let input_id = TensorResourceId::new("mock-input");
+    let output_id = TensorResourceId::new("mock-output");
+    let descriptor = TensorDescriptor::materialized(
+        ShapeDescriptor::new([2]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent);
+    api.write_tensor(
+        input_id.clone(),
+        HostTensor::new([2], vec![1.0, 2.0]).unwrap(),
+    );
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("mock-invocation"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        provider_binding.clone(),
+        affinity.clone(),
+    )
+    .with_input(KernelResource::new(
+        TensorResourceDescriptor::new(input_id, descriptor.clone(), affinity.clone()),
+        KernelMemoryClass::Host,
+    ))
+    .with_output(KernelResource::new(
+        TensorResourceDescriptor::new(output_id.clone(), descriptor, affinity),
+        KernelMemoryClass::Host,
+    ));
+
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+    let handle = api
+        .submit_kernel(&advertisement, operator, &invocation, &mut memory)
+        .expect("mock Provider implements Kernel-level submission");
+    let result = api
+        .complete_kernel(&handle)
+        .expect("mock Provider implements Kernel-level completion");
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    let output = api
+        .read_tensor(&output_id)
+        .expect("mock Provider's minimal kernel copied input to output");
+    assert_eq!(output.data, vec![1.0, 2.0]);
+}
+
+/// `define-provider-prepared-kernel-execution-contract`: a Provider that
+/// only ever answers [`TensorValue::Opaque`] (never `Host`) is a valid,
+/// independent implementation of the Provider-agnostic tensor value
+/// contract -- resolved the same generic way as any other Provider
+/// (`Provider::execution_api`, no downcasting), and
+/// [`TensorValue::into_host`] SHALL fail with a structured,
+/// resource-naming error for it rather than panicking or silently
+/// fabricating bytes.
+#[test]
+fn tensor_value_into_host_fails_structurally_for_a_device_resident_only_provider() {
+    let executor = DeviceResidentOnlyExecutor::new();
+    let id = TensorResourceId::new("device-only-resource");
+
+    // Nothing written yet: genuinely absent, distinct from "present but
+    // opaque".
+    assert!(executor.read_tensor_value(&id).is_none());
+
+    executor.write_tensor_value(id.clone(), TensorValue::Opaque);
+    let value = executor
+        .read_tensor_value(&id)
+        .expect("resource is present after being written");
+    assert!(matches!(value, TensorValue::Opaque));
+
+    match value.into_host(&id) {
+        Err(TensorError::ResidencyUnavailable { reason }) => {
+            assert!(
+                reason.contains(id.as_str()),
+                "expected the residency-unavailable error to name the resource id; got: {reason}"
+            );
+        }
+        Err(other) => panic!("expected ResidencyUnavailable, got {other:?}"),
+        Ok(_) => panic!("into_host must not succeed for an Opaque value"),
+    }
+}
+
+/// Static check (Correctif 3 Definition of Done): first-native dispatch
+/// must never recover a concrete Provider type from `&dyn Provider` via
+/// `downcast_ref`. Reads this module's own source text rather than
+/// asserting on run-time behavior, since the property being enforced is the
+/// absence of a coding pattern, not a computed result.
+#[test]
+fn first_native_dispatch_source_contains_no_provider_downcast() {
+    let source = include_str!("../first_native_runtime.rs");
+    assert!(
+        !source.contains("downcast_ref"),
+        "first_native_runtime.rs must not recover a concrete Provider type via \
+         downcast_ref; resolve through ProviderExecutionApi (Provider::execution_api) instead"
+    );
+    assert!(
+        !source.contains("as &dyn std::any::Any") && !source.contains("as &dyn Any"),
+        "first_native_runtime.rs must not cast a Provider reference to dyn Any"
+    );
+}
+
+/// Static guard (Correctif 7 / task group 10): the Rust-synthesized,
+/// unattested Qwen graph fallback (`qwen_component_graph_semantics_for_prompt`,
+/// used when no real Component engine is available) must only be reachable
+/// from production dispatch entry points when the crate was explicitly
+/// built with `non-strict-fixture-fallback` -- verified by `cargo check
+/// --no-default-features` failing to compile without that feature (see
+/// `Cargo.toml`'s doc comment on it). This guard catches a *weakening* of
+/// that gate (e.g. someone deleting the `feature = "non-strict-fixture-
+/// fallback"` clause from one of the two `#[cfg(...)]` attributes) that
+/// would not itself cause a compile failure under default features, so it
+/// would otherwise go unnoticed by the normal build/test cycle.
+#[test]
+fn first_native_dispatch_fallback_requires_non_strict_fixture_fallback_feature() {
+    let source = include_str!("../first_native_runtime.rs");
+    let occurrences = source
+        .matches("feature = \"non-strict-fixture-fallback\"")
+        .count();
+    assert_eq!(
+        occurrences, 2,
+        "expected exactly the two documented #[cfg(...)] sites (in \
+         run_success_path_with_prompt and FirstNativeChatSession::turn) to require \
+         `feature = \"non-strict-fixture-fallback\"` alongside the unattested Qwen graph \
+         fallback; found {occurrences}. If a new fallback call site was added, it must be \
+         gated the same way; if one was intentionally removed, lower this count."
+    );
+}
+
+/// Static guard (Correctif 13 / task group 7): `execute_qwen_graph` used to
+/// require `std::mem::take(runtime.memory_mut())` to get an independent
+/// `&mut MemoryManager` alongside a `&Runtime`; that gap is closed now that
+/// `QwenDispatchContext` holds a single `&mut Runtime` instead of separate
+/// `runtime`/`memory` fields (see its doc comment), so no first-native
+/// dispatch code should call `std::mem::take` on the Runtime memory service
+/// at all. This fails if the pattern reappears -- prefer cloning the
+/// specific value borrowed from `runtime` (e.g. a `KernelAdvertisement`)
+/// instead of taking the whole `MemoryManager`.
+#[test]
+fn first_native_dispatch_never_takes_runtime_memory_manager() {
+    let source = include_str!("../first_native_runtime.rs");
+    let occurrences = source
+        .matches("std::mem::take(runtime.memory_mut())")
+        .count();
+    assert_eq!(
+        occurrences, 0,
+        "expected zero std::mem::take(runtime.memory_mut()) calls in first_native_runtime.rs; \
+         found {occurrences}. Hold a single `&mut Runtime` (see `QwenDispatchContext`) and clone \
+         out any value that must outlive a later `memory_mut()` call instead of taking the whole \
+         MemoryManager."
+    );
+}
+
+#[test]
 fn e2e_graph_dispatch_accounts_outputs_through_runtime_memory_manager() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_graph_dispatch_accounts_outputs_through_runtime_memory_manager(&fixture)
         .expect("graph dispatch accounts outputs through Runtime's MemoryManager");
+}
+
+#[test]
+fn e2e_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage(&fixture)
+        .expect("intermediate graph edges resolve from Provider storage, not a private cache");
 }
 
 #[test]
@@ -417,6 +840,20 @@ fn e2e_weight_binding_rejects_tampered_artifact_bytes() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_weight_binding_rejects_tampered_artifact_bytes(&fixture)
         .expect("model loading rejects a weight artifact with tampered bytes");
+}
+
+#[test]
+fn e2e_weight_materialization_failure_demotes_instance_from_ready() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_weight_materialization_failure_demotes_instance_from_ready(&fixture)
+        .expect("a Model Instance is demoted away from Ready when weight materialization fails");
+}
+
+#[test]
+fn e2e_weight_byte_change_alters_generated_logits() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_weight_byte_change_alters_generated_logits(&fixture)
+        .expect("changing one weight byte changes the generated logits");
 }
 
 #[test]
@@ -1228,6 +1665,12 @@ fn e2e_authoritative_path_collects_correlated_runtime_observations() {
         InferenceApiObservationKind::LogitsProduced,
         InferenceApiObservationKind::SamplingCompleted,
         InferenceApiObservationKind::TokenCommitted,
+        InferenceApiObservationKind::GraphNodeReady,
+        InferenceApiObservationKind::PlanBindingResolved,
+        InferenceApiObservationKind::PreparedKernelResolved,
+        InferenceApiObservationKind::TensorResourceProduced,
+        InferenceApiObservationKind::KvUpdatePrepared,
+        InferenceApiObservationKind::KvUpdateCommitted,
     ] {
         assert!(
             observations
@@ -1236,6 +1679,30 @@ fn e2e_authoritative_path_collects_correlated_runtime_observations() {
             "missing authoritative observation {kind:?}"
         );
     }
+    // Correctif 17 / task group 17: these six are per-*node*, not global --
+    // a real multi-node graph run must produce more than one, each
+    // correlated to a different node, not one repeated event.
+    let distinct_ready_nodes: std::collections::BTreeSet<&str> = observations
+        .iter()
+        .filter(|observation| observation.kind == InferenceApiObservationKind::GraphNodeReady)
+        .filter_map(|observation| {
+            observation
+                .message
+                .split("node=")
+                .nth(1)
+                .map(|rest| rest.split(' ').next().unwrap_or(rest))
+        })
+        .collect();
+    assert!(
+        distinct_ready_nodes.len() > 1,
+        "expected GraphNodeReady for more than one distinct graph node, found: \
+         {distinct_ready_nodes:?}"
+    );
+    assert!(observations.iter().any(|observation| {
+        observation.kind == InferenceApiObservationKind::TensorResourceProduced
+            && observation.message.contains("node=")
+            && observation.message.contains("resource=")
+    }));
     assert!(observations.iter().any(|observation| {
         observation.kind == InferenceApiObservationKind::PlanSelected
             && observation.message.contains("request=e2e-success-path")
@@ -1290,6 +1757,28 @@ fn e2e_kv_cancelled_decode_does_not_corrupt_committed_cache() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_kv_cancelled_decode_does_not_corrupt_committed_cache(&fixture)
         .expect("a cancelled decode's pending KV write does not alter the committed cache");
+}
+
+#[test]
+fn e2e_kv_pending_write_is_memory_admitted_for_its_concatenated_size() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_kv_pending_write_is_memory_admitted_for_its_concatenated_size(&fixture)
+        .expect("decode's concatenated pending KV write is memory-admitted at its real size");
+}
+
+#[test]
+fn e2e_kv_pending_write_allocation_is_released_on_discard() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_kv_pending_write_allocation_is_released_on_discard(&fixture)
+        .expect("discarding a pending KV state releases its admitted allocations");
+}
+
+#[test]
+fn e2e_kv_partial_layer_failure_during_commit_rolls_back_cleanly() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_kv_partial_layer_failure_during_commit_rolls_back_cleanly(&fixture).expect(
+        "a partial-layer commit failure rolls back cleanly, without a mixed-generation cache",
+    );
 }
 
 #[test]

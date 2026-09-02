@@ -475,20 +475,16 @@ pub fn validate_execution_graph(
         GraphObservationKind::GraphValidationStarted,
         graph.id.clone(),
     )];
-    let mut producers: BTreeMap<&TensorEdgeId, &ExecutionNodeId> = BTreeMap::new();
 
     for edge in graph.edges.values() {
         if matches!(edge.aliasing, super::execution_graph::TensorAliasing::MayAlias(ref aliased) | super::execution_graph::TensorAliasing::MustAlias(ref aliased) if !graph.edges.contains_key(aliased))
         {
             return Err(GraphError::AliasingInvalid(edge.id.clone()));
         }
-        if let Some(producer) = &edge.producer {
-            if producers.insert(&edge.id, producer).is_some() {
-                return Err(GraphError::DuplicateProducer(edge.id.clone()));
-            }
-            if !graph.nodes.contains_key(producer) {
-                return Err(GraphError::NodeMissing(producer.clone()));
-            }
+        if let Some(producer) = &edge.producer
+            && !graph.nodes.contains_key(producer)
+        {
+            return Err(GraphError::NodeMissing(producer.clone()));
         }
         for consumer in &edge.consumers {
             if !graph.nodes.contains_key(consumer) {
@@ -503,6 +499,49 @@ pub fn validate_execution_graph(
             ));
         }
     }
+
+    // `node.inputs`/`node.outputs` are the authoritative topology
+    // (Correctif 6): derive the true producer/consumer map from them and
+    // reject a graph whose separately-settable `TensorEdge::producer`/
+    // `::consumers` metadata was populated but disagrees with it, rather
+    // than letting two topology representations silently diverge. A graph
+    // producer that leaves `producer`/`consumers` unpopulated (the common
+    // case today) is unaffected -- only an explicitly wrong value is
+    // rejected. `derive_edge_producers` also rejects an edge that two
+    // different nodes both list as an output.
+    let derived_producers = derive_edge_producers(graph)?;
+    for edge in graph.edges.values() {
+        if let Some(declared) = &edge.producer {
+            match derived_producers.get(&edge.id) {
+                Some(derived) if *derived == declared => {}
+                _ => {
+                    return Err(GraphError::LifecycleInvalid(format!(
+                        "edge '{}' declares producer '{declared}', which does not match any node's outputs",
+                        edge.id
+                    )));
+                }
+            }
+        }
+    }
+    let derived_consumers = derive_edge_consumers(graph);
+    for edge in graph.edges.values() {
+        if edge.consumers.is_empty() {
+            continue;
+        }
+        let derived: BTreeSet<&ExecutionNodeId> =
+            derived_consumers.get(&edge.id).cloned().unwrap_or_default();
+        let declared: BTreeSet<&ExecutionNodeId> = edge.consumers.iter().collect();
+        if declared != derived {
+            return Err(GraphError::LifecycleInvalid(format!(
+                "edge '{}' declares consumers that do not match any node's inputs",
+                edge.id
+            )));
+        }
+    }
+    // Reject a cycle (or a node input with no resolvable producer among
+    // remaining unscheduled nodes) as part of validation itself, not only
+    // when a caller happens to also plan the graph.
+    topological_order(graph)?;
 
     for node in graph.nodes.values() {
         let spec = catalog
@@ -740,7 +779,43 @@ fn validate_node_affinity(node: &ExecutionNode, graph: &ExecutionGraph) -> Resul
     Ok(())
 }
 
+/// Derives each edge's producing node from `node.outputs` -- the
+/// authoritative topology (Correctif 6) -- rather than the separately
+/// settable `TensorEdge::producer` field, which a graph producer MAY leave
+/// unpopulated or let drift out of sync with the node list.
+fn derive_edge_producers(
+    graph: &ExecutionGraph,
+) -> Result<BTreeMap<&TensorEdgeId, &ExecutionNodeId>, GraphError> {
+    let mut producers: BTreeMap<&TensorEdgeId, &ExecutionNodeId> = BTreeMap::new();
+    for (node_id, node) in &graph.nodes {
+        for output in &node.outputs {
+            if let Some(existing) = producers.insert(output, node_id)
+                && existing != node_id
+            {
+                return Err(GraphError::DuplicateProducer(output.clone()));
+            }
+        }
+    }
+    Ok(producers)
+}
+
+/// Derives each edge's consuming nodes from `node.inputs` -- the
+/// authoritative topology (Correctif 6) -- rather than the separately
+/// settable `TensorEdge::consumers` field.
+fn derive_edge_consumers(
+    graph: &ExecutionGraph,
+) -> BTreeMap<&TensorEdgeId, BTreeSet<&ExecutionNodeId>> {
+    let mut consumers: BTreeMap<&TensorEdgeId, BTreeSet<&ExecutionNodeId>> = BTreeMap::new();
+    for (node_id, node) in &graph.nodes {
+        for input in &node.inputs {
+            consumers.entry(input).or_default().insert(node_id);
+        }
+    }
+    consumers
+}
+
 fn topological_order(graph: &ExecutionGraph) -> Result<Vec<ExecutionNodeId>, GraphError> {
+    let edge_producers = derive_edge_producers(graph)?;
     let mut remaining = graph.nodes.keys().cloned().collect::<BTreeSet<_>>();
     let mut order = Vec::with_capacity(remaining.len());
     while !remaining.is_empty() {
@@ -749,11 +824,9 @@ fn topological_order(graph: &ExecutionGraph) -> Result<Vec<ExecutionNodeId>, Gra
             .find(|node_id| {
                 let node = &graph.nodes[*node_id];
                 node.inputs.iter().all(|edge_id| {
-                    graph
-                        .edges
+                    edge_producers
                         .get(edge_id)
-                        .and_then(|edge| edge.producer.as_ref())
-                        .is_none_or(|producer| !remaining.contains(producer))
+                        .is_none_or(|producer| !remaining.contains(*producer))
                 })
             })
             .cloned();

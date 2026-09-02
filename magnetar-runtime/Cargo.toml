@@ -14,6 +14,15 @@ rust-version = "1.98"
 default = ["wasmtime-component-engine"]
 wasmtime-component-engine = ["dep:wasmtime"]
 web-component-engine = []
+# Correctif 7 / task group 10: without this feature, a build lacking a real
+# Component engine (`wasmtime-component-engine` off, or the `wasm32` target,
+# which has no Wasmtime engine at all) fails to compile rather than silently
+# falling back to an unattested, Rust-synthesized graph -- first-native
+# generation must fail closed without a Component, not fail open. Enable
+# this only for genuinely non-strict uses (fixture-driven conformance
+# checks, local experimentation without Wasmtime installed); it is not
+# implied by any other feature, including `web-component-engine`.
+non-strict-fixture-fallback = []
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

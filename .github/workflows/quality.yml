@@ -210,6 +210,44 @@ jobs:
       - name: Validate OpenSpec artifacts
         run: openspec validate --all --strict
 
+  # Submodule integration (task group 15): checks out components/, formats/,
+  # and providers/ submodules and sanity-builds each one independently. Every
+  # job above this one checks out without `submodules:`, so the Core clone
+  # and Core CI stay submodule-free by construction, not by convention. Each
+  # submodule is still the default `cargo new --lib` template today (no real
+  # Component/Format/Provider content yet), so this is one consolidated job
+  # rather than the audit's full Component/Format/Provider/Full-conformance
+  # tiers -- split it once each submodule has real, independently meaningful
+  # conformance to run.
+  submodule-integration:
+    name: quality / submodule integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+      - name: Build and test each submodule crate independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manifest in \
+            components/qwen/Cargo.toml \
+            components/llama/Cargo.toml \
+            formats/gguf/Cargo.toml \
+            formats/safetensors/Cargo.toml \
+            providers/cpu/Cargo.toml \
+            providers/cuda/Cargo.toml
+          do
+            echo "::group::$manifest"
+            cargo test --locked --manifest-path "$manifest"
+            echo "::endgroup::"
+          done
+
   coverage:
     name: quality / coverage
     runs-on: ubuntu-latest

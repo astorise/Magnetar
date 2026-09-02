@@ -2149,7 +2149,7 @@ impl Runtime {
         provider: &ProviderBinding,
         device: Option<&DeviceBinding>,
         phase: ProviderExecutionPhase,
-    ) -> Result<&dyn ProviderExecutionApi, ProviderExecutionError> {
+    ) -> Result<Arc<dyn ProviderExecutionApi>, ProviderExecutionError> {
         self.validate_provider_execution_bindings(provider, device, phase)?;
         let provider_ref = self.providers.provider(provider.as_str()).ok_or_else(|| {
             ProviderExecutionError::new(
