@@ -3,6 +3,26 @@
 //! portable semantics before optimized Providers (CUDA, Metal, OpenVINO, QNN,
 //! WebGPU) define behavior.
 //!
+//! # In-crate test double, not the sole implementation
+//!
+//! The `providers/cpu` submodule (crate `magnetar-provider-cpu`) now holds
+//! the real, externally-consumable extraction of this same implementation
+//! (task group 14 / Correctif 15), depending on this crate's public
+//! contracts rather than the reverse. This in-crate copy is kept
+//! deliberately, not as leftover debt: magnetar-runtime's own ~1000-test
+//! suite instantiates [`ReferenceCpuExecutor`] directly as its generic test
+//! double, and migrating that suite onto an external crate dependency was
+//! judged not worth the churn versus keeping a small in-crate copy. The two
+//! implementations are independent and never reference each other. Three
+//! types straddle the boundary the other direction: [`HostTensor`],
+//! [`ReferenceCpuError`], and [`ReferenceCpuErrorCode`] are still what
+//! [`crate::provider::ProviderExecutionApi`]'s `write_tensor`/`read_tensor`/
+//! `write_tensor_admitted` are typed against (a provisional pre-Resource-based
+//! transport, task group 5), so `providers/cpu` imports magnetar-runtime's
+//! copies of exactly those three rather than redefining them -- everything
+//! else in `providers/cpu` (kernels, [`ReferenceCpuExecutor`],
+//! [`ReferenceCpuProvider`], SIMD detection) is its own, independent code.
+//!
 //! Tensor storage is Provider-owned and opaque to the rest of the Runtime, the
 //! same way any other Provider's device buffers would be: the Kernel Contract
 //! and Memory Manager only see resource identity and accounting, never raw

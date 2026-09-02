@@ -342,24 +342,49 @@ own right, not a mechanical follow-on of 11.5.
 
 ## 14. Extract Reference CPU into `providers/cpu` (after task 13 resolves)
 
-**Status: unblocked by task group 13 but not started.** This is a real
-crate split across a repository boundary (moving `ReferenceCpuProvider`,
-its kernels, and `HostTensor` out of `magnetar-runtime` into the
-`providers/cpu` submodule, then wiring a cross-repository dependency back
-onto `magnetar-runtime`'s contracts) — a large, high-blast-radius change
-deliberately not attempted alongside the in-crate refactors in this pass.
-It also has a real prerequisite this session surfaced: task group 5's
-Resource-based rewrite should land first, since `HostTensor` is currently
-still the transport type the generic dispatch trait (`ProviderExecutionApi`)
-carries (see task 3.3), and extracting `HostTensor` into a separate crate
-before that is resolved would just move the same layering problem across a
-repository boundary instead of fixing it.
+**Status: 4/5 done (14.5 N/A — see its note).** Chosen architecture, decided
+via explicit user arbitration (`AskUserQuestion`, "Double généraliste
+minimal in-crate"): `magnetar-runtime` keeps a small in-crate copy of
+`reference_cpu.rs` as the generic test double its ~1000-test suite
+instantiates directly (unchanged, still exactly what it was); `providers/cpu`
+becomes the real, independent extraction, depending on `magnetar-runtime`'s
+contracts, never referenced back. Not a literal file move — a duplicated,
+repositioned implementation, deliberately, because migrating magnetar-runtime's
+entire existing test suite onto an external crate dependency was judged not
+worth the churn.
 
-- [ ] 14.1 Keep Provider traits, Device contracts, Kernel contracts, Kernel Registry, Provider loading/orchestration, and generic conformance in `magnetar-runtime`.
-- [ ] 14.2 Move `ReferenceCpuProvider`, CPU kernels, `HostTensor`/private CPU storage, SIMD detection, and CPU conformance into `providers/cpu`.
-- [ ] 14.3 Verify the dependency direction is `providers/cpu -> magnetar-runtime` contracts only, never the reverse in the generic Core.
-- [ ] 14.4 Verify `magnetar-runtime` compiles and tests without the `providers/cpu` crate present.
-- [ ] 14.5 Verify the first-native integration suite loads and registers the external CPU Provider and still passes.
+This surfaced a real, previously undocumented coupling this session's own
+prerequisite note anticipated but didn't fully specify: `HostTensor` is not
+purely Reference-CPU-private. `magnetar-runtime/src/provider.rs`'s
+`ProviderExecutionApi::write_tensor`/`read_tensor`/`write_tensor_admitted`
+are typed directly against it as the trait's still-provisional (task group
+5) host-tensor-shaped transport — confirmed by direct compilation, not
+assumption: an initial mechanical copy that redefined `HostTensor` locally
+in `providers/cpu` failed with `E0053`/`E0308` (`ReferenceCpuExecutor`'s
+`impl ProviderExecutionApi` requires the one canonical
+`magnetar_runtime::HostTensor` the trait signature names, not a same-named
+local struct). `HostTensor::new`/`rows_cols` in turn return
+`ReferenceCpuError` (inherent impls must live in the defining crate, so this
+follows automatically), and `magnetar-runtime`'s own
+`impl From<ReferenceCpuError> for KernelError` cannot be duplicated in
+`providers/cpu` either way (Rust's orphan rule forbids
+`impl ForeignTrait for ForeignType`, and `KernelError` is foreign to
+`providers/cpu` regardless of where `ReferenceCpuError` lives). Resolution:
+`providers/cpu` imports `HostTensor`, `ReferenceCpuError`, and
+`ReferenceCpuErrorCode` from `magnetar_runtime` (already `pub`, already
+re-exported at its crate root) instead of redefining them — the smallest set
+of types actually forced to be shared. Everything else (`ReferenceCpuFeatureFlags`,
+all numeric kernels, `ReferenceCpuExecutor`, `ReferenceCpuProvider`, SIMD
+detection, conformance reporting) is `providers/cpu`'s own, independent
+code, matching magnetar-runtime's in-crate copy in behavior but sharing no
+types with it. `magnetar-runtime/src/reference_cpu.rs` itself was not
+otherwise modified — only a doc comment added explaining this split.
+
+- [x] 14.1 Keep Provider traits, Device contracts, Kernel contracts, Kernel Registry, Provider loading/orchestration, and generic conformance in `magnetar-runtime`. (Unchanged; `magnetar-runtime` still owns all of it, including its own in-crate `reference_cpu.rs` test double.)
+- [x] 14.2 Move `ReferenceCpuProvider`, CPU kernels, `HostTensor`/private CPU storage, SIMD detection, and CPU conformance into `providers/cpu`. (Duplicated-with-repositioning, not moved — see the group note. `HostTensor` itself stays magnetar-runtime-owned, imported by `providers/cpu`, for the reason above; everything else genuinely lives only in `providers/cpu` now as a real, independent implementation.)
+- [x] 14.3 Verify the dependency direction is `providers/cpu -> magnetar-runtime` contracts only, never the reverse in the generic Core. (`providers/cpu/Cargo.toml` depends on `magnetar-runtime` via a relative path dependency; `magnetar-runtime/Cargo.toml` has no dependency on `providers/cpu` and no code in `magnetar-runtime` references the `magnetar-provider-cpu` crate.)
+- [x] 14.4 Verify `magnetar-runtime` compiles and tests without the `providers/cpu` crate present. (True by construction under this architecture — `magnetar-runtime` never references `providers/cpu` — and reverified directly: full `magnetar-runtime` suite still 1108/1108 passing, `cargo fmt --check` and `cargo doc --lib --no-deps` both clean, after `providers/cpu`'s extraction and the new doc comment in `reference_cpu.rs`.)
+- [ ] 14.5 Verify the first-native integration suite loads and registers the external CPU Provider and still passes. (N/A under this architecture: `magnetar-runtime`'s first-native integration suite deliberately never loads `providers/cpu` — it uses the in-crate test double, per the group note. `providers/cpu` has its own standalone verification instead: `cargo build`/`test --lib` (9/9 passing, including the bit-identical-to-oracle matmul/attention conformance tests), `cargo clippy --lib --tests -- -D warnings` (clean), `cargo fmt --check` (clean), and `cargo check --target wasm32-unknown-unknown --no-default-features --features magnetar-runtime/non-strict-fixture-fallback` (clean — the feature combination required because `magnetar-runtime` is fail-closed on `wasm32` without either `wasmtime-component-engine`, gated off there, or this fallback feature).
 
 ## 15. Materialize and CI-integrate submodules
 
