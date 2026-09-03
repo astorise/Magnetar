@@ -8896,64 +8896,21 @@ fn model_instance_definition() -> ModelInstanceDefinition {
     }
 }
 
-/// Binds one real, Provider-backed weight to `instance` and reaches
-/// `Ready` through `warm_model_instance` -- the only way an external
-/// caller now can (Correctif: Runtime-owned ModelInstance readiness
-/// authority). Requires a `ReferenceCpuProvider` already registered on
-/// `runtime` and `instance`'s placement pinned to it.
+/// Materializes one real, Runtime-issued-evidence-backed weight for
+/// `instance` through `materialize_model_instance_weights` -- the one
+/// legitimate way any caller (production or an external embedder) can turn
+/// weight bytes into bound, Ready-eligible resources
+/// (`bind-model-loading-evidence-to-validated-artifact`). This alone
+/// reaches `Ready`: the underlying transaction commits bindings, mints
+/// materialization evidence, and marks the instance Ready in one step, the
+/// same as the real production path -- a separate follow-up
+/// `warm_model_instance` call is not just redundant but would fail (no
+/// `Ready -> Ready` lifecycle transition exists). Requires a
+/// `ReferenceCpuProvider` already registered on `runtime` and `instance`'s
+/// placement pinned to it.
 fn reach_ready_with_real_weight(runtime: &mut Runtime, instance: &ModelInstanceId) {
-    let allocation = runtime
-        .memory_mut()
-        .allocate(MemoryAllocationRequest::new(
-            MemoryAllocationClass::Tensor,
-            1,
-            MemoryPlacement::HostOrdinary,
-            MemoryAllocationOwner::InferenceArtifact("test".into()),
-        ))
-        .unwrap();
-    let weight_resource = TensorResourceId::new(format!("test.weight.{instance}"));
-    let executor = runtime
-        .providers()
-        .provider(REFERENCE_CPU_PROVIDER_NAME)
-        .and_then(|provider| provider.execution_api())
-        .unwrap();
-    executor.write_tensor(
-        weight_resource.clone(),
-        HostTensor::new([1], [0.0]).unwrap(),
-    );
-    runtime
-        .memory_mut()
-        .record_tensor_residency(
-            TensorResidency::new(
-                weight_resource.clone(),
-                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
-                    REFERENCE_CPU_PROVIDER_NAME,
-                )),
-                ResourceAffinity::new(FallbackClass::Transparent)
-                    .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
-            )
-            .with_allocation(allocation.id),
-        )
-        .unwrap();
-    runtime
-        .model_instances_mut()
-        .instance_mut(instance)
-        .unwrap()
-        .definition
-        .resource_bindings
-        .weights
-        .insert("weight".into(), weight_resource);
-    let plan = ModelInstanceWarmupPlan {
-        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
-        steps: Vec::new(),
-    };
-    warm_model_instance(
-        runtime,
-        instance,
-        &plan,
-        &ModelInstanceReadinessChecks::default(),
-    )
-    .unwrap();
+    let weights = BTreeMap::from([("weight".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(runtime, instance, "test", &weights).unwrap();
 }
 
 #[test]
@@ -9064,8 +9021,16 @@ fn inference_api_resume_model_instance_revalidates_and_rejects_stale_evidence() 
 /// test 25 "Inventaire incomplet": a manifest declaring multiple mandatory
 /// tensors, with only some of them bound, must not reach Ready even
 /// though every bound entry is individually real (residency-backed,
-/// Provider-written). Round 2's fix only checked that whatever *was*
-/// bound was real; it never checked the bound set was *complete*.
+/// Provider-written, and -- since `bind-model-loading-evidence-to-
+/// validated-artifact` -- Runtime-evidenced). Round 2's fix only checked
+/// that whatever *was* bound was real; it never checked the bound set was
+/// *complete*. Materializes "weight.a" for real through the one authorized
+/// transaction (which has no knowledge of `required_weight_names` --
+/// that's `derive_effective_readiness_checks`'s own concern -- so it marks
+/// the instance Ready on its own terms); a subsequent `warm_model_instance`
+/// re-derivation must then find the mandatory inventory still incomplete
+/// and demote it, the same defense-in-depth property the resume-
+/// revalidation test above proves for stale residency.
 #[test]
 fn inference_api_warm_model_instance_rejects_incomplete_mandatory_weight_inventory() {
     let mut runtime = Runtime::builder()
@@ -9081,46 +9046,10 @@ fn inference_api_warm_model_instance_rejects_incomplete_mandatory_weight_invento
         BTreeSet::from(["weight.a".to_string(), "weight.b".to_string()]);
     let instance = runtime.model_instances_mut().create(definition).unwrap();
 
-    // Bind and really materialize only "weight.a" -- "weight.b" stays
-    // entirely absent.
-    let allocation = runtime
-        .memory_mut()
-        .allocate(MemoryAllocationRequest::new(
-            MemoryAllocationClass::Tensor,
-            1,
-            MemoryPlacement::HostOrdinary,
-            MemoryAllocationOwner::InferenceArtifact("test".into()),
-        ))
-        .unwrap();
-    let resource_a = TensorResourceId::new("test.weight.a");
-    let executor = runtime
-        .providers()
-        .provider(REFERENCE_CPU_PROVIDER_NAME)
-        .and_then(|provider| provider.execution_api())
-        .unwrap();
-    executor.write_tensor(resource_a.clone(), HostTensor::new([1], [0.0]).unwrap());
-    runtime
-        .memory_mut()
-        .record_tensor_residency(
-            TensorResidency::new(
-                resource_a.clone(),
-                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
-                    REFERENCE_CPU_PROVIDER_NAME,
-                )),
-                ResourceAffinity::new(FallbackClass::Transparent)
-                    .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
-            )
-            .with_allocation(allocation.id),
-        )
-        .unwrap();
-    runtime
-        .model_instances_mut()
-        .instance_mut(&instance)
-        .unwrap()
-        .definition
-        .resource_bindings
-        .weights
-        .insert("weight.a".into(), resource_a);
+    // Really materialize only "weight.a" -- "weight.b" stays entirely
+    // absent.
+    let weights = BTreeMap::from([("weight.a".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
 
     let plan = ModelInstanceWarmupPlan {
         policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
@@ -9145,7 +9074,14 @@ fn inference_api_warm_model_instance_rejects_incomplete_mandatory_weight_invento
 /// but with no matching `Provider::write_tensor` ever having run must not
 /// count as materialized. Round 2's fix only checked a residency record
 /// existed; it did not check the Provider it claims to describe actually
-/// holds the tensor.
+/// holds the tensor. **Mechanism note (`bind-model-loading-evidence-to-
+/// validated-artifact`):** this scenario now also fails the newer
+/// evidence-matching check (no `MaterializationEvidence` exists for a
+/// hand-constructed binding at all, regardless of whether `write_tensor`
+/// ran) -- kept as its own test anyway since it demonstrates the
+/// `TensorResidency`-presence check on a *different* axis than evidence
+/// does (residency answers "is it still resident now", not "did an
+/// authorized transaction produce it").
 #[test]
 fn inference_api_warm_model_instance_rejects_residency_without_provider_write() {
     let mut runtime = Runtime::builder()
@@ -9450,6 +9386,266 @@ fn inference_api_warm_model_instance_reaches_ready_when_weights_and_provider_are
             .acquire_usage(&instance, 0)
             .is_ok()
     );
+}
+
+/// `bind-model-loading-evidence-to-validated-artifact`: a weight binding
+/// assembled by hand -- real Memory Manager allocation, real
+/// `Provider::write_tensor` call, real `TensorResidency` record, real
+/// binding -- but never produced by `WeightMaterializationTransaction`
+/// itself must not count as materialized, because no
+/// `MaterializationEvidence` exists for it. This is the general property
+/// the audit's `bind_fake_weight`-in-`contract_tests` finding demonstrated
+/// concretely: every individual piece of state a caller can construct with
+/// ordinary public/`pub(crate)` access looks legitimate, but the one thing
+/// a caller cannot fabricate without the real transaction is Runtime-issued
+/// evidence.
+#[test]
+fn inference_api_warm_model_instance_rejects_hand_assembled_binding_without_evidence() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    let allocation = runtime
+        .memory_mut()
+        .allocate(MemoryAllocationRequest::new(
+            MemoryAllocationClass::Tensor,
+            1,
+            MemoryPlacement::HostOrdinary,
+            MemoryAllocationOwner::InferenceArtifact("test".into()),
+        ))
+        .unwrap();
+    let resource_id = TensorResourceId::new("test.weight.hand-assembled");
+    let executor = runtime
+        .providers()
+        .provider(REFERENCE_CPU_PROVIDER_NAME)
+        .and_then(|provider| provider.execution_api())
+        .unwrap();
+    executor.write_tensor(resource_id.clone(), HostTensor::new([1], [0.0]).unwrap());
+    runtime
+        .memory_mut()
+        .record_tensor_residency(
+            TensorResidency::new(
+                resource_id.clone(),
+                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+                    REFERENCE_CPU_PROVIDER_NAME,
+                )),
+                ResourceAffinity::new(FallbackClass::Transparent)
+                    .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+            )
+            .with_allocation(allocation.id),
+        )
+        .unwrap();
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), resource_id);
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// `bind-model-loading-evidence-to-validated-artifact`: materialization
+/// evidence is looked up by the instance's own id, so Model Instance B
+/// cannot become materialized by having its weight bindings set to match
+/// Model Instance A's already-legitimately-materialized bindings -- B's
+/// lookup only ever finds evidence `commit` minted for B's own id (none),
+/// regardless of what A's evidence says.
+#[test]
+fn inference_api_warm_model_instance_rejects_bindings_copied_from_another_instance() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition_a = model_instance_definition();
+    definition_a.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance_a = runtime.model_instances_mut().create(definition_a).unwrap();
+    reach_ready_with_real_weight(&mut runtime, &instance_a);
+
+    let mut definition_b = model_instance_definition();
+    definition_b.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance_b = runtime.model_instances_mut().create(definition_b).unwrap();
+
+    // Copy A's already-legitimate bindings directly onto B -- the exact
+    // "reuse another instance's materialization" scenario the audit's own
+    // "Artifact mismatch" test asks for, here proven for same-artifact
+    // reuse across two distinct instances (the stronger, more general
+    // case: even identical bindings for the identical artifact do not
+    // transfer, because evidence is instance-scoped, not artifact-scoped).
+    let copied_weights = runtime
+        .model_instance(&instance_a)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .clone();
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance_b)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights = copied_weights;
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance_b,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status_b = model_instance_status(&runtime, &instance_b).unwrap();
+    assert_ne!(status_b.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status_b.readiness.accepts_generation());
+    // A remains legitimately Ready throughout -- this is not a mutation of
+    // A's own state, only B reading A's (still-valid) bindings.
+    assert_eq!(
+        model_instance_status(&runtime, &instance_a)
+            .unwrap()
+            .lifecycle,
+        ModelInstanceLifecycleState::Ready
+    );
+}
+
+/// `bind-model-loading-evidence-to-validated-artifact`: materialization
+/// evidence records the `ModelArtifactId` that was current when it was
+/// minted; if a Model Instance's declared artifact later differs from what
+/// its evidence recorded, the evidence no longer matches and readiness
+/// must reject it. `artifact` has no dedicated setter, but the field
+/// remains `pub` on `ModelInstanceDefinition` -- unlike `resource_bindings`,
+/// reassigning it can only ever make otherwise-valid evidence stop
+/// matching (fail closed), never let a caller borrow a *different*
+/// instance's evidence, since evidence lookup is keyed by instance id, not
+/// artifact id (see the previous test). Proven directly here rather than
+/// left as a hypothetical.
+#[test]
+fn inference_api_warm_model_instance_rejects_evidence_after_artifact_reassignment() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+    reach_ready_with_real_weight(&mut runtime, &instance);
+    assert_eq!(
+        model_instance_status(&runtime, &instance)
+            .unwrap()
+            .lifecycle,
+        ModelInstanceLifecycleState::Ready
+    );
+
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .artifact = ModelArtifactId::new(
+        ModelArtifactKind::ModelWeights,
+        ModelName::new("qwen").unwrap(),
+        ModelRevision::new("2-different".to_string()).unwrap(),
+        ModelDigest::sha256(b"different weights"),
+    );
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// `bind-model-loading-evidence-to-validated-artifact`: closes the
+/// companion P1 the same audit round identified -- a Provider that never
+/// implements host-memory tensor readback (`read_tensor` always returning
+/// `None`, its documented default) must still be able to reach
+/// `weights_materialized: true` through the authorized transaction, since
+/// readiness derivation no longer calls `read_tensor` at all.
+/// `TestProviderExecutionApi` does not override `write_tensor`/
+/// `read_tensor`, so it inherits the trait's real default bodies -- a
+/// faithful stand-in for a device-only Provider, not a mock that merely
+/// asserts it was never called.
+#[test]
+fn inference_api_warm_model_instance_reaches_ready_without_provider_read_tensor_support() {
+    let mut provider = TestProvider::new(REFERENCE_CPU_PROVIDER_NAME);
+    provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    // Confirm this Provider genuinely does not support host readback,
+    // rather than assuming the trait default -- if a future change to
+    // `TestProviderExecutionApi` overrides `read_tensor`, this assertion
+    // (not just the one below) would catch that this test no longer tests
+    // what it claims to.
+    let probe_resource = TensorResourceId::new("probe");
+    let executor = runtime
+        .providers()
+        .provider(REFERENCE_CPU_PROVIDER_NAME)
+        .and_then(|provider| provider.execution_api())
+        .unwrap();
+    executor.write_tensor(probe_resource.clone(), HostTensor::new([1], [0.0]).unwrap());
+    assert!(executor.read_tensor(&probe_resource).is_none());
+
+    let weights = BTreeMap::from([("weight".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(status.readiness.accepts_generation());
 }
 
 /// Implements `runtime-owned-model-instance-readiness-authority` round 2,

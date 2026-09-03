@@ -177,6 +177,60 @@ under-closes the general property. Read-only public accessors are added if
 and when `cargo build --tests` shows a real external caller needs one
 (none does today per the Context grep).
 
+## Implementation Corrections
+
+Found during implementation, not anticipated by the plan above -- recorded
+here rather than silently reconciled, matching this session's standing
+practice of not letting a plan's own gaps go unacknowledged:
+
+**`weights_materialized` keeps a `TensorResidency`-presence check alongside
+evidence matching; it does not drop residency checking entirely.**
+Evidence alone is a *historical* fact (a legitimate transaction once
+committed these bindings) and does not by itself prove the resource is
+*still* resident right now -- something else could release it afterward
+(unload of a related resource, eviction, a rollback elsewhere). This
+matters concretely: `harden-model-instance-readiness-proof`'s resume-
+revalidation test proves that state regressing during suspension (a
+weight's `TensorResidency` being removed) must make `resume_model_instance`
+fail. Evidence-matching alone would not catch this (the evidence itself
+does not change), so residency-presence stays as a second, independent
+check. What evidence *replaces* is only the `read_tensor` Provider-storage
+readback call -- the part that actually depended on `HostTensor`/host-CPU-
+shaped readback and needed replacing to close the P1. `TensorResidency`
+itself is not Provider-specific and needless to remove.
+
+**`materialize_model_instance_weights` bundles bind + evidence + `mark_ready`
+in one call (matching the pre-existing production contract), so a caller
+cannot follow it with a separate `warm_model_instance` call -- doing so
+attempts an invalid `Ready -> Ready` lifecycle transition and fails.**
+`contract_tests/model_instance.rs`'s `bind_fake_weight`/`reach_ready` and
+one direct call site needed their trailing `warm_model_instance` calls
+removed as a result (replaced with a direct `lifecycle()` assertion where
+one was asserting anything at all). Not a design flaw so much as the
+proposal's "Ready-eligible resources" phrasing being read two ways in
+advance; resolved by matching the actual, unchanged production contract
+rather than inventing a non-bundled variant that would have added a second
+public entrypoint for no real benefit (nothing in this crate needs a
+"materialized but not yet Ready" state as a first-class API surface --
+every current caller wants one or the other, not both in sequence).
+
+**`ModelInstanceDefinition` gained a second narrow public method,
+`track_memory_allocation`, alongside `bind_fake_weight`'s migration.** One
+`contract_tests` fixture tracked an out-of-band `MemoryAllocationId` (for
+unload-accounting purposes, unrelated to weight materialization) by direct
+field assignment; sealing `resource_bindings` broke it. Since this method
+does not touch `weights` or materialization evidence, it cannot be used to
+forge `weights_materialized` and does not reopen any part of this Change's
+threat model.
+
+**`LoadedModelContext`/`ModelLoadingResidencyPlan` needed four new public
+read-only accessors (`state()`, `plan()`, `quantization_handling()`,
+`memory_placements()`) the Context section's grep did not find**, because
+that grep matched a `loaded.<field>` variable-name pattern and
+`contract_tests/model_loading.rs` reads through a variable named `context`
+instead. All four are read-only, mirror the existing `lifecycle()`/
+`readiness()` precedent, and touch nothing forgery-relevant.
+
 ## Risks / Trade-offs
 
 - [Risk] Byte-content provenance remains unverified generically (see

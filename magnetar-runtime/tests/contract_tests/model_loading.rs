@@ -119,18 +119,18 @@ fn loading_creates_runtime_owned_ready_context_without_raw_handles() {
         .load(request, &manifest, &trusted(), &mut memory)
         .unwrap();
 
-    assert_eq!(context.state, ModelLoadingState::Ready);
+    assert_eq!(context.state(), ModelLoadingState::Ready);
     assert!(context.can_start_inference());
-    assert!(!context.plan.has_raw_native_handles());
+    assert!(!context.plan().has_raw_native_handles());
     assert_eq!(
-        context.plan.quantization_handling,
-        ModelQuantizationHandling::DequantizeAtLoad(
+        context.plan().quantization_handling(),
+        &ModelQuantizationHandling::DequantizeAtLoad(
             magnetar_runtime::ModelQuantizationFormat::GgufQ4K
         )
     );
     assert_eq!(
-        context.plan.memory_placements,
-        vec![ModelResidencyLocation::Host]
+        context.plan().memory_placements(),
+        &[ModelResidencyLocation::Host]
     );
     assert_eq!(memory.allocations().count(), 1);
     assert!(

@@ -255,29 +255,48 @@ pub enum ModelQuantizationHandling {
     ProviderSpecificTransform(ModelQuantizationFormat),
 }
 
+/// Runtime-issued: producible only as part of a `LoadedModelContext`
+/// returned by `ModelLoadingCoordinator::load()`. Fields are `pub(crate)`,
+/// not `pub` -- an external caller SHALL NOT be able to construct or
+/// mutate one directly and pass it off as evidence Model Loading actually
+/// ran (`bind-model-loading-evidence-to-validated-artifact`, closing a gap
+/// an external audit of PR #36 found: every field here was previously
+/// `pub`, with no crate-internal constructor).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelLoadingResidencyPlan {
-    pub artifact: ModelArtifactId,
-    pub architecture: ModelArchitecture,
-    pub target_compute_dtype: Option<ModelDType>,
-    pub storage_dtype: Option<ModelDType>,
-    pub quantization_handling: ModelQuantizationHandling,
-    pub shard_placement: ModelShardingPolicy,
-    pub memory_placements: Vec<ModelResidencyLocation>,
-    pub provider_binding: Option<ProviderBinding>,
-    pub device_binding: Option<DeviceBinding>,
-    pub required_data_movement: Vec<String>,
-    pub temporary_workspace_bytes: u64,
-    pub expected_resident_bytes: u64,
-    pub loading_phases: Vec<ModelLoadingPhase>,
-    pub fallback_options: Vec<String>,
-    pub unload_policy: ModelUnloadPolicy,
-    pub diagnostics: Vec<String>,
+    pub(crate) artifact: ModelArtifactId,
+    pub(crate) architecture: ModelArchitecture,
+    pub(crate) target_compute_dtype: Option<ModelDType>,
+    pub(crate) storage_dtype: Option<ModelDType>,
+    pub(crate) quantization_handling: ModelQuantizationHandling,
+    pub(crate) shard_placement: ModelShardingPolicy,
+    pub(crate) memory_placements: Vec<ModelResidencyLocation>,
+    pub(crate) provider_binding: Option<ProviderBinding>,
+    pub(crate) device_binding: Option<DeviceBinding>,
+    pub(crate) required_data_movement: Vec<String>,
+    pub(crate) temporary_workspace_bytes: u64,
+    pub(crate) expected_resident_bytes: u64,
+    pub(crate) loading_phases: Vec<ModelLoadingPhase>,
+    pub(crate) fallback_options: Vec<String>,
+    pub(crate) unload_policy: ModelUnloadPolicy,
+    pub(crate) diagnostics: Vec<String>,
 }
 
 impl ModelLoadingResidencyPlan {
     pub fn has_raw_native_handles(&self) -> bool {
         false
+    }
+
+    /// How this plan handles quantization. Read-only: see the struct-level
+    /// doc comment for why `quantization_handling` is not a public field.
+    pub fn quantization_handling(&self) -> &ModelQuantizationHandling {
+        &self.quantization_handling
+    }
+
+    /// Where this plan places residency. Read-only: see the struct-level
+    /// doc comment for why `memory_placements` is not a public field.
+    pub fn memory_placements(&self) -> &[ModelResidencyLocation] {
+        &self.memory_placements
     }
 }
 
@@ -474,24 +493,47 @@ impl From<ModelArtifactError> for ModelLoadingError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Runtime-issued: the only way to obtain one is a successful
+/// `ModelLoadingCoordinator::load()` call. Fields are `pub(crate)`, not
+/// `pub` -- an external caller SHALL NOT be able to construct one directly
+/// and pass it to `Runtime::create_model_instance()` claiming Model Loading
+/// (and the trust/digest validation it performs) ran when it did not
+/// (`bind-model-loading-evidence-to-validated-artifact`, closing a gap an
+/// external audit of PR #36 found: every field here was previously `pub`,
+/// with no crate-internal constructor). Public read-only accessors are
+/// added only if a real external caller needs to inspect a field after
+/// loading -- `can_start_inference()` below already covers the one known
+/// need.
 pub struct LoadedModelContext {
-    pub residency: ModelResidencyId,
-    pub request: ModelLoadingRequestId,
-    pub artifact: ModelArtifactId,
-    pub state: ModelLoadingState,
-    pub plan: ModelLoadingResidencyPlan,
-    pub allocation: Option<MemoryAllocation>,
-    pub partial: bool,
+    pub(crate) residency: ModelResidencyId,
+    pub(crate) request: ModelLoadingRequestId,
+    pub(crate) artifact: ModelArtifactId,
+    pub(crate) state: ModelLoadingState,
+    pub(crate) plan: ModelLoadingResidencyPlan,
+    pub(crate) allocation: Option<MemoryAllocation>,
+    pub(crate) partial: bool,
     /// Tensor names the loaded `ModelManifest` declares. Carried through to
     /// `ModelInstanceDefinition::required_weight_names` so weight-readiness
     /// derivation can check the full mandatory inventory is bound, not only
     /// that whatever happens to be bound has residency (Correctif:
     /// Runtime-owned ModelInstance readiness authority, round 3). Empty for
     /// a manifest that declares no tensors.
-    pub required_weight_names: std::collections::BTreeSet<String>,
+    pub(crate) required_weight_names: std::collections::BTreeSet<String>,
 }
 
 impl LoadedModelContext {
+    /// Current loading state. Read-only: see the struct-level doc comment
+    /// for why `state` is not a public field.
+    pub const fn state(&self) -> ModelLoadingState {
+        self.state
+    }
+
+    /// The residency plan Model Loading produced. Read-only: see the
+    /// struct-level doc comment for why `plan` is not a public field.
+    pub const fn plan(&self) -> &ModelLoadingResidencyPlan {
+        &self.plan
+    }
+
     pub const fn can_start_inference(&self) -> bool {
         matches!(
             self.state,

@@ -469,36 +469,56 @@ fn derive_effective_readiness_checks(
     // Non-empty alone is not proof: a caller with mutable access to
     // `resource_bindings.weights` could insert an arbitrary
     // `TensorResourceId` that was never actually staged through
-    // `WeightMaterializationTransaction`. Two independent checks close
-    // that further than round 2's residency-presence check alone
-    // (Correctif: Runtime-owned ModelInstance readiness authority, round
-    // 3):
+    // `WeightMaterializationTransaction`. Round 3-5 closed this by reading
+    // the resource back from its residency's claimed Provider via
+    // `read_tensor` -- proof that *some* bytes exist there, but not proof
+    // *this instance's own authorized transaction* put them there (a
+    // caller retaining ordinary public access to `write_tensor`/
+    // `record_tensor_residency` could still assemble a passing state by
+    // hand, confirmed concretely by this crate's own `contract_tests`
+    // `bind_fake_weight` helper doing exactly that). Two independent checks
+    // close this for real (`bind-model-loading-evidence-to-validated-
+    // artifact`):
     //
-    // 1. Every bound resource must resolve to a real, currently-written
-    //    Provider tensor -- not just a `TensorResidency` record, which is
-    //    itself a plain public struct a caller could construct without
-    //    ever calling `Provider::write_tensor`. Reading the resource back
-    //    from its residency's own recorded owning Provider is a check
-    //    against Provider-side state a caller cannot fabricate through
-    //    Runtime bookkeeping alone -- forging it would mean actually
-    //    writing real bytes into that Provider's storage.
-    // 2. When the loaded artifact's manifest declared mandatory tensor
-    //    names (`required_weight_names`, non-empty), every one of them
-    //    must be present as a bound key -- a caller supplying only some
-    //    of a multi-weight model's tensors no longer passes.
+    // 1. Every bound resource must still have a current `TensorResidency`
+    //    record -- proof the resource has not since been released
+    //    (unloaded, evicted, rolled back) out from under this instance.
+    //    This is *not* the provenance check (a residency record is a plain
+    //    public struct a caller could still construct by hand); it is the
+    //    "is this still true right now" check that a historical proof
+    //    alone cannot provide -- state that made an instance eligible for
+    //    `Ready` can regress (e.g. during suspension), and that must still
+    //    be caught.
+    // 2. Runtime-issued `MaterializationEvidence` must exist and match
+    //    this instance's own declared `ModelArtifactId` and its exact
+    //    current weight-binding set -- minted only by
+    //    `WeightMaterializationTransaction::commit`, so evidence from a
+    //    different instance, a different artifact, or a stale binding set
+    //    does not count. This is the provenance check a bare residency
+    //    record cannot provide. Unlike round 3-5's check, this needs no
+    //    Provider-specific readback capability (`read_tensor`/
+    //    `HostTensor`) at all -- closing the companion P1 (a device-only
+    //    Provider without host readback can still prove materialization)
+    //    as a consequence.
+    //
+    // When the loaded artifact's manifest declared mandatory tensor names
+    // (`required_weight_names`, non-empty), every one of them must still
+    // be present as a bound key -- a caller supplying only some of a
+    // multi-weight model's tensors still does not pass.
     let weights_materialized = checks.weights_materialized
         && !bindings.is_empty()
-        && bindings.values().all(|resource_id| {
-            runtime
-                .memory()
-                .tensor_residency(resource_id)
-                .and_then(|residency| residency.affinity.provider())
-                .and_then(|provider_binding| {
-                    runtime.providers().provider(provider_binding.as_str())
-                })
-                .and_then(|provider| provider.execution_api())
-                .is_some_and(|executor| executor.read_tensor(resource_id).is_some())
-        })
+        && bindings
+            .values()
+            .all(|resource_id| runtime.memory().tensor_residency(resource_id).is_some())
+        && runtime
+            .model_instances()
+            .materialization_evidence(instance)
+            .is_some_and(|evidence| {
+                evidence.matches(
+                    &model_instance.definition.artifact,
+                    &bindings.values().cloned().collect(),
+                )
+            })
         && model_instance
             .definition
             .required_weight_names

@@ -110,18 +110,21 @@ fn loaded_context() -> magnetar_runtime::LoadedModelContext {
 
 /// Reaches `Ready` the only way this crate (an external consumer of
 /// `magnetar_runtime`'s public API, same as any embedder) now can:
-/// `ModelInstance::mark_ready`/`transition_to`/`warmup` and the matching
-/// `ModelInstanceManager` wrappers became `pub(crate)` after an external
-/// audit of PR #36 demonstrated they were a direct, unverified bypass
-/// (`runtime.model_instances_mut().mark_ready(&id)` skipped every
-/// readiness check entirely). Reaching `Ready` now requires real evidence
-/// the Runtime can verify: a Memory Manager allocation, a real
-/// `Provider::write_tensor` call, a matching `TensorResidency` record, and
-/// (when the fixture's manifest declares mandatory tensors, as `definition()`
-/// here does) binding under the exact required name -- exactly the same
-/// evidence a real embedder must supply through `warm_model_instance`. This
-/// mirrors the real path deliberately: it is not a workaround, it *is* the
-/// contract now.
+/// `magnetar_runtime::materialize_model_instance_weights` -- the same
+/// Runtime-owned, evidence-minting transaction production code uses
+/// (`bind-model-loading-evidence-to-validated-artifact`). This replaced an
+/// earlier version of this helper that wrote real Provider bytes and a
+/// real residency but then bound the weight and marked the instance Ready
+/// by directly poking `resource_bindings`/calling `warm_model_instance` --
+/// exactly the hand-assembled forgery an external audit of PR #36
+/// demonstrated this crate's own test suite was still capable of, even
+/// with every earlier round's check in place. `resource_bindings` is now
+/// `pub(crate)` and materialization evidence is Runtime-issued, so this is
+/// no longer possible; going through the one real transaction is not a
+/// workaround, it *is* the contract now. Binds under `manifest()`'s own
+/// declared tensor name (`transformer.wte.weight`), matching
+/// `required_weight_names` (itself `pub(crate)`, populated from this exact
+/// fixture's manifest) so the inventory-completeness check is satisfied.
 fn bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId) {
     if runtime
         .providers()
@@ -134,74 +137,21 @@ fn bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId) {
             ))
             .unwrap();
     }
-    let allocation = runtime
-        .memory_mut()
-        .allocate(magnetar_runtime::MemoryAllocationRequest::new(
-            magnetar_runtime::MemoryAllocationClass::Tensor,
-            1,
-            magnetar_runtime::MemoryPlacement::HostOrdinary,
-            magnetar_runtime::MemoryAllocationOwner::InferenceArtifact("test".into()),
-        ))
-        .unwrap();
-    let resource_id = magnetar_runtime::TensorResourceId::new(format!("test.weight.{id}"));
-    let provider_binding = ProviderBinding::new(magnetar_runtime::REFERENCE_CPU_PROVIDER_NAME);
-    runtime
-        .providers()
-        .provider(magnetar_runtime::REFERENCE_CPU_PROVIDER_NAME)
-        .and_then(|provider| provider.execution_api())
-        .unwrap()
-        .write_tensor(
-            resource_id.clone(),
-            magnetar_runtime::HostTensor::new([1], [0.0]).unwrap(),
-        );
-    runtime
-        .memory_mut()
-        .record_tensor_residency(
-            magnetar_runtime::TensorResidency::new(
-                resource_id.clone(),
-                magnetar_runtime::MemoryPlacement::ProviderOwnedOpaque(provider_binding.clone()),
-                ResourceAffinity::new(FallbackClass::Transparent).with_provider(provider_binding),
-            )
-            .with_allocation(allocation.id),
-        )
-        .unwrap();
-    // Bind under `manifest()`'s own declared tensor name: `required_weight_names`
-    // is `pub(crate)` (not readable from this external test crate, by
-    // design -- an embedder cannot redeclare it either), populated from
-    // this exact fixture's manifest (`tensors: - name: transformer.wte.weight`),
-    // so this key is exactly what the inventory-completeness check needs.
-    let weight_name = "transformer.wte.weight".to_string();
-    runtime
-        .model_instances_mut()
-        .instance_mut(id)
-        .unwrap()
-        .definition
-        .resource_bindings
-        .weights
-        .insert(weight_name, resource_id);
-    runtime
-        .model_instances_mut()
-        .instance_mut(id)
-        .unwrap()
-        .definition
-        .resource_bindings
-        .memory_allocations
-        .insert(allocation.id);
+    let weights = std::collections::BTreeMap::from([(
+        "transformer.wte.weight".to_string(),
+        magnetar_runtime::HostTensor::new([1], [0.0]).unwrap(),
+    )]);
+    magnetar_runtime::materialize_model_instance_weights(runtime, id, "test", &weights).unwrap();
 }
 
+/// `bind_fake_weight` alone already reaches `Ready` -- its underlying
+/// `materialize_model_instance_weights` transaction commits bindings,
+/// mints materialization evidence, and marks the instance Ready in one
+/// step, the same as the real production path. An explicit follow-up
+/// `warm_model_instance` call is not just redundant but would fail (no
+/// `Ready -> Ready` lifecycle transition exists).
 fn reach_ready(runtime: &mut Runtime, id: &ModelInstanceId) {
     bind_fake_weight(runtime, id);
-    let plan = ModelInstanceWarmupPlan {
-        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
-        steps: Vec::new(),
-    };
-    magnetar_runtime::warm_model_instance(
-        runtime,
-        id,
-        &plan,
-        &ModelInstanceReadinessChecks::default(),
-    )
-    .unwrap();
 }
 
 #[test]
@@ -629,19 +579,18 @@ fn warmup_policy_covers_provider_kernel_shape_metadata_memory_and_adapter_checks
     );
 
     // A freshly created instance already starts in `Loading` (creation no
-    // longer auto-readies), so warmup can run directly -- no scaffolding
-    // through Reloading/Loading needed once real evidence (a bound,
-    // residency-backed weight) is present.
+    // longer auto-readies); `bind_fake_weight`'s real materialization
+    // transaction alone (evidence-minting commit, then `mark_ready`) is
+    // now sufficient to reach `Ready` -- an explicit follow-up
+    // `warm_model_instance` call would be redundant and would fail (no
+    // `Ready -> Ready` lifecycle transition exists).
     let mut runtime = Runtime::initialize(RuntimeConfig::default());
     let id = runtime.model_instances_mut().create(definition()).unwrap();
     bind_fake_weight(&mut runtime, &id);
-    magnetar_runtime::warm_model_instance(
-        &mut runtime,
-        &id,
-        &plan,
-        &ModelInstanceReadinessChecks::default(),
-    )
-    .unwrap();
+    assert_eq!(
+        runtime.model_instance(&id).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
 
     let failing = ModelInstanceReadinessChecks {
         adapter_ready: false,
@@ -823,7 +772,7 @@ fn unload_releases_memory_provider_resources_adapters_and_cache_dependencies() {
     // real allocation from the same `MemoryManager`, whose ids start at 1,
     // so a fixture id of `1` here would silently collide in the
     // `BTreeSet` and undercount `released_memory_allocations`.
-    def.resource_bindings.memory_allocations = [MemoryAllocationId::new(999)].into();
+    def.track_memory_allocation(MemoryAllocationId::new(999));
     // `placement` stays the fixture's default (no pinned Provider) through
     // `reach_ready`, since `warm_model_instance` now derives `provider_ready`
     // from a real, registered Provider -- "provider-a" below is a fake

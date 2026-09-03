@@ -4712,7 +4712,15 @@ fn bind_qwen_fixture_weights(
 /// Provider resolution and the failure-path lifecycle transition below --
 /// moving it would make `model_loading.rs` depend on `runtime.rs`, which
 /// already depends on `model_loading.rs`, for no behavioral benefit.
-fn materialize_model_instance_weights(
+///
+/// `pub`: this is the one legitimate way -- for production code or an
+/// external embedder alike -- to turn named weight bytes into bound,
+/// Ready-eligible resources for a Model Instance
+/// (`bind-model-loading-evidence-to-validated-artifact`). Its success is
+/// itself the proof `derive_effective_readiness_checks` trusts (via the
+/// `MaterializationEvidence` this call's `WeightMaterializationTransaction::commit`
+/// mints); there is no separate token for a caller to construct or forge.
+pub fn materialize_model_instance_weights(
     runtime: &mut Runtime,
     instance: &ModelInstanceId,
     artifact_owner: &str,
@@ -4855,9 +4863,15 @@ impl WeightMaterializationTransaction {
         }
     }
 
-    /// Publishes every staged weight's binding onto the Model Instance and
-    /// marks it Ready, reached only once every weight in this attempt
-    /// staged successfully.
+    /// Publishes every staged weight's binding onto the Model Instance,
+    /// mints/replaces its Runtime-issued `MaterializationEvidence` to match
+    /// the resulting *full* current weight-binding set (not just this
+    /// attempt's own staged subset -- a second materialization attempt on
+    /// an already-partially-materialized instance must still produce
+    /// evidence covering every previously-bound weight, or a legitimate
+    /// instance would fail its own evidence-matching readiness check), and
+    /// marks the instance Ready. Reached only once every weight in this
+    /// attempt staged successfully.
     fn commit(
         self,
         runtime: &mut Runtime,
@@ -4881,6 +4895,27 @@ impl WeightMaterializationTransaction {
                     .insert(staged.allocation);
             }
         }
+        let (artifact, bound_resources) = {
+            let model_instance = runtime
+                .model_instance(instance)
+                .map_err(InferenceApiError::from)?;
+            (
+                model_instance.definition.artifact.clone(),
+                model_instance
+                    .definition
+                    .resource_bindings
+                    .weights
+                    .values()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
+        };
+        runtime
+            .model_instances_mut()
+            .record_materialization_evidence(
+                instance,
+                MaterializationEvidence::new(artifact, bound_resources),
+            );
         runtime
             .model_instances_mut()
             .mark_ready(instance)

@@ -493,6 +493,16 @@ pub struct ProviderModelResource {
     pub release_required: bool,
 }
 
+/// `pub(crate)` fields, not `pub`: the only legitimate way to bind a
+/// weight resource is the one authorized weight-materialization
+/// transaction (`WeightMaterializationTransaction::commit` in
+/// `first_native_runtime.rs`) committing successfully
+/// (`bind-model-loading-evidence-to-validated-artifact`, closing a gap an
+/// external audit of PR #36 found concretely: this crate's own
+/// `contract_tests` helper was directly inserting into `weights` and
+/// `memory_allocations` by hand). Public read-only accessors are added
+/// only if a real external caller needs to inspect a binding after
+/// `warm_model_instance` succeeds; none is known to today.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ModelInstanceResourceBindings {
     /// Canonical model tensor name (matching `ModelManifest`'s declared
@@ -500,10 +510,46 @@ pub struct ModelInstanceResourceBindings {
     /// during model loading, so graph execution can look weights up by name
     /// through this Model Instance rather than a private side-channel
     /// keeping its own copy of tensor bytes.
-    pub weights: BTreeMap<String, TensorResourceId>,
-    pub memory_allocations: BTreeSet<MemoryAllocationId>,
-    pub released_memory_allocations: BTreeSet<MemoryAllocationId>,
-    pub released_provider_resources: BTreeSet<ProviderBinding>,
+    pub(crate) weights: BTreeMap<String, TensorResourceId>,
+    pub(crate) memory_allocations: BTreeSet<MemoryAllocationId>,
+    pub(crate) released_memory_allocations: BTreeSet<MemoryAllocationId>,
+    pub(crate) released_provider_resources: BTreeSet<ProviderBinding>,
+}
+
+/// Runtime-issued proof that a specific Model Instance's weight resources
+/// were bound by the one authorized weight-materialization transaction
+/// (`WeightMaterializationTransaction::commit` in `first_native_runtime.rs`),
+/// not assembled by hand from otherwise-public Memory Manager/Provider
+/// primitives. Not constructible or settable by an external caller --
+/// see `bind-model-loading-evidence-to-validated-artifact`'s design.md for
+/// why this lives as a separate Runtime-owned record keyed by
+/// `ModelInstanceId`, rather than a field on `ModelInstance`/
+/// `ModelInstanceDefinition`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializationEvidence {
+    artifact: ModelArtifactId,
+    resources: BTreeSet<TensorResourceId>,
+}
+
+impl MaterializationEvidence {
+    pub(crate) fn new(artifact: ModelArtifactId, resources: BTreeSet<TensorResourceId>) -> Self {
+        Self {
+            artifact,
+            resources,
+        }
+    }
+
+    /// True only if this evidence was minted for `artifact` and the exact
+    /// resource set `bound` -- both the instance's own declared artifact
+    /// and its exact currently-bound weight resources, so evidence minted
+    /// for a different instance or a stale binding set does not match.
+    pub(crate) fn matches(
+        &self,
+        artifact: &ModelArtifactId,
+        bound: &BTreeSet<TensorResourceId>,
+    ) -> bool {
+        &self.artifact == artifact && &self.resources == bound
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -544,7 +590,14 @@ pub struct ModelInstanceDefinition {
     pub mutation_version: u64,
     pub tenant: Option<String>,
     pub owner: Option<String>,
-    pub resource_bindings: ModelInstanceResourceBindings,
+    /// `pub(crate)`, not `pub`: sealing only `ModelInstanceResourceBindings`'s
+    /// own fields is not enough on its own -- an external caller could
+    /// still replace this whole field with another instance's (already
+    /// legitimately bound) bindings via a plain assignment (`Clone` does
+    /// not require field visibility), which is exactly the audit's
+    /// "materialization evidence reused for a different instance/artifact"
+    /// scenario. See `bind-model-loading-evidence-to-validated-artifact`.
+    pub(crate) resource_bindings: ModelInstanceResourceBindings,
     /// Implements "Model Instance Kernel Policy"
     /// (`define-kernel-optimization-and-selection-policy`): "A Model
     /// Instance SHALL own or reference an explicit Kernel selection
@@ -592,6 +645,18 @@ impl ModelInstanceDefinition {
             kernel_selection_policy: None,
             required_weight_names: context.required_weight_names.clone(),
         }
+    }
+
+    /// Tracks an additional Memory Manager allocation against this
+    /// instance's resource bindings, for allocations outside the weight-
+    /// materialization transaction's scope (e.g. an adapter or workspace
+    /// allocation a caller manages directly). Deliberately narrow: this
+    /// does not touch `weights` or materialization evidence, so it cannot
+    /// be used to forge `weights_materialized` readiness -- see
+    /// `bind-model-loading-evidence-to-validated-artifact`'s design.md for
+    /// why `resource_bindings` is otherwise sealed.
+    pub fn track_memory_allocation(&mut self, allocation: MemoryAllocationId) {
+        self.resource_bindings.memory_allocations.insert(allocation);
     }
 }
 
@@ -1151,6 +1216,7 @@ pub struct ModelInstanceManager {
     next_id: u64,
     instances: BTreeMap<ModelInstanceId, ModelInstance>,
     observations: Vec<ModelInstanceObservation>,
+    materialization_evidence: BTreeMap<ModelInstanceId, MaterializationEvidence>,
 }
 
 impl ModelInstanceManager {
@@ -1159,7 +1225,38 @@ impl ModelInstanceManager {
             next_id: 1,
             instances: BTreeMap::new(),
             observations: Vec::new(),
+            materialization_evidence: BTreeMap::new(),
         }
+    }
+
+    /// Mints (or replaces) `instance`'s materialization evidence. Called
+    /// only by `WeightMaterializationTransaction::commit`
+    /// (`first_native_runtime.rs`) once every weight in an attempt has
+    /// staged successfully.
+    pub(crate) fn record_materialization_evidence(
+        &mut self,
+        instance: &ModelInstanceId,
+        evidence: MaterializationEvidence,
+    ) {
+        self.materialization_evidence
+            .insert(instance.clone(), evidence);
+    }
+
+    /// `instance`'s current materialization evidence, if any. Used by
+    /// `derive_effective_readiness_checks` (`inference_api.rs`) to derive
+    /// `weights_materialized`.
+    pub(crate) fn materialization_evidence(
+        &self,
+        instance: &ModelInstanceId,
+    ) -> Option<&MaterializationEvidence> {
+        self.materialization_evidence.get(instance)
+    }
+
+    /// Clears `instance`'s materialization evidence, if any. Called on
+    /// unload and on a failed materialization attempt's rollback, mirroring
+    /// `TensorResidency` cleanup (`invalidate-tensor-residency-on-release`).
+    pub(crate) fn clear_materialization_evidence(&mut self, instance: &ModelInstanceId) {
+        self.materialization_evidence.remove(instance);
     }
 
     pub fn instances(&self) -> impl Iterator<Item = &ModelInstance> {

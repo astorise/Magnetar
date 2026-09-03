@@ -677,6 +677,12 @@ impl Runtime {
         for allocation in &report.released_memory_allocations {
             let _ = self.memory.release(*allocation);
         }
+        // Clear this instance's materialization evidence: its weight
+        // bindings are gone (or about to be replaced by a future load), so
+        // stale evidence must not outlive them (`bind-model-loading-
+        // evidence-to-validated-artifact`).
+        self.model_instances
+            .clear_materialization_evidence(instance);
         Ok(report)
     }
     pub fn admit_generation_to_batch(
