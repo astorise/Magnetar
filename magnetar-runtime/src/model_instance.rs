@@ -552,6 +552,17 @@ pub struct ModelInstanceDefinition {
     /// full `KernelSelectionPolicy`, mirroring how `tokenizer` references a
     /// `TokenizerId`.
     pub kernel_selection_policy: Option<crate::kernel_selection_policy::KernelSelectionPolicyId>,
+    /// Tensor names the loaded `ModelManifest` declared as mandatory,
+    /// carried from `LoadedModelContext::required_weight_names`.
+    /// `pub(crate)`, not `pub`: this is Runtime-recorded evidence of what
+    /// the artifact actually requires, not something an external caller
+    /// should be able to redeclare after creation to make an incomplete
+    /// binding set appear complete. Empty means "unknown" (e.g. a
+    /// generically-constructed instance with no loaded manifest behind
+    /// it) -- readiness derivation falls back to its prior,
+    /// presence-only heuristic in that case rather than treating an
+    /// empty requirement as trivially satisfied by anything.
+    pub(crate) required_weight_names: BTreeSet<String>,
 }
 
 impl ModelInstanceDefinition {
@@ -579,6 +590,7 @@ impl ModelInstanceDefinition {
             owner: None,
             resource_bindings: ModelInstanceResourceBindings::default(),
             kernel_selection_policy: None,
+            required_weight_names: context.required_weight_names.clone(),
         }
     }
 }
@@ -930,10 +942,21 @@ impl ModelInstance {
         }
     }
 
+    /// Transitions `Suspended -> Loading` only. Reaching `Ready` from
+    /// there requires fresh Runtime-derived readiness evidence -- the
+    /// state that made this instance eligible for suspension (Provider,
+    /// Device, weight materialization) may have changed while it was
+    /// suspended, so resuming SHALL NOT jump straight back to `Ready`
+    /// without revalidation. `crate::inference_api::resume_model_instance`
+    /// performs that revalidation after calling this (Correctif:
+    /// Runtime-owned ModelInstance readiness authority, round 3 -- this
+    /// method used to transition all the way to `Ready` itself, an
+    /// external audit of PR #36 found it was still a direct bypass of
+    /// `warm_model_instance`'s derivation even after `mark_ready`/
+    /// `transition_to`/`warmup` were sealed).
     pub fn resume(&mut self) -> Result<(), ModelInstanceError> {
         if self.lifecycle == ModelInstanceLifecycleState::Suspended {
-            self.transition_to(ModelInstanceLifecycleState::Loading)?;
-            self.transition_to(ModelInstanceLifecycleState::Ready)
+            self.transition_to(ModelInstanceLifecycleState::Loading)
         } else {
             Err(ModelInstanceError::ModelInstanceNotReady)
         }

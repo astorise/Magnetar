@@ -8892,20 +8892,93 @@ fn model_instance_definition() -> ModelInstanceDefinition {
         owner: None,
         resource_bindings: ModelInstanceResourceBindings::default(),
         kernel_selection_policy: None,
+        required_weight_names: BTreeSet::new(),
     }
+}
+
+/// Binds one real, Provider-backed weight to `instance` and reaches
+/// `Ready` through `warm_model_instance` -- the only way an external
+/// caller now can (Correctif: Runtime-owned ModelInstance readiness
+/// authority). Requires a `ReferenceCpuProvider` already registered on
+/// `runtime` and `instance`'s placement pinned to it.
+fn reach_ready_with_real_weight(runtime: &mut Runtime, instance: &ModelInstanceId) {
+    let allocation = runtime
+        .memory_mut()
+        .allocate(MemoryAllocationRequest::new(
+            MemoryAllocationClass::Tensor,
+            1,
+            MemoryPlacement::HostOrdinary,
+            MemoryAllocationOwner::InferenceArtifact("test".into()),
+        ))
+        .unwrap();
+    let weight_resource = TensorResourceId::new(format!("test.weight.{instance}"));
+    let executor = runtime
+        .providers()
+        .provider(REFERENCE_CPU_PROVIDER_NAME)
+        .and_then(|provider| provider.execution_api())
+        .unwrap();
+    executor.write_tensor(
+        weight_resource.clone(),
+        HostTensor::new([1], [0.0]).unwrap(),
+    );
+    runtime
+        .memory_mut()
+        .record_tensor_residency(
+            TensorResidency::new(
+                weight_resource.clone(),
+                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+                    REFERENCE_CPU_PROVIDER_NAME,
+                )),
+                ResourceAffinity::new(FallbackClass::Transparent)
+                    .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+            )
+            .with_allocation(allocation.id),
+        )
+        .unwrap();
+    runtime
+        .model_instances_mut()
+        .instance_mut(instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), weight_resource);
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        runtime,
+        instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap();
 }
 
 #[test]
 fn inference_api_model_instance_suspend_resume_drain_through_api_boundary() {
-    let mut runtime = Runtime::builder().build().unwrap();
-    let instance = runtime
-        .model_instances_mut()
-        .create(model_instance_definition())
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
         .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
     // `create()` no longer reaches Ready on its own (transactional-weight-
     // materialization); this test's own concern is suspend/resume/drain
-    // *from* Ready, so reach Ready explicitly first.
-    runtime.model_instances_mut().mark_ready(&instance).unwrap();
+    // *from* Ready, so reach Ready explicitly first -- with real,
+    // Provider-backed evidence: `resume_model_instance` now re-derives
+    // readiness (Correctif: Runtime-owned ModelInstance readiness
+    // authority, round 3), so an instance that was never really
+    // materialized correctly cannot resume back to Ready any more, and
+    // this test's own concern (the suspend/resume/drain state machine,
+    // not weight materialization) needs a genuinely resumable instance
+    // to exercise that machinery at all.
+    reach_ready_with_real_weight(&mut runtime, &instance);
 
     let status = model_instance_status(&runtime, &instance).unwrap();
     assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
@@ -8924,6 +8997,231 @@ fn inference_api_model_instance_suspend_resume_drain_through_api_boundary() {
 
     let status = model_instance_status(&runtime, &instance).unwrap();
     assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Draining);
+}
+
+/// Implements `seal-model-instance-readiness-authority` round 3, the
+/// audit's own resume scenario: state that made an instance eligible for
+/// `Ready` can change while it is suspended, so `resume_model_instance`
+/// must re-derive readiness against *current* Runtime state, not assume
+/// whatever was true before suspension still holds. Proven here by
+/// invalidating the weight evidence during suspension (removing its
+/// `TensorResidency`, a legitimate way real state can regress -- e.g. a
+/// rollback or eviction elsewhere) rather than by mutating a `Provider`'s
+/// status snapshot, which this test double has no interior mutability to
+/// do after registration; both exercise the same property: resume must
+/// look at current state, not trust the state from before suspension.
+#[test]
+fn inference_api_resume_model_instance_revalidates_and_rejects_stale_evidence() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+    reach_ready_with_real_weight(&mut runtime, &instance);
+    assert_eq!(
+        model_instance_status(&runtime, &instance)
+            .unwrap()
+            .lifecycle,
+        ModelInstanceLifecycleState::Ready
+    );
+
+    suspend_model_instance(
+        &mut runtime,
+        &instance,
+        ModelInstanceSuspensionReason::AdministrativePolicy,
+    )
+    .unwrap();
+
+    // While suspended, the weight evidence that made this instance Ready
+    // becomes invalid (its TensorResidency is removed) -- simulating real
+    // state regressing during the suspension window, exactly the scenario
+    // the audit's own resume test targets.
+    let weight_resource = runtime
+        .model_instance(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .get("weight")
+        .unwrap()
+        .clone();
+    runtime
+        .memory_mut()
+        .remove_tensor_residency(&weight_resource);
+
+    resume_model_instance(&mut runtime, &instance).unwrap_err();
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// Implements `seal-model-instance-readiness-authority` round 3, audit
+/// test 25 "Inventaire incomplet": a manifest declaring multiple mandatory
+/// tensors, with only some of them bound, must not reach Ready even
+/// though every bound entry is individually real (residency-backed,
+/// Provider-written). Round 2's fix only checked that whatever *was*
+/// bound was real; it never checked the bound set was *complete*.
+#[test]
+fn inference_api_warm_model_instance_rejects_incomplete_mandatory_weight_inventory() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    definition.required_weight_names =
+        BTreeSet::from(["weight.a".to_string(), "weight.b".to_string()]);
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    // Bind and really materialize only "weight.a" -- "weight.b" stays
+    // entirely absent.
+    let allocation = runtime
+        .memory_mut()
+        .allocate(MemoryAllocationRequest::new(
+            MemoryAllocationClass::Tensor,
+            1,
+            MemoryPlacement::HostOrdinary,
+            MemoryAllocationOwner::InferenceArtifact("test".into()),
+        ))
+        .unwrap();
+    let resource_a = TensorResourceId::new("test.weight.a");
+    let executor = runtime
+        .providers()
+        .provider(REFERENCE_CPU_PROVIDER_NAME)
+        .and_then(|provider| provider.execution_api())
+        .unwrap();
+    executor.write_tensor(resource_a.clone(), HostTensor::new([1], [0.0]).unwrap());
+    runtime
+        .memory_mut()
+        .record_tensor_residency(
+            TensorResidency::new(
+                resource_a.clone(),
+                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+                    REFERENCE_CPU_PROVIDER_NAME,
+                )),
+                ResourceAffinity::new(FallbackClass::Transparent)
+                    .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+            )
+            .with_allocation(allocation.id),
+        )
+        .unwrap();
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight.a".into(), resource_a);
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// Implements `seal-model-instance-readiness-authority` round 3, audit
+/// test 25 "Residency synthétique": a `TensorResidency` recorded manually
+/// (real Memory Manager allocation, real `record_tensor_residency` call)
+/// but with no matching `Provider::write_tensor` ever having run must not
+/// count as materialized. Round 2's fix only checked a residency record
+/// existed; it did not check the Provider it claims to describe actually
+/// holds the tensor.
+#[test]
+fn inference_api_warm_model_instance_rejects_residency_without_provider_write() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    let allocation = runtime
+        .memory_mut()
+        .allocate(MemoryAllocationRequest::new(
+            MemoryAllocationClass::Tensor,
+            1,
+            MemoryPlacement::HostOrdinary,
+            MemoryAllocationOwner::InferenceArtifact("test".into()),
+        ))
+        .unwrap();
+    let weight_resource = TensorResourceId::new("test.weight.never-written");
+    // Record a real residency -- but never call `write_tensor` on the
+    // Provider it claims. This is exactly what a caller with mutable
+    // access to `Runtime::memory_mut()` and `resource_bindings.weights`
+    // could always do; the Provider's own storage is the one thing they
+    // cannot forge without actually writing real bytes to it.
+    runtime
+        .memory_mut()
+        .record_tensor_residency(
+            TensorResidency::new(
+                weight_resource.clone(),
+                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+                    REFERENCE_CPU_PROVIDER_NAME,
+                )),
+                ResourceAffinity::new(FallbackClass::Transparent)
+                    .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+            )
+            .with_allocation(allocation.id),
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .providers()
+            .provider(REFERENCE_CPU_PROVIDER_NAME)
+            .and_then(|provider| provider.execution_api())
+            .unwrap()
+            .read_tensor(&weight_resource)
+            .is_none(),
+        "test precondition: nothing was ever written to the Provider for this resource"
+    );
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), weight_resource);
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
 }
 
 #[test]
@@ -9132,50 +9430,16 @@ fn inference_api_warm_model_instance_reaches_ready_when_weights_and_provider_are
             .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
     );
     let instance = runtime.model_instances_mut().create(definition).unwrap();
-    // A residency-backed weight, not just a bare map entry: since
-    // `runtime-owned-model-instance-readiness-authority` (round 2),
-    // `weights_materialized` derivation also requires a matching
-    // `TensorResidency` record per bound weight, closing the exact "fake
-    // TensorResourceId with no real residency" forgery an external audit
-    // of PR #36 demonstrated -- this happy-path test must supply real
-    // evidence too, not just a plausible-looking one.
-    let allocation = runtime
-        .memory_mut()
-        .allocate(MemoryAllocationRequest::new(
-            MemoryAllocationClass::Tensor,
-            1,
-            MemoryPlacement::HostOrdinary,
-            MemoryAllocationOwner::InferenceArtifact("test".into()),
-        ))
-        .unwrap();
-    let weight_resource = TensorResourceId::new("test.weight");
-    runtime
-        .memory_mut()
-        .record_tensor_residency(
-            TensorResidency::new(
-                weight_resource.clone(),
-                MemoryPlacement::HostOrdinary,
-                ResourceAffinity::new(FallbackClass::Transparent),
-            )
-            .with_allocation(allocation.id),
-        )
-        .unwrap();
-    runtime
-        .model_instances_mut()
-        .instance_mut(&instance)
-        .unwrap()
-        .definition
-        .resource_bindings
-        .weights
-        .insert("weight".into(), weight_resource);
-
-    let plan = ModelInstanceWarmupPlan {
-        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
-        steps: Vec::new(),
-    };
-    let checks = ModelInstanceReadinessChecks::default();
-
-    warm_model_instance(&mut runtime, &instance, &plan, &checks).unwrap();
+    // Real, Provider-backed evidence, not just a residency record or a
+    // bare map entry: `weights_materialized` derivation resolves each
+    // residency's recorded Provider and reads the tensor back from it, so
+    // a residency whose Provider never actually received a `write_tensor`
+    // call does not count (Correctif: Runtime-owned ModelInstance
+    // readiness authority, round 3 -- closing the "synthetic residency"
+    // forgery a further audit of PR #36 demonstrated: a caller could
+    // previously construct a valid-looking `TensorResidency` for a
+    // resource no Provider ever wrote).
+    reach_ready_with_real_weight(&mut runtime, &instance);
 
     let status = model_instance_status(&runtime, &instance).unwrap();
     assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);

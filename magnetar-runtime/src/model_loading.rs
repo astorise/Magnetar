@@ -482,6 +482,13 @@ pub struct LoadedModelContext {
     pub plan: ModelLoadingResidencyPlan,
     pub allocation: Option<MemoryAllocation>,
     pub partial: bool,
+    /// Tensor names the loaded `ModelManifest` declares. Carried through to
+    /// `ModelInstanceDefinition::required_weight_names` so weight-readiness
+    /// derivation can check the full mandatory inventory is bound, not only
+    /// that whatever happens to be bound has residency (Correctif:
+    /// Runtime-owned ModelInstance readiness authority, round 3). Empty for
+    /// a manifest that declares no tensors.
+    pub required_weight_names: std::collections::BTreeSet<String>,
 }
 
 impl LoadedModelContext {
@@ -807,6 +814,11 @@ impl ModelLoadingCoordinator {
                 request.residency_policy,
                 ModelLoadingResidencyPolicy::PartialAllowed
             ),
+            required_weight_names: manifest
+                .tensors
+                .iter()
+                .map(|tensor| tensor.name.clone())
+                .collect(),
         })
     }
 }

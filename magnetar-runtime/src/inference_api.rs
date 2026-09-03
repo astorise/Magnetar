@@ -465,27 +465,45 @@ fn derive_effective_readiness_checks(
     checks: &ModelInstanceReadinessChecks,
 ) -> Result<ModelInstanceReadinessChecks, InferenceApiError> {
     let model_instance = runtime.model_instance(instance)?;
+    let bindings = &model_instance.definition.resource_bindings.weights;
     // Non-empty alone is not proof: a caller with mutable access to
     // `resource_bindings.weights` could insert an arbitrary
     // `TensorResourceId` that was never actually staged through
-    // `WeightMaterializationTransaction`. Requiring a matching
-    // `TensorResidency` record for every bound weight closes that -- a
-    // residency entry can only exist because `record_tensor_residency` ran
-    // (staged via a real Memory Manager allocation), which is a
-    // meaningfully higher bar than an unchecked map insert (Correctif:
-    // Runtime-owned ModelInstance readiness authority, round 2).
+    // `WeightMaterializationTransaction`. Two independent checks close
+    // that further than round 2's residency-presence check alone
+    // (Correctif: Runtime-owned ModelInstance readiness authority, round
+    // 3):
+    //
+    // 1. Every bound resource must resolve to a real, currently-written
+    //    Provider tensor -- not just a `TensorResidency` record, which is
+    //    itself a plain public struct a caller could construct without
+    //    ever calling `Provider::write_tensor`. Reading the resource back
+    //    from its residency's own recorded owning Provider is a check
+    //    against Provider-side state a caller cannot fabricate through
+    //    Runtime bookkeeping alone -- forging it would mean actually
+    //    writing real bytes into that Provider's storage.
+    // 2. When the loaded artifact's manifest declared mandatory tensor
+    //    names (`required_weight_names`, non-empty), every one of them
+    //    must be present as a bound key -- a caller supplying only some
+    //    of a multi-weight model's tensors no longer passes.
     let weights_materialized = checks.weights_materialized
-        && !model_instance
-            .definition
-            .resource_bindings
-            .weights
-            .is_empty()
+        && !bindings.is_empty()
+        && bindings.values().all(|resource_id| {
+            runtime
+                .memory()
+                .tensor_residency(resource_id)
+                .and_then(|residency| residency.affinity.provider())
+                .and_then(|provider_binding| {
+                    runtime.providers().provider(provider_binding.as_str())
+                })
+                .and_then(|provider| provider.execution_api())
+                .is_some_and(|executor| executor.read_tensor(resource_id).is_some())
+        })
         && model_instance
             .definition
-            .resource_bindings
-            .weights
-            .values()
-            .all(|resource_id| runtime.memory().tensor_residency(resource_id).is_some());
+            .required_weight_names
+            .iter()
+            .all(|required| bindings.contains_key(required));
     let provider_ready = checks.provider_ready
         && match &model_instance.definition.placement.provider {
             None => true,
@@ -551,6 +569,13 @@ pub fn suspend_model_instance(
         .map_err(InferenceApiError::from)
 }
 
+/// Resumes a suspended Model Instance. Reaching `Ready` requires fresh
+/// Runtime-derived readiness evidence, the same as any other path to
+/// `Ready` -- `ModelInstance::resume` only reaches `Loading`; this
+/// function completes the transition through `warm_model_instance` so
+/// state that changed while suspended (Provider health, weight residency,
+/// Device availability) is re-verified rather than assumed still valid
+/// (Correctif: Runtime-owned ModelInstance readiness authority, round 3).
 pub fn resume_model_instance(
     runtime: &mut Runtime,
     instance: &ModelInstanceId,
@@ -559,7 +584,17 @@ pub fn resume_model_instance(
         .model_instances_mut()
         .instance_mut(instance)?
         .resume()
-        .map_err(InferenceApiError::from)
+        .map_err(InferenceApiError::from)?;
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        runtime,
+        instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
 }
 
 pub fn drain_model_instance(

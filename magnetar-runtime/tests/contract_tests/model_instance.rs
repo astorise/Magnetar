@@ -115,12 +115,25 @@ fn loaded_context() -> magnetar_runtime::LoadedModelContext {
 /// audit of PR #36 demonstrated they were a direct, unverified bypass
 /// (`runtime.model_instances_mut().mark_ready(&id)` skipped every
 /// readiness check entirely). Reaching `Ready` now requires real evidence
-/// the Runtime can verify: a Memory Manager allocation, a matching
-/// `TensorResidency` record, and `warm_model_instance` deriving
-/// `weights_materialized` from that -- exactly the same path a real
-/// embedder must use. This mirrors the real path deliberately: it is not
-/// a workaround, it *is* the contract now.
+/// the Runtime can verify: a Memory Manager allocation, a real
+/// `Provider::write_tensor` call, a matching `TensorResidency` record, and
+/// (when the fixture's manifest declares mandatory tensors, as `definition()`
+/// here does) binding under the exact required name -- exactly the same
+/// evidence a real embedder must supply through `warm_model_instance`. This
+/// mirrors the real path deliberately: it is not a workaround, it *is* the
+/// contract now.
 fn bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId) {
+    if runtime
+        .providers()
+        .provider(magnetar_runtime::REFERENCE_CPU_PROVIDER_NAME)
+        .is_none()
+    {
+        runtime
+            .register_provider(std::sync::Arc::new(
+                magnetar_runtime::ReferenceCpuProvider::new(),
+            ))
+            .unwrap();
+    }
     let allocation = runtime
         .memory_mut()
         .allocate(magnetar_runtime::MemoryAllocationRequest::new(
@@ -131,17 +144,33 @@ fn bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId) {
         ))
         .unwrap();
     let resource_id = magnetar_runtime::TensorResourceId::new(format!("test.weight.{id}"));
+    let provider_binding = ProviderBinding::new(magnetar_runtime::REFERENCE_CPU_PROVIDER_NAME);
+    runtime
+        .providers()
+        .provider(magnetar_runtime::REFERENCE_CPU_PROVIDER_NAME)
+        .and_then(|provider| provider.execution_api())
+        .unwrap()
+        .write_tensor(
+            resource_id.clone(),
+            magnetar_runtime::HostTensor::new([1], [0.0]).unwrap(),
+        );
     runtime
         .memory_mut()
         .record_tensor_residency(
             magnetar_runtime::TensorResidency::new(
                 resource_id.clone(),
-                magnetar_runtime::MemoryPlacement::HostOrdinary,
-                ResourceAffinity::new(FallbackClass::Transparent),
+                magnetar_runtime::MemoryPlacement::ProviderOwnedOpaque(provider_binding.clone()),
+                ResourceAffinity::new(FallbackClass::Transparent).with_provider(provider_binding),
             )
             .with_allocation(allocation.id),
         )
         .unwrap();
+    // Bind under `manifest()`'s own declared tensor name: `required_weight_names`
+    // is `pub(crate)` (not readable from this external test crate, by
+    // design -- an embedder cannot redeclare it either), populated from
+    // this exact fixture's manifest (`tensors: - name: transformer.wte.weight`),
+    // so this key is exactly what the inventory-completeness check needs.
+    let weight_name = "transformer.wte.weight".to_string();
     runtime
         .model_instances_mut()
         .instance_mut(id)
@@ -149,7 +178,7 @@ fn bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId) {
         .definition
         .resource_bindings
         .weights
-        .insert("weight".into(), resource_id);
+        .insert(weight_name, resource_id);
     runtime
         .model_instances_mut()
         .instance_mut(id)
