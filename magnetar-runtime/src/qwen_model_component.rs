@@ -865,6 +865,7 @@ pub fn qwen_conformance_fixture_names() -> BTreeSet<&'static str> {
     ])
 }
 
+#[cfg(test)]
 fn f32_edge(id: impl Into<String>, dims: Vec<u64>) -> TensorEdge {
     let id = TensorEdgeId::new(id);
     TensorEdge::new(
@@ -877,6 +878,7 @@ fn f32_edge(id: impl Into<String>, dims: Vec<u64>) -> TensorEdge {
     )
 }
 
+#[cfg(test)]
 fn token_id_edge(id: impl Into<String>, dims: Vec<u64>) -> TensorEdge {
     let id = TensorEdgeId::new(id);
     TensorEdge::new(
@@ -893,6 +895,7 @@ fn token_id_edge(id: impl Into<String>, dims: Vec<u64>) -> TensorEdge {
 /// this logical tensor is declared with [`TensorAliasing::MayAlias`] pointing
 /// at `weight.token_embedding`, recording that it shares storage rather than
 /// silently duplicating it; when untied it is an independent tensor.
+#[cfg(test)]
 fn qwen_lm_head_weight_edge(config: &QwenConfig) -> TensorEdge {
     let a = &config.architecture;
     let mut edge = f32_edge("weight.lm_head", vec![a.hidden_size, a.vocabulary_size]);
@@ -914,6 +917,14 @@ fn op_node(id: impl Into<String>, name: &str, family: OperatorFamily) -> Executi
 /// output projection, residual-add, RMSNorm, gated MLP, residual-add), a
 /// final RMSNorm, and an `lm_head` logits projection. Every node uses a
 /// required-now Operator.
+///
+/// Test-oracle only (Correctif 9 / `reach-architecture-freeze-1` task 12.6):
+/// production first-native generation never calls this -- the real Qwen
+/// WASM Component is the sole production source of graph semantics. This
+/// Rust implementation survives only to be compared against the real
+/// Component's output in tests, proving the two agree numerically, and as
+/// a conformance fixture for this module's own tests.
+#[cfg(test)]
 pub fn qwen_build_graph(
     config: &QwenConfig,
     identity: &ModelComponentIdentity,
@@ -975,7 +986,7 @@ pub fn qwen_build_graph(
         let normed = format!("{prefix}.normed");
         graph = graph
             .with_edge(f32_edge(
-                format!("weight.{prefix}.input_norm"),
+                format!("weight.layers.{layer}.input_norm"),
                 vec![a.hidden_size],
             ))
             .with_edge(f32_edge(
@@ -989,7 +1000,9 @@ pub fn qwen_build_graph(
                     OperatorFamily::Normalization,
                 )
                 .with_input(TensorEdgeId::new(residual_in.clone()))
-                .with_input(TensorEdgeId::new(format!("weight.{prefix}.input_norm")))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.input_norm"
+                )))
                 .with_output(TensorEdgeId::new(normed.clone()))
                 .with_attribute(
                     "epsilon",
@@ -1002,7 +1015,7 @@ pub fn qwen_build_graph(
         let v = format!("{prefix}.v");
         graph = graph
             .with_edge(f32_edge(
-                format!("weight.{prefix}.q_proj"),
+                format!("weight.layers.{layer}.self_attn.q_proj"),
                 vec![a.hidden_size, q_dim],
             ))
             .with_edge(f32_edge(q.clone(), vec![sequence_length, q_dim]))
@@ -1013,11 +1026,13 @@ pub fn qwen_build_graph(
                     OperatorFamily::LinearAlgebra,
                 )
                 .with_input(TensorEdgeId::new(normed.clone()))
-                .with_input(TensorEdgeId::new(format!("weight.{prefix}.q_proj")))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.self_attn.q_proj"
+                )))
                 .with_output(TensorEdgeId::new(q.clone())),
             )
             .with_edge(f32_edge(
-                format!("weight.{prefix}.k_proj"),
+                format!("weight.layers.{layer}.self_attn.k_proj"),
                 vec![a.hidden_size, kv_dim],
             ))
             .with_edge(f32_edge(k.clone(), vec![sequence_length, kv_dim]))
@@ -1028,11 +1043,13 @@ pub fn qwen_build_graph(
                     OperatorFamily::LinearAlgebra,
                 )
                 .with_input(TensorEdgeId::new(normed.clone()))
-                .with_input(TensorEdgeId::new(format!("weight.{prefix}.k_proj")))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.self_attn.k_proj"
+                )))
                 .with_output(TensorEdgeId::new(k.clone())),
             )
             .with_edge(f32_edge(
-                format!("weight.{prefix}.v_proj"),
+                format!("weight.layers.{layer}.self_attn.v_proj"),
                 vec![a.hidden_size, kv_dim],
             ))
             .with_edge(f32_edge(v.clone(), vec![sequence_length, kv_dim]))
@@ -1043,7 +1060,9 @@ pub fn qwen_build_graph(
                     OperatorFamily::LinearAlgebra,
                 )
                 .with_input(TensorEdgeId::new(normed.clone()))
-                .with_input(TensorEdgeId::new(format!("weight.{prefix}.v_proj")))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.self_attn.v_proj"
+                )))
                 .with_output(TensorEdgeId::new(v.clone())),
             );
 
@@ -1147,7 +1166,7 @@ pub fn qwen_build_graph(
         let attn_proj = format!("{prefix}.attn_proj");
         graph = graph
             .with_edge(f32_edge(
-                format!("weight.{prefix}.o_proj"),
+                format!("weight.layers.{layer}.self_attn.o_proj"),
                 vec![q_dim, a.hidden_size],
             ))
             .with_edge(f32_edge(
@@ -1161,7 +1180,9 @@ pub fn qwen_build_graph(
                     OperatorFamily::LinearAlgebra,
                 )
                 .with_input(TensorEdgeId::new(attn_out.clone()))
-                .with_input(TensorEdgeId::new(format!("weight.{prefix}.o_proj")))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.self_attn.o_proj"
+                )))
                 .with_output(TensorEdgeId::new(attn_proj.clone())),
             );
 
@@ -1185,7 +1206,7 @@ pub fn qwen_build_graph(
         let mlp_normed = format!("{prefix}.mlp_normed");
         graph = graph
             .with_edge(f32_edge(
-                format!("weight.{prefix}.post_attn_norm"),
+                format!("weight.layers.{layer}.post_attn_norm"),
                 vec![a.hidden_size],
             ))
             .with_edge(f32_edge(
@@ -1199,7 +1220,9 @@ pub fn qwen_build_graph(
                     OperatorFamily::Normalization,
                 )
                 .with_input(TensorEdgeId::new(post_attn.clone()))
-                .with_input(TensorEdgeId::new(format!("weight.{prefix}.post_attn_norm")))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.post_attn_norm"
+                )))
                 .with_output(TensorEdgeId::new(mlp_normed.clone()))
                 .with_attribute(
                     "epsilon",
@@ -1214,7 +1237,7 @@ pub fn qwen_build_graph(
         let mlp_out = format!("{prefix}.mlp_out");
         graph = graph
             .with_edge(f32_edge(
-                format!("weight.{prefix}.gate_proj"),
+                format!("weight.layers.{layer}.mlp.gate_proj"),
                 vec![a.hidden_size, a.intermediate_size],
             ))
             .with_edge(f32_edge(
@@ -1228,11 +1251,13 @@ pub fn qwen_build_graph(
                     OperatorFamily::LinearAlgebra,
                 )
                 .with_input(TensorEdgeId::new(mlp_normed.clone()))
-                .with_input(TensorEdgeId::new(format!("weight.{prefix}.gate_proj")))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.mlp.gate_proj"
+                )))
                 .with_output(TensorEdgeId::new(gate.clone())),
             )
             .with_edge(f32_edge(
-                format!("weight.{prefix}.up_proj"),
+                format!("weight.layers.{layer}.mlp.up_proj"),
                 vec![a.hidden_size, a.intermediate_size],
             ))
             .with_edge(f32_edge(
@@ -1246,7 +1271,9 @@ pub fn qwen_build_graph(
                     OperatorFamily::LinearAlgebra,
                 )
                 .with_input(TensorEdgeId::new(mlp_normed.clone()))
-                .with_input(TensorEdgeId::new(format!("weight.{prefix}.up_proj")))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.mlp.up_proj"
+                )))
                 .with_output(TensorEdgeId::new(up.clone())),
             )
             .with_edge(f32_edge(
@@ -1269,7 +1296,7 @@ pub fn qwen_build_graph(
                     .with_output(TensorEdgeId::new(mlp_hidden.clone())),
             )
             .with_edge(f32_edge(
-                format!("weight.{prefix}.down_proj"),
+                format!("weight.layers.{layer}.mlp.down_proj"),
                 vec![a.intermediate_size, a.hidden_size],
             ))
             .with_edge(f32_edge(
@@ -1283,7 +1310,9 @@ pub fn qwen_build_graph(
                     OperatorFamily::LinearAlgebra,
                 )
                 .with_input(TensorEdgeId::new(mlp_hidden.clone()))
-                .with_input(TensorEdgeId::new(format!("weight.{prefix}.down_proj")))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.mlp.down_proj"
+                )))
                 .with_output(TensorEdgeId::new(mlp_out.clone())),
             );
 
@@ -1337,6 +1366,9 @@ pub fn qwen_build_graph(
 
 /// Produce a validated Qwen prefill Execution Graph for `prompt_length`
 /// tokens.
+///
+/// Test-oracle only -- see [`qwen_build_graph`]'s doc comment.
+#[cfg(test)]
 pub fn qwen_prefill_graph(
     config: &QwenConfig,
     identity: &ModelComponentIdentity,
@@ -1365,6 +1397,9 @@ pub fn qwen_prefill_graph(
 /// rather than defaulted: a decode graph built as if the new token were at
 /// position zero produces wrong rotations for every token after the first, and
 /// does so silently.
+///
+/// Test-oracle only -- see [`qwen_build_graph`]'s doc comment.
+#[cfg(test)]
 pub fn qwen_decode_graph(
     config: &QwenConfig,
     identity: &ModelComponentIdentity,
@@ -1880,6 +1915,7 @@ pub fn qwen_observation_conformance_result(
 // Conformance report
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QwenConformanceCheck {
     pub name: &'static str,
@@ -1887,11 +1923,13 @@ pub struct QwenConformanceCheck {
     pub detail: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QwenConformanceReport {
     pub checks: Vec<QwenConformanceCheck>,
 }
 
+#[cfg(test)]
 impl QwenConformanceReport {
     pub fn is_conformant(&self) -> bool {
         self.checks.iter().all(|check| check.passed)
@@ -1903,6 +1941,7 @@ impl QwenConformanceReport {
 /// for the full named fixture set this baseline SHALL cover; some fixtures
 /// (e.g. authority denial) are covered by dedicated unit tests rather than
 /// this data-driven report.
+#[cfg(test)]
 pub fn qwen_conformance_report(
     config: &QwenConfig,
     identity: &ModelComponentIdentity,

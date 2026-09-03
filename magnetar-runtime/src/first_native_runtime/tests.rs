@@ -763,48 +763,51 @@ fn first_native_dispatch_source_contains_no_provider_downcast() {
     );
 }
 
-/// Static guard (Correctif 7 / task group 10; recount at task 11.5): the
-/// Rust-synthesized, unattested Qwen graph fallback (`qwen_component_graph_
-/// semantics_for_prompt`/`build_first_native_graphs_from_component_output`
-/// and the helpers only they use, plus every dispatch entry point's own
-/// fallback branch) must only be reachable when the crate was explicitly
-/// built with `non-strict-fixture-fallback` -- verified by `cargo check
-/// --no-default-features` failing to compile without that feature (see
-/// `Cargo.toml`'s doc comment on it). This guard catches a *weakening* of
-/// that gate (e.g. someone deleting the `feature = "non-strict-fixture-
-/// fallback"` clause from one of these `#[cfg(...)]` attributes) that would
-/// not itself cause a compile failure under default features, so it would
-/// otherwise go unnoticed by the normal build/test cycle.
-///
-/// 10, not 2, since task 11.5 (the real Qwen Component became the strict,
-/// default graph source) grew this list two ways: one genuine new fallback
-/// *call site* (`first_native_component_graphs_for_prompt`'s own fallback
-/// branch, alongside the original two in `run_success_path_with_prompt` and
-/// `FirstNativeChatSession::turn`), and seven now-fallback-only *helper*
-/// declarations (`qwen_operator_kind_code`, `qwen_graph_operator_codes`,
-/// `qwen_operator_sequence_hash`, `QwenComponentGraphSemantics`'s struct and
-/// impl, `build_first_native_graphs_from_component_output`,
-/// `qwen_component_graph_semantics_for_prompt`) that the strict path no
-/// longer calls at all, so they need `#[cfg(any(test, feature =
-/// "non-strict-fixture-fallback"))]` themselves to avoid being dead code in
-/// a plain (non-test) strict build. Both kinds matter equally to this
-/// guard's actual purpose (nothing here reachable without the explicit
-/// feature or a test), so both are counted together.
+/// Static guard (Correctif 7 / task group 10; superseded at task 12.6, per
+/// explicit direction to remove the `non-strict-fixture-fallback` opt-in
+/// entirely rather than keep it as a production escape hatch). The prior
+/// version of this guard verified that the Rust-synthesized Qwen graph
+/// fallback required an explicit Cargo feature to even *compile* into a
+/// production build -- `cargo check --no-default-features` failed to
+/// compile without it, a real but blunt fail-closed mechanism (an
+/// environment that cannot get a real Component engine could not produce a
+/// runnable binary at all, only a compile error). That opt-in is gone now:
+/// production has exactly one graph-producing branch of
+/// `first_native_component_graphs_for_prompt` (and the sibling inline
+/// blocks in `run_success_path_with_prompt`/`FirstNativeChatSession::turn`)
+/// when a strict Component engine is unavailable, and it is an unconditional,
+/// structured runtime error -- not a second, unattested Rust-synthesized
+/// graph, and not a compile failure either. This guard checks, by source
+/// inspection (the only way to check something a `not(test)` cfg makes
+/// impossible to invoke directly from a `#[test]`, and the same technique
+/// the guard it replaces already used), that: (1) every production,
+/// non-test cfg branch that used to require `feature =
+/// "non-strict-fixture-fallback"` is gone from `first_native_runtime.rs`
+/// entirely -- the feature no longer exists in `Cargo.toml`, so if this
+/// string reappears here it means someone reintroduced a production
+/// opt-in fallback; and (2) the fail-closed production stub's error
+/// message is still present, at the expected count of call sites
+/// (`first_native_component_graphs_for_prompt`, `run_success_path_with_prompt`,
+/// `FirstNativeChatSession::turn`).
 #[test]
-fn first_native_dispatch_fallback_requires_non_strict_fixture_fallback_feature() {
+fn first_native_dispatch_has_no_production_fallback_and_fails_closed_instead() {
     let source = include_str!("../first_native_runtime.rs");
-    let occurrences = source
-        .matches("feature = \"non-strict-fixture-fallback\"")
+    assert!(
+        !source.contains("non-strict-fixture-fallback"),
+        "the non-strict-fixture-fallback Cargo feature was deliberately removed (task 12.6); \
+         its reappearance in first_native_runtime.rs means a production opt-in fallback to the \
+         unattested Rust-synthesized graph was reintroduced"
+    );
+    let fail_closed_occurrences = source
+        .matches("no Component engine is available on this build target")
         .count();
     assert_eq!(
-        occurrences, 10,
-        "expected exactly the ten documented #[cfg(...)] sites (three real fallback call \
-         sites in run_success_path_with_prompt, FirstNativeChatSession::turn, and \
-         first_native_component_graphs_for_prompt, plus seven now-fallback-only helper \
-         declarations) to require `feature = \"non-strict-fixture-fallback\"` alongside the \
-         unattested Qwen graph fallback; found {occurrences}. If a new fallback call site or \
-         fallback-only helper was added, it must be gated the same way; if one was \
-         intentionally removed, lower this count."
+        fail_closed_occurrences, 3,
+        "expected exactly the three documented production fail-closed stubs \
+         (first_native_component_graphs_for_prompt, run_success_path_with_prompt, \
+         FirstNativeChatSession::turn) to share this exact structured error message when no \
+         strict Component engine is available; found {fail_closed_occurrences}. If a call site \
+         was added or removed, update this count."
     );
 }
 
@@ -1709,9 +1712,26 @@ fn e2e_authoritative_path_collects_correlated_runtime_observations() {
     let fixture = e2e_fixture().expect("fixture builds");
     let outcome = run_success_path(&fixture).expect("success path runs");
     let observations = outcome.observer.observations();
+    // ComponentValidated/ComponentInstantiated are only emitted by the real
+    // Qwen Component's strict-path preflight (`build_first_native_graphs_
+    // from_real_qwen_component`); a test build without a strict Component
+    // engine takes the test-oracle fallback instead (task 12.6), which
+    // never claims to validate/instantiate a real Component, so asserting
+    // this evidence only makes sense when the strict engine is what this
+    // build actually exercises.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
     for kind in [
         InferenceApiObservationKind::ComponentValidated,
         InferenceApiObservationKind::ComponentInstantiated,
+    ] {
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.kind == kind),
+            "missing authoritative observation {kind:?}"
+        );
+    }
+    for kind in [
         InferenceApiObservationKind::ModelInstanceReady,
         InferenceApiObservationKind::GraphValidationCompleted,
         InferenceApiObservationKind::PlanSelected,

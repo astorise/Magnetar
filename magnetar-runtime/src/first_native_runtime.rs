@@ -2474,20 +2474,14 @@ fn qwen_rope_head_count(
 /// `prefill-operator-code`/`decode-operator-code` exports). A plain
 /// name-to-code table rather than `OperatorId` equality: the Component
 /// boundary exchanges scalar `u32`s, not portable Operator identities.
-// Task 11.5: this whole checksum-hash family (through
+// Task 11.5/12.6: this whole checksum-hash family (through
 // `qwen_component_graph_semantics_for_prompt`/`QwenComponentGraphSemantics`/
-// `build_first_native_graphs_from_component_output`) is only reachable from
-// tests and the explicit `non-strict-fixture-fallback` build now -- the
-// strict, default production path gets its graph directly from the real
-// Component instead of cross-checking a Rust-synthesized one against a
-// declared checksum.
-#[cfg(any(
-    test,
-    all(
-        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
-        feature = "non-strict-fixture-fallback"
-    )
-))]
+// `build_first_native_graphs_from_component_output`) is test-oracle only --
+// the strict, default production path gets its graph directly from the
+// real Component instead of cross-checking a Rust-synthesized one against a
+// declared checksum, and no production build has a second, unattested
+// graph source to fall back to.
+#[cfg(test)]
 fn qwen_operator_kind_code(name: &str) -> Option<u32> {
     match name {
         "embedding" => Some(0),
@@ -2506,13 +2500,7 @@ fn qwen_operator_kind_code(name: &str) -> Option<u32> {
 /// dependency order `execute_qwen_graph` executes it in: the semantic
 /// content a Qwen Model Component is expected to reproduce when describing
 /// its own graph (see `qwen_operator_kind_code`).
-#[cfg(any(
-    test,
-    all(
-        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
-        feature = "non-strict-fixture-fallback"
-    )
-))]
+#[cfg(test)]
 fn qwen_graph_operator_codes(graph: &ExecutionGraph) -> Result<Vec<u32>, E2eConformanceError> {
     let order = qwen_graph_execution_order(graph)?;
     order
@@ -2544,13 +2532,7 @@ fn qwen_graph_operator_codes(graph: &ExecutionGraph) -> Result<Vec<u32>, E2eConf
 /// identical unrolled XOR/multiply steps over its own hard-coded sequence)
 /// and Runtime compares hashes -- a proof over the actual ordered semantic
 /// content, not just a count.
-#[cfg(any(
-    test,
-    all(
-        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
-        feature = "non-strict-fixture-fallback"
-    )
-))]
+#[cfg(test)]
 fn qwen_operator_sequence_hash(codes: &[u32]) -> u32 {
     const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
     const FNV_PRIME: u32 = 0x0100_0193;
@@ -3874,10 +3856,12 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // exact-match, not semantic.
             // `first_native_component_graphs_for_prompt` is that same
             // recipe (real Qwen Component under the strict, default build;
-            // the explicit `non-strict-fixture-fallback` recipe otherwise)
-            // -- both are fully deterministic for a given `(fixture,
-            // prompt_token_count)`, so calling it again here reproduces the
-            // identical graph the plan was prepared against.
+            // a structured fail-closed error in production otherwise; the
+            // Rust-synthesized recipe only in a test build without a
+            // strict engine) -- deterministic for a given `(fixture,
+            // prompt_token_count)` whenever it succeeds at all, so calling
+            // it again here reproduces the identical graph the plan was
+            // prepared against.
             let component_graphs = first_native_component_graphs_for_prompt(
                 &self.fixture,
                 request.input_token_ids.len() as u64,
@@ -4965,9 +4949,9 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
 /// `build-prefill-graph`/`build-decode-graph` exports, which produce the
 /// graph through real `graph-builder` host calls into a
 /// [`GraphBuilderCapability`] -- not `qwen_prefill_graph`/`qwen_decode_graph`
-/// (task 11.5: this is the strict, default production path's graph source;
-/// those Rust functions remain only for the explicit, non-default
-/// `non-strict-fixture-fallback` path and test oracles). Returns the
+/// (task 11.5/12.6: this is production's *only* graph source; those Rust
+/// functions are test-oracle only now, unreachable from any non-test
+/// build). Returns the
 /// component's own `ComponentDefinitionId`/`ComponentInstanceId` alongside
 /// the graphs so the caller can still emit the same
 /// `ComponentValidated`/`ComponentInstantiated` observations the prior
@@ -5103,13 +5087,7 @@ struct QwenComponentPreflight {
 /// `validate_against_graphs` performs genuine semantic comparison against
 /// the Runtime-built graph rather than proving only that the two graphs
 /// happen to be the same size.
-#[cfg(any(
-    test,
-    all(
-        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
-        feature = "non-strict-fixture-fallback"
-    )
-))]
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QwenComponentGraphSemantics {
     prefill_node_count: usize,
@@ -5118,13 +5096,7 @@ struct QwenComponentGraphSemantics {
     decode_operator_hash: u32,
 }
 
-#[cfg(any(
-    test,
-    all(
-        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
-        feature = "non-strict-fixture-fallback"
-    )
-))]
+#[cfg(test)]
 impl QwenComponentGraphSemantics {
     fn validate_against_graphs(
         &self,
@@ -5179,13 +5151,7 @@ struct FirstNativeComponentGraphs {
     decode_node_count: usize,
 }
 
-#[cfg(any(
-    test,
-    all(
-        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
-        feature = "non-strict-fixture-fallback"
-    )
-))]
+#[cfg(test)]
 fn build_first_native_graphs_from_component_output(
     fixture: &E2eFixture,
     prompt_token_count: u64,
@@ -5640,13 +5606,7 @@ fn prepare_first_native_execution_plans(
 /// one queried across the Component boundary (the non-component fallback
 /// build, and tests not themselves exercising component/graph mismatch
 /// detection).
-#[cfg(any(
-    test,
-    all(
-        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
-        feature = "non-strict-fixture-fallback"
-    )
-))]
+#[cfg(test)]
 fn qwen_component_graph_semantics_for_prompt(
     config: &QwenConfig,
     identity: &ModelComponentIdentity,
@@ -5669,9 +5629,7 @@ fn qwen_component_graph_semantics_for_prompt(
 /// [`PreparedExecutionPlan`] (via [`first_native_plans_for_prompt`]) that
 /// must fingerprint-match whatever graph actually gets dispatched. Task
 /// 11.5: under the strict, default build this is the real Qwen Component
-/// (matching `execute_generation_step`'s own strict branch); the
-/// Rust-synthesized recipe survives only behind the same explicit
-/// `non-strict-fixture-fallback` gate every other fallback site uses.
+/// (matching `execute_generation_step`'s own strict branch).
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn first_native_component_graphs_for_prompt(
     fixture: &E2eFixture,
@@ -5681,9 +5639,15 @@ fn first_native_component_graphs_for_prompt(
         .map(|(graphs, _definition, _instance)| graphs)
 }
 
+/// Test-oracle branch (`reach-architecture-freeze-1` task 12.6): when no
+/// strict Component engine is available, a test build still needs *some*
+/// graph to drive downstream (KV, sampling, tokenization, ...) coverage
+/// with, so it falls back to the Rust-synthesized recipe -- never reachable
+/// outside `#[cfg(test)]`, and never the thing first-native generation
+/// treats as authoritative in a real build.
 #[cfg(all(
-    not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
-    feature = "non-strict-fixture-fallback"
+    test,
+    not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))
 ))]
 fn first_native_component_graphs_for_prompt(
     fixture: &E2eFixture,
@@ -5695,6 +5659,29 @@ fn first_native_component_graphs_for_prompt(
         prompt_token_count,
     )?;
     build_first_native_graphs_from_component_output(fixture, prompt_token_count, semantics)
+}
+
+/// Production, non-test branch when no strict Component engine is
+/// available (no `wasmtime-component-engine`, or `wasm32`, which has none
+/// today -- see task group 10's investigation note). Correctif 7 / task
+/// group 10's fail-closed requirement, and the explicit decision behind
+/// task 12.6: production first-native generation has exactly one semantic
+/// source for Model Component graphs, the real Component itself. There is
+/// no second, Rust-synthesized production path to fall back to, silently
+/// or otherwise -- this fails structurally instead.
+#[cfg(all(
+    not(test),
+    not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))
+))]
+fn first_native_component_graphs_for_prompt(
+    _fixture: &E2eFixture,
+    _prompt_token_count: u64,
+) -> Result<FirstNativeComponentGraphs, E2eConformanceError> {
+    Err(E2eConformanceError::ModelComponentFailed {
+        reason: "no Component engine is available on this build target; first-native generation \
+                 requires a real Model Component and has no unattested fallback graph source"
+            .into(),
+    })
 }
 
 /// Builds real published prepared execution plans for `fixture` at
@@ -5820,15 +5807,15 @@ fn run_success_path_with_prompt(
         );
         graphs
     };
-    // Correctif 7 / task group 10: this fallback only compiles at all with
-    // `non-strict-fixture-fallback` explicitly enabled -- without it, a
-    // build lacking a real Component engine (no `wasmtime-component-engine`,
-    // or the `wasm32` target) fails to compile here rather than silently
-    // producing an unattested, Rust-synthesized graph. See that feature's
-    // doc comment in Cargo.toml.
+    // Correctif 7 / task group 10, task 12.6: without a real Component
+    // engine, production has no second, Rust-synthesized graph source to
+    // fall back to -- it fails closed, structurally. A test build still
+    // needs *some* graph to drive downstream coverage with when built
+    // without a strict engine, so it keeps the Rust-synthesized recipe as a
+    // test-oracle-only fallback.
     #[cfg(all(
-        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
-        feature = "non-strict-fixture-fallback"
+        test,
+        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))
     ))]
     let component_graphs = {
         let semantics = qwen_component_graph_semantics_for_prompt(
@@ -5842,6 +5829,17 @@ fn run_success_path_with_prompt(
             semantics,
         )?
     };
+    #[cfg(all(
+        not(test),
+        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))
+    ))]
+    let component_graphs: FirstNativeComponentGraphs =
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "no Component engine is available on this build target; first-native \
+                     generation requires a real Model Component and has no unattested \
+                     fallback graph source"
+                .into(),
+        });
     let mut prepared_plans = prepare_first_native_execution_plans(
         &runtime,
         &instance,
@@ -6114,12 +6112,15 @@ impl FirstNativeChatSession {
             );
             graphs
         };
-        // Correctif 7 / task group 10: see the sibling fallback in
-        // `run_success_path_with_prompt` -- this compiles only with
-        // `non-strict-fixture-fallback` explicitly enabled.
+        // Correctif 7 / task group 10, task 12.6: see the sibling fallback
+        // in `run_success_path_with_prompt` -- production has no second,
+        // Rust-synthesized graph source without a strict Component engine;
+        // it fails closed. The Rust-synthesized recipe survives only as a
+        // test-oracle fallback so a test build without a strict engine
+        // still has some graph to drive downstream coverage with.
         #[cfg(all(
-            not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
-            feature = "non-strict-fixture-fallback"
+            test,
+            not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))
         ))]
         let component_graphs = {
             let semantics = qwen_component_graph_semantics_for_prompt(
@@ -6135,6 +6136,18 @@ impl FirstNativeChatSession {
             )
             .map_err(FirstNativeRuntimeError::from_conformance)?
         };
+        #[cfg(all(
+            not(test),
+            not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))
+        ))]
+        let component_graphs: FirstNativeComponentGraphs = return Err(
+            FirstNativeRuntimeError::from_conformance(E2eConformanceError::ModelComponentFailed {
+                reason: "no Component engine is available on this build target; \
+                             first-native generation requires a real Model Component and has \
+                             no unattested fallback graph source"
+                    .into(),
+            }),
+        );
 
         let mut prepared_plans = prepare_first_native_execution_plans(
             &self.runtime,
@@ -6607,6 +6620,10 @@ fn check_invalid_graph_fixture() -> Result<(), E2eConformanceError> {
     }
 }
 
+/// Test-oracle only (task 12.6): exercises the Rust-synthesized graph
+/// builder directly to prove it stays internally valid, independent of
+/// whether anything in production ever uses it as a graph source.
+#[cfg(test)]
 fn check_graph_production_and_execution(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
     // kv_cache_enabled=true so the prefill graph's K/V edges are actually
     // marked as cache outputs -- otherwise the decode graph below would
@@ -9318,6 +9335,7 @@ pub fn run_e2e_local_inference_conformance() -> E2eConformanceReport {
         "invalid-graph-fixture-rejected",
         check_invalid_graph_fixture(),
     ));
+    #[cfg(test)]
     report.record(E2eTestResult::from_result(
         "graph-production-and-execution",
         check_graph_production_and_execution(&fixture),

@@ -342,7 +342,7 @@ item, so it is recorded here rather than silently folded into 11.1's note.
 
 ## 12. Remove Qwen/model-family semantics from `magnetar-runtime`
 
-**Status: 5/7 done, 2 deliberately not attempted (12.4, 12.6).** 12.1/12.2/12.5
+**Status: 6/7 done, 1 in progress (12.4).** 12.1/12.2/12.5
 were already substantially achieved as a side effect of 11.4/11.5 (noted
 below). This pass closed the real remaining gap in 12.3: the Qwen Component
 (`components/qwen/src/lib.rs`) now calls `weight-edge` with the canonical
@@ -369,29 +369,58 @@ the new logical names because `qwen_weight_shapes_for_config`'s keys were
 still in the old shorthand) before that was caught and fixed. Full suite is
 1108/1108 passing after the fix.
 
-What remains genuinely open: `qwen_build_graph`/`qwen_prefill_graph`/
-`qwen_decode_graph` and the rest of `qwen_model_component.rs` still exist in
-`magnetar-runtime` (kept, deliberately, as the `non-strict-fixture-fallback`
-recipe and test oracles -- removing them entirely, 12.6, is a separate,
-larger decision this pass did not make); the `kv_namespace: "qwen"` literal
-in `SessionContext` construction and `qwen_weight_shapes_for_config`'s
-architecture-to-shape derivation still live in `first_native_runtime.rs` --
-expected, not a gap, since that file (along with `qwen_model_component.rs`)
-is the designated Qwen-scoped file, not a generic Core module (see 12.7's
-new CI guard, which encodes exactly this distinction); and 12.4 (fixtures
-out of production code) was not attempted -- the real Qwen Component binary
-is still embedded via `include_bytes!` directly into the strict/production
-path as a `ComponentDistributionSourceKind::DevelopmentFixture`, real,
-pre-existing architecture debt (no real Component distribution/registry
-mechanism exists yet) outside this task group's Qwen-semantics-leakage
-focus.
+12.6 is now also done, per an explicit architectural decision (not this
+pass's own judgment call): `qwen_build_graph`/`qwen_prefill_graph`/
+`qwen_decode_graph` (and their exclusively-owned private helpers,
+`f32_edge`/`token_id_edge`/`qwen_lm_head_weight_edge`) are now `#[cfg(test)]`
+in `qwen_model_component.rs` -- unreachable from any non-test build, with or
+without any feature. The `non-strict-fixture-fallback` Cargo feature that
+used to gate an opt-in production fallback to this Rust-synthesized graph is
+gone entirely (`magnetar-runtime/Cargo.toml`); production's only remaining
+branch when no strict Component engine is available is a new, unconditional,
+structured `E2eConformanceError::ModelComponentFailed` at
+`first_native_component_graphs_for_prompt` and the two sibling inline call
+sites in `run_success_path_with_prompt`/`FirstNativeChatSession::turn` --
+production has exactly one graph-producing source now (the real Component),
+never a second, unattested one, and no longer a compile-time trap either
+(the old design failed to *compile* at all without the feature; the new one
+compiles cleanly everywhere and fails closed at *runtime* instead, which is
+strictly better for a real deployed binary, e.g. wasm32, that could not
+previously even build without opting into the fallback). Verified against
+every real build configuration, not just the one that used to matter: default
+features (1140 passed), `--no-default-features` (previously failed to
+compile at all; now compiles and passes, 1100/1100 -- one test's assertions
+were narrowed to the strict-engine-only observations they actually depend on,
+`ComponentValidated`/`ComponentInstantiated`, since the test-oracle fallback
+branch genuinely does not produce those), `--all-features`, and
+`--target wasm32-unknown-unknown --all-features` (the exact CI command,
+previously dependent on the now-removed feature to compile at all). A real,
+previously-undetected bug surfaced by finally exercising the Rust builder's
+full weight-resolution path end to end (via the `--no-default-features` test
+run): `qwen_build_graph`'s weight-edge names were stale, still using the
+pre-task-12.3 shorthand (`weight.layer0.input_norm`) instead of the
+canonical names (`weight.layers.0.input_norm`,
+`weight.layers.0.self_attn.q_proj`, etc.) the real Component and
+`weight_bindings` have used since 12.3 landed -- invisible until now because
+the strict production cutover (11.5) stopped exercising this function with
+real weight resolution, and no test happened to run the full success path
+through the Rust-builder branch with real weight binding until this pass's
+`--no-default-features` verification did. Fixed to match
+`qwen_expected_tensor_names`'s canonical convention exactly.
+
+The `kv_namespace: "qwen"` literal in `SessionContext` construction and
+`qwen_weight_shapes_for_config`'s architecture-to-shape derivation still
+live in `first_native_runtime.rs` -- expected, not a gap, since that file
+(along with `qwen_model_component.rs`) is the designated Qwen-scoped file,
+not a generic Core module (see 12.7's CI guard, which encodes exactly this
+distinction). 12.4 is now in progress -- see its own note.
 
 - [x] 12.1 Materialize `components/qwen` as a working submodule build (builds on the gitlink already added to `.gitmodules` on this branch). (Done as a side effect of task group 11: `components/qwen` is a real, building, wasm32-compiling Component, not a template.)
-- [x] 12.2 Move the Qwen graph builder out of `magnetar-runtime` into the Component (superseded by task 11.4/11.5 once the contract lands). (Done: 11.5's cutover made the real Component the exclusive production graph source under the strict path; the in-crate Rust builder survives only as the explicit, non-default fallback.)
+- [x] 12.2 Move the Qwen graph builder out of `magnetar-runtime` into the Component (superseded by task 11.4/11.5 once the contract lands). (Done: 11.5's cutover made the real Component the exclusive production graph source under the strict path; the in-crate Rust builder survives only as a `#[cfg(test)]`-only oracle now, per 12.6.)
 - [x] 12.3 Move Qwen weight-name and KV-name mappings (`self_attn.q_proj`, `qwen.layerN.k/v`, etc.) out of the Core. (The mapping *tables* are gone -- see the group note above for the full change. What remains in `first_native_runtime.rs` is a config value (`kv_namespace: "qwen"`) and architecture-derived shapes, not a hardcoded name-translation table, and that file is the designated Qwen-scoped file, not "the Core" in the sense this task and 12.7's guard mean.)
 - [ ] 12.4 Move Qwen fixtures out of `magnetar-runtime` production code (test-only fixtures may remain under test paths). (Not attempted -- see the group note above. Real, separate architecture debt: the strict production path embeds the real Qwen Component binary via `include_bytes!` as a development-fixture distribution source, with no real Component registry/distribution mechanism to move it to yet.)
 - [x] 12.5 Execute the real Qwen Component Artifact in the first-native test suite. (Done via 11.5; reconfirmed still true after this task's weight-naming change and Component rebuild -- full suite 1108/1108 passing.)
-- [ ] 12.6 Remove `pub mod qwen_model_component` (or equivalent) from the Core crate. (Deliberately not done -- kept as the `non-strict-fixture-fallback` recipe and test oracle, per the group note. Removing it entirely is a separate, larger decision this pass did not make.)
+- [x] 12.6 Remove `pub mod qwen_model_component` (or equivalent) from the Core crate. (Done, per an explicit architectural decision -- see the group note above for the full change. The module itself is not deleted (most of it -- config validation, target modules, KV/tokenizer metadata, adapter support -- is genuinely production-used, unrelated to the graph-semantics-duplication concern this task targets), but `qwen_build_graph`/`qwen_prefill_graph`/`qwen_decode_graph` specifically, the part that actually duplicated Model Component graph semantics, are now `#[cfg(test)]`-only and unreachable from any production build. Production has exactly one Model Component graph source.)
 - [x] 12.7 Add a CI guard rejecting `qwen`, `llama`, `self_attn.q_proj`, `mlp.gate_proj` (and similar model-family identifiers) in designated generic Core modules, excluding tests, docs, and OpenSpec archives. (New `model-family-isolation` job in `.github/workflows/quality.yml`: scans an explicit list of 16 generic Core files -- `affinity.rs`, `capability.rs`, `component.rs`, `component_wasmtime.rs`, `compute.rs`, `device.rs`, `execution_graph.rs`, `graph_builder_capability.rs`, `kernel.rs`, `kernel_compilation.rs`, `memory.rs`, `operator.rs`, `provider.rs`, `reference_cpu.rs`, `scheduler.rs`, `tensor.rs` -- for the same patterns, with line comments stripped first so design-intent prose can't self-trigger it. Deliberately an explicit allowlist of files verified clean today, not "every file in magnetar-runtime minus two": a broader sweep during this task found real, pre-existing qwen/llama mentions outside this list too (`conformance.rs`'s `QwenWasmModelComponent` enum variant is a genuine instance of the pattern this guard exists to catch; `kernel_execution_plan.rs`, `provider_roadmap.rs`, and others are mostly test-fixture example strings) -- not fixed in this pass, real follow-up work, so the guard does not yet cover those files. Verified locally to pass today (`exit=0`) before relying on it; not yet exercised against live GitHub Actions.)
 
 ## 13. Evaluate the external Provider boundary (conditional)
