@@ -119,11 +119,16 @@ be able to assert a Runtime-observable fact as `true` when the Runtime does
 not itself observe it as true.
 
 A bound weight resource SHALL only count toward `weights_materialized` if
-it has a corresponding residency record the Runtime itself recorded; a
-resource identifier present without one SHALL NOT count. A pinned
-Provider SHALL only count toward `provider_ready` if its own status model
-reports it as currently accepting new work, not merely that it is
-registered and exposes an execution interface in principle.
+it has a corresponding residency record the Runtime itself recorded, and
+that residency's recorded Provider SHALL itself currently hold the tensor
+-- a residency record alone, without confirmation from the Provider it
+claims, SHALL NOT count. When the loaded artifact declares a mandatory
+tensor inventory, every one of those tensors SHALL be bound; a partial
+subset, however individually well-evidenced, SHALL NOT count as
+materialized. A pinned Provider SHALL only count toward `provider_ready`
+if its own status model reports it as currently accepting new work, not
+merely that it is registered and exposes an execution interface in
+principle.
 
 The public surface for producing a `Ready` Model Instance SHALL NOT permit
 an external caller to reach `Ready` other than through a path that
@@ -156,6 +161,22 @@ When a caller requests warmup asserting weights are materialized
 
 Then the Runtime does not treat that resource as materialized and the instance does not become Ready.
 
+#### Scenario: A residency record without a real Provider write does not count
+
+Given a Model Instance has a weight resource with a recorded residency, but the residency's claimed Provider never received a write for that resource
+
+When a caller requests warmup asserting weights are materialized
+
+Then the Runtime does not treat that resource as materialized and the instance does not become Ready.
+
+#### Scenario: An incomplete mandatory weight inventory does not count
+
+Given the loaded artifact declares multiple mandatory weight tensors and only some are bound, each with real residency and Provider-backed evidence
+
+When a caller requests warmup asserting weights are materialized
+
+Then the Runtime does not treat the instance as fully materialized and it does not become Ready.
+
 #### Scenario: A Provider that rejects new work does not count as ready
 
 Given a Model Instance is pinned to a Provider that is registered and exposes an execution interface
@@ -165,8 +186,6 @@ But that Provider's own status model reports it does not currently accept new wo
 When a caller requests warmup asserting the Provider is ready
 
 Then the Runtime does not treat the Provider as ready and the instance does not become Ready.
-
----
 
 ### Requirement: Model Instance Creation
 
@@ -907,4 +926,34 @@ An active ModelInstance SHALL expose the stable resource bindings for weights, c
 #### Scenario: Instance unloads
 - **WHEN** a ModelInstance is unloaded
 - **THEN** its resource bindings are released according to Runtime policy and cannot be used for new execution.
+
+### Requirement: Model Instance Resume Revalidates Readiness
+
+Resuming a suspended Model Instance SHALL NOT transition it directly to
+`Ready`. State that made the instance eligible for suspension (Provider
+health, weight materialization evidence, Device availability) MAY have
+changed while it was suspended; resume SHALL re-derive readiness against
+current Runtime state through the same evidence-deriving path used to
+reach `Ready` from any other lifecycle state, rather than assuming prior
+readiness still holds.
+
+#### Scenario: Resume rejects stale evidence
+
+Given a Model Instance was Ready and is then suspended
+
+But readiness-relevant Runtime state changes to invalidate that instance's prior evidence while it is suspended
+
+When resume is requested
+
+Then the instance does not become Ready and the resume request fails
+
+#### Scenario: Resume succeeds when evidence still holds
+
+Given a Model Instance was Ready and is then suspended
+
+And all readiness-relevant Runtime state remains valid while suspended
+
+When resume is requested
+
+Then the instance becomes Ready again
 

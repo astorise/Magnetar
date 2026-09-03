@@ -63,8 +63,8 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Architecture Freeze #1 is **accepted** at commit `0539df0` (2026-09-03,
-  CI run https://github.com/astorise/Magnetar/actions/runs/33772079066,
+- Architecture Freeze #1 is **accepted** at commit `146e87e` (2026-09-03,
+  CI run https://github.com/astorise/Magnetar/actions/runs/33778950316,
   zero non-`success` jobs confirmed via `gh run view --json
   status,conclusion` and the jobs list directly). The history below is
   kept in full because each round found something real; the commit and
@@ -203,8 +203,46 @@
   downstream consumer who also builds with `--all-features`). Verified:
   full workspace test suite (1,399 tests) passing, `cargo doc` clean,
   wasm32 check clean, coverage ratchet at 78.91% (above baseline),
-  `openspec validate --all --strict` 77/77, live `qwen-test` unaffected,
-  and the CI run cited in this note's opening sentence.
+  `openspec validate --all --strict` 77/77, live `qwen-test` unaffected.
+  A fifth audit round -- confirming every round-2 gap was genuinely
+  closed before looking for new ones -- found two further real gaps,
+  both already contradicting pre-existing canonical spec text
+  (spec-correct, code non-compliant): (P0-1) `resume_model_instance`
+  still reached `Ready` via `ModelInstance::resume()`'s internal
+  `Suspended -> Loading -> Ready` transitions with no call to the
+  Runtime-derived readiness check anywhere in between -- state that made
+  an instance eligible for suspension could have changed while
+  suspended, and resume would jump straight back to `Ready` on stale
+  assumptions; (P0-2) `weights_materialized` checked that every *bound*
+  weight had a real residency, but never that the bound set was
+  *complete* against the loaded manifest's declared tensor inventory
+  (`model-loading`'s pre-existing "Qwen Loading Validates Tensor
+  Inventory" and "Partial Loading Policy" requirements), nor that a
+  residency's claimed Provider had actually received a `write_tensor`
+  call for it -- a caller could record a fully legitimate-looking
+  `TensorResidency` for a resource no Provider ever wrote. Fixed by
+  `openspec/changes/harden-model-instance-readiness-proof`:
+  `ModelInstance::resume()` now only reaches `Loading`;
+  `resume_model_instance` completes the transition through
+  `warm_model_instance`, reusing the same Runtime-derived-evidence path
+  every other route to `Ready` uses. `LoadedModelContext` gains
+  `required_weight_names`, populated by `ModelLoadingCoordinator::load()`
+  from the manifest (no signature change needed on `create_model_instance`
+  or `from_loaded_context`); `weights_materialized` derivation now
+  requires every declared name to be bound (when known) and resolves
+  each bound weight's residency to its recorded Provider, calling
+  `read_tensor` to confirm real backing storage rather than trusting the
+  residency record alone -- reading actual Provider storage, not new
+  Runtime-owned bookkeeping, because any new state gated behind
+  `pub(crate)` would reintroduce the "external test crate can't
+  legitimately construct evidence" problem round 2 already solved, and
+  any publicly-settable flag would just move the forgery surface.
+  Verified: full workspace test suite (1,402 tests) passing, `cargo doc`
+  clean, wasm32 check clean, coverage ratchet at 78.93% (above
+  baseline), `openspec validate --all --strict` 77/77, live `qwen-test`
+  unaffected (its production path never calls `warm_model_instance`/
+  `resume_model_instance`), and the CI run cited in this note's opening
+  sentence.
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
