@@ -498,7 +498,7 @@ fn derive_effective_readiness_checks(
 /// Runs the Model Instance warmup plan through the Runtime Inference API
 /// boundary, without exposing Provider/Device handles. The caller-supplied
 /// `checks` are not trusted as-is for the facts the Runtime can itself
-/// observe -- see [`derive_effective_readiness_checks`].
+/// observe -- see `derive_effective_readiness_checks` above.
 pub fn warm_model_instance(
     runtime: &mut Runtime,
     instance: &ModelInstanceId,
