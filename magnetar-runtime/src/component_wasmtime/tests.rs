@@ -892,6 +892,67 @@ fn wasmtime_engine_rejects_unauthorized_wasi_fixtures_without_link_plan() {
 }
 
 #[test]
+fn wasmtime_engine_reports_capability_version_mismatch_distinctly_from_unresolved_import() {
+    // `CAPABILITY_ECHO_COMPONENT`'s real compiled import is
+    // "example:test/capability@1.0.0" -- the Link Plan below approves that
+    // same interface *name* at a different version ("2.0.0"), so the exact
+    // `(name, version)` lookup misses while the name itself is still known.
+    // `model-component-graph-contract`'s "Component requires unsupported
+    // contract version" scenario is exactly this case.
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-capability-version-mismatch-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("capability-echo.component.wasm");
+    std::fs::write(&artifact, CAPABILITY_ECHO_COMPONENT).unwrap();
+
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let requested_interface = WitInterface::new("example:test/capability", "1.0.0");
+    let approved_interface = WitInterface::new("example:test/capability", "2.0.0");
+    let export_interface = WitInterface::new("example:test/capability-echo", "1.0.0");
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(191),
+        metadata: crate::ComponentMetadata::new(
+            "capability-echo-version-mismatch",
+            "1",
+            "capability echo component requiring an unapproved version",
+        )
+        .with_import(requested_interface)
+        .with_export(export_interface),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let mut link_plan = ComponentLinkPlan::default();
+    link_plan.insert_for_test(crate::ComponentEndpoint::Capability {
+        interface: approved_interface.clone(),
+    });
+
+    let error = engine.instantiate(&prepared, &link_plan).unwrap_err();
+    match error {
+        ComponentError::CapabilityVersionMismatch {
+            name,
+            requested_version,
+            available_version,
+            ..
+        } => {
+            assert_eq!(name, "example:test/capability");
+            assert_eq!(requested_version, "1.0.0");
+            assert_eq!(available_version, "2.0.0");
+        }
+        other => panic!("expected CapabilityVersionMismatch, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn wasmtime_engine_rejects_resource_imports_without_runtime_resource_mapping() {
     let directory =
         std::env::temp_dir().join(format!("magnetar-wasmtime-resource-{}", std::process::id()));

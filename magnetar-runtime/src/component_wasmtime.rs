@@ -572,6 +572,19 @@ fn configure_linker(
     for (import_name, item) in component.component_type().imports(engine) {
         let interface = wit_interface_from_component_name(import_name);
         if link_plan.endpoint(&interface).is_none() {
+            // The interface name may still be approved at a different
+            // version, distinguishing "known interface, wrong version"
+            // (a structured `CapabilityVersionMismatch`) from "this
+            // interface name is unknown at any version" (the generic
+            // `InstantiationFailed` below).
+            if let Some(approved) = link_plan.interface_by_name(&interface.name) {
+                return Err(ComponentError::CapabilityVersionMismatch {
+                    definition,
+                    name: interface.name.clone(),
+                    requested_version: interface.version.clone(),
+                    available_version: approved.version.clone(),
+                });
+            }
             return Err(ComponentError::InstantiationFailed {
                 definition,
                 message: format!(

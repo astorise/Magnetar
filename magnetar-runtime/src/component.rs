@@ -1286,6 +1286,16 @@ impl ComponentLinkPlan {
         self.links.get(interface)
     }
 
+    /// Finds an approved interface by name alone, ignoring version --
+    /// distinguishes "this interface name is unknown at any version" from
+    /// "this interface name is known, but not at the requested version"
+    /// when [`Self::endpoint`]'s exact `(name, version)` lookup misses
+    /// (`model-component-graph-contract`'s "Component requires unsupported
+    /// contract version" scenario).
+    pub fn interface_by_name(&self, name: &str) -> Option<&WitInterface> {
+        self.links.keys().find(|interface| interface.name == name)
+    }
+
     #[cfg(all(test, feature = "wasmtime-component-engine"))]
     pub(crate) fn insert_for_test(&mut self, endpoint: ComponentEndpoint) {
         self.links.insert(endpoint.interface().clone(), endpoint);
@@ -2436,7 +2446,10 @@ impl ComponentManager {
                 ComponentObservationKind::PlatformUnsupported
             }
             ComponentError::HostBindingFailed { .. } => ComponentObservationKind::Instantiation,
-            ComponentError::InstantiationFailed { .. } => ComponentObservationKind::Instantiation,
+            ComponentError::InstantiationFailed { .. }
+            | ComponentError::CapabilityVersionMismatch { .. } => {
+                ComponentObservationKind::Instantiation
+            }
             ComponentError::InvocationFailed { .. }
             | ComponentError::CapabilityCallRejected { .. } => ComponentObservationKind::Invocation,
             ComponentError::PreparationFailed { .. }
@@ -3175,6 +3188,20 @@ pub enum ComponentError {
         instance_key: String,
         message: String,
     },
+    /// A Component's WIT import names a known Capability interface, but not
+    /// at a version the Runtime's approved Link Plan has an entry for.
+    /// Distinct from `InstantiationFailed`'s generic "absent from the
+    /// approved Link Plan" wording, which otherwise covers both "this
+    /// interface name is unknown at any version" and "known interface,
+    /// wrong version" indistinguishably
+    /// (`model-component-graph-contract`'s "Component requires unsupported
+    /// contract version" scenario names this failure mode specifically).
+    CapabilityVersionMismatch {
+        definition: ComponentDefinitionId,
+        name: String,
+        requested_version: String,
+        available_version: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3372,6 +3399,16 @@ impl fmt::Display for ComponentError {
             } => write!(
                 f,
                 "capability '{capability}' rejected a call from instance '{instance_key}': {message}"
+            ),
+            Self::CapabilityVersionMismatch {
+                definition,
+                name,
+                requested_version,
+                available_version,
+            } => write!(
+                f,
+                "component definition '{}' requires capability '{name}@{requested_version}', but the approved Link Plan only has '{name}@{available_version}' (capability-version-mismatch)",
+                definition.get()
             ),
         }
     }
