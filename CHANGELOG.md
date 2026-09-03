@@ -63,12 +63,12 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Architecture Freeze #1 is **accepted** at commit `146e87e` (2026-09-03,
-  CI run https://github.com/astorise/Magnetar/actions/runs/33778950316,
-  zero non-`success` jobs confirmed via `gh run view --json
-  status,conclusion` and the jobs list directly). The history below is
-  kept in full because each round found something real; the commit and
-  CI run cited in this first sentence are what to trust as current.
+- Architecture Freeze #1 is **CANDIDATE, not yet accepted** -- a sixth audit
+  round (HEAD `9939232`, PR #36) found a deeper P0 (loading/materialization
+  evidence authority) still open after this Change's implementation lands;
+  see this section's final paragraph for the current status and what
+  remains. The history below is kept in full because each round found
+  something real.
   (An earlier point in this history was itself briefly declared
   "accepted" at commit `e7dc45d` -- that run's first pass had one failing
   job, `wasmtime component engine`, on a pre-existing test
@@ -242,7 +242,46 @@
   baseline), `openspec validate --all --strict` 77/77, live `qwen-test`
   unaffected (its production path never calls `warm_model_instance`/
   `resume_model_instance`), and the CI run cited in this note's opening
-  sentence.
+  sentence. A sixth audit round, again a full re-audit rather than a
+  narrow revalidation (HEAD `9939232`), confirmed every round-5 closure
+  held and found two further real gaps: (P0-B) the `openspec archive
+  model-loading-materializes-weight-resources -y` merge in `9939232`
+  itself had *overwritten*, not merged, three normative paragraphs and
+  five anti-forgery scenarios already accepted into the canonical
+  `openspec/specs/model-instance/spec.md` "Model Instance Readiness"
+  requirement with the older, weaker pre-round-3 text the archived
+  Change's own delta file carried -- verified by diffing the spec across
+  the commit directly (`db9c947` vs `9939232`). Fixed immediately (a
+  spec-text restore, not a design question): the deleted paragraphs and
+  scenarios are back, merged with -- not replacing -- the archived
+  Change's own new "weight materialization state" addition;
+  `openspec/specs/model-loading/spec.md` was unaffected by the same
+  archive (purely additive there). (P0-A) `LoadedModelContext` and its
+  nested `ModelLoadingResidencyPlan` remain fully publicly constructible
+  (every field `pub`, no crate-internal constructor) and
+  `Runtime::create_model_instance()` trusts a caller-supplied
+  `&LoadedModelContext` with no link back to a Runtime-issued record of
+  an actual `ModelLoadingCoordinator::load()` run; separately, round 5's
+  `weights_materialized` fix proves only that *some* bytes exist in
+  Provider storage under each required `TensorResourceId`, not that
+  those bytes are this specific instance's own Runtime-authorized
+  materialization -- a caller retaining ordinary public access to
+  `Provider::execution_api().write_tensor()`,
+  `MemoryManager::record_tensor_residency()`, and
+  `resource_bindings.weights` can still assemble a passing state by
+  hand, confirmed concretely by this crate's own `contract_tests`
+  helper (`bind_fake_weight`) doing exactly that. This gap is
+  architecturally larger than any prior round's (comparable to round
+  2's field-sealing in kind, larger in the new Runtime-owned evidence
+  machinery it needs) and was not fixed inline: scoped into
+  `openspec/changes/bind-model-loading-evidence-to-validated-artifact`
+  (proposal, design, spec deltas, and a task list are complete; code is
+  not yet implemented) per explicit direction, rather than rushed.
+  **Architecture Freeze #1 therefore remains CANDIDATE, not accepted,
+  until that Change's implementation lands and passes full verification
+  on its own final HEAD.** This round's own fix (P0-B only) verified:
+  `openspec validate --all --strict` 77/77 (76 canonical items plus the
+  new active Change) passing at commit `f57ecde`.
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
