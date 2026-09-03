@@ -63,12 +63,20 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Architecture Freeze #1 is **accepted** at commit `86714ff`
+- Architecture Freeze #1 is **accepted** at commit `e7dc45d`
   (2026-09-03, CI run
-  https://github.com/astorise/Magnetar/actions/runs/33756904283, all
-  jobs green, independently confirmed via `gh run view --json
-  status,conclusion` with zero non-`success` jobs). (The P0 fix itself
-  landed as `f71b346`; that push's own
+  https://github.com/astorise/Magnetar/actions/runs/33765211820, zero
+  non-`success` jobs confirmed via `gh run view --json status,conclusion`
+  and the jobs list directly -- that run's first pass had one failing
+  job, `wasmtime component engine`, on a pre-existing test
+  (`pushed_component_package_temp_materialization_is_removed_with_manager`)
+  unrelated to this Change (a parallel-test race scanning the shared
+  system temp directory for a filename prefix multiple tests use;
+  confirmed by local reproduction under the exact CI feature flags,
+  passing in isolation, and passing clean on this branch's prior 3 CI
+  runs); a rerun of just that job came back green, so this is noted as
+  a known pre-existing flake, not fixed as part of this Change). (The P0
+  fix itself landed as `f71b346`; that push's own
   CI run failed on `clippy` for an unrelated reason -- a helper this
   same fix added, `check_repeated_load_unload_does_not_accumulate_
   weight_storage`, was missing the `#[cfg(test)]` attribute its sibling
@@ -115,11 +123,56 @@
   `MemoryManager::remove_tensor_residency` is now called from both
   rollback and unload, in the order the audit itself recommended
   (release the Provider tensor, then remove the residency record, then
-  release the Memory Manager allocation). Verified: full workspace test
-  suite (1,393 tests across the lib, CLI, and `contract_tests`
-  integration binaries) passing, coverage ratchet at 78.89% matching
-  baseline, `openspec validate --all --strict` 78/78, live `magnetar
-  run qwen-test "Hello"` unaffected, and the CI run cited above.
+  release the Memory Manager allocation). A third audit round, this
+  time a full-scope re-audit rather than a narrow revalidation
+  (commit `a4d411b`), found readiness itself was still partly
+  caller-declared: `warm_model_instance`'s public
+  `ModelInstanceReadinessChecks` defaults `weights_materialized: true`,
+  and the Runtime trusted that outright, so a caller using default
+  checks against an instance whose weights were never materialized
+  could warm it straight to `Ready`; `WarmupPolicy::Disabled`
+  compounded this by publishing `readiness: Ready` without the
+  lifecycle transition warmup's other policies perform, producing an
+  internally inconsistent `lifecycle: Loading, readiness: Ready` state
+  that `acquire_usage`/`generation_reference` (checking only readiness,
+  never lifecycle) would still accept. **This means the "accepted"
+  declaration above was live and technically inaccurate for the window
+  between the previous audit round and this fix landing** -- noted here
+  rather than silently corrected, per this document's own standard of
+  not letting a known-false claim stand uncorrected. Scope was
+  clarified directly with the auditor before fixing (their own initial
+  reply mixed "necessary for this PR" with "desirable future
+  architecture"): fixed by `openspec/changes/runtime-owned-model-
+  instance-readiness-authority` without a warmup-API redesign --
+  `warm_model_instance` now derives `weights_materialized`,
+  `provider_ready`, and `device_ready` from actual Runtime state
+  (resource bindings, the Provider registry, the Device list), ANDed
+  with the caller's claim; `ModelInstance::validate_readiness` no
+  longer lets a computed `Ready` readiness publish while the lifecycle
+  hasn't itself reached a state that supports it; and
+  `acquire_usage`/`generation_reference` now require both
+  `lifecycle.supports_inference_use()` and
+  `readiness.accepts_generation()` as a structural safety net.
+  Deliberately not closed, and documented as an explicit trade-off
+  rather than an oversight: `kernel_preparation_ready`/
+  `autotuning_ready` remain caller-supplied (no generic Runtime-side
+  derivation exists for these today), and the direct
+  `ModelInstanceManager::mark_ready` bypass is not sealed by Rust
+  visibility (would require editing 15 test call sites for a partial
+  close, since `mark_ready` has no Runtime context to derive
+  `provider_ready`/`device_ready` from even if hardened) -- both
+  authorized explicitly by the auditor as acceptable for this PR.
+  Verified: full workspace test suite (1,397 tests across the lib, CLI,
+  and `contract_tests` integration binaries) passing, `cargo doc
+  --locked --workspace --no-deps` with `RUSTDOCFLAGS="-D warnings"`
+  clean (a private intra-doc link this Change introduced broke CI's
+  `docs` job on the first push; none of this session's other local
+  checks run `cargo doc`, so it was only caught by CI -- fixed and
+  reverified locally before repushing), coverage ratchet at 78.91%
+  (above the 78.89% baseline), `openspec validate --all --strict`
+  77/77, live `magnetar run qwen-test "Hello"` unaffected (the
+  production path never calls `warm_model_instance`), and the CI run
+  cited above.
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
