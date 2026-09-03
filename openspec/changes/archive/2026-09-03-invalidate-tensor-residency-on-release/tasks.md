@@ -25,8 +25,8 @@
 - [x] 5.4 `cargo check --target wasm32-unknown-unknown --all-features -p magnetar-runtime`. Clean.
 - [x] 5.5 Coverage ratchet: initially **failed** (78.88% vs 78.89% baseline) after adding the three `tensor_residency(id).is_none()` assertions -- their error arms are new lines that only execute if the fix is broken, so they don't execute in a passing run, and `magnetar-runtime/src/tests.rs` (where a first attempt to offset this with a direct `remove_tensor_residency` unit test was added) turned out to be excluded from this measurement entirely by cargo-llvm-cov's own built-in `(tests\.rs|...[_-]tests\.rs)$` pattern (documented in `quality/coverage-baseline.json`'s `exclusions`), so that unit test contributed nothing to the number. Fixed properly, not by adjusting the baseline: consolidated the three duplicated assertion blocks into one shared `assert_tensor_residency_absent` helper (real deduplication, not a coverage-chasing contortion) -- fewer total new uncovered lines restored the ratchet to exactly 78.89%, matching baseline.
 - [x] 5.6 `openspec validate --all --strict`. 78/78 passed.
-- [ ] 5.7 Push, confirm a full green CI run without relying on a piped `gh run watch` exit code (this session's own two prior masked-failure incidents on this exact branch).
-- [ ] 5.8 Live `magnetar run qwen-test "Hello"` still works.
+- [x] 5.7 Push, confirm a full green CI run without relying on a piped `gh run watch` exit code (this session's own two prior masked-failure incidents on this exact branch). Commit `86714ff`, CI run https://github.com/astorise/Magnetar/actions/runs/33756904283, verified via `gh run view --json status,conclusion` directly (`completed`/`success`) and independently confirmed zero non-`success` jobs.
+- [x] 5.8 Live `magnetar run qwen-test "Hello"` still works. Full causal chain fired end to end, matching prior runs.
 
 ## 6. Close out
 

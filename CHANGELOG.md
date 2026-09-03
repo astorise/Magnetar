@@ -63,10 +63,12 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Architecture Freeze #1 is **accepted** at commit `ff06d98`
+- Architecture Freeze #1 is **accepted** at commit `86714ff`
   (2026-09-03, CI run
-  https://github.com/astorise/Magnetar/actions/runs/33747066010, all 24
-  jobs green). (The P0 fix itself landed as `f71b346`; that push's own
+  https://github.com/astorise/Magnetar/actions/runs/33756904283, all
+  jobs green, independently confirmed via `gh run view --json
+  status,conclusion` with zero non-`success` jobs). (The P0 fix itself
+  landed as `f71b346`; that push's own
   CI run failed on `clippy` for an unrelated reason -- a helper this
   same fix added, `check_repeated_load_unload_does_not_accumulate_
   weight_storage`, was missing the `#[cfg(test)]` attribute its sibling
@@ -101,12 +103,23 @@
   abort-releases-everything pattern; and `unload_model_instance` now
   resolves each released weight's owning Provider generically (via
   `TensorResidency`/`ResourceAffinity`, no hardcoded Provider name in
-  the generic Runtime layer) and releases its storage. Verified: full
-  workspace test suite (1,393 tests across the lib, CLI, and
-  `contract_tests` integration binaries) passing, coverage ratchet at
-  78.89% matching baseline, `openspec validate --all --strict` 79/79,
-  live `magnetar run qwen-test "Hello"` unaffected, and the CI run cited
-  above.
+  the generic Runtime layer) and releases its storage. A follow-up
+  revalidation audit of that fix (commit `633e942`) found one further
+  gap: `MemoryManager::release(allocation)` only changes the
+  `MemoryAllocation`'s own state and never removed the resource's
+  `TensorResidency` record, so `tensor_residency()` kept reporting a
+  weight as resident indefinitely after both its Provider storage and
+  allocation were released -- a metadata leak growing on every failed
+  materialization attempt and every load/unload cycle. Fixed by
+  `openspec/changes/invalidate-tensor-residency-on-release`: a new
+  `MemoryManager::remove_tensor_residency` is now called from both
+  rollback and unload, in the order the audit itself recommended
+  (release the Provider tensor, then remove the residency record, then
+  release the Memory Manager allocation). Verified: full workspace test
+  suite (1,393 tests across the lib, CLI, and `contract_tests`
+  integration binaries) passing, coverage ratchet at 78.89% matching
+  baseline, `openspec validate --all --strict` 78/78, live `magnetar
+  run qwen-test "Hello"` unaffected, and the CI run cited above.
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
