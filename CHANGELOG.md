@@ -70,15 +70,16 @@
   manifest-level content-digest verification is a deliberately deferred
   follow-up, not implemented as of `bind-model-loading-evidence-to-
   validated-artifact`.
-- Architecture Freeze #1 is **accepted** at commit `4918614` (2026-09-03, CI
-  run https://github.com/astorise/Magnetar/actions/runs/33791192078, zero
+- Architecture Freeze #1 is **accepted** at commit `44ae71e` (2026-09-03, CI
+  run https://github.com/astorise/Magnetar/actions/runs/33797346234, zero
   non-`success` jobs confirmed via `gh run view --json status,conclusion`
   and the jobs list directly). The history below is kept in full because
   each round found something real; the commit and CI run cited in this
   first sentence are what to trust as current. (This was briefly
-  downgraded to CANDIDATE after a sixth audit round found P0-A open --
-  see this section's final paragraph for the fix and what, if anything,
-  remains open.)
+  downgraded to CANDIDATE twice -- once after a sixth audit round found
+  P0-A open, once after a seventh found a narrower P0 in that same fix's
+  own `commit` path -- see this section's final two paragraphs for both
+  fixes and what, if anything, remains open.)
   (An earlier point in this history was itself briefly declared
   "accepted" at commit `e7dc45d` -- that run's first pass had one failing
   job, `wasmtime component engine`, on a pre-existing test
@@ -355,7 +356,45 @@
   evidence (closed), not cryptographic content verification (already
   documented as v0.1-deferred, alongside artifact publisher signing, in
   this section's Security Notes) -- so this is recorded as a known
-  limitation, not a blocker to the freeze.
+  limitation, not a blocker to the freeze. A seventh audit round (HEAD
+  `ef0e9e2`), revalidating that exact fix, confirmed every round-6 closure
+  held (`LoadedModelContext`/bindings sealing, instance-scoped evidence,
+  artifact-id matching, the removed `read_tensor` dependency, the restored
+  canonical spec text) and found one further real gap in the fix's own
+  new code: `WeightMaterializationTransaction::commit`
+  (`first_native_runtime.rs`) minted `MaterializationEvidence` and called
+  `ModelInstanceManager::mark_ready` unconditionally right after
+  publishing whatever bindings this attempt staged -- so
+  `materialize_model_instance_weights(..., &BTreeMap::new())` against an
+  instance with a non-empty mandatory weight inventory could still reach
+  `Ready`, and a strict subset of a multi-tensor inventory produced
+  evidence that was exactly correct for what it staged while still being
+  incomplete. Verified directly against the code and the canonical spec
+  before accepting this: `model-loading`'s pre-existing "Model Loading
+  Does Not Bypass Instance Readiness" ("Successful materialization alone
+  SHALL not imply Model Instance readiness") and "Partial Loading Policy"
+  requirements already prohibited exactly this -- the code was simply
+  non-compliant with spec text that already existed, so (matching the
+  audit's own classification) this was fixed directly, with no new
+  OpenSpec Change. `commit` now gates the `mark_ready` call behind the
+  same Runtime-derived readiness gate `warm_model_instance`/
+  `resume_model_instance` already use (`derive_effective_readiness_checks`,
+  promoted from private to `pub(crate)` for this) via
+  `ModelInstance::validate_readiness`, rather than a parallel or weaker
+  check; progressive/incremental materialization across multiple calls
+  still works unchanged, since evidence is recomputed against the full
+  current binding set on every commit. Four new tests prove this at the
+  exact public entrypoint the bug was in -- empty map, partial inventory
+  (plus completing it in a follow-up call), and a Provider that rejects
+  new work -- since `warm_model_instance`'s own tests, though already
+  correct, could not by themselves prove this separate bypass was closed.
+  Verified: full workspace test suite (1,163 lib tests + 182
+  `contract_tests`) passing, `cargo clippy`/`cargo fmt --check` clean,
+  `cargo doc` clean, wasm32 check clean, coverage ratchet at 78.97%
+  (above baseline), `openspec validate --all --strict` 76/76 (unchanged --
+  this fix touched no spec text), live `magnetar run qwen-test "Hello"`
+  unaffected, and the CI run cited in this note's opening sentence
+  (commit `44ae71e`).
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
