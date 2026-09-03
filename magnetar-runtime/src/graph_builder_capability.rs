@@ -251,15 +251,12 @@ fn decode_attribute_value(value: &ComponentValue) -> Result<OperatorAttributeVal
                         "attribute-value 'boolean' expected a bool, got {other:?}"
                     )),
                 },
-                "integer" => Ok(OperatorAttributeValue::Integer(
-                    i64::try_from(expect_u64(payload).or_else(|_| match payload {
-                        ComponentValue::S64(value) => Ok(*value as u64),
-                        other => Err(format!(
-                            "attribute-value 'integer' expected an s64, got {other:?}"
-                        )),
-                    })?)
-                    .unwrap_or_default(),
-                )),
+                "integer" => match payload {
+                    ComponentValue::S64(value) => Ok(OperatorAttributeValue::Integer(*value)),
+                    other => Err(format!(
+                        "attribute-value 'integer' expected an s64, got {other:?}"
+                    )),
+                },
                 "float-value" => match payload {
                     ComponentValue::F64(value) => Ok(OperatorAttributeValue::Float(*value)),
                     other => Err(format!(
