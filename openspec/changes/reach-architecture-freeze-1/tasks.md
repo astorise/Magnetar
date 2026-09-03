@@ -342,7 +342,7 @@ item, so it is recorded here rather than silently folded into 11.1's note.
 
 ## 12. Remove Qwen/model-family semantics from `magnetar-runtime`
 
-**Status: 6/7 done, 1 in progress (12.4).** 12.1/12.2/12.5
+**Status: 7/7 -- done.** 12.1/12.2/12.5
 were already substantially achieved as a side effect of 11.4/11.5 (noted
 below). This pass closed the real remaining gap in 12.3: the Qwen Component
 (`components/qwen/src/lib.rs`) now calls `weight-edge` with the canonical
@@ -413,12 +413,55 @@ The `kv_namespace: "qwen"` literal in `SessionContext` construction and
 live in `first_native_runtime.rs` -- expected, not a gap, since that file
 (along with `qwen_model_component.rs`) is the designated Qwen-scoped file,
 not a generic Core module (see 12.7's CI guard, which encodes exactly this
-distinction). 12.4 is now in progress -- see its own note.
+distinction).
+
+12.4 is now also done, per the same explicit architectural decision as
+12.6: production's Qwen Component loader (`qwen_real_component_package`'s
+`not(test)` branch in `first_native_runtime.rs`) no longer embeds the real
+Component binary via `include_bytes!` or claims
+`ComponentDistributionSourceKind::DevelopmentFixture`. It resolves the
+Component's bytes and manifest from a caller-configured local path
+(`MAGNETAR_QWEN_COMPONENT_PATH`, plus `<path>.magnetar-component.yaml` for
+the manifest) at runtime, reports `ComponentDistributionSourceKind::
+LocalDirectory`, and fails closed with a structured
+`E2eConformanceError::ModelComponentFailed` if the variable is unset, the
+file cannot be read, or the bytes do not hash to the same
+`QWEN_REAL_COMPONENT_DIGEST` every build has always required (that check
+was and remains real: `ComponentManager::prepare_distributed_package`
+computes the actual sha256 of whatever bytes it receives and rejects a
+mismatch, so a corrupted or substituted local file is rejected structurally,
+not merely by convention). This is deliberately the minimal external-source
+mechanism the task calls for -- a real Component distribution/registry
+service (OCI, HTTP, S3, GitHub Releases, ...) is explicitly not built here;
+that remains real, separate, larger work for whenever a second real
+Component or a genuine multi-artifact deployment story exists. Test builds
+are unaffected: a `#[cfg(test)]`-only sibling overload of
+`qwen_real_component_package` keeps using `include_bytes!` against the
+checked-in fixture, exactly as before, since `#[cfg(test)]` fixtures are
+explicitly fine under the same decision. `magnetar-cli` does not yet set
+`MAGNETAR_QWEN_COMPONENT_PATH` or expose any flag for it -- there is
+currently no CLI command that reaches this code path at all (confirmed by
+inspection: `magnetar-cli` never calls into `first_native_runtime`'s
+Component-loading or conformance-suite functions today), so this is
+correctly scoped as "the Runtime-side contract now requires and validates
+an external source" rather than "a working end-to-end CLI flag," which
+would be new CLI-layer work this task does not include.
+
+Verified: default features (1141 passed, including a new static guard,
+`qwen_component_production_loader_has_no_embedded_fixture`, checking by
+source inspection -- the only way to check `not(test)` code at all -- that
+the production branch contains no `include_bytes!`/`DevelopmentFixture` and
+does resolve via `std::env::var`/`std::fs::read`), `--no-default-features`
+(1100 passed, test-oracle branch unaffected), `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean, `cargo fmt --check`
+clean, `cargo check --target wasm32-unknown-unknown --all-features` clean
+(this whole branch is already `not(target_arch = "wasm32")`-gated, so
+wasm32 was never affected), `cargo build --workspace` clean.
 
 - [x] 12.1 Materialize `components/qwen` as a working submodule build (builds on the gitlink already added to `.gitmodules` on this branch). (Done as a side effect of task group 11: `components/qwen` is a real, building, wasm32-compiling Component, not a template.)
 - [x] 12.2 Move the Qwen graph builder out of `magnetar-runtime` into the Component (superseded by task 11.4/11.5 once the contract lands). (Done: 11.5's cutover made the real Component the exclusive production graph source under the strict path; the in-crate Rust builder survives only as a `#[cfg(test)]`-only oracle now, per 12.6.)
 - [x] 12.3 Move Qwen weight-name and KV-name mappings (`self_attn.q_proj`, `qwen.layerN.k/v`, etc.) out of the Core. (The mapping *tables* are gone -- see the group note above for the full change. What remains in `first_native_runtime.rs` is a config value (`kv_namespace: "qwen"`) and architecture-derived shapes, not a hardcoded name-translation table, and that file is the designated Qwen-scoped file, not "the Core" in the sense this task and 12.7's guard mean.)
-- [ ] 12.4 Move Qwen fixtures out of `magnetar-runtime` production code (test-only fixtures may remain under test paths). (Not attempted -- see the group note above. Real, separate architecture debt: the strict production path embeds the real Qwen Component binary via `include_bytes!` as a development-fixture distribution source, with no real Component registry/distribution mechanism to move it to yet.)
+- [x] 12.4 Move Qwen fixtures out of `magnetar-runtime` production code (test-only fixtures may remain under test paths). (Done -- see the group note above for the full change. Production resolves the Component externally (`MAGNETAR_QWEN_COMPONENT_PATH`); `include_bytes!` against the checked-in fixture survives only under `#[cfg(test)]`.)
 - [x] 12.5 Execute the real Qwen Component Artifact in the first-native test suite. (Done via 11.5; reconfirmed still true after this task's weight-naming change and Component rebuild -- full suite 1108/1108 passing.)
 - [x] 12.6 Remove `pub mod qwen_model_component` (or equivalent) from the Core crate. (Done, per an explicit architectural decision -- see the group note above for the full change. The module itself is not deleted (most of it -- config validation, target modules, KV/tokenizer metadata, adapter support -- is genuinely production-used, unrelated to the graph-semantics-duplication concern this task targets), but `qwen_build_graph`/`qwen_prefill_graph`/`qwen_decode_graph` specifically, the part that actually duplicated Model Component graph semantics, are now `#[cfg(test)]`-only and unreachable from any production build. Production has exactly one Model Component graph source.)
 - [x] 12.7 Add a CI guard rejecting `qwen`, `llama`, `self_attn.q_proj`, `mlp.gate_proj` (and similar model-family identifiers) in designated generic Core modules, excluding tests, docs, and OpenSpec archives. (New `model-family-isolation` job in `.github/workflows/quality.yml`: scans an explicit list of 16 generic Core files -- `affinity.rs`, `capability.rs`, `component.rs`, `component_wasmtime.rs`, `compute.rs`, `device.rs`, `execution_graph.rs`, `graph_builder_capability.rs`, `kernel.rs`, `kernel_compilation.rs`, `memory.rs`, `operator.rs`, `provider.rs`, `reference_cpu.rs`, `scheduler.rs`, `tensor.rs` -- for the same patterns, with line comments stripped first so design-intent prose can't self-trigger it. Deliberately an explicit allowlist of files verified clean today, not "every file in magnetar-runtime minus two": a broader sweep during this task found real, pre-existing qwen/llama mentions outside this list too (`conformance.rs`'s `QwenWasmModelComponent` enum variant is a genuine instance of the pattern this guard exists to catch; `kernel_execution_plan.rs`, `provider_roadmap.rs`, and others are mostly test-fixture example strings) -- not fixed in this pass, real follow-up work, so the guard does not yet cover those files. Verified locally to pass today (`exit=0`) before relying on it; not yet exercised against live GitHub Actions.)
@@ -567,9 +610,10 @@ New regression coverage beyond the three tasks above: `tests::e2e_authoritative_
 
 ## 19. Architecture Freeze #1 gate verification
 
-**Status: blocked, but materially closer.** 16 of 19 groups are now fully
-done (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 16, 17, 18); groups 12, 14
-are partially done; group 19 (this one) is 0/3. This gate still cannot
+**Status: blocked, but materially closer.** 17 of 19 groups are now fully
+done (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18); group 14
+is partially done (14.5 is N/A by the chosen architecture, not a real gap);
+group 19 (this one) is 0/3. This gate still cannot
 honestly be closed while those partial groups remain open — several of
 `first-native-implementation-cut`'s `Architecture Freeze #1` AND-conditions
 are not yet fully true, though most of the highest-blast-radius work this
@@ -599,15 +643,17 @@ actual invariant that matters (a Model Instance is never usable before its
 weights are genuinely bound, enforced at the graph-dispatch boundary) as a
 new normative requirement rather than reopening `load()`'s signature.
 
-What genuinely remains, per group: **12** (12.4 moving the embedded
-Component fixture out of the production path's `include_bytes!`, and 12.6
-removing the Rust-builder fallback recipe entirely — both now explicitly
-decided and in progress: see this group's updated note); **14** (14.5 is
-N/A by the chosen architecture, not a real gap — see its note). Group 15 is
-now fully closed (15.6-15.8's per-tier Component/Format/Provider CI jobs
-added alongside the existing "Full conformance" job). None of these
-remaining items block correctness of what has shipped; they are scope
-being closed out now under explicit direction, not left unconsidered.
+What genuinely remains, per group: **14** only (14.5 is N/A by the chosen
+architecture, not a real gap — see its note; nothing else in that group is
+open). Group 12 is now fully closed too (12.4 and 12.6 both resolved by the
+same explicit architectural decision: production has exactly one Model
+Component graph source, resolved externally, with no embedded fixture and
+no Rust-synthesized fallback -- see that group's note). Group 15 is fully
+closed (15.6-15.8's per-tier Component/Format/Provider CI jobs added
+alongside the existing "Full conformance" job). Nothing remaining blocks
+correctness of what has shipped; group 19's own three tasks (re-running the
+causal-chain verification, confirming every AND-condition, confirming CI is
+green) are what is left to actually close this gate.
 
 - [ ] 19.1 Re-run `magnetar run qwen-test "Hello"` and confirm it exercises every link in the causal chain from CLI through `RuntimeInferenceApi`, Model Loading, `ModelInstance`, the Qwen Component (via the new graph contract), `PreparedExecutionPlan`/`PreparedExecutionPlanExecutor`, `ProviderExecutionApi.submit`, the external CPU Provider, admitted Tensor Resources, Runtime-owned KV Resources, incremental decode, Sampling, and token commit.
 - [ ] 19.2 Confirm every AND-condition in `first-native-implementation-cut`'s `Architecture Freeze #1` requirement holds before flipping that requirement's status from `candidate` to `accepted`.

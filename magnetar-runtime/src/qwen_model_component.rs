@@ -14,21 +14,28 @@
 use crate::{
     ActivationKind, AdapterArchitectureCompatibility, AdapterLayerSelector, AdapterMethod,
     AdapterTargetModule, AdapterTargetModuleRole, ComputeDType, DTypeDescriptor, ExecutionGraph,
-    ExecutionGraphId, ExecutionGraphPhase, ExecutionGraphProducer, ExecutionNode, ExecutionNodeId,
-    FirstScopeError, FirstScopeErrorCode, GraphError, GraphKvCacheBehavior, GraphKvCacheMetadata,
-    GraphModelCompatibility, GraphProductionResult, LayoutDescriptor,
-    MODEL_ARTIFACT_SCHEMA_VERSION, ModelComponentArchitectureMetadata, ModelComponentAuthority,
-    ModelComponentDescriptor, ModelComponentError, ModelComponentId, ModelComponentIdentity,
-    ModelComponentImplementationKind, ModelComponentKvCacheMetadata, ModelComponentModelType,
-    ModelComponentObservation, ModelComponentObservationKind,
+    ExecutionGraphPhase, ExecutionNode, ExecutionNodeId, FirstScopeError, FirstScopeErrorCode,
+    GraphError, MODEL_ARTIFACT_SCHEMA_VERSION, ModelComponentArchitectureMetadata,
+    ModelComponentAuthority, ModelComponentDescriptor, ModelComponentError, ModelComponentId,
+    ModelComponentIdentity, ModelComponentImplementationKind, ModelComponentKvCacheMetadata,
+    ModelComponentModelType, ModelComponentObservation, ModelComponentObservationKind,
     ModelComponentQuantizationCompatibility, ModelComponentTokenizerCompatibility,
     ModelComponentVersion, ModelDType, ModelGenerationDefaults, ModelManifest, ModelTensorMetadata,
     NormalizationKind, OperatorAttributeValue, OperatorFamily, OperatorId, OperatorRequirement,
-    PositionEncodingKind, ShapeDescriptor, TargetModuleMetadata, TargetModuleRole, TensorAliasing,
-    TensorDescriptor, TensorEdge, TensorEdgeId, TensorLayoutKind, browser_feature_supported,
-    default_graph_catalog, reference_cpu_kernel_advertisements, validate_first_scope_graph,
+    PositionEncodingKind, TargetModuleMetadata, TargetModuleRole, TensorDescriptor, TensorEdge,
+    TensorEdgeId, TensorLayoutKind, browser_feature_supported, reference_cpu_kernel_advertisements,
     validate_model_component_first_scope_requirements,
     validate_reference_cpu_required_kernel_coverage,
+};
+// Test-oracle only (`reach-architecture-freeze-1` task 12.6): these back
+// `qwen_build_graph`/`qwen_prefill_graph`/`qwen_decode_graph` and their
+// exclusively-owned helpers, all `#[cfg(test)]` now that production never
+// calls them.
+#[cfg(test)]
+use crate::{
+    ExecutionGraphId, ExecutionGraphProducer, GraphKvCacheBehavior, GraphKvCacheMetadata,
+    GraphModelCompatibility, GraphProductionResult, LayoutDescriptor, ShapeDescriptor,
+    TensorAliasing, default_graph_catalog, validate_first_scope_graph,
 };
 use std::{collections::BTreeSet, error::Error, fmt};
 

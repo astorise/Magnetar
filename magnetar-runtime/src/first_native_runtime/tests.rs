@@ -811,6 +811,45 @@ fn first_native_dispatch_has_no_production_fallback_and_fails_closed_instead() {
     );
 }
 
+/// Static guard (`reach-architecture-freeze-1` task 12.4): production's
+/// Qwen Component loader (`qwen_real_component_package`'s `not(test)`
+/// branch) must never embed the real Component binary via `include_bytes!`
+/// or claim `ComponentDistributionSourceKind::DevelopmentFixture` -- those
+/// are only legitimate in the `#[cfg(test)]` branch, checked separately
+/// below. `not(test)` code cannot be invoked from a `#[test]` at all (that
+/// is the whole point of the cfg), so this is a source-text check, the same
+/// technique the sibling guards above already use for the same structural
+/// reason.
+#[test]
+fn qwen_component_production_loader_has_no_embedded_fixture() {
+    let source = include_str!("../first_native_runtime.rs");
+    let production_loader_start = source
+        .find("not(test)\n))]\nfn qwen_real_component_package()")
+        .expect("the production (not(test)) qwen_real_component_package overload exists");
+    let production_loader_end = production_loader_start
+        + source[production_loader_start..]
+            .find("\n}\n")
+            .expect("the production loader function has a closing brace");
+    let production_loader_source = &source[production_loader_start..production_loader_end];
+    assert!(
+        !production_loader_source.contains("include_bytes!"),
+        "production's Qwen Component loader must never embed the Component binary via \
+         include_bytes! -- that is a test-fixture-only mechanism (task 12.4)"
+    );
+    assert!(
+        !production_loader_source.contains("DevelopmentFixture"),
+        "production's Qwen Component loader must never claim \
+         ComponentDistributionSourceKind::DevelopmentFixture -- it resolves bytes externally \
+         and should report LocalDirectory (or another real source kind), not a fixture"
+    );
+    assert!(
+        production_loader_source.contains("std::env::var")
+            && production_loader_source.contains("std::fs::read"),
+        "expected production's Qwen Component loader to resolve bytes from an external, \
+         caller-configured source (env var + local file read) rather than an embedded fixture"
+    );
+}
+
 /// Static guard (Correctif 13 / task group 7): `execute_qwen_graph` used to
 /// require `std::mem::take(runtime.memory_mut())` to get an independent
 /// `&mut MemoryManager` alongside a `&Runtime`; that gap is closed now that

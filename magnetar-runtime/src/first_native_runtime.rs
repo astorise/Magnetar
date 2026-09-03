@@ -4785,19 +4785,43 @@ const QWEN_GRAPH_COMPONENT_MANIFEST_BYTES: &[u8] =
 /// resource limits), not by anything claiming to produce a real graph.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
+/// The digest a Qwen Component artifact MUST have to be accepted, in
+/// production or in tests -- not merely a description of whatever bytes
+/// happen to be embedded. `prepare_distributed_package` computes the real
+/// sha256 of whatever bytes it actually receives and rejects a mismatch
+/// (`ComponentDistributionErrorCategory::DigestMismatch`), so a stale or
+/// substituted artifact -- from either loading branch below -- is rejected
+/// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
     "sha256:552bb114838c10f742a1b6b6afade7c3044116826bb31cb33e21b16a2a422feb";
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+
+/// Test-oracle only (`reach-architecture-freeze-1` task 12.4): the checked-in
+/// real Qwen Component binary, embedded for test fixtures. Production never
+/// reads this -- see the `not(test)` branch of [`qwen_real_component_package`]
+/// below.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    test
+))]
 const QWEN_REAL_COMPONENT_BYTES: &[u8] =
     include_bytes!("../fixtures/components/qwen-real.component.wasm");
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    test
+))]
 const QWEN_REAL_COMPONENT_MANIFEST_BYTES: &[u8] =
     include_bytes!("../fixtures/components/qwen-real.component.wasm.magnetar-component.yaml");
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-fn qwen_real_component_package() -> ComponentArtifactPackage {
-    ComponentArtifactPackage::new(
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    test
+))]
+fn qwen_real_component_package() -> Result<ComponentArtifactPackage, E2eConformanceError> {
+    Ok(ComponentArtifactPackage::new(
         QWEN_REAL_COMPONENT_BYTES.to_vec(),
         QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
         ComponentDigest::parse("sha256", QWEN_REAL_COMPONENT_DIGEST),
@@ -4805,7 +4829,63 @@ fn qwen_real_component_package() -> ComponentArtifactPackage {
             ComponentDistributionSourceKind::DevelopmentFixture,
             QWEN_REAL_COMPONENT_NAME,
         ),
-    )
+    ))
+}
+
+/// Production Qwen Component loading (`reach-architecture-freeze-1` task
+/// 12.4): no `include_bytes!`, no `DevelopmentFixture` distribution source,
+/// no silent fallback. The real Component artifact and its manifest are
+/// read from a caller-configured local path -- the minimal external-source
+/// resolution mechanism this task calls for, deliberately not a full
+/// Component registry/distribution service (a separate, larger piece of
+/// infrastructure that does not exist yet and this task does not invent).
+/// `MAGNETAR_QWEN_COMPONENT_PATH` names the Component `.wasm` file itself;
+/// its manifest is expected alongside it as `<path>.magnetar-component.yaml`
+/// (the same naming convention the checked-in test fixture already uses).
+/// Missing configuration, an unreadable file, or bytes that do not hash to
+/// [`QWEN_REAL_COMPONENT_DIGEST`] all fail closed with a structured error --
+/// never a fallback to an embedded fixture, because production has none.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    not(test)
+))]
+fn qwen_real_component_package() -> Result<ComponentArtifactPackage, E2eConformanceError> {
+    const COMPONENT_PATH_ENV_VAR: &str = "MAGNETAR_QWEN_COMPONENT_PATH";
+    let component_path = std::env::var(COMPONENT_PATH_ENV_VAR).map_err(|_| {
+        E2eConformanceError::ModelComponentFailed {
+            reason: format!(
+                "{COMPONENT_PATH_ENV_VAR} is not set; production first-native generation \
+                 requires an externally provided Qwen Model Component artifact and has no \
+                 embedded development fixture to fall back to"
+            ),
+        }
+    })?;
+    let component_bytes = std::fs::read(&component_path).map_err(|error| {
+        E2eConformanceError::ModelComponentFailed {
+            reason: format!(
+                "failed to read Qwen Component bytes from '{component_path}' \
+                 ({COMPONENT_PATH_ENV_VAR}): {error}"
+            ),
+        }
+    })?;
+    let manifest_path = format!("{component_path}.magnetar-component.yaml");
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
+        E2eConformanceError::ModelComponentFailed {
+            reason: format!(
+                "failed to read Qwen Component manifest from '{manifest_path}': {error}"
+            ),
+        }
+    })?;
+    Ok(ComponentArtifactPackage::new(
+        component_bytes,
+        manifest_bytes,
+        ComponentDigest::parse("sha256", QWEN_REAL_COMPONENT_DIGEST),
+        ComponentDistributionSource::new(
+            ComponentDistributionSourceKind::LocalDirectory,
+            QWEN_REAL_COMPONENT_NAME,
+        ),
+    ))
 }
 
 /// Real per-weight dimensions for `config`'s architecture, keyed by the
@@ -4927,7 +5007,7 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
         capability.clone() as Arc<dyn HostCapability>,
     );
     let definition = manager
-        .prepare_pushed_package(qwen_real_component_package())
+        .prepare_pushed_package(qwen_real_component_package()?)
         .map_err(|error| E2eConformanceError::ModelComponentFailed {
             reason: error.to_string(),
         })?;
