@@ -4477,6 +4477,27 @@ fn load_fixture_instance(
 /// the instance as `Ready` during that window. This test's name and
 /// assertions were rewritten to match the corrected behavior, not just the
 /// corrected code.
+/// Shared by every check that proves a weight's `TensorResidency` record is
+/// gone once its Provider storage and Memory Manager allocation have both
+/// been released -- rollback, unload, and repeated load/unload all assert
+/// this same property (`invalidate-tensor-residency-on-release`); `context`
+/// names which one, for the failure message.
+#[cfg(test)]
+fn assert_tensor_residency_absent(
+    runtime: &Runtime,
+    resource_id: &TensorResourceId,
+    context: &str,
+) -> Result<(), E2eConformanceError> {
+    if runtime.memory().tensor_residency(resource_id).is_some() {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "weight resource '{resource_id}' still has a TensorResidency record {context}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn check_weight_materialization_failure_never_reaches_ready(
     fixture: &E2eFixture,
@@ -4615,6 +4636,11 @@ fn check_weight_materialization_failure_never_reaches_ready(
                 ),
             });
         }
+        assert_tensor_residency_absent(
+            &runtime,
+            &resource_id,
+            "after a failed materialization attempt was supposed to roll it back",
+        )?;
     }
     Ok(())
 }
@@ -4817,6 +4843,14 @@ impl WeightMaterializationTransaction {
     fn abort(self, runtime: &mut Runtime) {
         for staged in &self.staged {
             self.executor.release_tensor(&staged.resource_id);
+            // Remove the residency record before releasing the allocation
+            // it references: once the Provider tensor and allocation are
+            // both gone, a lingering `TensorResidency` entry would
+            // misreport this resource as still resident (Correctif:
+            // `invalidate-tensor-residency-on-release`).
+            runtime
+                .memory_mut()
+                .remove_tensor_residency(&staged.resource_id);
             let _ = runtime.memory_mut().release(staged.allocation);
         }
     }
@@ -7932,6 +7966,7 @@ fn check_unload_releases_weight_resource_allocations(
                 ),
             });
         }
+        assert_tensor_residency_absent(&runtime, resource_id, "after Model Instance unload")?;
     }
     Ok(())
 }
@@ -7985,6 +8020,17 @@ fn check_repeated_load_unload_does_not_accumulate_weight_storage(
                     ),
                 });
             }
+            // Each cycle creates a fresh Model Instance, so a fresh
+            // TensorResourceId per weight -- a residency record surviving
+            // past its own cycle's unload would mean residency metadata
+            // grows unbounded across cycles even though Provider storage
+            // and Memory Manager accounting both look clean
+            // (`invalidate-tensor-residency-on-release`).
+            assert_tensor_residency_absent(
+                &runtime,
+                resource_id,
+                &format!("after unload in cycle {cycle} -- residency metadata is accumulating"),
+            )?;
         }
     }
     Ok(())

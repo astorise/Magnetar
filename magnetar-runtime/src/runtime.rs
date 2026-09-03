@@ -661,6 +661,13 @@ impl Runtime {
             {
                 executor.release_tensor(resource_id);
             }
+            // Remove the residency record itself, now that its Provider
+            // tensor is gone -- read only after the Provider lookup above,
+            // which needs it to resolve the owning Provider; otherwise
+            // `tensor_residency()` would keep reporting this resource as
+            // resident indefinitely across every load/unload cycle
+            // (Correctif: `invalidate-tensor-residency-on-release`).
+            self.memory.remove_tensor_residency(resource_id);
         }
         // Release this instance's own MemoryManager allocations (weight/
         // constant tensor resources and any other Runtime-owned allocation

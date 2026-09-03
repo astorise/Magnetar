@@ -5830,6 +5830,15 @@ fn memory_manager_tracks_allocation_lifetime_and_tensor_residency() {
         observation.kind == MemoryObservationKind::AllocationReleased
             && observation.allocation == Some(allocation.id)
     }));
+    // `release()` only changes the allocation's own state -- it does not
+    // remove the tensor's residency record (`invalidate-tensor-residency-
+    // on-release`), so the record is still present here until a caller
+    // explicitly removes it.
+    assert!(manager.tensor_residency(&tensor).is_some());
+    let removed = manager.remove_tensor_residency(&tensor).unwrap();
+    assert_eq!(removed.tensor, tensor);
+    assert!(manager.tensor_residency(&tensor).is_none());
+    assert!(manager.remove_tensor_residency(&tensor).is_none());
     assert!(matches!(
         manager.record_tensor_residency(
             TensorResidency::new(

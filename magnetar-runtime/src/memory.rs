@@ -3985,6 +3985,21 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// Removes a Tensor Resource's residency record. Callers releasing a
+    /// tensor's Provider-owned storage and Memory Manager allocation (weight
+    /// materialization rollback, Model Instance unload) SHALL also remove
+    /// its `TensorResidency` here -- `release()` only changes the
+    /// `MemoryAllocation`'s own state and never touches this map, so without
+    /// an explicit removal `tensor_residency()` keeps reporting a resource
+    /// as resident after the Provider tensor and allocation it described
+    /// are both gone.
+    pub fn remove_tensor_residency(
+        &mut self,
+        tensor: &TensorResourceId,
+    ) -> Option<TensorResidency> {
+        self.tensor_residency.remove(tensor)
+    }
+
     pub fn record_resource_residency(
         &mut self,
         residency: ResourceResidency,
