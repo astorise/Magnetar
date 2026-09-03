@@ -416,52 +416,75 @@ not a generic Core module (see 12.7's CI guard, which encodes exactly this
 distinction).
 
 12.4 is now also done, per the same explicit architectural decision as
-12.6: production's Qwen Component loader (`qwen_real_component_package`'s
+12.6, in its final form -- corrected once by real CI feedback along the
+way, not left at the first design that merely compiled clean locally.
+Production's Qwen Component loader (`qwen_real_component_package`'s
 `not(test)` branch in `first_native_runtime.rs`) no longer embeds the real
 Component binary via `include_bytes!` or claims
-`ComponentDistributionSourceKind::DevelopmentFixture`. It resolves the
-Component's bytes and manifest from a caller-configured local path
+`ComponentDistributionSourceKind::DevelopmentFixture`. It first checks for
+an artifact an embedder has explicitly *pushed* via a new public function,
+`register_qwen_component_artifact(component_bytes, manifest_bytes)`
+(process-wide, set-once, idempotent -- a second call is a harmless no-op);
+if none was pushed, it falls back to a caller-configured local path
 (`MAGNETAR_QWEN_COMPONENT_PATH`, plus `<path>.magnetar-component.yaml` for
-the manifest) at runtime, reports `ComponentDistributionSourceKind::
-LocalDirectory`, and fails closed with a structured
-`E2eConformanceError::ModelComponentFailed` if the variable is unset, the
-file cannot be read, or the bytes do not hash to the same
-`QWEN_REAL_COMPONENT_DIGEST` every build has always required (that check
-was and remains real: `ComponentManager::prepare_distributed_package`
-computes the actual sha256 of whatever bytes it receives and rejects a
-mismatch, so a corrupted or substituted local file is rejected structurally,
-not merely by convention). This is deliberately the minimal external-source
-mechanism the task calls for -- a real Component distribution/registry
-service (OCI, HTTP, S3, GitHub Releases, ...) is explicitly not built here;
-that remains real, separate, larger work for whenever a second real
-Component or a genuine multi-artifact deployment story exists. Test builds
-are unaffected: a `#[cfg(test)]`-only sibling overload of
-`qwen_real_component_package` keeps using `include_bytes!` against the
-checked-in fixture, exactly as before, since `#[cfg(test)]` fixtures are
-explicitly fine under the same decision. `magnetar-cli` does not yet set
-`MAGNETAR_QWEN_COMPONENT_PATH` or expose any flag for it -- there is
-currently no CLI command that reaches this code path at all (confirmed by
-inspection: `magnetar-cli` never calls into `first_native_runtime`'s
-Component-loading or conformance-suite functions today), so this is
-correctly scoped as "the Runtime-side contract now requires and validates
-an external source" rather than "a working end-to-end CLI flag," which
-would be new CLI-layer work this task does not include.
+the manifest); if neither, it fails closed with a structured
+`E2eConformanceError::ModelComponentFailed`. Either source still goes
+through the same digest verification every build has always required
+(`QWEN_REAL_COMPONENT_DIGEST`, checked in
+`ComponentManager::prepare_distributed_package` against the real sha256 of
+whatever bytes were actually supplied) -- pushing or pointing at the wrong
+bytes fails closed exactly like a missing source would, it does not bypass
+trust. Test builds are unaffected: a `#[cfg(test)]`-only sibling overload
+of `qwen_real_component_package` keeps using `include_bytes!` against the
+checked-in fixture, exactly as before.
 
-Verified: default features (1141 passed, including a new static guard,
+**The push mechanism exists because the first design (local-path-only) was
+wrong, caught by CI, not by local verification.** `magnetar-cli`'s own
+first-native entry points (`run_first_native_generation`,
+`FirstNativeChatSession::open`) are genuinely production code -- not
+`#[cfg(test)]`-gated in any crate, including `magnetar-cli`'s own -- and
+both hard-require `model_ref == "qwen-test"`; there is no other real
+caller-facing "model" yet. An earlier investigation (checking whether
+`magnetar-cli` reaches `first_native_runtime`'s *conformance-suite*
+functions specifically) correctly found no such call site and was read too
+broadly as "no CLI path reaches first-native code at all" -- it does, just
+through the generation entry points, not the conformance suite. Pushing
+this change without setting `MAGNETAR_QWEN_COMPONENT_PATH` anywhere broke
+9 real tests in `magnetar-cli`'s own suite (`agent.rs`, `commands.rs`,
+`pipeline.rs`, `serve.rs`), caught by the very first CI run against it.
+Corrected per explicit direction: `magnetar-cli` is the "deployment / CLI /
+Component source adapter" layer the task's own design names -- it now
+embeds the Component fixture itself (`magnetar-cli/fixtures/`, copied from
+`magnetar-runtime`'s, `include_bytes!`'d in `pipeline.rs`) and pushes it via
+`register_qwen_component_artifact` before every call to
+`run_first_native_generation`/`FirstNativeChatSession::open`
+(`ensure_qwen_component_registered`, called unconditionally and cheaply
+thanks to the push API's idempotence). `magnetar-runtime` itself still has
+zero `include_bytes!` of the Qwen Component outside `#[cfg(test)]` -- the
+embedding moved to the one real embedder that exists, exactly matching the
+task's own diagram, rather than staying in the Runtime by default because
+nothing else supplied a source yet.
+
+Verified: `magnetar-cli`'s full test suite (64 passed, including all 9
+previously-broken by the first design), `magnetar-runtime` default features
+(1141 passed, including a static guard,
 `qwen_component_production_loader_has_no_embedded_fixture`, checking by
 source inspection -- the only way to check `not(test)` code at all -- that
 the production branch contains no `include_bytes!`/`DevelopmentFixture` and
-does resolve via `std::env::var`/`std::fs::read`), `--no-default-features`
-(1100 passed, test-oracle branch unaffected), `cargo clippy --workspace
---all-targets --all-features -- -D warnings` clean, `cargo fmt --check`
-clean, `cargo check --target wasm32-unknown-unknown --all-features` clean
-(this whole branch is already `not(target_arch = "wasm32")`-gated, so
-wasm32 was never affected), `cargo build --workspace` clean.
+does resolve externally), `--no-default-features` (1101 passed, test-oracle
+branch unaffected), `cargo clippy --workspace --all-targets --all-features
+-- -D warnings` clean across both crates, `cargo fmt --check` clean, `cargo
+check --target wasm32-unknown-unknown --all-features` clean (this whole
+branch is already `not(target_arch = "wasm32")`-gated, so wasm32 was never
+affected), `cargo build --workspace` clean. CI run pending against this
+exact commit at the time this note was written; the point of pushing
+early and often through this task was precisely to let CI itself catch
+what local verification could not.
 
 - [x] 12.1 Materialize `components/qwen` as a working submodule build (builds on the gitlink already added to `.gitmodules` on this branch). (Done as a side effect of task group 11: `components/qwen` is a real, building, wasm32-compiling Component, not a template.)
 - [x] 12.2 Move the Qwen graph builder out of `magnetar-runtime` into the Component (superseded by task 11.4/11.5 once the contract lands). (Done: 11.5's cutover made the real Component the exclusive production graph source under the strict path; the in-crate Rust builder survives only as a `#[cfg(test)]`-only oracle now, per 12.6.)
 - [x] 12.3 Move Qwen weight-name and KV-name mappings (`self_attn.q_proj`, `qwen.layerN.k/v`, etc.) out of the Core. (The mapping *tables* are gone -- see the group note above for the full change. What remains in `first_native_runtime.rs` is a config value (`kv_namespace: "qwen"`) and architecture-derived shapes, not a hardcoded name-translation table, and that file is the designated Qwen-scoped file, not "the Core" in the sense this task and 12.7's guard mean.)
-- [x] 12.4 Move Qwen fixtures out of `magnetar-runtime` production code (test-only fixtures may remain under test paths). (Done -- see the group note above for the full change. Production resolves the Component externally (`MAGNETAR_QWEN_COMPONENT_PATH`); `include_bytes!` against the checked-in fixture survives only under `#[cfg(test)]`.)
+- [x] 12.4 Move Qwen fixtures out of `magnetar-runtime` production code (test-only fixtures may remain under test paths). (Done -- see the group note above for the full change and the real CI-caught correction along the way. `magnetar-runtime` production resolves the Component externally (pushed via `register_qwen_component_artifact`, or `MAGNETAR_QWEN_COMPONENT_PATH` as a fallback); `magnetar-cli` is the actual embedder now (`magnetar-cli/fixtures/`); `include_bytes!` against the checked-in `magnetar-runtime` fixture survives only under `#[cfg(test)]`.)
 - [x] 12.5 Execute the real Qwen Component Artifact in the first-native test suite. (Done via 11.5; reconfirmed still true after this task's weight-naming change and Component rebuild -- full suite 1108/1108 passing.)
 - [x] 12.6 Remove `pub mod qwen_model_component` (or equivalent) from the Core crate. (Done, per an explicit architectural decision -- see the group note above for the full change. The module itself is not deleted (most of it -- config validation, target modules, KV/tokenizer metadata, adapter support -- is genuinely production-used, unrelated to the graph-semantics-duplication concern this task targets), but `qwen_build_graph`/`qwen_prefill_graph`/`qwen_decode_graph` specifically, the part that actually duplicated Model Component graph semantics, are now `#[cfg(test)]`-only and unreachable from any production build. Production has exactly one Model Component graph source.)
 - [x] 12.7 Add a CI guard rejecting `qwen`, `llama`, `self_attn.q_proj`, `mlp.gate_proj` (and similar model-family identifiers) in designated generic Core modules, excluding tests, docs, and OpenSpec archives. (New `model-family-isolation` job in `.github/workflows/quality.yml`: scans an explicit list of 16 generic Core files -- `affinity.rs`, `capability.rs`, `component.rs`, `component_wasmtime.rs`, `compute.rs`, `device.rs`, `execution_graph.rs`, `graph_builder_capability.rs`, `kernel.rs`, `kernel_compilation.rs`, `memory.rs`, `operator.rs`, `provider.rs`, `reference_cpu.rs`, `scheduler.rs`, `tensor.rs` -- for the same patterns, with line comments stripped first so design-intent prose can't self-trigger it. Deliberately an explicit allowlist of files verified clean today, not "every file in magnetar-runtime minus two": a broader sweep during this task found real, pre-existing qwen/llama mentions outside this list too (`conformance.rs`'s `QwenWasmModelComponent` enum variant is a genuine instance of the pattern this guard exists to catch; `kernel_execution_plan.rs`, `provider_roadmap.rs`, and others are mostly test-fixture example strings) -- not fixed in this pass, real follow-up work, so the guard does not yet cover those files. Verified locally to pass today (`exit=0`) before relying on it; not yet exercised against live GitHub Actions.)

@@ -4832,32 +4832,79 @@ fn qwen_real_component_package() -> Result<ComponentArtifactPackage, E2eConforma
     ))
 }
 
+/// A Component artifact an embedder (e.g. `magnetar-cli`, the "deployment /
+/// CLI / Component source adapter" layer in this task's own design) has
+/// explicitly pushed for production first-native generation to use --
+/// [`register_qwen_component_artifact`] is the only way to populate this.
+/// Process-wide and set-once by design (`qwen_real_component_runtime`
+/// itself already caches the *compiled* Component process-wide for the
+/// same reason: compiling a real Component is expensive, and first-native
+/// generation today has exactly one caller-facing model, `"qwen-test"`
+/// (see [`run_first_native_generation`]), not a fleet of distinct
+/// artifacts that would need per-call selection).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+static QWEN_COMPONENT_ARTIFACT: std::sync::OnceLock<ComponentArtifactPackage> =
+    std::sync::OnceLock::new();
+
+/// Lets an embedder push a real Qwen Component artifact for production
+/// first-native generation to use (`reach-architecture-freeze-1` task
+/// 12.4's "deployment / CLI / Component source adapter" boundary --
+/// `magnetar-cli` calls this with a Component binary and manifest it owns
+/// and embeds itself, e.g. for the bundled `"qwen-test"` self-test/demo
+/// alias). Idempotent: a second call with the process already holding a
+/// registered artifact is a harmless no-op, not an error -- a caller like
+/// `magnetar-cli` can call this unconditionally before every generation
+/// request rather than tracking its own "have I registered yet" state.
+/// The pushed bytes still go through the same digest verification every
+/// other loading path already required
+/// ([`QWEN_REAL_COMPONENT_DIGEST`], checked in
+/// `ComponentManager::prepare_distributed_package`): pushing the wrong
+/// bytes fails closed exactly like a missing or corrupted external source
+/// would, it does not bypass trust.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn register_qwen_component_artifact(component_bytes: Vec<u8>, manifest_bytes: Vec<u8>) {
+    let _ = QWEN_COMPONENT_ARTIFACT.set(ComponentArtifactPackage::new(
+        component_bytes,
+        manifest_bytes,
+        ComponentDigest::parse("sha256", QWEN_REAL_COMPONENT_DIGEST),
+        ComponentDistributionSource::new(
+            ComponentDistributionSourceKind::DevelopmentFixture,
+            QWEN_REAL_COMPONENT_NAME,
+        ),
+    ));
+}
+
 /// Production Qwen Component loading (`reach-architecture-freeze-1` task
-/// 12.4): no `include_bytes!`, no `DevelopmentFixture` distribution source,
-/// no silent fallback. The real Component artifact and its manifest are
-/// read from a caller-configured local path -- the minimal external-source
-/// resolution mechanism this task calls for, deliberately not a full
+/// 12.4): no `include_bytes!` here, no silent fallback. First checks for an
+/// artifact an embedder has explicitly pushed via
+/// [`register_qwen_component_artifact`]; if none was pushed, falls back to
+/// a caller-configured local path (`MAGNETAR_QWEN_COMPONENT_PATH` names the
+/// Component `.wasm` file itself, with its manifest expected alongside it
+/// as `<path>.magnetar-component.yaml`) -- the minimal external-source
+/// resolution mechanisms this task calls for, deliberately not a full
 /// Component registry/distribution service (a separate, larger piece of
 /// infrastructure that does not exist yet and this task does not invent).
-/// `MAGNETAR_QWEN_COMPONENT_PATH` names the Component `.wasm` file itself;
-/// its manifest is expected alongside it as `<path>.magnetar-component.yaml`
-/// (the same naming convention the checked-in test fixture already uses).
-/// Missing configuration, an unreadable file, or bytes that do not hash to
+/// Neither configured, an unreadable file, or bytes that do not hash to
 /// [`QWEN_REAL_COMPONENT_DIGEST`] all fail closed with a structured error --
-/// never a fallback to an embedded fixture, because production has none.
+/// never a fallback to an embedded fixture, because this crate has none.
 #[cfg(all(
     not(target_arch = "wasm32"),
     feature = "wasmtime-component-engine",
     not(test)
 ))]
 fn qwen_real_component_package() -> Result<ComponentArtifactPackage, E2eConformanceError> {
+    if let Some(package) = QWEN_COMPONENT_ARTIFACT.get() {
+        return Ok(package.clone());
+    }
     const COMPONENT_PATH_ENV_VAR: &str = "MAGNETAR_QWEN_COMPONENT_PATH";
     let component_path = std::env::var(COMPONENT_PATH_ENV_VAR).map_err(|_| {
         E2eConformanceError::ModelComponentFailed {
             reason: format!(
-                "{COMPONENT_PATH_ENV_VAR} is not set; production first-native generation \
-                 requires an externally provided Qwen Model Component artifact and has no \
-                 embedded development fixture to fall back to"
+                "no Qwen Component artifact was registered (see \
+                 register_qwen_component_artifact) and {COMPONENT_PATH_ENV_VAR} is not set; \
+                 production first-native generation requires an externally provided Qwen \
+                 Model Component artifact and has no embedded development fixture of its own \
+                 to fall back to"
             ),
         }
     })?;
