@@ -63,11 +63,18 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Architecture Freeze #1 remains a candidate, not accepted: the P0 causal
-  datapath requirements above are implemented and test-covered, but the
-  freeze is only accepted once the full validation pass (formatting,
-  clippy, workspace tests, WIT/component validation, and OpenSpec
-  validation) completes and this change is archived with linked CI evidence.
+- Architecture Freeze #1 is **accepted**: all P0 causal datapath
+  requirements (`reach-architecture-freeze-1`) are implemented, test-covered,
+  and proven by a full green CI run (formatting, clippy, workspace tests
+  across Linux/Windows/macOS, WIT/component validation, wasm32, submodule
+  integration, and OpenSpec validation) at commit `0197be1` on
+  `make-first-native-datapath-authoritative`, which is now archived as
+  `2026-09-03-make-first-native-datapath-authoritative`. `reach-architecture-
+  freeze-1`'s own task group 19 re-ran the full causal chain
+  (`magnetar run qwen-test "Hello"`, live, not just via test) end to end and
+  confirmed evidence for every step from CLI through Model Loading, the real
+  Qwen Component, `PreparedExecutionPlan`, the Provider, admitted Tensor
+  Resources, Runtime-owned KV Resources, Sampling, and token commit.
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 

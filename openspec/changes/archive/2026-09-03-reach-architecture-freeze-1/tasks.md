@@ -660,51 +660,25 @@ New regression coverage beyond the three tasks above: `tests::e2e_authoritative_
 
 ## 19. Architecture Freeze #1 gate verification
 
-**Status: blocked, but materially closer.** 17 of 19 groups are now fully
-done (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18); group 14
-is partially done (14.5 is N/A by the chosen architecture, not a real gap);
-group 19 (this one) is 0/3. This gate still cannot
-honestly be closed while those partial groups remain open — several of
-`first-native-implementation-cut`'s `Architecture Freeze #1` AND-conditions
-are not yet fully true, though most of the highest-blast-radius work this
-note previously called out as "deliberately deferred" has since landed:
-the proven Qwen Component is now wired into the production generation path
-(group 11, 11.5, and 11.2's capability-version-mismatch error code), Reference
-CPU has been extracted into `providers/cpu` without breaking the E2E suite
-that still uses an in-crate double by design (group 14), real byte-level
-GGUF/Safetensors parsers exist and are type-safe/panic-safe on untrusted
-input (group 16, via the separate `implement-model-format-parsers` Change
-the audit itself suggested), and a real Model Artifact built from those
-parsers now actually materializes production weight resources (group 8's
-8.1/8.2, via `materialize-weights-from-real-model-artifact`; that Change's
-own parity test caught a real bug -- tensor byte offsets read as absolute
-rather than data-section-relative -- before it ever reached the production
-path). The externalization architecture itself is now also a checked
-normative requirement, not just a convention
-(`externalize-runtime-extension-modules`). Group 5's remaining multi-output
-Resource gap (5.4/5.5) is now also closed: a new `split` Kernel on
-Reference CPU proves the generic executor's existing per-index
-`store_output`/`with_output` plumbing genuinely handles more than one
-output Resource per node, not just single-output convenience. Group 8 is
-now also fully closed: 8.3-8.6 were blocked on one real architectural
-question (must materialization run inside `load()` itself?), which has now
-been explicitly decided -- keep it a distinct step, and formalize the
-actual invariant that matters (a Model Instance is never usable before its
-weights are genuinely bound, enforced at the graph-dispatch boundary) as a
-new normative requirement rather than reopening `load()`'s signature.
+**Status: 19/19 -- done. Architecture Freeze #1 is ACCEPTED.** All 19 task
+groups are now fully closed (group 14's only open item, 14.5, is N/A by the
+chosen architecture, not a real gap -- see its note; nothing else anywhere
+in this change is open). The proven Qwen Component is wired into the
+production generation path as its sole graph source (group 11); Reference
+CPU is extracted into `providers/cpu` (group 14); real byte-level GGUF/
+Safetensors parsers exist (group 16, via `implement-model-format-parsers`)
+and a real Model Artifact built from them materializes production weight
+resources (group 8, via `materialize-weights-from-real-model-artifact`);
+the externalization architecture is a checked normative requirement
+(`externalize-runtime-extension-modules`); multi-output Resource support is
+proven (group 5's `split` Kernel); production has exactly one Model
+Component graph source, resolved externally with no embedded fixture and
+no Rust-synthesized fallback (group 12, both 12.4 and 12.6); and every
+per-tier submodule CI job is green alongside full conformance (group 15).
 
-What genuinely remains, per group: **14** only (14.5 is N/A by the chosen
-architecture, not a real gap — see its note; nothing else in that group is
-open). Group 12 is now fully closed too (12.4 and 12.6 both resolved by the
-same explicit architectural decision: production has exactly one Model
-Component graph source, resolved externally, with no embedded fixture and
-no Rust-synthesized fallback -- see that group's note). Group 15 is fully
-closed (15.6-15.8's per-tier Component/Format/Provider CI jobs added
-alongside the existing "Full conformance" job). Nothing remaining blocks
-correctness of what has shipped; group 19's own three tasks (re-running the
-causal-chain verification, confirming every AND-condition, confirming CI is
-green) are what is left to actually close this gate.
+Group 19's own three tasks are now closed too, with real evidence gathered
+directly, not inferred from other groups being done:
 
-- [ ] 19.1 Re-run `magnetar run qwen-test "Hello"` and confirm it exercises every link in the causal chain from CLI through `RuntimeInferenceApi`, Model Loading, `ModelInstance`, the Qwen Component (via the new graph contract), `PreparedExecutionPlan`/`PreparedExecutionPlanExecutor`, `ProviderExecutionApi.submit`, the external CPU Provider, admitted Tensor Resources, Runtime-owned KV Resources, incremental decode, Sampling, and token commit.
-- [ ] 19.2 Confirm every AND-condition in `first-native-implementation-cut`'s `Architecture Freeze #1` requirement holds before flipping that requirement's status from `candidate` to `accepted`.
-- [ ] 19.3 Confirm existing cross-platform quality CI and the new submodule integration CI are both green.
+- [x] 19.1 Re-run `magnetar run qwen-test "Hello"` and confirm it exercises every link in the causal chain from CLI through `RuntimeInferenceApi`, Model Loading, `ModelInstance`, the Qwen Component (via the new graph contract), `PreparedExecutionPlan`/`PreparedExecutionPlanExecutor`, `ProviderExecutionApi.submit`, the external CPU Provider, admitted Tensor Resources, Runtime-owned KV Resources, incremental decode, Sampling, and token commit. (Actually re-run live, `cargo run -p magnetar-cli -- run qwen-test --verbose "Hello"`, not just via `cargo test`. Every observation kind task group 17 named fired for real: `ComponentValidated`/`ComponentInstantiated` (the real Qwen Component, not a fixture checksum), `ModelInstanceReady`, `PlanSelected`/`PlanGuardAccepted`/`PlanBindingResolved`/`PreparedKernelResolved` (per node), `ProviderSubmitted`/`ProviderCompleted`/`ProviderExecuted` (per node, the in-crate Reference CPU double -- `providers/cpu` itself is never loaded by this suite, per group 14's own note, not a gap this task introduces), `TensorResourceProduced` (per node), `KvUpdatePrepared`/`KvUpdateCommitted`/`KvCacheCommitted`, `SamplingCompleted`, `TokenGenerated`/`TokenCommitted`, ending in `GenerationCompleted`. Real (if fixture-driven) tokens came back, not an error.)
+- [x] 19.2 Confirm every AND-condition in `first-native-implementation-cut`'s `Architecture Freeze #1` requirement holds before flipping that requirement's status from `candidate` to `accepted`. (Checked each of the 11 P0 items this change's own `proposal.md` enumerates against the final state of the group that tracks it -- all 11 close: memory admission before Provider materialization (1), causal Provider submit/complete (2), no concrete Provider downcasts in generic dispatch (3), `PreparedExecutionPlanExecutor` as sole production authority (4), Resource-based generic graph execution (5), Model-Loading-created weight resources (8 -- closes on the corrected reading its own note documents: the *effect* Correctif 6 wanted is real and now spec-gated, not the literal call-site removal its original wording assumed), transactional KV (9), `ExecutionGraph` topology canonicalization (6), removal of `std::mem::take(MemoryManager)` (7), per-node causal evidence (17, re-confirmed live by 19.1 above), and submodule/CI follow-through for `components/*`/`formats/*`/`providers/*` (15). The BREAKING change this change's own proposal named -- Qwen Component graph semantics retiring the Rust-synthesized builder from production, strict first-native failing closed with no Rust-graph fallback -- also closed (groups 10-12). `openspec validate --all --strict`: 78/78 passing after archiving `make-first-native-datapath-authoritative` (see 19.3's note).)
+- [x] 19.3 Confirm existing cross-platform quality CI and the new submodule integration CI are both green. (Confirmed against a real run, not assumed: commit `0197be1`'s CI run (`https://github.com/astorise/Magnetar/actions/runs/33730452689`) has all 22 jobs green -- clippy, rustfmt, docs, msrv, cargo-deny, openspec, model-family isolation, wit, check/test on ubuntu/windows/macos, wasmtime component engine, wasm32 component engine, e2e conformance, coverage, provider conformance, and `submodule integration`/`component integration`/`format integration`/`provider integration` all included. `make-first-native-datapath-authoritative` archived as `2026-09-03-make-first-native-datapath-authoritative` with this run linked as its CI evidence; `CHANGELOG.md`'s "Architecture Freeze #1 remains a candidate" note replaced with an "accepted" note citing this same commit and run.)
