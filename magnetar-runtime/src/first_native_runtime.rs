@@ -7942,6 +7942,7 @@ fn check_unload_releases_weight_resource_allocations(
 /// proves the property; more repetitions prove only that it does not
 /// degrade with iteration count, which a fixed small count already shows
 /// as well without materially slower test runs).
+#[cfg(test)]
 fn check_repeated_load_unload_does_not_accumulate_weight_storage(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
