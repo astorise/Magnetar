@@ -63,11 +63,14 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Architecture Freeze #1 is **accepted** at commit `e7dc45d`
-  (2026-09-03, CI run
-  https://github.com/astorise/Magnetar/actions/runs/33765211820, zero
-  non-`success` jobs confirmed via `gh run view --json status,conclusion`
-  and the jobs list directly -- that run's first pass had one failing
+- Architecture Freeze #1 is **accepted** at commit `0539df0` (2026-09-03,
+  CI run https://github.com/astorise/Magnetar/actions/runs/33772079066,
+  zero non-`success` jobs confirmed via `gh run view --json
+  status,conclusion` and the jobs list directly). The history below is
+  kept in full because each round found something real; the commit and
+  CI run cited in this first sentence are what to trust as current.
+  (An earlier point in this history was itself briefly declared
+  "accepted" at commit `e7dc45d` -- that run's first pass had one failing
   job, `wasmtime component engine`, on a pre-existing test
   (`pushed_component_package_temp_materialization_is_removed_with_manager`)
   unrelated to this Change (a parallel-test race scanning the shared
@@ -153,15 +156,12 @@
   `acquire_usage`/`generation_reference` now require both
   `lifecycle.supports_inference_use()` and
   `readiness.accepts_generation()` as a structural safety net.
-  Deliberately not closed, and documented as an explicit trade-off
-  rather than an oversight: `kernel_preparation_ready`/
-  `autotuning_ready` remain caller-supplied (no generic Runtime-side
-  derivation exists for these today), and the direct
-  `ModelInstanceManager::mark_ready` bypass is not sealed by Rust
-  visibility (would require editing 15 test call sites for a partial
-  close, since `mark_ready` has no Runtime context to derive
-  `provider_ready`/`device_ready` from even if hardened) -- both
-  authorized explicitly by the auditor as acceptable for this PR.
+  `kernel_preparation_ready`/`autotuning_ready` were deliberately left
+  caller-supplied (no generic Runtime-side derivation exists for these
+  today). The direct `ModelInstanceManager::mark_ready` bypass was
+  *not* closed at this point -- **this was a misreading of the
+  auditor's own guidance, corrected in the very next audit round
+  below, not something the auditor actually authorized leaving open.**
   Verified: full workspace test suite (1,397 tests across the lib, CLI,
   and `contract_tests` integration binaries) passing, `cargo doc
   --locked --workspace --no-deps` with `RUSTDOCFLAGS="-D warnings"`
@@ -172,7 +172,39 @@
   (above the 78.89% baseline), `openspec validate --all --strict`
   77/77, live `magnetar run qwen-test "Hello"` unaffected (the
   production path never calls `warm_model_instance`), and the CI run
-  cited above.
+  cited above. A fourth audit round, a full re-audit of this exact
+  fix, found the mark_ready bypass -- and two more real gaps -- still
+  open: (P0-A) `ModelInstance.lifecycle`/`.readiness` were still fully
+  public mutable fields, so even sealing `mark_ready`/`transition_to`
+  would not have stopped `instance.lifecycle = Ready` as a raw field
+  assignment; (P0-B) `weights_materialized` only checked
+  `resource_bindings.weights` was non-empty, not that entries were
+  backed by a real `TensorResidency` record -- the round-1 test suite
+  itself demonstrated this, since its own happy-path test inserted an
+  unregistered `TensorResourceId` and still passed; (P0-C)
+  `provider_ready` only checked a Provider was registered and exposed
+  `execution_api()`, not that its own status model reported it
+  actually accepting new work. Fixed by `openspec/changes/seal-model-
+  instance-readiness-authority`: `mark_ready`/`transition_to`/`warmup`
+  and the matching `ModelInstanceManager` wrappers are now `pub(crate)`
+  (verified `magnetar-cli` calls none of them directly before sealing);
+  `lifecycle`/`readiness` are now `pub(crate)` fields with public
+  read-only `lifecycle()`/`readiness()` accessors; `weights_materialized`
+  now requires a matching `TensorResidency` per bound weight;
+  `provider_ready` now requires
+  `Provider::status_snapshot().accepts_new_work_by_default()`. The
+  crate's own integration test suite (an external consumer of this
+  crate's public API, same as any embedder) was migrated onto
+  `warm_model_instance` with real, residency-backed evidence --
+  deliberately the same contract a real embedder must use, not a
+  parallel test-only escape hatch (a Cargo feature flag for this was
+  considered and rejected: it would be included by `--all-features`,
+  which this project's own CI uses, reopening the exact gap for any
+  downstream consumer who also builds with `--all-features`). Verified:
+  full workspace test suite (1,399 tests) passing, `cargo doc` clean,
+  wasm32 check clean, coverage ratchet at 78.91% (above baseline),
+  `openspec validate --all --strict` 77/77, live `qwen-test` unaffected,
+  and the CI run cited in this note's opening sentence.
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 

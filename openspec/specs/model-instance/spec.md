@@ -118,6 +118,18 @@ outright from a caller-supplied claim. A caller MAY assert a stricter
 be able to assert a Runtime-observable fact as `true` when the Runtime does
 not itself observe it as true.
 
+A bound weight resource SHALL only count toward `weights_materialized` if
+it has a corresponding residency record the Runtime itself recorded; a
+resource identifier present without one SHALL NOT count. A pinned
+Provider SHALL only count toward `provider_ready` if its own status model
+reports it as currently accepting new work, not merely that it is
+registered and exposes an execution interface in principle.
+
+The public surface for producing a `Ready` Model Instance SHALL NOT permit
+an external caller to reach `Ready` other than through a path that
+performs this derivation; lifecycle and readiness state SHALL NOT be
+directly settable by an external caller.
+
 #### Scenario: Provider not ready
 
 Given an instance lifecycle exists
@@ -135,6 +147,24 @@ Given a Model Instance has no weight resources bound
 When a caller requests warmup asserting weights are materialized
 
 Then the Runtime's own observation of empty resource bindings overrides the caller's claim and the instance does not become Ready.
+
+#### Scenario: A bound weight without a residency record does not count
+
+Given a Model Instance has a weight resource identifier bound with no corresponding residency record
+
+When a caller requests warmup asserting weights are materialized
+
+Then the Runtime does not treat that resource as materialized and the instance does not become Ready.
+
+#### Scenario: A Provider that rejects new work does not count as ready
+
+Given a Model Instance is pinned to a Provider that is registered and exposes an execution interface
+
+But that Provider's own status model reports it does not currently accept new work
+
+When a caller requests warmup asserting the Provider is ready
+
+Then the Runtime does not treat the Provider as ready and the instance does not become Ready.
 
 ---
 
@@ -171,6 +201,13 @@ Regardless of warmup policy, `readiness` SHALL NOT report `Ready` while
 warmup policy that does not perform lifecycle transitions SHALL NOT be able
 to publish `Ready` readiness as a side effect.
 
+The primitives capable of transitioning a Model Instance to `Ready`
+(the underlying lifecycle transition and the raw ready-marking operation)
+SHALL NOT be reachable by a caller outside the Runtime's own
+implementation. An external caller SHALL only be able to request warmup
+through the Runtime-owned entry point that performs readiness derivation
+first.
+
 #### Scenario: Warmup failure
 
 Given Provider warmup fails
@@ -187,7 +224,13 @@ When warmup is invoked with a policy that does not transition the lifecycle
 
 Then readiness does not report Ready even if the supplied checks would otherwise compute Ready
 
----
+#### Scenario: The raw ready-marking primitive is not externally reachable
+
+Given a caller external to the Runtime's own implementation holds a mutable reference to a Model Instance
+
+When that caller attempts to invoke the underlying lifecycle transition or ready-marking operation directly, bypassing the Runtime-owned warmup entry point
+
+Then no such path is available to that caller
 
 ### Requirement: Model Instance Usage Reference
 
