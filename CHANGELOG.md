@@ -63,30 +63,40 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Architecture Freeze #1 **reverts to candidate**, not accepted -- an
-  external audit of commit `0197be1` (2026-09-03, PR #36) correctly found
-  two P0 gaps in the weight-materialization lifecycle that the acceptance
-  declared at that commit missed: (1) `ModelInstance` is marked `Ready`
-  immediately on creation, before mandatory weights are ever bound, and
-  `acquire_usage`'s own readiness check does not inspect weight bindings --
-  only a deeper, incidental graph-dispatch check happens to catch a missing
-  weight today, which is not the same as the instance's own reported
-  readiness being trustworthy; (2) weight materialization is not
-  transactional: `Provider.write_tensor` is called before `MemoryManager`
-  admission (inverting the intended authority order), a residency
-  registration error is silently discarded (`let _ = record_tensor_residency
-  (...)`), a mid-loop failure leaves already-written weights unrolled-back,
-  and `unload_model_instance` releases `MemoryAllocationId`s but never calls
-  `Provider.release_tensor` for weight `TensorResourceId`s, leaking
-  Provider-owned storage across repeated load/unload cycles. Tracked for a
-  real fix, not a re-assertion: see `openspec/changes/reach-architecture-
-  freeze-1`'s reopened task group 8 (or its successor) for the transactional
-  redesign, using the admission-first primitive (`write_tensor_admitted`)
-  the KV cache path already established correctly for the same class of
-  problem. Architecture Freeze #1 will be re-declared accepted only after
-  both P0s are fixed, tested (including repeated load/unload leak proof),
-  and a fresh green CI run and live `magnetar run qwen-test "Hello"` confirm
-  it, per this same audit's own acceptance criteria.
+- Architecture Freeze #1 is **accepted** at commit `f71b346`
+  (2026-09-03, CI run
+  https://github.com/astorise/Magnetar/actions/runs/33746039192, all 10
+  jobs green). An external audit of commit `0197be1` (PR #36) had
+  correctly found two P0 gaps in the weight-materialization lifecycle
+  that an earlier acceptance declared at that commit missed: (1)
+  `ModelInstance` was marked `Ready` immediately on creation, before
+  mandatory weights were ever bound, and `acquire_usage`'s own readiness
+  check did not inspect weight bindings -- only a deeper, incidental
+  graph-dispatch check happened to catch a missing weight, which is not
+  the same as the instance's own reported readiness being trustworthy;
+  (2) weight materialization was not transactional:
+  `Provider.write_tensor` was called before `MemoryManager` admission
+  (inverting the intended authority order), a residency registration
+  error was silently discarded (`let _ = record_tensor_residency(...)`),
+  a mid-loop failure left already-written weights unrolled-back, and
+  `unload_model_instance` released `MemoryAllocationId`s but never
+  called `Provider.release_tensor` for weight `TensorResourceId`s,
+  leaking Provider-owned storage across repeated load/unload cycles.
+  Both are now fixed by `openspec/changes/transactional-weight-
+  materialization`: creation no longer auto-readies (the caller must
+  explicitly reach `Ready` through the new `ModelInstances::mark_ready`,
+  used only once every weight is bound); a new
+  `WeightMaterializationTransaction` mirrors the KV cache path's
+  already-correct admission-first, error-propagating,
+  abort-releases-everything pattern; and `unload_model_instance` now
+  resolves each released weight's owning Provider generically (via
+  `TensorResidency`/`ResourceAffinity`, no hardcoded Provider name in
+  the generic Runtime layer) and releases its storage. Verified: full
+  workspace test suite (1,393 tests across the lib, CLI, and
+  `contract_tests` integration binaries) passing, coverage ratchet at
+  78.89% matching baseline, `openspec validate --all --strict` 79/79,
+  live `magnetar run qwen-test "Hello"` unaffected, and the CI run cited
+  above.
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
