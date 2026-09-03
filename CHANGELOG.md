@@ -63,12 +63,22 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Architecture Freeze #1 is **CANDIDATE, not yet accepted** -- a sixth audit
-  round (HEAD `9939232`, PR #36) found a deeper P0 (loading/materialization
-  evidence authority) still open after this Change's implementation lands;
-  see this section's final paragraph for the current status and what
-  remains. The history below is kept in full because each round found
-  something real.
+- Materialization evidence proves a Model Instance's own authorized
+  transaction produced its weight bindings, but does not verify those bytes
+  are bit-identical to the validated Model Artifact's declared tensor
+  content beyond the one existing fixture-specific digest check -- a
+  manifest-level content-digest verification is a deliberately deferred
+  follow-up, not implemented as of `bind-model-loading-evidence-to-
+  validated-artifact`.
+- Architecture Freeze #1 is **accepted** at commit `4918614` (2026-09-03, CI
+  run https://github.com/astorise/Magnetar/actions/runs/33791192078, zero
+  non-`success` jobs confirmed via `gh run view --json status,conclusion`
+  and the jobs list directly). The history below is kept in full because
+  each round found something real; the commit and CI run cited in this
+  first sentence are what to trust as current. (This was briefly
+  downgraded to CANDIDATE after a sixth audit round found P0-A open --
+  see this section's final paragraph for the fix and what, if anything,
+  remains open.)
   (An earlier point in this history was itself briefly declared
   "accepted" at commit `e7dc45d` -- that run's first pass had one failing
   job, `wasmtime component engine`, on a pre-existing test
@@ -281,7 +291,71 @@
   until that Change's implementation lands and passes full verification
   on its own final HEAD.** This round's own fix (P0-B only) verified:
   `openspec validate --all --strict` 77/77 (76 canonical items plus the
-  new active Change) passing at commit `f57ecde`.
+  new active Change) passing at commit `f57ecde`. P0-A was fixed by
+  `openspec/changes/bind-model-loading-evidence-to-validated-artifact`:
+  `LoadedModelContext`/`ModelLoadingResidencyPlan` fields became
+  `pub(crate)` (Runtime-issued, no longer externally constructible --
+  confirmed by grep that no external caller depended on direct
+  construction or field access, a materially smaller blast radius than
+  round 2's field-sealing);
+  `ModelInstanceDefinition.resource_bindings` and all four
+  `ModelInstanceResourceBindings` fields became `pub(crate)` (sealing both
+  direct-field mutation and whole-field replacement -- cloning one
+  instance's bindings onto another, which sealing only the inner fields
+  would not have closed); the previously-private
+  `materialize_model_instance_weights` became the one public entrypoint
+  for turning weight bytes into bound resources, and
+  `WeightMaterializationTransaction::commit` now mints a Runtime-owned
+  `MaterializationEvidence` (artifact id + the full current committed
+  resource-id set) per instance, keyed by `ModelInstanceId` so evidence
+  cannot transfer across instances regardless of whether they share an
+  artifact. `derive_effective_readiness_checks`'s `weights_materialized`
+  now requires this evidence to match alongside `TensorResidency`
+  presence, replacing the `read_tensor` Provider-storage probe entirely --
+  closing the companion P1 (a device-only Provider without host readback
+  can now still prove materialization) as a direct consequence, proven by
+  a dedicated test using a Provider double that never overrides
+  `write_tensor`/`read_tensor` from their documented no-op/`None`
+  defaults. `contract_tests/model_instance.rs`'s `bind_fake_weight` --
+  which the audit found was already performing the exact hand-assembled
+  forgery it described (real `write_tensor` and real `TensorResidency`,
+  but binding and marking Ready by direct field access rather than
+  through the authorized transaction) -- was migrated onto the public
+  entrypoint; this changed its behavior (the transaction bundles bind,
+  evidence, and `mark_ready` in one step, matching the pre-existing
+  production contract), which surfaced and required fixing an
+  `Ready -> Ready` invalid-lifecycle-transition trap in two dependent
+  tests that had previously relied on a separate, now-redundant
+  `warm_model_instance` call. Four new tests cover hand-assembled bindings
+  without evidence, evidence copied from another instance, evidence after
+  an artifact reassignment, and the device-only-Provider happy path.
+  Verified: full workspace test suite (1,160 lib tests + 182
+  `contract_tests`) passing, `cargo doc` clean (one private intra-doc link
+  fixed, the same class of issue round 3 hit), wasm32 check clean,
+  coverage ratchet at 78.97% (above the 78.89% baseline), `openspec
+  validate --all --strict` 76/76 after archiving (diffed the canonical
+  specs across the archive commit -- the same check that caught `9939232`'s
+  regression earlier this round -- and confirmed the merge was purely
+  additive plus the one intended paragraph rewrite, nothing silently
+  dropped), live `magnetar run qwen-test "Hello"` unaffected (real
+  generation completed, matching output shape to every prior round), and
+  the CI run cited in this note's opening sentence. **Deliberately not
+  closed by this fix, and out of this Change's stated scope from the
+  start:** byte-content provenance -- proving materialized bytes are
+  bit-identical to the specific validated Model Artifact's declared tensor
+  content, beyond the one existing fixture-specific digest check in
+  `bind_qwen_fixture_weights` -- would need a manifest-level per-tensor or
+  aggregate digest threaded from artifact parsing through
+  `LoadedModelContext` (the same shape of plumbing `required_weight_names`
+  already established) and verified inside the transaction; this touches
+  the `model-artifact`/`model-loading` manifest schema, a different
+  capability boundary than `model-instance` readiness, and is proposed as
+  its own future Change rather than folded in here. The round-6 audit's
+  own P0 classification was specifically about caller-constructible
+  evidence (closed), not cryptographic content verification (already
+  documented as v0.1-deferred, alongside artifact publisher signing, in
+  this section's Security Notes) -- so this is recorded as a known
+  limitation, not a blocker to the freeze.
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
