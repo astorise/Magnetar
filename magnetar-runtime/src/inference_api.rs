@@ -459,7 +459,19 @@ pub fn model_instance_status(
 /// Kernel Registry linkage from a `ModelInstanceId` to its expected
 /// prepared Kernel set, no per-instance autotuning/adapter/policy signal
 /// today). Closing that is future work, not fabricated here.
-fn derive_effective_readiness_checks(
+///
+/// `pub(crate)`, not private: `WeightMaterializationTransaction::commit`
+/// (`first_native_runtime.rs`) also needs this exact derivation to decide
+/// whether a materialization attempt reaches `Ready`, rather than
+/// publishing bindings and calling `mark_ready` unconditionally -- closing
+/// a gap a further audit of PR #36 found: an empty or partial weights map
+/// could still reach `Ready` because `commit` never consulted this
+/// derivation at all, bypassing "Model Loading Does Not Bypass Instance
+/// Readiness" (`model-loading` spec: "Successful materialization alone
+/// SHALL not imply Model Instance readiness") and "Partial Loading Policy"
+/// ("Partial loading SHALL...NOT produce ready state if required parts are
+/// missing").
+pub(crate) fn derive_effective_readiness_checks(
     runtime: &Runtime,
     instance: &ModelInstanceId,
     checks: &ModelInstanceReadinessChecks,

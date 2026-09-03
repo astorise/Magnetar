@@ -4714,12 +4714,27 @@ fn bind_qwen_fixture_weights(
 /// already depends on `model_loading.rs`, for no behavioral benefit.
 ///
 /// `pub`: this is the one legitimate way -- for production code or an
-/// external embedder alike -- to turn named weight bytes into bound,
-/// Ready-eligible resources for a Model Instance
+/// external embedder alike -- to turn named weight bytes into bound
+/// resources for a Model Instance
 /// (`bind-model-loading-evidence-to-validated-artifact`). Its success is
 /// itself the proof `derive_effective_readiness_checks` trusts (via the
 /// `MaterializationEvidence` this call's `WeightMaterializationTransaction::commit`
 /// mints); there is no separate token for a caller to construct or forge.
+///
+/// `Ok(())` means the supplied `weights` staged and committed
+/// successfully -- it does **not** by itself mean the instance reached
+/// `Ready`. `commit` only marks the instance `Ready` if the full
+/// Runtime-derived readiness gate (mandatory inventory complete, Provider
+/// and Device ready, ...) is satisfied afterward; an empty or partial
+/// `weights` map against an instance with an unmet mandatory inventory
+/// commits and evidences what it was given, correctly leaving the
+/// instance non-`Ready`. Check `runtime.model_instance(instance)?.
+/// lifecycle()`/`.readiness()` (or call `warm_model_instance` again once
+/// conditions change) to find out. A further audit of PR #36 found the
+/// previous behavior -- unconditionally marking `Ready` once staging
+/// succeeded -- let an incomplete materialization reach `Ready`, violating
+/// `model-loading`'s pre-existing "Model Loading Does Not Bypass Instance
+/// Readiness" and "Partial Loading Policy" requirements.
 pub fn materialize_model_instance_weights(
     runtime: &mut Runtime,
     instance: &ModelInstanceId,
@@ -4870,8 +4885,27 @@ impl WeightMaterializationTransaction {
     /// an already-partially-materialized instance must still produce
     /// evidence covering every previously-bound weight, or a legitimate
     /// instance would fail its own evidence-matching readiness check), and
-    /// marks the instance Ready. Reached only once every weight in this
-    /// attempt staged successfully.
+    /// -- only if the full Runtime-derived readiness gate (the same one
+    /// `warm_model_instance`/`resume_model_instance` use, not a parallel or
+    /// weaker check) is actually satisfied -- marks the instance Ready.
+    ///
+    /// Does *not* unconditionally mark Ready once staging succeeds: a
+    /// materialization attempt supplying an empty or partial `weights` map
+    /// (legitimate for incremental/progressive materialization, per this
+    /// method's own evidence-recomputation above) must still leave the
+    /// instance non-Ready if the loaded artifact's mandatory tensor
+    /// inventory is not yet fully covered, or if Provider/Device readiness
+    /// is not currently satisfied -- publishing bindings and evidence for
+    /// what *was* successfully staged is not itself proof the instance is
+    /// usable. A further audit of PR #36 found this exact gap: `commit`
+    /// previously called `mark_ready` unconditionally right after minting
+    /// evidence, so `materialize_model_instance_weights(..., &BTreeMap::
+    /// new())` against an instance with a non-empty mandatory inventory
+    /// could still reach `Ready` -- non-compliant with `model-loading`'s
+    /// pre-existing "Model Loading Does Not Bypass Instance Readiness" and
+    /// "Partial Loading Policy" requirements, which this fix makes the code
+    /// actually honor rather than changing the spec to match the bug.
+    /// Reached only once every weight in this attempt staged successfully.
     fn commit(
         self,
         runtime: &mut Runtime,
@@ -4916,6 +4950,29 @@ impl WeightMaterializationTransaction {
                 instance,
                 MaterializationEvidence::new(artifact, bound_resources),
             );
+        let effective_checks = derive_effective_readiness_checks(
+            runtime,
+            instance,
+            &ModelInstanceReadinessChecks::default(),
+        )?;
+        let model_instance = runtime
+            .model_instances_mut()
+            .instance_mut(instance)
+            .map_err(InferenceApiError::from)?;
+        if model_instance
+            .validate_readiness(&effective_checks)
+            .is_err()
+        {
+            // Not yet fully ready (incomplete mandatory inventory, Provider
+            // or Device not ready, ...): materialization of what was
+            // staged this attempt still succeeded and its evidence still
+            // stands, but the instance itself is correctly left non-Ready
+            // rather than force-marked. A later call -- either another
+            // `materialize_model_instance_weights` attempt completing the
+            // inventory, or `warm_model_instance` once other conditions
+            // clear -- re-derives from scratch.
+            return Ok(());
+        }
         runtime
             .model_instances_mut()
             .mark_ready(instance)

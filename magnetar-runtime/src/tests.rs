@@ -9648,6 +9648,151 @@ fn inference_api_warm_model_instance_reaches_ready_without_provider_read_tensor_
     assert!(status.readiness.accepts_generation());
 }
 
+/// A further audit of PR #36 found that `WeightMaterializationTransaction::
+/// commit` called `ModelInstanceManager::mark_ready` unconditionally right
+/// after staging succeeded and evidence was minted -- so
+/// `materialize_model_instance_weights(..., &BTreeMap::new())` against an
+/// instance with a non-empty mandatory inventory could still reach
+/// `Ready`, bypassing the exact same Runtime-derived readiness gate
+/// `warm_model_instance`/`resume_model_instance` already correctly use.
+/// Non-compliant with `model-loading`'s pre-existing "Model Loading Does
+/// Not Bypass Instance Readiness" ("Successful materialization alone
+/// SHALL not imply Model Instance readiness") and "Partial Loading
+/// Policy" requirements. Proven here at the exact public entrypoint the
+/// bug was in, not only through `warm_model_instance` (which was already
+/// correct on its own and could not, by itself, prove this bypass was
+/// closed).
+#[test]
+fn inference_api_materialize_model_instance_weights_does_not_ready_with_empty_map() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    definition.required_weight_names =
+        BTreeSet::from(["weight.a".to_string(), "weight.b".to_string()]);
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &BTreeMap::new()).unwrap();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// Same root gap as the empty-map test above, for a strict subset of a
+/// multi-tensor mandatory inventory -- audit scenario "subset partiel":
+/// `commit` minted an evidence record that was *exactly correct* for what
+/// it staged, but exact correctness for an incomplete set is still
+/// incomplete, and `commit` never checked completeness before marking
+/// Ready.
+#[test]
+fn inference_api_materialize_model_instance_weights_does_not_ready_with_partial_inventory() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    definition.required_weight_names = BTreeSet::from([
+        "weight.a".to_string(),
+        "weight.b".to_string(),
+        "weight.c".to_string(),
+    ]);
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    let weights = BTreeMap::from([
+        ("weight.a".to_string(), HostTensor::new([1], [0.0]).unwrap()),
+        ("weight.b".to_string(), HostTensor::new([1], [0.0]).unwrap()),
+    ]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+
+    // The partial materialization itself still succeeded for real: its
+    // evidence exists and matches exactly what was staged, proving
+    // `commit`'s gate rejects on inventory completeness specifically, not
+    // by failing to publish anything at all (which would also incidentally
+    // "fix" the symptom without fixing the actual defect).
+    assert_eq!(
+        runtime
+            .model_instance(&instance)
+            .unwrap()
+            .definition
+            .resource_bindings
+            .weights
+            .len(),
+        2
+    );
+
+    // Completing the inventory in a second, independent call reaches
+    // Ready -- proving incremental/progressive materialization (which
+    // `commit`'s own evidence-recomputation is designed to support) still
+    // works once the gate this fix adds is actually satisfied.
+    let remaining =
+        BTreeMap::from([("weight.c".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &remaining).unwrap();
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(status.readiness.accepts_generation());
+}
+
+/// Audit scenario "Provider non-ready": a complete mandatory inventory
+/// staged and evidenced for real, but the pinned Provider's own status
+/// model reports it does not currently accept new work -- `commit` must
+/// not mark the instance Ready anyway. Proven at the materialize
+/// entrypoint directly, the same reasoning as the two tests above: this is
+/// specifically about what `commit` itself does after staging succeeds,
+/// not about `warm_model_instance`'s already-correct behavior.
+#[test]
+fn inference_api_materialize_model_instance_weights_does_not_ready_when_provider_rejects_work() {
+    let mut provider = TestProvider::new(REFERENCE_CPU_PROVIDER_NAME);
+    provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
+    let mut snapshot = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        HealthState::Available,
+    ));
+    snapshot.pressure = ProviderPressureLevel::Saturated;
+    snapshot.admission = provider_admission_from_dimensions(
+        snapshot.lifecycle,
+        snapshot.health,
+        snapshot.readiness,
+        snapshot.pressure,
+    );
+    provider.status_snapshot = Some(snapshot);
+    assert!(
+        !provider.status_snapshot().accepts_new_work_by_default(),
+        "test precondition: this Provider's own status model rejects new work"
+    );
+
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    let weights = BTreeMap::from([("weight".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
 /// Implements `runtime-owned-model-instance-readiness-authority` round 2,
 /// audit test 23.3: a `TensorResourceId` inserted directly into
 /// `resource_bindings.weights`, with no matching `TensorResidency`, must
