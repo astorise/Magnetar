@@ -222,7 +222,7 @@ non-strict mode?), which is a real design decision, not a mechanical fix.
 
 ## 11. Implement `model-component-graph-contract` (see specs/model-component-graph-contract/spec.md)
 
-**Status: 9/9 -- done.** Engine prerequisite, WIT interface design, the Runtime-side graph-builder capability (with real semantic validation against the portable Operator catalog), the first real Qwen Component, malicious-graph/round-trip/CI-validation coverage, the production cutover, and fail-closed verification all landed and proven end to end (1108 tests green). One small, honestly-tracked gap noted on 11.6 (no dedicated test for a runtime-absent-Component-Engine scenario specifically, as opposed to a Component that fails to prepare/instantiate).
+**Status: 8/9.** Engine prerequisite, WIT interface design, the Runtime-side graph-builder capability (with real semantic validation against the portable Operator catalog), the first real Qwen Component, malicious-graph/round-trip/CI-validation coverage, the production cutover, and fail-closed verification all landed and proven end to end (1108 tests green). One small, honestly-tracked gap noted on 11.6 (no dedicated test for a runtime-absent-Component-Engine scenario specifically, as opposed to a Component that fails to prepare/instantiate). 11.2 (named `capability-version-mismatch` error code, distinguishing "unknown interface" from "known interface, wrong version") remains genuinely open, not done — see its own note; this status line previously and incorrectly said "9/9 -- done," corrected here.
 design.md's own Non-Goals section excludes implementing this contract from
 this change — it defines the *spec* for the new capability but leaves
 implementation (a real WIT interface, Runtime-side builder, and Qwen
@@ -509,28 +509,36 @@ New regression coverage beyond the three tasks above: `tests::e2e_authoritative_
 
 ## 19. Architecture Freeze #1 gate verification
 
-**Status: blocked, but materially closer.** 11 of 19 groups are now fully
-done (1, 2, 4, 6, 7, 9, 10, 13, 15, 17, 18); group 11 is 8/9 (only the
-production cutover and its dependent fail-closed wiring remain). This gate
-still cannot honestly be closed while groups 8 (partially), 11 (partially),
-12, 14, and 16 remain open — several of `first-native-implementation-cut`'s
-`Architecture Freeze #1` AND-conditions (Component supplies real graph
-semantics *in production*, not just proven in isolation; Reference CPU and
-Qwen run from external modules; a real byte-level Model Artifact format
-exists) are not yet true. Unlike the picture at the start of this session's
-`reach-architecture-freeze-1` work, the remaining gaps are no longer
-"blocked on external content this session cannot author" -- the first real
-Qwen Component now exists and is proven correct, and every submodule
-actually builds under CI. What remains is genuinely large, high-blast-radius
-work each deliberately deferred rather than rushed alongside everything
-else in this pass: wiring the proven Component into the production
-generation path (11.5, touching every one of `first_native_runtime.rs`'s
-graph-production call sites), extracting Reference CPU into `providers/cpu`
-without breaking the ~200 E2E tests that currently obtain their Kernel
-backend from it directly (group 14), and a real byte-level Model Artifact
-format plus GGUF/Safetensors parsers (groups 8's remaining half and 16) --
-the audit's own text already flagged the latter as "arguably large enough
-to warrant its own OpenSpec Change."
+**Status: blocked, but materially closer.** 12 of 19 groups are now fully
+done (1, 2, 3, 4, 6, 7, 9, 10, 13, 16, 17, 18); groups 5, 8, 11, 12, 14, 15
+are partially done; group 19 (this one) is 0/3. This gate still cannot
+honestly be closed while those partial groups remain open — several of
+`first-native-implementation-cut`'s `Architecture Freeze #1` AND-conditions
+are not yet fully true, though most of the highest-blast-radius work this
+note previously called out as "deliberately deferred" has since landed:
+the proven Qwen Component is now wired into the production generation path
+(group 11, 11.5), Reference CPU has been extracted into `providers/cpu`
+without breaking the E2E suite that still uses an in-crate double by design
+(group 14), and real byte-level GGUF/Safetensors parsers exist and are
+type-safe/panic-safe on untrusted input (group 16, via the separate
+`implement-model-format-parsers` Change the audit itself suggested).
+
+What genuinely remains, per group: **5** (multi-output Resource support,
+5.4/5.5 -- no multi-output Kernel exists yet to need it); **8** (the deeper
+half of Correctif 6: `ModelLoadingCoordinator::load()` itself does not yet
+accept a Provider and per-tensor bytes to materialize weight resources from
+within `load()` — a real parser now exists (group 16) but is not wired in,
+a spec-level API/lifecycle decision deliberately left open, not an
+implementation gap); **11** (11.2's named capability-version-mismatch error
+code); **12** (12.4 moving the embedded Component fixture out of the
+production path's `include_bytes!`, and 12.6 removing the Rust-builder
+fallback recipe entirely — both explicitly deferred, larger decisions);
+**14** (14.5 is N/A by the chosen architecture, not a real gap — see its
+note); **15** (15.6-15.8's per-tier Component/Format/Provider CI jobs,
+still one consolidated job instead, though four of six submodules are now
+real rather than templates, weakening the original "premature" rationale
+somewhat). None of these block correctness of what has shipped; they are
+scope this pass deliberately did not chase to closure.
 
 - [ ] 19.1 Re-run `magnetar run qwen-test "Hello"` and confirm it exercises every link in the causal chain from CLI through `RuntimeInferenceApi`, Model Loading, `ModelInstance`, the Qwen Component (via the new graph contract), `PreparedExecutionPlan`/`PreparedExecutionPlanExecutor`, `ProviderExecutionApi.submit`, the external CPU Provider, admitted Tensor Resources, Runtime-owned KV Resources, incremental decode, Sampling, and token commit.
 - [ ] 19.2 Confirm every AND-condition in `first-native-implementation-cut`'s `Architecture Freeze #1` requirement holds before flipping that requirement's status from `candidate` to `accepted`.
