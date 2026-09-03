@@ -228,5 +228,10 @@ Phase 5).
   close here.
 - Should `externalize-runtime-extension-modules` (Change C) become a
   normative OpenSpec statement that Components/Formats/Providers live outside
-  the Core repository, or stay a repository/packaging decision? Not decided
-  here; revisit after Phase 7.
+  the Core repository, or stay a repository/packaging decision? **Decided:**
+  formalized as a normative requirement, per explicit user direction once
+  the underlying extraction work (task groups 11, 14, and
+  `implement-model-format-parsers`) had actually landed rather than while it
+  was still hypothetical. See `externalize-runtime-extension-modules` for
+  the requirement itself (a new `project-architecture` requirement) and the
+  generalized CI dependency guard it added.

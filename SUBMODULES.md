@@ -2,10 +2,16 @@
 
 Magnetar's Model Components, Providers, and Formats live in separate
 repositories, pinned into this repository as git submodules under
-`components/`, `providers/`, and `formats/`. This document defines
-versioning/release ownership per submodule (`reach-architecture-freeze-1`
-task 15.3) and the current Magnetar-to-module compatibility matrix (task
-15.4).
+`components/`, `providers/`, and `formats/`. This is a normative
+requirement, not only a packaging convention -- see `project-architecture`'s
+"Model Components, Providers, and Formats Are Externalized" requirement
+(`externalize-runtime-extension-modules`), which also names the one
+deliberate exception (a minimal, generic in-crate Reference CPU double for
+the Core's own test suite) and is enforced by a CI dependency guard
+(`.github/workflows/quality.yml`'s `submodule-integration` job). This
+document defines versioning/release ownership per submodule
+(`reach-architecture-freeze-1` task 15.3) and the current
+Magnetar-to-module compatibility matrix (task 15.4).
 
 ## Modules
 
