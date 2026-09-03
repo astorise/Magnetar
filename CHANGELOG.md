@@ -63,10 +63,20 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Architecture Freeze #1 is **accepted** at commit `f71b346`
+- Architecture Freeze #1 is **accepted** at commit `ff06d98`
   (2026-09-03, CI run
-  https://github.com/astorise/Magnetar/actions/runs/33746039192, all 10
-  jobs green). An external audit of commit `0197be1` (PR #36) had
+  https://github.com/astorise/Magnetar/actions/runs/33747066010, all 24
+  jobs green). (The P0 fix itself landed as `f71b346`; that push's own
+  CI run failed on `clippy` for an unrelated reason -- a helper this
+  same fix added, `check_repeated_load_unload_does_not_accumulate_
+  weight_storage`, was missing the `#[cfg(test)]` attribute its sibling
+  helpers all carry, so a fresh non-incremental build flagged it as
+  dead code; my own local clippy pass had missed this because
+  incremental compilation reused a stale artifact. Fixed by `ff06d98`,
+  re-verified with `CARGO_INCREMENTAL=0` locally before repushing, and
+  confirmed green by the CI run cited above -- this note exists so the
+  accepted commit and the fix commit are not silently conflated.) An
+  external audit of commit `0197be1` (PR #36) had
   correctly found two P0 gaps in the weight-materialization lifecycle
   that an earlier acceptance declared at that commit missed: (1)
   `ModelInstance` was marked `Ready` immediately on creation, before
