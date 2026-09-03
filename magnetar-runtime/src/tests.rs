@@ -9132,6 +9132,34 @@ fn inference_api_warm_model_instance_reaches_ready_when_weights_and_provider_are
             .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
     );
     let instance = runtime.model_instances_mut().create(definition).unwrap();
+    // A residency-backed weight, not just a bare map entry: since
+    // `runtime-owned-model-instance-readiness-authority` (round 2),
+    // `weights_materialized` derivation also requires a matching
+    // `TensorResidency` record per bound weight, closing the exact "fake
+    // TensorResourceId with no real residency" forgery an external audit
+    // of PR #36 demonstrated -- this happy-path test must supply real
+    // evidence too, not just a plausible-looking one.
+    let allocation = runtime
+        .memory_mut()
+        .allocate(MemoryAllocationRequest::new(
+            MemoryAllocationClass::Tensor,
+            1,
+            MemoryPlacement::HostOrdinary,
+            MemoryAllocationOwner::InferenceArtifact("test".into()),
+        ))
+        .unwrap();
+    let weight_resource = TensorResourceId::new("test.weight");
+    runtime
+        .memory_mut()
+        .record_tensor_residency(
+            TensorResidency::new(
+                weight_resource.clone(),
+                MemoryPlacement::HostOrdinary,
+                ResourceAffinity::new(FallbackClass::Transparent),
+            )
+            .with_allocation(allocation.id),
+        )
+        .unwrap();
     runtime
         .model_instances_mut()
         .instance_mut(&instance)
@@ -9139,7 +9167,7 @@ fn inference_api_warm_model_instance_reaches_ready_when_weights_and_provider_are
         .definition
         .resource_bindings
         .weights
-        .insert("weight".into(), TensorResourceId::new("test.weight"));
+        .insert("weight".into(), weight_resource);
 
     let plan = ModelInstanceWarmupPlan {
         policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
@@ -9158,6 +9186,143 @@ fn inference_api_warm_model_instance_reaches_ready_when_weights_and_provider_are
             .acquire_usage(&instance, 0)
             .is_ok()
     );
+}
+
+/// Implements `runtime-owned-model-instance-readiness-authority` round 2,
+/// audit test 23.3: a `TensorResourceId` inserted directly into
+/// `resource_bindings.weights`, with no matching `TensorResidency`, must
+/// not let `warm_model_instance` derive `weights_materialized = true` --
+/// the exact gap a follow-up audit of PR #36 found: the round-1 fix only
+/// checked the map was non-empty, not that its entries were real.
+#[test]
+fn inference_api_warm_model_instance_rejects_weight_binding_without_residency() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let instance = runtime
+        .model_instances_mut()
+        .create(model_instance_definition())
+        .unwrap();
+    // Insert a plausible-looking `TensorResourceId` directly -- no
+    // `MemoryManager::allocate`, no `record_tensor_residency`. This is
+    // exactly what a caller with `&mut Runtime` could always do, and what
+    // this Change's derivation must not trust.
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), TensorResourceId::new("forged.weight"));
+    assert!(
+        runtime
+            .memory()
+            .tensor_residency(&TensorResourceId::new("forged.weight"))
+            .is_none(),
+        "test precondition: no residency was ever recorded for this resource"
+    );
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// Implements `runtime-owned-model-instance-readiness-authority` round 2,
+/// audit test 23.5: a Provider that is registered and offers a real
+/// `execution_api()` but whose own status model reports it as not
+/// accepting new work (here: `Saturated` pressure) must make
+/// `provider_ready` derive `false`, even though the caller claims `true`
+/// -- the round-1 fix only checked the Provider "exists and is executable
+/// in principle" (`execution_api().is_some()`), not "is ready now".
+#[test]
+fn inference_api_warm_model_instance_rejects_provider_that_rejects_new_work() {
+    let mut provider = TestProvider::new("saturated-provider");
+    provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
+    let mut snapshot = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        ProviderBinding::new("saturated-provider"),
+        HealthState::Available,
+    ));
+    snapshot.pressure = ProviderPressureLevel::Saturated;
+    snapshot.admission = provider_admission_from_dimensions(
+        snapshot.lifecycle,
+        snapshot.health,
+        snapshot.readiness,
+        snapshot.pressure,
+    );
+    provider.status_snapshot = Some(snapshot);
+    assert!(
+        !provider.status_snapshot().accepts_new_work_by_default(),
+        "test precondition: this Provider's own status model rejects new work"
+    );
+
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new("saturated-provider")),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+    let allocation = runtime
+        .memory_mut()
+        .allocate(MemoryAllocationRequest::new(
+            MemoryAllocationClass::Tensor,
+            1,
+            MemoryPlacement::HostOrdinary,
+            MemoryAllocationOwner::InferenceArtifact("test".into()),
+        ))
+        .unwrap();
+    let weight_resource = TensorResourceId::new("test.weight");
+    runtime
+        .memory_mut()
+        .record_tensor_residency(
+            TensorResidency::new(
+                weight_resource.clone(),
+                MemoryPlacement::HostOrdinary,
+                ResourceAffinity::new(FallbackClass::Transparent),
+            )
+            .with_allocation(allocation.id),
+        )
+        .unwrap();
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), weight_resource);
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    // Real weight evidence is present; only `provider_ready` should be
+    // what fails this attempt.
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
 }
 
 #[test]

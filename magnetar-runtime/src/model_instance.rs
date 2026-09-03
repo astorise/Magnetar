@@ -636,13 +636,39 @@ pub struct ModelInstanceReloadRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInstance {
     pub id: ModelInstanceId,
-    pub lifecycle: ModelInstanceLifecycleState,
-    pub readiness: ModelInstanceReadiness,
+    // `lifecycle`/`readiness` are intentionally `pub(crate)`, not `pub`: an
+    // external caller with `&mut ModelInstance` (obtainable via the
+    // already-public `Runtime::model_instances_mut()`/`instance_mut()`)
+    // SHALL NOT be able to forge `Ready` by direct field assignment, only
+    // through the Runtime-controlled paths that verify real evidence first
+    // (Correctif: Runtime-owned ModelInstance readiness authority, closing
+    // the public mutable field gap an external audit of PR #36 found still
+    // open after `mark_ready`/`transition_to`/`warmup` were sealed).
+    // `pub(crate)` (rather than fully private) is what a real embedder's
+    // dependency on this crate cannot see or write, while still letting
+    // this crate's own test suite construct otherwise-unreachable states
+    // to prove defense-in-depth checks (e.g. the `acquire_usage`/
+    // `generation_reference` lifecycle+readiness safety net) hold even if
+    // some future internal bug were to reintroduce an inconsistency.
+    pub(crate) lifecycle: ModelInstanceLifecycleState,
+    pub(crate) readiness: ModelInstanceReadiness,
     pub definition: ModelInstanceDefinition,
     pub last_error: Option<ModelInstanceError>,
 }
 
 impl ModelInstance {
+    /// Current lifecycle state. Read-only: see the struct-level doc comment
+    /// for why `lifecycle` is not a public field.
+    pub const fn lifecycle(&self) -> ModelInstanceLifecycleState {
+        self.lifecycle
+    }
+
+    /// Current readiness state. Read-only: see the struct-level doc comment
+    /// for why `readiness` is not a public field.
+    pub const fn readiness(&self) -> ModelInstanceReadiness {
+        self.readiness
+    }
+
     pub fn new(id: ModelInstanceId, definition: ModelInstanceDefinition) -> Self {
         Self {
             id,
@@ -653,7 +679,14 @@ impl ModelInstance {
         }
     }
 
-    pub fn transition_to(
+    /// Crate-internal only: a raw lifecycle transition with no readiness
+    /// evidence check. Public callers reach lifecycle changes only through
+    /// the business methods below (`suspend`, `resume`, `drain`, `unload`,
+    /// ...) or, for `Ready` specifically, through
+    /// `crate::inference_api::warm_model_instance` -- never through this
+    /// primitive directly (Correctif: Runtime-owned ModelInstance readiness
+    /// authority).
+    pub(crate) fn transition_to(
         &mut self,
         next: ModelInstanceLifecycleState,
     ) -> Result<(), ModelInstanceError> {
@@ -668,7 +701,16 @@ impl ModelInstance {
         Ok(())
     }
 
-    pub fn mark_ready(&mut self) -> Result<(), ModelInstanceError> {
+    /// Crate-internal only. Transitions straight to `Ready` with no
+    /// evidence check of its own -- callers of this method are themselves
+    /// responsible for having already verified real readiness (the
+    /// materialization transaction's `commit`, or `warmup`'s own
+    /// Runtime-derived checks). A caller outside this crate cannot reach
+    /// this method at all (Correctif: Runtime-owned ModelInstance readiness
+    /// authority; this was previously `pub` and directly callable via
+    /// `Runtime::model_instances_mut()`, the exact bypass an external audit
+    /// of PR #36 demonstrated).
+    pub(crate) fn mark_ready(&mut self) -> Result<(), ModelInstanceError> {
         match self.lifecycle {
             ModelInstanceLifecycleState::Creating => {
                 self.transition_to(ModelInstanceLifecycleState::Loading)?;
@@ -718,7 +760,15 @@ impl ModelInstance {
         result
     }
 
-    pub fn warmup(
+    /// Crate-internal only: `checks` here are trusted as-is, with no
+    /// Runtime-side derivation of their own. The public entry point is
+    /// `crate::inference_api::warm_model_instance`, which derives the
+    /// Runtime-observable facts before calling this (Correctif:
+    /// Runtime-owned ModelInstance readiness authority; a direct external
+    /// call to this method, bypassing that derivation, was the exact
+    /// second bypass an external audit of PR #36 demonstrated alongside
+    /// `mark_ready`).
+    pub(crate) fn warmup(
         &mut self,
         plan: &ModelInstanceWarmupPlan,
         checks: &ModelInstanceReadinessChecks,
@@ -1165,7 +1215,8 @@ impl ModelInstanceManager {
     /// condition genuinely holds, per `model-instance`'s "Model Instance
     /// Creation" requirement (creation alone SHALL NOT produce a Ready
     /// instance).
-    pub fn mark_ready(&mut self, id: &ModelInstanceId) -> Result<(), ModelInstanceError> {
+    /// Crate-internal only -- see `ModelInstance::mark_ready` above.
+    pub(crate) fn mark_ready(&mut self, id: &ModelInstanceId) -> Result<(), ModelInstanceError> {
         let result = self.instance_mut(id)?.mark_ready();
         self.observe(
             if result.is_ok() {
@@ -1184,7 +1235,8 @@ impl ModelInstanceManager {
         result
     }
 
-    pub fn warmup(
+    /// Crate-internal only -- see `ModelInstance::warmup` above.
+    pub(crate) fn warmup(
         &mut self,
         id: &ModelInstanceId,
         plan: &ModelInstanceWarmupPlan,

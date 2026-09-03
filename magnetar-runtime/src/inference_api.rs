@@ -465,20 +465,47 @@ fn derive_effective_readiness_checks(
     checks: &ModelInstanceReadinessChecks,
 ) -> Result<ModelInstanceReadinessChecks, InferenceApiError> {
     let model_instance = runtime.model_instance(instance)?;
+    // Non-empty alone is not proof: a caller with mutable access to
+    // `resource_bindings.weights` could insert an arbitrary
+    // `TensorResourceId` that was never actually staged through
+    // `WeightMaterializationTransaction`. Requiring a matching
+    // `TensorResidency` record for every bound weight closes that -- a
+    // residency entry can only exist because `record_tensor_residency` ran
+    // (staged via a real Memory Manager allocation), which is a
+    // meaningfully higher bar than an unchecked map insert (Correctif:
+    // Runtime-owned ModelInstance readiness authority, round 2).
     let weights_materialized = checks.weights_materialized
         && !model_instance
             .definition
             .resource_bindings
             .weights
-            .is_empty();
+            .is_empty()
+        && model_instance
+            .definition
+            .resource_bindings
+            .weights
+            .values()
+            .all(|resource_id| runtime.memory().tensor_residency(resource_id).is_some());
     let provider_ready = checks.provider_ready
         && match &model_instance.definition.placement.provider {
             None => true,
             Some(binding) => runtime
                 .providers()
                 .provider(binding.as_str())
-                .and_then(|provider| provider.execution_api())
-                .is_some(),
+                // A Provider that resolves and offers an execution API is
+                // only "exists and is executable in principle" -- not
+                // "ready now". `status_snapshot().accepts_new_work_by_
+                // default()` consults the Provider's actual lifecycle,
+                // health, readiness, pressure, and admission state, so a
+                // Provider that is Unavailable/Draining/Saturated/NotReady
+                // (or whose admission policy currently rejects new work)
+                // correctly fails this check even though it is registered
+                // and `execution_api()` returns `Some` (Correctif:
+                // Runtime-owned ModelInstance readiness authority, round 2).
+                .is_some_and(|provider| {
+                    provider.execution_api().is_some()
+                        && provider.status_snapshot().accepts_new_work_by_default()
+                }),
         };
     let device_ready = checks.device_ready
         && match &model_instance.definition.placement.device {
@@ -508,8 +535,7 @@ pub fn warm_model_instance(
     let effective_checks = derive_effective_readiness_checks(runtime, instance, checks)?;
     runtime
         .model_instances_mut()
-        .instance_mut(instance)?
-        .warmup(plan, &effective_checks)
+        .warmup(instance, plan, &effective_checks)
         .map_err(InferenceApiError::from)
 }
 

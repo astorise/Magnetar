@@ -6,14 +6,13 @@ use magnetar_runtime::{
     ModelInstanceCreationChecks, ModelInstanceDefinition, ModelInstanceError, ModelInstanceId,
     ModelInstanceLifecycleState, ModelInstanceManager, ModelInstanceObservationKind,
     ModelInstancePlacement, ModelInstancePolicy, ModelInstanceReadiness,
-    ModelInstanceReadinessChecks, ModelInstanceReloadRequest, ModelInstanceResourceBindings,
-    ModelInstanceSharingContext, ModelInstanceSharingPolicy, ModelInstanceUnloadPolicy,
-    ModelInstanceWarmupPlan, ModelInstanceWarmupPolicy, ModelInstanceWarmupStep,
-    ModelLoadingCoordinator, ModelLoadingRequest, ModelLoadingRequestId, ModelQuantizationPolicy,
-    ModelResidencyId, ModelTrustDecision, ModelTrustStatus, PrefixCacheEntryId,
-    ProviderAdmissionDecision, ProviderBinding, ProviderHealthState, ProviderModelResource,
-    ProviderPressureLevel, ProviderReadinessState, ResourceAffinity, Runtime, RuntimeConfig,
-    TokenizerId,
+    ModelInstanceReadinessChecks, ModelInstanceReloadRequest, ModelInstanceSharingContext,
+    ModelInstanceSharingPolicy, ModelInstanceUnloadPolicy, ModelInstanceWarmupPlan,
+    ModelInstanceWarmupPolicy, ModelInstanceWarmupStep, ModelLoadingCoordinator,
+    ModelLoadingRequest, ModelLoadingRequestId, ModelQuantizationPolicy, ModelResidencyId,
+    ModelTrustDecision, ModelTrustStatus, PrefixCacheEntryId, ProviderAdmissionDecision,
+    ProviderBinding, ProviderHealthState, ProviderModelResource, ProviderPressureLevel,
+    ProviderReadinessState, ResourceAffinity, Runtime, RuntimeConfig, TokenizerId,
 };
 
 fn digest() -> String {
@@ -109,6 +108,73 @@ fn loaded_context() -> magnetar_runtime::LoadedModelContext {
         .unwrap()
 }
 
+/// Reaches `Ready` the only way this crate (an external consumer of
+/// `magnetar_runtime`'s public API, same as any embedder) now can:
+/// `ModelInstance::mark_ready`/`transition_to`/`warmup` and the matching
+/// `ModelInstanceManager` wrappers became `pub(crate)` after an external
+/// audit of PR #36 demonstrated they were a direct, unverified bypass
+/// (`runtime.model_instances_mut().mark_ready(&id)` skipped every
+/// readiness check entirely). Reaching `Ready` now requires real evidence
+/// the Runtime can verify: a Memory Manager allocation, a matching
+/// `TensorResidency` record, and `warm_model_instance` deriving
+/// `weights_materialized` from that -- exactly the same path a real
+/// embedder must use. This mirrors the real path deliberately: it is not
+/// a workaround, it *is* the contract now.
+fn bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId) {
+    let allocation = runtime
+        .memory_mut()
+        .allocate(magnetar_runtime::MemoryAllocationRequest::new(
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            1,
+            magnetar_runtime::MemoryPlacement::HostOrdinary,
+            magnetar_runtime::MemoryAllocationOwner::InferenceArtifact("test".into()),
+        ))
+        .unwrap();
+    let resource_id = magnetar_runtime::TensorResourceId::new(format!("test.weight.{id}"));
+    runtime
+        .memory_mut()
+        .record_tensor_residency(
+            magnetar_runtime::TensorResidency::new(
+                resource_id.clone(),
+                magnetar_runtime::MemoryPlacement::HostOrdinary,
+                ResourceAffinity::new(FallbackClass::Transparent),
+            )
+            .with_allocation(allocation.id),
+        )
+        .unwrap();
+    runtime
+        .model_instances_mut()
+        .instance_mut(id)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), resource_id);
+    runtime
+        .model_instances_mut()
+        .instance_mut(id)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .memory_allocations
+        .insert(allocation.id);
+}
+
+fn reach_ready(runtime: &mut Runtime, id: &ModelInstanceId) {
+    bind_fake_weight(runtime, id);
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    magnetar_runtime::warm_model_instance(
+        runtime,
+        id,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn model_instance_id_is_opaque_runtime_owned_and_not_authority() {
     assert!(ModelInstanceId::new("client-instance").is_ok());
@@ -128,13 +194,13 @@ fn model_instance_id_is_opaque_runtime_owned_and_not_authority() {
 
 #[test]
 fn model_instance_binds_loaded_context_without_exposing_raw_handles() {
-    let mut manager = ModelInstanceManager::new();
-    let id = manager.create(definition()).unwrap();
-    manager.mark_ready(&id).unwrap();
-    let instance = manager.instance(&id).unwrap();
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.model_instances_mut().create(definition()).unwrap();
+    reach_ready(&mut runtime, &id);
+    let instance = runtime.model_instance(&id).unwrap();
 
-    assert_eq!(instance.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert_eq!(instance.readiness, ModelInstanceReadiness::Ready);
+    assert_eq!(instance.lifecycle(), ModelInstanceLifecycleState::Ready);
+    assert_eq!(instance.readiness(), ModelInstanceReadiness::Ready);
     assert_eq!(
         instance.definition.residencies,
         [ModelResidencyId::new(1)].into()
@@ -159,95 +225,122 @@ fn lifecycle_and_readiness_are_distinct_and_transitions_are_checked() {
             .allows_transition_to(ModelInstanceLifecycleState::Ready)
     );
 
-    let mut manager = ModelInstanceManager::new();
-    let id = manager.create(definition()).unwrap();
-    manager.mark_ready(&id).unwrap();
-    manager
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.model_instances_mut().create(definition()).unwrap();
+    reach_ready(&mut runtime, &id);
+    runtime
+        .model_instances_mut()
         .instance_mut(&id)
         .unwrap()
-        .transition_to(ModelInstanceLifecycleState::Draining)
+        .drain()
         .unwrap();
 
-    let error = manager.generation_reference(&id).unwrap_err();
+    let error = runtime
+        .model_instances_mut()
+        .generation_reference(&id)
+        .unwrap_err();
     assert_eq!(error, ModelInstanceError::ModelInstanceDraining);
 }
 
 #[test]
 fn generation_uses_ready_model_instance_reference_and_usage_lifecycle() {
-    let mut manager = ModelInstanceManager::new();
-    let id = manager.create(definition()).unwrap();
-    manager.mark_ready(&id).unwrap();
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.model_instances_mut().create(definition()).unwrap();
+    reach_ready(&mut runtime, &id);
 
     assert_eq!(
-        manager.generation_reference(&id).unwrap(),
+        runtime
+            .model_instances_mut()
+            .generation_reference(&id)
+            .unwrap(),
         GenerationModelReference::ModelInstance(id.clone())
     );
 
-    manager.acquire_usage(&id, 42).unwrap();
+    runtime
+        .model_instances_mut()
+        .acquire_usage(&id, 42)
+        .unwrap();
     assert_eq!(
-        manager.instance(&id).unwrap().lifecycle,
+        runtime.model_instance(&id).unwrap().lifecycle(),
         ModelInstanceLifecycleState::Active
     );
     assert!(matches!(
-        manager.unload(&id, ModelInstanceUnloadPolicy::RejectActiveUse),
+        runtime
+            .model_instances_mut()
+            .unload(&id, ModelInstanceUnloadPolicy::RejectActiveUse),
         Err(ModelInstanceError::ModelInstanceActive)
     ));
 
-    manager.release_usage(&id).unwrap();
+    runtime.model_instances_mut().release_usage(&id).unwrap();
     assert_eq!(
-        manager.instance(&id).unwrap().lifecycle,
+        runtime.model_instance(&id).unwrap().lifecycle(),
         ModelInstanceLifecycleState::Idle
     );
-    manager
+    runtime
+        .model_instances_mut()
         .unload(&id, ModelInstanceUnloadPolicy::DrainActiveUse)
         .unwrap();
     assert_eq!(
-        manager.instance(&id).unwrap().lifecycle,
+        runtime.model_instance(&id).unwrap().lifecycle(),
         ModelInstanceLifecycleState::Unloaded
     );
 }
 
 #[test]
 fn model_instance_observability_is_redacted() {
-    let mut manager = ModelInstanceManager::new();
-    let id = manager.create(definition()).unwrap();
-    manager.mark_ready(&id).unwrap();
-    manager.acquire_usage(&id, 42).unwrap();
-    manager.release_usage(&id).unwrap();
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.model_instances_mut().create(definition()).unwrap();
+    reach_ready(&mut runtime, &id);
+    runtime
+        .model_instances_mut()
+        .acquire_usage(&id, 42)
+        .unwrap();
+    runtime.model_instances_mut().release_usage(&id).unwrap();
 
     assert!(
-        manager
+        runtime
+            .model_instances_mut()
             .observations()
             .iter()
             .any(|observation| observation.kind == ModelInstanceObservationKind::Ready)
     );
-    assert!(manager.observations().iter().all(|observation| {
-        !observation.raw_weights_available
-            && !observation.raw_prompt_available
-            && !observation.raw_cache_available
-            && !observation.raw_provider_handle_available
-            && !observation.raw_device_handle_available
-    }));
+    assert!(
+        runtime
+            .model_instances_mut()
+            .observations()
+            .iter()
+            .all(|observation| {
+                !observation.raw_weights_available
+                    && !observation.raw_prompt_available
+                    && !observation.raw_cache_available
+                    && !observation.raw_provider_handle_available
+                    && !observation.raw_device_handle_available
+            })
+    );
 }
 
 #[test]
 fn memory_pressure_suspends_idle_instance_and_browser_error_is_structured() {
-    let mut manager = ModelInstanceManager::new();
-    let id = manager.create(definition()).unwrap();
-    manager.mark_ready(&id).unwrap();
-    manager
-        .instance_mut(&id)
-        .unwrap()
-        .transition_to(ModelInstanceLifecycleState::Idle)
-        .unwrap();
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.model_instances_mut().create(definition()).unwrap();
+    reach_ready(&mut runtime, &id);
+    // Reach `Idle` the legitimate way: acquire then release usage
+    // (Ready -> Active -> Idle), rather than a raw `transition_to`.
+    runtime.model_instances_mut().acquire_usage(&id, 0).unwrap();
+    runtime.model_instances_mut().release_usage(&id).unwrap();
+    assert_eq!(
+        runtime.model_instance(&id).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Idle
+    );
 
-    manager
+    runtime
+        .model_instances_mut()
         .mark_memory_pressure(&id, MemoryPressureLevel::High)
         .unwrap();
 
-    let instance = manager.instance(&id).unwrap();
-    assert_eq!(instance.lifecycle, ModelInstanceLifecycleState::Suspended);
-    assert_eq!(instance.readiness, ModelInstanceReadiness::Suspended);
+    let instance = runtime.model_instance(&id).unwrap();
+    assert_eq!(instance.lifecycle(), ModelInstanceLifecycleState::Suspended);
+    assert_eq!(instance.readiness(), ModelInstanceReadiness::Suspended);
     assert_eq!(
         ModelInstanceError::ModelInstanceBrowserFeatureUnsupported.to_string(),
         "model instance browser feature unsupported"
@@ -265,7 +358,7 @@ fn runtime_owns_model_instance_registry_and_usage() {
             ResourceAffinity::new(FallbackClass::Transparent),
         )
         .unwrap();
-    runtime.model_instances_mut().mark_ready(&id).unwrap();
+    reach_ready(&mut runtime, &id);
 
     assert_eq!(
         runtime.model_instance_generation_reference(&id).unwrap(),
@@ -284,7 +377,7 @@ fn runtime_owns_model_instance_registry_and_usage() {
         .unload_model_instance(&id, ModelInstanceUnloadPolicy::DrainActiveUse)
         .unwrap();
     assert_eq!(
-        runtime.model_instance(&id).unwrap().lifecycle,
+        runtime.model_instance(&id).unwrap().lifecycle(),
         ModelInstanceLifecycleState::Unloaded
     );
 }
@@ -300,7 +393,7 @@ fn runtime_unload_releases_model_instance_kv_caches() {
             ResourceAffinity::new(FallbackClass::Transparent),
         )
         .unwrap();
-    runtime.model_instances_mut().mark_ready(&instance).unwrap();
+    reach_ready(&mut runtime, &instance);
     let cache = KvCache::new(
         KvCacheId::new("temporary-cache-id").unwrap(),
         KvCacheScope::ModelInstance,
@@ -334,7 +427,7 @@ fn runtime_rejected_unload_preserves_model_instance_kv_caches() {
             ResourceAffinity::new(FallbackClass::Transparent),
         )
         .unwrap();
-    runtime.model_instances_mut().mark_ready(&instance).unwrap();
+    reach_ready(&mut runtime, &instance);
     let cache = KvCache::new(
         KvCacheId::new("temporary-cache-id").unwrap(),
         KvCacheScope::ModelInstance,
@@ -371,7 +464,7 @@ fn runtime_close_then_unload_skips_already_released_session_kv_cache_memory() {
             ResourceAffinity::new(FallbackClass::Transparent),
         )
         .unwrap();
-    runtime.model_instances_mut().mark_ready(&instance).unwrap();
+    reach_ready(&mut runtime, &instance);
     let session = runtime
         .create_inference_session(magnetar_runtime::SessionCreationRequest {
             model: GenerationModelReference::ModelInstance(instance.clone()),
@@ -506,46 +599,34 @@ fn warmup_policy_covers_provider_kernel_shape_metadata_memory_and_adapter_checks
             .contains(&ModelInstanceWarmupStep::AdapterReadinessVerification)
     );
 
-    let mut manager = ModelInstanceManager::new();
-    let id = manager.create(definition()).unwrap();
-    manager.mark_ready(&id).unwrap();
-    manager
-        .instance_mut(&id)
-        .unwrap()
-        .transition_to(ModelInstanceLifecycleState::Reloading)
-        .unwrap();
-    manager
-        .instance_mut(&id)
-        .unwrap()
-        .transition_to(ModelInstanceLifecycleState::Loading)
-        .unwrap();
-    manager
-        .warmup(&id, &plan, &ModelInstanceReadinessChecks::default())
-        .unwrap();
+    // A freshly created instance already starts in `Loading` (creation no
+    // longer auto-readies), so warmup can run directly -- no scaffolding
+    // through Reloading/Loading needed once real evidence (a bound,
+    // residency-backed weight) is present.
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.model_instances_mut().create(definition()).unwrap();
+    bind_fake_weight(&mut runtime, &id);
+    magnetar_runtime::warm_model_instance(
+        &mut runtime,
+        &id,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap();
 
     let failing = ModelInstanceReadinessChecks {
         adapter_ready: false,
         ..ModelInstanceReadinessChecks::default()
     };
-    let mut manager = ModelInstanceManager::new();
-    let failed = manager.create(definition()).unwrap();
-    manager.mark_ready(&failed).unwrap();
-    manager
-        .instance_mut(&failed)
-        .unwrap()
-        .transition_to(ModelInstanceLifecycleState::Reloading)
-        .unwrap();
-    manager
-        .instance_mut(&failed)
-        .unwrap()
-        .transition_to(ModelInstanceLifecycleState::Loading)
-        .unwrap();
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let failed = runtime.model_instances_mut().create(definition()).unwrap();
+    bind_fake_weight(&mut runtime, &failed);
+    assert!(matches!(
+        magnetar_runtime::warm_model_instance(&mut runtime, &failed, &plan, &failing),
+        Err(magnetar_runtime::InferenceApiError::ModelInstanceUnavailable { .. })
+    ));
     assert_eq!(
-        manager.warmup(&failed, &plan, &failing),
-        Err(ModelInstanceError::ModelInstanceAdapterIncompatible)
-    );
-    assert_eq!(
-        manager.instance(&failed).unwrap().lifecycle,
+        runtime.model_instance(&failed).unwrap().lifecycle(),
         ModelInstanceLifecycleState::Failed
     );
 }
@@ -646,17 +727,17 @@ fn batching_compatibility_includes_model_instance_readiness_adapter_and_pressure
 
 #[test]
 fn provider_and_device_status_drive_instance_lifecycle() {
-    let mut instance = magnetar_runtime::ModelInstance::new(
-        ModelInstanceId::new("instance-status1").unwrap(),
-        definition(),
-    );
-    instance
-        .transition_to(ModelInstanceLifecycleState::Loading)
-        .unwrap();
-    instance
-        .transition_to(ModelInstanceLifecycleState::Ready)
-        .unwrap();
-
+    // `provider_status_changed`/`device_unavailable` are reactive business
+    // methods on an already-Ready `ModelInstance` -- they stay directly
+    // callable via `instance_mut()`, unlike the Ready-producing primitives
+    // (`transition_to`, `mark_ready`, `warmup`) that are now crate-internal
+    // only. A separate `Runtime`-backed instance per scenario (rather than
+    // manually resetting `readiness` mid-test, no longer possible on a
+    // private field) keeps each scenario's starting state unambiguous.
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id1 = runtime.model_instances_mut().create(definition()).unwrap();
+    reach_ready(&mut runtime, &id1);
+    let instance = runtime.model_instances_mut().instance_mut(&id1).unwrap();
     assert_eq!(
         instance.provider_status_changed(
             ProviderHealthState::Healthy,
@@ -666,9 +747,12 @@ fn provider_and_device_status_drive_instance_lifecycle() {
         ),
         Err(ModelInstanceError::ModelInstanceProviderNotReady)
     );
-    assert_eq!(instance.readiness, ModelInstanceReadiness::NotReady);
+    assert_eq!(instance.readiness(), ModelInstanceReadiness::NotReady);
 
-    instance.readiness = ModelInstanceReadiness::Ready;
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id2 = runtime.model_instances_mut().create(definition()).unwrap();
+    reach_ready(&mut runtime, &id2);
+    let instance = runtime.model_instances_mut().instance_mut(&id2).unwrap();
     assert_eq!(
         instance.provider_status_changed(
             ProviderHealthState::Failed,
@@ -678,23 +762,20 @@ fn provider_and_device_status_drive_instance_lifecycle() {
         ),
         Err(ModelInstanceError::ModelInstanceProviderFailed)
     );
-    assert_eq!(instance.lifecycle, ModelInstanceLifecycleState::Failed);
+    assert_eq!(instance.lifecycle(), ModelInstanceLifecycleState::Failed);
 
-    let mut device = magnetar_runtime::ModelInstance::new(
-        ModelInstanceId::new("instance-loss1").unwrap(),
-        definition(),
-    );
-    device
-        .transition_to(ModelInstanceLifecycleState::Loading)
-        .unwrap();
-    device
-        .transition_to(ModelInstanceLifecycleState::Ready)
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let device_id = runtime.model_instances_mut().create(definition()).unwrap();
+    reach_ready(&mut runtime, &device_id);
+    let device = runtime
+        .model_instances_mut()
+        .instance_mut(&device_id)
         .unwrap();
     assert_eq!(
         device.device_unavailable(true),
         Err(ModelInstanceError::ModelInstanceDeviceLost)
     );
-    assert_eq!(device.lifecycle, ModelInstanceLifecycleState::Suspended);
+    assert_eq!(device.lifecycle(), ModelInstanceLifecycleState::Suspended);
 }
 
 #[test]
@@ -709,49 +790,63 @@ fn unload_releases_memory_provider_resources_adapters_and_cache_dependencies() {
         .prefix_cache_dependencies
         .insert(PrefixCacheEntryId::new("prefix-unload").unwrap());
     def.usage.adapter_dependencies.insert(AdapterSetId::empty());
-    def.resource_bindings = ModelInstanceResourceBindings {
-        memory_allocations: [MemoryAllocationId::new(1)].into(),
-        ..ModelInstanceResourceBindings::default()
-    };
-    def.placement = ModelInstancePlacement {
-        provider: Some(ProviderBinding::new("provider-a")),
-        device: Some(DeviceBinding::new(DeviceId::new("device-a"))),
-        affinity: ResourceAffinity::new(FallbackClass::ProviderPinned)
-            .with_provider(ProviderBinding::new("provider-a"))
-            .with_device(DeviceBinding::new(DeviceId::new("device-a"))),
-        provider_resource: Some(ProviderModelResource {
-            provider: ProviderBinding::new("provider-a"),
-            handle_kind: "opaque-model".into(),
-            release_required: true,
-        }),
-    };
-    let mut manager = ModelInstanceManager::new();
-    let id = manager.create(def).unwrap();
-    manager.mark_ready(&id).unwrap();
+    // A deliberately out-of-band id: `reach_ready` below issues its own
+    // real allocation from the same `MemoryManager`, whose ids start at 1,
+    // so a fixture id of `1` here would silently collide in the
+    // `BTreeSet` and undercount `released_memory_allocations`.
+    def.resource_bindings.memory_allocations = [MemoryAllocationId::new(999)].into();
+    // `placement` stays the fixture's default (no pinned Provider) through
+    // `reach_ready`, since `warm_model_instance` now derives `provider_ready`
+    // from a real, registered Provider -- "provider-a" below is a fake
+    // identity that exists only to prove unload's own
+    // `released_provider_resources` counting, not a Provider this test
+    // actually registers. Injected directly after reaching Ready.
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.model_instances_mut().create(def).unwrap();
+    reach_ready(&mut runtime, &id);
+    {
+        let instance = runtime.model_instances_mut().instance_mut(&id).unwrap();
+        instance.definition.placement = ModelInstancePlacement {
+            provider: Some(ProviderBinding::new("provider-a")),
+            device: Some(DeviceBinding::new(DeviceId::new("device-a"))),
+            affinity: ResourceAffinity::new(FallbackClass::ProviderPinned)
+                .with_provider(ProviderBinding::new("provider-a"))
+                .with_device(DeviceBinding::new(DeviceId::new("device-a"))),
+            provider_resource: Some(ProviderModelResource {
+                provider: ProviderBinding::new("provider-a"),
+                handle_kind: "opaque-model".into(),
+                release_required: true,
+            }),
+        };
+    }
 
-    let report = manager
+    let report = runtime
+        .model_instances_mut()
         .unload(&id, ModelInstanceUnloadPolicy::DrainActiveUse)
         .unwrap();
 
     assert_eq!(report.invalidated.kv_caches.len(), 1);
     assert_eq!(report.invalidated.prefix_entries.len(), 1);
     assert_eq!(report.invalidated.adapters_released.len(), 1);
-    assert_eq!(report.released_memory_allocations.len(), 1);
+    // +1 relative to the fixture's single pre-set `memory_allocations`
+    // entry: `reach_ready`'s own Memory Manager allocation for the bound
+    // weight is released on unload too.
+    assert_eq!(report.released_memory_allocations.len(), 2);
     assert_eq!(report.released_provider_resources.len(), 1);
     assert!(!report.dangling_session_references);
     assert_eq!(
-        manager.instance(&id).unwrap().lifecycle,
+        runtime.model_instance(&id).unwrap().lifecycle(),
         ModelInstanceLifecycleState::Unloaded
     );
 }
 
 #[test]
 fn reload_creates_validated_replacement_and_blocks_active_semantic_mutation() {
-    let mut manager = ModelInstanceManager::new();
-    let id = manager.create(definition()).unwrap();
-    manager.mark_ready(&id).unwrap();
-    manager.acquire_usage(&id, 1).unwrap();
-    let blocked = manager.reload(
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.model_instances_mut().create(definition()).unwrap();
+    reach_ready(&mut runtime, &id);
+    runtime.model_instances_mut().acquire_usage(&id, 1).unwrap();
+    let blocked = runtime.model_instances_mut().reload(
         &id,
         ModelInstanceReloadRequest {
             replacement: definition(),
@@ -760,9 +855,10 @@ fn reload_creates_validated_replacement_and_blocks_active_semantic_mutation() {
         },
     );
     assert_eq!(blocked, Err(ModelInstanceError::ModelInstanceActive));
-    manager.release_usage(&id).unwrap();
+    runtime.model_instances_mut().release_usage(&id).unwrap();
 
-    let replacement = manager
+    let replacement = runtime
+        .model_instances_mut()
         .reload(
             &id,
             ModelInstanceReloadRequest {
@@ -777,12 +873,12 @@ fn reload_creates_validated_replacement_and_blocks_active_semantic_mutation() {
     // change's fix applies to -- it stays non-Ready until an explicit
     // readiness step, same as any other freshly created instance.
     assert_eq!(
-        manager.instance(&replacement).unwrap().lifecycle,
+        runtime.model_instance(&replacement).unwrap().lifecycle(),
         ModelInstanceLifecycleState::Loading
     );
-    manager.mark_ready(&replacement).unwrap();
+    reach_ready(&mut runtime, &replacement);
     assert_eq!(
-        manager.instance(&replacement).unwrap().lifecycle,
+        runtime.model_instance(&replacement).unwrap().lifecycle(),
         ModelInstanceLifecycleState::Ready
     );
 }
