@@ -68,22 +68,50 @@ the full test suite (1087 passed, including the numerical-correctness oracle
 plus a new dedicated test proving an *intermediate* edge (not just the final
 output) is independently readable from Provider storage.
 
-What remains open: true multi-output support (5.4/5.5) needs a Kernel that
-actually produces more than one output to be meaningful to test -- no
-Reference CPU kernel does today (each calls `store_output` at index 0 only),
-so this is new Kernel/Operator capability, not a plumbing fix, and was not
-attempted. Task 5.6 (tensors "never host-readable") needs a Provider
-concept for device-resident data distinct from `HostTensor` itself, which
-does not exist yet -- that is task 3.3's still-open, deeper gap (the trait
-is Resource-ID-*addressed* now throughout the graph executor, but the value
+5.4/5.5 (multi-output support) are now closed. A new `"split"` Kernel was
+added to Reference CPU (`split_last_dim_in_half`, `reference_cpu.rs`) that
+genuinely produces two output Resources from one input -- it halves a
+tensor's last dimension and writes each half to its own Resource via
+`store_output(invocation, 0, left)` / `store_output(invocation, 1, right)`,
+proving the executor's existing per-index `store_output` and
+`KernelInvocation::with_output` plumbing (already generic, never previously
+exercised past index 0) genuinely handles multiple declared outputs per
+node, not just per-node-single-output convenience. `split` is registered in
+`initial_operator_catalog()` (`operator.rs`, arity `(1, 2)`) and advertised
+by `reference_cpu_kernel_advertisements()`; it is a proof-only Operator no
+Qwen graph node references, deliberately, since retrofitting the ~15 arms of
+the production `dispatch_qwen_graph_node`/`dispatch_reference_cpu_operator`
+path (`first_native_runtime.rs`) for multi-output was judged out of scope
+for proving the *generic* Resource-based plumbing works -- that path stays
+single-output because every real Qwen operator today is single-output, not
+because multi-output isn't supported. Tested at both layers: 4 unit tests
+on `split_last_dim_in_half` itself (rank-1 and rank-N splitting, rejecting
+odd/zero last-dimension, rejecting rank-0) plus one end-to-end test,
+`reference_cpu_split_kernel_produces_a_dedicated_resource_per_output`, that
+drives the Kernel through `ReferenceCpuExecutor::execute_invocation` exactly
+as production dispatch would and asserts `result.updated_resources.len() ==
+2` with each resource independently `read_tensor`-able and holding the
+correct half of the input. Adding `split` as a fifth advertised kernel
+surfaced a real bug in an unrelated existing test,
+`check_required_kernel_removal_fails_coverage`: it removed "whichever
+kernel is last in `reference_cpu_kernel_advertisements()`'s Vec" via
+`.pop()`, silently assuming every advertised kernel is Qwen-graph-required
+-- true only by coincidence before `split` existed. Fixed by having it find
+and remove `matmul` explicitly by name (`matmul` is unconditionally
+required, since every Qwen projection is one) instead of relying on Vec
+order. Full suite verified green after the fix (1120 passed). Task 5.6
+(tensors "never host-readable") needs a Provider concept for
+device-resident data distinct from `HostTensor` itself, which does not
+exist yet -- that is task 3.3's still-open, deeper gap (the trait is
+Resource-ID-*addressed* now throughout the graph executor, but the value
 type at each address is still `HostTensor`), not something this task group
 can close on its own.
 
 - [x] 5.1 Replace the `BTreeMap<TensorEdgeId, HostTensor>` intermediate representation with a Resource-binding table (`TensorResourceId`-keyed).
 - [x] 5.2 Represent graph inputs as Resource IDs. (Written into Provider storage once at the top of `execute_qwen_graph_nodes`, referenced by resource id from then on.)
 - [x] 5.3 Represent intermediates as Resource IDs.
-- [ ] 5.4 Represent outputs as Resource IDs, supporting multiple outputs per node (do not assume `node.outputs.first()`). (Outputs are Resource IDs now; multiple-outputs-per-node is not implemented -- see the group note above.)
-- [ ] 5.5 Test: a multi-output Operator produces a dedicated resource per declared output. (Blocked on 5.4; no multi-output Kernel exists to test against.)
+- [x] 5.4 Represent outputs as Resource IDs, supporting multiple outputs per node (do not assume `node.outputs.first()`). (`store_output`/`with_output` were already generic and index-addressed; the new `split` Kernel is the first thing to actually call `store_output` at index 1, proving it works. The production Qwen dispatch path remains single-output per node since no real Qwen operator needs more -- see the group note above.)
+- [x] 5.5 Test: a multi-output Operator produces a dedicated resource per declared output. (`reference_cpu_split_kernel_produces_a_dedicated_resource_per_output`, plus 4 unit tests on `split_last_dim_in_half` -- see the group note above.)
 - [x] 5.6 Test: a fake Provider whose tensors are never host-readable still executes correctly through the generic executor. (Done for what this task can actually mean today: `define-provider-prepared-kernel-execution-contract` (see task 3.3's updated note) proved a fake `TensorValue::Opaque`-only Provider can implement the new contract and that `TensorValue::into_host` fails structurally, naming the resource, against it (`tensor_value_into_host_fails_structurally_for_a_device_resident_only_provider`) -- and `execute_qwen_graph_nodes` itself now reads/writes exclusively through that contract, so a non-host-readable Provider fails *there*, structurally, exactly where the real work happens, not merely in isolation. "Executes correctly" for a Provider that declines host materialization everywhere still means "fails closed and legibly," not "produces a result," since Reference CPU's Kernel bodies genuinely need host bytes to compute -- no Provider, real or fake, can skip that and still produce numerically correct output. A fake Provider that is `Opaque`-only *and* still produces correct results would need its own Kernel computation path, which is a different, larger thing than this task asks for (that is `define-provider-prepared-kernel-execution-contract` task group 3's multi-output work's eventual sibling, once a second real Provider exists).)
 - [x] 5.7 Test/guard: no implicit host materialization occurs on the generic execution path. (`tests::e2e_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage` proves an intermediate edge's value lives in Provider storage under a known resource id, not only in a private executor-side cache.)
 
@@ -498,8 +526,8 @@ New regression coverage beyond the three tasks above: `tests::e2e_authoritative_
 
 ## 19. Architecture Freeze #1 gate verification
 
-**Status: blocked, but materially closer.** 14 of 19 groups are now fully
-done (1, 2, 3, 4, 6, 7, 9, 10, 11, 13, 15, 16, 17, 18); groups 5, 8, 12, 14
+**Status: blocked, but materially closer.** 15 of 19 groups are now fully
+done (1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 13, 15, 16, 17, 18); groups 8, 12, 14
 are partially done; group 19 (this one) is 0/3. This gate still cannot
 honestly be closed while those partial groups remain open — several of
 `first-native-implementation-cut`'s `Architecture Freeze #1` AND-conditions
@@ -508,20 +536,23 @@ note previously called out as "deliberately deferred" has since landed:
 the proven Qwen Component is now wired into the production generation path
 (group 11, 11.5, and 11.2's capability-version-mismatch error code), Reference
 CPU has been extracted into `providers/cpu` without breaking the E2E suite
-that still uses an in-crate double by design (group 14), and real byte-level
+that still uses an in-crate double by design (group 14), real byte-level
 GGUF/Safetensors parsers exist and are type-safe/panic-safe on untrusted
 input (group 16, via the separate `implement-model-format-parsers` Change
-the audit itself suggested) -- and, since that landed, a real Model
-Artifact built from those parsers now actually materializes production
-weight resources (group 8's 8.1/8.2, via `materialize-weights-from-real-
-model-artifact`; that Change's own parity test caught a real bug -- tensor
-byte offsets read as absolute rather than data-section-relative -- before
-it ever reached the production path). The externalization architecture
-itself is now also a checked normative requirement, not just a convention
-(`externalize-runtime-extension-modules`).
+the audit itself suggested), and a real Model Artifact built from those
+parsers now actually materializes production weight resources (group 8's
+8.1/8.2, via `materialize-weights-from-real-model-artifact`; that Change's
+own parity test caught a real bug -- tensor byte offsets read as absolute
+rather than data-section-relative -- before it ever reached the production
+path). The externalization architecture itself is now also a checked
+normative requirement, not just a convention
+(`externalize-runtime-extension-modules`). Group 5's remaining multi-output
+Resource gap (5.4/5.5) is now also closed: a new `split` Kernel on
+Reference CPU proves the generic executor's existing per-index
+`store_output`/`with_output` plumbing genuinely handles more than one
+output Resource per node, not just single-output convenience.
 
-What genuinely remains, per group: **5** (multi-output Resource support,
-5.4/5.5 -- no multi-output Kernel exists yet to need it); **8** (down to
+What genuinely remains, per group: **8** (down to
 7/11 -- a real Model Artifact now exists, is parsed by the real parser, and
 materializes weight resources from real bytes (`materialize-weights-from-
 real-model-artifact`, closing 8.1/8.2); what remains is only the deeper,

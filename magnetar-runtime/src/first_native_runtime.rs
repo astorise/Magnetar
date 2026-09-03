@@ -7673,12 +7673,24 @@ fn check_missing_kernel() -> Result<(), E2eConformanceError> {
 
 fn check_required_kernel_removal_fails_coverage() -> Result<(), E2eConformanceError> {
     let mut advertisements = reference_cpu_kernel_advertisements();
-    let removed = advertisements
-        .pop()
+    // Must remove a kernel the Qwen fixture's graph actually requires, not
+    // merely the last-advertised one: `reference_cpu_kernel_advertisements`
+    // also advertises Kernels (e.g. `split`, `reach-architecture-freeze-1`
+    // task 5.4/5.5's multi-output proof Operator) that exist to prove
+    // generic execution-path capability, not because any E2E fixture graph
+    // node uses them -- removing one of those is correctly *not* expected
+    // to fail coverage, so `.pop()`'s "whatever is last" used to work only
+    // by coincidence (every advertised kernel was Qwen-required) and broke
+    // the moment that stopped being true. `matmul` is unconditionally
+    // required by every Qwen graph (every projection is one), so find it
+    // by name rather than relying on Vec order at all.
+    let matmul_index = advertisements
+        .iter()
+        .position(|advertisement| advertisement.implemented_operator.name() == "matmul")
         .ok_or_else(|| E2eConformanceError::Internal {
-            reason: "expected first-native fixture to advertise at least one required kernel"
-                .into(),
+            reason: "expected first-native fixture to advertise a 'matmul' kernel".into(),
         })?;
+    let removed = advertisements.remove(matmul_index);
     match validate_reference_cpu_required_kernel_coverage(&advertisements) {
         Err(error) if error.reason.contains(removed.implemented_operator.name()) => Ok(()),
         Err(error) => Err(E2eConformanceError::Internal {

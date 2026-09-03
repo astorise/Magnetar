@@ -397,3 +397,43 @@ fn rope_offset_zero_is_the_previous_behaviour() {
     // Position 0 leaves the first row untouched, as before the offset existed.
     assert_eq!(rotated.data[..4], input.data[..4]);
 }
+
+#[test]
+fn split_last_dim_in_half_splits_each_row_correctly() {
+    let input = HostTensor::new([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
+    let (left, right) = split_last_dim_in_half(&input).unwrap();
+    assert_eq!(left.shape, vec![2, 2]);
+    assert_eq!(right.shape, vec![2, 2]);
+    assert_eq!(left.data, vec![1.0, 2.0, 5.0, 6.0]);
+    assert_eq!(right.data, vec![3.0, 4.0, 7.0, 8.0]);
+}
+
+#[test]
+fn split_last_dim_in_half_handles_rank_one_input() {
+    let input = HostTensor::new([4], [10.0, 20.0, 30.0, 40.0]).unwrap();
+    let (left, right) = split_last_dim_in_half(&input).unwrap();
+    assert_eq!(left.shape, vec![2]);
+    assert_eq!(right.shape, vec![2]);
+    assert_eq!(left.data, vec![10.0, 20.0]);
+    assert_eq!(right.data, vec![30.0, 40.0]);
+}
+
+#[test]
+fn split_last_dim_in_half_rejects_odd_last_dimension() {
+    let input = HostTensor::new([3], [1.0, 2.0, 3.0]).unwrap();
+    assert_eq!(
+        split_last_dim_in_half(&input).unwrap_err().code,
+        ReferenceCpuErrorCode::ShapeUnsupported
+    );
+}
+
+#[test]
+fn split_last_dim_in_half_rejects_zero_rank() {
+    // An empty shape is a scalar (rank 0, exactly one element) -- there is
+    // no "last dimension" at all to split.
+    let input = HostTensor::new(Vec::<u64>::new(), vec![42.0]).unwrap();
+    assert_eq!(
+        split_last_dim_in_half(&input).unwrap_err().code,
+        ReferenceCpuErrorCode::ShapeUnsupported
+    );
+}

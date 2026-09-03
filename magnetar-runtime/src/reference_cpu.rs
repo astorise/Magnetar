@@ -836,6 +836,59 @@ pub fn residual_add(
     add(input, residual)
 }
 
+/// Splits `input`'s last dimension into two equal halves, producing two
+/// tensors of the same rank with that one dimension halved (row-major
+/// layout means each contiguous run of `last` elements is exactly one
+/// "row" along that axis, regardless of the tensor's overall rank, so this
+/// is correct for any rank). `reach-architecture-freeze-1` task 5.4/5.5:
+/// the first portable Operator with more than one declared output,
+/// existing to prove the Resource-based generic execution path's
+/// already-existing multi-output support
+/// (`KernelInvocation.outputs: Vec<..>`, `store_output(invocation, index,
+/// ..)`) end to end -- not because any current graph needs a split
+/// Operator.
+pub fn split_last_dim_in_half(
+    input: &HostTensor,
+) -> Result<(HostTensor, HostTensor), ReferenceCpuError> {
+    let Some((&last, outer_dims)) = input.shape.split_last() else {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "split requires a tensor with at least one dimension",
+        ));
+    };
+    if last == 0 || last % 2 != 0 {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("split requires a nonzero even last dimension, got {last}"),
+        ));
+    }
+    let half = last / 2;
+    let mut half_shape = outer_dims.to_vec();
+    half_shape.push(half);
+    let half_usize = usize::try_from(half).map_err(|_| {
+        ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("split half-dimension {half} overflows this platform's usize"),
+        )
+    })?;
+    let last_usize = usize::try_from(last).map_err(|_| {
+        ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("split last dimension {last} overflows this platform's usize"),
+        )
+    })?;
+    let row_count = input.data.len() / last_usize;
+    let mut left_data = Vec::with_capacity(row_count * half_usize);
+    let mut right_data = Vec::with_capacity(row_count * half_usize);
+    for row in input.data.chunks_exact(last_usize) {
+        left_data.extend_from_slice(&row[..half_usize]);
+        right_data.extend_from_slice(&row[half_usize..]);
+    }
+    let left = HostTensor::new(half_shape.clone(), left_data)?;
+    let right = HostTensor::new(half_shape, right_data)?;
+    Ok((left, right))
+}
+
 /// Reference CPU only stores `f32`; any other portable dtype requires an
 /// explicit conversion step and is never converted silently.
 pub fn dtype_conversion(
@@ -1118,6 +1171,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
         baseline_advertisement("layout-conversion", OperatorFamily::Layout),
+        baseline_advertisement("split", OperatorFamily::Tensor),
     ]
 }
 
@@ -2036,6 +2090,25 @@ impl ReferenceCpuExecutor {
                     TensorLayoutKind::Contiguous,
                 )
                 .map_err(KernelError::from)?
+            }
+            // Genuinely multi-output (task 5.4/5.5): returns early, storing
+            // both outputs itself, rather than falling into the shared
+            // single-output tail below (`store_output(invocation, 0, ..)`)
+            // every other arm relies on.
+            "split" => {
+                let input = self.input_tensor(invocation, 0)?;
+                let (left, right) = split_last_dim_in_half(&input).map_err(KernelError::from)?;
+                let left_descriptor = self.store_output(invocation, 0, left)?;
+                let right_descriptor = self.store_output(invocation, 1, right)?;
+                result
+                    .output_readiness
+                    .insert(left_descriptor.id.to_string(), true);
+                result
+                    .output_readiness
+                    .insert(right_descriptor.id.to_string(), true);
+                result.updated_resources.push(left_descriptor);
+                result.updated_resources.push(right_descriptor);
+                return Ok(result);
             }
             "quantize" | "dequantize" => return Err(dequantize_placeholder().into()),
             other => {

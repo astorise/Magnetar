@@ -7306,6 +7306,62 @@ fn reference_cpu_executes_matmul_invocation_end_to_end() {
     assert_eq!(output.data, vec![19.0, 22.0, 43.0, 50.0]);
 }
 
+/// `reach-architecture-freeze-1` task 5.4/5.5: a real Operator with more
+/// than one declared output ("split") dispatched through the same generic
+/// `KernelInvocation`/`execute_invocation` path every other Kernel uses,
+/// proving `KernelInvocation.outputs: Vec<..>` and
+/// `store_output(invocation, index, ..)` actually produce a distinct,
+/// independently-readable resource per declared output -- not just that
+/// the types allow more than one.
+#[test]
+fn reference_cpu_split_kernel_produces_a_dedicated_resource_per_output() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "split")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (input_id, input_resource) = reference_cpu_resource("split-in", [2, 4]);
+    let (_left_id, left_resource) = reference_cpu_resource("split-left", [2, 2]);
+    let (_right_id, right_resource) = reference_cpu_resource("split-right", [2, 2]);
+    executor.write_tensor(
+        input_id,
+        reference_cpu_host_tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+    );
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-split"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(input_resource)
+    .with_output(left_resource.clone())
+    .with_output(right_resource.clone());
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    assert_eq!(
+        result.updated_resources.len(),
+        2,
+        "split must report both output resources as updated, not just one"
+    );
+
+    let left = executor.read_tensor(&left_resource.resource.id).unwrap();
+    let right = executor.read_tensor(&right_resource.resource.id).unwrap();
+    assert_eq!(left.shape, vec![2, 2]);
+    assert_eq!(right.shape, vec![2, 2]);
+    // Each row of the [2, 4] input splits into its first-half/second-half
+    // elements, landing in two independently-readable resources.
+    assert_eq!(left.data, vec![1.0, 2.0, 5.0, 6.0]);
+    assert_eq!(right.data, vec![3.0, 4.0, 7.0, 8.0]);
+}
+
 #[test]
 fn reference_cpu_execution_tracks_output_through_memory_manager() {
     let provider = ReferenceCpuProvider::new();
