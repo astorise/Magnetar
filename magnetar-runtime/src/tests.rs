@@ -18954,3 +18954,110 @@ fn registry_performance_evidence_is_keyed_by_generation_and_never_fabricated() {
         "a new generation must not silently inherit the prior generation's evidence"
     );
 }
+
+// ---------------------------------------------------------------------
+// `host_tensors_from_artifact_bytes` (materialize-weights-from-real-model-
+// artifact task group 1): the generic bytes-to-HostTensor bridge a format
+// parser's own tensor inventory (`ModelTensorMetadata`) feeds into, without
+// `magnetar-runtime` ever depending on a concrete format-parser crate.
+// ---------------------------------------------------------------------
+
+fn artifact_bytes_test_tensor(
+    name: &str,
+    shape: Vec<u64>,
+    data: &[f32],
+) -> (ModelTensorMetadata, Vec<u8>) {
+    let mut bytes = Vec::with_capacity(data.len() * 4);
+    for value in data {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let metadata = ModelTensorMetadata {
+        name: name.to_string(),
+        shape,
+        storage_dtype: ModelDType::F32,
+        layout: None,
+        shard: None,
+        offset_bytes: Some(0),
+        size_bytes: Some(bytes.len() as u64),
+        quantization: None,
+        expected_compute_dtype: None,
+    };
+    (metadata, bytes)
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_reads_a_well_formed_tensor() {
+    let (mut metadata, tensor_bytes) =
+        artifact_bytes_test_tensor("weight.a", vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    // Simulate a second tensor's bytes preceding this one in a real file by
+    // offsetting into a larger buffer, rather than only ever testing offset
+    // zero.
+    let mut file = vec![0u8; 16];
+    file.extend_from_slice(&tensor_bytes);
+    metadata.offset_bytes = Some(16);
+
+    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &file, 0)
+        .expect("well-formed tensor materializes");
+    let tensor = weights.get("weight.a").expect("tensor present");
+    assert_eq!(tensor.shape, vec![2, 2]);
+    assert_eq!(tensor.data, vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+/// Regression guard for a real bug found while implementing
+/// `materialize-weights-from-real-model-artifact`: `offset_bytes` is
+/// relative to the tensor-data section's start, not the whole file, and an
+/// earlier version of this function ignored `data_section_start` entirely
+/// (silently reading the wrong bytes for any nonzero data-section start,
+/// exactly the shape a real Safetensors/GGUF file always has once a header
+/// precedes the data). This test's `metadata.offset_bytes` deliberately
+/// stays relative to the data section (`0`), and a nonzero
+/// `data_section_start` is what must be added to land on the tensor's real
+/// bytes.
+#[test]
+fn host_tensors_from_artifact_bytes_honors_nonzero_data_section_start() {
+    let (metadata, tensor_bytes) =
+        artifact_bytes_test_tensor("weight.a", vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    // A "header" occupies the first 20 bytes; the tensor's own
+    // `offset_bytes` (0) is relative to where the data section begins
+    // (byte 20), not to the start of `file` itself.
+    let mut file = vec![0xAAu8; 20];
+    file.extend_from_slice(&tensor_bytes);
+
+    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &file, 20)
+        .expect("well-formed tensor materializes with a nonzero data section start");
+    let tensor = weights.get("weight.a").expect("tensor present");
+    assert_eq!(tensor.data, vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_rejects_non_f32_dtype() {
+    let (mut metadata, bytes) = artifact_bytes_test_tensor("weight.a", vec![1], &[1.0]);
+    metadata.storage_dtype = ModelDType::F16;
+
+    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect_err("non-F32 dtype must be rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::StorageDTypeUnsupported);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_rejects_out_of_bounds_range() {
+    let (metadata, _bytes) = artifact_bytes_test_tensor("weight.a", vec![4], &[1.0, 2.0, 3.0, 4.0]);
+    // Declare a range that does not actually fit in a much smaller buffer.
+    let short_file = vec![0u8; 4];
+
+    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &short_file, 0)
+        .expect_err("out-of-bounds range must be rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_rejects_shape_size_mismatch() {
+    let (mut metadata, bytes) =
+        artifact_bytes_test_tensor("weight.a", vec![4], &[1.0, 2.0, 3.0, 4.0]);
+    // Shape says 4 elements (16 bytes), but size_bytes disagrees.
+    metadata.size_bytes = Some(8);
+
+    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect_err("shape/size mismatch must be rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
+}

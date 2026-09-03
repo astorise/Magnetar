@@ -860,6 +860,40 @@ fn e2e_graph_dispatch_records_memory_feasibility_failure_under_tight_budget() {
         .expect("tight memory budget is recorded as a feasibility failure");
 }
 
+/// `materialize-weights-from-real-model-artifact` task 3.1: proves the
+/// real-artifact-bytes path (`e2e_fixture_weights_from_real_artifact`,
+/// reading the checked-in `E2E_FIXTURE_SAFETENSORS_BYTES` at real offsets)
+/// produces the exact same materialized tensors as the pre-existing
+/// in-memory construction (`e2e_fixture_weights`) -- before
+/// `bind_qwen_fixture_weights`'s production call site is allowed to switch
+/// from one to the other. Equivalence proven, not assumed, matching this
+/// session's own working pattern for prior real-Component/real-artifact
+/// cutovers.
+#[test]
+fn e2e_fixture_real_artifact_weights_match_in_memory_weights() {
+    let config = e2e_fixture_config();
+    let in_memory = e2e_fixture_weights(&config).expect("in-memory fixture weights build");
+    let from_real_artifact =
+        e2e_fixture_weights_from_real_artifact(&config).expect("real-artifact weights materialize");
+
+    assert_eq!(
+        in_memory.keys().collect::<Vec<_>>(),
+        from_real_artifact.keys().collect::<Vec<_>>(),
+        "real-artifact and in-memory weight maps must cover the same tensor names"
+    );
+    for (name, expected_tensor) in &in_memory {
+        let actual_tensor = &from_real_artifact[name];
+        assert_eq!(
+            actual_tensor.shape, expected_tensor.shape,
+            "tensor '{name}' shape mismatch between real-artifact and in-memory paths"
+        );
+        assert_eq!(
+            actual_tensor.data, expected_tensor.data,
+            "tensor '{name}' data mismatch between real-artifact and in-memory paths"
+        );
+    }
+}
+
 #[test]
 fn e2e_weight_binding_rejects_tampered_artifact_bytes() {
     let fixture = e2e_fixture().expect("fixture builds");

@@ -736,6 +736,8 @@ pub fn e2e_fixture_manifest(
     architecture: &ModelArchitecture,
 ) -> Result<ModelManifest, E2eConformanceError> {
     const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000003";
+    let weights_digest = e2e_fixture_safetensors_digest();
+    let weights_size_bytes = E2E_FIXTURE_SAFETENSORS_BYTES.len();
     let mut tensor_yaml = String::new();
     for name in qwen_expected_tensor_names(config.architecture.layer_count, config.tied_embeddings)
     {
@@ -775,8 +777,8 @@ generation:
 artifacts:
   weights:
     kind: model-weights
-    digest: {DIGEST}
-    size_bytes: 128
+    digest: {weights_digest}
+    size_bytes: {weights_size_bytes}
   config:
     kind: model-config
     digest: {DIGEST}
@@ -870,6 +872,115 @@ pub fn e2e_fixture_weights(
         weights.insert(name.clone(), fixture_tensor(&name, &shape)?);
     }
     Ok(weights)
+}
+
+/// Raw bytes of a real, checked-in Safetensors file encoding the exact same
+/// deterministic weights [`e2e_fixture_weights`] builds in memory --
+/// generated once via `formats/safetensors`'s own test suite (that crate,
+/// not this one, is allowed to depend on both `magnetar-runtime` and a
+/// Safetensors writer; see `materialize-weights-from-real-model-artifact`'s
+/// design.md for why), committed here, and read by [`e2e_fixture_weight_inventory`]/
+/// [`host_tensors_from_artifact_bytes`] as the real byte-level Model
+/// Artifact the production first-native path actually materializes weights
+/// from -- not merely an in-memory recreation.
+pub const E2E_FIXTURE_SAFETENSORS_BYTES: &[u8] =
+    include_bytes!("../fixtures/e2e-fixture-weights.safetensors");
+
+/// Size, in bytes, of the little-endian header-length prefix every
+/// Safetensors file begins with -- a local copy of the same constant
+/// `formats/safetensors::HEADER_LENGTH_PREFIX_BYTES` defines, since
+/// `magnetar-runtime` cannot depend on that crate even to reuse a `usize`
+/// (`externalize-runtime-extension-modules`).
+const HEADER_LENGTH_PREFIX_BYTES: usize = 8;
+
+/// The real sha256 digest of [`E2E_FIXTURE_SAFETENSORS_BYTES`]'s actual
+/// bytes -- computed at call time (not hardcoded) so it can never drift
+/// from the checked-in file it describes; used by [`e2e_fixture_manifest`]'s
+/// `artifacts.weights.digest` field, checked the same way
+/// `bind_qwen_fixture_weights`'s existing digest gate already checks every
+/// other declared digest.
+pub fn e2e_fixture_safetensors_digest() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(E2E_FIXTURE_SAFETENSORS_BYTES);
+    format!("sha256:{}", hex_digest(&hasher.finalize()))
+}
+
+/// The generic `ModelTensorMetadata` inventory [`E2E_FIXTURE_SAFETENSORS_BYTES`]'s
+/// real, checked-in file actually contains, computed directly rather than by
+/// calling a format parser: `magnetar-runtime` cannot depend on
+/// `formats/safetensors` even at test time (`externalize-runtime-extension-modules`),
+/// but this fixture's tensor names/shapes/generation order are already
+/// fully known here (`qwen_expected_tensor_names`/`qwen_expected_tensor_shape`),
+/// and the file was written by iterating that exact same sorted order (a
+/// `BTreeSet`/`BTreeMap`'s iteration order, deterministic regardless of
+/// insertion order) with each tensor's byte length equal to its element
+/// count times 4 -- so the offsets below are provably the same offsets a
+/// real parse of this file would produce, not merely assumed to match.
+/// `formats/safetensors`'s own test suite is what actually proves the file
+/// is parseable by the real, independent parser (see that crate's
+/// `e2e_fixture_weights_round_trip_through_real_safetensors_bytes` test).
+pub fn e2e_fixture_weight_inventory(
+    config: &QwenConfig,
+) -> Result<Vec<ModelTensorMetadata>, E2eConformanceError> {
+    let mut tensors = Vec::new();
+    let mut offset = 0_u64;
+    for name in qwen_expected_tensor_names(config.architecture.layer_count, config.tied_embeddings)
+    {
+        let shape = qwen_expected_tensor_shape(&name, config).ok_or_else(|| {
+            E2eConformanceError::FixtureInvalid {
+                reason: format!("no expected shape for fixture tensor '{name}'"),
+            }
+        })?;
+        let element_count: u64 = shape.iter().product();
+        let size_bytes = element_count * 4;
+        tensors.push(ModelTensorMetadata {
+            name: name.clone(),
+            shape,
+            storage_dtype: ModelDType::F32,
+            layout: None,
+            shard: None,
+            offset_bytes: Some(offset),
+            size_bytes: Some(size_bytes),
+            quantization: None,
+            expected_compute_dtype: None,
+        });
+        offset += size_bytes;
+    }
+    Ok(tensors)
+}
+
+/// Materializes the E2E fixture's weights by reading
+/// [`E2E_FIXTURE_SAFETENSORS_BYTES`]'s real bytes at
+/// [`e2e_fixture_weight_inventory`]'s declared offsets -- the real-file
+/// counterpart to [`e2e_fixture_weights`]'s in-memory construction, proven
+/// equal to it by `tests::e2e_fixture_real_artifact_weights_match_in_memory_weights`.
+pub fn e2e_fixture_weights_from_real_artifact(
+    config: &QwenConfig,
+) -> Result<BTreeMap<String, HostTensor>, E2eConformanceError> {
+    let inventory = e2e_fixture_weight_inventory(config)?;
+    // The Safetensors envelope's own 8-byte little-endian header-length
+    // prefix -- reading it is not "parsing" in the sense
+    // `externalize-runtime-extension-modules` forbids (no JSON, no
+    // validation, no `formats/safetensors` call): it is the one universally
+    // fixed part of the container format, needed here only to locate where
+    // the tensor-data section starts within the file
+    // (`host_tensors_from_artifact_bytes`'s `data_section_start`).
+    let header_length = E2E_FIXTURE_SAFETENSORS_BYTES
+        .get(..HEADER_LENGTH_PREFIX_BYTES)
+        .and_then(|prefix| prefix.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| E2eConformanceError::FixtureInvalid {
+            reason: "real artifact bytes are too short to hold a header length prefix".into(),
+        })?;
+    let data_section_start = HEADER_LENGTH_PREFIX_BYTES as u64 + header_length;
+    host_tensors_from_artifact_bytes(
+        &inventory,
+        E2E_FIXTURE_SAFETENSORS_BYTES,
+        data_section_start,
+    )
+    .map_err(|error| E2eConformanceError::FixtureInvalid {
+        reason: format!("real artifact bytes failed to materialize: {error}"),
+    })
 }
 
 pub fn e2e_fixture() -> Result<E2eFixture, E2eConformanceError> {
@@ -4473,11 +4584,20 @@ fn bind_qwen_fixture_weights(
             ),
         });
     }
+    // Task group 8 / Correctif 6: materialize from the real, checked-in
+    // Safetensors artifact's actual bytes (`e2e_fixture_weights_from_real_artifact`),
+    // not the in-memory `fixture.weights` the digest check above just
+    // verified -- `materialize-weights-from-real-model-artifact`'s parity
+    // test (`tests::e2e_fixture_real_artifact_weights_match_in_memory_weights`)
+    // proves the two are bit-identical for an untampered fixture, so this
+    // is a real change in *source*, not in observable behavior for every
+    // existing caller of this function.
+    let real_weights = e2e_fixture_weights_from_real_artifact(&fixture.config)?;
     materialize_model_instance_weights(
         runtime,
         instance,
         fixture.manifest.id.name.as_str(),
-        &fixture.weights,
+        &real_weights,
     )
     .map_err(E2eConformanceError::from)
 }

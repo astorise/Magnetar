@@ -100,47 +100,36 @@ can close on its own.
 
 ## 8. Model Loading creates the exact weight resources consumed by execution
 
-**Status: not started; deeper blocker confirmed.** `bind_qwen_fixture_weights`
-(called from `load_fixture_instance`, right after `create_model_instance`,
-not inside `load_model` itself) already creates one `TensorResourceId` per
-weight, writes it into the registered Provider's storage, admits it through
-`MemoryManager`, and populates `ModelInstance.resource_bindings.weights` --
-i.e. it already does tasks 8.3-8.5's *effects*, just as a bolt-on step after
-loading rather than as part of `Model Loading`'s own process (Correctif 6's
-actual complaint).
-
-Read `ModelLoadingCoordinator::load()` (`model_loading.rs:718`) end to end
-this pass: it allocates one *aggregate* `MemoryAllocationRequest` sized to
-the whole model, then "materialization" is exactly two observation events
-(`MaterializationStarted`/`MaterializationCompleted`) with no tensor bytes
-read, no `TensorResourceId` created, and no Provider interaction at all --
-for *any* artifact type, not just Qwen's fixture. Two real blockers, not
-one: (a) there is no byte-level Model Artifact format anywhere in this repo
-yet (`fixture.weights` is a pure in-memory `BTreeMap<String, HostTensor>`,
-never serialized) -- **this half is now resolved**: `implement-model-format-parsers`
-gave `formats/gguf`/`formats/safetensors` real parsers producing
-`ModelTensorMetadata`, so a byte-level Model Artifact format now exists and
-is parseable; and (b) `load()`'s signature takes `memory: &mut MemoryManager`
-but no Provider reference at all, so it structurally cannot call
-`write_tensor` even if it had bytes to write -- **this half remains open.**
-Fixing this for real means extending `ModelLoadingCoordinator::load()`'s
+**Status: 7/11.** `bind_qwen_fixture_weights` (called from `load_fixture_instance`,
+right after `create_model_instance`, not inside `load_model` itself) creates
+one `TensorResourceId` per weight, writes it into the registered Provider's
+storage, admits it through `MemoryManager`, and populates
+`ModelInstance.resource_bindings.weights` -- i.e. it does tasks 8.3-8.5's
+*effects*, as a step after loading rather than as part of `Model Loading`'s
+own process (Correctif 6's actual complaint) -- and, since
+`materialize-weights-from-real-model-artifact`, does so by reading a real,
+checked-in `.safetensors` file's actual bytes (parsed by the real
+`formats/safetensors` parser, verified in that crate's own test suite),
+not an in-memory recreation. 8.1/8.2 are closed on that basis. What
+`materialize-weights-from-real-model-artifact` explicitly did not attempt,
+matching its own non-goals: extending `ModelLoadingCoordinator::load()`'s
 public contract (used by `inference_api::load_model`, itself governed by
 the `model-loading` and `inference-api` OpenSpec capabilities) to accept a
-Provider and per-tensor byte data -- a spec-level API change, not an
-implementation-only fix, and a decision (does materialization become a
-phase inside `load()`, or a strictly-sequenced follow-on call within one
-loading transaction?) better made deliberately than folded into this pass,
-and deliberately left open by `implement-model-format-parsers`'s own
-non-goals (a real parser existing and `Model Loading` consuming one are
-kept as separate decisions). The API-redesign part is not attempted here,
-but see 8.3-8.6 below for a smaller, safe step that was.
+Provider and per-tensor byte data directly, so materialization can be
+triggered from *inside* `load()` itself rather than as a distinct following
+step -- `model-loading-materializes-weight-resources`'s own design.md
+Decision 1 already chose to keep materialization a distinct step (`load()`'s
+Lazy Loading Policy requirement means it must stay callable without weight
+bytes ready), so this is a considered position held across two Changes now,
+not an oversight. 8.6 stays open on that same basis: `bind_qwen_fixture_weights`
+is not removed, only its interior changed to source real bytes.
 
-- [ ] 8.1 Build a real minimal `Model Artifact` containing the payloads currently supplied by the fixture.
-- [ ] 8.2 Parse/read those bytes through `Model Loading`.
+- [x] 8.1 Build a real minimal `Model Artifact` containing the payloads currently supplied by the fixture. (`magnetar-runtime/fixtures/e2e-fixture-weights.safetensors`, a real Safetensors file (5685 bytes) encoding the exact deterministic weights `e2e_fixture_weights()` builds in memory, generated via `formats/safetensors::serialize` and proven parseable by the real, independent `formats/safetensors::parse` in that crate's own test suite -- `materialize-weights-from-real-model-artifact`.)
+- [x] 8.2 Parse/read those bytes through `Model Loading`. (New `host_tensors_from_artifact_bytes` (`model_loading.rs`) reads real tensor bytes at real, format-declared offsets into `HostTensor`s, generic over any format's `Vec<ModelTensorMetadata>`; `bind_qwen_fixture_weights` now calls it via `e2e_fixture_weights_from_real_artifact` instead of using the in-memory-only weight map for materialization. A real, previously-undetected bug was caught by this Change's own parity test before cutover: an initial version of the bridge function treated tensor offsets as absolute file positions rather than relative to the tensor-data section's start (the actual convention every format parser uses) -- see that Change's design.md and task 1.7's note.)
 - [ ] 8.3 Create `TensorResourceId`s for weights during `Model Loading`, not after. (Already true of the *effect*, just not triggered from inside `Model Loading` itself — see the group note above; still blocked on 8.1/8.2. **Now also spec-recognized, not just true-in-practice:** `model-loading-materializes-weight-resources` added the `model-loading` capability's "Model Loading Materializes Weight Resources" requirement, formally naming this generic per-tensor phase as part of the Model Loading contract, and closed a real gap it found along the way -- `ModelInstances::create()` was marking every instance `Ready` unconditionally before this phase even ran, so a materialization failure left a `Ready` instance with incomplete weight bindings; that Change added a lifecycle demotion (`Ready` -> `Failed`) on materialization failure, verified end to end under a calibrated tight memory budget. Still blocked on 8.1/8.2 for the "triggered from inside `load()` itself" half specifically -- that Change deliberately kept materialization a distinct step after `load()`, per its own design.md Decision 1, since `load()`'s Lazy Loading Policy requirement means it must stay callable without weight bytes ready.)
 - [ ] 8.4 Register the resulting allocations in the Runtime `MemoryManager`. (Same as 8.3: already happens, just as a post-load bolt-on rather than from within `Model Loading`. Same spec-recognition update applies.)
 - [ ] 8.5 Populate `ModelInstance.resource_bindings.weights` from that allocation. (Same as 8.3/8.4. Same spec-recognition update applies.)
-- [ ] 8.6 Remove `bind_qwen_fixture_weights()` (or equivalent) from the production path. (Cannot remove the post-load *call* until 8.1/8.2 give `Model Loading` itself something to create these resources from. What was achievable now: `bind_qwen_fixture_weights` is reduced to a thin wrapper that only does the fixture's own digest check, then delegates to a new `materialize_model_instance_weights(runtime, instance, artifact_owner, weights: &BTreeMap<String, HostTensor>)` — a fully generic function with zero Qwen/fixture dependency, living alongside `create_model_instance` rather than framed as model-family-specific. This directly serves Correctif 9 ("no Qwen semantics in magnetar-runtime") for this one piece even though the deeper "called from inside `load()`" question in 8.1/8.2 remains open.)
+- [ ] 8.6 Remove `bind_qwen_fixture_weights()` (or equivalent) from the production path. (Still not removed -- 8.1/8.2 now give `Model Loading` real bytes to create these resources from, but that alone doesn't let this post-load *call site* disappear, since materialization still isn't triggered from inside `load()` itself, a deliberately separate, still-open question (see the group note). What changed since the prior note: `bind_qwen_fixture_weights` now delegates to `e2e_fixture_weights_from_real_artifact` (real file bytes) rather than the in-memory-only `fixture.weights` map for what actually gets materialized, while its own digest-check gate deliberately stays checked against `fixture.weights` (a real, currently-load-bearing tamper-detection mechanism `include_bytes!`-embedded bytes cannot support at runtime -- see `materialize-weights-from-real-model-artifact` task 3.2's note). `materialize_model_instance_weights` itself was already fully generic, zero-Qwen-dependency, before this Change; that part of Correctif 9 was already served.)
 - [x] 8.7 Test: changing one weight byte in the Artifact changes generated logits. (Independent of the 8.1/8.2 Model Artifact-format blocker -- this only needs the graph-executed path to consume the bound weight bytes, not a real byte-level Artifact loader. New `first_native_runtime::tests::e2e_weight_byte_change_alters_generated_logits`: runs the same prompt through `execute_qwen_graph` (the production path `execute_generation_step` uses) twice, once with `fixture.weights` unmodified and once with the first weight's first element perturbed, via two new test-only helpers -- `load_fixture_instance_with_weights` (binds a caller-supplied weight map through `materialize_model_instance_weights` directly, bypassing the fixture's own digest gate in `bind_qwen_fixture_weights`, which is task 8.8's separate concern) and `forward_logits_with_weights` -- and asserts the two logits vectors differ. Full suite (1095 passed, up from 1094), `cargo clippy -p magnetar-runtime --lib --tests -- -D warnings` clean, `cargo build --workspace` clean.)
 - [x] 8.8 Test: digest mismatch is rejected. (`tests::e2e_weight_binding_rejects_tampered_artifact_bytes`, pre-existing and passing.)
 - [x] 8.9 Test: a required weight missing from the Artifact fails loading/binding before the first Kernel. (`tests::e2e_graph_execution_fails_closed_on_missing_weight`, pre-existing and passing.)
@@ -522,25 +511,34 @@ CPU has been extracted into `providers/cpu` without breaking the E2E suite
 that still uses an in-crate double by design (group 14), and real byte-level
 GGUF/Safetensors parsers exist and are type-safe/panic-safe on untrusted
 input (group 16, via the separate `implement-model-format-parsers` Change
-the audit itself suggested). The externalization architecture itself is
-now also a checked normative requirement, not just a convention
+the audit itself suggested) -- and, since that landed, a real Model
+Artifact built from those parsers now actually materializes production
+weight resources (group 8's 8.1/8.2, via `materialize-weights-from-real-
+model-artifact`; that Change's own parity test caught a real bug -- tensor
+byte offsets read as absolute rather than data-section-relative -- before
+it ever reached the production path). The externalization architecture
+itself is now also a checked normative requirement, not just a convention
 (`externalize-runtime-extension-modules`).
 
 What genuinely remains, per group: **5** (multi-output Resource support,
-5.4/5.5 -- no multi-output Kernel exists yet to need it); **8** (the deeper
-half of Correctif 6: `ModelLoadingCoordinator::load()` itself does not yet
-accept a Provider and per-tensor bytes to materialize weight resources from
-within `load()` — a real parser now exists (group 16) but is not wired in,
-a spec-level API/lifecycle decision deliberately left open, not an
-implementation gap); **12** (12.4 moving the embedded Component fixture out
-of the production path's `include_bytes!`, and 12.6 removing the
-Rust-builder fallback recipe entirely — both explicitly deferred, larger
-decisions); **14** (14.5 is N/A by the chosen architecture, not a real gap
-— see its note); **15** (15.6-15.8's per-tier Component/Format/Provider CI
-jobs, still one consolidated job instead, though four of six submodules are
-now real rather than templates, weakening the original "premature"
-rationale somewhat). None of these block correctness of what has shipped;
-they are scope this pass deliberately did not chase to closure.
+5.4/5.5 -- no multi-output Kernel exists yet to need it); **8** (down to
+7/11 -- a real Model Artifact now exists, is parsed by the real parser, and
+materializes weight resources from real bytes (`materialize-weights-from-
+real-model-artifact`, closing 8.1/8.2); what remains is only the deeper,
+deliberately-deferred half: `ModelLoadingCoordinator::load()` itself still
+does not accept a Provider and per-tensor bytes to materialize *from
+within* `load()`, so `bind_qwen_fixture_weights` still exists as a
+post-load call site (8.6) -- a spec-level API/lifecycle decision two
+separate Changes now have deliberately left open, not an implementation
+gap); **12** (12.4 moving the embedded Component fixture out of the
+production path's `include_bytes!`, and 12.6 removing the Rust-builder
+fallback recipe entirely — both explicitly deferred, larger decisions);
+**14** (14.5 is N/A by the chosen architecture, not a real gap — see its
+note); **15** (15.6-15.8's per-tier Component/Format/Provider CI jobs,
+still one consolidated job instead, though four of six submodules are now
+real rather than templates, weakening the original "premature" rationale
+somewhat). None of these block correctness of what has shipped; they are
+scope this pass deliberately did not chase to closure.
 
 - [ ] 19.1 Re-run `magnetar run qwen-test "Hello"` and confirm it exercises every link in the causal chain from CLI through `RuntimeInferenceApi`, Model Loading, `ModelInstance`, the Qwen Component (via the new graph contract), `PreparedExecutionPlan`/`PreparedExecutionPlanExecutor`, `ProviderExecutionApi.submit`, the external CPU Provider, admitted Tensor Resources, Runtime-owned KV Resources, incremental decode, Sampling, and token commit.
 - [ ] 19.2 Confirm every AND-condition in `first-native-implementation-cut`'s `Architecture Freeze #1` requirement holds before flipping that requirement's status from `candidate` to `accepted`.
