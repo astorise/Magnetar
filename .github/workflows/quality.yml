@@ -268,15 +268,100 @@ jobs:
           done
           exit "$fail"
 
-  # Submodule integration (task group 15): checks out components/, formats/,
-  # and providers/ submodules and sanity-builds each one independently. Every
-  # job above this one checks out without `submodules:`, so the Core clone
-  # and Core CI stay submodule-free by construction, not by convention.
-  # `components/qwen` and `providers/cpu` are real implementations now (task
-  # groups 11 and 14); the rest are still the default `cargo new --lib`
-  # template. This is one consolidated job rather than the audit's full
-  # Component/Format/Provider/Full-conformance tiers -- split it once every
-  # submodule has real, independently meaningful conformance to run.
+  # Component integration (task 15.6): Component submodules only, sparse
+  # checkout. Split out from the single consolidated `submodule-integration`
+  # job below now that `components/qwen` is real (task group 11);
+  # `components/llama` remains a template and simply passes trivially until
+  # it has real content of its own.
+  component-integration:
+    name: quality / component integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout Component submodules
+        run: git submodule update --init -- components/qwen components/llama
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Build and test each Component crate independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manifest in \
+            components/qwen/Cargo.toml \
+            components/llama/Cargo.toml
+          do
+            echo "::group::$manifest"
+            cargo test --locked --manifest-path "$manifest"
+            echo "::endgroup::"
+          done
+
+  # Format integration (task 15.7): Format submodules only, sparse checkout.
+  # `cargo test` already runs each crate's malformed-input corpus regression
+  # suite (task 16.3); real `cargo-fuzz` execution stays a local/periodic
+  # activity, not a per-PR CI step, per `implement-model-format-parsers`'s
+  # own documented reasoning (nightly-toolchain requirement, and no
+  # sanitizer-runtime-equipped runner configured here).
+  format-integration:
+    name: quality / format integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout Format submodules
+        run: git submodule update --init -- formats/gguf formats/safetensors
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Build and test each Format crate independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manifest in \
+            formats/gguf/Cargo.toml \
+            formats/safetensors/Cargo.toml
+          do
+            echo "::group::$manifest"
+            cargo test --locked --manifest-path "$manifest"
+            echo "::endgroup::"
+          done
+
+  # Provider integration (task 15.8): Provider submodules only, sparse
+  # checkout. `providers/cpu` is real (task group 14) and mandatory here --
+  # a failure fails this job. `providers/cuda` remains an empty template
+  # with no CUDA toolchain or GPU on this runner; it is built/tested the
+  # same way for now (trivially passes as a template) with no hardware gate
+  # yet to apply, since there is nothing hardware-dependent in it yet --
+  # revisit this step (a real hardware/toolchain gate, or a dedicated
+  # GPU-equipped runner) once it has real CUDA content, per 15.8's own
+  # "CPU mandatory, CUDA optional/hardware-gated" wording.
+  provider-integration:
+    name: quality / provider integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout Provider submodules
+        run: git submodule update --init -- providers/cpu providers/cuda
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Build and test the mandatory CPU Provider
+        run: cargo test --locked --manifest-path providers/cpu/Cargo.toml
+      - name: Build and test the optional CUDA Provider (template today, no hardware gate needed yet)
+        run: cargo test --locked --manifest-path providers/cuda/Cargo.toml
+
+  # Full conformance (task 15.9): the original, unsplit job -- checks out
+  # every submodule via `submodules: recursive` and re-runs the same
+  # build/test loop across all six, as a single comprehensive gate
+  # alongside (not instead of) the three narrower tier jobs above. Some
+  # redundancy with those jobs is intentional: a tier job gives fast,
+  # scoped feedback when only one area changes, while this job proves the
+  # full submodule set still integrates together.
   submodule-integration:
     name: quality / submodule integration
     runs-on: ubuntu-latest

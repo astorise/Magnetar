@@ -413,10 +413,10 @@ otherwise modified — only a doc comment added explaining this split.
 - [x] 15.3 Define release/versioning ownership per submodule. (New `SUBMODULES.md`: each module versions itself independently (its own `Cargo.toml` version is that module's own concern), Magnetar pins exact commits rather than floating branches (advancing a pin is an ordinary commit in this repository, reviewed like any other change), and compatibility is determined by this repository's own CI at the pinned commit, not by any version-number contract a module declares. No compatible-version *range* policy yet -- meaningless while every module but `components/qwen` is still an empty template; noted as real follow-up work once a module has more than one real release to range against.)
 - [x] 15.4 Define the Magnetar-to-Component/Provider/Format compatibility matrix. (`SUBMODULES.md`'s compatibility matrix: one real row today (this branch requires `components/qwen` at `aeb6493` or later, for `magnetar:model-component-graph@1.0.0`, not yet wired into the production path), and an explicit statement that every other module has no real content yet, so no compatibility claim beyond "the empty template builds" is meaningful for it.)
 - [x] 15.5 Add a "Core CI" job: checkout without submodules, build/test `magnetar-runtime` only. (Already true by construction: every pre-existing job in `.github/workflows/quality.yml` checks out with plain `actions/checkout@v7`, no `submodules:` key, so the Core clone and Core CI have never depended on the submodules.)
-- [ ] 15.6 Add a "Component integration CI" job: checkout Component submodules, build Components, run Component conformance. (Not split out yet — see 15.9's consolidated job. Splitting into per-tier jobs is premature while every submodule is an empty template with nothing tier-specific to run.)
-- [ ] 15.7 Add a "Format integration CI" job: checkout Format submodules, run parser conformance and malformed/fuzz corpus. (Same as 15.6.)
-- [ ] 15.8 Add a "Provider integration CI" job: checkout Provider submodules, CPU mandatory, CUDA optional/hardware-gated. (Same as 15.6.)
-- [x] 15.9 Add a "Full conformance" job: `submodules: recursive`. (New `submodule-integration` job in `.github/workflows/quality.yml`: checks out with `submodules: recursive` and runs `cargo test` against each of the six submodule crates independently. Deliberately one consolidated job rather than the audit's four separate tiers, since there is no tier-specific content yet to justify splitting it — see 15.6-15.8. YAML validity checked with `python -c "import yaml; yaml.safe_load(...)"`; not exercised against live GitHub Actions.)
+- [x] 15.6 Add a "Component integration CI" job: checkout Component submodules, build Components, run Component conformance. (New `component-integration` job: sparse `git submodule update --init -- components/qwen components/llama` after a plain checkout, then `cargo test --locked` per crate. `components/qwen` is real (task group 11); `components/llama` is still a template and passes trivially.)
+- [x] 15.7 Add a "Format integration CI" job: checkout Format submodules, run parser conformance and malformed/fuzz corpus. (New `format-integration` job, same sparse-checkout pattern, covering `formats/gguf`/`formats/safetensors`. `cargo test --locked` already runs each crate's malformed-input corpus regression suite (task 16.3); real `cargo-fuzz` execution stays local/periodic, not per-PR CI, per `implement-model-format-parsers`'s own documented reasoning.)
+- [x] 15.8 Add a "Provider integration CI" job: checkout Provider submodules, CPU mandatory, CUDA optional/hardware-gated. (New `provider-integration` job, same sparse-checkout pattern. `providers/cpu` (real, task group 14) is a separate, non-continue-on-error step -- a failure fails the job. `providers/cuda` remains an empty template with no CUDA toolchain or GPU on this runner, so "hardware-gated" has nothing real to gate yet; built/tested the same way for now, with a comment marking this as the step to revisit once it has real CUDA content.)
+- [x] 15.9 Add a "Full conformance" job: `submodules: recursive`. (Unchanged `submodule-integration` job in `.github/workflows/quality.yml`: still checks out with `submodules: recursive` and runs `cargo test` against all six submodule crates, now alongside (not instead of) the three narrower tier jobs 15.6-15.8 -- intentional redundancy: a tier job gives fast, scoped feedback when only one area changes, this job proves the full set still integrates together. YAML validity checked with `python -c "import yaml; yaml.safe_load(...)"` after every job addition; `git submodule update --init -- <paths>` syntax verified locally to exit cleanly for all three tier subsets; not exercised against live GitHub Actions.)
 - [x] 15.10 Verify no job outside "Full conformance" makes the minimal Core clone depend on all submodules. (Verified: `submodule-integration` is the only job in `quality.yml` with a `submodules:` key.)
 
 ## 16. Prepare external formats without type leakage
@@ -498,8 +498,8 @@ New regression coverage beyond the three tasks above: `tests::e2e_authoritative_
 
 ## 19. Architecture Freeze #1 gate verification
 
-**Status: blocked, but materially closer.** 13 of 19 groups are now fully
-done (1, 2, 3, 4, 6, 7, 9, 10, 11, 13, 16, 17, 18); groups 5, 8, 12, 14, 15
+**Status: blocked, but materially closer.** 14 of 19 groups are now fully
+done (1, 2, 3, 4, 6, 7, 9, 10, 11, 13, 15, 16, 17, 18); groups 5, 8, 12, 14
 are partially done; group 19 (this one) is 0/3. This gate still cannot
 honestly be closed while those partial groups remain open — several of
 `first-native-implementation-cut`'s `Architecture Freeze #1` AND-conditions
@@ -532,13 +532,16 @@ post-load call site (8.6) -- a spec-level API/lifecycle decision two
 separate Changes now have deliberately left open, not an implementation
 gap); **12** (12.4 moving the embedded Component fixture out of the
 production path's `include_bytes!`, and 12.6 removing the Rust-builder
-fallback recipe entirely — both explicitly deferred, larger decisions);
-**14** (14.5 is N/A by the chosen architecture, not a real gap — see its
-note); **15** (15.6-15.8's per-tier Component/Format/Provider CI jobs,
-still one consolidated job instead, though four of six submodules are now
-real rather than templates, weakening the original "premature" rationale
-somewhat). None of these block correctness of what has shipped; they are
-scope this pass deliberately did not chase to closure.
+fallback recipe entirely — both explicitly deferred, larger decisions,
+evaluated and deliberately not attempted this pass, per explicit user
+direction, given real regression risk and/or a missing prerequisite (a
+Component distribution/registry mechanism for 12.4) rather than left
+unconsidered); **14** (14.5 is N/A by the chosen architecture, not a real
+gap — see its note). Group 15 is now fully closed (15.6-15.8's per-tier
+Component/Format/Provider CI jobs added alongside the existing "Full
+conformance" job). None of these remaining items block correctness of what
+has shipped; they are scope this pass deliberately did not chase to
+closure.
 
 - [ ] 19.1 Re-run `magnetar run qwen-test "Hello"` and confirm it exercises every link in the causal chain from CLI through `RuntimeInferenceApi`, Model Loading, `ModelInstance`, the Qwen Component (via the new graph contract), `PreparedExecutionPlan`/`PreparedExecutionPlanExecutor`, `ProviderExecutionApi.submit`, the external CPU Provider, admitted Tensor Resources, Runtime-owned KV Resources, incremental decode, Sampling, and token commit.
 - [ ] 19.2 Confirm every AND-condition in `first-native-implementation-cut`'s `Architecture Freeze #1` requirement holds before flipping that requirement's status from `candidate` to `accepted`.
