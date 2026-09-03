@@ -63,18 +63,30 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Architecture Freeze #1 is **accepted**: all P0 causal datapath
-  requirements (`reach-architecture-freeze-1`) are implemented, test-covered,
-  and proven by a full green CI run (formatting, clippy, workspace tests
-  across Linux/Windows/macOS, WIT/component validation, wasm32, submodule
-  integration, and OpenSpec validation) at commit `0197be1` on
-  `make-first-native-datapath-authoritative`, which is now archived as
-  `2026-09-03-make-first-native-datapath-authoritative`. `reach-architecture-
-  freeze-1`'s own task group 19 re-ran the full causal chain
-  (`magnetar run qwen-test "Hello"`, live, not just via test) end to end and
-  confirmed evidence for every step from CLI through Model Loading, the real
-  Qwen Component, `PreparedExecutionPlan`, the Provider, admitted Tensor
-  Resources, Runtime-owned KV Resources, Sampling, and token commit.
+- Architecture Freeze #1 **reverts to candidate**, not accepted -- an
+  external audit of commit `0197be1` (2026-09-03, PR #36) correctly found
+  two P0 gaps in the weight-materialization lifecycle that the acceptance
+  declared at that commit missed: (1) `ModelInstance` is marked `Ready`
+  immediately on creation, before mandatory weights are ever bound, and
+  `acquire_usage`'s own readiness check does not inspect weight bindings --
+  only a deeper, incidental graph-dispatch check happens to catch a missing
+  weight today, which is not the same as the instance's own reported
+  readiness being trustworthy; (2) weight materialization is not
+  transactional: `Provider.write_tensor` is called before `MemoryManager`
+  admission (inverting the intended authority order), a residency
+  registration error is silently discarded (`let _ = record_tensor_residency
+  (...)`), a mid-loop failure leaves already-written weights unrolled-back,
+  and `unload_model_instance` releases `MemoryAllocationId`s but never calls
+  `Provider.release_tensor` for weight `TensorResourceId`s, leaking
+  Provider-owned storage across repeated load/unload cycles. Tracked for a
+  real fix, not a re-assertion: see `openspec/changes/reach-architecture-
+  freeze-1`'s reopened task group 8 (or its successor) for the transactional
+  redesign, using the admission-first primitive (`write_tensor_admitted`)
+  the KV cache path already established correctly for the same class of
+  problem. Architecture Freeze #1 will be re-declared accepted only after
+  both P0s are fixed, tested (including repeated load/unload leak proof),
+  and a fresh green CI run and live `magnetar run qwen-test "Hello"` confirm
+  it, per this same audit's own acceptance criteria.
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
