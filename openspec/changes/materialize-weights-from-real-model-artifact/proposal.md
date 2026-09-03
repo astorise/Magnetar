@@ -18,7 +18,7 @@ None.
 
 ### Modified Capabilities
 
-- `model-loading`: adds a requirement that Model Loading's weight-materialization phase SHALL be able to source tensor data from real Model Artifact bytes (via a format parser's generic tensor inventory), not only a pre-materialized in-memory source.
+- `model-loading`: adds a requirement that Model Loading's weight-materialization phase SHALL be able to source tensor data from real Model Artifact bytes (via a format parser's generic tensor inventory), not only a pre-materialized in-memory source; adds a requirement that weight-resource completeness gates generation at the graph-dispatch boundary, independent of the instance's coarser lifecycle/readiness flag.
 
 ## Impact
 
