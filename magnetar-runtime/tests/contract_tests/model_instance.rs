@@ -130,6 +130,7 @@ fn model_instance_id_is_opaque_runtime_owned_and_not_authority() {
 fn model_instance_binds_loaded_context_without_exposing_raw_handles() {
     let mut manager = ModelInstanceManager::new();
     let id = manager.create(definition()).unwrap();
+    manager.mark_ready(&id).unwrap();
     let instance = manager.instance(&id).unwrap();
 
     assert_eq!(instance.lifecycle, ModelInstanceLifecycleState::Ready);
@@ -160,6 +161,7 @@ fn lifecycle_and_readiness_are_distinct_and_transitions_are_checked() {
 
     let mut manager = ModelInstanceManager::new();
     let id = manager.create(definition()).unwrap();
+    manager.mark_ready(&id).unwrap();
     manager
         .instance_mut(&id)
         .unwrap()
@@ -174,6 +176,7 @@ fn lifecycle_and_readiness_are_distinct_and_transitions_are_checked() {
 fn generation_uses_ready_model_instance_reference_and_usage_lifecycle() {
     let mut manager = ModelInstanceManager::new();
     let id = manager.create(definition()).unwrap();
+    manager.mark_ready(&id).unwrap();
 
     assert_eq!(
         manager.generation_reference(&id).unwrap(),
@@ -208,6 +211,7 @@ fn generation_uses_ready_model_instance_reference_and_usage_lifecycle() {
 fn model_instance_observability_is_redacted() {
     let mut manager = ModelInstanceManager::new();
     let id = manager.create(definition()).unwrap();
+    manager.mark_ready(&id).unwrap();
     manager.acquire_usage(&id, 42).unwrap();
     manager.release_usage(&id).unwrap();
 
@@ -230,6 +234,7 @@ fn model_instance_observability_is_redacted() {
 fn memory_pressure_suspends_idle_instance_and_browser_error_is_structured() {
     let mut manager = ModelInstanceManager::new();
     let id = manager.create(definition()).unwrap();
+    manager.mark_ready(&id).unwrap();
     manager
         .instance_mut(&id)
         .unwrap()
@@ -260,6 +265,7 @@ fn runtime_owns_model_instance_registry_and_usage() {
             ResourceAffinity::new(FallbackClass::Transparent),
         )
         .unwrap();
+    runtime.model_instances_mut().mark_ready(&id).unwrap();
 
     assert_eq!(
         runtime.model_instance_generation_reference(&id).unwrap(),
@@ -294,6 +300,7 @@ fn runtime_unload_releases_model_instance_kv_caches() {
             ResourceAffinity::new(FallbackClass::Transparent),
         )
         .unwrap();
+    runtime.model_instances_mut().mark_ready(&instance).unwrap();
     let cache = KvCache::new(
         KvCacheId::new("temporary-cache-id").unwrap(),
         KvCacheScope::ModelInstance,
@@ -327,6 +334,7 @@ fn runtime_rejected_unload_preserves_model_instance_kv_caches() {
             ResourceAffinity::new(FallbackClass::Transparent),
         )
         .unwrap();
+    runtime.model_instances_mut().mark_ready(&instance).unwrap();
     let cache = KvCache::new(
         KvCacheId::new("temporary-cache-id").unwrap(),
         KvCacheScope::ModelInstance,
@@ -363,6 +371,7 @@ fn runtime_close_then_unload_skips_already_released_session_kv_cache_memory() {
             ResourceAffinity::new(FallbackClass::Transparent),
         )
         .unwrap();
+    runtime.model_instances_mut().mark_ready(&instance).unwrap();
     let session = runtime
         .create_inference_session(magnetar_runtime::SessionCreationRequest {
             model: GenerationModelReference::ModelInstance(instance.clone()),
@@ -499,6 +508,7 @@ fn warmup_policy_covers_provider_kernel_shape_metadata_memory_and_adapter_checks
 
     let mut manager = ModelInstanceManager::new();
     let id = manager.create(definition()).unwrap();
+    manager.mark_ready(&id).unwrap();
     manager
         .instance_mut(&id)
         .unwrap()
@@ -519,6 +529,7 @@ fn warmup_policy_covers_provider_kernel_shape_metadata_memory_and_adapter_checks
     };
     let mut manager = ModelInstanceManager::new();
     let failed = manager.create(definition()).unwrap();
+    manager.mark_ready(&failed).unwrap();
     manager
         .instance_mut(&failed)
         .unwrap()
@@ -716,6 +727,7 @@ fn unload_releases_memory_provider_resources_adapters_and_cache_dependencies() {
     };
     let mut manager = ModelInstanceManager::new();
     let id = manager.create(def).unwrap();
+    manager.mark_ready(&id).unwrap();
 
     let report = manager
         .unload(&id, ModelInstanceUnloadPolicy::DrainActiveUse)
@@ -737,6 +749,7 @@ fn unload_releases_memory_provider_resources_adapters_and_cache_dependencies() {
 fn reload_creates_validated_replacement_and_blocks_active_semantic_mutation() {
     let mut manager = ModelInstanceManager::new();
     let id = manager.create(definition()).unwrap();
+    manager.mark_ready(&id).unwrap();
     manager.acquire_usage(&id, 1).unwrap();
     let blocked = manager.reload(
         &id,
@@ -760,6 +773,14 @@ fn reload_creates_validated_replacement_and_blocks_active_semantic_mutation() {
         )
         .unwrap();
     assert_ne!(id, replacement);
+    // `reload`'s replacement is created via the same `create()` this
+    // change's fix applies to -- it stays non-Ready until an explicit
+    // readiness step, same as any other freshly created instance.
+    assert_eq!(
+        manager.instance(&replacement).unwrap().lifecycle,
+        ModelInstanceLifecycleState::Loading
+    );
+    manager.mark_ready(&replacement).unwrap();
     assert_eq!(
         manager.instance(&replacement).unwrap().lifecycle,
         ModelInstanceLifecycleState::Ready

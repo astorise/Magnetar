@@ -640,6 +640,28 @@ impl Runtime {
                 }
             })?;
         }
+        // Release the Provider-owned weight Tensor Resources themselves,
+        // not only their Memory Manager allocation accounting below --
+        // otherwise Provider storage accumulates orphaned weight tensors
+        // across every load/unload cycle even though the Memory Manager
+        // ledger looks clean (`transactional-weight-materialization`).
+        // Resolved generically from each resource's own recorded Tensor
+        // Residency (its Provider affinity, set when it was materialized),
+        // not a hardcoded Provider name -- this file is generic Core and
+        // SHALL NOT know about any specific model family's Provider choice.
+        for resource_id in &report.released_weight_resources {
+            if let Some(provider_binding) = self
+                .memory
+                .tensor_residency(resource_id)
+                .and_then(|residency| residency.affinity.provider())
+                && let Some(executor) = self
+                    .providers
+                    .provider(provider_binding.as_str())
+                    .and_then(|provider| provider.execution_api())
+            {
+                executor.release_tensor(resource_id);
+            }
+        }
         // Release this instance's own MemoryManager allocations (weight/
         // constant tensor resources and any other Runtime-owned allocation
         // bound to it) now that unload has moved them into

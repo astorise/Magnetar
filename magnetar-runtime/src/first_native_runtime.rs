@@ -4461,16 +4461,24 @@ fn load_fixture_instance(
     Ok((instance, MemoryManager::default()))
 }
 
-/// `model-loading-materializes-weight-resources`: a Model Instance whose
-/// weight materialization fails after `create_model_instance` already
-/// marked it `Ready` (the existing, unconditional behavior of
-/// `ModelInstances::create()`) SHALL be demoted away from `Ready` rather
-/// than left claiming readiness with incomplete weight bindings -- proven
-/// here under a memory budget tight enough to admit `load()`'s own
-/// aggregate allocation but not every subsequent per-tensor weight
-/// admission.
+/// `transactional-weight-materialization`: a Model Instance whose weight
+/// materialization fails SHALL never have reported Ready in the first
+/// place -- `ModelInstances::create()` leaves it in `Loading`, and only a
+/// fully successful `WeightMaterializationTransaction::commit` reaches
+/// Ready. Proven here under a memory budget tight enough to admit `load()`'s
+/// own aggregate allocation but not every subsequent per-tensor weight
+/// admission, and that the failed attempt leaves no weight bound to the
+/// instance (real rollback, not just a lifecycle label).
+///
+/// An earlier version of this test (and the code it tested) had the
+/// instance reach `Ready` immediately on creation, then get demoted after
+/// materialization failed -- a real, since-fixed bug an external audit of
+/// PR #36 correctly identified: nothing prevented a caller from observing
+/// the instance as `Ready` during that window. This test's name and
+/// assertions were rewritten to match the corrected behavior, not just the
+/// corrected code.
 #[cfg(test)]
-fn check_weight_materialization_failure_demotes_instance_from_ready(
+fn check_weight_materialization_failure_never_reaches_ready(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
     let mut runtime = Runtime::builder()
@@ -4510,18 +4518,21 @@ fn check_weight_materialization_failure_demotes_instance_from_ready(
         ResourceAffinity::new(FallbackClass::Transparent),
     )?;
 
-    // Confirm the instance really is Ready immediately after creation,
-    // before materialization runs -- the exact window this fix closes.
+    // Confirm the instance is genuinely NOT Ready immediately after
+    // creation -- the corrected behavior, replacing what used to be an
+    // assertion that it *was* Ready here.
     let status_before = runtime
         .model_instance(&instance)
         .map_err(InferenceApiError::from)?
         .status();
-    if status_before.lifecycle != ModelInstanceLifecycleState::Ready {
+    if status_before.lifecycle == ModelInstanceLifecycleState::Ready
+        || status_before.readiness.accepts_generation()
+    {
         return Err(E2eConformanceError::GenerationFailed {
             reason: format!(
-                "expected the instance to already be Ready right after creation \
-                 (ModelInstances::create()'s existing unconditional behavior); got {:?}",
-                status_before.lifecycle
+                "expected the instance to NOT be Ready right after creation, before any \
+                 weight materialization has run; got lifecycle {:?} / readiness {:?}",
+                status_before.lifecycle, status_before.readiness
             ),
         });
     }
@@ -4548,17 +4559,62 @@ fn check_weight_materialization_failure_demotes_instance_from_ready(
         .status();
     if status_after.lifecycle == ModelInstanceLifecycleState::Ready {
         return Err(E2eConformanceError::GenerationFailed {
-            reason: "instance is still Ready after weight materialization failed".into(),
+            reason: "instance is Ready after weight materialization failed".into(),
         });
     }
     if status_after.readiness.accepts_generation() {
         return Err(E2eConformanceError::GenerationFailed {
             reason: format!(
-                "instance readiness still accepts generation after weight materialization \
-                 failed: {:?}",
+                "instance readiness accepts generation after weight materialization failed: {:?}",
                 status_after.readiness
             ),
         });
+    }
+    if status_after.lifecycle != ModelInstanceLifecycleState::Failed {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "expected the instance to end in Failed after materialization failed; got {:?}",
+                status_after.lifecycle
+            ),
+        });
+    }
+    let bound_weight_count = runtime
+        .model_instance(&instance)
+        .map_err(InferenceApiError::from)?
+        .definition
+        .resource_bindings
+        .weights
+        .len();
+    if bound_weight_count != 0 {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "expected zero weights bound after a failed materialization attempt rolled \
+                 back (real rollback, not just a lifecycle label); found {bound_weight_count}"
+            ),
+        });
+    }
+    // Prove the rollback released Provider-owned storage too, not only the
+    // Model Instance's own bindings -- `WeightMaterializationTransaction::
+    // abort` must have called `release_tensor` for every weight staged
+    // before the failure, for any weight this attempt might have reached.
+    let executor = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(|error| E2eConformanceError::GenerationFailed {
+        reason: error.to_string(),
+    })?;
+    for name in fixture.weights.keys() {
+        let resource_id = TensorResourceId::new(format!("model.{instance}.weight.{name}"));
+        if executor.read_tensor(&resource_id).is_some() {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "weight resource '{resource_id}' remained present in Provider-owned \
+                     storage after a failed materialization attempt was supposed to roll it \
+                     back"
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -4636,78 +4692,166 @@ fn materialize_model_instance_weights(
     artifact_owner: &str,
     weights: &BTreeMap<String, HostTensor>,
 ) -> Result<(), InferenceApiError> {
-    let result =
-        materialize_model_instance_weights_inner(runtime, instance, artifact_owner, weights);
-    if result.is_err() {
-        // `model-loading-materializes-weight-resources`'s "Missing Weight
-        // Materialization Is Structurally Detectable" requirement:
-        // `ModelInstances::create()` marks a freshly-created instance
-        // `Ready` unconditionally, before this step ever runs (via
-        // `readiness_for_lifecycle`, a lifecycle-transition-based
-        // mechanism separate from `ModelInstanceReadinessChecks`). A
-        // Runtime that already recorded this instance as `Ready` SHALL
-        // NOT keep claiming so once materialization is known to have
-        // failed -- demote it explicitly here rather than relying on
-        // every caller to notice and react to this `Result::Err` itself.
-        // Best-effort: if the instance cannot be found, or is not
-        // presently in a state `(Ready, Failed)` legally transitions from,
-        // the original materialization error below is still what is
-        // returned either way.
-        if let Ok(model_instance) = runtime.model_instances_mut().instance_mut(instance) {
-            let _ = model_instance.transition_to(ModelInstanceLifecycleState::Failed);
+    let mut transaction = WeightMaterializationTransaction::begin(runtime)?;
+    for (name, tensor) in weights {
+        if let Err(error) =
+            transaction.stage_weight(runtime, instance, artifact_owner, name, tensor)
+        {
+            transaction.abort(runtime);
+            // The instance never reached Ready for this attempt (`create()`
+            // no longer auto-readies, and `commit` -- which alone calls
+            // `mark_ready` -- is never reached on this path), so there is
+            // nothing to demote; transition it to `Failed` so the failure
+            // is durably visible on the instance itself, not only in this
+            // `Result::Err`. Best-effort: if the instance cannot be found,
+            // or is not presently in a state `Failed` legally transitions
+            // from, the original materialization error below is still what
+            // is returned either way.
+            if let Ok(model_instance) = runtime.model_instances_mut().instance_mut(instance) {
+                let _ = model_instance.transition_to(ModelInstanceLifecycleState::Failed);
+            }
+            return Err(error);
         }
     }
-    result
+    transaction.commit(runtime, instance)
 }
 
-fn materialize_model_instance_weights_inner(
-    runtime: &mut Runtime,
-    instance: &ModelInstanceId,
-    artifact_owner: &str,
-    weights: &BTreeMap<String, HostTensor>,
-) -> Result<(), InferenceApiError> {
-    let provider_binding = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
-    let executor = resolve_kernel_execution_provider(runtime, &provider_binding)?;
-    for (name, tensor) in weights {
+/// Stages weight materialization one resource at a time -- Memory Manager
+/// admission, then Provider write, then residency registration, each
+/// step's error propagated rather than discarded -- and either rolls back
+/// everything staged so far ([`Self::abort`]) or publishes it all at once
+/// and marks the instance Ready ([`Self::commit`]), mirroring
+/// [`KvUpdateTransaction`]'s already-correct pattern for the same class of
+/// problem (Correctif 11 / task group 9). Implements
+/// `transactional-weight-materialization`'s "Weight Materialization Is
+/// Transactional" requirement.
+struct WeightMaterializationTransaction {
+    provider_binding: ProviderBinding,
+    executor: Arc<dyn ProviderExecutionApi>,
+    staged: Vec<StagedWeight>,
+}
+
+struct StagedWeight {
+    name: String,
+    resource_id: TensorResourceId,
+    allocation: MemoryAllocationId,
+}
+
+impl WeightMaterializationTransaction {
+    fn begin(runtime: &Runtime) -> Result<Self, InferenceApiError> {
+        let provider_binding = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+        let executor = resolve_kernel_execution_provider(runtime, &provider_binding)?;
+        Ok(Self {
+            provider_binding,
+            executor,
+            staged: Vec::new(),
+        })
+    }
+
+    /// Admits `tensor` through the Memory Manager, then writes it into
+    /// Provider-owned storage, then registers its residency -- in that
+    /// order, each step's error surfacing immediately rather than being
+    /// discarded. Does not touch the Model Instance's `resource_bindings`;
+    /// that is [`Self::commit`]'s responsibility once every weight in this
+    /// attempt has staged successfully.
+    fn stage_weight(
+        &mut self,
+        runtime: &mut Runtime,
+        instance: &ModelInstanceId,
+        artifact_owner: &str,
+        name: &str,
+        tensor: &HostTensor,
+    ) -> Result<(), InferenceApiError> {
         let resource_id = TensorResourceId::new(format!("model.{instance}.weight.{name}"));
-        executor.write_tensor(resource_id.clone(), tensor.clone());
         let byte_size = tensor.data.len() as u64 * std::mem::size_of::<f32>() as u64;
+        // Admission SHALL precede Provider materialization: reserve the
+        // resource's memory before writing its bytes into Provider-owned
+        // storage, not after.
         let allocation = runtime
             .memory_mut()
             .allocate(MemoryAllocationRequest::new(
                 MemoryAllocationClass::ModelArtifact,
                 byte_size,
-                MemoryPlacement::ProviderOwnedOpaque(provider_binding.clone()),
+                MemoryPlacement::ProviderOwnedOpaque(self.provider_binding.clone()),
                 MemoryAllocationOwner::InferenceArtifact(artifact_owner.into()),
             ))
             .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
                 reason: format!("failed to account weight resource '{name}': {error}"),
             })?;
-        let _ = runtime.memory_mut().record_tensor_residency(
+        self.executor
+            .write_tensor(resource_id.clone(), tensor.clone());
+        if let Err(error) = runtime.memory_mut().record_tensor_residency(
             TensorResidency::new(
                 resource_id.clone(),
-                MemoryPlacement::ProviderOwnedOpaque(provider_binding.clone()),
+                MemoryPlacement::ProviderOwnedOpaque(self.provider_binding.clone()),
                 ResourceAffinity::new(FallbackClass::Transparent)
-                    .with_provider(provider_binding.clone()),
+                    .with_provider(self.provider_binding.clone()),
             )
             .with_allocation(allocation.id),
-        );
-        let model_instance = runtime
-            .model_instances_mut()
-            .instance_mut(instance)
-            .map_err(InferenceApiError::from)?;
-        model_instance
-            .definition
-            .resource_bindings
-            .weights
-            .insert(name.clone(), resource_id);
-        model_instance
-            .definition
-            .resource_bindings
-            .memory_allocations
-            .insert(allocation.id);
+        ) {
+            // Residency registration failed after admission and write both
+            // succeeded: release what was just staged for this one weight
+            // before propagating, so the caller's subsequent `abort()`
+            // over `self.staged` never sees this half-staged entry (it was
+            // never pushed).
+            self.executor.release_tensor(&resource_id);
+            let _ = runtime.memory_mut().release(allocation.id);
+            return Err(InferenceApiError::MemoryAdmissionFailed {
+                reason: format!(
+                    "failed to register residency for weight resource '{name}': {error}"
+                ),
+            });
+        }
+        self.staged.push(StagedWeight {
+            name: name.to_string(),
+            resource_id,
+            allocation: allocation.id,
+        });
+        Ok(())
     }
-    Ok(())
+
+    /// Releases every resource staged so far this attempt -- Provider
+    /// tensor then Memory Manager allocation, per weight -- leaving no
+    /// trace of this attempt behind. Reached whenever any weight in the
+    /// attempt fails to stage.
+    fn abort(self, runtime: &mut Runtime) {
+        for staged in &self.staged {
+            self.executor.release_tensor(&staged.resource_id);
+            let _ = runtime.memory_mut().release(staged.allocation);
+        }
+    }
+
+    /// Publishes every staged weight's binding onto the Model Instance and
+    /// marks it Ready, reached only once every weight in this attempt
+    /// staged successfully.
+    fn commit(
+        self,
+        runtime: &mut Runtime,
+        instance: &ModelInstanceId,
+    ) -> Result<(), InferenceApiError> {
+        {
+            let model_instance = runtime
+                .model_instances_mut()
+                .instance_mut(instance)
+                .map_err(InferenceApiError::from)?;
+            for staged in &self.staged {
+                model_instance
+                    .definition
+                    .resource_bindings
+                    .weights
+                    .insert(staged.name.clone(), staged.resource_id.clone());
+                model_instance
+                    .definition
+                    .resource_bindings
+                    .memory_allocations
+                    .insert(staged.allocation);
+            }
+        }
+        runtime
+            .model_instances_mut()
+            .mark_ready(instance)
+            .map_err(InferenceApiError::from)
+    }
 }
 
 fn require_ready_first_native_instance<'a>(
@@ -7724,6 +7868,41 @@ fn check_unload_releases_weight_resource_allocations(
             reason: "loading the fixture bound no weight memory allocations to release".into(),
         });
     }
+    // `transactional-weight-materialization` (P0-2-bis): unload must also
+    // release the Provider-owned weight Tensor Resources themselves, not
+    // only Memory Manager accounting -- capture them before unload so they
+    // can be checked against Provider storage afterward.
+    let weight_resource_ids: Vec<TensorResourceId> = runtime
+        .model_instance(&instance)
+        .map_err(InferenceApiError::from)?
+        .definition
+        .resource_bindings
+        .weights
+        .values()
+        .cloned()
+        .collect();
+    if weight_resource_ids.is_empty() {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "loading the fixture bound no weight Tensor Resources to release".into(),
+        });
+    }
+    let executor = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(|error| E2eConformanceError::GenerationFailed {
+        reason: error.to_string(),
+    })?;
+    for resource_id in &weight_resource_ids {
+        if executor.read_tensor(resource_id).is_none() {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "weight resource '{resource_id}' was not actually present in Provider \
+                     storage before unload (test precondition broken)"
+                ),
+            });
+        }
+    }
     runtime
         .unload_model_instance(&instance, ModelInstanceUnloadPolicy::RejectActiveUse)
         .map_err(|error| E2eConformanceError::GenerationFailed {
@@ -7741,6 +7920,70 @@ fn check_unload_releases_weight_resource_allocations(
                     "weight allocation {allocation_id:?} remained Active after Model Instance unload"
                 ),
             });
+        }
+    }
+    for resource_id in &weight_resource_ids {
+        if executor.read_tensor(resource_id).is_some() {
+            return Err(E2eConformanceError::MemoryValidationFailed {
+                reason: format!(
+                    "weight resource '{resource_id}' remained present in Provider-owned \
+                     storage after Model Instance unload (P0-2-bis: unload must release \
+                     Provider-owned weight storage, not only Memory Manager accounting)"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Proves the load/unload cycle does not accumulate Provider-owned weight
+/// storage over repeated cycles -- the audit's own "100x load/unload"
+/// case, done at a smaller, still-meaningful count (each cycle already
+/// proves the property; more repetitions prove only that it does not
+/// degrade with iteration count, which a fixed small count already shows
+/// as well without materially slower test runs).
+fn check_repeated_load_unload_does_not_accumulate_weight_storage(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    const CYCLES: usize = 10;
+    let mut runtime = build_runtime();
+    for cycle in 0..CYCLES {
+        let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+        let weight_resource_ids: Vec<TensorResourceId> = runtime
+            .model_instance(&instance)
+            .map_err(InferenceApiError::from)?
+            .definition
+            .resource_bindings
+            .weights
+            .values()
+            .cloned()
+            .collect();
+        if weight_resource_ids.is_empty() {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!("cycle {cycle}: loading the fixture bound no weight resources"),
+            });
+        }
+        runtime
+            .unload_model_instance(&instance, ModelInstanceUnloadPolicy::RejectActiveUse)
+            .map_err(|error| E2eConformanceError::GenerationFailed {
+                reason: format!("cycle {cycle}: unload failed: {error}"),
+            })?;
+        let executor = resolve_kernel_execution_provider(
+            &runtime,
+            &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        )
+        .map_err(|error| E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        })?;
+        for resource_id in &weight_resource_ids {
+            if executor.read_tensor(resource_id).is_some() {
+                return Err(E2eConformanceError::MemoryValidationFailed {
+                    reason: format!(
+                        "cycle {cycle}: weight resource '{resource_id}' still present in \
+                         Provider storage after unload -- storage is accumulating across cycles"
+                    ),
+                });
+            }
         }
     }
     Ok(())

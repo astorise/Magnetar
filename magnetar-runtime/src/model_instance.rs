@@ -607,6 +607,11 @@ pub struct ModelInstanceInvalidationReport {
 pub struct ModelInstanceUnloadReport {
     pub invalidated: ModelInstanceInvalidationReport,
     pub released_memory_allocations: BTreeSet<MemoryAllocationId>,
+    /// Weight `TensorResourceId`s this unload SHALL also release from
+    /// Provider-owned storage, not merely from Memory Manager accounting
+    /// (`transactional-weight-materialization`'s "Unloading A Model
+    /// Instance Releases Its Provider-Owned Weight Storage" requirement).
+    pub released_weight_resources: BTreeSet<TensorResourceId>,
     pub released_provider_resources: BTreeSet<ProviderBinding>,
     pub dangling_session_references: bool,
 }
@@ -1099,18 +1104,11 @@ impl ModelInstanceManager {
         );
         let mut instance = ModelInstance::new(id.clone(), definition);
         instance.transition_to(ModelInstanceLifecycleState::Loading)?;
-        instance.mark_ready()?;
         self.instances.insert(id.clone(), instance);
         self.observe(
             ModelInstanceObservationKind::Created,
             Some(id.clone()),
             "model instance created",
-            None,
-        );
-        self.observe(
-            ModelInstanceObservationKind::Ready,
-            Some(id.clone()),
-            "model instance ready",
             None,
         );
         Ok(id)
@@ -1123,6 +1121,35 @@ impl ModelInstanceManager {
     ) -> Result<ModelInstanceId, ModelInstanceError> {
         checks.validate()?;
         self.create(definition)
+    }
+
+    /// Transitions a Model Instance from `Loading` (or `Warming`) to
+    /// `Ready`, mirroring [`Self::warmup`]'s exact pattern: call into the
+    /// individual instance's own state-machine method, then emit the
+    /// matching observation based on the real outcome. `create()` no
+    /// longer reaches `Ready` on its own -- a caller with a readiness
+    /// condition to satisfy first (weight materialization, warmup, or any
+    /// other mandatory readiness check) SHALL call this only after that
+    /// condition genuinely holds, per `model-instance`'s "Model Instance
+    /// Creation" requirement (creation alone SHALL NOT produce a Ready
+    /// instance).
+    pub fn mark_ready(&mut self, id: &ModelInstanceId) -> Result<(), ModelInstanceError> {
+        let result = self.instance_mut(id)?.mark_ready();
+        self.observe(
+            if result.is_ok() {
+                ModelInstanceObservationKind::Ready
+            } else {
+                ModelInstanceObservationKind::Failed
+            },
+            Some(id.clone()),
+            if result.is_ok() {
+                "model instance ready"
+            } else {
+                "model instance mark-ready failed"
+            },
+            None,
+        );
+        result
     }
 
     pub fn warmup(
@@ -1330,6 +1357,20 @@ impl ModelInstanceManager {
             .resource_bindings
             .released_memory_allocations
             .extend(released_memory_allocations.iter().copied());
+        // `transactional-weight-materialization`: unload must release the
+        // Provider-owned weight Tensor Resources themselves, not only their
+        // Memory Manager allocation accounting -- otherwise Provider
+        // storage accumulates orphaned weight tensors across every
+        // load/unload cycle even though the Memory Manager ledger looks
+        // clean.
+        let released_weight_resources: BTreeSet<TensorResourceId> = instance
+            .definition
+            .resource_bindings
+            .weights
+            .values()
+            .cloned()
+            .collect();
+        instance.definition.resource_bindings.weights.clear();
         let released_provider_resources = instance
             .definition
             .placement
@@ -1346,6 +1387,7 @@ impl ModelInstanceManager {
         Ok(ModelInstanceUnloadReport {
             invalidated,
             released_memory_allocations,
+            released_weight_resources,
             released_provider_resources,
             dangling_session_references: false,
         })

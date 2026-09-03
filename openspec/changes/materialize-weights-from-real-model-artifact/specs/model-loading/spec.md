@@ -34,21 +34,35 @@ Then they produce equal tensor data.
 
 ---
 
-### Requirement: Weight Resource Completeness Gates Generation, Not Merely Instance Lifecycle
+### Requirement: Weight Resource Completeness Gates Generation And Instance Lifecycle
 
-A Model Instance SHALL NOT be usable for generation while any of its mandatory weight resources have not been materialized, admitted through the Memory Manager, and bound into `resource_bindings.weights`, regardless of what the instance's coarse lifecycle/readiness flag currently reports.
+A Model Instance SHALL NOT report Ready, and SHALL NOT be usable for generation, while any of its mandatory weight resources have not been materialized, admitted through the Memory Manager, and bound into `resource_bindings.weights`.
 
-This gate SHALL be enforced at the graph-dispatch boundary that resolves a weight edge to a bound Tensor Resource, not only by the instance's lifecycle state at creation time: `ModelLoadingCoordinator::load()` and Model Instance creation MAY report an instance as structurally ready before a later, distinct weight-materialization step runs (the Lazy Loading Policy requirement already permits `load()` to succeed without weight bytes ready), but generation against that instance SHALL fail closed, naming the missing weight, until materialization for it has actually completed.
+**Correction, not the original wording:** an earlier version of this requirement said Model Instance creation "MAY report an instance as structurally ready before" materialization, relying only on a deeper graph-dispatch-time check to fail closed. An external audit correctly identified that this was an incomplete guarantee: `acquire_usage`-style readiness checks that inspect only the instance's coarse lifecycle/readiness flag (not weight bindings) would incorrectly accept a not-yet-materialized instance as usable. The instance's own reported readiness SHALL be trustworthy on its own, not merely "safe in practice because something deeper happens to also check." `ModelLoadingCoordinator::load()` itself stays separate from materialization (the Lazy Loading Policy requirement is unaffected: `load()` still succeeds without weight bytes ready), but Model Instance creation SHALL leave the instance in a non-Ready lifecycle state until a subsequent, explicit weight-materialization step completes successfully and itself transitions the instance to Ready.
 
-#### Scenario: Generation against a not-yet-materialized weight fails closed
+#### Scenario: An instance is not Ready until its weights are materialized
 
-Given a Model Instance whose lifecycle already reports Ready but a required weight has not been bound into `resource_bindings.weights`
+Given a Model Instance has just been created from a successfully loaded artifact
 
-When graph execution resolves that weight's edge
+When no weight-materialization step has run yet for it
 
-Then execution fails with a structured error naming the missing weight, before any Kernel dispatches
+Then the instance's lifecycle and readiness both report a non-Ready state, and generation against it is rejected before any Kernel dispatches
 
-And the failure does not depend on the instance's lifecycle/readiness flag having already been demoted.
+#### Scenario: Weight materialization is what makes the instance Ready
+
+Given a Model Instance's mandatory weight resources have all been materialized, admitted through the Memory Manager, and bound
+
+When that materialization step completes
+
+Then the instance transitions to Ready, and only then does generation against it become possible
+
+#### Scenario: A failed or partial materialization never produces a Ready instance
+
+Given weight materialization fails partway through, for any reason (memory admission denied, Provider write failure, residency registration failure)
+
+When the failure is handled
+
+Then every resource staged during that attempt is rolled back, and the instance is left in a Failed lifecycle state, never Ready
 
 #### Scenario: A later, distinct materialization step remains architecturally valid
 
@@ -57,3 +71,51 @@ Given `load()` completed successfully under the Lazy Loading Policy, with weight
 When that later step subsequently materializes, admits, and binds every mandatory weight
 
 Then the instance becomes genuinely usable for generation at that point, and no change to `load()`'s own signature or contract was required to reach it.
+
+### Requirement: Weight Materialization Is Transactional
+
+Weight materialization SHALL admit each resource through the Memory Manager before writing it into Provider-owned storage, SHALL propagate every step's errors rather than discarding them, and SHALL roll back every resource staged during a failed attempt rather than leaving partial state behind.
+
+#### Scenario: Memory admission precedes Provider materialization
+
+Given a weight is about to be materialized
+
+When its resource is staged
+
+Then Memory Manager admission is attempted first, and Provider-owned storage is written to only after admission succeeds
+
+#### Scenario: A residency registration failure is not silently discarded
+
+Given a weight's Memory Manager admission and Provider write both succeed
+
+When residency registration for that weight fails
+
+Then the failure is propagated as a real error, not discarded, and triggers rollback of that weight and every weight staged before it in the same attempt
+
+#### Scenario: A failure partway through rolls back every already-staged weight
+
+Given weights 1 through N-1 were staged successfully in one materialization attempt
+
+When weight N fails to stage, for any reason
+
+Then weights 1 through N-1's Provider-owned storage and Memory Manager allocations are released, and none of them remain bound to the Model Instance
+
+### Requirement: Unloading A Model Instance Releases Its Provider-Owned Weight Storage
+
+Unloading a Model Instance SHALL release both its Memory Manager allocations and its Provider-owned weight Tensor Resources, not the allocations alone.
+
+#### Scenario: Unload leaves no orphaned Provider-owned weight storage
+
+Given a Model Instance whose weights were materialized into Provider-owned storage
+
+When that instance is unloaded
+
+Then every weight Tensor Resource bound to it is released from Provider-owned storage, in addition to its Memory Manager allocations being released
+
+#### Scenario: Repeated load and unload does not accumulate Provider-owned storage
+
+Given a Model Instance is repeatedly loaded and unloaded with no other instance created in between
+
+When this is repeated many times
+
+Then Provider-owned storage returns to its prior baseline after each unload, not growing unboundedly across cycles

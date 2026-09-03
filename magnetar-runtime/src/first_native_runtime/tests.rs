@@ -1066,10 +1066,12 @@ fn e2e_weight_binding_rejects_tampered_artifact_bytes() {
 }
 
 #[test]
-fn e2e_weight_materialization_failure_demotes_instance_from_ready() {
+fn e2e_weight_materialization_failure_never_reaches_ready() {
     let fixture = e2e_fixture().expect("fixture builds");
-    check_weight_materialization_failure_demotes_instance_from_ready(&fixture)
-        .expect("a Model Instance is demoted away from Ready when weight materialization fails");
+    check_weight_materialization_failure_never_reaches_ready(&fixture).expect(
+        "a Model Instance never reports Ready when weight materialization fails, and rolls \
+         back every weight staged in the failed attempt",
+    );
 }
 
 #[test]
@@ -1098,6 +1100,13 @@ fn e2e_unload_releases_weight_resource_allocations() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_unload_releases_weight_resource_allocations(&fixture)
         .expect("unloading a Model Instance releases its weight resource allocations");
+}
+
+#[test]
+fn e2e_repeated_load_unload_does_not_accumulate_weight_storage() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_repeated_load_unload_does_not_accumulate_weight_storage(&fixture)
+        .expect("repeated load/unload cycles do not accumulate Provider-owned weight storage");
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]

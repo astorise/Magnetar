@@ -8893,6 +8893,10 @@ fn inference_api_model_instance_suspend_resume_drain_through_api_boundary() {
         .model_instances_mut()
         .create(model_instance_definition())
         .unwrap();
+    // `create()` no longer reaches Ready on its own (transactional-weight-
+    // materialization); this test's own concern is suspend/resume/drain
+    // *from* Ready, so reach Ready explicitly first.
+    runtime.model_instances_mut().mark_ready(&instance).unwrap();
 
     let status = model_instance_status(&runtime, &instance).unwrap();
     assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
@@ -8920,6 +8924,11 @@ fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_r
         .model_instances_mut()
         .create(model_instance_definition())
         .unwrap();
+    // `create()` no longer reaches Ready on its own (transactional-weight-
+    // materialization); this test's own concern is warmup's conflict
+    // detection against an *already Ready* instance, so reach Ready
+    // explicitly first.
+    runtime.model_instances_mut().mark_ready(&instance).unwrap();
     let plan = ModelInstanceWarmupPlan {
         policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
         steps: Vec::new(),
