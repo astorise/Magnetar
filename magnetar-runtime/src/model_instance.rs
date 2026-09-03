@@ -72,6 +72,16 @@ impl ModelInstanceLifecycleState {
         )
     }
 
+    /// Whether this lifecycle state legitimately permits accepting
+    /// inference usage. `readiness == Ready` alone SHALL NOT be trusted as
+    /// sufficient (Correctif: Runtime-owned ModelInstance readiness
+    /// authority) -- a caller-forged or internally inconsistent
+    /// `readiness` value must not grant usage while the instance's own
+    /// lifecycle has not actually reached one of these states.
+    pub const fn supports_inference_use(self) -> bool {
+        matches!(self, Self::Ready | Self::Idle | Self::Active)
+    }
+
     pub const fn allows_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
@@ -684,7 +694,24 @@ impl ModelInstance {
         checks: &ModelInstanceReadinessChecks,
     ) -> Result<(), ModelInstanceError> {
         let result = checks.validate();
-        self.readiness = checks.readiness();
+        let computed = checks.readiness();
+        // `Ready` readiness is only meaningful once the lifecycle itself
+        // has actually reached (or is transitioning through, e.g.
+        // `Warming`) a state that legitimately allows inference use --
+        // otherwise this would publish `Ready` readiness on an instance
+        // still sitting in `Creating`/`Loading`, the exact
+        // lifecycle/readiness inconsistency `WarmupPolicy::Disabled`
+        // could previously produce by calling this method without ever
+        // transitioning the lifecycle (Correctif: Runtime-owned
+        // ModelInstance readiness authority).
+        self.readiness = if computed == ModelInstanceReadiness::Ready
+            && !self.lifecycle.supports_inference_use()
+            && self.lifecycle != ModelInstanceLifecycleState::Warming
+        {
+            ModelInstanceReadiness::NotReady
+        } else {
+            computed
+        };
         if result.is_err() {
             self.last_error = result.clone().err();
         }
@@ -728,7 +755,12 @@ impl ModelInstance {
     }
 
     pub fn acquire_usage(&mut self, now_millis: u64) -> Result<(), ModelInstanceError> {
-        if !self.readiness.accepts_generation() {
+        // Both conditions are required, not just readiness: a lifecycle
+        // that has not actually reached a usable state must reject usage
+        // even if `readiness` was somehow (forged, or left inconsistent by
+        // a caller-driven readiness update) reported as `Ready`
+        // (Correctif: Runtime-owned ModelInstance readiness authority).
+        if !self.lifecycle.supports_inference_use() || !self.readiness.accepts_generation() {
             return Err(readiness_error(self.lifecycle, self.readiness));
         }
         self.definition.usage.active_operation_count = self
@@ -1207,7 +1239,8 @@ impl ModelInstanceManager {
         id: &ModelInstanceId,
     ) -> Result<GenerationModelReference, ModelInstanceError> {
         let instance = self.instance(id)?;
-        if !instance.readiness.accepts_generation() {
+        if !instance.lifecycle.supports_inference_use() || !instance.readiness.accepts_generation()
+        {
             return Err(readiness_error(instance.lifecycle, instance.readiness));
         }
         Ok(GenerationModelReference::ModelInstance(id.clone()))

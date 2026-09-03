@@ -8936,7 +8936,22 @@ fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_r
     // `create()` no longer reaches Ready on its own (transactional-weight-
     // materialization); this test's own concern is warmup's conflict
     // detection against an *already Ready* instance, so reach Ready
-    // explicitly first.
+    // explicitly first. Bind a weight resource before doing so: since
+    // `warm_model_instance` now derives `weights_materialized` from
+    // `resource_bindings.weights` non-emptiness (`runtime-owned-model-
+    // instance-readiness-authority`), an instance with none would make the
+    // later `warm_model_instance` call fail on that check instead of the
+    // already-Ready conflict this test actually means to exercise -- both
+    // happen to map to the same broad `ModelInstanceUnavailable` variant,
+    // which would silently let this test pass for the wrong reason.
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), TensorResourceId::new("test.weight"));
     runtime.model_instances_mut().mark_ready(&instance).unwrap();
     let plan = ModelInstanceWarmupPlan {
         policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
@@ -8960,6 +8975,189 @@ fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_r
         error,
         InferenceApiError::ModelInstanceUnavailable { .. }
     ));
+}
+
+/// Implements `runtime-owned-model-instance-readiness-authority`. An
+/// external audit of PR #36 found `warm_model_instance` trusted a caller's
+/// `weights_materialized: true` claim outright, even though
+/// `ModelInstanceReadinessChecks::default()` sets it `true` -- a caller
+/// using the default checks against an instance whose weights were never
+/// materialized could reach `Ready`. Covers the audit's test 18.1 (warmup
+/// without materialization must not reach Ready) and 18.3 (a forged
+/// `weights_materialized=true` claim against empty bindings is rejected).
+#[test]
+fn inference_api_warm_model_instance_rejects_forged_weights_materialized_claim() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let instance = runtime
+        .model_instances_mut()
+        .create(model_instance_definition())
+        .unwrap();
+    assert!(
+        runtime
+            .model_instance(&instance)
+            .unwrap()
+            .definition
+            .resource_bindings
+            .weights
+            .is_empty(),
+        "test precondition: no weights ever bound"
+    );
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    // The caller asserts every fact is satisfied, exactly matching
+    // `ModelInstanceReadinessChecks::default()` -- the audit's own
+    // exploit scenario (section 11).
+    let forged_checks = ModelInstanceReadinessChecks::default();
+    assert!(forged_checks.weights_materialized);
+
+    warm_model_instance(&mut runtime, &instance, &plan, &forged_checks).unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// Implements `runtime-owned-model-instance-readiness-authority`, test
+/// 18.2: `WarmupPolicy::Disabled` calls `ModelInstance::validate_readiness`
+/// directly, without the lifecycle transition `warmup()`'s other policies
+/// perform first -- so before this fix, a caller-forged `readiness =
+/// Ready` could be published while `lifecycle` stayed `Loading`, an
+/// internally inconsistent state. This test isolates that specific gap
+/// from `weights_materialized` derivation (covered separately above) by
+/// directly binding a weight resource, so the *only* thing preventing
+/// `Ready` here is the lifecycle/readiness consistency check.
+#[test]
+fn inference_api_warm_model_instance_disabled_policy_cannot_forge_ready_readiness() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let instance = runtime
+        .model_instances_mut()
+        .create(model_instance_definition())
+        .unwrap();
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), TensorResourceId::new("test.weight"));
+    assert_eq!(
+        model_instance_status(&runtime, &instance)
+            .unwrap()
+            .lifecycle,
+        ModelInstanceLifecycleState::Loading,
+        "test precondition: still Loading, no transition has run"
+    );
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::Disabled,
+        steps: Vec::new(),
+    };
+    let checks = ModelInstanceReadinessChecks::default();
+
+    // Disabled policy's own contract (`ModelInstance::warmup`) means this
+    // call does not have to fail -- `validate_readiness`'s own `Result`
+    // reflects whether the checks *themselves* are internally coherent,
+    // which they are. What matters is `self.readiness` afterward.
+    let _ = warm_model_instance(&mut runtime, &instance, &plan, &checks);
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_eq!(
+        status.lifecycle,
+        ModelInstanceLifecycleState::Loading,
+        "Disabled policy must not transition the lifecycle"
+    );
+    assert_ne!(
+        status.readiness,
+        ModelInstanceReadiness::Ready,
+        "readiness must not report Ready while lifecycle is still Loading"
+    );
+}
+
+/// Implements `runtime-owned-model-instance-readiness-authority`, test
+/// 18.4: an internally inconsistent `lifecycle: Loading, readiness: Ready`
+/// state -- however it might arise -- must never grant `acquire_usage` or
+/// `generation_reference`. This is the structural safety net: it holds
+/// regardless of which caller-forgeable path produced the inconsistency.
+#[test]
+fn model_instance_acquire_usage_rejects_ready_readiness_with_incompatible_lifecycle() {
+    let mut manager = ModelInstanceManager::new();
+    let id = manager.create(model_instance_definition()).unwrap();
+    assert_eq!(
+        manager.instance(&id).unwrap().lifecycle,
+        ModelInstanceLifecycleState::Loading
+    );
+
+    // Force the inconsistent state directly (bypassing every public
+    // entry point) to prove the check in `acquire_usage`/
+    // `generation_reference` itself, independent of how the
+    // inconsistency might be produced.
+    manager.instance_mut(&id).unwrap().readiness = ModelInstanceReadiness::Ready;
+    assert_eq!(
+        manager.instance(&id).unwrap().lifecycle,
+        ModelInstanceLifecycleState::Loading
+    );
+    assert_eq!(
+        manager.instance(&id).unwrap().readiness,
+        ModelInstanceReadiness::Ready
+    );
+
+    assert!(matches!(
+        manager.instance_mut(&id).unwrap().acquire_usage(0),
+        Err(ModelInstanceError::ModelInstanceLoading)
+    ));
+    assert!(matches!(
+        manager.generation_reference(&id),
+        Err(ModelInstanceError::ModelInstanceLoading)
+    ));
+}
+
+/// Implements `runtime-owned-model-instance-readiness-authority`, test
+/// 18.5: the happy path -- real weight materialization, a Provider the
+/// Runtime can actually resolve, and no forged claims -- still reaches
+/// Ready and accepts usage. Closing the forgery gap must not regress the
+/// legitimate warmup path.
+#[test]
+fn inference_api_warm_model_instance_reaches_ready_when_weights_and_provider_are_real() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), TensorResourceId::new("test.weight"));
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    let checks = ModelInstanceReadinessChecks::default();
+
+    warm_model_instance(&mut runtime, &instance, &plan, &checks).unwrap();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(status.readiness.accepts_generation());
+    assert!(
+        runtime
+            .model_instances_mut()
+            .acquire_usage(&instance, 0)
+            .is_ok()
+    );
 }
 
 #[test]

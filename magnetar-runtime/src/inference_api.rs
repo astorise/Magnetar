@@ -442,18 +442,74 @@ pub fn model_instance_status(
         .map_err(InferenceApiError::from)
 }
 
+/// Derives the Runtime-observable facts within `checks` from actual Runtime
+/// state instead of trusting the caller's claim, for every field the
+/// Runtime can verify today (`weights_materialized`, `provider_ready`,
+/// `device_ready`). A caller MAY still assert `false` to force a stricter
+/// outcome than Runtime state alone would produce, but MAY NOT use a
+/// caller-supplied `true` to claim a Runtime-internal fact the Runtime
+/// itself does not observe as true (Correctif: Runtime-owned ModelInstance
+/// readiness authority; see `openspec/changes/runtime-owned-model-instance-
+/// readiness-authority`'s design.md).
+///
+/// `kernel_preparation_ready`, `autotuning_ready`, `adapter_ready`,
+/// `memory_pressure`, `runtime_policy_allows`, `residency_available`, and
+/// `browser_supported` remain caller-supplied here: no generic,
+/// Runtime-side derivation for these exists in the current baseline (no
+/// Kernel Registry linkage from a `ModelInstanceId` to its expected
+/// prepared Kernel set, no per-instance autotuning/adapter/policy signal
+/// today). Closing that is future work, not fabricated here.
+fn derive_effective_readiness_checks(
+    runtime: &Runtime,
+    instance: &ModelInstanceId,
+    checks: &ModelInstanceReadinessChecks,
+) -> Result<ModelInstanceReadinessChecks, InferenceApiError> {
+    let model_instance = runtime.model_instance(instance)?;
+    let weights_materialized = checks.weights_materialized
+        && !model_instance
+            .definition
+            .resource_bindings
+            .weights
+            .is_empty();
+    let provider_ready = checks.provider_ready
+        && match &model_instance.definition.placement.provider {
+            None => true,
+            Some(binding) => runtime
+                .providers()
+                .provider(binding.as_str())
+                .and_then(|provider| provider.execution_api())
+                .is_some(),
+        };
+    let device_ready = checks.device_ready
+        && match &model_instance.definition.placement.device {
+            None => true,
+            Some(binding) => runtime.devices().any(|device| {
+                device.id() == binding.id()
+                    && device.availability() == DeviceAvailability::Available
+            }),
+        };
+    let mut effective = checks.clone();
+    effective.weights_materialized = weights_materialized;
+    effective.provider_ready = provider_ready;
+    effective.device_ready = device_ready;
+    Ok(effective)
+}
+
 /// Runs the Model Instance warmup plan through the Runtime Inference API
-/// boundary, without exposing Provider/Device handles.
+/// boundary, without exposing Provider/Device handles. The caller-supplied
+/// `checks` are not trusted as-is for the facts the Runtime can itself
+/// observe -- see [`derive_effective_readiness_checks`].
 pub fn warm_model_instance(
     runtime: &mut Runtime,
     instance: &ModelInstanceId,
     plan: &ModelInstanceWarmupPlan,
     checks: &ModelInstanceReadinessChecks,
 ) -> Result<(), InferenceApiError> {
+    let effective_checks = derive_effective_readiness_checks(runtime, instance, checks)?;
     runtime
         .model_instances_mut()
         .instance_mut(instance)?
-        .warmup(plan, checks)
+        .warmup(plan, &effective_checks)
         .map_err(InferenceApiError::from)
 }
 
