@@ -822,14 +822,28 @@ fn first_native_dispatch_has_no_production_fallback_and_fails_closed_instead() {
 /// reason.
 #[test]
 fn qwen_component_production_loader_has_no_embedded_fixture() {
-    let source = include_str!("../first_native_runtime.rs");
+    // Normalized to `\n` regardless of this checkout's line-ending
+    // convention (a real bug this test itself had: it panicked on Windows
+    // CI, whose checkout uses CRLF, before this normalization was added).
+    let source = include_str!("../first_native_runtime.rs").replace("\r\n", "\n");
     let production_loader_start = source
         .find("not(test)\n))]\nfn qwen_real_component_package()")
         .expect("the production (not(test)) qwen_real_component_package overload exists");
-    let production_loader_end = production_loader_start
+    // Covers both qwen_real_component_package's thin not(test) wrapper and
+    // its sibling resolve_qwen_component_from_env_var (immediately after
+    // it in the source, factored out so the actual env-var/file-read logic
+    // stays directly testable rather than living inside a not(test) cfg
+    // that no #[test] could ever reach) -- the second `\n}\n` closes that
+    // sibling function.
+    let first_fn_end = production_loader_start
         + source[production_loader_start..]
             .find("\n}\n")
-            .expect("the production loader function has a closing brace");
+            .expect("qwen_real_component_package has a closing brace")
+        + "\n}\n".len();
+    let production_loader_end = first_fn_end
+        + source[first_fn_end..]
+            .find("\n}\n")
+            .expect("resolve_qwen_component_from_env_var has a closing brace");
     let production_loader_source = &source[production_loader_start..production_loader_end];
     assert!(
         !production_loader_source.contains("include_bytes!"),
@@ -848,6 +862,114 @@ fn qwen_component_production_loader_has_no_embedded_fixture() {
         "expected production's Qwen Component loader to resolve bytes from an external, \
          caller-configured source (env var + local file read) rather than an embedded fixture"
     );
+}
+
+/// `register_qwen_component_artifact` must be safe to call unconditionally,
+/// every time a caller might need first-native generation, without the
+/// caller tracking its own "have I registered yet" state (task 12.4's
+/// design: `magnetar-cli` calls this before every `one_shot`/`ChatSession::
+/// open`). Proves the second call is a genuine no-op, not a panic or an
+/// error, regardless of whether the bytes differ from the first call's.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn register_qwen_component_artifact_is_idempotent() {
+    register_qwen_component_artifact(
+        b"first-call-bytes".to_vec(),
+        b"first-call-manifest".to_vec(),
+    );
+    register_qwen_component_artifact(
+        b"second-call-different-bytes".to_vec(),
+        b"second-call-different-manifest".to_vec(),
+    );
+}
+
+/// `resolve_qwen_component_from_env_var` is the extracted, directly
+/// testable logic behind `qwen_real_component_package`'s production
+/// fallback branch, which is itself `not(test)` and so can never be
+/// invoked from a `#[test]` at all -- each of these tests uses its own
+/// uniquely-named env var (never `MAGNETAR_QWEN_COMPONENT_PATH` itself,
+/// the one a real production process would set) so parallel test threads
+/// mutating process-wide environment state cannot race each other.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+mod resolve_qwen_component_from_env_var_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_missing_env_var() {
+        let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_UNSET_CASE";
+        unsafe {
+            std::env::remove_var(var_name);
+        }
+        let error = resolve_qwen_component_from_env_var(var_name).unwrap_err();
+        assert!(matches!(
+            error,
+            E2eConformanceError::ModelComponentFailed { reason } if reason.contains(var_name)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_nonexistent_component_file() {
+        let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_MISSING_FILE_CASE";
+        let path = std::env::temp_dir().join("magnetar-test-qwen-component-does-not-exist.wasm");
+        unsafe {
+            std::env::set_var(var_name, &path);
+        }
+        let error = resolve_qwen_component_from_env_var(var_name).unwrap_err();
+        unsafe {
+            std::env::remove_var(var_name);
+        }
+        assert!(matches!(
+            error,
+            E2eConformanceError::ModelComponentFailed { reason }
+                if reason.contains("failed to read Qwen Component bytes")
+        ));
+    }
+
+    #[test]
+    fn rejects_a_component_file_with_no_manifest() {
+        let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_MISSING_MANIFEST_CASE";
+        let path = std::env::temp_dir().join("magnetar-test-qwen-component-no-manifest.wasm");
+        std::fs::write(&path, b"pretend-component-bytes").expect("write test component file");
+        unsafe {
+            std::env::set_var(var_name, &path);
+        }
+        let error = resolve_qwen_component_from_env_var(var_name).unwrap_err();
+        unsafe {
+            std::env::remove_var(var_name);
+        }
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            error,
+            E2eConformanceError::ModelComponentFailed { reason }
+                if reason.contains("failed to read Qwen Component manifest")
+        ));
+    }
+
+    #[test]
+    fn reads_bytes_and_manifest_from_the_configured_path() {
+        let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_HAPPY_CASE";
+        let path = std::env::temp_dir().join("magnetar-test-qwen-component-happy.wasm");
+        let manifest_path = std::env::temp_dir()
+            .join("magnetar-test-qwen-component-happy.wasm.magnetar-component.yaml");
+        std::fs::write(&path, b"pretend-component-bytes").expect("write test component file");
+        std::fs::write(&manifest_path, b"pretend-manifest-bytes")
+            .expect("write test manifest file");
+        unsafe {
+            std::env::set_var(var_name, &path);
+        }
+        let package = resolve_qwen_component_from_env_var(var_name).expect("resolves successfully");
+        unsafe {
+            std::env::remove_var(var_name);
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&manifest_path);
+        assert_eq!(package.component_bytes, b"pretend-component-bytes");
+        assert_eq!(package.manifest_bytes, b"pretend-manifest-bytes");
+        assert_eq!(
+            package.source.kind,
+            ComponentDistributionSourceKind::LocalDirectory
+        );
+    }
 }
 
 /// Static guard (Correctif 13 / task group 7): `execute_qwen_graph` used to

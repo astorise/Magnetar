@@ -4856,11 +4856,10 @@ static QWEN_COMPONENT_ARTIFACT: std::sync::OnceLock<ComponentArtifactPackage> =
 /// `magnetar-cli` can call this unconditionally before every generation
 /// request rather than tracking its own "have I registered yet" state.
 /// The pushed bytes still go through the same digest verification every
-/// other loading path already required
-/// ([`QWEN_REAL_COMPONENT_DIGEST`], checked in
-/// `ComponentManager::prepare_distributed_package`): pushing the wrong
-/// bytes fails closed exactly like a missing or corrupted external source
-/// would, it does not bypass trust.
+/// other loading path already required (`QWEN_REAL_COMPONENT_DIGEST`,
+/// checked in `ComponentManager::prepare_distributed_package`): pushing the
+/// wrong bytes fails closed exactly like a missing or corrupted external
+/// source would, it does not bypass trust.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub fn register_qwen_component_artifact(component_bytes: Vec<u8>, manifest_bytes: Vec<u8>) {
     let _ = QWEN_COMPONENT_ARTIFACT.set(ComponentArtifactPackage::new(
@@ -4896,23 +4895,35 @@ fn qwen_real_component_package() -> Result<ComponentArtifactPackage, E2eConforma
     if let Some(package) = QWEN_COMPONENT_ARTIFACT.get() {
         return Ok(package.clone());
     }
-    const COMPONENT_PATH_ENV_VAR: &str = "MAGNETAR_QWEN_COMPONENT_PATH";
-    let component_path = std::env::var(COMPONENT_PATH_ENV_VAR).map_err(|_| {
-        E2eConformanceError::ModelComponentFailed {
+    resolve_qwen_component_from_env_var("MAGNETAR_QWEN_COMPONENT_PATH")
+}
+
+/// The actual local-path resolution logic behind
+/// [`qwen_real_component_package`]'s fallback branch, extracted as its own
+/// testable function taking the env var *name* as a parameter (never
+/// `#[cfg(not(test))]` itself, unlike its one production caller) so tests
+/// can point it at a controlled variable instead of depending on -- or
+/// polluting -- the real process environment. `env_var_name` names the
+/// Component `.wasm` file itself; its manifest is expected alongside it as
+/// `<path>.magnetar-component.yaml`.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn resolve_qwen_component_from_env_var(
+    env_var_name: &str,
+) -> Result<ComponentArtifactPackage, E2eConformanceError> {
+    let component_path =
+        std::env::var(env_var_name).map_err(|_| E2eConformanceError::ModelComponentFailed {
             reason: format!(
                 "no Qwen Component artifact was registered (see \
-                 register_qwen_component_artifact) and {COMPONENT_PATH_ENV_VAR} is not set; \
-                 production first-native generation requires an externally provided Qwen \
-                 Model Component artifact and has no embedded development fixture of its own \
-                 to fall back to"
+                 register_qwen_component_artifact) and {env_var_name} is not set; production \
+                 first-native generation requires an externally provided Qwen Model Component \
+                 artifact and has no embedded development fixture of its own to fall back to"
             ),
-        }
-    })?;
+        })?;
     let component_bytes = std::fs::read(&component_path).map_err(|error| {
         E2eConformanceError::ModelComponentFailed {
             reason: format!(
                 "failed to read Qwen Component bytes from '{component_path}' \
-                 ({COMPONENT_PATH_ENV_VAR}): {error}"
+                 ({env_var_name}): {error}"
             ),
         }
     })?;

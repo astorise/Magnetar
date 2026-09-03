@@ -476,10 +476,37 @@ branch unaffected), `cargo clippy --workspace --all-targets --all-features
 -- -D warnings` clean across both crates, `cargo fmt --check` clean, `cargo
 check --target wasm32-unknown-unknown --all-features` clean (this whole
 branch is already `not(target_arch = "wasm32")`-gated, so wasm32 was never
-affected), `cargo build --workspace` clean. CI run pending against this
-exact commit at the time this note was written; the point of pushing
-early and often through this task was precisely to let CI itself catch
-what local verification could not.
+affected), `cargo build --workspace` clean.
+
+**That push's CI run found three more real, small gaps local verification
+missed, all fixed on this same commit's follow-up:** (1) `cargo doc
+--locked --workspace --no-deps` (`RUSTDOCFLAGS=-D warnings`, a CI job never
+run locally this session) rejected a public doc comment on
+`register_qwen_component_artifact` linking to `QWEN_REAL_COMPONENT_DIGEST`,
+a private item -- fixed by dropping the intra-doc link, keeping the name as
+plain text. (2) The new static guard,
+`qwen_component_production_loader_has_no_embedded_fixture`, panicked on
+`quality / test (windows-latest)` specifically -- it searched
+`include_str!`'d source text for literal `\n`-delimited patterns, and a
+Windows checkout uses CRLF, so the exact byte sequence never appeared;
+fixed by normalizing `\r\n` to `\n` before searching, a bug in the test
+itself, not the code it checked. (3) The coverage ratchet failed narrowly
+(78.87% vs. 78.89%) -- the production-only `not(test)` loader branch is
+structurally untestable by construction (no `#[test]` can ever set
+`cfg(test)` to false), so instead of chasing that specific gap with a
+baseline exception, the actual env-var/file-read logic was extracted into
+`resolve_qwen_component_from_env_var(env_var_name: &str)`, a sibling
+function that is *not* `not(test)`-gated and takes the variable name as a
+parameter precisely so tests can point it at a controlled name instead of
+the real `MAGNETAR_QWEN_COMPONENT_PATH`. Four new tests exercise it
+directly (missing var, unreadable component file, missing manifest file,
+and a full happy path reading real temp files) -- genuine behavioral
+coverage of logic that used to be locked behind an untestable cfg gate, not
+coverage-number chasing. Re-verified after all three fixes: `magnetar-
+runtime` default features (1146 passed, up from 1142), `--no-default-
+features` (1101 passed), `cargo clippy`/`cargo fmt --check`/wasm32 clean
+again, and the coverage ratchet passing outright (78.93%, above the 78.89%
+baseline, not just recovered to it).
 
 - [x] 12.1 Materialize `components/qwen` as a working submodule build (builds on the gitlink already added to `.gitmodules` on this branch). (Done as a side effect of task group 11: `components/qwen` is a real, building, wasm32-compiling Component, not a template.)
 - [x] 12.2 Move the Qwen graph builder out of `magnetar-runtime` into the Component (superseded by task 11.4/11.5 once the contract lands). (Done: 11.5's cutover made the real Component the exclusive production graph source under the strict path; the in-crate Rust builder survives only as a `#[cfg(test)]`-only oracle now, per 12.6.)
