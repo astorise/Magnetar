@@ -2481,7 +2481,13 @@ fn qwen_rope_head_count(
 // strict, default production path gets its graph directly from the real
 // Component instead of cross-checking a Rust-synthesized one against a
 // declared checksum.
-#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
+#[cfg(any(
+    test,
+    all(
+        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
+        feature = "non-strict-fixture-fallback"
+    )
+))]
 fn qwen_operator_kind_code(name: &str) -> Option<u32> {
     match name {
         "embedding" => Some(0),
@@ -2500,7 +2506,13 @@ fn qwen_operator_kind_code(name: &str) -> Option<u32> {
 /// dependency order `execute_qwen_graph` executes it in: the semantic
 /// content a Qwen Model Component is expected to reproduce when describing
 /// its own graph (see `qwen_operator_kind_code`).
-#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
+#[cfg(any(
+    test,
+    all(
+        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
+        feature = "non-strict-fixture-fallback"
+    )
+))]
 fn qwen_graph_operator_codes(graph: &ExecutionGraph) -> Result<Vec<u32>, E2eConformanceError> {
     let order = qwen_graph_execution_order(graph)?;
     order
@@ -2532,7 +2544,13 @@ fn qwen_graph_operator_codes(graph: &ExecutionGraph) -> Result<Vec<u32>, E2eConf
 /// identical unrolled XOR/multiply steps over its own hard-coded sequence)
 /// and Runtime compares hashes -- a proof over the actual ordered semantic
 /// content, not just a count.
-#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
+#[cfg(any(
+    test,
+    all(
+        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
+        feature = "non-strict-fixture-fallback"
+    )
+))]
 fn qwen_operator_sequence_hash(codes: &[u32]) -> u32 {
     const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
     const FNV_PRIME: u32 = 0x0100_0193;
@@ -5085,7 +5103,13 @@ struct QwenComponentPreflight {
 /// `validate_against_graphs` performs genuine semantic comparison against
 /// the Runtime-built graph rather than proving only that the two graphs
 /// happen to be the same size.
-#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
+#[cfg(any(
+    test,
+    all(
+        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
+        feature = "non-strict-fixture-fallback"
+    )
+))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct QwenComponentGraphSemantics {
     prefill_node_count: usize,
@@ -5094,7 +5118,13 @@ struct QwenComponentGraphSemantics {
     decode_operator_hash: u32,
 }
 
-#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
+#[cfg(any(
+    test,
+    all(
+        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
+        feature = "non-strict-fixture-fallback"
+    )
+))]
 impl QwenComponentGraphSemantics {
     fn validate_against_graphs(
         &self,
@@ -5149,7 +5179,13 @@ struct FirstNativeComponentGraphs {
     decode_node_count: usize,
 }
 
-#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
+#[cfg(any(
+    test,
+    all(
+        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
+        feature = "non-strict-fixture-fallback"
+    )
+))]
 fn build_first_native_graphs_from_component_output(
     fixture: &E2eFixture,
     prompt_token_count: u64,
@@ -5604,7 +5640,13 @@ fn prepare_first_native_execution_plans(
 /// one queried across the Component boundary (the non-component fallback
 /// build, and tests not themselves exercising component/graph mismatch
 /// detection).
-#[cfg(any(test, feature = "non-strict-fixture-fallback"))]
+#[cfg(any(
+    test,
+    all(
+        not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")),
+        feature = "non-strict-fixture-fallback"
+    )
+))]
 fn qwen_component_graph_semantics_for_prompt(
     config: &QwenConfig,
     identity: &ModelComponentIdentity,
