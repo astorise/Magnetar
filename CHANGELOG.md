@@ -64,22 +64,22 @@
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
 - Materialization evidence proves a Model Instance's own authorized
-  transaction produced its weight bindings, but does not verify those bytes
-  are bit-identical to the validated Model Artifact's declared tensor
-  content beyond the one existing fixture-specific digest check -- a
-  manifest-level content-digest verification is a deliberately deferred
-  follow-up, not implemented as of `bind-model-loading-evidence-to-
-  validated-artifact`.
-- Architecture Freeze #1 is **accepted** at commit `44ae71e` (2026-09-03, CI
-  run https://github.com/astorise/Magnetar/actions/runs/33797346234, zero
-  non-`success` jobs confirmed via `gh run view --json status,conclusion`
-  and the jobs list directly). The history below is kept in full because
-  each round found something real; the commit and CI run cited in this
-  first sentence are what to trust as current. (This was briefly
-  downgraded to CANDIDATE twice -- once after a sixth audit round found
-  P0-A open, once after a seventh found a narrower P0 in that same fix's
-  own `commit` path -- see this section's final two paragraphs for both
-  fixes and what, if anything, remains open.)
+  transaction produced its weight bindings, but does not yet verify those
+  bytes are bit-identical to the validated Model Artifact's declared tensor
+  content beyond the one existing fixture-specific digest check.
+  **This was round-6's own original P0 finding, not a lower-priority
+  follow-up** -- see this section's history for the correction of an
+  earlier, inaccurate characterization here. A Change implementing
+  manifest-level content-digest verification
+  (`bind-materialized-weight-content-to-model-artifact-digests`) is in
+  progress; this bullet is stale the moment that lands and should be
+  removed then, not left here alongside a closed Change.
+- Architecture Freeze #1 is **CANDIDATE, not yet accepted** -- P0-1
+  (`ModelInstance` semantic-state mutability, an eighth audit round's
+  finding) is fixed and CI-confirmed green at commit `539e723`; P0-2
+  (byte-content provenance, above) is in progress. See this section's
+  history for both. The history below is kept in full because each round
+  found something real.
   (An earlier point in this history was itself briefly declared
   "accepted" at commit `e7dc45d` -- that run's first pass had one failing
   job, `wasmtime component engine`, on a pre-existing test
@@ -351,12 +351,30 @@
   already established) and verified inside the transaction; this touches
   the `model-artifact`/`model-loading` manifest schema, a different
   capability boundary than `model-instance` readiness, and is proposed as
-  its own future Change rather than folded in here. The round-6 audit's
-  own P0 classification was specifically about caller-constructible
-  evidence (closed), not cryptographic content verification (already
-  documented as v0.1-deferred, alongside artifact publisher signing, in
-  this section's Security Notes) -- so this is recorded as a known
-  limitation, not a blocker to the freeze. A seventh audit round (HEAD
+  its own future Change rather than folded in here.
+  **Correction, made when an eighth audit round questioned it directly:**
+  the sentence originally here claimed "the round-6 audit's own P0
+  classification was specifically about caller-constructible evidence,
+  not cryptographic content verification" -- re-reading round-6's actual
+  text (its sections 12-16) shows this was not accurate. Round 6 explicitly
+  treated "Provider weight bytes are not provenance-bound to the validated
+  Model Artifact" as the second half of the *same* P0-A, recommending both
+  halves "be treated as one architectural P0," not as a separate,
+  lower-priority concern. Scoping byte-content provenance out of that
+  Change's actual implementation was this session's own decision (recorded
+  in the Change's own design.md Non-Goals, for real reasons: smaller blast
+  radius, avoiding a second large schema change bundled into an already-
+  large fix), not something round-6 itself endorsed as sufficient on its
+  own. A seventh audit round reviewed that scoping decision and accepted it
+  (classifying the residual as P1); an eighth round revisited the same
+  question and did not accept it, citing round-6's original text -- a
+  legitimate disagreement between two revalidation passes about how much
+  deferral round-6's finding could bear, not a new fact either time. Given
+  this, and given cryptographic byte-content provenance was never actually
+  implemented, it is more honest to say: **byte-content provenance was
+  part of round-6's original P0 and has not yet been closed** -- see the
+  ninth-round paragraph below for the OpenSpec Change now implementing it
+  (`bind-materialized-weight-content-to-model-artifact-digests`). A seventh audit round (HEAD
   `ef0e9e2`), revalidating that exact fix, confirmed every round-6 closure
   held (`LoadedModelContext`/bindings sealing, instance-scoped evidence,
   artifact-id matching, the removed `read_tensor` dependency, the restored
@@ -394,7 +412,55 @@
   (above baseline), `openspec validate --all --strict` 76/76 (unchanged --
   this fix touched no spec text), live `magnetar run qwen-test "Hello"`
   unaffected, and the CI run cited in this note's opening sentence
-  (commit `44ae71e`).
+  (commit `44ae71e`). An eighth audit round (HEAD `44edcad`), a full
+  re-audit, confirmed every round-7 closure held and found two further
+  real gaps -- one genuinely new (P0-1), and one that turned out to be a
+  correction of this document's own prior wording rather than a new code
+  defect (P0-2, addressed above where that correction lives). (P0-1)
+  `ModelInstance.definition` was still a fully public mutable field, so
+  every semantic property of an already-`Ready` instance -- `artifact`,
+  `architecture`, `placement`, `policy`, `tokenizer`,
+  `kernel_selection_policy`, ... -- could be reassigned directly by any
+  external caller, with no immediate invalidation:
+  `acquire_usage`/`generation_reference` only check lifecycle/readiness,
+  never whether the definition still matches what was evidenced. Worse,
+  `ModelInstanceDefinition`'s `#[derive(Clone)]` copies every field --
+  including the already-sealed `resource_bindings` from round 6 -- since
+  `Clone`'s generated code runs with full in-crate access regardless of
+  the caller's own field visibility; a caller could clone an
+  already-`Ready` instance's definition (carrying real weight bindings
+  pointing at live Provider resources) into a *new* instance via
+  `ModelInstanceManager::create` (directly, or through `reload`, which
+  calls `create` internally), then call
+  `materialize_model_instance_weights` with an empty weights map --
+  `commit` minted fresh evidence over the instance's full *current*
+  binding set (inherited from the clone, not staged by this attempt),
+  aliasing a real Provider resource across two distinct
+  `ModelInstanceId`s. This is a resource-ownership break, not only a
+  metadata inconsistency: unloading the new instance would release a
+  resource the original instance still owned. Fixed by sealing
+  `ModelInstance.definition` to `pub(crate)` with a read-only
+  `definition()` accessor (two narrow post-creation methods,
+  `set_provider_resource` and `track_memory_allocation`, cover the only
+  legitimate external mutation needs this crate's own test suite had,
+  neither able to affect readiness, generation, or Provider/Device
+  resolution), and by having `ModelInstanceManager::create` reset
+  `resource_bindings` unconditionally regardless of what the supplied
+  definition carried -- the shared chokepoint both `create` and `reload`
+  go through, so bindings can only ever be populated again by that
+  specific instance's own future `commit` calls. Direct fix against
+  already-correct canonical spec text ("Runtime owns Model Instance",
+  silent semantic mutation forbidden); no new OpenSpec Change needed.
+  Two new tests prove both the `create()` and `reload()` paths are closed
+  at the exact public entrypoints the audit described. Verified: full
+  workspace test suite (1,163 lib tests + 184 `contract_tests`) passing,
+  `cargo clippy`/`cargo fmt --check` clean, `cargo doc` clean, wasm32
+  check clean, coverage ratchet at 78.97% (above baseline), `openspec
+  validate --all --strict` 76/76 (unchanged), live `magnetar run
+  qwen-test "Hello"` unaffected, and CI run
+  https://github.com/astorise/Magnetar/actions/runs/33838701914 (commit
+  `539e723`) confirmed green via `gh run view --json status,conclusion`
+  and the jobs list directly.
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
