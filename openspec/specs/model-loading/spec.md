@@ -843,6 +843,8 @@ Model Loading's weight-materialization phase SHALL be able to construct material
 
 The construction step SHALL depend only on generic Model Artifact types, never on a concrete format parser crate.
 
+When a tensor's inventory entry declares a content digest (see `model-artifact`'s "Tensor Content Digest Binding"), the weight-materialization transaction SHALL verify that the tensor data actually supplied for materialization hashes to that declared digest before admitting or writing it, and SHALL reject the attempt otherwise. A tensor whose inventory entry declares no digest is not subject to this check.
+
 #### Scenario: Materialize from a real Safetensors file
 
 Given a real `.safetensors` file's bytes and its parsed generic tensor inventory
@@ -869,7 +871,29 @@ When both are materialized independently
 
 Then they produce equal tensor data.
 
----
+#### Scenario: Tensor content matching its declared digest is accepted
+
+Given a tensor's inventory entry declares a content digest
+
+When the data supplied for materialization hashes to that declared digest
+
+Then the weight-materialization transaction admits and writes it normally.
+
+#### Scenario: Tensor content not matching its declared digest is rejected
+
+Given a tensor's inventory entry declares a content digest
+
+When the data supplied for materialization does not hash to that declared digest
+
+Then the weight-materialization transaction rejects the attempt before admission or write, and the affected weight resource is not bound to the Model Instance.
+
+#### Scenario: A tensor with no declared digest is unaffected
+
+Given a tensor's inventory entry declares no content digest
+
+When any data is supplied for materialization under that tensor's name
+
+Then the weight-materialization transaction does not reject it on content-digest grounds.
 
 ### Requirement: Weight Resource Completeness Gates Generation And Instance Lifecycle
 

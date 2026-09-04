@@ -63,23 +63,26 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Materialization evidence proves a Model Instance's own authorized
-  transaction produced its weight bindings, but does not yet verify those
-  bytes are bit-identical to the validated Model Artifact's declared tensor
-  content beyond the one existing fixture-specific digest check.
-  **This was round-6's own original P0 finding, not a lower-priority
-  follow-up** -- see this section's history for the correction of an
-  earlier, inaccurate characterization here. A Change implementing
-  manifest-level content-digest verification
-  (`bind-materialized-weight-content-to-model-artifact-digests`) is in
-  progress; this bullet is stale the moment that lands and should be
-  removed then, not left here alongside a closed Change.
-- Architecture Freeze #1 is **CANDIDATE, not yet accepted** -- P0-1
-  (`ModelInstance` semantic-state mutability, an eighth audit round's
-  finding) is fixed and CI-confirmed green at commit `539e723`; P0-2
-  (byte-content provenance, above) is in progress. See this section's
-  history for both. The history below is kept in full because each round
-  found something real.
+- Weight content-digest verification (`bind-materialized-weight-content-
+  to-model-artifact-digests`) covers only the E2E fixture's real, checked-in
+  Safetensors file today, since `formats/gguf`/`formats/safetensors` (the
+  real format-parser submodules) do not yet compute or declare per-tensor
+  digests of their own -- a manifest from either currently produces
+  `digest: None` per tensor (permissive, not rejected). Populating real
+  digests from those parsers is future work in those submodules, not this
+  repository.
+- Architecture Freeze #1 is **accepted** at commit `08f9178` (2026-09-04,
+  CI run https://github.com/astorise/Magnetar/actions/runs/33842405682,
+  zero non-`success` jobs confirmed via `gh run view --json
+  status,conclusion` and the jobs list directly). The history below is
+  kept in full because each round found something real; the commit and
+  CI run cited in this first sentence are what to trust as current. (This
+  was briefly downgraded to CANDIDATE three times -- after a sixth audit
+  round found P0-A open, after a seventh found a narrower P0 in that same
+  fix's own `commit` path, and after an eighth found both a
+  `ModelInstance` semantic-mutability gap and confirmed byte-content
+  provenance was still open -- see this section's history for all three
+  fixes.)
   (An earlier point in this history was itself briefly declared
   "accepted" at commit `e7dc45d` -- that run's first pass had one failing
   job, `wasmtime component engine`, on a pre-existing test
@@ -460,7 +463,62 @@
   qwen-test "Hello"` unaffected, and CI run
   https://github.com/astorise/Magnetar/actions/runs/33838701914 (commit
   `539e723`) confirmed green via `gh run view --json status,conclusion`
-  and the jobs list directly.
+  and the jobs list directly. The same eighth audit round also revisited
+  byte-content provenance (P0-2) and, reading round-6's original text
+  directly, disputed this document's own prior claim that round-6's P0
+  was "specifically about caller-constructible evidence, not
+  cryptographic content verification" -- that characterization is
+  corrected earlier in this history rather than silently rewritten.
+  Closed by `openspec/changes/bind-materialized-weight-content-to-model-
+  artifact-digests`: `ModelTensorMetadata` gains an optional per-tensor
+  content digest field (mirroring the existing whole-artifact/part/shard
+  digest fields), parsed from manifest YAML the same way the
+  artifact-level digest already is; `LoadedModelContext`/
+  `ModelInstanceDefinition` gain `required_weight_digests`, threaded
+  exactly the way `required_weight_names` already is (populated once at
+  `ModelLoadingCoordinator::load()` time, empty means unknown, no
+  signature changes); `WeightMaterializationTransaction::stage_weight`
+  verifies each staged tensor's bytes against its declared digest (via a
+  new `HostTensor::content_bytes()` canonical byte representation)
+  before Memory Manager admission, returning the new
+  `InferenceApiError::WeightContentDigestMismatch` on a mismatch through
+  the existing rollback path. The check is generic (any manifest that
+  declares digests), not fixture-specific -- `formats/gguf`/`formats/
+  safetensors` (confirmed real, but not yet digest-populating, format
+  parsers, unlike `model_format_roadmap.rs`'s still-unimplemented
+  roadmap contracts) need no rework to benefit from it once they compute
+  digests of their own. The E2E fixture's checked-in `.safetensors` file
+  is the one real artifact source populated with real digests today --
+  `e2e_fixture_manifest` now builds its tensor YAML from
+  `e2e_fixture_weight_inventory_with_digests`, computing each digest
+  from the real file's actually-parsed bytes. Two new tests prove the
+  exact entrypoint the gap was in (tampered content rejected with the
+  specific new error; real content still materializes normally); a
+  pre-existing test (`check_weight_byte_change_alters_generated_logits`,
+  proving mutated weight bytes are numerically consumed) needed a
+  digest-free clone of the fixture manifest to keep working, since its
+  own deliberately-mutated bytes would otherwise now be correctly
+  rejected by the new check -- isolating that test's orthogonal concern
+  from this Change's. Shipping this surfaced a real, separate gap in my
+  own initial change-scope check: `ModelTensorMetadata` is also
+  constructed directly by the `formats/gguf` and `formats/safetensors`
+  git submodules (`astorise/Magnetar-format-GGUF`,
+  `astorise/Magnetar-format-safetensors`), which a grep scoped to
+  `magnetar-runtime/` alone did not reach; CI's "format integration" and
+  "submodule integration" jobs caught the resulting missing-field
+  compile error on the first push (commit `61c6061`), fixed in both
+  submodules (each defaulting the new field to `None`, matching its
+  "absent means unknown" semantics) and the main repo's submodule
+  pointers bumped (commit `08f9178`). Verified: full workspace test
+  suite (1,165 lib tests + 184 `contract_tests`) passing, `cargo
+  clippy`/`cargo fmt --check` clean, `cargo doc` clean, wasm32 check
+  clean, coverage ratchet at 79.00% (above baseline), `openspec validate
+  --all --strict` 76/76 (unchanged by the submodule fix), live `magnetar
+  run qwen-test "Hello"` unaffected (confirming the real fixture's real
+  digests match its real materialized bytes in production, not only in
+  tests), each submodule's own test suite passing independently (16/16
+  each), and the CI run cited in this note's opening sentence (commit
+  `08f9178`).
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
