@@ -37,10 +37,10 @@
 - [x] 6.7 Coverage ratchet: 79.01% local (above the 78.89% accepted baseline).
 - [x] 6.8 `openspec validate --all --strict`: 76/76.
 - [x] 6.9 Live `magnetar run qwen-test "Hello"` unaffected: `[generated token ids: 239 239 239 239]`.
-- [ ] 6.10 Push, confirm a full green CI run via `gh run view --json status,conclusion` and the jobs list directly (never a piped `gh run watch`).
+- [x] 6.10 Pushed as `0b353fe`; CI run 33910944204 confirmed green (`status: completed`, `conclusion: success`, 0 non-successful jobs) via direct `gh run view --json`.
 
 ## 7. Close out
 
-- [ ] 7.1 Diff the canonical spec files this Change touches before and after archiving, to confirm the archive-merge did not silently drop anything.
-- [ ] 7.2 Archive this Change.
-- [ ] 7.3 Update `CHANGELOG.md`: round-11's findings closed (or, for the Provider/Device gap, honestly documented); Architecture Freeze #1 status updated.
+- [x] 7.1 Diffed all three touched specs (order-independent requirement-heading comparison plus direct reads of both modified requirement bodies): each gained exactly the one new requirement authored for this Change; both MODIFIED bodies merged with all scenarios intact. No content dropped.
+- [x] 7.2 Archived as `2026-09-04-seal-model-loading-and-instance-creation-primitives`. `openspec validate --all --strict`: 75/75.
+- [x] 7.3 `CHANGELOG.md` updated: round-11's two P0s closed, Provider/Device gap honestly documented as a limitation; Architecture Freeze #1 status updated.

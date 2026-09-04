@@ -77,24 +77,42 @@
   (`seal-runtime-model-trust-and-provenance-authority`) -- this
   limitation is about digest *coverage*, not about whether such tensors
   can be silently forged.
-- Architecture Freeze #1 is **accepted** at commit `045a536` (2026-09-04,
-  CI run https://github.com/astorise/Magnetar/actions/runs/33879062757,
+- Model Instance creation applies a caller-supplied Resource Affinity's
+  provider/device directly as the instance's effective placement whenever
+  the loading phase resolved no provider/device binding for that
+  artifact -- there is no Runtime-side arbitration step at
+  instance-creation time yet (the existing `ResolutionPolicy`/
+  `BuiltInResolutionPolicy` mechanism resolves Capability/Provider
+  candidates at execution time, not instance creation). `Runtime::
+  create_model_instance` still rejects a caller-supplied value that
+  *disagrees* with one the loading phase *did* resolve
+  (`seal-runtime-model-trust-and-provenance-authority`'s architecture/
+  affinity cross-check); this limitation is specifically about the
+  unresolved case, where there is nothing yet to disagree with
+  (`seal-model-loading-and-instance-creation-primitives`).
+- Architecture Freeze #1 is **accepted** at commit `0b353fe` (2026-09-04,
+  CI run https://github.com/astorise/Magnetar/actions/runs/33910944204,
   zero non-`success` jobs confirmed via `gh run view --json
   status,conclusion` and the jobs list directly). The history below is
   kept in full because each round found something real; the commit and
   CI run cited in this first sentence are what to trust as current. (This
-  was briefly downgraded to CANDIDATE five times -- after a sixth audit
+  was briefly downgraded to CANDIDATE six times -- after a sixth audit
   round found P0-A open, after a seventh found a narrower P0 in that same
   fix's own `commit` path, after an eighth found both a `ModelInstance`
   semantic-mutability gap and confirmed byte-content provenance was still
   open, after a ninth found `ModelTrustDecision` forgeable, a further
   `ModelInstanceDefinition` clone-identity gap, and that the real format
-  parsers still produced no per-tensor digests at all, and after a tenth
-  found `ModelTrustStore` itself freely constructible, `create_model_
-  instance` never cross-checking caller-supplied architecture/affinity
-  against the loading phase's own resolved plan, and weight materialization
-  never checking declared shape/dtype independent of digest presence --
-  see this section's history for all five fixes.)
+  parsers still produced no per-tensor digests at all, after a tenth found
+  `ModelTrustStore` itself freely constructible, `create_model_instance`
+  never cross-checking caller-supplied architecture/affinity against the
+  loading phase's own resolved plan, and weight materialization never
+  checking declared shape/dtype independent of digest presence, and after
+  an eleventh found that round 10's two seals held only on the facades
+  they touched -- the primitives underneath (`ModelLoadingCoordinator::
+  load`, `ModelInstanceDefinition::from_loaded_context`/
+  `ModelInstanceManager::create`) stayed `pub` -- and a real
+  self-contradiction round 10 had introduced between two canonical specs
+  -- see this section's history for all six fixes.)
   (An earlier point in this history was itself briefly declared
   "accepted" at commit `e7dc45d` -- that run's first pass had one failing
   job, `wasmtime component engine`, on a pre-existing test
@@ -649,6 +667,64 @@
   before archiving (75/75 canonical after), live `magnetar run qwen-test
   "Hello"` unaffected, and the CI run cited in this section's opening
   sentence (commit `045a536`).
+  An eleventh audit round (commit `83a5d92`) found both of round 10's
+  seals held only on the facades they touched, not the primitives
+  underneath: `ModelLoadingCoordinator::load` remained `pub` and still
+  accepted a caller-constructed `ModelTrustDecision` directly -- a caller
+  could build their own `ModelTrustStore`, evaluate it (legitimately, not
+  forged -- `ModelTrustStore::evaluate` stays public), and load an
+  artifact a `Runtime`'s own sealed policy would reject, entirely without
+  touching `Runtime`. Likewise `ModelInstanceDefinition::
+  from_loaded_context` and `ModelInstanceManager::create` remained `pub`,
+  reachable via `Runtime::model_instances_mut()`, bypassing `Runtime::
+  create_model_instance`'s architecture/affinity cross-checks entirely.
+  Neither was hypothetical: `magnetar-runtime/tests/contract_tests/`,
+  compiled and run as a separate crate against `magnetar_runtime`'s
+  public API -- the same vantage point a real embedder has -- already
+  used both. Fixed: both primitives sealed to `pub(crate)`, plus
+  `ModelInstanceManager::create_checked` (found only during
+  implementation -- a second, equally public path to the identical
+  bypass the audit had not named; confirmed zero non-test callers
+  anywhere before sealing, now `#[cfg(test)]`-gated as genuinely
+  test-only). Confirmed by inspection before sealing: zero non-test
+  caller anywhere in the crate (`magnetar-cli`, `formats/gguf`,
+  `formats/safetensors`) used either primitive directly. 28 break sites
+  surfaced across `contract_tests/model_instance.rs` (more than
+  initially estimated) plus 5 in `contract_tests/model_loading.rs`: ~18
+  migrated in place to the real public entrypoints (`Runtime::
+  create_model_instance`, `magnetar_runtime::load_model`); 11 tests that
+  genuinely exercise the sealed primitives' own contract (definition
+  clone/reset-on-create, `create_checked`'s checks validation, pre-create
+  field injection `Runtime::create_model_instance` has no parameter to
+  express) relocated into `magnetar-runtime/src/tests.rs`, where
+  `pub(crate)` access still applies -- net test count unchanged, moved
+  rather than lost. The same round found a real self-contradiction round
+  10 had introduced: `model-instance`'s new requirement blessed an
+  unresolved Provider/Device field as "the caller's legitimate choice,
+  SHALL NOT be constrained," while `inference-api`'s pre-existing
+  requirement says "Runtime SHALL own Provider and Device selection" --
+  and in real code, `ModelInstancePlacement::new` does copy the caller's
+  affinity straight into effective placement whenever the loading phase
+  resolved nothing, with no Runtime-side arbitration step (the existing
+  `ResolutionPolicy`/`BuiltInResolutionPolicy` mechanism resolves
+  Capability/Provider candidates at execution time, not instance
+  creation). Given the choice between building that resolution mechanism
+  now or documenting the gap honestly, the user chose the latter: both
+  specs now describe this as a known limitation -- caller preference
+  becomes authoritative placement directly when nothing else resolved it
+  first -- cross-referencing each other, rather than one over-claiming
+  what the other's implementation does not yet do. Tracked as
+  `seal-model-loading-and-instance-creation-primitives`, archived at
+  `2026-09-04-seal-model-loading-and-instance-creation-primitives`.
+  Verified: full workspace test suite (64 + 1,182 lib tests [+11
+  relocated, net unchanged] + 173 `contract_tests` [-11 relocated])
+  passing, `cargo clippy`/`cargo fmt --check` clean, `cargo doc` clean
+  after fixing one private-intra-doc-link (`load_model`'s doc comment
+  referenced the now-private `ModelLoadingCoordinator::load`), wasm32
+  check clean, coverage ratchet at 79.01% (above baseline), `openspec
+  validate --all --strict` 76/76 before archiving (75/75 canonical
+  after), live `magnetar run qwen-test "Hello"` unaffected, and the CI
+  run cited in this section's opening sentence (commit `0b353fe`).
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
