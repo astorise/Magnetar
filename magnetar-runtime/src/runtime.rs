@@ -35,6 +35,7 @@ use crate::memory::{
     MemoryAllocationOwner, MemoryAllocationRequest, MemoryAllocationState, MemoryManager,
     MemoryManagerConfig, MemoryPlacement,
 };
+use crate::model::ModelTrustStore;
 use crate::model_instance::{
     ModelInstance, ModelInstanceDefinition, ModelInstanceError, ModelInstanceId,
     ModelInstanceManager, ModelInstanceStatus, ModelInstanceUnloadPolicy,
@@ -170,6 +171,7 @@ pub struct RuntimeBuilder {
     config: RuntimeConfig,
     providers: Vec<Arc<dyn Provider>>,
     model_execution_engine: Option<SharedRuntimeModelExecutionEngine>,
+    trust: ModelTrustStore,
 }
 impl RuntimeBuilder {
     pub fn new() -> Self {
@@ -181,6 +183,16 @@ impl RuntimeBuilder {
     }
     pub fn register_provider(mut self, x: Arc<dyn Provider>) -> Self {
         self.providers.push(x);
+        self
+    }
+    /// The Model Artifact trust policy this Runtime evaluates every
+    /// `load_model` call against. Set once, here, before the Runtime a
+    /// caller receives exists -- there is no way to replace it afterward
+    /// (`seal-runtime-model-trust-and-provenance-authority`'s "Runtime-Sealed
+    /// Trust Configuration" requirement). Unset defaults to
+    /// [`ModelTrustStore::default`], which trusts nothing.
+    pub fn trust_store(mut self, x: ModelTrustStore) -> Self {
+        self.trust = x;
         self
     }
     pub(crate) fn model_execution_engine(
@@ -257,6 +269,7 @@ impl RuntimeBuilder {
             dropped_session_observations: 0,
             startup_diagnostics,
             initialized: true,
+            trust: self.trust,
         }
     }
 }
@@ -275,6 +288,10 @@ pub struct Runtime {
     dropped_session_observations: u64,
     startup_diagnostics: Vec<RuntimeDiagnostic>,
     initialized: bool,
+    /// Sealed at build time by [`RuntimeBuilder::trust_store`]; no public
+    /// accessor returns an owned or mutable copy, so nothing downstream of
+    /// construction can substitute a different trust policy for a load.
+    trust: ModelTrustStore,
 }
 impl Runtime {
     pub fn builder() -> RuntimeBuilder {
@@ -338,6 +355,12 @@ impl Runtime {
     }
     pub(crate) fn model_execution_engine(&self) -> Option<&SharedRuntimeModelExecutionEngine> {
         self.model_execution_engine.as_ref()
+    }
+    /// The Model Artifact trust policy this Runtime was built with. Crate
+    /// internal: `load_model`/`load_model_observed` use this to evaluate
+    /// trust themselves rather than accepting a caller-supplied decision.
+    pub(crate) fn trust_store(&self) -> &ModelTrustStore {
+        &self.trust
     }
     pub fn sessions(&self) -> impl Iterator<Item = &InferenceSession> {
         self.sessions.values()
@@ -581,6 +604,30 @@ impl Runtime {
         architecture: ModelArchitectureImplementation,
         affinity: ResourceAffinity,
     ) -> Result<ModelInstanceId, ModelInstanceError> {
+        if architecture.architecture != loaded.plan().architecture {
+            return Err(ModelInstanceError::ArchitectureMismatch {
+                expected: loaded.plan().architecture.clone(),
+                actual: architecture.architecture.clone(),
+            });
+        }
+        if let Some(expected_provider) = loaded.plan().provider_binding.as_ref()
+            && affinity.provider() != Some(expected_provider)
+        {
+            return Err(ModelInstanceError::AffinityMismatch {
+                reason: format!(
+                    "affinity provider disagrees with the loading phase's resolved provider binding '{expected_provider:?}'"
+                ),
+            });
+        }
+        if let Some(expected_device) = loaded.plan().device_binding.as_ref()
+            && affinity.device() != Some(expected_device)
+        {
+            return Err(ModelInstanceError::AffinityMismatch {
+                reason: format!(
+                    "affinity device disagrees with the loading phase's resolved device binding '{expected_device:?}'"
+                ),
+            });
+        }
         let definition =
             ModelInstanceDefinition::from_loaded_context(loaded, architecture, affinity);
         self.model_instances.create(definition)

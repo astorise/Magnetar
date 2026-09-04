@@ -4399,6 +4399,26 @@ fn build_runtime() -> Runtime {
     runtime
 }
 
+/// Same as [`build_runtime`], but the Runtime's sealed trust configuration
+/// (`seal-runtime-model-trust-and-provenance-authority`) trusts `fixture`'s
+/// manifest digest -- for the many E2E tests that go on to actually load
+/// `fixture` through it via [`load_fixture_instance`] or
+/// [`load_fixture_instance_with_weights`]. Tests that only inspect Runtime
+/// state without loading anything (kernel registry advertisement checks,
+/// for instance) use [`build_runtime`] directly instead, since they have no
+/// fixture to trust.
+fn build_runtime_trusting_fixture(fixture: &E2eFixture) -> Runtime {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
+        .build()
+        .expect("Reference CPU provider registers cleanly");
+    register_reference_cpu_prepared_kernels(&mut runtime);
+    runtime
+}
+
 fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
     let mut runtime = Runtime::builder()
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
@@ -4409,6 +4429,9 @@ fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
             #[cfg(test)]
             forced_token: None,
         }))
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
         .build()
         .expect("Reference CPU provider registers cleanly");
     register_reference_cpu_prepared_kernels(&mut runtime);
@@ -4428,6 +4451,9 @@ fn build_runtime_with_model_execution_engine_and_forced_token(
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             forced_token,
         }))
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
         .build()
         .expect("Reference CPU provider registers cleanly");
     register_reference_cpu_prepared_kernels(&mut runtime);
@@ -4484,10 +4510,9 @@ fn load_fixture_instance(
     request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
     let loaded = load_model(
         &mut coordinator,
-        runtime.memory_mut(),
+        runtime,
         ModelLoadingApiRequest::new(request),
         &fixture.manifest,
-        &ModelTrustDecision::new(ModelTrustStatus::Trusted, "trusted E2E fixture"),
     )?;
     let instance = create_model_instance(
         runtime,
@@ -4550,6 +4575,9 @@ fn check_weight_materialization_failure_never_reaches_ready(
             },
             ..RuntimeConfig::default()
         })
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
         .build()
         .map_err(|error| E2eConformanceError::SuiteUnavailable {
             reason: error.to_string(),
@@ -4565,10 +4593,9 @@ fn check_weight_materialization_failure_never_reaches_ready(
     request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
     let loaded = load_model(
         &mut coordinator,
-        runtime.memory_mut(),
+        &mut runtime,
         ModelLoadingApiRequest::new(request),
         &fixture.manifest,
-        &ModelTrustDecision::new(ModelTrustStatus::Trusted, "trusted E2E fixture"),
     )?;
     let instance = create_model_instance(
         &mut runtime,
@@ -4849,9 +4876,33 @@ impl WeightMaterializationTransaction {
         name: &str,
         tensor: &HostTensor,
     ) -> Result<(), InferenceApiError> {
-        // Content verification precedes even Memory Manager admission: if
-        // the loaded artifact declared a content digest for this tensor
-        // name, the bytes supplied here must match it before anything is
+        // Shape/dtype agreement precedes even the content digest check:
+        // a tensor the artifact declares quantized has no digest (digests
+        // are F32-only, mirroring `host_tensors_from_artifact_bytes`'s own
+        // materialization limit), so without this check a caller could
+        // fabricate F32 content under a quantized tensor's name and have
+        // nothing reject it. This applies to every tensor with a declared
+        // shape, independent of whether that tensor also has a declared
+        // digest -- the two checks guard different things
+        // (`seal-runtime-model-trust-and-provenance-authority`).
+        if let Some((expected_shape, expected_dtype)) = runtime
+            .model_instance(instance)
+            .map_err(InferenceApiError::from)?
+            .definition()
+            .required_weight_shapes
+            .get(name)
+            .cloned()
+            && (tensor.shape != expected_shape || expected_dtype != ModelDType::F32)
+        {
+            return Err(InferenceApiError::WeightShapeOrDtypeMismatch {
+                reason: format!(
+                    "weight resource '{name}' declared shape {expected_shape:?} and dtype {expected_dtype:?}, which this Runtime can only materialize as F32 content matching that shape"
+                ),
+            });
+        }
+        // Content verification precedes Memory Manager admission: if the
+        // loaded artifact declared a content digest for this tensor name,
+        // the bytes supplied here must match it before anything is
         // admitted or written. A caller with legitimate access to this
         // transaction (the one authorized path to bind a weight) can still
         // supply the *wrong* bytes under the *right* name -- this check is
@@ -6798,7 +6849,7 @@ fn record_operator_dispatch(
 }
 
 fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let provider: Arc<dyn ProviderExecutionApi> = Arc::new(ReferenceCpuExecutor::new());
     let mut node_events = Vec::new();
     let mut dispatch_ctx = QwenDispatchContext {
@@ -7312,7 +7363,7 @@ fn check_sampling_greedy_deterministic() -> Result<(), E2eConformanceError> {
 fn check_closed_session_rejects_generation(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let session_request = SessionCreationRequest {
         model: GenerationModelReference::ModelInstance(instance),
@@ -7344,7 +7395,7 @@ fn check_closed_session_rejects_generation(
 fn check_first_native_generation_requires_ready_model_instance(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     suspend_model_instance(
         &mut runtime,
@@ -7385,7 +7436,7 @@ fn check_missing_prepared_plan_fails_closed() -> Result<(), E2eConformanceError>
 fn check_invalidated_prepared_plan_rejects_new_work(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let graphs = build_first_native_graphs_from_component_output(
         fixture,
@@ -7412,7 +7463,7 @@ fn check_invalidated_prepared_plan_rejects_new_work(
 fn check_stale_plan_outside_policy_fails_closed(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let graphs = build_first_native_graphs_from_component_output(
         fixture,
@@ -7441,7 +7492,7 @@ fn check_stale_plan_outside_policy_fails_closed(
 fn check_qwen_graph_nodes_have_prepared_kernel_bindings(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let graphs = build_first_native_graphs_from_component_output(
         fixture,
@@ -7506,7 +7557,7 @@ fn check_qwen_graph_nodes_have_prepared_kernel_bindings(
 fn check_graph_dispatch_rejects_unregistered_provider(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
     let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
@@ -7549,7 +7600,7 @@ fn check_graph_dispatch_rejects_unregistered_provider(
 fn check_graph_dispatch_uses_registered_provider_instance(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
     let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
@@ -7603,7 +7654,7 @@ fn check_graph_dispatch_uses_registered_provider_instance(
 fn check_graph_dispatch_accounts_outputs_through_runtime_memory_manager(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
     let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
@@ -7646,7 +7697,7 @@ fn check_graph_dispatch_accounts_outputs_through_runtime_memory_manager(
 fn check_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
     let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
@@ -7696,7 +7747,7 @@ fn check_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage(
 fn check_graph_dispatch_releases_workspace_after_use(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
     // This fixture's one layer includes an `attention` node, the only
@@ -7756,6 +7807,9 @@ fn check_graph_dispatch_records_memory_feasibility_failure_under_tight_budget(
             },
             ..RuntimeConfig::default()
         })
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
         .build()
         .map_err(|error| E2eConformanceError::SuiteUnavailable {
             reason: error.to_string(),
@@ -7803,7 +7857,7 @@ fn check_graph_dispatch_records_memory_feasibility_failure_under_tight_budget(
 fn check_weight_binding_rejects_tampered_artifact_bytes(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let mut tampered = fixture.clone();
     let (_name, tensor) =
         tampered
@@ -7846,10 +7900,9 @@ fn load_fixture_instance_with_weights(
     request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
     let loaded = load_model(
         &mut coordinator,
-        runtime.memory_mut(),
+        runtime,
         ModelLoadingApiRequest::new(request),
         &fixture.manifest,
-        &ModelTrustDecision::new(ModelTrustStatus::Trusted, "trusted E2E fixture"),
     )?;
     let instance = create_model_instance(
         runtime,
@@ -7881,7 +7934,7 @@ fn load_fixture_instance_with_weights(
 fn check_materialize_model_instance_weights_rejects_content_digest_mismatch(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let mut tampered_weights = fixture.weights.clone();
     let (_name, tensor) =
         tampered_weights
@@ -7915,7 +7968,7 @@ fn check_materialize_model_instance_weights_rejects_content_digest_mismatch(
 fn check_materialize_model_instance_weights_accepts_matching_content(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let real_weights = e2e_fixture_weights_from_real_artifact(&fixture.config)?;
     load_fixture_instance_with_weights(fixture, &mut runtime, &real_weights)?;
     Ok(())
@@ -7931,7 +7984,7 @@ fn forward_logits_with_weights(
     weights: &BTreeMap<String, HostTensor>,
     prompt: &[TokenId],
 ) -> Result<Vec<f32>, E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let instance = load_fixture_instance_with_weights(fixture, &mut runtime, weights)?;
     let mut plans =
         first_native_plans_for_prompt(&runtime, fixture, &instance, prompt.len() as u64)?;
@@ -8015,7 +8068,7 @@ fn check_weight_byte_change_alters_generated_logits(
 fn check_graph_execution_fails_closed_on_missing_weight(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     // Loading bound every declared weight successfully (digest verified);
     // removing one binding afterward -- without touching the fixture or its
@@ -8064,7 +8117,7 @@ fn check_graph_execution_fails_closed_on_missing_weight(
 fn check_weight_resources_are_isolated_per_model_instance(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (first, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let (second, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     if first == second {
@@ -8113,7 +8166,7 @@ fn check_weight_resources_are_isolated_per_model_instance(
 fn check_unload_releases_weight_resource_allocations(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let allocation_ids: Vec<_> = runtime
         .model_instance(&instance)
@@ -8209,7 +8262,7 @@ fn check_repeated_load_unload_does_not_accumulate_weight_storage(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
     const CYCLES: usize = 10;
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     for cycle in 0..CYCLES {
         let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
         let weight_resource_ids: Vec<TensorResourceId> = runtime
@@ -8517,7 +8570,7 @@ fn check_kv_cache_diagnostics_redacted() -> Result<(), E2eConformanceError> {
 fn check_incremental_decode_matches_full_sequence_oracle(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let prompt = vec![1, 2];
     let admitted = 3;
@@ -8605,7 +8658,7 @@ fn check_incremental_decode_matches_full_sequence_oracle(
 fn check_graph_executor_matches_full_sequence_oracle(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let prompt = vec![1, 2];
     let admitted = 3;
@@ -8787,7 +8840,7 @@ fn graph_prefill_setup(
     ),
     E2eConformanceError,
 > {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let prompt = [1, 2];
     let plans = first_native_plans_for_prompt(&runtime, fixture, &instance, prompt.len() as u64)?;
@@ -9362,7 +9415,7 @@ fn check_generation_loop_executes_published_plan_bindings(
 fn check_incremental_decode_rejects_missing_layer_kv(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
     let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
     let kv_state = FirstNativeExecutionKvState {

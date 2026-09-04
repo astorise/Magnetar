@@ -1505,7 +1505,7 @@ fn e2e_tensor_output_updates_readiness_without_raw_pointer() {
 #[test]
 fn e2e_resource_cleanup_after_generation_and_session_close() {
     let fixture = e2e_fixture().expect("fixture builds");
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
     let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).expect("loads");
     let report = unload_model_instance(
         &mut runtime,
@@ -1751,7 +1751,7 @@ fn e2e_fixture_tokenizer_streams_decode_across_multiple_chunks() {
 #[test]
 fn e2e_one_shot_session_uses_normal_model_instance_and_tokenizer_path() {
     let fixture = e2e_fixture().expect("fixture builds");
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
     let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).expect("loads");
     let session_request = SessionCreationRequest {
         model: GenerationModelReference::ModelInstance(instance),

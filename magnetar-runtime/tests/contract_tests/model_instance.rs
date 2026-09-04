@@ -47,7 +47,7 @@ artifacts:
 tensors:
   - name: transformer.wte.weight
     shape: [4, 8]
-    storage_dtype: bf16
+    storage_dtype: f32
 "#,
         digest(),
         digest(),
@@ -141,9 +141,13 @@ fn bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId) {
             ))
             .unwrap();
     }
+    // Shape must match `manifest()`'s declared `[4, 8]` -- this crate now
+    // enforces that materialized content agrees with declared shape/dtype
+    // independent of digest presence
+    // (`seal-runtime-model-trust-and-provenance-authority`).
     let weights = std::collections::BTreeMap::from([(
         "transformer.wte.weight".to_string(),
-        magnetar_runtime::HostTensor::new([1], [0.0]).unwrap(),
+        magnetar_runtime::HostTensor::new([4, 8], vec![0.0; 32]).unwrap(),
     )]);
     magnetar_runtime::materialize_model_instance_weights(runtime, id, "test", &weights).unwrap();
 }

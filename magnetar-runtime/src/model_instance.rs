@@ -10,10 +10,11 @@
 use crate::{
     AdapterSetId, CorrelationId, DeviceBinding, GenerationModelReference, InferenceSessionId,
     KernelAutotuningPolicy, KernelId, KernelPerformanceFeedbackMode, KvCacheId, LoadedModelContext,
-    MemoryAllocationId, MemoryPressureLevel, ModelArchitectureImplementation, ModelArtifactId,
-    ModelDType, ModelDigest, ModelResidencyId, PrefixCacheEntryId, ProviderAdmissionDecision,
-    ProviderBinding, ProviderHealthState, ProviderPressureLevel, ProviderReadinessState,
-    ResourceAffinity, TensorResourceId, TokenizerId, reproducible_mode_blocks_adaptation,
+    MemoryAllocationId, MemoryPressureLevel, ModelArchitecture, ModelArchitectureImplementation,
+    ModelArtifactId, ModelDType, ModelDigest, ModelResidencyId, PrefixCacheEntryId,
+    ProviderAdmissionDecision, ProviderBinding, ProviderHealthState, ProviderPressureLevel,
+    ProviderReadinessState, ResourceAffinity, TensorResourceId, TokenizerId,
+    reproducible_mode_blocks_adaptation,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -645,6 +646,15 @@ pub struct ModelInstanceDefinition {
     /// verification, not treated as having empty/zero content
     /// (`bind-materialized-weight-content-to-model-artifact-digests`).
     pub(crate) required_weight_digests: BTreeMap<String, ModelDigest>,
+    /// Declared `(shape, storage_dtype)` per tensor name the loaded
+    /// `ModelManifest` declared, carried from
+    /// `LoadedModelContext::required_weight_shapes`. `pub(crate)` for the
+    /// same reason as `required_weight_digests`. Checked independently of
+    /// digest presence: a tensor with no declared digest (for example
+    /// because its dtype cannot yet be digested) is still constrained to
+    /// materialize as its declared shape and dtype
+    /// (`seal-runtime-model-trust-and-provenance-authority`).
+    pub(crate) required_weight_shapes: BTreeMap<String, (Vec<u64>, ModelDType)>,
 }
 
 impl ModelInstanceDefinition {
@@ -674,6 +684,7 @@ impl ModelInstanceDefinition {
             kernel_selection_policy: None,
             required_weight_names: context.required_weight_names.clone(),
             required_weight_digests: context.required_weight_digests.clone(),
+            required_weight_shapes: context.required_weight_shapes.clone(),
         }
     }
 }
@@ -1767,6 +1778,19 @@ pub enum ModelInstanceError {
         from: ModelInstanceLifecycleState,
         to: ModelInstanceLifecycleState,
     },
+    /// The caller-supplied architecture implementation's architecture
+    /// identity disagrees with the one the loading phase already resolved
+    /// for this artifact (`seal-runtime-model-trust-and-provenance-authority`).
+    ArchitectureMismatch {
+        expected: ModelArchitecture,
+        actual: ModelArchitecture,
+    },
+    /// The caller-supplied Resource Affinity names a provider or device
+    /// that disagrees with one the loading phase already resolved for this
+    /// artifact (`seal-runtime-model-trust-and-provenance-authority`).
+    AffinityMismatch {
+        reason: String,
+    },
     InternalModelInstance {
         reason: String,
     },
@@ -1831,6 +1855,15 @@ impl fmt::Display for ModelInstanceError {
                     f,
                     "invalid model instance transition from {from:?} to {to:?}"
                 )
+            }
+            Self::ArchitectureMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "model instance architecture {actual:?} disagrees with the loaded artifact's resolved architecture {expected:?}"
+                )
+            }
+            Self::AffinityMismatch { reason } => {
+                write!(f, "model instance affinity mismatch: {reason}")
             }
             Self::InternalModelInstance { reason } => {
                 write!(f, "internal model instance: {reason}")

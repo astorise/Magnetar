@@ -8894,6 +8894,7 @@ fn model_instance_definition() -> ModelInstanceDefinition {
         kernel_selection_policy: None,
         required_weight_names: BTreeSet::new(),
         required_weight_digests: BTreeMap::new(),
+        required_weight_shapes: BTreeMap::new(),
     }
 }
 
@@ -9933,9 +9934,11 @@ fn inference_api_warm_model_instance_rejects_provider_that_rejects_new_work() {
 
 #[test]
 fn inference_api_create_model_instance_observed_emits_model_instance_selected() {
-    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
     let manifest = minimal_model_manifest();
-    let trust = ModelTrustDecision::new(ModelTrustStatus::Trusted, "test fixture");
+    let mut load_runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
     let mut coordinator = ModelLoadingCoordinator::new();
     coordinator.register_architecture(ModelArchitectureImplementation {
         architecture: manifest.architecture.clone(),
@@ -9945,10 +9948,9 @@ fn inference_api_create_model_instance_observed_emits_model_instance_selected() 
     let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
     let loaded = load_model(
         &mut coordinator,
-        &mut memory,
+        &mut load_runtime,
         ModelLoadingApiRequest::new(core),
         &manifest,
-        &trust,
     )
     .unwrap();
 
@@ -10023,8 +10025,10 @@ fn inference_api_load_model_wires_coordinator_and_memory_manager() {
         kind: ModelArchitectureImplementationKind::TestFixture,
         required_capabilities: Vec::new(),
     });
-    let trust = ModelTrustDecision::new(ModelTrustStatus::Trusted, "test fixture");
-    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+    let mut runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
 
     let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
     let mut request = ModelLoadingApiRequest::new(core);
@@ -10040,7 +10044,7 @@ fn inference_api_load_model_wires_coordinator_and_memory_manager() {
     request.layout_policy = Some(TensorLayoutKind::Contiguous);
     request.provider_preferences = vec![ProviderBinding::new("reference-cpu")];
 
-    let loaded = load_model(&mut coordinator, &mut memory, request, &manifest, &trust).unwrap();
+    let loaded = load_model(&mut coordinator, &mut runtime, request, &manifest).unwrap();
     assert_eq!(loaded.artifact, manifest.id);
     assert_eq!(loaded.state, ModelLoadingState::Ready);
 }
@@ -10054,17 +10058,18 @@ fn inference_api_load_model_observed_emits_loading_lifecycle_observations() {
         kind: ModelArchitectureImplementationKind::TestFixture,
         required_capabilities: Vec::new(),
     });
-    let trust = ModelTrustDecision::new(ModelTrustStatus::Trusted, "test fixture");
-    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+    let mut runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
     let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
     let mut observer = InferenceApiObserver::new();
 
     load_model_observed(
         &mut coordinator,
-        &mut memory,
+        &mut runtime,
         ModelLoadingApiRequest::new(core),
         &manifest,
-        &trust,
         &mut observer,
     )
     .unwrap();
@@ -10076,6 +10081,324 @@ fn inference_api_load_model_observed_emits_loading_lifecycle_observations() {
         .collect();
     assert!(kinds.contains(&InferenceApiObservationKind::ModelLoadingRequested));
     assert!(kinds.contains(&InferenceApiObservationKind::ModelLoaded));
+}
+
+/// `seal-runtime-model-trust-and-provenance-authority` P0-A: `load_model`
+/// no longer accepts a caller-supplied trust decision at all -- trust is
+/// evaluated from the performing `Runtime`'s own sealed configuration. A
+/// `Runtime` built without trusting this manifest's digest must reject the
+/// load, proving there is no parameter through which a caller could still
+/// supply a favorable decision for an untrusted artifact.
+#[test]
+fn inference_api_load_model_rejects_when_runtime_trust_store_does_not_trust_digest() {
+    let manifest = minimal_model_manifest();
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    // Sealed with an empty trust store -- trusts nothing, matching
+    // `RuntimeBuilder::trust_store`'s documented default.
+    let mut runtime = Runtime::builder().build().unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+
+    let error = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("ModelArtifactUntrusted"));
+}
+
+/// P0-B: `create_model_instance` cross-checks the caller-supplied
+/// architecture against `loaded.plan().architecture`, which the loading
+/// phase already resolved from the same manifest -- a disagreement is
+/// rejected rather than silently accepted.
+#[test]
+fn runtime_create_model_instance_rejects_architecture_disagreeing_with_resolved_plan() {
+    let manifest = minimal_model_manifest();
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+
+    let disagreeing_architecture = ModelArchitectureImplementation {
+        architecture: ModelArchitecture::new("a-different-family", "a-different-identifier"),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    };
+    let error = runtime
+        .create_model_instance(
+            &loaded,
+            disagreeing_architecture,
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ModelInstanceError::ArchitectureMismatch { .. }
+    ));
+
+    // Agreeing architecture is unaffected.
+    runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+}
+
+/// P0-B: when the loading phase *did* resolve a provider binding for the
+/// plan, a caller-supplied affinity naming a different provider is
+/// rejected. Nothing in today's real loading pipeline resolves
+/// `plan.provider_binding` yet (confirmed by inspection: it is
+/// unconditionally `None` at construction), so this forces the scenario
+/// directly on the loaded plan rather than only exercising the
+/// permissive "unresolved" branch every other test already covers.
+#[test]
+fn runtime_create_model_instance_rejects_affinity_disagreeing_with_resolved_provider_binding() {
+    let manifest = minimal_model_manifest();
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let mut loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+    loaded.plan.provider_binding = Some(ProviderBinding::new("resolved-provider"));
+
+    let disagreeing_affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new("a-different-provider"));
+    let error = runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            disagreeing_affinity,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ModelInstanceError::AffinityMismatch { .. }));
+
+    let agreeing_affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new("resolved-provider"));
+    runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            agreeing_affinity,
+        )
+        .unwrap();
+}
+
+fn manifest_with_one_tensor(shape: Vec<u64>, storage_dtype: ModelDType) -> ModelManifest {
+    ModelManifest {
+        tensors: vec![ModelTensorMetadata {
+            name: "the-only-tensor".into(),
+            shape,
+            storage_dtype,
+            layout: None,
+            shard: None,
+            offset_bytes: None,
+            size_bytes: None,
+            quantization: None,
+            expected_compute_dtype: None,
+            digest: None,
+        }],
+        ..minimal_model_manifest()
+    }
+}
+
+/// P0-C: `materialize_model_instance_weights` rejects content whose shape
+/// disagrees with the manifest's declared shape for that tensor name, even
+/// though this tensor has no content digest (permissive elsewhere, but not
+/// for shape/dtype agreement).
+#[test]
+fn materialize_model_instance_weights_rejects_shape_mismatch() {
+    let manifest = manifest_with_one_tensor(vec![2, 2], ModelDType::F32);
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+
+    let wrong_shape_weights = BTreeMap::from([(
+        "the-only-tensor".to_string(),
+        HostTensor::new([3], vec![0.0, 0.0, 0.0]).unwrap(),
+    )]);
+    let error =
+        materialize_model_instance_weights(&mut runtime, &instance, "test", &wrong_shape_weights)
+            .unwrap_err();
+    assert!(matches!(
+        error,
+        InferenceApiError::WeightShapeOrDtypeMismatch { .. }
+    ));
+}
+
+/// P0-C: a tensor the manifest declares with a non-F32 storage dtype is
+/// rejected even when the caller supplies well-formed, correctly-shaped
+/// content -- this Runtime cannot legitimately materialize that tensor as
+/// F32 at all, regardless of digest presence.
+#[test]
+fn materialize_model_instance_weights_rejects_non_f32_declared_dtype() {
+    let manifest = manifest_with_one_tensor(vec![2, 2], ModelDType::Bf16);
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+
+    let well_formed_f32_weights = BTreeMap::from([(
+        "the-only-tensor".to_string(),
+        HostTensor::new([2, 2], vec![0.0, 0.0, 0.0, 0.0]).unwrap(),
+    )]);
+    let error = materialize_model_instance_weights(
+        &mut runtime,
+        &instance,
+        "test",
+        &well_formed_f32_weights,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        InferenceApiError::WeightShapeOrDtypeMismatch { .. }
+    ));
+}
+
+/// P0-C regression guard: matching shape and F32 dtype still materializes
+/// normally.
+#[test]
+fn materialize_model_instance_weights_accepts_matching_shape_and_dtype() {
+    let manifest = manifest_with_one_tensor(vec![2, 2], ModelDType::F32);
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+
+    let matching_weights = BTreeMap::from([(
+        "the-only-tensor".to_string(),
+        HostTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+    )]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &matching_weights).unwrap();
+    assert_eq!(
+        runtime.model_instance(&instance).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
 }
 
 #[test]

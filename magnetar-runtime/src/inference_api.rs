@@ -348,13 +348,17 @@ impl ModelLoadingApiRequest {
 /// or session-creation code path.
 pub fn load_model(
     coordinator: &mut ModelLoadingCoordinator,
-    memory: &mut MemoryManager,
+    runtime: &mut Runtime,
     request: ModelLoadingApiRequest,
     manifest: &ModelManifest,
-    trust: &ModelTrustDecision,
 ) -> Result<LoadedModelContext, InferenceApiError> {
+    // Evaluated -- and dropped as a borrow of `runtime` -- before
+    // `runtime.memory_mut()` is taken below: `runtime: &mut Runtime` is one
+    // parameter, not two aliasing ones, precisely so a caller cannot supply
+    // a trust decision independent of the Runtime performing the load.
+    let trust = runtime.trust_store().evaluate(manifest);
     coordinator
-        .load(request.core, manifest, trust, memory)
+        .load(request.core, manifest, &trust, runtime.memory_mut())
         .map_err(InferenceApiError::from)
 }
 
@@ -362,10 +366,9 @@ pub fn load_model(
 /// `ModelLoadingRequested`/`ModelLoaded`/`ModelLoadingFailed`.
 pub fn load_model_observed(
     coordinator: &mut ModelLoadingCoordinator,
-    memory: &mut MemoryManager,
+    runtime: &mut Runtime,
     request: ModelLoadingApiRequest,
     manifest: &ModelManifest,
-    trust: &ModelTrustDecision,
     observer: &mut InferenceApiObserver,
 ) -> Result<LoadedModelContext, InferenceApiError> {
     let correlation_id = request.core.correlation_id.clone().map(CorrelationId::new);
@@ -374,7 +377,7 @@ pub fn load_model_observed(
         "model loading requested",
         correlation_id.clone(),
     );
-    match load_model(coordinator, memory, request, manifest, trust) {
+    match load_model(coordinator, runtime, request, manifest) {
         Ok(loaded) => {
             observer.observe(
                 InferenceApiObservationKind::ModelLoaded,
@@ -2524,6 +2527,7 @@ pub enum InferenceApiError {
     PrefixCacheUnavailable { reason: String },
     MemoryAdmissionFailed { reason: String },
     WeightContentDigestMismatch { reason: String },
+    WeightShapeOrDtypeMismatch { reason: String },
     ProviderUnavailable { reason: String },
     DeviceUnavailable { reason: String },
     KernelUnavailable { reason: String },
@@ -2593,6 +2597,9 @@ impl fmt::Display for InferenceApiError {
             }
             Self::WeightContentDigestMismatch { reason } => {
                 write!(f, "weight content digest mismatch: {reason}")
+            }
+            Self::WeightShapeOrDtypeMismatch { reason } => {
+                write!(f, "weight shape or dtype mismatch: {reason}")
             }
             Self::ProviderUnavailable { reason } => write!(f, "provider unavailable: {reason}"),
             Self::DeviceUnavailable { reason } => write!(f, "device unavailable: {reason}"),

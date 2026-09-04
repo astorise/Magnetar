@@ -529,6 +529,15 @@ pub struct LoadedModelContext {
     /// permissive, the same "absent means unknown" precedent
     /// `required_weight_names` already established.
     pub(crate) required_weight_digests: std::collections::BTreeMap<String, ModelDigest>,
+    /// Declared `(shape, storage_dtype)` per tensor name the loaded
+    /// `ModelManifest` declares. Carried through to
+    /// `ModelInstanceDefinition::required_weight_shapes` so weight
+    /// materialization can reject content whose shape or dtype disagrees
+    /// with the artifact's declared metadata even when no content digest
+    /// exists for that tensor -- a digest and a shape/dtype check are
+    /// independent guards, not substitutes for each other
+    /// (`seal-runtime-model-trust-and-provenance-authority`).
+    pub(crate) required_weight_shapes: std::collections::BTreeMap<String, (Vec<u64>, ModelDType)>,
 }
 
 impl LoadedModelContext {
@@ -879,6 +888,16 @@ impl ModelLoadingCoordinator {
                         .digest
                         .clone()
                         .map(|digest| (tensor.name.clone(), digest))
+                })
+                .collect(),
+            required_weight_shapes: manifest
+                .tensors
+                .iter()
+                .map(|tensor| {
+                    (
+                        tensor.name.clone(),
+                        (tensor.shape.clone(), tensor.storage_dtype),
+                    )
                 })
                 .collect(),
         })
