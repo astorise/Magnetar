@@ -2,10 +2,10 @@ use magnetar_runtime::{
     MemoryManager, MemoryManagerConfig, ModelArchitecture, ModelArchitectureImplementation,
     ModelArchitectureImplementationKind, ModelDType, ModelLoadingCachePolicy,
     ModelLoadingCoordinator, ModelLoadingErrorCode, ModelLoadingObservationKind,
-    ModelLoadingRequest, ModelLoadingRequestId, ModelLoadingState, ModelQuantizationHandling,
-    ModelQuantizationPolicy, ModelResidencyLocation, ModelShardingPolicy, ModelTrustDecision,
-    ModelTrustStatus, ModelUnloadPolicy, compute_dtype_supported, invalidates_kv_cache_on_unload,
-    reload_is_new_loading_process,
+    ModelLoadingRequest, ModelLoadingRequestId, ModelLoadingState, ModelManifest,
+    ModelQuantizationHandling, ModelQuantizationPolicy, ModelResidencyLocation,
+    ModelShardingPolicy, ModelTrustDecision, ModelTrustStore, ModelUnloadPolicy,
+    compute_dtype_supported, invalidates_kv_cache_on_unload, reload_is_new_loading_process,
 };
 
 fn digest() -> String {
@@ -59,8 +59,16 @@ tensors:
     .unwrap()
 }
 
-fn trusted() -> ModelTrustDecision {
-    ModelTrustDecision::new(ModelTrustStatus::Trusted, "trusted fixture")
+/// Runtime-issued: the only way to obtain a `Trusted` `ModelTrustDecision`
+/// is `ModelTrustStore::evaluate` (`ModelTrustDecision::new` became
+/// `pub(crate)` -- a further audit of PR #36 found it was previously
+/// `pub`, letting an external caller construct `Trusted` directly and pass
+/// it to `load_model`/`ModelLoadingCoordinator::load` as if a real trust
+/// store had evaluated it).
+fn trusted(manifest: &ModelManifest) -> ModelTrustDecision {
+    ModelTrustStore::default()
+        .trust_digest(manifest.id.digest.value.clone())
+        .evaluate(manifest)
 }
 
 fn coordinator() -> ModelLoadingCoordinator {
@@ -80,7 +88,9 @@ fn loading_rejects_untrusted_artifact_before_memory_allocation() {
     let mut memory = MemoryManager::default();
     let request =
         ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    let untrusted = ModelTrustDecision::new(ModelTrustStatus::Rejected, "policy denied");
+    let untrusted = ModelTrustStore::default()
+        .reject_digest(manifest.id.digest.value.clone())
+        .evaluate(&manifest);
 
     let error = coordinator
         .load(request, &manifest, &untrusted, &mut memory)
@@ -116,7 +126,7 @@ fn loading_creates_runtime_owned_ready_context_without_raw_handles() {
     request.sharding_policy = ModelShardingPolicy::Sequential;
 
     let context = coordinator
-        .load(request, &manifest, &trusted(), &mut memory)
+        .load(request, &manifest, &trusted(&manifest), &mut memory)
         .unwrap();
 
     assert_eq!(context.state(), ModelLoadingState::Ready);
@@ -160,7 +170,7 @@ fn memory_budget_failure_does_not_allocate() {
     request.memory_budget_bytes = Some(1);
 
     let error = coordinator
-        .load(request, &manifest, &trusted(), &mut memory)
+        .load(request, &manifest, &trusted(&manifest), &mut memory)
         .unwrap_err();
 
     assert_eq!(error.code, ModelLoadingErrorCode::MemoryFeasibilityFailed);
@@ -176,7 +186,7 @@ fn unsupported_quantization_requires_explicit_policy() {
         ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
 
     let error = coordinator
-        .load(request, &manifest, &trusted(), &mut memory)
+        .load(request, &manifest, &trusted(&manifest), &mut memory)
         .unwrap_err();
 
     assert_eq!(error.code, ModelLoadingErrorCode::QuantizationUnsupported);
@@ -195,7 +205,7 @@ fn memory_manager_rejection_maps_to_loading_error() {
     request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
 
     let error = coordinator
-        .load(request, &manifest, &trusted(), &mut memory)
+        .load(request, &manifest, &trusted(&manifest), &mut memory)
         .unwrap_err();
 
     assert_eq!(error.code, ModelLoadingErrorCode::MemoryAllocationFailed);

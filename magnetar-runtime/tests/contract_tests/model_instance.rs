@@ -9,10 +9,10 @@ use magnetar_runtime::{
     ModelInstanceReloadRequest, ModelInstanceSharingContext, ModelInstanceSharingPolicy,
     ModelInstanceUnloadPolicy, ModelInstanceWarmupPlan, ModelInstanceWarmupPolicy,
     ModelInstanceWarmupStep, ModelLoadingCoordinator, ModelLoadingRequest, ModelLoadingRequestId,
-    ModelQuantizationPolicy, ModelResidencyId, ModelTrustDecision, ModelTrustStatus,
-    PrefixCacheEntryId, ProviderAdmissionDecision, ProviderBinding, ProviderHealthState,
-    ProviderModelResource, ProviderPressureLevel, ProviderReadinessState, ResourceAffinity,
-    Runtime, RuntimeConfig, TokenizerId,
+    ModelQuantizationPolicy, ModelResidencyId, ModelTrustStore, PrefixCacheEntryId,
+    ProviderAdmissionDecision, ProviderBinding, ProviderHealthState, ProviderModelResource,
+    ProviderPressureLevel, ProviderReadinessState, ResourceAffinity, Runtime, RuntimeConfig,
+    TokenizerId,
 };
 
 fn digest() -> String {
@@ -76,7 +76,9 @@ fn definition() -> ModelInstanceDefinition {
         .load(
             request,
             &manifest,
-            &ModelTrustDecision::new(ModelTrustStatus::Trusted, "trusted fixture"),
+            &ModelTrustStore::default()
+                .trust_digest(manifest.id.digest.value.clone())
+                .evaluate(&manifest),
             &mut memory,
         )
         .unwrap();
@@ -102,7 +104,9 @@ fn loaded_context() -> magnetar_runtime::LoadedModelContext {
         .load(
             request,
             &manifest,
-            &ModelTrustDecision::new(ModelTrustStatus::Trusted, "trusted fixture"),
+            &ModelTrustStore::default()
+                .trust_digest(manifest.id.digest.value.clone())
+                .evaluate(&manifest),
             &mut memory,
         )
         .unwrap()

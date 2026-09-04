@@ -733,18 +733,41 @@ pub enum ModelTrustStatus {
     PolicyDenied,
 }
 
+/// `pub(crate)` fields and constructor, not `pub`: this is the authority
+/// `ModelLoadingCoordinator::validate_preconditions` trusts outright
+/// (`Trusted` skips straight past trust validation) -- an external caller
+/// SHALL NOT be able to construct one claiming `Trusted` directly and pass
+/// it to the public `load_model`/`load_model_observed` as if a
+/// `ModelTrustStore` had actually evaluated it (a further audit of PR #36
+/// found every field and the constructor here were previously `pub`, with
+/// `ModelTrustStore::evaluate` -- the one fail-closed, Runtime-owned
+/// mechanism that actually exists for this -- entirely optional to go
+/// through). Public read-only accessors below; the one legitimate way to
+/// obtain a `Trusted` decision is `ModelTrustStore::evaluate`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelTrustDecision {
-    pub status: ModelTrustStatus,
-    pub reason: String,
+    pub(crate) status: ModelTrustStatus,
+    pub(crate) reason: String,
 }
 
 impl ModelTrustDecision {
-    pub fn new(status: ModelTrustStatus, reason: impl Into<String>) -> Self {
+    pub(crate) fn new(status: ModelTrustStatus, reason: impl Into<String>) -> Self {
         Self {
             status,
             reason: reason.into(),
         }
+    }
+
+    /// This decision's trust status. Read-only: see the struct-level doc
+    /// comment for why `status` is not a public field.
+    pub const fn status(&self) -> ModelTrustStatus {
+        self.status
+    }
+
+    /// This decision's human-readable reason. Read-only: see the
+    /// struct-level doc comment for why `reason` is not a public field.
+    pub fn reason(&self) -> &str {
+        &self.reason
     }
 }
 

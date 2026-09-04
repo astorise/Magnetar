@@ -577,8 +577,28 @@ impl ModelInstancePlacement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInstanceDefinition {
-    pub artifact: ModelArtifactId,
-    pub architecture: ModelArchitectureImplementation,
+    /// `pub(crate)`, not `pub`: this is Runtime-issued identity, derived
+    /// only by `from_loaded_context` from an actual `ModelLoadingCoordinator::
+    /// load()` result -- not something an external caller should be able
+    /// to reassign after obtaining a definition (whether freshly derived
+    /// or `.clone()`d from an existing, already-`Ready` instance's
+    /// `definition()`). A ninth audit of PR #36 found reassigning this
+    /// field on a cloned definition, then passing the clone to the public
+    /// `ModelInstanceManager::create`, let a caller publish a *new*
+    /// instance declaring a different `ModelArtifactId` than any Model
+    /// Loading ever actually validated -- while `create`'s round-8 fix
+    /// (resetting `resource_bindings`) correctly stopped the clone from
+    /// inheriting *resources*, it did not stop the clone from inheriting
+    /// (or the caller from rewriting) *identity*. `Clone` copies this
+    /// field regardless of its own visibility (same reasoning as
+    /// `resource_bindings`'s sealing), so the fix here is field-level:
+    /// sealing stops the reassignment itself, which is what actually
+    /// matters, not merely the specific `create()` call site the audit
+    /// happened to demonstrate it through.
+    pub(crate) artifact: ModelArtifactId,
+    /// `pub(crate)` for the same reason as `artifact`: Runtime-issued
+    /// identity, not externally reassignable after the fact.
+    pub(crate) architecture: ModelArchitectureImplementation,
     pub residencies: BTreeSet<ModelResidencyId>,
     pub tokenizer: Option<TokenizerId>,
     pub placement: ModelInstancePlacement,
