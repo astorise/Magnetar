@@ -70,21 +70,31 @@
   correctly have no digest (they cannot be materialized this way at all
   yet, so no digest of theirs could be checked regardless); extending
   coverage to those needs dequantization/re-encoding support in
-  `magnetar-runtime` first, not just a digest.
-- Architecture Freeze #1 is **accepted** at commit `e2379eb` (2026-09-04,
-  CI run https://github.com/astorise/Magnetar/actions/runs/33860345020,
+  `magnetar-runtime` first, not just a digest. A non-`F32`-declared
+  tensor is not therefore unchecked, though: weight materialization
+  independently rejects any tensor whose declared `storage_dtype` is not
+  `F32`, regardless of digest presence
+  (`seal-runtime-model-trust-and-provenance-authority`) -- this
+  limitation is about digest *coverage*, not about whether such tensors
+  can be silently forged.
+- Architecture Freeze #1 is **accepted** at commit `045a536` (2026-09-04,
+  CI run https://github.com/astorise/Magnetar/actions/runs/33879062757,
   zero non-`success` jobs confirmed via `gh run view --json
   status,conclusion` and the jobs list directly). The history below is
   kept in full because each round found something real; the commit and
   CI run cited in this first sentence are what to trust as current. (This
-  was briefly downgraded to CANDIDATE four times -- after a sixth audit
+  was briefly downgraded to CANDIDATE five times -- after a sixth audit
   round found P0-A open, after a seventh found a narrower P0 in that same
   fix's own `commit` path, after an eighth found both a `ModelInstance`
   semantic-mutability gap and confirmed byte-content provenance was still
-  open, and after a ninth found `ModelTrustDecision` forgeable, a further
+  open, after a ninth found `ModelTrustDecision` forgeable, a further
   `ModelInstanceDefinition` clone-identity gap, and that the real format
-  parsers still produced no per-tensor digests at all -- see this
-  section's history for all four fixes.)
+  parsers still produced no per-tensor digests at all, and after a tenth
+  found `ModelTrustStore` itself freely constructible, `create_model_
+  instance` never cross-checking caller-supplied architecture/affinity
+  against the loading phase's own resolved plan, and weight materialization
+  never checking declared shape/dtype independent of digest presence --
+  see this section's history for all five fixes.)
   (An earlier point in this history was itself briefly declared
   "accepted" at commit `e7dc45d` -- that run's first pass had one failing
   job, `wasmtime component engine`, on a pre-existing test
@@ -591,6 +601,54 @@
   spec text), live `magnetar run qwen-test "Hello"` unaffected, and the
   CI run cited in this note's opening sentence (commit `e2379eb`, main
   repo; submodule commits `5fc5ac7`/`da890d9`).
+  A tenth audit round (commit `7269290`) found that each of the ninth
+  round's sealed-forgery fixes had a sibling gap one level up, reachable
+  through code that stayed fully `pub`: (P0-A) `ModelTrustStore` itself
+  had every field `pub` and a fully public builder/evaluation API -- any
+  caller could construct their own store, self-declare a digest trusted,
+  and obtain a real (not forged) `Trusted` decision for whatever artifact
+  they chose before calling `load_model`; sealing `ModelTrustDecision::
+  new` (round 9) closed fabricating a decision directly, not this.
+  Investigating the fix surfaced that `Runtime` held no
+  `ModelLoadingCoordinator` anywhere in the codebase -- every real call
+  site (CLI, the qwen-test live E2E fixture, both test modules) built one
+  standalone and only wired the result into a separate `Runtime`
+  afterward -- so sealing trust for real required coupling `load_model`
+  to a `Runtime`-owned, once-configured policy, not narrowing
+  `ModelTrustStore`'s visibility. Fixed: `RuntimeBuilder::trust_store`
+  (set once, no post-build reconfiguration, default trusts nothing);
+  `load_model`/`load_model_observed` take `&mut Runtime` and evaluate
+  trust internally, with no parameter through which a caller can still
+  supply a decision. (P0-B) `Runtime::create_model_instance` accepted
+  caller-supplied `architecture`/`affinity` never compared against
+  `loaded.plan()`'s own resolved values. Fixed: rejects an architecture
+  identity disagreeing with the loading phase's resolved architecture,
+  and an affinity naming a provider/device disagreeing with one the
+  loading phase resolved (an unresolved plan field imposes no
+  constraint, consistent with this crate's `None`-is-permissive
+  precedent); new `ModelInstanceError::ArchitectureMismatch`/
+  `AffinityMismatch`. (P0-C) Weight materialization only ever checked a
+  content digest, and digests are `F32`-only (the known limitation noted
+  above) -- so a tensor the manifest declared quantized had no digest,
+  letting a caller fabricate `F32` content under its name with nothing to
+  reject it, silently bypassing the format parser's correct refusal to
+  materialize non-`F32` content. Fixed: `stage_weight` now also checks
+  the manifest's declared shape and that the declared `storage_dtype` is
+  `F32`, independent of digest presence and preceding the digest check;
+  new `InferenceApiError::WeightShapeOrDtypeMismatch`. Implementing this
+  check surfaced a real, previously-unnoticed inconsistency in
+  `contract_tests::model_instance`'s generic fixture (a `bf16`-declared
+  tensor whose test helper fabricated fake `F32` content under its name)
+  -- fixed by aligning the fixture, not by loosening the check. All three
+  tracked as `seal-runtime-model-trust-and-provenance-authority`, archived
+  at `2026-09-04-seal-runtime-model-trust-and-provenance-authority`.
+  Verified: full workspace test suite (64 + 1,171 lib tests [+6 from this
+  fix] + 184 `contract_tests`) passing, `cargo clippy`/`cargo fmt --check`
+  clean, `cargo doc` clean, wasm32 check clean, coverage ratchet at
+  79.00% (above baseline), `openspec validate --all --strict` 76/76
+  before archiving (75/75 canonical after), live `magnetar run qwen-test
+  "Hello"` unaffected, and the CI run cited in this section's opening
+  sentence (commit `045a536`).
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 

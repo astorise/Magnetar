@@ -45,10 +45,10 @@
 - [x] 6.7 Coverage ratchet: 79.00% local (above the 78.89% accepted baseline).
 - [x] 6.8 `openspec validate --all --strict`: 76/76.
 - [x] 6.9 Live `magnetar run qwen-test "Hello"` unaffected: `[generated token ids: 239 239 239 239]`, identical to every prior round.
-- [ ] 6.10 Push, confirm a full green CI run via `gh run view --json status,conclusion` and the jobs list directly (never a piped `gh run watch`).
+- [x] 6.10 Pushed as `045a536`; CI run 33879062757 confirmed green (`status: completed`, `conclusion: success`, 0 non-successful jobs) via direct `gh run view --json`.
 
 ## 7. Close out
 
-- [ ] 7.1 Diff the canonical spec files this Change touches before and after archiving, to confirm the archive-merge did not silently drop anything.
-- [ ] 7.2 Archive this Change.
-- [ ] 7.3 Update `CHANGELOG.md`: round-10's three P0s closed; update Architecture Freeze #1 status.
+- [x] 7.1 Diffed all four touched specs (order-independent requirement-heading comparison plus direct reads of both new/modified requirement bodies): `model` and `inference-api` unchanged requirement sets with the two MODIFIED bodies merged correctly (including both new scenarios each); `runtime` and `model-instance` each gained exactly the one new requirement authored for this Change. No content dropped.
+- [x] 7.2 Archived as `2026-09-04-seal-runtime-model-trust-and-provenance-authority`. `openspec validate --all --strict`: 75/75.
+- [x] 7.3 `CHANGELOG.md` updated: round-10's P0-A/P0-B/P0-C closed; Architecture Freeze #1 status updated.
