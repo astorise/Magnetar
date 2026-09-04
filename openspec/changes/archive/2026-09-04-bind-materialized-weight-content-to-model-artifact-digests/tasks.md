@@ -52,10 +52,10 @@
 - [x] 8.7 Coverage ratchet: 79.00% (above the 78.89% baseline).
 - [x] 8.8 `openspec validate --all --strict`: 77/77 (76 canonical + this active Change).
 - [x] 8.9 Live `magnetar run qwen-test "Hello"` unaffected.
-- [ ] 8.10 Push, confirm a full green CI run via `gh run view --json status,conclusion` and the jobs list directly (never a piped `gh run watch`).
+- [x] 8.10 Push, confirm a full green CI run via `gh run view --json status,conclusion` and the jobs list directly (never a piped `gh run watch`).
 
 ## 9. Close out
 
-- [ ] 9.1 Diff the canonical spec files this Change touches before and after archiving, to confirm the archive-merge did not silently drop anything (the recurring check this session established after `9939232`'s regression).
-- [ ] 9.2 Archive this Change.
-- [ ] 9.3 Update `CHANGELOG.md`: P0-2 closed; update Architecture Freeze #1 status (should move from CANDIDATE back toward accepted if no other blocker remains open).
+- [x] 9.1 Diff the canonical spec files this Change touches before and after archiving, to confirm the archive-merge did not silently drop anything (the recurring check this session established after `9939232`'s regression).
+- [x] 9.2 Archive this Change.
+- [x] 9.3 Update `CHANGELOG.md`: P0-2 closed; update Architecture Freeze #1 status (should move from CANDIDATE back toward accepted if no other blocker remains open).
