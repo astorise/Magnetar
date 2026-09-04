@@ -237,12 +237,13 @@ impl ChatSession {
     /// Chat Template Boundary (§16): the first turn sends
     /// `PromptInput::PlainText` directly -- the same "CLI pre-renders"
     /// path `pipeline::one_shot` uses for `run`. Every turn after the
-    /// first instead sends the CLI-owned transcript (plus this turn's
-    /// line) as `PromptInput::ChatMessages` through
-    /// [`CliChatTemplateFormatter`], so Runtime applies the authorized
-    /// chat template via `tokenize_prompt_input` rather than the CLI
-    /// joining strings itself -- the concrete "Runtime applies authorized
-    /// chat template" half of the boundary, made explicit by this branch.
+    /// first also sends `PromptInput::PlainText`, but rendered from the
+    /// CLI-owned transcript (plus this turn's line) via
+    /// [`CliChatTemplateFormatter`] first -- the template is applied
+    /// CLI-side, matching this boundary's "MAY" (not "SHALL") Runtime
+    /// templating language; it does not itself send `PromptInput::
+    /// ChatMessages` or invoke Runtime's `tokenize_prompt_input` chat
+    /// templating path.
     ///
     /// Every branch executes through `self.chat` -- this chat session's one
     /// persistent Runtime, Model Instance, and `InferenceSessionId` -- so
