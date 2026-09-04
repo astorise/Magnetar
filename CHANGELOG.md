@@ -63,26 +63,28 @@
   production tokenizer artifact.
 - Production model hub downloads, production server API, GPU Providers,
   production CLI UX, and agent/tool Runtime execution are outside v0.1 scope.
-- Weight content-digest verification (`bind-materialized-weight-content-
-  to-model-artifact-digests`) covers only the E2E fixture's real, checked-in
-  Safetensors file today, since `formats/gguf`/`formats/safetensors` (the
-  real format-parser submodules) do not yet compute or declare per-tensor
-  digests of their own -- a manifest from either currently produces
-  `digest: None` per tensor (permissive, not rejected). Populating real
-  digests from those parsers is future work in those submodules, not this
-  repository.
-- Architecture Freeze #1 is **accepted** at commit `08f9178` (2026-09-04,
-  CI run https://github.com/astorise/Magnetar/actions/runs/33842405682,
+- Weight content-digest verification covers `F32` tensors only -- the one
+  dtype `magnetar-runtime`'s `host_tensors_from_artifact_bytes` can
+  materialize into a `HostTensor` today. `formats/gguf`'s quantized dtypes
+  (`Q4_K`, `Q5_K`, `Q8_0`) and `formats/safetensors`' non-`F32` dtypes
+  correctly have no digest (they cannot be materialized this way at all
+  yet, so no digest of theirs could be checked regardless); extending
+  coverage to those needs dequantization/re-encoding support in
+  `magnetar-runtime` first, not just a digest.
+- Architecture Freeze #1 is **accepted** at commit `e2379eb` (2026-09-04,
+  CI run https://github.com/astorise/Magnetar/actions/runs/33860345020,
   zero non-`success` jobs confirmed via `gh run view --json
   status,conclusion` and the jobs list directly). The history below is
   kept in full because each round found something real; the commit and
   CI run cited in this first sentence are what to trust as current. (This
-  was briefly downgraded to CANDIDATE three times -- after a sixth audit
+  was briefly downgraded to CANDIDATE four times -- after a sixth audit
   round found P0-A open, after a seventh found a narrower P0 in that same
-  fix's own `commit` path, and after an eighth found both a
-  `ModelInstance` semantic-mutability gap and confirmed byte-content
-  provenance was still open -- see this section's history for all three
-  fixes.)
+  fix's own `commit` path, after an eighth found both a `ModelInstance`
+  semantic-mutability gap and confirmed byte-content provenance was still
+  open, and after a ninth found `ModelTrustDecision` forgeable, a further
+  `ModelInstanceDefinition` clone-identity gap, and that the real format
+  parsers still produced no per-tensor digests at all -- see this
+  section's history for all four fixes.)
   (An earlier point in this history was itself briefly declared
   "accepted" at commit `e7dc45d` -- that run's first pass had one failing
   job, `wasmtime component engine`, on a pre-existing test
@@ -518,7 +520,77 @@
   digests match its real materialized bytes in production, not only in
   tests), each submodule's own test suite passing independently (16/16
   each), and the CI run cited in this note's opening sentence (commit
-  `08f9178`).
+  `08f9178`). A ninth audit round (HEAD `7908e29`), a full re-audit,
+  confirmed every round-8 closure held and found three further real gaps,
+  all matching the same "field sealing closes construction, but not
+  Clone-and-carry, and only covers what was actually reset" root cause
+  this session has now seen several times. (P0-A) `ModelTrustDecision`'s
+  fields and constructor were still fully `pub`. Model Loading's public
+  `load_model`/`load_model_observed` accept a caller-supplied
+  `&ModelTrustDecision` directly, and `validate_preconditions` only
+  switches on `trust.status` -- it never re-derives trust from a
+  `ModelTrustStore`. So an external caller could construct
+  `ModelTrustDecision::new(Trusted, "...")` directly and pass it straight
+  through as if a real trust store had evaluated it, entirely bypassing
+  the one fail-closed mechanism that actually exists
+  (`ModelTrustStore::evaluate`, already correctly used by `magnetar-cli`'s
+  own production code at `commands.rs:714`, but never enforced at the
+  public API boundary itself). Fixed by sealing the constructor and
+  fields to `pub(crate)` with `status()`/`reason()` read accessors; the
+  only way to obtain a `Trusted` decision is now
+  `ModelTrustStore::evaluate`. Confirmed via grep before making the
+  change: only 4 external (`contract_tests`) call sites existed, all
+  constructing fixtures, none reading the fields directly except in one
+  file this grep initially missed (`contract_tests/model.rs`, caught by
+  the build) -- migrated onto `ModelTrustStore::default().trust_digest(...)
+  /.reject_digest(...).evaluate(...)`. (P0-B) `ModelInstanceDefinition.
+  artifact`/`.architecture` were still fully `pub`, so a caller could
+  clone an existing instance's `definition()` (round 8's read-only
+  accessor), reassign `.artifact` to a different `ModelArtifactId`, and
+  pass the mutated clone to the still-public `ModelInstanceManager::
+  create` -- publishing a new instance declaring an artifact identity
+  Model Loading never actually validated, while inheriting the original's
+  `required_weight_names`/`required_weight_digests` (`pub(crate)`, but
+  `Clone` copies them regardless of field visibility, the exact reasoning
+  round 8 already established for `resource_bindings`). Round 8's fix
+  (resetting `resource_bindings` in `create()`) correctly stopped the
+  clone from inheriting *resources* but not from inheriting or rewriting
+  *identity*. Fixed by sealing both fields to `pub(crate)` -- confirmed
+  via grep, zero external blast radius. Both P0-A and P0-B are direct
+  fixes against already-correct canonical spec text, per the audit's own
+  governance framing; no new OpenSpec Change needed for either. (P0-C)
+  The real `formats/gguf`/`formats/safetensors` submodules -- confirmed
+  real parsers, not `model_format_roadmap.rs`'s still-unimplemented
+  roadmap contracts -- always set `digest: None` on every tensor they
+  produced, so `bind-materialized-weight-content-to-model-artifact-
+  digests`'s content verification, implemented in round 8, never actually
+  constrained materialized weight bytes for a real Safetensors/GGUF
+  artifact, only the in-repo E2E fixture. Fixed in both submodules: for
+  `F32` tensors (safetensors) and unquantized `F32` tensors
+  (`ggml_type == 0`, GGUF) -- the one dtype `magnetar-runtime`'s
+  `host_tensors_from_artifact_bytes` materializes into a `HostTensor`
+  today -- each parser now computes a real `ModelDigest::sha256` over the
+  tensor's actual raw file bytes; both formats' `F32` on-disk layout
+  (raw, native-width, little-endian IEEE754) is already byte-identical to
+  `HostTensor::content_bytes()`'s canonical representation, so this
+  cannot mismatch what the transaction verifies later. Non-`F32`/quantized
+  dtypes correctly stay `digest: None` -- they cannot be materialized
+  into a `HostTensor` without a re-encoding or dequantization step neither
+  crate performs, so no digest of theirs could ever be checked anyway (a
+  genuine, not merely deferred, limitation -- see this section's own
+  entry above). Two new tests per submodule prove a real digest verifies
+  against its own bytes and rejects tampering, and that non-materializable
+  dtypes correctly have none. Verified: both submodules' own test suites
+  (18/18 each, +2 from this fix), full workspace test suite (1,165 lib
+  tests + 184 `contract_tests`, unchanged counts -- P0-A/P0-B needed no
+  new runtime tests, matching the compile-time-guarantee precedent round
+  6's `LoadedModelContext` sealing already established) passing, `cargo
+  clippy`/`cargo fmt --check` clean, `cargo doc` clean, wasm32 check
+  clean, coverage ratchet at 79.00% (above baseline), `openspec validate
+  --all --strict` 76/76 (unchanged -- none of the three fixes touched
+  spec text), live `magnetar run qwen-test "Hello"` unaffected, and the
+  CI run cited in this note's opening sentence (commit `e2379eb`, main
+  repo; submodule commits `5fc5ac7`/`da890d9`).
 - Release artifacts are not final until generated from the exact release commit
   and tag.
 
