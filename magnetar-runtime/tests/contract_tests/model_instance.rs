@@ -1,18 +1,18 @@
 use magnetar_runtime::{
-    AdapterSetId, BatchCompatibility, ComputeDType, DeviceBinding, DeviceId, FallbackClass,
-    GenerationModelReference, KvCache, KvCacheCompatibility, KvCacheId, KvCacheLayoutMetadata,
-    KvCacheLifecycleState, KvCacheScope, MemoryAllocationId, MemoryManager, MemoryPressureLevel,
-    ModelArchitecture, ModelArchitectureImplementation, ModelArchitectureImplementationKind,
+    AdapterSetId, BatchCompatibility, ComputeDType, FallbackClass, GenerationModelReference,
+    KvCache, KvCacheCompatibility, KvCacheId, KvCacheLayoutMetadata, KvCacheLifecycleState,
+    KvCacheScope, MemoryAllocationId, MemoryManager, MemoryPressureLevel, ModelArchitecture,
+    ModelArchitectureImplementation, ModelArchitectureImplementationKind,
     ModelInstanceCreationChecks, ModelInstanceDefinition, ModelInstanceError, ModelInstanceId,
     ModelInstanceLifecycleState, ModelInstanceManager, ModelInstanceObservationKind,
-    ModelInstancePlacement, ModelInstancePolicy, ModelInstanceReadiness,
-    ModelInstanceReadinessChecks, ModelInstanceReloadRequest, ModelInstanceSharingContext,
-    ModelInstanceSharingPolicy, ModelInstanceUnloadPolicy, ModelInstanceWarmupPlan,
-    ModelInstanceWarmupPolicy, ModelInstanceWarmupStep, ModelLoadingCoordinator,
-    ModelLoadingRequest, ModelLoadingRequestId, ModelQuantizationPolicy, ModelResidencyId,
-    ModelTrustDecision, ModelTrustStatus, PrefixCacheEntryId, ProviderAdmissionDecision,
-    ProviderBinding, ProviderHealthState, ProviderModelResource, ProviderPressureLevel,
-    ProviderReadinessState, ResourceAffinity, Runtime, RuntimeConfig, TokenizerId,
+    ModelInstancePolicy, ModelInstanceReadiness, ModelInstanceReadinessChecks,
+    ModelInstanceReloadRequest, ModelInstanceSharingContext, ModelInstanceSharingPolicy,
+    ModelInstanceUnloadPolicy, ModelInstanceWarmupPlan, ModelInstanceWarmupPolicy,
+    ModelInstanceWarmupStep, ModelLoadingCoordinator, ModelLoadingRequest, ModelLoadingRequestId,
+    ModelQuantizationPolicy, ModelResidencyId, ModelTrustDecision, ModelTrustStatus,
+    PrefixCacheEntryId, ProviderAdmissionDecision, ProviderBinding, ProviderHealthState,
+    ProviderModelResource, ProviderPressureLevel, ProviderReadinessState, ResourceAffinity,
+    Runtime, RuntimeConfig, TokenizerId,
 };
 
 fn digest() -> String {
@@ -154,6 +154,95 @@ fn reach_ready(runtime: &mut Runtime, id: &ModelInstanceId) {
     bind_fake_weight(runtime, id);
 }
 
+/// A further audit of PR #36 found that `ModelInstanceDefinition`'s
+/// `#[derive(Clone)]` copies every field -- including the already-sealed
+/// `resource_bindings` -- regardless of the caller's own inability to name
+/// those fields directly, and that `ModelInstanceManager::create` accepted
+/// a caller-supplied definition as-is. So an external caller with only
+/// `pub` access (`ModelInstance::definition()`, `Clone`,
+/// `ModelInstanceManager::create`) could clone a `Ready` instance's
+/// definition -- carrying its real weight bindings -- into a brand-new
+/// instance, aliasing live Provider resources across two distinct
+/// `ModelInstanceId`s. Fixed by having `create` unconditionally reset
+/// `resource_bindings` regardless of what the supplied definition
+/// contained; proven here at the exact public surface the audit
+/// described, not only by inspecting the fix's internals.
+#[test]
+fn cloned_definition_does_not_inherit_weight_authority() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id_a = runtime.model_instances_mut().create(definition()).unwrap();
+    reach_ready(&mut runtime, &id_a);
+    assert_eq!(
+        runtime.model_instance(&id_a).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+
+    let cloned = runtime.model_instance(&id_a).unwrap().definition().clone();
+    let id_b = runtime.model_instances_mut().create(cloned).unwrap();
+
+    // B must not be Ready on arrival -- creation alone never implies
+    // readiness, cloned definition or not.
+    assert_ne!(
+        runtime.model_instance(&id_b).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+
+    // The real regression: an *empty* materialization attempt on B must
+    // not be able to "adopt" A's already-committed bindings by minting
+    // fresh evidence over whatever `resource_bindings.weights` happens to
+    // contain. If `create` had not reset it, this would have reached
+    // `Ready` for B using A's real Provider resource, with zero bytes
+    // actually staged by this call.
+    magnetar_runtime::materialize_model_instance_weights(
+        &mut runtime,
+        &id_b,
+        "test",
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    assert_ne!(
+        runtime.model_instance(&id_b).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+
+    // A is unaffected throughout -- this is not a mutation of A's own
+    // state, only B's (failed) attempt to inherit it.
+    assert_eq!(
+        runtime.model_instance(&id_a).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+}
+
+/// Same root cause as the test above, exercised through `reload` (which
+/// also calls `ModelInstanceManager::create` internally with a
+/// caller-supplied replacement definition) rather than a direct `create`
+/// call, since the audit's fix needed to close the shared chokepoint both
+/// paths go through, not just the more obvious one.
+#[test]
+fn reload_replacement_does_not_inherit_original_weight_authority() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.model_instances_mut().create(definition()).unwrap();
+    reach_ready(&mut runtime, &id);
+    let existing_definition = runtime.model_instance(&id).unwrap().definition().clone();
+
+    let replacement_id = runtime
+        .model_instances_mut()
+        .reload(
+            &id,
+            ModelInstanceReloadRequest {
+                replacement: existing_definition,
+                migrate_sessions: false,
+                allow_active_semantic_mutation: false,
+            },
+        )
+        .unwrap();
+
+    assert_ne!(
+        runtime.model_instance(&replacement_id).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+}
+
 #[test]
 fn model_instance_id_is_opaque_runtime_owned_and_not_authority() {
     assert!(ModelInstanceId::new("client-instance").is_ok());
@@ -181,10 +270,10 @@ fn model_instance_binds_loaded_context_without_exposing_raw_handles() {
     assert_eq!(instance.lifecycle(), ModelInstanceLifecycleState::Ready);
     assert_eq!(instance.readiness(), ModelInstanceReadiness::Ready);
     assert_eq!(
-        instance.definition.residencies,
+        instance.definition().residencies,
         [ModelResidencyId::new(1)].into()
     );
-    assert!(!instance.definition.placement.exposes_raw_handles());
+    assert!(!instance.definition().placement.exposes_raw_handles());
 
     let status = instance.status();
     assert!(!status.raw_weights_available);
@@ -611,19 +700,27 @@ fn warmup_policy_covers_provider_kernel_shape_metadata_memory_and_adapter_checks
 
 #[test]
 fn sharing_policy_considers_tenant_adapter_cache_privacy_and_affinity() {
-    let mut instance =
-        magnetar_runtime::ModelInstance::new(ModelInstanceId::new("share1").unwrap(), definition());
-    instance.definition.policy.sharing = ModelInstanceSharingPolicy::RuntimeLocal;
-    let context = ModelInstanceSharingContext::from_definition(&instance.definition);
+    let mut runtime_local_def = definition();
+    runtime_local_def.policy.sharing = ModelInstanceSharingPolicy::RuntimeLocal;
+    let instance = magnetar_runtime::ModelInstance::new(
+        ModelInstanceId::new("share1").unwrap(),
+        runtime_local_def,
+    );
+    let context = ModelInstanceSharingContext::from_definition(instance.definition());
     assert!(instance.can_share_with(&context));
 
     let mut private_cache = context.clone();
     private_cache.kv_cache_private = true;
     assert!(!instance.can_share_with(&private_cache));
 
-    instance.definition.policy.sharing = ModelInstanceSharingPolicy::TenantIsolated;
-    instance.definition.tenant = Some("tenant-a".into());
-    let mut tenant_context = ModelInstanceSharingContext::from_definition(&instance.definition);
+    let mut tenant_isolated_def = definition();
+    tenant_isolated_def.policy.sharing = ModelInstanceSharingPolicy::TenantIsolated;
+    tenant_isolated_def.tenant = Some("tenant-a".into());
+    let instance = magnetar_runtime::ModelInstance::new(
+        ModelInstanceId::new("share2").unwrap(),
+        tenant_isolated_def,
+    );
+    let mut tenant_context = ModelInstanceSharingContext::from_definition(instance.definition());
     assert!(instance.can_share_with(&tenant_context));
     tenant_context.tenant = Some("tenant-b".into());
     assert!(!instance.can_share_with(&tenant_context));
@@ -632,20 +729,14 @@ fn sharing_policy_considers_tenant_adapter_cache_privacy_and_affinity() {
 #[test]
 fn adapter_activation_records_mutation_and_invalidates_dependent_caches() {
     let mut manager = ModelInstanceManager::new();
-    let id = manager.create(definition()).unwrap();
-    {
-        let instance = manager.instance_mut(&id).unwrap();
-        instance
-            .definition
-            .usage
-            .kv_cache_dependencies
-            .insert(KvCacheId::new("cache-a").unwrap());
-        instance
-            .definition
-            .usage
-            .prefix_cache_dependencies
-            .insert(PrefixCacheEntryId::new("prefix-a").unwrap());
-    }
+    let mut def = definition();
+    def.usage
+        .kv_cache_dependencies
+        .insert(KvCacheId::new("cache-a").unwrap());
+    def.usage
+        .prefix_cache_dependencies
+        .insert(PrefixCacheEntryId::new("prefix-a").unwrap());
+    let id = manager.create(def).unwrap();
 
     let report = manager
         .activate_adapters(&id, AdapterSetId::empty(), "session:opaque", true)
@@ -654,7 +745,7 @@ fn adapter_activation_records_mutation_and_invalidates_dependent_caches() {
     assert_eq!(report.kv_caches.len(), 1);
     assert_eq!(report.prefix_entries.len(), 1);
     assert_eq!(
-        manager.instance(&id).unwrap().definition.mutation_version,
+        manager.instance(&id).unwrap().definition().mutation_version,
         1
     );
     assert!(
@@ -768,34 +859,36 @@ fn unload_releases_memory_provider_resources_adapters_and_cache_dependencies() {
         .prefix_cache_dependencies
         .insert(PrefixCacheEntryId::new("prefix-unload").unwrap());
     def.usage.adapter_dependencies.insert(AdapterSetId::empty());
-    // A deliberately out-of-band id: `reach_ready` below issues its own
-    // real allocation from the same `MemoryManager`, whose ids start at 1,
-    // so a fixture id of `1` here would silently collide in the
-    // `BTreeSet` and undercount `released_memory_allocations`.
-    def.track_memory_allocation(MemoryAllocationId::new(999));
     // `placement` stays the fixture's default (no pinned Provider) through
     // `reach_ready`, since `warm_model_instance` now derives `provider_ready`
     // from a real, registered Provider -- "provider-a" below is a fake
     // identity that exists only to prove unload's own
     // `released_provider_resources` counting, not a Provider this test
-    // actually registers. Injected directly after reaching Ready.
+    // actually registers. Injected directly after reaching Ready, through
+    // `set_provider_resource`/`track_memory_allocation` -- the two narrow,
+    // post-creation mutations `ModelInstance` still allows, precisely
+    // because neither can affect what artifact/weights/Provider the
+    // instance actually executes against (see each method's own doc
+    // comment). `ModelInstanceManager::create` resets `resource_bindings`
+    // unconditionally, so the out-of-band memory allocation id below can no
+    // longer be pre-populated on `def` before `create` the way it could
+    // before a further audit of PR #36 found that path let a caller clone
+    // another instance's real bindings into a new one.
     let mut runtime = Runtime::initialize(RuntimeConfig::default());
     let id = runtime.model_instances_mut().create(def).unwrap();
     reach_ready(&mut runtime, &id);
     {
         let instance = runtime.model_instances_mut().instance_mut(&id).unwrap();
-        instance.definition.placement = ModelInstancePlacement {
-            provider: Some(ProviderBinding::new("provider-a")),
-            device: Some(DeviceBinding::new(DeviceId::new("device-a"))),
-            affinity: ResourceAffinity::new(FallbackClass::ProviderPinned)
-                .with_provider(ProviderBinding::new("provider-a"))
-                .with_device(DeviceBinding::new(DeviceId::new("device-a"))),
-            provider_resource: Some(ProviderModelResource {
-                provider: ProviderBinding::new("provider-a"),
-                handle_kind: "opaque-model".into(),
-                release_required: true,
-            }),
-        };
+        instance.set_provider_resource(Some(ProviderModelResource {
+            provider: ProviderBinding::new("provider-a"),
+            handle_kind: "opaque-model".into(),
+            release_required: true,
+        }));
+        // A deliberately out-of-band id: `reach_ready` above issues its own
+        // real allocation from the same `MemoryManager`, whose ids start
+        // at 1, so a fixture id of `1` here would silently collide in the
+        // `BTreeSet` and undercount `released_memory_allocations`.
+        instance.track_memory_allocation(MemoryAllocationId::new(999));
     }
 
     let report = runtime

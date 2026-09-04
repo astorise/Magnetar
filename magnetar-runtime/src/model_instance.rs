@@ -646,18 +646,6 @@ impl ModelInstanceDefinition {
             required_weight_names: context.required_weight_names.clone(),
         }
     }
-
-    /// Tracks an additional Memory Manager allocation against this
-    /// instance's resource bindings, for allocations outside the weight-
-    /// materialization transaction's scope (e.g. an adapter or workspace
-    /// allocation a caller manages directly). Deliberately narrow: this
-    /// does not touch `weights` or materialization evidence, so it cannot
-    /// be used to forge `weights_materialized` readiness -- see
-    /// `bind-model-loading-evidence-to-validated-artifact`'s design.md for
-    /// why `resource_bindings` is otherwise sealed.
-    pub fn track_memory_allocation(&mut self, allocation: MemoryAllocationId) {
-        self.resource_bindings.memory_allocations.insert(allocation);
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -729,7 +717,25 @@ pub struct ModelInstance {
     // some future internal bug were to reintroduce an inconsistency.
     pub(crate) lifecycle: ModelInstanceLifecycleState,
     pub(crate) readiness: ModelInstanceReadiness,
-    pub definition: ModelInstanceDefinition,
+    // `pub(crate)`, not `pub`: an external caller with `&mut ModelInstance`
+    // SHALL NOT be able to silently mutate Runtime-owned semantic state
+    // (artifact identity, architecture, placement, policy, tokenizer, ...)
+    // on an already-`Ready` instance by raw field assignment, nor carry an
+    // existing instance's `definition` -- including its already-sealed
+    // `resource_bindings`, which `Clone` copies regardless of field
+    // visibility -- into a *different* instance via `.clone()` +
+    // `ModelInstanceManager::create()`/`reload()` (a further audit of PR
+    // #36 found both: direct post-`Ready` mutation went unnoticed by
+    // `acquire_usage`/`generation_reference`, which only check
+    // lifecycle/readiness, not whether the definition still matches what
+    // was evidenced; and a cloned definition's weight bindings could be
+    // "adopted" by an empty `materialize_model_instance_weights` call on
+    // the new instance, aliasing live Provider resources across two
+    // instances). Read-only public accessor below; the real fix for the
+    // clone-and-create path is `ModelInstanceManager::create` resetting
+    // `resource_bindings` unconditionally, not this field's visibility
+    // alone -- see its own doc comment.
+    pub(crate) definition: ModelInstanceDefinition,
     pub last_error: Option<ModelInstanceError>,
 }
 
@@ -738,6 +744,47 @@ impl ModelInstance {
     /// for why `lifecycle` is not a public field.
     pub const fn lifecycle(&self) -> ModelInstanceLifecycleState {
         self.lifecycle
+    }
+
+    /// This instance's Runtime-owned semantic definition (artifact,
+    /// architecture, placement, policy, tokenizer, usage, ...). Read-only:
+    /// see the struct-level doc comment for why `definition` is not a
+    /// public mutable field.
+    pub const fn definition(&self) -> &ModelInstanceDefinition {
+        &self.definition
+    }
+
+    /// Records a Provider-owned resource handle for cleanup accounting on
+    /// unload (`ModelInstanceUnloadReport::released_provider_resources`).
+    /// Deliberately narrow: unlike the rest of `placement`, `provider_
+    /// resource` drives only this bookkeeping -- never readiness,
+    /// generation, or Provider/Device resolution (execution resolves
+    /// Providers through `resource_bindings`/`TensorResidency`, not this
+    /// field) -- so setting it after `Ready` cannot be used to silently
+    /// redirect what artifact, weights, or Provider an instance actually
+    /// executes against.
+    pub fn set_provider_resource(&mut self, resource: Option<ProviderModelResource>) {
+        self.definition.placement.provider_resource = resource;
+    }
+
+    /// Tracks an additional Memory Manager allocation against this
+    /// instance's resource bindings, for allocations outside the weight-
+    /// materialization transaction's scope (e.g. an adapter or workspace
+    /// allocation a caller manages directly). Deliberately narrow: this
+    /// does not touch `weights` or materialization evidence, so it cannot
+    /// be used to forge `weights_materialized` readiness -- see
+    /// `bind-model-loading-evidence-to-validated-artifact`'s design.md.
+    /// Only reachable post-creation, on this specific instance -- not a way
+    /// to pre-populate a definition before `ModelInstanceManager::create`,
+    /// which resets `resource_bindings` unconditionally regardless of what
+    /// the supplied definition carried (a further audit of PR #36 found a
+    /// caller could otherwise clone another instance's already-populated
+    /// bindings into a new one).
+    pub fn track_memory_allocation(&mut self, allocation: MemoryAllocationId) {
+        self.definition
+            .resource_bindings
+            .memory_allocations
+            .insert(allocation);
     }
 
     /// Current readiness state. Read-only: see the struct-level doc comment
@@ -1284,7 +1331,7 @@ impl ModelInstanceManager {
 
     pub fn create(
         &mut self,
-        definition: ModelInstanceDefinition,
+        mut definition: ModelInstanceDefinition,
     ) -> Result<ModelInstanceId, ModelInstanceError> {
         definition
             .policy
@@ -1296,6 +1343,20 @@ impl ModelInstanceManager {
         if definition.residencies.is_empty() {
             return Err(ModelInstanceError::ModelInstanceResidencyMissing);
         }
+        // A newly created instance SHALL start with no weight resource
+        // bindings, regardless of what the caller-supplied `definition`
+        // carried -- `ModelInstanceDefinition` is `Clone`, and `Clone`
+        // copies `resource_bindings` (and every other field) regardless of
+        // their own visibility, so field-sealing `resource_bindings` alone
+        // does not stop a caller from cloning an already-`Ready`
+        // instance's definition and passing it here (directly, or via
+        // `reload`, which also calls `create`) to fabricate a *new*
+        // instance that already appears materialized -- for real Provider
+        // resources still owned by the original instance. Only this
+        // instance's own future `WeightMaterializationTransaction::commit`
+        // calls may populate these fields again (a further audit of PR
+        // #36 found this exact cross-instance resource-aliasing path).
+        definition.resource_bindings = ModelInstanceResourceBindings::default();
         let id = ModelInstanceId::runtime_issued(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
         self.observe(
