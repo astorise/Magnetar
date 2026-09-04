@@ -1066,6 +1066,20 @@ fn e2e_weight_binding_rejects_tampered_artifact_bytes() {
 }
 
 #[test]
+fn e2e_materialize_model_instance_weights_rejects_content_digest_mismatch() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_materialize_model_instance_weights_rejects_content_digest_mismatch(&fixture)
+        .expect("materialize_model_instance_weights rejects tampered tensor content");
+}
+
+#[test]
+fn e2e_materialize_model_instance_weights_accepts_matching_content() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_materialize_model_instance_weights_accepts_matching_content(&fixture)
+        .expect("materialize_model_instance_weights accepts real, untampered tensor content");
+}
+
+#[test]
 fn e2e_weight_materialization_failure_never_reaches_ready() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_weight_materialization_failure_never_reaches_ready(&fixture).expect(

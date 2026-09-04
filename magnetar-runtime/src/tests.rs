@@ -8893,6 +8893,7 @@ fn model_instance_definition() -> ModelInstanceDefinition {
         resource_bindings: ModelInstanceResourceBindings::default(),
         kernel_selection_policy: None,
         required_weight_names: BTreeSet::new(),
+        required_weight_digests: BTreeMap::new(),
     }
 }
 
@@ -11922,6 +11923,7 @@ fn tensor(name: &str, shape: Vec<u64>) -> ModelTensorMetadata {
         size_bytes: None,
         quantization: None,
         expected_compute_dtype: None,
+        digest: None,
     }
 }
 
@@ -20023,6 +20025,7 @@ fn artifact_bytes_test_tensor(
         size_bytes: Some(bytes.len() as u64),
         quantization: None,
         expected_compute_dtype: None,
+        digest: None,
     };
     (metadata, bytes)
 }

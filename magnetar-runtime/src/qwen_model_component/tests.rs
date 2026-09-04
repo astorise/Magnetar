@@ -77,6 +77,7 @@ fn missing_tensor_inventory_is_detected() {
         size_bytes: None,
         quantization: None,
         expected_compute_dtype: None,
+        digest: None,
     }];
     assert!(matches!(
         qwen_validate_tensor_inventory(&config, &tensors),
@@ -97,6 +98,7 @@ fn invalid_tensor_shape_is_detected() {
         size_bytes: None,
         quantization: None,
         expected_compute_dtype: None,
+        digest: None,
     };
     assert!(matches!(
         qwen_validate_tensor_shapes(&config, std::slice::from_ref(&tensor)),
@@ -362,6 +364,7 @@ fn tied_embedding_shape_must_match_vocabulary_and_hidden_size() {
             size_bytes: None,
             quantization: None,
             expected_compute_dtype: None,
+            digest: None,
         });
     }
     assert!(qwen_validate_tied_embedding_shape(&config, &tensors).is_ok());
@@ -500,6 +503,7 @@ fn chat_template_required_but_missing_is_rejected() {
             size_bytes: None,
             quantization: None,
             expected_compute_dtype: None,
+            digest: None,
         });
     }
     let manifest = ModelManifest {

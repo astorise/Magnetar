@@ -738,21 +738,33 @@ pub fn e2e_fixture_manifest(
     const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000003";
     let weights_digest = e2e_fixture_safetensors_digest();
     let weights_size_bytes = E2E_FIXTURE_SAFETENSORS_BYTES.len();
+    // Real per-tensor content digests, computed from the checked-in
+    // Safetensors file's actual bytes -- not the synthetic in-memory
+    // `e2e_fixture_weights` -- so this manifest genuinely constrains what
+    // counts as each tensor's content
+    // (`bind-materialized-weight-content-to-model-artifact-digests`).
+    let inventory = e2e_fixture_weight_inventory_with_digests(config)?;
     let mut tensor_yaml = String::new();
-    for name in qwen_expected_tensor_names(config.architecture.layer_count, config.tied_embeddings)
-    {
-        let shape = qwen_expected_tensor_shape(&name, config).ok_or_else(|| {
-            E2eConformanceError::FixtureInvalid {
-                reason: format!("no expected shape for fixture tensor '{name}'"),
-            }
-        })?;
-        let shape_text = shape
+    for tensor in &inventory {
+        let shape_text = tensor
+            .shape
             .iter()
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(", ");
+        let digest = tensor
+            .digest
+            .as_ref()
+            .ok_or_else(|| E2eConformanceError::FixtureInvalid {
+                reason: format!(
+                    "fixture tensor '{}' unexpectedly has no computed content digest",
+                    tensor.name
+                ),
+            })?;
         tensor_yaml.push_str(&format!(
-            "  - name: {name}\n    shape: [{shape_text}]\n    storage_dtype: f32\n"
+            "  - name: {name}\n    shape: [{shape_text}]\n    storage_dtype: f32\n    digest: {digest}\n",
+            name = tensor.name,
+            digest = digest.value,
         ));
     }
     let yaml = format!(
@@ -943,10 +955,36 @@ pub fn e2e_fixture_weight_inventory(
             size_bytes: Some(size_bytes),
             quantization: None,
             expected_compute_dtype: None,
+            digest: None,
         });
         offset += size_bytes;
     }
     Ok(tensors)
+}
+
+/// [`e2e_fixture_weight_inventory`], with each tensor's `digest` populated
+/// from the real, checked-in Safetensors file's actual bytes -- computed
+/// from [`e2e_fixture_weights_from_real_artifact`]'s already-real,
+/// already-parsed [`HostTensor`]s (not from [`e2e_fixture_weights`]'s
+/// synthetic in-memory values), so this is a real, non-circular content
+/// binding: the fixture is not hashing its own assumptions about itself.
+/// Implements `bind-materialized-weight-content-to-model-artifact-digests`'s
+/// "Tensor Content Digest Binding" requirement for the one real artifact
+/// source this crate has today.
+pub fn e2e_fixture_weight_inventory_with_digests(
+    config: &QwenConfig,
+) -> Result<Vec<ModelTensorMetadata>, E2eConformanceError> {
+    let inventory = e2e_fixture_weight_inventory(config)?;
+    let real_weights = e2e_fixture_weights_from_real_artifact(config)?;
+    Ok(inventory
+        .into_iter()
+        .map(|mut metadata| {
+            if let Some(tensor) = real_weights.get(&metadata.name) {
+                metadata.digest = Some(ModelDigest::sha256(&tensor.content_bytes()));
+            }
+            metadata
+        })
+        .collect())
 }
 
 /// Materializes the E2E fixture's weights by reading
@@ -4811,6 +4849,32 @@ impl WeightMaterializationTransaction {
         name: &str,
         tensor: &HostTensor,
     ) -> Result<(), InferenceApiError> {
+        // Content verification precedes even Memory Manager admission: if
+        // the loaded artifact declared a content digest for this tensor
+        // name, the bytes supplied here must match it before anything is
+        // admitted or written. A caller with legitimate access to this
+        // transaction (the one authorized path to bind a weight) can still
+        // supply the *wrong* bytes under the *right* name -- this check is
+        // what stops that from being accepted as the declared tensor's
+        // content (`bind-materialized-weight-content-to-model-artifact-
+        // digests`). A tensor whose inventory entry declared no digest is
+        // unaffected (`None` means unknown, not "no content required" --
+        // the same precedent `required_weight_names` already established).
+        if let Some(expected_digest) = runtime
+            .model_instance(instance)
+            .map_err(InferenceApiError::from)?
+            .definition()
+            .required_weight_digests
+            .get(name)
+            .cloned()
+            && let Err(error) = expected_digest.verify_bytes(&tensor.content_bytes())
+        {
+            return Err(InferenceApiError::WeightContentDigestMismatch {
+                reason: format!(
+                    "weight resource '{name}' content does not match the artifact's declared digest: {error}"
+                ),
+            });
+        }
         let resource_id = TensorResourceId::new(format!("model.{instance}.weight.{name}"));
         let byte_size = tensor.data.len() as u64 * std::mem::size_of::<f32>() as u64;
         // Admission SHALL precede Provider materialization: reserve the
@@ -7802,6 +7866,61 @@ fn load_fixture_instance_with_weights(
     Ok(instance)
 }
 
+/// `bind-materialized-weight-content-to-model-artifact-digests`: proves
+/// the content-digest check at the exact public entrypoint it lives in
+/// (`WeightMaterializationTransaction::stage_weight`, reached through
+/// `materialize_model_instance_weights`), not only through
+/// `bind_qwen_fixture_weights`'s separate, earlier, aggregate in-memory
+/// check (`check_weight_binding_rejects_tampered_artifact_bytes` proves
+/// that one). `fixture.manifest`'s tensor inventory now carries real
+/// per-tensor digests computed from the real checked-in Safetensors file
+/// (`e2e_fixture_manifest`), so tampering one tensor's bytes before
+/// materializing it directly must be rejected with the specific
+/// content-digest-mismatch error, not merely *some* error.
+#[cfg(test)]
+fn check_materialize_model_instance_weights_rejects_content_digest_mismatch(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime();
+    let mut tampered_weights = fixture.weights.clone();
+    let (_name, tensor) =
+        tampered_weights
+            .iter_mut()
+            .next()
+            .ok_or_else(|| E2eConformanceError::FixtureInvalid {
+                reason: "fixture has no weight tensors to tamper with".into(),
+            })?;
+    tensor.data[0] += 1.0;
+    match load_fixture_instance_with_weights(fixture, &mut runtime, &tampered_weights) {
+        Err(E2eConformanceError::GenerationFailed { reason })
+            if reason.contains("weight content digest mismatch") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("expected a weight content digest mismatch error, got: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "materialize_model_instance_weights accepted tampered tensor content".into(),
+        }),
+    }
+}
+
+/// Regression guard for the happy path this Change's check sits directly
+/// in front of: the real, untampered fixture weights (bit-identical to
+/// what their declared digests were computed from) must still materialize
+/// and bind normally through the exact same entrypoint the mismatch test
+/// above uses.
+#[cfg(test)]
+fn check_materialize_model_instance_weights_accepts_matching_content(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime();
+    let real_weights = e2e_fixture_weights_from_real_artifact(&fixture.config)?;
+    load_fixture_instance_with_weights(fixture, &mut runtime, &real_weights)?;
+    Ok(())
+}
+
 /// Runs a real prefill through the production graph-execution path
 /// (`execute_qwen_graph`, the same one `execute_generation_step` uses) with
 /// `weights` bound to a fresh `ModelInstance`, and returns the "logits"
@@ -7854,8 +7973,23 @@ fn forward_logits_with_weights(
 fn check_weight_byte_change_alters_generated_logits(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
+    // This test's own mutated weights would now (correctly) be rejected by
+    // `bind-materialized-weight-content-to-model-artifact-digests`'s
+    // content-digest check if bound against `fixture.manifest`'s real,
+    // digest-bearing tensor inventory -- that rejection is a *different*
+    // property, already proven by `check_weight_binding_rejects_tampered_
+    // artifact_bytes` and the new digest-mismatch tests this Change adds.
+    // This test's own concern is orthogonal: given bytes that *did* bind
+    // (however that happened), are they actually consumed numerically. A
+    // digest-free copy of the fixture keeps that concern isolated rather
+    // than conflating it with the digest check.
+    let mut digest_free_fixture = fixture.clone();
+    for tensor in &mut digest_free_fixture.manifest.tensors {
+        tensor.digest = None;
+    }
     let prompt = [1, 2];
-    let baseline_logits = forward_logits_with_weights(fixture, &fixture.weights, &prompt)?;
+    let baseline_logits =
+        forward_logits_with_weights(&digest_free_fixture, &fixture.weights, &prompt)?;
 
     let mut mutated_weights = fixture.weights.clone();
     let (_name, tensor) =
@@ -7866,7 +8000,8 @@ fn check_weight_byte_change_alters_generated_logits(
                 reason: "fixture has no weight tensors to mutate".into(),
             })?;
     tensor.data[0] += 1.0;
-    let mutated_logits = forward_logits_with_weights(fixture, &mutated_weights, &prompt)?;
+    let mutated_logits =
+        forward_logits_with_weights(&digest_free_fixture, &mutated_weights, &prompt)?;
 
     if baseline_logits == mutated_logits {
         return Err(E2eConformanceError::GenerationFailed {
@@ -8217,6 +8352,7 @@ fn check_invalid_tensor_shape(fixture: &E2eFixture) -> Result<(), E2eConformance
         size_bytes: None,
         quantization: None,
         expected_compute_dtype: None,
+        digest: None,
     };
     match qwen_validate_tensor_shapes(&fixture.config, std::slice::from_ref(&bad_tensor)) {
         Err(_) => Ok(()),

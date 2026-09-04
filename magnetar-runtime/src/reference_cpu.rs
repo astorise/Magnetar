@@ -364,6 +364,24 @@ impl HostTensor {
             )),
         }
     }
+
+    /// This tensor's canonical content byte representation: `data`'s `f32`
+    /// values concatenated as little-endian bytes, in order. Used to
+    /// compute and verify content digests
+    /// (`bind-materialized-weight-content-to-model-artifact-digests`) --
+    /// callers combine this with `ModelDigest::sha256`/`verify_bytes`
+    /// rather than this module depending on `model.rs`'s digest type
+    /// directly. `shape` deliberately does not participate: a digest binds
+    /// tensor *content*, and shape mismatches are already caught
+    /// separately (residency/binding validation), not by this
+    /// content-only check.
+    pub fn content_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.data.len() * 4);
+        for value in &self.data {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
 }
 
 /// Element count for a Reference CPU host tensor shape.

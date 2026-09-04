@@ -11,9 +11,9 @@ use crate::{
     AdapterSetId, CorrelationId, DeviceBinding, GenerationModelReference, InferenceSessionId,
     KernelAutotuningPolicy, KernelId, KernelPerformanceFeedbackMode, KvCacheId, LoadedModelContext,
     MemoryAllocationId, MemoryPressureLevel, ModelArchitectureImplementation, ModelArtifactId,
-    ModelDType, ModelResidencyId, PrefixCacheEntryId, ProviderAdmissionDecision, ProviderBinding,
-    ProviderHealthState, ProviderPressureLevel, ProviderReadinessState, ResourceAffinity,
-    TensorResourceId, TokenizerId, reproducible_mode_blocks_adaptation,
+    ModelDType, ModelDigest, ModelResidencyId, PrefixCacheEntryId, ProviderAdmissionDecision,
+    ProviderBinding, ProviderHealthState, ProviderPressureLevel, ProviderReadinessState,
+    ResourceAffinity, TensorResourceId, TokenizerId, reproducible_mode_blocks_adaptation,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -616,6 +616,15 @@ pub struct ModelInstanceDefinition {
     /// presence-only heuristic in that case rather than treating an
     /// empty requirement as trivially satisfied by anything.
     pub(crate) required_weight_names: BTreeSet<String>,
+    /// Per-tensor content digests the loaded `ModelManifest` declared,
+    /// carried from `LoadedModelContext::required_weight_digests`.
+    /// `pub(crate)` for the same reason as `required_weight_names`: not
+    /// something an external caller should be able to redeclare after
+    /// creation. Only tensors the artifact declared a digest for are
+    /// present as keys; a tensor absent here is unconstrained by content
+    /// verification, not treated as having empty/zero content
+    /// (`bind-materialized-weight-content-to-model-artifact-digests`).
+    pub(crate) required_weight_digests: BTreeMap<String, ModelDigest>,
 }
 
 impl ModelInstanceDefinition {
@@ -644,6 +653,7 @@ impl ModelInstanceDefinition {
             resource_bindings: ModelInstanceResourceBindings::default(),
             kernel_selection_policy: None,
             required_weight_names: context.required_weight_names.clone(),
+            required_weight_digests: context.required_weight_digests.clone(),
         }
     }
 }

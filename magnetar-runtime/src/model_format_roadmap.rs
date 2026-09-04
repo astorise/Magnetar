@@ -368,6 +368,7 @@ impl SafetensorsManifest {
                 size_bytes: Some(tensor.byte_length),
                 quantization: None,
                 expected_compute_dtype: None,
+                digest: None,
             })
             .collect()
     }
@@ -840,6 +841,7 @@ impl GgufMetadata {
                 size_bytes: None,
                 quantization: tensor.quantization.clone(),
                 expected_compute_dtype: None,
+                digest: None,
             })
             .collect()
     }
@@ -1378,6 +1380,7 @@ pub fn run_model_format_roadmap_conformance() -> ModelFormatRoadmapConformanceRe
                 size_bytes: None,
                 quantization: None,
                 expected_compute_dtype: None,
+                digest: None,
             },
             ModelTensorMetadata {
                 name: "layer.0.weight".into(),
@@ -1389,6 +1392,7 @@ pub fn run_model_format_roadmap_conformance() -> ModelFormatRoadmapConformanceRe
                 size_bytes: None,
                 quantization: None,
                 expected_compute_dtype: None,
+                digest: None,
             },
         ];
         let outcome = detect_duplicate_tensor_names(&duplicate);

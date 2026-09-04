@@ -317,6 +317,15 @@ pub struct ModelTensorMetadata {
     pub size_bytes: Option<u64>,
     pub quantization: Option<ModelQuantization>,
     pub expected_compute_dtype: Option<ModelDType>,
+    /// The specific bytes that count as this tensor's content for the
+    /// artifact it belongs to, when the artifact declares one
+    /// (`bind-materialized-weight-content-to-model-artifact-digests`'s
+    /// "Tensor Content Digest Binding" requirement). `None` means no
+    /// digest was declared for this tensor -- permissive, not "no content
+    /// required" -- mirroring `required_weight_names`'s existing
+    /// "empty/absent means unknown" precedent rather than making every
+    /// pre-existing manifest that predates this field suddenly fail.
+    pub digest: Option<ModelDigest>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1375,6 +1384,8 @@ struct RawTensor {
     size_bytes: Option<u64>,
     #[serde(default)]
     expected_compute_dtype: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 impl TryFrom<RawTensor> for ModelTensorMetadata {
@@ -1394,6 +1405,7 @@ impl TryFrom<RawTensor> for ModelTensorMetadata {
                 .expected_compute_dtype
                 .map(|value| parse_dtype(value, false))
                 .transpose()?,
+            digest: raw.digest.map(ModelDigest::parse).transpose()?,
         })
     }
 }

@@ -2523,6 +2523,7 @@ pub enum InferenceApiError {
     KvCacheUnavailable { reason: String },
     PrefixCacheUnavailable { reason: String },
     MemoryAdmissionFailed { reason: String },
+    WeightContentDigestMismatch { reason: String },
     ProviderUnavailable { reason: String },
     DeviceUnavailable { reason: String },
     KernelUnavailable { reason: String },
@@ -2589,6 +2590,9 @@ impl fmt::Display for InferenceApiError {
             }
             Self::MemoryAdmissionFailed { reason } => {
                 write!(f, "memory admission failed: {reason}")
+            }
+            Self::WeightContentDigestMismatch { reason } => {
+                write!(f, "weight content digest mismatch: {reason}")
             }
             Self::ProviderUnavailable { reason } => write!(f, "provider unavailable: {reason}"),
             Self::DeviceUnavailable { reason } => write!(f, "device unavailable: {reason}"),

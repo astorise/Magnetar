@@ -10,8 +10,8 @@ use crate::{
     CapabilityBinding, ComputeDType, DeviceBinding, HostTensor, MemoryAllocation,
     MemoryAllocationClass, MemoryAllocationOwner, MemoryAllocationRequest, MemoryAllocationState,
     MemoryManager, MemoryPlacement, ModelArchitecture, ModelArtifactError, ModelArtifactId,
-    ModelDType, ModelManifest, ModelQuantizationFormat, ModelResidencyPlan, ModelTensorMetadata,
-    ModelTrustDecision, ModelTrustStatus, ProviderBinding, ResourceAffinity,
+    ModelDType, ModelDigest, ModelManifest, ModelQuantizationFormat, ModelResidencyPlan,
+    ModelTensorMetadata, ModelTrustDecision, ModelTrustStatus, ProviderBinding, ResourceAffinity,
 };
 use std::{collections::BTreeMap, error::Error, fmt};
 
@@ -519,6 +519,16 @@ pub struct LoadedModelContext {
     /// Runtime-owned ModelInstance readiness authority, round 3). Empty for
     /// a manifest that declares no tensors.
     pub(crate) required_weight_names: std::collections::BTreeSet<String>,
+    /// Per-tensor content digests the loaded `ModelManifest` declares
+    /// (only tensors with a declared digest are present as keys). Carried
+    /// through to `ModelInstanceDefinition::required_weight_digests` so
+    /// weight-materialization can verify staged content against declared
+    /// content, not just that a name was bound
+    /// (`bind-materialized-weight-content-to-model-artifact-digests`).
+    /// Empty for a manifest that declares no per-tensor digests --
+    /// permissive, the same "absent means unknown" precedent
+    /// `required_weight_names` already established.
+    pub(crate) required_weight_digests: std::collections::BTreeMap<String, ModelDigest>,
 }
 
 impl LoadedModelContext {
@@ -860,6 +870,16 @@ impl ModelLoadingCoordinator {
                 .tensors
                 .iter()
                 .map(|tensor| tensor.name.clone())
+                .collect(),
+            required_weight_digests: manifest
+                .tensors
+                .iter()
+                .filter_map(|tensor| {
+                    tensor
+                        .digest
+                        .clone()
+                        .map(|digest| (tensor.name.clone(), digest))
+                })
                 .collect(),
         })
     }

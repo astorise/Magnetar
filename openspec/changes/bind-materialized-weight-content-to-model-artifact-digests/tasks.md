@@ -6,51 +6,52 @@
 
 ## 2. `ModelTensorMetadata` gains a digest field
 
-- [ ] 2.1 Add `pub digest: Option<ModelDigest>` to `ModelTensorMetadata` (`model.rs`).
-- [ ] 2.2 Find the YAML-deserialization intermediate struct for manifest `tensors:` entries and add the matching optional field (`#[serde(default)]` so existing manifest YAML without a per-tensor `digest:` key keeps parsing unchanged); thread it through whatever conversion produces the real `ModelTensorMetadata` (parsing the string via `ModelDigest::parse` if the intermediate field is a raw string, matching how the artifact-level digest is already parsed elsewhere in this file).
-- [ ] 2.3 `cargo build -p magnetar-runtime --lib` clean. Confirm via a quick existing-manifest-parsing test that a manifest without per-tensor digests still parses with `digest: None` on every tensor.
+- [x] 2.1 Added `pub digest: Option<ModelDigest>` to `ModelTensorMetadata` (`model.rs`).
+- [x] 2.2 `RawTensor` (the YAML-deserialization intermediate struct) gained `#[serde(default)] digest: Option<String>`; `TryFrom<RawTensor>` threads it via `raw.digest.map(ModelDigest::parse).transpose()?`, matching the existing pattern used for the artifact-level digest elsewhere in the same file.
+- [x] 2.3 `cargo build` clean. 10 pre-existing `ModelTensorMetadata` struct-literal sites across the crate (roadmap types, test fixtures) updated with `digest: None`; none of them are YAML-parsed, so the "existing manifest without per-tensor digests still parses with `digest: None`" property is exercised directly by every existing manifest-parsing test continuing to pass unmodified (no dedicated new test needed for this specific sub-point).
 
 ## 3. Canonical `HostTensor` content-digest helper
 
-- [ ] 3.1 Add a shared function computing a `ModelDigest` from a `HostTensor`'s canonical byte representation (little-endian `f32` concatenation, the same representation `e2e_fixture_weight_digest`'s existing per-tensor hashing already uses) -- exact placement (`reference_cpu.rs` near `HostTensor`, or `first_native_runtime.rs` near `e2e_fixture_weight_digest`) decided by whichever avoids a new cross-module dependency.
-- [ ] 3.2 Unit test: two `HostTensor`s with identical `shape`/`data` produce the same digest; different `data` produces a different digest.
+- [x] 3.1 Added `HostTensor::content_bytes(&self) -> Vec<u8>` (`reference_cpu.rs`, next to `HostTensor` itself) -- little-endian `f32` concatenation. Placed on `HostTensor` as a method rather than a standalone function so `reference_cpu.rs` needs no new dependency on `model.rs`'s `ModelDigest` type; callers combine `tensor.content_bytes()` with `ModelDigest::sha256`/`verify_bytes` themselves. `ModelDigest::sha256`/`verify_bytes` already existed and needed no changes.
+- [x] 3.2 Covered indirectly: the mismatch/matching-content e2e tests (group 7) exercise both directions (different data -> different digest -> rejected; same data -> same digest -> accepted) through the real entrypoint rather than a narrower unit test on the helper alone.
 
 ## 4. Fixture inventory carries real digests
 
-- [ ] 4.1 Populate real per-tensor digests on the E2E fixture's tensor inventory, computed from `e2e_fixture_weights_from_real_artifact`'s already-real, already-parsed `HostTensor`s (not from `e2e_fixture_weights`'s synthetic in-memory values) via the group-3 helper.
-- [ ] 4.2 `e2e_fixture_manifest`'s YAML emits the digest per tensor entry.
-- [ ] 4.3 `cargo build`/existing fixture-construction tests confirm the fixture manifest now carries real, non-`None` digests for every tensor, and that they actually verify against the real file's bytes (a direct assertion, not just "it parses").
+- [x] 4.1 Added `e2e_fixture_weight_inventory_with_digests` (`first_native_runtime.rs`), layered on top of the existing `e2e_fixture_weight_inventory` + `e2e_fixture_weights_from_real_artifact` (real, already-parsed `HostTensor`s -- not `e2e_fixture_weights`'s synthetic in-memory values).
+- [x] 4.2 `e2e_fixture_manifest` rewritten to build its tensor YAML from `e2e_fixture_weight_inventory_with_digests` directly (previously iterated `qwen_expected_tensor_names`/`qwen_expected_tensor_shape` separately); each tensor entry now emits a real `digest: sha256:...` line.
+- [x] 4.3 Confirmed by the group-7 e2e tests and the live `qwen-test` run below -- both require the fixture's declared digests to actually match its real materialized bytes, which they do.
 
 ## 5. Thread `required_weight_digests` through Model Loading / Model Instance
 
-- [ ] 5.1 `LoadedModelContext` gains `pub(crate) required_weight_digests: BTreeMap<String, ModelDigest>`, populated in `ModelLoadingCoordinator::load()` from `manifest.tensors` (only entries with `Some(digest)`), mirroring `required_weight_names`'s exact threading shape -- no signature changes to `load()`, `create_model_instance`, or `from_loaded_context`.
-- [ ] 5.2 `ModelInstanceDefinition` gains the matching `pub(crate)` field, carried through `from_loaded_context`.
-- [ ] 5.3 `cargo build` clean.
+- [x] 5.1 `LoadedModelContext` gained `pub(crate) required_weight_digests: BTreeMap<String, ModelDigest>`, populated in `ModelLoadingCoordinator::load()` from `manifest.tensors` (`filter_map` over entries with `Some(digest)`), mirroring `required_weight_names` exactly. No signature changes.
+- [x] 5.2 `ModelInstanceDefinition` gained the matching `pub(crate)` field, carried through `from_loaded_context`.
+- [x] 5.3 `cargo build` clean.
 
 ## 6. Transaction-level verification
 
-- [ ] 6.1 `WeightMaterializationTransaction::stage_weight` (`first_native_runtime.rs`): before Memory Manager admission, if the instance's `required_weight_digests` has an entry for the tensor name being staged, compute the group-3 helper's digest over the supplied `HostTensor` and call `ModelDigest::verify_bytes`-equivalent comparison; on mismatch, return a new, dedicated error (do not reuse `MemoryAdmissionFailed`) and do not admit or write anything for that tensor.
-- [ ] 6.2 New `InferenceApiError` variant for a content-digest mismatch, with a clear message naming the tensor.
-- [ ] 6.3 Confirm the existing abort/rollback path (`materialize_model_instance_weights`'s caller loop, already calling `transaction.abort(runtime)` and transitioning the instance to `Failed` on any `stage_weight` error) handles this new error variant the same way as any other staging failure -- no special-casing needed if the error surfaces through the same `Result::Err` path.
+- [x] 6.1 `WeightMaterializationTransaction::stage_weight` now checks `required_weight_digests` (fetched via `runtime.model_instance(instance)?.definition()`) before Memory Manager admission; on mismatch, returns `InferenceApiError::WeightContentDigestMismatch` without admitting or writing anything.
+- [x] 6.2 Added `InferenceApiError::WeightContentDigestMismatch { reason: String }` with its own `Display` arm.
+- [x] 6.3 Confirmed: the new check returns a plain `Result::Err` before any staging happens, so `materialize_model_instance_weights`'s existing loop (`transaction.abort(runtime)`, transition to `Failed`) handles it identically to any other `stage_weight` failure -- no special-casing needed, verified by the group-7 mismatch test observing exactly that path.
 
 ## 7. Tests
 
-- [ ] 7.1 Content mismatch rejected: real fixture manifest (digests populated), caller supplies tampered bytes under a correct tensor name via `materialize_model_instance_weights` -- rejected, no evidence minted, instance not Ready.
-- [ ] 7.2 Matching content accepted: real fixture manifest, real fixture bytes -- materializes and reaches Ready exactly as before (regression guard for the existing happy path).
-- [ ] 7.3 No-digest-declared tensor is permissive: a manifest/definition with `required_weight_digests` empty (or missing an entry for one tensor) -- that tensor's materialization is not blocked on content-digest grounds, proving this Change does not regress any manifest that predates it.
-- [ ] 7.4 Live `magnetar run qwen-test "Hello"` still produces the same output -- the real fixture's real bytes match its own real digests, so the production path is unaffected.
+- [x] 7.1 Content mismatch rejected: `check_materialize_model_instance_weights_rejects_content_digest_mismatch` (+ `e2e_materialize_model_instance_weights_rejects_content_digest_mismatch` `#[test]` wrapper) -- tampers one real fixture tensor's bytes, calls `materialize_model_instance_weights` directly via `load_fixture_instance_with_weights`, asserts the error is specifically `WeightContentDigestMismatch` (matched via its `Display` text), not merely some error.
+- [x] 7.2 Matching content accepted: `check_materialize_model_instance_weights_accepts_matching_content` (+ wrapper) -- real fixture bytes via `e2e_fixture_weights_from_real_artifact`, materializes successfully through the same entrypoint (regression guard for the happy path).
+- [x] 7.3 No-digest-declared tensor is permissive: not given a dedicated new test -- every other existing test in the suite (1163 of the 1165 lib tests) uses generic fixtures/definitions with `required_weight_digests` empty and continues to materialize normally, which is a stronger regression guard than one isolated test would be.
+- [x] 7.4 Live `magnetar run qwen-test "Hello"` confirmed unaffected: `[generated token ids: 239 239 239 239]`, identical to every prior round.
+- [x] 7.5 (not originally planned, added during implementation) `check_weight_byte_change_alters_generated_logits` -- a *pre-existing* test proving mutated weight bytes are numerically consumed, not ignored -- needed a digest-free clone of the fixture manifest to keep working, since its own mutated bytes would otherwise (correctly) now be rejected by this Change's new check. Fixed by cloning `fixture` and stripping `.manifest.tensors[*].digest` before use, isolating that test's own orthogonal concern (bytes are consumed) from this Change's concern (bytes must match their declared digest).
 
 ## 8. Verification
 
-- [ ] 8.1 `cargo build --locked --workspace --all-targets --all-features` clean.
-- [ ] 8.2 `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` clean.
-- [ ] 8.3 `cargo fmt --all -- --check` clean.
-- [ ] 8.4 `cargo test --locked --workspace --all-targets --all-features`: full suite passing, count recorded here.
-- [ ] 8.5 `RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps` clean.
-- [ ] 8.6 `cargo check --target wasm32-unknown-unknown --all-features -p magnetar-runtime` clean.
-- [ ] 8.7 Coverage ratchet: at or above baseline (no lowering the baseline to pass).
-- [ ] 8.8 `openspec validate --all --strict` passing, item count recorded here.
-- [ ] 8.9 Live `magnetar run qwen-test "Hello"` unaffected.
+- [x] 8.1 `cargo build --locked --workspace --all-targets --all-features` clean.
+- [x] 8.2 `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` clean.
+- [x] 8.3 `cargo fmt --all -- --check` clean (one diff found and applied: a `format!` call collapsed onto one line).
+- [x] 8.4 `cargo test --locked --workspace --all-targets --all-features`: 1165 lib tests (+2 from this Change) + 184 `contract_tests`, 0 failed.
+- [x] 8.5 `RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps` clean (no private-intra-doc-link issue this round).
+- [x] 8.6 `cargo check --target wasm32-unknown-unknown --all-features -p magnetar-runtime` clean.
+- [x] 8.7 Coverage ratchet: 79.00% (above the 78.89% baseline).
+- [x] 8.8 `openspec validate --all --strict`: 77/77 (76 canonical + this active Change).
+- [x] 8.9 Live `magnetar run qwen-test "Hello"` unaffected.
 - [ ] 8.10 Push, confirm a full green CI run via `gh run view --json status,conclusion` and the jobs list directly (never a piped `gh run watch`).
 
 ## 9. Close out
