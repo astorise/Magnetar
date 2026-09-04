@@ -341,7 +341,7 @@ impl ModelLoadingApiRequest {
     }
 }
 
-/// Drives [`ModelLoadingCoordinator::load`] on behalf of the Runtime
+/// Drives `ModelLoadingCoordinator::load` on behalf of the Runtime
 /// Inference API, translating [`ModelLoadingError`] into
 /// [`InferenceApiError`]. Model loading is explicit here; policy-controlled
 /// implicit loading is expressed by callers invoking this from a one-shot

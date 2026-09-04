@@ -783,7 +783,16 @@ impl ModelLoadingCoordinator {
         Ok(plan)
     }
 
-    pub fn load(
+    /// `pub(crate)`, not `pub`: the only Runtime-sealed path to this is
+    /// `inference_api::load_model`/`load_model_observed`, which derive
+    /// `trust` from the performing `Runtime`'s own sealed
+    /// `ModelTrustStore` rather than accepting one as a parameter. A
+    /// caller with only `pub` access could otherwise build their own
+    /// `ModelTrustStore`, evaluate it (a real, not forged, decision --
+    /// `ModelTrustStore::evaluate` stays legitimately public), and call
+    /// this directly with a decision no `Runtime` actually endorsed
+    /// (`seal-model-loading-and-instance-creation-primitives`).
+    pub(crate) fn load(
         &mut self,
         request: ModelLoadingRequest,
         manifest: &ModelManifest,

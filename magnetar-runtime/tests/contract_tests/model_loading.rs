@@ -1,11 +1,7 @@
 use magnetar_runtime::{
-    MemoryManager, MemoryManagerConfig, ModelArchitecture, ModelArchitectureImplementation,
-    ModelArchitectureImplementationKind, ModelDType, ModelLoadingCachePolicy,
-    ModelLoadingCoordinator, ModelLoadingErrorCode, ModelLoadingObservationKind,
-    ModelLoadingRequest, ModelLoadingRequestId, ModelLoadingState, ModelManifest,
-    ModelQuantizationHandling, ModelQuantizationPolicy, ModelResidencyLocation,
-    ModelShardingPolicy, ModelTrustDecision, ModelTrustStore, ModelUnloadPolicy,
-    compute_dtype_supported, invalidates_kv_cache_on_unload, reload_is_new_loading_process,
+    ModelDType, ModelLoadingCachePolicy, ModelLoadingCoordinator, ModelLoadingErrorCode,
+    ModelLoadingState, ModelUnloadPolicy, compute_dtype_supported, invalidates_kv_cache_on_unload,
+    reload_is_new_loading_process,
 };
 
 fn digest() -> String {
@@ -59,47 +55,11 @@ tensors:
     .unwrap()
 }
 
-/// Runtime-issued: the only way to obtain a `Trusted` `ModelTrustDecision`
-/// is `ModelTrustStore::evaluate` (`ModelTrustDecision::new` became
-/// `pub(crate)` -- a further audit of PR #36 found it was previously
-/// `pub`, letting an external caller construct `Trusted` directly and pass
-/// it to `load_model`/`ModelLoadingCoordinator::load` as if a real trust
-/// store had evaluated it).
-fn trusted(manifest: &ModelManifest) -> ModelTrustDecision {
-    ModelTrustStore::default()
-        .trust_digest(manifest.id.digest.value.clone())
-        .evaluate(manifest)
-}
-
-fn coordinator() -> ModelLoadingCoordinator {
-    let mut coordinator = ModelLoadingCoordinator::new();
-    coordinator.register_architecture(ModelArchitectureImplementation {
-        architecture: ModelArchitecture::new("qwen", "qwen2"),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    });
-    coordinator
-}
-
-#[test]
-fn loading_rejects_untrusted_artifact_before_memory_allocation() {
-    let manifest = valid_manifest();
-    let mut coordinator = coordinator();
-    let mut memory = MemoryManager::default();
-    let request =
-        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    let untrusted = ModelTrustStore::default()
-        .reject_digest(manifest.id.digest.value.clone())
-        .evaluate(&manifest);
-
-    let error = coordinator
-        .load(request, &manifest, &untrusted, &mut memory)
-        .unwrap_err();
-
-    assert_eq!(error.code, ModelLoadingErrorCode::ModelArtifactUntrusted);
-    assert_eq!(memory.allocations().count(), 0);
-}
-
+/// `ModelLoadingCoordinator::load` became `pub(crate)`
+/// (`seal-model-loading-and-instance-creation-primitives`), so every test
+/// that called it directly moved into `magnetar-runtime/src/tests.rs`,
+/// where `pub(crate)` access still applies. What remains here genuinely
+/// does not depend on `load`.
 #[test]
 fn loading_resolves_architecture_before_planning() {
     let manifest = valid_manifest();
@@ -116,99 +76,11 @@ fn loading_resolves_architecture_before_planning() {
 }
 
 #[test]
-fn loading_creates_runtime_owned_ready_context_without_raw_handles() {
-    let manifest = valid_manifest();
-    let mut coordinator = coordinator();
-    let mut memory = MemoryManager::default();
-    let mut request =
-        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
-    request.sharding_policy = ModelShardingPolicy::Sequential;
-
-    let context = coordinator
-        .load(request, &manifest, &trusted(&manifest), &mut memory)
-        .unwrap();
-
-    assert_eq!(context.state(), ModelLoadingState::Ready);
-    assert!(context.can_start_inference());
-    assert!(!context.plan().has_raw_native_handles());
-    assert_eq!(
-        context.plan().quantization_handling(),
-        &ModelQuantizationHandling::DequantizeAtLoad(
-            magnetar_runtime::ModelQuantizationFormat::GgufQ4K
-        )
-    );
-    assert_eq!(
-        context.plan().memory_placements(),
-        &[ModelResidencyLocation::Host]
-    );
-    assert_eq!(memory.allocations().count(), 1);
-    assert!(
-        coordinator
-            .observations()
-            .iter()
-            .any(|observation| observation.kind == ModelLoadingObservationKind::ModelReady)
-    );
-}
-
-#[test]
 fn lifecycle_transitions_reject_invalid_jump() {
     assert!(ModelLoadingState::Requested.can_transition_to(ModelLoadingState::Validating));
     assert!(!ModelLoadingState::Requested.can_transition_to(ModelLoadingState::Ready));
     assert!(ModelLoadingState::Ready.can_transition_to(ModelLoadingState::Unloading));
     assert!(ModelLoadingState::Unloading.can_transition_to(ModelLoadingState::Unloaded));
-}
-
-#[test]
-fn memory_budget_failure_does_not_allocate() {
-    let manifest = valid_manifest();
-    let mut coordinator = coordinator();
-    let mut memory = MemoryManager::default();
-    let mut request =
-        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
-    request.memory_budget_bytes = Some(1);
-
-    let error = coordinator
-        .load(request, &manifest, &trusted(&manifest), &mut memory)
-        .unwrap_err();
-
-    assert_eq!(error.code, ModelLoadingErrorCode::MemoryFeasibilityFailed);
-    assert_eq!(memory.allocations().count(), 0);
-}
-
-#[test]
-fn unsupported_quantization_requires_explicit_policy() {
-    let manifest = valid_manifest();
-    let mut coordinator = coordinator();
-    let mut memory = MemoryManager::default();
-    let request =
-        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-
-    let error = coordinator
-        .load(request, &manifest, &trusted(&manifest), &mut memory)
-        .unwrap_err();
-
-    assert_eq!(error.code, ModelLoadingErrorCode::QuantizationUnsupported);
-}
-
-#[test]
-fn memory_manager_rejection_maps_to_loading_error() {
-    let manifest = valid_manifest();
-    let mut coordinator = coordinator();
-    let mut memory = MemoryManager::new(MemoryManagerConfig {
-        max_runtime_bytes: Some(1),
-        ..MemoryManagerConfig::default()
-    });
-    let mut request =
-        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
-
-    let error = coordinator
-        .load(request, &manifest, &trusted(&manifest), &mut memory)
-        .unwrap_err();
-
-    assert_eq!(error.code, ModelLoadingErrorCode::MemoryAllocationFailed);
 }
 
 #[test]
@@ -220,7 +92,10 @@ fn session_kv_cache_reload_and_dtype_policies_are_explicit() {
         ModelLoadingCachePolicy::InvalidateKvCacheOnUnload
     ));
 
-    let request = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-2"), manifest.id);
+    let request = magnetar_runtime::ModelLoadingRequest::new(
+        magnetar_runtime::ModelLoadingRequestId::new("load-2"),
+        manifest.id,
+    );
     let reload = magnetar_runtime::ModelReloadRequest {
         previous_residency: magnetar_runtime::ModelResidencyId::new(1),
         request,

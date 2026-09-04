@@ -658,7 +658,16 @@ pub struct ModelInstanceDefinition {
 }
 
 impl ModelInstanceDefinition {
-    pub fn from_loaded_context(
+    /// `pub(crate)`, not `pub`: the only Runtime-sealed path to construct
+    /// and register a definition is `Runtime::create_model_instance`,
+    /// which cross-checks `architecture`/`affinity` against the loading
+    /// phase's own resolved values before ever calling this. A caller
+    /// with only `pub` access could otherwise build a definition here
+    /// with whatever architecture/affinity they chose and register it
+    /// directly via `ModelInstanceManager::create` (also sealed for the
+    /// same reason), bypassing those cross-checks entirely
+    /// (`seal-model-loading-and-instance-creation-primitives`).
+    pub(crate) fn from_loaded_context(
         context: &LoadedModelContext,
         architecture: ModelArchitectureImplementation,
         affinity: ResourceAffinity,
@@ -1370,7 +1379,12 @@ impl ModelInstanceManager {
             .ok_or(ModelInstanceError::ModelInstanceNotFound)
     }
 
-    pub fn create(
+    /// `pub(crate)`, not `pub`: see `ModelInstanceDefinition::
+    /// from_loaded_context`'s doc comment -- the two are sealed together,
+    /// since either one alone being `pub` would still let a caller
+    /// bypass `Runtime::create_model_instance`'s cross-checks
+    /// (`seal-model-loading-and-instance-creation-primitives`).
+    pub(crate) fn create(
         &mut self,
         mut definition: ModelInstanceDefinition,
     ) -> Result<ModelInstanceId, ModelInstanceError> {
@@ -1418,7 +1432,18 @@ impl ModelInstanceManager {
         Ok(id)
     }
 
-    pub fn create_checked(
+    /// `pub(crate)`, not `pub`: same reasoning as `Self::create` -- this
+    /// is a second, equally-unsealed path to the same bypass had it
+    /// stayed `pub` (confirmed zero non-test callers anywhere in the
+    /// crate before sealing;
+    /// `seal-model-loading-and-instance-creation-primitives`). `#[cfg(test)]`
+    /// because sealing it also confirmed zero *production* callers exist
+    /// yet -- `Runtime::create_model_instance` never surfaces an explicit
+    /// `ModelInstanceCreationChecks` parameter -- so it is genuinely
+    /// test-only today, not merely unused; remove the gate if a real
+    /// caller is added.
+    #[cfg(test)]
+    pub(crate) fn create_checked(
         &mut self,
         definition: ModelInstanceDefinition,
         checks: &ModelInstanceCreationChecks,

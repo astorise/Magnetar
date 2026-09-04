@@ -10401,6 +10401,549 @@ fn materialize_model_instance_weights_accepts_matching_shape_and_dtype() {
     );
 }
 
+// The following helpers and tests were relocated from
+// `magnetar-runtime/tests/contract_tests/model_instance.rs` by
+// `seal-model-loading-and-instance-creation-primitives`:
+// `ModelLoadingCoordinator::load`, `ModelInstanceDefinition::
+// from_loaded_context`, and `ModelInstanceManager::create`/
+// `create_checked` all became `pub(crate)`, so they are no longer
+// reachable from that external test crate. Each test below genuinely
+// exercises one of those primitives' own contract (definition
+// cloning/reset-on-create, checked-creation validation, or pre-create
+// field injection `Runtime::create_model_instance` has no way to
+// express) rather than merely using it as a shortcut to reach some
+// other state -- see this Change's design.md ("D2: Relocate tests by
+// what they actually test, not wholesale") for the full reasoning.
+
+fn sealed_creation_manifest() -> ModelManifest {
+    ModelManifest::from_yaml_str(&format!(
+        r#"
+schema: magnetar-model-artifact
+schema_version: 1
+kind: model-bundle
+digest: {}
+model:
+  name: instance-model
+  revision: r1
+architecture:
+  family: qwen
+  identifier: qwen2
+storage_dtype: bf16
+compute_dtype: bf16
+supported_compute_dtypes: [bf16]
+artifacts:
+  weights:
+    kind: model-weights
+    digest: {}
+    size_bytes: 128
+  config:
+    kind: model-config
+    digest: {}
+    size_bytes: 16
+tensors:
+  - name: transformer.wte.weight
+    shape: [4, 8]
+    storage_dtype: f32
+"#,
+        "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+    ))
+    .unwrap()
+}
+
+fn sealed_creation_implementation() -> ModelArchitectureImplementation {
+    ModelArchitectureImplementation {
+        architecture: ModelArchitecture::new("qwen", "qwen2"),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    }
+}
+
+fn sealed_creation_definition() -> ModelInstanceDefinition {
+    let manifest = sealed_creation_manifest();
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(sealed_creation_implementation());
+    let mut memory = MemoryManager::default();
+    let mut request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = coordinator
+        .load(
+            request,
+            &manifest,
+            &ModelTrustStore::default()
+                .trust_digest(manifest.id.digest.value.clone())
+                .evaluate(&manifest),
+            &mut memory,
+        )
+        .unwrap();
+
+    ModelInstanceDefinition::from_loaded_context(
+        &loaded,
+        sealed_creation_implementation(),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+}
+
+fn sealed_creation_bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId) {
+    if runtime
+        .providers()
+        .provider(REFERENCE_CPU_PROVIDER_NAME)
+        .is_none()
+    {
+        runtime
+            .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+            .unwrap();
+    }
+    let weights = BTreeMap::from([(
+        "transformer.wte.weight".to_string(),
+        HostTensor::new([4, 8], vec![0.0; 32]).unwrap(),
+    )]);
+    materialize_model_instance_weights(runtime, id, "test", &weights).unwrap();
+}
+
+fn sealed_creation_reach_ready(runtime: &mut Runtime, id: &ModelInstanceId) {
+    sealed_creation_bind_fake_weight(runtime, id);
+}
+
+/// A further audit of PR #36 found that `ModelInstanceDefinition`'s
+/// `#[derive(Clone)]` copies every field -- including the already-sealed
+/// `resource_bindings` -- regardless of the caller's own inability to name
+/// those fields directly, and that `ModelInstanceManager::create` accepted
+/// a caller-supplied definition as-is. So an external caller with only
+/// `pub` access (`ModelInstance::definition()`, `Clone`,
+/// `ModelInstanceManager::create`) could clone a `Ready` instance's
+/// definition -- carrying its real weight bindings -- into a brand-new
+/// instance, aliasing live Provider resources across two distinct
+/// `ModelInstanceId`s. Fixed by having `create` unconditionally reset
+/// `resource_bindings` regardless of what the supplied definition
+/// contained.
+#[test]
+fn cloned_definition_does_not_inherit_weight_authority() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id_a = runtime
+        .model_instances_mut()
+        .create(sealed_creation_definition())
+        .unwrap();
+    sealed_creation_reach_ready(&mut runtime, &id_a);
+    assert_eq!(
+        runtime.model_instance(&id_a).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+
+    let cloned = runtime.model_instance(&id_a).unwrap().definition().clone();
+    let id_b = runtime.model_instances_mut().create(cloned).unwrap();
+
+    // B must not be Ready on arrival -- creation alone never implies
+    // readiness, cloned definition or not.
+    assert_ne!(
+        runtime.model_instance(&id_b).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+
+    // The real regression: an *empty* materialization attempt on B must
+    // not be able to "adopt" A's already-committed bindings by minting
+    // fresh evidence over whatever `resource_bindings.weights` happens to
+    // contain. If `create` had not reset it, this would have reached
+    // `Ready` for B using A's real Provider resource, with zero bytes
+    // actually staged by this call.
+    materialize_model_instance_weights(&mut runtime, &id_b, "test", &BTreeMap::new()).unwrap();
+    assert_ne!(
+        runtime.model_instance(&id_b).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+
+    // A is unaffected throughout -- this is not a mutation of A's own
+    // state, only B's (failed) attempt to inherit it.
+    assert_eq!(
+        runtime.model_instance(&id_a).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+}
+
+/// Same root cause as the test above, exercised through `reload` (which
+/// also calls `ModelInstanceManager::create` internally with a
+/// caller-supplied replacement definition) rather than a direct `create`
+/// call.
+#[test]
+fn reload_replacement_does_not_inherit_original_weight_authority() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime
+        .model_instances_mut()
+        .create(sealed_creation_definition())
+        .unwrap();
+    sealed_creation_reach_ready(&mut runtime, &id);
+    let existing_definition = runtime.model_instance(&id).unwrap().definition().clone();
+
+    let replacement_id = runtime
+        .model_instances_mut()
+        .reload(
+            &id,
+            ModelInstanceReloadRequest {
+                replacement: existing_definition,
+                migrate_sessions: false,
+                allow_active_semantic_mutation: false,
+            },
+        )
+        .unwrap();
+
+    assert_ne!(
+        runtime.model_instance(&replacement_id).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+}
+
+/// Proves `ModelInstanceManager::create_checked`'s own checks-validation
+/// contract directly: `checks.validate()` must run and reject before
+/// `create` is ever reached, and readiness checks are evaluated
+/// independently afterward. `Runtime::create_model_instance` has no
+/// parameter through which a caller can inject custom
+/// `ModelInstanceCreationChecks`, so this cannot be re-expressed through
+/// it.
+#[test]
+fn sealed_creation_and_readiness_checks_gate_ready_state() {
+    let mut manager = ModelInstanceManager::new();
+    let denied = ModelInstanceCreationChecks {
+        artifact_trusted: false,
+        ..ModelInstanceCreationChecks::default()
+    };
+    assert_eq!(
+        manager.create_checked(sealed_creation_definition(), &denied),
+        Err(ModelInstanceError::ModelInstancePolicyDenied)
+    );
+
+    let id = manager
+        .create_checked(
+            sealed_creation_definition(),
+            &ModelInstanceCreationChecks::default(),
+        )
+        .unwrap();
+    let checks = ModelInstanceReadinessChecks {
+        provider_ready: false,
+        ..ModelInstanceReadinessChecks::default()
+    };
+    assert_eq!(
+        manager
+            .instance_mut(&id)
+            .unwrap()
+            .validate_readiness(&checks),
+        Err(ModelInstanceError::ModelInstanceProviderNotReady)
+    );
+}
+
+/// Proves pre-create usage-dependency fields (`kv_cache_dependencies`,
+/// `prefix_cache_dependencies`) set directly on a hand-built definition
+/// are honored by `create`. `Runtime::create_model_instance` builds its
+/// definition internally from `architecture`/`affinity` alone, with no
+/// way for a caller to inject these before creation.
+#[test]
+fn sealed_creation_adapter_activation_records_mutation_and_invalidates_dependent_caches() {
+    let mut manager = ModelInstanceManager::new();
+    let mut def = sealed_creation_definition();
+    def.usage
+        .kv_cache_dependencies
+        .insert(KvCacheId::new("cache-a").unwrap());
+    def.usage
+        .prefix_cache_dependencies
+        .insert(PrefixCacheEntryId::new("prefix-a").unwrap());
+    let id = manager.create(def).unwrap();
+
+    let report = manager
+        .activate_adapters(&id, AdapterSetId::empty(), "session:opaque", true)
+        .unwrap();
+
+    assert_eq!(report.kv_caches.len(), 1);
+    assert_eq!(report.prefix_entries.len(), 1);
+    assert_eq!(
+        manager.instance(&id).unwrap().definition().mutation_version,
+        1
+    );
+    assert!(
+        manager
+            .observations()
+            .iter()
+            .any(|event| event.kind == ModelInstanceObservationKind::CacheInvalidation)
+    );
+}
+
+/// Proves pre-create session/usage/adapter dependency fields are honored
+/// by `create` and correctly released on unload, and that `create`
+/// unconditionally resets `resource_bindings` regardless of what the
+/// caller-supplied `def` pre-populated -- so an out-of-band memory
+/// allocation id set here cannot be pre-populated on `def` before
+/// `create`, only injected afterward via the two narrow, post-creation
+/// mutations `ModelInstance` still allows
+/// (`set_provider_resource`/`track_memory_allocation`).
+#[test]
+fn sealed_creation_unload_releases_memory_provider_resources_adapters_and_cache_dependencies() {
+    let mut def = sealed_creation_definition();
+    def.associated_sessions
+        .insert(InferenceSessionId::new("session-unload").unwrap());
+    def.usage
+        .kv_cache_dependencies
+        .insert(KvCacheId::new("cache-unload").unwrap());
+    def.usage
+        .prefix_cache_dependencies
+        .insert(PrefixCacheEntryId::new("prefix-unload").unwrap());
+    def.usage.adapter_dependencies.insert(AdapterSetId::empty());
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.model_instances_mut().create(def).unwrap();
+    sealed_creation_reach_ready(&mut runtime, &id);
+    {
+        let instance = runtime.model_instances_mut().instance_mut(&id).unwrap();
+        instance.set_provider_resource(Some(ProviderModelResource {
+            provider: ProviderBinding::new("provider-a"),
+            handle_kind: "opaque-model".into(),
+            release_required: true,
+        }));
+        // A deliberately out-of-band id: `reach_ready` above issues its own
+        // real allocation from the same `MemoryManager`, whose ids start
+        // at 1, so a fixture id of `1` here would silently collide in the
+        // `BTreeSet` and undercount `released_memory_allocations`.
+        instance.track_memory_allocation(MemoryAllocationId::new(999));
+    }
+
+    let report = runtime
+        .model_instances_mut()
+        .unload(&id, ModelInstanceUnloadPolicy::DrainActiveUse)
+        .unwrap();
+
+    assert_eq!(report.invalidated.kv_caches.len(), 1);
+    assert_eq!(report.invalidated.prefix_entries.len(), 1);
+    assert_eq!(report.invalidated.adapters_released.len(), 1);
+    // +1 relative to the fixture's single pre-set `memory_allocations`
+    // entry: `reach_ready`'s own Memory Manager allocation for the bound
+    // weight is released on unload too.
+    assert_eq!(report.released_memory_allocations.len(), 2);
+    assert_eq!(report.released_provider_resources.len(), 1);
+    assert!(!report.dangling_session_references);
+    assert_eq!(
+        runtime.model_instance(&id).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Unloaded
+    );
+}
+
+/// Proves pre-create `policy.browser_linear_memory_limit_bytes` is
+/// enforced by `create` itself. `Runtime::create_model_instance` builds
+/// `policy: ModelInstancePolicy::default()` internally with no way for a
+/// caller to override it before creation.
+#[test]
+fn sealed_creation_browser_policy_rejects_native_or_oversized_instance_features() {
+    let mut def = sealed_creation_definition();
+    def.policy = ModelInstancePolicy {
+        browser_linear_memory_limit_bytes: Some(1),
+        ..ModelInstancePolicy::default()
+    };
+    let mut manager = ModelInstanceManager::new();
+    assert_eq!(
+        manager.create(def),
+        Err(ModelInstanceError::ModelInstanceBrowserFeatureUnsupported)
+    );
+}
+
+// The following helpers and tests were relocated from
+// `magnetar-runtime/tests/contract_tests/model_loading.rs` for the same
+// reason as the `sealed_creation_*` block above: they call
+// `ModelLoadingCoordinator::load` directly to inspect
+// `ModelLoadingCoordinator`'s/`LoadedModelContext`'s own contract
+// (untrusted-artifact rejection before allocation, memory-budget/
+// quantization/allocation failure mapping, exact resolved plan shape) --
+// concerns `inference_api::load_model`'s `Runtime`-sealed wrapper does not
+// re-expose 1:1.
+
+fn sealed_loading_digest() -> String {
+    "sha256:0000000000000000000000000000000000000000000000000000000000000001".into()
+}
+
+fn sealed_loading_valid_manifest() -> ModelManifest {
+    ModelManifest::from_yaml_str(&format!(
+        r#"
+schema: magnetar-model-artifact
+schema_version: 1
+kind: model-bundle
+digest: {}
+model:
+  name: qwen.example
+  revision: r1
+architecture:
+  family: qwen
+  identifier: qwen2
+storage_dtype: int8
+compute_dtype: bf16
+supported_compute_dtypes: [bf16, fp16]
+artifacts:
+  weights:
+    kind: model-weights
+    digest: {}
+    size_bytes: 128
+  config:
+    kind: model-config
+    digest: {}
+    size_bytes: 16
+quantization:
+  format: q4_k
+  workspace_bytes: 64
+shards:
+  - id: shard0
+    digest: {}
+    size_bytes: 128
+    order: 0
+tensors:
+  - name: transformer.wte.weight
+    shape: [4, 8]
+    storage_dtype: int8
+    shard: shard0
+"#,
+        sealed_loading_digest(),
+        sealed_loading_digest(),
+        sealed_loading_digest(),
+        sealed_loading_digest()
+    ))
+    .unwrap()
+}
+
+fn sealed_loading_trusted(manifest: &ModelManifest) -> ModelTrustDecision {
+    ModelTrustStore::default()
+        .trust_digest(manifest.id.digest.value.clone())
+        .evaluate(manifest)
+}
+
+fn sealed_loading_coordinator() -> ModelLoadingCoordinator {
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: ModelArchitecture::new("qwen", "qwen2"),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    coordinator
+}
+
+#[test]
+fn sealed_loading_rejects_untrusted_artifact_before_memory_allocation() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::default();
+    let request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let untrusted = ModelTrustStore::default()
+        .reject_digest(manifest.id.digest.value.clone())
+        .evaluate(&manifest);
+
+    let error = coordinator
+        .load(request, &manifest, &untrusted, &mut memory)
+        .unwrap_err();
+
+    assert_eq!(error.code, ModelLoadingErrorCode::ModelArtifactUntrusted);
+    assert_eq!(memory.allocations().count(), 0);
+}
+
+#[test]
+fn sealed_loading_creates_runtime_owned_ready_context_without_raw_handles() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::default();
+    let mut request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
+    request.sharding_policy = ModelShardingPolicy::Sequential;
+
+    let context = coordinator
+        .load(
+            request,
+            &manifest,
+            &sealed_loading_trusted(&manifest),
+            &mut memory,
+        )
+        .unwrap();
+
+    assert_eq!(context.state(), ModelLoadingState::Ready);
+    assert!(context.can_start_inference());
+    assert!(!context.plan().has_raw_native_handles());
+    assert_eq!(
+        context.plan().quantization_handling(),
+        &ModelQuantizationHandling::DequantizeAtLoad(ModelQuantizationFormat::GgufQ4K)
+    );
+    assert_eq!(
+        context.plan().memory_placements(),
+        &[ModelResidencyLocation::Host]
+    );
+    assert_eq!(memory.allocations().count(), 1);
+    assert!(
+        coordinator
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == ModelLoadingObservationKind::ModelReady)
+    );
+}
+
+#[test]
+fn sealed_loading_memory_budget_failure_does_not_allocate() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::default();
+    let mut request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
+    request.memory_budget_bytes = Some(1);
+
+    let error = coordinator
+        .load(
+            request,
+            &manifest,
+            &sealed_loading_trusted(&manifest),
+            &mut memory,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code, ModelLoadingErrorCode::MemoryFeasibilityFailed);
+    assert_eq!(memory.allocations().count(), 0);
+}
+
+#[test]
+fn sealed_loading_unsupported_quantization_requires_explicit_policy() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::default();
+    let request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+
+    let error = coordinator
+        .load(
+            request,
+            &manifest,
+            &sealed_loading_trusted(&manifest),
+            &mut memory,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code, ModelLoadingErrorCode::QuantizationUnsupported);
+}
+
+#[test]
+fn sealed_loading_memory_manager_rejection_maps_to_loading_error() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::new(MemoryManagerConfig {
+        max_runtime_bytes: Some(1),
+        ..MemoryManagerConfig::default()
+    });
+    let mut request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
+
+    let error = coordinator
+        .load(
+            request,
+            &manifest,
+            &sealed_loading_trusted(&manifest),
+            &mut memory,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code, ModelLoadingErrorCode::MemoryAllocationFailed);
+}
+
 #[test]
 fn inference_api_model_resolution_observed_emits_model_resolved_and_failed() {
     let reference = ModelRef::new("qwen-test").unwrap();
