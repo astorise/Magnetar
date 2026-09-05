@@ -1229,6 +1229,13 @@ struct FirstNativeExecutionKvState {
     cache: KvCacheId,
     compatibility: KvCacheCompatibility,
     layer_kv: Vec<FirstNativeLayerKvState>,
+    /// The Provider `execute_qwen_graph` actually resolved and wrote this
+    /// step's pending K/V resources under. `None` before the first graph
+    /// execution for this state (freshly created by
+    /// `create_prefill_kv_state`); `KvUpdateTransaction::begin`/
+    /// `discard_pending_kv_state` fall back to Reference CPU only in that
+    /// case (`generalize-first-native-provider-dispatch`).
+    provider: Option<ProviderBinding>,
 }
 
 /// One layer's K/V tensor resource identities. Before commit, these name
@@ -1275,6 +1282,7 @@ impl E2eRuntimeModelExecutionEngine {
             cache: cache_id,
             compatibility,
             layer_kv: Vec::new(),
+            provider: None,
         })
     }
 
@@ -1347,10 +1355,16 @@ impl E2eRuntimeModelExecutionEngine {
         let Some(discarded) = discarded else {
             return Ok(());
         };
-        if let Ok(provider) = resolve_kernel_execution_provider(
-            runtime,
-            &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
-        ) {
+        // `generalize-first-native-provider-dispatch`: resolve the Provider
+        // this step's graph execution actually wrote the pending resources
+        // under, not Reference CPU unconditionally -- discarding a non-CPU
+        // step's pending state used to look for it in the wrong Provider's
+        // storage.
+        let provider_binding = discarded
+            .provider
+            .clone()
+            .unwrap_or_else(|| ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+        if let Ok(provider) = resolve_kernel_execution_provider(runtime, &provider_binding) {
             // `release_admitted_tensor`, not `release_tensor`: the pending
             // write these resources came from was itself admitted through
             // `write_tensor_admitted` (Correctif 1), so discarding it must
@@ -2861,6 +2875,16 @@ type QwenGraphExecutionOutput = (
     KernelDispatchResult,
     BTreeMap<TensorEdgeId, HostTensor>,
     Vec<FirstNativeLayerKvState>,
+    ProviderBinding,
+);
+
+/// [`execute_qwen_graph_nodes`]'s own return shape -- the same as
+/// [`QwenGraphExecutionOutput`] minus the resolved [`ProviderBinding`],
+/// which only [`execute_qwen_graph`] (its caller) has resolved.
+type QwenGraphNodesOutput = (
+    KernelDispatchResult,
+    BTreeMap<TensorEdgeId, HostTensor>,
+    Vec<FirstNativeLayerKvState>,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -2908,7 +2932,7 @@ fn execute_qwen_graph(
     // concurrent execution. Walking the graph is delegated to a helper
     // (rather than continuing inline) purely for readability now, not to
     // manage a restore point.
-    execute_qwen_graph_nodes(
+    let (dispatch, bindings, layer_kv) = execute_qwen_graph_nodes(
         &order,
         runtime,
         fixture,
@@ -2921,7 +2945,8 @@ fn execute_qwen_graph(
         kv_history,
         absolute_position_override,
         node_events,
-    )
+    )?;
+    Ok((dispatch, bindings, layer_kv, provider_binding))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2938,7 +2963,7 @@ fn execute_qwen_graph_nodes(
     kv_history: Option<&[FirstNativeLayerKvState]>,
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
-) -> Result<QwenGraphExecutionOutput, InferenceApiError> {
+) -> Result<QwenGraphNodesOutput, InferenceApiError> {
     // This step's token count, for `PlanGuardContext::sequence_length`
     // (Correctif 4): the same value every dispatched node's Plan guards
     // were built against (`PlanGuard::SequenceRange`), read from the graph
@@ -2988,8 +3013,21 @@ fn execute_qwen_graph_nodes(
                 MemoryAllocationClass::Tensor,
                 MemoryAllocationOwner::Session(kv_cache_id.to_string()),
             )
-            .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
-                reason: format!("failed to account graph input resource '{resource_id}': {error}"),
+            .map_err(|error| match error {
+                TensorValueAdmissionError::Memory(error) => {
+                    InferenceApiError::MemoryAdmissionFailed {
+                        reason: format!(
+                            "failed to account graph input resource '{resource_id}': {error}"
+                        ),
+                    }
+                }
+                TensorValueAdmissionError::Provider(error) => {
+                    InferenceApiError::ProviderTensorWriteFailed {
+                        reason: format!(
+                            "failed to write graph input resource '{resource_id}': {error}"
+                        ),
+                    }
+                }
             })?;
         bindings.insert(edge_id, resource_id);
     }
@@ -3131,10 +3169,21 @@ fn execute_qwen_graph_nodes(
                     MemoryAllocationClass::Tensor,
                     MemoryAllocationOwner::Session(kv_cache_id.to_string()),
                 )
-                .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
-                    reason: format!(
-                        "failed to account pending KV resource '{pending_resource}': {error}"
-                    ),
+                .map_err(|error| match error {
+                    TensorValueAdmissionError::Memory(error) => {
+                        InferenceApiError::MemoryAdmissionFailed {
+                            reason: format!(
+                                "failed to account pending KV resource '{pending_resource}': {error}"
+                            ),
+                        }
+                    }
+                    TensorValueAdmissionError::Provider(error) => {
+                        InferenceApiError::ProviderTensorWriteFailed {
+                            reason: format!(
+                                "failed to write pending KV resource '{pending_resource}': {error}"
+                            ),
+                        }
+                    }
                 })?;
             dispatch_ctx.node_events.push(
                 PerNodeCausalEvent::new(
@@ -3166,10 +3215,21 @@ fn execute_qwen_graph_nodes(
                 MemoryAllocationClass::Tensor,
                 MemoryAllocationOwner::Session(kv_cache_id.to_string()),
             )
-            .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
-                reason: format!(
-                    "failed to account graph edge resource '{output_resource_id}': {error}"
-                ),
+            .map_err(|error| match error {
+                TensorValueAdmissionError::Memory(error) => {
+                    InferenceApiError::MemoryAdmissionFailed {
+                        reason: format!(
+                            "failed to account graph edge resource '{output_resource_id}': {error}"
+                        ),
+                    }
+                }
+                TensorValueAdmissionError::Provider(error) => {
+                    InferenceApiError::ProviderTensorWriteFailed {
+                        reason: format!(
+                            "failed to write graph edge resource '{output_resource_id}': {error}"
+                        ),
+                    }
+                }
             })?;
         bindings.insert(output_edge_id.clone(), output_resource_id);
         last_dispatch = Some(dispatch_result);
@@ -4000,49 +4060,50 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // `execute_qwen_graph`'s doc comment). Its output edge
             // `"logits"` carries logits for every model-input row; only the
             // last row is a newly admitted token's distribution.
-            let (dispatch, mut bindings, layer_kv) = if generated_tokens.is_empty() {
-                let ids_tensor = HostTensor::new(
-                    [request.input_token_ids.len() as u64],
-                    request
-                        .input_token_ids
-                        .iter()
-                        .map(|id| *id as f32)
-                        .collect::<Vec<_>>(),
-                )
-                .map_err(runtime_generation_failed)?;
-                execute_qwen_graph(
-                    runtime,
-                    &self.fixture,
-                    model_instance,
-                    &kv_state.cache,
-                    &component_graphs.prefill,
-                    execution_plan,
-                    BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)]),
-                    None,
-                    Some(0),
-                    &mut node_events,
-                )?
-            } else {
-                let token = *generated_tokens.last().ok_or_else(|| {
-                    InferenceApiError::GenerationFailed {
-                        reason: "decode requires a newly admitted token".into(),
-                    }
-                })?;
-                let ids_tensor =
-                    HostTensor::new([1], vec![token as f32]).map_err(runtime_generation_failed)?;
-                execute_qwen_graph(
-                    runtime,
-                    &self.fixture,
-                    model_instance,
-                    &kv_state.cache,
-                    &component_graphs.decode,
-                    execution_plan,
-                    BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)]),
-                    Some(&kv_state.layer_kv),
-                    Some(absolute_position as u64),
-                    &mut node_events,
-                )?
-            };
+            let (dispatch, mut bindings, layer_kv, resolved_provider) =
+                if generated_tokens.is_empty() {
+                    let ids_tensor = HostTensor::new(
+                        [request.input_token_ids.len() as u64],
+                        request
+                            .input_token_ids
+                            .iter()
+                            .map(|id| *id as f32)
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(runtime_generation_failed)?;
+                    execute_qwen_graph(
+                        runtime,
+                        &self.fixture,
+                        model_instance,
+                        &kv_state.cache,
+                        &component_graphs.prefill,
+                        execution_plan,
+                        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)]),
+                        None,
+                        Some(0),
+                        &mut node_events,
+                    )?
+                } else {
+                    let token = *generated_tokens.last().ok_or_else(|| {
+                        InferenceApiError::GenerationFailed {
+                            reason: "decode requires a newly admitted token".into(),
+                        }
+                    })?;
+                    let ids_tensor = HostTensor::new([1], vec![token as f32])
+                        .map_err(runtime_generation_failed)?;
+                    execute_qwen_graph(
+                        runtime,
+                        &self.fixture,
+                        model_instance,
+                        &kv_state.cache,
+                        &component_graphs.decode,
+                        execution_plan,
+                        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)]),
+                        Some(&kv_state.layer_kv),
+                        Some(absolute_position as u64),
+                        &mut node_events,
+                    )?
+                };
             // `execute_qwen_graph` topologically validates the graph (via
             // `qwen_graph_execution_order`) as its first action -- reaching
             // this point with an `Ok` result means that validation
@@ -4050,6 +4111,13 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // is merely assumed.
             graph_validated = true;
             kv_state.layer_kv = layer_kv;
+            // Carries the Provider this step's graph execution actually
+            // resolved through to KV commit/discard
+            // (`generalize-first-native-provider-dispatch`): those used to
+            // hardcode Reference CPU unconditionally regardless of which
+            // Provider the pending K/V resources were actually written
+            // under.
+            kv_state.provider = Some(resolved_provider);
             let logits_tensor = bindings
                 .remove(&TensorEdgeId::new("logits"))
                 .ok_or_else(|| InferenceApiError::GenerationFailed {
@@ -4146,8 +4214,20 @@ struct KvUpdateTransaction {
 }
 
 impl KvUpdateTransaction {
-    fn begin(runtime: &Runtime) -> Result<Self, InferenceApiError> {
-        let provider_binding = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+    /// Resolves the Provider `execute_qwen_graph` actually wrote this step's
+    /// pending K/V resources under (carried on `state.provider`), falling
+    /// back to Reference CPU only when unset -- `generalize-first-native-
+    /// provider-dispatch`'s fix: this used to hardcode Reference CPU
+    /// unconditionally, so a non-CPU step's pending writes would be looked
+    /// for under the wrong Provider binding at commit time.
+    fn begin(
+        runtime: &Runtime,
+        state: &FirstNativeExecutionKvState,
+    ) -> Result<Self, InferenceApiError> {
+        let provider_binding = state
+            .provider
+            .clone()
+            .unwrap_or_else(|| ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
         let executor = resolve_kernel_execution_provider(runtime, &provider_binding)?;
         Ok(Self {
             provider_binding,
@@ -4346,7 +4426,7 @@ impl E2eRuntimeModelExecutionEngine {
         runtime: &mut Runtime,
         state: &FirstNativeExecutionKvState,
     ) -> Result<Vec<FirstNativeLayerKvState>, InferenceApiError> {
-        let mut transaction = KvUpdateTransaction::begin(runtime)?;
+        let mut transaction = KvUpdateTransaction::begin(runtime, state)?;
         for (layer, pending) in state.layer_kv.iter().enumerate() {
             if let Err(error) = transaction.promote_layer(runtime, &state.cache, layer, pending) {
                 transaction.abort(runtime);
@@ -4899,7 +4979,7 @@ pub fn materialize_model_instance_weights(
     artifact_owner: &str,
     weights: &BTreeMap<String, HostTensor>,
 ) -> Result<(), InferenceApiError> {
-    let mut transaction = WeightMaterializationTransaction::begin(runtime)?;
+    let mut transaction = WeightMaterializationTransaction::begin(runtime, instance)?;
     for (name, tensor) in weights {
         if let Err(error) =
             transaction.stage_weight(runtime, instance, artifact_owner, name, tensor)
@@ -4945,8 +5025,22 @@ struct StagedWeight {
 }
 
 impl WeightMaterializationTransaction {
-    fn begin(runtime: &Runtime) -> Result<Self, InferenceApiError> {
-        let provider_binding = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+    /// Resolves the Provider bound to `instance`'s placement
+    /// (`Runtime::create_model_instance` already cross-validated this
+    /// against the prepared plan when the instance was created), falling
+    /// back to Reference CPU only when placement left no Provider bound --
+    /// `generalize-first-native-provider-dispatch`'s "Runtime Treats
+    /// Reference CPU As Normal Provider" fix: this used to hardcode
+    /// Reference CPU unconditionally, making a non-CPU-bound Model Instance
+    /// materialize its weights through the wrong Provider's storage.
+    fn begin(runtime: &Runtime, instance: &ModelInstanceId) -> Result<Self, InferenceApiError> {
+        let provider_binding = runtime
+            .model_instance(instance)?
+            .definition()
+            .placement
+            .provider
+            .clone()
+            .unwrap_or_else(|| ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
         let executor = resolve_kernel_execution_provider(runtime, &provider_binding)?;
         Ok(Self {
             provider_binding,
@@ -8113,7 +8207,7 @@ fn forward_logits_with_weights(
         prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
     )?;
     let cache_id = KvCacheId::new("test-weight-sensitivity-cache")?;
-    let (_dispatch, mut bindings, _layer_kv) = execute_qwen_graph(
+    let (_dispatch, mut bindings, _layer_kv, _provider) = execute_qwen_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -8709,6 +8803,7 @@ fn check_incremental_decode_matches_full_sequence_oracle(
             TokenizerId::new("qwen-test-tokenizer")?,
         ),
         layer_kv,
+        provider: None,
     };
 
     let (_decode_dispatch, decode_hidden, updated_layer_kv) =
@@ -8790,7 +8885,7 @@ fn check_graph_executor_matches_full_sequence_oracle(
         [prompt.len() as u64],
         prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
     )?;
-    let (_prefill_dispatch, _prefill_bindings, layer_kv) = execute_qwen_graph(
+    let (_prefill_dispatch, _prefill_bindings, layer_kv, _provider) = execute_qwen_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -8805,7 +8900,7 @@ fn check_graph_executor_matches_full_sequence_oracle(
     .map_err(E2eConformanceError::from)?;
 
     let admitted_ids = HostTensor::new([1], vec![admitted as f32])?;
-    let (_decode_dispatch, decode_bindings, updated_layer_kv) = execute_qwen_graph(
+    let (_decode_dispatch, decode_bindings, updated_layer_kv, _provider) = execute_qwen_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -9184,7 +9279,7 @@ fn check_graph_executor_logits_provenance_requires_declared_output_edge(
         Err(error) => Err(E2eConformanceError::GenerationFailed {
             reason: format!("unexpected error for a missing output-producing node: {error}"),
         }),
-        Ok((_dispatch, bindings, _layer_kv)) => {
+        Ok((_dispatch, bindings, _layer_kv, _provider)) => {
             if bindings.contains_key(&TensorEdgeId::new("logits")) {
                 Err(E2eConformanceError::GenerationFailed {
                     reason: "graph executor produced a 'logits' binding with no producing node"
@@ -9544,6 +9639,7 @@ fn check_incremental_decode_rejects_missing_layer_kv(
             TokenizerId::new("qwen-test-tokenizer")?,
         ),
         layer_kv: Vec::new(),
+        provider: None,
     };
     match execute_qwen_decode_hidden_states_through_dispatch(
         &mut runtime,

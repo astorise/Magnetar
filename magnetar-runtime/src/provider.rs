@@ -539,6 +539,32 @@ impl TensorValue {
     }
 }
 
+/// The failure shape for [`ProviderExecutionApi::write_tensor_value_admitted`]:
+/// a Memory Manager admission failure and a genuine Provider-native write
+/// failure are distinct categories that SHALL NOT be conflated into one
+/// error type (`generalize-first-native-provider-dispatch`'s "Provider
+/// TensorValue Mutation Error Channel"). `Memory` means admission itself
+/// never succeeded -- no write was attempted. `Provider` means admission
+/// succeeded but the Provider's own write failed; the allocation that was
+/// admitted has already been released by the time this variant is
+/// returned.
+#[derive(Clone, Debug)]
+pub enum TensorValueAdmissionError {
+    Memory(crate::memory::MemoryError),
+    Provider(ProviderExecutionError),
+}
+
+impl fmt::Display for TensorValueAdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Memory(error) => write!(f, "memory admission failed: {error:?}"),
+            Self::Provider(error) => write!(f, "Provider tensor value write failed: {error}"),
+        }
+    }
+}
+
+impl Error for TensorValueAdmissionError {}
+
 /// Native Runtime-to-Provider execution boundary for validated planned work.
 pub trait ProviderExecutionApi: Send + Sync {
     fn submit(
@@ -726,10 +752,23 @@ pub trait ProviderExecutionApi: Send + Sync {
 
     /// Writes a Provider-agnostic tensor value, unadmitted -- the
     /// [`TensorValue`] counterpart to [`Self::write_tensor`]. The default
-    /// implementation does nothing; a Provider that only implements the
-    /// `HostTensor`-typed pathway is still valid without change.
-    fn write_tensor_value(&self, id: TensorResourceId, value: TensorValue) {
+    /// implementation does nothing and succeeds; a Provider that only
+    /// implements the `HostTensor`-typed pathway is still valid without
+    /// change.
+    ///
+    /// Returns a structured [`ProviderExecutionError`] on failure, mirroring
+    /// [`Self::write_tensor`]'s existing contract (`generalize-first-native-
+    /// provider-dispatch`'s "Provider TensorValue Mutation Error Channel"):
+    /// a real Provider's write can fail (allocation, H2D/D2D copy, lost
+    /// context, an async error surfaced at sync time), and a bare `()`
+    /// cannot represent that.
+    fn write_tensor_value(
+        &self,
+        id: TensorResourceId,
+        value: TensorValue,
+    ) -> Result<(), ProviderExecutionError> {
         let _ = (id, value);
+        Ok(())
     }
 
     /// The [`TensorValue`] counterpart to [`Self::write_tensor_admitted`]:
@@ -738,8 +777,27 @@ pub trait ProviderExecutionApi: Send + Sync {
     /// accounting model may admit however is appropriate for them) before
     /// writing, replacing and releasing whatever allocation this Provider
     /// previously admitted for the same `resource_id`, exactly like
-    /// [`Self::write_tensor_admitted`]. The default implementation fails
-    /// closed, matching [`Self::write_tensor_admitted`]'s default.
+    /// [`Self::write_tensor_admitted`].
+    ///
+    /// Returns [`TensorValueAdmissionError`] rather than a bare
+    /// [`crate::memory::MemoryError`]: admission and the Provider-native
+    /// write are genuinely different failure categories (Memory Manager
+    /// ledger vs. Provider execution), and conflating them into one
+    /// `MemoryError`-typed result would force a real write failure to be
+    /// misreported as a memory-admission failure or silently dropped
+    /// (`generalize-first-native-provider-dispatch`'s "Provider TensorValue
+    /// Mutation Error Channel").
+    ///
+    /// The default implementation fails closed, matching
+    /// [`Self::write_tensor_admitted`]'s default: a generic default has no
+    /// way to know this Provider's own identity for
+    /// [`crate::memory::MemoryPlacement::ProviderOwnedOpaque`], so it cannot
+    /// safely admit on a Provider's behalf. A concrete Provider that knows
+    /// its own identity -- e.g. `ReferenceCpuExecutor`, which delegates to
+    /// its own already-correct [`Self::write_tensor_admitted`] for the
+    /// `Host` case -- overrides this with the real admit-then-write-with-
+    /// rollback sequence `WeightMaterializationTransaction::stage_weight`
+    /// already establishes for the `HostTensor`-typed pair.
     fn write_tensor_value_admitted(
         &self,
         memory: &mut crate::memory::MemoryManager,
@@ -747,11 +805,13 @@ pub trait ProviderExecutionApi: Send + Sync {
         value: TensorValue,
         class: crate::memory::MemoryAllocationClass,
         owner: crate::memory::MemoryAllocationOwner,
-    ) -> Result<(), crate::memory::MemoryError> {
+    ) -> Result<(), TensorValueAdmissionError> {
         let _ = (memory, resource_id, value, class, owner);
-        Err(crate::memory::MemoryError::AllocationDenied {
-            reason: "this Provider does not implement admitted tensor value writes".into(),
-        })
+        Err(TensorValueAdmissionError::Memory(
+            crate::memory::MemoryError::AllocationDenied {
+                reason: "this Provider does not implement admitted tensor value writes".into(),
+            },
+        ))
     }
 
     /// Requests scratch-space workspace through the Runtime's

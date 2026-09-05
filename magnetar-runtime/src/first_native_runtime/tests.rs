@@ -540,10 +540,15 @@ impl ProviderExecutionApi for MockKernelExecutor {
     fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
         self.storage.lock().unwrap().get(id).cloned()
     }
-    fn write_tensor_value(&self, id: TensorResourceId, value: TensorValue) {
+    fn write_tensor_value(
+        &self,
+        id: TensorResourceId,
+        value: TensorValue,
+    ) -> Result<(), ProviderExecutionError> {
         if let TensorValue::Host(tensor) = value {
-            let _ = self.write_tensor(id, tensor);
+            self.write_tensor(id, tensor)?;
         }
+        Ok(())
     }
     fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
         self.read_tensor(id).map(TensorValue::Host)
@@ -610,8 +615,13 @@ impl ProviderExecutionApi for DeviceResidentOnlyExecutor {
     fn release(&self, _handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
         Ok(())
     }
-    fn write_tensor_value(&self, id: TensorResourceId, _value: TensorValue) {
+    fn write_tensor_value(
+        &self,
+        id: TensorResourceId,
+        _value: TensorValue,
+    ) -> Result<(), ProviderExecutionError> {
         self.resources.lock().unwrap().insert(id);
+        Ok(())
     }
     fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
         if self.resources.lock().unwrap().contains(id) {
@@ -711,6 +721,52 @@ impl ProviderExecutionApi for FailableProviderExecutionApi {
         }
         Ok(self.inner.release_tensor(id))
     }
+    fn write_tensor_value(
+        &self,
+        id: TensorResourceId,
+        value: TensorValue,
+    ) -> Result<(), ProviderExecutionError> {
+        if self.fail_write.load(Ordering::SeqCst) {
+            return Err(self.simulated_error(ProviderExecutionPhase::Prepare));
+        }
+        if let TensorValue::Host(tensor) = value {
+            self.inner.write_tensor(id, tensor);
+        }
+        Ok(())
+    }
+    // Real admit-then-write-with-rollback (mirrors
+    // `ReferenceCpuExecutor`/the default trait implementation's documented
+    // shape) rather than the trait's fail-closed default: this mock needs
+    // admission to actually succeed so `write_tensor_value`'s injectable
+    // failure is the thing under test, not admission itself.
+    fn write_tensor_value_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        resource_id: TensorResourceId,
+        value: TensorValue,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), TensorValueAdmissionError> {
+        let byte_size = match &value {
+            TensorValue::Host(tensor) => tensor.data.len() as u64 * size_of::<f32>() as u64,
+            TensorValue::Opaque => 0,
+        };
+        let allocation = memory
+            .allocate(MemoryAllocationRequest::new(
+                class,
+                byte_size,
+                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+                    REFERENCE_CPU_PROVIDER_NAME,
+                )),
+                owner,
+            ))
+            .map_err(TensorValueAdmissionError::Memory)?;
+        if let Err(error) = self.write_tensor_value(resource_id, value) {
+            let _ = memory.release(allocation.id);
+            return Err(TensorValueAdmissionError::Provider(error));
+        }
+        Ok(())
+    }
 }
 
 /// P0 fix regression: `WeightMaterializationTransaction::stage_weight`
@@ -757,6 +813,45 @@ fn stage_weight_propagates_and_rolls_back_on_provider_write_failure() {
         .allocations()
         .max_by_key(|allocation| allocation.id)
         .expect("at least one allocation exists");
+    assert_eq!(
+        this_attempts_allocation.state,
+        MemoryAllocationState::Released,
+        "the allocation admitted just before the failed write must be rolled back, not leaked"
+    );
+}
+
+/// `generalize-first-native-provider-dispatch` regression: the `TensorValue`
+/// counterpart to `stage_weight_propagates_and_rolls_back_on_provider_write_failure`
+/// above. Before this change, `write_tensor_value_admitted` could only
+/// report a `MemoryError`, so a genuine Provider-native write failure after
+/// successful admission had no way to surface -- this asserts it now does,
+/// distinguishably, with the same allocate-then-release-on-failure rollback
+/// discipline.
+#[test]
+fn write_tensor_value_admitted_propagates_and_rolls_back_on_provider_write_failure() {
+    let executor = FailableProviderExecutionApi::new();
+    executor.fail_write.store(true, Ordering::SeqCst);
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+
+    let tensor = HostTensor::new([4, 8], vec![0.0; 32]).unwrap();
+    let error = executor
+        .write_tensor_value_admitted(
+            &mut memory,
+            TensorResourceId::new("test-tensor-value-write-failure"),
+            TensorValue::Host(tensor),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, TensorValueAdmissionError::Provider(_)),
+        "a write failure after successful admission must be reported as Provider, not Memory: {error:?}"
+    );
+
+    let this_attempts_allocation = memory
+        .allocations()
+        .max_by_key(|allocation| allocation.id)
+        .expect("admission ran before the write failed");
     assert_eq!(
         this_attempts_allocation.state,
         MemoryAllocationState::Released,
@@ -1058,6 +1153,147 @@ fn provider_execution_generic_resolution_reaches_non_reference_cpu_provider() {
     assert_eq!(output.data, vec![1.0, 2.0]);
 }
 
+/// `generalize-first-native-provider-dispatch` P0 fix regression: a Model
+/// Instance whose placement binds a non-Reference-CPU registered Provider
+/// materializes its weights through *that* Provider's storage, not
+/// Reference CPU's -- `WeightMaterializationTransaction::begin()` used to
+/// hardcode Reference CPU unconditionally, which would have silently
+/// written this weight into the wrong Provider (or failed to find it later
+/// under the right one).
+#[test]
+fn weight_materialization_uses_the_model_instances_bound_provider() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mock_provider = ProviderBinding::new("magnetar:provider/mock-kernel");
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .register_provider(Arc::new(MockKernelProvider::new()))
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
+        .build()
+        .expect("both providers register cleanly");
+
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(fixture.architecture_implementation.clone());
+    let mut request = ModelLoadingRequest::new(
+        ModelLoadingRequestId::new("provider-dispatch-weight-test"),
+        fixture.manifest.id.clone(),
+    );
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(request),
+        &fixture.manifest,
+    )
+    .expect("model loads");
+    let instance = create_model_instance(
+        &mut runtime,
+        &loaded,
+        fixture.architecture_implementation.clone(),
+        ResourceAffinity::new(FallbackClass::Transparent).with_provider(mock_provider.clone()),
+    )
+    .expect("instance binds to the mock provider (loading resolved no conflicting binding)");
+
+    let weight_name = "test.arbitrary.weight";
+    let tensor = HostTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    materialize_model_instance_weights(
+        &mut runtime,
+        &instance,
+        "test",
+        &BTreeMap::from([(weight_name.to_string(), tensor.clone())]),
+    )
+    .expect("weight materializes through the bound (mock) provider");
+
+    let resource_id = runtime
+        .model_instance(&instance)
+        .unwrap()
+        .definition()
+        .resource_bindings
+        .weights
+        .get(weight_name)
+        .cloned()
+        .expect("weight binding recorded");
+
+    let mock_api = resolve_kernel_execution_provider(&runtime, &mock_provider)
+        .expect("mock provider resolves");
+    assert_eq!(
+        mock_api.read_tensor(&resource_id),
+        Some(tensor),
+        "weight must be readable from the bound mock Provider's storage"
+    );
+
+    let cpu_api = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .expect("reference CPU provider resolves");
+    assert!(
+        cpu_api.read_tensor(&resource_id).is_none(),
+        "weight must not have been written to Reference CPU's storage"
+    );
+}
+
+/// `generalize-first-native-provider-dispatch` P0 fix regression:
+/// `KvUpdateTransaction::begin` resolves the Provider carried on
+/// `FirstNativeExecutionKvState.provider` (what `execute_qwen_graph`
+/// resolved and wrote this step's pending K/V resources under), not
+/// Reference CPU unconditionally. Tests `begin`'s resolution directly
+/// (rather than driving a full non-CPU generation step, which would need a
+/// mock Provider implementing every Qwen graph Operator, not just this
+/// contract) since `begin` is the entire fix -- everything downstream of it
+/// already receives whichever `provider_binding` it resolves.
+#[test]
+fn kv_update_transaction_resolves_the_states_bound_provider() {
+    let mock_provider = ProviderBinding::new("magnetar:provider/mock-kernel");
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .register_provider(Arc::new(MockKernelProvider::new()))
+        .build()
+        .expect("both providers register cleanly");
+
+    let state = FirstNativeExecutionKvState {
+        cache: KvCacheId::new("test-kv-transaction-binding-cache").unwrap(),
+        compatibility: KvCacheCompatibility::new(
+            GenerationModelReference::LoadedModelContext("qwen-test".into()),
+            TokenizerId::new("qwen-test-tokenizer").unwrap(),
+        ),
+        layer_kv: Vec::new(),
+        provider: Some(mock_provider.clone()),
+    };
+
+    let transaction = KvUpdateTransaction::begin(&runtime, &state).expect("mock provider resolves");
+    assert_eq!(
+        transaction.provider_binding, mock_provider,
+        "must resolve the Provider bound on the KV state, not Reference CPU"
+    );
+}
+
+/// Same fix, the other branch: a state with no bound Provider (never
+/// touched by `execute_qwen_graph`, e.g. a freshly created prefill state)
+/// still falls back to Reference CPU -- preserving today's only real
+/// behavior exactly.
+#[test]
+fn kv_update_transaction_falls_back_to_reference_cpu_when_unbound() {
+    let runtime = build_runtime_trusting_fixture(&e2e_fixture().expect("fixture builds"));
+
+    let state = FirstNativeExecutionKvState {
+        cache: KvCacheId::new("test-kv-transaction-fallback-cache").unwrap(),
+        compatibility: KvCacheCompatibility::new(
+            GenerationModelReference::LoadedModelContext("qwen-test".into()),
+            TokenizerId::new("qwen-test-tokenizer").unwrap(),
+        ),
+        layer_kv: Vec::new(),
+        provider: None,
+    };
+
+    let transaction = KvUpdateTransaction::begin(&runtime, &state).expect("reference CPU resolves");
+    assert_eq!(
+        transaction.provider_binding,
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)
+    );
+}
+
 /// `define-provider-prepared-kernel-execution-contract`: a Provider that
 /// only ever answers [`TensorValue::Opaque`] (never `Host`) is a valid,
 /// independent implementation of the Provider-agnostic tensor value
@@ -1075,7 +1311,9 @@ fn tensor_value_into_host_fails_structurally_for_a_device_resident_only_provider
     // opaque".
     assert!(executor.read_tensor_value(&id).is_none());
 
-    executor.write_tensor_value(id.clone(), TensorValue::Opaque);
+    executor
+        .write_tensor_value(id.clone(), TensorValue::Opaque)
+        .unwrap();
     let value = executor
         .read_tensor_value(&id)
         .expect("resource is present after being written");
