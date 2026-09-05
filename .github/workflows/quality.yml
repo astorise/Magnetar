@@ -210,23 +210,38 @@ jobs:
       - name: Validate OpenSpec artifacts
         run: openspec validate --all --strict
 
-  # Model-family isolation (task group 12 / Correctif 9, task 12.7): the
-  # Provider/Kernel/Device/Memory/Tensor/Component contract files listed
-  # below are the generic Core magnetar-runtime itself depends on for every
-  # model family, not just Qwen -- they must never encode Qwen- or
-  # Llama-specific knowledge (a weight-name suffix table, a hardcoded KV
-  # namespace, an enum variant naming one model family by name). This is a
-  # narrower, explicit allowlist of files verified clean today, not "every
-  # file in magnetar-runtime": a broader sweep during this task found real,
-  # pre-existing qwen/llama mentions in conformance.rs, kernel_execution_plan.rs,
-  # provider_roadmap.rs, and other files outside this list (mostly test-fixture
-  # example strings, but conformance.rs's `QwenWasmModelComponent` enum
-  # variant is a genuine, real instance of the pattern this guard exists to
-  # catch) -- deliberately not fixed in this pass, real follow-up work, so
-  # this guard does not yet cover those files. `first_native_runtime.rs` and
-  # `qwen_model_component.rs` are the two files designated to legitimately
-  # carry Qwen-specific knowledge (see their own doc comments) and are never
-  # in scope for this guard.
+  # Model-family isolation (task group 12 / Correctif 9, task 12.7; extended
+  # to close GitHub issue "Finish model-family isolation beyond the current
+  # CI allowlist"): the Provider/Kernel/Device/Memory/Tensor/Component
+  # contract files listed below are the generic Core magnetar-runtime itself
+  # depends on for every model family, not just Qwen -- they must never
+  # encode Qwen- or Llama-specific knowledge (a weight-name suffix table, a
+  # hardcoded KV namespace, an enum variant naming one model family by
+  # name). A full sweep of every file in `magnetar-runtime/src/` (not just
+  # this list) for the same pattern found exactly one genuine violation
+  # outside it -- `conformance.rs`'s `QwenWasmModelComponent` enum variant,
+  # a "generic first-native capability" enum with one entry naming a
+  # specific Model Component implementation, now renamed to
+  # `ModelWasmComponent` -- plus one test-fixture string in
+  # `kernel_execution_plan.rs` (`ModelInstanceId::new("qwen-decode")`,
+  # renamed to `"model-decode"`; the value was never live logic, just an
+  # arbitrary test id). Both files are now clean and added below.
+  #
+  # Deliberately still excluded, by classification rather than oversight:
+  # `first_native_runtime.rs` and `qwen_model_component.rs` are the two
+  # files designated to legitimately carry Qwen-specific knowledge (see
+  # their own doc comments); `first_native_implementation_cut.rs` and
+  # `e2e_conformance.rs` are explicitly scoped to the first-native
+  # (currently Qwen) cut and to test/conformance fixtures respectively, not
+  # generic Core; `model_format_roadmap.rs`, `model_source_cache_roadmap.rs`,
+  # `provider_roadmap.rs`, `release_cutover.rs`, `release_packaging.rs`, and
+  # `release_security.rs` are roadmap/release-process files whose explicit
+  # purpose is to name specific model families (planned format/provider
+  # support, the current release's own Qwen-baseline scope) -- naming a
+  # family there is the point, not a leak, so this guard does not apply to
+  # them. `tests.rs` and other `#[cfg(test)]`-only modules are exempt for
+  # the same reason as the "explicitly isolated tests/oracles" carve-out in
+  # the tracking issue: a fixture identifier string is not live Core logic.
   model-family-isolation:
     name: quality / model-family isolation
     runs-on: ubuntu-latest
@@ -244,11 +259,13 @@ jobs:
             magnetar-runtime/src/component.rs
             magnetar-runtime/src/component_wasmtime.rs
             magnetar-runtime/src/compute.rs
+            magnetar-runtime/src/conformance.rs
             magnetar-runtime/src/device.rs
             magnetar-runtime/src/execution_graph.rs
             magnetar-runtime/src/graph_builder_capability.rs
             magnetar-runtime/src/kernel.rs
             magnetar-runtime/src/kernel_compilation.rs
+            magnetar-runtime/src/kernel_execution_plan.rs
             magnetar-runtime/src/memory.rs
             magnetar-runtime/src/operator.rs
             magnetar-runtime/src/provider.rs

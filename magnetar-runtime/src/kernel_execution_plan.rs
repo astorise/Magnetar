@@ -2424,7 +2424,7 @@ mod tests {
 
     #[test]
     fn plan_scope_validates_model_instance_revision_adapter_and_policy() {
-        let instance = ModelInstanceId::new("qwen-decode").unwrap();
+        let instance = ModelInstanceId::new("model-decode").unwrap();
         let adapter = AdapterRevision::new("adapter-r1").unwrap();
         let scope = PreparedExecutionPlanScope::for_phase(PreparedExecutionPhase::Decode)
             .with_model_instance(instance.clone(), 7)

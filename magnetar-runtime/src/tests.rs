@@ -583,7 +583,7 @@ fn first_native_model_execution_profile_declares_versioned_mandatory_capabilitie
         "local-runtime",
         "platform-component-engine",
         "wasmtime-component-engine",
-        "qwen-wasm-model-component",
+        "model-wasm-component",
         "model-artifact",
         "tokenizer",
         "operator-catalog",
