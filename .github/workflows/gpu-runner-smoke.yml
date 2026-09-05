@@ -30,7 +30,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Checkout CUDA Provider submodule
-        run: git submodule update --init -- providers/cuda
+        # The container's git refuses to touch a workspace it doesn't own --
+        # the checkout step ran before git existed in this image, so the
+        # workspace's ownership doesn't match this step's user.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init -- providers/cuda
       - name: Verify GPU is visible
         run: |
           set -eux
