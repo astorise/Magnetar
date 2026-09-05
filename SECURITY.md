@@ -38,12 +38,15 @@ alone is not treated as cryptographic proof.
 
 These are tracked publicly and do not need a private report:
 
-- Component signatures carry no cryptographic material and are not verified.
-  Publisher/source metadata alone is treated as `Unknown` and does not satisfy
-  trust policy; acceptance still requires digest pinning or explicit local
-  development policy. Design work for cryptographic artifact signatures and
-  authenticated publisher identity is tracked in
-  [#37](https://github.com/astorise/Magnetar/issues/37).
+- Component and Model Artifact signatures carry no cryptographic material and
+  are not verified. Publisher/source metadata alone is treated as `Unknown`
+  and does not satisfy trust policy; acceptance still requires digest pinning
+  or explicit local development policy. The design for cryptographic artifact
+  signatures and authenticated publisher identity (what gets signed, Ed25519,
+  key identification and trust/revocation, and the resulting fail-closed
+  verification policy) is recorded in
+  [`docs/cryptographic-artifact-signatures.md`](docs/cryptographic-artifact-signatures.md);
+  implementation is separate, not-yet-scheduled follow-up work.
 - Non-Wasmtime or future Component engines must provide equivalent fuel,
   deadline/interruption, resource-limit, and no-ambient-authority guarantees
   before they can satisfy the same native security profile.
