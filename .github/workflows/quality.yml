@@ -44,7 +44,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Check workspace
         run: cargo check --locked --workspace --all-targets --all-features
 
@@ -57,7 +57,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
@@ -74,7 +74,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run tests
         run: cargo test --locked --workspace --all-targets
 
@@ -93,7 +93,7 @@ jobs:
       - name: Install MSRV toolchain
         run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Check workspace against the declared MSRV
         run: cargo +${{ steps.msrv.outputs.version }} check --locked --workspace --all-features
 
@@ -117,7 +117,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Test Wasmtime Component Engine
         run: cargo test --locked -p magnetar-runtime --all-targets --features wasmtime-component-engine
 
@@ -132,7 +132,7 @@ jobs:
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Check wasm32 Component Runtime
         run: cargo check --locked -p magnetar-runtime --target wasm32-unknown-unknown --all-features
 
@@ -145,7 +145,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run hardware-independent Provider conformance
         run: cargo test --locked -p magnetar-runtime provider_conformance -- --nocapture
 
@@ -158,7 +158,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run First-Native Runtime Conformance (no GPU required)
         run: cargo test --locked -p magnetar-runtime first_native_runtime -- --nocapture
 
@@ -173,7 +173,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build workspace documentation
         run: cargo doc --locked --workspace --no-deps
       - name: Build Wasmtime Component Engine documentation
@@ -284,7 +284,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build and test each Component crate independently
         shell: bash
         run: |
@@ -315,7 +315,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build and test each Format crate independently
         shell: bash
         run: |
@@ -349,7 +349,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build and test the mandatory CPU Provider
         run: cargo test --locked --manifest-path providers/cpu/Cargo.toml
       - name: Build and test the optional CUDA Provider (template today, no hardware gate needed yet)
@@ -373,7 +373,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build and test each submodule crate independently
         shell: bash
         run: |
@@ -429,7 +429,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@b1d53d4d726d74b5a950a5b3798a3c6ede4e0f64 # cargo-llvm-cov
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Prepare coverage output
         run: mkdir -p target/llvm-cov
       - name: Generate coverage
