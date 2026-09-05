@@ -1,0 +1,43 @@
+name: GPU Runner Smoke Test
+
+# Confirms the arc-gpu-magnetar self-hosted GPU runner is reachable and can
+# build/test providers/cuda. Manual only: providers/cuda is currently an
+# empty template (see providers/cuda/README.md), so there is no CUDA-specific
+# behavior yet worth gating per-PR CI on -- this just proves the runner and
+# submodule wiring work, ahead of real CUDA content landing.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: gpu-runner-smoke
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: gpu / smoke test
+    runs-on: arc-gpu-magnetar
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout CUDA Provider submodule
+        run: git submodule update --init -- providers/cuda
+      - name: Verify GPU is visible
+        run: |
+          set -eux
+          nvidia-smi
+          command -v nvcc
+          nvcc --version
+          test -d "${CUDA_HOME:-/usr/local/cuda}"
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Build and test the CUDA Provider template
+        run: cargo test --locked --manifest-path providers/cuda/Cargo.toml
