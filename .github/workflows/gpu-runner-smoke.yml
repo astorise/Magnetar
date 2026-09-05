@@ -19,6 +19,9 @@ jobs:
   smoke:
     name: gpu / smoke test
     runs-on: arc-gpu-magnetar
+    container:
+      image: nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
+      options: --gpus all
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -33,6 +36,8 @@ jobs:
           command -v nvcc
           nvcc --version
           test -d "${CUDA_HOME:-/usr/local/cuda}"
+      - name: Install build dependencies
+        run: apt-get update && apt-get install -y --no-install-recommends curl build-essential
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
