@@ -9429,7 +9429,9 @@ fn inference_api_warm_model_instance_rejects_hand_assembled_binding_without_evid
         .provider(REFERENCE_CPU_PROVIDER_NAME)
         .and_then(|provider| provider.execution_api())
         .unwrap();
-    executor.write_tensor(resource_id.clone(), HostTensor::new([1], [0.0]).unwrap());
+    executor
+        .write_tensor(resource_id.clone(), HostTensor::new([1], [0.0]).unwrap())
+        .unwrap();
     runtime
         .memory_mut()
         .record_tensor_residency(
@@ -9639,7 +9641,9 @@ fn inference_api_warm_model_instance_reaches_ready_without_provider_read_tensor_
         .provider(REFERENCE_CPU_PROVIDER_NAME)
         .and_then(|provider| provider.execution_api())
         .unwrap();
-    executor.write_tensor(probe_resource.clone(), HostTensor::new([1], [0.0]).unwrap());
+    executor
+        .write_tensor(probe_resource.clone(), HostTensor::new([1], [0.0]).unwrap())
+        .unwrap();
     assert!(executor.read_tensor(&probe_resource).is_none());
 
     let weights = BTreeMap::from([("weight".to_string(), HostTensor::new([1], [0.0]).unwrap())]);

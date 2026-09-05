@@ -1357,8 +1357,10 @@ impl E2eRuntimeModelExecutionEngine {
             // release that allocation too, not just drop the Provider
             // storage entry.
             for layer in &discarded.layer_kv {
-                provider.release_admitted_tensor(runtime.memory_mut(), &layer.k);
-                provider.release_admitted_tensor(runtime.memory_mut(), &layer.v);
+                // Best-effort: this pending state is being discarded
+                // regardless of whether Provider-side release succeeds.
+                let _ = provider.release_admitted_tensor(runtime.memory_mut(), &layer.k);
+                let _ = provider.release_admitted_tensor(runtime.memory_mut(), &layer.v);
             }
         }
         Ok(())
@@ -1785,14 +1787,21 @@ impl HotPathKernelSelection {
     }
 }
 
-fn dispatch_reference_cpu_operator(
+/// Dispatches one Reference CPU Operator node with an arbitrary number of
+/// outputs -- most callers have exactly one and use
+/// [`dispatch_reference_cpu_operator`]'s single-output convenience wrapper
+/// below, but a genuinely multi-output Operator (e.g. `split`) needs every
+/// entry of the Kernel's `KernelResult::updated_resources` bound to its own
+/// requested output, not just the first (GitHub issue "First-native graph
+/// executor only propagates the first output of a multi-output node").
+fn dispatch_reference_cpu_operator_multi(
     ctx: &mut QwenDispatchContext<'_>,
     operation_id: &str,
     operator: OperatorId,
     inputs: Vec<(TensorResourceId, TensorDescriptor, HostTensor)>,
-    output: (TensorResourceId, TensorDescriptor),
+    outputs: Vec<(TensorResourceId, TensorDescriptor)>,
     attributes: BTreeMap<String, OperatorAttributeValue>,
-) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+) -> Result<(KernelDispatchResult, Vec<HostTensor>), InferenceApiError> {
     // Correctif 17 / task group 17: this node's causal chain starts here,
     // once its inputs (written just below) are resolved and it is about to
     // be dispatched. `node` is reused for every later event this call
@@ -1807,20 +1816,28 @@ fn dispatch_reference_cpu_operator(
     let affinity = ResourceAffinity::new(FallbackClass::Transparent)
         .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
         .with_execution_context(ctx.runtime.context().id());
-    let output_resource =
-        TensorResourceDescriptor::new(output.0.clone(), output.1, affinity.clone());
+    let output_resources: Vec<TensorResourceDescriptor> = outputs
+        .into_iter()
+        .map(|(id, descriptor)| TensorResourceDescriptor::new(id, descriptor, affinity.clone()))
+        .collect();
     let mut selection_request = KernelSelectionRequest::new(
         format!("e2e-runtime-{operation_id}"),
         operator,
         affinity.clone(),
-    )
-    .with_output(KernelResource::new(
-        output_resource.clone(),
-        KernelMemoryClass::Host,
-    ));
+    );
+    for output_resource in &output_resources {
+        selection_request = selection_request.with_output(KernelResource::new(
+            output_resource.clone(),
+            KernelMemoryClass::Host,
+        ));
+    }
     for (id, descriptor, tensor) in inputs {
         let resource = TensorResourceDescriptor::new(id.clone(), descriptor, affinity.clone());
-        ctx.provider.write_tensor(id, tensor);
+        ctx.provider.write_tensor(id, tensor).map_err(|error| {
+            InferenceApiError::ProviderTensorWriteFailed {
+                reason: error.to_string(),
+            }
+        })?;
         selection_request =
             selection_request.with_input(KernelResource::new(resource, KernelMemoryClass::Host));
     }
@@ -1996,20 +2013,65 @@ fn dispatch_reference_cpu_operator(
         InferenceApiObservationKind::ProviderCompleted,
         node.clone(),
     ));
-    let output_tensor = ctx
-        .provider
-        .read_tensor(&output_resource.id)
-        .ok_or_else(|| InferenceApiError::GenerationFailed {
-            reason: format!("Reference CPU dispatch for {operation_id} produced no output"),
-        })?;
-    ctx.node_events.push(
-        PerNodeCausalEvent::new(InferenceApiObservationKind::TensorResourceProduced, node)
+    // Every requested output is read back and bound to its corresponding
+    // graph edge in the same order `outputs` was given, not just the
+    // first -- a genuinely multi-output Operator (e.g. `split`) produces
+    // one `KernelResult::updated_resources` entry per output, and each
+    // needs its own `TensorResourceProduced` causal event and its own
+    // read-back, the same treatment the single-output case already got.
+    let mut output_tensors = Vec::with_capacity(output_resources.len());
+    for output_resource in &output_resources {
+        let output_tensor = ctx
+            .provider
+            .read_tensor(&output_resource.id)
+            .ok_or_else(|| InferenceApiError::GenerationFailed {
+                reason: format!(
+                    "Reference CPU dispatch for {operation_id} produced no output for resource '{}'",
+                    output_resource.id
+                ),
+            })?;
+        ctx.node_events.push(
+            PerNodeCausalEvent::new(
+                InferenceApiObservationKind::TensorResourceProduced,
+                node.clone(),
+            )
             .with_resource(output_resource.id.clone()),
-    );
+        );
+        output_tensors.push(output_tensor);
+    }
     ctx.last_provider_execution = Some(ProviderExecutionResult::completed(
         handle,
         dispatch_result.updated_resources.clone(),
     ));
+    Ok((dispatch_result, output_tensors))
+}
+
+/// Single-output convenience wrapper over
+/// [`dispatch_reference_cpu_operator_multi`]: almost every graph node in
+/// this file's Qwen dispatch has exactly one output, and threading a
+/// `Vec` through every one of those call sites for a case that structurally
+/// cannot produce more than one element would only add noise.
+fn dispatch_reference_cpu_operator(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    operator: OperatorId,
+    inputs: Vec<(TensorResourceId, TensorDescriptor, HostTensor)>,
+    output: (TensorResourceId, TensorDescriptor),
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let (dispatch_result, mut outputs) = dispatch_reference_cpu_operator_multi(
+        ctx,
+        operation_id,
+        operator,
+        inputs,
+        vec![output],
+        attributes,
+    )?;
+    let output_tensor = outputs
+        .pop()
+        .ok_or_else(|| InferenceApiError::GenerationFailed {
+            reason: format!("Reference CPU dispatch for {operation_id} produced no output"),
+        })?;
     Ok((dispatch_result, output_tensor))
 }
 
@@ -3406,10 +3468,16 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         let v_resource = TensorResourceId::new(format!("oracle-kv.layer{layer}.v"));
         dispatch_ctx
             .provider
-            .write_tensor(k_resource.clone(), k.clone());
+            .write_tensor(k_resource.clone(), k.clone())
+            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                reason: error.to_string(),
+            })?;
         dispatch_ctx
             .provider
-            .write_tensor(v_resource.clone(), v.clone());
+            .write_tensor(v_resource.clone(), v.clone())
+            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                reason: error.to_string(),
+            })?;
         layer_kv.push(FirstNativeLayerKvState {
             k: k_resource,
             v: v_resource,
@@ -3680,10 +3748,16 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         let v_resource = TensorResourceId::new(format!("oracle-kv.layer{layer}.v"));
         dispatch_ctx
             .provider
-            .write_tensor(k_resource.clone(), k.clone());
+            .write_tensor(k_resource.clone(), k.clone())
+            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                reason: error.to_string(),
+            })?;
         dispatch_ctx
             .provider
-            .write_tensor(v_resource.clone(), v.clone());
+            .write_tensor(v_resource.clone(), v.clone())
+            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                reason: error.to_string(),
+            })?;
         updated_layer_kv.push(FirstNativeLayerKvState {
             k: k_resource,
             v: v_resource,
@@ -4120,8 +4194,11 @@ impl KvUpdateTransaction {
         for already in &self.promoted {
             let _ = runtime.memory_mut().release(already.binding.k_allocation);
             let _ = runtime.memory_mut().release(already.binding.v_allocation);
-            self.executor.release_tensor(&already.binding.k);
-            self.executor.release_tensor(&already.binding.v);
+            // Best-effort, like the memory releases above: this is already
+            // an unwind over a different failure, with nothing further to
+            // roll back to if the Provider release itself fails.
+            let _ = self.executor.release_tensor(&already.binding.k);
+            let _ = self.executor.release_tensor(&already.binding.v);
         }
     }
 
@@ -4138,8 +4215,12 @@ impl KvUpdateTransaction {
             if let Some(previous) = promoted_layer.previous {
                 let _ = runtime.memory_mut().release(previous.k_allocation);
                 let _ = runtime.memory_mut().release(previous.v_allocation);
-                self.executor.release_tensor(&previous.k);
-                self.executor.release_tensor(&previous.v);
+                // Best-effort: the new binding above already promoted
+                // successfully, so a failure releasing the superseded one
+                // is a leak to surface separately, not a reason to fail
+                // this otherwise-successful commit.
+                let _ = self.executor.release_tensor(&previous.k);
+                let _ = self.executor.release_tensor(&previous.v);
             }
             runtime
                 .kv_caches_mut()
@@ -4239,7 +4320,19 @@ fn promote_pending_kv_layer_role(
         "kv.{cache}.layer{layer}.{role}.gen{}",
         allocation.id
     ));
-    executor.write_tensor(committed_resource.clone(), tensor);
+    if let Err(error) = executor.write_tensor(committed_resource.clone(), tensor) {
+        // The allocation above already admitted successfully: release it
+        // before propagating, so this failed promotion leaves no trace in
+        // the Memory Manager ledger (same rollback shape as
+        // `WeightMaterializationTransaction::stage_weight`'s own
+        // admission-then-write-or-residency-failure handling).
+        let _ = runtime.memory_mut().release(allocation.id);
+        return Err(InferenceApiError::ProviderTensorWriteFailed {
+            reason: format!(
+                "failed to write committed KV resource for layer {layer} ({role}): {error}"
+            ),
+        });
+    }
     Ok((committed_resource, allocation.id))
 }
 
@@ -4942,8 +5035,20 @@ impl WeightMaterializationTransaction {
             .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
                 reason: format!("failed to account weight resource '{name}': {error}"),
             })?;
-        self.executor
-            .write_tensor(resource_id.clone(), tensor.clone());
+        if let Err(error) = self
+            .executor
+            .write_tensor(resource_id.clone(), tensor.clone())
+        {
+            // Admission above already succeeded: release it before
+            // propagating, so a write failure leaves no trace in the
+            // Memory Manager ledger.
+            let _ = runtime.memory_mut().release(allocation.id);
+            return Err(InferenceApiError::ProviderTensorWriteFailed {
+                reason: format!(
+                    "failed to write weight resource '{name}' to Provider storage: {error}"
+                ),
+            });
+        }
         if let Err(error) = runtime.memory_mut().record_tensor_residency(
             TensorResidency::new(
                 resource_id.clone(),
@@ -4957,8 +5062,12 @@ impl WeightMaterializationTransaction {
             // succeeded: release what was just staged for this one weight
             // before propagating, so the caller's subsequent `abort()`
             // over `self.staged` never sees this half-staged entry (it was
-            // never pushed).
-            self.executor.release_tensor(&resource_id);
+            // never pushed). Best-effort: this call is already on a
+            // failure path over a different error, so a further failure
+            // releasing the just-written tensor is not itself surfaced --
+            // the original residency-registration error is what the caller
+            // needs to see.
+            let _ = self.executor.release_tensor(&resource_id);
             let _ = runtime.memory_mut().release(allocation.id);
             return Err(InferenceApiError::MemoryAdmissionFailed {
                 reason: format!(
@@ -4980,7 +5089,10 @@ impl WeightMaterializationTransaction {
     /// attempt fails to stage.
     fn abort(self, runtime: &mut Runtime) {
         for staged in &self.staged {
-            self.executor.release_tensor(&staged.resource_id);
+            // Best-effort: this is already unwinding a failed attempt, with
+            // nothing further to roll back to if the Provider release
+            // itself fails.
+            let _ = self.executor.release_tensor(&staged.resource_id);
             // Remove the residency record before releasing the allocation
             // it references: once the Provider tensor and allocation are
             // both gone, a lingering `TensorResidency` entry would
@@ -5252,7 +5364,14 @@ pub fn register_qwen_component_artifact(component_bytes: Vec<u8>, manifest_bytes
         manifest_bytes,
         ComponentDigest::parse("sha256", QWEN_REAL_COMPONENT_DIGEST),
         ComponentDistributionSource::new(
-            ComponentDistributionSourceKind::DevelopmentFixture,
+            // Not `DevelopmentFixture`: this function is not test-gated --
+            // it is `magnetar-cli`'s real, production embedder-facing call
+            // path (see this function's own doc comment), which supplies
+            // bytes it owns and embeds itself. `DevelopmentFixture` stays
+            // reserved for the `#[cfg(test)]`-gated fixture packages
+            // elsewhere in this file (`ClientProvided instead of
+            // DevelopmentFixture` GitHub issue).
+            ComponentDistributionSourceKind::ClientProvided,
             QWEN_REAL_COMPONENT_NAME,
         ),
     ));
@@ -10711,7 +10830,7 @@ fn check_kv_partial_layer_failure_during_commit_rolls_back_cleanly(
         &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
     )
     .map_err(E2eConformanceError::from)?;
-    provider.release_tensor(&pending_v);
+    let _ = provider.release_tensor(&pending_v);
 
     match engine.commit_generation_step(&mut runtime, &request, &generated, 2, &decode_step) {
         Err(InferenceApiError::KvCacheUnavailable { .. }) => {}

@@ -706,7 +706,13 @@ impl Runtime {
                     .provider(provider_binding.as_str())
                     .and_then(|provider| provider.execution_api())
             {
-                executor.release_tensor(resource_id);
+                executor.release_tensor(resource_id).map_err(|error| {
+                    ModelInstanceError::InternalModelInstance {
+                        reason: format!(
+                            "failed to release Provider-owned weight resource '{resource_id}': {error}"
+                        ),
+                    }
+                })?;
             }
             // Remove the residency record itself, now that its Provider
             // tensor is gone -- read only after the Provider lookup above,

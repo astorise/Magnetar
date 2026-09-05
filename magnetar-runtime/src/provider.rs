@@ -614,8 +614,22 @@ pub trait ProviderExecutionApi: Send + Sync {
     /// downcasting `&dyn Provider` to a concrete type. Replacing it with a
     /// genuinely portable Resource-based transport, so this method can be
     /// removed, is tracked separately (task group 5).
-    fn write_tensor(&self, id: TensorResourceId, tensor: crate::reference_cpu::HostTensor) {
+    ///
+    /// Returns a structured [`ProviderExecutionError`] on failure (GitHub
+    /// issue "Provider tensor resource mutations lack structured failure
+    /// channels"): a real Provider's write can fail (out of device memory,
+    /// a transfer error), and this is the Provider Execution API's own
+    /// existing structured-error contract, `ProviderExecutionErrorCode::
+    /// MaterializationFailed` fitting this failure exactly. The default
+    /// implementation is infallible (`Ok(())`), matching a Provider that
+    /// does not implement this optional method at all.
+    fn write_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: crate::reference_cpu::HostTensor,
+    ) -> Result<(), ProviderExecutionError> {
         let _ = (id, tensor);
+        Ok(())
     }
 
     /// Reads back a tensor previously written through [`Self::write_tensor`]
@@ -627,8 +641,8 @@ pub trait ProviderExecutionApi: Send + Sync {
     }
 
     /// Drops a tensor previously written through [`Self::write_tensor`] from
-    /// this Provider's opaque storage. Returns `true` if a resource was
-    /// actually present and removed, `false` if `id` was already absent
+    /// this Provider's opaque storage. `Ok(true)` if a resource was
+    /// actually present and removed, `Ok(false)` if `id` was already absent
     /// (idempotent: dropping an already-dropped or never-written resource is
     /// not an error). Runtime memory accounting (`MemoryManager::release`)
     /// is a separate concern from this Provider-side storage release (task
@@ -636,10 +650,14 @@ pub trait ProviderExecutionApi: Send + Sync {
     /// not by itself free the Provider-owned bytes, and vice versa -- both
     /// must be released for a resource to be fully gone. See
     /// [`Self::write_tensor`]'s documentation for the same provisional-API
-    /// rationale.
-    fn release_tensor(&self, id: &TensorResourceId) -> bool {
+    /// rationale, and for why this returns a structured
+    /// [`ProviderExecutionError`] on genuine failure -- distinct from
+    /// `Ok(false)`'s "nothing to release," a real Provider's release can
+    /// itself fail (e.g. Device lost mid-release), which `Ok`/`Err` can now
+    /// distinguish where a bare `bool` could not.
+    fn release_tensor(&self, id: &TensorResourceId) -> Result<bool, ProviderExecutionError> {
         let _ = id;
-        false
+        Ok(false)
     }
 
     /// The [`Self::write_tensor_admitted`] counterpart to [`Self::release_tensor`]:
@@ -649,8 +667,8 @@ pub trait ProviderExecutionApi: Send + Sync {
     /// is still holding one -- a later `write_tensor_admitted` call to the
     /// same `id` already releases and replaces the previous allocation
     /// itself, so calling this after that is a no-op for the allocation
-    /// half, not a double-release. Returns `true` if a resource was
-    /// actually present and removed, `false` if `id` was already absent.
+    /// half, not a double-release. `Ok(true)` if a resource was actually
+    /// present and removed, `Ok(false)` if `id` was already absent.
     /// Resources written through plain [`Self::write_tensor`] were never
     /// admitted in the first place, so this releases nothing extra for
     /// them beyond what [`Self::release_tensor`] already does.
@@ -658,7 +676,7 @@ pub trait ProviderExecutionApi: Send + Sync {
         &self,
         memory: &mut crate::memory::MemoryManager,
         id: &TensorResourceId,
-    ) -> bool {
+    ) -> Result<bool, ProviderExecutionError> {
         let _ = memory;
         self.release_tensor(id)
     }

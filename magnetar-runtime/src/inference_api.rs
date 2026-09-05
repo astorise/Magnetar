@@ -2528,6 +2528,8 @@ pub enum InferenceApiError {
     MemoryAdmissionFailed { reason: String },
     WeightContentDigestMismatch { reason: String },
     WeightShapeOrDtypeMismatch { reason: String },
+    ProviderTensorWriteFailed { reason: String },
+    ProviderTensorReleaseFailed { reason: String },
     ProviderUnavailable { reason: String },
     DeviceUnavailable { reason: String },
     KernelUnavailable { reason: String },
@@ -2600,6 +2602,12 @@ impl fmt::Display for InferenceApiError {
             }
             Self::WeightShapeOrDtypeMismatch { reason } => {
                 write!(f, "weight shape or dtype mismatch: {reason}")
+            }
+            Self::ProviderTensorWriteFailed { reason } => {
+                write!(f, "provider tensor write failed: {reason}")
+            }
+            Self::ProviderTensorReleaseFailed { reason } => {
+                write!(f, "provider tensor release failed: {reason}")
             }
             Self::ProviderUnavailable { reason } => write!(f, "provider unavailable: {reason}"),
             Self::DeviceUnavailable { reason } => write!(f, "device unavailable: {reason}"),

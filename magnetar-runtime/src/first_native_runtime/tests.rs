@@ -6,6 +6,7 @@
 use super::*;
 use crate::planning::*;
 use crate::scheduler::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The correct prefill/decode Operator-sequence hash for the E2E fixture
 /// architecture (see `qwen_operator_sequence_hash`), computed once and
@@ -528,15 +529,20 @@ impl ProviderExecutionApi for MockKernelExecutor {
             handle.plan.as_str(),
         )))
     }
-    fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) {
+    fn write_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: HostTensor,
+    ) -> Result<(), ProviderExecutionError> {
         self.storage.lock().unwrap().insert(id, tensor);
+        Ok(())
     }
     fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
         self.storage.lock().unwrap().get(id).cloned()
     }
     fn write_tensor_value(&self, id: TensorResourceId, value: TensorValue) {
         if let TensorValue::Host(tensor) = value {
-            self.write_tensor(id, tensor);
+            let _ = self.write_tensor(id, tensor);
         }
     }
     fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
@@ -616,6 +622,281 @@ impl ProviderExecutionApi for DeviceResidentOnlyExecutor {
     }
 }
 
+/// A `ProviderExecutionApi` whose `write_tensor`/`release_tensor` fail on
+/// demand, so tests can prove the structured-error propagation added by
+/// the "Provider tensor resource mutations lack structured failure
+/// channels" GitHub issue actually reaches `WeightMaterializationTransaction`
+/// and `Runtime::unload_model_instance`. Every other method delegates to a
+/// real `ReferenceCpuExecutor`, so a test that only fails one specific
+/// operation still sees otherwise-normal behavior for everything else.
+struct FailableProviderExecutionApi {
+    inner: ReferenceCpuExecutor,
+    fail_write: AtomicBool,
+    fail_release: AtomicBool,
+}
+impl FailableProviderExecutionApi {
+    fn new() -> Self {
+        Self {
+            inner: ReferenceCpuExecutor::new(),
+            fail_write: AtomicBool::new(false),
+            fail_release: AtomicBool::new(false),
+        }
+    }
+    fn simulated_error(&self, phase: ProviderExecutionPhase) -> ProviderExecutionError {
+        ProviderExecutionError::new(
+            ProviderExecutionErrorCode::MaterializationFailed,
+            phase,
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            None,
+            "simulated Provider failure injected by FailableProviderExecutionApi",
+        )
+    }
+}
+impl ProviderExecutionApi for FailableProviderExecutionApi {
+    fn submit(
+        &self,
+        request: ProviderExecutionRequest,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        Ok(ProviderExecutionHandle::new(
+            request.operation,
+            request.plan.id.clone(),
+            request.provider.clone(),
+            request.device.clone(),
+        ))
+    }
+    fn status(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+        Ok(ProviderExecutionStatus::new(
+            handle.clone(),
+            SchedulingState::Completed,
+        ))
+    }
+    fn cancel(
+        &self,
+        _handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderCancellationOutcome, ProviderExecutionError> {
+        Ok(ProviderCancellationOutcome::Unsupported)
+    }
+    fn complete(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        Ok(ProviderExecutionResult::completed(
+            handle.clone(),
+            Vec::new(),
+        ))
+    }
+    fn release(&self, _handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+        Ok(())
+    }
+    fn write_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: HostTensor,
+    ) -> Result<(), ProviderExecutionError> {
+        if self.fail_write.load(Ordering::SeqCst) {
+            return Err(self.simulated_error(ProviderExecutionPhase::Prepare));
+        }
+        self.inner.write_tensor(id, tensor);
+        Ok(())
+    }
+    fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
+        self.inner.read_tensor(id)
+    }
+    fn release_tensor(&self, id: &TensorResourceId) -> Result<bool, ProviderExecutionError> {
+        if self.fail_release.load(Ordering::SeqCst) {
+            return Err(self.simulated_error(ProviderExecutionPhase::Release));
+        }
+        Ok(self.inner.release_tensor(id))
+    }
+}
+
+/// P0 fix regression: `WeightMaterializationTransaction::stage_weight`
+/// propagates a real Provider write failure as
+/// `InferenceApiError::ProviderTensorWriteFailed` instead of ignoring a
+/// bare `()`, and rolls back the Memory Manager allocation it had already
+/// admitted for that weight before propagating -- the same rollback shape
+/// this transaction already applies to a residency-registration failure.
+#[test]
+fn stage_weight_propagates_and_rolls_back_on_provider_write_failure() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _memory) =
+        load_fixture_instance(&fixture, &mut runtime).expect("instance loads");
+
+    let executor = Arc::new(FailableProviderExecutionApi::new());
+    executor.fail_write.store(true, Ordering::SeqCst);
+    let mut transaction = WeightMaterializationTransaction {
+        provider_binding: ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        executor,
+        staged: Vec::new(),
+    };
+    let tensor = HostTensor::new([4, 8], vec![0.0; 32]).unwrap();
+    let error = transaction
+        .stage_weight(
+            &mut runtime,
+            &instance,
+            "test",
+            "transformer.wte.weight",
+            &tensor,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        InferenceApiError::ProviderTensorWriteFailed { .. }
+    ));
+    // `MemoryManager::allocations()` is a permanent ledger -- a released
+    // allocation stays present with `state: Released`, it does not
+    // disappear -- so "rolled back, not leaked" means the allocation this
+    // attempt admitted (the highest-numbered one, ids being assigned
+    // sequentially) ended in `Released` state, not `Active`.
+    let this_attempts_allocation = runtime
+        .memory()
+        .allocations()
+        .max_by_key(|allocation| allocation.id)
+        .expect("at least one allocation exists");
+    assert_eq!(
+        this_attempts_allocation.state,
+        MemoryAllocationState::Released,
+        "the allocation admitted just before the failed write must be rolled back, not leaked"
+    );
+}
+
+/// `Provider` wrapper around [`FailableProviderExecutionApi`], the minimum
+/// needed to register it with a `Runtime` under [`REFERENCE_CPU_PROVIDER_NAME`]
+/// (only `metadata`/`register` are non-defaulted on `Provider`; `devices`/
+/// `kernel_advertisements` default to empty, which is fine here -- this
+/// provider is used only to exercise weight materialization and unload,
+/// neither of which dispatch through the Kernel Registry).
+struct TestFailableProvider {
+    metadata: ProviderMetadata,
+    executor: Arc<FailableProviderExecutionApi>,
+}
+impl Provider for TestFailableProvider {
+    fn metadata(&self) -> ProviderMetadata {
+        self.metadata.clone()
+    }
+    fn register(&self, _registry: &mut ProviderRegistry) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    fn execution_api(&self) -> Option<Arc<dyn ProviderExecutionApi>> {
+        Some(self.executor.clone())
+    }
+}
+
+/// P0 fix regression: `Runtime::unload_model_instance` propagates a real
+/// Provider release failure as a structured `ModelInstanceError` instead
+/// of ignoring a bare `bool`.
+#[test]
+fn unload_model_instance_propagates_provider_release_failure() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let executor = Arc::new(FailableProviderExecutionApi::new());
+    executor.fail_release.store(true, Ordering::SeqCst);
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(TestFailableProvider {
+            metadata: ProviderMetadata::new(
+                REFERENCE_CPU_PROVIDER_NAME,
+                "test",
+                "test",
+                "test-only Provider whose release_tensor always fails",
+            ),
+            executor,
+        }))
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
+        .build()
+        .unwrap();
+    // `load_fixture_instance` materializes the fixture's weights internally
+    // (via `bind_qwen_fixture_weights`) and reaches `Ready` -- this
+    // succeeds because only `fail_release`, not `fail_write`, is set.
+    let (instance, _memory) =
+        load_fixture_instance(&fixture, &mut runtime).expect("instance loads and reaches Ready");
+    assert_eq!(
+        runtime.model_instance(&instance).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+
+    let error = runtime
+        .unload_model_instance(&instance, ModelInstanceUnloadPolicy::DrainActiveUse)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ModelInstanceError::InternalModelInstance { .. }
+    ));
+}
+
+/// GitHub issue "First-native graph executor only propagates the first
+/// output of a multi-output node": `dispatch_reference_cpu_operator_multi`
+/// (the shared implementation `dispatch_reference_cpu_operator`'s
+/// single-output wrapper now delegates to) threads every requested output
+/// through to the graph, not just the first. `split` is the Reference CPU
+/// Provider's one genuinely multi-output Operator (`updated_resources` gets
+/// two entries), so dispatching it through this path and checking both
+/// outputs -- not just the first -- come back with the correct data is the
+/// most direct proof this actually works end to end, not just at the type
+/// level.
+#[test]
+fn dispatch_reference_cpu_operator_multi_binds_every_output() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let provider: Arc<dyn ProviderExecutionApi> = Arc::new(ReferenceCpuExecutor::new());
+    let mut node_events = Vec::new();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime: &mut runtime,
+        provider,
+        prepared_plan: None,
+        graph: None,
+        sequence_length: None,
+        last_provider_execution: None,
+        node_events: &mut node_events,
+    };
+    let input = HostTensor::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let (_dispatch_result, mut outputs) = dispatch_reference_cpu_operator_multi(
+        &mut dispatch_ctx,
+        "multi-output.split",
+        dispatch_operator_id("split", OperatorFamily::Tensor),
+        vec![(
+            TensorResourceId::new("multi-output.split.in"),
+            f32_tensor_descriptor(&input),
+            input,
+        )],
+        vec![
+            (
+                TensorResourceId::new("multi-output.split.left"),
+                TensorDescriptor::new(
+                    ShapeDescriptor::new([1, 2]),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                    LayoutDescriptor::Contiguous,
+                ),
+            ),
+            (
+                TensorResourceId::new("multi-output.split.right"),
+                TensorDescriptor::new(
+                    ShapeDescriptor::new([1, 2]),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                    LayoutDescriptor::Contiguous,
+                ),
+            ),
+        ],
+        BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        outputs.len(),
+        2,
+        "both outputs must be bound, not just the first"
+    );
+    let right = outputs.pop().unwrap();
+    let left = outputs.pop().unwrap();
+    assert_eq!(left.shape, vec![1, 2]);
+    assert_eq!(left.data, vec![1.0, 2.0]);
+    assert_eq!(right.shape, vec![1, 2]);
+    assert_eq!(right.data, vec![3.0, 4.0]);
+}
+
 struct MockKernelProvider {
     executor: Arc<MockKernelExecutor>,
 }
@@ -678,7 +959,8 @@ fn provider_execution_generic_resolution_reaches_non_reference_cpu_provider() {
     api.write_tensor(
         input_id.clone(),
         HostTensor::new([2], vec![1.0, 2.0]).unwrap(),
-    );
+    )
+    .unwrap();
     let invocation = KernelInvocation::new(
         KernelInvocationId::new("mock-invocation"),
         advertisement.implemented_operator.clone(),
