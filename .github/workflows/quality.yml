@@ -348,13 +348,16 @@ jobs:
 
   # Provider integration (task 15.8): Provider submodules only, sparse
   # checkout. `providers/cpu` is real (task group 14) and mandatory here --
-  # a failure fails this job. `providers/cuda` remains an empty template
-  # with no CUDA toolchain or GPU on this runner; it is built/tested the
-  # same way for now (trivially passes as a template) with no hardware gate
-  # yet to apply, since there is nothing hardware-dependent in it yet --
-  # revisit this step (a real hardware/toolchain gate, or a dedicated
-  # GPU-equipped runner) once it has real CUDA content, per 15.8's own
-  # "CPU mandatory, CUDA optional/hardware-gated" wording.
+  # a failure fails this job. `providers/cuda` is real too now
+  # (`implement-cuda-provider-baseline`), but this runner has no CUDA
+  # toolchain or GPU: `CudaProvider` is designed to construct successfully
+  # and report itself gracefully unavailable in that case (`cudarc`'s
+  # dynamic-loading feature has no build-time CUDA dependency at all), so
+  # this job exercises exactly that "no hardware" branch, not a hardware
+  # gate. It is genuinely optional/hardware-gated the way 15.8 intended: the
+  # real GPU-required kernel/conformance path runs separately on the
+  # self-hosted `arc-gpu-magnetar` runner (`gpu-runner-smoke.yml`), not
+  # here.
   provider-integration:
     name: quality / provider integration
     runs-on: ubuntu-latest
@@ -369,7 +372,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build and test the mandatory CPU Provider
         run: cargo test --locked --manifest-path providers/cpu/Cargo.toml
-      - name: Build and test the optional CUDA Provider (template today, no hardware gate needed yet)
+      - name: "Build and test the CUDA Provider (GPU-less here: exercises its graceful-unavailability path)"
         run: cargo test --locked --manifest-path providers/cuda/Cargo.toml
 
   # Full conformance (task 15.9): the original, unsplit job -- checks out

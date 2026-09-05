@@ -289,10 +289,25 @@
 
 ## 10. Verification
 
-- [ ] 10.1 Run `cargo test --locked --manifest-path providers/cuda/Cargo.toml`
+- [x] 10.1 Run `cargo test --locked --manifest-path providers/cuda/Cargo.toml`
       in an environment with no CUDA driver/Toolkit available and confirm it
       passes via the graceful-unavailability path (matches CI's
       `submodule-integration` job).
+      Done via the real thing, not a simulation: CI's `submodule-integration`
+      and `provider integration` jobs (genuinely driver-less `ubuntu-latest`)
+      on commit `1bbf9ad`. **First run failed, and it was a real bug, not a
+      CI environment problem**: `cudarc`'s dynamic-loading mode calls
+      `panic_no_lib_found` (a hard `panic!`, not a catchable `DriverError`)
+      when the driver/NVRTC shared library is completely absent from the
+      system — this baseline's graceful-unavailability design (task 2.2) had
+      only ever been exercised on machines that *do* have the driver, so it
+      only accounted for the "library present, wrong version" `Err` case,
+      never the "library entirely absent" panic case. Every test crashed the
+      process instead of exercising the "no GPU" branch. Fixed in `7ac13b1`
+      by wrapping both driver discovery and NVRTC kernel compilation in
+      `std::panic::catch_unwind`; both CI jobs pass on `7ac13b1`. This is
+      exactly the class of gap the CI job's whole purpose is to catch, and
+      it caught it.
 - [x] 10.2 Run the same test suite plus the hardware-gated conformance cases
       on this workstation (RTX 3070, CUDA Toolkit 13.2) and confirm real
       Device discovery, real kernel execution, and conformance-passing
