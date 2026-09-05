@@ -897,6 +897,73 @@ fn dispatch_reference_cpu_operator_multi_binds_every_output() {
     assert_eq!(right.data, vec![3.0, 4.0]);
 }
 
+/// GitHub issue "A Model Instance stuck in Loading cannot currently be
+/// unloaded or canceled": proves the existing `fail_instance` +
+/// `unload_model_instance` combination already provides a real, working
+/// cancellation path for an instance that was created but never (or only
+/// partially) materialized -- `ModelInstance::fail`/`invalidate`
+/// unconditionally set lifecycle to `Failed`/`Invalid` regardless of the
+/// instance's current state (they do not go through
+/// `allows_transition_to` at all), and `(Failed, Unloading)` is already a
+/// valid transition `ModelInstanceManager::unload` already accepts. No new
+/// lifecycle transition or unload entrypoint was needed.
+#[test]
+fn loading_instance_can_be_canceled_via_fail_then_unload() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(fixture.architecture_implementation.clone());
+    let mut request = ModelLoadingRequest::new(
+        ModelLoadingRequestId::new("e2e-fixture-load"),
+        fixture.manifest.id.clone(),
+    );
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(request),
+        &fixture.manifest,
+    )
+    .expect("loading succeeds");
+    let instance = create_model_instance(
+        &mut runtime,
+        &loaded,
+        fixture.architecture_implementation.clone(),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .expect("creation succeeds");
+    // Never materialized: still Loading, exactly the stuck scenario this
+    // issue describes.
+    assert_eq!(
+        runtime.model_instance(&instance).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Loading
+    );
+
+    runtime
+        .model_instances_mut()
+        .fail_instance(
+            &instance,
+            ModelInstanceError::InternalModelInstance {
+                reason: "abandoned before materialization".into(),
+            },
+        )
+        .expect("fail_instance works from Loading");
+    assert_eq!(
+        runtime.model_instance(&instance).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Failed
+    );
+
+    let report = runtime
+        .unload_model_instance(&instance, ModelInstanceUnloadPolicy::DrainActiveUse)
+        .expect("an instance that never materialized anything still unloads cleanly");
+    assert!(report.released_weight_resources.is_empty());
+    assert!(report.released_memory_allocations.is_empty());
+    assert_eq!(
+        runtime.model_instance(&instance).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Unloaded
+    );
+}
+
 struct MockKernelProvider {
     executor: Arc<MockKernelExecutor>,
 }
