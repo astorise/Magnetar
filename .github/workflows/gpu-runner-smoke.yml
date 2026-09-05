@@ -20,7 +20,7 @@ jobs:
     name: gpu / smoke test
     runs-on: arc-gpu-magnetar
     container:
-      image: nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
+      image: nvidia/cuda:13.3.1-cudnn-devel-ubuntu24.04
       options: --gpus all
     env:
       CARGO_TERM_COLOR: always
