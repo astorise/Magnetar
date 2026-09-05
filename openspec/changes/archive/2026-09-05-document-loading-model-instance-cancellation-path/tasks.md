@@ -19,10 +19,10 @@
 - [x] 3.7 Coverage ratchet: 79.00% (baseline 78.89%).
 - [x] 3.8 `openspec validate --all --strict`: 76/76.
 - [x] 3.9 Live `magnetar run qwen-test "Hello"` unaffected: `[generated token ids: 239 239 239 239]`.
-- [ ] 3.10 Push, confirm a full green CI run via `gh run view --json status,conclusion` and the jobs list directly (never a piped `gh run watch`).
+- [x] 3.10 Pushed as `64f3d2e`; CI run 33952787107 confirmed green (`status: completed`, `conclusion: success`, 0 non-successful jobs) via direct `gh run view --json`.
 
 ## 4. Close out
 
-- [ ] 4.1 Diff the canonical spec file this Change touches before and after archiving, to confirm the archive-merge did not silently drop anything.
-- [ ] 4.2 Archive this Change.
-- [ ] 4.3 Close GitHub issue "A Model Instance stuck in Loading cannot currently be unloaded or canceled" with a comment linking the archived Change and the new test.
+- [x] 4.1 Diffed the canonical spec: gained exactly the one new requirement, no drops.
+- [x] 4.2 Archived as `2026-09-05-document-loading-model-instance-cancellation-path`. `openspec validate --all --strict`: 75/75.
+- [x] 4.3 Closed GitHub issue #42, linking the archived Change and the new test.
