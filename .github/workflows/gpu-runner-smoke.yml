@@ -25,6 +25,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
+      - name: Install build dependencies
+        run: apt-get update && apt-get install -y --no-install-recommends git curl build-essential ca-certificates
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Checkout CUDA Provider submodule
@@ -36,8 +38,6 @@ jobs:
           command -v nvcc
           nvcc --version
           test -d "${CUDA_HOME:-/usr/local/cuda}"
-      - name: Install build dependencies
-        run: apt-get update && apt-get install -y --no-install-recommends curl build-essential
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
