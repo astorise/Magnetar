@@ -8,6 +8,7 @@ use crate::affinity::*;
 use crate::compute::*;
 use crate::device::*;
 use crate::kernel::*;
+use crate::kernel_execution_plan::PreparedPlanNodeExecution;
 use crate::kernel_registry::*;
 use crate::memory::*;
 use crate::operator::*;
@@ -216,6 +217,72 @@ impl KernelDispatchPlan {
             invocation,
             movement_steps,
             conversion_steps,
+        })
+    }
+
+    /// Builds a dispatch plan directly from a published Plan's
+    /// [`PreparedPlanNodeExecution`] (produced by
+    /// `PreparedExecutionPlanExecutor::prepare_node_execution`), rather than
+    /// from a freshly-ranked [`KernelCandidate`]. A published, ready Plan's
+    /// binding is authoritative: there is no candidate-ranking fallback
+    /// chain to (re)derive here, since re-deriving one would mean
+    /// re-running selection after publication (Correctif 4).
+    pub fn from_prepared_node_execution(
+        id: KernelDispatchPlanId,
+        request: &KernelSelectionRequest,
+        prepared: &PreparedPlanNodeExecution,
+        advertisement: &KernelAdvertisement,
+        invocation_id: KernelInvocationId,
+    ) -> Result<Self, KernelDispatchError> {
+        if prepared.kernel != advertisement.id {
+            return Err(KernelDispatchError::PlanInvalid(
+                "prepared execution's Kernel does not match advertisement".into(),
+            ));
+        }
+        let mut invocation = KernelInvocation::new(
+            invocation_id,
+            request.operator.clone(),
+            prepared.kernel.clone(),
+            prepared.provider.clone(),
+            request.affinity.clone(),
+        );
+        invocation.inputs = request.inputs.clone();
+        invocation.outputs = request.outputs.clone();
+        invocation.device = prepared.device.clone();
+        invocation.execution_mode = request.execution_mode.unwrap_or_else(|| {
+            advertisement
+                .execution_modes
+                .iter()
+                .next()
+                .copied()
+                .unwrap_or(KernelExecutionMode::Synchronous)
+        });
+        invocation.deadline_millis = request.deadline_millis;
+        invocation.observability_correlation = request.observability_correlation.clone();
+        invocation.policy = request.policy.clone();
+        invocation.deterministic_required = request.deterministic_required;
+        invocation.precision = request.precision;
+
+        Ok(Self {
+            id,
+            selected_kernel: prepared.kernel.clone(),
+            provider: prepared.provider.clone(),
+            device: prepared.device.clone(),
+            input_bindings: request.inputs.clone(),
+            output_bindings: request.outputs.clone(),
+            workspace_reservation: invocation.workspace,
+            execution_mode: invocation.execution_mode,
+            cancellation: advertisement.cancellation,
+            deadline_millis: request.deadline_millis,
+            fallback_chain: Vec::new(),
+            observability_correlation: request.observability_correlation.clone(),
+            cleanup_behavior: BTreeMap::new(),
+            expected_result_metadata: BTreeMap::new(),
+            device_metadata: None,
+            lifecycle: KernelDispatchLifecycleState::Planned,
+            invocation,
+            movement_steps: Vec::new(),
+            conversion_steps: Vec::new(),
         })
     }
 

@@ -630,3 +630,25 @@ When it is documented
 
 Then it is clearly marked experimental or non-conformant.
 
+### Requirement: Coverage Measures Production Source
+The documented production coverage baseline SHALL exclude test-only Rust code from the measured production source scope.
+
+#### Scenario: Test-only code moves or grows
+- **WHEN** only test-only code changes
+- **THEN** the production coverage baseline is not artificially improved.
+
+#### Scenario: Coverage baseline is updated
+- **WHEN** the coverage baseline is regenerated
+- **THEN** its documented exclusions match the coverage tool output.
+
+### Requirement: Documentation Quality Gate Covers Runtime Features
+Quality checks SHALL keep documentation builds green for the workspace default feature set and the Wasmtime Component Engine feature set.
+
+#### Scenario: Default docs
+- **WHEN** CI runs documentation quality checks
+- **THEN** `cargo doc --workspace --no-deps` succeeds without global warning suppression added solely for CI.
+
+#### Scenario: Wasmtime docs
+- **WHEN** CI validates Component Runtime documentation
+- **THEN** `cargo doc -p magnetar-runtime --no-deps --features wasmtime-component-engine` or an equivalent job succeeds.
+

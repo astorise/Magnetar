@@ -9,8 +9,38 @@ use magnetar_runtime::{
     ChatMessage, ChatTemplateFormatter, CliBoundaryError, FirstNativeChatSession,
     FirstNativeRuntimeError, InferenceApiError, InferenceApiObserver, InferenceSessionId,
     MODEL_ARTIFACT_SCHEMA_VERSION, ModelArchitecture, ModelArtifactId, ModelArtifactKind,
-    ModelDigest, ModelManifest, ModelName, ModelRef, ModelRevision, run_first_native_generation,
+    ModelDigest, ModelManifest, ModelName, ModelRef, ModelRevision,
+    register_qwen_component_artifact, run_first_native_generation,
 };
+
+/// The real Qwen Component binary this CLI bundles for its `"qwen-test"`
+/// self-test/demo alias (`reach-architecture-freeze-1` task 12.4). This is
+/// deliberately the only `include_bytes!` of the Qwen Component anywhere in
+/// production code now: `magnetar-runtime` itself has none, and requires an
+/// embedder like this crate -- the "deployment / CLI / Component source
+/// adapter" boundary the task's design calls for -- to push one explicitly
+/// via `register_qwen_component_artifact` before requesting first-native
+/// generation. There is currently exactly one real caller-facing "model"
+/// (`run_first_native_generation`/`FirstNativeChatSession::open` both
+/// hard-require `model_ref == "qwen-test"`), so bundling its Component here
+/// is not a stand-in for real model loading -- it genuinely is the whole
+/// feature this alias offers.
+const QWEN_COMPONENT_BYTES: &[u8] = include_bytes!("../fixtures/qwen-real.component.wasm");
+const QWEN_COMPONENT_MANIFEST_BYTES: &[u8] =
+    include_bytes!("../fixtures/qwen-real.component.wasm.magnetar-component.yaml");
+
+/// Pushes this CLI's bundled Qwen Component artifact to the Runtime, if it
+/// has not been already. Idempotent by construction
+/// (`register_qwen_component_artifact` itself no-ops past the first real
+/// registration), so every call site that might need first-native
+/// generation can call this unconditionally rather than tracking its own
+/// "have I registered yet" state.
+fn ensure_qwen_component_registered() {
+    register_qwen_component_artifact(
+        QWEN_COMPONENT_BYTES.to_vec(),
+        QWEN_COMPONENT_MANIFEST_BYTES.to_vec(),
+    );
+}
 #[cfg(test)]
 use magnetar_runtime::{
     SpecialToken, SpecialTokenKind, TokenIdRange, TokenizerArtifactId, TokenizerFamily,
@@ -155,6 +185,7 @@ pub fn one_shot(
     model_ref: &ModelRef,
     prompt: &str,
 ) -> Result<(String, InferenceApiObserver), CliBoundaryError> {
+    ensure_qwen_component_registered();
     let generated = run_first_native_generation(model_ref, prompt).map_err(|error| {
         CliBoundaryError::CliRuntimeRequestFailed(first_native_runtime_error_to_api_error(error))
     })?;
@@ -180,6 +211,7 @@ pub struct ChatSession {
 
 impl ChatSession {
     pub fn open(model_ref: &ModelRef) -> Result<Self, CliBoundaryError> {
+        ensure_qwen_component_registered();
         let chat = FirstNativeChatSession::open(model_ref).map_err(|error| {
             CliBoundaryError::CliRuntimeRequestFailed(first_native_runtime_error_to_api_error(
                 error,
@@ -205,12 +237,13 @@ impl ChatSession {
     /// Chat Template Boundary (§16): the first turn sends
     /// `PromptInput::PlainText` directly -- the same "CLI pre-renders"
     /// path `pipeline::one_shot` uses for `run`. Every turn after the
-    /// first instead sends the CLI-owned transcript (plus this turn's
-    /// line) as `PromptInput::ChatMessages` through
-    /// [`CliChatTemplateFormatter`], so Runtime applies the authorized
-    /// chat template via `tokenize_prompt_input` rather than the CLI
-    /// joining strings itself -- the concrete "Runtime applies authorized
-    /// chat template" half of the boundary, made explicit by this branch.
+    /// first also sends `PromptInput::PlainText`, but rendered from the
+    /// CLI-owned transcript (plus this turn's line) via
+    /// [`CliChatTemplateFormatter`] first -- the template is applied
+    /// CLI-side, matching this boundary's "MAY" (not "SHALL") Runtime
+    /// templating language; it does not itself send `PromptInput::
+    /// ChatMessages` or invoke Runtime's `tokenize_prompt_input` chat
+    /// templating path.
     ///
     /// Every branch executes through `self.chat` -- this chat session's one
     /// persistent Runtime, Model Instance, and `InferenceSessionId` -- so

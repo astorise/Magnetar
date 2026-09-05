@@ -62,7 +62,7 @@ Then Runtime returns validated model metadata.
 
 ### Requirement: Model Loading API
 
-Runtime Inference API SHALL expose explicit model loading or policy-controlled implicit loading.
+Runtime Inference API SHALL expose explicit model loading or policy-controlled implicit loading, and the trust decision used to authorize that load SHALL be sourced from the Runtime instance performing it rather than accepted as a loading-call parameter.
 
 #### Scenario: Explicit load
 
@@ -75,9 +75,19 @@ contracts before creating a ready Model Instance.
 
 ---
 
+#### Scenario: Loading API does not accept a caller-supplied trust decision
+
+Given a loading request for a model artifact
+
+When the Model Loading API call is made
+
+Then the trust decision applied is the one the performing Runtime instance was configured with, and the API surface provides no parameter through which a caller can substitute a different trust decision for that call
+
+---
+
 ### Requirement: Provider Preferences Are Non-Authoritative
 
-Provider and Device preferences in API requests SHALL be policy inputs only. Runtime SHALL own Provider and Device selection.
+Provider and Device preferences in API requests SHALL be policy inputs only. Runtime SHALL own Provider and Device selection, except at Model Instance creation time when the loading phase resolved no provider or device binding, which is a documented limitation (see `model-instance`'s "Model Instance References Architecture Implementation" requirement) rather than a second authority model: today's implementation applies the caller's Resource Affinity directly as effective placement in that specific case, with no Runtime-side arbitration step, until instance-creation-time resolution is implemented.
 
 #### Scenario: Caller requests CUDA
 
@@ -803,4 +813,33 @@ Given Runtime API can execute fixture prompt
 When API test runs
 
 Then generated result can be verified independently.
+
+### Requirement: Chat Uses Persistent Runtime Session
+The chat CLI SHALL execute all turns of a ChatSession through its persistent Runtime and InferenceSession.
+
+#### Scenario: Two chat turns execute
+- **WHEN** two turns are submitted through one ChatSession
+- **THEN** both turns use the same Runtime InferenceSession identifier.
+
+#### Scenario: Chat is cancelled
+- **WHEN** ChatSession cancellation is requested
+- **THEN** cancellation targets the Runtime session used by chat turns and blocks new turns.
+
+### Requirement: Production Inference API Rejects Logits Injection
+RuntimeInferenceApi SHALL NOT expose a production API that lets callers provide logits, substitute model execution, or install a per-request forward callback.
+
+#### Scenario: Caller cannot inject logits
+- **WHEN** production callers build a generation request
+- **THEN** the request contains prompt/session/model parameters but no logits array or forward callback.
+
+#### Scenario: Synthetic support is test-only
+- **WHEN** tests require synthetic logits
+- **THEN** the support is gated by `#[cfg(test)]` or an explicitly non-production conformance feature.
+
+### Requirement: Runtime Owns Model Execution Chain
+RuntimeInferenceApi SHALL own the chain from model reference or loaded ModelInstance to graph planning, PreparedExecutionPlan execution, logits production, Sampling, streaming, and cleanup.
+
+#### Scenario: Generation fails without model instance
+- **WHEN** generation cannot resolve or access a valid ready ModelInstance
+- **THEN** RuntimeInferenceApi rejects generation with a structured model error.
 

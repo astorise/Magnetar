@@ -823,6 +823,17 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::Any,
         ),
+        // `reach-architecture-freeze-1` task 5.4/5.5: the first portable
+        // Operator with more than one declared output, proving the
+        // Resource-based generic execution path's already-existing
+        // multi-output support (`KernelInvocation.outputs: Vec<..>`,
+        // `store_output(invocation, index, ..)`) end to end, not just at
+        // the type level. Splits a rank-2 input's last dimension in half
+        // into two equally-shaped outputs; `ShapeRule::Any` because no
+        // existing rule expresses "half the last dimension of the input,"
+        // and inventing one for a single deliberately-minimal proof
+        // operator is not warranted.
+        ("split", OperatorFamily::Tensor, 1, 2, ShapeRule::Any),
     ] {
         let mut spec = OperatorSpec::new(OperatorId::magnetar(name, 1, family), inputs, outputs)
             .with_shape_rule(shape)

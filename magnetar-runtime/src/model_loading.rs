@@ -7,13 +7,13 @@
 //! errors, and observations without exposing raw weights or native handles.
 
 use crate::{
-    CapabilityBinding, ComputeDType, DeviceBinding, MemoryAllocation, MemoryAllocationClass,
-    MemoryAllocationOwner, MemoryAllocationRequest, MemoryAllocationState, MemoryManager,
-    MemoryPlacement, ModelArchitecture, ModelArtifactError, ModelArtifactId, ModelDType,
-    ModelManifest, ModelQuantizationFormat, ModelResidencyPlan, ModelTrustDecision,
-    ModelTrustStatus, ProviderBinding, ResourceAffinity,
+    CapabilityBinding, ComputeDType, DeviceBinding, HostTensor, MemoryAllocation,
+    MemoryAllocationClass, MemoryAllocationOwner, MemoryAllocationRequest, MemoryAllocationState,
+    MemoryManager, MemoryPlacement, ModelArchitecture, ModelArtifactError, ModelArtifactId,
+    ModelDType, ModelDigest, ModelManifest, ModelQuantizationFormat, ModelResidencyPlan,
+    ModelTensorMetadata, ModelTrustDecision, ModelTrustStatus, ProviderBinding, ResourceAffinity,
 };
-use std::{error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt};
 
 pub use crate::model::ModelResidencyPlan as ArtifactResidencyPlan;
 
@@ -255,29 +255,48 @@ pub enum ModelQuantizationHandling {
     ProviderSpecificTransform(ModelQuantizationFormat),
 }
 
+/// Runtime-issued: producible only as part of a `LoadedModelContext`
+/// returned by `ModelLoadingCoordinator::load()`. Fields are `pub(crate)`,
+/// not `pub` -- an external caller SHALL NOT be able to construct or
+/// mutate one directly and pass it off as evidence Model Loading actually
+/// ran (`bind-model-loading-evidence-to-validated-artifact`, closing a gap
+/// an external audit of PR #36 found: every field here was previously
+/// `pub`, with no crate-internal constructor).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelLoadingResidencyPlan {
-    pub artifact: ModelArtifactId,
-    pub architecture: ModelArchitecture,
-    pub target_compute_dtype: Option<ModelDType>,
-    pub storage_dtype: Option<ModelDType>,
-    pub quantization_handling: ModelQuantizationHandling,
-    pub shard_placement: ModelShardingPolicy,
-    pub memory_placements: Vec<ModelResidencyLocation>,
-    pub provider_binding: Option<ProviderBinding>,
-    pub device_binding: Option<DeviceBinding>,
-    pub required_data_movement: Vec<String>,
-    pub temporary_workspace_bytes: u64,
-    pub expected_resident_bytes: u64,
-    pub loading_phases: Vec<ModelLoadingPhase>,
-    pub fallback_options: Vec<String>,
-    pub unload_policy: ModelUnloadPolicy,
-    pub diagnostics: Vec<String>,
+    pub(crate) artifact: ModelArtifactId,
+    pub(crate) architecture: ModelArchitecture,
+    pub(crate) target_compute_dtype: Option<ModelDType>,
+    pub(crate) storage_dtype: Option<ModelDType>,
+    pub(crate) quantization_handling: ModelQuantizationHandling,
+    pub(crate) shard_placement: ModelShardingPolicy,
+    pub(crate) memory_placements: Vec<ModelResidencyLocation>,
+    pub(crate) provider_binding: Option<ProviderBinding>,
+    pub(crate) device_binding: Option<DeviceBinding>,
+    pub(crate) required_data_movement: Vec<String>,
+    pub(crate) temporary_workspace_bytes: u64,
+    pub(crate) expected_resident_bytes: u64,
+    pub(crate) loading_phases: Vec<ModelLoadingPhase>,
+    pub(crate) fallback_options: Vec<String>,
+    pub(crate) unload_policy: ModelUnloadPolicy,
+    pub(crate) diagnostics: Vec<String>,
 }
 
 impl ModelLoadingResidencyPlan {
     pub fn has_raw_native_handles(&self) -> bool {
         false
+    }
+
+    /// How this plan handles quantization. Read-only: see the struct-level
+    /// doc comment for why `quantization_handling` is not a public field.
+    pub fn quantization_handling(&self) -> &ModelQuantizationHandling {
+        &self.quantization_handling
+    }
+
+    /// Where this plan places residency. Read-only: see the struct-level
+    /// doc comment for why `memory_placements` is not a public field.
+    pub fn memory_placements(&self) -> &[ModelResidencyLocation] {
+        &self.memory_placements
     }
 }
 
@@ -474,17 +493,66 @@ impl From<ModelArtifactError> for ModelLoadingError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Runtime-issued: the only way to obtain one is a successful
+/// `ModelLoadingCoordinator::load()` call. Fields are `pub(crate)`, not
+/// `pub` -- an external caller SHALL NOT be able to construct one directly
+/// and pass it to `Runtime::create_model_instance()` claiming Model Loading
+/// (and the trust/digest validation it performs) ran when it did not
+/// (`bind-model-loading-evidence-to-validated-artifact`, closing a gap an
+/// external audit of PR #36 found: every field here was previously `pub`,
+/// with no crate-internal constructor). Public read-only accessors are
+/// added only if a real external caller needs to inspect a field after
+/// loading -- `can_start_inference()` below already covers the one known
+/// need.
 pub struct LoadedModelContext {
-    pub residency: ModelResidencyId,
-    pub request: ModelLoadingRequestId,
-    pub artifact: ModelArtifactId,
-    pub state: ModelLoadingState,
-    pub plan: ModelLoadingResidencyPlan,
-    pub allocation: Option<MemoryAllocation>,
-    pub partial: bool,
+    pub(crate) residency: ModelResidencyId,
+    pub(crate) request: ModelLoadingRequestId,
+    pub(crate) artifact: ModelArtifactId,
+    pub(crate) state: ModelLoadingState,
+    pub(crate) plan: ModelLoadingResidencyPlan,
+    pub(crate) allocation: Option<MemoryAllocation>,
+    pub(crate) partial: bool,
+    /// Tensor names the loaded `ModelManifest` declares. Carried through to
+    /// `ModelInstanceDefinition::required_weight_names` so weight-readiness
+    /// derivation can check the full mandatory inventory is bound, not only
+    /// that whatever happens to be bound has residency (Correctif:
+    /// Runtime-owned ModelInstance readiness authority, round 3). Empty for
+    /// a manifest that declares no tensors.
+    pub(crate) required_weight_names: std::collections::BTreeSet<String>,
+    /// Per-tensor content digests the loaded `ModelManifest` declares
+    /// (only tensors with a declared digest are present as keys). Carried
+    /// through to `ModelInstanceDefinition::required_weight_digests` so
+    /// weight-materialization can verify staged content against declared
+    /// content, not just that a name was bound
+    /// (`bind-materialized-weight-content-to-model-artifact-digests`).
+    /// Empty for a manifest that declares no per-tensor digests --
+    /// permissive, the same "absent means unknown" precedent
+    /// `required_weight_names` already established.
+    pub(crate) required_weight_digests: std::collections::BTreeMap<String, ModelDigest>,
+    /// Declared `(shape, storage_dtype)` per tensor name the loaded
+    /// `ModelManifest` declares. Carried through to
+    /// `ModelInstanceDefinition::required_weight_shapes` so weight
+    /// materialization can reject content whose shape or dtype disagrees
+    /// with the artifact's declared metadata even when no content digest
+    /// exists for that tensor -- a digest and a shape/dtype check are
+    /// independent guards, not substitutes for each other
+    /// (`seal-runtime-model-trust-and-provenance-authority`).
+    pub(crate) required_weight_shapes: std::collections::BTreeMap<String, (Vec<u64>, ModelDType)>,
 }
 
 impl LoadedModelContext {
+    /// Current loading state. Read-only: see the struct-level doc comment
+    /// for why `state` is not a public field.
+    pub const fn state(&self) -> ModelLoadingState {
+        self.state
+    }
+
+    /// The residency plan Model Loading produced. Read-only: see the
+    /// struct-level doc comment for why `plan` is not a public field.
+    pub const fn plan(&self) -> &ModelLoadingResidencyPlan {
+        &self.plan
+    }
+
     pub const fn can_start_inference(&self) -> bool {
         matches!(
             self.state,
@@ -715,7 +783,16 @@ impl ModelLoadingCoordinator {
         Ok(plan)
     }
 
-    pub fn load(
+    /// `pub(crate)`, not `pub`: the only Runtime-sealed path to this is
+    /// `inference_api::load_model`/`load_model_observed`, which derive
+    /// `trust` from the performing `Runtime`'s own sealed
+    /// `ModelTrustStore` rather than accepting one as a parameter. A
+    /// caller with only `pub` access could otherwise build their own
+    /// `ModelTrustStore`, evaluate it (a real, not forged, decision --
+    /// `ModelTrustStore::evaluate` stays legitimately public), and call
+    /// this directly with a decision no `Runtime` actually endorsed
+    /// (`seal-model-loading-and-instance-creation-primitives`).
+    pub(crate) fn load(
         &mut self,
         request: ModelLoadingRequest,
         manifest: &ModelManifest,
@@ -807,8 +884,192 @@ impl ModelLoadingCoordinator {
                 request.residency_policy,
                 ModelLoadingResidencyPolicy::PartialAllowed
             ),
+            required_weight_names: manifest
+                .tensors
+                .iter()
+                .map(|tensor| tensor.name.clone())
+                .collect(),
+            required_weight_digests: manifest
+                .tensors
+                .iter()
+                .filter_map(|tensor| {
+                    tensor
+                        .digest
+                        .clone()
+                        .map(|digest| (tensor.name.clone(), digest))
+                })
+                .collect(),
+            required_weight_shapes: manifest
+                .tensors
+                .iter()
+                .map(|tensor| {
+                    (
+                        tensor.name.clone(),
+                        (tensor.shape.clone(), tensor.storage_dtype),
+                    )
+                })
+                .collect(),
         })
     }
+}
+
+/// Materializes a `BTreeMap<String, HostTensor>` from a generic Model
+/// Artifact tensor inventory (`ModelTensorMetadata`, produced by any format
+/// parser -- GGUF, Safetensors, or a future format) plus the raw bytes those
+/// tensors' `offset_bytes`/`size_bytes` index into, relative to
+/// `data_section_start` (the byte offset, within `bytes`, where the file's
+/// tensor-data section actually begins -- e.g. `8 + header_length` for
+/// Safetensors, or the aligned post-tensor-info-section offset for GGUF).
+/// `ModelTensorMetadata.offset_bytes` is deliberately relative to that
+/// section, not to the start of the whole file, matching every format
+/// parser's own construction (`formats/safetensors::parse`/
+/// `formats/gguf::parse` both set it this way); the caller, having already
+/// parsed the header, is the one who knows where the data section starts --
+/// this generic bridge does not (it never parses a header at all, see
+/// below), so it must be told explicitly rather than assuming zero.
+///
+/// **Real bug found and fixed while implementing this Change's own parity
+/// test**, not designed in from the start: an earlier version of this
+/// function treated `offset_bytes` as an absolute file offset, silently
+/// reading garbage (the tail of the JSON header, reinterpreted as `f32`)
+/// for every tensor after the first. Caught by
+/// `materialize-weights-from-real-model-artifact`'s own parity test
+/// (`e2e_fixture_real_artifact_weights_match_in_memory_weights`) actually
+/// failing with denormal/huge float values, not assumed correct because the
+/// code compiled and the shapes matched.
+///
+/// This is the missing "read the actual tensor bytes" step a format
+/// parser's own `parse()` deliberately leaves to its caller (see
+/// `implement-model-format-parsers`'s design.md): it depends only on
+/// `magnetar-runtime`'s own generic types, never a concrete format-parser
+/// crate, so it can live in the Core without violating
+/// `externalize-runtime-extension-modules`'s "Model Components, Providers,
+/// and Formats Are Externalized" requirement.
+///
+/// Only `ModelDType::F32` storage is supported today, matching
+/// `HostTensor`'s own f32-only representation -- a tensor declaring any
+/// other storage dtype is rejected with `StorageDTypeUnsupported` rather
+/// than reinterpreting its bytes. Real dtype conversion on load (F16/BF16
+/// checkpoints) is real, separate follow-up work
+/// (`materialize-weights-from-real-model-artifact`'s design.md Non-Goals).
+pub fn host_tensors_from_artifact_bytes(
+    tensors: &[ModelTensorMetadata],
+    bytes: &[u8],
+    data_section_start: u64,
+) -> Result<BTreeMap<String, HostTensor>, ModelLoadingError> {
+    let mut weights = BTreeMap::new();
+    for tensor in tensors {
+        if tensor.storage_dtype != ModelDType::F32 {
+            return Err(ModelLoadingError::new(
+                ModelLoadingErrorCode::StorageDTypeUnsupported,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!(
+                    "tensor '{}' declares unsupported storage dtype {:?} (only F32 is supported)",
+                    tensor.name, tensor.storage_dtype
+                ),
+            ));
+        }
+        let element_count = tensor
+            .shape
+            .iter()
+            .try_fold(1_u64, |count, &dimension| count.checked_mul(dimension))
+            .ok_or_else(|| {
+                ModelLoadingError::new(
+                    ModelLoadingErrorCode::MaterializationFailed,
+                    Some(ModelLoadingPhase::MaterializeWeights),
+                    format!(
+                        "tensor '{}' shape element-count computation overflowed",
+                        tensor.name
+                    ),
+                )
+            })?;
+        let expected_size = element_count.checked_mul(4).ok_or_else(|| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!("tensor '{}' byte-size computation overflowed", tensor.name),
+            )
+        })?;
+        let (offset, declared_size) = match (tensor.offset_bytes, tensor.size_bytes) {
+            (Some(offset), Some(size)) => (offset, size),
+            _ => {
+                return Err(ModelLoadingError::new(
+                    ModelLoadingErrorCode::MaterializationFailed,
+                    Some(ModelLoadingPhase::MaterializeWeights),
+                    format!(
+                        "tensor '{}' has no declared byte offset/size to read from",
+                        tensor.name
+                    ),
+                ));
+            }
+        };
+        if declared_size != expected_size {
+            return Err(ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!(
+                    "tensor '{}' declares {declared_size} bytes but its shape implies {expected_size}",
+                    tensor.name
+                ),
+            ));
+        }
+        let offset = data_section_start.checked_add(offset).ok_or_else(|| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!(
+                    "tensor '{}' data-section-relative offset overflowed",
+                    tensor.name
+                ),
+            )
+        })?;
+        let end = offset.checked_add(declared_size).ok_or_else(|| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!("tensor '{}' byte range overflowed", tensor.name),
+            )
+        })?;
+        let start = usize::try_from(offset).map_err(|_| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!("tensor '{}' byte offset is out of range", tensor.name),
+            )
+        })?;
+        let end = usize::try_from(end).map_err(|_| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!("tensor '{}' byte range is out of range", tensor.name),
+            )
+        })?;
+        let range = bytes.get(start..end).ok_or_else(|| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!(
+                    "tensor '{}' byte range [{start}, {end}) is out of bounds",
+                    tensor.name
+                ),
+            )
+        })?;
+        let data: Vec<f32> = range
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        let host_tensor = HostTensor::new(tensor.shape.clone(), data).map_err(|error| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!("tensor '{}' failed to materialize: {error}", tensor.name),
+            )
+        })?;
+        weights.insert(tensor.name.clone(), host_tensor);
+    }
+    Ok(weights)
 }
 
 pub fn invalidates_kv_cache_on_unload(policy: ModelLoadingCachePolicy) -> bool {

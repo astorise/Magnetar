@@ -111,6 +111,145 @@ fn graph_planning_rejects_silent_movement() {
 }
 
 #[test]
+fn graph_validation_rejects_producer_field_that_disagrees_with_node_outputs() {
+    // `node.outputs` is authoritative (Correctif 6); a `TensorEdge::producer`
+    // that names a node other than the one whose `outputs` actually lists
+    // this edge is a diverging topology, not a harmless annotation.
+    let catalog = default_graph_catalog();
+    let input = TensorEdgeId::new("input");
+    let output = TensorEdgeId::new("output");
+    let real_producer = ExecutionNodeId::new("gelu");
+    // A real node in the graph, just not the one `node.outputs` actually
+    // lists this edge under -- so the earlier "producer node exists" check
+    // passes and the producer/outputs consistency check is what fires.
+    let wrong_producer = ExecutionNodeId::new("silu");
+    let graph = ExecutionGraph::new(
+        ExecutionGraphId::new("bad-producer"),
+        ExecutionGraphPhase::Test,
+    )
+    .with_edge(TensorEdge::new(input.clone(), tensor([1, 1])))
+    .with_edge(
+        TensorEdge::new(output.clone(), tensor([1, 1])).with_producer(wrong_producer.clone()),
+    )
+    .with_node(
+        ExecutionNode::new(
+            real_producer,
+            OperatorId::magnetar("gelu", 1, OperatorFamily::Activation),
+        )
+        .with_input(input)
+        .with_output(output),
+    )
+    .with_node(ExecutionNode::new(
+        wrong_producer,
+        OperatorId::magnetar("silu", 1, OperatorFamily::Activation),
+    ));
+
+    assert!(matches!(
+        graph.validate(&catalog),
+        Err(GraphError::LifecycleInvalid(_))
+    ));
+}
+
+#[test]
+fn graph_validation_rejects_two_nodes_claiming_the_same_output() {
+    let catalog = default_graph_catalog();
+    let shared_output = TensorEdgeId::new("shared-output");
+    let first = ExecutionNodeId::new("first");
+    let second = ExecutionNodeId::new("second");
+    let graph = ExecutionGraph::new(
+        ExecutionGraphId::new("duplicate-producer"),
+        ExecutionGraphPhase::Test,
+    )
+    .with_edge(TensorEdge::new(shared_output.clone(), tensor([1, 1])))
+    .with_node(
+        ExecutionNode::new(
+            first,
+            OperatorId::magnetar("gelu", 1, OperatorFamily::Activation),
+        )
+        .with_output(shared_output.clone()),
+    )
+    .with_node(
+        ExecutionNode::new(
+            second,
+            OperatorId::magnetar("gelu", 1, OperatorFamily::Activation),
+        )
+        .with_output(shared_output),
+    );
+
+    assert!(matches!(
+        graph.validate(&catalog),
+        Err(GraphError::DuplicateProducer(_))
+    ));
+}
+
+#[test]
+fn graph_validation_rejects_cycle() {
+    let catalog = default_graph_catalog();
+    let a_to_b = TensorEdgeId::new("a-to-b");
+    let b_to_a = TensorEdgeId::new("b-to-a");
+    let node_a = ExecutionNodeId::new("a");
+    let node_b = ExecutionNodeId::new("b");
+    let graph = ExecutionGraph::new(ExecutionGraphId::new("cyclic"), ExecutionGraphPhase::Test)
+        .with_edge(TensorEdge::new(a_to_b.clone(), tensor([1, 1])))
+        .with_edge(TensorEdge::new(b_to_a.clone(), tensor([1, 1])))
+        .with_node(
+            ExecutionNode::new(
+                node_a,
+                OperatorId::magnetar("gelu", 1, OperatorFamily::Activation),
+            )
+            .with_input(b_to_a.clone())
+            .with_output(a_to_b.clone()),
+        )
+        .with_node(
+            ExecutionNode::new(
+                node_b,
+                OperatorId::magnetar("gelu", 1, OperatorFamily::Activation),
+            )
+            .with_input(a_to_b)
+            .with_output(b_to_a),
+        );
+
+    assert!(matches!(
+        graph.validate(&catalog),
+        Err(GraphError::LifecycleInvalid(_))
+    ));
+}
+
+#[test]
+fn graph_validation_rejects_consumers_field_that_disagrees_with_node_inputs() {
+    let catalog = default_graph_catalog();
+    let input = TensorEdgeId::new("input");
+    let output = TensorEdgeId::new("output");
+    let real_consumer = ExecutionNodeId::new("gelu");
+    // A real node in the graph, just not the one `node.inputs` actually
+    // lists this edge under.
+    let wrong_consumer = ExecutionNodeId::new("silu");
+    let graph = ExecutionGraph::new(
+        ExecutionGraphId::new("bad-consumer"),
+        ExecutionGraphPhase::Test,
+    )
+    .with_edge(TensorEdge::new(input.clone(), tensor([1, 1])).with_consumer(wrong_consumer.clone()))
+    .with_edge(TensorEdge::new(output.clone(), tensor([1, 1])))
+    .with_node(
+        ExecutionNode::new(
+            real_consumer,
+            OperatorId::magnetar("gelu", 1, OperatorFamily::Activation),
+        )
+        .with_input(input)
+        .with_output(output),
+    )
+    .with_node(ExecutionNode::new(
+        wrong_consumer,
+        OperatorId::magnetar("silu", 1, OperatorFamily::Activation),
+    ));
+
+    assert!(matches!(
+        graph.validate(&catalog),
+        Err(GraphError::LifecycleInvalid(_))
+    ));
+}
+
+#[test]
 fn kv_prefix_adapter_and_observability_metadata_are_explicit() {
     let edge_id = TensorEdgeId::new("kv");
     let edge = TensorEdge::new(edge_id.clone(), tensor([1, 8]));

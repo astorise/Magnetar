@@ -590,6 +590,11 @@ Then Memory Manager rejects, queues, or delays loading according to policy.
 Memory Manager SHALL release model residency memory when unload policy requires
 it.
 
+Releasing a Tensor Resource's residency SHALL remove its `TensorResidency`
+record, not only change the state of the `MemoryAllocation` it references. A
+resource whose Provider-owned storage and Memory Manager allocation have both
+been released SHALL NOT continue to be reported as resident.
+
 #### Scenario: Unload releases memory
 
 Given a loaded model owns Device memory
@@ -598,7 +603,13 @@ When Runtime unloads the model
 
 Then Memory Manager releases associated memory records.
 
----
+#### Scenario: Released residency is not reported as resident
+
+Given a Tensor Resource's Provider-owned storage and Memory Manager allocation have both been released, whether by weight materialization rollback or by Model Instance unload
+
+When residency is queried for that Tensor Resource
+
+Then Memory Manager reports no current residency for it
 
 ### Requirement: Memory Manager Accounts For Quantization Transform Workspace
 
@@ -1964,4 +1975,15 @@ Given backing uses Rust/host allocation
 When Tensor Resource is inspected
 
 Then logical Resource identity remains separate from pointer.
+
+### Requirement: Runtime Memory Accounts Compute Resources
+First-native outputs, workspaces, model weight resources, and KV resources SHALL be allocated, tracked, and released through the Runtime MemoryManager.
+
+#### Scenario: Runtime memory limit is exceeded
+- **WHEN** a first-native compute step requires memory beyond the Runtime MemoryManager limit
+- **THEN** the compute step fails before unaccounted allocation occurs.
+
+#### Scenario: Workspace lifecycle ends
+- **WHEN** a provider workspace is no longer needed
+- **THEN** Runtime memory accounting releases the workspace according to its lifecycle.
 

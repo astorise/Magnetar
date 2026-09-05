@@ -430,15 +430,7 @@ pub struct ProviderDescriptor {
 
 /// A globally unique, package-qualified capability identifier.
 /// Trusted native extension contract for provider-owned execution capabilities.
-///
-/// `Any` is a supertrait so a caller holding `&dyn Provider` from Runtime
-/// provider registration can recover the concrete registered instance (e.g.
-/// resolving the registered `ReferenceCpuProvider` so first-native dispatch
-/// executes through the same executor Runtime holds, rather than an
-/// unregistered throwaway) via `(provider as &dyn std::any::Any)
-/// .downcast_ref::<T>()`. `Any`'s blanket `impl<T: 'static> Any for T` means
-/// no existing `impl Provider for _` needs updating.
-pub trait Provider: Send + Sync + std::any::Any {
+pub trait Provider: Send + Sync {
     fn metadata(&self) -> ProviderMetadata;
     fn register(&self, registry: &mut ProviderRegistry) -> Result<(), ProviderError>;
     fn health(&self) -> ProviderHealth {
@@ -478,7 +470,13 @@ pub trait Provider: Send + Sync + std::any::Any {
     fn shutdown(&self) -> Result<(), ProviderError> {
         Ok(())
     }
-    fn execution_api(&self) -> Option<&dyn ProviderExecutionApi> {
+    /// Optional Runtime-to-Provider Kernel execution boundary. Returns an
+    /// owned, cloneable handle (not a borrow tied to this Provider's own
+    /// lifetime) so callers can resolve it once from Runtime's provider
+    /// registration and hold it independently -- e.g. across a later `&mut
+    /// Runtime` borrow for Memory Manager access -- without downcasting
+    /// `&dyn Provider` to a concrete type to recover an owned reference.
+    fn execution_api(&self) -> Option<Arc<dyn ProviderExecutionApi>> {
         None
     }
     /// Optional Kernel Compilation Capability advertisement, implementing
@@ -501,6 +499,46 @@ pub trait Provider: Send + Sync + std::any::Any {
     }
 }
 
+/// A Provider-agnostic tensor value (`define-provider-prepared-kernel-execution-contract`):
+/// the value [`ProviderExecutionApi::read_tensor_value`]/[`ProviderExecutionApi::write_tensor_value`]
+/// exchange, additive alongside the pre-existing `HostTensor`-typed
+/// [`ProviderExecutionApi::read_tensor`]/[`ProviderExecutionApi::write_tensor`]
+/// (see that trait's documentation for why both exist). Unlike those, a
+/// Provider that holds a resource only device-resident can answer honestly
+/// with [`Self::Opaque`] instead of being structurally required to produce
+/// host bytes it does not have.
+#[derive(Clone, Debug)]
+pub enum TensorValue {
+    /// Host-visible bytes. What every current Provider and test double
+    /// produces and consumes today.
+    Host(crate::reference_cpu::HostTensor),
+    /// This Provider holds the resource privately and declines to expose
+    /// host-visible bytes for it. Never produced by Reference CPU today;
+    /// exists so a genuinely device-resident Provider has a truthful
+    /// answer instead of being forced to fabricate or panic.
+    Opaque,
+}
+
+impl TensorValue {
+    /// Unwraps a host-visible value, or a structured
+    /// [`crate::tensor::TensorError::ResidencyUnavailable`] naming `id` if
+    /// this value declined host materialization. The three call sites that
+    /// genuinely need host bytes (weight binding, KV-history concatenation,
+    /// final logits extraction) use this rather than matching `Host`/`Opaque`
+    /// themselves, so the failure is reported uniformly.
+    pub fn into_host(
+        self,
+        id: &TensorResourceId,
+    ) -> Result<crate::reference_cpu::HostTensor, crate::tensor::TensorError> {
+        match self {
+            Self::Host(tensor) => Ok(tensor),
+            Self::Opaque => Err(crate::tensor::TensorError::residency_unavailable(format!(
+                "resource '{id}' is device-resident and declined host materialization"
+            ))),
+        }
+    }
+}
+
 /// Native Runtime-to-Provider execution boundary for validated planned work.
 pub trait ProviderExecutionApi: Send + Sync {
     fn submit(
@@ -520,6 +558,207 @@ pub trait ProviderExecutionApi: Send + Sync {
         handle: &ProviderExecutionHandle,
     ) -> Result<ProviderExecutionResult, ProviderExecutionError>;
     fn release(&self, handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError>;
+
+    /// Optional Kernel-level execution boundary: submits one Runtime-created
+    /// [`KernelInvocation`] for causal execution, mirroring [`Self::submit`]
+    /// but carrying the actually-executable Kernel work directly rather than
+    /// a `ComputeExecutionPlan`. A Provider that dispatches first-native
+    /// Kernel work overrides this and [`Self::complete_kernel`] together;
+    /// the default reports the capability as unsupported so a Provider that
+    /// only implements the coarser plan-shaped API above remains valid
+    /// without change.
+    fn submit_kernel(
+        &self,
+        advertisement: &KernelAdvertisement,
+        operator: &crate::operator::OperatorSpec,
+        invocation: &KernelInvocation,
+        memory: &mut crate::memory::MemoryManager,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        let _ = (advertisement, operator, invocation, memory);
+        Err(ProviderExecutionError::new(
+            ProviderExecutionErrorCode::UnsupportedOperation,
+            ProviderExecutionPhase::Submit,
+            ProviderBinding::new("unknown"),
+            None,
+            "this Provider does not implement Kernel-level execution",
+        ))
+    }
+
+    /// Observes the result of a Kernel invocation previously submitted
+    /// through [`Self::submit_kernel`]. See that method's documentation.
+    fn complete_kernel(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<KernelResult, ProviderExecutionError> {
+        Err(ProviderExecutionError::new(
+            ProviderExecutionErrorCode::UnsupportedOperation,
+            ProviderExecutionPhase::Complete,
+            handle.provider.clone(),
+            handle.device.clone(),
+            "this Provider does not implement Kernel-level execution",
+        ))
+    }
+
+    /// Writes one host-visible tensor into this Provider's opaque storage,
+    /// keyed by [`TensorResourceId`]. Optional, alongside
+    /// [`Self::submit_kernel`]: a Provider that implements Kernel-level
+    /// execution through host-visible tensor data overrides this,
+    /// [`Self::read_tensor`], and [`Self::allocate_workspace`] together.
+    ///
+    /// [`crate::reference_cpu::HostTensor`] is host-CPU-shaped data movement,
+    /// not a portable Runtime resource representation; a device-only
+    /// Provider (CUDA, Metal, ...) is not expected to implement this
+    /// meaningfully. It exists on this generic trait -- rather than only as
+    /// a `ReferenceCpuExecutor` inherent method -- solely so first-native
+    /// dispatch can reach the Runtime-registered Provider without
+    /// downcasting `&dyn Provider` to a concrete type. Replacing it with a
+    /// genuinely portable Resource-based transport, so this method can be
+    /// removed, is tracked separately (task group 5).
+    fn write_tensor(&self, id: TensorResourceId, tensor: crate::reference_cpu::HostTensor) {
+        let _ = (id, tensor);
+    }
+
+    /// Reads back a tensor previously written through [`Self::write_tensor`]
+    /// or produced by a completed Kernel invocation. See that method's
+    /// documentation for why this is host-tensor-shaped and provisional.
+    fn read_tensor(&self, id: &TensorResourceId) -> Option<crate::reference_cpu::HostTensor> {
+        let _ = id;
+        None
+    }
+
+    /// Drops a tensor previously written through [`Self::write_tensor`] from
+    /// this Provider's opaque storage. Returns `true` if a resource was
+    /// actually present and removed, `false` if `id` was already absent
+    /// (idempotent: dropping an already-dropped or never-written resource is
+    /// not an error). Runtime memory accounting (`MemoryManager::release`)
+    /// is a separate concern from this Provider-side storage release (task
+    /// group 9 / Correctif 11): releasing an allocation's accounting does
+    /// not by itself free the Provider-owned bytes, and vice versa -- both
+    /// must be released for a resource to be fully gone. See
+    /// [`Self::write_tensor`]'s documentation for the same provisional-API
+    /// rationale.
+    fn release_tensor(&self, id: &TensorResourceId) -> bool {
+        let _ = id;
+        false
+    }
+
+    /// The [`Self::write_tensor_admitted`] counterpart to [`Self::release_tensor`]:
+    /// drops `id` from this Provider's opaque storage (same as
+    /// [`Self::release_tensor`]) *and* releases the `MemoryManager`
+    /// allocation `write_tensor_admitted` admitted for it, if this Provider
+    /// is still holding one -- a later `write_tensor_admitted` call to the
+    /// same `id` already releases and replaces the previous allocation
+    /// itself, so calling this after that is a no-op for the allocation
+    /// half, not a double-release. Returns `true` if a resource was
+    /// actually present and removed, `false` if `id` was already absent.
+    /// Resources written through plain [`Self::write_tensor`] were never
+    /// admitted in the first place, so this releases nothing extra for
+    /// them beyond what [`Self::release_tensor`] already does.
+    fn release_admitted_tensor(
+        &self,
+        memory: &mut crate::memory::MemoryManager,
+        id: &TensorResourceId,
+    ) -> bool {
+        let _ = memory;
+        self.release_tensor(id)
+    }
+
+    /// Admits `tensor`'s byte size through `memory` (Correctif 1: admission
+    /// SHALL precede Provider materialization) and writes it into this
+    /// Provider's storage under `resource_id`, exactly like
+    /// [`Self::write_tensor`] -- except that if this Provider already holds
+    /// an allocation it admitted for the *same* `resource_id` (from an
+    /// earlier call), that prior allocation is released as part of this
+    /// call, after the new one succeeds. This is for resource ids a caller
+    /// writes to repeatedly across calls under a *stable* id -- e.g. a
+    /// first-native graph's per-node intermediate edges, rewritten once per
+    /// generation step -- where plain [`Self::write_tensor`] plus a
+    /// caller-side `memory.allocate` would either never account the write
+    /// at all, or mint a new allocation every call with nothing releasing
+    /// the one it superseded, growing the memory ledger unboundedly over a
+    /// long-running session even though Provider storage itself does not
+    /// grow (each write overwrites the same entry). Unlike
+    /// [`Self::write_tensor`]/[`Self::release_tensor`], a Provider tracking
+    /// this replacement itself is what makes that safe without the caller
+    /// having to hold onto allocation ids across calls.
+    fn write_tensor_admitted(
+        &self,
+        memory: &mut crate::memory::MemoryManager,
+        resource_id: TensorResourceId,
+        tensor: crate::reference_cpu::HostTensor,
+        class: crate::memory::MemoryAllocationClass,
+        owner: crate::memory::MemoryAllocationOwner,
+    ) -> Result<(), crate::memory::MemoryError> {
+        let _ = (memory, resource_id, tensor, class, owner);
+        Err(crate::memory::MemoryError::AllocationDenied {
+            reason: "this Provider does not implement admitted tensor writes".into(),
+        })
+    }
+
+    /// Reads back a value previously written through [`Self::write_tensor_value`]
+    /// or [`Self::write_tensor_value_admitted`], as a Provider-agnostic
+    /// [`TensorValue`] rather than the `HostTensor`-typed [`Self::read_tensor`].
+    /// The default implementation reports nothing found; a Provider that
+    /// only implements the `HostTensor`-typed pathway is still valid
+    /// without change.
+    fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
+        let _ = id;
+        None
+    }
+
+    /// Writes a Provider-agnostic tensor value, unadmitted -- the
+    /// [`TensorValue`] counterpart to [`Self::write_tensor`]. The default
+    /// implementation does nothing; a Provider that only implements the
+    /// `HostTensor`-typed pathway is still valid without change.
+    fn write_tensor_value(&self, id: TensorResourceId, value: TensorValue) {
+        let _ = (id, value);
+    }
+
+    /// The [`TensorValue`] counterpart to [`Self::write_tensor_admitted`]:
+    /// admits `value`'s byte size (when it is [`TensorValue::Host`]; a
+    /// Provider whose [`TensorValue::Opaque`] resources have their own
+    /// accounting model may admit however is appropriate for them) before
+    /// writing, replacing and releasing whatever allocation this Provider
+    /// previously admitted for the same `resource_id`, exactly like
+    /// [`Self::write_tensor_admitted`]. The default implementation fails
+    /// closed, matching [`Self::write_tensor_admitted`]'s default.
+    fn write_tensor_value_admitted(
+        &self,
+        memory: &mut crate::memory::MemoryManager,
+        resource_id: TensorResourceId,
+        value: TensorValue,
+        class: crate::memory::MemoryAllocationClass,
+        owner: crate::memory::MemoryAllocationOwner,
+    ) -> Result<(), crate::memory::MemoryError> {
+        let _ = (memory, resource_id, value, class, owner);
+        Err(crate::memory::MemoryError::AllocationDenied {
+            reason: "this Provider does not implement admitted tensor value writes".into(),
+        })
+    }
+
+    /// Requests scratch-space workspace through the Runtime's
+    /// [`crate::memory::MemoryManager`] for a Kernel that advertises a
+    /// required workspace. See [`Self::write_tensor`]'s documentation for
+    /// why this lives on the generic trait provisionally.
+    fn allocate_workspace(
+        &self,
+        memory: &mut crate::memory::MemoryManager,
+        size_bytes: u64,
+    ) -> Result<crate::memory::MemoryAllocationId, crate::memory::MemoryError> {
+        let _ = (memory, size_bytes);
+        Err(crate::memory::MemoryError::AllocationDenied {
+            reason: "this Provider does not implement Kernel-level workspace allocation".into(),
+        })
+    }
+
+    /// This Provider's own Kernel-dispatch observation trail (see
+    /// [`Self::write_tensor`]'s documentation for the same provisional-API
+    /// rationale). Lets a caller confirm dispatch reached the same
+    /// Runtime-registered Provider instance it resolved, without
+    /// downcasting to a concrete type to call an inherent method.
+    fn observations(&self) -> Vec<KernelObservation> {
+        Vec::new()
+    }
 }
 
 /// Receives provider contributions.

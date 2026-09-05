@@ -22,11 +22,11 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use magnetar_runtime::{
-    CliBoundaryError, InferenceApiError, MemoryManager, MemoryManagerConfig, ModelArtifactSource,
-    ModelInstanceId, ModelInstanceUnloadPolicy, ModelLoadingApiRequest, ModelLoadingCoordinator,
+    CliBoundaryError, InferenceApiError, ModelArtifactSource, ModelInstanceId,
+    ModelInstanceUnloadPolicy, ModelLoadingApiRequest, ModelLoadingCoordinator,
     ModelLoadingRequest, ModelLoadingRequestId, ModelRef, ModelRegistry, ModelResolutionRequest,
-    ModelTrustStore, ReferenceCpuProvider, ReleaseVersion, Runtime,
-    build_release_binary_version_report, load_model, unload_model_instance,
+    ReferenceCpuProvider, ReleaseVersion, Runtime, build_release_binary_version_report, load_model,
+    unload_model_instance,
 };
 
 use crate::observability::{CliObservationKind, CliObserver};
@@ -708,22 +708,27 @@ fn cmd_model_load_local_file(args: &[String]) -> Result<(), CliBoundaryError> {
 
 /// Shared Runtime model loading call used by both [`cmd_model_load`] and
 /// [`cmd_model_load_local_file`]: builds a fresh `ModelLoadingCoordinator`
-/// and `MemoryManager`, evaluates real (not fabricated) trust from an empty
-/// `ModelTrustStore`, and calls the real `magnetar_runtime::load_model`.
+/// and a `Runtime` sealed with an empty `ModelTrustStore` (trusts nothing --
+/// this CLI path never configures a deployment trust policy), and calls the
+/// real `magnetar_runtime::load_model`, which evaluates trust from that
+/// Runtime internally rather than accepting a caller-supplied decision.
 fn run_load_model(manifest: &magnetar_runtime::ModelManifest) -> Result<(), CliBoundaryError> {
-    let trust = ModelTrustStore::default().evaluate(manifest);
     let mut coordinator = ModelLoadingCoordinator::new();
-    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+    let mut runtime =
+        Runtime::builder()
+            .build()
+            .map_err(|error| CliBoundaryError::CliRuntimeUnavailable {
+                reason: error.to_string(),
+            })?;
     let core = ModelLoadingRequest::new(
         ModelLoadingRequestId::new(format!("cli-load-{}", manifest.id.digest.value)),
         manifest.id.clone(),
     );
     load_model(
         &mut coordinator,
-        &mut memory,
+        &mut runtime,
         ModelLoadingApiRequest::new(core),
         manifest,
-        &trust,
     )?;
     Ok(())
 }

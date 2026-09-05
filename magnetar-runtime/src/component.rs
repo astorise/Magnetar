@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use serde::Deserialize;
@@ -1285,6 +1286,16 @@ impl ComponentLinkPlan {
         self.links.get(interface)
     }
 
+    /// Finds an approved interface by name alone, ignoring version --
+    /// distinguishes "this interface name is unknown at any version" from
+    /// "this interface name is known, but not at the requested version"
+    /// when [`Self::endpoint`]'s exact `(name, version)` lookup misses
+    /// (`model-component-graph-contract`'s "Component requires unsupported
+    /// contract version" scenario).
+    pub fn interface_by_name(&self, name: &str) -> Option<&WitInterface> {
+        self.links.keys().find(|interface| interface.name == name)
+    }
+
     #[cfg(all(test, feature = "wasmtime-component-engine"))]
     pub(crate) fn insert_for_test(&mut self, endpoint: ComponentEndpoint) {
         self.links.insert(endpoint.interface().clone(), endpoint);
@@ -1526,12 +1537,16 @@ pub enum ComponentInterruptionReason {
     Administrative,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+// Not `Eq`: `arguments` can carry `ComponentValue::F64`, and `f64` has no
+// total order/equality, so `ComponentValue` (and everything embedding it)
+// is `PartialEq`-only from here down.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ComponentInvocation {
     pub instance_id: ComponentInstanceId,
     pub interface: WitInterface,
     pub operation: String,
     pub deadline_millis: Option<u64>,
+    pub arguments: Vec<ComponentValue>,
 }
 
 impl ComponentInvocation {
@@ -1545,16 +1560,53 @@ impl ComponentInvocation {
             interface,
             operation: operation.into(),
             deadline_millis: None,
+            arguments: Vec::new(),
         }
+    }
+
+    /// Attaches call arguments (`model-component-graph-contract`): a caller
+    /// invoking a Component export that takes real parameters (not just the
+    /// legacy zero-arg/`u32`-result shape) supplies them here instead of
+    /// mutating `arguments` directly, matching `WitInterface::new`'s
+    /// builder-free-function style.
+    pub fn with_arguments(mut self, arguments: Vec<ComponentValue>) -> Self {
+        self.arguments = arguments;
+        self
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A dynamically-typed WIT value (`model-component-graph-contract`): the
+/// value shape [`ComponentInvocation::arguments`]/[`ComponentInvocationResult`]
+/// carry across the native Component Model boundary, and what a
+/// [`HostCapability`] exchanges with a calling Component. Deliberately not a
+/// 1:1 mirror of every `wasmtime::component::Val` case -- only the shapes
+/// this repo's WIT interfaces (`compute.wit`, `observability.wit`, and the
+/// forthcoming graph-builder interface) actually need: no `map`, `tuple`,
+/// `flags`, `resource`, `future`, `stream`, or `error-context` case, since
+/// nothing here uses those WIT constructs. `Enum` and `Variant` are kept
+/// distinct (rather than collapsing `Enum` into a payload-less `Variant`)
+/// because a Wasmtime `Type::Enum` and `Type::Variant` are different target
+/// shapes when converting back to `wasmtime::component::Val` -- collapsing
+/// them would lose the information needed to pick the right one.
+#[derive(Clone, Debug, PartialEq)]
 pub enum ComponentValue {
+    Bool(bool),
     U32(u32),
+    S64(i64),
+    F64(f64),
+    String(String),
+    List(Vec<ComponentValue>),
+    /// A WIT `record`: field name/value pairs in declaration order.
+    Record(Vec<(String, ComponentValue)>),
+    /// A WIT `variant` case: its name and optional payload.
+    Variant(String, Option<Box<ComponentValue>>),
+    /// A WIT `enum` case: its name (no payload -- an `enum` case never
+    /// carries one; a case that does is a `variant`, represented above).
+    Enum(String),
+    Option(Option<Box<ComponentValue>>),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ComponentInvocationResult {
     pub values: Vec<ComponentValue>,
 }
@@ -1569,6 +1621,31 @@ impl ComponentInvocationResult {
             values: vec![value],
         }
     }
+}
+
+/// A Runtime-provided capability a Component calls into as a host import
+/// (`model-component-graph-contract`): the counterpart to a Component
+/// *export* the Runtime calls (`ComponentEngine::invoke`). `instance_key` is
+/// the calling Component instance's own [`ComponentEngineInstance::engine_key`]
+/// -- a single `HostCapability` is registered once and shared across every
+/// Component instance that imports its interface, so a capability that needs
+/// per-instance state (a graph-builder session under construction, for
+/// example) uses this to key it; a capability with no such state can ignore
+/// it. `operation` is the WIT function name within the imported interface;
+/// `arguments` are already the callee's declared parameters, in order,
+/// converted from the Component's own typed call. A capability that rejects
+/// a call (invalid arguments, a semantic violation the capability itself is
+/// responsible for validating) returns `Err`, which the calling engine
+/// surfaces to the Component as a trapped/failed host call -- never a silent
+/// default value, matching this crate's fail-closed posture for every other
+/// Provider/Kernel boundary.
+pub trait HostCapability: Send + Sync {
+    fn call(
+        &self,
+        instance_key: &str,
+        operation: &str,
+        arguments: &[ComponentValue],
+    ) -> Result<Vec<ComponentValue>, ComponentError>;
 }
 
 pub trait ComponentEngine: Send {
@@ -1598,6 +1675,23 @@ pub trait ComponentEngine: Send {
         reason: ComponentInterruptionReason,
     ) -> Result<(), ComponentError>;
     fn destroy(&mut self, instance: ComponentEngineInstance) -> Result<(), ComponentError>;
+
+    /// Registers a real implementation for a host-provided `WitInterface`
+    /// (`model-component-graph-contract`), so an engine backend that
+    /// actually links Components (`WasmtimeComponentEngine`) can wire a
+    /// Component's import of that interface to `capability`'s real behavior
+    /// instead of a generic conformance stub. Additive and optional, like
+    /// `ProviderExecutionApi`'s defaulted methods: an engine backend that
+    /// never links real Components (`MockComponentEngine`, `WebComponentEngine`)
+    /// has no meaningful behavior to add here, so the default is a no-op
+    /// rather than a required override.
+    fn register_capability(
+        &mut self,
+        interface: WitInterface,
+        capability: Arc<dyn HostCapability>,
+    ) {
+        let _ = (interface, capability);
+    }
 }
 
 #[derive(Default)]
@@ -1778,6 +1872,21 @@ impl ComponentManager {
         self.authorized_interfaces.insert(interface);
     }
 
+    /// Declares `interface` provided (same bookkeeping as
+    /// [`Self::provide_interface`]) *and* wires `capability` as its real
+    /// implementation on the underlying engine backend, so a Component
+    /// importing `interface` calls into real Runtime behavior rather than a
+    /// generic conformance stub. See [`HostCapability`] and
+    /// [`ComponentEngine::register_capability`].
+    pub fn provide_capability(
+        &mut self,
+        interface: WitInterface,
+        capability: Arc<dyn HostCapability>,
+    ) {
+        self.provide_interface(interface.clone());
+        self.engine.register_capability(interface, capability);
+    }
+
     pub fn authorize_interface(&mut self, interface: WitInterface) {
         self.authorized_interfaces.insert(interface);
     }
@@ -1854,6 +1963,19 @@ impl ComponentManager {
 
     pub fn instance_state(&self, id: ComponentInstanceId) -> Option<ComponentInstanceState> {
         self.instances.get(&id).map(|instance| instance.state)
+    }
+
+    /// The underlying engine instance's own key for `id`
+    /// (`model-component-graph-contract`): needed by a caller that must
+    /// call a [`HostCapability`]'s concrete methods (e.g.
+    /// `GraphBuilderCapability::prepare_session`) directly, keyed the same
+    /// way [`HostCapability::call`] itself is -- the manager-level
+    /// [`ComponentInstanceId`] this method takes is never the key a
+    /// capability sees, only this engine key is.
+    pub fn engine_instance_key(&self, id: ComponentInstanceId) -> Option<&str> {
+        self.instances
+            .get(&id)
+            .map(|instance| instance.engine_instance().engine_key())
     }
 
     pub fn link_plan(&self, name: &str) -> Result<ComponentLinkPlan, ComponentError> {
@@ -2324,8 +2446,12 @@ impl ComponentManager {
                 ComponentObservationKind::PlatformUnsupported
             }
             ComponentError::HostBindingFailed { .. } => ComponentObservationKind::Instantiation,
-            ComponentError::InstantiationFailed { .. } => ComponentObservationKind::Instantiation,
-            ComponentError::InvocationFailed { .. } => ComponentObservationKind::Invocation,
+            ComponentError::InstantiationFailed { .. }
+            | ComponentError::CapabilityVersionMismatch { .. } => {
+                ComponentObservationKind::Instantiation
+            }
+            ComponentError::InvocationFailed { .. }
+            | ComponentError::CapabilityCallRejected { .. } => ComponentObservationKind::Invocation,
             ComponentError::PreparationFailed { .. }
             | ComponentError::ComponentLoadFailed { .. } => ComponentObservationKind::Preparation,
             ComponentError::UnauthorizedImport { .. }
@@ -3052,6 +3178,30 @@ pub enum ComponentError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A registered [`HostCapability`] rejected a call
+    /// (`model-component-graph-contract`). Distinct from `InvocationFailed`
+    /// (which needs a [`ComponentInstanceId`] the manager assigns, not
+    /// visible to a `HostCapability` -- it only sees the calling engine
+    /// instance's own key, see [`HostCapability::call`]'s `instance_key`).
+    CapabilityCallRejected {
+        capability: String,
+        instance_key: String,
+        message: String,
+    },
+    /// A Component's WIT import names a known Capability interface, but not
+    /// at a version the Runtime's approved Link Plan has an entry for.
+    /// Distinct from `InstantiationFailed`'s generic "absent from the
+    /// approved Link Plan" wording, which otherwise covers both "this
+    /// interface name is unknown at any version" and "known interface,
+    /// wrong version" indistinguishably
+    /// (`model-component-graph-contract`'s "Component requires unsupported
+    /// contract version" scenario names this failure mode specifically).
+    CapabilityVersionMismatch {
+        definition: ComponentDefinitionId,
+        name: String,
+        requested_version: String,
+        available_version: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3241,6 +3391,24 @@ impl fmt::Display for ComponentError {
                 f,
                 "could not discover components in '{}': {source}",
                 path.display()
+            ),
+            Self::CapabilityCallRejected {
+                capability,
+                instance_key,
+                message,
+            } => write!(
+                f,
+                "capability '{capability}' rejected a call from instance '{instance_key}': {message}"
+            ),
+            Self::CapabilityVersionMismatch {
+                definition,
+                name,
+                requested_version,
+                available_version,
+            } => write!(
+                f,
+                "component definition '{}' requires capability '{name}@{requested_version}', but the approved Link Plan only has '{name}@{available_version}' (capability-version-mismatch)",
+                definition.get()
             ),
         }
     }

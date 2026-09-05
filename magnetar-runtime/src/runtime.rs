@@ -35,6 +35,7 @@ use crate::memory::{
     MemoryAllocationOwner, MemoryAllocationRequest, MemoryAllocationState, MemoryManager,
     MemoryManagerConfig, MemoryPlacement,
 };
+use crate::model::ModelTrustStore;
 use crate::model_instance::{
     ModelInstance, ModelInstanceDefinition, ModelInstanceError, ModelInstanceId,
     ModelInstanceManager, ModelInstanceStatus, ModelInstanceUnloadPolicy,
@@ -170,6 +171,7 @@ pub struct RuntimeBuilder {
     config: RuntimeConfig,
     providers: Vec<Arc<dyn Provider>>,
     model_execution_engine: Option<SharedRuntimeModelExecutionEngine>,
+    trust: ModelTrustStore,
 }
 impl RuntimeBuilder {
     pub fn new() -> Self {
@@ -181,6 +183,16 @@ impl RuntimeBuilder {
     }
     pub fn register_provider(mut self, x: Arc<dyn Provider>) -> Self {
         self.providers.push(x);
+        self
+    }
+    /// The Model Artifact trust policy this Runtime evaluates every
+    /// `load_model` call against. Set once, here, before the Runtime a
+    /// caller receives exists -- there is no way to replace it afterward
+    /// (`seal-runtime-model-trust-and-provenance-authority`'s "Runtime-Sealed
+    /// Trust Configuration" requirement). Unset defaults to
+    /// [`ModelTrustStore::default`], which trusts nothing.
+    pub fn trust_store(mut self, x: ModelTrustStore) -> Self {
+        self.trust = x;
         self
     }
     pub(crate) fn model_execution_engine(
@@ -257,6 +269,7 @@ impl RuntimeBuilder {
             dropped_session_observations: 0,
             startup_diagnostics,
             initialized: true,
+            trust: self.trust,
         }
     }
 }
@@ -275,6 +288,10 @@ pub struct Runtime {
     dropped_session_observations: u64,
     startup_diagnostics: Vec<RuntimeDiagnostic>,
     initialized: bool,
+    /// Sealed at build time by [`RuntimeBuilder::trust_store`]; no public
+    /// accessor returns an owned or mutable copy, so nothing downstream of
+    /// construction can substitute a different trust policy for a load.
+    trust: ModelTrustStore,
 }
 impl Runtime {
     pub fn builder() -> RuntimeBuilder {
@@ -338,6 +355,12 @@ impl Runtime {
     }
     pub(crate) fn model_execution_engine(&self) -> Option<&SharedRuntimeModelExecutionEngine> {
         self.model_execution_engine.as_ref()
+    }
+    /// The Model Artifact trust policy this Runtime was built with. Crate
+    /// internal: `load_model`/`load_model_observed` use this to evaluate
+    /// trust themselves rather than accepting a caller-supplied decision.
+    pub(crate) fn trust_store(&self) -> &ModelTrustStore {
+        &self.trust
     }
     pub fn sessions(&self) -> impl Iterator<Item = &InferenceSession> {
         self.sessions.values()
@@ -581,6 +604,30 @@ impl Runtime {
         architecture: ModelArchitectureImplementation,
         affinity: ResourceAffinity,
     ) -> Result<ModelInstanceId, ModelInstanceError> {
+        if architecture.architecture != loaded.plan().architecture {
+            return Err(ModelInstanceError::ArchitectureMismatch {
+                expected: loaded.plan().architecture.clone(),
+                actual: architecture.architecture.clone(),
+            });
+        }
+        if let Some(expected_provider) = loaded.plan().provider_binding.as_ref()
+            && affinity.provider() != Some(expected_provider)
+        {
+            return Err(ModelInstanceError::AffinityMismatch {
+                reason: format!(
+                    "affinity provider disagrees with the loading phase's resolved provider binding '{expected_provider:?}'"
+                ),
+            });
+        }
+        if let Some(expected_device) = loaded.plan().device_binding.as_ref()
+            && affinity.device() != Some(expected_device)
+        {
+            return Err(ModelInstanceError::AffinityMismatch {
+                reason: format!(
+                    "affinity device disagrees with the loading phase's resolved device binding '{expected_device:?}'"
+                ),
+            });
+        }
         let definition =
             ModelInstanceDefinition::from_loaded_context(loaded, architecture, affinity);
         self.model_instances.create(definition)
@@ -640,6 +687,35 @@ impl Runtime {
                 }
             })?;
         }
+        // Release the Provider-owned weight Tensor Resources themselves,
+        // not only their Memory Manager allocation accounting below --
+        // otherwise Provider storage accumulates orphaned weight tensors
+        // across every load/unload cycle even though the Memory Manager
+        // ledger looks clean (`transactional-weight-materialization`).
+        // Resolved generically from each resource's own recorded Tensor
+        // Residency (its Provider affinity, set when it was materialized),
+        // not a hardcoded Provider name -- this file is generic Core and
+        // SHALL NOT know about any specific model family's Provider choice.
+        for resource_id in &report.released_weight_resources {
+            if let Some(provider_binding) = self
+                .memory
+                .tensor_residency(resource_id)
+                .and_then(|residency| residency.affinity.provider())
+                && let Some(executor) = self
+                    .providers
+                    .provider(provider_binding.as_str())
+                    .and_then(|provider| provider.execution_api())
+            {
+                executor.release_tensor(resource_id);
+            }
+            // Remove the residency record itself, now that its Provider
+            // tensor is gone -- read only after the Provider lookup above,
+            // which needs it to resolve the owning Provider; otherwise
+            // `tensor_residency()` would keep reporting this resource as
+            // resident indefinitely across every load/unload cycle
+            // (Correctif: `invalidate-tensor-residency-on-release`).
+            self.memory.remove_tensor_residency(resource_id);
+        }
         // Release this instance's own MemoryManager allocations (weight/
         // constant tensor resources and any other Runtime-owned allocation
         // bound to it) now that unload has moved them into
@@ -648,6 +724,12 @@ impl Runtime {
         for allocation in &report.released_memory_allocations {
             let _ = self.memory.release(*allocation);
         }
+        // Clear this instance's materialization evidence: its weight
+        // bindings are gone (or about to be replaced by a future load), so
+        // stale evidence must not outlive them (`bind-model-loading-
+        // evidence-to-validated-artifact`).
+        self.model_instances
+            .clear_materialization_evidence(instance);
         Ok(report)
     }
     pub fn admit_generation_to_batch(
@@ -2149,7 +2231,7 @@ impl Runtime {
         provider: &ProviderBinding,
         device: Option<&DeviceBinding>,
         phase: ProviderExecutionPhase,
-    ) -> Result<&dyn ProviderExecutionApi, ProviderExecutionError> {
+    ) -> Result<Arc<dyn ProviderExecutionApi>, ProviderExecutionError> {
         self.validate_provider_execution_bindings(provider, device, phase)?;
         let provider_ref = self.providers.provider(provider.as_str()).ok_or_else(|| {
             ProviderExecutionError::new(

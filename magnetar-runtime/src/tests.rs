@@ -166,8 +166,8 @@ impl Provider for TestProvider {
         self.shut_down.store(true, Ordering::SeqCst);
         Ok(())
     }
-    fn execution_api(&self) -> Option<&dyn ProviderExecutionApi> {
-        self.execution_api.as_deref()
+    fn execution_api(&self) -> Option<Arc<dyn ProviderExecutionApi>> {
+        self.execution_api.clone()
     }
 }
 struct TestProviderExecutionApi {
@@ -5830,6 +5830,15 @@ fn memory_manager_tracks_allocation_lifetime_and_tensor_residency() {
         observation.kind == MemoryObservationKind::AllocationReleased
             && observation.allocation == Some(allocation.id)
     }));
+    // `release()` only changes the allocation's own state -- it does not
+    // remove the tensor's residency record (`invalidate-tensor-residency-
+    // on-release`), so the record is still present here until a caller
+    // explicitly removes it.
+    assert!(manager.tensor_residency(&tensor).is_some());
+    let removed = manager.remove_tensor_residency(&tensor).unwrap();
+    assert_eq!(removed.tensor, tensor);
+    assert!(manager.tensor_residency(&tensor).is_none());
+    assert!(manager.remove_tensor_residency(&tensor).is_none());
     assert!(matches!(
         manager.record_tensor_residency(
             TensorResidency::new(
@@ -7306,6 +7315,62 @@ fn reference_cpu_executes_matmul_invocation_end_to_end() {
     assert_eq!(output.data, vec![19.0, 22.0, 43.0, 50.0]);
 }
 
+/// `reach-architecture-freeze-1` task 5.4/5.5: a real Operator with more
+/// than one declared output ("split") dispatched through the same generic
+/// `KernelInvocation`/`execute_invocation` path every other Kernel uses,
+/// proving `KernelInvocation.outputs: Vec<..>` and
+/// `store_output(invocation, index, ..)` actually produce a distinct,
+/// independently-readable resource per declared output -- not just that
+/// the types allow more than one.
+#[test]
+fn reference_cpu_split_kernel_produces_a_dedicated_resource_per_output() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "split")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (input_id, input_resource) = reference_cpu_resource("split-in", [2, 4]);
+    let (_left_id, left_resource) = reference_cpu_resource("split-left", [2, 2]);
+    let (_right_id, right_resource) = reference_cpu_resource("split-right", [2, 2]);
+    executor.write_tensor(
+        input_id,
+        reference_cpu_host_tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+    );
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-split"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(input_resource)
+    .with_output(left_resource.clone())
+    .with_output(right_resource.clone());
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    assert_eq!(
+        result.updated_resources.len(),
+        2,
+        "split must report both output resources as updated, not just one"
+    );
+
+    let left = executor.read_tensor(&left_resource.resource.id).unwrap();
+    let right = executor.read_tensor(&right_resource.resource.id).unwrap();
+    assert_eq!(left.shape, vec![2, 2]);
+    assert_eq!(right.shape, vec![2, 2]);
+    // Each row of the [2, 4] input splits into its first-half/second-half
+    // elements, landing in two independently-readable resources.
+    assert_eq!(left.data, vec![1.0, 2.0, 5.0, 6.0]);
+    assert_eq!(right.data, vec![3.0, 4.0, 7.0, 8.0]);
+}
+
 #[test]
 fn reference_cpu_execution_tracks_output_through_memory_manager() {
     let provider = ReferenceCpuProvider::new();
@@ -7359,7 +7424,7 @@ fn reference_cpu_execution_tracks_output_through_memory_manager() {
 }
 
 #[test]
-fn reference_cpu_emits_memory_feasibility_failed_observation_on_allocation_rejection() {
+fn reference_cpu_denies_dispatch_when_output_admission_is_rejected() {
     let provider = ReferenceCpuProvider::new();
     let executor = provider.executor();
     let advertisements = provider.kernel_advertisements();
@@ -7377,9 +7442,15 @@ fn reference_cpu_emits_memory_feasibility_failed_observation_on_allocation_rejec
 
     let (a_id, a_resource) = reference_cpu_resource("mem-fail-a", [2, 2]);
     let (b_id, b_resource) = reference_cpu_resource("mem-fail-b", [2, 2]);
-    let (_out_id, out_resource) = reference_cpu_resource("mem-fail-out", [2, 2]);
-    executor.write_tensor(a_id, reference_cpu_host_tensor([2, 2], vec![0.0; 4]));
-    executor.write_tensor(b_id, reference_cpu_host_tensor([2, 2], vec![0.0; 4]));
+    let (out_id, out_resource) = reference_cpu_resource("mem-fail-out", [2, 2]);
+    executor.write_tensor(
+        a_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+    );
+    executor.write_tensor(
+        b_id,
+        reference_cpu_host_tensor([2, 2], [5.0, 6.0, 7.0, 8.0]),
+    );
 
     let invocation = KernelInvocation::new(
         KernelInvocationId::new("invocation-memory-fail"),
@@ -7398,12 +7469,344 @@ fn reference_cpu_emits_memory_feasibility_failed_observation_on_allocation_rejec
         &invocation,
         &mut memory,
     );
-    // Kernel execution itself still succeeds (opaque storage is independent);
-    // only the Memory Manager accounting request is rejected.
-    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    // Memory Admission Precedes Provider Materialization: when the declared
+    // output cannot be admitted, the Kernel is never dispatched to the
+    // Provider at all (no numerical work runs, no bytes are written).
+    assert_eq!(result.status, KernelResultStatus::Failed);
+    assert!(executor.read_tensor(&out_id).is_none());
     assert!(executor.observations().iter().any(
         |observation| observation.kind == KernelObservationKind::KernelMemoryFeasibilityFailed
     ));
+    assert!(
+        !executor
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == KernelObservationKind::KernelDispatchStarted)
+    );
+    assert!(memory.allocations().next().is_none());
+}
+
+/// Correctif 1: `write_tensor_admitted` (unlike plain `write_tensor`, which
+/// takes no `MemoryManager` at all) SHALL reject a write whose byte size
+/// cannot be admitted, before the Provider's storage is touched.
+#[test]
+fn reference_cpu_write_tensor_admitted_rejects_write_when_budget_exhausted() {
+    let executor = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::new(MemoryManagerConfig {
+        max_runtime_bytes: Some(1),
+        ..MemoryManagerConfig::default()
+    });
+    let id = TensorResourceId::new("admitted-write-oom");
+    let result = executor.write_tensor_admitted(
+        &mut memory,
+        id.clone(),
+        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+        MemoryAllocationClass::Tensor,
+        MemoryAllocationOwner::Session("test-session".into()),
+    );
+    assert!(
+        result.is_err(),
+        "write must be rejected under an exhausted budget"
+    );
+    assert!(
+        executor.read_tensor(&id).is_none(),
+        "a rejected admission must not materialize the tensor into Provider storage"
+    );
+    assert!(memory.allocations().next().is_none());
+}
+
+/// Correctif 1: writing to the *same* resource id twice through
+/// `write_tensor_admitted` SHALL release the allocation the first write
+/// admitted, not accumulate a second, independent one -- otherwise a
+/// resource id a caller rewrites every generation step (first-native graph
+/// edges, KV-pending writes) would grow the memory ledger unboundedly over
+/// a long-running session even though Provider storage itself does not
+/// grow (each write overwrites the same entry).
+#[test]
+fn reference_cpu_write_tensor_admitted_releases_previous_allocation_for_same_resource_id() {
+    let executor = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let id = TensorResourceId::new("admitted-write-replaced");
+    let owner = || MemoryAllocationOwner::Session("test-session".into());
+
+    executor
+        .write_tensor_admitted(
+            &mut memory,
+            id.clone(),
+            reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+            MemoryAllocationClass::Tensor,
+            owner(),
+        )
+        .expect("first admitted write succeeds");
+    let active_after_first = memory
+        .allocations()
+        .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+        .count();
+    assert_eq!(active_after_first, 1);
+
+    executor
+        .write_tensor_admitted(
+            &mut memory,
+            id.clone(),
+            reference_cpu_host_tensor([2, 2], [5.0, 6.0, 7.0, 8.0]),
+            MemoryAllocationClass::Tensor,
+            owner(),
+        )
+        .expect("second admitted write to the same resource id succeeds");
+    let active_after_second = memory
+        .allocations()
+        .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+        .count();
+    assert_eq!(
+        active_after_second, 1,
+        "the first write's allocation must be released when the second replaces it, \
+         not left active alongside the new one"
+    );
+    assert_eq!(
+        executor
+            .read_tensor(&id)
+            .expect("resource is still present")
+            .data,
+        vec![5.0, 6.0, 7.0, 8.0],
+        "Provider storage must reflect the second write's value"
+    );
+}
+
+#[test]
+fn reference_cpu_releases_admitted_output_reservation_when_kernel_execution_fails() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+
+    let (_a_id, a_resource) = reference_cpu_resource("mem-release-a", [2, 2]);
+    let (_b_id, b_resource) = reference_cpu_resource("mem-release-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("mem-release-out", [2, 2]);
+    // Inputs are intentionally left unwritten so the Kernel itself fails
+    // (`input_tensor` finds no materialized data) after admission already
+    // succeeded, exercising the rollback path rather than the admission
+    // rejection path.
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-memory-release"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource);
+
+    let result = executor.execute_invocation_with_memory_manager(
+        advertisement,
+        operator,
+        &invocation,
+        &mut memory,
+    );
+    assert_eq!(result.status, KernelResultStatus::Failed);
+    assert!(
+        !memory
+            .allocations()
+            .any(|allocation| allocation.state == MemoryAllocationState::Active),
+        "the output reservation admitted before dispatch must be released when the Kernel itself fails"
+    );
+}
+
+#[test]
+fn reference_cpu_kernel_submission_is_causal_and_single_consumption() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+
+    let (a_id, a_resource) = reference_cpu_resource("submit-a", [2, 2]);
+    let (b_id, b_resource) = reference_cpu_resource("submit-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("submit-out", [2, 2]);
+    executor.write_tensor(
+        a_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 0.0, 0.0, 1.0]),
+    );
+    executor.write_tensor(
+        b_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+    );
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-submit"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource);
+
+    assert!(
+        executor.observations().is_empty(),
+        "no dispatch should have happened before submission"
+    );
+
+    // submit_kernel_invocation is what causally triggers the numerical
+    // work; Reference CPU is synchronous, so it has already run by the time
+    // this call returns.
+    let handle =
+        executor.submit_kernel_invocation(advertisement, operator, &invocation, &mut memory);
+    assert!(
+        executor
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == KernelObservationKind::KernelDispatchStarted)
+    );
+
+    let result = executor
+        .complete_kernel_invocation(&handle)
+        .expect("work submitted above is completable exactly once");
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    assert_eq!(result.updated_resources.len(), 1);
+
+    // Single consumption: completing the same handle a second time fails
+    // rather than silently re-reporting the same result.
+    assert!(executor.complete_kernel_invocation(&handle).is_err());
+}
+
+#[test]
+fn reference_cpu_kernel_completion_reports_real_failure_not_false_success() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+
+    let (_a_id, a_resource) = reference_cpu_resource("submit-fail-a", [2, 2]);
+    let (_b_id, b_resource) = reference_cpu_resource("submit-fail-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("submit-fail-out", [2, 2]);
+    // Inputs are intentionally left unwritten so the Kernel itself fails.
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-submit-fail"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource);
+
+    let handle =
+        executor.submit_kernel_invocation(advertisement, operator, &invocation, &mut memory);
+    let result = executor
+        .complete_kernel_invocation(&handle)
+        .expect("a submitted invocation is completable even when the Kernel itself failed");
+    assert_eq!(
+        result.status,
+        KernelResultStatus::Failed,
+        "completion must report the real Kernel failure, not fabricate a success"
+    );
+    assert!(result.error.is_some());
+}
+
+#[test]
+fn reference_cpu_rejects_completion_of_a_handle_that_was_never_submitted() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let fabricated_handle = ProviderExecutionHandle::new(
+        ScheduledOperationId::new(0xDEAD_BEEF),
+        ExecutionPlanId::new("never-submitted-plan"),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        None,
+    );
+    assert!(
+        executor
+            .complete_kernel_invocation(&fabricated_handle)
+            .is_err()
+    );
+    // The generic ProviderExecutionApi surface rejects the same fabricated
+    // handle for the same reason: no submission is associated with it.
+    assert!(ProviderExecutionApi::complete(executor.as_ref(), &fabricated_handle).is_err());
+    assert!(ProviderExecutionApi::status(executor.as_ref(), &fabricated_handle).is_err());
+}
+
+#[test]
+fn reference_cpu_cancellation_is_explicitly_unsupported_not_silently_ignored() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let handle = ProviderExecutionHandle::new(
+        ScheduledOperationId::new(1),
+        ExecutionPlanId::new("cancel-probe-plan"),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        None,
+    );
+    let outcome = ProviderExecutionApi::cancel(executor.as_ref(), &handle).unwrap();
+    assert_eq!(outcome, ProviderCancellationOutcome::Unsupported);
+}
+
+#[test]
+fn reference_cpu_generic_provider_execution_api_completes_exactly_once() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let provider_binding = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+    let plan = ComputeExecutionPlan {
+        id: ExecutionPlanId::new("generic-submit-plan"),
+        trace_id: TraceId::new("trace-generic-submit"),
+        graph: ComputeGraphId::new("generic-submit-graph"),
+        provider: provider_binding.clone(),
+        device: None,
+        capability: CapabilityBinding::new(
+            CapabilityId::new(COMPUTE_CAPABILITY_ID),
+            COMPUTE_CAPABILITY_VERSION,
+        ),
+        policy: ResolutionPolicyId::new("generic-submit-policy"),
+        classification: ComputeExecutionClassification::Transparent,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        constraints: Vec::new(),
+        steps: Vec::new(),
+        memory_plan: MemoryPlan::new(provider_binding.clone(), None, ExecutionContextId::new(0)),
+        diagnostics: Vec::new(),
+        validated: true,
+    };
+    let request = ProviderExecutionRequest {
+        operation: ScheduledOperationId::new(1),
+        plan,
+        provider: provider_binding.clone(),
+        device: None,
+        affinity: ResourceAffinity::new(FallbackClass::Transparent),
+        memory_plan: MemoryPlan::new(provider_binding, None, ExecutionContextId::new(0)),
+        steps: Vec::new(),
+        constraints: Vec::new(),
+    };
+
+    let handle = ProviderExecutionApi::submit(executor.as_ref(), request).unwrap();
+    let status = ProviderExecutionApi::status(executor.as_ref(), &handle).unwrap();
+    assert_eq!(status.state, SchedulingState::Completed);
+    let result = ProviderExecutionApi::complete(executor.as_ref(), &handle).unwrap();
+    assert_eq!(result.state, SchedulingState::Completed);
+    ProviderExecutionApi::release(executor.as_ref(), handle.clone()).unwrap();
+
+    // submit -> status -> complete -> release is now exhausted: neither
+    // status nor a second complete succeeds against the same handle.
+    assert!(ProviderExecutionApi::status(executor.as_ref(), &handle).is_err());
+    assert!(ProviderExecutionApi::complete(executor.as_ref(), &handle).is_err());
 }
 
 #[test]
@@ -8489,16 +8892,52 @@ fn model_instance_definition() -> ModelInstanceDefinition {
         owner: None,
         resource_bindings: ModelInstanceResourceBindings::default(),
         kernel_selection_policy: None,
+        required_weight_names: BTreeSet::new(),
+        required_weight_digests: BTreeMap::new(),
+        required_weight_shapes: BTreeMap::new(),
     }
+}
+
+/// Materializes one real, Runtime-issued-evidence-backed weight for
+/// `instance` through `materialize_model_instance_weights` -- the one
+/// legitimate way any caller (production or an external embedder) can turn
+/// weight bytes into bound, Ready-eligible resources
+/// (`bind-model-loading-evidence-to-validated-artifact`). This alone
+/// reaches `Ready`: the underlying transaction commits bindings, mints
+/// materialization evidence, and marks the instance Ready in one step, the
+/// same as the real production path -- a separate follow-up
+/// `warm_model_instance` call is not just redundant but would fail (no
+/// `Ready -> Ready` lifecycle transition exists). Requires a
+/// `ReferenceCpuProvider` already registered on `runtime` and `instance`'s
+/// placement pinned to it.
+fn reach_ready_with_real_weight(runtime: &mut Runtime, instance: &ModelInstanceId) {
+    let weights = BTreeMap::from([("weight".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(runtime, instance, "test", &weights).unwrap();
 }
 
 #[test]
 fn inference_api_model_instance_suspend_resume_drain_through_api_boundary() {
-    let mut runtime = Runtime::builder().build().unwrap();
-    let instance = runtime
-        .model_instances_mut()
-        .create(model_instance_definition())
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
         .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+    // `create()` no longer reaches Ready on its own (transactional-weight-
+    // materialization); this test's own concern is suspend/resume/drain
+    // *from* Ready, so reach Ready explicitly first -- with real,
+    // Provider-backed evidence: `resume_model_instance` now re-derives
+    // readiness (Correctif: Runtime-owned ModelInstance readiness
+    // authority, round 3), so an instance that was never really
+    // materialized correctly cannot resume back to Ready any more, and
+    // this test's own concern (the suspend/resume/drain state machine,
+    // not weight materialization) needs a genuinely resumable instance
+    // to exercise that machinery at all.
+    reach_ready_with_real_weight(&mut runtime, &instance);
 
     let status = model_instance_status(&runtime, &instance).unwrap();
     assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
@@ -8519,6 +8958,210 @@ fn inference_api_model_instance_suspend_resume_drain_through_api_boundary() {
     assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Draining);
 }
 
+/// Implements `seal-model-instance-readiness-authority` round 3, the
+/// audit's own resume scenario: state that made an instance eligible for
+/// `Ready` can change while it is suspended, so `resume_model_instance`
+/// must re-derive readiness against *current* Runtime state, not assume
+/// whatever was true before suspension still holds. Proven here by
+/// invalidating the weight evidence during suspension (removing its
+/// `TensorResidency`, a legitimate way real state can regress -- e.g. a
+/// rollback or eviction elsewhere) rather than by mutating a `Provider`'s
+/// status snapshot, which this test double has no interior mutability to
+/// do after registration; both exercise the same property: resume must
+/// look at current state, not trust the state from before suspension.
+#[test]
+fn inference_api_resume_model_instance_revalidates_and_rejects_stale_evidence() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+    reach_ready_with_real_weight(&mut runtime, &instance);
+    assert_eq!(
+        model_instance_status(&runtime, &instance)
+            .unwrap()
+            .lifecycle,
+        ModelInstanceLifecycleState::Ready
+    );
+
+    suspend_model_instance(
+        &mut runtime,
+        &instance,
+        ModelInstanceSuspensionReason::AdministrativePolicy,
+    )
+    .unwrap();
+
+    // While suspended, the weight evidence that made this instance Ready
+    // becomes invalid (its TensorResidency is removed) -- simulating real
+    // state regressing during the suspension window, exactly the scenario
+    // the audit's own resume test targets.
+    let weight_resource = runtime
+        .model_instance(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .get("weight")
+        .unwrap()
+        .clone();
+    runtime
+        .memory_mut()
+        .remove_tensor_residency(&weight_resource);
+
+    resume_model_instance(&mut runtime, &instance).unwrap_err();
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// Implements `seal-model-instance-readiness-authority` round 3, audit
+/// test 25 "Inventaire incomplet": a manifest declaring multiple mandatory
+/// tensors, with only some of them bound, must not reach Ready even
+/// though every bound entry is individually real (residency-backed,
+/// Provider-written, and -- since `bind-model-loading-evidence-to-
+/// validated-artifact` -- Runtime-evidenced). Round 2's fix only checked
+/// that whatever *was* bound was real; it never checked the bound set was
+/// *complete*. Materializes "weight.a" for real through the one authorized
+/// transaction (which has no knowledge of `required_weight_names` --
+/// that's `derive_effective_readiness_checks`'s own concern -- so it marks
+/// the instance Ready on its own terms); a subsequent `warm_model_instance`
+/// re-derivation must then find the mandatory inventory still incomplete
+/// and demote it, the same defense-in-depth property the resume-
+/// revalidation test above proves for stale residency.
+#[test]
+fn inference_api_warm_model_instance_rejects_incomplete_mandatory_weight_inventory() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    definition.required_weight_names =
+        BTreeSet::from(["weight.a".to_string(), "weight.b".to_string()]);
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    // Really materialize only "weight.a" -- "weight.b" stays entirely
+    // absent.
+    let weights = BTreeMap::from([("weight.a".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// Implements `seal-model-instance-readiness-authority` round 3, audit
+/// test 25 "Residency synthétique": a `TensorResidency` recorded manually
+/// (real Memory Manager allocation, real `record_tensor_residency` call)
+/// but with no matching `Provider::write_tensor` ever having run must not
+/// count as materialized. Round 2's fix only checked a residency record
+/// existed; it did not check the Provider it claims to describe actually
+/// holds the tensor. **Mechanism note (`bind-model-loading-evidence-to-
+/// validated-artifact`):** this scenario now also fails the newer
+/// evidence-matching check (no `MaterializationEvidence` exists for a
+/// hand-constructed binding at all, regardless of whether `write_tensor`
+/// ran) -- kept as its own test anyway since it demonstrates the
+/// `TensorResidency`-presence check on a *different* axis than evidence
+/// does (residency answers "is it still resident now", not "did an
+/// authorized transaction produce it").
+#[test]
+fn inference_api_warm_model_instance_rejects_residency_without_provider_write() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    let allocation = runtime
+        .memory_mut()
+        .allocate(MemoryAllocationRequest::new(
+            MemoryAllocationClass::Tensor,
+            1,
+            MemoryPlacement::HostOrdinary,
+            MemoryAllocationOwner::InferenceArtifact("test".into()),
+        ))
+        .unwrap();
+    let weight_resource = TensorResourceId::new("test.weight.never-written");
+    // Record a real residency -- but never call `write_tensor` on the
+    // Provider it claims. This is exactly what a caller with mutable
+    // access to `Runtime::memory_mut()` and `resource_bindings.weights`
+    // could always do; the Provider's own storage is the one thing they
+    // cannot forge without actually writing real bytes to it.
+    runtime
+        .memory_mut()
+        .record_tensor_residency(
+            TensorResidency::new(
+                weight_resource.clone(),
+                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+                    REFERENCE_CPU_PROVIDER_NAME,
+                )),
+                ResourceAffinity::new(FallbackClass::Transparent)
+                    .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+            )
+            .with_allocation(allocation.id),
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .providers()
+            .provider(REFERENCE_CPU_PROVIDER_NAME)
+            .and_then(|provider| provider.execution_api())
+            .unwrap()
+            .read_tensor(&weight_resource)
+            .is_none(),
+        "test precondition: nothing was ever written to the Provider for this resource"
+    );
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), weight_resource);
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
 #[test]
 fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_ready() {
     let mut runtime = Runtime::builder().build().unwrap();
@@ -8526,6 +9169,26 @@ fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_r
         .model_instances_mut()
         .create(model_instance_definition())
         .unwrap();
+    // `create()` no longer reaches Ready on its own (transactional-weight-
+    // materialization); this test's own concern is warmup's conflict
+    // detection against an *already Ready* instance, so reach Ready
+    // explicitly first. Bind a weight resource before doing so: since
+    // `warm_model_instance` now derives `weights_materialized` from
+    // `resource_bindings.weights` non-emptiness (`runtime-owned-model-
+    // instance-readiness-authority`), an instance with none would make the
+    // later `warm_model_instance` call fail on that check instead of the
+    // already-Ready conflict this test actually means to exercise -- both
+    // happen to map to the same broad `ModelInstanceUnavailable` variant,
+    // which would silently let this test pass for the wrong reason.
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), TensorResourceId::new("test.weight"));
+    runtime.model_instances_mut().mark_ready(&instance).unwrap();
     let plan = ModelInstanceWarmupPlan {
         policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
         steps: Vec::new(),
@@ -8540,6 +9203,7 @@ fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_r
         browser_supported: true,
         kernel_preparation_ready: true,
         autotuning_ready: true,
+        weights_materialized: true,
     };
 
     let error = warm_model_instance(&mut runtime, &instance, &plan, &checks).unwrap_err();
@@ -8549,11 +9213,732 @@ fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_r
     ));
 }
 
+/// Implements `runtime-owned-model-instance-readiness-authority`. An
+/// external audit of PR #36 found `warm_model_instance` trusted a caller's
+/// `weights_materialized: true` claim outright, even though
+/// `ModelInstanceReadinessChecks::default()` sets it `true` -- a caller
+/// using the default checks against an instance whose weights were never
+/// materialized could reach `Ready`. Covers the audit's test 18.1 (warmup
+/// without materialization must not reach Ready) and 18.3 (a forged
+/// `weights_materialized=true` claim against empty bindings is rejected).
+#[test]
+fn inference_api_warm_model_instance_rejects_forged_weights_materialized_claim() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let instance = runtime
+        .model_instances_mut()
+        .create(model_instance_definition())
+        .unwrap();
+    assert!(
+        runtime
+            .model_instance(&instance)
+            .unwrap()
+            .definition
+            .resource_bindings
+            .weights
+            .is_empty(),
+        "test precondition: no weights ever bound"
+    );
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    // The caller asserts every fact is satisfied, exactly matching
+    // `ModelInstanceReadinessChecks::default()` -- the audit's own
+    // exploit scenario (section 11).
+    let forged_checks = ModelInstanceReadinessChecks::default();
+    assert!(forged_checks.weights_materialized);
+
+    warm_model_instance(&mut runtime, &instance, &plan, &forged_checks).unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// Implements `runtime-owned-model-instance-readiness-authority`, test
+/// 18.2: `WarmupPolicy::Disabled` calls `ModelInstance::validate_readiness`
+/// directly, without the lifecycle transition `warmup()`'s other policies
+/// perform first -- so before this fix, a caller-forged `readiness =
+/// Ready` could be published while `lifecycle` stayed `Loading`, an
+/// internally inconsistent state. This test isolates that specific gap
+/// from `weights_materialized` derivation (covered separately above) by
+/// directly binding a weight resource, so the *only* thing preventing
+/// `Ready` here is the lifecycle/readiness consistency check.
+#[test]
+fn inference_api_warm_model_instance_disabled_policy_cannot_forge_ready_readiness() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let instance = runtime
+        .model_instances_mut()
+        .create(model_instance_definition())
+        .unwrap();
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), TensorResourceId::new("test.weight"));
+    assert_eq!(
+        model_instance_status(&runtime, &instance)
+            .unwrap()
+            .lifecycle,
+        ModelInstanceLifecycleState::Loading,
+        "test precondition: still Loading, no transition has run"
+    );
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::Disabled,
+        steps: Vec::new(),
+    };
+    let checks = ModelInstanceReadinessChecks::default();
+
+    // Disabled policy's own contract (`ModelInstance::warmup`) means this
+    // call does not have to fail -- `validate_readiness`'s own `Result`
+    // reflects whether the checks *themselves* are internally coherent,
+    // which they are. What matters is `self.readiness` afterward.
+    let _ = warm_model_instance(&mut runtime, &instance, &plan, &checks);
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_eq!(
+        status.lifecycle,
+        ModelInstanceLifecycleState::Loading,
+        "Disabled policy must not transition the lifecycle"
+    );
+    assert_ne!(
+        status.readiness,
+        ModelInstanceReadiness::Ready,
+        "readiness must not report Ready while lifecycle is still Loading"
+    );
+}
+
+/// Implements `runtime-owned-model-instance-readiness-authority`, test
+/// 18.4: an internally inconsistent `lifecycle: Loading, readiness: Ready`
+/// state -- however it might arise -- must never grant `acquire_usage` or
+/// `generation_reference`. This is the structural safety net: it holds
+/// regardless of which caller-forgeable path produced the inconsistency.
+#[test]
+fn model_instance_acquire_usage_rejects_ready_readiness_with_incompatible_lifecycle() {
+    let mut manager = ModelInstanceManager::new();
+    let id = manager.create(model_instance_definition()).unwrap();
+    assert_eq!(
+        manager.instance(&id).unwrap().lifecycle,
+        ModelInstanceLifecycleState::Loading
+    );
+
+    // Force the inconsistent state directly (bypassing every public
+    // entry point) to prove the check in `acquire_usage`/
+    // `generation_reference` itself, independent of how the
+    // inconsistency might be produced.
+    manager.instance_mut(&id).unwrap().readiness = ModelInstanceReadiness::Ready;
+    assert_eq!(
+        manager.instance(&id).unwrap().lifecycle,
+        ModelInstanceLifecycleState::Loading
+    );
+    assert_eq!(
+        manager.instance(&id).unwrap().readiness,
+        ModelInstanceReadiness::Ready
+    );
+
+    assert!(matches!(
+        manager.instance_mut(&id).unwrap().acquire_usage(0),
+        Err(ModelInstanceError::ModelInstanceLoading)
+    ));
+    assert!(matches!(
+        manager.generation_reference(&id),
+        Err(ModelInstanceError::ModelInstanceLoading)
+    ));
+}
+
+/// Implements `runtime-owned-model-instance-readiness-authority`, test
+/// 18.5: the happy path -- real weight materialization, a Provider the
+/// Runtime can actually resolve, and no forged claims -- still reaches
+/// Ready and accepts usage. Closing the forgery gap must not regress the
+/// legitimate warmup path.
+#[test]
+fn inference_api_warm_model_instance_reaches_ready_when_weights_and_provider_are_real() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+    // Real, Provider-backed evidence, not just a residency record or a
+    // bare map entry: `weights_materialized` derivation resolves each
+    // residency's recorded Provider and reads the tensor back from it, so
+    // a residency whose Provider never actually received a `write_tensor`
+    // call does not count (Correctif: Runtime-owned ModelInstance
+    // readiness authority, round 3 -- closing the "synthetic residency"
+    // forgery a further audit of PR #36 demonstrated: a caller could
+    // previously construct a valid-looking `TensorResidency` for a
+    // resource no Provider ever wrote).
+    reach_ready_with_real_weight(&mut runtime, &instance);
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(status.readiness.accepts_generation());
+    assert!(
+        runtime
+            .model_instances_mut()
+            .acquire_usage(&instance, 0)
+            .is_ok()
+    );
+}
+
+/// `bind-model-loading-evidence-to-validated-artifact`: a weight binding
+/// assembled by hand -- real Memory Manager allocation, real
+/// `Provider::write_tensor` call, real `TensorResidency` record, real
+/// binding -- but never produced by `WeightMaterializationTransaction`
+/// itself must not count as materialized, because no
+/// `MaterializationEvidence` exists for it. This is the general property
+/// the audit's `bind_fake_weight`-in-`contract_tests` finding demonstrated
+/// concretely: every individual piece of state a caller can construct with
+/// ordinary public/`pub(crate)` access looks legitimate, but the one thing
+/// a caller cannot fabricate without the real transaction is Runtime-issued
+/// evidence.
+#[test]
+fn inference_api_warm_model_instance_rejects_hand_assembled_binding_without_evidence() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    let allocation = runtime
+        .memory_mut()
+        .allocate(MemoryAllocationRequest::new(
+            MemoryAllocationClass::Tensor,
+            1,
+            MemoryPlacement::HostOrdinary,
+            MemoryAllocationOwner::InferenceArtifact("test".into()),
+        ))
+        .unwrap();
+    let resource_id = TensorResourceId::new("test.weight.hand-assembled");
+    let executor = runtime
+        .providers()
+        .provider(REFERENCE_CPU_PROVIDER_NAME)
+        .and_then(|provider| provider.execution_api())
+        .unwrap();
+    executor.write_tensor(resource_id.clone(), HostTensor::new([1], [0.0]).unwrap());
+    runtime
+        .memory_mut()
+        .record_tensor_residency(
+            TensorResidency::new(
+                resource_id.clone(),
+                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+                    REFERENCE_CPU_PROVIDER_NAME,
+                )),
+                ResourceAffinity::new(FallbackClass::Transparent)
+                    .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+            )
+            .with_allocation(allocation.id),
+        )
+        .unwrap();
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), resource_id);
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// `bind-model-loading-evidence-to-validated-artifact`: materialization
+/// evidence is looked up by the instance's own id, so Model Instance B
+/// cannot become materialized by having its weight bindings set to match
+/// Model Instance A's already-legitimately-materialized bindings -- B's
+/// lookup only ever finds evidence `commit` minted for B's own id (none),
+/// regardless of what A's evidence says.
+#[test]
+fn inference_api_warm_model_instance_rejects_bindings_copied_from_another_instance() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition_a = model_instance_definition();
+    definition_a.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance_a = runtime.model_instances_mut().create(definition_a).unwrap();
+    reach_ready_with_real_weight(&mut runtime, &instance_a);
+
+    let mut definition_b = model_instance_definition();
+    definition_b.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance_b = runtime.model_instances_mut().create(definition_b).unwrap();
+
+    // Copy A's already-legitimate bindings directly onto B -- the exact
+    // "reuse another instance's materialization" scenario the audit's own
+    // "Artifact mismatch" test asks for, here proven for same-artifact
+    // reuse across two distinct instances (the stronger, more general
+    // case: even identical bindings for the identical artifact do not
+    // transfer, because evidence is instance-scoped, not artifact-scoped).
+    let copied_weights = runtime
+        .model_instance(&instance_a)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .clone();
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance_b)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights = copied_weights;
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance_b,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status_b = model_instance_status(&runtime, &instance_b).unwrap();
+    assert_ne!(status_b.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status_b.readiness.accepts_generation());
+    // A remains legitimately Ready throughout -- this is not a mutation of
+    // A's own state, only B reading A's (still-valid) bindings.
+    assert_eq!(
+        model_instance_status(&runtime, &instance_a)
+            .unwrap()
+            .lifecycle,
+        ModelInstanceLifecycleState::Ready
+    );
+}
+
+/// `bind-model-loading-evidence-to-validated-artifact`: materialization
+/// evidence records the `ModelArtifactId` that was current when it was
+/// minted; if a Model Instance's declared artifact later differs from what
+/// its evidence recorded, the evidence no longer matches and readiness
+/// must reject it. `artifact` has no dedicated setter, but the field
+/// remains `pub` on `ModelInstanceDefinition` -- unlike `resource_bindings`,
+/// reassigning it can only ever make otherwise-valid evidence stop
+/// matching (fail closed), never let a caller borrow a *different*
+/// instance's evidence, since evidence lookup is keyed by instance id, not
+/// artifact id (see the previous test). Proven directly here rather than
+/// left as a hypothetical.
+#[test]
+fn inference_api_warm_model_instance_rejects_evidence_after_artifact_reassignment() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+    reach_ready_with_real_weight(&mut runtime, &instance);
+    assert_eq!(
+        model_instance_status(&runtime, &instance)
+            .unwrap()
+            .lifecycle,
+        ModelInstanceLifecycleState::Ready
+    );
+
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .artifact = ModelArtifactId::new(
+        ModelArtifactKind::ModelWeights,
+        ModelName::new("qwen").unwrap(),
+        ModelRevision::new("2-different".to_string()).unwrap(),
+        ModelDigest::sha256(b"different weights"),
+    );
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// `bind-model-loading-evidence-to-validated-artifact`: closes the
+/// companion P1 the same audit round identified -- a Provider that never
+/// implements host-memory tensor readback (`read_tensor` always returning
+/// `None`, its documented default) must still be able to reach
+/// `weights_materialized: true` through the authorized transaction, since
+/// readiness derivation no longer calls `read_tensor` at all.
+/// `TestProviderExecutionApi` does not override `write_tensor`/
+/// `read_tensor`, so it inherits the trait's real default bodies -- a
+/// faithful stand-in for a device-only Provider, not a mock that merely
+/// asserts it was never called.
+#[test]
+fn inference_api_warm_model_instance_reaches_ready_without_provider_read_tensor_support() {
+    let mut provider = TestProvider::new(REFERENCE_CPU_PROVIDER_NAME);
+    provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    // Confirm this Provider genuinely does not support host readback,
+    // rather than assuming the trait default -- if a future change to
+    // `TestProviderExecutionApi` overrides `read_tensor`, this assertion
+    // (not just the one below) would catch that this test no longer tests
+    // what it claims to.
+    let probe_resource = TensorResourceId::new("probe");
+    let executor = runtime
+        .providers()
+        .provider(REFERENCE_CPU_PROVIDER_NAME)
+        .and_then(|provider| provider.execution_api())
+        .unwrap();
+    executor.write_tensor(probe_resource.clone(), HostTensor::new([1], [0.0]).unwrap());
+    assert!(executor.read_tensor(&probe_resource).is_none());
+
+    let weights = BTreeMap::from([("weight".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(status.readiness.accepts_generation());
+}
+
+/// A further audit of PR #36 found that `WeightMaterializationTransaction::
+/// commit` called `ModelInstanceManager::mark_ready` unconditionally right
+/// after staging succeeded and evidence was minted -- so
+/// `materialize_model_instance_weights(..., &BTreeMap::new())` against an
+/// instance with a non-empty mandatory inventory could still reach
+/// `Ready`, bypassing the exact same Runtime-derived readiness gate
+/// `warm_model_instance`/`resume_model_instance` already correctly use.
+/// Non-compliant with `model-loading`'s pre-existing "Model Loading Does
+/// Not Bypass Instance Readiness" ("Successful materialization alone
+/// SHALL not imply Model Instance readiness") and "Partial Loading
+/// Policy" requirements. Proven here at the exact public entrypoint the
+/// bug was in, not only through `warm_model_instance` (which was already
+/// correct on its own and could not, by itself, prove this bypass was
+/// closed).
+#[test]
+fn inference_api_materialize_model_instance_weights_does_not_ready_with_empty_map() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    definition.required_weight_names =
+        BTreeSet::from(["weight.a".to_string(), "weight.b".to_string()]);
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &BTreeMap::new()).unwrap();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// Same root gap as the empty-map test above, for a strict subset of a
+/// multi-tensor mandatory inventory -- audit scenario "subset partiel":
+/// `commit` minted an evidence record that was *exactly correct* for what
+/// it staged, but exact correctness for an incomplete set is still
+/// incomplete, and `commit` never checked completeness before marking
+/// Ready.
+#[test]
+fn inference_api_materialize_model_instance_weights_does_not_ready_with_partial_inventory() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    definition.required_weight_names = BTreeSet::from([
+        "weight.a".to_string(),
+        "weight.b".to_string(),
+        "weight.c".to_string(),
+    ]);
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    let weights = BTreeMap::from([
+        ("weight.a".to_string(), HostTensor::new([1], [0.0]).unwrap()),
+        ("weight.b".to_string(), HostTensor::new([1], [0.0]).unwrap()),
+    ]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+
+    // The partial materialization itself still succeeded for real: its
+    // evidence exists and matches exactly what was staged, proving
+    // `commit`'s gate rejects on inventory completeness specifically, not
+    // by failing to publish anything at all (which would also incidentally
+    // "fix" the symptom without fixing the actual defect).
+    assert_eq!(
+        runtime
+            .model_instance(&instance)
+            .unwrap()
+            .definition
+            .resource_bindings
+            .weights
+            .len(),
+        2
+    );
+
+    // Completing the inventory in a second, independent call reaches
+    // Ready -- proving incremental/progressive materialization (which
+    // `commit`'s own evidence-recomputation is designed to support) still
+    // works once the gate this fix adds is actually satisfied.
+    let remaining =
+        BTreeMap::from([("weight.c".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &remaining).unwrap();
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(status.readiness.accepts_generation());
+}
+
+/// Audit scenario "Provider non-ready": a complete mandatory inventory
+/// staged and evidenced for real, but the pinned Provider's own status
+/// model reports it does not currently accept new work -- `commit` must
+/// not mark the instance Ready anyway. Proven at the materialize
+/// entrypoint directly, the same reasoning as the two tests above: this is
+/// specifically about what `commit` itself does after staging succeeds,
+/// not about `warm_model_instance`'s already-correct behavior.
+#[test]
+fn inference_api_materialize_model_instance_weights_does_not_ready_when_provider_rejects_work() {
+    let mut provider = TestProvider::new(REFERENCE_CPU_PROVIDER_NAME);
+    provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
+    let mut snapshot = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        HealthState::Available,
+    ));
+    snapshot.pressure = ProviderPressureLevel::Saturated;
+    snapshot.admission = provider_admission_from_dimensions(
+        snapshot.lifecycle,
+        snapshot.health,
+        snapshot.readiness,
+        snapshot.pressure,
+    );
+    provider.status_snapshot = Some(snapshot);
+    assert!(
+        !provider.status_snapshot().accepts_new_work_by_default(),
+        "test precondition: this Provider's own status model rejects new work"
+    );
+
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    let weights = BTreeMap::from([("weight".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// Implements `runtime-owned-model-instance-readiness-authority` round 2,
+/// audit test 23.3: a `TensorResourceId` inserted directly into
+/// `resource_bindings.weights`, with no matching `TensorResidency`, must
+/// not let `warm_model_instance` derive `weights_materialized = true` --
+/// the exact gap a follow-up audit of PR #36 found: the round-1 fix only
+/// checked the map was non-empty, not that its entries were real.
+#[test]
+fn inference_api_warm_model_instance_rejects_weight_binding_without_residency() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let instance = runtime
+        .model_instances_mut()
+        .create(model_instance_definition())
+        .unwrap();
+    // Insert a plausible-looking `TensorResourceId` directly -- no
+    // `MemoryManager::allocate`, no `record_tensor_residency`. This is
+    // exactly what a caller with `&mut Runtime` could always do, and what
+    // this Change's derivation must not trust.
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), TensorResourceId::new("forged.weight"));
+    assert!(
+        runtime
+            .memory()
+            .tensor_residency(&TensorResourceId::new("forged.weight"))
+            .is_none(),
+        "test precondition: no residency was ever recorded for this resource"
+    );
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
+/// Implements `runtime-owned-model-instance-readiness-authority` round 2,
+/// audit test 23.5: a Provider that is registered and offers a real
+/// `execution_api()` but whose own status model reports it as not
+/// accepting new work (here: `Saturated` pressure) must make
+/// `provider_ready` derive `false`, even though the caller claims `true`
+/// -- the round-1 fix only checked the Provider "exists and is executable
+/// in principle" (`execution_api().is_some()`), not "is ready now".
+#[test]
+fn inference_api_warm_model_instance_rejects_provider_that_rejects_new_work() {
+    let mut provider = TestProvider::new("saturated-provider");
+    provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
+    let mut snapshot = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
+        ProviderBinding::new("saturated-provider"),
+        HealthState::Available,
+    ));
+    snapshot.pressure = ProviderPressureLevel::Saturated;
+    snapshot.admission = provider_admission_from_dimensions(
+        snapshot.lifecycle,
+        snapshot.health,
+        snapshot.readiness,
+        snapshot.pressure,
+    );
+    provider.status_snapshot = Some(snapshot);
+    assert!(
+        !provider.status_snapshot().accepts_new_work_by_default(),
+        "test precondition: this Provider's own status model rejects new work"
+    );
+
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new("saturated-provider")),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+    let allocation = runtime
+        .memory_mut()
+        .allocate(MemoryAllocationRequest::new(
+            MemoryAllocationClass::Tensor,
+            1,
+            MemoryPlacement::HostOrdinary,
+            MemoryAllocationOwner::InferenceArtifact("test".into()),
+        ))
+        .unwrap();
+    let weight_resource = TensorResourceId::new("test.weight");
+    runtime
+        .memory_mut()
+        .record_tensor_residency(
+            TensorResidency::new(
+                weight_resource.clone(),
+                MemoryPlacement::HostOrdinary,
+                ResourceAffinity::new(FallbackClass::Transparent),
+            )
+            .with_allocation(allocation.id),
+        )
+        .unwrap();
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), weight_resource);
+
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    // Real weight evidence is present; only `provider_ready` should be
+    // what fails this attempt.
+    warm_model_instance(
+        &mut runtime,
+        &instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
+    .unwrap_err();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.readiness.accepts_generation());
+}
+
 #[test]
 fn inference_api_create_model_instance_observed_emits_model_instance_selected() {
-    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
     let manifest = minimal_model_manifest();
-    let trust = ModelTrustDecision::new(ModelTrustStatus::Trusted, "test fixture");
+    let mut load_runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
     let mut coordinator = ModelLoadingCoordinator::new();
     coordinator.register_architecture(ModelArchitectureImplementation {
         architecture: manifest.architecture.clone(),
@@ -8563,10 +9948,9 @@ fn inference_api_create_model_instance_observed_emits_model_instance_selected() 
     let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
     let loaded = load_model(
         &mut coordinator,
-        &mut memory,
+        &mut load_runtime,
         ModelLoadingApiRequest::new(core),
         &manifest,
-        &trust,
     )
     .unwrap();
 
@@ -8641,8 +10025,10 @@ fn inference_api_load_model_wires_coordinator_and_memory_manager() {
         kind: ModelArchitectureImplementationKind::TestFixture,
         required_capabilities: Vec::new(),
     });
-    let trust = ModelTrustDecision::new(ModelTrustStatus::Trusted, "test fixture");
-    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+    let mut runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
 
     let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
     let mut request = ModelLoadingApiRequest::new(core);
@@ -8658,7 +10044,7 @@ fn inference_api_load_model_wires_coordinator_and_memory_manager() {
     request.layout_policy = Some(TensorLayoutKind::Contiguous);
     request.provider_preferences = vec![ProviderBinding::new("reference-cpu")];
 
-    let loaded = load_model(&mut coordinator, &mut memory, request, &manifest, &trust).unwrap();
+    let loaded = load_model(&mut coordinator, &mut runtime, request, &manifest).unwrap();
     assert_eq!(loaded.artifact, manifest.id);
     assert_eq!(loaded.state, ModelLoadingState::Ready);
 }
@@ -8672,17 +10058,18 @@ fn inference_api_load_model_observed_emits_loading_lifecycle_observations() {
         kind: ModelArchitectureImplementationKind::TestFixture,
         required_capabilities: Vec::new(),
     });
-    let trust = ModelTrustDecision::new(ModelTrustStatus::Trusted, "test fixture");
-    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+    let mut runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
     let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
     let mut observer = InferenceApiObserver::new();
 
     load_model_observed(
         &mut coordinator,
-        &mut memory,
+        &mut runtime,
         ModelLoadingApiRequest::new(core),
         &manifest,
-        &trust,
         &mut observer,
     )
     .unwrap();
@@ -8694,6 +10081,867 @@ fn inference_api_load_model_observed_emits_loading_lifecycle_observations() {
         .collect();
     assert!(kinds.contains(&InferenceApiObservationKind::ModelLoadingRequested));
     assert!(kinds.contains(&InferenceApiObservationKind::ModelLoaded));
+}
+
+/// `seal-runtime-model-trust-and-provenance-authority` P0-A: `load_model`
+/// no longer accepts a caller-supplied trust decision at all -- trust is
+/// evaluated from the performing `Runtime`'s own sealed configuration. A
+/// `Runtime` built without trusting this manifest's digest must reject the
+/// load, proving there is no parameter through which a caller could still
+/// supply a favorable decision for an untrusted artifact.
+#[test]
+fn inference_api_load_model_rejects_when_runtime_trust_store_does_not_trust_digest() {
+    let manifest = minimal_model_manifest();
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    // Sealed with an empty trust store -- trusts nothing, matching
+    // `RuntimeBuilder::trust_store`'s documented default.
+    let mut runtime = Runtime::builder().build().unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+
+    let error = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("ModelArtifactUntrusted"));
+}
+
+/// P0-B: `create_model_instance` cross-checks the caller-supplied
+/// architecture against `loaded.plan().architecture`, which the loading
+/// phase already resolved from the same manifest -- a disagreement is
+/// rejected rather than silently accepted.
+#[test]
+fn runtime_create_model_instance_rejects_architecture_disagreeing_with_resolved_plan() {
+    let manifest = minimal_model_manifest();
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+
+    let disagreeing_architecture = ModelArchitectureImplementation {
+        architecture: ModelArchitecture::new("a-different-family", "a-different-identifier"),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    };
+    let error = runtime
+        .create_model_instance(
+            &loaded,
+            disagreeing_architecture,
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ModelInstanceError::ArchitectureMismatch { .. }
+    ));
+
+    // Agreeing architecture is unaffected.
+    runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+}
+
+/// P0-B: when the loading phase *did* resolve a provider binding for the
+/// plan, a caller-supplied affinity naming a different provider is
+/// rejected. Nothing in today's real loading pipeline resolves
+/// `plan.provider_binding` yet (confirmed by inspection: it is
+/// unconditionally `None` at construction), so this forces the scenario
+/// directly on the loaded plan rather than only exercising the
+/// permissive "unresolved" branch every other test already covers.
+#[test]
+fn runtime_create_model_instance_rejects_affinity_disagreeing_with_resolved_provider_binding() {
+    let manifest = minimal_model_manifest();
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let mut loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+    loaded.plan.provider_binding = Some(ProviderBinding::new("resolved-provider"));
+
+    let disagreeing_affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new("a-different-provider"));
+    let error = runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            disagreeing_affinity,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ModelInstanceError::AffinityMismatch { .. }));
+
+    let agreeing_affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new("resolved-provider"));
+    runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            agreeing_affinity,
+        )
+        .unwrap();
+}
+
+fn manifest_with_one_tensor(shape: Vec<u64>, storage_dtype: ModelDType) -> ModelManifest {
+    ModelManifest {
+        tensors: vec![ModelTensorMetadata {
+            name: "the-only-tensor".into(),
+            shape,
+            storage_dtype,
+            layout: None,
+            shard: None,
+            offset_bytes: None,
+            size_bytes: None,
+            quantization: None,
+            expected_compute_dtype: None,
+            digest: None,
+        }],
+        ..minimal_model_manifest()
+    }
+}
+
+/// P0-C: `materialize_model_instance_weights` rejects content whose shape
+/// disagrees with the manifest's declared shape for that tensor name, even
+/// though this tensor has no content digest (permissive elsewhere, but not
+/// for shape/dtype agreement).
+#[test]
+fn materialize_model_instance_weights_rejects_shape_mismatch() {
+    let manifest = manifest_with_one_tensor(vec![2, 2], ModelDType::F32);
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+
+    let wrong_shape_weights = BTreeMap::from([(
+        "the-only-tensor".to_string(),
+        HostTensor::new([3], vec![0.0, 0.0, 0.0]).unwrap(),
+    )]);
+    let error =
+        materialize_model_instance_weights(&mut runtime, &instance, "test", &wrong_shape_weights)
+            .unwrap_err();
+    assert!(matches!(
+        error,
+        InferenceApiError::WeightShapeOrDtypeMismatch { .. }
+    ));
+}
+
+/// P0-C: a tensor the manifest declares with a non-F32 storage dtype is
+/// rejected even when the caller supplies well-formed, correctly-shaped
+/// content -- this Runtime cannot legitimately materialize that tensor as
+/// F32 at all, regardless of digest presence.
+#[test]
+fn materialize_model_instance_weights_rejects_non_f32_declared_dtype() {
+    let manifest = manifest_with_one_tensor(vec![2, 2], ModelDType::Bf16);
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+
+    let well_formed_f32_weights = BTreeMap::from([(
+        "the-only-tensor".to_string(),
+        HostTensor::new([2, 2], vec![0.0, 0.0, 0.0, 0.0]).unwrap(),
+    )]);
+    let error = materialize_model_instance_weights(
+        &mut runtime,
+        &instance,
+        "test",
+        &well_formed_f32_weights,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        InferenceApiError::WeightShapeOrDtypeMismatch { .. }
+    ));
+}
+
+/// P0-C regression guard: matching shape and F32 dtype still materializes
+/// normally.
+#[test]
+fn materialize_model_instance_weights_accepts_matching_shape_and_dtype() {
+    let manifest = manifest_with_one_tensor(vec![2, 2], ModelDType::F32);
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+
+    let matching_weights = BTreeMap::from([(
+        "the-only-tensor".to_string(),
+        HostTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+    )]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &matching_weights).unwrap();
+    assert_eq!(
+        runtime.model_instance(&instance).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+}
+
+// The following helpers and tests were relocated from
+// `magnetar-runtime/tests/contract_tests/model_instance.rs` by
+// `seal-model-loading-and-instance-creation-primitives`:
+// `ModelLoadingCoordinator::load`, `ModelInstanceDefinition::
+// from_loaded_context`, and `ModelInstanceManager::create`/
+// `create_checked` all became `pub(crate)`, so they are no longer
+// reachable from that external test crate. Each test below genuinely
+// exercises one of those primitives' own contract (definition
+// cloning/reset-on-create, checked-creation validation, or pre-create
+// field injection `Runtime::create_model_instance` has no way to
+// express) rather than merely using it as a shortcut to reach some
+// other state -- see this Change's design.md ("D2: Relocate tests by
+// what they actually test, not wholesale") for the full reasoning.
+
+fn sealed_creation_manifest() -> ModelManifest {
+    ModelManifest::from_yaml_str(&format!(
+        r#"
+schema: magnetar-model-artifact
+schema_version: 1
+kind: model-bundle
+digest: {}
+model:
+  name: instance-model
+  revision: r1
+architecture:
+  family: qwen
+  identifier: qwen2
+storage_dtype: bf16
+compute_dtype: bf16
+supported_compute_dtypes: [bf16]
+artifacts:
+  weights:
+    kind: model-weights
+    digest: {}
+    size_bytes: 128
+  config:
+    kind: model-config
+    digest: {}
+    size_bytes: 16
+tensors:
+  - name: transformer.wte.weight
+    shape: [4, 8]
+    storage_dtype: f32
+"#,
+        "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+    ))
+    .unwrap()
+}
+
+fn sealed_creation_implementation() -> ModelArchitectureImplementation {
+    ModelArchitectureImplementation {
+        architecture: ModelArchitecture::new("qwen", "qwen2"),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    }
+}
+
+fn sealed_creation_definition() -> ModelInstanceDefinition {
+    let manifest = sealed_creation_manifest();
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(sealed_creation_implementation());
+    let mut memory = MemoryManager::default();
+    let mut request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = coordinator
+        .load(
+            request,
+            &manifest,
+            &ModelTrustStore::default()
+                .trust_digest(manifest.id.digest.value.clone())
+                .evaluate(&manifest),
+            &mut memory,
+        )
+        .unwrap();
+
+    ModelInstanceDefinition::from_loaded_context(
+        &loaded,
+        sealed_creation_implementation(),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+}
+
+fn sealed_creation_bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId) {
+    if runtime
+        .providers()
+        .provider(REFERENCE_CPU_PROVIDER_NAME)
+        .is_none()
+    {
+        runtime
+            .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+            .unwrap();
+    }
+    let weights = BTreeMap::from([(
+        "transformer.wte.weight".to_string(),
+        HostTensor::new([4, 8], vec![0.0; 32]).unwrap(),
+    )]);
+    materialize_model_instance_weights(runtime, id, "test", &weights).unwrap();
+}
+
+fn sealed_creation_reach_ready(runtime: &mut Runtime, id: &ModelInstanceId) {
+    sealed_creation_bind_fake_weight(runtime, id);
+}
+
+/// A further audit of PR #36 found that `ModelInstanceDefinition`'s
+/// `#[derive(Clone)]` copies every field -- including the already-sealed
+/// `resource_bindings` -- regardless of the caller's own inability to name
+/// those fields directly, and that `ModelInstanceManager::create` accepted
+/// a caller-supplied definition as-is. So an external caller with only
+/// `pub` access (`ModelInstance::definition()`, `Clone`,
+/// `ModelInstanceManager::create`) could clone a `Ready` instance's
+/// definition -- carrying its real weight bindings -- into a brand-new
+/// instance, aliasing live Provider resources across two distinct
+/// `ModelInstanceId`s. Fixed by having `create` unconditionally reset
+/// `resource_bindings` regardless of what the supplied definition
+/// contained.
+#[test]
+fn cloned_definition_does_not_inherit_weight_authority() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id_a = runtime
+        .model_instances_mut()
+        .create(sealed_creation_definition())
+        .unwrap();
+    sealed_creation_reach_ready(&mut runtime, &id_a);
+    assert_eq!(
+        runtime.model_instance(&id_a).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+
+    let cloned = runtime.model_instance(&id_a).unwrap().definition().clone();
+    let id_b = runtime.model_instances_mut().create(cloned).unwrap();
+
+    // B must not be Ready on arrival -- creation alone never implies
+    // readiness, cloned definition or not.
+    assert_ne!(
+        runtime.model_instance(&id_b).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+
+    // The real regression: an *empty* materialization attempt on B must
+    // not be able to "adopt" A's already-committed bindings by minting
+    // fresh evidence over whatever `resource_bindings.weights` happens to
+    // contain. If `create` had not reset it, this would have reached
+    // `Ready` for B using A's real Provider resource, with zero bytes
+    // actually staged by this call.
+    materialize_model_instance_weights(&mut runtime, &id_b, "test", &BTreeMap::new()).unwrap();
+    assert_ne!(
+        runtime.model_instance(&id_b).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+
+    // A is unaffected throughout -- this is not a mutation of A's own
+    // state, only B's (failed) attempt to inherit it.
+    assert_eq!(
+        runtime.model_instance(&id_a).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+}
+
+/// Same root cause as the test above, exercised through `reload` (which
+/// also calls `ModelInstanceManager::create` internally with a
+/// caller-supplied replacement definition) rather than a direct `create`
+/// call.
+#[test]
+fn reload_replacement_does_not_inherit_original_weight_authority() {
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime
+        .model_instances_mut()
+        .create(sealed_creation_definition())
+        .unwrap();
+    sealed_creation_reach_ready(&mut runtime, &id);
+    let existing_definition = runtime.model_instance(&id).unwrap().definition().clone();
+
+    let replacement_id = runtime
+        .model_instances_mut()
+        .reload(
+            &id,
+            ModelInstanceReloadRequest {
+                replacement: existing_definition,
+                migrate_sessions: false,
+                allow_active_semantic_mutation: false,
+            },
+        )
+        .unwrap();
+
+    assert_ne!(
+        runtime.model_instance(&replacement_id).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+}
+
+/// Proves `ModelInstanceManager::create_checked`'s own checks-validation
+/// contract directly: `checks.validate()` must run and reject before
+/// `create` is ever reached, and readiness checks are evaluated
+/// independently afterward. `Runtime::create_model_instance` has no
+/// parameter through which a caller can inject custom
+/// `ModelInstanceCreationChecks`, so this cannot be re-expressed through
+/// it.
+#[test]
+fn sealed_creation_and_readiness_checks_gate_ready_state() {
+    let mut manager = ModelInstanceManager::new();
+    let denied = ModelInstanceCreationChecks {
+        artifact_trusted: false,
+        ..ModelInstanceCreationChecks::default()
+    };
+    assert_eq!(
+        manager.create_checked(sealed_creation_definition(), &denied),
+        Err(ModelInstanceError::ModelInstancePolicyDenied)
+    );
+
+    let id = manager
+        .create_checked(
+            sealed_creation_definition(),
+            &ModelInstanceCreationChecks::default(),
+        )
+        .unwrap();
+    let checks = ModelInstanceReadinessChecks {
+        provider_ready: false,
+        ..ModelInstanceReadinessChecks::default()
+    };
+    assert_eq!(
+        manager
+            .instance_mut(&id)
+            .unwrap()
+            .validate_readiness(&checks),
+        Err(ModelInstanceError::ModelInstanceProviderNotReady)
+    );
+}
+
+/// Proves pre-create usage-dependency fields (`kv_cache_dependencies`,
+/// `prefix_cache_dependencies`) set directly on a hand-built definition
+/// are honored by `create`. `Runtime::create_model_instance` builds its
+/// definition internally from `architecture`/`affinity` alone, with no
+/// way for a caller to inject these before creation.
+#[test]
+fn sealed_creation_adapter_activation_records_mutation_and_invalidates_dependent_caches() {
+    let mut manager = ModelInstanceManager::new();
+    let mut def = sealed_creation_definition();
+    def.usage
+        .kv_cache_dependencies
+        .insert(KvCacheId::new("cache-a").unwrap());
+    def.usage
+        .prefix_cache_dependencies
+        .insert(PrefixCacheEntryId::new("prefix-a").unwrap());
+    let id = manager.create(def).unwrap();
+
+    let report = manager
+        .activate_adapters(&id, AdapterSetId::empty(), "session:opaque", true)
+        .unwrap();
+
+    assert_eq!(report.kv_caches.len(), 1);
+    assert_eq!(report.prefix_entries.len(), 1);
+    assert_eq!(
+        manager.instance(&id).unwrap().definition().mutation_version,
+        1
+    );
+    assert!(
+        manager
+            .observations()
+            .iter()
+            .any(|event| event.kind == ModelInstanceObservationKind::CacheInvalidation)
+    );
+}
+
+/// Proves pre-create session/usage/adapter dependency fields are honored
+/// by `create` and correctly released on unload, and that `create`
+/// unconditionally resets `resource_bindings` regardless of what the
+/// caller-supplied `def` pre-populated -- so an out-of-band memory
+/// allocation id set here cannot be pre-populated on `def` before
+/// `create`, only injected afterward via the two narrow, post-creation
+/// mutations `ModelInstance` still allows
+/// (`set_provider_resource`/`track_memory_allocation`).
+#[test]
+fn sealed_creation_unload_releases_memory_provider_resources_adapters_and_cache_dependencies() {
+    let mut def = sealed_creation_definition();
+    def.associated_sessions
+        .insert(InferenceSessionId::new("session-unload").unwrap());
+    def.usage
+        .kv_cache_dependencies
+        .insert(KvCacheId::new("cache-unload").unwrap());
+    def.usage
+        .prefix_cache_dependencies
+        .insert(PrefixCacheEntryId::new("prefix-unload").unwrap());
+    def.usage.adapter_dependencies.insert(AdapterSetId::empty());
+    let mut runtime = Runtime::initialize(RuntimeConfig::default());
+    let id = runtime.model_instances_mut().create(def).unwrap();
+    sealed_creation_reach_ready(&mut runtime, &id);
+    {
+        let instance = runtime.model_instances_mut().instance_mut(&id).unwrap();
+        instance.set_provider_resource(Some(ProviderModelResource {
+            provider: ProviderBinding::new("provider-a"),
+            handle_kind: "opaque-model".into(),
+            release_required: true,
+        }));
+        // A deliberately out-of-band id: `reach_ready` above issues its own
+        // real allocation from the same `MemoryManager`, whose ids start
+        // at 1, so a fixture id of `1` here would silently collide in the
+        // `BTreeSet` and undercount `released_memory_allocations`.
+        instance.track_memory_allocation(MemoryAllocationId::new(999));
+    }
+
+    let report = runtime
+        .model_instances_mut()
+        .unload(&id, ModelInstanceUnloadPolicy::DrainActiveUse)
+        .unwrap();
+
+    assert_eq!(report.invalidated.kv_caches.len(), 1);
+    assert_eq!(report.invalidated.prefix_entries.len(), 1);
+    assert_eq!(report.invalidated.adapters_released.len(), 1);
+    // +1 relative to the fixture's single pre-set `memory_allocations`
+    // entry: `reach_ready`'s own Memory Manager allocation for the bound
+    // weight is released on unload too.
+    assert_eq!(report.released_memory_allocations.len(), 2);
+    assert_eq!(report.released_provider_resources.len(), 1);
+    assert!(!report.dangling_session_references);
+    assert_eq!(
+        runtime.model_instance(&id).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Unloaded
+    );
+}
+
+/// Proves pre-create `policy.browser_linear_memory_limit_bytes` is
+/// enforced by `create` itself. `Runtime::create_model_instance` builds
+/// `policy: ModelInstancePolicy::default()` internally with no way for a
+/// caller to override it before creation.
+#[test]
+fn sealed_creation_browser_policy_rejects_native_or_oversized_instance_features() {
+    let mut def = sealed_creation_definition();
+    def.policy = ModelInstancePolicy {
+        browser_linear_memory_limit_bytes: Some(1),
+        ..ModelInstancePolicy::default()
+    };
+    let mut manager = ModelInstanceManager::new();
+    assert_eq!(
+        manager.create(def),
+        Err(ModelInstanceError::ModelInstanceBrowserFeatureUnsupported)
+    );
+}
+
+// The following helpers and tests were relocated from
+// `magnetar-runtime/tests/contract_tests/model_loading.rs` for the same
+// reason as the `sealed_creation_*` block above: they call
+// `ModelLoadingCoordinator::load` directly to inspect
+// `ModelLoadingCoordinator`'s/`LoadedModelContext`'s own contract
+// (untrusted-artifact rejection before allocation, memory-budget/
+// quantization/allocation failure mapping, exact resolved plan shape) --
+// concerns `inference_api::load_model`'s `Runtime`-sealed wrapper does not
+// re-expose 1:1.
+
+fn sealed_loading_digest() -> String {
+    "sha256:0000000000000000000000000000000000000000000000000000000000000001".into()
+}
+
+fn sealed_loading_valid_manifest() -> ModelManifest {
+    ModelManifest::from_yaml_str(&format!(
+        r#"
+schema: magnetar-model-artifact
+schema_version: 1
+kind: model-bundle
+digest: {}
+model:
+  name: qwen.example
+  revision: r1
+architecture:
+  family: qwen
+  identifier: qwen2
+storage_dtype: int8
+compute_dtype: bf16
+supported_compute_dtypes: [bf16, fp16]
+artifacts:
+  weights:
+    kind: model-weights
+    digest: {}
+    size_bytes: 128
+  config:
+    kind: model-config
+    digest: {}
+    size_bytes: 16
+quantization:
+  format: q4_k
+  workspace_bytes: 64
+shards:
+  - id: shard0
+    digest: {}
+    size_bytes: 128
+    order: 0
+tensors:
+  - name: transformer.wte.weight
+    shape: [4, 8]
+    storage_dtype: int8
+    shard: shard0
+"#,
+        sealed_loading_digest(),
+        sealed_loading_digest(),
+        sealed_loading_digest(),
+        sealed_loading_digest()
+    ))
+    .unwrap()
+}
+
+fn sealed_loading_trusted(manifest: &ModelManifest) -> ModelTrustDecision {
+    ModelTrustStore::default()
+        .trust_digest(manifest.id.digest.value.clone())
+        .evaluate(manifest)
+}
+
+fn sealed_loading_coordinator() -> ModelLoadingCoordinator {
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: ModelArchitecture::new("qwen", "qwen2"),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    coordinator
+}
+
+#[test]
+fn sealed_loading_rejects_untrusted_artifact_before_memory_allocation() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::default();
+    let request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let untrusted = ModelTrustStore::default()
+        .reject_digest(manifest.id.digest.value.clone())
+        .evaluate(&manifest);
+
+    let error = coordinator
+        .load(request, &manifest, &untrusted, &mut memory)
+        .unwrap_err();
+
+    assert_eq!(error.code, ModelLoadingErrorCode::ModelArtifactUntrusted);
+    assert_eq!(memory.allocations().count(), 0);
+}
+
+#[test]
+fn sealed_loading_creates_runtime_owned_ready_context_without_raw_handles() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::default();
+    let mut request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
+    request.sharding_policy = ModelShardingPolicy::Sequential;
+
+    let context = coordinator
+        .load(
+            request,
+            &manifest,
+            &sealed_loading_trusted(&manifest),
+            &mut memory,
+        )
+        .unwrap();
+
+    assert_eq!(context.state(), ModelLoadingState::Ready);
+    assert!(context.can_start_inference());
+    assert!(!context.plan().has_raw_native_handles());
+    assert_eq!(
+        context.plan().quantization_handling(),
+        &ModelQuantizationHandling::DequantizeAtLoad(ModelQuantizationFormat::GgufQ4K)
+    );
+    assert_eq!(
+        context.plan().memory_placements(),
+        &[ModelResidencyLocation::Host]
+    );
+    assert_eq!(memory.allocations().count(), 1);
+    assert!(
+        coordinator
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == ModelLoadingObservationKind::ModelReady)
+    );
+}
+
+#[test]
+fn sealed_loading_memory_budget_failure_does_not_allocate() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::default();
+    let mut request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
+    request.memory_budget_bytes = Some(1);
+
+    let error = coordinator
+        .load(
+            request,
+            &manifest,
+            &sealed_loading_trusted(&manifest),
+            &mut memory,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code, ModelLoadingErrorCode::MemoryFeasibilityFailed);
+    assert_eq!(memory.allocations().count(), 0);
+}
+
+#[test]
+fn sealed_loading_unsupported_quantization_requires_explicit_policy() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::default();
+    let request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+
+    let error = coordinator
+        .load(
+            request,
+            &manifest,
+            &sealed_loading_trusted(&manifest),
+            &mut memory,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code, ModelLoadingErrorCode::QuantizationUnsupported);
+}
+
+#[test]
+fn sealed_loading_memory_manager_rejection_maps_to_loading_error() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::new(MemoryManagerConfig {
+        max_runtime_bytes: Some(1),
+        ..MemoryManagerConfig::default()
+    });
+    let mut request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
+
+    let error = coordinator
+        .load(
+            request,
+            &manifest,
+            &sealed_loading_trusted(&manifest),
+            &mut memory,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code, ModelLoadingErrorCode::MemoryAllocationFailed);
 }
 
 #[test]
@@ -10541,6 +12789,7 @@ fn tensor(name: &str, shape: Vec<u64>) -> ModelTensorMetadata {
         size_bytes: None,
         quantization: None,
         expected_compute_dtype: None,
+        digest: None,
     }
 }
 
@@ -18614,4 +20863,112 @@ fn registry_performance_evidence_is_keyed_by_generation_and_never_fabricated() {
         lookup_performance_evidence(&evidence, &artifact, generation_n_plus_1).is_none(),
         "a new generation must not silently inherit the prior generation's evidence"
     );
+}
+
+// ---------------------------------------------------------------------
+// `host_tensors_from_artifact_bytes` (materialize-weights-from-real-model-
+// artifact task group 1): the generic bytes-to-HostTensor bridge a format
+// parser's own tensor inventory (`ModelTensorMetadata`) feeds into, without
+// `magnetar-runtime` ever depending on a concrete format-parser crate.
+// ---------------------------------------------------------------------
+
+fn artifact_bytes_test_tensor(
+    name: &str,
+    shape: Vec<u64>,
+    data: &[f32],
+) -> (ModelTensorMetadata, Vec<u8>) {
+    let mut bytes = Vec::with_capacity(data.len() * 4);
+    for value in data {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let metadata = ModelTensorMetadata {
+        name: name.to_string(),
+        shape,
+        storage_dtype: ModelDType::F32,
+        layout: None,
+        shard: None,
+        offset_bytes: Some(0),
+        size_bytes: Some(bytes.len() as u64),
+        quantization: None,
+        expected_compute_dtype: None,
+        digest: None,
+    };
+    (metadata, bytes)
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_reads_a_well_formed_tensor() {
+    let (mut metadata, tensor_bytes) =
+        artifact_bytes_test_tensor("weight.a", vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    // Simulate a second tensor's bytes preceding this one in a real file by
+    // offsetting into a larger buffer, rather than only ever testing offset
+    // zero.
+    let mut file = vec![0u8; 16];
+    file.extend_from_slice(&tensor_bytes);
+    metadata.offset_bytes = Some(16);
+
+    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &file, 0)
+        .expect("well-formed tensor materializes");
+    let tensor = weights.get("weight.a").expect("tensor present");
+    assert_eq!(tensor.shape, vec![2, 2]);
+    assert_eq!(tensor.data, vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+/// Regression guard for a real bug found while implementing
+/// `materialize-weights-from-real-model-artifact`: `offset_bytes` is
+/// relative to the tensor-data section's start, not the whole file, and an
+/// earlier version of this function ignored `data_section_start` entirely
+/// (silently reading the wrong bytes for any nonzero data-section start,
+/// exactly the shape a real Safetensors/GGUF file always has once a header
+/// precedes the data). This test's `metadata.offset_bytes` deliberately
+/// stays relative to the data section (`0`), and a nonzero
+/// `data_section_start` is what must be added to land on the tensor's real
+/// bytes.
+#[test]
+fn host_tensors_from_artifact_bytes_honors_nonzero_data_section_start() {
+    let (metadata, tensor_bytes) =
+        artifact_bytes_test_tensor("weight.a", vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    // A "header" occupies the first 20 bytes; the tensor's own
+    // `offset_bytes` (0) is relative to where the data section begins
+    // (byte 20), not to the start of `file` itself.
+    let mut file = vec![0xAAu8; 20];
+    file.extend_from_slice(&tensor_bytes);
+
+    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &file, 20)
+        .expect("well-formed tensor materializes with a nonzero data section start");
+    let tensor = weights.get("weight.a").expect("tensor present");
+    assert_eq!(tensor.data, vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_rejects_non_f32_dtype() {
+    let (mut metadata, bytes) = artifact_bytes_test_tensor("weight.a", vec![1], &[1.0]);
+    metadata.storage_dtype = ModelDType::F16;
+
+    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect_err("non-F32 dtype must be rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::StorageDTypeUnsupported);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_rejects_out_of_bounds_range() {
+    let (metadata, _bytes) = artifact_bytes_test_tensor("weight.a", vec![4], &[1.0, 2.0, 3.0, 4.0]);
+    // Declare a range that does not actually fit in a much smaller buffer.
+    let short_file = vec![0u8; 4];
+
+    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &short_file, 0)
+        .expect_err("out-of-bounds range must be rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_rejects_shape_size_mismatch() {
+    let (mut metadata, bytes) =
+        artifact_bytes_test_tensor("weight.a", vec![4], &[1.0, 2.0, 3.0, 4.0]);
+    // Shape says 4 elements (16 bytes), but size_bytes disagrees.
+    metadata.size_bytes = Some(8);
+
+    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect_err("shape/size mismatch must be rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
 }

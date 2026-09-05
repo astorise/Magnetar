@@ -14,6 +14,21 @@ rust-version = "1.98"
 default = ["wasmtime-component-engine"]
 wasmtime-component-engine = ["dep:wasmtime"]
 web-component-engine = []
+# Correctif 7 / task group 10, task 12.6: a build lacking a real Component
+# engine (`wasmtime-component-engine` off, or the `wasm32` target, which has
+# no Wasmtime engine at all) has no fallback graph source of any kind --
+# first-native generation fails closed at runtime with a structured error,
+# not by falling back to an unattested Rust-synthesized graph, and not by
+# refusing to compile at all. There used to be a `non-strict-fixture-
+# fallback` feature that opted a production build into the unattested
+# fallback; it was removed deliberately, not merely unused -- production has
+# exactly one graph-producing source (the real Component) now, with no
+# second path to keep in sync or accidentally leave enabled. The
+# Rust-synthesized graph builder (`qwen_model_component.rs`'s
+# `qwen_build_graph`/`qwen_prefill_graph`/`qwen_decode_graph`) survives only
+# under `#[cfg(test)]`, as a numerical-comparison oracle against the real
+# Component and a fixture for this crate's own tests -- never reachable from
+# a non-test build, with or without any feature.
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

@@ -106,8 +106,47 @@ Then lifecycle may become ready.
 Model Instance lifecycle and readiness SHALL be distinct.
 
 Readiness SHALL consider residency, Provider readiness, Device readiness,
-adapter state, memory pressure, Runtime policy, and architecture implementation
-readiness.
+adapter state, memory pressure, Runtime policy, architecture implementation
+readiness, and weight materialization state.
+
+Readiness-relevant facts the Runtime can itself observe -- including whether
+mandatory weight resources are bound, whether a pinned Provider actually
+resolves and offers an execution API, and whether a pinned Device is
+available -- SHALL be derived from actual Runtime state, not accepted
+outright from a caller-supplied claim. A caller MAY assert a stricter
+(`false`) value than Runtime state alone would produce; a caller SHALL NOT
+be able to assert a Runtime-observable fact as `true` when the Runtime does
+not itself observe it as true.
+
+A bound weight resource SHALL only count toward `weights_materialized` if
+the Model Instance holds Runtime-issued materialization evidence -- minted
+only by the one authorized weight-materialization transaction on successful
+commit, never settable by an external caller -- whose recorded
+`ModelArtifactId` matches this instance's own declared artifact and whose
+recorded resource-id set matches the instance's currently-bound weight
+resources exactly. Materialization evidence minted for one Model Instance
+SHALL NOT cause any other Model Instance -- whether bound to the same or a
+different Model Artifact -- to be treated as materialized. When the loaded
+artifact declares a mandatory tensor inventory, every one of those tensors
+SHALL be bound; a partial subset, however individually evidenced, SHALL NOT
+count as materialized. A pinned Provider SHALL only count toward
+`provider_ready` if its own status model reports it as currently accepting
+new work, not merely that it is registered and exposes an execution
+interface in principle.
+
+The public surface for producing a `Ready` Model Instance SHALL NOT permit
+an external caller to reach `Ready` other than through a path that performs
+this derivation; lifecycle and readiness state SHALL NOT be directly
+settable by an external caller. Weight resource bindings themselves SHALL
+NOT be directly settable by an external caller either -- the only way to
+bind a weight resource is for the one authorized materialization
+transaction to commit successfully.
+
+Readiness derivation SHALL NOT depend on a Provider-specific storage
+readback capability (such as a host-memory tensor readback API). A Provider
+that never implements host-memory readback for its resident storage SHALL
+be able to reach `weights_materialized: true` through the same
+Runtime-issued evidence every other Provider uses.
 
 #### Scenario: Provider not ready
 
@@ -119,12 +158,89 @@ When Runtime checks readiness
 
 Then the instance is not ready for generation.
 
----
+#### Scenario: Weights not materialized
+
+Given an instance lifecycle exists
+
+But its declared weights were never successfully materialized into Tensor
+Resources
+
+When Runtime checks readiness
+
+Then the instance is not ready for generation, distinguishable from every
+other readiness factor being satisfied.
+
+#### Scenario: Caller cannot forge a Runtime-observable fact
+
+Given a Model Instance has no weight resources bound
+
+When a caller requests warmup asserting weights are materialized
+
+Then the Runtime's own observation of empty resource bindings overrides the caller's claim and the instance does not become Ready.
+
+#### Scenario: A bound weight without a residency record does not count
+
+Given a Model Instance has a weight resource identifier bound with no corresponding residency record
+
+When a caller requests warmup asserting weights are materialized
+
+Then the Runtime does not treat that resource as materialized and the instance does not become Ready.
+
+#### Scenario: An incomplete mandatory weight inventory does not count
+
+Given the loaded artifact declares multiple mandatory weight tensors and only some are bound, each with real residency and Runtime-issued materialization evidence
+
+When a caller requests warmup asserting weights are materialized
+
+Then the Runtime does not treat the instance as fully materialized and it does not become Ready.
+
+#### Scenario: A Provider that rejects new work does not count as ready
+
+Given a Model Instance is pinned to a Provider that is registered and exposes an execution interface
+
+But that Provider's own status model reports it does not currently accept new work
+
+When a caller requests warmup asserting the Provider is ready
+
+Then the Runtime does not treat the Provider as ready and the instance does not become Ready.
+
+#### Scenario: A hand-written weight binding without matching materialization evidence does not count
+
+Given a caller writes tensor bytes directly into Provider storage and records a matching residency and weight binding by hand, without going through the authorized materialization transaction
+
+When a caller requests warmup asserting weights are materialized
+
+Then the Runtime finds no matching materialization evidence for that binding and the instance does not become Ready.
+
+#### Scenario: Materialization evidence from a different Model Instance does not count
+
+Given Model Instance A has successfully materialized weights through the authorized transaction, and Model Instance B has not
+
+When Model Instance B's weight resource bindings are set to match Model Instance A's, and a caller requests warmup for Model Instance B asserting weights are materialized
+
+Then the Runtime finds no materialization evidence recorded for Model Instance B's own id and Model Instance B does not become Ready.
+
+#### Scenario: Materialized weights for a mismatched artifact do not count
+
+Given a Model Instance declares Model Artifact A but its recorded materialization evidence was minted while it declared a different Model Artifact
+
+When a caller requests warmup asserting weights are materialized
+
+Then the Runtime treats the evidence as not matching this instance's current artifact and the instance does not become Ready.
+
+#### Scenario: A device-only Provider without host readback can still prove materialization
+
+Given a Provider never implements host-memory tensor readback for its resident storage
+
+When that Provider's weights are materialized through the authorized transaction and a caller requests warmup
+
+Then the Runtime derives `weights_materialized: true` from materialization evidence alone, without calling any Provider-specific readback capability, and the instance becomes Ready.
 
 ### Requirement: Model Instance Creation
 
-Model Instance creation SHALL require successful Model Loading or an explicit
-policy-controlled loading path.
+Model Instance creation SHALL require successful Model Loading or an explicit policy-controlled loading path, and creation SHALL NOT by itself produce a Ready Model Instance.
+
+A newly created Model Instance SHALL be left in a non-Ready lifecycle state (`Loading`). Transition to Ready SHALL happen only through a separate, explicit step performed after every mandatory readiness condition for that instance -- including, where applicable, weight materialization -- has actually been satisfied.
 
 #### Scenario: Artifact only
 
@@ -134,13 +250,31 @@ When a caller requests a Model Instance without implicit loading policy
 
 Then creation fails.
 
----
+#### Scenario: Creation alone does not imply readiness
+
+Given a Model Instance has just been created from a successfully loaded artifact
+
+When no explicit readiness-completing step has run yet for it
+
+Then the instance reports a non-Ready lifecycle and readiness state, and any check that inspects only that state (not a deeper, resource-specific check) correctly rejects it as not usable
 
 ### Requirement: Model Instance Warmup
 
 Model Instance warmup MAY be supported and SHALL be policy-controlled.
 
 Warmup failure SHALL prevent ready state.
+
+Regardless of warmup policy, `readiness` SHALL NOT report `Ready` while
+`lifecycle` has not itself reached a state that supports inference use. A
+warmup policy that does not perform lifecycle transitions SHALL NOT be able
+to publish `Ready` readiness as a side effect.
+
+The primitives capable of transitioning a Model Instance to `Ready`
+(the underlying lifecycle transition and the raw ready-marking operation)
+SHALL NOT be reachable by a caller outside the Runtime's own
+implementation. An external caller SHALL only be able to request warmup
+through the Runtime-owned entry point that performs readiness derivation
+first.
 
 #### Scenario: Warmup failure
 
@@ -150,7 +284,21 @@ When Runtime evaluates instance readiness
 
 Then the instance becomes failed or not-ready according to policy.
 
----
+#### Scenario: Disabled policy cannot forge readiness
+
+Given a Model Instance is in a lifecycle state that does not support inference use
+
+When warmup is invoked with a policy that does not transition the lifecycle
+
+Then readiness does not report Ready even if the supplied checks would otherwise compute Ready
+
+#### Scenario: The raw ready-marking primitive is not externally reachable
+
+Given a caller external to the Runtime's own implementation holds a mutable reference to a Model Instance
+
+When that caller attempts to invoke the underlying lifecycle transition or ready-marking operation directly, bypassing the Runtime-owned warmup entry point
+
+Then no such path is available to that caller
 
 ### Requirement: Model Instance Usage Reference
 
@@ -278,6 +426,12 @@ Then Runtime rejects reuse.
 Generation SHALL require a ready Model Instance or a policy-controlled implicit
 load path.
 
+Accepting usage (acquiring a generation reference or a usage handle) SHALL
+require both that the lifecycle is in a state that supports inference use
+and that readiness reports Ready. An internally inconsistent combination
+(readiness reporting Ready while lifecycle does not support inference use)
+SHALL be rejected, regardless of how that inconsistency arose.
+
 #### Scenario: Generate on failed instance
 
 Given a Model Instance is failed
@@ -286,7 +440,13 @@ When generation is requested
 
 Then Runtime rejects generation.
 
----
+#### Scenario: Inconsistent lifecycle and readiness reject usage
+
+Given a Model Instance reports readiness Ready but its lifecycle has not reached a state that supports inference use
+
+When a caller attempts to acquire usage or a generation reference
+
+Then Runtime rejects the request based on the lifecycle, not only the readiness value
 
 ### Requirement: Batching Uses Model Instance Compatibility
 
@@ -488,7 +648,11 @@ Then graph identity reflects the changed semantic state.
 ### Requirement: Model Instance References Architecture Implementation
 
 A Model Instance SHALL be able to reference the Model Component or Runtime-native
-architecture implementation used to create it.
+architecture implementation used to create it, and the referenced architecture and Resource Affinity SHALL be consistent with the values the loading phase already resolved for that artifact wherever the loading phase resolved a value.
+
+Model Instance creation SHALL reject an architecture implementation whose architecture identity disagrees with the loaded artifact's resolved architecture, and SHALL reject a Resource Affinity whose provider or device disagrees with a provider or device the loading phase already resolved.
+
+An architecture implementation kind or required capability the loading phase did not resolve is a legitimate choice for the caller creating the Model Instance, since the loading phase never resolves a value for either. A Resource Affinity's provider or device left unresolved by the loading phase is a known, documented limitation, not an intentional grant of caller authority: today's implementation applies the caller-supplied value directly as the instance's effective placement, with no Runtime-side arbitration step at instance-creation time, which does not yet fully satisfy `inference-api`'s "Provider Preferences Are Non-Authoritative" requirement for this specific case.
 
 #### Scenario: Instance compatibility
 
@@ -497,6 +661,36 @@ Given a Model Instance was created with Model Component C
 When cache compatibility is evaluated
 
 Then C's identity and version may be considered.
+
+---
+
+#### Scenario: Architecture disagreeing with the resolved load is rejected
+
+Given a Model Artifact was loaded and its loading phase resolved a specific architecture identity
+
+When Model Instance creation is attempted with a different architecture identity
+
+Then Runtime rejects the creation rather than silently accepting the caller's value
+
+---
+
+#### Scenario: Affinity disagreeing with a resolved provider or device binding is rejected
+
+Given a Model Artifact's loading phase resolved a specific provider or device binding
+
+When Model Instance creation is attempted with a Resource Affinity naming a different provider or device
+
+Then Runtime rejects the creation rather than silently accepting the caller's value
+
+---
+
+#### Scenario: Unresolved provider or device becomes the caller's value directly
+
+Given a Model Artifact's loading phase did not resolve a provider or device binding
+
+When Model Instance creation supplies a Resource Affinity naming a provider or device
+
+Then Runtime accepts it and that value becomes the instance's effective placement directly, without Runtime-side arbitration
 
 ---
 
@@ -804,4 +998,127 @@ Given new adapter no longer fits current Device allocation
 When revision changes
 
 Then placement is rebuilt or rejected.
+
+### Requirement: ModelInstance Owns Executed Resource Bindings
+An active ModelInstance SHALL expose the stable resource bindings for weights, constants, and adapters used by its prepared graph execution.
+
+#### Scenario: Two instances are loaded
+- **WHEN** two ModelInstances for different artifacts execute
+- **THEN** each execution uses only the resource bindings owned by its active instance.
+
+#### Scenario: Instance unloads
+- **WHEN** a ModelInstance is unloaded
+- **THEN** its resource bindings are released according to Runtime policy and cannot be used for new execution.
+
+### Requirement: Model Instance Resume Revalidates Readiness
+
+Resuming a suspended Model Instance SHALL NOT transition it directly to
+`Ready`. State that made the instance eligible for suspension (Provider
+health, weight materialization evidence, Device availability) MAY have
+changed while it was suspended; resume SHALL re-derive readiness against
+current Runtime state through the same evidence-deriving path used to
+reach `Ready` from any other lifecycle state, rather than assuming prior
+readiness still holds.
+
+#### Scenario: Resume rejects stale evidence
+
+Given a Model Instance was Ready and is then suspended
+
+But readiness-relevant Runtime state changes to invalidate that instance's prior evidence while it is suspended
+
+When resume is requested
+
+Then the instance does not become Ready and the resume request fails
+
+#### Scenario: Resume succeeds when evidence still holds
+
+Given a Model Instance was Ready and is then suspended
+
+And all readiness-relevant Runtime state remains valid while suspended
+
+When resume is requested
+
+Then the instance becomes Ready again
+
+### Requirement: Model Instance Weight Resource Bindings Are Runtime-Sealed
+
+A Model Instance's weight resource bindings SHALL be mutable only by the Runtime's own authorized weight-materialization transaction.
+
+The weight resource bindings (the mapping from declared tensor name to
+bound `TensorResourceId`, and the memory allocations backing them) SHALL
+NOT be insertable, removable, or wholly replaceable by an external caller
+holding a mutable reference to a Model Instance -- including by direct field
+access or by assigning another Model Instance's bindings onto it.
+
+#### Scenario: Direct binding mutation is not possible through the public API
+
+Given a caller holds a mutable reference to a Model Instance obtained through the Runtime's public API
+
+When the caller attempts to insert a weight resource binding without invoking the authorized materialization transaction
+
+Then no public API exists to perform that mutation directly, and the instance's weight bindings remain unchanged.
+
+### Requirement: Materialized Weight Content Matches Its Declared Digest When One Exists
+
+Materialization evidence for a weight tensor whose inventory entry declares a content digest SHALL only be produced for content that matches that digest.
+
+This extends -- it does not replace -- the existing requirement that materialization evidence is Runtime-issued and instance-bound: a caller with access to the one authorized weight-materialization transaction still cannot make an arbitrary tensor count as a declared tensor's content when a content digest for that tensor exists, even though the transaction itself is the legitimate, non-forgeable path. A tensor whose inventory entry declares no content digest is unaffected by this requirement; its materialization evidence continues to be governed only by the existing instance-bound, artifact-bound, and inventory-completeness requirements.
+
+#### Scenario: Matching content is evidenced normally
+
+Given a Model Instance's loaded artifact declares a content digest for a mandatory tensor
+
+When the authorized materialization transaction stages content that matches that digest
+
+Then materialization evidence is minted for that tensor as usual
+
+#### Scenario: Mismatched content does not become evidenced
+
+Given a Model Instance's loaded artifact declares a content digest for a mandatory tensor
+
+When a caller attempts to materialize different content under that tensor's name
+
+Then no materialization evidence is minted for that tensor, and the instance does not become Ready on the strength of it
+
+### Requirement: Materialized Weight Content Matches Its Declared Shape And Storage Dtype
+
+Materialization evidence for a weight tensor SHALL only be produced for content whose shape matches the artifact's declared shape for that tensor and whose declared storage dtype is one the Runtime can legitimately materialize as the supplied content's representation.
+
+This applies independently of, and precedes, digest verification: a tensor whose inventory entry declares no content digest -- for example because its declared storage dtype cannot yet be digested -- is not thereby exempt from shape and dtype agreement. A caller cannot bypass a format parser's correct refusal to materialize a non-materializable tensor by supplying self-constructed content directly to the materialization transaction under that tensor's name.
+
+#### Scenario: Matching shape and dtype is evidenced normally
+
+Given a Model Instance's loaded artifact declares a tensor's shape and a materializable storage dtype
+
+When the authorized materialization transaction stages content with that shape
+
+Then materialization evidence is minted for that tensor as usual
+
+#### Scenario: Shape mismatch is rejected regardless of digest presence
+
+Given a Model Instance's loaded artifact declares a specific shape for a tensor
+
+When a caller attempts to materialize content with a different shape under that tensor's name
+
+Then no materialization evidence is minted for that tensor, whether or not the tensor's inventory entry declares a content digest
+
+#### Scenario: Declared non-materializable dtype is rejected even with well-formed content
+
+Given a Model Instance's loaded artifact declares a tensor's storage dtype as one the Runtime cannot materialize into the supplied content's representation
+
+When a caller attempts to materialize well-formed content under that tensor's name
+
+Then no materialization evidence is minted for that tensor
+
+### Requirement: Model Instance Creation Is Reachable Only Through Runtime
+
+`ModelInstanceDefinition::from_loaded_context` and the operation that registers a definition as a new Model Instance SHALL NOT be reachable by a caller outside the Runtime-owned Model Instance creation entrypoint, so that the architecture and Resource Affinity cross-checks that entrypoint performs cannot be bypassed by constructing and registering a definition directly.
+
+#### Scenario: No external construct-and-register path
+
+Given a caller outside the Runtime-owned Model Instance creation entrypoint
+
+When that caller attempts to construct a Model Instance Definition from a loaded context and register it as a new Model Instance
+
+Then no such path is reachable outside the crate implementing Runtime
 

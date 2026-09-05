@@ -1,0 +1,37 @@
+schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "sha256:552bb114838c10f742a1b6b6afade7c3044116826bb31cb33e21b16a2a422feb"
+component:
+  name: "magnetar.qwen.real"
+  version: "0.1.0"
+  description: "The first real, minimal Qwen Model Component"
+  role: "qwen-model-component"
+runtime:
+  magnetar:
+    min_version: "0.1.0"
+wit:
+  imports:
+    - package: "magnetar:model-component-graph"
+      interface: "graph-builder"
+      version: "1.0.0"
+  exports: []
+capabilities:
+  requires: []
+authority:
+  requires: []
+engine:
+  profile: "native"
+  features:
+    - component-model
+    - resource-limits
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./fixtures/components/qwen-real.component.wasm"
+signatures: []

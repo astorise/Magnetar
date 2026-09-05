@@ -220,7 +220,7 @@ fn model_trust_is_policy_owned_not_manifest_owned() {
         .trust_digest(digest())
         .evaluate(&manifest);
 
-    assert_eq!(decision.status, ModelTrustStatus::Trusted);
+    assert_eq!(decision.status(), ModelTrustStatus::Trusted);
 }
 
 #[test]
@@ -231,8 +231,8 @@ fn model_manifest_publisher_metadata_does_not_grant_trust() {
 
     let decision = store.evaluate(&manifest);
 
-    assert_eq!(decision.status, ModelTrustStatus::Unknown);
-    assert!(decision.reason.contains("metadata only"));
+    assert_eq!(decision.status(), ModelTrustStatus::Unknown);
+    assert!(decision.reason().contains("metadata only"));
 }
 
 #[test]
@@ -245,8 +245,8 @@ fn model_trust_policy_rejects_and_revokes() {
         .revoke_digest(digest())
         .evaluate(&manifest);
 
-    assert_eq!(rejected.status, ModelTrustStatus::Rejected);
-    assert_eq!(revoked.status, ModelTrustStatus::Revoked);
+    assert_eq!(rejected.status(), ModelTrustStatus::Rejected);
+    assert_eq!(revoked.status(), ModelTrustStatus::Revoked);
 }
 
 #[test]

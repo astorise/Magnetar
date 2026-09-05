@@ -317,6 +317,15 @@ pub struct ModelTensorMetadata {
     pub size_bytes: Option<u64>,
     pub quantization: Option<ModelQuantization>,
     pub expected_compute_dtype: Option<ModelDType>,
+    /// The specific bytes that count as this tensor's content for the
+    /// artifact it belongs to, when the artifact declares one
+    /// (`bind-materialized-weight-content-to-model-artifact-digests`'s
+    /// "Tensor Content Digest Binding" requirement). `None` means no
+    /// digest was declared for this tensor -- permissive, not "no content
+    /// required" -- mirroring `required_weight_names`'s existing
+    /// "empty/absent means unknown" precedent rather than making every
+    /// pre-existing manifest that predates this field suddenly fail.
+    pub digest: Option<ModelDigest>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -397,6 +406,13 @@ impl ModelDType {
 pub enum ModelQuantizationFormat {
     GgufQ4K,
     GgufQ5K,
+    /// GGUF's `Q8_0` block quantization (`ggml_type` 8): 32 elements per
+    /// 34-byte block (2-byte `f16` scale + 32 `i8` quants). Paired with
+    /// [`ModelDType::Q8`], which `ModelDType::parse` already accepts under
+    /// `"q8"`/`"q8_0"`; this variant was missing even though that dtype
+    /// existed, found while implementing `formats/gguf`'s real parser
+    /// (`implement-model-format-parsers`).
+    GgufQ8,
     Gptq,
     Awq,
     BitsAndBytes,
@@ -407,6 +423,7 @@ impl ModelQuantizationFormat {
         match value.to_ascii_lowercase().as_str() {
             "gguf-q4-k" | "q4_k" => Some(Self::GgufQ4K),
             "gguf-q5-k" | "q5_k" => Some(Self::GgufQ5K),
+            "gguf-q8-0" | "q8_0" => Some(Self::GgufQ8),
             "gptq" => Some(Self::Gptq),
             "awq" => Some(Self::Awq),
             "bitsandbytes" | "bnb" => Some(Self::BitsAndBytes),
@@ -716,18 +733,41 @@ pub enum ModelTrustStatus {
     PolicyDenied,
 }
 
+/// `pub(crate)` fields and constructor, not `pub`: this is the authority
+/// `ModelLoadingCoordinator::validate_preconditions` trusts outright
+/// (`Trusted` skips straight past trust validation) -- an external caller
+/// SHALL NOT be able to construct one claiming `Trusted` directly and pass
+/// it to the public `load_model`/`load_model_observed` as if a
+/// `ModelTrustStore` had actually evaluated it (a further audit of PR #36
+/// found every field and the constructor here were previously `pub`, with
+/// `ModelTrustStore::evaluate` -- the one fail-closed, Runtime-owned
+/// mechanism that actually exists for this -- entirely optional to go
+/// through). Public read-only accessors below; the one legitimate way to
+/// obtain a `Trusted` decision is `ModelTrustStore::evaluate`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelTrustDecision {
-    pub status: ModelTrustStatus,
-    pub reason: String,
+    pub(crate) status: ModelTrustStatus,
+    pub(crate) reason: String,
 }
 
 impl ModelTrustDecision {
-    pub fn new(status: ModelTrustStatus, reason: impl Into<String>) -> Self {
+    pub(crate) fn new(status: ModelTrustStatus, reason: impl Into<String>) -> Self {
         Self {
             status,
             reason: reason.into(),
         }
+    }
+
+    /// This decision's trust status. Read-only: see the struct-level doc
+    /// comment for why `status` is not a public field.
+    pub const fn status(&self) -> ModelTrustStatus {
+        self.status
+    }
+
+    /// This decision's human-readable reason. Read-only: see the
+    /// struct-level doc comment for why `reason` is not a public field.
+    pub fn reason(&self) -> &str {
+        &self.reason
     }
 }
 
@@ -1367,6 +1407,8 @@ struct RawTensor {
     size_bytes: Option<u64>,
     #[serde(default)]
     expected_compute_dtype: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 impl TryFrom<RawTensor> for ModelTensorMetadata {
@@ -1386,6 +1428,7 @@ impl TryFrom<RawTensor> for ModelTensorMetadata {
                 .expected_compute_dtype
                 .map(|value| parse_dtype(value, false))
                 .transpose()?,
+            digest: raw.digest.map(ModelDigest::parse).transpose()?,
         })
     }
 }

@@ -4,6 +4,8 @@
 //! rather than Runtime implementation source (task 9.1).
 
 use super::*;
+use crate::planning::*;
+use crate::scheduler::*;
 
 /// The correct prefill/decode Operator-sequence hash for the E2E fixture
 /// architecture (see `qwen_operator_sequence_hash`), computed once and
@@ -211,6 +213,13 @@ fn e2e_fixture_tokenizer_produces_deterministic_tokens() {
 }
 
 #[test]
+fn e2e_graph_nodes_transport_stays_tensor_value_typed() {
+    check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls().expect(
+        "execute_qwen_graph_nodes's per-node transport has no direct HostTensor-typed calls",
+    );
+}
+
+#[test]
 fn e2e_already_tokenized_prompt_path_bypasses_text_tokenization() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_already_tokenized_prompt_path(&fixture).expect("already-tokenized path is preserved");
@@ -232,6 +241,12 @@ fn e2e_required_path_returns_usage_and_cleans_up() {
 #[test]
 fn e2e_no_shortcut_direct_provider_invocation_is_rejected() {
     check_no_shortcut_direct_provider_rejected().expect("direct-invocation shortcut rejected");
+}
+
+#[test]
+fn e2e_no_shortcuts_rejects_incomplete_per_node_causal_chain() {
+    check_e2e_no_shortcuts_rejects_incomplete_per_node_causal_chain()
+        .expect("incomplete per-node causal chain is rejected");
 }
 
 #[test]
@@ -392,10 +407,607 @@ fn e2e_graph_dispatch_uses_registered_provider_instance() {
 }
 
 #[test]
+fn e2e_graph_dispatch_rejects_revoked_prepared_kernel() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_graph_dispatch_rejects_revoked_prepared_kernel(&fixture)
+        .expect("graph dispatch refuses a revoked PreparedKernel");
+}
+
+#[test]
+fn e2e_graph_dispatch_ignores_kernel_registry_preference_change_after_plan_publication() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_graph_dispatch_ignores_kernel_registry_preference_change_after_plan_publication(&fixture)
+        .expect(
+            "a Kernel Registry preference change after Plan publication does not affect an \
+             already-published, ready Plan",
+        );
+}
+
+#[test]
+fn e2e_graph_dispatch_rejects_stale_prepared_kernel_generation() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_graph_dispatch_rejects_stale_prepared_kernel_generation(&fixture)
+        .expect("graph dispatch refuses a stale PreparedKernel generation");
+}
+
+#[test]
+fn e2e_graph_dispatch_rejects_provider_binding_mismatch() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_graph_dispatch_rejects_provider_binding_mismatch(&fixture)
+        .expect("graph dispatch refuses a Provider binding mismatch");
+}
+
+/// Non-Reference-CPU Kernel-level `ProviderExecutionApi` implementation used
+/// only to prove that generic resolution (Correctif 3) reaches whatever
+/// Provider Runtime has registered, not specifically `ReferenceCpuExecutor`.
+/// Its "kernel" is a minimal, deterministic copy of the sole input resource
+/// to the sole output resource -- not a real Kernel catalog implementation.
+struct MockKernelExecutor {
+    storage: Mutex<BTreeMap<TensorResourceId, HostTensor>>,
+}
+impl MockKernelExecutor {
+    fn new() -> Self {
+        Self {
+            storage: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+impl ProviderExecutionApi for MockKernelExecutor {
+    fn submit(
+        &self,
+        request: ProviderExecutionRequest,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        Ok(ProviderExecutionHandle::new(
+            request.operation,
+            request.plan.id.clone(),
+            request.provider.clone(),
+            request.device.clone(),
+        ))
+    }
+    fn status(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+        Ok(ProviderExecutionStatus::new(
+            handle.clone(),
+            SchedulingState::Completed,
+        ))
+    }
+    fn cancel(
+        &self,
+        _handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderCancellationOutcome, ProviderExecutionError> {
+        Ok(ProviderCancellationOutcome::Unsupported)
+    }
+    fn complete(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        Ok(ProviderExecutionResult::completed(
+            handle.clone(),
+            Vec::new(),
+        ))
+    }
+    fn release(&self, _handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+        Ok(())
+    }
+    fn submit_kernel(
+        &self,
+        _advertisement: &KernelAdvertisement,
+        _operator: &OperatorSpec,
+        invocation: &KernelInvocation,
+        _memory: &mut MemoryManager,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        if let (Some(input), Some(output)) = (invocation.inputs.first(), invocation.outputs.first())
+        {
+            let tensor = self
+                .storage
+                .lock()
+                .unwrap()
+                .get(&input.resource.id)
+                .cloned();
+            if let Some(tensor) = tensor {
+                self.storage
+                    .lock()
+                    .unwrap()
+                    .insert(output.resource.id.clone(), tensor);
+            }
+        }
+        Ok(ProviderExecutionHandle::new(
+            ScheduledOperationId::new(1),
+            ExecutionPlanId::new(invocation.id.as_str().to_string()),
+            ProviderBinding::new("magnetar:provider/mock-kernel"),
+            None,
+        ))
+    }
+    fn complete_kernel(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<KernelResult, ProviderExecutionError> {
+        Ok(KernelResult::success(KernelInvocationId::new(
+            handle.plan.as_str(),
+        )))
+    }
+    fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) {
+        self.storage.lock().unwrap().insert(id, tensor);
+    }
+    fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
+        self.storage.lock().unwrap().get(id).cloned()
+    }
+    fn write_tensor_value(&self, id: TensorResourceId, value: TensorValue) {
+        if let TensorValue::Host(tensor) = value {
+            self.write_tensor(id, tensor);
+        }
+    }
+    fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
+        self.read_tensor(id).map(TensorValue::Host)
+    }
+}
+
+/// A minimal, non-Reference-CPU Provider execution API implementation that
+/// never exposes host-visible bytes for any resource
+/// (`define-provider-prepared-kernel-execution-contract`): every
+/// `read_tensor_value` answers [`TensorValue::Opaque`], and the
+/// `HostTensor`-typed `read_tensor`/`write_tensor` pair (which this
+/// contract deliberately leaves in place for callers that want it, see
+/// that trait's documentation) is simply never implemented, defaulting to
+/// "nothing". Exists to prove [`TensorValue::into_host`]'s
+/// residency-unavailable error fires against a real, independent
+/// implementation of the Provider-agnostic contract, not only against
+/// Reference CPU (which never produces `Opaque`).
+struct DeviceResidentOnlyExecutor {
+    resources: Mutex<BTreeSet<TensorResourceId>>,
+}
+impl DeviceResidentOnlyExecutor {
+    fn new() -> Self {
+        Self {
+            resources: Mutex::new(BTreeSet::new()),
+        }
+    }
+}
+impl ProviderExecutionApi for DeviceResidentOnlyExecutor {
+    fn submit(
+        &self,
+        request: ProviderExecutionRequest,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        Ok(ProviderExecutionHandle::new(
+            request.operation,
+            request.plan.id.clone(),
+            request.provider.clone(),
+            request.device.clone(),
+        ))
+    }
+    fn status(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+        Ok(ProviderExecutionStatus::new(
+            handle.clone(),
+            SchedulingState::Completed,
+        ))
+    }
+    fn cancel(
+        &self,
+        _handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderCancellationOutcome, ProviderExecutionError> {
+        Ok(ProviderCancellationOutcome::Unsupported)
+    }
+    fn complete(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        Ok(ProviderExecutionResult::completed(
+            handle.clone(),
+            Vec::new(),
+        ))
+    }
+    fn release(&self, _handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+        Ok(())
+    }
+    fn write_tensor_value(&self, id: TensorResourceId, _value: TensorValue) {
+        self.resources.lock().unwrap().insert(id);
+    }
+    fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
+        if self.resources.lock().unwrap().contains(id) {
+            Some(TensorValue::Opaque)
+        } else {
+            None
+        }
+    }
+}
+
+struct MockKernelProvider {
+    executor: Arc<MockKernelExecutor>,
+}
+impl MockKernelProvider {
+    fn new() -> Self {
+        Self {
+            executor: Arc::new(MockKernelExecutor::new()),
+        }
+    }
+}
+impl Provider for MockKernelProvider {
+    fn metadata(&self) -> ProviderMetadata {
+        ProviderMetadata::new(
+            "magnetar:provider/mock-kernel",
+            "0.0.0",
+            "test",
+            "Non-Reference-CPU mock Provider proving generic Kernel dispatch (Correctif 3)",
+        )
+    }
+    fn register(&self, _registry: &mut ProviderRegistry) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    fn execution_api(&self) -> Option<Arc<dyn ProviderExecutionApi>> {
+        Some(self.executor.clone())
+    }
+}
+
+#[test]
+fn provider_execution_generic_resolution_reaches_non_reference_cpu_provider() {
+    let provider_binding = ProviderBinding::new("magnetar:provider/mock-kernel");
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(MockKernelProvider::new()))
+        .build()
+        .expect("mock provider registers cleanly");
+
+    let api = resolve_kernel_execution_provider(&runtime, &provider_binding).expect(
+        "generic resolution finds the registered mock provider without downcasting to a \
+         concrete Provider type",
+    );
+
+    // Borrow an arbitrary, valid advertisement/operator pair from Reference
+    // CPU purely as inert filler: the mock ignores their content entirely,
+    // and constructing one from scratch is not the point of this test.
+    let reference_cpu = ReferenceCpuProvider::new();
+    let advertisement = reference_cpu
+        .kernel_advertisements()
+        .into_iter()
+        .next()
+        .expect("Reference CPU advertises at least one Kernel");
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let input_id = TensorResourceId::new("mock-input");
+    let output_id = TensorResourceId::new("mock-output");
+    let descriptor = TensorDescriptor::materialized(
+        ShapeDescriptor::new([2]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent);
+    api.write_tensor(
+        input_id.clone(),
+        HostTensor::new([2], vec![1.0, 2.0]).unwrap(),
+    );
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("mock-invocation"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        provider_binding.clone(),
+        affinity.clone(),
+    )
+    .with_input(KernelResource::new(
+        TensorResourceDescriptor::new(input_id, descriptor.clone(), affinity.clone()),
+        KernelMemoryClass::Host,
+    ))
+    .with_output(KernelResource::new(
+        TensorResourceDescriptor::new(output_id.clone(), descriptor, affinity),
+        KernelMemoryClass::Host,
+    ));
+
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+    let handle = api
+        .submit_kernel(&advertisement, operator, &invocation, &mut memory)
+        .expect("mock Provider implements Kernel-level submission");
+    let result = api
+        .complete_kernel(&handle)
+        .expect("mock Provider implements Kernel-level completion");
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    let output = api
+        .read_tensor(&output_id)
+        .expect("mock Provider's minimal kernel copied input to output");
+    assert_eq!(output.data, vec![1.0, 2.0]);
+}
+
+/// `define-provider-prepared-kernel-execution-contract`: a Provider that
+/// only ever answers [`TensorValue::Opaque`] (never `Host`) is a valid,
+/// independent implementation of the Provider-agnostic tensor value
+/// contract -- resolved the same generic way as any other Provider
+/// (`Provider::execution_api`, no downcasting), and
+/// [`TensorValue::into_host`] SHALL fail with a structured,
+/// resource-naming error for it rather than panicking or silently
+/// fabricating bytes.
+#[test]
+fn tensor_value_into_host_fails_structurally_for_a_device_resident_only_provider() {
+    let executor = DeviceResidentOnlyExecutor::new();
+    let id = TensorResourceId::new("device-only-resource");
+
+    // Nothing written yet: genuinely absent, distinct from "present but
+    // opaque".
+    assert!(executor.read_tensor_value(&id).is_none());
+
+    executor.write_tensor_value(id.clone(), TensorValue::Opaque);
+    let value = executor
+        .read_tensor_value(&id)
+        .expect("resource is present after being written");
+    assert!(matches!(value, TensorValue::Opaque));
+
+    match value.into_host(&id) {
+        Err(TensorError::ResidencyUnavailable { reason }) => {
+            assert!(
+                reason.contains(id.as_str()),
+                "expected the residency-unavailable error to name the resource id; got: {reason}"
+            );
+        }
+        Err(other) => panic!("expected ResidencyUnavailable, got {other:?}"),
+        Ok(_) => panic!("into_host must not succeed for an Opaque value"),
+    }
+}
+
+/// Static check (Correctif 3 Definition of Done): first-native dispatch
+/// must never recover a concrete Provider type from `&dyn Provider` via
+/// `downcast_ref`. Reads this module's own source text rather than
+/// asserting on run-time behavior, since the property being enforced is the
+/// absence of a coding pattern, not a computed result.
+#[test]
+fn first_native_dispatch_source_contains_no_provider_downcast() {
+    let source = include_str!("../first_native_runtime.rs");
+    assert!(
+        !source.contains("downcast_ref"),
+        "first_native_runtime.rs must not recover a concrete Provider type via \
+         downcast_ref; resolve through ProviderExecutionApi (Provider::execution_api) instead"
+    );
+    assert!(
+        !source.contains("as &dyn std::any::Any") && !source.contains("as &dyn Any"),
+        "first_native_runtime.rs must not cast a Provider reference to dyn Any"
+    );
+}
+
+/// Static guard (Correctif 7 / task group 10; superseded at task 12.6, per
+/// explicit direction to remove the `non-strict-fixture-fallback` opt-in
+/// entirely rather than keep it as a production escape hatch). The prior
+/// version of this guard verified that the Rust-synthesized Qwen graph
+/// fallback required an explicit Cargo feature to even *compile* into a
+/// production build -- `cargo check --no-default-features` failed to
+/// compile without it, a real but blunt fail-closed mechanism (an
+/// environment that cannot get a real Component engine could not produce a
+/// runnable binary at all, only a compile error). That opt-in is gone now:
+/// production has exactly one graph-producing branch of
+/// `first_native_component_graphs_for_prompt` (and the sibling inline
+/// blocks in `run_success_path_with_prompt`/`FirstNativeChatSession::turn`)
+/// when a strict Component engine is unavailable, and it is an unconditional,
+/// structured runtime error -- not a second, unattested Rust-synthesized
+/// graph, and not a compile failure either. This guard checks, by source
+/// inspection (the only way to check something a `not(test)` cfg makes
+/// impossible to invoke directly from a `#[test]`, and the same technique
+/// the guard it replaces already used), that: (1) every production,
+/// non-test cfg branch that used to require `feature =
+/// "non-strict-fixture-fallback"` is gone from `first_native_runtime.rs`
+/// entirely -- the feature no longer exists in `Cargo.toml`, so if this
+/// string reappears here it means someone reintroduced a production
+/// opt-in fallback; and (2) the fail-closed production stub's error
+/// message is still present, at the expected count of call sites
+/// (`first_native_component_graphs_for_prompt`, `run_success_path_with_prompt`,
+/// `FirstNativeChatSession::turn`).
+#[test]
+fn first_native_dispatch_has_no_production_fallback_and_fails_closed_instead() {
+    let source = include_str!("../first_native_runtime.rs");
+    assert!(
+        !source.contains("non-strict-fixture-fallback"),
+        "the non-strict-fixture-fallback Cargo feature was deliberately removed (task 12.6); \
+         its reappearance in first_native_runtime.rs means a production opt-in fallback to the \
+         unattested Rust-synthesized graph was reintroduced"
+    );
+    let fail_closed_occurrences = source
+        .matches("no Component engine is available on this build target")
+        .count();
+    assert_eq!(
+        fail_closed_occurrences, 3,
+        "expected exactly the three documented production fail-closed stubs \
+         (first_native_component_graphs_for_prompt, run_success_path_with_prompt, \
+         FirstNativeChatSession::turn) to share this exact structured error message when no \
+         strict Component engine is available; found {fail_closed_occurrences}. If a call site \
+         was added or removed, update this count."
+    );
+}
+
+/// Static guard (`reach-architecture-freeze-1` task 12.4): production's
+/// Qwen Component loader (`qwen_real_component_package`'s `not(test)`
+/// branch) must never embed the real Component binary via `include_bytes!`
+/// or claim `ComponentDistributionSourceKind::DevelopmentFixture` -- those
+/// are only legitimate in the `#[cfg(test)]` branch, checked separately
+/// below. `not(test)` code cannot be invoked from a `#[test]` at all (that
+/// is the whole point of the cfg), so this is a source-text check, the same
+/// technique the sibling guards above already use for the same structural
+/// reason.
+#[test]
+fn qwen_component_production_loader_has_no_embedded_fixture() {
+    // Normalized to `\n` regardless of this checkout's line-ending
+    // convention (a real bug this test itself had: it panicked on Windows
+    // CI, whose checkout uses CRLF, before this normalization was added).
+    let source = include_str!("../first_native_runtime.rs").replace("\r\n", "\n");
+    let production_loader_start = source
+        .find("not(test)\n))]\nfn qwen_real_component_package()")
+        .expect("the production (not(test)) qwen_real_component_package overload exists");
+    // Covers both qwen_real_component_package's thin not(test) wrapper and
+    // its sibling resolve_qwen_component_from_env_var (immediately after
+    // it in the source, factored out so the actual env-var/file-read logic
+    // stays directly testable rather than living inside a not(test) cfg
+    // that no #[test] could ever reach) -- the second `\n}\n` closes that
+    // sibling function.
+    let first_fn_end = production_loader_start
+        + source[production_loader_start..]
+            .find("\n}\n")
+            .expect("qwen_real_component_package has a closing brace")
+        + "\n}\n".len();
+    let production_loader_end = first_fn_end
+        + source[first_fn_end..]
+            .find("\n}\n")
+            .expect("resolve_qwen_component_from_env_var has a closing brace");
+    let production_loader_source = &source[production_loader_start..production_loader_end];
+    assert!(
+        !production_loader_source.contains("include_bytes!"),
+        "production's Qwen Component loader must never embed the Component binary via \
+         include_bytes! -- that is a test-fixture-only mechanism (task 12.4)"
+    );
+    assert!(
+        !production_loader_source.contains("DevelopmentFixture"),
+        "production's Qwen Component loader must never claim \
+         ComponentDistributionSourceKind::DevelopmentFixture -- it resolves bytes externally \
+         and should report LocalDirectory (or another real source kind), not a fixture"
+    );
+    assert!(
+        production_loader_source.contains("std::env::var")
+            && production_loader_source.contains("std::fs::read"),
+        "expected production's Qwen Component loader to resolve bytes from an external, \
+         caller-configured source (env var + local file read) rather than an embedded fixture"
+    );
+}
+
+/// `register_qwen_component_artifact` must be safe to call unconditionally,
+/// every time a caller might need first-native generation, without the
+/// caller tracking its own "have I registered yet" state (task 12.4's
+/// design: `magnetar-cli` calls this before every `one_shot`/`ChatSession::
+/// open`). Proves the second call is a genuine no-op, not a panic or an
+/// error, regardless of whether the bytes differ from the first call's.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn register_qwen_component_artifact_is_idempotent() {
+    register_qwen_component_artifact(
+        b"first-call-bytes".to_vec(),
+        b"first-call-manifest".to_vec(),
+    );
+    register_qwen_component_artifact(
+        b"second-call-different-bytes".to_vec(),
+        b"second-call-different-manifest".to_vec(),
+    );
+}
+
+/// `resolve_qwen_component_from_env_var` is the extracted, directly
+/// testable logic behind `qwen_real_component_package`'s production
+/// fallback branch, which is itself `not(test)` and so can never be
+/// invoked from a `#[test]` at all -- each of these tests uses its own
+/// uniquely-named env var (never `MAGNETAR_QWEN_COMPONENT_PATH` itself,
+/// the one a real production process would set) so parallel test threads
+/// mutating process-wide environment state cannot race each other.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+mod resolve_qwen_component_from_env_var_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_missing_env_var() {
+        let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_UNSET_CASE";
+        unsafe {
+            std::env::remove_var(var_name);
+        }
+        let error = resolve_qwen_component_from_env_var(var_name).unwrap_err();
+        assert!(matches!(
+            error,
+            E2eConformanceError::ModelComponentFailed { reason } if reason.contains(var_name)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_nonexistent_component_file() {
+        let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_MISSING_FILE_CASE";
+        let path = std::env::temp_dir().join("magnetar-test-qwen-component-does-not-exist.wasm");
+        unsafe {
+            std::env::set_var(var_name, &path);
+        }
+        let error = resolve_qwen_component_from_env_var(var_name).unwrap_err();
+        unsafe {
+            std::env::remove_var(var_name);
+        }
+        assert!(matches!(
+            error,
+            E2eConformanceError::ModelComponentFailed { reason }
+                if reason.contains("failed to read Qwen Component bytes")
+        ));
+    }
+
+    #[test]
+    fn rejects_a_component_file_with_no_manifest() {
+        let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_MISSING_MANIFEST_CASE";
+        let path = std::env::temp_dir().join("magnetar-test-qwen-component-no-manifest.wasm");
+        std::fs::write(&path, b"pretend-component-bytes").expect("write test component file");
+        unsafe {
+            std::env::set_var(var_name, &path);
+        }
+        let error = resolve_qwen_component_from_env_var(var_name).unwrap_err();
+        unsafe {
+            std::env::remove_var(var_name);
+        }
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            error,
+            E2eConformanceError::ModelComponentFailed { reason }
+                if reason.contains("failed to read Qwen Component manifest")
+        ));
+    }
+
+    #[test]
+    fn reads_bytes_and_manifest_from_the_configured_path() {
+        let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_HAPPY_CASE";
+        let path = std::env::temp_dir().join("magnetar-test-qwen-component-happy.wasm");
+        let manifest_path = std::env::temp_dir()
+            .join("magnetar-test-qwen-component-happy.wasm.magnetar-component.yaml");
+        std::fs::write(&path, b"pretend-component-bytes").expect("write test component file");
+        std::fs::write(&manifest_path, b"pretend-manifest-bytes")
+            .expect("write test manifest file");
+        unsafe {
+            std::env::set_var(var_name, &path);
+        }
+        let package = resolve_qwen_component_from_env_var(var_name).expect("resolves successfully");
+        unsafe {
+            std::env::remove_var(var_name);
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&manifest_path);
+        assert_eq!(package.component_bytes, b"pretend-component-bytes");
+        assert_eq!(package.manifest_bytes, b"pretend-manifest-bytes");
+        assert_eq!(
+            package.source.kind,
+            ComponentDistributionSourceKind::LocalDirectory
+        );
+    }
+}
+
+/// Static guard (Correctif 13 / task group 7): `execute_qwen_graph` used to
+/// require `std::mem::take(runtime.memory_mut())` to get an independent
+/// `&mut MemoryManager` alongside a `&Runtime`; that gap is closed now that
+/// `QwenDispatchContext` holds a single `&mut Runtime` instead of separate
+/// `runtime`/`memory` fields (see its doc comment), so no first-native
+/// dispatch code should call `std::mem::take` on the Runtime memory service
+/// at all. This fails if the pattern reappears -- prefer cloning the
+/// specific value borrowed from `runtime` (e.g. a `KernelAdvertisement`)
+/// instead of taking the whole `MemoryManager`.
+#[test]
+fn first_native_dispatch_never_takes_runtime_memory_manager() {
+    let source = include_str!("../first_native_runtime.rs");
+    let occurrences = source
+        .matches("std::mem::take(runtime.memory_mut())")
+        .count();
+    assert_eq!(
+        occurrences, 0,
+        "expected zero std::mem::take(runtime.memory_mut()) calls in first_native_runtime.rs; \
+         found {occurrences}. Hold a single `&mut Runtime` (see `QwenDispatchContext`) and clone \
+         out any value that must outlive a later `memory_mut()` call instead of taking the whole \
+         MemoryManager."
+    );
+}
+
+#[test]
 fn e2e_graph_dispatch_accounts_outputs_through_runtime_memory_manager() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_graph_dispatch_accounts_outputs_through_runtime_memory_manager(&fixture)
         .expect("graph dispatch accounts outputs through Runtime's MemoryManager");
+}
+
+#[test]
+fn e2e_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage(&fixture)
+        .expect("intermediate graph edges resolve from Provider storage, not a private cache");
 }
 
 #[test]
@@ -412,11 +1024,75 @@ fn e2e_graph_dispatch_records_memory_feasibility_failure_under_tight_budget() {
         .expect("tight memory budget is recorded as a feasibility failure");
 }
 
+/// `materialize-weights-from-real-model-artifact` task 3.1: proves the
+/// real-artifact-bytes path (`e2e_fixture_weights_from_real_artifact`,
+/// reading the checked-in `E2E_FIXTURE_SAFETENSORS_BYTES` at real offsets)
+/// produces the exact same materialized tensors as the pre-existing
+/// in-memory construction (`e2e_fixture_weights`) -- before
+/// `bind_qwen_fixture_weights`'s production call site is allowed to switch
+/// from one to the other. Equivalence proven, not assumed, matching this
+/// session's own working pattern for prior real-Component/real-artifact
+/// cutovers.
+#[test]
+fn e2e_fixture_real_artifact_weights_match_in_memory_weights() {
+    let config = e2e_fixture_config();
+    let in_memory = e2e_fixture_weights(&config).expect("in-memory fixture weights build");
+    let from_real_artifact =
+        e2e_fixture_weights_from_real_artifact(&config).expect("real-artifact weights materialize");
+
+    assert_eq!(
+        in_memory.keys().collect::<Vec<_>>(),
+        from_real_artifact.keys().collect::<Vec<_>>(),
+        "real-artifact and in-memory weight maps must cover the same tensor names"
+    );
+    for (name, expected_tensor) in &in_memory {
+        let actual_tensor = &from_real_artifact[name];
+        assert_eq!(
+            actual_tensor.shape, expected_tensor.shape,
+            "tensor '{name}' shape mismatch between real-artifact and in-memory paths"
+        );
+        assert_eq!(
+            actual_tensor.data, expected_tensor.data,
+            "tensor '{name}' data mismatch between real-artifact and in-memory paths"
+        );
+    }
+}
+
 #[test]
 fn e2e_weight_binding_rejects_tampered_artifact_bytes() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_weight_binding_rejects_tampered_artifact_bytes(&fixture)
         .expect("model loading rejects a weight artifact with tampered bytes");
+}
+
+#[test]
+fn e2e_materialize_model_instance_weights_rejects_content_digest_mismatch() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_materialize_model_instance_weights_rejects_content_digest_mismatch(&fixture)
+        .expect("materialize_model_instance_weights rejects tampered tensor content");
+}
+
+#[test]
+fn e2e_materialize_model_instance_weights_accepts_matching_content() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_materialize_model_instance_weights_accepts_matching_content(&fixture)
+        .expect("materialize_model_instance_weights accepts real, untampered tensor content");
+}
+
+#[test]
+fn e2e_weight_materialization_failure_never_reaches_ready() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_weight_materialization_failure_never_reaches_ready(&fixture).expect(
+        "a Model Instance never reports Ready when weight materialization fails, and rolls \
+         back every weight staged in the failed attempt",
+    );
+}
+
+#[test]
+fn e2e_weight_byte_change_alters_generated_logits() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_weight_byte_change_alters_generated_logits(&fixture)
+        .expect("changing one weight byte changes the generated logits");
 }
 
 #[test]
@@ -438,6 +1114,13 @@ fn e2e_unload_releases_weight_resource_allocations() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_unload_releases_weight_resource_allocations(&fixture)
         .expect("unloading a Model Instance releases its weight resource allocations");
+}
+
+#[test]
+fn e2e_repeated_load_unload_does_not_accumulate_weight_storage() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_repeated_load_unload_does_not_accumulate_weight_storage(&fixture)
+        .expect("repeated load/unload cycles do not accumulate Provider-owned weight storage");
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -822,7 +1505,7 @@ fn e2e_tensor_output_updates_readiness_without_raw_pointer() {
 #[test]
 fn e2e_resource_cleanup_after_generation_and_session_close() {
     let fixture = e2e_fixture().expect("fixture builds");
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
     let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).expect("loads");
     let report = unload_model_instance(
         &mut runtime,
@@ -1068,7 +1751,7 @@ fn e2e_fixture_tokenizer_streams_decode_across_multiple_chunks() {
 #[test]
 fn e2e_one_shot_session_uses_normal_model_instance_and_tokenizer_path() {
     let fixture = e2e_fixture().expect("fixture builds");
-    let mut runtime = build_runtime();
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
     let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).expect("loads");
     let session_request = SessionCreationRequest {
         model: GenerationModelReference::ModelInstance(instance),
@@ -1213,9 +1896,26 @@ fn e2e_authoritative_path_collects_correlated_runtime_observations() {
     let fixture = e2e_fixture().expect("fixture builds");
     let outcome = run_success_path(&fixture).expect("success path runs");
     let observations = outcome.observer.observations();
+    // ComponentValidated/ComponentInstantiated are only emitted by the real
+    // Qwen Component's strict-path preflight (`build_first_native_graphs_
+    // from_real_qwen_component`); a test build without a strict Component
+    // engine takes the test-oracle fallback instead (task 12.6), which
+    // never claims to validate/instantiate a real Component, so asserting
+    // this evidence only makes sense when the strict engine is what this
+    // build actually exercises.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
     for kind in [
         InferenceApiObservationKind::ComponentValidated,
         InferenceApiObservationKind::ComponentInstantiated,
+    ] {
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.kind == kind),
+            "missing authoritative observation {kind:?}"
+        );
+    }
+    for kind in [
         InferenceApiObservationKind::ModelInstanceReady,
         InferenceApiObservationKind::GraphValidationCompleted,
         InferenceApiObservationKind::PlanSelected,
@@ -1228,6 +1928,12 @@ fn e2e_authoritative_path_collects_correlated_runtime_observations() {
         InferenceApiObservationKind::LogitsProduced,
         InferenceApiObservationKind::SamplingCompleted,
         InferenceApiObservationKind::TokenCommitted,
+        InferenceApiObservationKind::GraphNodeReady,
+        InferenceApiObservationKind::PlanBindingResolved,
+        InferenceApiObservationKind::PreparedKernelResolved,
+        InferenceApiObservationKind::TensorResourceProduced,
+        InferenceApiObservationKind::KvUpdatePrepared,
+        InferenceApiObservationKind::KvUpdateCommitted,
     ] {
         assert!(
             observations
@@ -1236,6 +1942,30 @@ fn e2e_authoritative_path_collects_correlated_runtime_observations() {
             "missing authoritative observation {kind:?}"
         );
     }
+    // Correctif 17 / task group 17: these six are per-*node*, not global --
+    // a real multi-node graph run must produce more than one, each
+    // correlated to a different node, not one repeated event.
+    let distinct_ready_nodes: std::collections::BTreeSet<&str> = observations
+        .iter()
+        .filter(|observation| observation.kind == InferenceApiObservationKind::GraphNodeReady)
+        .filter_map(|observation| {
+            observation
+                .message
+                .split("node=")
+                .nth(1)
+                .map(|rest| rest.split(' ').next().unwrap_or(rest))
+        })
+        .collect();
+    assert!(
+        distinct_ready_nodes.len() > 1,
+        "expected GraphNodeReady for more than one distinct graph node, found: \
+         {distinct_ready_nodes:?}"
+    );
+    assert!(observations.iter().any(|observation| {
+        observation.kind == InferenceApiObservationKind::TensorResourceProduced
+            && observation.message.contains("node=")
+            && observation.message.contains("resource=")
+    }));
     assert!(observations.iter().any(|observation| {
         observation.kind == InferenceApiObservationKind::PlanSelected
             && observation.message.contains("request=e2e-success-path")
@@ -1290,6 +2020,28 @@ fn e2e_kv_cancelled_decode_does_not_corrupt_committed_cache() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_kv_cancelled_decode_does_not_corrupt_committed_cache(&fixture)
         .expect("a cancelled decode's pending KV write does not alter the committed cache");
+}
+
+#[test]
+fn e2e_kv_pending_write_is_memory_admitted_for_its_concatenated_size() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_kv_pending_write_is_memory_admitted_for_its_concatenated_size(&fixture)
+        .expect("decode's concatenated pending KV write is memory-admitted at its real size");
+}
+
+#[test]
+fn e2e_kv_pending_write_allocation_is_released_on_discard() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_kv_pending_write_allocation_is_released_on_discard(&fixture)
+        .expect("discarding a pending KV state releases its admitted allocations");
+}
+
+#[test]
+fn e2e_kv_partial_layer_failure_during_commit_rolls_back_cleanly() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_kv_partial_layer_failure_during_commit_rolls_back_cleanly(&fixture).expect(
+        "a partial-layer commit failure rolls back cleanly, without a mixed-generation cache",
+    );
 }
 
 #[test]

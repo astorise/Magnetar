@@ -3,6 +3,26 @@
 //! portable semantics before optimized Providers (CUDA, Metal, OpenVINO, QNN,
 //! WebGPU) define behavior.
 //!
+//! # In-crate test double, not the sole implementation
+//!
+//! The `providers/cpu` submodule (crate `magnetar-provider-cpu`) now holds
+//! the real, externally-consumable extraction of this same implementation
+//! (task group 14 / Correctif 15), depending on this crate's public
+//! contracts rather than the reverse. This in-crate copy is kept
+//! deliberately, not as leftover debt: magnetar-runtime's own ~1000-test
+//! suite instantiates [`ReferenceCpuExecutor`] directly as its generic test
+//! double, and migrating that suite onto an external crate dependency was
+//! judged not worth the churn versus keeping a small in-crate copy. The two
+//! implementations are independent and never reference each other. Three
+//! types straddle the boundary the other direction: [`HostTensor`],
+//! [`ReferenceCpuError`], and [`ReferenceCpuErrorCode`] are still what
+//! [`crate::provider::ProviderExecutionApi`]'s `write_tensor`/`read_tensor`/
+//! `write_tensor_admitted` are typed against (a provisional pre-Resource-based
+//! transport, task group 5), so `providers/cpu` imports magnetar-runtime's
+//! copies of exactly those three rather than redefining them -- everything
+//! else in `providers/cpu` (kernels, [`ReferenceCpuExecutor`],
+//! [`ReferenceCpuProvider`], SIMD detection) is its own, independent code.
+//!
 //! Tensor storage is Provider-owned and opaque to the rest of the Runtime, the
 //! same way any other Provider's device buffers would be: the Kernel Contract
 //! and Memory Manager only see resource identity and accounting, never raw
@@ -94,6 +114,7 @@
 //! is defined in the error model for future use if a browser-specific limitation
 //! is identified; none is known today.
 
+use crate::ExecutionPlanId;
 use crate::affinity::{
     DeviceBinding, FallbackClass, ProviderBinding, ProviderHealth, ProviderPressureLevel,
     ProviderStatusSnapshot, ResourceAffinity,
@@ -121,18 +142,22 @@ use crate::operator::{
 };
 use crate::provider::{
     PROVIDER_API_VERSION, Provider, ProviderError, ProviderExecutionApi, ProviderMetadata,
-    ProviderRegistry,
+    ProviderRegistry, TensorValue,
 };
 use crate::scheduler::{
-    ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionHandle,
-    ProviderExecutionRequest, ProviderExecutionResult, ProviderExecutionStatus, SchedulingState,
+    ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionErrorCode,
+    ProviderExecutionHandle, ProviderExecutionId, ProviderExecutionPhase, ProviderExecutionRequest,
+    ProviderExecutionResult, ProviderExecutionStatus, ScheduledOperationId, SchedulingState,
 };
 use crate::tensor::{TensorLifecycleState, TensorReadiness, TensorResource};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// Stable, package-qualified Reference CPU Provider identity.
@@ -338,6 +363,24 @@ impl HostTensor {
                 format!("expected rank-2 tensor, got shape {other:?}"),
             )),
         }
+    }
+
+    /// This tensor's canonical content byte representation: `data`'s `f32`
+    /// values concatenated as little-endian bytes, in order. Used to
+    /// compute and verify content digests
+    /// (`bind-materialized-weight-content-to-model-artifact-digests`) --
+    /// callers combine this with `ModelDigest::sha256`/`verify_bytes`
+    /// rather than this module depending on `model.rs`'s digest type
+    /// directly. `shape` deliberately does not participate: a digest binds
+    /// tensor *content*, and shape mismatches are already caught
+    /// separately (residency/binding validation), not by this
+    /// content-only check.
+    pub fn content_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.data.len() * 4);
+        for value in &self.data {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
     }
 }
 
@@ -811,6 +854,59 @@ pub fn residual_add(
     add(input, residual)
 }
 
+/// Splits `input`'s last dimension into two equal halves, producing two
+/// tensors of the same rank with that one dimension halved (row-major
+/// layout means each contiguous run of `last` elements is exactly one
+/// "row" along that axis, regardless of the tensor's overall rank, so this
+/// is correct for any rank). `reach-architecture-freeze-1` task 5.4/5.5:
+/// the first portable Operator with more than one declared output,
+/// existing to prove the Resource-based generic execution path's
+/// already-existing multi-output support
+/// (`KernelInvocation.outputs: Vec<..>`, `store_output(invocation, index,
+/// ..)`) end to end -- not because any current graph needs a split
+/// Operator.
+pub fn split_last_dim_in_half(
+    input: &HostTensor,
+) -> Result<(HostTensor, HostTensor), ReferenceCpuError> {
+    let Some((&last, outer_dims)) = input.shape.split_last() else {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "split requires a tensor with at least one dimension",
+        ));
+    };
+    if last == 0 || last % 2 != 0 {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("split requires a nonzero even last dimension, got {last}"),
+        ));
+    }
+    let half = last / 2;
+    let mut half_shape = outer_dims.to_vec();
+    half_shape.push(half);
+    let half_usize = usize::try_from(half).map_err(|_| {
+        ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("split half-dimension {half} overflows this platform's usize"),
+        )
+    })?;
+    let last_usize = usize::try_from(last).map_err(|_| {
+        ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("split last dimension {last} overflows this platform's usize"),
+        )
+    })?;
+    let row_count = input.data.len() / last_usize;
+    let mut left_data = Vec::with_capacity(row_count * half_usize);
+    let mut right_data = Vec::with_capacity(row_count * half_usize);
+    for row in input.data.chunks_exact(last_usize) {
+        left_data.extend_from_slice(&row[..half_usize]);
+        right_data.extend_from_slice(&row[half_usize..]);
+    }
+    let left = HostTensor::new(half_shape.clone(), left_data)?;
+    let right = HostTensor::new(half_shape, right_data)?;
+    Ok((left, right))
+}
+
 /// Reference CPU only stores `f32`; any other portable dtype requires an
 /// explicit conversion step and is never converted silently.
 pub fn dtype_conversion(
@@ -1093,6 +1189,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
         baseline_advertisement("layout-conversion", OperatorFamily::Layout),
+        baseline_advertisement("split", OperatorFamily::Tensor),
     ]
 }
 
@@ -1172,7 +1269,21 @@ fn reference_cpu_tensor_resource_conformance_check() -> ReferenceCpuConformanceC
 pub struct ReferenceCpuExecutor {
     storage: Mutex<BTreeMap<TensorResourceId, HostTensor>>,
     observations: Mutex<Vec<KernelObservation>>,
-    submitted: Mutex<Vec<ProviderExecutionRequest>>,
+    submitted: Mutex<BTreeMap<ProviderExecutionId, ProviderExecutionRequest>>,
+    /// Results of Kernel invocations submitted through
+    /// [`Self::submit_kernel_invocation`], keyed by the
+    /// [`ProviderExecutionHandle`] returned at submission time and removed
+    /// on the first [`Self::complete_kernel_invocation`] call that consumes
+    /// them (single-consumption; task 5.3/Correctif 2 causality).
+    kernel_executions: Mutex<BTreeMap<ProviderExecutionId, KernelResult>>,
+    /// The current `MemoryManager` allocation backing each resource id
+    /// written through [`Self::write_tensor_admitted`], so a later write
+    /// to the *same* resource id can release the allocation it replaces
+    /// instead of leaving it accounted forever. Resources written through
+    /// plain [`Self::write_tensor`] are never tracked here -- that path
+    /// remains genuinely unadmitted, unchanged.
+    resource_allocations: Mutex<BTreeMap<TensorResourceId, MemoryAllocationId>>,
+    next_execution_ordinal: AtomicU64,
 }
 
 impl Default for ReferenceCpuExecutor {
@@ -1180,7 +1291,10 @@ impl Default for ReferenceCpuExecutor {
         Self {
             storage: Mutex::new(BTreeMap::new()),
             observations: Mutex::new(Vec::new()),
-            submitted: Mutex::new(Vec::new()),
+            submitted: Mutex::new(BTreeMap::new()),
+            kernel_executions: Mutex::new(BTreeMap::new()),
+            resource_allocations: Mutex::new(BTreeMap::new()),
+            next_execution_ordinal: AtomicU64::new(0),
         }
     }
 }
@@ -1196,6 +1310,95 @@ impl ReferenceCpuExecutor {
 
     pub fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
         self.storage.lock().unwrap().get(id).cloned()
+    }
+
+    /// Drops a tensor from this executor's opaque storage. Returns `true`
+    /// if `id` was present and removed, `false` if it was already absent.
+    pub fn release_tensor(&self, id: &TensorResourceId) -> bool {
+        self.storage.lock().unwrap().remove(id).is_some()
+    }
+
+    /// See [`ProviderExecutionApi::release_admitted_tensor`]: releases the
+    /// `MemoryManager` allocation this executor tracked for `id` (from a
+    /// prior [`Self::write_tensor_admitted`] call), if any, then drops `id`
+    /// from storage exactly like [`Self::release_tensor`].
+    pub fn release_admitted_tensor(
+        &self,
+        memory: &mut MemoryManager,
+        id: &TensorResourceId,
+    ) -> bool {
+        if let Some(allocation) = self.resource_allocations.lock().unwrap().remove(id) {
+            let _ = memory.release(allocation);
+        }
+        self.storage.lock().unwrap().remove(id).is_some()
+    }
+
+    /// See [`ProviderExecutionApi::write_tensor_admitted`]: admits `tensor`
+    /// through `memory` before writing it, and releases whatever allocation
+    /// this executor previously admitted for the same `id`, if any.
+    pub fn write_tensor_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        id: TensorResourceId,
+        tensor: HostTensor,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), MemoryError> {
+        let byte_size = tensor.data.len() as u64 * std::mem::size_of::<f32>() as u64;
+        let allocation = memory.allocate(MemoryAllocationRequest::new(
+            class,
+            byte_size,
+            MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+            owner,
+        ))?;
+        let previous = self
+            .resource_allocations
+            .lock()
+            .unwrap()
+            .insert(id.clone(), allocation.id);
+        if let Some(previous) = previous {
+            let _ = memory.release(previous);
+        }
+        self.storage.lock().unwrap().insert(id, tensor);
+        Ok(())
+    }
+
+    /// See [`ProviderExecutionApi::read_tensor_value`]: always
+    /// [`TensorValue::Host`] -- Reference CPU never declines host
+    /// materialization.
+    pub fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
+        self.read_tensor(id).map(TensorValue::Host)
+    }
+
+    /// See [`ProviderExecutionApi::write_tensor_value`]. Reference CPU only
+    /// ever receives [`TensorValue::Host`]; an [`TensorValue::Opaque`] write
+    /// (which would mean "store this, but I have no bytes for it") is not
+    /// meaningful for a host-visible-only Provider, so it is a documented
+    /// no-op rather than a panic.
+    pub fn write_tensor_value(&self, id: TensorResourceId, value: TensorValue) {
+        if let TensorValue::Host(tensor) = value {
+            self.write_tensor(id, tensor);
+        }
+    }
+
+    /// See [`ProviderExecutionApi::write_tensor_value_admitted`]. Same
+    /// `Opaque`-is-a-no-op reasoning as [`Self::write_tensor_value`]; an
+    /// `Opaque` write admits nothing and succeeds trivially, since there is
+    /// no byte size to account for it.
+    pub fn write_tensor_value_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        id: TensorResourceId,
+        value: TensorValue,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), MemoryError> {
+        match value {
+            TensorValue::Host(tensor) => {
+                self.write_tensor_admitted(memory, id, tensor, class, owner)
+            }
+            TensorValue::Opaque => Ok(()),
+        }
     }
 
     pub fn observations(&self) -> Vec<KernelObservation> {
@@ -1448,10 +1651,15 @@ impl ReferenceCpuExecutor {
         memory.allocate(request).map(|allocation| allocation.id)
     }
 
-    /// Executes one Runtime-created [`KernelInvocation`], then additionally
-    /// requests output allocation and records tensor residency through the
-    /// Runtime's [`MemoryManager`], so Memory Manager accounting stays in
-    /// sync with the Provider's own opaque storage.
+    /// Admits Runtime memory for every declared output of one
+    /// [`KernelInvocation`] *before* dispatching it, then executes it and
+    /// records tensor residency through the Runtime's [`MemoryManager`], so
+    /// Provider materialization can never precede Runtime admission.
+    ///
+    /// If admission for any output is denied, the Kernel is never dispatched
+    /// (`self.execute_invocation` is not called) and no bytes are written
+    /// into Provider-owned storage. Reservations already admitted for this
+    /// invocation are released before returning.
     pub fn execute_invocation_with_memory_manager(
         &self,
         advertisement: &KernelAdvertisement,
@@ -1459,14 +1667,27 @@ impl ReferenceCpuExecutor {
         invocation: &KernelInvocation,
         memory: &mut MemoryManager,
     ) -> KernelResult {
-        let result = self.execute_invocation(advertisement, operator, invocation);
-        if result.status != KernelResultStatus::Succeeded {
-            return result;
-        }
         let provider = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
-        for resource in &result.updated_resources {
-            let Ok(byte_size) = resource.descriptor.byte_size() else {
-                continue;
+        let mut admitted: Vec<(TensorResourceId, MemoryAllocationId)> =
+            Vec::with_capacity(invocation.outputs.len());
+        for output in &invocation.outputs {
+            let resource = &output.resource;
+            let byte_size = match resource.descriptor.byte_size() {
+                Ok(byte_size) => byte_size,
+                Err(error) => {
+                    for (_, allocation_id) in &admitted {
+                        let _ = memory.release(*allocation_id);
+                    }
+                    return KernelResult::failure(
+                        invocation.id.clone(),
+                        KernelError::KernelExecutionFailed {
+                            reason: format!(
+                                "cannot admit output {}: invalid tensor descriptor ({error:?})",
+                                resource.id
+                            ),
+                        },
+                    );
+                }
             };
             let request = MemoryAllocationRequest::new(
                 MemoryAllocationClass::Tensor,
@@ -1476,17 +1697,8 @@ impl ReferenceCpuExecutor {
             )
             .with_affinity(resource.affinity.clone());
             match memory.allocate(request) {
-                Ok(allocation) => {
-                    let _ = memory.record_tensor_residency(
-                        TensorResidency::new(
-                            resource.id.clone(),
-                            MemoryPlacement::ProviderOwnedOpaque(provider.clone()),
-                            resource.affinity.clone(),
-                        )
-                        .with_allocation(allocation.id),
-                    );
-                }
-                Err(_) => {
+                Ok(allocation) => admitted.push((resource.id.clone(), allocation.id)),
+                Err(error) => {
                     self.observe(
                         KernelObservation::new(
                             KernelObservationKind::KernelMemoryFeasibilityFailed,
@@ -1494,10 +1706,118 @@ impl ReferenceCpuExecutor {
                         .with_kernel(&invocation.kernel)
                         .with_invocation(invocation.id.clone()),
                     );
+                    for (_, allocation_id) in &admitted {
+                        let _ = memory.release(*allocation_id);
+                    }
+                    return KernelResult::failure(
+                        invocation.id.clone(),
+                        KernelError::KernelExecutionFailed {
+                            reason: format!(
+                                "memory admission denied for output {}: {error:?}",
+                                resource.id
+                            ),
+                        },
+                    );
                 }
             }
         }
+
+        let result = self.execute_invocation(advertisement, operator, invocation);
+        if result.status != KernelResultStatus::Succeeded {
+            for (_, allocation_id) in &admitted {
+                let _ = memory.release(*allocation_id);
+            }
+            return result;
+        }
+        for resource in &result.updated_resources {
+            let Some((_, allocation_id)) = admitted
+                .iter()
+                .find(|(resource_id, _)| *resource_id == resource.id)
+                .map(|(resource_id, allocation_id)| (resource_id.clone(), *allocation_id))
+            else {
+                continue;
+            };
+            let _ = memory.record_tensor_residency(
+                TensorResidency::new(
+                    resource.id.clone(),
+                    MemoryPlacement::ProviderOwnedOpaque(provider.clone()),
+                    resource.affinity.clone(),
+                )
+                .with_allocation(allocation_id),
+            );
+        }
         result
+    }
+
+    fn next_provider_execution_id(&self, label: &str) -> ProviderExecutionId {
+        let ordinal = self.next_execution_ordinal.fetch_add(1, Ordering::Relaxed);
+        ProviderExecutionId::new(format!("{REFERENCE_CPU_PROVIDER_NAME}:{label}:{ordinal}"))
+    }
+
+    /// Submits one Runtime-created [`KernelInvocation`] for execution and
+    /// returns the [`ProviderExecutionHandle`] that causally identifies it:
+    /// since Reference CPU is a synchronous Provider, the numerical work
+    /// (via [`Self::execute_invocation_with_memory_manager`]) runs as part
+    /// of this call, and the resulting [`KernelResult`] is stored under the
+    /// returned handle for a later, single [`Self::complete_kernel_invocation`]
+    /// call to observe. No [`ProviderExecutionHandle`] is ever constructed
+    /// without a corresponding submission (Correctif 2: Provider submit and
+    /// complete are causal, not post-hoc evidence).
+    pub fn submit_kernel_invocation(
+        &self,
+        advertisement: &KernelAdvertisement,
+        operator: &OperatorSpec,
+        invocation: &KernelInvocation,
+        memory: &mut MemoryManager,
+    ) -> ProviderExecutionHandle {
+        let provider = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+        let execution_id = self.next_provider_execution_id(invocation.id.as_str());
+        let handle = ProviderExecutionHandle {
+            id: execution_id.clone(),
+            operation: ScheduledOperationId::new(
+                self.next_execution_ordinal.load(Ordering::Relaxed),
+            ),
+            plan: ExecutionPlanId::new(invocation.id.as_str().to_string()),
+            provider,
+            device: None,
+        };
+        let result = self.execute_invocation_with_memory_manager(
+            advertisement,
+            operator,
+            invocation,
+            memory,
+        );
+        self.kernel_executions
+            .lock()
+            .unwrap()
+            .insert(execution_id, result);
+        handle
+    }
+
+    /// Observes the result of a Kernel invocation previously submitted
+    /// through [`Self::submit_kernel_invocation`]. Fails with a structured
+    /// error if `handle` was never returned by that method, or has already
+    /// been completed once (single consumption: the stored result is
+    /// removed on success).
+    pub fn complete_kernel_invocation(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<KernelResult, ProviderExecutionError> {
+        self.kernel_executions
+            .lock()
+            .unwrap()
+            .remove(&handle.id)
+            .ok_or_else(|| {
+                ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::ExecutionFailed,
+                    ProviderExecutionPhase::Complete,
+                    handle.provider.clone(),
+                    handle.device.clone(),
+                    "no Kernel execution is associated with this handle: it was never \
+                     submitted through submit_kernel_invocation, or has already been \
+                     completed once",
+                )
+            })
     }
 
     /// Executes one Runtime-created [`KernelInvocation`] against this
@@ -1789,6 +2109,25 @@ impl ReferenceCpuExecutor {
                 )
                 .map_err(KernelError::from)?
             }
+            // Genuinely multi-output (task 5.4/5.5): returns early, storing
+            // both outputs itself, rather than falling into the shared
+            // single-output tail below (`store_output(invocation, 0, ..)`)
+            // every other arm relies on.
+            "split" => {
+                let input = self.input_tensor(invocation, 0)?;
+                let (left, right) = split_last_dim_in_half(&input).map_err(KernelError::from)?;
+                let left_descriptor = self.store_output(invocation, 0, left)?;
+                let right_descriptor = self.store_output(invocation, 1, right)?;
+                result
+                    .output_readiness
+                    .insert(left_descriptor.id.to_string(), true);
+                result
+                    .output_readiness
+                    .insert(right_descriptor.id.to_string(), true);
+                result.updated_resources.push(left_descriptor);
+                result.updated_resources.push(right_descriptor);
+                return Ok(result);
+            }
             "quantize" | "dequantize" => return Err(dequantize_placeholder().into()),
             other => {
                 return Err(KernelError::KernelNotFound {
@@ -1816,7 +2155,10 @@ impl ProviderExecutionApi for ReferenceCpuExecutor {
             request.provider.clone(),
             request.device.clone(),
         );
-        self.submitted.lock().unwrap().push(request);
+        self.submitted
+            .lock()
+            .unwrap()
+            .insert(handle.id.clone(), request);
         Ok(handle)
     }
 
@@ -1824,6 +2166,16 @@ impl ProviderExecutionApi for ReferenceCpuExecutor {
         &self,
         handle: &ProviderExecutionHandle,
     ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+        if !self.submitted.lock().unwrap().contains_key(&handle.id) {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::ExecutionFailed,
+                ProviderExecutionPhase::Observe,
+                handle.provider.clone(),
+                handle.device.clone(),
+                "no submission is associated with this handle: it was never submitted, \
+                 or has already been completed and released",
+            ));
+        }
         Ok(ProviderExecutionStatus::new(
             handle.clone(),
             SchedulingState::Completed,
@@ -1841,14 +2193,116 @@ impl ProviderExecutionApi for ReferenceCpuExecutor {
         &self,
         handle: &ProviderExecutionHandle,
     ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        // Single consumption: a handle's submission is removed the first
+        // time it is completed, so a second `complete()` call on the same
+        // handle -- or a handle that was never `submit()`-ted -- is
+        // rejected rather than silently echoed back as evidence of work
+        // that never causally happened.
+        self.submitted
+            .lock()
+            .unwrap()
+            .remove(&handle.id)
+            .ok_or_else(|| {
+                ProviderExecutionError::new(
+                    ProviderExecutionErrorCode::ExecutionFailed,
+                    ProviderExecutionPhase::Complete,
+                    handle.provider.clone(),
+                    handle.device.clone(),
+                    "no submission is associated with this handle: it was never \
+                     submitted, or has already been completed once",
+                )
+            })?;
         Ok(ProviderExecutionResult::completed(
             handle.clone(),
             Vec::new(),
         ))
     }
 
-    fn release(&self, _handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+    fn release(&self, handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+        self.submitted.lock().unwrap().remove(&handle.id);
         Ok(())
+    }
+
+    fn submit_kernel(
+        &self,
+        advertisement: &KernelAdvertisement,
+        operator: &OperatorSpec,
+        invocation: &KernelInvocation,
+        memory: &mut MemoryManager,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        Ok(self.submit_kernel_invocation(advertisement, operator, invocation, memory))
+    }
+
+    fn complete_kernel(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<KernelResult, ProviderExecutionError> {
+        self.complete_kernel_invocation(handle)
+    }
+
+    fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) {
+        ReferenceCpuExecutor::write_tensor(self, id, tensor)
+    }
+
+    fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
+        ReferenceCpuExecutor::read_tensor(self, id)
+    }
+
+    fn release_tensor(&self, id: &TensorResourceId) -> bool {
+        ReferenceCpuExecutor::release_tensor(self, id)
+    }
+
+    fn release_admitted_tensor(&self, memory: &mut MemoryManager, id: &TensorResourceId) -> bool {
+        ReferenceCpuExecutor::release_admitted_tensor(self, memory, id)
+    }
+
+    fn write_tensor_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        resource_id: TensorResourceId,
+        tensor: HostTensor,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), MemoryError> {
+        ReferenceCpuExecutor::write_tensor_admitted(self, memory, resource_id, tensor, class, owner)
+    }
+
+    fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
+        ReferenceCpuExecutor::read_tensor_value(self, id)
+    }
+
+    fn write_tensor_value(&self, id: TensorResourceId, value: TensorValue) {
+        ReferenceCpuExecutor::write_tensor_value(self, id, value)
+    }
+
+    fn write_tensor_value_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        resource_id: TensorResourceId,
+        value: TensorValue,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), MemoryError> {
+        ReferenceCpuExecutor::write_tensor_value_admitted(
+            self,
+            memory,
+            resource_id,
+            value,
+            class,
+            owner,
+        )
+    }
+
+    fn allocate_workspace(
+        &self,
+        memory: &mut MemoryManager,
+        size_bytes: u64,
+    ) -> Result<MemoryAllocationId, MemoryError> {
+        ReferenceCpuExecutor::allocate_workspace(self, memory, size_bytes)
+    }
+
+    fn observations(&self) -> Vec<KernelObservation> {
+        ReferenceCpuExecutor::observations(self)
     }
 }
 
@@ -1962,8 +2416,8 @@ impl Provider for ReferenceCpuProvider {
         Ok(())
     }
 
-    fn execution_api(&self) -> Option<&dyn ProviderExecutionApi> {
-        Some(self.executor.as_ref())
+    fn execution_api(&self) -> Option<Arc<dyn ProviderExecutionApi>> {
+        Some(self.executor.clone())
     }
 }
 

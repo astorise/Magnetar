@@ -10,10 +10,11 @@
 use crate::{
     AdapterSetId, CorrelationId, DeviceBinding, GenerationModelReference, InferenceSessionId,
     KernelAutotuningPolicy, KernelId, KernelPerformanceFeedbackMode, KvCacheId, LoadedModelContext,
-    MemoryAllocationId, MemoryPressureLevel, ModelArchitectureImplementation, ModelArtifactId,
-    ModelDType, ModelResidencyId, PrefixCacheEntryId, ProviderAdmissionDecision, ProviderBinding,
-    ProviderHealthState, ProviderPressureLevel, ProviderReadinessState, ResourceAffinity,
-    TensorResourceId, TokenizerId, reproducible_mode_blocks_adaptation,
+    MemoryAllocationId, MemoryPressureLevel, ModelArchitecture, ModelArchitectureImplementation,
+    ModelArtifactId, ModelDType, ModelDigest, ModelResidencyId, PrefixCacheEntryId,
+    ProviderAdmissionDecision, ProviderBinding, ProviderHealthState, ProviderPressureLevel,
+    ProviderReadinessState, ResourceAffinity, TensorResourceId, TokenizerId,
+    reproducible_mode_blocks_adaptation,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -70,6 +71,16 @@ impl ModelInstanceLifecycleState {
             self,
             Self::Unloaded | Self::Failed | Self::Invalid | Self::Removed
         )
+    }
+
+    /// Whether this lifecycle state legitimately permits accepting
+    /// inference usage. `readiness == Ready` alone SHALL NOT be trusted as
+    /// sufficient (Correctif: Runtime-owned ModelInstance readiness
+    /// authority) -- a caller-forged or internally inconsistent
+    /// `readiness` value must not grant usage while the instance's own
+    /// lifecycle has not actually reached one of these states.
+    pub const fn supports_inference_use(self) -> bool {
+        matches!(self, Self::Ready | Self::Idle | Self::Active)
     }
 
     pub const fn allows_transition_to(self, next: Self) -> bool {
@@ -309,6 +320,16 @@ pub struct ModelInstanceReadinessChecks {
     /// SHALL set this to the actual completion state when policy requires
     /// tuning (see [`crate::model_instance_autotuning_ready`]).
     pub autotuning_ready: bool,
+    /// Whether this Model Instance's declared weights were successfully
+    /// materialized into Provider-owned Tensor Resources
+    /// (`model-loading-materializes-weight-resources`: "Model Instance
+    /// Readiness" SHALL consider weight materialization state, alongside
+    /// residency/Provider/Device/adapter/memory-pressure/policy/architecture
+    /// readiness). Defaults to `true` so a Model Instance whose caller never
+    /// materializes weights through the generic phase (or has none to
+    /// materialize) is unaffected; a caller that does materialize weights
+    /// SHALL set this from the real success/failure outcome.
+    pub weights_materialized: bool,
 }
 
 impl Default for ModelInstanceReadinessChecks {
@@ -323,6 +344,7 @@ impl Default for ModelInstanceReadinessChecks {
             browser_supported: true,
             kernel_preparation_ready: true,
             autotuning_ready: true,
+            weights_materialized: true,
         }
     }
 }
@@ -335,6 +357,7 @@ impl ModelInstanceReadinessChecks {
             || !self.runtime_policy_allows
             || !self.kernel_preparation_ready
             || !self.autotuning_ready
+            || !self.weights_materialized
         {
             return ModelInstanceReadiness::Failed;
         }
@@ -370,6 +393,9 @@ impl ModelInstanceReadinessChecks {
         }
         if !self.autotuning_ready {
             return Err(ModelInstanceError::ModelInstanceAutotuningIncomplete);
+        }
+        if !self.weights_materialized {
+            return Err(ModelInstanceError::ModelInstanceWeightsNotMaterialized);
         }
         if matches!(
             self.memory_pressure,
@@ -468,6 +494,16 @@ pub struct ProviderModelResource {
     pub release_required: bool,
 }
 
+/// `pub(crate)` fields, not `pub`: the only legitimate way to bind a
+/// weight resource is the one authorized weight-materialization
+/// transaction (`WeightMaterializationTransaction::commit` in
+/// `first_native_runtime.rs`) committing successfully
+/// (`bind-model-loading-evidence-to-validated-artifact`, closing a gap an
+/// external audit of PR #36 found concretely: this crate's own
+/// `contract_tests` helper was directly inserting into `weights` and
+/// `memory_allocations` by hand). Public read-only accessors are added
+/// only if a real external caller needs to inspect a binding after
+/// `warm_model_instance` succeeds; none is known to today.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ModelInstanceResourceBindings {
     /// Canonical model tensor name (matching `ModelManifest`'s declared
@@ -475,10 +511,46 @@ pub struct ModelInstanceResourceBindings {
     /// during model loading, so graph execution can look weights up by name
     /// through this Model Instance rather than a private side-channel
     /// keeping its own copy of tensor bytes.
-    pub weights: BTreeMap<String, TensorResourceId>,
-    pub memory_allocations: BTreeSet<MemoryAllocationId>,
-    pub released_memory_allocations: BTreeSet<MemoryAllocationId>,
-    pub released_provider_resources: BTreeSet<ProviderBinding>,
+    pub(crate) weights: BTreeMap<String, TensorResourceId>,
+    pub(crate) memory_allocations: BTreeSet<MemoryAllocationId>,
+    pub(crate) released_memory_allocations: BTreeSet<MemoryAllocationId>,
+    pub(crate) released_provider_resources: BTreeSet<ProviderBinding>,
+}
+
+/// Runtime-issued proof that a specific Model Instance's weight resources
+/// were bound by the one authorized weight-materialization transaction
+/// (`WeightMaterializationTransaction::commit` in `first_native_runtime.rs`),
+/// not assembled by hand from otherwise-public Memory Manager/Provider
+/// primitives. Not constructible or settable by an external caller --
+/// see `bind-model-loading-evidence-to-validated-artifact`'s design.md for
+/// why this lives as a separate Runtime-owned record keyed by
+/// `ModelInstanceId`, rather than a field on `ModelInstance`/
+/// `ModelInstanceDefinition`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializationEvidence {
+    artifact: ModelArtifactId,
+    resources: BTreeSet<TensorResourceId>,
+}
+
+impl MaterializationEvidence {
+    pub(crate) fn new(artifact: ModelArtifactId, resources: BTreeSet<TensorResourceId>) -> Self {
+        Self {
+            artifact,
+            resources,
+        }
+    }
+
+    /// True only if this evidence was minted for `artifact` and the exact
+    /// resource set `bound` -- both the instance's own declared artifact
+    /// and its exact currently-bound weight resources, so evidence minted
+    /// for a different instance or a stale binding set does not match.
+    pub(crate) fn matches(
+        &self,
+        artifact: &ModelArtifactId,
+        bound: &BTreeSet<TensorResourceId>,
+    ) -> bool {
+        &self.artifact == artifact && &self.resources == bound
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -506,8 +578,28 @@ impl ModelInstancePlacement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInstanceDefinition {
-    pub artifact: ModelArtifactId,
-    pub architecture: ModelArchitectureImplementation,
+    /// `pub(crate)`, not `pub`: this is Runtime-issued identity, derived
+    /// only by `from_loaded_context` from an actual `ModelLoadingCoordinator::
+    /// load()` result -- not something an external caller should be able
+    /// to reassign after obtaining a definition (whether freshly derived
+    /// or `.clone()`d from an existing, already-`Ready` instance's
+    /// `definition()`). A ninth audit of PR #36 found reassigning this
+    /// field on a cloned definition, then passing the clone to the public
+    /// `ModelInstanceManager::create`, let a caller publish a *new*
+    /// instance declaring a different `ModelArtifactId` than any Model
+    /// Loading ever actually validated -- while `create`'s round-8 fix
+    /// (resetting `resource_bindings`) correctly stopped the clone from
+    /// inheriting *resources*, it did not stop the clone from inheriting
+    /// (or the caller from rewriting) *identity*. `Clone` copies this
+    /// field regardless of its own visibility (same reasoning as
+    /// `resource_bindings`'s sealing), so the fix here is field-level:
+    /// sealing stops the reassignment itself, which is what actually
+    /// matters, not merely the specific `create()` call site the audit
+    /// happened to demonstrate it through.
+    pub(crate) artifact: ModelArtifactId,
+    /// `pub(crate)` for the same reason as `artifact`: Runtime-issued
+    /// identity, not externally reassignable after the fact.
+    pub(crate) architecture: ModelArchitectureImplementation,
     pub residencies: BTreeSet<ModelResidencyId>,
     pub tokenizer: Option<TokenizerId>,
     pub placement: ModelInstancePlacement,
@@ -519,7 +611,14 @@ pub struct ModelInstanceDefinition {
     pub mutation_version: u64,
     pub tenant: Option<String>,
     pub owner: Option<String>,
-    pub resource_bindings: ModelInstanceResourceBindings,
+    /// `pub(crate)`, not `pub`: sealing only `ModelInstanceResourceBindings`'s
+    /// own fields is not enough on its own -- an external caller could
+    /// still replace this whole field with another instance's (already
+    /// legitimately bound) bindings via a plain assignment (`Clone` does
+    /// not require field visibility), which is exactly the audit's
+    /// "materialization evidence reused for a different instance/artifact"
+    /// scenario. See `bind-model-loading-evidence-to-validated-artifact`.
+    pub(crate) resource_bindings: ModelInstanceResourceBindings,
     /// Implements "Model Instance Kernel Policy"
     /// (`define-kernel-optimization-and-selection-policy`): "A Model
     /// Instance SHALL own or reference an explicit Kernel selection
@@ -527,10 +626,48 @@ pub struct ModelInstanceDefinition {
     /// full `KernelSelectionPolicy`, mirroring how `tokenizer` references a
     /// `TokenizerId`.
     pub kernel_selection_policy: Option<crate::kernel_selection_policy::KernelSelectionPolicyId>,
+    /// Tensor names the loaded `ModelManifest` declared as mandatory,
+    /// carried from `LoadedModelContext::required_weight_names`.
+    /// `pub(crate)`, not `pub`: this is Runtime-recorded evidence of what
+    /// the artifact actually requires, not something an external caller
+    /// should be able to redeclare after creation to make an incomplete
+    /// binding set appear complete. Empty means "unknown" (e.g. a
+    /// generically-constructed instance with no loaded manifest behind
+    /// it) -- readiness derivation falls back to its prior,
+    /// presence-only heuristic in that case rather than treating an
+    /// empty requirement as trivially satisfied by anything.
+    pub(crate) required_weight_names: BTreeSet<String>,
+    /// Per-tensor content digests the loaded `ModelManifest` declared,
+    /// carried from `LoadedModelContext::required_weight_digests`.
+    /// `pub(crate)` for the same reason as `required_weight_names`: not
+    /// something an external caller should be able to redeclare after
+    /// creation. Only tensors the artifact declared a digest for are
+    /// present as keys; a tensor absent here is unconstrained by content
+    /// verification, not treated as having empty/zero content
+    /// (`bind-materialized-weight-content-to-model-artifact-digests`).
+    pub(crate) required_weight_digests: BTreeMap<String, ModelDigest>,
+    /// Declared `(shape, storage_dtype)` per tensor name the loaded
+    /// `ModelManifest` declared, carried from
+    /// `LoadedModelContext::required_weight_shapes`. `pub(crate)` for the
+    /// same reason as `required_weight_digests`. Checked independently of
+    /// digest presence: a tensor with no declared digest (for example
+    /// because its dtype cannot yet be digested) is still constrained to
+    /// materialize as its declared shape and dtype
+    /// (`seal-runtime-model-trust-and-provenance-authority`).
+    pub(crate) required_weight_shapes: BTreeMap<String, (Vec<u64>, ModelDType)>,
 }
 
 impl ModelInstanceDefinition {
-    pub fn from_loaded_context(
+    /// `pub(crate)`, not `pub`: the only Runtime-sealed path to construct
+    /// and register a definition is `Runtime::create_model_instance`,
+    /// which cross-checks `architecture`/`affinity` against the loading
+    /// phase's own resolved values before ever calling this. A caller
+    /// with only `pub` access could otherwise build a definition here
+    /// with whatever architecture/affinity they chose and register it
+    /// directly via `ModelInstanceManager::create` (also sealed for the
+    /// same reason), bypassing those cross-checks entirely
+    /// (`seal-model-loading-and-instance-creation-primitives`).
+    pub(crate) fn from_loaded_context(
         context: &LoadedModelContext,
         architecture: ModelArchitectureImplementation,
         affinity: ResourceAffinity,
@@ -554,6 +691,9 @@ impl ModelInstanceDefinition {
             owner: None,
             resource_bindings: ModelInstanceResourceBindings::default(),
             kernel_selection_policy: None,
+            required_weight_names: context.required_weight_names.clone(),
+            required_weight_digests: context.required_weight_digests.clone(),
+            required_weight_shapes: context.required_weight_shapes.clone(),
         }
     }
 }
@@ -592,6 +732,11 @@ pub struct ModelInstanceInvalidationReport {
 pub struct ModelInstanceUnloadReport {
     pub invalidated: ModelInstanceInvalidationReport,
     pub released_memory_allocations: BTreeSet<MemoryAllocationId>,
+    /// Weight `TensorResourceId`s this unload SHALL also release from
+    /// Provider-owned storage, not merely from Memory Manager accounting
+    /// (`transactional-weight-materialization`'s "Unloading A Model
+    /// Instance Releases Its Provider-Owned Weight Storage" requirement).
+    pub released_weight_resources: BTreeSet<TensorResourceId>,
     pub released_provider_resources: BTreeSet<ProviderBinding>,
     pub dangling_session_references: bool,
 }
@@ -606,13 +751,98 @@ pub struct ModelInstanceReloadRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelInstance {
     pub id: ModelInstanceId,
-    pub lifecycle: ModelInstanceLifecycleState,
-    pub readiness: ModelInstanceReadiness,
-    pub definition: ModelInstanceDefinition,
+    // `lifecycle`/`readiness` are intentionally `pub(crate)`, not `pub`: an
+    // external caller with `&mut ModelInstance` (obtainable via the
+    // already-public `Runtime::model_instances_mut()`/`instance_mut()`)
+    // SHALL NOT be able to forge `Ready` by direct field assignment, only
+    // through the Runtime-controlled paths that verify real evidence first
+    // (Correctif: Runtime-owned ModelInstance readiness authority, closing
+    // the public mutable field gap an external audit of PR #36 found still
+    // open after `mark_ready`/`transition_to`/`warmup` were sealed).
+    // `pub(crate)` (rather than fully private) is what a real embedder's
+    // dependency on this crate cannot see or write, while still letting
+    // this crate's own test suite construct otherwise-unreachable states
+    // to prove defense-in-depth checks (e.g. the `acquire_usage`/
+    // `generation_reference` lifecycle+readiness safety net) hold even if
+    // some future internal bug were to reintroduce an inconsistency.
+    pub(crate) lifecycle: ModelInstanceLifecycleState,
+    pub(crate) readiness: ModelInstanceReadiness,
+    // `pub(crate)`, not `pub`: an external caller with `&mut ModelInstance`
+    // SHALL NOT be able to silently mutate Runtime-owned semantic state
+    // (artifact identity, architecture, placement, policy, tokenizer, ...)
+    // on an already-`Ready` instance by raw field assignment, nor carry an
+    // existing instance's `definition` -- including its already-sealed
+    // `resource_bindings`, which `Clone` copies regardless of field
+    // visibility -- into a *different* instance via `.clone()` +
+    // `ModelInstanceManager::create()`/`reload()` (a further audit of PR
+    // #36 found both: direct post-`Ready` mutation went unnoticed by
+    // `acquire_usage`/`generation_reference`, which only check
+    // lifecycle/readiness, not whether the definition still matches what
+    // was evidenced; and a cloned definition's weight bindings could be
+    // "adopted" by an empty `materialize_model_instance_weights` call on
+    // the new instance, aliasing live Provider resources across two
+    // instances). Read-only public accessor below; the real fix for the
+    // clone-and-create path is `ModelInstanceManager::create` resetting
+    // `resource_bindings` unconditionally, not this field's visibility
+    // alone -- see its own doc comment.
+    pub(crate) definition: ModelInstanceDefinition,
     pub last_error: Option<ModelInstanceError>,
 }
 
 impl ModelInstance {
+    /// Current lifecycle state. Read-only: see the struct-level doc comment
+    /// for why `lifecycle` is not a public field.
+    pub const fn lifecycle(&self) -> ModelInstanceLifecycleState {
+        self.lifecycle
+    }
+
+    /// This instance's Runtime-owned semantic definition (artifact,
+    /// architecture, placement, policy, tokenizer, usage, ...). Read-only:
+    /// see the struct-level doc comment for why `definition` is not a
+    /// public mutable field.
+    pub const fn definition(&self) -> &ModelInstanceDefinition {
+        &self.definition
+    }
+
+    /// Records a Provider-owned resource handle for cleanup accounting on
+    /// unload (`ModelInstanceUnloadReport::released_provider_resources`).
+    /// Deliberately narrow: unlike the rest of `placement`, `provider_
+    /// resource` drives only this bookkeeping -- never readiness,
+    /// generation, or Provider/Device resolution (execution resolves
+    /// Providers through `resource_bindings`/`TensorResidency`, not this
+    /// field) -- so setting it after `Ready` cannot be used to silently
+    /// redirect what artifact, weights, or Provider an instance actually
+    /// executes against.
+    pub fn set_provider_resource(&mut self, resource: Option<ProviderModelResource>) {
+        self.definition.placement.provider_resource = resource;
+    }
+
+    /// Tracks an additional Memory Manager allocation against this
+    /// instance's resource bindings, for allocations outside the weight-
+    /// materialization transaction's scope (e.g. an adapter or workspace
+    /// allocation a caller manages directly). Deliberately narrow: this
+    /// does not touch `weights` or materialization evidence, so it cannot
+    /// be used to forge `weights_materialized` readiness -- see
+    /// `bind-model-loading-evidence-to-validated-artifact`'s design.md.
+    /// Only reachable post-creation, on this specific instance -- not a way
+    /// to pre-populate a definition before `ModelInstanceManager::create`,
+    /// which resets `resource_bindings` unconditionally regardless of what
+    /// the supplied definition carried (a further audit of PR #36 found a
+    /// caller could otherwise clone another instance's already-populated
+    /// bindings into a new one).
+    pub fn track_memory_allocation(&mut self, allocation: MemoryAllocationId) {
+        self.definition
+            .resource_bindings
+            .memory_allocations
+            .insert(allocation);
+    }
+
+    /// Current readiness state. Read-only: see the struct-level doc comment
+    /// for why `readiness` is not a public field.
+    pub const fn readiness(&self) -> ModelInstanceReadiness {
+        self.readiness
+    }
+
     pub fn new(id: ModelInstanceId, definition: ModelInstanceDefinition) -> Self {
         Self {
             id,
@@ -623,7 +853,14 @@ impl ModelInstance {
         }
     }
 
-    pub fn transition_to(
+    /// Crate-internal only: a raw lifecycle transition with no readiness
+    /// evidence check. Public callers reach lifecycle changes only through
+    /// the business methods below (`suspend`, `resume`, `drain`, `unload`,
+    /// ...) or, for `Ready` specifically, through
+    /// `crate::inference_api::warm_model_instance` -- never through this
+    /// primitive directly (Correctif: Runtime-owned ModelInstance readiness
+    /// authority).
+    pub(crate) fn transition_to(
         &mut self,
         next: ModelInstanceLifecycleState,
     ) -> Result<(), ModelInstanceError> {
@@ -638,7 +875,16 @@ impl ModelInstance {
         Ok(())
     }
 
-    pub fn mark_ready(&mut self) -> Result<(), ModelInstanceError> {
+    /// Crate-internal only. Transitions straight to `Ready` with no
+    /// evidence check of its own -- callers of this method are themselves
+    /// responsible for having already verified real readiness (the
+    /// materialization transaction's `commit`, or `warmup`'s own
+    /// Runtime-derived checks). A caller outside this crate cannot reach
+    /// this method at all (Correctif: Runtime-owned ModelInstance readiness
+    /// authority; this was previously `pub` and directly callable via
+    /// `Runtime::model_instances_mut()`, the exact bypass an external audit
+    /// of PR #36 demonstrated).
+    pub(crate) fn mark_ready(&mut self) -> Result<(), ModelInstanceError> {
         match self.lifecycle {
             ModelInstanceLifecycleState::Creating => {
                 self.transition_to(ModelInstanceLifecycleState::Loading)?;
@@ -664,14 +910,39 @@ impl ModelInstance {
         checks: &ModelInstanceReadinessChecks,
     ) -> Result<(), ModelInstanceError> {
         let result = checks.validate();
-        self.readiness = checks.readiness();
+        let computed = checks.readiness();
+        // `Ready` readiness is only meaningful once the lifecycle itself
+        // has actually reached (or is transitioning through, e.g.
+        // `Warming`) a state that legitimately allows inference use --
+        // otherwise this would publish `Ready` readiness on an instance
+        // still sitting in `Creating`/`Loading`, the exact
+        // lifecycle/readiness inconsistency `WarmupPolicy::Disabled`
+        // could previously produce by calling this method without ever
+        // transitioning the lifecycle (Correctif: Runtime-owned
+        // ModelInstance readiness authority).
+        self.readiness = if computed == ModelInstanceReadiness::Ready
+            && !self.lifecycle.supports_inference_use()
+            && self.lifecycle != ModelInstanceLifecycleState::Warming
+        {
+            ModelInstanceReadiness::NotReady
+        } else {
+            computed
+        };
         if result.is_err() {
             self.last_error = result.clone().err();
         }
         result
     }
 
-    pub fn warmup(
+    /// Crate-internal only: `checks` here are trusted as-is, with no
+    /// Runtime-side derivation of their own. The public entry point is
+    /// `crate::inference_api::warm_model_instance`, which derives the
+    /// Runtime-observable facts before calling this (Correctif:
+    /// Runtime-owned ModelInstance readiness authority; a direct external
+    /// call to this method, bypassing that derivation, was the exact
+    /// second bypass an external audit of PR #36 demonstrated alongside
+    /// `mark_ready`).
+    pub(crate) fn warmup(
         &mut self,
         plan: &ModelInstanceWarmupPlan,
         checks: &ModelInstanceReadinessChecks,
@@ -708,7 +979,12 @@ impl ModelInstance {
     }
 
     pub fn acquire_usage(&mut self, now_millis: u64) -> Result<(), ModelInstanceError> {
-        if !self.readiness.accepts_generation() {
+        // Both conditions are required, not just readiness: a lifecycle
+        // that has not actually reached a usable state must reject usage
+        // even if `readiness` was somehow (forged, or left inconsistent by
+        // a caller-driven readiness update) reported as `Ready`
+        // (Correctif: Runtime-owned ModelInstance readiness authority).
+        if !self.lifecycle.supports_inference_use() || !self.readiness.accepts_generation() {
             return Err(readiness_error(self.lifecycle, self.readiness));
         }
         self.definition.usage.active_operation_count = self
@@ -828,10 +1104,21 @@ impl ModelInstance {
         }
     }
 
+    /// Transitions `Suspended -> Loading` only. Reaching `Ready` from
+    /// there requires fresh Runtime-derived readiness evidence -- the
+    /// state that made this instance eligible for suspension (Provider,
+    /// Device, weight materialization) may have changed while it was
+    /// suspended, so resuming SHALL NOT jump straight back to `Ready`
+    /// without revalidation. `crate::inference_api::resume_model_instance`
+    /// performs that revalidation after calling this (Correctif:
+    /// Runtime-owned ModelInstance readiness authority, round 3 -- this
+    /// method used to transition all the way to `Ready` itself, an
+    /// external audit of PR #36 found it was still a direct bypass of
+    /// `warm_model_instance`'s derivation even after `mark_ready`/
+    /// `transition_to`/`warmup` were sealed).
     pub fn resume(&mut self) -> Result<(), ModelInstanceError> {
         if self.lifecycle == ModelInstanceLifecycleState::Suspended {
-            self.transition_to(ModelInstanceLifecycleState::Loading)?;
-            self.transition_to(ModelInstanceLifecycleState::Ready)
+            self.transition_to(ModelInstanceLifecycleState::Loading)
         } else {
             Err(ModelInstanceError::ModelInstanceNotReady)
         }
@@ -1026,6 +1313,7 @@ pub struct ModelInstanceManager {
     next_id: u64,
     instances: BTreeMap<ModelInstanceId, ModelInstance>,
     observations: Vec<ModelInstanceObservation>,
+    materialization_evidence: BTreeMap<ModelInstanceId, MaterializationEvidence>,
 }
 
 impl ModelInstanceManager {
@@ -1034,7 +1322,38 @@ impl ModelInstanceManager {
             next_id: 1,
             instances: BTreeMap::new(),
             observations: Vec::new(),
+            materialization_evidence: BTreeMap::new(),
         }
+    }
+
+    /// Mints (or replaces) `instance`'s materialization evidence. Called
+    /// only by `WeightMaterializationTransaction::commit`
+    /// (`first_native_runtime.rs`) once every weight in an attempt has
+    /// staged successfully.
+    pub(crate) fn record_materialization_evidence(
+        &mut self,
+        instance: &ModelInstanceId,
+        evidence: MaterializationEvidence,
+    ) {
+        self.materialization_evidence
+            .insert(instance.clone(), evidence);
+    }
+
+    /// `instance`'s current materialization evidence, if any. Used by
+    /// `derive_effective_readiness_checks` (`inference_api.rs`) to derive
+    /// `weights_materialized`.
+    pub(crate) fn materialization_evidence(
+        &self,
+        instance: &ModelInstanceId,
+    ) -> Option<&MaterializationEvidence> {
+        self.materialization_evidence.get(instance)
+    }
+
+    /// Clears `instance`'s materialization evidence, if any. Called on
+    /// unload and on a failed materialization attempt's rollback, mirroring
+    /// `TensorResidency` cleanup (`invalidate-tensor-residency-on-release`).
+    pub(crate) fn clear_materialization_evidence(&mut self, instance: &ModelInstanceId) {
+        self.materialization_evidence.remove(instance);
     }
 
     pub fn instances(&self) -> impl Iterator<Item = &ModelInstance> {
@@ -1060,9 +1379,14 @@ impl ModelInstanceManager {
             .ok_or(ModelInstanceError::ModelInstanceNotFound)
     }
 
-    pub fn create(
+    /// `pub(crate)`, not `pub`: see `ModelInstanceDefinition::
+    /// from_loaded_context`'s doc comment -- the two are sealed together,
+    /// since either one alone being `pub` would still let a caller
+    /// bypass `Runtime::create_model_instance`'s cross-checks
+    /// (`seal-model-loading-and-instance-creation-primitives`).
+    pub(crate) fn create(
         &mut self,
-        definition: ModelInstanceDefinition,
+        mut definition: ModelInstanceDefinition,
     ) -> Result<ModelInstanceId, ModelInstanceError> {
         definition
             .policy
@@ -1074,6 +1398,20 @@ impl ModelInstanceManager {
         if definition.residencies.is_empty() {
             return Err(ModelInstanceError::ModelInstanceResidencyMissing);
         }
+        // A newly created instance SHALL start with no weight resource
+        // bindings, regardless of what the caller-supplied `definition`
+        // carried -- `ModelInstanceDefinition` is `Clone`, and `Clone`
+        // copies `resource_bindings` (and every other field) regardless of
+        // their own visibility, so field-sealing `resource_bindings` alone
+        // does not stop a caller from cloning an already-`Ready`
+        // instance's definition and passing it here (directly, or via
+        // `reload`, which also calls `create`) to fabricate a *new*
+        // instance that already appears materialized -- for real Provider
+        // resources still owned by the original instance. Only this
+        // instance's own future `WeightMaterializationTransaction::commit`
+        // calls may populate these fields again (a further audit of PR
+        // #36 found this exact cross-instance resource-aliasing path).
+        definition.resource_bindings = ModelInstanceResourceBindings::default();
         let id = ModelInstanceId::runtime_issued(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
         self.observe(
@@ -1084,7 +1422,6 @@ impl ModelInstanceManager {
         );
         let mut instance = ModelInstance::new(id.clone(), definition);
         instance.transition_to(ModelInstanceLifecycleState::Loading)?;
-        instance.mark_ready()?;
         self.instances.insert(id.clone(), instance);
         self.observe(
             ModelInstanceObservationKind::Created,
@@ -1092,16 +1429,21 @@ impl ModelInstanceManager {
             "model instance created",
             None,
         );
-        self.observe(
-            ModelInstanceObservationKind::Ready,
-            Some(id.clone()),
-            "model instance ready",
-            None,
-        );
         Ok(id)
     }
 
-    pub fn create_checked(
+    /// `pub(crate)`, not `pub`: same reasoning as `Self::create` -- this
+    /// is a second, equally-unsealed path to the same bypass had it
+    /// stayed `pub` (confirmed zero non-test callers anywhere in the
+    /// crate before sealing;
+    /// `seal-model-loading-and-instance-creation-primitives`). `#[cfg(test)]`
+    /// because sealing it also confirmed zero *production* callers exist
+    /// yet -- `Runtime::create_model_instance` never surfaces an explicit
+    /// `ModelInstanceCreationChecks` parameter -- so it is genuinely
+    /// test-only today, not merely unused; remove the gate if a real
+    /// caller is added.
+    #[cfg(test)]
+    pub(crate) fn create_checked(
         &mut self,
         definition: ModelInstanceDefinition,
         checks: &ModelInstanceCreationChecks,
@@ -1110,7 +1452,38 @@ impl ModelInstanceManager {
         self.create(definition)
     }
 
-    pub fn warmup(
+    /// Transitions a Model Instance from `Loading` (or `Warming`) to
+    /// `Ready`, mirroring [`Self::warmup`]'s exact pattern: call into the
+    /// individual instance's own state-machine method, then emit the
+    /// matching observation based on the real outcome. `create()` no
+    /// longer reaches `Ready` on its own -- a caller with a readiness
+    /// condition to satisfy first (weight materialization, warmup, or any
+    /// other mandatory readiness check) SHALL call this only after that
+    /// condition genuinely holds, per `model-instance`'s "Model Instance
+    /// Creation" requirement (creation alone SHALL NOT produce a Ready
+    /// instance).
+    /// Crate-internal only -- see `ModelInstance::mark_ready` above.
+    pub(crate) fn mark_ready(&mut self, id: &ModelInstanceId) -> Result<(), ModelInstanceError> {
+        let result = self.instance_mut(id)?.mark_ready();
+        self.observe(
+            if result.is_ok() {
+                ModelInstanceObservationKind::Ready
+            } else {
+                ModelInstanceObservationKind::Failed
+            },
+            Some(id.clone()),
+            if result.is_ok() {
+                "model instance ready"
+            } else {
+                "model instance mark-ready failed"
+            },
+            None,
+        );
+        result
+    }
+
+    /// Crate-internal only -- see `ModelInstance::warmup` above.
+    pub(crate) fn warmup(
         &mut self,
         id: &ModelInstanceId,
         plan: &ModelInstanceWarmupPlan,
@@ -1165,7 +1538,8 @@ impl ModelInstanceManager {
         id: &ModelInstanceId,
     ) -> Result<GenerationModelReference, ModelInstanceError> {
         let instance = self.instance(id)?;
-        if !instance.readiness.accepts_generation() {
+        if !instance.lifecycle.supports_inference_use() || !instance.readiness.accepts_generation()
+        {
             return Err(readiness_error(instance.lifecycle, instance.readiness));
         }
         Ok(GenerationModelReference::ModelInstance(id.clone()))
@@ -1315,6 +1689,20 @@ impl ModelInstanceManager {
             .resource_bindings
             .released_memory_allocations
             .extend(released_memory_allocations.iter().copied());
+        // `transactional-weight-materialization`: unload must release the
+        // Provider-owned weight Tensor Resources themselves, not only their
+        // Memory Manager allocation accounting -- otherwise Provider
+        // storage accumulates orphaned weight tensors across every
+        // load/unload cycle even though the Memory Manager ledger looks
+        // clean.
+        let released_weight_resources: BTreeSet<TensorResourceId> = instance
+            .definition
+            .resource_bindings
+            .weights
+            .values()
+            .cloned()
+            .collect();
+        instance.definition.resource_bindings.weights.clear();
         let released_provider_resources = instance
             .definition
             .placement
@@ -1331,6 +1719,7 @@ impl ModelInstanceManager {
         Ok(ModelInstanceUnloadReport {
             invalidated,
             released_memory_allocations,
+            released_weight_resources,
             released_provider_resources,
             dangling_session_references: false,
         })
@@ -1406,12 +1795,26 @@ pub enum ModelInstanceError {
     ModelInstanceAdapterIncompatible,
     ModelInstanceKernelPreparationFailed,
     ModelInstanceAutotuningIncomplete,
+    ModelInstanceWeightsNotMaterialized,
     ModelInstanceKvCacheInvalidated,
     ModelInstancePrefixCacheInvalidated,
     ModelInstanceBrowserFeatureUnsupported,
     InvalidLifecycleTransition {
         from: ModelInstanceLifecycleState,
         to: ModelInstanceLifecycleState,
+    },
+    /// The caller-supplied architecture implementation's architecture
+    /// identity disagrees with the one the loading phase already resolved
+    /// for this artifact (`seal-runtime-model-trust-and-provenance-authority`).
+    ArchitectureMismatch {
+        expected: ModelArchitecture,
+        actual: ModelArchitecture,
+    },
+    /// The caller-supplied Resource Affinity names a provider or device
+    /// that disagrees with one the loading phase already resolved for this
+    /// artifact (`seal-runtime-model-trust-and-provenance-authority`).
+    AffinityMismatch {
+        reason: String,
     },
     InternalModelInstance {
         reason: String,
@@ -1460,6 +1863,9 @@ impl fmt::Display for ModelInstanceError {
             Self::ModelInstanceAutotuningIncomplete => {
                 f.write_str("model instance required Kernel Autotuning incomplete")
             }
+            Self::ModelInstanceWeightsNotMaterialized => {
+                f.write_str("model instance weights not materialized")
+            }
             Self::ModelInstanceKvCacheInvalidated => {
                 f.write_str("model instance KV cache invalidated")
             }
@@ -1474,6 +1880,15 @@ impl fmt::Display for ModelInstanceError {
                     f,
                     "invalid model instance transition from {from:?} to {to:?}"
                 )
+            }
+            Self::ArchitectureMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "model instance architecture {actual:?} disagrees with the loaded artifact's resolved architecture {expected:?}"
+                )
+            }
+            Self::AffinityMismatch { reason } => {
+                write!(f, "model instance affinity mismatch: {reason}")
             }
             Self::InternalModelInstance { reason } => {
                 write!(f, "internal model instance: {reason}")

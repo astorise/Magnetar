@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # rust-toolchain.toml pins the toolchain and its components, so rustup
       # installs exactly that on first use. Installing a different version here
       # would download a toolchain that the toolchain file then overrides.
@@ -40,11 +40,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Check workspace
         run: cargo check --locked --workspace --all-targets --all-features
 
@@ -53,11 +53,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
@@ -70,11 +70,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Run tests
         run: cargo test --locked --workspace --all-targets
 
@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # The declared rust-version floor is only a real claim if something
       # builds against it, so this job deliberately overrides the pinned
       # toolchain instead of using rust-toolchain.toml.
@@ -93,7 +93,7 @@ jobs:
       - name: Install MSRV toolchain
         run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Check workspace against the declared MSRV
         run: cargo +${{ steps.msrv.outputs.version }} check --locked --workspace --all-features
 
@@ -102,9 +102,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install cargo-deny
-        uses: taiki-e/install-action@cargo-deny
+        uses: taiki-e/install-action@04aca1d9d6d82c63188ba3f33b7f820ea39a9197 # cargo-deny
       - name: Check advisories, bans, licenses and sources
         run: cargo deny --all-features check
 
@@ -113,11 +113,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Test Wasmtime Component Engine
         run: cargo test --locked -p magnetar-runtime --all-targets --features wasmtime-component-engine
 
@@ -126,13 +126,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Check wasm32 Component Runtime
         run: cargo check --locked -p magnetar-runtime --target wasm32-unknown-unknown --all-features
 
@@ -141,11 +141,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Run hardware-independent Provider conformance
         run: cargo test --locked -p magnetar-runtime provider_conformance -- --nocapture
 
@@ -154,11 +154,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Run First-Native Runtime Conformance (no GPU required)
         run: cargo test --locked -p magnetar-runtime first_native_runtime -- --nocapture
 
@@ -169,11 +169,11 @@ jobs:
       RUSTDOCFLAGS: -D warnings
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Build workspace documentation
         run: cargo doc --locked --workspace --no-deps
       - name: Build Wasmtime Component Engine documentation
@@ -184,9 +184,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install wasm-tools
-        uses: taiki-e/install-action@wasm-tools
+        uses: taiki-e/install-action@5bc80b59ba0c072ba9c9b28d94f1b8edd87f5138 # wasm-tools
       - name: Validate WIT packages
         shell: bash
         run: |
@@ -204,24 +204,232 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install OpenSpec
         run: npm install -g @fission-ai/openspec@1.2.0
       - name: Validate OpenSpec artifacts
         run: openspec validate --all --strict
+
+  # Model-family isolation (task group 12 / Correctif 9, task 12.7): the
+  # Provider/Kernel/Device/Memory/Tensor/Component contract files listed
+  # below are the generic Core magnetar-runtime itself depends on for every
+  # model family, not just Qwen -- they must never encode Qwen- or
+  # Llama-specific knowledge (a weight-name suffix table, a hardcoded KV
+  # namespace, an enum variant naming one model family by name). This is a
+  # narrower, explicit allowlist of files verified clean today, not "every
+  # file in magnetar-runtime": a broader sweep during this task found real,
+  # pre-existing qwen/llama mentions in conformance.rs, kernel_execution_plan.rs,
+  # provider_roadmap.rs, and other files outside this list (mostly test-fixture
+  # example strings, but conformance.rs's `QwenWasmModelComponent` enum
+  # variant is a genuine, real instance of the pattern this guard exists to
+  # catch) -- deliberately not fixed in this pass, real follow-up work, so
+  # this guard does not yet cover those files. `first_native_runtime.rs` and
+  # `qwen_model_component.rs` are the two files designated to legitimately
+  # carry Qwen-specific knowledge (see their own doc comments) and are never
+  # in scope for this guard.
+  model-family-isolation:
+    name: quality / model-family isolation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Reject model-family identifiers in generic Core modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='(qwen|llama|self_attn\.[a-z]+_proj|mlp\.(gate|up|down)_proj)'
+          modules=(
+            magnetar-runtime/src/affinity.rs
+            magnetar-runtime/src/capability.rs
+            magnetar-runtime/src/component.rs
+            magnetar-runtime/src/component_wasmtime.rs
+            magnetar-runtime/src/compute.rs
+            magnetar-runtime/src/device.rs
+            magnetar-runtime/src/execution_graph.rs
+            magnetar-runtime/src/graph_builder_capability.rs
+            magnetar-runtime/src/kernel.rs
+            magnetar-runtime/src/kernel_compilation.rs
+            magnetar-runtime/src/memory.rs
+            magnetar-runtime/src/operator.rs
+            magnetar-runtime/src/provider.rs
+            magnetar-runtime/src/reference_cpu.rs
+            magnetar-runtime/src/scheduler.rs
+            magnetar-runtime/src/tensor.rs
+          )
+          fail=0
+          for module in "${modules[@]}"; do
+            # Strip line comments first, so prose explaining genericness
+            # (e.g. "nothing here names Qwen or Llama") cannot itself trip
+            # the guard -- only live code is checked.
+            if sed -E 's#//.*$##' "$module" | grep -nEi "$pattern"; then
+              echo "::error file=$module::model-family identifier found in a designated generic Core module"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+  # Component integration (task 15.6): Component submodules only, sparse
+  # checkout. Split out from the single consolidated `submodule-integration`
+  # job below now that `components/qwen` is real (task group 11);
+  # `components/llama` remains a template and simply passes trivially until
+  # it has real content of its own.
+  component-integration:
+    name: quality / component integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout Component submodules
+        run: git submodule update --init -- components/qwen components/llama
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Build and test each Component crate independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manifest in \
+            components/qwen/Cargo.toml \
+            components/llama/Cargo.toml
+          do
+            echo "::group::$manifest"
+            cargo test --locked --manifest-path "$manifest"
+            echo "::endgroup::"
+          done
+
+  # Format integration (task 15.7): Format submodules only, sparse checkout.
+  # `cargo test` already runs each crate's malformed-input corpus regression
+  # suite (task 16.3); real `cargo-fuzz` execution stays a local/periodic
+  # activity, not a per-PR CI step, per `implement-model-format-parsers`'s
+  # own documented reasoning (nightly-toolchain requirement, and no
+  # sanitizer-runtime-equipped runner configured here).
+  format-integration:
+    name: quality / format integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout Format submodules
+        run: git submodule update --init -- formats/gguf formats/safetensors
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Build and test each Format crate independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manifest in \
+            formats/gguf/Cargo.toml \
+            formats/safetensors/Cargo.toml
+          do
+            echo "::group::$manifest"
+            cargo test --locked --manifest-path "$manifest"
+            echo "::endgroup::"
+          done
+
+  # Provider integration (task 15.8): Provider submodules only, sparse
+  # checkout. `providers/cpu` is real (task group 14) and mandatory here --
+  # a failure fails this job. `providers/cuda` remains an empty template
+  # with no CUDA toolchain or GPU on this runner; it is built/tested the
+  # same way for now (trivially passes as a template) with no hardware gate
+  # yet to apply, since there is nothing hardware-dependent in it yet --
+  # revisit this step (a real hardware/toolchain gate, or a dedicated
+  # GPU-equipped runner) once it has real CUDA content, per 15.8's own
+  # "CPU mandatory, CUDA optional/hardware-gated" wording.
+  provider-integration:
+    name: quality / provider integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout Provider submodules
+        run: git submodule update --init -- providers/cpu providers/cuda
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Build and test the mandatory CPU Provider
+        run: cargo test --locked --manifest-path providers/cpu/Cargo.toml
+      - name: Build and test the optional CUDA Provider (template today, no hardware gate needed yet)
+        run: cargo test --locked --manifest-path providers/cuda/Cargo.toml
+
+  # Full conformance (task 15.9): the original, unsplit job -- checks out
+  # every submodule via `submodules: recursive` and re-runs the same
+  # build/test loop across all six, as a single comprehensive gate
+  # alongside (not instead of) the three narrower tier jobs above. Some
+  # redundancy with those jobs is intentional: a tier job gives fast,
+  # scoped feedback when only one area changes, while this job proves the
+  # full submodule set still integrates together.
+  submodule-integration:
+    name: quality / submodule integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Build and test each submodule crate independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manifest in \
+            components/qwen/Cargo.toml \
+            components/llama/Cargo.toml \
+            formats/gguf/Cargo.toml \
+            formats/safetensors/Cargo.toml \
+            providers/cpu/Cargo.toml \
+            providers/cuda/Cargo.toml
+          do
+            echo "::group::$manifest"
+            cargo test --locked --manifest-path "$manifest"
+            echo "::endgroup::"
+          done
+      # `externalize-runtime-extension-modules`'s "Model Components,
+      # Providers, and Formats Are Externalized" requirement: the Core
+      # (magnetar-runtime) SHALL have zero compile-time dependency on any
+      # externalized Component/Provider/Format crate. Originally added
+      # narrower (`implement-model-format-parsers` task 5.1/5.2, covering
+      # only the two format crates, itself replacing reach-architecture-
+      # freeze-1 task 16.4's "trivially true, unverified by tooling" state);
+      # generalized here to every module following the established
+      # `magnetar-component-*`/`magnetar-format-*`/`magnetar-provider-*`
+      # naming convention (verified against all six submodules' own
+      # Cargo.toml `name` fields), so a new module added under that
+      # convention is covered automatically rather than needing this
+      # guard's pattern hand-updated every time.
+      - name: Verify magnetar-runtime has no externalized-module dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='magnetar-(component|format|provider)-'
+          if grep -qE "$pattern" magnetar-runtime/Cargo.toml; then
+            echo "::error file=magnetar-runtime/Cargo.toml::magnetar-runtime must not depend on an externalized Component/Provider/Format crate"
+            exit 1
+          fi
+          tree_output="$(cargo tree --manifest-path magnetar-runtime/Cargo.toml --all-features)"
+          if grep -qE "$pattern" <<< "$tree_output"; then
+            echo "::error file=magnetar-runtime/Cargo.toml::magnetar-runtime's resolved dependency graph includes an externalized Component/Provider/Format crate"
+            exit 1
+          fi
 
   coverage:
     name: quality / coverage
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@b1d53d4d726d74b5a950a5b3798a3c6ede4e0f64 # cargo-llvm-cov
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Prepare coverage output
         run: mkdir -p target/llvm-cov
       - name: Generate coverage
@@ -241,7 +449,7 @@ jobs:
         run: cargo run --manifest-path tools/coverage-ratchet/Cargo.toml -- --summary target/llvm-cov/coverage.json quality/coverage-baseline.json >> "$GITHUB_STEP_SUMMARY"
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage
           path: target/llvm-cov/

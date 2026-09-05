@@ -27,6 +27,42 @@ const BOUNDED_LOOP_COMPONENT: &str =
     include_str!("../../fixtures/components/bounded-loop.component.wat");
 const QWEN_GRAPH_COMPONENT: &str =
     include_str!("../../fixtures/components/qwen-graph.component.wat");
+const CAPABILITY_ECHO_COMPONENT: &str =
+    include_str!("../../fixtures/components/capability-echo.component.wat");
+/// The first real, minimal Qwen Model Component (task 11.4,
+/// `model-component-graph-contract`): a compiled `magnetar-component-Qwen`
+/// (the `components/qwen` submodule) Component binary, built via
+/// `cargo build --target wasm32-unknown-unknown --release` then
+/// `wasm-tools component new`. A pre-built binary fixture, not `.wat` text
+/// like this file's other fixtures, because its real graph-building logic
+/// (calling `graph-builder` through `wit-bindgen`-generated bindings) is
+/// not reasonably hand-writable as WAT. Regenerate from
+/// `components/qwen`'s source with the same two commands if that source
+/// changes.
+const QWEN_REAL_COMPONENT: &[u8] =
+    include_bytes!("../../fixtures/components/qwen-real.component.wasm");
+
+/// Test-only [`HostCapability`] (`model-component-graph-contract`): answers
+/// `echo(x: u32) -> u32` with `x + 1`, real enough to prove the dynamic
+/// argument/result marshaling actually round-trips a value through a real
+/// Component's own core-wasm call, not just that linking succeeds.
+struct AddOneCapability;
+
+impl HostCapability for AddOneCapability {
+    fn call(
+        &self,
+        instance_key: &str,
+        operation: &str,
+        arguments: &[ComponentValue],
+    ) -> Result<Vec<ComponentValue>, ComponentError> {
+        assert!(!instance_key.is_empty());
+        assert_eq!(operation, "echo");
+        let [ComponentValue::U32(x)] = arguments else {
+            panic!("expected exactly one u32 argument, got {arguments:?}");
+        };
+        Ok(vec![ComponentValue::U32(x + 1)])
+    }
+}
 
 #[test]
 fn wasmtime_engine_reports_component_capabilities() {
@@ -186,6 +222,203 @@ fn wasmtime_engine_links_authorized_unit_host_import() {
     link_plan.insert_for_test(crate::ComponentEndpoint::Capability { interface });
 
     let instance = engine.instantiate(&prepared, &link_plan).unwrap();
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn wasmtime_engine_dispatches_registered_capability_with_real_arguments() {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-capability-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("capability-echo.component.wasm");
+    std::fs::write(&artifact, CAPABILITY_ECHO_COMPONENT).unwrap();
+
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let interface = WitInterface::new("example:test/capability", "1.0.0");
+    engine.register_capability(interface.clone(), Arc::new(AddOneCapability));
+    let export_interface = WitInterface::new("example:test/capability-echo", "1.0.0");
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(19),
+        metadata: crate::ComponentMetadata::new(
+            "capability-echo",
+            "1",
+            "capability echo component",
+        )
+        .with_import(interface.clone())
+        .with_export(export_interface.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let mut link_plan = ComponentLinkPlan::default();
+    link_plan.insert_for_test(crate::ComponentEndpoint::Capability { interface });
+
+    let instance = engine.instantiate(&prepared, &link_plan).unwrap();
+    let result = engine
+        .invoke(
+            &instance,
+            &ComponentInvocation::new(
+                crate::ComponentInstanceId::new(190),
+                export_interface,
+                "run",
+            ),
+        )
+        .unwrap();
+    // The Component calls the registered capability with a fixed `41` and
+    // returns whatever it got back (`AddOneCapability` answers `x + 1`) --
+    // `42` here proves the value actually crossed the real host-import
+    // boundary and back, not merely that linking succeeded.
+    assert_eq!(
+        result,
+        ComponentInvocationResult::single(ComponentValue::U32(42))
+    );
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_capability() {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-qwen-real-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("qwen-real.component.wasm");
+    std::fs::write(&artifact, QWEN_REAL_COMPONENT).unwrap();
+
+    let capability = Arc::new(crate::GraphBuilderCapability::new());
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let graph_builder_interface =
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.0.0");
+    engine.register_capability(
+        graph_builder_interface.clone(),
+        capability.clone() as Arc<dyn HostCapability>,
+    );
+
+    let export_interface = WitInterface::new(
+        "magnetar:model-component-graph/model-component-graph-producer",
+        "1.0.0",
+    );
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(200),
+        metadata: crate::ComponentMetadata::new(
+            "qwen-real",
+            "1",
+            "the first real, minimal Qwen Model Component",
+        )
+        .with_import(graph_builder_interface.clone())
+        .with_export(export_interface.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let mut link_plan = ComponentLinkPlan::default();
+    link_plan.insert_for_test(crate::ComponentEndpoint::Capability {
+        interface: graph_builder_interface,
+    });
+    let instance = engine.instantiate(&prepared, &link_plan).unwrap();
+
+    let mut weight_shapes = BTreeMap::new();
+    for (name, dims) in [
+        ("layers.0.input_norm", vec![4]),
+        ("layers.0.self_attn.q_proj", vec![4, 4]),
+        ("layers.0.self_attn.k_proj", vec![4, 4]),
+        ("layers.0.self_attn.v_proj", vec![4, 4]),
+        ("layers.0.self_attn.o_proj", vec![4, 4]),
+        ("layers.0.post_attn_norm", vec![4]),
+        ("layers.0.mlp.gate_proj", vec![4, 8]),
+        ("layers.0.mlp.up_proj", vec![4, 8]),
+        ("layers.0.mlp.down_proj", vec![8, 4]),
+        ("token_embedding", vec![258, 4]),
+        ("final_norm", vec![4]),
+        ("lm_head", vec![4, 258]),
+    ] {
+        weight_shapes.insert(name.to_string(), dims);
+    }
+    capability.prepare_session(
+        instance.engine_key(),
+        crate::graph_builder_capability::SessionContext {
+            component_id: "qwen-real".to_string(),
+            compatibility_key: "qwen-real-fixture".to_string(),
+            kv_namespace: "qwen".to_string(),
+            weight_shapes,
+            output_edge_name: "logits".to_string(),
+        },
+    );
+
+    let result = engine
+        .invoke(
+            &instance,
+            &ComponentInvocation::new(
+                crate::ComponentInstanceId::new(200),
+                export_interface,
+                "build-prefill-graph",
+            )
+            .with_arguments(vec![ComponentValue::S64(4)]),
+        )
+        .unwrap();
+    let [ComponentValue::String(handle)] = result.values.as_slice() else {
+        panic!("expected a single string handle, got {:?}", result.values);
+    };
+
+    let graph = capability
+        .take_graph(instance.engine_key(), handle)
+        .expect("the finished graph is retrievable by its handle");
+    // embedding(1) + 16 nodes per layer (matching qwen_build_graph exactly)
+    // for the fixture's one layer + final_norm(1) + lm_head(1) -- the same
+    // 19-node count `wasmtime_engine_executes_qwen_graph_component_fixture`
+    // already asserts for this architecture via the Rust-synthesized path,
+    // now produced through the WIT graph-builder contract instead.
+    assert_eq!(graph.nodes.len(), 19);
+    assert!(
+        graph
+            .edges
+            .contains_key(&crate::TensorEdgeId::new("logits"))
+    );
+    assert_eq!(graph.phase, crate::ExecutionGraphPhase::Prefill);
+    assert!(matches!(
+        &graph.producer,
+        crate::ExecutionGraphProducer::ModelComponent { component_id } if component_id == "qwen-real"
+    ));
+    // Tied embeddings: the lm_head weight edge aliases token_embedding.
+    let lm_head_edge = graph
+        .edges
+        .get(&crate::TensorEdgeId::new("weight.lm_head"))
+        .expect("lm_head weight edge exists");
+    assert_eq!(
+        lm_head_edge.aliasing,
+        crate::TensorAliasing::MayAlias(crate::TensorEdgeId::new("weight.token_embedding"))
+    );
+    // The K/V edges carry KV cache metadata under the qwen.layer0.{k,v}
+    // namespace `parse_kv_cache_id` (the existing execution path, generic
+    // over the namespace) expects.
+    let k_edge = graph
+        .edges
+        .values()
+        .find(|edge| {
+            edge.kv_cache
+                .as_ref()
+                .is_some_and(|kv| kv.cache_id == "qwen.layer0.k")
+        })
+        .expect("a k edge carries kv metadata under the expected cache id");
+    assert_eq!(
+        k_edge.kv_cache.as_ref().unwrap().behavior,
+        crate::GraphKvCacheBehavior::Output
+    );
+
     engine.destroy(instance).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -656,6 +889,67 @@ fn wasmtime_engine_rejects_unauthorized_wasi_fixtures_without_link_plan() {
         ));
         std::fs::remove_dir_all(directory).unwrap();
     }
+}
+
+#[test]
+fn wasmtime_engine_reports_capability_version_mismatch_distinctly_from_unresolved_import() {
+    // `CAPABILITY_ECHO_COMPONENT`'s real compiled import is
+    // "example:test/capability@1.0.0" -- the Link Plan below approves that
+    // same interface *name* at a different version ("2.0.0"), so the exact
+    // `(name, version)` lookup misses while the name itself is still known.
+    // `model-component-graph-contract`'s "Component requires unsupported
+    // contract version" scenario is exactly this case.
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-capability-version-mismatch-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("capability-echo.component.wasm");
+    std::fs::write(&artifact, CAPABILITY_ECHO_COMPONENT).unwrap();
+
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let requested_interface = WitInterface::new("example:test/capability", "1.0.0");
+    let approved_interface = WitInterface::new("example:test/capability", "2.0.0");
+    let export_interface = WitInterface::new("example:test/capability-echo", "1.0.0");
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(191),
+        metadata: crate::ComponentMetadata::new(
+            "capability-echo-version-mismatch",
+            "1",
+            "capability echo component requiring an unapproved version",
+        )
+        .with_import(requested_interface)
+        .with_export(export_interface),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let mut link_plan = ComponentLinkPlan::default();
+    link_plan.insert_for_test(crate::ComponentEndpoint::Capability {
+        interface: approved_interface.clone(),
+    });
+
+    let error = engine.instantiate(&prepared, &link_plan).unwrap_err();
+    match error {
+        ComponentError::CapabilityVersionMismatch {
+            name,
+            requested_version,
+            available_version,
+            ..
+        } => {
+            assert_eq!(name, "example:test/capability");
+            assert_eq!(requested_version, "1.0.0");
+            assert_eq!(available_version, "2.0.0");
+        }
+        other => panic!("expected CapabilityVersionMismatch, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

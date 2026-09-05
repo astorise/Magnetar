@@ -826,3 +826,248 @@ When generation test begins
 
 Then release gate fails.
 
+### Requirement: Loaded Artifact Resources Feed Execution
+Model loading SHALL create the weight and constant resources used by first-native execution.
+
+#### Scenario: Artifact bytes change
+- **WHEN** the loaded model artifact bytes change and validation succeeds
+- **THEN** first-native numerical outputs reflect the resources loaded from those bytes.
+
+#### Scenario: Required weight missing
+- **WHEN** a model artifact lacks a required weight resource
+- **THEN** loading or binding fails before compute reads a substitute source.
+
+### Requirement: Weight Materialization Sources Real Artifact Bytes
+
+Model Loading's weight-materialization phase SHALL be able to construct materialized tensor data from real Model Artifact bytes, using a format parser's generic tensor inventory to locate each tensor's byte range, not only from a pre-materialized in-memory source.
+
+The construction step SHALL depend only on generic Model Artifact types, never on a concrete format parser crate.
+
+When a tensor's inventory entry declares a content digest (see `model-artifact`'s "Tensor Content Digest Binding"), the weight-materialization transaction SHALL verify that the tensor data actually supplied for materialization hashes to that declared digest before admitting or writing it, and SHALL reject the attempt otherwise. A tensor whose inventory entry declares no digest is not subject to this check.
+
+#### Scenario: Materialize from a real Safetensors file
+
+Given a real `.safetensors` file's bytes and its parsed generic tensor inventory
+
+When weight materialization runs
+
+Then it reads each tensor's declared byte range from the file bytes and produces the same materialized tensor data structure the existing in-memory materialization path produces
+
+And no format-specific type crosses into the materialization step itself.
+
+#### Scenario: Unsupported storage dtype is rejected structurally
+
+Given a tensor's declared storage dtype is not one the Runtime's host tensor representation supports
+
+When weight materialization attempts to read it
+
+Then it returns a structured error rather than silently reinterpreting the bytes.
+
+#### Scenario: Real and in-memory materialization agree
+
+Given the same logical weights are available both as an in-memory source and as real artifact bytes
+
+When both are materialized independently
+
+Then they produce equal tensor data.
+
+#### Scenario: Tensor content matching its declared digest is accepted
+
+Given a tensor's inventory entry declares a content digest
+
+When the data supplied for materialization hashes to that declared digest
+
+Then the weight-materialization transaction admits and writes it normally.
+
+#### Scenario: Tensor content not matching its declared digest is rejected
+
+Given a tensor's inventory entry declares a content digest
+
+When the data supplied for materialization does not hash to that declared digest
+
+Then the weight-materialization transaction rejects the attempt before admission or write, and the affected weight resource is not bound to the Model Instance.
+
+#### Scenario: A tensor with no declared digest is unaffected
+
+Given a tensor's inventory entry declares no content digest
+
+When any data is supplied for materialization under that tensor's name
+
+Then the weight-materialization transaction does not reject it on content-digest grounds.
+
+### Requirement: Weight Resource Completeness Gates Generation And Instance Lifecycle
+
+A Model Instance SHALL NOT report Ready, and SHALL NOT be usable for generation, while any of its mandatory weight resources have not been materialized, admitted through the Memory Manager, and bound into `resource_bindings.weights`.
+
+**Correction, not the original wording:** an earlier version of this requirement said Model Instance creation "MAY report an instance as structurally ready before" materialization, relying only on a deeper graph-dispatch-time check to fail closed. An external audit correctly identified that this was an incomplete guarantee: `acquire_usage`-style readiness checks that inspect only the instance's coarse lifecycle/readiness flag (not weight bindings) would incorrectly accept a not-yet-materialized instance as usable. The instance's own reported readiness SHALL be trustworthy on its own, not merely "safe in practice because something deeper happens to also check." `ModelLoadingCoordinator::load()` itself stays separate from materialization (the Lazy Loading Policy requirement is unaffected: `load()` still succeeds without weight bytes ready), but Model Instance creation SHALL leave the instance in a non-Ready lifecycle state until a subsequent, explicit weight-materialization step completes successfully and itself transitions the instance to Ready.
+
+#### Scenario: An instance is not Ready until its weights are materialized
+
+Given a Model Instance has just been created from a successfully loaded artifact
+
+When no weight-materialization step has run yet for it
+
+Then the instance's lifecycle and readiness both report a non-Ready state, and generation against it is rejected before any Kernel dispatches
+
+#### Scenario: Weight materialization is what makes the instance Ready
+
+Given a Model Instance's mandatory weight resources have all been materialized, admitted through the Memory Manager, and bound
+
+When that materialization step completes
+
+Then the instance transitions to Ready, and only then does generation against it become possible
+
+#### Scenario: A failed or partial materialization never produces a Ready instance
+
+Given weight materialization fails partway through, for any reason (memory admission denied, Provider write failure, residency registration failure)
+
+When the failure is handled
+
+Then every resource staged during that attempt is rolled back, and the instance is left in a Failed lifecycle state, never Ready
+
+#### Scenario: A later, distinct materialization step remains architecturally valid
+
+Given `load()` completed successfully under the Lazy Loading Policy, with weight materialization intentionally deferred to a distinct, later step
+
+When that later step subsequently materializes, admits, and binds every mandatory weight
+
+Then the instance becomes genuinely usable for generation at that point, and no change to `load()`'s own signature or contract was required to reach it.
+
+### Requirement: Weight Materialization Is Transactional
+
+Weight materialization SHALL admit each resource through the Memory Manager before writing it into Provider-owned storage, SHALL propagate every step's errors rather than discarding them, and SHALL roll back every resource staged during a failed attempt rather than leaving partial state behind.
+
+#### Scenario: Memory admission precedes Provider materialization
+
+Given a weight is about to be materialized
+
+When its resource is staged
+
+Then Memory Manager admission is attempted first, and Provider-owned storage is written to only after admission succeeds
+
+#### Scenario: A residency registration failure is not silently discarded
+
+Given a weight's Memory Manager admission and Provider write both succeed
+
+When residency registration for that weight fails
+
+Then the failure is propagated as a real error, not discarded, and triggers rollback of that weight and every weight staged before it in the same attempt
+
+#### Scenario: A failure partway through rolls back every already-staged weight
+
+Given weights 1 through N-1 were staged successfully in one materialization attempt
+
+When weight N fails to stage, for any reason
+
+Then weights 1 through N-1's Provider-owned storage and Memory Manager allocations are released, and none of them remain bound to the Model Instance
+
+### Requirement: Unloading A Model Instance Releases Its Provider-Owned Weight Storage
+
+Unloading a Model Instance SHALL release both its Memory Manager allocations and its Provider-owned weight Tensor Resources, not the allocations alone.
+
+#### Scenario: Unload leaves no orphaned Provider-owned weight storage
+
+Given a Model Instance whose weights were materialized into Provider-owned storage
+
+When that instance is unloaded
+
+Then every weight Tensor Resource bound to it is released from Provider-owned storage, in addition to its Memory Manager allocations being released
+
+#### Scenario: Repeated load and unload does not accumulate Provider-owned storage
+
+Given a Model Instance is repeatedly loaded and unloaded with no other instance created in between
+
+When this is repeated many times
+
+Then Provider-owned storage returns to its prior baseline after each unload, not growing unboundedly across cycles
+
+### Requirement: Model Loading Materializes Weight Resources
+
+Model Loading SHALL provide a generic, artifact-source-agnostic weight
+materialization phase, distinct from the aggregate residency allocation
+`load()` performs, that creates one Tensor Resource per declared weight
+through a registered Provider and records each resulting Tensor Resource
+identity against the Model Instance it belongs to.
+
+This phase SHALL NOT assume a specific Model Artifact format or a specific
+model family: any weight source that can supply named tensors SHALL be able
+to invoke it, whether the source is a test fixture or a real Model Artifact
+parser.
+
+#### Scenario: Fixture-sourced weights are materialized generically
+
+Given a Model Instance is created from a fixture's in-memory weight tensors
+
+When Model Loading materializes its weights
+
+Then each weight is written into Provider storage and admitted through
+Runtime's Memory Manager via the same generic materialization phase a real
+Model Artifact loader would use.
+
+#### Scenario: Materialization does not require load() to accept a Provider
+
+Given a Model Instance whose weights are not yet materialized (a
+lazily-loaded instance)
+
+When `load()` completes for that instance
+
+Then `load()` itself succeeds without requiring a Provider or weight byte
+source, and materialization remains a distinct, later step.
+
+---
+
+### Requirement: Missing Weight Materialization Is Structurally Detectable
+
+Runtime SHALL be able to determine, before first Kernel dispatch, whether a
+Model Instance's declared weights were successfully materialized, rather
+than that failure surfacing only as an opaque missing-resource error deep
+inside generation.
+
+#### Scenario: Weight materialization failure is visible at the boundary
+
+Given weight materialization fails or was never attempted for a Model
+Instance
+
+When Runtime checks whether that instance can accept generation
+
+Then Runtime can determine the materialization failure at that boundary,
+not only after a Kernel fails to find a resource it needs.
+
+### Requirement: Loaded Model Context Is Runtime-Issued
+
+A `LoadedModelContext` SHALL be producible only as the result of a successful `ModelLoadingCoordinator::load()` call.
+
+The `ModelLoadingResidencyPlan` it carries is subject to the same
+constraint. An external caller SHALL NOT be able to construct a
+`LoadedModelContext` or `ModelLoadingResidencyPlan` directly, whether
+claiming a real or fabricated `ModelArtifactId`, `ModelLoadingState`, or
+residency plan.
+
+#### Scenario: A caller cannot fabricate a loaded context
+
+Given a caller has not invoked `ModelLoadingCoordinator::load()`
+
+When the caller attempts to obtain a `LoadedModelContext` claiming a given `ModelArtifactId` and a ready `ModelLoadingState`
+
+Then no public constructor or field-literal path exists to produce one, and `Runtime::create_model_instance()` can only ever be called with a context Model Loading itself produced.
+
+#### Scenario: A successfully loaded context is usable as before
+
+Given `ModelLoadingCoordinator::load()` completes successfully for a validated, trusted Model Artifact
+
+When the returned `LoadedModelContext` is passed to `Runtime::create_model_instance()`
+
+Then instance creation proceeds exactly as it did before this requirement, with no change to the public signature of `create_model_instance` or `ModelInstanceDefinition::from_loaded_context`.
+
+### Requirement: Model Loading Is Reachable Only Through the Runtime-Sealed Loading API
+
+The Model Loading operation that evaluates trust and produces a loaded model context SHALL NOT be reachable by a caller outside the Runtime-owned Model Loading API, so that the Runtime-sealed trust policy that API enforces cannot be bypassed by supplying a trust decision directly to the underlying loading operation.
+
+#### Scenario: No external direct-load path
+
+Given a caller outside the Runtime-owned Model Loading API
+
+When that caller attempts to supply their own trust decision directly to the underlying Model Loading operation
+
+Then no such path is reachable outside the crate implementing Runtime
+

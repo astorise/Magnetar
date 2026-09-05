@@ -341,20 +341,24 @@ impl ModelLoadingApiRequest {
     }
 }
 
-/// Drives [`ModelLoadingCoordinator::load`] on behalf of the Runtime
+/// Drives `ModelLoadingCoordinator::load` on behalf of the Runtime
 /// Inference API, translating [`ModelLoadingError`] into
 /// [`InferenceApiError`]. Model loading is explicit here; policy-controlled
 /// implicit loading is expressed by callers invoking this from a one-shot
 /// or session-creation code path.
 pub fn load_model(
     coordinator: &mut ModelLoadingCoordinator,
-    memory: &mut MemoryManager,
+    runtime: &mut Runtime,
     request: ModelLoadingApiRequest,
     manifest: &ModelManifest,
-    trust: &ModelTrustDecision,
 ) -> Result<LoadedModelContext, InferenceApiError> {
+    // Evaluated -- and dropped as a borrow of `runtime` -- before
+    // `runtime.memory_mut()` is taken below: `runtime: &mut Runtime` is one
+    // parameter, not two aliasing ones, precisely so a caller cannot supply
+    // a trust decision independent of the Runtime performing the load.
+    let trust = runtime.trust_store().evaluate(manifest);
     coordinator
-        .load(request.core, manifest, trust, memory)
+        .load(request.core, manifest, &trust, runtime.memory_mut())
         .map_err(InferenceApiError::from)
 }
 
@@ -362,10 +366,9 @@ pub fn load_model(
 /// `ModelLoadingRequested`/`ModelLoaded`/`ModelLoadingFailed`.
 pub fn load_model_observed(
     coordinator: &mut ModelLoadingCoordinator,
-    memory: &mut MemoryManager,
+    runtime: &mut Runtime,
     request: ModelLoadingApiRequest,
     manifest: &ModelManifest,
-    trust: &ModelTrustDecision,
     observer: &mut InferenceApiObserver,
 ) -> Result<LoadedModelContext, InferenceApiError> {
     let correlation_id = request.core.correlation_id.clone().map(CorrelationId::new);
@@ -374,7 +377,7 @@ pub fn load_model_observed(
         "model loading requested",
         correlation_id.clone(),
     );
-    match load_model(coordinator, memory, request, manifest, trust) {
+    match load_model(coordinator, runtime, request, manifest) {
         Ok(loaded) => {
             observer.observe(
                 InferenceApiObservationKind::ModelLoaded,
@@ -442,18 +445,150 @@ pub fn model_instance_status(
         .map_err(InferenceApiError::from)
 }
 
+/// Derives the Runtime-observable facts within `checks` from actual Runtime
+/// state instead of trusting the caller's claim, for every field the
+/// Runtime can verify today (`weights_materialized`, `provider_ready`,
+/// `device_ready`). A caller MAY still assert `false` to force a stricter
+/// outcome than Runtime state alone would produce, but MAY NOT use a
+/// caller-supplied `true` to claim a Runtime-internal fact the Runtime
+/// itself does not observe as true (Correctif: Runtime-owned ModelInstance
+/// readiness authority; see `openspec/changes/runtime-owned-model-instance-
+/// readiness-authority`'s design.md).
+///
+/// `kernel_preparation_ready`, `autotuning_ready`, `adapter_ready`,
+/// `memory_pressure`, `runtime_policy_allows`, `residency_available`, and
+/// `browser_supported` remain caller-supplied here: no generic,
+/// Runtime-side derivation for these exists in the current baseline (no
+/// Kernel Registry linkage from a `ModelInstanceId` to its expected
+/// prepared Kernel set, no per-instance autotuning/adapter/policy signal
+/// today). Closing that is future work, not fabricated here.
+///
+/// `pub(crate)`, not private: `WeightMaterializationTransaction::commit`
+/// (`first_native_runtime.rs`) also needs this exact derivation to decide
+/// whether a materialization attempt reaches `Ready`, rather than
+/// publishing bindings and calling `mark_ready` unconditionally -- closing
+/// a gap a further audit of PR #36 found: an empty or partial weights map
+/// could still reach `Ready` because `commit` never consulted this
+/// derivation at all, bypassing "Model Loading Does Not Bypass Instance
+/// Readiness" (`model-loading` spec: "Successful materialization alone
+/// SHALL not imply Model Instance readiness") and "Partial Loading Policy"
+/// ("Partial loading SHALL...NOT produce ready state if required parts are
+/// missing").
+pub(crate) fn derive_effective_readiness_checks(
+    runtime: &Runtime,
+    instance: &ModelInstanceId,
+    checks: &ModelInstanceReadinessChecks,
+) -> Result<ModelInstanceReadinessChecks, InferenceApiError> {
+    let model_instance = runtime.model_instance(instance)?;
+    let bindings = &model_instance.definition.resource_bindings.weights;
+    // Non-empty alone is not proof: a caller with mutable access to
+    // `resource_bindings.weights` could insert an arbitrary
+    // `TensorResourceId` that was never actually staged through
+    // `WeightMaterializationTransaction`. Round 3-5 closed this by reading
+    // the resource back from its residency's claimed Provider via
+    // `read_tensor` -- proof that *some* bytes exist there, but not proof
+    // *this instance's own authorized transaction* put them there (a
+    // caller retaining ordinary public access to `write_tensor`/
+    // `record_tensor_residency` could still assemble a passing state by
+    // hand, confirmed concretely by this crate's own `contract_tests`
+    // `bind_fake_weight` helper doing exactly that). Two independent checks
+    // close this for real (`bind-model-loading-evidence-to-validated-
+    // artifact`):
+    //
+    // 1. Every bound resource must still have a current `TensorResidency`
+    //    record -- proof the resource has not since been released
+    //    (unloaded, evicted, rolled back) out from under this instance.
+    //    This is *not* the provenance check (a residency record is a plain
+    //    public struct a caller could still construct by hand); it is the
+    //    "is this still true right now" check that a historical proof
+    //    alone cannot provide -- state that made an instance eligible for
+    //    `Ready` can regress (e.g. during suspension), and that must still
+    //    be caught.
+    // 2. Runtime-issued `MaterializationEvidence` must exist and match
+    //    this instance's own declared `ModelArtifactId` and its exact
+    //    current weight-binding set -- minted only by
+    //    `WeightMaterializationTransaction::commit`, so evidence from a
+    //    different instance, a different artifact, or a stale binding set
+    //    does not count. This is the provenance check a bare residency
+    //    record cannot provide. Unlike round 3-5's check, this needs no
+    //    Provider-specific readback capability (`read_tensor`/
+    //    `HostTensor`) at all -- closing the companion P1 (a device-only
+    //    Provider without host readback can still prove materialization)
+    //    as a consequence.
+    //
+    // When the loaded artifact's manifest declared mandatory tensor names
+    // (`required_weight_names`, non-empty), every one of them must still
+    // be present as a bound key -- a caller supplying only some of a
+    // multi-weight model's tensors still does not pass.
+    let weights_materialized = checks.weights_materialized
+        && !bindings.is_empty()
+        && bindings
+            .values()
+            .all(|resource_id| runtime.memory().tensor_residency(resource_id).is_some())
+        && runtime
+            .model_instances()
+            .materialization_evidence(instance)
+            .is_some_and(|evidence| {
+                evidence.matches(
+                    &model_instance.definition.artifact,
+                    &bindings.values().cloned().collect(),
+                )
+            })
+        && model_instance
+            .definition
+            .required_weight_names
+            .iter()
+            .all(|required| bindings.contains_key(required));
+    let provider_ready = checks.provider_ready
+        && match &model_instance.definition.placement.provider {
+            None => true,
+            Some(binding) => runtime
+                .providers()
+                .provider(binding.as_str())
+                // A Provider that resolves and offers an execution API is
+                // only "exists and is executable in principle" -- not
+                // "ready now". `status_snapshot().accepts_new_work_by_
+                // default()` consults the Provider's actual lifecycle,
+                // health, readiness, pressure, and admission state, so a
+                // Provider that is Unavailable/Draining/Saturated/NotReady
+                // (or whose admission policy currently rejects new work)
+                // correctly fails this check even though it is registered
+                // and `execution_api()` returns `Some` (Correctif:
+                // Runtime-owned ModelInstance readiness authority, round 2).
+                .is_some_and(|provider| {
+                    provider.execution_api().is_some()
+                        && provider.status_snapshot().accepts_new_work_by_default()
+                }),
+        };
+    let device_ready = checks.device_ready
+        && match &model_instance.definition.placement.device {
+            None => true,
+            Some(binding) => runtime.devices().any(|device| {
+                device.id() == binding.id()
+                    && device.availability() == DeviceAvailability::Available
+            }),
+        };
+    let mut effective = checks.clone();
+    effective.weights_materialized = weights_materialized;
+    effective.provider_ready = provider_ready;
+    effective.device_ready = device_ready;
+    Ok(effective)
+}
+
 /// Runs the Model Instance warmup plan through the Runtime Inference API
-/// boundary, without exposing Provider/Device handles.
+/// boundary, without exposing Provider/Device handles. The caller-supplied
+/// `checks` are not trusted as-is for the facts the Runtime can itself
+/// observe -- see `derive_effective_readiness_checks` above.
 pub fn warm_model_instance(
     runtime: &mut Runtime,
     instance: &ModelInstanceId,
     plan: &ModelInstanceWarmupPlan,
     checks: &ModelInstanceReadinessChecks,
 ) -> Result<(), InferenceApiError> {
+    let effective_checks = derive_effective_readiness_checks(runtime, instance, checks)?;
     runtime
         .model_instances_mut()
-        .instance_mut(instance)?
-        .warmup(plan, checks)
+        .warmup(instance, plan, &effective_checks)
         .map_err(InferenceApiError::from)
 }
 
@@ -469,6 +604,13 @@ pub fn suspend_model_instance(
         .map_err(InferenceApiError::from)
 }
 
+/// Resumes a suspended Model Instance. Reaching `Ready` requires fresh
+/// Runtime-derived readiness evidence, the same as any other path to
+/// `Ready` -- `ModelInstance::resume` only reaches `Loading`; this
+/// function completes the transition through `warm_model_instance` so
+/// state that changed while suspended (Provider health, weight residency,
+/// Device availability) is re-verified rather than assumed still valid
+/// (Correctif: Runtime-owned ModelInstance readiness authority, round 3).
 pub fn resume_model_instance(
     runtime: &mut Runtime,
     instance: &ModelInstanceId,
@@ -477,7 +619,17 @@ pub fn resume_model_instance(
         .model_instances_mut()
         .instance_mut(instance)?
         .resume()
-        .map_err(InferenceApiError::from)
+        .map_err(InferenceApiError::from)?;
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    warm_model_instance(
+        runtime,
+        instance,
+        &plan,
+        &ModelInstanceReadinessChecks::default(),
+    )
 }
 
 pub fn drain_model_instance(
@@ -1004,6 +1156,11 @@ pub(crate) struct RuntimeModelExecutionStep {
     pub(crate) logits: Vec<f32>,
     pub(crate) evidence: RuntimeGenerationExecutionEvidence,
     pub(crate) kv_commit: Option<RuntimeKvCacheCommit>,
+    /// Per-node causal-chain events (Correctif 17 / task group 17) captured
+    /// during this step's graph dispatch, turned into redacted
+    /// `InferenceApiObservation`s by the generation loop that calls
+    /// `execute_generation_step`.
+    pub(crate) node_events: Vec<crate::first_native_runtime::PerNodeCausalEvent>,
 }
 
 impl RuntimeModelExecutionStep {
@@ -1012,11 +1169,20 @@ impl RuntimeModelExecutionStep {
             logits,
             evidence,
             kv_commit: None,
+            node_events: Vec::new(),
         }
     }
 
     pub(crate) fn with_kv_commit(mut self, commit: RuntimeKvCacheCommit) -> Self {
         self.kv_commit = Some(commit);
+        self
+    }
+
+    pub(crate) fn with_node_events(
+        mut self,
+        node_events: Vec<crate::first_native_runtime::PerNodeCausalEvent>,
+    ) -> Self {
+        self.node_events = node_events;
         self
     }
 }
@@ -1562,6 +1728,27 @@ fn run_generation_loop_inner(
                 correlation_id.clone(),
             );
         }
+        // Correctif 17 / task group 17: one real `InferenceApiObservation`
+        // per captured per-node causal event, correlated by `node=...`
+        // (and `resource=...` where the event produces one) in the message
+        // -- not just the five global evidence-category booleans above.
+        // Emitted even on a later failure (the `?`s above only run once
+        // `execute_generation_step` already returned `Ok`, so every event
+        // it did capture before any internal failure is still here).
+        for event in &runtime_step.node_events {
+            let mut context = vec![
+                format!("request={}", request.request_id),
+                format!("node={}", event.node),
+            ];
+            if let Some(resource) = &event.resource {
+                context.push(format!("resource={resource}"));
+            }
+            observer.observe(
+                event.kind,
+                observation_message("per-node causal event", &context),
+                correlation_id.clone(),
+            );
+        }
         if let Err(error) = runtime_step.evidence.clone().validate() {
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
             return Err(error);
@@ -1616,6 +1803,40 @@ fn run_generation_loop_inner(
                 observation_message("kv cache committed", &commit_context),
                 correlation_id.clone(),
             );
+            // Correctif 17 / task group 17: one `KvUpdateCommitted` event
+            // per committed layer/role resource, not just the one aggregate
+            // `KvCacheCommitted` above -- `promote_pending_kv_resources`
+            // (task group 9's `KvUpdateTransaction`) already published these
+            // bindings to `runtime`'s KV cache by the time this runs, so
+            // reading them back here needs no new plumbing through the
+            // commit call itself. Correlated by `TensorResourceId`, not
+            // `ExecutionNodeId`: by commit time (after sampling, a separate
+            // phase from graph dispatch) the specific graph node that
+            // originally produced a given layer's pending write is no
+            // longer tracked, only the resource it left behind.
+            let cache_id = match commit {
+                RuntimeKvCacheCommit::PrefillCompleted { cache, .. }
+                | RuntimeKvCacheCommit::DecodeAppended { cache, .. } => cache,
+            };
+            if let Ok(kv_cache) = runtime.kv_cache(cache_id) {
+                for (layer, binding) in &kv_cache.layer_resources {
+                    for (role, resource) in [("k", &binding.k), ("v", &binding.v)] {
+                        observer.observe(
+                            InferenceApiObservationKind::KvUpdateCommitted,
+                            observation_message(
+                                "kv update committed",
+                                &[
+                                    format!("kv_cache={cache_id}"),
+                                    format!("layer={layer}"),
+                                    format!("role={role}"),
+                                    format!("resource={resource}"),
+                                ],
+                            ),
+                            correlation_id.clone(),
+                        );
+                    }
+                }
+            }
         }
         rng_state = sampling.updated_rng_state;
         generated.push(step.token_id);
@@ -2188,6 +2409,26 @@ pub enum InferenceApiObservationKind {
     StreamInterrupted,
     KvCacheCommitted,
     TokenCommitted,
+    /// Correctif 17 / task group 17: a graph node's inputs are all resolved
+    /// (from `bindings` or a weight edge) and it is about to be dispatched.
+    /// The first per-node event in a node's causal chain.
+    GraphNodeReady,
+    /// The node's `PlanNodeBinding` was resolved from a published
+    /// `PreparedExecutionPlan` via `PreparedExecutionPlanExecutor::prepare_node_execution`.
+    PlanBindingResolved,
+    /// The node's bound `PreparedKernelId` resolved to a currently-active
+    /// `KernelAdvertisement` in the Kernel Registry.
+    PreparedKernelResolved,
+    /// The node's Kernel output was produced and written into the
+    /// registered Provider's storage under a `TensorResourceId`. The last
+    /// per-node event in a node's causal chain.
+    TensorResourceProduced,
+    /// A node's KV-cache-bearing output was written under a *pending*
+    /// resource id (not yet Runtime-owned).
+    KvUpdatePrepared,
+    /// A pending KV update was promoted to the KV cache's committed,
+    /// Runtime-owned state.
+    KvUpdateCommitted,
 }
 
 /// A redacted-by-default observation. `message` MUST NOT contain raw
@@ -2285,6 +2526,8 @@ pub enum InferenceApiError {
     KvCacheUnavailable { reason: String },
     PrefixCacheUnavailable { reason: String },
     MemoryAdmissionFailed { reason: String },
+    WeightContentDigestMismatch { reason: String },
+    WeightShapeOrDtypeMismatch { reason: String },
     ProviderUnavailable { reason: String },
     DeviceUnavailable { reason: String },
     KernelUnavailable { reason: String },
@@ -2351,6 +2594,12 @@ impl fmt::Display for InferenceApiError {
             }
             Self::MemoryAdmissionFailed { reason } => {
                 write!(f, "memory admission failed: {reason}")
+            }
+            Self::WeightContentDigestMismatch { reason } => {
+                write!(f, "weight content digest mismatch: {reason}")
+            }
+            Self::WeightShapeOrDtypeMismatch { reason } => {
+                write!(f, "weight shape or dtype mismatch: {reason}")
             }
             Self::ProviderUnavailable { reason } => write!(f, "provider unavailable: {reason}"),
             Self::DeviceUnavailable { reason } => write!(f, "device unavailable: {reason}"),
