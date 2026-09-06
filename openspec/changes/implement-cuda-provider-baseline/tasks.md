@@ -324,12 +324,18 @@
       against `providers/cpu` within tolerance, and both
       `ProviderConformanceProfile::ProviderCore`/`ProviderCompute` through a
       real `Runtime`.
-- [ ] 10.3 Dispatch `gpu-runner-smoke.yml` (extended to run the real test
+- [x] 10.3 Dispatch `gpu-runner-smoke.yml` (extended to run the real test
       suite, not just the template) against the self-hosted `arc-gpu-magnetar`
       runner and confirm the same pass on its GPU (RTX 3060, confirmed
       reachable in run `33961785474`) — a second, different-hardware data
       point. Treat a `Pending`-timeout dispatch as inconclusive (retry once
       Tachyon's shared GPU capacity frees up), not as a `CudaProvider` defect.
+      Done, repeatedly, across `enable-device-resident-kernel-chaining` and
+      `unify-provider-output-admission-and-residency`'s own work: green runs
+      `34011615965`, `34013840770`, and (on the exact commits this repo's
+      `main` currently pins) `34018630488` -- all `completed`/`success` on
+      `arc-gpu-magnetar`'s own RTX 3060, a genuinely different GPU from this
+      workstation's RTX 3070 Ti Laptop GPU used for tasks 10.1/10.2.
 - [x] 10.4 Run `cargo deny check` (or the project's equivalent licensing
       check) covering the new `cudarc` dependency.
       Finding: this task's premise doesn't hold. CI's `deny` job
