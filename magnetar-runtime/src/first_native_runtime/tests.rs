@@ -984,8 +984,16 @@ fn dispatch_reference_cpu_operator_multi_binds_every_output() {
         2,
         "both outputs must be bound, not just the first"
     );
-    let right = outputs.pop().unwrap();
-    let left = outputs.pop().unwrap();
+    let right = outputs
+        .pop()
+        .unwrap()
+        .into_host(&dispatch_ctx.provider)
+        .unwrap();
+    let left = outputs
+        .pop()
+        .unwrap()
+        .into_host(&dispatch_ctx.provider)
+        .unwrap();
     assert_eq!(left.shape, vec![1, 2]);
     assert_eq!(left.data, vec![1.0, 2.0]);
     assert_eq!(right.shape, vec![1, 2]);
@@ -1154,6 +1162,7 @@ fn resident_input_passthrough_reuses_existing_resource_and_computes_correctly() 
         BTreeMap::new(),
     )
     .unwrap();
+    let sum = sum.into_host(&dispatch_ctx.provider).unwrap();
     assert_eq!(sum.data, vec![11.0, 12.0, 13.0, 14.0]);
 
     // The producer's own output resource id -- reused verbatim, not a
@@ -1187,6 +1196,7 @@ fn resident_input_passthrough_reuses_existing_resource_and_computes_correctly() 
         BTreeMap::new(),
     )
     .unwrap();
+    let product = product.into_host(&dispatch_ctx.provider).unwrap();
     assert_eq!(product.data, vec![22.0, 24.0, 26.0, 28.0]);
 }
 

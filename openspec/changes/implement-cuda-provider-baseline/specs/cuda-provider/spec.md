@@ -58,16 +58,36 @@ discoverable, rather than failing Runtime initialization or the build.
 
 ### Requirement: CUDA Device Discovery
 
-CUDA Provider SHALL expose each discoverable compatible CUDA Device through
-Runtime-owned Device metadata, including name, compute capability, and a
-memory pressure estimate.
+CUDA Provider SHALL expose its primary compatible CUDA Device (device
+ordinal 0) through Runtime-owned Device metadata, including name, compute
+capability, and a memory pressure estimate. This baseline targets exactly
+one `ModelInstance`/execution bound to exactly one selected GPU Device;
+discovering or exposing more than one Device on a multi-GPU host is
+explicitly out of scope until a real multi-GPU deployment need drives a
+dedicated change (product decision, 2026-09-06). The already-archived
+`multi-device-placement` capability (Runtime-owned placement, explicit
+`MultiDevicePlacementPlan`) is the target contract for that future work --
+this baseline does not implement it, and the two-phase rollout the product
+decision named (independent Devices with per-request Runtime placement
+first; model/tensor sharding and replication across Devices only if a real
+need later emerges) should build on that existing contract rather than
+inventing a new one.
 
 #### Scenario: Single GPU available
 
 - **GIVEN** one compatible CUDA-capable GPU is present
 - **WHEN** Runtime lists Devices
-- **THEN** at least one CUDA Device is visible through Runtime-owned metadata
+- **THEN** the primary CUDA Device is visible through Runtime-owned metadata
 - **AND** no raw CUDA context, stream, or device pointer is exposed
+
+#### Scenario: Multiple GPUs available
+
+- **GIVEN** more than one compatible CUDA-capable GPU is present on the host
+- **WHEN** Runtime lists Devices
+- **THEN** only the primary Device (ordinal 0) is visible through
+  Runtime-owned metadata
+- **AND** no requirement in this baseline depends on any other Device being
+  discovered or selectable
 
 ### Requirement: CUDA Provider Layout and DType Support
 

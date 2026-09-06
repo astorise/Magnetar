@@ -8,7 +8,7 @@ use crate::{
     AffinityError, CompletionTokenId, DTypeDescriptor, DeviceAvailability, DeviceBinding,
     DeviceMetadata, HostStagingPolicy, ProviderAdmissionDecision, ProviderBinding,
     ProviderPressureLevel, ProviderStatusSnapshot, ResourceAffinity, ShapeDescriptor,
-    TensorDescriptor, TensorResourceId,
+    TensorDescriptor, TensorResourceDescriptor, TensorResourceId,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -3983,6 +3983,59 @@ impl MemoryManager {
         self.tensor_residency
             .insert(residency.tensor.clone(), residency);
         Ok(())
+    }
+
+    /// Admits a Kernel output's final resource identity *before* dispatch,
+    /// on the caller's behalf, under a caller-chosen `owner` --
+    /// `unify-provider-output-admission-and-residency`'s Runtime-owned
+    /// alternative to a Provider admitting (and owning) its own output
+    /// storage. Replaces-and-releases whatever allocation `id` previously
+    /// held (the same pattern `write_tensor_admitted` already uses), so
+    /// repeated dispatch of the same stable resource id (e.g. a graph edge
+    /// reused across generation steps) never accumulates orphaned
+    /// allocations. A Provider's `execute_invocation_with_memory_manager`
+    /// checks `tensor_residency(id)` for exactly this record before
+    /// deciding whether to self-admit; see that method's own doc comment
+    /// for the fallback this enables.
+    pub fn admit_kernel_output(
+        &mut self,
+        id: TensorResourceId,
+        descriptor: &TensorDescriptor,
+        placement: MemoryPlacement,
+        owner: MemoryAllocationOwner,
+        affinity: ResourceAffinity,
+    ) -> Result<TensorResourceDescriptor, MemoryError> {
+        let byte_size = descriptor
+            .byte_size()
+            .map_err(|error| MemoryError::AllocationDenied {
+                reason: format!(
+                    "cannot admit output '{id}': invalid tensor descriptor ({error:?})"
+                ),
+            })?;
+        let request = MemoryAllocationRequest::new(
+            MemoryAllocationClass::Tensor,
+            byte_size,
+            placement.clone(),
+            owner,
+        )
+        .with_affinity(affinity.clone());
+        let allocation = self.allocate(request)?;
+        let previous = self
+            .tensor_residency
+            .get(&id)
+            .and_then(|residency| residency.allocation);
+        self.record_tensor_residency(
+            TensorResidency::new(id.clone(), placement, affinity.clone())
+                .with_allocation(allocation.id),
+        )?;
+        if let Some(previous) = previous {
+            let _ = self.release(previous);
+        }
+        Ok(TensorResourceDescriptor::new(
+            id,
+            descriptor.clone(),
+            affinity,
+        ))
     }
 
     /// Removes a Tensor Resource's residency record. Callers releasing a

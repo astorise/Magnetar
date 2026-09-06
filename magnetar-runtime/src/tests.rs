@@ -5852,6 +5852,63 @@ fn memory_manager_tracks_allocation_lifetime_and_tensor_residency() {
     ));
 }
 
+/// `unify-provider-output-admission-and-residency` task 1.2/1.3:
+/// `admit_kernel_output` is the Runtime-owned pre-admission helper a
+/// dispatch caller uses to admit a Kernel output's *final* resource
+/// identity before submission, under a caller-chosen owner, instead of
+/// letting the Provider admit (and own) it itself.
+#[test]
+fn admit_kernel_output_replaces_and_releases_the_previous_allocation_for_the_same_id() {
+    let mut manager = MemoryManager::new(MemoryManagerConfig {
+        max_runtime_bytes: Some(4096),
+        ..MemoryManagerConfig::default()
+    });
+    let id = TensorResourceId::new("edge.layer0.attention.out");
+    let descriptor = TensorDescriptor::new(
+        ShapeDescriptor::new([2, 4]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+        LayoutDescriptor::Contiguous,
+    );
+    let affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
+        .with_provider(ProviderBinding::new("cuda"));
+    let owner = MemoryAllocationOwner::Session("cache-1".into());
+    let placement = MemoryPlacement::Device(DeviceBinding::new(DeviceId::new("cuda:0")));
+
+    let resource = manager
+        .admit_kernel_output(
+            id.clone(),
+            &descriptor,
+            placement.clone(),
+            owner.clone(),
+            affinity.clone(),
+        )
+        .unwrap();
+    assert_eq!(resource.id, id);
+    let first_allocation = manager.tensor_residency(&id).unwrap().allocation.unwrap();
+    assert!(
+        manager
+            .allocations()
+            .any(|allocation| allocation.id == first_allocation
+                && allocation.state == MemoryAllocationState::Active)
+    );
+
+    // Re-admitting the same id (a later generation step dispatching the
+    // same graph node) must replace and release the previous allocation,
+    // not accumulate a second one.
+    manager
+        .admit_kernel_output(id.clone(), &descriptor, placement, owner, affinity)
+        .unwrap();
+    let second_allocation = manager.tensor_residency(&id).unwrap().allocation.unwrap();
+    assert_ne!(first_allocation, second_allocation);
+    assert!(
+        !manager
+            .allocations()
+            .any(|allocation| allocation.id == first_allocation
+                && allocation.state == MemoryAllocationState::Active),
+        "the first allocation must no longer be Active after re-admission"
+    );
+}
+
 #[test]
 fn memory_manager_distinguishes_storage_and_compute_dtype_costs() {
     let dtype = MemoryDTypeRelation::new(
@@ -7421,6 +7478,85 @@ fn reference_cpu_execution_tracks_output_through_memory_manager() {
     assert!(residency.provider_owned);
     assert!(residency.allocation.is_some());
     assert!(memory.allocations().next().is_some());
+}
+
+/// `unify-provider-output-admission-and-residency` task 2.4: an output
+/// resource id a caller already admitted via `MemoryManager::
+/// admit_kernel_output` (under a caller-chosen owner, e.g. `Session`) is
+/// honored as-is by `execute_invocation_with_memory_manager` -- no second,
+/// Provider-owned allocation, no overwritten residency.
+#[test]
+fn reference_cpu_honors_a_caller_pre_admitted_output_without_double_admitting() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+
+    let (a_id, a_resource) = reference_cpu_resource("mm-preadmit-a", [2, 2]);
+    let (b_id, b_resource) = reference_cpu_resource("mm-preadmit-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("mm-preadmit-out", [2, 2]);
+    executor.write_tensor(
+        a_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 0.0, 0.0, 1.0]),
+    );
+    executor.write_tensor(
+        b_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+    );
+
+    let owner = MemoryAllocationOwner::Session("preadmit-cache".into());
+    let placement = MemoryPlacement::HostOrdinary;
+    memory
+        .admit_kernel_output(
+            out_resource.resource.id.clone(),
+            &out_resource.resource.descriptor,
+            placement.clone(),
+            owner,
+            out_resource.resource.affinity.clone(),
+        )
+        .expect("caller pre-admission must succeed");
+    assert_eq!(memory.allocations().count(), 1);
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-preadmitted"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource.clone());
+
+    let result = executor.execute_invocation_with_memory_manager(
+        advertisement,
+        operator,
+        &invocation,
+        &mut memory,
+    );
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+
+    // Still exactly one allocation -- the Provider did not admit a second,
+    // Provider-owned allocation for the same resource id.
+    assert_eq!(memory.allocations().count(), 1);
+    let residency = memory
+        .tensor_residency(&out_resource.resource.id)
+        .expect("residency record must still exist");
+    // The caller's own placement is preserved, not overwritten with the
+    // Provider's own `ProviderOwnedOpaque` default.
+    assert_eq!(residency.placement, placement);
+    assert!(
+        executor
+            .read_tensor(&out_resource.resource.id)
+            .is_some_and(|tensor| tensor.data == vec![1.0, 2.0, 3.0, 4.0]),
+        "the Kernel must still have written its actual output into the pre-admitted resource id"
+    );
 }
 
 #[test]
