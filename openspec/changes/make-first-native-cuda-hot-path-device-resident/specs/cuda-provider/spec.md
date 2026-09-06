@@ -2,11 +2,17 @@
 
 ### Requirement: CUDA RoPE Kernel Supports Native Multi-Head Rotation
 
-The CUDA Provider's `rope` Kernel SHALL accept a `head_count` parameter and
-rotate each of `head_count` contiguous, equal-width column blocks per row
-independently, using the same per-block rotation formula already defined
-for a single block. `head_count` not provided (or `1`) SHALL reproduce the
-existing single-block rotation behavior exactly.
+The CUDA Provider's `rope` Kernel SHALL accept an optional `head_count`
+parameter. When `head_count` is present and greater than `1`, the Kernel
+SHALL divide each row into `head_count` equal-width blocks of
+`head_width = cols / head_count` columns and, within each block
+independently, rotate exactly the first `dimension` columns of that block
+(`dimension` MAY be less than `head_width`, partial rotation) using the
+same per-pair rotation formula already defined for the single-block case;
+`position` is per-row, not per-head. Columns outside a rotated range SHALL
+be copied through unchanged, never zeroed. `head_count` absent (or `1`)
+SHALL reproduce the existing single-block rotation behavior exactly, with
+`dimension` unconstrained by `head_count`'s divisibility rule.
 
 Multi-head rotation SHALL execute as a single Kernel invocation regardless
 of `head_count`; the Provider SHALL NOT require one invocation per head.
@@ -19,20 +25,29 @@ of `head_count`; the Provider SHALL NOT require one invocation per head.
 - **THEN** the rotated output is bit-for-bit identical to this Provider's
   pre-existing single-block `rope` behavior
 
-#### Scenario: Multi-head call rotates each head independently
+#### Scenario: Multi-head call with different Q and K head counts
 
-- **GIVEN** a `rope` Kernel invocation with `head_count > 1` and a row width
-  equal to `head_count` times the per-head rotation width
+- **GIVEN** two `rope` Kernel invocations over the same row count, one with
+  `head_count` equal to a model's attention head count and one with
+  `head_count` equal to a smaller grouped-query key/value head count
+- **WHEN** the CUDA Provider dispatches each
+- **THEN** each rotates its own row width using its own `head_width = cols
+  / head_count`, independently of the other invocation's head count
+
+#### Scenario: Partial RoPE within a head is supported
+
+- **GIVEN** a `rope` Kernel invocation with `head_count > 1` and a rotation
+  `dimension` strictly less than `head_width = cols / head_count`
 - **WHEN** the CUDA Provider dispatches it
-- **THEN** each head's column block is rotated using that head's own local
-  column offset within the block, with position and frequency computed the
-  same way for every head in a row
-- **AND** exactly one Kernel invocation performs the rotation for all heads
+- **THEN** only the first `dimension` columns of each head's block are
+  rotated
+- **AND** the remaining columns of that block are copied from input to
+  output unchanged, not zeroed
 
 #### Scenario: Multi-head output matches Reference CPU
 
-- **GIVEN** the same input tensor, `head_count`, rotation width, base, scale,
-  and position offset
-- **WHEN** CUDA's multi-head `rope` and Reference CPU's multi-head `rope` are
-  each run once
+- **GIVEN** the same input tensor, `head_count`, rotation `dimension`, base,
+  scale, and position offset
+- **WHEN** CUDA's multi-head `rope` and Reference CPU's multi-head `rope`
+  are each run once
 - **THEN** their outputs agree within the declared numeric tolerance
