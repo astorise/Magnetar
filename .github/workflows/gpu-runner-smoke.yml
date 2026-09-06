@@ -59,4 +59,10 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Build and test the CUDA Provider
-        run: cargo test --locked --manifest-path providers/cuda/Cargo.toml
+        # `--include-ignored`: also runs
+        # `hardware_conformance_actually_ran_not_silently_skipped`, the one
+        # test in this suite that is not allowed to silently pass by
+        # early-returning when no GPU is found -- this job's whole purpose
+        # is a run where that must never happen (`docs/audits/cuda-provider-full-audit-2026-09-05.md`'s
+        # P1 "explicit provider-hardware-cuda == Passed signal" finding).
+        run: cargo test --locked --manifest-path providers/cuda/Cargo.toml -- --include-ignored

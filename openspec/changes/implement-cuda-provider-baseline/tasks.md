@@ -338,24 +338,23 @@
       workstation's RTX 3070 Ti Laptop GPU used for tasks 10.1/10.2.
 - [x] 10.4 Run `cargo deny check` (or the project's equivalent licensing
       check) covering the new `cudarc` dependency.
-      Finding: this task's premise doesn't hold. CI's `deny` job
-      (`.github/workflows/quality.yml`) checks out *without* submodules and
-      runs `cargo deny --all-features check` from the repo root against only
-      `magnetar-cli`/`magnetar-runtime` — `providers/cuda` is never a
-      workspace member there and its submodule isn't even checked out for
-      that job, so `cudarc` never enters the graph `cargo deny` inspects, by
-      design (`externalize-runtime-extension-modules`'s "zero compile-time
-      dependency on any externalized module"). Running `cargo deny check`
-      standalone inside `providers/cuda` also doesn't work as a substitute:
-      there's no `deny.toml` there (matching `providers/cpu`'s same
-      no-`deny.toml`/no-`license`-field convention), so it falls back to
-      flagging this crate itself as unlicensed rather than checking
-      `cudarc`. Verified manually instead: `cudarc` 0.19.9 is `MIT OR
-      Apache-2.0` (from its own `Cargo.toml`), which satisfies the root
-      `deny.toml`'s allow-list in spirit, but no automated gate enforces
-      this today for any submodule dependency, `cudarc` included — that's a
-      pre-existing gap in the project's tooling, not something specific to
-      this change.
+      Originally found infeasible (the root `deny` job checks out without
+      submodules by design, and a bare `cargo deny check` run standalone
+      inside `providers/cuda` only flagged the crate itself as unlicensed,
+      not `cudarc`) and closed instead with a one-time manual verification.
+      **Superseded**: `providers/cuda/deny.toml` (new) plus
+      `publish = false` on both `providers/cpu` and `providers/cuda`'s
+      `[package]` (documents already-true intent, and lets `deny.toml`'s
+      `licenses.private.ignore = true` exempt this never-published crate
+      from needing its own SPDX license field without asserting one on the
+      submodule owner's behalf) now make `cargo deny --manifest-path
+      providers/cuda/Cargo.toml check` a real, passing, automatable check
+      of `cudarc`'s full transitive graph (confirmed: `advisories ok, bans
+      ok, licenses ok, sources ok`, exit 0). Wired into CI as a new step in
+      `.github/workflows/quality.yml`'s `provider-integration` job, right
+      after that job's existing CUDA Provider build/test step. Found while
+      closing out `docs/audits/cuda-provider-full-audit-2026-09-05.md`'s P2
+      finding on this same gap.
 
 ## 11. Documentation
 

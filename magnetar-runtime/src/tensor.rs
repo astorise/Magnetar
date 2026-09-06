@@ -12,8 +12,8 @@
 
 use crate::compute::redact_backend_diagnostic;
 use crate::{
-    CorrelationId, DTypeDescriptor, MemoryPlacement, ResourceAffinity, ShapeDescriptor,
-    TensorDescriptor, TensorResidency, TensorResourceId, ViewDescriptor,
+    CorrelationId, DTypeDescriptor, KernelError, MemoryPlacement, ResourceAffinity,
+    ShapeDescriptor, TensorDescriptor, TensorResidency, TensorResourceId, ViewDescriptor,
 };
 use std::{error::Error, fmt};
 
@@ -597,5 +597,219 @@ impl TensorObservation {
     pub fn with_message(mut self, message: impl AsRef<str>) -> Self {
         self.message = redact_backend_diagnostic(message.as_ref());
         self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host tensor storage and its error model
+// ---------------------------------------------------------------------------
+//
+// Moved here from `reference_cpu.rs` (`docs/audits/cuda-provider-full-audit-
+// 2026-09-05.md`'s P2 finding: `TensorValue::Host`/`ProviderExecutionApi`'s
+// `write_tensor`/`read_tensor`/`write_tensor_admitted` are typed against
+// `HostTensor`, which every optimized Provider -- CUDA included -- now
+// genuinely depends on, not just Reference CPU internally). `tensor.rs` is
+// this crate's neutral, Provider-agnostic tensor contract module; Reference
+// CPU's own executor (`reference_cpu.rs`) now imports these types like any
+// other consumer instead of owning them. `crate::HostTensor`/
+// `crate::ReferenceCpuError`/`crate::ReferenceCpuErrorCode` (the paths every
+// external caller, including `providers/cpu`/`providers/cuda`, already uses)
+// are unchanged: both this module and `reference_cpu` are glob-re-exported
+// at the crate root, so this move is not an API break.
+
+/// A concrete, host-visible tensor. The Provider-agnostic transport type
+/// [`crate::TensorValue::Host`] carries; only whichever Provider owns a given
+/// [`TensorResourceId`] reads or writes the actual bytes, the Runtime only
+/// ever sees `TensorResourceId`/[`TensorDescriptor`] metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostTensor {
+    pub shape: Vec<u64>,
+    pub data: Vec<f32>,
+}
+
+impl HostTensor {
+    pub fn new(
+        shape: impl Into<Vec<u64>>,
+        data: impl Into<Vec<f32>>,
+    ) -> Result<Self, ReferenceCpuError> {
+        let shape = shape.into();
+        let data = data.into();
+        let expected = host_tensor_element_count(&shape)?;
+        if expected != data.len() {
+            return Err(ReferenceCpuError::new(
+                ReferenceCpuErrorCode::ShapeUnsupported,
+                format!(
+                    "shape {shape:?} expects {expected} elements, got {}",
+                    data.len()
+                ),
+            ));
+        }
+        Ok(Self { shape, data })
+    }
+
+    pub fn rows_cols(&self) -> Result<(u64, u64), ReferenceCpuError> {
+        match self.shape.as_slice() {
+            [rows, cols] => Ok((*rows, *cols)),
+            other => Err(ReferenceCpuError::new(
+                ReferenceCpuErrorCode::ShapeUnsupported,
+                format!("expected rank-2 tensor, got shape {other:?}"),
+            )),
+        }
+    }
+
+    /// This tensor's canonical content byte representation: `data`'s `f32`
+    /// values concatenated as little-endian bytes, in order. Used to
+    /// compute and verify content digests
+    /// (`bind-materialized-weight-content-to-model-artifact-digests`) --
+    /// callers combine this with `ModelDigest::sha256`/`verify_bytes`
+    /// rather than this module depending on `model.rs`'s digest type
+    /// directly. `shape` deliberately does not participate: a digest binds
+    /// tensor *content*, and shape mismatches are already caught
+    /// separately (residency/binding validation), not by this
+    /// content-only check.
+    pub fn content_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.data.len() * 4);
+        for value in &self.data {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+}
+
+/// Element count for a host tensor shape.
+///
+/// Uses checked arithmetic throughout: `Iterator::product` wraps silently in
+/// release builds, and the subsequent `usize` narrowing truncates on 32-bit
+/// targets such as `wasm32-unknown-unknown`. A wrapped count would let a
+/// mismatched buffer pass the length check in [`HostTensor::new`] and turn a
+/// structured shape rejection into a slice-index panic inside a kernel.
+fn host_tensor_element_count(shape: &[u64]) -> Result<usize, ReferenceCpuError> {
+    let overflow = || {
+        ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("shape {shape:?} element count overflows the host address space"),
+        )
+    };
+    shape
+        .iter()
+        .try_fold(1_u64, |count, dimension| count.checked_mul(*dimension))
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(overflow)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ReferenceCpuErrorCode {
+    ProviderUnavailable,
+    ProviderDisabledByPolicy,
+    DeviceUnavailable,
+    KernelNotFound,
+    DTypeUnsupported,
+    LayoutUnsupported,
+    ShapeUnsupported,
+    MemoryClassUnsupported,
+    WorkspaceUnavailable,
+    ExecutionFailed,
+    DeterministicModeUnsupported,
+    PrecisionUnsupported,
+    ConformanceFailed,
+    FallbackDenied,
+    BrowserFeatureUnsupported,
+    Internal,
+}
+
+impl ReferenceCpuErrorCode {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::ProviderUnavailable => "reference-cpu-provider-unavailable",
+            Self::ProviderDisabledByPolicy => "reference-cpu-provider-disabled-by-policy",
+            Self::DeviceUnavailable => "reference-cpu-device-unavailable",
+            Self::KernelNotFound => "reference-cpu-kernel-not-found",
+            Self::DTypeUnsupported => "reference-cpu-dtype-unsupported",
+            Self::LayoutUnsupported => "reference-cpu-layout-unsupported",
+            Self::ShapeUnsupported => "reference-cpu-shape-unsupported",
+            Self::MemoryClassUnsupported => "reference-cpu-memory-class-unsupported",
+            Self::WorkspaceUnavailable => "reference-cpu-workspace-unavailable",
+            Self::ExecutionFailed => "reference-cpu-execution-failed",
+            Self::DeterministicModeUnsupported => "reference-cpu-deterministic-mode-unsupported",
+            Self::PrecisionUnsupported => "reference-cpu-precision-unsupported",
+            Self::ConformanceFailed => "reference-cpu-conformance-failed",
+            Self::FallbackDenied => "reference-cpu-fallback-denied",
+            Self::BrowserFeatureUnsupported => "reference-cpu-browser-feature-unsupported",
+            Self::Internal => "internal-reference-cpu",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferenceCpuError {
+    pub code: ReferenceCpuErrorCode,
+    pub reason: String,
+}
+
+impl ReferenceCpuError {
+    pub fn new(code: ReferenceCpuErrorCode, reason: impl Into<String>) -> Self {
+        Self {
+            code,
+            reason: reason.into(),
+        }
+    }
+
+    pub const fn id(&self) -> &'static str {
+        self.code.id()
+    }
+}
+
+impl fmt::Display for ReferenceCpuError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.id(), self.reason)
+    }
+}
+
+impl Error for ReferenceCpuError {}
+
+impl From<ReferenceCpuError> for KernelError {
+    fn from(error: ReferenceCpuError) -> Self {
+        match error.code {
+            ReferenceCpuErrorCode::DTypeUnsupported => Self::KernelDTypeUnsupported {
+                dtype: error.reason,
+            },
+            ReferenceCpuErrorCode::LayoutUnsupported => Self::KernelLayoutUnsupported {
+                layout: error.reason,
+            },
+            ReferenceCpuErrorCode::ShapeUnsupported => Self::KernelShapeUnsupported {
+                reason: error.reason,
+            },
+            ReferenceCpuErrorCode::MemoryClassUnsupported => Self::KernelMemoryClassUnsupported {
+                memory_class: error.reason,
+            },
+            ReferenceCpuErrorCode::WorkspaceUnavailable => Self::KernelWorkspaceUnavailable,
+            ReferenceCpuErrorCode::KernelNotFound => Self::KernelNotFound {
+                kernel: error.reason,
+            },
+            ReferenceCpuErrorCode::DeviceUnavailable => Self::KernelDeviceUnsupported {
+                device: error.reason,
+            },
+            ReferenceCpuErrorCode::ProviderUnavailable
+            | ReferenceCpuErrorCode::ProviderDisabledByPolicy => Self::KernelProviderUnavailable {
+                provider: error.reason,
+            },
+            ReferenceCpuErrorCode::DeterministicModeUnsupported => {
+                Self::KernelDeterminismUnsupported
+            }
+            ReferenceCpuErrorCode::PrecisionUnsupported => Self::KernelPrecisionUnsupported,
+            ReferenceCpuErrorCode::ConformanceFailed => Self::KernelConformanceFailed {
+                report: error.reason,
+            },
+            ReferenceCpuErrorCode::BrowserFeatureUnsupported => {
+                Self::KernelBrowserFeatureUnsupported {
+                    feature: error.reason,
+                }
+            }
+            ReferenceCpuErrorCode::FallbackDenied
+            | ReferenceCpuErrorCode::ExecutionFailed
+            | ReferenceCpuErrorCode::Internal => Self::KernelExecutionFailed {
+                reason: error.reason,
+            },
+        }
     }
 }

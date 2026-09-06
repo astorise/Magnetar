@@ -511,7 +511,7 @@ pub trait Provider: Send + Sync {
 pub enum TensorValue {
     /// Host-visible bytes. What every current Provider and test double
     /// produces and consumes today.
-    Host(crate::reference_cpu::HostTensor),
+    Host(crate::tensor::HostTensor),
     /// This Provider holds the resource privately and declines to expose
     /// host-visible bytes for it. Never produced by Reference CPU today;
     /// exists so a genuinely device-resident Provider has a truthful
@@ -529,7 +529,7 @@ impl TensorValue {
     pub fn into_host(
         self,
         id: &TensorResourceId,
-    ) -> Result<crate::reference_cpu::HostTensor, crate::tensor::TensorError> {
+    ) -> Result<crate::tensor::HostTensor, crate::tensor::TensorError> {
         match self {
             Self::Host(tensor) => Ok(tensor),
             Self::Opaque => Err(crate::tensor::TensorError::residency_unavailable(format!(
@@ -631,7 +631,7 @@ pub trait ProviderExecutionApi: Send + Sync {
     /// execution through host-visible tensor data overrides this,
     /// [`Self::read_tensor`], and [`Self::allocate_workspace`] together.
     ///
-    /// [`crate::reference_cpu::HostTensor`] is host-CPU-shaped data movement,
+    /// [`crate::tensor::HostTensor`] is host-CPU-shaped data movement,
     /// not a portable Runtime resource representation; a device-only
     /// Provider (CUDA, Metal, ...) is not expected to implement this
     /// meaningfully. It exists on this generic trait -- rather than only as
@@ -652,7 +652,7 @@ pub trait ProviderExecutionApi: Send + Sync {
     fn write_tensor(
         &self,
         id: TensorResourceId,
-        tensor: crate::reference_cpu::HostTensor,
+        tensor: crate::tensor::HostTensor,
     ) -> Result<(), ProviderExecutionError> {
         let _ = (id, tensor);
         Ok(())
@@ -661,7 +661,7 @@ pub trait ProviderExecutionApi: Send + Sync {
     /// Reads back a tensor previously written through [`Self::write_tensor`]
     /// or produced by a completed Kernel invocation. See that method's
     /// documentation for why this is host-tensor-shaped and provisional.
-    fn read_tensor(&self, id: &TensorResourceId) -> Option<crate::reference_cpu::HostTensor> {
+    fn read_tensor(&self, id: &TensorResourceId) -> Option<crate::tensor::HostTensor> {
         let _ = id;
         None
     }
@@ -729,7 +729,7 @@ pub trait ProviderExecutionApi: Send + Sync {
         &self,
         memory: &mut crate::memory::MemoryManager,
         resource_id: TensorResourceId,
-        tensor: crate::reference_cpu::HostTensor,
+        tensor: crate::tensor::HostTensor,
         class: crate::memory::MemoryAllocationClass,
         owner: crate::memory::MemoryAllocationOwner,
     ) -> Result<(), crate::memory::MemoryError> {

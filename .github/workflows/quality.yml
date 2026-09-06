@@ -374,6 +374,17 @@ jobs:
         run: cargo test --locked --manifest-path providers/cpu/Cargo.toml
       - name: "Build and test the CUDA Provider (GPU-less here: exercises its graceful-unavailability path)"
         run: cargo test --locked --manifest-path providers/cuda/Cargo.toml
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@5724fe4561a201b0d36bddf13177e3557b43787b # cargo-deny
+      # The root `deny` job above never sees this submodule (it checks out
+      # without submodules by design, `externalize-runtime-extension-
+      # modules`'s "zero compile-time dependency on any externalized
+      # module"), so `cudarc` -- the CUDA Provider's one new, critical,
+      # native-library-adjacent dependency -- never entered any `cargo deny`
+      # graph until this step (`docs/audits/cuda-provider-full-audit-2026-09-05.md`'s
+      # P2 finding; `providers/cuda/deny.toml` carries the rationale).
+      - name: Check the CUDA Provider's own dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path providers/cuda/Cargo.toml check
 
   # Full conformance (task 15.9): the original, unsplit job -- checks out
   # every submodule via `submodules: recursive` and re-runs the same
