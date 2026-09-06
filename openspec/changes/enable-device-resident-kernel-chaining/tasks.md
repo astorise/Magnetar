@@ -240,7 +240,7 @@ actually shipped):
   description and its step name (now "Build and test the CUDA Provider",
   comment block describes the real device-allocation-table/explicit-
   movement/conformance behavior).
-- [ ] 6.4 Dispatched `gpu-runner-smoke.yml` on `arc-gpu-magnetar`
+- [x] 6.4 Dispatched `gpu-runner-smoke.yml` on `arc-gpu-magnetar`
   (run `34011516921`). First attempt failed -- but not from this change's
   code: `error: failed to load manifest for dependency
   'magnetar-provider-cpu' ... failed to read
@@ -249,8 +249,9 @@ actually shipped):
   `providers/cuda`, never `providers/cpu` -- a genuine, pre-existing gap
   (CUDA's `[dev-dependencies]` path-depends on `providers/cpu` for its
   conformance oracle comparisons), not something this change introduced.
-  Fixed the checkout step to also initialize `providers/cpu`; re-dispatch
-  pending.
+  Fixed the checkout step to also initialize `providers/cpu`
+  (commit `bdf02db`); re-dispatched (run `34011615965`) and confirmed
+  **green in 2m11s** on real hardware.
 
 ## 7. Cross-repository verification
 
@@ -266,11 +267,10 @@ actually shipped):
   `repeated_write_release_cycles_do_not_grow_storage_unboundedly`, and
   `passes_provider_data_movement_conformance_when_available` tests; clippy
   and fmt clean.
-- [ ] 7.3 Update `SUBMODULES.md`'s compatibility matrix with the new
-  `providers/cuda` commit and, if `providers/cpu` needed any change at all
-  (expected: none, confirmed by 7.1), its commit too. (Deferred until the
-  submodule commits actually exist -- committing/pushing is a user-facing
-  action held for explicit confirmation.)
+- [x] 7.3 Updated `SUBMODULES.md`'s compatibility matrix:
+  `providers/cuda` row now points at `557ceaa` (pushed to
+  `Magnetar-provider-CUDA`); `providers/cpu` unchanged (confirmed no code
+  change needed by 7.1).
 
 ## 8. Full verification
 
