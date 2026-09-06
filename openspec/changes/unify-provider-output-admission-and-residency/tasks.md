@@ -167,7 +167,9 @@
   gate's fall-through (self-admit exactly as before); the pre-existing
   "Output consumed by a later invocation" scenario matches unchanged
   (governed by task group 2's leak fix, not this task group).
-- [ ] 6.2 Update `providers/cpu`/`providers/cuda` submodule pins in `SUBMODULES.md` with the new commits.
+- [x] 6.2 Updated `providers/cpu`/`providers/cuda` submodule pins in
+  `SUBMODULES.md` with the new commits (`560895b`, `7997a2f`) and their
+  rationale.
 - [x] 6.3 Dispatched `gpu-runner-smoke.yml` on `arc-gpu-magnetar` against
   `main` at these exact commits (parent `32a70ef`, `providers/cpu`
   `560895b`, `providers/cuda` `7997a2f`): green --
