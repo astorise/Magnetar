@@ -1789,6 +1789,13 @@ fn e2e_graph_dispatch_accounts_outputs_through_runtime_memory_manager() {
 }
 
 #[test]
+fn e2e_graph_dispatch_does_not_leak_kernel_output_allocations_across_repeated_dispatch() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_graph_dispatch_does_not_leak_kernel_output_allocations_across_repeated_dispatch(&fixture)
+        .expect("repeated graph dispatch does not leak Provider-owned Kernel output allocations");
+}
+
+#[test]
 fn e2e_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage(&fixture)

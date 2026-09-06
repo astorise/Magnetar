@@ -8032,6 +8032,94 @@ fn check_graph_dispatch_accounts_outputs_through_runtime_memory_manager(
     Ok(())
 }
 
+/// `enable-device-resident-kernel-chaining`'s discovered leak fix:
+/// `execute_invocation_with_memory_manager` (both `providers/cpu` and
+/// `providers/cuda`, and this crate's own in-crate `ReferenceCpuExecutor`)
+/// previously admitted a fresh `MemoryAllocationId` for each Kernel-internal
+/// output resource on every single dispatch, without ever releasing the
+/// previous one for that same resource id -- and a Kernel-internal output
+/// id (e.g. `{operation_id}.out`) is derived only from the graph node id,
+/// so it is stable across every separate dispatch of the same graph.
+/// Without the fix, dispatching the identical graph twice would leave the
+/// first run's now-orphaned allocations still `Active` in the Memory
+/// Manager's ledger forever; with it, the second run's admissions replace
+/// (and release) the first's, so the Provider-owned Tensor allocation
+/// count does not grow.
+#[cfg(test)]
+fn check_graph_dispatch_does_not_leak_kernel_output_allocations_across_repeated_dispatch(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+
+    let provider_owned_active_tensor_count = |runtime: &Runtime| {
+        runtime
+            .memory()
+            .allocations()
+            .filter(|allocation| {
+                allocation.state == MemoryAllocationState::Active
+                    && allocation.request.class == MemoryAllocationClass::Tensor
+                    && matches!(allocation.request.owner, MemoryAllocationOwner::Provider(_))
+            })
+            .count()
+    };
+
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
+    let cache_id_1 = KvCacheId::new("test-leak-fix-cache-one")?;
+    execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id_1,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids.clone())]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let count_after_first_dispatch = provider_owned_active_tensor_count(&runtime);
+
+    // A second, independent dispatch of the *same* graph (same node ids,
+    // hence the same Kernel-internal output resource ids), under a
+    // different KV cache so Session-owned edge resources don't collide --
+    // only the Provider-owned Kernel-internal admissions this fix targets
+    // are being counted above.
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
+    let cache_id_2 = KvCacheId::new("test-leak-fix-cache-two")?;
+    execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id_2,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let count_after_second_dispatch = provider_owned_active_tensor_count(&runtime);
+
+    if count_after_second_dispatch != count_after_first_dispatch {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "expected the Provider-owned Active Tensor allocation count to stay constant \
+                 across a second dispatch of the identical graph (Kernel-internal output ids are \
+                 stable across dispatches, so re-admission must replace, not accumulate): \
+                 {count_after_first_dispatch} after the first dispatch, \
+                 {count_after_second_dispatch} after the second"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Correctif 5: `execute_qwen_graph_nodes`'s node-to-node transport is
 /// Resource-based, not a private `HostTensor` cache -- an *intermediate*
 /// graph edge's value (not just the final returned bindings) must be

@@ -255,10 +255,13 @@ actually shipped):
 
 ## 7. Cross-repository verification
 
-- [x] 7.1 Built `providers/cpu` unmodified against this change's
-  `magnetar-runtime` (`cargo build` in `providers/cpu`): clean, confirming
-  no CPU Provider code change is required (design.md Decision 4's removal
-  rationale holds).
+- [x] 7.1 Built/tested `providers/cpu` against this change's
+  `magnetar-runtime`: clean, 9/9 tests, clippy/fmt clean. Design.md Decision
+  4's "no CPU Provider trait-surface change" claim holds; `providers/cpu`
+  did end up needing one small code change of its own, unrelated to
+  Decision 4 -- see task group 9 (the Memory Manager admission leak fix
+  applies identically to `providers/cpu`'s own
+  `execute_invocation_with_memory_manager`).
 - [x] 7.2 Built/tested `providers/cuda` locally against real hardware (RTX
   3070 Ti): 23/23 tests pass, including the new
   `back_to_back_kernels_do_not_round_trip_through_host`,
@@ -268,21 +271,22 @@ actually shipped):
   `passes_provider_data_movement_conformance_when_available` tests; clippy
   and fmt clean.
 - [x] 7.3 Updated `SUBMODULES.md`'s compatibility matrix:
-  `providers/cuda` row now points at `557ceaa` (pushed to
-  `Magnetar-provider-CUDA`); `providers/cpu` unchanged (confirmed no code
-  change needed by 7.1).
+  `providers/cuda` row points at `557ceaa` (pushed to
+  `Magnetar-provider-CUDA`); `providers/cpu` needed the task-group-9 leak
+  fix but no compatibility-matrix commit bump was required for it (the
+  fix is behavior-internal, not a contract change other repos depend on).
 
 ## 8. Full verification
 
 - [x] 8.1 `cargo build -p magnetar-runtime --lib`, `cargo test -p
-  magnetar-runtime --lib` (1192 passed, up from 1190), `cargo clippy -p
+  magnetar-runtime --lib` (1193 passed, up from 1190), `cargo clippy -p
   magnetar-runtime --lib --tests -- -D warnings`, `cargo fmt --check`,
   `cargo build --workspace`. All clean.
 - [x] 8.2 `cargo check --target wasm32-unknown-unknown -p magnetar-runtime
   --all-features`. Clean (only pre-existing, unrelated warnings about
   unreachable wasm32-only code paths -- confirmed not introduced by this
   change).
-- [x] 8.3 The full first-native E2E suite (part of the 1192-test run in
+- [x] 8.3 The full first-native E2E suite (part of the 1193-test run in
   8.1, including `e2e_ci_can_run_without_gpu_and_reports_only_expected_required_failure`
   and every `e2e_*`/`dispatch_reference_cpu_operator_multi_*` test) passes
   unchanged, confirming the per-node causal-evidence chain still holds with
@@ -291,3 +295,32 @@ actually shipped):
   same suite; no separate invocation needed.
 - [x] 8.4 `openspec validate enable-device-resident-kernel-chaining --strict`
   passes.
+
+## 9. Memory Manager admission leak fix (discovered while finishing Decision 7)
+
+**Not part of the original task breakdown** -- found while investigating
+exactly how to complete Decision 7's deferred output-side work, in
+response to being asked to finish the change fully rather than leave a
+partially-understood gap.
+
+- [x] 9.1 Confirmed the bug empirically before fixing: added
+  `check_graph_dispatch_does_not_leak_kernel_output_allocations_across_repeated_dispatch`
+  (`magnetar-runtime/src/first_native_runtime.rs` +
+  `first_native_runtime/tests.rs`), which dispatches the identical graph
+  twice and counts Active, Provider-owned Tensor allocations. Confirmed it
+  fails without a fix (21 -> 42, exactly doubling) by temporarily reverting
+  the fix and re-running.
+- [x] 9.2 Fixed `execute_invocation_with_memory_manager` in all three
+  places it's duplicated identically: `providers/cuda/src/executor.rs`,
+  `providers/cpu/src/lib.rs`, and this crate's own in-crate
+  `reference_cpu.rs`. Each now reuses its existing `resource_allocations`
+  map (already used by `write_tensor_admitted`) to replace-and-release the
+  previous admission for a given output resource id instead of admitting a
+  fresh, never-released one on every dispatch.
+- [x] 9.3 Verified the fix doesn't disturb the existing owner-tag-filtering
+  tests (`check_kv_pending_write_allocation_is_released_on_discard`, the
+  decode-KV `matching_allocations` check): both filter by `Session`-owned
+  allocations, a disjoint set from the `Provider`-owned ones this fix
+  touches. Full re-run: `magnetar-runtime` 1193/1193, `providers/cpu` 9/9,
+  `providers/cuda` 23/23 (real hardware), clippy/fmt clean across all
+  three.

@@ -194,18 +194,26 @@ chose to proceed with the corrected scope in the same change):
    under the Kernel's own internal id, e.g. `{node_id}.out`), and the outer
    loop then re-uploads that value under a *different* id
    (`edge.{output_edge_id}`) via `write_tensor_value_admitted`. Eliminating
-   this too would require either unifying those two ids (so the Kernel
-   writes directly under the edge's id) or making the edge-level
-   `write_tensor_value_admitted(Opaque, ...)` call skip its own
-   Memory-Manager admission -- both risk double-counting or dropping the
-   Session-owned accounting that resource lifecycle (KV pending/promote,
-   session release) depends on. **Deliberately left unfixed here**: the
-   input-side fix alone already removes half of the round-trip traffic
-   between two chained device-resident Kernels (the *consumer's* D2H+H2D),
-   safely, without touching Memory Manager admission semantics at all
-   (confirmed: `write_tensor`, the input-side-only path, performs no
-   admission). The output side is real follow-up work, not silently
-   solved.
+   the *copy itself* would require unifying those two ids (so the Kernel
+   writes directly under the edge's id) so the edge-level write becomes a
+   true no-op. **Confirmed, not just suspected, why this is unsafe to do
+   casually**: existing tests
+   (`check_kv_pending_write_allocation_is_released_on_discard`, and the
+   `matching_allocations` check in the decode-KV test) filter/count Active
+   allocations by `MemoryAllocationOwner::Session(cache_id)` specifically --
+   id-unification would mean these resources' admission comes from
+   `execute_invocation_with_memory_manager`, which hardcodes
+   `MemoryAllocationOwner::Provider(...)`, not `Session`. Making the owner
+   caller-selectable would mean threading an `owner` parameter through the
+   `ProviderExecutionApi::submit_kernel` trait method itself -- a breaking
+   change to every Provider implementation (CPU, CUDA, and any future one),
+   for a byte-copy-avoidance optimization. **Deliberately left unfixed
+   here**: the input-side fix alone already removes half of the round-trip
+   traffic between two chained device-resident Kernels (the *consumer's*
+   D2H+H2D), safely, without touching Memory Manager admission semantics at
+   all (confirmed: `write_tensor`, the input-side-only path, performs no
+   admission). The physical copy is real follow-up work, not silently
+   solved -- see Decision 8 below for what *was* fixed at this same seam.
 2. **`KernelMemoryClass` was hardcoded to `Host`** for every
    `KernelResource` (both inputs and the output) this dispatch loop builds,
    regardless of which Provider is actually resolved.
@@ -301,6 +309,51 @@ state is invented; `CudaProvider::health()` simply returns
 instead of `Available`. This is a one-line implementation fix closing a real
 observability gap identified by the audit, not a spec change.
 
+### Decision 8: fix `execute_invocation_with_memory_manager`'s unbounded Memory Manager ledger leak
+
+**Found while re-examining Decision 7's output-side admission** (asked by
+the user to finish the change fully, not leave a half-understood gap): the
+Provider-owned admission `execute_invocation_with_memory_manager` creates
+per Kernel output (`providers/cuda/src/executor.rs`, `providers/cpu`'s own
+copy, and this crate's in-crate `reference_cpu.rs`, all three identical)
+calls `memory.allocate(...)` fresh on *every single Kernel dispatch* and
+never releases the previous allocation for that same resource id. Since a
+Kernel-internal output id (e.g. `{operation_id}.out`) is derived only from
+the graph node id, it is *stable across every generation step* that
+dispatches the same node -- so every token generated leaves one more
+`MemoryAllocationId` permanently `Active` in the Memory Manager's ledger,
+never released, for the lifetime of the Runtime. This is a genuine,
+pre-existing Core defect (present before this change, in both real
+Providers identically), not something `enable-device-resident-kernel-
+chaining` introduced -- but it sits exactly at the seam Decision 7
+discusses, and was only found by tracing that seam closely enough to
+answer "is the output-side admission itself even correct today,
+independent of the copy." Confirmed empirically before fixing: a new test
+dispatching the identical graph twice found the count of Active,
+Provider-owned Tensor allocations *doubled* (21 -> 42) between runs.
+
+**Fix**: all three call sites now reuse the same `resource_allocations:
+Mutex<BTreeMap<TensorResourceId, MemoryAllocationId>>` map
+`write_tensor_admitted` already maintains for exactly this "replace and
+release whatever this id previously held" pattern -- after recording each
+output's `TensorResidency`, insert its new `MemoryAllocationId` under the
+resource id and release whatever the map's previous entry for that id was
+(if any). Zero behavior change for a resource id's *first* dispatch;
+every *subsequent* dispatch of the same node now correctly releases the
+prior step's ledger entry instead of orphaning it. Verified: the same
+new test now shows a *constant* count across two dispatches, and the
+existing owner-tag-filtering tests (`check_kv_pending_write_allocation_is_
+released_on_discard`, the decode-KV `matching_allocations` check) are
+unaffected since they filter by `Session`-owned allocations, a disjoint
+set from the `Provider`-owned ones this fix touches.
+
+**Not attempted**: unifying this now-correctly-bookkept Provider-owned
+admission with the Session-owned edge-level one (Decision 7's own
+deferred item) -- that is still the separate, harder "eliminate the
+physical copy" problem, unaffected by this leak fix. This fix makes the
+*existing, two-admission* design correct and bounded; it does not
+collapse it to one admission.
+
 ## Risks / Trade-offs
 
 - [Resource-reference passthrough (Decision 1) only reaches Kernel dispatch
@@ -358,12 +411,16 @@ observability gap identified by the audit, not a spec change.
 
 - The output-side round-trip (Decision 7) is real follow-up work: unifying
   the Kernel-internal output resource id with the graph edge's id (or
-  otherwise making the edge-level write a true no-op) needs a Memory
+  otherwise making the edge-level write a true no-op) needs either a Memory
   Manager admission model that can represent "this Provider-internal
   allocation is *the same physical resource* as this Session-owned edge,"
-  not two independent admissions. Worth scoping as its own change once a
-  real workload's profile shows this is the dominant remaining cost --
-  premature to design the admission-unification model speculatively here.
+  or a breaking `ProviderExecutionApi::submit_kernel` signature change
+  letting the caller choose the admission's owner (confirmed as the actual
+  blocker, not just suspected -- Decision 7). Worth scoping as its own
+  change once a real workload's profile shows the remaining physical copy
+  (not the now-fixed ledger leak, Decision 8) is the dominant remaining
+  cost -- premature to design the admission-unification/trait-break model
+  speculatively here.
 - `device-resident-resource`'s "Residency Survives Asynchronous Execution"
   and most of `execution-stream`'s multi-stream/ordering requirements stay
   genuinely unimplemented by any Provider after this change (Decision 4).
