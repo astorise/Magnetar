@@ -168,11 +168,20 @@
   "Output consumed by a later invocation" scenario matches unchanged
   (governed by task group 2's leak fix, not this task group).
 - [ ] 6.2 Update `providers/cpu`/`providers/cuda` submodule pins in `SUBMODULES.md` with the new commits.
-- [ ] 6.3 Dispatch `gpu-runner-smoke.yml` on `arc-gpu-magnetar`, confirm green.
+- [x] 6.3 Dispatched `gpu-runner-smoke.yml` on `arc-gpu-magnetar` against
+  `main` at these exact commits (parent `32a70ef`, `providers/cpu`
+  `560895b`, `providers/cuda` `7997a2f`): green --
+  https://github.com/astorise/Magnetar/actions/runs/34018630488
 
 ## 7. Full verification
 
-- [ ] 7.1 `cargo build -p magnetar-runtime --lib`, `cargo test -p magnetar-runtime --lib`, `cargo clippy -p magnetar-runtime --lib --tests -- -D warnings`, `cargo fmt --check`, `cargo build --workspace`.
-- [ ] 7.2 `cargo check --target wasm32-unknown-unknown -p magnetar-runtime --all-features`.
-- [ ] 7.3 `providers/cpu` and `providers/cuda`: build, test, clippy, fmt clean (CUDA on real hardware).
-- [ ] 7.4 `openspec validate unify-provider-output-admission-and-residency --strict`.
+- [x] 7.1 `cargo build -p magnetar-runtime --lib`, `cargo test -p magnetar-runtime --lib`
+  (1195/1195), `cargo clippy -p magnetar-runtime --lib --tests -- -D warnings` (clean),
+  `cargo fmt --check` (clean), `cargo build --workspace` (clean).
+- [x] 7.2 `cargo check --target wasm32-unknown-unknown -p magnetar-runtime --all-features`
+  -- clean (pre-existing unused-variable warnings only, unrelated to this change).
+- [x] 7.3 `providers/cpu` (9/9) and `providers/cuda` (23/23, real hardware,
+  RTX 3070 Ti Laptop GPU): build, test, clippy (including `--benches`), fmt
+  all clean.
+- [x] 7.4 `openspec validate unify-provider-output-admission-and-residency --strict`
+  -- valid, re-confirmed after the final design.md/tasks.md edits.
