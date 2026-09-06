@@ -1,10 +1,13 @@
 name: GPU Runner Smoke Test
 
 # Confirms the arc-gpu-magnetar self-hosted GPU runner is reachable and can
-# build/test providers/cuda. Manual only: providers/cuda is currently an
-# empty template (see providers/cuda/README.md), so there is no CUDA-specific
-# behavior yet worth gating per-PR CI on -- this just proves the runner and
-# submodule wiring work, ahead of real CUDA content landing.
+# build/test providers/cuda's real CUDA Provider: device discovery, the
+# `operator-scope` required-now kernel set (NVRTC-compiled), the
+# device-resident allocation table and explicit host/device data movement
+# (`enable-device-resident-kernel-chaining`), and the `provider-core`/
+# `provider-compute`/`provider-data-movement` conformance profiles against
+# real hardware. Manual only: not gated per-PR because it needs a live GPU
+# runner, not because there is nothing CUDA-specific to test.
 on:
   workflow_dispatch:
 
@@ -49,5 +52,5 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Install pinned Rust toolchain
         run: rustup show
-      - name: Build and test the CUDA Provider template
+      - name: Build and test the CUDA Provider
         run: cargo test --locked --manifest-path providers/cuda/Cargo.toml

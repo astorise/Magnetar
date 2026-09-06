@@ -1020,6 +1020,7 @@ pub enum KernelErrorCode {
     KernelProviderNotReady,
     KernelProviderSaturated,
     KernelExecutionFailed,
+    KernelOutOfDeviceMemory,
     KernelCancellationUnsupported,
     KernelCancelled,
     KernelTimeout,
@@ -1048,6 +1049,7 @@ pub enum KernelError {
     KernelProviderNotReady { provider: String },
     KernelProviderSaturated { provider: String },
     KernelExecutionFailed { reason: String },
+    KernelOutOfDeviceMemory { reason: String },
     KernelCancellationUnsupported,
     KernelCancelled,
     KernelTimeout,
@@ -1085,6 +1087,7 @@ impl KernelError {
             Self::KernelProviderNotReady { .. } => KernelErrorCode::KernelProviderNotReady,
             Self::KernelProviderSaturated { .. } => KernelErrorCode::KernelProviderSaturated,
             Self::KernelExecutionFailed { .. } => KernelErrorCode::KernelExecutionFailed,
+            Self::KernelOutOfDeviceMemory { .. } => KernelErrorCode::KernelOutOfDeviceMemory,
             Self::KernelCancellationUnsupported => KernelErrorCode::KernelCancellationUnsupported,
             Self::KernelCancelled => KernelErrorCode::KernelCancelled,
             Self::KernelTimeout => KernelErrorCode::KernelTimeout,
@@ -1177,6 +1180,7 @@ impl KernelErrorCode {
             Self::KernelProviderNotReady => "kernel-provider-not-ready",
             Self::KernelProviderSaturated => "kernel-provider-saturated",
             Self::KernelExecutionFailed => "kernel-execution-failed",
+            Self::KernelOutOfDeviceMemory => "kernel-out-of-device-memory",
             Self::KernelCancellationUnsupported => "kernel-cancellation-unsupported",
             Self::KernelCancelled => "kernel-cancelled",
             Self::KernelTimeout => "kernel-timeout",
@@ -1236,6 +1240,9 @@ impl fmt::Display for KernelError {
             }
             Self::KernelExecutionFailed { reason } => {
                 write!(f, "kernel execution failed: {reason}")
+            }
+            Self::KernelOutOfDeviceMemory { reason } => {
+                write!(f, "kernel out of device memory: {reason}")
             }
             Self::KernelCancellationUnsupported => write!(f, "kernel cancellation unsupported"),
             Self::KernelCancelled => write!(f, "kernel cancelled"),

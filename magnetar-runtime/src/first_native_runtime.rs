@@ -1597,11 +1597,136 @@ fn dispatch_matmul_with_prepared_plan(
 }
 
 fn f32_tensor_descriptor(tensor: &HostTensor) -> TensorDescriptor {
+    f32_tensor_descriptor_from_shape(&tensor.shape)
+}
+
+fn shape_rows_cols(shape: &[u64]) -> Result<(u64, u64), InferenceApiError> {
+    match shape {
+        [rows, cols] => Ok((*rows, *cols)),
+        other => Err(InferenceApiError::GraphPlanningFailed {
+            reason: format!("expected rank-2 tensor, got shape {other:?}"),
+        }),
+    }
+}
+
+fn f32_tensor_descriptor_from_shape(shape: &[u64]) -> TensorDescriptor {
     TensorDescriptor::new(
-        ShapeDescriptor::new(tensor.shape.clone()),
+        ShapeDescriptor::new(shape.to_vec()),
         DTypeDescriptor::portable(ComputeDType::Float32),
         LayoutDescriptor::Contiguous,
     )
+}
+
+/// One node's resolved input: either real host bytes, or an existing
+/// device-resident (or otherwise Provider-opaque) resource this dispatch
+/// can reuse in place instead of downloading and re-uploading a copy under
+/// a fresh id (`enable-device-resident-kernel-chaining`'s input-side
+/// passthrough decision). `shape` is carried alongside `Resident` because
+/// `TensorValue::Opaque` itself carries no metadata -- callers that only
+/// need shape (matmul's `rows_cols`, embedding's `sequence_length`, ...)
+/// never have to materialize the value just to read it.
+enum NodeInputValue {
+    Host(HostTensor),
+    Resident {
+        id: TensorResourceId,
+        shape: Vec<u64>,
+    },
+}
+
+impl NodeInputValue {
+    fn shape(&self) -> &[u64] {
+        match self {
+            Self::Host(tensor) => &tensor.shape,
+            Self::Resident { shape, .. } => shape,
+        }
+    }
+
+    fn rows_cols(&self) -> Result<(u64, u64), InferenceApiError> {
+        shape_rows_cols(self.shape())
+    }
+
+    /// Materializes to real host bytes, downloading only if this value
+    /// wasn't already host-shaped. Used for the operators
+    /// (`rmsnorm`'s weight broadcast, `rope`'s per-head slicing) that
+    /// genuinely manipulate raw floats in Rust rather than only forwarding
+    /// the value to a Kernel dispatch.
+    fn into_host(
+        self,
+        provider: &Arc<dyn ProviderExecutionApi>,
+    ) -> Result<HostTensor, InferenceApiError> {
+        match self {
+            Self::Host(tensor) => Ok(tensor),
+            Self::Resident { id, .. } => {
+                provider
+                    .read_tensor(&id)
+                    .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+                        reason: format!("no materialized data for resident resource '{id}'"),
+                    })
+            }
+        }
+    }
+}
+
+/// One input resource ready to hand to
+/// [`dispatch_reference_cpu_operator_multi`]: either fresh host bytes that
+/// still need writing under a newly synthesized id (today's behavior), or
+/// an existing resource this dispatch reuses by id with no write at all.
+enum NodeInputResource {
+    Fresh(TensorResourceId, TensorDescriptor, HostTensor),
+    Resident(TensorResourceId, TensorDescriptor),
+}
+
+/// Builds a [`NodeInputResource`] for one named input argument (`suffix`,
+/// e.g. `"a"`/`"b"`) of `operation_id`'s dispatch.
+fn node_input_resource(
+    operation_id: &str,
+    suffix: &str,
+    value: NodeInputValue,
+) -> NodeInputResource {
+    match value {
+        NodeInputValue::Host(tensor) => {
+            let descriptor = f32_tensor_descriptor(&tensor);
+            NodeInputResource::Fresh(
+                TensorResourceId::new(format!("{operation_id}.{suffix}")),
+                descriptor,
+                tensor,
+            )
+        }
+        NodeInputValue::Resident { id, shape } => {
+            NodeInputResource::Resident(id, f32_tensor_descriptor_from_shape(&shape))
+        }
+    }
+}
+
+/// The `KernelMemoryClass` this dispatch's resources should advertise:
+/// derived from the Prepared Plan's own resolved Provider binding for this
+/// node when one exists, defaulting to `Host` (Reference CPU's class, and
+/// the safe default for the no-Prepared-Plan fallback/test-oracle path).
+/// Every real Provider other than Reference CPU advertises `Device`
+/// (`providers/cuda`'s own Kernel advertisements do) -- hardcoding `Host`
+/// unconditionally here made every CUDA Kernel invocation through this
+/// dispatch loop fail `KernelMemoryClassUnsupported` at
+/// `validate_invocation`, independent of residency
+/// (`enable-device-resident-kernel-chaining`'s discovered prerequisite fix).
+fn resolved_kernel_memory_class(
+    prepared_plan: Option<&PreparedExecutionPlan>,
+    node: &ExecutionNodeId,
+) -> KernelMemoryClass {
+    let Some(prepared_plan) = prepared_plan else {
+        return KernelMemoryClass::Host;
+    };
+    let Some(binding) = prepared_plan
+        .node_bindings
+        .iter()
+        .find(|binding| binding.graph_nodes.contains(node))
+    else {
+        return KernelMemoryClass::Host;
+    };
+    if binding.provider.as_str() == REFERENCE_CPU_PROVIDER_NAME {
+        KernelMemoryClass::Host
+    } else {
+        KernelMemoryClass::Device
+    }
 }
 
 struct QwenDispatchContext<'a> {
@@ -1812,7 +1937,7 @@ fn dispatch_reference_cpu_operator_multi(
     ctx: &mut QwenDispatchContext<'_>,
     operation_id: &str,
     operator: OperatorId,
-    inputs: Vec<(TensorResourceId, TensorDescriptor, HostTensor)>,
+    inputs: Vec<NodeInputResource>,
     outputs: Vec<(TensorResourceId, TensorDescriptor)>,
     attributes: BTreeMap<String, OperatorAttributeValue>,
 ) -> Result<(KernelDispatchResult, Vec<HostTensor>), InferenceApiError> {
@@ -1830,6 +1955,7 @@ fn dispatch_reference_cpu_operator_multi(
     let affinity = ResourceAffinity::new(FallbackClass::Transparent)
         .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
         .with_execution_context(ctx.runtime.context().id());
+    let memory_class = resolved_kernel_memory_class(ctx.prepared_plan.as_deref(), &node);
     let output_resources: Vec<TensorResourceDescriptor> = outputs
         .into_iter()
         .map(|(id, descriptor)| TensorResourceDescriptor::new(id, descriptor, affinity.clone()))
@@ -1840,20 +1966,31 @@ fn dispatch_reference_cpu_operator_multi(
         affinity.clone(),
     );
     for output_resource in &output_resources {
-        selection_request = selection_request.with_output(KernelResource::new(
-            output_resource.clone(),
-            KernelMemoryClass::Host,
-        ));
+        selection_request = selection_request
+            .with_output(KernelResource::new(output_resource.clone(), memory_class));
     }
-    for (id, descriptor, tensor) in inputs {
-        let resource = TensorResourceDescriptor::new(id.clone(), descriptor, affinity.clone());
-        ctx.provider.write_tensor(id, tensor).map_err(|error| {
-            InferenceApiError::ProviderTensorWriteFailed {
-                reason: error.to_string(),
+    for input in inputs {
+        let resource = match input {
+            NodeInputResource::Fresh(id, descriptor, tensor) => {
+                let resource =
+                    TensorResourceDescriptor::new(id.clone(), descriptor, affinity.clone());
+                ctx.provider.write_tensor(id, tensor).map_err(|error| {
+                    InferenceApiError::ProviderTensorWriteFailed {
+                        reason: error.to_string(),
+                    }
+                })?;
+                resource
             }
-        })?;
+            // Already resident under `id` in the resolved Provider's own
+            // storage (this dispatch's earlier producer wrote it there,
+            // or a graph input/weight was admitted under it) -- reused by
+            // reference, no download-then-reupload copy.
+            NodeInputResource::Resident(id, descriptor) => {
+                TensorResourceDescriptor::new(id, descriptor, affinity.clone())
+            }
+        };
         selection_request =
-            selection_request.with_input(KernelResource::new(resource, KernelMemoryClass::Host));
+            selection_request.with_input(KernelResource::new(resource, memory_class));
     }
     // Correctif 4: once a Plan is published, a node's execution SHALL be
     // driven directly from its `PlanNodeBinding`/`PreparedKernelId` through
@@ -2069,7 +2206,7 @@ fn dispatch_reference_cpu_operator(
     ctx: &mut QwenDispatchContext<'_>,
     operation_id: &str,
     operator: OperatorId,
-    inputs: Vec<(TensorResourceId, TensorDescriptor, HostTensor)>,
+    inputs: Vec<NodeInputResource>,
     output: (TensorResourceId, TensorDescriptor),
     attributes: BTreeMap<String, OperatorAttributeValue>,
 ) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
@@ -2102,26 +2239,18 @@ fn dispatch_operator_id(name: &str, family: OperatorFamily) -> OperatorId {
 fn dispatch_qwen_matmul(
     ctx: &mut QwenDispatchContext<'_>,
     operation_id: &str,
-    a: HostTensor,
-    b: HostTensor,
+    a: NodeInputValue,
+    b: NodeInputValue,
 ) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
-    let (rows, _) = a.rows_cols().map_err(runtime_generation_failed)?;
-    let (_, cols) = b.rows_cols().map_err(runtime_generation_failed)?;
+    let (rows, _) = a.rows_cols()?;
+    let (_, cols) = b.rows_cols()?;
     dispatch_reference_cpu_operator(
         ctx,
         operation_id,
         dispatch_operator_id("matmul", OperatorFamily::LinearAlgebra),
         vec![
-            (
-                TensorResourceId::new(format!("{operation_id}.a")),
-                f32_tensor_descriptor(&a),
-                a,
-            ),
-            (
-                TensorResourceId::new(format!("{operation_id}.b")),
-                f32_tensor_descriptor(&b),
-                b,
-            ),
+            node_input_resource(operation_id, "a", a),
+            node_input_resource(operation_id, "b", b),
         ],
         (
             TensorResourceId::new(format!("{operation_id}.out")),
@@ -2140,21 +2269,18 @@ fn dispatch_qwen_unary(
     operation_id: &str,
     name: &str,
     family: OperatorFamily,
-    input: HostTensor,
+    input: NodeInputValue,
     attributes: BTreeMap<String, OperatorAttributeValue>,
 ) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let output_descriptor = f32_tensor_descriptor_from_shape(input.shape());
     dispatch_reference_cpu_operator(
         ctx,
         operation_id,
         dispatch_operator_id(name, family),
-        vec![(
-            TensorResourceId::new(format!("{operation_id}.input")),
-            f32_tensor_descriptor(&input),
-            input.clone(),
-        )],
+        vec![node_input_resource(operation_id, "input", input)],
         (
             TensorResourceId::new(format!("{operation_id}.out")),
-            f32_tensor_descriptor(&input),
+            output_descriptor,
         ),
         attributes,
     )
@@ -2165,28 +2291,21 @@ fn dispatch_qwen_binary_same_shape(
     operation_id: &str,
     name: &str,
     family: OperatorFamily,
-    a: HostTensor,
-    b: HostTensor,
+    a: NodeInputValue,
+    b: NodeInputValue,
 ) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
+    let output_descriptor = f32_tensor_descriptor_from_shape(a.shape());
     dispatch_reference_cpu_operator(
         ctx,
         operation_id,
         dispatch_operator_id(name, family),
         vec![
-            (
-                TensorResourceId::new(format!("{operation_id}.a")),
-                f32_tensor_descriptor(&a),
-                a.clone(),
-            ),
-            (
-                TensorResourceId::new(format!("{operation_id}.b")),
-                f32_tensor_descriptor(&b),
-                b,
-            ),
+            node_input_resource(operation_id, "a", a),
+            node_input_resource(operation_id, "b", b),
         ],
         (
             TensorResourceId::new(format!("{operation_id}.out")),
-            f32_tensor_descriptor(&a),
+            output_descriptor,
         ),
         BTreeMap::new(),
     )
@@ -2219,12 +2338,12 @@ fn dispatch_qwen_rmsnorm(
         operation_id,
         dispatch_operator_id("rmsnorm", OperatorFamily::Normalization),
         vec![
-            (
+            NodeInputResource::Fresh(
                 TensorResourceId::new(format!("{operation_id}.input")),
                 f32_tensor_descriptor(&input),
                 input.clone(),
             ),
-            (
+            NodeInputResource::Fresh(
                 TensorResourceId::new(format!("{operation_id}.weight")),
                 f32_tensor_descriptor(&weight),
                 weight,
@@ -2285,7 +2404,7 @@ fn dispatch_qwen_rope_per_head(
             &format!("{operation_id}.head{head}"),
             "rope",
             OperatorFamily::PositionEncoding,
-            head_tensor,
+            NodeInputValue::Host(head_tensor),
             attributes,
         )?;
         for row in 0..rows {
@@ -2306,9 +2425,9 @@ fn dispatch_qwen_rope_per_head(
 fn dispatch_qwen_attention(
     ctx: &mut QwenDispatchContext<'_>,
     operation_id: &str,
-    q: HostTensor,
-    k: HostTensor,
-    v: HostTensor,
+    q: NodeInputValue,
+    k: NodeInputValue,
+    v: NodeInputValue,
     architecture: &ModelComponentArchitectureMetadata,
 ) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
     let mut attributes = BTreeMap::new();
@@ -2329,30 +2448,19 @@ fn dispatch_qwen_attention(
         "attention_mask_kind".into(),
         OperatorAttributeValue::String("causal".into()),
     );
+    let output_descriptor = f32_tensor_descriptor_from_shape(q.shape());
     dispatch_reference_cpu_operator(
         ctx,
         operation_id,
         dispatch_operator_id("attention", OperatorFamily::Attention),
         vec![
-            (
-                TensorResourceId::new(format!("{operation_id}.q")),
-                f32_tensor_descriptor(&q),
-                q.clone(),
-            ),
-            (
-                TensorResourceId::new(format!("{operation_id}.k")),
-                f32_tensor_descriptor(&k),
-                k,
-            ),
-            (
-                TensorResourceId::new(format!("{operation_id}.v")),
-                f32_tensor_descriptor(&v),
-                v,
-            ),
+            node_input_resource(operation_id, "q", q),
+            node_input_resource(operation_id, "k", k),
+            node_input_resource(operation_id, "v", v),
         ],
         (
             TensorResourceId::new(format!("{operation_id}.out")),
-            f32_tensor_descriptor(&q),
+            output_descriptor,
         ),
         attributes,
     )
@@ -2668,7 +2776,7 @@ fn dispatch_qwen_graph_node(
     ctx: &mut QwenDispatchContext<'_>,
     fixture: &E2eFixture,
     node: &ExecutionNode,
-    mut inputs: Vec<HostTensor>,
+    mut inputs: Vec<NodeInputValue>,
     absolute_position_override: Option<u64>,
 ) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
     let node_id = node.id.as_str();
@@ -2691,22 +2799,14 @@ fn dispatch_qwen_graph_node(
                     .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
                         reason: format!("graph node '{node_id}' has no output edge"),
                     })?;
-            let sequence_length = ids.shape.first().copied().unwrap_or(0);
+            let sequence_length = ids.shape().first().copied().unwrap_or(0);
             dispatch_reference_cpu_operator(
                 ctx,
                 node_id,
                 node.operator.clone(),
                 vec![
-                    (
-                        TensorResourceId::new(format!("{node_id}.table")),
-                        f32_tensor_descriptor(&table),
-                        table,
-                    ),
-                    (
-                        TensorResourceId::new(format!("{node_id}.ids")),
-                        f32_tensor_descriptor(&ids),
-                        ids,
-                    ),
+                    node_input_resource(node_id, "table", table),
+                    node_input_resource(node_id, "ids", ids),
                 ],
                 (
                     TensorResourceId::new(output_edge.as_str()),
@@ -2725,8 +2825,14 @@ fn dispatch_qwen_graph_node(
                     reason: format!("graph node '{node_id}' expects 2 rmsnorm inputs"),
                 });
             }
-            let input = inputs.remove(0);
-            let weight = inputs.remove(0);
+            // RMSNorm's own Rust code broadcasts a single-row weight and
+            // reads real bytes directly (see `dispatch_qwen_rmsnorm`), so
+            // both inputs materialize here rather than staying Resident --
+            // this node never benefits from the passthrough optimization,
+            // by design (`enable-device-resident-kernel-chaining` design.md
+            // Non-Goals).
+            let input = inputs.remove(0).into_host(&ctx.provider)?;
+            let weight = inputs.remove(0).into_host(&ctx.provider)?;
             let epsilon = node_attribute_f64(node, "epsilon")? as f32;
             dispatch_qwen_rmsnorm(ctx, node_id, input, weight, epsilon)
         }
@@ -2746,7 +2852,11 @@ fn dispatch_qwen_graph_node(
                     reason: format!("graph node '{node_id}' expects 1 rope input"),
                 });
             }
-            let tensor = inputs.remove(0);
+            // RoPE slices real per-head byte ranges out of this tensor in
+            // Rust (see `dispatch_qwen_rope_per_head`), so it materializes
+            // here rather than staying Resident -- same non-goal as
+            // rmsnorm above.
+            let tensor = inputs.remove(0).into_host(&ctx.provider)?;
             let head_dimension = node_attribute_u64(node, "dimension")?;
             let head_count = qwen_rope_head_count(node, architecture)?;
             let base = node_attribute_f64(node, "base")?;
@@ -3001,9 +3111,10 @@ fn execute_qwen_graph_nodes(
     // tracks and releases the allocation each resource id previously held,
     // Provider-side, so accounting stays bounded to this graph's edge count
     // no matter how many steps a session runs.
-    let mut bindings: BTreeMap<TensorEdgeId, TensorResourceId> = BTreeMap::new();
+    let mut bindings: BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)> = BTreeMap::new();
     for (edge_id, tensor) in initial_bindings {
         let resource_id = TensorResourceId::new(edge_id.as_str());
+        let shape = tensor.shape.clone();
         dispatch_ctx
             .provider
             .write_tensor_value_admitted(
@@ -3029,7 +3140,7 @@ fn execute_qwen_graph_nodes(
                     }
                 }
             })?;
-        bindings.insert(edge_id, resource_id);
+        bindings.insert(edge_id, (resource_id, shape));
     }
     let mut layer_k: Vec<Option<TensorResourceId>> = vec![None; layer_count];
     let mut layer_v: Vec<Option<TensorResourceId>> = vec![None; layer_count];
@@ -3043,14 +3154,21 @@ fn execute_qwen_graph_nodes(
                 .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
                     reason: format!("first-native graph is missing node '{node_id}'"),
                 })?;
+        // Nodes whose own Rust code never dereferences input bytes directly
+        // (they only forward the value to a Kernel dispatch) can accept an
+        // already device-resident input by reference; `rmsnorm`/`rope`
+        // genuinely manipulate raw floats (weight broadcast, per-head
+        // slicing) and always materialize instead
+        // (`enable-device-resident-kernel-chaining` design.md Decision 1/
+        // Non-Goals).
+        let passthrough_eligible = matches!(
+            node.operator.name(),
+            "matmul" | "attention" | "silu" | "mul" | "residual-add" | "embedding"
+        );
         let mut inputs = Vec::with_capacity(node.inputs.len());
         for edge_id in &node.inputs {
-            let tensor = match bindings.get(edge_id) {
-                // Reference CPU Kernel input boundary: this edge's value
-                // feeds `dispatch_qwen_graph_node`'s compute directly, so it
-                // is materialized to host bytes here rather than carried as
-                // an opaque `TensorValue` further into the generic loop.
-                Some(resource_id) => {
+            let value = match bindings.get(edge_id) {
+                Some((resource_id, shape)) => {
                     let value = dispatch_ctx
                         .provider
                         .read_tensor_value(resource_id)
@@ -3059,22 +3177,34 @@ fn execute_qwen_graph_nodes(
                                 "no materialized data for graph edge '{edge_id}' (resource '{resource_id}')"
                             ),
                         })?;
-                    value.into_host(resource_id).map_err(|error| {
-                        InferenceApiError::GraphPlanningFailed {
-                            reason: format!(
-                                "graph edge '{edge_id}' (resource '{resource_id}'): {error}"
-                            ),
+                    match value {
+                        // Same Provider already holds this edge device-
+                        // (or otherwise Provider-)resident: reuse it in
+                        // place instead of downloading and immediately
+                        // re-uploading a copy under a fresh id.
+                        TensorValue::Opaque if passthrough_eligible => NodeInputValue::Resident {
+                            id: resource_id.clone(),
+                            shape: shape.clone(),
+                        },
+                        other => {
+                            NodeInputValue::Host(other.into_host(resource_id).map_err(|error| {
+                                InferenceApiError::GraphPlanningFailed {
+                                    reason: format!(
+                                        "graph edge '{edge_id}' (resource '{resource_id}'): {error}"
+                                    ),
+                                }
+                            })?)
                         }
-                    })?
+                    }
                 }
-                None => resolve_qwen_weight_edge(
+                None => NodeInputValue::Host(resolve_qwen_weight_edge(
                     executor,
                     weight_bindings,
                     fixture.config.tied_embeddings,
                     edge_id.as_str(),
-                )?,
+                )?),
             };
-            inputs.push(tensor);
+            inputs.push(value);
         }
         let (dispatch_result, mut output_tensor) = dispatch_qwen_graph_node(
             &mut dispatch_ctx,
@@ -3206,6 +3336,7 @@ fn execute_qwen_graph_nodes(
         // sees the concatenated value, matching this function's prior
         // HostTensor-based behavior exactly).
         let output_resource_id = TensorResourceId::new(format!("edge.{output_edge_id}"));
+        let output_shape = output_tensor.shape.clone();
         dispatch_ctx
             .provider
             .write_tensor_value_admitted(
@@ -3231,7 +3362,7 @@ fn execute_qwen_graph_nodes(
                     }
                 }
             })?;
-        bindings.insert(output_edge_id.clone(), output_resource_id);
+        bindings.insert(output_edge_id.clone(), (output_resource_id, output_shape));
         last_dispatch = Some(dispatch_result);
     }
 
@@ -3263,7 +3394,7 @@ fn execute_qwen_graph_nodes(
     // carries `TensorValue` instead of assuming every Tensor Resource is
     // host-visible.
     let mut materialized_bindings = BTreeMap::new();
-    for (edge_id, resource_id) in &bindings {
+    for (edge_id, (resource_id, _shape)) in &bindings {
         let value = dispatch_ctx
             .provider
             .read_tensor_value(resource_id)
@@ -3420,12 +3551,12 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         "embedding",
         dispatch_operator_id("embedding", OperatorFamily::Tensor),
         vec![
-            (
+            NodeInputResource::Fresh(
                 TensorResourceId::new("embedding.table"),
                 f32_tensor_descriptor(&token_embedding),
                 token_embedding,
             ),
-            (
+            NodeInputResource::Fresh(
                 TensorResourceId::new("embedding.ids"),
                 f32_tensor_descriptor(&ids_tensor),
                 ids_tensor,
@@ -3491,20 +3622,20 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         let (_dispatch, q) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.q_proj"),
-            normed.clone(),
-            q_weight,
+            NodeInputValue::Host(normed.clone()),
+            NodeInputValue::Host(q_weight),
         )?;
         let (_dispatch, k) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.k_proj"),
-            normed.clone(),
-            k_weight,
+            NodeInputValue::Host(normed.clone()),
+            NodeInputValue::Host(k_weight),
         )?;
         let (_dispatch, v) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.v_proj"),
-            normed,
-            v_weight,
+            NodeInputValue::Host(normed),
+            NodeInputValue::Host(v_weight),
         )?;
         let (_dispatch, q) = dispatch_qwen_rope_per_head(
             &mut dispatch_ctx,
@@ -3545,24 +3676,24 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         let (_dispatch, attention_out) = dispatch_qwen_attention(
             &mut dispatch_ctx,
             &format!("{layer_id}.attention"),
-            q,
-            k,
-            v,
+            NodeInputValue::Host(q),
+            NodeInputValue::Host(k),
+            NodeInputValue::Host(v),
             architecture,
         )?;
         let (_dispatch, attention_proj) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.o_proj"),
-            attention_out,
-            o_weight,
+            NodeInputValue::Host(attention_out),
+            NodeInputValue::Host(o_weight),
         )?;
         let (_dispatch, post_attention) = dispatch_qwen_binary_same_shape(
             &mut dispatch_ctx,
             &format!("{layer_id}.residual1"),
             "residual-add",
             OperatorFamily::Tensor,
-            attention_proj,
-            hidden_states,
+            NodeInputValue::Host(attention_proj),
+            NodeInputValue::Host(hidden_states),
         )?;
         let (_dispatch, normed_mlp) = dispatch_qwen_rmsnorm(
             &mut dispatch_ctx,
@@ -3574,21 +3705,21 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         let (_dispatch, gate) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.gate_proj"),
-            normed_mlp.clone(),
-            gate_weight,
+            NodeInputValue::Host(normed_mlp.clone()),
+            NodeInputValue::Host(gate_weight),
         )?;
         let (_dispatch, up) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.up_proj"),
-            normed_mlp,
-            up_weight,
+            NodeInputValue::Host(normed_mlp),
+            NodeInputValue::Host(up_weight),
         )?;
         let (_dispatch, activated) = dispatch_qwen_unary(
             &mut dispatch_ctx,
             &format!("{layer_id}.silu"),
             "silu",
             OperatorFamily::Activation,
-            gate,
+            NodeInputValue::Host(gate),
             BTreeMap::new(),
         )?;
         let (_dispatch, gated) = dispatch_qwen_binary_same_shape(
@@ -3596,22 +3727,22 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             &format!("{layer_id}.mul"),
             "mul",
             OperatorFamily::Tensor,
-            activated,
-            up,
+            NodeInputValue::Host(activated),
+            NodeInputValue::Host(up),
         )?;
         let (_dispatch, mlp_out) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.down_proj"),
-            gated,
-            down_weight,
+            NodeInputValue::Host(gated),
+            NodeInputValue::Host(down_weight),
         )?;
         let (_dispatch, layer_out) = dispatch_qwen_binary_same_shape(
             &mut dispatch_ctx,
             &format!("{layer_id}.residual2"),
             "residual-add",
             OperatorFamily::Tensor,
-            mlp_out,
-            post_attention,
+            NodeInputValue::Host(mlp_out),
+            NodeInputValue::Host(post_attention),
         )?;
         hidden_states = layer_out;
     }
@@ -3685,12 +3816,12 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         "decode.embedding",
         dispatch_operator_id("embedding", OperatorFamily::Tensor),
         vec![
-            (
+            NodeInputResource::Fresh(
                 TensorResourceId::new("decode.embedding.table"),
                 f32_tensor_descriptor(&token_embedding),
                 token_embedding,
             ),
-            (
+            NodeInputResource::Fresh(
                 TensorResourceId::new("decode.embedding.ids"),
                 f32_tensor_descriptor(&ids_tensor),
                 ids_tensor,
@@ -3756,20 +3887,20 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         let (_dispatch, q) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.q_proj"),
-            normed.clone(),
-            q_weight,
+            NodeInputValue::Host(normed.clone()),
+            NodeInputValue::Host(q_weight),
         )?;
         let (_dispatch, k_new) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.k_proj"),
-            normed.clone(),
-            k_weight,
+            NodeInputValue::Host(normed.clone()),
+            NodeInputValue::Host(k_weight),
         )?;
         let (_dispatch, v_new) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.v_proj"),
-            normed,
-            v_weight,
+            NodeInputValue::Host(normed),
+            NodeInputValue::Host(v_weight),
         )?;
         let (_dispatch, q) = dispatch_qwen_rope_per_head(
             &mut dispatch_ctx,
@@ -3825,24 +3956,24 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         let (_dispatch, attention_out) = dispatch_qwen_attention(
             &mut dispatch_ctx,
             &format!("{layer_id}.attention"),
-            q,
-            k,
-            v,
+            NodeInputValue::Host(q),
+            NodeInputValue::Host(k),
+            NodeInputValue::Host(v),
             architecture,
         )?;
         let (_dispatch, attention_proj) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.o_proj"),
-            attention_out,
-            o_weight,
+            NodeInputValue::Host(attention_out),
+            NodeInputValue::Host(o_weight),
         )?;
         let (_dispatch, post_attention) = dispatch_qwen_binary_same_shape(
             &mut dispatch_ctx,
             &format!("{layer_id}.residual1"),
             "residual-add",
             OperatorFamily::Tensor,
-            attention_proj,
-            hidden_states,
+            NodeInputValue::Host(attention_proj),
+            NodeInputValue::Host(hidden_states),
         )?;
         let (_dispatch, normed_mlp) = dispatch_qwen_rmsnorm(
             &mut dispatch_ctx,
@@ -3854,21 +3985,21 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         let (_dispatch, gate) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.gate_proj"),
-            normed_mlp.clone(),
-            gate_weight,
+            NodeInputValue::Host(normed_mlp.clone()),
+            NodeInputValue::Host(gate_weight),
         )?;
         let (_dispatch, up) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.up_proj"),
-            normed_mlp,
-            up_weight,
+            NodeInputValue::Host(normed_mlp),
+            NodeInputValue::Host(up_weight),
         )?;
         let (_dispatch, activated) = dispatch_qwen_unary(
             &mut dispatch_ctx,
             &format!("{layer_id}.silu"),
             "silu",
             OperatorFamily::Activation,
-            gate,
+            NodeInputValue::Host(gate),
             BTreeMap::new(),
         )?;
         let (_dispatch, gated) = dispatch_qwen_binary_same_shape(
@@ -3876,22 +4007,22 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             &format!("{layer_id}.mul"),
             "mul",
             OperatorFamily::Tensor,
-            activated,
-            up,
+            NodeInputValue::Host(activated),
+            NodeInputValue::Host(up),
         )?;
         let (_dispatch, mlp_out) = dispatch_qwen_matmul(
             &mut dispatch_ctx,
             &format!("{layer_id}.down_proj"),
-            gated,
-            down_weight,
+            NodeInputValue::Host(gated),
+            NodeInputValue::Host(down_weight),
         )?;
         let (_dispatch, layer_out) = dispatch_qwen_binary_same_shape(
             &mut dispatch_ctx,
             &format!("{layer_id}.residual2"),
             "residual-add",
             OperatorFamily::Tensor,
-            mlp_out,
-            post_attention,
+            NodeInputValue::Host(mlp_out),
+            NodeInputValue::Host(post_attention),
         )?;
         hidden_states = layer_out;
     }
@@ -7094,12 +7225,12 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             "coverage.embedding",
             dispatch_operator_id("embedding", OperatorFamily::Tensor),
             vec![
-                (
+                NodeInputResource::Fresh(
                     TensorResourceId::new("coverage.embedding.table"),
                     f32_tensor_descriptor(&embedding_table),
                     embedding_table,
                 ),
-                (
+                NodeInputResource::Fresh(
                     TensorResourceId::new("coverage.embedding.ids"),
                     f32_tensor_descriptor(&ids),
                     ids,
@@ -7141,8 +7272,8 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
         dispatch_qwen_matmul(
             &mut dispatch_ctx,
             "coverage.matmul",
-            one_row_hidden.clone(),
-            matmul_b,
+            NodeInputValue::Host(one_row_hidden.clone()),
+            NodeInputValue::Host(matmul_b),
         ),
     )?;
     record_operator_dispatch(
@@ -7164,9 +7295,9 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
         dispatch_qwen_attention(
             &mut dispatch_ctx,
             "coverage.attention",
-            one_row_hidden.clone(),
-            one_row_hidden.clone(),
-            one_row_hidden.clone(),
+            NodeInputValue::Host(one_row_hidden.clone()),
+            NodeInputValue::Host(one_row_hidden.clone()),
+            NodeInputValue::Host(one_row_hidden.clone()),
             architecture,
         ),
     )?;
@@ -7178,7 +7309,7 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             "coverage.softmax",
             "softmax",
             OperatorFamily::Activation,
-            one_row_hidden.clone(),
+            NodeInputValue::Host(one_row_hidden.clone()),
             BTreeMap::new(),
         ),
     )?;
@@ -7190,7 +7321,7 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             "coverage.silu",
             "silu",
             OperatorFamily::Activation,
-            one_row_hidden.clone(),
+            NodeInputValue::Host(one_row_hidden.clone()),
             BTreeMap::new(),
         ),
     )?;
@@ -7202,8 +7333,8 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             "coverage.mul",
             "mul",
             OperatorFamily::Tensor,
-            one_row_hidden.clone(),
-            one_row_hidden.clone(),
+            NodeInputValue::Host(one_row_hidden.clone()),
+            NodeInputValue::Host(one_row_hidden.clone()),
         ),
     )?;
     record_operator_dispatch(
@@ -7214,8 +7345,8 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             "coverage.add",
             "add",
             OperatorFamily::Tensor,
-            one_row_hidden.clone(),
-            one_row_hidden.clone(),
+            NodeInputValue::Host(one_row_hidden.clone()),
+            NodeInputValue::Host(one_row_hidden.clone()),
         ),
     )?;
     record_operator_dispatch(
@@ -7226,8 +7357,8 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             "coverage.residual_add",
             "residual-add",
             OperatorFamily::Tensor,
-            one_row_hidden.clone(),
-            one_row_hidden,
+            NodeInputValue::Host(one_row_hidden.clone()),
+            NodeInputValue::Host(one_row_hidden),
         ),
     )?;
     Ok(covered)
@@ -9424,12 +9555,12 @@ fn check_graph_dispatch_ignores_kernel_registry_preference_change_after_plan_pub
         "embedding",
         dispatch_operator_id("embedding", OperatorFamily::Tensor),
         vec![
-            (
+            NodeInputResource::Fresh(
                 TensorResourceId::new("embedding.table"),
                 f32_tensor_descriptor(&token_embedding),
                 token_embedding,
             ),
-            (
+            NodeInputResource::Fresh(
                 TensorResourceId::new("embedding.ids"),
                 f32_tensor_descriptor(&ids),
                 ids.clone(),

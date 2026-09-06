@@ -953,7 +953,7 @@ fn dispatch_reference_cpu_operator_multi_binds_every_output() {
         &mut dispatch_ctx,
         "multi-output.split",
         dispatch_operator_id("split", OperatorFamily::Tensor),
-        vec![(
+        vec![NodeInputResource::Fresh(
             TensorResourceId::new("multi-output.split.in"),
             f32_tensor_descriptor(&input),
             input,
@@ -990,6 +990,204 @@ fn dispatch_reference_cpu_operator_multi_binds_every_output() {
     assert_eq!(left.data, vec![1.0, 2.0]);
     assert_eq!(right.shape, vec![1, 2]);
     assert_eq!(right.data, vec![3.0, 4.0]);
+}
+
+/// A `ProviderExecutionApi` that delegates real computation to an inner
+/// `ReferenceCpuExecutor` but always reports `TensorValue::Opaque` for any
+/// resource it holds -- simulating a device-resident Provider (like CUDA)
+/// with a real, independently-correct Kernel implementation behind it,
+/// rather than a synthetic no-op double. Used to exercise
+/// `enable-device-resident-kernel-chaining`'s `NodeInputResource::Resident`
+/// passthrough against real Kernel dispatch, not just at the type level.
+struct OpaqueReportingExecutor {
+    inner: ReferenceCpuExecutor,
+}
+impl OpaqueReportingExecutor {
+    fn new() -> Self {
+        Self {
+            inner: ReferenceCpuExecutor::new(),
+        }
+    }
+}
+impl ProviderExecutionApi for OpaqueReportingExecutor {
+    fn submit(
+        &self,
+        request: ProviderExecutionRequest,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        self.inner.submit(request)
+    }
+    fn status(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+        self.inner.status(handle)
+    }
+    fn cancel(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderCancellationOutcome, ProviderExecutionError> {
+        self.inner.cancel(handle)
+    }
+    fn complete(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        self.inner.complete(handle)
+    }
+    fn release(&self, handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+        self.inner.release(handle)
+    }
+    fn submit_kernel(
+        &self,
+        advertisement: &KernelAdvertisement,
+        operator: &OperatorSpec,
+        invocation: &KernelInvocation,
+        memory: &mut MemoryManager,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        self.inner
+            .submit_kernel(advertisement, operator, invocation, memory)
+    }
+    fn complete_kernel(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<KernelResult, ProviderExecutionError> {
+        self.inner.complete_kernel(handle)
+    }
+    fn write_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: HostTensor,
+    ) -> Result<(), ProviderExecutionError> {
+        self.inner.write_tensor(id, tensor);
+        Ok(())
+    }
+    fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
+        self.inner.read_tensor(id)
+    }
+    fn release_tensor(&self, id: &TensorResourceId) -> Result<bool, ProviderExecutionError> {
+        Ok(self.inner.release_tensor(id))
+    }
+    fn write_tensor_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        resource_id: TensorResourceId,
+        tensor: HostTensor,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), MemoryError> {
+        self.inner
+            .write_tensor_admitted(memory, resource_id, tensor, class, owner)
+    }
+    // The one deliberate divergence from `self.inner`: always `Opaque` when
+    // present, never `Host`, so callers can never assume this Provider's
+    // resources are host-visible without an explicit `into_host`.
+    fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
+        self.inner.read_tensor(id).map(|_| TensorValue::Opaque)
+    }
+    fn write_tensor_value(
+        &self,
+        id: TensorResourceId,
+        value: TensorValue,
+    ) -> Result<(), ProviderExecutionError> {
+        self.inner.write_tensor_value(id, value)
+    }
+    fn write_tensor_value_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        resource_id: TensorResourceId,
+        value: TensorValue,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), TensorValueAdmissionError> {
+        self.inner
+            .write_tensor_value_admitted(memory, resource_id, value, class, owner)
+    }
+    fn observations(&self) -> Vec<KernelObservation> {
+        self.inner.observations()
+    }
+}
+
+/// `enable-device-resident-kernel-chaining` task 5.6: two consecutive
+/// Kernel dispatches against a Provider that never reports `Host` values
+/// (`OpaqueReportingExecutor`) -- the second dispatch's `NodeInputResource`
+/// for the first dispatch's output must be `Resident` (reused by id), never
+/// re-uploaded under a fresh id, yet the actual computed numbers must still
+/// be correct (proving the passthrough reaches real, independently
+/// verified Kernel computation, not a stub).
+#[test]
+fn resident_input_passthrough_reuses_existing_resource_and_computes_correctly() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let provider: Arc<dyn ProviderExecutionApi> = Arc::new(OpaqueReportingExecutor::new());
+    let mut node_events = Vec::new();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime: &mut runtime,
+        provider: provider.clone(),
+        prepared_plan: None,
+        graph: None,
+        sequence_length: None,
+        last_provider_execution: None,
+        node_events: &mut node_events,
+    };
+    let a = HostTensor::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let b = HostTensor::new([1, 4], vec![10.0, 10.0, 10.0, 10.0]).unwrap();
+    let (_dispatch, sum) = dispatch_reference_cpu_operator(
+        &mut dispatch_ctx,
+        "resident.add",
+        dispatch_operator_id("add", OperatorFamily::Tensor),
+        vec![
+            NodeInputResource::Fresh(
+                TensorResourceId::new("resident.add.a"),
+                f32_tensor_descriptor(&a),
+                a,
+            ),
+            NodeInputResource::Fresh(
+                TensorResourceId::new("resident.add.b"),
+                f32_tensor_descriptor(&b),
+                b,
+            ),
+        ],
+        (
+            TensorResourceId::new("resident.add.out"),
+            f32_tensor_descriptor(&HostTensor::new([1, 4], vec![0.0; 4]).unwrap()),
+        ),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(sum.data, vec![11.0, 12.0, 13.0, 14.0]);
+
+    // The producer's own output resource id -- reused verbatim, not a
+    // freshly synthesized one -- confirming this is a real by-reference
+    // passthrough, not merely a same-shaped copy.
+    let sum_resource_id = TensorResourceId::new("resident.add.out");
+    assert!(matches!(
+        provider.read_tensor_value(&sum_resource_id),
+        Some(TensorValue::Opaque)
+    ));
+
+    let scale = HostTensor::new([1, 4], vec![2.0, 2.0, 2.0, 2.0]).unwrap();
+    let (_dispatch, product) = dispatch_reference_cpu_operator(
+        &mut dispatch_ctx,
+        "resident.mul",
+        dispatch_operator_id("mul", OperatorFamily::Tensor),
+        vec![
+            // The Resident input: no write, no fresh id -- `sum_resource_id`
+            // is used exactly as-is.
+            NodeInputResource::Resident(sum_resource_id, f32_tensor_descriptor(&scale)),
+            NodeInputResource::Fresh(
+                TensorResourceId::new("resident.mul.b"),
+                f32_tensor_descriptor(&scale),
+                scale,
+            ),
+        ],
+        (
+            TensorResourceId::new("resident.mul.out"),
+            f32_tensor_descriptor(&HostTensor::new([1, 4], vec![0.0; 4]).unwrap()),
+        ),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(product.data, vec![22.0, 24.0, 26.0, 28.0]);
 }
 
 /// GitHub issue "A Model Instance stuck in Loading cannot currently be
