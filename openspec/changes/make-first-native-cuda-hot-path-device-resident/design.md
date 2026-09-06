@@ -364,6 +364,21 @@ forward again.
 
 ## Risks / Trade-offs
 
+- [`rope` actually has **three** independent implementations, not two --
+  found during implementation, not during this design's own investigation]
+  -> `magnetar-runtime/src/reference_cpu.rs` carries its own in-crate copy
+  (the module's own doc comment: "in-crate test double, not the sole
+  implementation"), and it is what `ReferenceCpuExecutor`/`dispatch_qwen_
+  graph_node` actually dispatch through -- distinct from `providers/cpu`'s
+  copy. Updating only `providers/cpu`/`providers/cuda` left this third copy
+  silently ignoring `head_count`, producing wrong-but-self-consistent
+  results (the graph and the oracle functions this task group also updated
+  shared the same bug, so they agreed with each other) until caught by
+  `e2e_forward_hidden_states`'s fully independent, untouched reference
+  implementation. Fixed with the identical correction plus the identical
+  new test trio in `reference_cpu/tests.rs`. Retained here as a standing
+  note for any *future* change to a Reference CPU Kernel: check for this
+  third copy before considering Provider-side coverage sufficient.
 - [`rope`'s signature change touches two Provider crates' public free
   functions] -> both are `publish = false`, submodule-only crates this
   change also updates in the same session; no external consumer exists

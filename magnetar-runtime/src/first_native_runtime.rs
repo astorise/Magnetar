@@ -1099,6 +1099,7 @@ fn apply_rope_per_head(
             rope_config.scale.unwrap_or(1.0) as f32,
             rope_config.dimension,
             0,
+            1,
         )?;
         for row in 0..rows {
             let dst_base = (row * cols + start_col) as usize;
@@ -1769,6 +1770,99 @@ fn resolved_output_placement(
     }
 }
 
+/// The `ResourceAffinity` a freshly-admitted resource for this dispatch
+/// should carry (`make-first-native-cuda-hot-path-device-resident`'s
+/// Decision 6): mirrors `resolved_output_placement`'s exact lookup pattern
+/// rather than the previous hardcoded `REFERENCE_CPU_PROVIDER_NAME` --
+/// `dispatch_reference_cpu_operator_multi` no longer has to guess which
+/// Provider a node actually resolved to when the Prepared Plan already
+/// says so.
+fn resolved_resource_affinity(
+    prepared_plan: Option<&PreparedExecutionPlan>,
+    node: &ExecutionNodeId,
+    execution_context: ExecutionContextId,
+) -> ResourceAffinity {
+    let base =
+        ResourceAffinity::new(FallbackClass::Transparent).with_execution_context(execution_context);
+    let Some(prepared_plan) = prepared_plan else {
+        return base.with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+    };
+    let Some(binding) = prepared_plan
+        .node_bindings
+        .iter()
+        .find(|binding| binding.graph_nodes.contains(node))
+    else {
+        return base.with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+    };
+    let base = base.with_provider(binding.provider.clone());
+    match &binding.device {
+        Some(device) => base.with_device(device.clone()),
+        None => base,
+    }
+}
+
+/// The `ResourceAffinity` a `NodeInputResource::Resident` resource should
+/// carry for this dispatch (`make-first-native-cuda-hot-path-device-
+/// resident`'s Decision 6): if `id` already has a recorded
+/// `TensorResidency` (a Model-Load-time weight, or an earlier producer's
+/// output), its own affinity is preserved and aggregated with `dispatch_
+/// affinity` through `resource-affinity`'s existing "Affinity Constraint
+/// Aggregation" contract (conflict rejected, not silently overwritten).
+/// A resource with no recorded residency yet (should not normally happen
+/// for a caller-asserted `Resident` value, but handled rather than
+/// panicking) falls back to `dispatch_affinity` alone.
+fn resident_resource_affinity(
+    memory: &MemoryManager,
+    id: &TensorResourceId,
+    dispatch_affinity: &ResourceAffinity,
+    node: &ExecutionNodeId,
+) -> Result<ResourceAffinity, InferenceApiError> {
+    match memory.tensor_residency(id) {
+        Some(residency) => {
+            AffinityConstraints::try_from_affinities([&residency.affinity, dispatch_affinity])
+                .map(AffinityConstraints::into_affinity)
+                .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "resident resource '{id}' affinity conflicts with node '{node}'s resolved Provider/Device: {error:?}"
+                    ),
+                })
+        }
+        None => Ok(dispatch_affinity.clone()),
+    }
+}
+
+/// Production validation, not `debug_assert!` (`make-first-native-cuda-
+/// hot-path-device-resident`'s Decision 6): the Provider a `KernelInvocation`
+/// actually resolved to (`invocation.kernel.provider`, via Kernel Registry/
+/// `PreparedExecutionPlanExecutor` selection -- a code path independent of
+/// `resolved_resource_affinity`'s own `PreparedExecutionPlan.node_bindings`
+/// lookup) must agree with the `ResourceAffinity` this dispatch is about to
+/// attach to every one of its resources. These two are not the same value
+/// by construction: `PlanNodeBinding::new` accepts its `kernel: KernelId`
+/// and its own `provider: ProviderBinding` as independent parameters with
+/// no validation that `kernel.provider == provider` -- exactly the class of
+/// divergence this change's own root cause was (the Prepared Plan resolving
+/// CUDA while first-native's affinity stayed hardcoded to Reference CPU).
+/// Runs in every build, not only debug ones.
+fn validate_invocation_provider_matches_affinity(
+    invocation: &KernelInvocation,
+    affinity: &ResourceAffinity,
+    node: &ExecutionNodeId,
+) -> Result<(), InferenceApiError> {
+    let Some(expected_provider) = affinity.provider() else {
+        return Ok(());
+    };
+    if &invocation.kernel.provider != expected_provider {
+        return Err(InferenceApiError::GraphPlanningFailed {
+            reason: format!(
+                "node '{node}' resolved Kernel Provider '{}' disagrees with its own ResourceAffinity Provider '{expected_provider}'",
+                invocation.kernel.provider
+            ),
+        });
+    }
+    Ok(())
+}
+
 struct QwenDispatchContext<'a> {
     /// A single exclusive borrow (Correctif 13 / task group 7), not split
     /// into separate `runtime`/`memory` fields: `MemoryManager` is a field
@@ -1992,9 +2086,11 @@ fn dispatch_reference_cpu_operator_multi(
         InferenceApiObservationKind::GraphNodeReady,
         node.clone(),
     ));
-    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
-        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
-        .with_execution_context(ctx.runtime.context().id());
+    let affinity = resolved_resource_affinity(
+        ctx.prepared_plan.as_deref(),
+        &node,
+        ctx.runtime.context().id(),
+    );
     let memory_class = resolved_kernel_memory_class(ctx.prepared_plan.as_deref(), &node);
     let output_resources: Vec<TensorResourceDescriptor> = outputs
         .into_iter()
@@ -2024,9 +2120,16 @@ fn dispatch_reference_cpu_operator_multi(
             // Already resident under `id` in the resolved Provider's own
             // storage (this dispatch's earlier producer wrote it there,
             // or a graph input/weight was admitted under it) -- reused by
-            // reference, no download-then-reupload copy.
+            // reference, no download-then-reupload copy. Its own recorded
+            // affinity (e.g. a Model-Load-time weight's) is preserved, not
+            // overwritten by this dispatch's freshly-derived one --
+            // `make-first-native-cuda-hot-path-device-resident`'s Decision
+            // 6 -- via `resource-affinity`'s own existing aggregation
+            // contract (conflict rejected, not silently replaced).
             NodeInputResource::Resident(id, descriptor) => {
-                TensorResourceDescriptor::new(id, descriptor, affinity.clone())
+                let resolved_affinity =
+                    resident_resource_affinity(ctx.runtime.memory(), &id, &affinity, &node)?;
+                TensorResourceDescriptor::new(id, descriptor, resolved_affinity)
             }
         };
         selection_request =
@@ -2123,6 +2226,10 @@ fn dispatch_reference_cpu_operator_multi(
         reason: format!("{error:?}"),
     })?;
     plan.invocation.attributes = attributes;
+    // Production validation, not `debug_assert!` (`make-first-native-cuda-
+    // hot-path-device-resident`'s Decision 6) -- see
+    // `validate_invocation_provider_matches_affinity`.
+    validate_invocation_provider_matches_affinity(&plan.invocation, &affinity, &node)?;
     if advertisement.workspace.required {
         let workspace = ctx
             .provider
@@ -2409,120 +2516,97 @@ fn dispatch_qwen_binary_same_shape(
     )
 }
 
+/// Both real Kernels behind this Operator (`providers/cpu::rmsnorm`,
+/// `providers/cuda::CudaKernels::rmsnorm`) derive `cols` from `input`'s own
+/// shape and accept a `[cols]`-shaped `weight` directly, broadcasting it
+/// internally -- confirmed by reading both directly
+/// (`make-first-native-cuda-hot-path-device-resident` task 2.1). The
+/// per-row broadcast this function used to perform in Rust before
+/// dispatch was unneeded duplication of work every real Kernel already
+/// does, and forced both inputs to materialize to `HostTensor` even when
+/// one or both were already Device-resident. `input`/`weight` are
+/// `NodeValue` now, passed straight through to `node_input_resource`
+/// exactly like `dispatch_qwen_matmul`'s inputs.
 fn dispatch_qwen_rmsnorm(
     ctx: &mut QwenDispatchContext<'_>,
     operation_id: &str,
-    input: HostTensor,
-    weight: HostTensor,
+    input: NodeValue,
+    weight: NodeValue,
     epsilon: f32,
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
-    let (rows, cols) = input.rows_cols().map_err(runtime_generation_failed)?;
-    let weight = if weight.shape == [cols] {
-        let mut data = Vec::with_capacity((rows * cols) as usize);
-        for _ in 0..rows {
-            data.extend_from_slice(&weight.data);
-        }
-        HostTensor::new([rows, cols], data).map_err(runtime_generation_failed)?
-    } else {
-        weight
-    };
     let mut attributes = BTreeMap::new();
     attributes.insert(
         "epsilon".into(),
         OperatorAttributeValue::Float(epsilon as f64),
     );
-    let output_descriptor = f32_tensor_descriptor(&input);
+    let output_descriptor = f32_tensor_descriptor_from_shape(input.shape());
     let output = resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
     dispatch_reference_cpu_operator(
         ctx,
         operation_id,
         dispatch_operator_id("rmsnorm", OperatorFamily::Normalization),
         vec![
-            NodeInputResource::Fresh(
-                TensorResourceId::new(format!("{operation_id}.input")),
-                f32_tensor_descriptor(&input),
-                input.clone(),
-            ),
-            NodeInputResource::Fresh(
-                TensorResourceId::new(format!("{operation_id}.weight")),
-                f32_tensor_descriptor(&weight),
-                weight,
-            ),
+            node_input_resource(operation_id, "input", input),
+            node_input_resource(operation_id, "weight", weight),
         ],
         output,
         attributes,
     )
 }
 
-fn dispatch_qwen_rope_per_head(
+/// A single Kernel invocation rotating all `head_count` head blocks of
+/// `input` at once, via the `rope` Operator's `head_count` attribute
+/// (`make-first-native-cuda-hot-path-device-resident`) -- replaces the
+/// former `dispatch_qwen_rope_per_head`, which dispatched one Kernel
+/// invocation per head by slicing/reassembling real bytes in Rust. `input`
+/// is `NodeValue`-eligible for Resident passthrough like every other
+/// operator here, since this is now a genuine single Kernel dispatch
+/// rather than a Rust-computed reassembly of several.
+fn dispatch_qwen_rope(
     ctx: &mut QwenDispatchContext<'_>,
     operation_id: &str,
-    tensor: &HostTensor,
+    input: NodeValue,
     head_count: u64,
-    head_dimension: u64,
     rope_config: &QwenRopeConfig,
     position_offset: u64,
-) -> Result<(KernelDispatchResult, HostTensor), InferenceApiError> {
-    let (rows, cols) = tensor.rows_cols().map_err(runtime_generation_failed)?;
-    let mut out = vec![0.0_f32; tensor.data.len()];
-    let mut last_dispatch = None;
-    for head in 0..head_count {
-        let start_col = head * head_dimension;
-        let mut head_data = Vec::with_capacity((rows * head_dimension) as usize);
-        for row in 0..rows {
-            let base = (row * cols + start_col) as usize;
-            head_data.extend_from_slice(&tensor.data[base..base + head_dimension as usize]);
-        }
-        let head_tensor = HostTensor::new([rows, head_dimension], head_data)
-            .map_err(runtime_generation_failed)?;
-        let mut attributes = BTreeMap::new();
-        attributes.insert(
-            "base".into(),
-            OperatorAttributeValue::Float(rope_config.base),
-        );
-        attributes.insert(
-            "scale".into(),
-            OperatorAttributeValue::Float(rope_config.scale.unwrap_or(1.0)),
-        );
-        attributes.insert(
-            "dimension".into(),
-            OperatorAttributeValue::Integer(rope_config.dimension as i64),
-        );
-        attributes.insert(
-            "position_mode".into(),
-            OperatorAttributeValue::String(rope_config.position_mode.as_str().into()),
-        );
-        attributes.insert(
-            "position_offset".into(),
-            OperatorAttributeValue::Integer(position_offset as i64),
-        );
-        let (dispatch, rotated) = dispatch_qwen_unary(
-            ctx,
-            &format!("{operation_id}.head{head}"),
-            "rope",
-            OperatorFamily::PositionEncoding,
-            NodeValue::Host(head_tensor),
-            attributes,
-            // No edge identity for this per-head intermediate -- it is
-            // reassembled into `out` below and never independently bound
-            // to a graph edge of its own.
-            None,
-        )?;
-        let rotated = rotated.into_host(&ctx.provider)?;
-        for row in 0..rows {
-            let dst_base = (row * cols + start_col) as usize;
-            let src_base = (row * head_dimension) as usize;
-            out[dst_base..dst_base + head_dimension as usize]
-                .copy_from_slice(&rotated.data[src_base..src_base + head_dimension as usize]);
-        }
-        last_dispatch = Some(dispatch);
-    }
-    let dispatch = last_dispatch.ok_or_else(|| InferenceApiError::GenerationFailed {
-        reason: "RoPE dispatch requires at least one head".into(),
-    })?;
-    let tensor = HostTensor::new(tensor.shape.clone(), out).map_err(runtime_generation_failed)?;
-    Ok((dispatch, tensor))
+    output_target: Option<OutputTarget>,
+) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "base".into(),
+        OperatorAttributeValue::Float(rope_config.base),
+    );
+    attributes.insert(
+        "scale".into(),
+        OperatorAttributeValue::Float(rope_config.scale.unwrap_or(1.0)),
+    );
+    attributes.insert(
+        "dimension".into(),
+        OperatorAttributeValue::Integer(rope_config.dimension as i64),
+    );
+    attributes.insert(
+        "position_mode".into(),
+        OperatorAttributeValue::String(rope_config.position_mode.as_str().into()),
+    );
+    attributes.insert(
+        "position_offset".into(),
+        OperatorAttributeValue::Integer(position_offset as i64),
+    );
+    attributes.insert(
+        "head_count".into(),
+        OperatorAttributeValue::Integer(head_count as i64),
+    );
+    let output_descriptor = f32_tensor_descriptor_from_shape(input.shape());
+    let output = resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
+    dispatch_reference_cpu_operator(
+        ctx,
+        operation_id,
+        dispatch_operator_id("rope", OperatorFamily::PositionEncoding),
+        vec![node_input_resource(operation_id, "input", input)],
+        output,
+        attributes,
+    )
 }
 
 fn dispatch_qwen_attention(
@@ -2942,16 +3026,16 @@ fn dispatch_qwen_graph_node(
                     reason: format!("graph node '{node_id}' expects 2 rmsnorm inputs"),
                 });
             }
-            // RMSNorm's own Rust code broadcasts a single-row weight and
-            // reads real bytes directly (see `dispatch_qwen_rmsnorm`), so
-            // both inputs materialize here rather than staying Resident --
-            // this node never benefits from the *input*-side passthrough
-            // optimization, by design (`enable-device-resident-kernel-
-            // chaining` design.md Non-Goals). Its *output* still targets
-            // the edge's final identity directly, same as every other
-            // operator here.
-            let input = inputs.remove(0).into_host(&ctx.provider)?;
-            let weight = inputs.remove(0).into_host(&ctx.provider)?;
+            // Both inputs are eligible for Resident passthrough now
+            // (`make-first-native-cuda-hot-path-device-resident` reverses
+            // `enable-device-resident-kernel-chaining` design.md's earlier
+            // Non-Goal here, once verified unnecessary: both real Kernels
+            // already accept a `[cols]` weight and broadcast internally,
+            // so there is no Rust-side transform left that would force
+            // materialization). Its output still targets the edge's final
+            // identity directly, same as every other operator here.
+            let input = inputs.remove(0);
+            let weight = inputs.remove(0);
             let epsilon = node_attribute_f64(node, "epsilon")? as f32;
             dispatch_qwen_rmsnorm(ctx, node_id, input, weight, epsilon, Some(output_target))
         }
@@ -2971,18 +3055,29 @@ fn dispatch_qwen_graph_node(
                     reason: format!("graph node '{node_id}' expects 1 rope input"),
                 });
             }
-            // RoPE slices real per-head byte ranges out of this tensor in
-            // Rust (see `dispatch_qwen_rope_per_head`), so it materializes
-            // here rather than staying Resident -- same non-goal as
-            // rmsnorm above. Unlike every other arm, RoPE's own final
-            // result is a purely Rust-computed reassembly of its per-head
-            // Kernel dispatches, not itself a Kernel invocation -- there is
-            // no Kernel-level output identity to pre-admit/unify with the
-            // edge here, so `output_target` is unused for this arm; the
-            // outer loop's existing edge-level write still applies to it.
-            let tensor = inputs.remove(0).into_host(&ctx.provider)?;
+            // A single Kernel invocation now rotates every head block at
+            // once (`make-first-native-cuda-hot-path-device-resident`),
+            // so this input is `NodeValue`-eligible for Resident
+            // passthrough like every other operator here -- no more
+            // forced materialization, no more per-head Rust slicing.
+            let input = inputs.remove(0);
             let head_dimension = node_attribute_u64(node, "dimension")?;
-            let head_count = qwen_rope_head_count(node, architecture)?;
+            // `head_count` is explicit graph data set by the Qwen Model
+            // Component (Q = attention_head_count, K = kv_head_count --
+            // correct for GQA/MQA); the id-suffix heuristic
+            // (`qwen_rope_head_count`) is only a fallback for a node that
+            // predates this attribute existing.
+            let head_count = match node.attributes.get("head_count") {
+                Some(OperatorAttributeValue::Integer(value)) if *value >= 0 => *value as u64,
+                Some(_) => {
+                    return Err(InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph node '{node_id}' attribute 'head_count' is not a non-negative integer"
+                        ),
+                    });
+                }
+                None => qwen_rope_head_count(node, architecture)?,
+            };
             let base = node_attribute_f64(node, "base")?;
             let position_offset = absolute_position_override
                 .map(Ok)
@@ -2994,16 +3089,26 @@ fn dispatch_qwen_graph_node(
                 position_mode: fixture.config.rope.position_mode,
                 dynamic_scaling_supported: fixture.config.rope.dynamic_scaling_supported,
             };
-            let (dispatch, tensor) = dispatch_qwen_rope_per_head(
+            // Unlike every other arm, `output_target` is deliberately
+            // *not* passed here (matches this function's own top-of-body
+            // comment, predating this task group): RoPE's output edge
+            // (`rope_k`'s in particular) carries KV-cache Append semantics
+            // that `execute_qwen_graph_nodes` handles via its own
+            // unconditional `needs_explicit_edge_write` path for this
+            // node kind. Passing a pre-admitted `output_target` here too
+            // caused a genuine regression (double-admission racing the
+            // KV-cache pending-write path) caught by the full oracle
+            // comparison suite -- confirmed empirically, not just by
+            // re-reading the comment.
+            dispatch_qwen_rope(
                 ctx,
                 node_id,
-                &tensor,
+                input,
                 head_count,
-                head_dimension,
                 &rope_config,
                 position_offset,
-            )?;
-            Ok((dispatch, NodeValue::Host(tensor)))
+                None,
+            )
         }
         "attention" => {
             if inputs.len() != 3 {
@@ -3782,8 +3887,8 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         let (_dispatch, normed) = dispatch_qwen_rmsnorm(
             &mut dispatch_ctx,
             &format!("{layer_id}.input_norm"),
-            hidden_states.clone(),
-            input_norm,
+            NodeValue::Host(hidden_states.clone()),
+            NodeValue::Host(input_norm),
             epsilon,
             None,
         )?;
@@ -3808,27 +3913,27 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             NodeValue::Host(v_weight),
             None,
         )?;
-        let q = q.into_host(&dispatch_ctx.provider)?;
         let v = v.into_host(&dispatch_ctx.provider)?;
-        let (_dispatch, q) = dispatch_qwen_rope_per_head(
+        let (_dispatch, q) = dispatch_qwen_rope(
             &mut dispatch_ctx,
             &format!("{layer_id}.rope_q"),
-            &q,
+            q,
             architecture.attention_head_count,
-            architecture.head_dimension,
             &fixture.config.rope,
             0,
+            None,
         )?;
-        let k = k.into_host(&dispatch_ctx.provider)?;
-        let (_dispatch, k) = dispatch_qwen_rope_per_head(
+        let q = q.into_host(&dispatch_ctx.provider)?;
+        let (_dispatch, k) = dispatch_qwen_rope(
             &mut dispatch_ctx,
             &format!("{layer_id}.rope_k"),
-            &k,
+            k,
             architecture.kv_head_count,
-            architecture.head_dimension,
             &fixture.config.rope,
             0,
+            None,
         )?;
+        let k = k.into_host(&dispatch_ctx.provider)?;
         let k_resource = TensorResourceId::new(format!("oracle-kv.layer{layer}.k"));
         let v_resource = TensorResourceId::new(format!("oracle-kv.layer{layer}.v"));
         dispatch_ctx
@@ -3872,12 +3977,11 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             NodeValue::Host(hidden_states),
             None,
         )?;
-        let post_attention_host = post_attention.clone().into_host(&dispatch_ctx.provider)?;
         let (_dispatch, normed_mlp) = dispatch_qwen_rmsnorm(
             &mut dispatch_ctx,
             &format!("{layer_id}.post_attn_norm"),
-            post_attention_host,
-            post_attn_norm,
+            post_attention.clone(),
+            NodeValue::Host(post_attn_norm),
             epsilon,
             None,
         )?;
@@ -3938,8 +4042,8 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
     let (dispatch, hidden_states) = dispatch_qwen_rmsnorm(
         &mut dispatch_ctx,
         "final_norm",
-        hidden_states,
-        final_norm,
+        NodeValue::Host(hidden_states),
+        NodeValue::Host(final_norm),
         epsilon,
         None,
     )?;
@@ -4068,8 +4172,8 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         let (_dispatch, normed) = dispatch_qwen_rmsnorm(
             &mut dispatch_ctx,
             &format!("{layer_id}.input_norm"),
-            hidden_states.clone(),
-            input_norm,
+            NodeValue::Host(hidden_states.clone()),
+            NodeValue::Host(input_norm),
             epsilon,
             None,
         )?;
@@ -4094,27 +4198,27 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             NodeValue::Host(v_weight),
             None,
         )?;
-        let q = q.into_host(&dispatch_ctx.provider)?;
         let v_new = v_new.into_host(&dispatch_ctx.provider)?;
-        let (_dispatch, q) = dispatch_qwen_rope_per_head(
+        let (_dispatch, q) = dispatch_qwen_rope(
             &mut dispatch_ctx,
             &format!("{layer_id}.rope_q"),
-            &q,
+            q,
             architecture.attention_head_count,
-            architecture.head_dimension,
             &fixture.config.rope,
             absolute_position,
+            None,
         )?;
-        let k_new = k_new.into_host(&dispatch_ctx.provider)?;
-        let (_dispatch, k_new) = dispatch_qwen_rope_per_head(
+        let q = q.into_host(&dispatch_ctx.provider)?;
+        let (_dispatch, k_new) = dispatch_qwen_rope(
             &mut dispatch_ctx,
             &format!("{layer_id}.rope_k"),
-            &k_new,
+            k_new,
             architecture.kv_head_count,
-            architecture.head_dimension,
             &fixture.config.rope,
             absolute_position,
+            None,
         )?;
+        let k_new = k_new.into_host(&dispatch_ctx.provider)?;
         let historical = &kv_state.layer_kv[layer as usize];
         let historical_k = dispatch_ctx
             .provider
@@ -4173,12 +4277,11 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             NodeValue::Host(hidden_states),
             None,
         )?;
-        let post_attention_host = post_attention.clone().into_host(&dispatch_ctx.provider)?;
         let (_dispatch, normed_mlp) = dispatch_qwen_rmsnorm(
             &mut dispatch_ctx,
             &format!("{layer_id}.post_attn_norm"),
-            post_attention_host,
-            post_attn_norm,
+            post_attention.clone(),
+            NodeValue::Host(post_attn_norm),
             epsilon,
             None,
         )?;
@@ -4239,8 +4342,8 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
     let (dispatch, hidden_states) = dispatch_qwen_rmsnorm(
         &mut dispatch_ctx,
         "decode.final_norm",
-        hidden_states,
-        final_norm,
+        NodeValue::Host(hidden_states),
+        NodeValue::Host(final_norm),
         epsilon,
         None,
     )?;
@@ -7465,8 +7568,8 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
         dispatch_qwen_rmsnorm(
             &mut dispatch_ctx,
             "coverage.rmsnorm",
-            hidden.clone(),
-            weight,
+            NodeValue::Host(hidden.clone()),
+            NodeValue::Host(weight),
             fixture.config.rmsnorm_epsilon,
             None,
         ),
@@ -7489,14 +7592,14 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
     record_operator_dispatch(
         &mut covered,
         "rope",
-        dispatch_qwen_rope_per_head(
+        dispatch_qwen_rope(
             &mut dispatch_ctx,
             "coverage.rope",
-            &one_row_hidden,
+            NodeValue::Host(one_row_hidden.clone()),
             architecture.attention_head_count,
-            architecture.head_dimension,
             &fixture.config.rope,
             0,
+            None,
         ),
     )?;
     record_operator_dispatch(

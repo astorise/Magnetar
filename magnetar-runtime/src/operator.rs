@@ -934,6 +934,17 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "position_offset",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            // Number of equal-width head blocks this row's columns divide
+            // into, each rotated independently (`make-first-native-cuda-
+            // hot-path-device-resident`). Absent or `1` reproduces the
+            // original single-block behavior. Set explicitly by whichever
+            // component constructs the graph (the number of heads is
+            // already known there -- Runtime must not infer it from a node
+            // identifier or other naming convention).
+            .with_rule(
+                "head_count",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             ),
         "rmsnorm" | "layernorm" => OperatorAttributeSchema::default()
             .with_rule(

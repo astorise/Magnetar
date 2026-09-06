@@ -6,6 +6,7 @@
 use super::*;
 use crate::planning::*;
 use crate::scheduler::*;
+use crate::{CapabilityVersion, ExecutionGraphSemanticFingerprint};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The correct prefill/decode Operator-sequence hash for the E2E fixture
@@ -1198,6 +1199,279 @@ fn resident_input_passthrough_reuses_existing_resource_and_computes_correctly() 
     .unwrap();
     let product = product.into_host(&dispatch_ctx.provider).unwrap();
     assert_eq!(product.data, vec![22.0, 24.0, 26.0, 28.0]);
+}
+
+/// `make-first-native-cuda-hot-path-device-resident` task 2.5: proves
+/// `dispatch_qwen_rmsnorm` no longer requires its caller to materialize a
+/// Device-resident input to `HostTensor` before calling it -- previously
+/// impossible (the old signature took `HostTensor` directly, so a caller
+/// with only a Resident value had no choice but to `.into_host()` first).
+/// A MatMul-shaped output already Resident under the resolved Provider
+/// (`OpaqueReportingExecutor`, which never reports `Host`) passes straight
+/// into RMSNorm and computes the real, independently-verified result.
+#[test]
+fn rmsnorm_accepts_a_resident_input_without_materializing_it_first() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let provider: Arc<dyn ProviderExecutionApi> = Arc::new(OpaqueReportingExecutor::new());
+
+    // Simulates a prior MatMul's output already written under its own
+    // resource id, resident in the Provider's own storage.
+    let matmul_output_id = TensorResourceId::new("rmsnorm.resident.input");
+    let input = HostTensor::new([1, 4], vec![2.0, 4.0, 4.0, 8.0]).unwrap();
+    provider
+        .write_tensor(matmul_output_id.clone(), input)
+        .unwrap();
+    assert!(matches!(
+        provider.read_tensor_value(&matmul_output_id),
+        Some(TensorValue::Opaque)
+    ));
+
+    let mut node_events = Vec::new();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime: &mut runtime,
+        provider: provider.clone(),
+        prepared_plan: None,
+        graph: None,
+        sequence_length: None,
+        last_provider_execution: None,
+        node_events: &mut node_events,
+    };
+    let weight = HostTensor::new([4], vec![1.0, 1.0, 1.0, 1.0]).unwrap();
+    let (_dispatch, normed) = dispatch_qwen_rmsnorm(
+        &mut dispatch_ctx,
+        "rmsnorm.resident",
+        NodeValue::Resident {
+            id: matmul_output_id,
+            shape: vec![1, 4],
+        },
+        NodeValue::Host(weight),
+        1e-6,
+        None,
+    )
+    .unwrap();
+    let normed = normed.into_host(&dispatch_ctx.provider).unwrap();
+    // RMS of [2,4,4,8] = sqrt((4+16+16+64)/4) = sqrt(25) = 5; each element
+    // divided by 5 (weight is all-ones): [0.4, 0.8, 0.8, 1.6].
+    for (actual, expected) in normed.data.iter().zip([0.4, 0.8, 0.8, 1.6]) {
+        assert!(
+            (actual - expected).abs() < 1e-4,
+            "expected {expected}, got {actual}"
+        );
+    }
+}
+
+fn test_kernel_id(provider: &str, name: &str) -> KernelId {
+    KernelId::new(
+        ProviderBinding::new(provider),
+        name,
+        CapabilityVersion::new(1, 0, 0),
+        OperatorId::magnetar(name, 1, OperatorFamily::LinearAlgebra),
+        KernelOperatorVersionRange::exact(1),
+        KernelImplementationFamily::CpuScalar,
+    )
+}
+
+/// `make-first-native-cuda-hot-path-device-resident` task 1.5: a node whose
+/// Prepared Plan binds a non-Reference-CPU Provider/Device must produce a
+/// `ResourceAffinity` matching that binding, not the previous hardcoded
+/// `reference-cpu` -- this is `resolved_resource_affinity`'s whole reason
+/// to exist (the audit's P0-3 finding). Tested directly against the helper
+/// rather than through a full dispatch: a minimal `PreparedExecutionPlan`
+/// with one binding is enough to prove the lookup, matching
+/// `resolved_output_placement`'s own established test style.
+#[test]
+fn resolved_resource_affinity_matches_a_non_reference_cpu_plan_binding() {
+    let node = ExecutionNodeId::new("cuda.matmul");
+    let mut plan = PreparedExecutionPlan::new(
+        PreparedExecutionPlanId::new("cuda-plan").unwrap(),
+        PreparedExecutionPlanGeneration::new(1),
+        ExecutionGraphSemanticFingerprint::new("sha256:test").unwrap(),
+        PreparedExecutionPlanScope::for_phase(PreparedExecutionPhase::Prefill),
+    )
+    .unwrap();
+    let device = DeviceBinding::new(DeviceId::new("cuda:0"));
+    let binding = PlanNodeBinding::new(
+        [node.clone()],
+        test_kernel_id("magnetar:provider/cuda", "matmul"),
+        ProviderBinding::new("magnetar:provider/cuda"),
+    )
+    .unwrap()
+    .with_device(device.clone());
+    plan.add_node_binding(binding).unwrap();
+
+    let context = ExecutionContextId::new(1);
+    let affinity = resolved_resource_affinity(Some(&plan), &node, context);
+
+    assert_eq!(
+        affinity.provider(),
+        Some(&ProviderBinding::new("magnetar:provider/cuda"))
+    );
+    assert_eq!(affinity.device(), Some(&device));
+}
+
+/// Companion to the above: no Prepared Plan, or a Plan with no binding for
+/// this node, must still fall back to the Reference CPU default -- every
+/// existing direct-dispatch/test caller without a Plan relies on this
+/// unchanged behavior.
+#[test]
+fn resolved_resource_affinity_falls_back_to_reference_cpu_without_a_binding() {
+    let node = ExecutionNodeId::new("some.node");
+    let context = ExecutionContextId::new(1);
+
+    let no_plan = resolved_resource_affinity(None, &node, context);
+    assert_eq!(
+        no_plan.provider(),
+        Some(&ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+    );
+
+    let plan = PreparedExecutionPlan::new(
+        PreparedExecutionPlanId::new("empty-plan").unwrap(),
+        PreparedExecutionPlanGeneration::new(1),
+        ExecutionGraphSemanticFingerprint::new("sha256:test2").unwrap(),
+        PreparedExecutionPlanScope::for_phase(PreparedExecutionPhase::Prefill),
+    )
+    .unwrap();
+    let no_binding = resolved_resource_affinity(Some(&plan), &node, context);
+    assert_eq!(
+        no_binding.provider(),
+        Some(&ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+    );
+}
+
+/// `make-first-native-cuda-hot-path-device-resident` task 1.6: a Resident
+/// resource's own recorded affinity (e.g. a Model-Load-time weight's) must
+/// survive a later dispatch on the same Provider -- aggregated, not
+/// replaced. Proven by giving the resident resource a `Device` binding the
+/// dispatch's own (no-Prepared-Plan) affinity does not have: if the result
+/// carries that Device, it can only have come from the resident resource's
+/// own record, not from the dispatch's freshly-derived affinity.
+#[test]
+fn resident_resource_affinity_is_preserved_not_overwritten() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let resident_id = TensorResourceId::new("resident.weight");
+    let device = DeviceBinding::new(DeviceId::new("cuda:0"));
+    let recorded_affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+        .with_device(device.clone());
+    runtime
+        .memory_mut()
+        .record_tensor_residency(TensorResidency::new(
+            resident_id.clone(),
+            MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+            recorded_affinity,
+        ))
+        .unwrap();
+
+    // The dispatch's own affinity (no Prepared Plan bound): same Provider,
+    // no Device of its own.
+    let dispatch_affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+    let node = ExecutionNodeId::new("resident.affinity.add");
+
+    let resolved =
+        resident_resource_affinity(runtime.memory(), &resident_id, &dispatch_affinity, &node)
+            .unwrap();
+
+    assert_eq!(
+        resolved.provider(),
+        Some(&ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+    );
+    assert_eq!(
+        resolved.device(),
+        Some(&device),
+        "the resident resource's own Device binding must survive aggregation, \
+         proving it was preserved rather than replaced by the dispatch's own \
+         (deviceless) affinity"
+    );
+}
+
+/// Companion to the above: a genuine Provider conflict between a Resident
+/// resource's recorded affinity and the dispatch's own resolved affinity
+/// must be rejected with a structured error, never silently overwritten.
+#[test]
+fn resident_resource_affinity_conflict_is_rejected() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let resident_id = TensorResourceId::new("resident.weight.conflict");
+    let recorded_affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new("magnetar:provider/cuda"));
+    runtime
+        .memory_mut()
+        .record_tensor_residency(TensorResidency::new(
+            resident_id.clone(),
+            MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new("magnetar:provider/cuda")),
+            recorded_affinity,
+        ))
+        .unwrap();
+
+    let dispatch_affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+    let node = ExecutionNodeId::new("resident.affinity.conflict.add");
+
+    let result =
+        resident_resource_affinity(runtime.memory(), &resident_id, &dispatch_affinity, &node);
+
+    assert!(
+        result.is_err(),
+        "a Provider mismatch between a Resident resource's recorded affinity \
+         and the dispatch's own resolved affinity must be rejected, not \
+         silently resolved by picking one of them"
+    );
+}
+
+/// `make-first-native-cuda-hot-path-device-resident` task 1.7: the
+/// production validation must actually reject a real Provider divergence
+/// between a resolved `KernelInvocation` and its own `ResourceAffinity` --
+/// not just be present in the code but never fire. `PlanNodeBinding::new`
+/// (confirmed by reading it directly) accepts its `kernel: KernelId` and
+/// its own `provider: ProviderBinding` as independent parameters with no
+/// validation that they agree, so this scenario is directly constructible,
+/// not contrived: a `KernelId` claiming CUDA on a binding whose own
+/// `provider` field says Reference CPU.
+#[test]
+fn validate_invocation_provider_matches_affinity_rejects_a_real_divergence() {
+    let node = ExecutionNodeId::new("mismatched.node");
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+    let mismatched_kernel = test_kernel_id("magnetar:provider/cuda", "matmul");
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("mismatched-invocation"),
+        OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra),
+        mismatched_kernel,
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        affinity.clone(),
+    );
+
+    let result = validate_invocation_provider_matches_affinity(&invocation, &affinity, &node);
+
+    assert!(
+        result.is_err(),
+        "a KernelInvocation whose own KernelId.provider disagrees with its \
+         ResourceAffinity.provider must be rejected"
+    );
+}
+
+/// Companion: an invocation whose resolved Kernel Provider genuinely
+/// agrees with its `ResourceAffinity` must pass -- the check must not
+/// reject the ordinary, correct case.
+#[test]
+fn validate_invocation_provider_matches_affinity_accepts_agreement() {
+    let node = ExecutionNodeId::new("matching.node");
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new("magnetar:provider/cuda"));
+    let matching_kernel = test_kernel_id("magnetar:provider/cuda", "matmul");
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("matching-invocation"),
+        OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra),
+        matching_kernel,
+        ProviderBinding::new("magnetar:provider/cuda"),
+        affinity.clone(),
+    );
+
+    validate_invocation_provider_matches_affinity(&invocation, &affinity, &node)
+        .expect("agreeing Provider bindings must pass validation");
 }
 
 /// GitHub issue "A Model Instance stuck in Loading cannot currently be

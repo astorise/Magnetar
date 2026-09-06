@@ -374,12 +374,12 @@ fn rope_offset_matches_the_corresponding_prefill_row() {
     let cols = 4_u64;
     let full = rng.tensor(rows, cols);
 
-    let prefill = rope(&full, 10000.0, 1.0, cols, 0).unwrap();
+    let prefill = rope(&full, 10000.0, 1.0, cols, 0, 1).unwrap();
 
     for row in 0..rows as usize {
         let start = row * cols as usize;
         let single = HostTensor::new([1, cols], &full.data[start..start + cols as usize]).unwrap();
-        let stepped = rope(&single, 10000.0, 1.0, cols, row as u64).unwrap();
+        let stepped = rope(&single, 10000.0, 1.0, cols, row as u64, 1).unwrap();
 
         assert_eq!(
             stepped.data,
@@ -393,9 +393,132 @@ fn rope_offset_matches_the_corresponding_prefill_row() {
 fn rope_offset_zero_is_the_previous_behaviour() {
     let mut rng = Rng(0x0ff0);
     let input = rng.tensor(4, 4);
-    let rotated = rope(&input, 10000.0, 1.0, 4, 0).unwrap();
+    let rotated = rope(&input, 10000.0, 1.0, 4, 0, 1).unwrap();
     // Position 0 leaves the first row untouched, as before the offset existed.
     assert_eq!(rotated.data[..4], input.data[..4]);
+}
+
+/// `make-first-native-cuda-hot-path-device-resident` task 3.5 (in-crate
+/// mirror of `providers/cpu`'s own test): a multi-head call (`head_count >
+/// 1`, `dimension == head_width`) must rotate each head's column block
+/// exactly as if that block had been sliced out and rotated on its own
+/// with `head_count = 1`. This is the in-crate `reference_cpu.rs` copy of
+/// `rope` -- the one `first_native_runtime.rs`'s own dispatch actually
+/// runs through -- independently verified from `providers/cpu`'s copy.
+#[test]
+fn rope_multi_head_matches_independent_single_head_slices() {
+    let mut rng = Rng(0x0fe1);
+    let rows = 3_u64;
+    let head_count = 4_u64;
+    let head_width = 2_u64;
+    let cols = head_count * head_width;
+    let input = rng.tensor(rows, cols);
+
+    let multi_head = rope(&input, 10000.0, 1.0, head_width, 5, head_count).unwrap();
+
+    for head in 0..head_count as usize {
+        let mut slice_data = Vec::with_capacity((rows * head_width) as usize);
+        for row in 0..rows as usize {
+            let start = row * cols as usize + head * head_width as usize;
+            slice_data.extend_from_slice(&input.data[start..start + head_width as usize]);
+        }
+        let slice = HostTensor::new([rows, head_width], slice_data).unwrap();
+        let single_head = rope(&slice, 10000.0, 1.0, head_width, 5, 1).unwrap();
+
+        for row in 0..rows as usize {
+            let multi_start = row * cols as usize + head * head_width as usize;
+            let single_start = row * head_width as usize;
+            assert_eq!(
+                multi_head.data[multi_start..multi_start + head_width as usize],
+                single_head.data[single_start..single_start + head_width as usize],
+                "head {head}, row {row}"
+            );
+        }
+    }
+}
+
+/// Partial RoPE (`dimension < head_width`): only the first `dimension`
+/// columns of each head's block rotate; the remainder is preserved
+/// unchanged, not zeroed.
+#[test]
+fn rope_partial_rotation_preserves_the_untouched_tail() {
+    let mut rng = Rng(0x0fe2);
+    let rows = 2_u64;
+    let head_count = 2_u64;
+    let head_width = 4_u64;
+    let dimension = 2_u64;
+    let cols = head_count * head_width;
+    let input = rng.tensor(rows, cols);
+
+    let rotated = rope(&input, 10000.0, 1.0, dimension, 0, head_count).unwrap();
+
+    for row in 0..rows as usize {
+        for head in 0..head_count as usize {
+            let block_start = row * cols as usize + head * head_width as usize;
+            let tail_start = block_start + dimension as usize;
+            let tail_end = block_start + head_width as usize;
+            assert_eq!(
+                rotated.data[tail_start..tail_end],
+                input.data[tail_start..tail_end],
+                "head {head}, row {row}: untouched tail must be preserved, not zeroed"
+            );
+        }
+    }
+}
+
+/// GQA-shaped independence: two RoPE calls with different `head_count`
+/// (as Q and K would have under grouped-query attention) each derive
+/// their own `head_width` from their own `cols`/`head_count`.
+#[test]
+fn rope_head_count_is_independent_per_call_matching_gqa_shapes() {
+    let mut rng = Rng(0x0fe3);
+    let rows = 2_u64;
+    let head_width = 2_u64;
+    let q_head_count = 4_u64;
+    let kv_head_count = 2_u64;
+
+    for head_count in [q_head_count, kv_head_count] {
+        let cols = head_count * head_width;
+        let input = rng.tensor(rows, cols);
+        let multi_head = rope(&input, 10000.0, 1.0, head_width, 3, head_count).unwrap();
+        for head in 0..head_count as usize {
+            let mut slice_data = Vec::with_capacity((rows * head_width) as usize);
+            for row in 0..rows as usize {
+                let start = row * cols as usize + head * head_width as usize;
+                slice_data.extend_from_slice(&input.data[start..start + head_width as usize]);
+            }
+            let slice = HostTensor::new([rows, head_width], slice_data).unwrap();
+            let single_head = rope(&slice, 10000.0, 1.0, head_width, 3, 1).unwrap();
+            for row in 0..rows as usize {
+                let multi_start = row * cols as usize + head * head_width as usize;
+                let single_start = row * head_width as usize;
+                assert_eq!(
+                    multi_head.data[multi_start..multi_start + head_width as usize],
+                    single_head.data[single_start..single_start + head_width as usize],
+                    "head_count {head_count}, head {head}, row {row}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rope_rejects_head_count_that_does_not_evenly_divide_cols() {
+    let mut rng = Rng(0x0fe4);
+    let input = rng.tensor(2, 6);
+    let result = rope(&input, 10000.0, 1.0, 2, 0, 4);
+    assert!(
+        result.is_err(),
+        "6 columns does not divide evenly into 4 heads"
+    );
+}
+
+#[test]
+fn rope_rejects_dimension_larger_than_head_width() {
+    let mut rng = Rng(0x0fe5);
+    let input = rng.tensor(2, 8);
+    let result = rope(&input, 10000.0, 1.0, 6, 0, 2);
+    assert!(result.is_err(), "dimension must not exceed head_width");
 }
 
 #[test]

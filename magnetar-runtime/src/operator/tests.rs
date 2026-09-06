@@ -45,6 +45,61 @@ fn operator_attributes_reject_provider_device_and_unknown_selectors() {
     ));
 }
 
+/// `make-first-native-cuda-hot-path-device-resident` task 3.2: the `rope`
+/// Operator's real `OperatorAttributeSchema` (which rejects any attribute
+/// it does not declare) must accept the new `head_count` attribute with
+/// its correct kind and reject a wrong one, while still rejecting a
+/// genuinely unknown attribute name -- the exact gap the audit found (a
+/// dispatch setting `head_count` would have failed validation before ever
+/// reaching a Kernel).
+#[test]
+fn rope_schema_accepts_head_count_with_correct_kind_only() {
+    let catalog = initial_operator_catalog();
+    let rope = catalog
+        .get(&OperatorId::magnetar(
+            "rope",
+            1,
+            OperatorFamily::PositionEncoding,
+        ))
+        .unwrap();
+    let base_attrs = || {
+        let mut attributes = BTreeMap::new();
+        attributes.insert("base".into(), OperatorAttributeValue::Float(10000.0));
+        attributes.insert("dimension".into(), OperatorAttributeValue::Integer(2));
+        attributes
+    };
+
+    // head_count absent -> accepted (today's exact existing behavior).
+    assert!(rope.attributes.validate(&base_attrs()).is_ok());
+
+    // head_count = 1 -> accepted.
+    let mut attrs = base_attrs();
+    attrs.insert("head_count".into(), OperatorAttributeValue::Integer(1));
+    assert!(rope.attributes.validate(&attrs).is_ok());
+
+    // head_count > 1 -> accepted.
+    let mut attrs = base_attrs();
+    attrs.insert("head_count".into(), OperatorAttributeValue::Integer(8));
+    assert!(rope.attributes.validate(&attrs).is_ok());
+
+    // Wrong kind (Float instead of Integer) -> rejected.
+    let mut attrs = base_attrs();
+    attrs.insert("head_count".into(), OperatorAttributeValue::Float(8.0));
+    assert!(matches!(
+        rope.attributes.validate(&attrs),
+        Err(OperatorError::OperatorAttributeInvalid { .. })
+    ));
+
+    // A still-unknown attribute name is still rejected -- this schema
+    // change did not accidentally loosen validation generally.
+    let mut attrs = base_attrs();
+    attrs.insert("totally_unknown".into(), OperatorAttributeValue::Integer(1));
+    assert!(matches!(
+        rope.attributes.validate(&attrs),
+        Err(OperatorError::OperatorAttributeInvalid { .. })
+    ));
+}
+
 #[test]
 fn operator_validation_rejects_shape_dtype_layout_errors() {
     let catalog = initial_operator_catalog();

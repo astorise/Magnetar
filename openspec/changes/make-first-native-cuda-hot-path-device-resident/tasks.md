@@ -1,39 +1,41 @@
 ## 1. ResourceAffinity: resolved helper, Resident preservation, production validation (design.md Decision 6)
 
-- [ ] 1.1 Add `resolved_resource_affinity(prepared_plan, node, execution_context) -> ResourceAffinity` to `first_native_runtime.rs`, mirroring `resolved_output_placement`'s lookup exactly.
-- [ ] 1.2 `dispatch_reference_cpu_operator_multi` calls it for `NodeInputResource::Fresh` resources and its own new outputs (replacing the hardcoded `ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)`).
-- [ ] 1.3 For `NodeInputResource::Resident` resources, look up the resource's existing recorded `ResourceAffinity` (via its `TensorResidency`/Memory Manager record) and aggregate it with the dispatch's own affinity through the existing `resource-affinity` aggregation contract, rejecting on conflict rather than overwriting.
-- [ ] 1.4 Add the production-level (not `debug_assert!`) structured validation at the Kernel/Runtime dispatch boundary: after `KernelDispatchPlan` is built, reject with a structured error if the invocation's resolved Provider/Device disagrees with the affinity recorded for its resources.
-- [ ] 1.5 Test: a Qwen node whose Prepared Plan binds a non-Reference-CPU Provider/Device produces `ResourceAffinity` matching that binding for a Fresh resource.
-- [ ] 1.6 Test: a Resident resource's own recorded affinity survives a later dispatch on the same Provider/Device (aggregated, not replaced); a conflicting Provider/Device on the same resource is rejected with a structured error.
-- [ ] 1.7 Test: the new production validation actually rejects a deliberately constructed Provider/Device-vs-affinity mismatch, in a release-mode-equivalent test (not relying on `debug_assert!`).
-- [ ] 1.8 Full regression: confirm every existing Reference-CPU-only test is bit-for-bit unaffected.
+- [x] 1.1 Add `resolved_resource_affinity(prepared_plan, node, execution_context) -> ResourceAffinity` to `first_native_runtime.rs`, mirroring `resolved_output_placement`'s lookup exactly.
+- [x] 1.2 `dispatch_reference_cpu_operator_multi` calls it for `NodeInputResource::Fresh` resources and its own new outputs (replacing the hardcoded `ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)`).
+- [x] 1.3 For `NodeInputResource::Resident` resources, look up the resource's existing recorded `ResourceAffinity` (via its `TensorResidency`/Memory Manager record) and aggregate it with the dispatch's own affinity through the existing `resource-affinity` aggregation contract, rejecting on conflict rather than overwriting. Extracted as `resident_resource_affinity` for direct testability.
+- [x] 1.4 Added the production-level (not `debug_assert!`) structured validation at the Kernel/Runtime dispatch boundary, extracted as `validate_invocation_provider_matches_affinity` (also for direct testability): after `KernelDispatchPlan` is built, rejects with `InferenceApiError::GraphPlanningFailed` if `invocation.kernel.provider` disagrees with the affinity's own provider. Real, not hypothetical: `PlanNodeBinding::new` accepts its `kernel: KernelId` and its own `provider: ProviderBinding` as independent parameters with no validation they agree (confirmed by reading it).
+- [x] 1.5 Test: `resolved_resource_affinity_matches_a_non_reference_cpu_plan_binding` / `..._falls_back_to_reference_cpu_without_a_binding`.
+- [x] 1.6 Test: `resident_resource_affinity_is_preserved_not_overwritten` (a Device binding absent from the dispatch's own affinity survives aggregation) / `resident_resource_affinity_conflict_is_rejected`.
+- [x] 1.7 Test: `validate_invocation_provider_matches_affinity_rejects_a_real_divergence` / `..._accepts_agreement`.
+- [x] 1.8 Full regression: 1201/1201 `magnetar-runtime` tests pass (1195 + 6 new), clippy/fmt clean.
 
 ## 2. RMSNorm Host materialization removed (design.md Decision 4)
 
-- [ ] 2.1 Confirm (re-confirm against current code before editing) that `providers/cpu::rmsnorm`/`providers/cuda::CudaKernels::rmsnorm` both accept a `[cols]`-shaped weight and broadcast internally.
-- [ ] 2.2 `dispatch_qwen_rmsnorm`'s signature changes `input: HostTensor, weight: HostTensor` to `input: NodeValue, weight: NodeValue`; delete the manual per-row weight broadcast.
-- [ ] 2.3 `dispatch_qwen_graph_node`'s "rmsnorm" arm stops calling `.into_host()` on either input before dispatch.
-- [ ] 2.4 Update the two large `#[cfg(test)]` oracle functions for the new signature.
-- [ ] 2.5 Test: a MatMul output already Resident under the resolved Provider passes into RMSNorm without an intervening `.into_host()` call.
-- [ ] 2.6 Full regression: Reference CPU's own RMSNorm numeric output is unchanged.
+- [x] 2.1 Confirmed: `providers/cpu::rmsnorm`/`providers/cuda::CudaKernels::rmsnorm` both derive `cols` from the input's own shape and accept a `[cols]`-shaped weight, broadcasting internally.
+- [x] 2.2 `dispatch_qwen_rmsnorm`'s signature changed `input: HostTensor, weight: HostTensor` to `input: NodeValue, weight: NodeValue`; manual per-row weight broadcast deleted.
+- [x] 2.3 `dispatch_qwen_graph_node`'s "rmsnorm" arm stops calling `.into_host()` on either input before dispatch.
+- [x] 2.4 Updated all 6 call sites across the two large `#[cfg(test)]` oracle functions for the new signature; one of them (`post_attention_host`) was itself an unneeded `.into_host()` this fix removed outright.
+- [x] 2.5 Test: `rmsnorm_accepts_a_resident_input_without_materializing_it_first` -- a MatMul-shaped output already Resident under `OpaqueReportingExecutor` passes into RMSNorm and computes the correct real result (RMS-normalization of `[2,4,4,8]` -> `[0.4,0.8,0.8,1.6]`), previously impossible to even call with a Resident value.
+- [x] 2.6 Full regression: 1202/1202 `magnetar-runtime` tests pass (1201 + 1 new), including every existing Reference CPU forward-pass test unchanged; clippy/fmt clean.
 
 ## 3. RoPE: explicit `head_count` graph attribute, corrected multi-head semantics (design.md Decisions 1-2)
 
-- [ ] 3.1 `operator.rs`'s `"rope"` `OperatorAttributeSchema` gains `head_count` as `OperatorAttributeRule::optional(OperatorAttributeKind::Integer)`.
-- [ ] 3.2 Schema test: `head_count` absent -> accepted; `head_count = 1` -> accepted; `head_count > 1` -> accepted; wrong attribute kind (e.g. Float) -> rejected; a still-unknown attribute name -> still rejected.
-- [ ] 3.3 `qwen_model_component.rs`'s `rope_q` node construction adds `head_count = a.attention_head_count`; `rope_k` adds `head_count = a.kv_head_count`.
-- [ ] 3.4 `providers/cpu::rope` gains `head_count: u64`. Validation: `head_count >= 1`, `cols % head_count == 0`, `dimension > 0`, `dimension % 2 == 0`, `dimension <= cols / head_count`. Loop one extra level (`for head in 0..head_count`), rotating `[head * head_width, head * head_width + dimension)` per row per head (`head_width = cols / head_count`); output starts as a copy of input so untouched columns (partial RoPE's tail) are preserved, not zeroed.
-- [ ] 3.5 `providers/cpu` test: `head_count` absent/`1` reproduces today's exact output (regression). New tests: `head_count > 1` with `dimension == head_width` (full multi-head rotation) against a hand-computed expected result; `head_count > 1` with `dimension < head_width` (partial RoPE) confirming the untouched tail is preserved; a GQA-shaped case (`head_count` for K smaller than for Q, over the same base tensor width assumptions) confirming both are computed independently and correctly.
-- [ ] 3.6 `providers/cuda/src/kernels.cu`'s `rope_kernel` gains `head_count`; re-derive `row`/`head`/`pair`/`col_base = head * head_width` from the flattened thread index exactly as design.md's Decision 2 specifies (thread count `rows * head_count * (dimension / 2)`, not `rows * head_count * (head_width / 2)`). Output buffer seeded as a copy of input (not zero-allocated) before the rotation kernel writes.
-- [ ] 3.7 `providers/cuda/src/kernels.rs`'s `CudaKernels::rope` gains the matching Rust parameter, updated launch config, and the same validation as 3.4.
-- [ ] 3.8 `providers/cuda` test (real hardware): `head_count` absent/`1` bit-for-bit unchanged from today's existing `rope_matches_reference_cpu` conformance test. New conformance tests mirroring 3.5's three new Reference CPU cases (full multi-head, partial RoPE, GQA-shaped), each comparing CUDA's output against `providers/cpu`'s corrected implementation.
-- [ ] 3.9 `CudaExecutor`'s "rope" dispatch arm reads a new `head_count` attribute, default `1` when absent. Mirror in `ReferenceCpuExecutor`'s "rope" arm.
-- [ ] 3.10 `first_native_runtime.rs`: RoPE dispatch reads `head_count` via `node_attribute_u64(node, "head_count")`, falling back to the existing `qwen_rope_head_count(node, architecture)` id-suffix heuristic only when the attribute is absent (keeps any pre-existing hand-written test graph working).
-- [ ] 3.11 Delete `dispatch_qwen_rope_per_head`; replace its call site with a single dispatch passing `head_count` and the full `NodeValue` input, no per-head slicing/reassembly in Rust.
-- [ ] 3.12 Update the two large `#[cfg(test)]` oracle functions for the new single-dispatch RoPE shape.
-- [ ] 3.13 Re-verify the per-node causal-evidence chain tests (`reach-architecture-freeze-1` task group 17) given RoPE's dispatch count per node changes from `head_count` to `1`.
-- [ ] 3.14 Full regression: Reference CPU's own RoPE numeric output (prefill and decode) is unchanged end to end.
+- [x] 3.1 `operator.rs`'s `"rope"` `OperatorAttributeSchema` gains `head_count` as `OperatorAttributeRule::optional(OperatorAttributeKind::Integer)`.
+- [x] 3.2 Schema test: `rope_schema_accepts_head_count_with_correct_kind_only` -- absent/`1`/`>1` accepted, wrong kind rejected, a still-unknown attribute name still rejected.
+- [x] 3.3 `qwen_model_component.rs`'s `rope_q` node construction adds `head_count = a.attention_head_count`; `rope_k` adds `head_count = a.kv_head_count`.
+- [x] 3.4 `providers/cpu::rope` gains `head_count: u64` with the corrected `head_width = cols / head_count` semantics and copy-seeded output.
+- [x] 3.5 `providers/cpu` tests: regression (`head_count` absent/`1`) plus new multi-head, partial-RoPE, and GQA-shaped cases, each cross-checked against independent single-head slices.
+- [x] 3.6 `providers/cuda/src/kernels.cu`'s `rope_kernel` gains `head_count`, corrected `(row, head, pair)` indexing, device-to-device copy seed (`clone_dtod`, replacing `alloc_zeros`).
+- [x] 3.7 `providers/cuda/src/kernels.rs`'s `CudaKernels::rope` gains the matching parameter, updated launch config (`rows * head_count * half`), and the same validation as 3.4.
+- [x] 3.8 `providers/cuda` tests (real hardware, RTX 3070 Ti): `rope_matches_reference_cpu` (unchanged), plus new `rope_multi_head_matches_reference_cpu`/`rope_partial_rotation_matches_reference_cpu`/`rope_gqa_shaped_head_count_matches_reference_cpu` -- all pass against `providers/cpu`'s corrected implementation.
+- [x] 3.9 `CudaExecutor`'s and `ReferenceCpuExecutor`'s (`providers/cpu`) "rope" dispatch arms read `head_count`, default `1`.
+- [x] 3.10 `first_native_runtime.rs`: RoPE dispatch reads `head_count` via `node.attributes.get("head_count")`, falling back to `qwen_rope_head_count(node, architecture)` only when absent.
+- [x] 3.11 Deleted `dispatch_qwen_rope_per_head`; replaced with single-dispatch `dispatch_qwen_rope`. `output_target` deliberately stays `None` for this arm (matches the pre-existing, unchanged top-of-function comment: RoPE's KV-cache-tracked output edge is handled by `execute_qwen_graph_nodes`'s own unconditional path for this node kind, not pre-admission).
+- [x] 3.12 Updated all 6 oracle call sites (4 rope calls + 2 downstream materializations) across the two large `#[cfg(test)]` oracle functions.
+- [x] 3.13 Re-verified: the full 1208-test suite includes the per-node causal-evidence chain tests unchanged.
+- [x] 3.14 Full regression, with a genuine bug found and fixed along the way (see below): `magnetar-runtime` 1208/1208, `providers/cpu` (own suite), `providers/cuda` 27/27 real hardware, clippy/fmt/wasm32 clean.
+
+**Critical bug found and fixed during 3.14's regression pass, not by inspection but by a real end-to-end oracle divergence**: `magnetar-runtime/src/reference_cpu.rs` carries its own in-crate copy of `rope()` (the "in-crate test double" the module's own doc comment describes, independent from `providers/cpu`'s copy) -- and its "rope" Kernel dispatch arm is what `ReferenceCpuExecutor` (the executor `dispatch_qwen_graph_node` and every oracle actually dispatch through) runs. Tasks 3.4-3.9 above updated `providers/cpu` and `providers/cuda`'s copies and dispatch arms, but missed this third copy entirely -- it kept its old 5-argument signature and silently ignored the new `head_count` attribute, rotating only the first `dimension` columns of every row regardless of `head_count`, leaving every head beyond the first completely unrotated. This produced identical (but wrong) results whether compared through `dispatch_qwen_graph_node` (the graph) or through the oracle functions this task group also updated to call the same shared `dispatch_qwen_rope` -- both shared the same silent bug, so they agreed with each other while disagreeing with `e2e_forward_hidden_states`'s fully independent, hand-written reference implementation (`apply_rope_per_head`, deliberately left untouched), which is what caught it. Fixed by applying the identical `head_count`/`head_width` correction to `reference_cpu.rs`'s own `rope()` and its dispatch arm, plus the same new multi-head/partial/GQA test trio in `reference_cpu/tests.rs`. This is the exact class of gap task group 7's end-to-end hardware test exists to catch -- confirmed here at the Reference CPU level before ever reaching real CUDA hardware.
 
 ## 4. Weight edges thread `NodeValue`, shaped from `TensorEdge.descriptor` (design.md Decision 3)
 

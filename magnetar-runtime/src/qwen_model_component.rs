@@ -1097,6 +1097,14 @@ pub fn qwen_build_graph(
                 .with_attribute(
                     "position_offset",
                     OperatorAttributeValue::Integer(position_offset as i64),
+                )
+                // `make-first-native-cuda-hot-path-device-resident`:
+                // explicit graph data, not inferred by Runtime from this
+                // node's id -- Q always rotates `attention_head_count`
+                // independent head blocks.
+                .with_attribute(
+                    "head_count",
+                    OperatorAttributeValue::Integer(a.attention_head_count as i64),
                 ),
             )
             .with_edge(f32_edge(k_rope.clone(), vec![sequence_length, kv_dim]))
@@ -1120,6 +1128,13 @@ pub fn qwen_build_graph(
                 .with_attribute(
                     "position_offset",
                     OperatorAttributeValue::Integer(position_offset as i64),
+                )
+                // K rotates `kv_head_count` independent head blocks --
+                // may differ from Q's under grouped-query/multi-query
+                // attention (`kv_head_count < attention_head_count`).
+                .with_attribute(
+                    "head_count",
+                    OperatorAttributeValue::Integer(a.kv_head_count as i64),
                 ),
             );
 
