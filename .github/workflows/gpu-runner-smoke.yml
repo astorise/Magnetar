@@ -35,10 +35,16 @@ jobs:
       - name: Checkout CUDA Provider submodule
         # The container's git refuses to touch a workspace it doesn't own --
         # the checkout step ran before git existed in this image, so the
-        # workspace's ownership doesn't match this step's user.
+        # workspace's ownership doesn't match this step's user. Also checks
+        # out providers/cpu: providers/cuda's [dev-dependencies] path-depends
+        # on it (conformance tests compare CUDA kernel output against
+        # Reference CPU's), so cargo cannot even load the manifest without it
+        # -- a real gap this workflow had (confirmed by dispatching it: it
+        # failed with "failed to read providers/cpu/Cargo.toml" before this
+        # fix), not something introduced by CUDA-specific test content.
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git submodule update --init -- providers/cuda
+          git submodule update --init -- providers/cuda providers/cpu
       - name: Verify GPU is visible
         run: |
           set -eux

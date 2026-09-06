@@ -240,11 +240,17 @@ actually shipped):
   description and its step name (now "Build and test the CUDA Provider",
   comment block describes the real device-allocation-table/explicit-
   movement/conformance behavior).
-- [ ] 6.4 Dispatch `gpu-runner-smoke.yml` manually against this change's
-  branch on `arc-gpu-magnetar` and confirm it passes on real hardware
-  before merging. (Not yet done -- requires pushing this change first;
-  dispatching CI is a user-facing action held for explicit confirmation,
-  consistent with this session's established pattern.)
+- [ ] 6.4 Dispatched `gpu-runner-smoke.yml` on `arc-gpu-magnetar`
+  (run `34011516921`). First attempt failed -- but not from this change's
+  code: `error: failed to load manifest for dependency
+  'magnetar-provider-cpu' ... failed to read
+  'providers/cpu/Cargo.toml' ... No such file or directory`. The
+  workflow's "Checkout CUDA Provider submodule" step only ever initialized
+  `providers/cuda`, never `providers/cpu` -- a genuine, pre-existing gap
+  (CUDA's `[dev-dependencies]` path-depends on `providers/cpu` for its
+  conformance oracle comparisons), not something this change introduced.
+  Fixed the checkout step to also initialize `providers/cpu`; re-dispatch
+  pending.
 
 ## 7. Cross-repository verification
 
