@@ -3778,34 +3778,55 @@ fn execute_qwen_graph_nodes(
     let dispatch_result = last_dispatch.ok_or_else(|| InferenceApiError::GenerationFailed {
         reason: "first-native graph executed no nodes".into(),
     })?;
-    // `QwenGraphExecutionOutput` returns materialized values to its callers
-    // (e.g. to extract the "logits" edge) -- that caller-facing contract is
-    // unchanged. Only this function's *internal* node-to-node transport is
-    // Resource-based; the final materialization back to `HostTensor` happens
-    // exactly once, here, not per-node.
-    // Final logits extraction boundary: this is the one point where every
-    // remaining live edge (including "output.logits") crosses back into the
-    // caller-facing `HostTensor` contract; everywhere above this in the loop
-    // carries `TensorValue` instead of assuming every Tensor Resource is
-    // host-visible.
+    let materialized_bindings =
+        materialize_qwen_graph_bindings(&*dispatch_ctx.provider, &bindings)?;
+    Ok((dispatch_result, materialized_bindings, updated_layer_kv))
+}
+
+/// The one designated Device-to-Host materialization boundary for a first-
+/// native graph dispatch: every remaining live edge (including
+/// `"output.logits"`) crosses back into the caller-facing `HostTensor`
+/// contract here, once, not per-node -- everywhere inside
+/// [`execute_qwen_graph_nodes`]'s own per-node transport loop carries
+/// `TensorValue` instead (that function's static guard,
+/// `check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls`,
+/// enforces zero raw `HostTensor`-typed `ProviderExecutionApi` calls there
+/// specifically -- this function is deliberately a separate one, outside
+/// that guard's scan, precisely because this boundary's whole job is the
+/// opposite of that loop's: to genuinely materialize, not to defer it).
+///
+/// Genuinely downloads through `read_tensor` (the `HostTensor`-typed
+/// method), not `read_tensor_value(...).into_host(...)` --
+/// `audit-complet-cuda-hot-path-2026-09-08` P1-1, found only once a real
+/// CUDA Provider actually reached this boundary (`run_first_native_graph_
+/// with_provider`'s new generalized entrypoint; every prior call site only
+/// ever ran against Reference CPU, which never produces `TensorValue::
+/// Opaque` in the first place). `read_tensor_value` is *never* required to
+/// answer `Host` for a genuinely Device-resident Provider (`define-
+/// provider-prepared-kernel-execution-contract`'s own documented contract:
+/// CUDA's `read_tensor_value` always answers `Opaque`, by design), so
+/// `.into_host()` on its result is structurally incapable of ever
+/// downloading real Device-resident data -- every intermediate edge this
+/// dispatch deliberately kept Resident (Decision 3's whole point) would
+/// fail exactly this way at this final boundary, Reference CPU's own
+/// always-`Host` behavior being the only reason this was never observed
+/// before.
+fn materialize_qwen_graph_bindings(
+    provider: &dyn ProviderExecutionApi,
+    bindings: &BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)>,
+) -> Result<BTreeMap<TensorEdgeId, HostTensor>, InferenceApiError> {
     let mut materialized_bindings = BTreeMap::new();
-    for (edge_id, (resource_id, _shape)) in &bindings {
-        let value = dispatch_ctx
-            .provider
-            .read_tensor_value(resource_id)
-            .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+    for (edge_id, (resource_id, _shape)) in bindings {
+        let tensor = provider.read_tensor(resource_id).ok_or_else(|| {
+            InferenceApiError::GraphPlanningFailed {
                 reason: format!(
                     "no materialized data for graph edge '{edge_id}' (resource '{resource_id}')"
                 ),
-            })?;
-        let tensor = value.into_host(resource_id).map_err(|error| {
-            InferenceApiError::GraphPlanningFailed {
-                reason: format!("graph edge '{edge_id}' (resource '{resource_id}'): {error}"),
             }
         })?;
         materialized_bindings.insert(edge_id.clone(), tensor);
     }
-    Ok((dispatch_result, materialized_bindings, updated_layer_kv))
+    Ok(materialized_bindings)
 }
 
 /// Static guard (`define-provider-prepared-kernel-execution-contract` task
@@ -6631,8 +6652,16 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
 /// fixture-checksum path did. Destroys the fresh instance this call
 /// creates before returning -- only the compiled artifact is cached, not
 /// instance state, so nothing accumulates across repeated calls.
+///
+/// Public (`audit-complet-cuda-hot-path-2026-09-08` P1-1) so an external
+/// caller with its own real Provider can obtain the exact same real,
+/// Component-produced graph production itself dispatches, to drive
+/// [`run_first_native_graph_with_provider`] end to end against it --
+/// unlike `qwen_prefill_graph`, exposing this does not weaken "production
+/// never Rust-synthesizes a graph": this function *is* the production
+/// path, unconditionally the real Component either way.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-fn build_first_native_graphs_from_real_qwen_component(
+pub fn build_first_native_graphs_from_real_qwen_component(
     fixture: &E2eFixture,
     prompt_token_count: u64,
 ) -> Result<
@@ -6817,11 +6846,18 @@ impl QwenComponentGraphSemantics {
     }
 }
 
-struct FirstNativeComponentGraphs {
-    prefill: ExecutionGraph,
-    prefill_node_count: usize,
-    decode: ExecutionGraph,
-    decode_node_count: usize,
+/// A produced prefill/decode `ExecutionGraph` pair, from whichever source
+/// this build's `first_native_component_graphs_for_prompt` actually used
+/// (the real Qwen Component under the strict, default build; the Rust-
+/// synthesized test-oracle recipe in a test build without a strict
+/// engine). Public so an external caller with its own real Provider (see
+/// `run_first_native_graph_with_provider`) can obtain the same real graph
+/// production drives, via [`build_first_native_graphs_from_real_qwen_component`].
+pub struct FirstNativeComponentGraphs {
+    pub prefill: ExecutionGraph,
+    pub prefill_node_count: usize,
+    pub decode: ExecutionGraph,
+    pub decode_node_count: usize,
 }
 
 #[cfg(test)]
@@ -7052,7 +7088,7 @@ fn prepare_first_native_plan_for_graph(
         selection_request.observability_correlation =
             Some(format!("first-native-plan:{phase:?}:{node_id}"));
         for input in &node.inputs {
-            let resource = graph_kernel_resource(graph, input, &node_affinity)?;
+            let resource = graph_kernel_resource(graph, input, &node_affinity, provider)?;
             merge_graph_edge_requirements(&mut selection_request, &resource);
             if let Some(kv) = graph
                 .edges
@@ -7067,7 +7103,7 @@ fn prepare_first_native_plan_for_graph(
             selection_request = selection_request.with_input(resource);
         }
         for output in &node.outputs {
-            let resource = graph_kernel_resource(graph, output, &node_affinity)?;
+            let resource = graph_kernel_resource(graph, output, &node_affinity, provider)?;
             merge_graph_edge_requirements(&mut selection_request, &resource);
             if let Some(kv) = graph
                 .edges
@@ -7134,7 +7170,28 @@ fn prepare_first_native_plan_for_graph(
     Ok(plan)
 }
 
-fn kernel_memory_class_for_edge(edge: &TensorEdge) -> KernelMemoryClass {
+/// `provider`-aware (`audit-complet-cuda-hot-path-2026-09-08` P1-1,
+/// discovered as a real blocker, not just the audit's own separately-
+/// flagged P2-1 architecture debt in `resolved_kernel_memory_class`):
+/// every graph edge this crate produces -- Rust-constructed and real
+/// Component-produced alike -- declares `TensorResidencyConstraint::Host`
+/// by default (a graph is Provider-agnostic declarative metadata; it does
+/// not know in advance which Provider will execute it), so the unqualified
+/// `Host` case previously mapped unconditionally to `KernelMemoryClass::
+/// Host`. That happened to match Reference CPU's own kernels (the only
+/// Provider this ever ran against before `run_first_native_graph_with_
+/// provider`), so the mismatch was never exercised -- CUDA's kernels
+/// require `KernelMemoryClass::Device` and were rejected outright
+/// (`MemoryClassUnsupported`) the first time a Prepared Plan was actually
+/// built for a non-Reference-CPU Provider. An edge that *explicitly*
+/// declares a residency constraint (`Device`, `BrowserLinearMemory`,
+/// `ProviderOwnedOpaque`) still wins outright -- only the default,
+/// unconstrained `Host` case is resolved from `provider` instead of
+/// assumed.
+fn kernel_memory_class_for_edge(
+    edge: &TensorEdge,
+    provider: &ProviderBinding,
+) -> KernelMemoryClass {
     match edge.residency {
         TensorResidencyConstraint::Device => KernelMemoryClass::Device,
         TensorResidencyConstraint::BrowserLinearMemory => KernelMemoryClass::BrowserLinearMemory,
@@ -7144,7 +7201,8 @@ fn kernel_memory_class_for_edge(edge: &TensorEdge) -> KernelMemoryClass {
                 KernelMemoryClass::PinnedHost
             }
             MemoryAllocationClass::BrowserLinearMemory => KernelMemoryClass::BrowserLinearMemory,
-            _ => KernelMemoryClass::Host,
+            _ if provider.as_str() == REFERENCE_CPU_PROVIDER_NAME => KernelMemoryClass::Host,
+            _ => KernelMemoryClass::Device,
         },
     }
 }
@@ -7166,6 +7224,7 @@ fn graph_kernel_resource(
     graph: &ExecutionGraph,
     edge_id: &TensorEdgeId,
     default_affinity: &ResourceAffinity,
+    provider: &ProviderBinding,
 ) -> Result<KernelResource, E2eConformanceError> {
     let edge =
         graph
@@ -7184,7 +7243,7 @@ fn graph_kernel_resource(
             edge.descriptor.clone(),
             affinity,
         ),
-        kernel_memory_class_for_edge(edge),
+        kernel_memory_class_for_edge(edge, provider),
     ))
 }
 

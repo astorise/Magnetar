@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "magnetar-integration-cuda-first-native"
+version = "0.1.0"
+edition = "2024"
+# Never published: this crate exists only to run the real first-native
+# pipeline (magnetar-runtime) against a real CUDA Provider
+# (magnetar-provider-cuda) end to end -- something neither crate can prove
+# on its own without one importing the other. magnetar-runtime never
+# depends on magnetar-provider-cuda (and must not: see this crate's own
+# README), so this glue lives here instead, outside both.
+publish = false
+
+[dev-dependencies]
+magnetar-runtime = { path = "../../magnetar-runtime" }
+magnetar-provider-cuda = { path = "../../providers/cuda" }

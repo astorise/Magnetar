@@ -4,3 +4,9 @@
 **/.env.*.local
 .vscode/*
 .artifacts/*
+# integration-tests/* crates are standalone workspaces (own [workspace]
+# table, like providers/cpu and providers/cuda), not members of the root
+# workspace -- their lockfiles follow the same not-committed convention
+# those submodules already use, kept consistent here since integration-
+# tests/ lives directly in this repository rather than as a submodule.
+integration-tests/*/Cargo.lock
