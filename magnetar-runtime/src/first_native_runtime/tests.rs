@@ -1122,8 +1122,10 @@ impl Provider for TestFailableKernelProvider {
 #[test]
 fn e2e_graph_dispatch_rolls_back_pre_admitted_output_on_submit_time_failure() {
     let fixture = e2e_fixture().expect("fixture builds");
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
     let mut runtime = Runtime::builder()
-        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .register_provider(Arc::new(provider))
         .config(RuntimeConfig {
             memory: MemoryManagerConfig {
                 max_runtime_bytes: Some(1 << 16),
@@ -1174,6 +1176,31 @@ fn e2e_graph_dispatch_rolls_back_pre_admitted_output_on_submit_time_failure() {
         MemoryAllocationState::Released,
         "a submit-time (Kernel Registry/dispatch-plan construction) failure must roll back \
          the pre-admitted output allocation, not leak it"
+    );
+
+    // audit-complet-cuda-hot-path-2026-09-08 P0-2 / Correctif B's "failure
+    // before materialization" case: `attention`'s workspace admission
+    // fails before the Provider is ever invoked, so its output was never
+    // written to Provider storage in the first place -- rollback's
+    // `release_tensor` call is a correctly idempotent no-op here, not a
+    // real cleanup. Checked anyway (the completion-time counterpart test
+    // covers the genuinely materialized case) so both halves of the
+    // audit's test list are directly represented.
+    let attention_node = graphs
+        .prefill
+        .nodes
+        .values()
+        .find(|node| node.operator.name() == "attention")
+        .expect("this fixture's prefill graph has an attention node");
+    let attention_output_edge = attention_node
+        .outputs
+        .first()
+        .expect("attention node has an output edge");
+    let attention_output_id = TensorResourceId::new(format!("edge.{attention_output_edge}"));
+    assert!(
+        executor.read_tensor_value(&attention_output_id).is_none(),
+        "a submit-time failure must never leave a Provider-side resource behind for the \
+         output it pre-admitted but never got to materialize"
     );
 }
 
@@ -1250,6 +1277,36 @@ fn e2e_graph_dispatch_rolls_back_pre_admitted_output_on_kernel_completion_failur
          `execute_qwen_graph_nodes`'s `initial_bindings` loop); `embedding`'s own \
          pre-admitted output must be rolled back, not left behind as a second, leaked \
          allocation"
+    );
+
+    // audit-complet-cuda-hot-path-2026-09-08 P0-2 / Correctif B: the
+    // allocation/residency check above only proves the *Memory Manager*
+    // side was rolled back -- Reference CPU's `submit_kernel_invocation`
+    // runs the Kernel and writes its output into Provider storage
+    // synchronously, *before* `complete_kernel` is ever called, so by the
+    // time this mock's injected `complete_kernel` failure fires, the
+    // Provider genuinely already materialized `embedding`'s output. The
+    // fix must release it from Provider storage too, not just Memory
+    // Manager's ledger -- checked directly against the same `executor`
+    // this dispatch actually ran through, not inferred from the
+    // allocation count alone.
+    let embedding_node = graphs
+        .prefill
+        .nodes
+        .values()
+        .find(|node| node.operator.name() == "embedding")
+        .expect("this fixture's prefill graph has an embedding node");
+    let embedding_output_edge = embedding_node
+        .outputs
+        .first()
+        .expect("embedding node has an output edge");
+    let embedding_output_id = TensorResourceId::new(format!("edge.{embedding_output_edge}"));
+    assert!(
+        executor.read_tensor_value(&embedding_output_id).is_none(),
+        "a kernel/completion-time failure must also release the pre-admitted output from \
+         Provider storage, not just Memory Manager's residency ledger -- \
+         `embedding`'s output was genuinely materialized Provider-side before completion \
+         failed, and must not survive rollback as an orphaned Provider-side resource"
     );
 
     // 6.4/6.5: a retry with the injected failure cleared must succeed
@@ -1917,59 +1974,6 @@ fn resident_resource_affinity_conflict_is_rejected() {
          and the dispatch's own resolved affinity must be rejected, not \
          silently resolved by picking one of them"
     );
-}
-
-/// `make-first-native-cuda-hot-path-device-resident` task 1.7: the
-/// production validation must actually reject a real Provider divergence
-/// between a resolved `KernelInvocation` and its own `ResourceAffinity` --
-/// not just be present in the code but never fire. `PlanNodeBinding::new`
-/// (confirmed by reading it directly) accepts its `kernel: KernelId` and
-/// its own `provider: ProviderBinding` as independent parameters with no
-/// validation that they agree, so this scenario is directly constructible,
-/// not contrived: a `KernelId` claiming CUDA on a binding whose own
-/// `provider` field says Reference CPU.
-#[test]
-fn validate_invocation_provider_matches_affinity_rejects_a_real_divergence() {
-    let node = ExecutionNodeId::new("mismatched.node");
-    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
-        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
-    let mismatched_kernel = test_kernel_id("magnetar:provider/cuda", "matmul");
-    let invocation = KernelInvocation::new(
-        KernelInvocationId::new("mismatched-invocation"),
-        OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra),
-        mismatched_kernel,
-        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
-        affinity.clone(),
-    );
-
-    let result = validate_invocation_provider_matches_affinity(&invocation, &affinity, &node);
-
-    assert!(
-        result.is_err(),
-        "a KernelInvocation whose own KernelId.provider disagrees with its \
-         ResourceAffinity.provider must be rejected"
-    );
-}
-
-/// Companion: an invocation whose resolved Kernel Provider genuinely
-/// agrees with its `ResourceAffinity` must pass -- the check must not
-/// reject the ordinary, correct case.
-#[test]
-fn validate_invocation_provider_matches_affinity_accepts_agreement() {
-    let node = ExecutionNodeId::new("matching.node");
-    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
-        .with_provider(ProviderBinding::new("magnetar:provider/cuda"));
-    let matching_kernel = test_kernel_id("magnetar:provider/cuda", "matmul");
-    let invocation = KernelInvocation::new(
-        KernelInvocationId::new("matching-invocation"),
-        OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra),
-        matching_kernel,
-        ProviderBinding::new("magnetar:provider/cuda"),
-        affinity.clone(),
-    );
-
-    validate_invocation_provider_matches_affinity(&invocation, &affinity, &node)
-        .expect("agreeing Provider bindings must pass validation");
 }
 
 /// GitHub issue "A Model Instance stuck in Loading cannot currently be

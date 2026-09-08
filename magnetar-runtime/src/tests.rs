@@ -8,6 +8,7 @@ use crate::compute::*;
 use crate::conformance::*;
 use crate::device::*;
 use crate::e2e_conformance::*;
+use crate::execution_graph::*;
 use crate::generation::*;
 use crate::inference_api::*;
 use crate::kernel::*;
@@ -18,6 +19,7 @@ use crate::kernel_autotuning::*;
 use crate::kernel_benchmark::*;
 use crate::kernel_cache::*;
 use crate::kernel_compilation::*;
+use crate::kernel_dispatch::*;
 use crate::kernel_execution_plan::*;
 use crate::kernel_performance_model::*;
 use crate::kernel_qualification::*;
@@ -8022,6 +8024,211 @@ fn reference_cpu_kernel_registry_selects_registered_candidate() {
             .iter()
             .any(|observation| observation.kind == KernelObservationKind::KernelSelected)
     );
+}
+
+/// Builds a real, fully consistent `matmul` `KernelDispatchPlan` against
+/// Reference CPU -- Provider affinity set, two inputs, one output, all
+/// agreeing -- for `kernel_dispatcher_revalidate_*` below to mutate one
+/// specific field of at a time. Registered through
+/// `register_provider_advertisement` (not the `PreparedKernel` machinery),
+/// matching `reference_cpu_kernel_registry_selects_registered_candidate`
+/// above, since these tests exercise `KernelDispatcher::revalidate`'s own
+/// Provider/Device/ResourceAffinity consistency check
+/// (audit-complet-cuda-hot-path-2026-09-08's Correctif A), not Kernel
+/// Registry selection itself.
+fn matmul_dispatch_plan_for_revalidation_tests() -> (KernelRegistry, KernelDispatchPlan) {
+    let mut registry = KernelRegistry::new();
+    for advertisement in ReferenceCpuProvider::new().kernel_advertisements() {
+        registry
+            .register_provider_advertisement(advertisement)
+            .unwrap();
+    }
+    registry.set_provider_status(ProviderStatusSnapshot::from_health_report(
+        ProviderHealthReport::new(
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            HealthState::Available,
+        ),
+    ));
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+    let (_a_id, a_resource) = reference_cpu_resource("revalidate-a", [2, 2]);
+    let (_b_id, b_resource) = reference_cpu_resource("revalidate-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("revalidate-out", [2, 2]);
+    let matmul_operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
+    let request = KernelSelectionRequest::new("revalidate-matmul", matmul_operator, affinity)
+        .with_input(a_resource)
+        .with_input(b_resource)
+        .with_output(out_resource);
+    let selection = registry.select(&request).unwrap();
+    let candidate = selection
+        .selected
+        .expect("a compatible Reference CPU candidate should be selected");
+    let advertisement = registry
+        .active_advertisement(&candidate.kernel)
+        .expect("just-selected candidate's advertisement must still be active")
+        .clone();
+    let plan = KernelDispatchPlan::from_selection(
+        KernelDispatchPlanId::new("revalidate-matmul-dispatch"),
+        &request,
+        &candidate,
+        &advertisement,
+        KernelInvocationId::new("revalidate-matmul-invocation"),
+    )
+    .expect("a compatible candidate builds a valid dispatch plan");
+    (registry, plan)
+}
+
+#[test]
+fn kernel_dispatcher_revalidate_accepts_a_fully_consistent_plan() {
+    let (registry, mut plan) = matmul_dispatch_plan_for_revalidation_tests();
+    KernelDispatcher::new()
+        .revalidate(&registry, &mut plan)
+        .expect("a plan whose invocation, resources, and affinity all agree must revalidate");
+}
+
+/// audit-complet-cuda-hot-path-2026-09-08 P0-1, Correctif A test list item
+/// "provider mismatch".
+#[test]
+fn kernel_dispatcher_revalidate_rejects_provider_mismatch() {
+    let (registry, mut plan) = matmul_dispatch_plan_for_revalidation_tests();
+    plan.invocation.provider = ProviderBinding::new("magnetar:provider/somewhere-else");
+    let error = KernelDispatcher::new()
+        .revalidate(&registry, &mut plan)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        KernelDispatchError::ResourceAffinityConflict(_)
+    ));
+}
+
+/// audit-complet-cuda-hot-path-2026-09-08 P0-1, Correctif A test list item
+/// "device mismatch même Provider" -- the exact regression the previous,
+/// Provider-only `validate_invocation_provider_matches_affinity` (removed
+/// in favor of this generic boundary check) could not catch: the same
+/// Provider resolving to the *wrong* Device among several it exposes.
+#[test]
+fn kernel_dispatcher_revalidate_rejects_device_mismatch_with_the_same_provider() {
+    let (registry, mut plan) = matmul_dispatch_plan_for_revalidation_tests();
+    plan.invocation.affinity = plan
+        .invocation
+        .affinity
+        .clone()
+        .with_device(DeviceBinding::new(DeviceId::new("gpu-0")));
+    plan.invocation.device = Some(DeviceBinding::new(DeviceId::new("gpu-1")));
+    let error = KernelDispatcher::new()
+        .revalidate(&registry, &mut plan)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        KernelDispatchError::ResourceAffinityConflict(_)
+    ));
+}
+
+/// audit-complet-cuda-hot-path-2026-09-08 P0-1, Correctif A test list item
+/// "input resource mismatch" -- the generic check now walks
+/// `input_bindings`, not only `output_bindings` (the previous check's own
+/// gap).
+#[test]
+fn kernel_dispatcher_revalidate_rejects_input_resource_affinity_mismatch() {
+    let (registry, mut plan) = matmul_dispatch_plan_for_revalidation_tests();
+    plan.invocation.inputs[0].resource.affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new("magnetar:provider/somewhere-else"));
+    plan.input_bindings[0].resource.affinity = plan.invocation.inputs[0].resource.affinity.clone();
+    let error = KernelDispatcher::new()
+        .revalidate(&registry, &mut plan)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        KernelDispatchError::ResourceAffinityConflict(_)
+    ));
+}
+
+/// audit-complet-cuda-hot-path-2026-09-08 P0-1, Correctif A test list item
+/// "output resource mismatch".
+#[test]
+fn kernel_dispatcher_revalidate_rejects_output_resource_affinity_mismatch() {
+    let (registry, mut plan) = matmul_dispatch_plan_for_revalidation_tests();
+    plan.invocation.outputs[0].resource.affinity =
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new("magnetar:provider/somewhere-else"));
+    plan.output_bindings[0].resource.affinity =
+        plan.invocation.outputs[0].resource.affinity.clone();
+    let error = KernelDispatcher::new()
+        .revalidate(&registry, &mut plan)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        KernelDispatchError::ResourceAffinityConflict(_)
+    ));
+}
+
+/// audit-complet-cuda-hot-path-2026-09-08 P0-1, Correctif A test list item
+/// "prepared plan device mismatch" -- the same invariant, checked through
+/// `KernelDispatchPlan::from_prepared_node_execution`'s construction path
+/// (a published Plan's binding), not only `from_selection`'s.
+#[test]
+fn kernel_dispatcher_revalidate_rejects_prepared_plan_device_mismatch() {
+    let mut registry = KernelRegistry::new();
+    for advertisement in ReferenceCpuProvider::new().kernel_advertisements() {
+        registry
+            .register_provider_advertisement(advertisement)
+            .unwrap();
+    }
+    registry.set_provider_status(ProviderStatusSnapshot::from_health_report(
+        ProviderHealthReport::new(
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            HealthState::Available,
+        ),
+    ));
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+        .with_device(DeviceBinding::new(DeviceId::new("gpu-0")));
+    let (_a_id, a_resource) = reference_cpu_resource("revalidate-prepared-a", [2, 2]);
+    let (_b_id, b_resource) = reference_cpu_resource("revalidate-prepared-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("revalidate-prepared-out", [2, 2]);
+    let matmul_operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
+    let request =
+        KernelSelectionRequest::new("revalidate-prepared-matmul", matmul_operator, affinity)
+            .with_input(a_resource)
+            .with_input(b_resource)
+            .with_output(out_resource);
+    let selection = registry.select(&request).unwrap();
+    let candidate = selection
+        .selected
+        .expect("a compatible Reference CPU candidate should be selected");
+    let advertisement = registry
+        .active_advertisement(&candidate.kernel)
+        .expect("just-selected candidate's advertisement must still be active")
+        .clone();
+    let prepared = PreparedPlanNodeExecution {
+        graph_node: ExecutionNodeId::new("revalidate-prepared-node"),
+        kernel: candidate.kernel.clone(),
+        prepared_kernel: PreparedKernelIdAllocator::default().allocate(),
+        prepared_kernel_generation: PreparedKernelGeneration::new(1),
+        provider: candidate.provider.clone(),
+        // Diverges from the request's own `affinity.device` (`gpu-0`)
+        // above -- a published Plan binding naming the wrong Device for
+        // this resource's declared affinity.
+        device: Some(DeviceBinding::new(DeviceId::new("gpu-1"))),
+        plan: PreparedExecutionPlanId::new("revalidate-prepared-plan")
+            .expect("a simple ascii identifier is a valid Prepared Execution Plan id"),
+        plan_generation: PreparedExecutionPlanGeneration::new(1),
+    };
+    let mut plan = KernelDispatchPlan::from_prepared_node_execution(
+        KernelDispatchPlanId::new("revalidate-prepared-matmul-dispatch"),
+        &request,
+        &prepared,
+        &advertisement,
+        KernelInvocationId::new("revalidate-prepared-matmul-invocation"),
+    )
+    .expect("a compatible prepared node execution builds a valid dispatch plan");
+    let error = KernelDispatcher::new()
+        .revalidate(&registry, &mut plan)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        KernelDispatchError::ResourceAffinityConflict(_)
+    ));
 }
 
 #[test]

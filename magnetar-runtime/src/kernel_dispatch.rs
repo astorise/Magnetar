@@ -452,6 +452,80 @@ impl KernelDispatcher {
             self.observe_failure(plan, &error);
             return Err(error);
         }
+        // Provider + Device + ResourceAffinity consistency, checked
+        // together at this one generic boundary every dispatch passes
+        // through (Prepared and Candidate selection alike) rather than by
+        // a per-caller helper elsewhere: a Provider-only check here would
+        // accept the same Provider resolving to the *wrong* Device among
+        // several it exposes (e.g. `affinity.device` = GPU0 but
+        // `invocation.device` = GPU1), which is exactly the class of
+        // divergence worth catching before multi-Device Providers exist.
+        // Covers both `input_bindings` and `output_bindings` -- an
+        // earlier, narrower version of this check only walked outputs.
+        if plan.invocation.provider != plan.provider
+            || plan.invocation.kernel.provider != plan.provider
+        {
+            plan.lifecycle = KernelDispatchLifecycleState::Failed;
+            let error = KernelDispatchError::ResourceAffinityConflict(format!(
+                "invocation Provider '{}' (Kernel declares '{}') disagrees with plan Provider '{}'",
+                plan.invocation.provider, plan.invocation.kernel.provider, plan.provider
+            ));
+            self.observe_failure(plan, &error);
+            self.observations.push(
+                KernelObservation::new(KernelObservationKind::KernelResourceAffinityConflict)
+                    .with_kernel(&plan.selected_kernel),
+            );
+            return Err(error);
+        }
+        if let Some(expected_provider) = plan.invocation.affinity.provider()
+            && expected_provider != &plan.invocation.provider
+        {
+            plan.lifecycle = KernelDispatchLifecycleState::Failed;
+            let error = KernelDispatchError::ResourceAffinityConflict(format!(
+                "invocation Provider '{}' disagrees with its own ResourceAffinity Provider '{expected_provider}'",
+                plan.invocation.provider
+            ));
+            self.observe_failure(plan, &error);
+            self.observations.push(
+                KernelObservation::new(KernelObservationKind::KernelResourceAffinityConflict)
+                    .with_kernel(&plan.selected_kernel),
+            );
+            return Err(error);
+        }
+        if let Some(expected_device) = plan.invocation.affinity.device()
+            && plan.invocation.device.as_ref() != Some(expected_device)
+        {
+            plan.lifecycle = KernelDispatchLifecycleState::Failed;
+            let error = KernelDispatchError::ResourceAffinityConflict(format!(
+                "invocation Device '{:?}' disagrees with its own ResourceAffinity Device '{expected_device}'",
+                plan.invocation.device
+            ));
+            self.observe_failure(plan, &error);
+            self.observations.push(
+                KernelObservation::new(KernelObservationKind::KernelResourceAffinityConflict)
+                    .with_kernel(&plan.selected_kernel),
+            );
+            return Err(error);
+        }
+        for resource in plan
+            .input_bindings
+            .iter()
+            .chain(plan.output_bindings.iter())
+        {
+            if let Err(error) = validate_affinity_compatibility(
+                &plan.invocation.affinity,
+                &resource.resource.affinity,
+            ) {
+                plan.lifecycle = KernelDispatchLifecycleState::Failed;
+                let error = KernelDispatchError::ResourceAffinityConflict(error.to_string());
+                self.observe_failure(plan, &error);
+                self.observations.push(
+                    KernelObservation::new(KernelObservationKind::KernelResourceAffinityConflict)
+                        .with_kernel(&plan.selected_kernel),
+                );
+                return Err(error);
+            }
+        }
         if let Some(status) = context.provider_status.as_ref() {
             match status.provider_health_compat() {
                 HealthState::Available | HealthState::Degraded => {}
@@ -523,21 +597,6 @@ impl KernelDispatcher {
             );
             self.observe_failure(plan, &error);
             return Err(error);
-        }
-        for output in &plan.output_bindings {
-            if let Err(error) = validate_affinity_compatibility(
-                &plan.invocation.affinity,
-                &output.resource.affinity,
-            ) {
-                plan.lifecycle = KernelDispatchLifecycleState::Failed;
-                let error = KernelDispatchError::ResourceAffinityConflict(error.to_string());
-                self.observe_failure(plan, &error);
-                self.observations.push(
-                    KernelObservation::new(KernelObservationKind::KernelResourceAffinityConflict)
-                        .with_kernel(&plan.selected_kernel),
-                );
-                return Err(error);
-            }
         }
         if !context.memory_reservation_valid {
             let error = KernelDispatchError::WorkspaceUnavailable;

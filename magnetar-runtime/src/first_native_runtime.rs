@@ -1831,38 +1831,6 @@ fn resident_resource_affinity(
     }
 }
 
-/// Production validation, not `debug_assert!` (`make-first-native-cuda-
-/// hot-path-device-resident`'s Decision 6): the Provider a `KernelInvocation`
-/// actually resolved to (`invocation.kernel.provider`, via Kernel Registry/
-/// `PreparedExecutionPlanExecutor` selection -- a code path independent of
-/// `resolved_resource_affinity`'s own `PreparedExecutionPlan.node_bindings`
-/// lookup) must agree with the `ResourceAffinity` this dispatch is about to
-/// attach to every one of its resources. These two are not the same value
-/// by construction: `PlanNodeBinding::new` accepts its `kernel: KernelId`
-/// and its own `provider: ProviderBinding` as independent parameters with
-/// no validation that `kernel.provider == provider` -- exactly the class of
-/// divergence this change's own root cause was (the Prepared Plan resolving
-/// CUDA while first-native's affinity stayed hardcoded to Reference CPU).
-/// Runs in every build, not only debug ones.
-fn validate_invocation_provider_matches_affinity(
-    invocation: &KernelInvocation,
-    affinity: &ResourceAffinity,
-    node: &ExecutionNodeId,
-) -> Result<(), InferenceApiError> {
-    let Some(expected_provider) = affinity.provider() else {
-        return Ok(());
-    };
-    if &invocation.kernel.provider != expected_provider {
-        return Err(InferenceApiError::GraphPlanningFailed {
-            reason: format!(
-                "node '{node}' resolved Kernel Provider '{}' disagrees with its own ResourceAffinity Provider '{expected_provider}'",
-                invocation.kernel.provider
-            ),
-        });
-    }
-    Ok(())
-}
-
 struct QwenDispatchContext<'a> {
     /// A single exclusive borrow (Correctif 13 / task group 7), not split
     /// into separate `runtime`/`memory` fields: `MemoryManager` is a field
@@ -2226,10 +2194,6 @@ fn dispatch_reference_cpu_operator_multi(
         reason: format!("{error:?}"),
     })?;
     plan.invocation.attributes = attributes;
-    // Production validation, not `debug_assert!` (`make-first-native-cuda-
-    // hot-path-device-resident`'s Decision 6) -- see
-    // `validate_invocation_provider_matches_affinity`.
-    validate_invocation_provider_matches_affinity(&plan.invocation, &affinity, &node)?;
     if advertisement.workspace.required {
         let workspace = ctx
             .provider
@@ -2443,19 +2407,36 @@ fn resolve_output_target(
     }
 }
 
-/// Releases a caller's pre-admission for `id` -- its `TensorResidency`
-/// record and the Memory Manager allocation it references, if any --
-/// leaving no trace behind. Reached only when a dispatch that pre-admitted
-/// its output (`resolve_output_target`'s `Some` branch) subsequently fails,
-/// at *any* point after admission: Kernel Registry/dispatch-plan
-/// construction (a "submit-time" failure) or the Kernel's own execution/
-/// completion (`make-first-native-cuda-hot-path-device-resident`'s
-/// Decision 7 -- both failure classes are handled uniformly here, by
-/// wrapping the entire post-admission call rather than distinguishing
-/// where exactly it failed). Best-effort: this runs on an already-failing
-/// path, so a further failure releasing the allocation is not itself
-/// surfaced -- the original dispatch error is what the caller needs to see.
-fn rollback_pre_admitted_output(memory: &mut MemoryManager, id: &TensorResourceId) {
+/// Releases a caller's pre-admission for `id` on *both* sides of the
+/// admission boundary -- this Provider's own opaque storage (if the failed
+/// dispatch had actually gone as far as materializing something there
+/// before failing) and the Memory Manager's `TensorResidency` record plus
+/// the allocation it references -- leaving no trace behind on either.
+/// Reached only when a dispatch that pre-admitted its output
+/// (`resolve_output_target`'s `Some` branch) subsequently fails, at *any*
+/// point after admission: Kernel Registry/dispatch-plan construction (a
+/// "submit-time" failure, before the Provider ever sees the invocation) or
+/// the Kernel's own execution/completion (`make-first-native-cuda-hot-
+/// path-device-resident`'s Decision 7 -- both failure classes are handled
+/// uniformly here, by wrapping the entire post-admission call rather than
+/// distinguishing where exactly it failed).
+///
+/// `provider.release_tensor` runs first, Memory Manager second (audit-
+/// complet-cuda-hot-path-2026-09-08's Correctif B): a submit-time failure
+/// never reached the Provider, so `release_tensor` is a correctly-`Ok(false)`
+/// no-op there -- calling it unconditionally rather than trying to guess
+/// whether the Provider materialized anything is simpler and no less
+/// correct, since `release_tensor` is documented idempotent for exactly
+/// this "nothing to release" case. Best-effort on both sides: this runs on
+/// an already-failing path, so a further failure releasing either side is
+/// not itself surfaced -- the original dispatch error is what the caller
+/// needs to see.
+fn rollback_pre_admitted_output(
+    provider: &dyn ProviderExecutionApi,
+    memory: &mut MemoryManager,
+    id: &TensorResourceId,
+) {
+    let _ = provider.release_tensor(id);
     if let Some(residency) = memory.remove_tensor_residency(id)
         && let Some(allocation) = residency.allocation
     {
@@ -2485,7 +2466,7 @@ fn dispatch_reference_cpu_operator_pre_admitted(
     let result =
         dispatch_reference_cpu_operator(ctx, operation_id, operator, inputs, output, attributes);
     if result.is_err() && pre_admitted {
-        rollback_pre_admitted_output(ctx.runtime.memory_mut(), &output_id);
+        rollback_pre_admitted_output(&*ctx.provider, ctx.runtime.memory_mut(), &output_id);
     }
     result
 }
@@ -3110,6 +3091,29 @@ fn dispatch_qwen_graph_node(
             // correct for GQA/MQA); the id-suffix heuristic
             // (`qwen_rope_head_count`) is only a fallback for a node that
             // predates this attribute existing.
+            //
+            // audit-complet-cuda-hot-path-2026-09-08 P1-2 / Correctif D
+            // asked for this fallback's removal -- verified NOT safe yet,
+            // not merely left as-is uncritically: `qwen_model_component.rs`
+            // sets `head_count` unconditionally today, but the *checked-in*
+            // `magnetar-runtime/fixtures/components/qwen-real.component.wasm`
+            // test fixture (the real, compiled Qwen Component
+            // `build_first_native_graphs_from_real_qwen_component` actually
+            // invokes for every default `cargo test` run -- `wasmtime-
+            // component-engine` is a default feature) is a separate,
+            // pre-compiled binary artifact last regenerated in `eae7313`/
+            // `156fb10`, before this attribute existed on the Runtime side.
+            // It genuinely does not emit `head_count`, so this fallback is
+            // still load-bearing for that real, currently-shipped artifact
+            // -- confirmed empirically: removing it turned
+            // `e2e_graph_executor_matches_full_sequence_oracle` red with a
+            // wrong-but-plausible decode logits divergence, the same
+            // silent-wrong-answer failure mode the whole `head_count`
+            // design exists to prevent. Removing this fallback safely
+            // requires first regenerating that `.wasm` fixture from an
+            // updated `components/qwen` source (a real, separate
+            // prerequisite the audit did not check for), tracked as its
+            // own follow-up rather than forced through here.
             let head_count = match node.attributes.get("head_count") {
                 Some(OperatorAttributeValue::Integer(value)) if *value >= 0 => *value as u64,
                 Some(_) => {
