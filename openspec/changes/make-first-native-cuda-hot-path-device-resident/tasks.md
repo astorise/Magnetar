@@ -71,8 +71,8 @@
 
 ## 8. OpenSpec accuracy pass (audit P1-3)
 
-- [ ] 8.1 Read `implement-cuda-provider-baseline/tasks.md` fully; correct any task text still describing pre-`enable-device-resident-kernel-chaining` (Host-resident storage, per-kernel-forced round-trip) behavior.
-- [ ] 8.2 Confirm this change's own spec deltas (`operator`, `operator-scope`, `cuda-provider`, `resource-affinity`) match what actually shipped once tasks 1-7 land.
+- [x] 8.1 Read `implement-cuda-provider-baseline/tasks.md` fully (all 11 task groups); found and corrected two stale completion notes still describing pre-`enable-device-resident-kernel-chaining` behavior -- task 7.1 (claimed bytes round-trip host↔device *within* each `CudaKernels` call rather than staying resident *between* calls; `executor.rs`'s module doc is now literally titled "Storage is device-resident between calls") and task 6.1 (claimed every `CudaKernels` kernel method uploads its own inputs/downloads its own output per call; those methods now take/return `CudaDeviceBuffer` directly with no upload/download of their own). Also found and fixed one genuinely stale checkbox unrelated to that behavior change: task 7.3 (the out-of-device-memory unit test) was actually implemented (`tests.rs`'s `out_of_device_memory_is_triggered_by_a_real_over_capacity_allocation`) but left unchecked.
+- [x] 8.2 Confirmed this change's own spec deltas (`operator`, `operator-scope`, `cuda-provider`, `resource-affinity`) match what shipped in tasks 1-7: `head_count` attribute semantics (operator, operator-scope, cuda-provider) match `qwen_model_component.rs`/`kernels.cu`/`kernels.rs`'s actual implementation and are covered by the new `rope_gqa_shaped_head_count_matches_reference_cpu`/`rope_partial_rotation_matches_reference_cpu` tests; production-build `ResourceAffinity` validation and Resident-resource-affinity-preservation (resource-affinity) match `validate_invocation_provider_matches_affinity`/`resident_resource_affinity` and their task group 1/6 tests. No corrections needed.
 
 ## 9. Cross-repository sequencing and full verification
 

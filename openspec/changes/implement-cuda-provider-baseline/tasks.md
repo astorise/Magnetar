@@ -151,12 +151,25 @@
 - [x] 6.1 Implement explicit host-to-device upload and device-to-host
       download operations; reject (rather than silently perform) upload/
       download when Runtime has not planned the movement step.
-      Satisfied at the `CudaKernels` level: every kernel method uploads its
-      inputs and downloads its output itself, once, per call — there is no
-      implicit/automatic movement path to accidentally trigger. What's
-      *not* yet done: the Runtime-Plan-level "was movement actually planned"
-      check, which requires task 8's `ProviderExecutionApi` to exist first
-      (there's no Execution Plan to consult yet).
+      Satisfied at the `CudaKernels` level via dedicated `upload`/`download`
+      methods, called only at genuine host/device crossings — there is no
+      implicit/automatic movement path to accidentally trigger.
+      **Superseded (accuracy pass, `make-first-native-cuda-hot-path-device-
+      resident` task group 8)**: this note originally said every kernel
+      method (`matmul`, `rmsnorm`, ...) uploaded its own inputs and
+      downloaded its own output, once per call; `enable-device-resident-
+      kernel-chaining` changed that -- every `CudaKernels` kernel method
+      now takes and returns `CudaDeviceBuffer` directly (see `kernels.rs`'s
+      `matmul`/`rmsnorm`/etc. signatures), performing no upload/download of
+      its own, so two chained kernel calls never force a round trip between
+      them. `CudaExecutor` (task group 8) is the one caller that invokes
+      `upload`/`download` today, and only at its own genuine host/device
+      crossings (`write_tensor`/`write_tensor_admitted` and `read_tensor`
+      respectively) -- the Runtime-Plan-level "was movement actually
+      planned" check this task originally deferred is still not a separate
+      mechanism, but is now moot in practice: nothing left in this path
+      moves data across the host/device boundary except those two explicit
+      calls.
 - [x] 6.2 Reject non-contiguous layout and non-f32 dtype inputs at kernel
       dispatch with structured errors, per `operator-scope`'s Initial
       Layout/DType Scope.
@@ -179,13 +192,20 @@
       baseline); free deterministically on Tensor Resource release.
       `CudaExecutor::write_tensor_admitted`/`release_admitted_tensor`
       (`executor.rs`) mirror `ReferenceCpuExecutor`'s admission/release
-      pairing exactly. Caveat carried over from `kernels.rs`: this baseline's
-      actual bytes round-trip host↔device *within* each `CudaKernels` call
-      rather than staying resident on the device *between* calls (see
-      `executor.rs`'s module doc, "Storage is host-resident between calls")
-      — genuine `cuMemAlloc`/`cuMemFree` happen, just not held open across
-      separate Kernel invocations. True cross-call device residency remains
-      out of scope (design.md's Device Memory Pool non-goal).
+      pairing exactly.
+      **Superseded (accuracy pass, `make-first-native-cuda-hot-path-device-
+      resident` task group 8)**: this note originally described a baseline
+      caveat -- bytes round-tripping host↔device *within* each
+      `CudaKernels` call rather than staying resident *between* calls --
+      that no longer describes this codebase. `enable-device-resident-
+      kernel-chaining` replaced that host-resident-between-calls storage
+      with a genuine in-process device allocation table (`executor.rs`'s
+      module doc is now literally titled "Storage is device-resident
+      between calls"): two back-to-back Kernel invocations that both read/
+      write through it never round-trip through host memory. Device memory
+      pooling itself is still out of scope (design.md's Device Memory Pool
+      non-goal is about pooling/reuse of allocations, not residency between
+      calls, and remains accurate).
 - [x] 7.2 Report Device residency and Provider-pinned Resource Affinity for
       every CUDA-produced output tensor to Runtime Memory Manager.
       `CudaExecutor::execute_invocation_with_memory_manager` admits every
@@ -197,11 +217,20 @@
       indirectly: `tests_provider_conformance.rs`'s real
       `ProviderConformanceProfile::ProviderCompute` run exercises this exact
       path against `magnetar_runtime`'s actual `MemoryManager` and passes.
-- [ ] 7.3 Unit test: simulated out-of-device-memory allocation failure maps
+- [x] 7.3 Unit test: simulated out-of-device-memory allocation failure maps
       to the stable out-of-memory error category, not an opaque native code.
-      Not yet done — needs a way to force `cuMemAlloc` to fail deterministically
-      (e.g. requesting a byte size larger than `mem_get_info`'s free bytes)
-      without flaking on machines with wildly different amounts of free VRAM.
+      **Stale checkbox fix (accuracy pass, `make-first-native-cuda-hot-
+      path-device-resident` task group 8)**: this was actually done and
+      left unchecked. `tests.rs`'s
+      `out_of_device_memory_is_triggered_by_a_real_over_capacity_allocation`
+      requests 64x the real device's own total memory (not just "over free
+      bytes" -- immune to Windows/WDDM transparently paging a small excess
+      out to system memory, confirmed empirically against this
+      workstation's driver), forcing a genuine `cuMemAlloc`-equivalent
+      failure deterministically regardless of how much VRAM/system RAM/
+      swap a given machine has, and asserts it maps through
+      `CudaError`/`KernelError` to `KernelErrorCode::KernelOutOfDeviceMemory`
+      end to end.
 
 ## 8. Provider Execution API (synchronous)
 
