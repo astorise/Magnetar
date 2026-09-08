@@ -2729,54 +2729,51 @@ fn weight_tensor_name_from_edge(edge_id: &str) -> Option<String> {
 /// 6.4). Applies the tied-embeddings `weight.lm_head` -> transposed
 /// `token_embedding` substitution `qwen_lm_head_weight_edge` declares via
 /// `TensorAliasing::MayAlias` (see that function's doc comment).
+///
+/// Returns a `NodeValue`, `Opaque` mapping to `Resident` instead of forcing
+/// `.into_host()` unconditionally (`make-first-native-cuda-hot-path-device-
+/// resident`'s Decision 3/audit P0-1) -- a Device-resident weight now flows
+/// to its consuming Kernel without a forced Host download. `descriptor` is
+/// the graph's own canonical shape source for this edge (`TensorEdge.
+/// descriptor`, never downloaded from the Provider and never recomputed
+/// from Qwen config) -- the source `NodeValue::Resident`'s shape needs,
+/// since `TensorValue::Opaque` itself carries none.
 fn resolve_qwen_weight_edge(
     provider: &Arc<dyn ProviderExecutionApi>,
     weight_bindings: &BTreeMap<String, TensorResourceId>,
-    tied_embeddings: bool,
     edge_id: &str,
-) -> Result<HostTensor, InferenceApiError> {
+    descriptor: &TensorDescriptor,
+) -> Result<NodeValue, InferenceApiError> {
     let name = weight_tensor_name_from_edge(edge_id).ok_or_else(|| {
         InferenceApiError::GraphPlanningFailed {
             reason: format!("graph edge '{edge_id}' is neither a bound input nor a known weight"),
         }
     })?;
-    let lookup_name = if name == "lm_head" && tied_embeddings {
-        "token_embedding"
-    } else {
-        &name
-    };
+    // Tied embeddings no longer need special-casing here (design.md's
+    // Decision 5): `bind_qwen_fixture_weights` stages the transposed
+    // `token_embedding` once, at Model Load, under the name `lm_head`
+    // itself -- this function resolves it exactly like any other weight,
+    // with no per-dispatch Rust-side transform and no redirect.
     let resource_id =
         weight_bindings
-            .get(lookup_name)
+            .get(&name)
             .ok_or_else(|| InferenceApiError::ModelLoadingFailed {
-                reason: format!(
-                    "active Model Instance has no weight resource bound for '{lookup_name}'"
-                ),
+                reason: format!("active Model Instance has no weight resource bound for '{name}'"),
             })?;
-    // Reference CPU Kernel input boundary (`define-provider-prepared-kernel-execution-contract`
-    // task 5.2): weight edges feed straight into `dispatch_qwen_*` compute,
-    // which needs real host bytes, so this is one of the points that
-    // explicitly materializes through `TensorValue::into_host` rather than
-    // carrying an opaque value further.
     let value = provider.read_tensor_value(resource_id).ok_or_else(|| {
         InferenceApiError::ModelLoadingFailed {
             reason: format!(
-                "weight resource '{resource_id}' bound for '{lookup_name}' has no materialized data"
+                "weight resource '{resource_id}' bound for '{name}' has no materialized data"
             ),
         }
     })?;
-    let tensor =
-        value
-            .into_host(resource_id)
-            .map_err(|error| InferenceApiError::ModelLoadingFailed {
-                reason: format!(
-                    "weight resource '{resource_id}' bound for '{lookup_name}': {error}"
-                ),
-            })?;
-    if name == "lm_head" && tied_embeddings {
-        return transpose_rows_cols(&tensor).map_err(runtime_generation_failed);
+    match value {
+        TensorValue::Host(tensor) => Ok(NodeValue::Host(tensor)),
+        TensorValue::Opaque => Ok(NodeValue::Resident {
+            id: resource_id.clone(),
+            shape: descriptor.shape.dimensions.clone(),
+        }),
     }
-    Ok(tensor)
 }
 
 /// Derives a Kahn's-algorithm topological order for `graph` from
@@ -3396,14 +3393,23 @@ fn execute_qwen_graph_nodes(
                 })?;
         // Nodes whose own Rust code never dereferences input bytes directly
         // (they only forward the value to a Kernel dispatch) can accept an
-        // already device-resident input by reference; `rmsnorm`/`rope`
-        // genuinely manipulate raw floats (weight broadcast, per-head
-        // slicing) and always materialize instead
-        // (`enable-device-resident-kernel-chaining` design.md Decision 1/
-        // Non-Goals).
+        // already device-resident input by reference. `rmsnorm` and `rope`
+        // joined this list in `make-first-native-cuda-hot-path-device-
+        // resident` (task groups 2-3): `rmsnorm`'s Rust-side weight
+        // broadcast and `rope`'s per-head Rust slicing were both removed --
+        // neither operator's own dispatch function dereferences raw floats
+        // anymore, both take `NodeValue` straight through to their Kernel
+        // dispatch like every operator here.
         let passthrough_eligible = matches!(
             node.operator.name(),
-            "matmul" | "attention" | "silu" | "mul" | "residual-add" | "embedding"
+            "matmul"
+                | "attention"
+                | "silu"
+                | "mul"
+                | "residual-add"
+                | "embedding"
+                | "rmsnorm"
+                | "rope"
         );
         let mut inputs = Vec::with_capacity(node.inputs.len());
         for edge_id in &node.inputs {
@@ -3437,12 +3443,19 @@ fn execute_qwen_graph_nodes(
                         }
                     }
                 }
-                None => NodeValue::Host(resolve_qwen_weight_edge(
-                    executor,
-                    weight_bindings,
-                    fixture.config.tied_embeddings,
-                    edge_id.as_str(),
-                )?),
+                None => {
+                    let edge = graph.edges.get(edge_id).ok_or_else(|| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: format!("first-native graph is missing edge '{edge_id}'"),
+                        }
+                    })?;
+                    resolve_qwen_weight_edge(
+                        executor,
+                        weight_bindings,
+                        edge_id.as_str(),
+                        &edge.descriptor,
+                    )?
+                }
             };
             inputs.push(value);
         }
@@ -5356,7 +5369,8 @@ fn bind_qwen_fixture_weights(
     // proves the two are bit-identical for an untampered fixture, so this
     // is a real change in *source*, not in observable behavior for every
     // existing caller of this function.
-    let real_weights = e2e_fixture_weights_from_real_artifact(&fixture.config)?;
+    let mut real_weights = e2e_fixture_weights_from_real_artifact(&fixture.config)?;
+    qwen_weights_with_derived_lm_head(fixture, &mut real_weights)?;
     materialize_model_instance_weights(
         runtime,
         instance,
@@ -5364,6 +5378,36 @@ fn bind_qwen_fixture_weights(
         &real_weights,
     )
     .map_err(E2eConformanceError::from)
+}
+
+/// `make-first-native-cuda-hot-path-device-resident`'s Decision 5: a
+/// tied-embeddings model's `lm_head` projection is the transpose of
+/// `token_embedding`, computed once here (Model Load, called once per
+/// instance) and staged as a genuine, independent weight under its own
+/// name -- not recomputed by `resolve_qwen_weight_edge` on every
+/// generation step's dispatch. Deliberately Qwen-fixture-specific code
+/// (shared by every path that materializes this fixture's weights for a
+/// tied-embeddings configuration), not the generic
+/// `materialize_model_instance_weights`: the transpose is a
+/// tied-embeddings *model* concept, not a Runtime concept. A no-op when
+/// `weights` already has an explicit `lm_head` entry (a non-tied
+/// configuration, or a caller that already staged one itself).
+fn qwen_weights_with_derived_lm_head(
+    fixture: &E2eFixture,
+    weights: &mut BTreeMap<String, HostTensor>,
+) -> Result<(), E2eConformanceError> {
+    if fixture.config.tied_embeddings && !weights.contains_key("lm_head") {
+        let reason = "tied-embeddings fixture has no token_embedding weight to derive lm_head from";
+        let token_embedding =
+            weights
+                .get("token_embedding")
+                .ok_or(E2eConformanceError::FixtureInvalid {
+                    reason: reason.into(),
+                })?;
+        let lm_head = transpose_rows_cols(token_embedding)?;
+        weights.insert("lm_head".to_string(), lm_head);
+    }
+    Ok(())
 }
 
 /// Materializes a Model Instance's weight tensors as Runtime resources:
@@ -8661,11 +8705,13 @@ fn load_fixture_instance_with_weights(
         fixture.architecture_implementation.clone(),
         ResourceAffinity::new(FallbackClass::Transparent),
     )?;
+    let mut weights = weights.clone();
+    qwen_weights_with_derived_lm_head(fixture, &mut weights)?;
     materialize_model_instance_weights(
         runtime,
         &instance,
         fixture.manifest.id.name.as_str(),
-        weights,
+        &weights,
     )?;
     Ok(instance)
 }

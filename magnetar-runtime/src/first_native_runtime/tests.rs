@@ -1261,6 +1261,146 @@ fn rmsnorm_accepts_a_resident_input_without_materializing_it_first() {
     }
 }
 
+/// `make-first-native-cuda-hot-path-device-resident` task 4.3: a weight
+/// resource reported `Opaque` by the resolved Provider must resolve to
+/// `NodeValue::Resident` with the shape taken from the graph edge's own
+/// `TensorEdge.descriptor` -- not an error. Before this fix,
+/// `resolve_qwen_weight_edge` called `.into_host()` unconditionally, which
+/// fails with a structured error (`TensorValue::into_host` on `Opaque`) the
+/// moment a weight is genuinely Device-resident -- exactly the audit's
+/// P0-1 finding. Proven directly: without the fix, this call panics with
+/// that same structured error instead of returning `Resident`.
+#[test]
+fn weight_edge_resolves_opaque_weight_to_resident_without_materializing() {
+    let provider: Arc<dyn ProviderExecutionApi> = Arc::new(OpaqueReportingExecutor::new());
+    let weight_id = TensorResourceId::new("weight.q_proj.resource");
+    let weight = HostTensor::new([4, 4], vec![1.0; 16]).unwrap();
+    provider.write_tensor(weight_id.clone(), weight).unwrap();
+    assert!(matches!(
+        provider.read_tensor_value(&weight_id),
+        Some(TensorValue::Opaque)
+    ));
+
+    let mut weight_bindings = BTreeMap::new();
+    weight_bindings.insert("q_proj".to_string(), weight_id.clone());
+    let descriptor = f32_tensor_descriptor_from_shape(&[4, 4]);
+
+    let resolved =
+        resolve_qwen_weight_edge(&provider, &weight_bindings, "weight.q_proj", &descriptor)
+            .expect("an Opaque weight must resolve, not error");
+
+    match resolved {
+        NodeValue::Resident { id, shape } => {
+            assert_eq!(id, weight_id);
+            assert_eq!(shape, vec![4, 4]);
+        }
+        NodeValue::Host(_) => panic!("expected NodeValue::Resident, got NodeValue::Host"),
+    }
+}
+
+/// `make-first-native-cuda-hot-path-device-resident` task 5.3: `lm_head`'s
+/// tied-embedding weight is transposed exactly once, at Model Load
+/// (`bind_qwen_fixture_weights` -> `qwen_weights_with_derived_lm_head`),
+/// not recomputed by `resolve_qwen_weight_edge` on every generation step.
+/// Proven by running two separate graph dispatches (prefill, then decode)
+/// against the same `ModelInstance` and confirming: the `lm_head` resource
+/// binding is the same resource id both times, the Provider's stored data
+/// for it is byte-identical to `token_embedding`'s transpose computed
+/// independently, and that data is unchanged after the second dispatch --
+/// nothing re-wrote it in between.
+#[test]
+fn lm_head_weight_is_transposed_once_at_model_load_not_per_generation_step() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    assert!(
+        fixture.config.tied_embeddings,
+        "this test's premise requires a tied-embeddings fixture"
+    );
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+
+    let weight_bindings = runtime
+        .model_instance(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .clone();
+    let lm_head_id = weight_bindings
+        .get("lm_head")
+        .expect("tied-embeddings Model Load must stage an lm_head weight")
+        .clone();
+
+    let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding").unwrap();
+    let expected = transpose_rows_cols(token_embedding).unwrap();
+
+    let executor = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .unwrap();
+    let staged_before = executor.read_tensor(&lm_head_id).unwrap();
+    assert_eq!(
+        staged_before.data, expected.data,
+        "staged lm_head must equal token_embedding's transpose"
+    );
+
+    // Two full dispatches (prefill, then decode) through the real graph
+    // executor, reusing the same ModelInstance/weight bindings.
+    let prompt = [1, 2];
+    let mut plans =
+        first_native_plans_for_prompt(&runtime, &fixture, &instance, prompt.len() as u64).unwrap();
+    let graphs = first_native_component_graphs_for_prompt(&fixture, prompt.len() as u64).unwrap();
+    let cache_id = KvCacheId::new("test-lm-head-single-transpose-cache").unwrap();
+    let prompt_ids = HostTensor::new(
+        [prompt.len() as u64],
+        prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let (_dispatch, _bindings, layer_kv, _provider) = execute_qwen_graph(
+        &mut runtime,
+        &fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), prompt_ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let admitted_ids = HostTensor::new([1], vec![3.0]).unwrap();
+    execute_qwen_graph(
+        &mut runtime,
+        &fixture,
+        &instance,
+        &cache_id,
+        &graphs.decode,
+        &mut plans.decode,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), admitted_ids)]),
+        Some(&layer_kv),
+        Some(prompt.len() as u64),
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    // Same resource id, same data, after both dispatches: nothing staged a
+    // second (or third) copy or rewrote it per step.
+    let weight_bindings_after = runtime
+        .model_instance(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .clone();
+    assert_eq!(weight_bindings_after.get("lm_head"), Some(&lm_head_id));
+    let staged_after = executor.read_tensor(&lm_head_id).unwrap();
+    assert_eq!(
+        staged_after.data, expected.data,
+        "lm_head's staged data must still equal the same transpose after two dispatches, not have been recomputed or corrupted"
+    );
+}
+
 fn test_kernel_id(provider: &str, name: &str) -> KernelId {
     KernelId::new(
         ProviderBinding::new(provider),

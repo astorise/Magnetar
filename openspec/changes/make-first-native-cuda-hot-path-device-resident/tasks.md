@@ -39,17 +39,17 @@
 
 ## 4. Weight edges thread `NodeValue`, shaped from `TensorEdge.descriptor` (design.md Decision 3)
 
-- [ ] 4.1 `resolve_qwen_weight_edge`'s return type changes `HostTensor` -> `NodeValue`; resolve the weight edge's `TensorDescriptor` from the graph's own `TensorEdge.descriptor` (not the Provider, not Qwen config). `provider.read_tensor_value(resource_id)` maps `Host` -> `NodeValue::Host`, `Opaque` -> `NodeValue::Resident { id, shape: edge.descriptor.shape.dimensions.clone() }`.
-- [ ] 4.2 Update the one call site (`dispatch_qwen_graph_node`'s weight-edge resolution) for the new return type.
-- [ ] 4.3 Test: a weight resource reported `Opaque` by the resolved Provider resolves to `NodeValue::Resident` with the shape taken from the graph edge, without error (today's code hits `ResidencyUnavailable` here -- prove the fix with a regression test that fails without it).
-- [ ] 4.4 Full regression: Reference CPU's own weight resolution (always `Host`) is unchanged.
+- [x] 4.1 `resolve_qwen_weight_edge`'s return type changed `HostTensor` -> `NodeValue`; resolves the weight edge's `TensorDescriptor` from the graph's own `TensorEdge.descriptor` (new parameter), not the Provider, not Qwen config. `provider.read_tensor_value(resource_id)` maps `Host` -> `NodeValue::Host`, `Opaque` -> `NodeValue::Resident { id, shape: descriptor.shape.dimensions.clone() }`. `lm_head`'s tied-embeddings branch still materializes for its Rust-side transpose (task group 5 removes this).
+- [x] 4.2 Updated the one call site (`execute_qwen_graph_nodes`'s weight-edge resolution, which now also looks up the edge for its descriptor). Also fixed a related gap found in the same area: `passthrough_eligible`'s list still excluded `rmsnorm`/`rope` even though task groups 2-3 already made both `NodeValue`-based -- added them, so a Resident edge feeding either no longer gets forced to materialize one level up before ever reaching their own (already-fixed) dispatch functions.
+- [x] 4.3 Test: `weight_edge_resolves_opaque_weight_to_resident_without_materializing` -- an `Opaque` weight resolves to `NodeValue::Resident` with the graph edge's shape, not an error.
+- [x] 4.4 Full regression: 1209/1209 `magnetar-runtime` tests pass (1208 + 1 new), clippy/fmt clean.
 
 ## 5. `lm_head` tied embeddings: transpose once at Model Load (design.md Decision 5)
 
-- [ ] 5.1 `WeightMaterializationTransaction::stage_weight` (or its caller, once per Model Load when `tied_embeddings` is set): after staging `token_embedding`, transpose it once via the existing `transpose_rows_cols` and stage the result under its own resource id through the same admission path every other weight uses.
-- [ ] 5.2 `resolve_qwen_weight_edge`'s `lm_head` branch resolves the pre-transposed resource id directly (Decision 3's `NodeValue` path), removing the per-call Rust transpose from the hot path entirely.
-- [ ] 5.3 Test: across multiple simulated generation steps reusing the same `ModelInstance`, `lm_head`'s weight is transposed exactly once (at Model Load), not once per step.
-- [ ] 5.4 Full regression: `lm_head`'s numeric output (logits) is unchanged for both tied and non-tied-embeddings configurations.
+- [x] 5.1 New shared helper `qwen_weights_with_derived_lm_head` (not inside `WeightMaterializationTransaction` itself, which stays generic per Correctif 9): for a tied-embeddings fixture with no explicit `lm_head` entry, transposes `token_embedding` once and inserts the result under the name `lm_head`, before the weight map ever reaches `materialize_model_instance_weights`. Called from `bind_qwen_fixture_weights` and `load_fixture_instance_with_weights` (both weight-loading entry points this fixture has).
+- [x] 5.2 `resolve_qwen_weight_edge` no longer has *any* `lm_head`/`tied_embeddings` special case -- its `tied_embeddings: bool` parameter was removed entirely; `lm_head` now resolves exactly like any other weight, by name, already pre-transposed. `weight_bindings` genuinely contains an `lm_head` entry from Model Load onward.
+- [x] 5.3 Test: `lm_head_weight_is_transposed_once_at_model_load_not_per_generation_step` -- runs a real prefill then decode dispatch against the same `ModelInstance`, confirms the `lm_head` resource id and its staged data (byte-identical to `token_embedding`'s independently-computed transpose) are unchanged after both dispatches.
+- [x] 5.4 Full regression: 1210/1210 `magnetar-runtime` tests pass (1209 + 1 new), including the existing weight-sensitivity/tied- and non-tied-embeddings tests, unchanged; clippy/fmt clean.
 
 ## 6. Pre-admission rollback: a real transactional guarantee (design.md Decision 7)
 
