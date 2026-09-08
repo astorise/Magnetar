@@ -76,9 +76,9 @@
 
 ## 9. Cross-repository sequencing and full verification
 
-- [ ] 9.1 `cargo build -p magnetar-runtime --lib`, `cargo test -p magnetar-runtime --lib`, `cargo clippy -p magnetar-runtime --lib --tests -- -D warnings`, `cargo fmt --check`, `cargo build --workspace`.
-- [ ] 9.2 `cargo check --target wasm32-unknown-unknown -p magnetar-runtime --all-features`.
-- [ ] 9.3 `providers/cpu` and `providers/cuda`: build, test, clippy, fmt clean (CUDA on real hardware, including `cargo deny --manifest-path providers/cuda/Cargo.toml check`).
-- [ ] 9.4 Commit and push `providers/cpu`, then `providers/cuda`, then the parent, updating `SUBMODULES.md`'s compatibility matrix with the new commits.
-- [ ] 9.5 Dispatch `gpu-runner-smoke.yml`, confirm green on the exact shipped commits (including task group 7's new E2E test).
-- [ ] 9.6 `openspec validate make-first-native-cuda-hot-path-device-resident --strict`.
+- [x] 9.1 `cargo build -p magnetar-runtime --lib` clean; `cargo test -p magnetar-runtime --lib` 1212/1212 passing; `cargo clippy -p magnetar-runtime --lib --tests -- -D warnings` clean; `cargo fmt --check` clean; `cargo build --workspace` clean.
+- [x] 9.2 `cargo check --target wasm32-unknown-unknown -p magnetar-runtime --all-features` exits 0 (pre-existing warnings only, in the no-strict-Component-engine wasm32 fallback path this change never touched -- not a regression).
+- [x] 9.3 `providers/cpu`: 14/14 tests pass, clippy/fmt clean. `providers/cuda`: 28/28 tests pass (1 correctly `#[ignore]`d), clippy/fmt clean, `cargo deny --manifest-path providers/cuda/Cargo.toml check` exits 0 (`advisories ok, bans ok, licenses ok, sources ok`).
+- [x] 9.4 `providers/cpu` had no changes this task group (already pinned at `76f082b` from task group 3); `providers/cuda` committed and pushed (`8121254`); parent committed and pushed (`9cdfb16`), with `SUBMODULES.md`'s compatibility matrix updated for both modules' commits.
+- [x] 9.5 Dispatched `gpu-runner-smoke.yml` on `main` after all of the above landed: run `34193381867`, green (`Build and test the CUDA Provider` passing) on `arc-gpu-magnetar`'s real GPU, exercising `providers/cuda@8121254` -- the exact commit carrying task group 7's new hot-path test.
+- [x] 9.6 `openspec validate make-first-native-cuda-hot-path-device-resident --strict`: "Change 'make-first-native-cuda-hot-path-device-resident' is valid".
