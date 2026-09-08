@@ -807,6 +807,90 @@ tensors:
     ModelManifest::from_yaml_str(&yaml).map_err(E2eConformanceError::from)
 }
 
+/// [`e2e_fixture_manifest`], generalized to compute every tensor's content
+/// digest from a caller-supplied `weights` map instead of the checked-in
+/// `E2E_FIXTURE_SAFETENSORS_BYTES` -- so a caller building a fixture for a
+/// `QwenConfig` other than the one canonical E2E fixture (for example a
+/// genuinely grouped-query-shaped configuration) gets a manifest whose
+/// declared digests actually match the weights it will go on to
+/// materialize, instead of either failing the digest mismatch check in
+/// [`WeightMaterializationTransaction::stage_weight`] or (worse) silently
+/// validating the wrong content. Structurally identical to
+/// `e2e_fixture_manifest` otherwise.
+pub fn e2e_fixture_manifest_from_weights(
+    config: &QwenConfig,
+    architecture: &ModelArchitecture,
+    weights: &BTreeMap<String, HostTensor>,
+) -> Result<ModelManifest, E2eConformanceError> {
+    const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000003";
+    let weights_digest = e2e_fixture_weight_digest(weights);
+    let weights_size_bytes: usize = weights
+        .values()
+        .map(|tensor| tensor.content_bytes().len())
+        .sum();
+    let inventory = e2e_fixture_weight_inventory(config)?;
+    let mut tensor_yaml = String::new();
+    for mut tensor in inventory {
+        let content =
+            weights
+                .get(&tensor.name)
+                .ok_or_else(|| E2eConformanceError::FixtureInvalid {
+                    reason: format!("no supplied weight for fixture tensor '{}'", tensor.name),
+                })?;
+        tensor.digest = Some(ModelDigest::sha256(&content.content_bytes()));
+        let shape_text = tensor
+            .shape
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let digest = tensor.digest.as_ref().expect("just set above");
+        tensor_yaml.push_str(&format!(
+            "  - name: {name}\n    shape: [{shape_text}]\n    storage_dtype: f32\n    digest: {digest}\n",
+            name = tensor.name,
+            digest = digest.value,
+        ));
+    }
+    let yaml = format!(
+        r#"
+schema: magnetar-model-artifact
+schema_version: 1
+kind: model-bundle
+digest: {DIGEST}
+model:
+  name: e2e-fixture-model
+  revision: r1
+architecture:
+  family: {family}
+  identifier: {identifier}
+tokenizer: tokenizer
+storage_dtype: f32
+compute_dtype: f32
+supported_compute_dtypes: [f32]
+generation:
+  temperature: 0.0
+  max_tokens: 4
+artifacts:
+  weights:
+    kind: model-weights
+    digest: {weights_digest}
+    size_bytes: {weights_size_bytes}
+  config:
+    kind: model-config
+    digest: {DIGEST}
+    size_bytes: 16
+  tokenizer:
+    kind: tokenizer
+    digest: {DIGEST}
+    size_bytes: 8
+tensors:
+{tensor_yaml}"#,
+        family = architecture.family,
+        identifier = architecture.identifier,
+    );
+    ModelManifest::from_yaml_str(&yaml).map_err(E2eConformanceError::from)
+}
+
 /// Deterministic pseudo-random value in `[-0.5, 0.5]`, purely a function of
 /// `seed` -- no RNG dependency, no shared mutable state, fully reproducible.
 fn fixture_value(seed: u64) -> f32 {
@@ -5255,6 +5339,55 @@ fn load_fixture_instance_for_provider(
     Ok((instance, MemoryManager::default()))
 }
 
+/// [`load_fixture_instance_for_provider`], generalized further to
+/// materialize caller-supplied `weights` directly through
+/// `materialize_model_instance_weights` instead of the fixture's own
+/// digest-checked `bind_qwen_fixture_weights` -- so a caller can run this
+/// pipeline against a `fixture`/`QwenConfig` of their own choosing (for
+/// example a genuinely grouped-query-shaped configuration,
+/// `attention_head_count != kv_head_count`, which the one canonical E2E
+/// fixture this crate ships is not) instead of only the one canonical E2E
+/// fixture's own weights. Mirrors `load_fixture_instance_with_weights`
+/// (the equivalent `#[cfg(test)]`-only helper this crate's own weight-
+/// sensitivity tests use), generalized the same way
+/// `load_fixture_instance_for_provider` generalizes `load_fixture_instance`.
+fn load_fixture_instance_with_weights_for_provider(
+    fixture: &E2eFixture,
+    runtime: &mut Runtime,
+    provider_binding: &ProviderBinding,
+    weights: &BTreeMap<String, HostTensor>,
+) -> Result<ModelInstanceId, E2eConformanceError> {
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(fixture.architecture_implementation.clone());
+    let mut request = ModelLoadingRequest::new(
+        ModelLoadingRequestId::new("first-native-provider-load-with-weights"),
+        fixture.manifest.id.clone(),
+    );
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = load_model(
+        &mut coordinator,
+        runtime,
+        ModelLoadingApiRequest::new(request),
+        &fixture.manifest,
+    )?;
+    let instance = create_model_instance(
+        runtime,
+        &loaded,
+        fixture.architecture_implementation.clone(),
+        ResourceAffinity::new(FallbackClass::Transparent).with_provider(provider_binding.clone()),
+    )?;
+    let mut weights = weights.clone();
+    qwen_weights_with_derived_lm_head(fixture, &mut weights)?;
+    materialize_model_instance_weights(
+        runtime,
+        &instance,
+        fixture.manifest.id.name.as_str(),
+        &weights,
+    )
+    .map_err(E2eConformanceError::from)?;
+    Ok(instance)
+}
+
 /// Registers Kernel Registry `PreparedKernel` entries for every one of
 /// `provider`'s own advertised Kernels, bound to `provider`'s own metadata
 /// name and its (first) discovered Device -- the Provider-agnostic core
@@ -5368,6 +5501,67 @@ pub fn run_first_native_graph_with_provider(
     let mut runtime = build_runtime_with_model_execution_engine_and_provider(fixture, provider)?;
     let (instance, _memory) =
         load_fixture_instance_for_provider(fixture, &mut runtime, &provider_binding)?;
+    run_first_native_graph_dispatch(
+        runtime,
+        fixture,
+        instance,
+        &provider_binding,
+        graph,
+        kv_cache_id,
+        token_ids,
+    )
+}
+
+/// [`run_first_native_graph_with_provider`], generalized to materialize
+/// caller-supplied `weights` (through
+/// [`load_fixture_instance_with_weights_for_provider`]) instead of the one
+/// canonical E2E fixture's own digest-checked weights -- lets a caller run
+/// the real first-native pipeline against a `fixture`/`QwenConfig`/`graph`
+/// of their own choosing end to end, for example a genuinely grouped-
+/// query-shaped configuration this crate's own fixture is not.
+pub fn run_first_native_graph_with_provider_and_weights(
+    provider: Arc<dyn Provider>,
+    fixture: &E2eFixture,
+    weights: &BTreeMap<String, HostTensor>,
+    graph: &ExecutionGraph,
+    kv_cache_id: &KvCacheId,
+    token_ids: &[u32],
+) -> Result<FirstNativeProviderRunOutcome, E2eConformanceError> {
+    let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
+    let mut runtime = build_runtime_with_model_execution_engine_and_provider(fixture, provider)?;
+    let instance = load_fixture_instance_with_weights_for_provider(
+        fixture,
+        &mut runtime,
+        &provider_binding,
+        weights,
+    )?;
+    run_first_native_graph_dispatch(
+        runtime,
+        fixture,
+        instance,
+        &provider_binding,
+        graph,
+        kv_cache_id,
+        token_ids,
+    )
+}
+
+/// Shared dispatch tail for [`run_first_native_graph_with_provider`] and
+/// [`run_first_native_graph_with_provider_and_weights`]: builds a real
+/// Prepared Execution Plan for `graph` bound to `provider_binding`, then
+/// runs the actual `execute_qwen_graph` entrypoint every production
+/// first-native call goes through. The two callers differ only in how
+/// `instance`'s weights were materialized before reaching here.
+#[allow(clippy::too_many_arguments)]
+fn run_first_native_graph_dispatch(
+    mut runtime: Runtime,
+    fixture: &E2eFixture,
+    instance: ModelInstanceId,
+    provider_binding: &ProviderBinding,
+    graph: &ExecutionGraph,
+    kv_cache_id: &KvCacheId,
+    token_ids: &[u32],
+) -> Result<FirstNativeProviderRunOutcome, E2eConformanceError> {
     let status = require_ready_first_native_instance(&runtime, &instance)?;
     let mutation_version = status.status().mutation_version;
     let mut plan = prepare_first_native_plan_for_graph(
@@ -5377,7 +5571,7 @@ pub fn run_first_native_graph_with_provider(
         mutation_version,
         token_ids.len() as u64,
         PreparedExecutionPlanGeneration::new(1),
-        &provider_binding,
+        provider_binding,
     )?;
     let ids_tensor = HostTensor::new(
         [token_ids.len() as u64],

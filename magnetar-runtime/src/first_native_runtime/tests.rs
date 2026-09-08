@@ -1176,6 +1176,101 @@ fn run_first_native_graph_with_provider_matches_reference_cpu_e2e_dispatch() {
     );
 }
 
+/// `audit-complet-cuda-hot-path-2026-09-08` P1-1: proves a fully custom,
+/// genuinely grouped-query-shaped `QwenConfig`
+/// (`attention_head_count=4, kv_head_count=2`, which the one canonical E2E
+/// fixture this crate ships is not) can run through the real first-native
+/// pipeline end to end -- own manifest, own synthetic weights, own
+/// Rust-constructed graph (`qwen_prefill_graph`, the same graph-building
+/// recipe the Component-based path itself calls into) -- via
+/// `run_first_native_graph_with_provider_and_weights`, sanity-checked
+/// in-crate against Reference CPU before trusting the same pattern for an
+/// external CUDA integration test. Confirms the graph's own `rope_q`/
+/// `rope_k` nodes actually carry *different* `head_count` values (the GQA
+/// shape itself, not just that dispatch succeeds), and that dispatch
+/// against this shape actually succeeds -- proving the generalized
+/// Prepared Plan/weight-materialization path handles a non-canonical
+/// configuration, not just the one fixture it was written against.
+#[test]
+fn run_first_native_graph_with_provider_and_weights_handles_a_genuinely_gqa_shaped_config() {
+    let architecture = qwen_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
+    let identity = qwen_component_identity(
+        ModelComponentId::new("gqa-integration-fixture").expect("static id is valid"),
+        ModelComponentVersion::new(1, 0, 0),
+        ModelComponentImplementationKind::WebAssemblyComponent,
+    );
+    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    config.validate(&identity).expect("GQA config validates");
+    let architecture_implementation = qwen_architecture_implementation(
+        &identity,
+        ModelArchitectureImplementationKind::ComponentBased,
+    );
+    let weights = e2e_fixture_weights(&config).expect("GQA fixture weights build");
+    let manifest = e2e_fixture_manifest_from_weights(
+        &config,
+        &architecture_implementation.architecture,
+        &weights,
+    )
+    .expect("GQA fixture manifest builds");
+    let tokenizer = e2e_fixture_tokenizer().expect("fixture tokenizer builds");
+    let descriptor = qwen_component_descriptor(identity.clone(), &config)
+        .expect("GQA component descriptor builds");
+    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+        .expect("GQA manifest matches its own descriptor");
+    let fixture = E2eFixture {
+        config,
+        identity,
+        architecture_implementation,
+        manifest,
+        tokenizer,
+        weights,
+    };
+
+    let graph = qwen_prefill_graph(&fixture.config, &fixture.identity, 2, true)
+        .expect("GQA prefill graph builds")
+        .graph;
+    let q_head_count = graph
+        .nodes
+        .get(&ExecutionNodeId::new("layer0.rope_q"))
+        .and_then(|node| node.attributes.get("head_count"))
+        .cloned();
+    let k_head_count = graph
+        .nodes
+        .get(&ExecutionNodeId::new("layer0.rope_k"))
+        .and_then(|node| node.attributes.get("head_count"))
+        .cloned();
+    assert_eq!(
+        q_head_count,
+        Some(OperatorAttributeValue::Integer(4)),
+        "rope_q must carry the attention head count"
+    );
+    assert_eq!(
+        k_head_count,
+        Some(OperatorAttributeValue::Integer(2)),
+        "rope_k must carry the (smaller) key/value head count -- the actual GQA shape"
+    );
+    assert_ne!(
+        q_head_count, k_head_count,
+        "this configuration is only a genuine GQA proof if Q and K actually differ"
+    );
+
+    let cache_id = KvCacheId::new("gqa-integration-fixture-cache").expect("cache id is valid");
+    let outcome = run_first_native_graph_with_provider_and_weights(
+        Arc::new(ReferenceCpuProvider::new()),
+        &fixture,
+        &fixture.weights,
+        &graph,
+        &cache_id,
+        &[1, 2],
+    )
+    .expect("a real GQA-shaped prefill dispatch through the generalized path succeeds");
+    assert_eq!(outcome.dispatch.status, KernelResultStatus::Succeeded);
+    assert_eq!(
+        outcome.resolved_provider.as_str(),
+        REFERENCE_CPU_PROVIDER_NAME
+    );
+}
+
 /// task group 6 (`make-first-native-cuda-hot-path-device-resident`'s
 /// Decision 7) / 6.2: a failure during Kernel Registry/dispatch-plan
 /// construction -- here, `attention`'s required workspace failing to admit
