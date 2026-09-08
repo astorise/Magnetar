@@ -6,7 +6,7 @@
 use super::*;
 use crate::planning::*;
 use crate::scheduler::*;
-use crate::{CapabilityVersion, ExecutionGraphSemanticFingerprint};
+use crate::{CapabilityVersion, Device, ExecutionGraphSemanticFingerprint};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The correct prefill/decode Operator-sequence hash for the E2E fixture
@@ -922,6 +922,364 @@ fn unload_model_instance_propagates_provider_release_failure() {
         error,
         ModelInstanceError::InternalModelInstance { .. }
     ));
+}
+
+/// A `ProviderExecutionApi` whose Kernel-level `complete_kernel` fails on
+/// demand for one targeted Operator, so tests can prove
+/// `dispatch_reference_cpu_operator_pre_admitted`'s rollback
+/// (`make-first-native-cuda-hot-path-device-resident`'s Decision 7) fires
+/// for a genuine kernel/completion-time failure -- as opposed to
+/// `stage_weight_propagates_and_rolls_back_on_provider_write_failure`'s
+/// weight-write failure, or a tight-memory-budget's submit-time admission
+/// failure. Every other Operator (and every non-Kernel method) delegates to
+/// a real, independent `ReferenceCpuExecutor`, so a test that only fails one
+/// specific Operator still sees otherwise-normal numeric execution for
+/// everything else -- including the weight materialization that has to
+/// succeed first for the graph to reach that Operator at all.
+struct KernelFailableProviderExecutionApi {
+    inner: ReferenceCpuExecutor,
+    fail_operator: Mutex<Option<&'static str>>,
+    failing_handles: Mutex<BTreeSet<ProviderExecutionId>>,
+}
+impl KernelFailableProviderExecutionApi {
+    fn new(fail_operator: &'static str) -> Self {
+        Self {
+            inner: ReferenceCpuExecutor::new(),
+            fail_operator: Mutex::new(Some(fail_operator)),
+            failing_handles: Mutex::new(BTreeSet::new()),
+        }
+    }
+}
+impl ProviderExecutionApi for KernelFailableProviderExecutionApi {
+    fn submit(
+        &self,
+        request: ProviderExecutionRequest,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        self.inner.submit(request)
+    }
+    fn status(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+        self.inner.status(handle)
+    }
+    fn cancel(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderCancellationOutcome, ProviderExecutionError> {
+        self.inner.cancel(handle)
+    }
+    fn complete(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        self.inner.complete(handle)
+    }
+    fn release(&self, handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+        self.inner.release(handle)
+    }
+    fn submit_kernel(
+        &self,
+        advertisement: &KernelAdvertisement,
+        operator: &OperatorSpec,
+        invocation: &KernelInvocation,
+        memory: &mut MemoryManager,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        let handle = self
+            .inner
+            .submit_kernel(advertisement, operator, invocation, memory)?;
+        if *self.fail_operator.lock().unwrap() == Some(invocation.operator.name()) {
+            self.failing_handles
+                .lock()
+                .unwrap()
+                .insert(handle.id.clone());
+        }
+        Ok(handle)
+    }
+    fn complete_kernel(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<KernelResult, ProviderExecutionError> {
+        if self.failing_handles.lock().unwrap().remove(&handle.id) {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::ExecutionFailed,
+                ProviderExecutionPhase::Complete,
+                handle.provider.clone(),
+                handle.device.clone(),
+                "simulated Kernel completion failure injected by \
+                 KernelFailableProviderExecutionApi",
+            ));
+        }
+        self.inner.complete_kernel(handle)
+    }
+    fn write_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: HostTensor,
+    ) -> Result<(), ProviderExecutionError> {
+        ReferenceCpuExecutor::write_tensor(&self.inner, id, tensor);
+        Ok(())
+    }
+    fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
+        ReferenceCpuExecutor::read_tensor(&self.inner, id)
+    }
+    fn release_tensor(&self, id: &TensorResourceId) -> Result<bool, ProviderExecutionError> {
+        Ok(ReferenceCpuExecutor::release_tensor(&self.inner, id))
+    }
+    fn release_admitted_tensor(
+        &self,
+        memory: &mut MemoryManager,
+        id: &TensorResourceId,
+    ) -> Result<bool, ProviderExecutionError> {
+        Ok(ReferenceCpuExecutor::release_admitted_tensor(
+            &self.inner,
+            memory,
+            id,
+        ))
+    }
+    fn write_tensor_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        resource_id: TensorResourceId,
+        tensor: HostTensor,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), MemoryError> {
+        self.inner
+            .write_tensor_admitted(memory, resource_id, tensor, class, owner)
+    }
+    fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
+        self.inner.read_tensor_value(id)
+    }
+    fn write_tensor_value(
+        &self,
+        id: TensorResourceId,
+        value: TensorValue,
+    ) -> Result<(), ProviderExecutionError> {
+        self.inner.write_tensor_value(id, value)
+    }
+    fn write_tensor_value_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        resource_id: TensorResourceId,
+        value: TensorValue,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), TensorValueAdmissionError> {
+        self.inner
+            .write_tensor_value_admitted(memory, resource_id, value, class, owner)
+    }
+    fn allocate_workspace(
+        &self,
+        memory: &mut MemoryManager,
+        size_bytes: u64,
+    ) -> Result<MemoryAllocationId, MemoryError> {
+        self.inner.allocate_workspace(memory, size_bytes)
+    }
+    fn observations(&self) -> Vec<KernelObservation> {
+        self.inner.observations()
+    }
+}
+
+/// `Provider` wrapper around [`KernelFailableProviderExecutionApi`], the
+/// minimum needed to register it with a `Runtime` under
+/// [`REFERENCE_CPU_PROVIDER_NAME`] so first-native dispatch resolves it
+/// exactly where it would otherwise resolve the real `ReferenceCpuProvider`.
+struct TestFailableKernelProvider {
+    executor: Arc<KernelFailableProviderExecutionApi>,
+}
+impl Provider for TestFailableKernelProvider {
+    fn metadata(&self) -> ProviderMetadata {
+        reference_cpu_provider_metadata()
+    }
+    fn register(&self, _registry: &mut ProviderRegistry) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    fn execution_api(&self) -> Option<Arc<dyn ProviderExecutionApi>> {
+        Some(self.executor.clone())
+    }
+    fn devices(&self) -> Vec<Arc<dyn Device>> {
+        vec![Arc::new(reference_cpu_device())]
+    }
+    fn kernel_advertisements(&self) -> Vec<KernelAdvertisement> {
+        reference_cpu_kernel_advertisements()
+    }
+}
+
+/// task group 6 (`make-first-native-cuda-hot-path-device-resident`'s
+/// Decision 7) / 6.2: a failure during Kernel Registry/dispatch-plan
+/// construction -- here, `attention`'s required workspace failing to admit
+/// under a tight Runtime memory budget, the same scenario
+/// `check_graph_dispatch_records_memory_feasibility_failure_under_tight_budget`
+/// already exercises -- must roll back the output this node had already
+/// pre-admitted before that point, not leak it. `attention` is the first
+/// node in this fixture's graph whose workspace does not fit the budget, so
+/// its own pre-admitted output allocation is still the highest-numbered
+/// allocation when the failure fires (workspace itself never became an
+/// allocation -- admission failed before one was created), matching
+/// `stage_weight_propagates_and_rolls_back_on_provider_write_failure`'s
+/// same "highest id -> this attempt's allocation" reasoning.
+#[test]
+fn e2e_graph_dispatch_rolls_back_pre_admitted_output_on_submit_time_failure() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .config(RuntimeConfig {
+            memory: MemoryManagerConfig {
+                max_runtime_bytes: Some(1 << 16),
+                allow_pending_allocations: false,
+                ..MemoryManagerConfig::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
+        .build()
+        .expect("Reference CPU provider registers cleanly");
+    register_reference_cpu_prepared_kernels(&mut runtime);
+    let (instance, _memory) =
+        load_fixture_instance(&fixture, &mut runtime).expect("instance loads");
+    let mut plans = first_native_plans_for_prompt(&runtime, &fixture, &instance, 2)
+        .expect("prepared plans build");
+    let graphs =
+        first_native_component_graphs_for_prompt(&fixture, 2).expect("component graphs build");
+    let ids = HostTensor::new([2], vec![1.0, 2.0]).expect("token id tensor builds");
+    let cache_id = KvCacheId::new("test-submit-time-rollback-cache").expect("cache id is valid");
+
+    let result = execute_qwen_graph(
+        &mut runtime,
+        &fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    );
+    assert!(
+        result.is_err(),
+        "expected the tight memory budget to fail graph dispatch"
+    );
+
+    let this_attempts_allocation = runtime
+        .memory()
+        .allocations()
+        .max_by_key(|allocation| allocation.id)
+        .expect("the failing node's output was pre-admitted before the workspace failed");
+    assert_eq!(
+        this_attempts_allocation.state,
+        MemoryAllocationState::Released,
+        "a submit-time (Kernel Registry/dispatch-plan construction) failure must roll back \
+         the pre-admitted output allocation, not leak it"
+    );
+}
+
+/// task group 6 (`make-first-native-cuda-hot-path-device-resident`'s
+/// Decision 7) / 6.3: a failure in the Kernel's own execution/completion
+/// (here, `ctx.provider.complete_kernel` itself, injected via
+/// `KernelFailableProviderExecutionApi`) must roll back the output that
+/// node had already pre-admitted before dispatch, exactly like a
+/// submit-time failure. Targets `embedding`, the first node this fixture's
+/// prefill graph dispatches, so zero earlier nodes have succeeded yet --
+/// the Runtime's Active allocation count right after model loading (weights
+/// staged, nothing dispatched) must be unchanged after the failed attempt,
+/// which is a stronger, id-independent way to prove "rolled back, not
+/// leaked" than picking out one allocation by id.
+#[test]
+fn e2e_graph_dispatch_rolls_back_pre_admitted_output_on_kernel_completion_failure() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let executor = Arc::new(KernelFailableProviderExecutionApi::new("embedding"));
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(TestFailableKernelProvider {
+            executor: executor.clone(),
+        }))
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
+        .build()
+        .expect("Reference CPU provider registers cleanly");
+    register_reference_cpu_prepared_kernels(&mut runtime);
+    let (instance, _memory) =
+        load_fixture_instance(&fixture, &mut runtime).expect("instance loads");
+    let mut plans = first_native_plans_for_prompt(&runtime, &fixture, &instance, 2)
+        .expect("prepared plans build");
+    let graphs =
+        first_native_component_graphs_for_prompt(&fixture, 2).expect("component graphs build");
+    let ids = HostTensor::new([2], vec![1.0, 2.0]).expect("token id tensor builds");
+    let cache_id =
+        KvCacheId::new("test-kernel-completion-rollback-cache").expect("cache id is valid");
+
+    let active_before = runtime
+        .memory()
+        .allocations()
+        .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+        .count();
+
+    let result = execute_qwen_graph(
+        &mut runtime,
+        &fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    );
+    assert!(
+        result.is_err(),
+        "expected the injected embedding completion failure to fail graph dispatch"
+    );
+
+    let active_after = runtime
+        .memory()
+        .allocations()
+        .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+        .count();
+    assert_eq!(
+        active_after,
+        active_before + 1,
+        "a kernel/completion-time failure on the very first graph node must leave the \
+         Runtime's Active allocation count exactly one higher than it was right after model \
+         loading -- the one legitimate admission being the graph's own 'input.token_ids' \
+         resource (admitted up front, before any node dispatches -- see \
+         `execute_qwen_graph_nodes`'s `initial_bindings` loop); `embedding`'s own \
+         pre-admitted output must be rolled back, not left behind as a second, leaked \
+         allocation"
+    );
+
+    // 6.4/6.5: a retry with the injected failure cleared must succeed
+    // cleanly -- proving the rollback left no orphaned residency/allocation
+    // under the same resource id that would otherwise collide with, or be
+    // silently reused by, the retried dispatch.
+    let mut retry_plans = first_native_plans_for_prompt(&runtime, &fixture, &instance, 2)
+        .expect("prepared plans build for retry");
+    let retry_ids = HostTensor::new([2], vec![1.0, 2.0]).expect("token id tensor builds");
+    let retry_cache_id =
+        KvCacheId::new("test-kernel-completion-rollback-retry-cache").expect("cache id is valid");
+    *executor.fail_operator.lock().unwrap() = None;
+    executor.failing_handles.lock().unwrap().clear();
+    let retry_result = execute_qwen_graph(
+        &mut runtime,
+        &fixture,
+        &instance,
+        &retry_cache_id,
+        &graphs.prefill,
+        &mut retry_plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), retry_ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    );
+    assert!(
+        retry_result.is_ok(),
+        "a retried dispatch after a rolled-back failure must succeed cleanly: {:?}",
+        retry_result.err()
+    );
 }
 
 /// GitHub issue "First-native graph executor only propagates the first

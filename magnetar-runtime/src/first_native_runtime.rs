@@ -2443,6 +2443,53 @@ fn resolve_output_target(
     }
 }
 
+/// Releases a caller's pre-admission for `id` -- its `TensorResidency`
+/// record and the Memory Manager allocation it references, if any --
+/// leaving no trace behind. Reached only when a dispatch that pre-admitted
+/// its output (`resolve_output_target`'s `Some` branch) subsequently fails,
+/// at *any* point after admission: Kernel Registry/dispatch-plan
+/// construction (a "submit-time" failure) or the Kernel's own execution/
+/// completion (`make-first-native-cuda-hot-path-device-resident`'s
+/// Decision 7 -- both failure classes are handled uniformly here, by
+/// wrapping the entire post-admission call rather than distinguishing
+/// where exactly it failed). Best-effort: this runs on an already-failing
+/// path, so a further failure releasing the allocation is not itself
+/// surfaced -- the original dispatch error is what the caller needs to see.
+fn rollback_pre_admitted_output(memory: &mut MemoryManager, id: &TensorResourceId) {
+    if let Some(residency) = memory.remove_tensor_residency(id)
+        && let Some(allocation) = residency.allocation
+    {
+        let _ = memory.release(allocation);
+    }
+}
+
+/// Dispatches through `dispatch_reference_cpu_operator`, rolling back a
+/// caller-pre-admitted output if the dispatch itself fails afterward -- a
+/// pre-admission is a real Memory Manager allocation the caller now owns;
+/// leaving it behind after a failed dispatch would be an admission leak.
+/// Replaces the `resolve_output_target` + `dispatch_reference_cpu_operator`
+/// pair every leaf `dispatch_qwen_*` function used to call directly, so the
+/// rollback is expressed once rather than duplicated across each of them.
+fn dispatch_reference_cpu_operator_pre_admitted(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    operator: OperatorId,
+    inputs: Vec<NodeInputResource>,
+    output_descriptor: TensorDescriptor,
+    output_target: Option<OutputTarget>,
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
+    let pre_admitted = output_target.is_some();
+    let output = resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
+    let output_id = output.0.clone();
+    let result =
+        dispatch_reference_cpu_operator(ctx, operation_id, operator, inputs, output, attributes);
+    if result.is_err() && pre_admitted {
+        rollback_pre_admitted_output(ctx.runtime.memory_mut(), &output_id);
+    }
+    result
+}
+
 fn dispatch_qwen_matmul(
     ctx: &mut QwenDispatchContext<'_>,
     operation_id: &str,
@@ -2457,8 +2504,7 @@ fn dispatch_qwen_matmul(
         DTypeDescriptor::portable(ComputeDType::Float32),
         LayoutDescriptor::Contiguous,
     );
-    let output = resolve_output_target(ctx, operation_id, descriptor, output_target)?;
-    dispatch_reference_cpu_operator(
+    dispatch_reference_cpu_operator_pre_admitted(
         ctx,
         operation_id,
         dispatch_operator_id("matmul", OperatorFamily::LinearAlgebra),
@@ -2466,7 +2512,8 @@ fn dispatch_qwen_matmul(
             node_input_resource(operation_id, "a", a),
             node_input_resource(operation_id, "b", b),
         ],
-        output,
+        descriptor,
+        output_target,
         BTreeMap::new(),
     )
 }
@@ -2481,13 +2528,13 @@ fn dispatch_qwen_unary(
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
     let output_descriptor = f32_tensor_descriptor_from_shape(input.shape());
-    let output = resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
-    dispatch_reference_cpu_operator(
+    dispatch_reference_cpu_operator_pre_admitted(
         ctx,
         operation_id,
         dispatch_operator_id(name, family),
         vec![node_input_resource(operation_id, "input", input)],
-        output,
+        output_descriptor,
+        output_target,
         attributes,
     )
 }
@@ -2502,8 +2549,7 @@ fn dispatch_qwen_binary_same_shape(
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
     let output_descriptor = f32_tensor_descriptor_from_shape(a.shape());
-    let output = resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
-    dispatch_reference_cpu_operator(
+    dispatch_reference_cpu_operator_pre_admitted(
         ctx,
         operation_id,
         dispatch_operator_id(name, family),
@@ -2511,7 +2557,8 @@ fn dispatch_qwen_binary_same_shape(
             node_input_resource(operation_id, "a", a),
             node_input_resource(operation_id, "b", b),
         ],
-        output,
+        output_descriptor,
+        output_target,
         BTreeMap::new(),
     )
 }
@@ -2541,8 +2588,7 @@ fn dispatch_qwen_rmsnorm(
         OperatorAttributeValue::Float(epsilon as f64),
     );
     let output_descriptor = f32_tensor_descriptor_from_shape(input.shape());
-    let output = resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
-    dispatch_reference_cpu_operator(
+    dispatch_reference_cpu_operator_pre_admitted(
         ctx,
         operation_id,
         dispatch_operator_id("rmsnorm", OperatorFamily::Normalization),
@@ -2550,7 +2596,8 @@ fn dispatch_qwen_rmsnorm(
             node_input_resource(operation_id, "input", input),
             node_input_resource(operation_id, "weight", weight),
         ],
-        output,
+        output_descriptor,
+        output_target,
         attributes,
     )
 }
@@ -2598,13 +2645,13 @@ fn dispatch_qwen_rope(
         OperatorAttributeValue::Integer(head_count as i64),
     );
     let output_descriptor = f32_tensor_descriptor_from_shape(input.shape());
-    let output = resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
-    dispatch_reference_cpu_operator(
+    dispatch_reference_cpu_operator_pre_admitted(
         ctx,
         operation_id,
         dispatch_operator_id("rope", OperatorFamily::PositionEncoding),
         vec![node_input_resource(operation_id, "input", input)],
-        output,
+        output_descriptor,
+        output_target,
         attributes,
     )
 }
@@ -2637,8 +2684,7 @@ fn dispatch_qwen_attention(
         OperatorAttributeValue::String("causal".into()),
     );
     let output_descriptor = f32_tensor_descriptor_from_shape(q.shape());
-    let output = resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
-    dispatch_reference_cpu_operator(
+    dispatch_reference_cpu_operator_pre_admitted(
         ctx,
         operation_id,
         dispatch_operator_id("attention", OperatorFamily::Attention),
@@ -2647,7 +2693,8 @@ fn dispatch_qwen_attention(
             node_input_resource(operation_id, "k", k),
             node_input_resource(operation_id, "v", v),
         ],
-        output,
+        output_descriptor,
+        output_target,
         attributes,
     )
 }
@@ -3003,9 +3050,7 @@ fn dispatch_qwen_graph_node(
                 DTypeDescriptor::portable(ComputeDType::Float32),
                 LayoutDescriptor::Contiguous,
             );
-            let output =
-                resolve_output_target(ctx, node_id, output_descriptor, Some(output_target))?;
-            dispatch_reference_cpu_operator(
+            dispatch_reference_cpu_operator_pre_admitted(
                 ctx,
                 node_id,
                 node.operator.clone(),
@@ -3013,7 +3058,8 @@ fn dispatch_qwen_graph_node(
                     node_input_resource(node_id, "table", table),
                     node_input_resource(node_id, "ids", ids),
                 ],
-                output,
+                output_descriptor,
+                Some(output_target),
                 BTreeMap::new(),
             )
         }
