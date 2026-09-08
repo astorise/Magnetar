@@ -2876,29 +2876,6 @@ fn node_attribute_u64(node: &ExecutionNode, name: &str) -> Result<u64, Inference
     }
 }
 
-/// Attention head count for a per-head `rope` node: the graph declares one
-/// whole-tensor `rope` node per Q/K projection (see `qwen_build_graph`), so
-/// the node id's own `rope_q`/`rope_k` suffix -- not a node attribute --
-/// distinguishes which head count applies. `head_dimension` is the rope
-/// node's own `dimension` attribute, which equals the architecture's head
-/// dimension for the standard (full-rotation) RoPE config this baseline
-/// uses.
-fn qwen_rope_head_count(
-    node: &ExecutionNode,
-    architecture: &ModelComponentArchitectureMetadata,
-) -> Result<u64, InferenceApiError> {
-    let id = node.id.as_str();
-    if id.ends_with("rope_q") {
-        Ok(architecture.attention_head_count)
-    } else if id.ends_with("rope_k") {
-        Ok(architecture.kv_head_count)
-    } else {
-        Err(InferenceApiError::GraphPlanningFailed {
-            reason: format!("graph node '{id}' is not a recognized RoPE node"),
-        })
-    }
-}
-
 /// Stable numeric codes for the Operator names the Qwen graph builder emits,
 /// shared between Runtime (deriving the expected sequence from
 /// `ExecutionGraph`) and the Qwen Model Component boundary (which describes
@@ -3088,32 +3065,32 @@ fn dispatch_qwen_graph_node(
             let head_dimension = node_attribute_u64(node, "dimension")?;
             // `head_count` is explicit graph data set by the Qwen Model
             // Component (Q = attention_head_count, K = kv_head_count --
-            // correct for GQA/MQA); the id-suffix heuristic
-            // (`qwen_rope_head_count`) is only a fallback for a node that
-            // predates this attribute existing.
+            // correct for GQA/MQA); absent reproduces the portable `rope`
+            // Operator's own single-block default (`1`), exactly like
+            // every other Provider's "rope" dispatch arm
+            // (`reference_cpu.rs`, `providers/cpu`, `providers/cuda`).
+            // Runtime never infers it from a node identifier or naming
+            // convention (`operator` spec's RoPE Operator requirement).
             //
-            // audit-complet-cuda-hot-path-2026-09-08 P1-2 / Correctif D
-            // asked for this fallback's removal -- verified NOT safe yet,
-            // not merely left as-is uncritically: `qwen_model_component.rs`
-            // sets `head_count` unconditionally today, but the *checked-in*
-            // `magnetar-runtime/fixtures/components/qwen-real.component.wasm`
-            // test fixture (the real, compiled Qwen Component
-            // `build_first_native_graphs_from_real_qwen_component` actually
-            // invokes for every default `cargo test` run -- `wasmtime-
-            // component-engine` is a default feature) is a separate,
-            // pre-compiled binary artifact last regenerated in `eae7313`/
-            // `156fb10`, before this attribute existed on the Runtime side.
-            // It genuinely does not emit `head_count`, so this fallback is
-            // still load-bearing for that real, currently-shipped artifact
-            // -- confirmed empirically: removing it turned
-            // `e2e_graph_executor_matches_full_sequence_oracle` red with a
-            // wrong-but-plausible decode logits divergence, the same
-            // silent-wrong-answer failure mode the whole `head_count`
-            // design exists to prevent. Removing this fallback safely
-            // requires first regenerating that `.wasm` fixture from an
-            // updated `components/qwen` source (a real, separate
-            // prerequisite the audit did not check for), tracked as its
-            // own follow-up rather than forced through here.
+            // audit-complet-cuda-hot-path-2026-09-08 P1-2 / Correctif D:
+            // the id-suffix fallback this used to have
+            // (`qwen_rope_head_count`) was removed only after fixing its
+            // real prerequisite, not by assuming the audit's premise held
+            // -- `components/qwen`'s checked-in, precompiled
+            // `qwen-real.component.wasm` test fixture (the real Component
+            // `build_first_native_graphs_from_real_qwen_component` invokes
+            // for every default `cargo test` run) did not emit
+            // `head_count` on its `rope_q`/`rope_k` nodes even though the
+            // Rust-side `qwen_model_component.rs` did, so a first attempt
+            // at removing this fallback (proven, not assumed) broke
+            // `e2e_graph_executor_matches_full_sequence_oracle` with a
+            // wrong-but-plausible decode-logits divergence -- exactly the
+            // silent-wrong-answer failure mode this design exists to
+            // prevent. Fixed at the source instead: `components/qwen`'s
+            // `rope_attrs` now sets `head_count` (Q = `ATTENTION_HEAD_COUNT`,
+            // K = `KV_HEAD_COUNT`) and the fixture `.wasm` was regenerated
+            // from that fix, confirmed green against the full suite before
+            // this fallback was removed.
             let head_count = match node.attributes.get("head_count") {
                 Some(OperatorAttributeValue::Integer(value)) if *value >= 0 => *value as u64,
                 Some(_) => {
@@ -3123,7 +3100,7 @@ fn dispatch_qwen_graph_node(
                         ),
                     });
                 }
-                None => qwen_rope_head_count(node, architecture)?,
+                None => 1,
             };
             let base = node_attribute_f64(node, "base")?;
             let position_offset = absolute_position_override
@@ -5116,6 +5093,42 @@ fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
     runtime
 }
 
+/// [`build_runtime_with_model_execution_engine`], generalized to register
+/// an arbitrary Provider instead of hardcoding Reference CPU -- the actual
+/// per-node dispatch this Runtime reaches
+/// (`E2eRuntimeModelExecutionEngine::execute_generation_step` ->
+/// `execute_qwen_graph`) was already Provider-generic, resolving through
+/// `resolve_kernel_execution_provider`; this and
+/// [`register_prepared_kernels_for_provider`] were the only two
+/// Reference-CPU-specific pieces standing in the way of running the real
+/// first-native pipeline against a different Provider end to end.
+/// Never imports or references any concrete non-Reference-CPU Provider
+/// type: `provider` arrives as a `Provider` trait object this crate
+/// already depends on.
+fn build_runtime_with_model_execution_engine_and_provider(
+    fixture: &E2eFixture,
+    provider: Arc<dyn Provider>,
+) -> Result<Runtime, E2eConformanceError> {
+    let mut runtime = Runtime::builder()
+        .register_provider(provider.clone())
+        .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
+            fixture: fixture.clone(),
+            kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            forced_token: None,
+        }))
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
+        .build()
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: format!("provider registration failed: {error}"),
+        })?;
+    register_prepared_kernels_for_provider(&mut runtime, &*provider)?;
+    Ok(runtime)
+}
+
 #[cfg(test)]
 fn build_runtime_with_model_execution_engine_and_forced_token(
     fixture: &E2eFixture,
@@ -5200,6 +5213,200 @@ fn load_fixture_instance(
     )?;
     bind_qwen_fixture_weights(runtime, &instance, fixture)?;
     Ok((instance, MemoryManager::default()))
+}
+
+/// [`load_fixture_instance`], generalized to pin the Model Instance's own
+/// placement `ResourceAffinity` to `provider` explicitly, instead of the
+/// empty (no-provider) affinity `load_fixture_instance` always passes --
+/// `audit-complet-cuda-hot-path-2026-09-08` P1-1: without an explicit
+/// provider here, `WeightMaterializationTransaction::begin` (see its own
+/// doc comment) falls back to Reference CPU whenever a Model Instance's
+/// placement leaves no Provider bound, which is *every* Model Instance
+/// `load_fixture_instance` itself creates -- so weight materialization for
+/// an arbitrary Provider needs this explicit pin to actually reach that
+/// Provider's own storage instead of silently reusing Reference CPU's.
+/// Never imports or references any concrete non-Reference-CPU Provider
+/// type: `provider_binding` is a plain name.
+fn load_fixture_instance_for_provider(
+    fixture: &E2eFixture,
+    runtime: &mut Runtime,
+    provider_binding: &ProviderBinding,
+) -> Result<(ModelInstanceId, MemoryManager), E2eConformanceError> {
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(fixture.architecture_implementation.clone());
+    let mut request = ModelLoadingRequest::new(
+        ModelLoadingRequestId::new("e2e-fixture-load"),
+        fixture.manifest.id.clone(),
+    );
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = load_model(
+        &mut coordinator,
+        runtime,
+        ModelLoadingApiRequest::new(request),
+        &fixture.manifest,
+    )?;
+    let instance = create_model_instance(
+        runtime,
+        &loaded,
+        fixture.architecture_implementation.clone(),
+        ResourceAffinity::new(FallbackClass::Transparent).with_provider(provider_binding.clone()),
+    )?;
+    bind_qwen_fixture_weights(runtime, &instance, fixture)?;
+    Ok((instance, MemoryManager::default()))
+}
+
+/// Registers Kernel Registry `PreparedKernel` entries for every one of
+/// `provider`'s own advertised Kernels, bound to `provider`'s own metadata
+/// name and its (first) discovered Device -- the Provider-agnostic core
+/// [`register_reference_cpu_prepared_kernels`] is a thin wrapper over, so
+/// a first-native run against *any* registered Provider (not only
+/// Reference CPU) can reach a `Ready` `PreparedKernel` generation for
+/// every Kernel it advertises. Never imports or references any concrete
+/// non-Reference-CPU Provider type: resolved entirely through the
+/// `Provider`/`Device` trait objects this crate already depends on.
+fn register_prepared_kernels_for_provider(
+    runtime: &mut Runtime,
+    provider: &dyn Provider,
+) -> Result<(), E2eConformanceError> {
+    let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
+    let device_binding = provider
+        .devices()
+        .first()
+        .map(|device| DeviceBinding::new(device.id().clone()))
+        .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
+            reason: format!(
+                "provider '{provider_binding}' has no discovered Device to bind prepared kernels to"
+            ),
+        })?;
+    let mut prepared_ids = PreparedKernelIdAllocator::default();
+    for advertisement in provider.kernel_advertisements() {
+        let id = prepared_ids.allocate();
+        let mut prepared = PreparedKernel::new(
+            id,
+            advertisement.id.clone(),
+            CompiledKernelArtifactId::from_digest(format!(
+                "builtin:{}",
+                advertisement.id.stable_key()
+            )),
+            provider_binding.clone(),
+            device_binding.clone(),
+            PreparedKernelGeneration::new(1),
+        );
+        prepared
+            .mark_ready()
+            .map_err(|error| E2eConformanceError::ModelComponentFailed {
+                reason: format!(
+                    "prepared kernel for '{}' could not become Ready: {error}",
+                    advertisement.id.stable_key()
+                ),
+            })?;
+        runtime
+            .kernel_registry_mut()
+            .register_prepared_kernel(prepared);
+        runtime
+            .kernel_registry_mut()
+            .promote_generation(&advertisement.id, id)
+            .map_err(|error| E2eConformanceError::ModelComponentFailed {
+                reason: format!(
+                    "prepared kernel generation for '{}' could not be promoted: {error}",
+                    advertisement.id.stable_key()
+                ),
+            })?;
+    }
+    Ok(())
+}
+
+/// Everything an external caller needs to verify Device residency,
+/// Provider/Device `ResourceAffinity`, and Kernel provenance directly
+/// after one real first-native dispatch run through
+/// [`run_first_native_graph_with_provider`]. `runtime` is deliberately
+/// still alive and owned here (not torn down the way the full generate-
+/// and-cleanup entrypoints in this file are), so its
+/// `MemoryManager`/`TensorResidency` state can be inspected before
+/// anything is unloaded.
+pub struct FirstNativeProviderRunOutcome {
+    pub runtime: Runtime,
+    pub instance: ModelInstanceId,
+    pub dispatch: KernelDispatchResult,
+    pub bindings: BTreeMap<TensorEdgeId, HostTensor>,
+    pub resolved_provider: ProviderBinding,
+}
+
+/// Runs one real first-native dispatch -- real Model Loading, real weight
+/// materialization, a real Prepared Execution Plan, and the actual
+/// `execute_qwen_graph` entrypoint every production first-native call
+/// goes through -- against `provider`, an arbitrary registered Provider,
+/// instead of the Reference CPU every other E2E helper in this file
+/// hardcodes (`audit-complet-cuda-hot-path-2026-09-08` P1-1). `graph` is
+/// the caller's own choice of Execution Graph: the real Qwen Model
+/// Component's own output (via this crate's Component Engine), or one
+/// directly Rust-constructed via the already-public
+/// `qwen_prefill_graph`/`qwen_decode_graph` -- both are equally real
+/// graph-building recipes, and this function does not care which produced
+/// `graph`. `kv_cache_id` names the KV Cache session this dispatch
+/// participates in (a fresh, caller-chosen id for a standalone run).
+///
+/// Never imports or references any concrete non-Reference-CPU Provider
+/// type: `provider` arrives as a `Provider` trait object this crate
+/// already depends on, and every Provider/Device resolution downstream
+/// (`execute_qwen_graph`, `resolve_qwen_weight_edge`,
+/// `resident_resource_affinity`, `resolved_resource_affinity`, ...) was
+/// already generic before this change -- the two pieces that did hardcode
+/// Reference CPU (`build_runtime_with_model_execution_engine`'s
+/// registration and Kernel Registry seeding, `prepare_first_native_plan_
+/// for_graph`'s Plan scope/fallback affinity) are generalized above this
+/// function via their own `_for_provider`/`_and_provider` siblings, not
+/// worked around here.
+pub fn run_first_native_graph_with_provider(
+    provider: Arc<dyn Provider>,
+    fixture: &E2eFixture,
+    graph: &ExecutionGraph,
+    kv_cache_id: &KvCacheId,
+    token_ids: &[u32],
+) -> Result<FirstNativeProviderRunOutcome, E2eConformanceError> {
+    let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
+    let mut runtime = build_runtime_with_model_execution_engine_and_provider(fixture, provider)?;
+    let (instance, _memory) =
+        load_fixture_instance_for_provider(fixture, &mut runtime, &provider_binding)?;
+    let status = require_ready_first_native_instance(&runtime, &instance)?;
+    let mutation_version = status.status().mutation_version;
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        graph,
+        &instance,
+        mutation_version,
+        token_ids.len() as u64,
+        PreparedExecutionPlanGeneration::new(1),
+        &provider_binding,
+    )?;
+    let ids_tensor = HostTensor::new(
+        [token_ids.len() as u64],
+        token_ids.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+    )
+    .map_err(|error| E2eConformanceError::GenerationFailed {
+        reason: error.to_string(),
+    })?;
+    let mut node_events = Vec::new();
+    let (dispatch, bindings, _layer_kv, resolved_provider) = execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        kv_cache_id,
+        graph,
+        &mut plan,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)]),
+        None,
+        Some(0),
+        &mut node_events,
+    )
+    .map_err(E2eConformanceError::from)?;
+    Ok(FirstNativeProviderRunOutcome {
+        runtime,
+        instance,
+        dispatch,
+        bindings,
+        resolved_provider,
+    })
 }
 
 /// `transactional-weight-materialization`: a Model Instance whose weight
@@ -5921,7 +6128,7 @@ const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:552bb114838c10f742a1b6b6afade7c3044116826bb31cb33e21b16a2a422feb";
+    "sha256:b80bb538a057f279fe04f937c7858bd99650f4a129c09e9e1fde9ae380ad6938";
 
 /// Test-oracle only (`reach-architecture-freeze-1` task 12.4): the checked-in
 /// real Qwen Component binary, embedded for test fixtures. Production never
@@ -6618,12 +6825,13 @@ fn prepare_first_native_plan_for_graph(
     model_instance_revision: u64,
     token_count: u64,
     generation: PreparedExecutionPlanGeneration,
+    provider: &ProviderBinding,
 ) -> Result<PreparedExecutionPlan, E2eConformanceError> {
     let phase = PreparedExecutionPhase::from(graph.phase);
     let mut scope = PreparedExecutionPlanScope::for_phase(phase)
         .with_model_instance(instance.clone(), model_instance_revision)
         .with_workload_bucket(format!("{:?}-{}-tokens", phase, token_count.max(1)));
-    scope.provider = Some(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+    scope.provider = Some(provider.clone());
 
     let mut plan = PreparedExecutionPlan::new(
         PreparedExecutionPlanId::new(format!("first-native-{phase:?}-plan"))?,
@@ -6632,7 +6840,7 @@ fn prepare_first_native_plan_for_graph(
         scope,
     )?;
     let affinity = ResourceAffinity::new(FallbackClass::Transparent)
-        .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME))
+        .with_provider(provider.clone())
         .with_execution_context(runtime.context().id());
 
     for (node_id, node) in &graph.nodes {
@@ -6846,6 +7054,36 @@ fn prepare_first_native_execution_plans(
     graphs: FirstNativeComponentGraphs,
     prompt_token_count: u64,
 ) -> Result<FirstNativePreparedPlans, E2eConformanceError> {
+    prepare_first_native_execution_plans_for_provider(
+        runtime,
+        instance,
+        graphs,
+        prompt_token_count,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+}
+
+/// [`prepare_first_native_execution_plans`], generalized to bind the
+/// resulting Prepared Execution Plans to an arbitrary Provider instead of
+/// hardcoding Reference CPU -- `prepare_first_native_plan_for_graph`'s own
+/// `scope.provider`/fallback `ResourceAffinity` are the actual source of
+/// the "every first-native Plan targets Reference CPU regardless of what
+/// is registered" behavior (`audit-complet-cuda-hot-path-2026-09-08`'s
+/// P1-1): a graph node with no `resource_affinity` of its own (true of
+/// every Qwen graph builder, Rust- and Component-produced alike) falls
+/// back to whatever this function passes as `provider`, and Kernel
+/// Registry selection then fails closed for any Provider that isn't the
+/// one named there. Never imports or references any concrete non-
+/// Reference-CPU Provider type: `provider` arrives as a plain
+/// `ProviderBinding` (a name), resolved against whatever the caller
+/// actually registered.
+fn prepare_first_native_execution_plans_for_provider(
+    runtime: &Runtime,
+    instance: &ModelInstanceId,
+    graphs: FirstNativeComponentGraphs,
+    prompt_token_count: u64,
+    provider: &ProviderBinding,
+) -> Result<FirstNativePreparedPlans, E2eConformanceError> {
     let status = require_ready_first_native_instance(runtime, instance)?;
     let mutation_version = status.status().mutation_version;
     Ok(FirstNativePreparedPlans {
@@ -6856,6 +7094,7 @@ fn prepare_first_native_execution_plans(
             mutation_version,
             prompt_token_count,
             PreparedExecutionPlanGeneration::new(1),
+            provider,
         )?,
         prefill_node_count: graphs.prefill_node_count,
         decode: prepare_first_native_plan_for_graph(
@@ -6865,6 +7104,7 @@ fn prepare_first_native_execution_plans(
             mutation_version,
             1,
             PreparedExecutionPlanGeneration::new(1),
+            provider,
         )?,
         decode_node_count: graphs.decode_node_count,
     })

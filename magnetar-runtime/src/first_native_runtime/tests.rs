@@ -1106,6 +1106,76 @@ impl Provider for TestFailableKernelProvider {
     }
 }
 
+/// `audit-complet-cuda-hot-path-2026-09-08` P1-1's generalized entrypoint
+/// (`run_first_native_graph_with_provider`), sanity-checked in-crate
+/// against Reference CPU before trusting it for an external CUDA
+/// integration test -- if the generalization introduced a bug, this is
+/// the fast place to catch it, not the slower cross-repo GPU loop.
+/// Confirms: the dispatch actually succeeds through the fully generalized
+/// path (`build_runtime_with_model_execution_engine_and_provider` ->
+/// `load_fixture_instance_for_provider` -> `prepare_first_native_plan_
+/// for_graph` with an explicit Provider -> `execute_qwen_graph`), the
+/// resolved Provider is genuinely Reference CPU (not silently defaulted
+/// there by some untouched hardcoded path), and every weight/output
+/// resource's own recorded `ResourceAffinity`/`MemoryPlacement` agrees.
+#[test]
+fn run_first_native_graph_with_provider_matches_reference_cpu_e2e_dispatch() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let graphs =
+        first_native_component_graphs_for_prompt(&fixture, 2).expect("component graphs build");
+    let cache_id =
+        KvCacheId::new("first-native-generalized-entrypoint-cache").expect("cache id is valid");
+    let outcome = run_first_native_graph_with_provider(
+        Arc::new(ReferenceCpuProvider::new()),
+        &fixture,
+        &graphs.prefill,
+        &cache_id,
+        &[1, 2],
+    )
+    .expect("a real prefill dispatch against Reference CPU through the generalized path succeeds");
+
+    assert_eq!(outcome.dispatch.status, KernelResultStatus::Succeeded);
+    assert_eq!(
+        outcome.resolved_provider.as_str(),
+        REFERENCE_CPU_PROVIDER_NAME,
+        "the generalized entrypoint must resolve to the Provider it was actually given"
+    );
+    assert!(
+        !outcome.bindings.is_empty(),
+        "a real prefill dispatch must bind at least the 'logits' output edge"
+    );
+
+    // Every graph edge with a recorded residency (RoPE's KV-cache-tied
+    // outputs, `rope_k` in particular, legitimately bypass
+    // `admit_kernel_output` for their own separate KV Append write path
+    // and so have none -- not a regression here, and not what this test is
+    // about) must have a `MemoryPlacement` naming Reference CPU
+    // specifically (`resolved_output_placement`'s provider-aware lookup,
+    // not the empty-affinity placeholder `admit_kernel_output` separately
+    // records for every output regardless of Provider) -- not left
+    // unresolved, and not silently defaulted to some other Provider by an
+    // untouched hardcoded path. At least one edge (`embedding`, the first
+    // node, never KV-tied) must actually be checked, so this cannot pass
+    // vacuously.
+    let mut checked_edges = 0;
+    for edge_id in outcome.bindings.keys() {
+        let resource_id = TensorResourceId::new(format!("edge.{edge_id}"));
+        let Some(residency) = outcome.runtime.memory().tensor_residency(&resource_id) else {
+            continue;
+        };
+        checked_edges += 1;
+        assert_eq!(
+            residency.placement,
+            MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+            "edge '{edge_id}' must be Reference-CPU-placed"
+        );
+    }
+    assert!(
+        checked_edges > 0,
+        "expected at least one bound edge to have a recorded residency"
+    );
+}
+
 /// task group 6 (`make-first-native-cuda-hot-path-device-resident`'s
 /// Decision 7) / 6.2: a failure during Kernel Registry/dispatch-plan
 /// construction -- here, `attention`'s required workspace failing to admit

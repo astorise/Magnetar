@@ -4,7 +4,7 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:552bb114838c10f742a1b6b6afade7c3044116826bb31cb33e21b16a2a422feb"
+    value: "sha256:b80bb538a057f279fe04f937c7858bd99650f4a129c09e9e1fde9ae380ad6938"
 component:
   name: "magnetar.qwen.real"
   version: "0.1.0"
