@@ -814,7 +814,7 @@ tensors:
 /// genuinely grouped-query-shaped configuration) gets a manifest whose
 /// declared digests actually match the weights it will go on to
 /// materialize, instead of either failing the digest mismatch check in
-/// [`WeightMaterializationTransaction::stage_weight`] or (worse) silently
+/// `WeightMaterializationTransaction::stage_weight` or (worse) silently
 /// validating the wrong content. Structurally identical to
 /// `e2e_fixture_manifest` otherwise.
 pub fn e2e_fixture_manifest_from_weights(
@@ -5535,7 +5535,7 @@ pub fn run_first_native_graph_with_provider(
 
 /// [`run_first_native_graph_with_provider`], generalized to materialize
 /// caller-supplied `weights` (through
-/// [`load_fixture_instance_with_weights_for_provider`]) instead of the one
+/// `load_fixture_instance_with_weights_for_provider`) instead of the one
 /// canonical E2E fixture's own digest-checked weights -- lets a caller run
 /// the real first-native pipeline against a `fixture`/`QwenConfig`/`graph`
 /// of their own choosing end to end, for example a genuinely grouped-
@@ -6639,7 +6639,7 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
 
 /// Builds prefill and decode Execution Graphs by instantiating the real
 /// Qwen Model Component (`QWEN_REAL_COMPONENT_BYTES`, compiled once and
-/// cached -- see [`qwen_real_component_runtime`]) and calling its
+/// cached -- see `qwen_real_component_runtime`) and calling its
 /// `build-prefill-graph`/`build-decode-graph` exports, which produce the
 /// graph through real `graph-builder` host calls into a
 /// [`GraphBuilderCapability`] -- not `qwen_prefill_graph`/`qwen_decode_graph`
