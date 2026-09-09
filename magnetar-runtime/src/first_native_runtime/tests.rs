@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// component is a fixed stand-in for one exact architecture shape, not a
 /// dynamic graph compiler.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-const QWEN_COMPONENT_FIXTURE_OPERATOR_HASH: u32 = 0x655b_1541;
+const QWEN_COMPONENT_FIXTURE_OPERATOR_HASH: u32 = 0x52b1_f815;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn qwen_component_fixture_wat(
@@ -2751,6 +2751,15 @@ fn e2e_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage(&fixture)
         .expect("intermediate graph edges resolve from Provider storage, not a private cache");
+}
+
+#[test]
+fn e2e_two_output_split_dispatch_produces_independently_resolvable_resources() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    check_two_output_split_dispatch_produces_independently_resolvable_resources(&fixture).expect(
+        "a two-output 'split' Kernel dispatch produces two independently resolvable Tensor \
+         Resources, each holding the correct half of its pre-split input",
+    );
 }
 
 #[test]

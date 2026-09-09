@@ -451,7 +451,7 @@ fn validate_first_scope_attributes(
     }
 }
 
-const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 31] = [
+const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 32] = [
     required_now("embedding", OperatorFamily::Tensor, true),
     required_now("matmul", OperatorFamily::LinearAlgebra, true),
     required_now("rmsnorm", OperatorFamily::Normalization, true),
@@ -464,6 +464,7 @@ const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 31] = [
     required_now("residual-add", OperatorFamily::Tensor, true),
     required_now("dtype-conversion", OperatorFamily::Tensor, false),
     required_now("layout-conversion", OperatorFamily::Layout, false),
+    first_decoder_optional("split", OperatorFamily::Tensor),
     placeholder("batched-matmul", OperatorFamily::LinearAlgebra),
     placeholder("layernorm", OperatorFamily::Normalization),
     first_decoder_optional("gelu", OperatorFamily::Activation),

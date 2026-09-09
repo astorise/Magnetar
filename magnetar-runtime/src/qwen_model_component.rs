@@ -676,6 +676,18 @@ pub fn qwen_expected_tensor_names(layer_count: u64, tied_embeddings: bool) -> BT
         ] {
             names.insert(format!("layers.{layer}.{suffix}"));
         }
+        // Fused gate/up projection (`define-provider-prepared-kernel-
+        // execution-contract` task group 3), additional to (not a
+        // replacement for) the standalone `gate_proj`/`up_proj` weights
+        // above: the checked-in real Qwen Component's own graph (the
+        // strict, default production path) still references those two
+        // standalone weights unchanged, while this crate's own Rust
+        // test-oracle graph (`qwen_build_graph`, exercised only when no
+        // strict Component engine is available) uses this fused tensor
+        // instead, halved at dispatch time by a genuinely two-output
+        // "split" node. Both consumers resolve against this same fixture
+        // tensor inventory, so it is a superset, not a per-path fork.
+        names.insert(format!("layers.{layer}.mlp.gate_up_proj"));
     }
     names.insert("final_norm".to_string());
     if !tied_embeddings {
@@ -719,6 +731,16 @@ pub fn qwen_expected_tensor_shape(name: &str, config: &QwenConfig) -> Option<Vec
         "self_attn.k_proj" | "self_attn.v_proj" => Some(vec![a.hidden_size, kv_dim]),
         "self_attn.o_proj" => Some(vec![q_dim, a.hidden_size]),
         "mlp.gate_proj" | "mlp.up_proj" => Some(vec![a.hidden_size, a.intermediate_size]),
+        // Fused gate/up projection (`define-provider-prepared-kernel-
+        // execution-contract` task group 3): additional to (not a
+        // replacement for) the standalone shapes above -- see
+        // `qwen_expected_tensor_names`'s doc comment for why both exist.
+        // Twice as wide as either standalone projection, halved by the
+        // "split" node the Rust test-oracle graph inserts below rather
+        // than two separate matmuls -- a genuine real-world LLM-serving
+        // fusion, and the one graph shape that recipe exercises a
+        // two-output Kernel with.
+        "mlp.gate_up_proj" => Some(vec![a.hidden_size, 2 * a.intermediate_size]),
         "mlp.down_proj" => Some(vec![a.intermediate_size, a.hidden_size]),
         _ => None,
     }
@@ -1252,6 +1274,7 @@ pub fn qwen_build_graph(
                 ),
             );
 
+        let gate_up = format!("{prefix}.gate_up");
         let gate = format!("{prefix}.gate");
         let up = format!("{prefix}.up");
         let activated = format!("{prefix}.activated");
@@ -1259,44 +1282,44 @@ pub fn qwen_build_graph(
         let mlp_out = format!("{prefix}.mlp_out");
         graph = graph
             .with_edge(f32_edge(
-                format!("weight.layers.{layer}.mlp.gate_proj"),
-                vec![a.hidden_size, a.intermediate_size],
+                format!("weight.layers.{layer}.mlp.gate_up_proj"),
+                vec![a.hidden_size, 2 * a.intermediate_size],
             ))
             .with_edge(f32_edge(
-                gate.clone(),
-                vec![sequence_length, a.intermediate_size],
+                gate_up.clone(),
+                vec![sequence_length, 2 * a.intermediate_size],
             ))
             .with_node(
                 op_node(
-                    format!("{prefix}.gate_proj"),
+                    format!("{prefix}.gate_up_proj"),
                     "matmul",
                     OperatorFamily::LinearAlgebra,
                 )
                 .with_input(TensorEdgeId::new(mlp_normed.clone()))
                 .with_input(TensorEdgeId::new(format!(
-                    "weight.layers.{layer}.mlp.gate_proj"
+                    "weight.layers.{layer}.mlp.gate_up_proj"
                 )))
-                .with_output(TensorEdgeId::new(gate.clone())),
+                .with_output(TensorEdgeId::new(gate_up.clone())),
             )
+            // Fused gate/up projection, halved by a genuinely two-output
+            // "split" node (`define-provider-prepared-kernel-execution-
+            // contract` task group 3) rather than two separate matmuls --
+            // a real-world LLM-serving optimization (one larger matmul
+            // instead of two smaller ones), and this recipe's only node
+            // with more than one output edge.
             .with_edge(f32_edge(
-                format!("weight.layers.{layer}.mlp.up_proj"),
-                vec![a.hidden_size, a.intermediate_size],
+                gate.clone(),
+                vec![sequence_length, a.intermediate_size],
             ))
             .with_edge(f32_edge(
                 up.clone(),
                 vec![sequence_length, a.intermediate_size],
             ))
             .with_node(
-                op_node(
-                    format!("{prefix}.up_proj"),
-                    "matmul",
-                    OperatorFamily::LinearAlgebra,
-                )
-                .with_input(TensorEdgeId::new(mlp_normed.clone()))
-                .with_input(TensorEdgeId::new(format!(
-                    "weight.layers.{layer}.mlp.up_proj"
-                )))
-                .with_output(TensorEdgeId::new(up.clone())),
+                op_node(format!("{prefix}.split"), "split", OperatorFamily::Tensor)
+                    .with_input(TensorEdgeId::new(gate_up.clone()))
+                    .with_output(TensorEdgeId::new(gate.clone()))
+                    .with_output(TensorEdgeId::new(up.clone())),
             )
             .with_edge(f32_edge(
                 activated.clone(),

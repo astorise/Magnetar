@@ -66,7 +66,7 @@ pub const E2E_SUITE_VERSION: &str = "0.1.0";
 pub const E2E_FIXTURE_VERSION: &str = "0.1.0";
 pub const E2E_FIXTURE_WEIGHT_DIGEST_VERSION: &str = "e2e-qwen-fixture-weights-v1";
 pub const E2E_FIXTURE_WEIGHT_DIGEST: &str =
-    "sha256:ed7d3a310ae30e08f170ed61cd73f9053e498ae9a17dd7dc980fd61a3152ed90";
+    "sha256:8faec419da193fed6cc8f83e1cb8a3c1122acf0e577110a29b5c6422ed60aab1";
 
 const E2E_FIXTURE_EOS_TOKEN: TokenId = 0;
 const E2E_FIXTURE_BOS_TOKEN: TokenId = 257;
@@ -94,7 +94,7 @@ const QWEN_GRAPH_COMPONENT_NAME: &str = "magnetar.qwen.graph-fixture";
     feature = "wasmtime-component-engine"
 ))]
 const QWEN_GRAPH_COMPONENT_DIGEST: &str =
-    "sha256:c95f5ac5c7843991c03543da5d521ee5a2aec14ad6031f6e7cd55d7e2b18078c";
+    "sha256:a85b9fc4fa182aa1ce2f4a55458b125e7cf4aac06dc9f5e60a2d686292677f7b";
 
 // ---------------------------------------------------------------------
 // Error model
@@ -966,6 +966,61 @@ pub fn e2e_fixture_weights(
             }
         })?;
         weights.insert(name.clone(), fixture_tensor(&name, &shape)?);
+    }
+    // `mlp.gate_up_proj` is defined as the horizontal concatenation of
+    // `mlp.gate_proj`/`mlp.up_proj` -- not an independently-seeded fixture
+    // tensor -- so that a fused `matmul` against it followed by `split`
+    // (the Rust test-oracle graph's recipe, `qwen_build_graph`) is
+    // mathematically identical to the two separate `matmul`s the hand-
+    // written oracle forward passes below still compute
+    // (`check_graph_executor_matches_full_sequence_oracle` and friends):
+    // `x @ [gate_proj | up_proj] == [x @ gate_proj | x @ up_proj]`. An
+    // independently-seeded `gate_up_proj` would make those two genuinely
+    // different numeric results, which is exactly what an earlier attempt
+    // at this fusion produced (`define-provider-prepared-kernel-execution-
+    // contract` task group 3): the oracles diverged from the graph
+    // executor's decode logits, not because either was wrong, but because
+    // the "fused" weight was not actually the same math.
+    for layer in 0..config.architecture.layer_count {
+        let gate_name = format!("layers.{layer}.mlp.gate_proj");
+        let up_name = format!("layers.{layer}.mlp.up_proj");
+        let gate = weights
+            .get(&gate_name)
+            .ok_or_else(|| E2eConformanceError::FixtureInvalid {
+                reason: format!("fixture is missing weight tensor '{gate_name}'"),
+            })?;
+        let up = weights
+            .get(&up_name)
+            .ok_or_else(|| E2eConformanceError::FixtureInvalid {
+                reason: format!("fixture is missing weight tensor '{up_name}'"),
+            })?;
+        let [rows, gate_cols] = gate.shape.as_slice() else {
+            return Err(E2eConformanceError::FixtureInvalid {
+                reason: format!("'{gate_name}' is not rank-2: {:?}", gate.shape),
+            });
+        };
+        let [up_rows, up_cols] = up.shape.as_slice() else {
+            return Err(E2eConformanceError::FixtureInvalid {
+                reason: format!("'{up_name}' is not rank-2: {:?}", up.shape),
+            });
+        };
+        if rows != up_rows {
+            return Err(E2eConformanceError::FixtureInvalid {
+                reason: format!(
+                    "'{gate_name}' and '{up_name}' row counts disagree: {rows} vs {up_rows}"
+                ),
+            });
+        }
+        let rows = *rows as usize;
+        let gate_cols = *gate_cols as usize;
+        let up_cols = *up_cols as usize;
+        let mut data = Vec::with_capacity(rows * (gate_cols + up_cols));
+        for row in 0..rows {
+            data.extend_from_slice(&gate.data[row * gate_cols..(row + 1) * gate_cols]);
+            data.extend_from_slice(&up.data[row * up_cols..(row + 1) * up_cols]);
+        }
+        let gate_up = HostTensor::new([rows as u64, (gate_cols + up_cols) as u64], data)?;
+        weights.insert(format!("layers.{layer}.mlp.gate_up_proj"), gate_up);
     }
     Ok(weights)
 }
@@ -2628,6 +2683,83 @@ fn dispatch_qwen_binary_same_shape(
     )
 }
 
+/// Dispatches the "split" Operator -- the one genuinely multi-output node
+/// this graph executor produces (`define-provider-prepared-kernel-
+/// execution-contract` task group 3): halves `input`'s last dimension into
+/// two independently resolvable outputs via
+/// [`dispatch_reference_cpu_operator_multi`] directly (there is no
+/// single-output convenience wrapper to go through here). Pre-admits both
+/// `output_targets` up front, same discipline as
+/// `dispatch_reference_cpu_operator_pre_admitted`'s single-output rollback,
+/// extended to roll back whichever of the two targets was actually admitted
+/// if either admission or the dispatch itself fails.
+fn dispatch_qwen_split(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    input: NodeValue,
+    output_targets: [Option<OutputTarget>; 2],
+) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
+    let (rows, cols) = input.rows_cols()?;
+    if cols % 2 != 0 || cols == 0 {
+        return Err(InferenceApiError::GraphPlanningFailed {
+            reason: format!(
+                "graph node '{operation_id}' (operator 'split') expects an even, non-zero last dimension, got {cols}"
+            ),
+        });
+    }
+    let half_descriptor = f32_tensor_descriptor_from_shape(&[rows, cols / 2]);
+    let [left_target, right_target] = output_targets;
+    let left_pre_admitted = left_target.is_some();
+    let left_output = resolve_output_target(
+        ctx,
+        &format!("{operation_id}.left"),
+        half_descriptor.clone(),
+        left_target,
+    )?;
+    let left_output_id = left_output.0.clone();
+    let right_pre_admitted = right_target.is_some();
+    let right_output = match resolve_output_target(
+        ctx,
+        &format!("{operation_id}.right"),
+        half_descriptor,
+        right_target,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            if left_pre_admitted {
+                rollback_pre_admitted_output(
+                    &*ctx.provider,
+                    ctx.runtime.memory_mut(),
+                    &left_output_id,
+                );
+            }
+            return Err(error);
+        }
+    };
+    let right_output_id = right_output.0.clone();
+    let result = dispatch_reference_cpu_operator_multi(
+        ctx,
+        operation_id,
+        dispatch_operator_id("split", OperatorFamily::Tensor),
+        vec![node_input_resource(operation_id, "input", input)],
+        vec![left_output, right_output],
+        BTreeMap::new(),
+    );
+    if result.is_err() {
+        if left_pre_admitted {
+            rollback_pre_admitted_output(&*ctx.provider, ctx.runtime.memory_mut(), &left_output_id);
+        }
+        if right_pre_admitted {
+            rollback_pre_admitted_output(
+                &*ctx.provider,
+                ctx.runtime.memory_mut(),
+                &right_output_id,
+            );
+        }
+    }
+    result
+}
+
 /// Both real Kernels behind this Operator (`providers/cpu::rmsnorm`,
 /// `providers/cuda::CudaKernels::rmsnorm`) derive `cols` from `input`'s own
 /// shape and accept a `[cols]`-shaped `weight` directly, broadcasting it
@@ -2986,6 +3118,7 @@ fn qwen_operator_kind_code(name: &str) -> Option<u32> {
         "silu" => Some(5),
         "mul" => Some(6),
         "residual-add" => Some(7),
+        "split" => Some(8),
         _ => None,
     }
 }
@@ -3051,7 +3184,7 @@ fn dispatch_qwen_graph_node(
     mut inputs: Vec<NodeValue>,
     absolute_position_override: Option<u64>,
     kv_cache_id: &KvCacheId,
-) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
+) -> Result<(KernelDispatchResult, Vec<NodeValue>), InferenceApiError> {
     let node_id = node.id.as_str();
     let architecture = &fixture.config.architecture;
     // Resolved once, before dispatch: this node's output edge's own final
@@ -3104,6 +3237,7 @@ fn dispatch_qwen_graph_node(
                 Some(output_target),
                 BTreeMap::new(),
             )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "rmsnorm" => {
             if inputs.len() != 2 {
@@ -3123,6 +3257,7 @@ fn dispatch_qwen_graph_node(
             let weight = inputs.remove(0);
             let epsilon = node_attribute_f64(node, "epsilon")? as f32;
             dispatch_qwen_rmsnorm(ctx, node_id, input, weight, epsilon, Some(output_target))
+                .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "matmul" => {
             if inputs.len() != 2 {
@@ -3133,6 +3268,7 @@ fn dispatch_qwen_graph_node(
             let a = inputs.remove(0);
             let b = inputs.remove(0);
             dispatch_qwen_matmul(ctx, node_id, a, b, Some(output_target))
+                .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "rope" => {
             if inputs.len() != 1 {
@@ -3217,6 +3353,7 @@ fn dispatch_qwen_graph_node(
                 position_offset,
                 None,
             )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "attention" => {
             if inputs.len() != 3 {
@@ -3228,6 +3365,7 @@ fn dispatch_qwen_graph_node(
             let k = inputs.remove(0);
             let v = inputs.remove(0);
             dispatch_qwen_attention(ctx, node_id, q, k, v, architecture, Some(output_target))
+                .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "silu" => {
             if inputs.len() != 1 {
@@ -3245,6 +3383,7 @@ fn dispatch_qwen_graph_node(
                 BTreeMap::new(),
                 Some(output_target),
             )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "mul" => {
             if inputs.len() != 2 {
@@ -3263,6 +3402,7 @@ fn dispatch_qwen_graph_node(
                 b,
                 Some(output_target),
             )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "residual-add" => {
             if inputs.len() != 2 {
@@ -3280,6 +3420,34 @@ fn dispatch_qwen_graph_node(
                 a,
                 b,
                 Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "split" => {
+            if inputs.len() != 1 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 1 split input"),
+                });
+            }
+            let input = inputs.remove(0);
+            let second_output_edge =
+                node.outputs
+                    .get(1)
+                    .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph node '{node_id}' (operator 'split') expects 2 output edges"
+                        ),
+                    })?;
+            let second_output_target: OutputTarget = (
+                TensorResourceId::new(format!("edge.{second_output_edge}")),
+                resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
+                MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+            );
+            dispatch_qwen_split(
+                ctx,
+                node_id,
+                input,
+                [Some(output_target), Some(second_output_target)],
             )
         }
         other => Err(InferenceApiError::OperatorUnsupported {
@@ -3570,7 +3738,7 @@ fn execute_qwen_graph_nodes(
             };
             inputs.push(value);
         }
-        let (dispatch_result, mut output_tensor) = dispatch_qwen_graph_node(
+        let (dispatch_result, output_values) = dispatch_qwen_graph_node(
             &mut dispatch_ctx,
             fixture,
             node,
@@ -3578,109 +3746,119 @@ fn execute_qwen_graph_nodes(
             absolute_position_override,
             kv_cache_id,
         )?;
-        let output_edge_id =
-            node.outputs
-                .first()
-                .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
-                    reason: format!("graph node '{node_id}' has no output edge"),
-                })?;
-        let output_edge = graph.edges.get(output_edge_id).ok_or_else(|| {
-            InferenceApiError::GraphPlanningFailed {
-                reason: format!("first-native graph is missing edge '{output_edge_id}'"),
-            }
-        })?;
-        let output_resource_id = TensorResourceId::new(format!("edge.{output_edge_id}"));
-        // Whether the Kernel already wrote directly into `output_resource_id`
-        // (Decision 3's pre-admission, `dispatch_qwen_graph_node`) or this
-        // loop must still explicitly (re-)write it: KV-history
-        // concatenation below produces genuinely new, host-computed data,
-        // and "rope" nodes have no Kernel-level output identity to begin
-        // with (always `NodeValue::Host`, never `Resident` under this id).
-        let mut needs_explicit_edge_write = !matches!(
-            &output_tensor,
-            NodeValue::Resident { id, .. } if *id == output_resource_id
-        );
-        if let Some(kv_meta) = &output_edge.kv_cache {
-            let (layer, role) = parse_kv_cache_id(&kv_meta.cache_id)?;
-            if layer >= layer_count {
-                return Err(InferenceApiError::GraphPlanningFailed {
-                    reason: format!(
-                        "graph KV cache id '{}' has an out-of-range layer",
-                        kv_meta.cache_id
-                    ),
-                });
-            }
-            if kv_meta.behavior == GraphKvCacheBehavior::Append {
-                let history = kv_history.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
-                    reason: "decode graph execution requires historical KV state".into(),
-                })?;
-                let historical =
-                    history
-                        .get(layer)
-                        .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+        if node.outputs.is_empty() {
+            return Err(InferenceApiError::GraphPlanningFailed {
+                reason: format!("graph node '{node_id}' has no output edge"),
+            });
+        }
+        if output_values.len() != node.outputs.len() {
+            return Err(InferenceApiError::GraphPlanningFailed {
+                reason: format!(
+                    "graph node '{node_id}' dispatch produced {} output value(s) for {} declared output edge(s)",
+                    output_values.len(),
+                    node.outputs.len()
+                ),
+            });
+        }
+        for (output_edge_id, mut output_tensor) in node.outputs.iter().zip(output_values) {
+            let output_edge = graph.edges.get(output_edge_id).ok_or_else(|| {
+                InferenceApiError::GraphPlanningFailed {
+                    reason: format!("first-native graph is missing edge '{output_edge_id}'"),
+                }
+            })?;
+            let output_resource_id = TensorResourceId::new(format!("edge.{output_edge_id}"));
+            // Whether the Kernel already wrote directly into `output_resource_id`
+            // (Decision 3's pre-admission, `dispatch_qwen_graph_node`) or this
+            // loop must still explicitly (re-)write it: KV-history
+            // concatenation below produces genuinely new, host-computed data,
+            // and "rope" nodes have no Kernel-level output identity to begin
+            // with (always `NodeValue::Host`, never `Resident` under this id).
+            let mut needs_explicit_edge_write = !matches!(
+                &output_tensor,
+                NodeValue::Resident { id, .. } if *id == output_resource_id
+            );
+            if let Some(kv_meta) = &output_edge.kv_cache {
+                let (layer, role) = parse_kv_cache_id(&kv_meta.cache_id)?;
+                if layer >= layer_count {
+                    return Err(InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph KV cache id '{}' has an out-of-range layer",
+                            kv_meta.cache_id
+                        ),
+                    });
+                }
+                if kv_meta.behavior == GraphKvCacheBehavior::Append {
+                    let history =
+                        kv_history.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                            reason: "decode graph execution requires historical KV state".into(),
+                        })?;
+                    let historical = history.get(layer).ok_or_else(|| {
+                        InferenceApiError::KvCacheUnavailable {
                             reason: format!(
                                 "decode requires historical KV state for layer {layer}"
                             ),
-                        })?;
-                let historical_resource = match role {
-                    KvRole::K => &historical.k,
-                    KvRole::V => &historical.v,
-                };
-                // Historical KV data is read back from the registered
-                // Provider's storage by resource id (task 7.2/7.3), not from
-                // a raw tensor an executor-private map handed the caller.
-                // KV-history concatenation boundary: `concat_rows` is plain
-                // Rust over `Vec<f32>`, so this materializes to host bytes
-                // explicitly here rather than carrying an opaque value in.
-                let historical_value = dispatch_ctx
-                    .provider
-                    .read_tensor_value(historical_resource)
-                    .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
-                        reason: format!("no materialized historical KV data for layer {layer}"),
+                        }
                     })?;
-                let historical_tensor = historical_value
+                    let historical_resource = match role {
+                        KvRole::K => &historical.k,
+                        KvRole::V => &historical.v,
+                    };
+                    // Historical KV data is read back from the registered
+                    // Provider's storage by resource id (task 7.2/7.3), not from
+                    // a raw tensor an executor-private map handed the caller.
+                    // KV-history concatenation boundary: `concat_rows` is plain
+                    // Rust over `Vec<f32>`, so this materializes to host bytes
+                    // explicitly here rather than carrying an opaque value in.
+                    let historical_value = dispatch_ctx
+                        .provider
+                        .read_tensor_value(historical_resource)
+                        .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                            reason: format!("no materialized historical KV data for layer {layer}"),
+                        })?;
+                    let historical_tensor = historical_value
                     .into_host(historical_resource)
                     .map_err(|error| InferenceApiError::KvCacheUnavailable {
                         reason: format!(
                             "historical KV data for layer {layer} (resource '{historical_resource}'): {error}"
                         ),
                     })?;
-                // Genuinely new, host-computed data -- the edge no longer
-                // holds what the Kernel itself wrote (if anything), so it
-                // must be explicitly (re-)written below.
-                output_tensor = NodeValue::Host(concat_rows(
-                    &historical_tensor,
-                    &output_tensor.clone().into_host(&dispatch_ctx.provider)?,
-                )?);
-                needs_explicit_edge_write = true;
-            }
-            // Written under a *pending* resource id (task 7.4 prepare):
-            // this generation step's KV update becomes Runtime-owned only
-            // once `commit_generation_step` promotes it after sampling and
-            // token commit succeed; a failure or cancellation before then
-            // simply leaves this pending write unpromoted. Always a real
-            // host-typed write here (unlike the edge-level write below):
-            // the pending resource is a *different* identity than
-            // `output_resource_id`, so a `Resident` value must materialize
-            // to reach it -- this specific KV-pending round-trip is not
-            // part of Decision 3's scope (`unify-provider-output-admission-
-            // and-residency`'s design.md).
-            let role_str = match role {
-                KvRole::K => "k",
-                KvRole::V => "v",
-            };
-            let pending_resource =
-                TensorResourceId::new(format!("kv.{kv_cache_id}.layer{layer}.{role_str}.pending"));
-            let pending_tensor = output_tensor.clone().into_host(&dispatch_ctx.provider)?;
-            // Correctif 1: admitted (via `write_tensor_admitted`), not a
-            // bare `write_tensor` -- this id is stable across every decode
-            // step for this layer/role, so admission replaces (and
-            // releases) whatever allocation the previous step's pending
-            // write held for it, the same reasoning as the graph-edge
-            // writes above. `discard_pending_kv_state` releases this
-            // through `release_admitted_tensor` when a step is cancelled or
-            // fails before commit.
-            dispatch_ctx
+                    // Genuinely new, host-computed data -- the edge no longer
+                    // holds what the Kernel itself wrote (if anything), so it
+                    // must be explicitly (re-)written below.
+                    output_tensor = NodeValue::Host(concat_rows(
+                        &historical_tensor,
+                        &output_tensor.clone().into_host(&dispatch_ctx.provider)?,
+                    )?);
+                    needs_explicit_edge_write = true;
+                }
+                // Written under a *pending* resource id (task 7.4 prepare):
+                // this generation step's KV update becomes Runtime-owned only
+                // once `commit_generation_step` promotes it after sampling and
+                // token commit succeed; a failure or cancellation before then
+                // simply leaves this pending write unpromoted. Always a real
+                // host-typed write here (unlike the edge-level write below):
+                // the pending resource is a *different* identity than
+                // `output_resource_id`, so a `Resident` value must materialize
+                // to reach it -- this specific KV-pending round-trip is not
+                // part of Decision 3's scope (`unify-provider-output-admission-
+                // and-residency`'s design.md).
+                let role_str = match role {
+                    KvRole::K => "k",
+                    KvRole::V => "v",
+                };
+                let pending_resource = TensorResourceId::new(format!(
+                    "kv.{kv_cache_id}.layer{layer}.{role_str}.pending"
+                ));
+                let pending_tensor = output_tensor.clone().into_host(&dispatch_ctx.provider)?;
+                // Correctif 1: admitted (via `write_tensor_admitted`), not a
+                // bare `write_tensor` -- this id is stable across every decode
+                // step for this layer/role, so admission replaces (and
+                // releases) whatever allocation the previous step's pending
+                // write held for it, the same reasoning as the graph-edge
+                // writes above. `discard_pending_kv_state` releases this
+                // through `release_admitted_tensor` when a step is cancelled or
+                // fails before commit.
+                dispatch_ctx
                 .provider
                 .write_tensor_value_admitted(
                     dispatch_ctx.runtime.memory_mut(),
@@ -3705,33 +3883,33 @@ fn execute_qwen_graph_nodes(
                         }
                     }
                 })?;
-            dispatch_ctx.node_events.push(
-                PerNodeCausalEvent::new(
-                    InferenceApiObservationKind::KvUpdatePrepared,
-                    node_id.clone(),
-                )
-                .with_resource(pending_resource.clone()),
-            );
-            match role {
-                KvRole::K => layer_k[layer] = Some(pending_resource),
-                KvRole::V => layer_v[layer] = Some(pending_resource),
+                dispatch_ctx.node_events.push(
+                    PerNodeCausalEvent::new(
+                        InferenceApiObservationKind::KvUpdatePrepared,
+                        node_id.clone(),
+                    )
+                    .with_resource(pending_resource.clone()),
+                );
+                match role {
+                    KvRole::K => layer_k[layer] = Some(pending_resource),
+                    KvRole::V => layer_v[layer] = Some(pending_resource),
+                }
             }
-        }
-        // `output_resource_id` (computed above, before the KV block) is
-        // this edge's own stable identity. When `needs_explicit_edge_write`
-        // is false, the Kernel already wrote directly into it via
-        // pre-admission (`dispatch_qwen_graph_node`'s `output_target`) --
-        // this loop only needs to record the binding, not re-download and
-        // re-upload a copy (`unify-provider-output-admission-and-
-        // residency`'s Decision 3: this is what actually eliminates the
-        // output-side round-trip `enable-device-resident-kernel-chaining`
-        // deferred). When true (KV-history concatenation produced new data,
-        // or the node -- "rope" -- has no Kernel-level output identity),
-        // the value is explicitly (re-)written exactly as before.
-        let output_shape = output_tensor.shape().to_vec();
-        if needs_explicit_edge_write {
-            let output_tensor = output_tensor.into_host(&dispatch_ctx.provider)?;
-            dispatch_ctx
+            // `output_resource_id` (computed above, before the KV block) is
+            // this edge's own stable identity. When `needs_explicit_edge_write`
+            // is false, the Kernel already wrote directly into it via
+            // pre-admission (`dispatch_qwen_graph_node`'s `output_target`) --
+            // this loop only needs to record the binding, not re-download and
+            // re-upload a copy (`unify-provider-output-admission-and-
+            // residency`'s Decision 3: this is what actually eliminates the
+            // output-side round-trip `enable-device-resident-kernel-chaining`
+            // deferred). When true (KV-history concatenation produced new data,
+            // or the node -- "rope" -- has no Kernel-level output identity),
+            // the value is explicitly (re-)written exactly as before.
+            let output_shape = output_tensor.shape().to_vec();
+            if needs_explicit_edge_write {
+                let output_tensor = output_tensor.into_host(&dispatch_ctx.provider)?;
+                dispatch_ctx
                 .provider
                 .write_tensor_value_admitted(
                     dispatch_ctx.runtime.memory_mut(),
@@ -3756,8 +3934,9 @@ fn execute_qwen_graph_nodes(
                         }
                     }
                 })?;
+            }
+            bindings.insert(output_edge_id.clone(), (output_resource_id, output_shape));
         }
-        bindings.insert(output_edge_id.clone(), (output_resource_id, output_shape));
         last_dispatch = Some(dispatch_result);
     }
 
@@ -3903,6 +4082,92 @@ fn check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls()
     Ok(())
 }
 
+/// The MLP gate/up projection the prefill/decode oracle dispatch sequences
+/// below exercise, split by which graph source `first_native_plans_for_prompt`
+/// actually built its `PreparedExecutionPlan` against (mirrors
+/// [`first_native_component_graphs_for_prompt`]'s own cfg split exactly):
+/// under the strict, default build the Plan comes from the checked-in real
+/// Qwen Component's graph, which still declares two standalone
+/// `gate_proj`/`up_proj` matmul nodes (`components/qwen` is unmodified);
+/// without a strict Component engine, the Plan comes from the Rust-
+/// synthesized fallback recipe (`qwen_model_component::qwen_build_graph`),
+/// which fuses them into one `gate_up_proj` matmul followed by a
+/// genuinely two-output `split` (`define-provider-prepared-kernel-
+/// execution-contract` task group 3). Every oracle dispatch here must use
+/// the identical node-id shape the Plan was actually built from, or Kernel
+/// selection fails closed with "no binding for node ...".
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+fn dispatch_qwen_oracle_mlp_gate_up(
+    dispatch_ctx: &mut QwenDispatchContext<'_>,
+    fixture: &E2eFixture,
+    prefix: &str,
+    layer_id: &str,
+    normed_mlp: NodeValue,
+) -> Result<(NodeValue, NodeValue), InferenceApiError> {
+    let gate_weight = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.gate_proj"))
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let up_weight = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.up_proj"))
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (_dispatch, gate) = dispatch_qwen_matmul(
+        dispatch_ctx,
+        &format!("{layer_id}.gate_proj"),
+        normed_mlp.clone(),
+        NodeValue::Host(gate_weight),
+        None,
+    )?;
+    let (_dispatch, up) = dispatch_qwen_matmul(
+        dispatch_ctx,
+        &format!("{layer_id}.up_proj"),
+        normed_mlp,
+        NodeValue::Host(up_weight),
+        None,
+    )?;
+    Ok((gate, up))
+}
+
+#[cfg(all(
+    test,
+    not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))
+))]
+fn dispatch_qwen_oracle_mlp_gate_up(
+    dispatch_ctx: &mut QwenDispatchContext<'_>,
+    fixture: &E2eFixture,
+    prefix: &str,
+    layer_id: &str,
+    normed_mlp: NodeValue,
+) -> Result<(NodeValue, NodeValue), InferenceApiError> {
+    let gate_up_weight =
+        fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.gate_up_proj"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+    let (_dispatch, gate_up) = dispatch_qwen_matmul(
+        dispatch_ctx,
+        &format!("{layer_id}.gate_up_proj"),
+        normed_mlp,
+        NodeValue::Host(gate_up_weight),
+        None,
+    )?;
+    let (_dispatch, split_outputs) = dispatch_qwen_split(
+        dispatch_ctx,
+        &format!("{layer_id}.split"),
+        gate_up,
+        [None, None],
+    )?;
+    let [gate, up]: [NodeValue; 2] =
+        split_outputs
+            .try_into()
+            .map_err(|_| InferenceApiError::GraphPlanningFailed {
+                reason: format!("'{layer_id}.split' produced an unexpected number of outputs"),
+            })?;
+    Ok((gate, up))
+}
+
 /// Test-only oracle: a hand-written, hard-coded prefill dispatch sequence
 /// kept only so tests can cross-check `execute_qwen_graph`'s output against
 /// an independently-written recipe. Production first-native execution
@@ -4016,13 +4281,6 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             fixture_tensor_by_name(&fixture.weights, &format!("{prefix}post_attn_norm"))
                 .map_err(runtime_generation_failed)?
                 .clone();
-        let gate_weight =
-            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.gate_proj"))
-                .map_err(runtime_generation_failed)?
-                .clone();
-        let up_weight = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.up_proj"))
-            .map_err(runtime_generation_failed)?
-            .clone();
         let down_weight =
             fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.down_proj"))
                 .map_err(runtime_generation_failed)?
@@ -4130,19 +4388,12 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             epsilon,
             None,
         )?;
-        let (_dispatch, gate) = dispatch_qwen_matmul(
+        let (gate, up) = dispatch_qwen_oracle_mlp_gate_up(
             &mut dispatch_ctx,
-            &format!("{layer_id}.gate_proj"),
-            normed_mlp.clone(),
-            NodeValue::Host(gate_weight),
-            None,
-        )?;
-        let (_dispatch, up) = dispatch_qwen_matmul(
-            &mut dispatch_ctx,
-            &format!("{layer_id}.up_proj"),
+            fixture,
+            &prefix,
+            &layer_id,
             normed_mlp,
-            NodeValue::Host(up_weight),
-            None,
         )?;
         let (_dispatch, activated) = dispatch_qwen_unary(
             &mut dispatch_ctx,
@@ -4301,13 +4552,6 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             fixture_tensor_by_name(&fixture.weights, &format!("{prefix}post_attn_norm"))
                 .map_err(runtime_generation_failed)?
                 .clone();
-        let gate_weight =
-            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.gate_proj"))
-                .map_err(runtime_generation_failed)?
-                .clone();
-        let up_weight = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.up_proj"))
-            .map_err(runtime_generation_failed)?
-            .clone();
         let down_weight =
             fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.down_proj"))
                 .map_err(runtime_generation_failed)?
@@ -4430,19 +4674,12 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             epsilon,
             None,
         )?;
-        let (_dispatch, gate) = dispatch_qwen_matmul(
+        let (gate, up) = dispatch_qwen_oracle_mlp_gate_up(
             &mut dispatch_ctx,
-            &format!("{layer_id}.gate_proj"),
-            normed_mlp.clone(),
-            NodeValue::Host(gate_weight),
-            None,
-        )?;
-        let (_dispatch, up) = dispatch_qwen_matmul(
-            &mut dispatch_ctx,
-            &format!("{layer_id}.up_proj"),
+            fixture,
+            &prefix,
+            &layer_id,
             normed_mlp,
-            NodeValue::Host(up_weight),
-            None,
         )?;
         let (_dispatch, activated) = dispatch_qwen_unary(
             &mut dispatch_ctx,
@@ -9077,6 +9314,140 @@ fn check_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage(
                  value only in a private, non-Provider-backed cache"
             ),
         });
+    }
+    Ok(())
+}
+
+/// `define-provider-prepared-kernel-execution-contract` task 3.4: a
+/// genuinely two-output Kernel dispatch ("split", the Rust test-oracle
+/// graph's fused `gate_up_proj` -> `split` -> `gate`/`up` recipe -- see
+/// `qwen_model_component::qwen_build_graph`) must leave *both* declared
+/// output edges independently resolvable from Provider storage, under
+/// *different* resource ids, each holding the correct half of the
+/// pre-split tensor -- not just the first output propagated, the second
+/// silently dropped or aliased onto the first (the historical bug this
+/// task group closes). Builds the graph directly through
+/// `qwen_prefill_graph` rather than `first_native_component_graphs_for_prompt`
+/// so this proof holds regardless of whether a strict Component engine is
+/// available: the "split" node exists only in this Rust-synthesized
+/// recipe (`qwen_expected_tensor_names`'s doc comment), not in the
+/// checked-in real Qwen Component's own graph.
+#[cfg(test)]
+fn check_two_output_split_dispatch_produces_independently_resolvable_resources(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let prefill = qwen_prefill_graph(&fixture.config, &fixture.identity, 2, true)?.graph;
+    let split_node = prefill
+        .nodes
+        .values()
+        .find(|node| node.operator.name() == "split")
+        .ok_or_else(|| E2eConformanceError::GraphValidationFailed {
+            reason: "prefill graph has no 'split' node".into(),
+        })?;
+    let split_input_edge = split_node.inputs.first().cloned().ok_or_else(|| {
+        E2eConformanceError::GraphValidationFailed {
+            reason: "'split' node has no input edge".into(),
+        }
+    })?;
+    let (gate_edge, up_edge) = match split_node.outputs.as_slice() {
+        [left, right] => (left.clone(), right.clone()),
+        other => {
+            return Err(E2eConformanceError::GraphValidationFailed {
+                reason: format!("'split' node expects exactly 2 output edges, got {other:?}"),
+            });
+        }
+    };
+    let decode = qwen_decode_graph(&fixture.config, &fixture.identity, 2)?.graph;
+    let prefill_graph = prefill.clone();
+    let graphs = FirstNativeComponentGraphs {
+        prefill_node_count: prefill.nodes.len(),
+        prefill,
+        decode_node_count: decode.nodes.len(),
+        decode,
+    };
+    let mut plans = prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)?;
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let cache_id = KvCacheId::new("test-two-output-split-cache")?;
+    execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &prefill_graph,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let provider = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let gate_up_resource = TensorResourceId::new(format!("edge.{split_input_edge}"));
+    let gate_resource = TensorResourceId::new(format!("edge.{gate_edge}"));
+    let up_resource = TensorResourceId::new(format!("edge.{up_edge}"));
+    if gate_resource == up_resource {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: "split's two output edges resolved to the same resource id".into(),
+        });
+    }
+    let gate_up = provider.read_tensor(&gate_up_resource).ok_or_else(|| {
+        E2eConformanceError::MemoryValidationFailed {
+            reason: format!("split's pre-split input '{gate_up_resource}' is not resolvable"),
+        }
+    })?;
+    let gate = provider.read_tensor(&gate_resource).ok_or_else(|| {
+        E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "split's first output '{gate_resource}' is not independently resolvable \
+                 from Provider storage"
+            ),
+        }
+    })?;
+    let up = provider.read_tensor(&up_resource).ok_or_else(|| {
+        E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "split's second output '{up_resource}' is not independently resolvable \
+                 from Provider storage"
+            ),
+        }
+    })?;
+    let cols = *gate_up
+        .shape
+        .last()
+        .ok_or_else(|| E2eConformanceError::MemoryValidationFailed {
+            reason: "split's pre-split input has no dimensions".into(),
+        })? as usize;
+    let half = cols / 2;
+    let rows = gate_up.data.len() / cols;
+    if gate.shape != up.shape || gate.data.len() != rows * half {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "split's two outputs have unexpected shapes: gate={:?}, up={:?}, \
+                 expected each to be the pre-split input's last dimension halved",
+                gate.shape, up.shape
+            ),
+        });
+    }
+    for row in 0..rows {
+        let expected_gate = &gate_up.data[row * cols..row * cols + half];
+        let expected_up = &gate_up.data[row * cols + half..(row + 1) * cols];
+        let actual_gate = &gate.data[row * half..(row + 1) * half];
+        let actual_up = &up.data[row * half..(row + 1) * half];
+        if actual_gate != expected_gate || actual_up != expected_up {
+            return Err(E2eConformanceError::MemoryValidationFailed {
+                reason: format!(
+                    "split's outputs for row {row} do not match the expected halves of its \
+                     pre-split input: gate {actual_gate:?} (expected {expected_gate:?}), \
+                     up {actual_up:?} (expected {expected_up:?})"
+                ),
+            });
+        }
     }
     Ok(())
 }
