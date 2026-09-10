@@ -147,6 +147,7 @@ pub fn fixture_model_manifest(label: &str) -> ModelManifest {
         provenance: None,
         signatures: Vec::new(),
         source: None,
+        architecture_config: None,
     }
 }
 

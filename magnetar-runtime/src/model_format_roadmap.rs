@@ -1562,5 +1562,6 @@ fn minimal_trust_probe_manifest() -> ModelManifest {
         provenance: None,
         signatures: Vec::new(),
         source: None,
+        architecture_config: None,
     }
 }

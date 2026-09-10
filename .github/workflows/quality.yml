@@ -433,12 +433,17 @@ jobs:
       # naming convention (verified against all six submodules' own
       # Cargo.toml `name` fields), so a new module added under that
       # convention is covered automatically rather than needing this
-      # guard's pattern hand-updated every time.
+      # guard's pattern hand-updated every time. Extended with `loader` by
+      # `implement-production-qwen-model-loading` task 1.4 to also cover
+      # `magnetar-loader-*` (the production Model Artifact ingestor
+      # externalization boundary `production-model-ingestion` defines --
+      # `magnetar-runtime` SHALL have zero compile-time dependency on
+      # `loaders/huggingface` or any future concrete ingestor crate).
       - name: Verify magnetar-runtime has no externalized-module dependency
         shell: bash
         run: |
           set -euo pipefail
-          pattern='magnetar-(component|format|provider)-'
+          pattern='magnetar-(component|format|provider|loader)-'
           if grep -qE "$pattern" magnetar-runtime/Cargo.toml; then
             echo "::error file=magnetar-runtime/Cargo.toml::magnetar-runtime must not depend on an externalized Component/Provider/Format crate"
             exit 1

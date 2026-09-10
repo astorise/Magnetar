@@ -39,6 +39,8 @@ use crate::kv_cache::*;
 use crate::memory::*;
 use crate::model::*;
 use crate::model_component::*;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+use crate::model_config_capability::*;
 use crate::model_instance::*;
 use crate::model_loading::*;
 use crate::operator::*;
@@ -6580,7 +6582,7 @@ const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:b80bb538a057f279fe04f937c7858bd99650f4a129c09e9e1fde9ae380ad6938";
+    "sha256:c50eeee444d47584055aac64c798a0599030d244fcdeeac0703b244f76a91cbd";
 
 /// Test-oracle only (`reach-architecture-freeze-1` task 12.4): the checked-in
 /// real Qwen Component binary, embedded for test fixtures. Production never
@@ -6802,6 +6804,33 @@ fn qwen_weight_shapes_for_config(config: &QwenConfig) -> BTreeMap<String, Vec<u6
     shapes
 }
 
+/// Bridges the Rust-side [`QwenConfig`] (this crate's own test-oracle
+/// architecture representation) into the generic, WIT-facing
+/// [`ModelArchitectureConfig`] the `model-config` Capability hands to a
+/// configurable Component (`implement-production-qwen-model-loading`
+/// Decision 6). `QwenConfig` carries no token id metadata today, so
+/// `bos_token_id`/`eos_token_id` are `None` here -- real production
+/// ingestion (task group 3) populates those from `config.json`.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn architecture_config_from_qwen_config(config: &QwenConfig) -> ModelArchitectureConfig {
+    let a = &config.architecture;
+    ModelArchitectureConfig {
+        hidden_size: a.hidden_size,
+        intermediate_size: a.intermediate_size,
+        num_hidden_layers: a.layer_count as u32,
+        num_attention_heads: a.attention_head_count as u32,
+        num_key_value_heads: a.kv_head_count as u32,
+        head_dim: a.head_dimension,
+        vocab_size: a.vocabulary_size,
+        rms_norm_eps: config.rmsnorm_epsilon,
+        rope_theta: config.rope.base,
+        rope_scaling_factor: config.rope.scale.map(|value| value as f32),
+        tie_word_embeddings: config.tied_embeddings,
+        bos_token_id: None,
+        eos_token_id: None,
+    }
+}
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn expect_single_string_invocation_result(
     result: &ComponentInvocationResult,
@@ -6831,6 +6860,7 @@ fn expect_single_string_invocation_result(
 struct QwenRealComponentRuntime {
     manager: Mutex<ComponentManager>,
     capability: Arc<GraphBuilderCapability>,
+    model_config_capability: Arc<ModelConfigCapability>,
     definition: ComponentDefinitionId,
 }
 
@@ -6841,6 +6871,7 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
         return Ok(runtime);
     }
     let capability = Arc::new(GraphBuilderCapability::new());
+    let model_config_capability = Arc::new(ModelConfigCapability::new());
     let mut manager = ComponentManager::with_engine(Box::new(
         crate::component_wasmtime::WasmtimeComponentEngine::new().map_err(|error| {
             E2eConformanceError::ModelComponentFailed {
@@ -6851,11 +6882,20 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
     manager.set_resource_limits(qwen_component_runtime_limits());
     manager
         .set_trust_store(ComponentTrustStore::default().trust_digest(QWEN_REAL_COMPONENT_DIGEST));
+    // `1.1.0`: the checked-in real Qwen Component now also imports
+    // `model-config` (Decision 6), a purely additive evolution over
+    // `1.0.0`'s `graph-builder`-only world.
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.0.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.1.0");
     manager.provide_capability(
         graph_builder_interface,
         capability.clone() as Arc<dyn HostCapability>,
+    );
+    let model_config_interface =
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.1.0");
+    manager.provide_capability(
+        model_config_interface,
+        model_config_capability.clone() as Arc<dyn HostCapability>,
     );
     let definition = manager
         .prepare_pushed_package(qwen_real_component_package()?)
@@ -6869,6 +6909,7 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
     let _ = RUNTIME.set(QwenRealComponentRuntime {
         manager: Mutex::new(manager),
         capability,
+        model_config_capability,
         definition,
     });
     Ok(RUNTIME.get().expect("just set or set by a racing caller"))
@@ -6912,6 +6953,7 @@ pub fn build_first_native_graphs_from_real_qwen_component(
     let runtime = qwen_real_component_runtime()?;
     let mut manager = runtime.manager.lock().unwrap();
     let capability = &runtime.capability;
+    let model_config_capability = &runtime.model_config_capability;
     let definition = runtime.definition;
 
     let instance = manager
@@ -6941,6 +6983,9 @@ pub fn build_first_native_graphs_from_real_qwen_component(
             output_edge_name: "logits".to_string(),
         };
 
+        let architecture_config = architecture_config_from_qwen_config(&fixture.config);
+        model_config_capability.bind_config(&engine_key, architecture_config.clone());
+
         capability.prepare_session(&engine_key, session_context(weight_shapes.clone()));
         let prefill_result = manager
             .invoke(
@@ -6958,6 +7003,7 @@ pub fn build_first_native_graphs_from_real_qwen_component(
                 reason: "build-prefill-graph handle did not resolve to a finished graph".into(),
             })?;
 
+        model_config_capability.bind_config(&engine_key, architecture_config);
         capability.prepare_session(&engine_key, session_context(weight_shapes));
         let decode_result = manager
             .invoke(
@@ -6978,6 +7024,7 @@ pub fn build_first_native_graphs_from_real_qwen_component(
         validate_first_scope_graph(&prefill)?;
         validate_first_scope_graph(&decode)?;
         capability.clear_session(&engine_key);
+        model_config_capability.clear_config(&engine_key);
         Ok(FirstNativeComponentGraphs {
             prefill_node_count: prefill.nodes.len(),
             decode_node_count: decode.nodes.len(),

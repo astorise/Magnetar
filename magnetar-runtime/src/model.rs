@@ -530,6 +530,78 @@ pub struct ModelManifest {
     pub provenance: Option<ModelProvenance>,
     pub signatures: Vec<ModelSignature>,
     pub source: Option<ModelArtifactSource>,
+    /// Runtime-authorized normalized model architecture configuration
+    /// (`implement-production-qwen-model-loading` Decision 5): the logical
+    /// values a configurable Model Component may query through the
+    /// versioned model-config Capability (`model-component-graph-contract`)
+    /// to produce a production-shaped graph, normalized by ingestion from
+    /// source-specific config metadata (e.g. Hugging Face `config.json`)
+    /// before Component graph production. `None` for artifacts that carry
+    /// no such configuration (every pre-existing fixture manifest).
+    pub architecture_config: Option<ModelArchitectureConfig>,
+}
+
+/// See [`ModelManifest::architecture_config`]. Deliberately narrow: only
+/// the specific architecture-shaped fields a Model Component needs to
+/// derive weight names/shapes and graph structure -- never raw JSON,
+/// arbitrary annotation maps, a file path, raw weight bytes, or
+/// Provider/Device identity (Decision 6's Capability boundary).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelArchitectureConfig {
+    pub hidden_size: u64,
+    pub intermediate_size: u64,
+    pub num_hidden_layers: u32,
+    pub num_attention_heads: u32,
+    pub num_key_value_heads: u32,
+    pub head_dim: u64,
+    pub vocab_size: u64,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f64,
+    pub rope_scaling_factor: Option<f32>,
+    pub tie_word_embeddings: bool,
+    pub bos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
+}
+
+impl ModelArchitectureConfig {
+    /// Structural consistency checks independent of any concrete tensor
+    /// inventory (Decision 5's "Runtime validates generic structural
+    /// constraints"): every count must be non-zero, `num_attention_heads`
+    /// must be an exact multiple of `num_key_value_heads` (GQA/MQA
+    /// requires whole-group division), and `head_dim * num_attention_heads`
+    /// must not overflow `u64`. Qwen-specific semantics are validated
+    /// separately by the Qwen Component itself.
+    pub fn validate(&self) -> Result<(), ModelArtifactError> {
+        let non_zero = [
+            ("hidden_size", self.hidden_size),
+            ("intermediate_size", self.intermediate_size),
+            ("num_hidden_layers", self.num_hidden_layers as u64),
+            ("num_attention_heads", self.num_attention_heads as u64),
+            ("num_key_value_heads", self.num_key_value_heads as u64),
+            ("head_dim", self.head_dim),
+            ("vocab_size", self.vocab_size),
+        ];
+        for (field, value) in non_zero {
+            if value == 0 {
+                return Err(ModelArtifactError::InvalidManifest {
+                    message: format!("architecture config field '{field}' must not be zero"),
+                });
+            }
+        }
+        if !self
+            .num_attention_heads
+            .is_multiple_of(self.num_key_value_heads)
+        {
+            return Err(ModelArtifactError::InvalidManifest {
+                message: "num_attention_heads must be an exact multiple of num_key_value_heads"
+                    .into(),
+            });
+        }
+        self.head_dim
+            .checked_mul(self.num_attention_heads as u64)
+            .ok_or(ModelArtifactError::SizeOverflow)?;
+        Ok(())
+    }
 }
 
 impl ModelManifest {
@@ -1306,6 +1378,7 @@ impl TryFrom<RawModelManifest> for ModelManifest {
             provenance: raw.provenance,
             signatures: Vec::new(),
             source: None,
+            architecture_config: None,
         })
     }
 }

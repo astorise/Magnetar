@@ -10360,6 +10360,7 @@ fn minimal_model_manifest() -> ModelManifest {
         provenance: None,
         signatures: Vec::new(),
         source: None,
+        architecture_config: None,
     }
 }
 
@@ -13122,6 +13123,7 @@ fn fixture_model_manifest() -> ModelManifest {
         provenance: None,
         signatures: Vec::new(),
         source: None,
+        architecture_config: None,
     }
 }
 
@@ -13706,6 +13708,7 @@ fn model_source_cache_roadmap_development_fixture_still_uses_real_trust_store() 
         provenance: None,
         signatures: Vec::new(),
         source: None,
+        architecture_config: None,
     };
     let decision = development_fixture_requires_explicit_trust_evaluation(&store, &manifest);
     assert_eq!(decision.status, ModelTrustStatus::Unknown);
@@ -13854,6 +13857,7 @@ fn model_source_cache_roadmap_artifact_identity_coverage_tracks_present_fields()
         provenance: None,
         signatures: Vec::new(),
         source: Some(ModelArtifactSource::LocalCache("qwen".into())),
+        architecture_config: None,
     };
     let coverage = ArtifactIdentityCoverage::from_manifest(&manifest);
     assert!(coverage.content_digest);
@@ -13966,6 +13970,7 @@ fn model_source_cache_roadmap_cache_trust_re_evaluates_and_revocation_wins() {
         provenance: None,
         signatures: Vec::new(),
         source: None,
+        architecture_config: None,
     };
     let trusted = evaluate_cache_trust(&store, &manifest, false);
     assert_eq!(trusted.status, ModelTrustStatus::Trusted);

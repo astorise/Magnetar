@@ -295,17 +295,24 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
     std::fs::write(&artifact, QWEN_REAL_COMPONENT).unwrap();
 
     let capability = Arc::new(crate::GraphBuilderCapability::new());
+    let model_config_capability = Arc::new(crate::ModelConfigCapability::new());
     let mut engine = WasmtimeComponentEngine::new().unwrap();
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.0.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.1.0");
     engine.register_capability(
         graph_builder_interface.clone(),
         capability.clone() as Arc<dyn HostCapability>,
     );
+    let model_config_interface =
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.1.0");
+    engine.register_capability(
+        model_config_interface.clone(),
+        model_config_capability.clone() as Arc<dyn HostCapability>,
+    );
 
     let export_interface = WitInterface::new(
         "magnetar:model-component-graph/model-component-graph-producer",
-        "1.0.0",
+        "1.1.0",
     );
     let definition = ComponentDefinition {
         id: ComponentDefinitionId::new(200),
@@ -315,6 +322,7 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
             "the first real, minimal Qwen Model Component",
         )
         .with_import(graph_builder_interface.clone())
+        .with_import(model_config_interface.clone())
         .with_export(export_interface.clone()),
         artifact_path: artifact,
         manifest_path: None,
@@ -328,6 +336,9 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
     let mut link_plan = ComponentLinkPlan::default();
     link_plan.insert_for_test(crate::ComponentEndpoint::Capability {
         interface: graph_builder_interface,
+    });
+    link_plan.insert_for_test(crate::ComponentEndpoint::Capability {
+        interface: model_config_interface,
     });
     let instance = engine.instantiate(&prepared, &link_plan).unwrap();
 
@@ -356,6 +367,24 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
             kv_namespace: "qwen".to_string(),
             weight_shapes,
             output_edge_name: "logits".to_string(),
+        },
+    );
+    model_config_capability.bind_config(
+        instance.engine_key(),
+        crate::ModelArchitectureConfig {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 2,
+            vocab_size: 258,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            rope_scaling_factor: None,
+            tie_word_embeddings: true,
+            bos_token_id: None,
+            eos_token_id: None,
         },
     );
 

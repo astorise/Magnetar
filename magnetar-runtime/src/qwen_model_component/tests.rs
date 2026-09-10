@@ -275,6 +275,7 @@ fn unsupported_quantization_is_rejected() {
         provenance: None,
         signatures: Vec::new(),
         source: Some(ModelArtifactSource::LocalCache("qwen-test".into())),
+        architecture_config: None,
     };
     assert_eq!(
         qwen_validate_model_artifact(&descriptor, &config, &manifest),
@@ -535,6 +536,7 @@ fn chat_template_required_but_missing_is_rejected() {
         provenance: None,
         signatures: Vec::new(),
         source: Some(ModelArtifactSource::LocalCache("qwen-test".into())),
+        architecture_config: None,
     };
     assert!(matches!(
         qwen_validate_model_artifact(&descriptor, &config, &manifest),

@@ -1271,6 +1271,109 @@ fn run_first_native_graph_with_provider_and_weights_handles_a_genuinely_gqa_shap
     );
 }
 
+/// `implement-production-qwen-model-loading` task 8.8: at least two
+/// materially different Qwen configurations must produce config-correct
+/// graphs through the *real, compiled* Qwen Component -- not only the one
+/// canonical tiny E2E fixture dimensions, and not only through
+/// `qwen_prefill_graph`'s Rust-synthesized oracle path (which the test
+/// directly above already covers for this same GQA shape). This proves the
+/// Component itself -- via the `model-config` Capability -- derives a
+/// different, still-correct graph for a materially different
+/// architecture, matching `qwen_prefill_graph`'s independent oracle exactly
+/// in node count and RoPE head-count attributes.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn real_qwen_component_produces_a_config_correct_graph_for_a_genuinely_gqa_shaped_config() {
+    let architecture = qwen_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
+    let identity = qwen_component_identity(
+        ModelComponentId::new("gqa-real-component-fixture").expect("static id is valid"),
+        ModelComponentVersion::new(1, 0, 0),
+        ModelComponentImplementationKind::WebAssemblyComponent,
+    );
+    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    config.validate(&identity).expect("GQA config validates");
+    let architecture_implementation = qwen_architecture_implementation(
+        &identity,
+        ModelArchitectureImplementationKind::ComponentBased,
+    );
+    let weights = e2e_fixture_weights(&config).expect("GQA fixture weights build");
+    let manifest = e2e_fixture_manifest_from_weights(
+        &config,
+        &architecture_implementation.architecture,
+        &weights,
+    )
+    .expect("GQA fixture manifest builds");
+    let tokenizer = e2e_fixture_tokenizer().expect("fixture tokenizer builds");
+    let descriptor = qwen_component_descriptor(identity.clone(), &config)
+        .expect("GQA component descriptor builds");
+    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+        .expect("GQA manifest matches its own descriptor");
+    let fixture = E2eFixture {
+        config,
+        identity,
+        architecture_implementation,
+        manifest,
+        tokenizer,
+        weights,
+    };
+
+    // The independent oracle -- same as the hand-built-graph test above --
+    // is what the real Component's output is compared against.
+    let oracle_graph = qwen_prefill_graph(&fixture.config, &fixture.identity, 2, true)
+        .expect("GQA oracle prefill graph builds")
+        .graph;
+
+    let (component_graphs, _definition, _instance) =
+        build_first_native_graphs_from_real_qwen_component(&fixture, 2)
+            .expect("the real Component produces graphs for a GQA-shaped config");
+
+    assert_eq!(
+        component_graphs.prefill.nodes.len(),
+        oracle_graph.nodes.len(),
+        "the real Component's prefill graph must have the same node count as the oracle \
+         for this architecture"
+    );
+    let component_q_head_count = component_graphs
+        .prefill
+        .nodes
+        .get(&ExecutionNodeId::new("layer0.rope_q"))
+        .and_then(|node| node.attributes.get("head_count"))
+        .cloned();
+    let component_k_head_count = component_graphs
+        .prefill
+        .nodes
+        .get(&ExecutionNodeId::new("layer0.rope_k"))
+        .and_then(|node| node.attributes.get("head_count"))
+        .cloned();
+    assert_eq!(
+        component_q_head_count,
+        Some(OperatorAttributeValue::Integer(4)),
+        "the real Component's rope_q must carry the attention head count from model-config"
+    );
+    assert_eq!(
+        component_k_head_count,
+        Some(OperatorAttributeValue::Integer(2)),
+        "the real Component's rope_k must carry the (smaller) key/value head count -- \
+         the actual GQA shape, derived from model-config rather than a compiled-in constant"
+    );
+
+    let cache_id = KvCacheId::new("gqa-real-component-fixture-cache").expect("cache id is valid");
+    let outcome = run_first_native_graph_with_provider_and_weights(
+        Arc::new(ReferenceCpuProvider::new()),
+        &fixture,
+        &fixture.weights,
+        &component_graphs.prefill,
+        &cache_id,
+        &[1, 2],
+    )
+    .expect("a real GQA-shaped prefill dispatch through the real Component's own graph succeeds");
+    assert_eq!(outcome.dispatch.status, KernelResultStatus::Succeeded);
+    assert_eq!(
+        outcome.resolved_provider.as_str(),
+        REFERENCE_CPU_PROVIDER_NAME
+    );
+}
+
 /// task group 6 (`make-first-native-cuda-hot-path-device-resident`'s
 /// Decision 7) / 6.2: a failure during Kernel Registry/dispatch-plan
 /// construction -- here, `attention`'s required workspace failing to admit
