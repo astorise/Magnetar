@@ -21,11 +21,13 @@
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
+use magnetar_loader_huggingface::HuggingFaceIngestor;
 use magnetar_runtime::{
     CliBoundaryError, InferenceApiError, ModelArtifactSource, ModelInstanceId,
     ModelInstanceUnloadPolicy, ModelLoadingApiRequest, ModelLoadingCoordinator,
     ModelLoadingRequest, ModelLoadingRequestId, ModelRef, ModelRegistry, ModelResolutionRequest,
-    ReferenceCpuProvider, ReleaseVersion, Runtime, build_release_binary_version_report, load_model,
+    ProductionModelArtifactIngestor, ProductionModelSource, ReferenceCpuProvider, ReleaseVersion,
+    Runtime, build_release_binary_version_report, load_model, load_production_qwen_instance,
     unload_model_instance,
 };
 
@@ -675,11 +677,15 @@ fn cmd_model_load(args: &[String]) -> Result<(), CliBoundaryError> {
 
 /// `magnetar model load --file <path>` (§23 "Local Model Files"). Path
 /// resolution -- a single `std::fs::canonicalize` existence check, never a
-/// directory scan -- happens here in the CLI (§150). Runtime only ever
-/// receives the resulting `ModelArtifactSource::LocalPath` as inert
-/// manifest metadata (§151/§152), and goes through the exact same
-/// trust/artifact validation as [`cmd_model_load`]'s `<model-ref>` path
-/// (§153/§154) -- `run_load_model` is shared, not duplicated.
+/// directory scan -- happens here in the CLI (§150). `path` may name either
+/// a production Hugging Face-style bundle *directory* directly, or a file
+/// inside one (its own `config.json`, most naturally); either way the
+/// bundle root is authorized once, here, and handed to the real external
+/// production ingestor (`loaders/huggingface`) as an already-authorized
+/// [`ProductionModelSource`] -- Runtime and the ingestor never receive a
+/// raw path string or perform their own filesystem discovery
+/// (`implement-production-qwen-model-loading` task 10.4: this no longer
+/// builds a fixture manifest for local files).
 fn cmd_model_load_local_file(args: &[String]) -> Result<(), CliBoundaryError> {
     let Some(raw_path) = args.first() else {
         return Err(CliBoundaryError::CliCommandInvalid {
@@ -690,18 +696,54 @@ fn cmd_model_load_local_file(args: &[String]) -> Result<(), CliBoundaryError> {
         std::fs::canonicalize(raw_path).map_err(|error| CliBoundaryError::CliFileReadFailed {
             reason: format!("local model path '{raw_path}' is not accessible: {error}"),
         })?;
-    if !canonical.is_file() {
+    let bundle_root = if canonical.is_dir() {
+        canonical.clone()
+    } else if canonical.is_file() {
+        canonical
+            .parent()
+            .ok_or_else(|| CliBoundaryError::CliFileReadFailed {
+                reason: format!(
+                    "local model path '{}' has no parent bundle directory",
+                    canonical.display()
+                ),
+            })?
+            .to_path_buf()
+    } else {
         return Err(CliBoundaryError::CliFileReadFailed {
-            reason: format!("local model path '{}' is not a file", canonical.display()),
+            reason: format!(
+                "local model path '{}' is neither a file nor a directory",
+                canonical.display()
+            ),
         });
-    }
+    };
 
-    let mut manifest = pipeline::fixture_model_manifest(&canonical.to_string_lossy());
-    manifest.source = Some(ModelArtifactSource::LocalPath(canonical.clone()));
-    run_load_model(&manifest)?;
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(bundle_root.clone()),
+        bundle_root.clone(),
+    );
+    let ingested = HuggingFaceIngestor::new()
+        .ingest(&source)
+        .map_err(|error| CliBoundaryError::CliFileReadFailed {
+            reason: format!(
+                "local model bundle '{}' failed production ingestion: {error}",
+                bundle_root.display()
+            ),
+        })?;
+
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .map_err(|error| CliBoundaryError::CliRuntimeUnavailable {
+            reason: error.to_string(),
+        })?;
+    let instance = load_production_qwen_instance(
+        &mut runtime,
+        &ingested.manifest,
+        ingested.payload_source.as_ref(),
+    )?;
     println!(
-        "model instance for local file '{}' loaded",
-        canonical.display()
+        "model instance {instance:?} for local bundle '{}' loaded and ready",
+        bundle_root.display()
     );
     Ok(())
 }
@@ -1071,16 +1113,53 @@ mod tests {
     /// as the `<model-ref>` path -- see `cmd_model_load`'s doc comment).
     #[test]
     fn cmd_model_load_local_file_existing_file_reaches_load_model_and_fails_on_trust() {
-        let path = std::env::temp_dir().join(format!(
-            "magnetar-cli-local-model-test-{}.bin",
+        let dir = std::env::temp_dir().join(format!(
+            "magnetar-cli-local-model-test-{}",
             std::process::id()
         ));
-        std::fs::write(&path, b"not a real model artifact").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
 
-        let error = cmd_model_load_local_file(&[path.to_str().unwrap().to_string()]).unwrap_err();
-        assert!(error.runtime_category().is_some());
+        // A minimal but real Hugging Face-style bundle: real config.json,
+        // real single-tensor Safetensors bytes with a real 8-byte header-
+        // length prefix (matching `loaders/huggingface`'s own test helper
+        // shape) -- ingestion must succeed and genuinely reach
+        // `load_production_qwen_instance`, which fails on trust (this test
+        // builds a `Runtime` with no configured trust policy, same as
+        // `cmd_model_load_calls_real_load_model_and_fails_on_trust`), not
+        // on parsing.
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+                "architectures": ["Qwen2ForCausalLM"],
+                "model_type": "qwen2",
+                "hidden_size": 4,
+                "intermediate_size": 8,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "vocab_size": 16,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 10000.0,
+                "tie_word_embeddings": false
+            }"#,
+        )
+        .unwrap();
+        let tensor_name = "model.embed_tokens.weight";
+        let header =
+            format!(r#"{{"{tensor_name}":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#);
+        let mut safetensors_bytes = (header.len() as u64).to_le_bytes().to_vec();
+        safetensors_bytes.extend_from_slice(header.as_bytes());
+        safetensors_bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        std::fs::write(dir.join("model.safetensors"), &safetensors_bytes).unwrap();
 
-        std::fs::remove_file(&path).unwrap();
+        let error = cmd_model_load_local_file(&[dir.to_str().unwrap().to_string()]).unwrap_err();
+        assert!(
+            error.runtime_category().is_some(),
+            "expected a Runtime-originated (trust) failure, not an ingestion/CLI-boundary one: \
+             {error:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// §42/§29: `magnetar model load <model-ref>` calls the real

@@ -1,3 +1,8 @@
+[workspace]
+# Own workspace root, not a member of the repository root's: this crate
+# depends on `loaders/huggingface` below, an externalized submodule not
+# present in every checkout -- see the root `Cargo.toml`'s comment.
+
 [package]
 name = "magnetar-cli"
 version = "0.1.0"
@@ -7,3 +12,4 @@ description = "First-party client/workspace/agent runtime around Magnetar infere
 
 [dependencies]
 magnetar-runtime = { path = "../magnetar-runtime", version = "0.1.0" }
+magnetar-loader-huggingface = { path = "../loaders/huggingface" }

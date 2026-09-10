@@ -4,11 +4,11 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:b80bb538a057f279fe04f937c7858bd99650f4a129c09e9e1fde9ae380ad6938"
+    value: "sha256:c50eeee444d47584055aac64c798a0599030d244fcdeeac0703b244f76a91cbd"
 component:
   name: "magnetar.qwen.real"
-  version: "0.1.0"
-  description: "The first real, minimal Qwen Model Component"
+  version: "0.2.0"
+  description: "The configurable, production Qwen Model Component"
   role: "qwen-model-component"
 runtime:
   magnetar:
@@ -17,7 +17,10 @@ wit:
   imports:
     - package: "magnetar:model-component-graph"
       interface: "graph-builder"
-      version: "1.0.0"
+      version: "1.1.0"
+    - package: "magnetar:model-component-graph"
+      interface: "model-config"
+      version: "1.1.0"
   exports: []
 capabilities:
   requires: []

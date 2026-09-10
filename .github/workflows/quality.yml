@@ -422,6 +422,32 @@ jobs:
             cargo test --locked --manifest-path "$manifest"
             echo "::endgroup::"
           done
+      # `magnetar-cli` moved out of the repository root's `[workspace]`
+      # (`implement-production-qwen-model-loading` task 10.4): it depends
+      # on `loaders/huggingface`, so a plain root-level `cargo check`/
+      # `clippy`/`test`/`fmt --all` (which run with submodules absent) can
+      # no longer cover it. This is the one job that checks it out
+      # recursively, so it is the one job that builds, tests, formats, and
+      # lints `magnetar-cli` now -- not merely `cargo test` like the other
+      # submodule crates above, since `magnetar-cli` is first-party code
+      # this repository owns directly, not an externalized module.
+      - name: Format-check magnetar-cli
+        shell: bash
+        run: cargo fmt --manifest-path magnetar-cli/Cargo.toml --all -- --check
+      - name: Check and test magnetar-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --manifest-path magnetar-cli/Cargo.toml --all-targets --all-features
+          cargo test --locked --manifest-path magnetar-cli/Cargo.toml --all-targets
+      - name: Clippy magnetar-cli
+        shell: bash
+        run: cargo clippy --locked --manifest-path magnetar-cli/Cargo.toml --all-targets --all-features -- -D warnings
+      - name: Build magnetar-cli documentation
+        shell: bash
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --manifest-path magnetar-cli/Cargo.toml --no-deps
       # `externalize-runtime-extension-modules`'s "Model Components,
       # Providers, and Formats Are Externalized" requirement: the Core
       # (magnetar-runtime) SHALL have zero compile-time dependency on any

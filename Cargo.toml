@@ -1,3 +1,14 @@
 [workspace]
-members = ["magnetar-cli", "magnetar-runtime"]
+# `magnetar-cli` is deliberately not a member: it depends on
+# `loaders/huggingface` (an externalized, submodule-pinned production
+# ingestor, `implement-production-qwen-model-loading` task group 10/11),
+# and a submodule is not present in every checkout of this repository
+# (only `submodule-integration` in `.github/workflows/quality.yml` clones
+# with `submodules: recursive`). Folding it into this workspace would make
+# a plain `cargo build`/`check`/`clippy`/`test` at the repository root
+# fail whenever submodules are absent. `magnetar-cli/Cargo.toml` declares
+# its own `[workspace]` table for exactly this reason (the same pattern
+# `integration-tests/cuda-first-native` already uses) and is built via its
+# own `--manifest-path`, not `--workspace` here.
+members = ["magnetar-runtime"]
 resolver = "2"
