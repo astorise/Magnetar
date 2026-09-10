@@ -108,7 +108,7 @@
 - [ ] 12.4 Add a real public Qwen-compatible checkpoint smoke test pinned by revision/digest (manual/nightly/hardware profile acceptable if size prevents per-PR execution).
 - [ ] 12.5 Compare CPU/CUDA logits or deterministic output within a documented tolerance.
 - [x] 12.6 Assert unload/failure leaves no ModelInstance weight allocation or Provider tensor leak.
-- [ ] 12.7 Make GPU CI fail if the required hardware test is skipped or selects `0 tests`.
+- [x] 12.7 Make GPU CI fail if the required hardware test is skipped or selects `0 tests`.
 - [x] 12.8 Add source guards proving production loading/generation does not call `fixture_model_manifest`, fixture tensor inventory builders, or require literal `qwen-test`.
 - [ ] 12.9 Run `cargo test`/clippy/fmt/doc/wasm checks for Runtime and every affected external module.
 - [ ] 12.10 Run CUDA hardware suite and capture exact commit/runner evidence.

@@ -103,3 +103,24 @@ fn real_production_ingestion_generates_on_real_cuda_hardware() {
     // have gone through CUDA -- there was nothing else for it to fall
     // back to.
 }
+
+/// Task 12.7: a GPU CI job that dispatches this crate's tests must not be
+/// able to report success while every CUDA-gated test above silently
+/// skipped (returned early because no device was available) -- that
+/// would make "0 real assertions ran" indistinguishable from "every
+/// assertion passed". Mirrors `providers/cuda`'s own
+/// `hardware_conformance_actually_ran_not_silently_skipped` exactly:
+/// `#[ignore]`d by default so a GPU-less dev machine's plain `cargo test`
+/// still passes cleanly, and run explicitly via `--include-ignored` only
+/// by a job that guarantees a real GPU, where this test's failure means
+/// the runner itself lost GPU access.
+#[test]
+#[ignore = "run explicitly via `cargo test -- --include-ignored` on a host guaranteed to have a GPU; every other test in this file already covers the GPU-less path"]
+fn hardware_conformance_actually_ran_not_silently_skipped() {
+    let provider = CudaProvider::new();
+    assert!(
+        provider.is_available(),
+        "this test only runs where a compatible CUDA driver/device is guaranteed present -- \
+         if it fails, the runner lost GPU access"
+    );
+}

@@ -42,9 +42,12 @@ jobs:
         # -- a real gap this workflow had (confirmed by dispatching it: it
         # failed with "failed to read providers/cpu/Cargo.toml" before this
         # fix), not something introduced by CUDA-specific test content.
+        # loaders/huggingface and formats/safetensors are
+        # integration-tests/production-loading's own dependencies (its real
+        # production Hugging Face bundle -> CUDA E2E test, task 12.3).
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git submodule update --init -- providers/cuda providers/cpu
+          git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors
       - name: Verify GPU is visible
         run: |
           set -eux
@@ -66,3 +69,13 @@ jobs:
         # is a run where that must never happen (`docs/audits/cuda-provider-full-audit-2026-09-05.md`'s
         # P1 "explicit provider-hardware-cuda == Passed signal" finding).
         run: cargo test --locked --manifest-path providers/cuda/Cargo.toml -- --include-ignored
+      - name: Build and test real production Qwen loading on CUDA
+        # implement-production-qwen-model-loading task 12.3/12.7: the same
+        # real ingested Hugging Face bundle, real tokenizer, and real
+        # compiled Qwen Component the Reference CPU test proves, instead
+        # dispatched through a real CudaProvider. `--include-ignored` also
+        # runs this crate's own `hardware_conformance_actually_ran_not_
+        # silently_skipped`, mirroring providers/cuda's -- a GPU CI job
+        # must not be able to report success while the CUDA-gated test
+        # above silently skipped.
+        run: cargo test --locked --manifest-path integration-tests/production-loading/Cargo.toml -- --include-ignored
