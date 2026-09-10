@@ -3,11 +3,33 @@ use magnetar_runtime::model::{ModelDType, ModelTrustStore};
 use magnetar_runtime::production_model_ingestion::{
     ProductionModelArtifactIngestor, ProductionModelSource,
 };
-use magnetar_runtime::tokenizer::{DecodeInput, EncodeInput, Tokenizer};
+use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
     ModelArtifactSource, load_production_qwen_instance, production_qwen_fixture,
+    register_qwen_component_artifact,
 };
 use std::{fs, io::Write, sync::Arc};
+
+/// Reads the checked-in, real Qwen Component artifact this repository
+/// ships and registers it for production first-native generation to use
+/// -- mirrors `integration-tests/cuda-first-native`'s own
+/// `register_real_qwen_component`, the same real embedder-facing call
+/// path `magnetar-cli` uses, not a test-only shortcut. `register_qwen_
+/// component_artifact` is idempotent (a `OnceLock`), so calling it from
+/// more than one test in this crate is safe.
+fn register_real_qwen_component() {
+    let component_bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../magnetar-runtime/fixtures/components/qwen-real.component.wasm"
+    ))
+    .expect("checked-in real Qwen Component .wasm is readable");
+    let manifest_bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../magnetar-runtime/fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
+    ))
+    .expect("checked-in real Qwen Component manifest is readable");
+    register_qwen_component_artifact(component_bytes, manifest_bytes);
+}
 
 const HIDDEN_SIZE: u64 = 4;
 const LAYER_COUNT: u64 = 1;
@@ -185,6 +207,7 @@ fn write_tiny_production_bundle(dir: &std::path::Path) {
 
 #[test]
 fn tachyon_shaped_real_production_ingestion_loads_through_the_real_qwen_component() {
+    register_real_qwen_component();
     let dir = tempfile::tempdir().unwrap();
     write_tiny_production_bundle(dir.path());
 
@@ -236,64 +259,38 @@ fn tachyon_shaped_real_production_ingestion_loads_through_the_real_qwen_componen
     )
     .expect("production fixture builds from real ingested data");
 
-    let mut runtime = magnetar_runtime::Runtime::builder()
-        .register_provider(Arc::new(magnetar_runtime::ReferenceCpuProvider::new()))
-        .trust_store(trust_store)
-        .build()
-        .expect("runtime builds");
-
-    let instance = load_production_qwen_instance(
-        &mut runtime,
-        &ingested.manifest,
+    // Real generation (task 12.2), through the real compiled Qwen
+    // Component: run_production_qwen_generation builds its own Runtime
+    // internally (Runtime's execution-engine wiring stays
+    // magnetar-runtime-internal by design -- a guarded invariant, not an
+    // oversight), then drives loading, session creation, tokenization,
+    // graph production, execution-plan preparation, and the generation
+    // loop through the same primitives every other first-native caller
+    // uses. No Rust-synthesized fallback graph, no fixture manifest, no
+    // qwen-test identity anywhere in this path.
+    let outcome = magnetar_runtime::run_production_qwen_generation(
+        fixture,
         ingested.payload_source.as_ref(),
+        trust_store,
+        "hi",
     )
-    .expect("real production loading succeeds through the generic Inference API");
-
-    // Ready, not merely "loaded": lifecycle observed directly through the
-    // same public accessor an embedder would use (the lower-level
-    // generation-orchestration primitives -- prepared execution plans,
-    // the generation loop itself -- remain Runtime-internal; full
-    // generation through a non-canonical config is proven inside
-    // magnetar-runtime's own test suite, where those primitives are
-    // reachable).
-    let state = runtime
-        .model_instance(&instance)
-        .expect("instance is registered")
-        .lifecycle();
-    assert_eq!(
-        state,
-        magnetar_runtime::ModelInstanceLifecycleState::Ready,
-        "a production-loaded instance from a real ingested bundle is genuinely ready"
+    .expect(
+        "generation runs end to end: real config.json -> real tokenizer.json -> real \
+         Safetensors -> the real compiled Qwen Component -> real Provider dispatch",
     );
 
-    // The real tokenizer round-trips real text independently of Runtime
-    // loading -- proving the ingested tokenizer.json is genuinely usable,
-    // not merely structurally present.
-    let encoded = fixture
-        .tokenizer
-        .encode(EncodeInput {
-            add_special_tokens: false,
-            ..EncodeInput::new("hi")
-        })
-        .expect("the real tokenizer encodes real text");
-    assert!(!encoded.token_ids.is_empty());
-    let decoded = fixture
-        .tokenizer
-        .decode(DecodeInput {
-            token_ids: encoded.token_ids,
-            skip_special_tokens: true,
-            clean_up_tokenization_spaces: false,
-            streaming_state: None,
-        })
-        .expect("the real tokenizer decodes its own encoded output");
-    assert_eq!(decoded.text, "hi");
-
-    magnetar_runtime::unload_model_instance(
-        &mut runtime,
-        &instance,
-        magnetar_runtime::ModelInstanceUnloadPolicy::DrainActiveUse,
-    )
-    .expect("model instance unloads cleanly");
+    assert!(
+        !outcome.result.output.generated_token_ids.is_empty(),
+        "real production ingestion + loading + generation produced at least one token"
+    );
+    // Not asserting specific text (weights are synthetic/random) -- only
+    // that the full real-artifact pipeline produced decoded text, not a
+    // raw-token-id fallback string.
+    assert!(
+        !outcome.text.starts_with("[generated token ids:"),
+        "the real tokenizer decoded the generated tokens as real text: {}",
+        outcome.text
+    );
 }
 
 #[test]
