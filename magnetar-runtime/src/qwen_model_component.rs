@@ -705,6 +705,19 @@ pub fn qwen_validate_tensor_inventory(
     for expected in
         qwen_expected_tensor_names(config.architecture.layer_count, config.tied_embeddings)
     {
+        // `mlp.gate_up_proj` is `qwen_expected_tensor_names`'s fixture-
+        // generation superset (its own doc comment: "additional to, not a
+        // replacement for" standalone gate_proj/up_proj) -- the real
+        // compiled Qwen Component's graph never references it, only this
+        // crate's own Rust test-oracle graph does. Requiring it here would
+        // reject every real production checkpoint, which never carries a
+        // redundant fused tensor a real Hugging Face export never
+        // produces (`implement-production-qwen-model-loading` task group
+        // 10, found wiring real ingested data through this validation for
+        // the first time).
+        if expected.ends_with("mlp.gate_up_proj") {
+            continue;
+        }
         if !present.contains(expected.as_str()) {
             return Err(QwenComponentError::TensorInventoryMissing { tensor: expected });
         }
