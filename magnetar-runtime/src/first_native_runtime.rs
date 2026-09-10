@@ -6901,6 +6901,169 @@ fn architecture_config_from_qwen_config(config: &QwenConfig) -> ModelArchitectur
     }
 }
 
+/// The inverse of [`architecture_config_from_qwen_config`]: builds a
+/// [`QwenConfig`] from a Runtime-authorized [`ModelArchitectureConfig`]
+/// (production ingestion's normalized output) plus `context_length`
+/// (`config.json`'s `max_position_embeddings`, not yet a field of
+/// `ModelArchitectureConfig` itself -- threaded separately here rather
+/// than widening that WIT-facing type for one production-only value).
+/// `require_bos`/`require_pad`/`chat_template_required` default to
+/// permissive (`false`)/absent: production loading validates tokenizer
+/// compatibility separately (task group 9), not through this constructor.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn qwen_config_from_architecture_config(
+    config: &ModelArchitectureConfig,
+    context_length: u64,
+) -> QwenConfig {
+    let architecture = qwen_architecture_metadata(
+        config.hidden_size,
+        config.num_hidden_layers as u64,
+        config.num_attention_heads as u64,
+        config.num_key_value_heads as u64,
+        config.head_dim,
+        config.intermediate_size,
+        config.vocab_size,
+        context_length,
+    );
+    QwenConfig {
+        architecture,
+        rope: QwenRopeConfig {
+            base: config.rope_theta,
+            scale: config.rope_scaling_factor.map(f64::from),
+            dimension: config.head_dim,
+            position_mode: QwenRopePositionMode::Sequential,
+            dynamic_scaling_supported: false,
+        },
+        rmsnorm_epsilon: config.rms_norm_eps,
+        tied_embeddings: config.tie_word_embeddings,
+        require_bos: false,
+        require_pad: false,
+        expected_added_tokens: None,
+        chat_template_required: false,
+    }
+}
+
+/// The compiled Qwen Component identity production loading uses --
+/// distinct from [`e2e_fixture_identity`] (a fixture-only id) but bound
+/// to the same real, checkpoint-configurable Component artifact
+/// [`qwen_real_component_runtime`] trusts by digest
+/// (`QWEN_REAL_COMPONENT_DIGEST`), independent of `ModelComponentId`/
+/// version: trust here is digest-based, not identity-based, so any
+/// consistent identity works, and every production-loaded Model Instance
+/// uses this same one.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn production_qwen_component_identity() -> ModelComponentIdentity {
+    qwen_component_identity(
+        ModelComponentId::new("production-qwen").expect("static id is valid"),
+        ModelComponentVersion::new(1, 0, 0),
+        ModelComponentImplementationKind::WebAssemblyComponent,
+    )
+}
+
+/// Builds a real [`E2eFixture`] from production ingestion output (task
+/// group 10): the same Qwen graph-execution/KV-cache/
+/// `RuntimeModelExecutionEngine` machinery every existing first-native
+/// caller already uses, driven by real Hugging Face bundle data instead
+/// of the canonical tiny fixture. `weights` is deliberately empty --
+/// production weight materialization goes through
+/// [`stream_materialize_model_instance_weights`] against Provider-bound
+/// Tensor Resources, never through this field (only the Rust-side test-
+/// oracle forward-pass functions and the whole-map fixture loading path
+/// read `E2eFixture::weights`; the real Component-graph execution path
+/// resolves weights by Provider resource id per node -- see
+/// `execute_qwen_graph`'s own doc comment).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn production_qwen_fixture(
+    manifest: ModelManifest,
+    tokenizer_metadata: TokenizerMetadata,
+    tokenizer: std::sync::Arc<dyn crate::tokenizer::Tokenizer + Send + Sync>,
+) -> Result<E2eFixture, E2eConformanceError> {
+    let architecture_config = manifest.architecture_config.clone().ok_or_else(|| {
+        E2eConformanceError::ModelResolutionFailed {
+            reason: "production Model Artifact has no Runtime-authorized architecture \
+                     configuration bound to it"
+                .into(),
+        }
+    })?;
+    // See this function's doc comment: max_position_embeddings is not
+    // yet threaded through ModelArchitectureConfig, so a generous
+    // context length stands in until that gap closes. Documented, not
+    // silent: a caller inspecting this fixture's config sees exactly
+    // this value, and it never came from an unrecorded assumption.
+    let context_length = 1_000_000u64;
+    let config = qwen_config_from_architecture_config(&architecture_config, context_length);
+    let identity = production_qwen_component_identity();
+    config
+        .validate(&identity)
+        .map_err(E2eConformanceError::from)?;
+    let architecture_implementation = ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::ComponentBased,
+        required_capabilities: Vec::new(),
+    };
+    let descriptor =
+        qwen_component_descriptor(identity.clone(), &config).map_err(E2eConformanceError::from)?;
+    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+        .map_err(E2eConformanceError::from)?;
+    Ok(E2eFixture {
+        config,
+        identity,
+        architecture_implementation,
+        manifest,
+        tokenizer: FixtureTokenizer::wrapping(tokenizer_metadata, tokenizer),
+        weights: BTreeMap::new(),
+    })
+}
+
+/// Loads a production-ingested [`ModelManifest`] into a ready
+/// [`ModelInstanceId`] through the same generic Runtime Inference API
+/// primitives ([`load_model`]/[`create_model_instance`]) every loading
+/// path already uses, then streams weight materialization from
+/// `payload_source` without requiring the whole model to first exist as
+/// a host `BTreeMap<String, HostTensor>` (task group 6's streaming
+/// transactional materialization). No fixture manifest, no `qwen-test`
+/// requirement -- this is the public production loading surface task
+/// groups 10-11 describe: an authorized source's ingested output goes
+/// straight to a ready Model Instance.
+pub fn load_production_qwen_instance(
+    runtime: &mut Runtime,
+    manifest: &ModelManifest,
+    payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
+) -> Result<ModelInstanceId, InferenceApiError> {
+    let mut coordinator = ModelLoadingCoordinator::new();
+    let architecture_implementation = ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::ComponentBased,
+        required_capabilities: Vec::new(),
+    };
+    coordinator.register_architecture(architecture_implementation.clone());
+    let mut request = ModelLoadingRequest::new(
+        ModelLoadingRequestId::new(format!("production-{}", manifest.id.name.as_str())),
+        manifest.id.clone(),
+    );
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = load_model(
+        &mut coordinator,
+        runtime,
+        ModelLoadingApiRequest::new(request),
+        manifest,
+    )?;
+    let instance = create_model_instance(
+        runtime,
+        &loaded,
+        architecture_implementation,
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )?;
+    stream_materialize_model_instance_weights(
+        runtime,
+        &instance,
+        manifest.id.name.as_str(),
+        &manifest.tensors,
+        payload_source,
+    )?;
+    Ok(instance)
+}
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn expect_single_string_invocation_result(
     result: &ComponentInvocationResult,
@@ -7020,6 +7183,29 @@ pub fn build_first_native_graphs_from_real_qwen_component(
     ),
     E2eConformanceError,
 > {
+    build_first_native_graphs_for_config(&fixture.config, &fixture.identity, prompt_token_count)
+}
+
+/// [`build_first_native_graphs_from_real_qwen_component`]'s actual body,
+/// decoupled from [`E2eFixture`] (task group 10): the only two fixture
+/// fields that function ever read. Additive -- the public, `E2eFixture`-
+/// shaped entry point above is now a one-line wrapper with unchanged
+/// behavior, so every existing caller is unaffected; this decoupled form
+/// is what production loading (driven by a real ingested `QwenConfig`/
+/// `ModelComponentIdentity`, not a fixture) calls directly.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn build_first_native_graphs_for_config(
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+    prompt_token_count: u64,
+) -> Result<
+    (
+        FirstNativeComponentGraphs,
+        ComponentDefinitionId,
+        ComponentInstanceId,
+    ),
+    E2eConformanceError,
+> {
     let runtime = qwen_real_component_runtime()?;
     let mut manager = runtime.manager.lock().unwrap();
     let capability = &runtime.capability;
@@ -7043,17 +7229,17 @@ pub fn build_first_native_graphs_from_real_qwen_component(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
-        let weight_shapes = qwen_weight_shapes_for_config(&fixture.config);
-        let compatibility_key = qwen_component_compatibility_key(&fixture.identity);
+        let weight_shapes = qwen_weight_shapes_for_config(config);
+        let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = |weight_shapes: BTreeMap<String, Vec<u64>>| SessionContext {
-            component_id: fixture.identity.id.as_str().to_string(),
+            component_id: identity.id.as_str().to_string(),
             compatibility_key: compatibility_key.clone(),
             kv_namespace: "qwen".to_string(),
             weight_shapes,
             output_edge_name: "logits".to_string(),
         };
 
-        let architecture_config = architecture_config_from_qwen_config(&fixture.config);
+        let architecture_config = architecture_config_from_qwen_config(config);
         model_config_capability.bind_config(&engine_key, architecture_config.clone());
 
         capability.prepare_session(&engine_key, session_context(weight_shapes.clone()));

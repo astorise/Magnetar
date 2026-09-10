@@ -12,7 +12,7 @@ use crate::{
     MemoryAllocationRequest, MemoryManager, MemoryPlacement, ModelArtifactKind, ModelDigest,
     ModelManifest,
 };
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
 
 pub type TokenId = u32;
 
@@ -724,14 +724,51 @@ impl<T: Tokenizer> RuntimeTokenizer<T> {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Despite the name (kept to avoid touching the ~100 existing call sites
+/// that construct one via [`Self::new`]), this is also the vehicle a
+/// production caller uses to plug a real tokenizer implementation (e.g.
+/// `loaders/huggingface`'s `HuggingFaceTokenizer`) into every Qwen
+/// graph-execution/KV-cache/`RuntimeModelExecutionEngine` code path that
+/// already accepts `E2eFixture`'s single `tokenizer: FixtureTokenizer`
+/// field slot -- see [`Self::wrapping`]
+/// (`implement-production-qwen-model-loading` task group 10). A fixture
+/// built via [`Self::new`] behaves exactly as before: this is additive,
+/// not a behavior change for any existing caller.
+#[derive(Clone)]
 pub struct FixtureTokenizer {
     metadata: TokenizerMetadata,
+    delegate: Option<Arc<dyn Tokenizer + Send + Sync>>,
+}
+
+impl fmt::Debug for FixtureTokenizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FixtureTokenizer")
+            .field("metadata", &self.metadata)
+            .field("delegate", &self.delegate.is_some())
+            .finish()
+    }
 }
 
 impl FixtureTokenizer {
     pub fn new(metadata: TokenizerMetadata) -> Self {
-        Self { metadata }
+        Self {
+            metadata,
+            delegate: None,
+        }
+    }
+
+    /// Wraps a real [`Tokenizer`] implementation: every `encode`/`decode`
+    /// call delegates to it, while `metadata()` still returns `metadata`
+    /// (usually `delegate.metadata().clone()`, supplied separately so the
+    /// caller is not forced to re-derive it on every call).
+    pub fn wrapping(
+        metadata: TokenizerMetadata,
+        delegate: Arc<dyn Tokenizer + Send + Sync>,
+    ) -> Self {
+        Self {
+            metadata,
+            delegate: Some(delegate),
+        }
     }
 }
 
@@ -741,6 +778,9 @@ impl Tokenizer for FixtureTokenizer {
     }
 
     fn encode(&self, input: EncodeInput) -> Result<EncodeOutput, TokenizerError> {
+        if let Some(delegate) = &self.delegate {
+            return delegate.encode(input);
+        }
         if input.return_offsets && !self.metadata.supports_offsets {
             return Err(TokenizerError::OffsetsUnsupported);
         }
@@ -828,6 +868,9 @@ impl Tokenizer for FixtureTokenizer {
     }
 
     fn decode(&self, input: DecodeInput) -> Result<DecodeOutput, TokenizerError> {
+        if let Some(delegate) = &self.delegate {
+            return delegate.decode(input);
+        }
         for id in &input.token_ids {
             if !self.metadata.token_id_range.contains(*id) {
                 return Err(TokenizerError::InvalidTokenId { token_id: *id });

@@ -3952,3 +3952,235 @@ fn e2e_chat_sessions_are_isolated_from_each_other() {
     check_chat_sessions_are_isolated_from_each_other()
         .expect("two chat sessions for the same model are isolated from each other");
 }
+
+/// In-memory [`ProductionArtifactPayloadSource`] test double: looks up
+/// bytes by tensor name only (offset/length are not cross-checked against
+/// a real file layout, since there is no file here) -- proves
+/// `load_production_qwen_instance` genuinely reads weight bytes through
+/// the payload-source contract, not a fixture-only shortcut.
+struct ProductionIntegrationPayloadSource {
+    bytes_by_name: BTreeMap<String, Vec<u8>>,
+}
+
+impl crate::production_model_ingestion::ProductionArtifactPayloadSource
+    for ProductionIntegrationPayloadSource
+{
+    fn read_payload(
+        &self,
+        range: &crate::production_model_ingestion::ProductionPayloadRange,
+    ) -> Result<Vec<u8>, crate::production_model_ingestion::ProductionIngestionError> {
+        self.bytes_by_name
+            .get(&range.identity)
+            .cloned()
+            .ok_or_else(|| {
+                crate::production_model_ingestion::ProductionIngestionError::PayloadOutOfBounds {
+                    identity: range.identity.clone(),
+                }
+            })
+    }
+}
+
+/// Task groups 10-11 end to end: a `QwenConfig` deliberately different
+/// from the canonical E2E fixture (hidden_size=8, attention_head_count=4,
+/// kv_head_count=2 -- genuinely GQA-shaped, unlike the fixture's 2/2) is
+/// wrapped as a production-shaped `ModelManifest` (no fixture manifest
+/// constructor, real `architecture_config`, a real payload source keyed
+/// only by canonical tensor name/bytes) and driven through
+/// `load_production_qwen_instance` -> `production_qwen_fixture` ->
+/// the same real Qwen Component graph production, generic Runtime
+/// Inference API, and generation loop every other first-native caller
+/// uses -- with no `qwen-test` identity or fixture manifest anywhere in
+/// this path.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
+    // vocab_size=258 (not 64): the delegate tokenizer below is the real
+    // byte-level FixtureTokenizer (each byte encodes to `byte + 1`, up to
+    // 256, plus BOS/EOS), so the vocabulary must cover that range
+    // regardless of this test's otherwise-deliberately-non-canonical
+    // dimensions.
+    let architecture = qwen_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 1_000_000);
+    let config = QwenConfig {
+        architecture,
+        rope: QwenRopeConfig {
+            base: 10_000.0,
+            scale: None,
+            dimension: 2,
+            position_mode: QwenRopePositionMode::Sequential,
+            dynamic_scaling_supported: false,
+        },
+        rmsnorm_epsilon: 1e-6,
+        tied_embeddings: false,
+        require_bos: false,
+        require_pad: false,
+        expected_added_tokens: None,
+        chat_template_required: false,
+    };
+
+    let weights = e2e_fixture_weights(&config).expect("synthetic weights build");
+    let tensors = e2e_fixture_weight_inventory(&config).expect("tensor inventory builds");
+    let mut bytes_by_name = BTreeMap::new();
+    for tensor in &tensors {
+        let host_tensor = weights
+            .get(&tensor.name)
+            .expect("a weight exists for every inventory tensor");
+        let mut bytes = Vec::with_capacity(host_tensor.data.len() * 4);
+        for value in &host_tensor.data {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes_by_name.insert(tensor.name.clone(), bytes);
+    }
+    let payload_source = ProductionIntegrationPayloadSource { bytes_by_name };
+
+    let digest = ModelDigest::parse(format!("sha256:{}", "7".repeat(64))).unwrap();
+    let id = ModelArtifactId::new(
+        ModelArtifactKind::ModelBundle,
+        ModelName::new("production-integration-test").unwrap(),
+        ModelRevision::new("r1").unwrap(),
+        digest,
+    );
+    let mut parts = BTreeMap::new();
+    parts.insert(
+        "weights".to_string(),
+        ModelArtifactPart {
+            name: "weights".to_string(),
+            kind: ModelArtifactKind::ModelWeights,
+            digest: ModelDigest::parse(format!("sha256:{}", "8".repeat(64))).unwrap(),
+            size_bytes: None,
+            required: true,
+        },
+    );
+    parts.insert(
+        "config".to_string(),
+        ModelArtifactPart {
+            name: "config".to_string(),
+            kind: ModelArtifactKind::ModelConfig,
+            digest: ModelDigest::parse(format!("sha256:{}", "9".repeat(64))).unwrap(),
+            size_bytes: None,
+            required: true,
+        },
+    );
+    let manifest = ModelManifest {
+        schema_version: crate::MODEL_ARTIFACT_SCHEMA_VERSION,
+        id,
+        architecture: ModelArchitecture::new("qwen", "production-integration-test"),
+        parts,
+        storage_dtype: Some(ModelDType::F32),
+        compute_dtype: None,
+        supported_compute_dtypes: BTreeSet::from([ModelDType::F32]),
+        tensors,
+        tokenizer: None,
+        tokenizer_config: None,
+        chat_template: None,
+        prompt_template: None,
+        generation: None,
+        quantization: None,
+        shards: Vec::new(),
+        runtime_features: BTreeSet::new(),
+        memory_features: BTreeSet::new(),
+        provider_capabilities: Vec::new(),
+        component: None,
+        license: None,
+        provenance: None,
+        signatures: Vec::new(),
+        source: None,
+        architecture_config: Some(architecture_config_from_qwen_config(&config)),
+    };
+
+    let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
+    let delegate_tokenizer: std::sync::Arc<dyn crate::tokenizer::Tokenizer + Send + Sync> =
+        std::sync::Arc::new(e2e_fixture_tokenizer().unwrap());
+    let fixture = production_qwen_fixture(manifest.clone(), tokenizer_metadata, delegate_tokenizer)
+        .expect("production fixture builds against a genuinely different config than the canonical fixture");
+    assert_eq!(fixture.config.architecture.attention_head_count, 4);
+    assert_eq!(fixture.config.architecture.kv_head_count, 2);
+
+    let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+    let instance = load_production_qwen_instance(&mut runtime, &manifest, &payload_source).expect(
+        "production loading succeeds through the generic Inference API, not a fixture loader",
+    );
+    require_ready_first_native_instance(&runtime, &instance)
+        .expect("a production-loaded instance is genuinely ready");
+
+    let session_request = SessionCreationRequest {
+        model: GenerationModelReference::ModelInstance(instance.clone()),
+        tokenizer: generation_tokenizer_reference(&fixture),
+        generation_defaults: GenerationParameters::greedy(),
+        policy: SessionPolicy::default(),
+        memory: SessionMemoryBudget::default(),
+        allowed_capabilities: BTreeSet::new(),
+        correlation_id: None,
+        created_at_millis: 0,
+    };
+    let session = create_inference_session(&mut runtime, session_request).expect("session creates");
+
+    let tokenized = tokenize_prompt_input(
+        &fixture.tokenizer,
+        TokenizationRequest::new(PromptInput::PlainText("hi".into())),
+        None,
+    )
+    .expect("tokenization succeeds");
+
+    let (component_graphs, _definition, _component_instance) =
+        build_first_native_graphs_from_real_qwen_component(
+            &fixture,
+            tokenized.token_ids.len() as u64,
+        )
+        .expect("the real Qwen Component produces graphs for this non-canonical config");
+
+    let mut prepared_plans = prepare_first_native_execution_plans(
+        &runtime,
+        &instance,
+        component_graphs,
+        tokenized.token_ids.len() as u64,
+    )
+    .expect("execution plans prepare");
+
+    let mut observer = InferenceApiObserver::new();
+    let request = build_generation_request(
+        GenerationRequestId::new("production-integration-test").unwrap(),
+        Some(session.clone()),
+        GenerationModelReference::ModelInstance(instance.clone()),
+        generation_tokenizer_reference(&fixture),
+        tokenized,
+        4,
+        GenerationParameters::greedy(),
+        StopConditions {
+            eos: EosPolicy {
+                eos_token_ids: vec![E2E_FIXTURE_EOS_TOKEN],
+                ..EosPolicy::default()
+            },
+            ..StopConditions::default()
+        },
+        StreamingMode::TokenIds,
+    );
+    let request = prepare_generation(&runtime, request).expect("generation request validates");
+
+    let mut execution_plans = RuntimeGenerationExecutionPlans {
+        prefill: &mut prepared_plans.prefill,
+        decode: &mut prepared_plans.decode,
+    };
+    let generation_result = run_generation_loop_with_execution_plans(
+        &mut runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated_so_far| false,
+        &mut observer,
+        &mut execution_plans,
+    )
+    .expect("generation runs end to end through the real Component graph and Provider dispatch");
+
+    assert!(
+        !generation_result.output.generated_token_ids.is_empty(),
+        "production loading + generation produced at least one token"
+    );
+
+    close_inference_session(&mut runtime, &session).expect("session closes");
+    unload_model_instance(
+        &mut runtime,
+        &instance,
+        ModelInstanceUnloadPolicy::DrainActiveUse,
+    )
+    .expect("model instance unloads cleanly, no leaked resources");
+}

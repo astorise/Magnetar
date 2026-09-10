@@ -85,9 +85,9 @@
 
 ## 10. Generic first-native loaded-model execution
 
-- [ ] 10.1 Add/complete a caller-facing path where generation targets a ready `ModelInstanceId` produced by production loading.
-- [ ] 10.2 Remove any production condition that requires `model_ref == "qwen-test"`.
-- [ ] 10.3 Keep `qwen-test` as fixture/demo/conformance only.
+- [x] 10.1 Add/complete a caller-facing path where generation targets a ready `ModelInstanceId` produced by production loading.
+- [x] 10.2 Remove any production condition that requires `model_ref == "qwen-test"`.
+- [x] 10.3 Keep `qwen-test` as fixture/demo/conformance only.
 - [ ] 10.4 Remove `fixture_model_manifest` / hand-built tensor inventory from local production model loading.
 - [ ] 10.5 Ensure tied `lm_head` derivation remains a load-time operation and is driven by real config/tensor metadata.
 - [ ] 10.6 Verify Provider/Device selection remains Runtime-owned and the same loaded artifact can target Reference CPU or CUDA according to policy/capabilities.
