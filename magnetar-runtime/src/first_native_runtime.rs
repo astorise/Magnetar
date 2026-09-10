@@ -5496,7 +5496,16 @@ fn build_runtime_with_model_execution_engine_and_forced_token(
     runtime
 }
 
-fn register_reference_cpu_prepared_kernels(runtime: &mut Runtime) {
+/// Registers Reference CPU's `PreparedKernel` coverage for every Operator
+/// the Qwen graph (Rust-synthesized or real-Component-produced) can emit,
+/// so [`prepare_first_native_execution_plans`] finds a `PreparedKernel`
+/// for every node instead of failing with `KernelCoverageMissing`. Public
+/// alongside the other generation-preparation primitives (task group 12):
+/// an embedder building its own `Runtime` for a production-loaded
+/// instance needs this same registration step, exactly as
+/// `build_runtime_with_model_execution_engine` (this crate's own
+/// internal helper) already performs it.
+pub fn register_reference_cpu_prepared_kernels(runtime: &mut Runtime) {
     let mut prepared_ids = PreparedKernelIdAllocator::default();
     for advertisement in reference_cpu_kernel_advertisements() {
         let id = prepared_ids.allocate();
@@ -6212,7 +6221,7 @@ pub fn materialize_model_instance_weights(
 /// not outlive this loop body's iteration), so peak transient host staging
 /// stays bounded by one tensor's size, independent of total model size.
 ///
-/// Reuses the same [`WeightMaterializationTransaction`] commit/rollback
+/// Reuses the same `WeightMaterializationTransaction` commit/rollback
 /// semantics as the whole-map entry point: `commit` publishes bindings/
 /// readiness only after every tensor in `tensors` stages successfully, and
 /// any failure releases every Provider-side tensor, Memory Manager
@@ -6568,7 +6577,14 @@ impl WeightMaterializationTransaction {
     }
 }
 
-fn require_ready_first_native_instance<'a>(
+/// Confirms `instance` is genuinely ready to generate *right now* (not
+/// merely inferred from a past check). Public for the same reason
+/// [`prepare_first_native_execution_plans`] is
+/// (`implement-production-qwen-model-loading` task group 12): an embedder
+/// driving a production-loaded instance through the real generation loop
+/// needs this same readiness confirmation before every step, exactly as
+/// every in-crate caller already does.
+pub fn require_ready_first_native_instance<'a>(
     runtime: &'a Runtime,
     instance: &ModelInstanceId,
 ) -> Result<&'a ModelInstance, InferenceApiError> {
@@ -6587,11 +6603,15 @@ fn require_ready_first_native_instance<'a>(
     Ok(model_instance)
 }
 
-struct FirstNativePreparedPlans {
-    prefill: PreparedExecutionPlan,
-    prefill_node_count: usize,
-    decode: PreparedExecutionPlan,
-    decode_node_count: usize,
+/// The prepared prefill/decode plans [`prepare_first_native_execution_plans`]
+/// publishes. Public alongside it (task group 12) so an embedder can hold
+/// `&mut prefill`/`&mut decode` to build a
+/// [`crate::inference_api::RuntimeGenerationExecutionPlans`].
+pub struct FirstNativePreparedPlans {
+    pub prefill: PreparedExecutionPlan,
+    pub prefill_node_count: usize,
+    pub decode: PreparedExecutionPlan,
+    pub decode_node_count: usize,
 }
 
 fn first_native_plan_context(phase: PreparedExecutionPhase, token_count: u64) -> PlanGuardContext {
@@ -7062,6 +7082,154 @@ pub fn load_production_qwen_instance(
         payload_source,
     )?;
     Ok(instance)
+}
+
+/// One-shot production generation (task group 12): authorized source's
+/// ingested manifest -> ready Model Instance -> real Component-produced
+/// graphs -> real Provider dispatch -> decoded output, in one call. Builds
+/// its own `Runtime` internally -- Runtime's execution-engine wiring is
+/// deliberately not exposed to external callers at all (`Runtime::
+/// builder().model_execution_engine` stays `pub(crate)`, a guarded
+/// invariant `first_native_implementation_cut.rs` checks explicitly), so
+/// this is the supported way an embedder actually drives generation for a
+/// production-loaded instance, mirroring [`run_first_native_generation`]'s
+/// own one-shot shape (fresh `Runtime`/session per call) but for real
+/// ingested data instead of the `qwen-test` fixture.
+///
+/// `fixture` is [`production_qwen_fixture`]'s output; `payload_source` is
+/// the same one the caller's ingestor produced; `trust_store` is the
+/// caller's own trust policy (Decision 2: this function grants no trust
+/// of its own -- an untrusted manifest fails inside `load_model` before
+/// any materialization, exactly like every other loading path).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn run_production_qwen_generation(
+    fixture: E2eFixture,
+    payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
+    trust_store: ModelTrustStore,
+    prompt: &str,
+) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
+            fixture: fixture.clone(),
+            kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            forced_token: None,
+        }))
+        .trust_store(trust_store)
+        .build()
+        .map_err(|error| InferenceApiError::InferenceApiUnavailable {
+            reason: error.to_string(),
+        })?;
+    register_reference_cpu_prepared_kernels(&mut runtime);
+
+    let instance = load_production_qwen_instance(&mut runtime, &fixture.manifest, payload_source)?;
+    require_ready_first_native_instance(&runtime, &instance)?;
+
+    let session_request = SessionCreationRequest {
+        model: GenerationModelReference::ModelInstance(instance.clone()),
+        tokenizer: generation_tokenizer_reference(&fixture),
+        generation_defaults: GenerationParameters::greedy(),
+        policy: SessionPolicy::default(),
+        memory: SessionMemoryBudget::default(),
+        allowed_capabilities: BTreeSet::new(),
+        correlation_id: None,
+        created_at_millis: 0,
+    };
+    let session = create_inference_session(&mut runtime, session_request)?;
+
+    let tokenized = tokenize_prompt_input(
+        &fixture.tokenizer,
+        TokenizationRequest::new(PromptInput::PlainText(prompt.into())),
+        None,
+    )?;
+    let mut observer = InferenceApiObserver::new();
+
+    let (component_graphs, _definition, _component_instance) =
+        build_first_native_graphs_from_real_qwen_component(
+            &fixture,
+            tokenized.token_ids.len() as u64,
+        )
+        .map_err(|error| InferenceApiError::GraphPlanningFailed {
+            reason: error.to_string(),
+        })?;
+    let mut prepared_plans = prepare_first_native_execution_plans(
+        &runtime,
+        &instance,
+        component_graphs,
+        tokenized.token_ids.len() as u64,
+    )
+    .map_err(|error| InferenceApiError::GraphPlanningFailed {
+        reason: error.to_string(),
+    })?;
+
+    let request = build_generation_request(
+        GenerationRequestId::new("production-generation")?,
+        Some(session.clone()),
+        GenerationModelReference::ModelInstance(instance.clone()),
+        generation_tokenizer_reference(&fixture),
+        tokenized,
+        fixture
+            .manifest
+            .generation
+            .as_ref()
+            .and_then(|defaults| defaults.max_tokens)
+            .unwrap_or(64) as usize,
+        GenerationParameters::greedy(),
+        StopConditions::default(),
+        StreamingMode::TokenIds,
+    );
+    let request = prepare_generation(&runtime, request)?;
+
+    let mut execution_plans = RuntimeGenerationExecutionPlans {
+        prefill: &mut prepared_plans.prefill,
+        decode: &mut prepared_plans.decode,
+    };
+    let generation_result = run_generation_loop_with_execution_plans(
+        &mut runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated_so_far| false,
+        &mut observer,
+        &mut execution_plans,
+    )?;
+
+    let decoded_text = decode_tokens_streaming(
+        &fixture.tokenizer,
+        StreamingDecodeRequest::new(generation_result.output.generated_token_ids.clone()),
+    )
+    .map(|decoded| decoded.text)
+    .unwrap_or_else(|_| {
+        let tokens = generation_result
+            .output
+            .generated_token_ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("[generated token ids: {tokens}]")
+    });
+    let generation_result = generation_result.with_decoded_text(decoded_text);
+
+    close_inference_session(&mut runtime, &session)?;
+    unload_model_instance(
+        &mut runtime,
+        &instance,
+        ModelInstanceUnloadPolicy::DrainActiveUse,
+    )?;
+
+    let text = generation_result.decoded_text.clone().ok_or_else(|| {
+        InferenceApiError::GenerationFailed {
+            reason: "production generation produced no decoded text".into(),
+        }
+    })?;
+    Ok(FirstNativeFixtureGeneration {
+        text,
+        result: generation_result,
+        observer,
+    })
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -7841,7 +8009,15 @@ fn merge_kernel_managed_kv_requirement(
     metadata.memory_classes.insert(resource.memory_class);
 }
 
-fn prepare_first_native_execution_plans(
+/// Builds real published prepared execution plans for `instance` at
+/// `prompt_token_count` against the Reference CPU Provider. Public
+/// (task group 12): the one supported way to prepare a production-loaded
+/// Model Instance's plans before driving
+/// [`crate::inference_api::run_generation_loop_with_execution_plans`].
+/// Reference-CPU-only; see
+/// [`prepare_first_native_execution_plans_for_provider`] for an arbitrary
+/// registered Provider (e.g. CUDA).
+pub fn prepare_first_native_execution_plans(
     runtime: &Runtime,
     instance: &ModelInstanceId,
     graphs: FirstNativeComponentGraphs,
@@ -7870,7 +8046,7 @@ fn prepare_first_native_execution_plans(
 /// Reference-CPU Provider type: `provider` arrives as a plain
 /// `ProviderBinding` (a name), resolved against whatever the caller
 /// actually registered.
-fn prepare_first_native_execution_plans_for_provider(
+pub fn prepare_first_native_execution_plans_for_provider(
     runtime: &Runtime,
     instance: &ModelInstanceId,
     graphs: FirstNativeComponentGraphs,

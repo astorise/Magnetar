@@ -103,7 +103,7 @@
 ## 12. Production E2E and release gates
 
 - [x] 12.1 Add a tiny deterministic **production-layout** Qwen bundle for per-PR tests: real `config.json`, real tokenizer files, real Safetensors parser input, optional real shard index. It may be small, but it must enter through the production ingestor; no fixture manifest/inventory constructor is allowed.
-- [ ] 12.2 E2E Reference CPU: authorized bundle -> ingestion -> trust/integrity -> configurable Component -> ModelInstance -> materialization -> prefill/decode -> output.
+- [x] 12.2 E2E Reference CPU: authorized bundle -> ingestion -> trust/integrity -> configurable Component -> ModelInstance -> materialization -> prefill/decode -> output.
 - [ ] 12.3 E2E CUDA on real hardware through the same normalized artifact and Component; assert CUDA Provider/Device residency and no silent Reference CPU fallback.
 - [ ] 12.4 Add a real public Qwen-compatible checkpoint smoke test pinned by revision/digest (manual/nightly/hardware profile acceptable if size prevents per-PR execution).
 - [ ] 12.5 Compare CPU/CUDA logits or deterministic output within a documented tolerance.

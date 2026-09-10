@@ -1193,9 +1193,15 @@ pub(crate) enum RuntimeKvCacheCommit {
     DecodeAppended { cache: KvCacheId, tokens: u32 },
 }
 
-pub(crate) struct RuntimeGenerationExecutionPlans<'a> {
-    pub(crate) prefill: &'a mut PreparedExecutionPlan,
-    pub(crate) decode: &'a mut PreparedExecutionPlan,
+/// The prefill/decode [`PreparedExecutionPlan`] pair a generation step
+/// dispatches through. Public (`implement-production-qwen-model-loading`
+/// task group 12): an embedder driving a production-loaded Model Instance
+/// through the real first-native generation loop needs to hold these the
+/// same way every in-crate caller already does, via
+/// [`crate::first_native_runtime::prepare_first_native_execution_plans`].
+pub struct RuntimeGenerationExecutionPlans<'a> {
+    pub prefill: &'a mut PreparedExecutionPlan,
+    pub decode: &'a mut PreparedExecutionPlan,
 }
 
 fn runtime_generation_plan_error(error: PreparedExecutionPlanError) -> InferenceApiError {
@@ -1417,7 +1423,13 @@ pub fn run_generation_loop(
     )
 }
 
-pub(crate) fn run_generation_loop_with_execution_plans(
+/// Runs one generation request through the real first-native execution
+/// loop, dispatching through `execution_plans`' already-published
+/// [`RuntimeGenerationExecutionPlans`] rather than reselecting Kernels ad
+/// hoc. Public for the same reason [`RuntimeGenerationExecutionPlans`] is
+/// (task group 12): the one supported way to drive generation for a
+/// production-loaded Model Instance once its plans are prepared.
+pub fn run_generation_loop_with_execution_plans(
     runtime: &mut Runtime,
     request: &GenerationRequest,
     sampling_policy: SamplingPolicy,
