@@ -449,6 +449,31 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --manifest-path magnetar-cli/Cargo.toml --no-deps
+      # `implement-production-qwen-model-loading` task 12.8: production
+      # loading/generation SHALL NOT call `fixture_model_manifest`, a
+      # fixture tensor inventory builder, or require the literal
+      # `qwen-test` model reference. `loaders/huggingface` (the real
+      # production ingestor) never depends on anything carrying fixture
+      # logic in the first place, so its source containing neither string
+      # anywhere is a direct, robust proof; `magnetar-cli`'s local-file
+      # loading command (the one caller this change moved off the fixture
+      # manifest path, task 10.4) is checked the same way, isolated to
+      # just that command's own function body so this does not also flag
+      # `cmd_model_load`'s deliberately-still-fixture-backed `<model-ref>`
+      # path (task 10.3: `qwen-test` stays fixture/demo/conformance only).
+      - name: Source guard -- production loading never uses the fixture manifest path
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -rlE 'fixture_model_manifest|"qwen-test"' loaders/huggingface/src/; then
+            echo "::error::loaders/huggingface (the production ingestor) must never reference fixture_model_manifest or the literal qwen-test model reference"
+            exit 1
+          fi
+          local_file_fn="$(awk '/^fn cmd_model_load_local_file/,/^}/' magnetar-cli/src/commands.rs)"
+          if grep -qE 'fixture_model_manifest|"qwen-test"' <<< "$local_file_fn"; then
+            echo "::error file=magnetar-cli/src/commands.rs::cmd_model_load_local_file must not call fixture_model_manifest or require the literal qwen-test model reference"
+            exit 1
+          fi
       # `externalize-runtime-extension-modules`'s "Model Components,
       # Providers, and Formats Are Externalized" requirement: the Core
       # (magnetar-runtime) SHALL have zero compile-time dependency on any
