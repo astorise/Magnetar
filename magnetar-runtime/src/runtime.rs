@@ -630,7 +630,31 @@ impl Runtime {
         }
         let definition =
             ModelInstanceDefinition::from_loaded_context(loaded, architecture, affinity);
-        self.model_instances.create(definition)
+        let instance = self.model_instances.create(definition)?;
+        // `loaded.allocation` is the whole-artifact-level Memory Manager
+        // reservation `ModelLoadingCoordinator::load` admitted, proving
+        // residency was feasible before this instance existed --
+        // `ModelInstances::create` deliberately resets every newly created
+        // instance's `resource_bindings` to empty regardless of what
+        // `definition` carried (a security fix against cross-instance
+        // resource aliasing -- see its own doc comment), so this
+        // allocation is never transferred into the instance's own
+        // tracking and `unload_model_instance` (which only releases what
+        // an instance's `resource_bindings.memory_allocations` names)
+        // would otherwise never release it. Its bookkeeping purpose is
+        // already fully superseded the moment a real instance exists:
+        // `from_loaded_context` copies `plan.expected_resident_bytes`
+        // into the instance's own `usage.residency_bytes`, and the actual
+        // per-tensor allocations `WeightMaterializationTransaction`
+        // admits later are the ones with real per-tensor granularity.
+        // Releasing it here, not leaving it to outlive every instance
+        // built from this load, closes a real, previously-unverified gap
+        // found by `implement-production-qwen-model-loading` task 12.6's
+        // allocation-count-before/after-unload check.
+        if let Some(allocation) = &loaded.allocation {
+            let _ = self.memory.release(allocation.id);
+        }
+        Ok(instance)
     }
     pub fn model_instance(
         &self,

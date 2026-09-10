@@ -57,7 +57,7 @@
 
 - [x] 7.1 Evolve `magnetar:model-component-graph` contract (recommended 1.1 if compatible, otherwise 2.0) so the Component can query Runtime-authorized normalized model configuration.
 - [x] 7.2 Expose only architecture/config values needed by model semantics; do not expose raw JSON, arbitrary file paths, weight bytes, Provider/Device identities, native handles, or unrestricted annotation maps.
-- [ ] 7.3 Extend portable tensor descriptor support beyond the current hard-coded contiguous-F32 assumption where required by production graph validation.
+- [x] 7.3 Extend portable tensor descriptor support beyond the current hard-coded contiguous-F32 assumption where required by production graph validation.
 - [x] 7.4 Preserve strict first-native rule: production graphs still originate from the Component through graph-builder, never Runtime-side Qwen synthesis.
 - [x] 7.5 Add WIT compatibility/version-mismatch tests and `wasm-tools component wit` validation.
 - [x] 7.6 Update Runtime Component host adapters for the new config Capability with fail-closed authorization and structured errors.
@@ -107,7 +107,7 @@
 - [x] 12.3 E2E CUDA on real hardware through the same normalized artifact and Component; assert CUDA Provider/Device residency and no silent Reference CPU fallback.
 - [ ] 12.4 Add a real public Qwen-compatible checkpoint smoke test pinned by revision/digest (manual/nightly/hardware profile acceptable if size prevents per-PR execution).
 - [ ] 12.5 Compare CPU/CUDA logits or deterministic output within a documented tolerance.
-- [ ] 12.6 Assert unload/failure leaves no ModelInstance weight allocation or Provider tensor leak.
+- [x] 12.6 Assert unload/failure leaves no ModelInstance weight allocation or Provider tensor leak.
 - [ ] 12.7 Make GPU CI fail if the required hardware test is skipped or selects `0 tests`.
 - [x] 12.8 Add source guards proving production loading/generation does not call `fixture_model_manifest`, fixture tensor inventory builders, or require literal `qwen-test`.
 - [ ] 12.9 Run `cargo test`/clippy/fmt/doc/wasm checks for Runtime and every affected external module.

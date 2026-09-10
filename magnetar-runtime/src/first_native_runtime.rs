@@ -5923,7 +5923,20 @@ fn check_weight_materialization_failure_never_reaches_ready(
         .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
         .config(RuntimeConfig {
             memory: MemoryManagerConfig {
-                max_runtime_bytes: Some(1 << 13),
+                // Generous: `create_model_instance` now releases the
+                // whole-artifact-level planning allocation `load_model`
+                // admits as soon as a real Model Instance exists to track
+                // residency through its own `usage.residency_bytes`
+                // instead (task 12.6's allocation-count-before/after-
+                // unload fix), and the fixture's per-tensor weight total
+                // exactly equals that planning size (both derived from the
+                // same manifest) -- leaving no numeric gap between "tight
+                // enough to still admit the one-time planning allocation"
+                // and "tight enough to fail partway through per-tensor
+                // admission". A manually admitted spacer allocation below,
+                // sized against this same generous budget, recreates that
+                // gap explicitly and controllably instead.
+                max_runtime_bytes: Some(5072 * 3),
                 allow_pending_allocations: false,
                 ..MemoryManagerConfig::default()
             },
@@ -5957,6 +5970,29 @@ fn check_weight_materialization_failure_never_reaches_ready(
         fixture.architecture_implementation.clone(),
         ResourceAffinity::new(FallbackClass::Transparent),
     )?;
+
+    // Explicit spacer: consumes most of the generous budget above,
+    // leaving enough room for some but not all of the fixture's per-
+    // tensor weight allocations (which sum to exactly the same bytes the
+    // now-released planning allocation used) -- a controlled way to
+    // recreate a tight-budget failure partway through materialization,
+    // now that the planning allocation itself no longer stays resident to
+    // do so implicitly.
+    let spacer = runtime
+        .memory_mut()
+        .allocate(
+            MemoryAllocationRequest::new(
+                MemoryAllocationClass::ModelArtifact,
+                (5072 * 3) - 2500,
+                MemoryPlacement::HostOrdinary,
+                MemoryAllocationOwner::InferenceArtifact("spacer".into()),
+            )
+            .with_alignment(64),
+        )
+        .map_err(|error| E2eConformanceError::SuiteUnavailable {
+            reason: format!("test spacer allocation failed to set up: {error}"),
+        })?;
+    let _ = spacer;
 
     // Confirm the instance is genuinely NOT Ready immediately after
     // creation -- the corrected behavior, replacing what used to be an
