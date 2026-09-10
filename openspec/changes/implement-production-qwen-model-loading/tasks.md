@@ -4,34 +4,34 @@
 - [x] 1.2 Define structured ingestion/payload errors covering unsupported format, unauthorized source, missing part, malformed metadata, payload out-of-bounds, payload unavailable, integrity mismatch, and implementation unavailable.
 - [x] 1.3 Ensure ingestion success never grants trust; Runtime trust evaluation remains mandatory before materialization.
 - [x] 1.4 Add a static CI guard proving `magnetar-runtime` has no compile-time dependency on Hugging Face/Safetensors concrete loader crates.
-- [ ] 1.5 Add/modify `project-architecture` documentation so concrete production Model Artifact ingestors are externalized and pinned, analogous to Formats/Providers.
-- [ ] 1.6 Create/pin the first external production ingestor module (recommended `loaders/huggingface` / `astorise/Magnetar-loader-HuggingFace`) or document an equivalently external module layout before implementation begins.
+- [x] 1.5 Add/modify `project-architecture` documentation so concrete production Model Artifact ingestors are externalized and pinned, analogous to Formats/Providers.
+- [x] 1.6 Create/pin the first external production ingestor module (recommended `loaders/huggingface` / `astorise/Magnetar-loader-HuggingFace`) or document an equivalently external module layout before implementation begins.
 
 ## 2. Authorized Hugging Face bundle discovery
 
-- [ ] 2.1 Accept an already-authorized local/client-provided bundle source; do not accept arbitrary raw filesystem traversal from a model reference.
-- [ ] 2.2 Discover `config.json`, tokenizer/config/generation files, chat-template source, and either single-file or indexed-sharded Safetensors inside the authorized bundle boundary.
-- [ ] 2.3 Reject path traversal and bundle escapes; define and test symlink policy explicitly.
-- [ ] 2.4 Normalize source identity/provenance without treating local/HuggingFace/Tachyon source kind as trust.
-- [ ] 2.5 Add tests for missing required config, missing weights, duplicate candidate files, unauthorized path, and bundle escape.
+- [x] 2.1 Accept an already-authorized local/client-provided bundle source; do not accept arbitrary raw filesystem traversal from a model reference.
+- [x] 2.2 Discover `config.json`, tokenizer/config/generation files, chat-template source, and either single-file or indexed-sharded Safetensors inside the authorized bundle boundary.
+- [x] 2.3 Reject path traversal and bundle escapes; define and test symlink policy explicitly.
+- [x] 2.4 Normalize source identity/provenance without treating local/HuggingFace/Tachyon source kind as trust.
+- [x] 2.5 Add tests for missing required config, missing weights, duplicate candidate files, unauthorized path, and bundle escape.
 
 ## 3. Real `config.json` parsing and normalization
 
-- [ ] 3.1 Parse Qwen-compatible Hugging Face config JSON in the external ingestor/module.
-- [ ] 3.2 Normalize at least `model_type`, `architectures`, `hidden_size`, `intermediate_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `head_dim` (or explicit validated derivation), `vocab_size`, `rms_norm_eps`, `rope_theta`, `rope_scaling`, `tie_word_embeddings`, `torch_dtype`, `bos_token_id`, `eos_token_id`.
-- [ ] 3.3 Reject missing/zero/overflow/internally-inconsistent architecture values with structured `model-config-invalid`/Qwen config errors.
-- [ ] 3.4 Preserve unknown source annotations without allowing them to become Runtime policy implicitly.
-- [ ] 3.5 Prove `torch_dtype` does not silently override requested compute dtype.
-- [ ] 3.6 Add corpus/negative tests for malformed JSON, wrong types, integer overflow, unsupported RoPE variants, invalid head/KV-head relationships, invalid vocab/token IDs.
+- [x] 3.1 Parse Qwen-compatible Hugging Face config JSON in the external ingestor/module.
+- [x] 3.2 Normalize at least `model_type`, `architectures`, `hidden_size`, `intermediate_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `head_dim` (or explicit validated derivation), `vocab_size`, `rms_norm_eps`, `rope_theta`, `rope_scaling`, `tie_word_embeddings`, `torch_dtype`, `bos_token_id`, `eos_token_id`.
+- [x] 3.3 Reject missing/zero/overflow/internally-inconsistent architecture values with structured `model-config-invalid`/Qwen config errors.
+- [x] 3.4 Preserve unknown source annotations without allowing them to become Runtime policy implicitly.
+- [x] 3.5 Prove `torch_dtype` does not silently override requested compute dtype.
+- [x] 3.6 Add corpus/negative tests for malformed JSON, wrong types, integer overflow, unsupported RoPE variants, invalid head/KV-head relationships, invalid vocab/token IDs.
 
 ## 4. Single-file and sharded Safetensors integration
 
-- [ ] 4.1 Reuse the real `Magnetar-format-safetensors` parser; do not introduce a second Safetensors parser in Core or the Qwen Component.
-- [ ] 4.2 Implement `model.safetensors.index.json` parsing and normalize tensor -> shard mapping into existing `ModelShard` / `ModelTensorMetadata` contracts.
-- [ ] 4.3 Resolve and parse every required shard inside the authorized bundle boundary.
-- [ ] 4.4 Reject missing shard, duplicate tensor, tensor mapped to multiple shards, unexpected shard escape, index/header inconsistency, and missing required tensor.
-- [ ] 4.5 Validate whole-part/shard/tensor digest bindings where declared.
-- [ ] 4.6 Add deterministic tests covering one-file, 2+ shard, missing shard, corrupt shard, duplicate tensor, wrong index mapping, and digest mismatch.
+- [x] 4.1 Reuse the real `Magnetar-format-safetensors` parser; do not introduce a second Safetensors parser in Core or the Qwen Component.
+- [x] 4.2 Implement `model.safetensors.index.json` parsing and normalize tensor -> shard mapping into existing `ModelShard` / `ModelTensorMetadata` contracts.
+- [x] 4.3 Resolve and parse every required shard inside the authorized bundle boundary.
+- [x] 4.4 Reject missing shard, duplicate tensor, tensor mapped to multiple shards, unexpected shard escape, index/header inconsistency, and missing required tensor.
+- [x] 4.5 Validate whole-part/shard/tensor digest bindings where declared.
+- [x] 4.6 Add deterministic tests covering one-file, 2+ shard, missing shard, corrupt shard, duplicate tensor, wrong index mapping, and digest mismatch.
 
 ## 5. F16/BF16 storage materialization
 
@@ -75,13 +75,13 @@
 
 ## 9. Production tokenizer/config/generation/chat-template loading
 
-- [ ] 9.1 Provide a real `tokenizer.json`-backed implementation behind `RuntimeTokenizer`/Tokenizer Contract; keep implementation dependency out of `magnetar-runtime`.
-- [ ] 9.2 Parse/normalize `tokenizer_config.json`, special tokens, BOS/EOS/PAD, model max length, truncation/padding metadata.
-- [ ] 9.3 Validate tokenizer vocabulary size and special-token compatibility against the loaded Qwen config.
-- [ ] 9.4 Implement encode/decode and streaming decode through the real tokenizer implementation.
-- [ ] 9.5 Parse/normalize `generation_config.json` into overridable defaults; explicit generation request values always win.
-- [ ] 9.6 Load chat-template data only from the authorized artifact/config; inference must not fetch arbitrary filesystem/network template data.
-- [ ] 9.7 Add parity tests against known tokenizer vectors and negative tests for tokenizer/model mismatch.
+- [x] 9.1 Provide a real `tokenizer.json`-backed implementation behind `RuntimeTokenizer`/Tokenizer Contract; keep implementation dependency out of `magnetar-runtime`.
+- [x] 9.2 Parse/normalize `tokenizer_config.json`, special tokens, BOS/EOS/PAD, model max length, truncation/padding metadata.
+- [x] 9.3 Validate tokenizer vocabulary size and special-token compatibility against the loaded Qwen config.
+- [x] 9.4 Implement encode/decode and streaming decode through the real tokenizer implementation.
+- [x] 9.5 Parse/normalize `generation_config.json` into overridable defaults; explicit generation request values always win.
+- [x] 9.6 Load chat-template data only from the authorized artifact/config; inference must not fetch arbitrary filesystem/network template data.
+- [x] 9.7 Add parity tests against known tokenizer vectors and negative tests for tokenizer/model mismatch.
 
 ## 10. Generic first-native loaded-model execution
 

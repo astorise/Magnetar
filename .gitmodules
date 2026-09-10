@@ -16,3 +16,6 @@
 [submodule "providers/cpu"]
 	path = providers/cpu
 	url = https://github.com/astorise/Magnetar-provider-CPU.git
+[submodule "loaders/huggingface"]
+	path = loaders/huggingface
+	url = https://github.com/astorise/Magnetar-loader-HuggingFace.git
