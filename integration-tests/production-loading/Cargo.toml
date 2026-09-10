@@ -16,4 +16,5 @@ publish = false
 [dev-dependencies]
 magnetar-runtime = { path = "../../magnetar-runtime", features = ["wasmtime-component-engine"] }
 magnetar-loader-huggingface = { path = "../../loaders/huggingface" }
+magnetar-provider-cuda = { path = "../../providers/cuda" }
 tempfile = "3"
