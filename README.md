@@ -107,16 +107,30 @@ Implemented today:
 - `magnetar chat` executing every turn of a chat session through one
   persistent Runtime `InferenceSessionId`, with cancellation and close acting
   on that same session
+- Production Qwen model artifact ingestion: an external, pinned ingestor
+  (`loaders/huggingface`) parses real Hugging Face-style `config.json`,
+  `tokenizer.json`/`tokenizer_config.json`, and single-file or sharded
+  Safetensors bundles into the same generic `ModelManifest`/`ModelTensorMetadata`
+  contracts Model Loading already used, with no concrete format dependency
+  inside `magnetar-runtime` itself. `magnetar model load --file <path>` uses
+  this path for local bundles instead of a fixture manifest.
+- Caller-facing first-native Qwen generation for a production-ingested
+  `ModelInstance`, not only the built-in `qwen-test` model reference, through
+  the same real compiled Qwen Component graph production and generic Runtime
+  Inference API every other first-native path uses. Verified end to end
+  against real ingested bundles on both Reference CPU and real CUDA hardware
+  (RTX 3070 Ti Laptop GPU); see the "Qwen production loading" subsection below
+  for the profile this currently covers and what it does not yet.
+- A real `tokenizer.json`-backed tokenizer implementation (via the
+  `tokenizers` crate, kept entirely inside the external ingestor module, never
+  a `magnetar-runtime` dependency), behind the same Tokenizer Contract the
+  deterministic fixture tokenizer implements
 - Quality gates documented in [docs/quality.md](docs/quality.md)
 
 Implemented only as a baseline, fixture, or incomplete production surface:
 
-- caller-facing first-native Qwen execution beyond the built-in `qwen-test`
-  model reference
-- arbitrary production model artifact parsing and loading from general
-  `config.json`, Safetensors shards/indexes, and tokenizer assets
-- production model source/hub download flows
-- production tokenizer integration beyond deterministic/baseline fixtures
+- production model source/hub download flows (a caller supplies an
+  already-authorized local bundle; Magnetar does not fetch one itself)
 - production continuous batching, prefix-cache reuse, adapters, quantization,
   and multi-device inference
 - complete Component host adapters and end-to-end WIT host-call coverage for
@@ -146,6 +160,48 @@ formats or artifact-loading paths Magnetar does not yet support. Missing model
 loading or inference functionality must be implemented in Magnetar rather than
 recreated in the integrating application.
 
+### Qwen production loading
+
+The first production Qwen profile currently supports, verified end to end
+against real ingested bundle bytes on both Reference CPU and real CUDA
+hardware:
+
+- Single Qwen decoder architecture family (Hugging Face `Qwen2ForCausalLM`
+  config shape), any layer/head/hidden/intermediate-size combination,
+  including grouped-query (distinct attention/KV head counts) configurations
+- Real `config.json` parsing and validation (rejects missing/zero/
+  inconsistent architecture values structurally)
+- Single-file and Hugging Face-style indexed sharded Safetensors, `F32`
+  storage, real per-tensor Safetensors parsing (`formats/safetensors`, no
+  second parser)
+- Real `tokenizer.json` (via the `tokenizers` crate) plus
+  `tokenizer_config.json`/`generation_config.json` normalization
+- An authorized local or Tachyon-sourced bundle (a caller-supplied,
+  already-authorized source; Magnetar does not fetch or discover one itself)
+
+Explicitly not yet supported by this profile:
+
+- `F16`/`BF16` weight storage is decoded and converted to `F32` at Model
+  Loading time, but native CUDA `F16`/`BF16` compute kernels do not exist yet
+- Multi-step CUDA decode: a generation request beyond one new token (prefill
+  only) requires reading back previous steps' Device-resident KV cache state
+  to host memory for historical-KV-history concatenation, and
+  `CudaProvider::read_tensor_value` deliberately never does this by design
+  (only `read_tensor` explicitly downloads) -- a real, pre-existing gap this
+  profile's CUDA path does not paper over
+- Tied-embedding (`tie_word_embeddings: true`) checkpoints: production loading
+  does not yet derive `lm_head` from `token_embedding` at load time the way
+  the canonical fixture path already does (untied checkpoints, which declare
+  their own `lm_head.weight` tensor, are unaffected)
+- A real, publicly downloaded multi-gigabyte Qwen checkpoint has not yet been
+  run through this path; verification so far uses tiny (kilobyte-scale),
+  synthetic-content bundles in the real production file layout, through the
+  real production parser and Component -- not a fixture manifest, but also
+  not yet a real published model's actual weights
+- GGUF, quantized (`Q4_K`/`Q5_K`/`Q8_0`/GPTQ/AWQ/BitsAndBytes) execution, LoRA
+  adapters, and non-Qwen architecture families
+- Remote model hub download, OCI distribution, and credential/retry handling
+
 ## Magnetar and Tachyon
 
 Magnetar owns local AI execution. Tachyon, when used, owns distributed service
@@ -171,6 +227,20 @@ Magnetar rather than fabricating parallel `TensorId`, `PreparedKernelId`,
 CUDA-device, memory-capacity, or dtype-support models of its own. If a local
 inference capability needed by Tachyon is missing, the capability belongs in
 Magnetar.
+
+**Qwen production loading cutover criterion**: Tachyon may remove any
+fail-closed placeholder standing in for real Qwen model loading only once the
+public production loading/generation surface (`load_production_qwen_instance`/
+`run_production_qwen_generation` and their Provider-generic variants,
+`ProductionModelArtifactIngestor`, and the `loaders/huggingface` external
+ingestor) has closed every item in `implement-production-qwen-model-loading`
+task group 12 -- not merely the Reference CPU and CUDA prefill proofs above,
+but also the real public checkpoint smoke test, CPU/CUDA output comparison,
+and release-gate hardening that change's own tasks 12.4-12.11 still track as
+open. Tachyon should keep parsing no model formats and managing no weight
+resources itself either way (see "Public embedder / Tachyon loading surface"
+in that change's proposal); this criterion is about when its fallback path
+becomes safe to delete, not about which side does the parsing.
 
 ## Terminology
 

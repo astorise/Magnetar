@@ -117,7 +117,7 @@
 ## 13. Documentation / cutover declaration
 
 - [ ] 13.1 Update `README.md` production status from "general model loading incomplete" only when tasks 1-12 meet their exit criteria.
-- [ ] 13.2 Update `SUBMODULES.md` with the production ingestor/tokenizer module pins and compatibility requirements.
-- [ ] 13.3 Document supported initial production profile precisely: Qwen + Hugging Face-style config/tokenizer + Safetensors F32/F16/BF16 storage + Reference CPU/CUDA Float32 compute path.
-- [ ] 13.4 Document explicit non-support separately: remote hub/cache behavior not yet implemented, native half compute if deferred, GGUF quantized execution, other model families.
-- [ ] 13.5 Publish a Tachyon cutover criterion: Tachyon may remove its fail-closed placeholder only after the public production E2E in task group 12 is green.
+- [x] 13.2 Update `SUBMODULES.md` with the production ingestor/tokenizer module pins and compatibility requirements.
+- [x] 13.3 Document supported initial production profile precisely: Qwen + Hugging Face-style config/tokenizer + Safetensors F32/F16/BF16 storage + Reference CPU/CUDA Float32 compute path.
+- [x] 13.4 Document explicit non-support separately: remote hub/cache behavior not yet implemented, native half compute if deferred, GGUF quantized execution, other model families.
+- [x] 13.5 Publish a Tachyon cutover criterion: Tachyon may remove its fail-closed placeholder only after the public production E2E in task group 12 is green.
