@@ -128,3 +128,74 @@ fn real_production_ingestion_rejects_when_untrusted() {
         "expected a trust-shaped rejection, got: {error}"
     );
 }
+
+/// Counts allocations still genuinely holding memory -- `MemoryManager::
+/// release` deliberately leaves a released allocation's ledger entry in
+/// place (marked `Released`/`Reusable` for caching/audit purposes,
+/// never removed outright: see its own doc comment), so
+/// `MemoryManager::allocations().count()` alone conflates "ever
+/// allocated" with "currently active" and cannot detect a leak by
+/// itself.
+fn active_allocation_count(runtime: &magnetar_runtime::Runtime) -> usize {
+    runtime
+        .memory()
+        .allocations()
+        .filter(|allocation| allocation.state == magnetar_runtime::MemoryAllocationState::Active)
+        .count()
+}
+
+/// Task 12.6: unloading a real production-loaded instance leaves no
+/// *active* Memory Manager allocation behind. Load through the real
+/// external ingestor's output, confirm real active allocations exist
+/// (weight materialization genuinely admitted something, not a no-op),
+/// unload, and confirm the active count returns to exactly what it was
+/// before loading -- not merely "less than during", which a partial leak
+/// could still satisfy.
+#[test]
+fn unloading_a_real_production_instance_leaves_no_memory_manager_allocation() {
+    register_real_qwen_component();
+    let dir = tempfile::tempdir().unwrap();
+    write_tiny_production_bundle(dir.path());
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+        dir.path().to_path_buf(),
+    );
+    let ingested = HuggingFaceIngestor::new().ingest(&source).unwrap();
+
+    let mut runtime = magnetar_runtime::Runtime::builder()
+        .register_provider(Arc::new(magnetar_runtime::ReferenceCpuProvider::new()))
+        .trust_store(
+            ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone()),
+        )
+        .build()
+        .unwrap();
+
+    let baseline_active = active_allocation_count(&runtime);
+
+    let instance = load_production_qwen_instance(
+        &mut runtime,
+        &ingested.manifest,
+        ingested.payload_source.as_ref(),
+    )
+    .expect("real production loading succeeds");
+    let active_while_loaded = active_allocation_count(&runtime);
+    assert!(
+        active_while_loaded > baseline_active,
+        "expected weight materialization to admit at least one real active Memory Manager \
+         allocation (baseline={baseline_active}, while loaded={active_while_loaded})"
+    );
+
+    magnetar_runtime::unload_model_instance(
+        &mut runtime,
+        &instance,
+        magnetar_runtime::ModelInstanceUnloadPolicy::DrainActiveUse,
+    )
+    .expect("model instance unloads cleanly");
+
+    let active_after_unload = active_allocation_count(&runtime);
+    assert_eq!(
+        active_after_unload, baseline_active,
+        "unloading a real production-loaded instance must release every active Memory \
+         Manager allocation it admitted, not merely some of them"
+    );
+}
