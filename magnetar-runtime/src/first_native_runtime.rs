@@ -5667,7 +5667,12 @@ fn load_fixture_instance_with_weights_for_provider(
 /// every Kernel it advertises. Never imports or references any concrete
 /// non-Reference-CPU Provider type: resolved entirely through the
 /// `Provider`/`Device` trait objects this crate already depends on.
-fn register_prepared_kernels_for_provider(
+/// [`register_reference_cpu_prepared_kernels`], generalized to an
+/// arbitrary registered Provider instead of hardcoding Reference CPU.
+/// Public alongside it (task group 12): an embedder targeting a Provider
+/// other than Reference CPU (e.g. CUDA) for production generation needs
+/// this same registration step.
+pub fn register_prepared_kernels_for_provider(
     runtime: &mut Runtime,
     provider: &dyn Provider,
 ) -> Result<(), E2eConformanceError> {
@@ -7050,6 +7055,32 @@ pub fn load_production_qwen_instance(
     manifest: &ModelManifest,
     payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
 ) -> Result<ModelInstanceId, InferenceApiError> {
+    load_production_qwen_instance_for_provider(
+        runtime,
+        manifest,
+        payload_source,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+}
+
+/// [`load_production_qwen_instance`], generalized to bind the resulting
+/// Model Instance's placement to an arbitrary registered Provider instead
+/// of hardcoding Reference CPU. Matters even though
+/// `WeightMaterializationTransaction::begin` itself resolves the
+/// Provider it stages weights through from the instance's *own*
+/// placement -- with no explicit `provider_binding` here that placement
+/// carries no Provider, and `begin` falls back to Reference CPU
+/// unconditionally when that happens (`generalize-first-native-provider-
+/// dispatch`'s own "Runtime Treats Reference CPU As Normal Provider"
+/// fix), which fails closed for a CUDA-only Runtime with a structured
+/// "provider not registered" error rather than silently materializing
+/// weights through the wrong Provider.
+pub fn load_production_qwen_instance_for_provider(
+    runtime: &mut Runtime,
+    manifest: &ModelManifest,
+    payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
+    provider_binding: &ProviderBinding,
+) -> Result<ModelInstanceId, InferenceApiError> {
     let mut coordinator = ModelLoadingCoordinator::new();
     let architecture_implementation = ModelArchitectureImplementation {
         architecture: manifest.architecture.clone(),
@@ -7072,7 +7103,7 @@ pub fn load_production_qwen_instance(
         runtime,
         &loaded,
         architecture_implementation,
-        ResourceAffinity::new(FallbackClass::Transparent),
+        ResourceAffinity::new(FallbackClass::Transparent).with_provider(provider_binding.clone()),
     )?;
     stream_materialize_model_instance_weights(
         runtime,
@@ -7108,8 +7139,34 @@ pub fn run_production_qwen_generation(
     trust_store: ModelTrustStore,
     prompt: &str,
 ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+    run_production_qwen_generation_for_provider(
+        fixture,
+        payload_source,
+        trust_store,
+        prompt,
+        std::sync::Arc::new(ReferenceCpuProvider::new()),
+    )
+}
+
+/// [`run_production_qwen_generation`], generalized to an arbitrary
+/// registered Provider instead of hardcoding Reference CPU -- task
+/// 10.6/12.3: the same production-loaded instance and Component-produced
+/// graph can target CUDA (or any other registered Provider) this way,
+/// with zero Provider-specific code in `magnetar-runtime` itself.
+/// `provider` arrives as a `Provider` trait object the caller constructs
+/// and owns; this function never imports or references a concrete non-
+/// Reference-CPU Provider crate.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn run_production_qwen_generation_for_provider(
+    fixture: E2eFixture,
+    payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
+    trust_store: ModelTrustStore,
+    prompt: &str,
+    provider: Arc<dyn Provider>,
+) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+    let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
     let mut runtime = Runtime::builder()
-        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .register_provider(provider.clone())
         .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
             fixture: fixture.clone(),
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
@@ -7122,9 +7179,18 @@ pub fn run_production_qwen_generation(
         .map_err(|error| InferenceApiError::InferenceApiUnavailable {
             reason: error.to_string(),
         })?;
-    register_reference_cpu_prepared_kernels(&mut runtime);
+    register_prepared_kernels_for_provider(&mut runtime, &*provider).map_err(|error| {
+        InferenceApiError::KernelUnavailable {
+            reason: error.to_string(),
+        }
+    })?;
 
-    let instance = load_production_qwen_instance(&mut runtime, &fixture.manifest, payload_source)?;
+    let instance = load_production_qwen_instance_for_provider(
+        &mut runtime,
+        &fixture.manifest,
+        payload_source,
+        &provider_binding,
+    )?;
     require_ready_first_native_instance(&runtime, &instance)?;
 
     let session_request = SessionCreationRequest {
@@ -7154,11 +7220,12 @@ pub fn run_production_qwen_generation(
         .map_err(|error| InferenceApiError::GraphPlanningFailed {
             reason: error.to_string(),
         })?;
-    let mut prepared_plans = prepare_first_native_execution_plans(
+    let mut prepared_plans = prepare_first_native_execution_plans_for_provider(
         &runtime,
         &instance,
         component_graphs,
         tokenized.token_ids.len() as u64,
+        &provider_binding,
     )
     .map_err(|error| InferenceApiError::GraphPlanningFailed {
         reason: error.to_string(),
