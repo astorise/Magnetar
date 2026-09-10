@@ -110,8 +110,8 @@
 - [x] 12.6 Assert unload/failure leaves no ModelInstance weight allocation or Provider tensor leak.
 - [x] 12.7 Make GPU CI fail if the required hardware test is skipped or selects `0 tests`.
 - [x] 12.8 Add source guards proving production loading/generation does not call `fixture_model_manifest`, fixture tensor inventory builders, or require literal `qwen-test`.
-- [ ] 12.9 Run `cargo test`/clippy/fmt/doc/wasm checks for Runtime and every affected external module.
-- [ ] 12.10 Run CUDA hardware suite and capture exact commit/runner evidence.
+- [x] 12.9 Run `cargo test`/clippy/fmt/doc/wasm checks for Runtime and every affected external module.
+- [x] 12.10 Run CUDA hardware suite and capture exact commit/runner evidence.
 - [ ] 12.11 Run `openspec validate --all --strict` and archive only after every task above is complete with linked evidence.
 
 ## 13. Documentation / cutover declaration
