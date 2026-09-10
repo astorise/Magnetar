@@ -416,7 +416,8 @@ jobs:
             formats/safetensors/Cargo.toml \
             providers/cpu/Cargo.toml \
             providers/cuda/Cargo.toml \
-            loaders/huggingface/Cargo.toml
+            loaders/huggingface/Cargo.toml \
+            integration-tests/production-loading/Cargo.toml
           do
             echo "::group::$manifest"
             cargo test --locked --manifest-path "$manifest"

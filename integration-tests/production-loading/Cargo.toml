@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "magnetar-integration-production-loading"
+version = "0.1.0"
+edition = "2024"
+# Never published: this crate exists only to run the real production
+# Qwen loading pipeline end to end against a real external ingestor
+# (loaders/huggingface) and the real Model Loading/Model Component
+# machinery in magnetar-runtime -- something neither crate can prove on
+# its own, since magnetar-runtime never depends on loaders/huggingface
+# (and must not: production-model-ingestion's externalization boundary).
+# Mirrors integration-tests/cuda-first-native's own pattern and rationale.
+publish = false
+
+[dev-dependencies]
+magnetar-runtime = { path = "../../magnetar-runtime", features = ["wasmtime-component-engine"] }
+magnetar-loader-huggingface = { path = "../../loaders/huggingface" }
+tempfile = "3"

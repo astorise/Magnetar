@@ -94,15 +94,15 @@
 
 ## 11. Public embedder / Tachyon loading surface
 
-- [ ] 11.1 Expose one supported public orchestration surface for authorized source -> normalized artifact -> Model Loading -> materialization -> warm/readiness -> `ModelInstanceId`.
-- [ ] 11.2 Ensure callers cannot mint trust decisions, ready evidence, resource bindings, or Provider allocations.
-- [ ] 11.3 Add a Tachyon-shaped integration test using only public APIs and a client-provided/Tachyon source identity.
+- [x] 11.1 Expose one supported public orchestration surface for authorized source -> normalized artifact -> Model Loading -> materialization -> warm/readiness -> `ModelInstanceId`.
+- [x] 11.2 Ensure callers cannot mint trust decisions, ready evidence, resource bindings, or Provider allocations.
+- [x] 11.3 Add a Tachyon-shaped integration test using only public APIs and a client-provided/Tachyon source identity.
 - [ ] 11.4 Static/source guard: the integration test and sample embedder contain no Safetensors tensor parser, Qwen graph builder, dtype conversion loop, or TensorResourceId fabrication.
 - [ ] 11.5 Document the minimal public integration recipe for Tachyon-Mesh and other embedders.
 
 ## 12. Production E2E and release gates
 
-- [ ] 12.1 Add a tiny deterministic **production-layout** Qwen bundle for per-PR tests: real `config.json`, real tokenizer files, real Safetensors parser input, optional real shard index. It may be small, but it must enter through the production ingestor; no fixture manifest/inventory constructor is allowed.
+- [x] 12.1 Add a tiny deterministic **production-layout** Qwen bundle for per-PR tests: real `config.json`, real tokenizer files, real Safetensors parser input, optional real shard index. It may be small, but it must enter through the production ingestor; no fixture manifest/inventory constructor is allowed.
 - [ ] 12.2 E2E Reference CPU: authorized bundle -> ingestion -> trust/integrity -> configurable Component -> ModelInstance -> materialization -> prefill/decode -> output.
 - [ ] 12.3 E2E CUDA on real hardware through the same normalized artifact and Component; assert CUDA Provider/Device residency and no silent Reference CPU fallback.
 - [ ] 12.4 Add a real public Qwen-compatible checkpoint smoke test pinned by revision/digest (manual/nightly/hardware profile acceptable if size prevents per-PR execution).
