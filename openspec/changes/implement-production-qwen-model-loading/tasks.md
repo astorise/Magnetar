@@ -35,13 +35,13 @@
 
 ## 5. F16/BF16 storage materialization
 
-- [ ] 5.1 Extend production bytes-to-staging materialization to decode F16 and BF16 in addition to F32.
-- [ ] 5.2 Verify tensor digest against source storage bytes before dtype conversion.
-- [ ] 5.3 Perform checked element-count/byte-count validation for each storage dtype.
-- [ ] 5.4 Convert F16/BF16 explicitly to selected supported compute/staging dtype when the Provider lacks native half support; record conversion in residency plan/diagnostics.
-- [ ] 5.5 Reject unsupported storage dtypes structurally; no reinterpret cast or silent dequantization.
-- [ ] 5.6 Add numeric edge-case tests: ±0, subnormal policy, finite extrema, infinities/NaNs according to declared policy, odd/truncated byte counts, shape mismatch.
-- [ ] 5.7 Keep native CUDA F16/BF16 compute outside this change unless required by discovered correctness constraints.
+- [x] 5.1 Extend production bytes-to-staging materialization to decode F16 and BF16 in addition to F32.
+- [x] 5.2 Verify tensor digest against source storage bytes before dtype conversion.
+- [x] 5.3 Perform checked element-count/byte-count validation for each storage dtype.
+- [x] 5.4 Convert F16/BF16 explicitly to selected supported compute/staging dtype when the Provider lacks native half support; record conversion in residency plan/diagnostics.
+- [x] 5.5 Reject unsupported storage dtypes structurally; no reinterpret cast or silent dequantization.
+- [x] 5.6 Add numeric edge-case tests: ±0, subnormal policy, finite extrema, infinities/NaNs according to declared policy, odd/truncated byte counts, shape mismatch.
+- [x] 5.7 Keep native CUDA F16/BF16 compute outside this change unless required by discovered correctness constraints.
 
 ## 6. Streaming transactional weight materialization
 

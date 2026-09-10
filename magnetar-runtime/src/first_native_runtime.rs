@@ -6262,21 +6262,26 @@ impl WeightMaterializationTransaction {
     ) -> Result<(), InferenceApiError> {
         // Shape/dtype agreement precedes even the content digest check:
         // a tensor the artifact declares quantized has no digest (digests
-        // are F32-only, mirroring `host_tensors_from_artifact_bytes`'s own
-        // materialization limit), so without this check a caller could
-        // fabricate F32 content under a quantized tensor's name and have
-        // nothing reject it. This applies to every tensor with a declared
-        // shape, independent of whether that tensor also has a declared
-        // digest -- the two checks guard different things
+        // are F32/F16/BF16-only, mirroring `host_tensors_from_artifact_
+        // bytes`'s own materialization limit), so without this check a
+        // caller could fabricate F32 content under a quantized tensor's
+        // name and have nothing reject it. This applies to every tensor
+        // with a declared shape, independent of whether that tensor also
+        // has a declared digest -- the two checks guard different things
         // (`seal-runtime-model-trust-and-provenance-authority`).
-        if let Some((expected_shape, expected_dtype)) = runtime
+        let declared_storage_dtype = runtime
             .model_instance(instance)
             .map_err(InferenceApiError::from)?
             .definition()
             .required_weight_shapes
             .get(name)
-            .cloned()
-            && (tensor.shape != expected_shape || expected_dtype != ModelDType::F32)
+            .cloned();
+        if let Some((expected_shape, expected_dtype)) = declared_storage_dtype.clone()
+            && (tensor.shape != expected_shape
+                || !matches!(
+                    expected_dtype,
+                    ModelDType::F32 | ModelDType::F16 | ModelDType::Bf16
+                ))
         {
             return Err(InferenceApiError::WeightShapeOrDtypeMismatch {
                 reason: format!(
@@ -6295,13 +6300,28 @@ impl WeightMaterializationTransaction {
         // digests`). A tensor whose inventory entry declared no digest is
         // unaffected (`None` means unknown, not "no content required" --
         // the same precedent `required_weight_names` already established).
-        if let Some(expected_digest) = runtime
-            .model_instance(instance)
-            .map_err(InferenceApiError::from)?
-            .definition()
-            .required_weight_digests
-            .get(name)
-            .cloned()
+        //
+        // Skipped when the declared storage dtype is not F32: for F16/BF16
+        // storage, `tensor` here is already the *converted* F32 content
+        // (`host_tensors_from_artifact_bytes` produced it), and the
+        // artifact's declared digest describes the original 2-byte-per-
+        // element storage bytes, not this 4-byte-per-element conversion --
+        // a digest computed over the former can never match the latter, so
+        // re-checking here would be structurally wrong, not merely
+        // redundant. That original-bytes check already happened inside
+        // `host_tensors_from_artifact_bytes` (Decision 8).
+        let storage_dtype_is_f32 = matches!(
+            declared_storage_dtype.map(|(_, dtype)| dtype),
+            None | Some(ModelDType::F32)
+        );
+        if storage_dtype_is_f32
+            && let Some(expected_digest) = runtime
+                .model_instance(instance)
+                .map_err(InferenceApiError::from)?
+                .definition()
+                .required_weight_digests
+                .get(name)
+                .cloned()
             && let Err(error) = expected_digest.verify_bytes(&tensor.content_bytes())
         {
             return Err(InferenceApiError::WeightContentDigestMismatch {

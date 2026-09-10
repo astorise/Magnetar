@@ -298,6 +298,14 @@ impl ModelLoadingResidencyPlan {
     pub fn memory_placements(&self) -> &[ModelResidencyLocation] {
         &self.memory_placements
     }
+
+    /// Human-readable notes about this plan, including whether an F16/BF16
+    /// storage-to-F32-compute conversion is in effect (Decision 8: this
+    /// conversion is never silent). Read-only: see the struct-level doc
+    /// comment for why `diagnostics` is not a public field.
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -755,6 +763,22 @@ impl ModelLoadingCoordinator {
                     ));
                 }
             };
+        let mut diagnostics = vec!["model loading plan is Runtime-owned".to_string()];
+        // Decision 8: an F16/BF16 storage-to-F32-compute conversion is
+        // never silent -- it is always visible on the residency plan a
+        // caller can inspect, in addition to `host_tensors_from_artifact_
+        // bytes` itself performing the conversion explicitly rather than
+        // reinterpreting bytes.
+        if matches!(
+            manifest.storage_dtype,
+            Some(ModelDType::F16 | ModelDType::Bf16)
+        ) {
+            diagnostics.push(format!(
+                "storage dtype {:?} is explicitly converted to F32 during weight materialization \
+                 (native half-precision compute is not required by this Provider path)",
+                manifest.storage_dtype
+            ));
+        }
         let plan = ModelLoadingResidencyPlan {
             artifact: manifest.id.clone(),
             architecture: manifest.architecture.clone(),
@@ -771,7 +795,7 @@ impl ModelLoadingCoordinator {
             loading_phases: default_loading_phases(),
             fallback_options: vec!["queue".into(), "retry".into(), "policy-fallback".into()],
             unload_policy: ModelUnloadPolicy::DrainActiveUse,
-            diagnostics: vec!["model loading plan is Runtime-owned".into()],
+            diagnostics,
         };
         self.observe(
             ModelLoadingObservationKind::ResidencyPlanningCompleted,
@@ -946,12 +970,27 @@ impl ModelLoadingCoordinator {
 /// `externalize-runtime-extension-modules`'s "Model Components, Providers,
 /// and Formats Are Externalized" requirement.
 ///
-/// Only `ModelDType::F32` storage is supported today, matching
-/// `HostTensor`'s own f32-only representation -- a tensor declaring any
-/// other storage dtype is rejected with `StorageDTypeUnsupported` rather
-/// than reinterpreting its bytes. Real dtype conversion on load (F16/BF16
-/// checkpoints) is real, separate follow-up work
-/// (`materialize-weights-from-real-model-artifact`'s design.md Non-Goals).
+/// `ModelDType::F32`, `ModelDType::F16`, and `ModelDType::Bf16` storage are
+/// supported: `F32` bytes are read directly, matching `HostTensor`'s own
+/// f32-only representation, while `F16`/`Bf16` bytes are explicitly
+/// converted to `F32` (`implement-production-qwen-model-loading` Decision
+/// 8 -- storage dtype and compute dtype remain distinct, and any
+/// conversion is explicit here, never inferred from a source annotation
+/// such as `torch_dtype`). A tensor declaring any other storage dtype
+/// (quantized formats, integer types) is rejected with
+/// `StorageDTypeUnsupported` rather than reinterpreting its bytes.
+///
+/// For an `F16`/`Bf16` tensor whose metadata declares a content digest,
+/// that digest is verified against the *original* storage bytes before
+/// conversion, not against the converted `F32` representation (Decision
+/// 8's "tensor content integrity is verified against the original storage
+/// bytes before conversion") -- a digest computed over 2-byte source
+/// elements could never match a 4-byte converted representation, so
+/// checking anywhere else would be structurally wrong, not merely
+/// stricter. `F32` tensors keep their existing digest-check location
+/// (`InferenceApiError::WeightContentDigestMismatch`, checked once the
+/// `HostTensor` is bound) unchanged, since for `F32` storage the in-memory
+/// bytes and the original storage bytes are identical either way.
 pub fn host_tensors_from_artifact_bytes(
     tensors: &[ModelTensorMetadata],
     bytes: &[u8],
@@ -959,16 +998,21 @@ pub fn host_tensors_from_artifact_bytes(
 ) -> Result<BTreeMap<String, HostTensor>, ModelLoadingError> {
     let mut weights = BTreeMap::new();
     for tensor in tensors {
-        if tensor.storage_dtype != ModelDType::F32 {
-            return Err(ModelLoadingError::new(
-                ModelLoadingErrorCode::StorageDTypeUnsupported,
-                Some(ModelLoadingPhase::MaterializeWeights),
-                format!(
-                    "tensor '{}' declares unsupported storage dtype {:?} (only F32 is supported)",
-                    tensor.name, tensor.storage_dtype
-                ),
-            ));
-        }
+        let bytes_per_element: u64 = match tensor.storage_dtype {
+            ModelDType::F32 => 4,
+            ModelDType::F16 | ModelDType::Bf16 => 2,
+            other => {
+                return Err(ModelLoadingError::new(
+                    ModelLoadingErrorCode::StorageDTypeUnsupported,
+                    Some(ModelLoadingPhase::MaterializeWeights),
+                    format!(
+                        "tensor '{}' declares unsupported storage dtype {other:?} (only F32, \
+                         F16, and BF16 are supported)",
+                        tensor.name
+                    ),
+                ));
+            }
+        };
         let element_count = tensor
             .shape
             .iter()
@@ -983,13 +1027,15 @@ pub fn host_tensors_from_artifact_bytes(
                     ),
                 )
             })?;
-        let expected_size = element_count.checked_mul(4).ok_or_else(|| {
-            ModelLoadingError::new(
-                ModelLoadingErrorCode::MaterializationFailed,
-                Some(ModelLoadingPhase::MaterializeWeights),
-                format!("tensor '{}' byte-size computation overflowed", tensor.name),
-            )
-        })?;
+        let expected_size = element_count
+            .checked_mul(bytes_per_element)
+            .ok_or_else(|| {
+                ModelLoadingError::new(
+                    ModelLoadingErrorCode::MaterializationFailed,
+                    Some(ModelLoadingPhase::MaterializeWeights),
+                    format!("tensor '{}' byte-size computation overflowed", tensor.name),
+                )
+            })?;
         let (offset, declared_size) = match (tensor.offset_bytes, tensor.size_bytes) {
             (Some(offset), Some(size)) => (offset, size),
             _ => {
@@ -1054,12 +1100,51 @@ pub fn host_tensors_from_artifact_bytes(
                 ),
             )
         })?;
-        let data: Vec<f32> = range
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|chunk| f32::from_le_bytes(*chunk))
-            .collect();
+        if tensor.storage_dtype != ModelDType::F32
+            && let Some(expected_digest) = &tensor.digest
+        {
+            expected_digest.verify_bytes(range).map_err(|error| {
+                ModelLoadingError::new(
+                    ModelLoadingErrorCode::MaterializationFailed,
+                    Some(ModelLoadingPhase::MaterializeWeights),
+                    format!(
+                        "tensor '{}' storage bytes do not match its declared content digest: \
+                         {error}",
+                        tensor.name
+                    ),
+                )
+            })?;
+        }
+        let data: Vec<f32> = match tensor.storage_dtype {
+            ModelDType::F32 => range
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
+                .collect(),
+            ModelDType::F16 => range
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|chunk| f16_to_f32(u16::from_le_bytes(*chunk)))
+                .collect(),
+            ModelDType::Bf16 => range
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|chunk| bf16_to_f32(u16::from_le_bytes(*chunk)))
+                .collect(),
+            other => {
+                return Err(ModelLoadingError::new(
+                    ModelLoadingErrorCode::StorageDTypeUnsupported,
+                    Some(ModelLoadingPhase::MaterializeWeights),
+                    format!(
+                        "tensor '{}' declares unsupported storage dtype {other:?}",
+                        tensor.name
+                    ),
+                ));
+            }
+        };
         let host_tensor = HostTensor::new(tensor.shape.clone(), data).map_err(|error| {
             ModelLoadingError::new(
                 ModelLoadingErrorCode::MaterializationFailed,
@@ -1070,6 +1155,64 @@ pub fn host_tensors_from_artifact_bytes(
         weights.insert(tensor.name.clone(), host_tensor);
     }
     Ok(weights)
+}
+
+/// Converts one IEEE 754 binary16 ("half float") value to `f32`, exactly
+/// (every `f16` value has an exact `f32` representation, since `f32`'s
+/// exponent and mantissa ranges both strictly contain `f16`'s). Handles
+/// every `f16` class explicitly rather than relying on a bit-shift
+/// shortcut that only works for normalized values: `+0.0`/`-0.0` preserve
+/// sign, subnormals are renormalized into `f32`'s wider exponent range
+/// (never flushed to zero), `+Inf`/`-Inf` map to `f32` infinities, and
+/// `NaN` maps to a `f32` `NaN` preserving the sign bit and (widened)
+/// mantissa payload rather than canonicalizing to one fixed `NaN` pattern.
+pub(crate) fn f16_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits >> 15) << 31;
+    let exponent = (bits >> 10) & 0x1F;
+    let mantissa = u32::from(bits & 0x3FF);
+    let magnitude_bits = if exponent == 0 {
+        if mantissa == 0 {
+            0
+        } else {
+            // Subnormal `f16`: renormalize by shifting the mantissa left
+            // until its implicit leading bit would land at position 10,
+            // counting how many shifts that took to compute the correct
+            // (negative, then rebiased) `f32` exponent.
+            let mut mantissa = mantissa;
+            let mut shift = 0u32;
+            while mantissa & 0x400 == 0 {
+                mantissa <<= 1;
+                shift += 1;
+            }
+            mantissa &= 0x3FF;
+            let f32_exponent = 127 - 15 - shift + 1;
+            (f32_exponent << 23) | (mantissa << 13)
+        }
+    } else if exponent == 0x1F {
+        // Infinity (mantissa == 0) or NaN (mantissa != 0): `f32`'s
+        // all-ones exponent field means the same thing.
+        (0xFFu32 << 23) | (mantissa << 13)
+    } else {
+        // `exponent` (1..=30) minus f16's bias (15) can be negative before
+        // rebiasing into f32's own (127) -- must go through signed
+        // arithmetic, unlike the always-non-negative subnormal branch
+        // above, or a small-but-normal f16 exponent (e.g. 14, for `0.5`)
+        // underflows this as `u32` subtraction.
+        let f32_exponent = (i32::from(exponent) - 15 + 127) as u32;
+        (f32_exponent << 23) | (mantissa << 13)
+    };
+    f32::from_bits(sign | magnitude_bits)
+}
+
+/// Converts one `bfloat16` value to `f32`, exactly: `bfloat16` is defined
+/// as `f32`'s sign/exponent/top-7-mantissa-bits truncated to 16 bits, so
+/// widening back is a zero-extending left shift with no case analysis
+/// needed -- `+0.0`/`-0.0`/subnormals/infinities/`NaN` all round-trip
+/// correctly through this shift because they do not depend on any bits
+/// `bfloat16` actually discards (the low 16 mantissa bits, which this
+/// shift fills with zero).
+pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
 }
 
 pub fn invalidates_kv_cache_on_unload(policy: ModelLoadingCachePolicy) -> bool {

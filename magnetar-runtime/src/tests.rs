@@ -10647,13 +10647,17 @@ fn materialize_model_instance_weights_rejects_shape_mismatch() {
     ));
 }
 
-/// P0-C: a tensor the manifest declares with a non-F32 storage dtype is
-/// rejected even when the caller supplies well-formed, correctly-shaped
-/// content -- this Runtime cannot legitimately materialize that tensor as
-/// F32 at all, regardless of digest presence.
+/// P0-C: a tensor the manifest declares with a quantized (unsupported)
+/// storage dtype is rejected even when the caller supplies well-formed,
+/// correctly-shaped content -- this Runtime cannot legitimately
+/// materialize that tensor as F32 at all, regardless of digest presence.
+/// `F16`/`Bf16` are *not* rejected here since
+/// `implement-production-qwen-model-loading` task group 5 made them
+/// legitimate declared storage dtypes (explicit conversion to F32) -- see
+/// `materialize_model_instance_weights_accepts_f16_and_bf16_declared_dtype`.
 #[test]
-fn materialize_model_instance_weights_rejects_non_f32_declared_dtype() {
-    let manifest = manifest_with_one_tensor(vec![2, 2], ModelDType::Bf16);
+fn materialize_model_instance_weights_rejects_quantized_declared_dtype() {
+    let manifest = manifest_with_one_tensor(vec![2, 2], ModelDType::Q8);
     let mut coordinator = ModelLoadingCoordinator::new();
     coordinator.register_architecture(ModelArchitectureImplementation {
         architecture: manifest.architecture.clone(),
@@ -10747,6 +10751,97 @@ fn materialize_model_instance_weights_accepts_matching_shape_and_dtype() {
         runtime.model_instance(&instance).unwrap().lifecycle(),
         ModelInstanceLifecycleState::Ready
     );
+}
+
+/// `implement-production-qwen-model-loading` task 5.4: an F16/BF16 storage
+/// dtype's explicit-conversion-to-F32 is recorded as a residency plan
+/// diagnostic, never silent; an F32-storage manifest carries no such note.
+#[test]
+fn residency_plan_records_f16_bf16_conversion_diagnostic() {
+    for (storage_dtype, expect_diagnostic) in [
+        (ModelDType::F32, false),
+        (ModelDType::F16, true),
+        (ModelDType::Bf16, true),
+    ] {
+        let mut manifest = manifest_with_one_tensor(vec![2, 2], storage_dtype);
+        manifest.storage_dtype = Some(storage_dtype);
+        let mut coordinator = ModelLoadingCoordinator::new();
+        coordinator.register_architecture(ModelArchitectureImplementation {
+            architecture: manifest.architecture.clone(),
+            kind: ModelArchitectureImplementationKind::TestFixture,
+            required_capabilities: Vec::new(),
+        });
+        let request =
+            ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+        let artifact_plan = manifest.residency_plan().unwrap();
+        let plan = coordinator
+            .plan(&request, &manifest, artifact_plan)
+            .unwrap();
+        let has_conversion_note = plan
+            .diagnostics()
+            .iter()
+            .any(|note| note.contains("explicitly converted to F32"));
+        assert_eq!(
+            has_conversion_note, expect_diagnostic,
+            "{storage_dtype:?}: unexpected diagnostic presence"
+        );
+    }
+}
+
+/// `implement-production-qwen-model-loading` task group 5: a tensor the
+/// manifest declares with `F16`/`Bf16` storage materializes normally when
+/// the caller supplies its already-converted `F32` content (the shape/
+/// dtype gate `materialize_model_instance_weights_rejects_quantized_
+/// declared_dtype` proves rejects `Q8` accepts `F16`/`Bf16` instead).
+#[test]
+fn materialize_model_instance_weights_accepts_f16_and_bf16_declared_dtype() {
+    for storage_dtype in [ModelDType::F16, ModelDType::Bf16] {
+        let manifest = manifest_with_one_tensor(vec![2, 2], storage_dtype);
+        let mut coordinator = ModelLoadingCoordinator::new();
+        coordinator.register_architecture(ModelArchitectureImplementation {
+            architecture: manifest.architecture.clone(),
+            kind: ModelArchitectureImplementationKind::TestFixture,
+            required_capabilities: Vec::new(),
+        });
+        let mut runtime = Runtime::builder()
+            .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+            .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+            .build()
+            .unwrap();
+        let core =
+            ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+        let loaded = load_model(
+            &mut coordinator,
+            &mut runtime,
+            ModelLoadingApiRequest::new(core),
+            &manifest,
+        )
+        .unwrap();
+        let instance = runtime
+            .create_model_instance(
+                &loaded,
+                ModelArchitectureImplementation {
+                    architecture: manifest.architecture.clone(),
+                    kind: ModelArchitectureImplementationKind::TestFixture,
+                    required_capabilities: Vec::new(),
+                },
+                ResourceAffinity::new(FallbackClass::Transparent),
+            )
+            .unwrap();
+
+        let converted_weights = BTreeMap::from([(
+            "the-only-tensor".to_string(),
+            HostTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+        )]);
+        materialize_model_instance_weights(&mut runtime, &instance, "test", &converted_weights)
+            .unwrap_or_else(|error| {
+                panic!("{storage_dtype:?}-declared tensor with converted F32 content must materialize: {error:?}")
+            });
+        assert_eq!(
+            runtime.model_instance(&instance).unwrap().lifecycle(),
+            ModelInstanceLifecycleState::Ready
+        );
+    }
 }
 
 // The following helpers and tests were relocated from
@@ -21306,13 +21401,128 @@ fn host_tensors_from_artifact_bytes_honors_nonzero_data_section_start() {
 }
 
 #[test]
-fn host_tensors_from_artifact_bytes_rejects_non_f32_dtype() {
+fn host_tensors_from_artifact_bytes_rejects_unsupported_dtype() {
     let (mut metadata, bytes) = artifact_bytes_test_tensor("weight.a", vec![1], &[1.0]);
-    metadata.storage_dtype = ModelDType::F16;
+    metadata.storage_dtype = ModelDType::Q8;
 
     let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
-        .expect_err("non-F32 dtype must be rejected");
+        .expect_err("a quantized/unsupported dtype must be rejected");
     assert_eq!(error.code, ModelLoadingErrorCode::StorageDTypeUnsupported);
+}
+
+fn f16_bytes(values: &[u16]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn f16_tensor_metadata(name: &str, shape: Vec<u64>, byte_len: usize) -> ModelTensorMetadata {
+    ModelTensorMetadata {
+        name: name.to_string(),
+        shape,
+        storage_dtype: ModelDType::F16,
+        layout: None,
+        shard: None,
+        offset_bytes: Some(0),
+        size_bytes: Some(byte_len as u64),
+        quantization: None,
+        expected_compute_dtype: None,
+        digest: None,
+    }
+}
+
+/// `implement-production-qwen-model-loading` task 5.6: numeric edge cases
+/// for F16 -> F32 conversion -- +0/-0, a subnormal, the largest finite
+/// magnitude, both infinities, and NaN (payload/sign preserved, not
+/// canonicalized).
+#[test]
+fn f16_to_f32_handles_every_numeric_class_exactly() {
+    assert_eq!(f16_to_f32(0x0000).to_bits(), 0f32.to_bits());
+    assert_eq!(f16_to_f32(0x8000).to_bits(), (-0f32).to_bits());
+    // Smallest positive subnormal f16 (2^-24) must renormalize exactly.
+    assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
+    // Largest subnormal f16 mantissa.
+    assert_eq!(f16_to_f32(0x03FF), 2f32.powi(-14) * (1023.0 / 1024.0));
+    // Largest finite f16 magnitude (65504).
+    assert_eq!(f16_to_f32(0x7BFF), 65504.0f32);
+    assert_eq!(f16_to_f32(0xFBFF), -65504.0f32);
+    assert!(f16_to_f32(0x7C00).is_infinite() && f16_to_f32(0x7C00) > 0.0);
+    assert!(f16_to_f32(0xFC00).is_infinite() && f16_to_f32(0xFC00) < 0.0);
+    let nan = f16_to_f32(0x7E00);
+    assert!(nan.is_nan());
+    assert_eq!(nan.to_bits() >> 31, 0, "sign bit must be preserved for NaN");
+    let signed_nan = f16_to_f32(0xFE00);
+    assert!(signed_nan.is_nan());
+    assert_eq!(signed_nan.to_bits() >> 31, 1);
+}
+
+/// Same edge-case coverage for BF16 -> F32 (task 5.6), which -- because
+/// bf16 is a pure truncation of f32 -- also proves the shift-based
+/// conversion round-trips every class correctly, not only normal numbers.
+#[test]
+fn bf16_to_f32_handles_every_numeric_class_exactly() {
+    assert_eq!(bf16_to_f32(0x0000).to_bits(), 0f32.to_bits());
+    assert_eq!(bf16_to_f32(0x8000).to_bits(), (-0f32).to_bits());
+    assert_eq!(bf16_to_f32(0x0001), f32::from_bits(1u32 << 16));
+    assert_eq!(bf16_to_f32(0x7F7F), f32::from_bits(0x7F7F_0000));
+    assert!(bf16_to_f32(0x7F80).is_infinite() && bf16_to_f32(0x7F80) > 0.0);
+    assert!(bf16_to_f32(0xFF80).is_infinite() && bf16_to_f32(0xFF80) < 0.0);
+    assert!(bf16_to_f32(0x7FC0).is_nan());
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_converts_f16_storage_to_f32() {
+    // 1.0, -2.0, 0.5, 0.0 as IEEE754 binary16 bit patterns.
+    let bytes = f16_bytes(&[0x3C00, 0xC000, 0x3800, 0x0000]);
+    let metadata = f16_tensor_metadata("weight.a", vec![4], bytes.len());
+
+    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect("F16 tensor materializes");
+    let tensor = weights.get("weight.a").expect("tensor present");
+    assert_eq!(tensor.data, vec![1.0, -2.0, 0.5, 0.0]);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_converts_bf16_storage_to_f32() {
+    // 1.0 and -2.0 as bfloat16 bit patterns (f32's top 16 bits).
+    let bytes: Vec<u8> = [0x3F80u16, 0xC000u16]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let metadata = ModelTensorMetadata {
+        storage_dtype: ModelDType::Bf16,
+        ..f16_tensor_metadata("weight.a", vec![2], bytes.len())
+    };
+
+    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect("BF16 tensor materializes");
+    let tensor = weights.get("weight.a").expect("tensor present");
+    assert_eq!(tensor.data, vec![1.0, -2.0]);
+}
+
+/// Decision 8: a declared tensor digest is verified against the *original*
+/// F16 storage bytes, not the converted F32 representation.
+#[test]
+fn host_tensors_from_artifact_bytes_verifies_f16_digest_against_original_bytes() {
+    let bytes = f16_bytes(&[0x3C00]);
+    let mut metadata = f16_tensor_metadata("weight.a", vec![1], bytes.len());
+    metadata.digest = Some(ModelDigest::sha256(&bytes));
+
+    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect("F16 tensor with a matching digest materializes");
+    assert_eq!(weights.get("weight.a").unwrap().data, vec![1.0]);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_rejects_f16_digest_mismatch() {
+    let bytes = f16_bytes(&[0x3C00]);
+    let mut metadata = f16_tensor_metadata("weight.a", vec![1], bytes.len());
+    metadata.digest = Some(ModelDigest::sha256(b"not the real storage bytes"));
+
+    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect_err("a digest mismatch against the original F16 bytes must be rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
 }
 
 #[test]
