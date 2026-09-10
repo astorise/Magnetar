@@ -162,6 +162,10 @@ recreated in the integrating application.
 
 ### Qwen production loading
 
+See
+[docs/production-model-loading-integration.md](docs/production-model-loading-integration.md)
+for the minimal embedder integration recipe (Tachyon-Mesh or otherwise).
+
 The first production Qwen profile currently supports, verified end to end
 against real ingested bundle bytes on both Reference CPU and real CUDA
 hardware:

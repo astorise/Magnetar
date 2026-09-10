@@ -474,6 +474,21 @@ jobs:
             echo "::error file=magnetar-cli/src/commands.rs::cmd_model_load_local_file must not call fixture_model_manifest or require the literal qwen-test model reference"
             exit 1
           fi
+      # Task 11.4: the production-loading integration test and sample
+      # embedder contain no Safetensors tensor parser, Qwen graph builder,
+      # dtype conversion loop, or TensorResourceId fabrication of their
+      # own -- an embedder consumes only the public ingestion/loading/
+      # generation surface, never reimplements or reaches into Runtime-
+      # internal primitives.
+      - name: Source guard -- the Tachyon-shaped integration test uses only public APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='TensorResourceId|SafetensorsTensorEntry|qwen_build_graph|dispatch_matmul|dispatch_reference_cpu_operator|convert_f16_to_f32|convert_bf16_to_f32'
+          if grep -rlE "$pattern" integration-tests/production-loading/src/; then
+            echo "::error::integration-tests/production-loading must drive production loading through public APIs only, never Runtime-internal parsing/graph-building/dtype-conversion/resource-id primitives"
+            exit 1
+          fi
       # `externalize-runtime-extension-modules`'s "Model Components,
       # Providers, and Formats Are Externalized" requirement: the Core
       # (magnetar-runtime) SHALL have zero compile-time dependency on any

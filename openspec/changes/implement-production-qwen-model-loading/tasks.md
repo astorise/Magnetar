@@ -97,8 +97,8 @@
 - [x] 11.1 Expose one supported public orchestration surface for authorized source -> normalized artifact -> Model Loading -> materialization -> warm/readiness -> `ModelInstanceId`.
 - [x] 11.2 Ensure callers cannot mint trust decisions, ready evidence, resource bindings, or Provider allocations.
 - [x] 11.3 Add a Tachyon-shaped integration test using only public APIs and a client-provided/Tachyon source identity.
-- [ ] 11.4 Static/source guard: the integration test and sample embedder contain no Safetensors tensor parser, Qwen graph builder, dtype conversion loop, or TensorResourceId fabrication.
-- [ ] 11.5 Document the minimal public integration recipe for Tachyon-Mesh and other embedders.
+- [x] 11.4 Static/source guard: the integration test and sample embedder contain no Safetensors tensor parser, Qwen graph builder, dtype conversion loop, or TensorResourceId fabrication.
+- [x] 11.5 Document the minimal public integration recipe for Tachyon-Mesh and other embedders.
 
 ## 12. Production E2E and release gates
 
