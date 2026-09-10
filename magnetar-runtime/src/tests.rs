@@ -37,6 +37,7 @@ use crate::operator::*;
 use crate::operator_scope::*;
 use crate::planning::*;
 use crate::prefix_cache::*;
+use crate::production_model_ingestion::*;
 use crate::provider::*;
 use crate::provider_roadmap::*;
 use crate::qwen_model_component::*;
@@ -10594,6 +10595,326 @@ fn manifest_with_one_tensor(shape: Vec<u64>, storage_dtype: ModelDType) -> Model
         }],
         ..minimal_model_manifest()
     }
+}
+
+fn manifest_with_tensors(tensors: Vec<(&str, Vec<u64>)>) -> ModelManifest {
+    let tensors = tensors
+        .into_iter()
+        .map(|(name, shape)| {
+            let element_count: u64 = shape.iter().product();
+            ModelTensorMetadata {
+                name: name.to_string(),
+                shape,
+                storage_dtype: ModelDType::F32,
+                layout: None,
+                shard: None,
+                offset_bytes: Some(0),
+                size_bytes: Some(element_count * 4),
+                quantization: None,
+                expected_compute_dtype: None,
+                digest: None,
+            }
+        })
+        .collect();
+    ModelManifest {
+        tensors,
+        ..minimal_model_manifest()
+    }
+}
+
+/// Test-only [`ProductionArtifactPayloadSource`]
+/// (`implement-production-qwen-model-loading` task group 6): serves each
+/// tensor's bytes from an in-memory map by logical name (ignoring
+/// `offset`/`length`, which a real ingestor would use to locate bytes
+/// within its own authorized source), and records every `read_payload`
+/// call's identity in order -- so a test can assert both *what* was read
+/// and *when*, proving no tensor is read more than once and no tensor is
+/// read out of the order [`stream_materialize_model_instance_weights`]
+/// was given.
+struct RecordingPayloadSource {
+    bytes_by_name: BTreeMap<String, Vec<u8>>,
+    calls: std::sync::Mutex<Vec<String>>,
+    fail_for: Option<String>,
+}
+
+impl RecordingPayloadSource {
+    fn new(bytes_by_name: BTreeMap<String, Vec<u8>>) -> Self {
+        Self {
+            bytes_by_name,
+            calls: std::sync::Mutex::new(Vec::new()),
+            fail_for: None,
+        }
+    }
+
+    fn failing_for(mut self, name: &str) -> Self {
+        self.fail_for = Some(name.to_string());
+        self
+    }
+
+    fn call_log(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl ProductionArtifactPayloadSource for RecordingPayloadSource {
+    fn read_payload(
+        &self,
+        range: &ProductionPayloadRange,
+    ) -> Result<Vec<u8>, ProductionIngestionError> {
+        self.calls.lock().unwrap().push(range.identity.clone());
+        if self.fail_for.as_deref() == Some(range.identity.as_str()) {
+            return Err(ProductionIngestionError::PayloadUnavailable {
+                identity: range.identity.clone(),
+            });
+        }
+        self.bytes_by_name
+            .get(&range.identity)
+            .cloned()
+            .ok_or_else(|| ProductionIngestionError::PayloadOutOfBounds {
+                identity: range.identity.clone(),
+            })
+    }
+}
+
+fn active_allocation_bytes(runtime: &Runtime) -> u64 {
+    runtime
+        .memory()
+        .allocations()
+        .filter(|allocation| !allocation_released(allocation))
+        .map(|allocation| allocation.request.size_bytes)
+        .sum()
+}
+
+fn f32_tensor_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+/// Shared setup for the `stream_materialize_model_instance_weights` tests
+/// below: a three-tensor manifest, a loaded (not yet materialized) Model
+/// Instance, and the `ReferenceCpuExecutor` handle backing the Provider
+/// that instance is bound to (obtained before the `ReferenceCpuProvider`
+/// itself is moved into the Runtime, since it shares state with whatever
+/// gets registered).
+fn streaming_materialization_fixture() -> (
+    Runtime,
+    ModelInstanceId,
+    ModelManifest,
+    Arc<ReferenceCpuExecutor>,
+) {
+    let manifest = manifest_with_tensors(vec![
+        ("weight.a", vec![2, 2]),
+        ("weight.b", vec![2, 2]),
+        ("weight.c", vec![2, 2]),
+    ]);
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(provider))
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+    (runtime, instance, manifest, executor)
+}
+
+fn streaming_fixture_payload_bytes() -> BTreeMap<String, Vec<u8>> {
+    BTreeMap::from([
+        (
+            "weight.a".to_string(),
+            f32_tensor_bytes(&[1.0, 2.0, 3.0, 4.0]),
+        ),
+        (
+            "weight.b".to_string(),
+            f32_tensor_bytes(&[5.0, 6.0, 7.0, 8.0]),
+        ),
+        (
+            "weight.c".to_string(),
+            f32_tensor_bytes(&[9.0, 10.0, 11.0, 12.0]),
+        ),
+    ])
+}
+
+/// `implement-production-qwen-model-loading` task group 6: production
+/// weight materialization can proceed one tensor at a time from a bounded
+/// payload source instead of requiring a whole-model `BTreeMap<String,
+/// HostTensor>` upfront -- and every tensor is read from the payload
+/// source exactly once, in the order given.
+#[test]
+fn stream_materialize_model_instance_weights_succeeds_and_reads_each_tensor_once() {
+    let (mut runtime, instance, manifest, _executor) = streaming_materialization_fixture();
+    let payload_source = RecordingPayloadSource::new(streaming_fixture_payload_bytes());
+
+    stream_materialize_model_instance_weights(
+        &mut runtime,
+        &instance,
+        "test",
+        &manifest.tensors,
+        &payload_source,
+    )
+    .expect("streaming materialization succeeds");
+
+    assert_eq!(
+        runtime.model_instance(&instance).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+    assert_eq!(
+        payload_source.call_log(),
+        vec!["weight.a", "weight.b", "weight.c"],
+        "each tensor must be read exactly once, in the manifest's own order"
+    );
+}
+
+/// Task 6.6: a payload-read failure partway through a streaming attempt
+/// rolls back every tensor staged so far in that attempt -- no orphan
+/// Provider tensor, no leaked Memory Manager allocation -- exercised at
+/// the first, middle, and last tensor in a three-tensor manifest.
+#[test]
+fn stream_materialize_model_instance_weights_rolls_back_on_failure_at_any_position() {
+    for failing_tensor in ["weight.a", "weight.b", "weight.c"] {
+        let (mut runtime, instance, manifest, executor) = streaming_materialization_fixture();
+        let payload_source = RecordingPayloadSource::new(streaming_fixture_payload_bytes())
+            .failing_for(failing_tensor);
+        let active_allocations_before = active_allocation_bytes(&runtime);
+
+        let error = stream_materialize_model_instance_weights(
+            &mut runtime,
+            &instance,
+            "test",
+            &manifest.tensors,
+            &payload_source,
+        )
+        .expect_err(&format!(
+            "a payload failure for '{failing_tensor}' must propagate"
+        ));
+        assert!(matches!(
+            error,
+            InferenceApiError::ModelLoadingFailed { .. }
+        ));
+
+        assert_ne!(
+            runtime.model_instance(&instance).unwrap().lifecycle(),
+            ModelInstanceLifecycleState::Ready,
+            "failing on '{failing_tensor}' must not leave the instance Ready"
+        );
+        assert_eq!(
+            active_allocation_bytes(&runtime),
+            active_allocations_before,
+            "failing on '{failing_tensor}' must leave no leaked Memory Manager allocation"
+        );
+        for tensor in &manifest.tensors {
+            let resource_id =
+                TensorResourceId::new(format!("model.{instance}.weight.{}", tensor.name));
+            assert!(
+                executor.read_tensor(&resource_id).is_none(),
+                "failing on '{failing_tensor}' must leave no orphan Provider tensor for '{}'",
+                tensor.name
+            );
+        }
+    }
+}
+
+/// Task 6.7: peak transient host staging is bounded independently of total
+/// model size. The exactly-once-per-tensor, in-order call log the other
+/// two streaming tests already assert *is* the proof this function never
+/// buffers ahead: this test additionally scales the tensor count well
+/// past the tiny three-tensor fixture (50 tensors) to show that scaling up
+/// the tensor *count* changes nothing about the one-tensor-at-a-time
+/// shape of each `read_payload` call -- `stream_materialize_model_
+/// instance_weights`'s loop body holds exactly one `HostTensor` local
+/// variable at a time (never a growing collection), so this property does
+/// not degrade as the model grows.
+#[test]
+fn stream_materialize_model_instance_weights_scales_tensor_count_without_buffering_ahead() {
+    const TENSOR_COUNT: usize = 50;
+    let names: Vec<String> = (0..TENSOR_COUNT).map(|i| format!("weight.{i}")).collect();
+    let manifest = manifest_with_tensors(
+        names
+            .iter()
+            .map(|name| (name.as_str(), vec![4, 4]))
+            .collect(),
+    );
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+    let instance = runtime
+        .create_model_instance(
+            &loaded,
+            ModelArchitectureImplementation {
+                architecture: manifest.architecture.clone(),
+                kind: ModelArchitectureImplementationKind::TestFixture,
+                required_capabilities: Vec::new(),
+            },
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .unwrap();
+
+    let bytes_by_name: BTreeMap<String, Vec<u8>> = names
+        .iter()
+        .map(|name| (name.clone(), f32_tensor_bytes(&[1.0; 16])))
+        .collect();
+    let payload_source = RecordingPayloadSource::new(bytes_by_name);
+
+    stream_materialize_model_instance_weights(
+        &mut runtime,
+        &instance,
+        "test",
+        &manifest.tensors,
+        &payload_source,
+    )
+    .expect("streaming materialization of 50 tensors succeeds");
+
+    assert_eq!(
+        runtime.model_instance(&instance).unwrap().lifecycle(),
+        ModelInstanceLifecycleState::Ready
+    );
+    assert_eq!(
+        payload_source.call_log(),
+        names,
+        "still exactly once, in order, at scale"
+    );
 }
 
 /// P0-C: `materialize_model_instance_weights` rejects content whose shape

@@ -8,6 +8,7 @@
 //! a real, if tiny, end-to-end inference run. The `e2e_conformance` module is
 //! now a compatibility wrapper around this runtime-owned implementation.
 
+use crate::ProductionArtifactPayloadSource;
 use crate::ProviderExecutionResult;
 use crate::affinity::*;
 use crate::batching::*;
@@ -6191,6 +6192,55 @@ pub fn materialize_model_instance_weights(
             // or is not presently in a state `Failed` legally transitions
             // from, the original materialization error below is still what
             // is returned either way.
+            if let Ok(model_instance) = runtime.model_instances_mut().instance_mut(instance) {
+                let _ = model_instance.transition_to(ModelInstanceLifecycleState::Failed);
+            }
+            return Err(error);
+        }
+    }
+    transaction.commit(runtime, instance)
+}
+
+/// Streaming counterpart to [`materialize_model_instance_weights`]
+/// (`implement-production-qwen-model-loading` task group 6 / "Production
+/// Loading Supports Bounded Tensor Payload Access"): reads, validates,
+/// converts, and stages each of `tensors` one at a time from
+/// `payload_source`, never requiring the entire model to first exist as a
+/// whole-model `BTreeMap<String, HostTensor>`. Each tensor's `HostTensor`
+/// is staged into Provider-owned storage and dropped before the next one
+/// is even read (`host_tensor_from_payload_source`'s only allocation does
+/// not outlive this loop body's iteration), so peak transient host staging
+/// stays bounded by one tensor's size, independent of total model size.
+///
+/// Reuses the same [`WeightMaterializationTransaction`] commit/rollback
+/// semantics as the whole-map entry point: `commit` publishes bindings/
+/// readiness only after every tensor in `tensors` stages successfully, and
+/// any failure releases every Provider-side tensor, Memory Manager
+/// allocation, and pending binding staged so far in this attempt.
+pub fn stream_materialize_model_instance_weights(
+    runtime: &mut Runtime,
+    instance: &ModelInstanceId,
+    artifact_owner: &str,
+    tensors: &[ModelTensorMetadata],
+    payload_source: &dyn ProductionArtifactPayloadSource,
+) -> Result<(), InferenceApiError> {
+    let mut transaction = WeightMaterializationTransaction::begin(runtime, instance)?;
+    for tensor in tensors {
+        let stage_result = host_tensor_from_payload_source(tensor, payload_source)
+            .map_err(|error| InferenceApiError::ModelLoadingFailed {
+                reason: error.to_string(),
+            })
+            .and_then(|host_tensor| {
+                transaction.stage_weight(
+                    runtime,
+                    instance,
+                    artifact_owner,
+                    &tensor.name,
+                    &host_tensor,
+                )
+            });
+        if let Err(error) = stage_result {
+            transaction.abort(runtime);
             if let Ok(model_instance) = runtime.model_instances_mut().instance_mut(instance) {
                 let _ = model_instance.transition_to(ModelInstanceLifecycleState::Failed);
             }

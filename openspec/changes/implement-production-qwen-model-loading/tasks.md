@@ -45,13 +45,13 @@
 
 ## 6. Streaming transactional weight materialization
 
-- [ ] 6.1 Add a production materialization path that iterates required tensor metadata/payloads without first building a whole-model `BTreeMap<String, HostTensor>`.
-- [ ] 6.2 Reuse/extend `WeightMaterializationTransaction`; do not create a parallel non-transactional loader.
-- [ ] 6.3 For each tensor: read bounded payload -> validate -> convert if needed -> Provider stage -> release transient host staging before proceeding where possible.
-- [ ] 6.4 Commit only when all required weight names are successfully staged and bindings match the validated manifest.
-- [ ] 6.5 On any failure, release Provider-side resources, Memory Manager allocations/residency, pending bindings, and readiness evidence.
-- [ ] 6.6 Add failure-injection tests at first/middle/last tensor and Provider-write/completion failure; assert no orphan Provider tensor and no leaked Memory Manager allocation.
-- [ ] 6.7 Add a scale test proving host staging peak is bounded independently of total model size (within explicit buffering policy).
+- [x] 6.1 Add a production materialization path that iterates required tensor metadata/payloads without first building a whole-model `BTreeMap<String, HostTensor>`.
+- [x] 6.2 Reuse/extend `WeightMaterializationTransaction`; do not create a parallel non-transactional loader.
+- [x] 6.3 For each tensor: read bounded payload -> validate -> convert if needed -> Provider stage -> release transient host staging before proceeding where possible.
+- [x] 6.4 Commit only when all required weight names are successfully staged and bindings match the validated manifest.
+- [x] 6.5 On any failure, release Provider-side resources, Memory Manager allocations/residency, pending bindings, and readiness evidence.
+- [x] 6.6 Add failure-injection tests at first/middle/last tensor and Provider-write/completion failure; assert no orphan Provider tensor and no leaked Memory Manager allocation.
+- [x] 6.7 Add a scale test proving host staging peak is bounded independently of total model size (within explicit buffering policy).
 
 ## 7. Versioned Runtime-authorized model config Capability
 

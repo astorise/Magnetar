@@ -998,163 +998,276 @@ pub fn host_tensors_from_artifact_bytes(
 ) -> Result<BTreeMap<String, HostTensor>, ModelLoadingError> {
     let mut weights = BTreeMap::new();
     for tensor in tensors {
-        let bytes_per_element: u64 = match tensor.storage_dtype {
-            ModelDType::F32 => 4,
-            ModelDType::F16 | ModelDType::Bf16 => 2,
-            other => {
-                return Err(ModelLoadingError::new(
-                    ModelLoadingErrorCode::StorageDTypeUnsupported,
-                    Some(ModelLoadingPhase::MaterializeWeights),
-                    format!(
-                        "tensor '{}' declares unsupported storage dtype {other:?} (only F32, \
-                         F16, and BF16 are supported)",
-                        tensor.name
-                    ),
-                ));
-            }
-        };
-        let element_count = tensor
-            .shape
-            .iter()
-            .try_fold(1_u64, |count, &dimension| count.checked_mul(dimension))
-            .ok_or_else(|| {
-                ModelLoadingError::new(
-                    ModelLoadingErrorCode::MaterializationFailed,
-                    Some(ModelLoadingPhase::MaterializeWeights),
-                    format!(
-                        "tensor '{}' shape element-count computation overflowed",
-                        tensor.name
-                    ),
-                )
-            })?;
-        let expected_size = element_count
-            .checked_mul(bytes_per_element)
-            .ok_or_else(|| {
-                ModelLoadingError::new(
-                    ModelLoadingErrorCode::MaterializationFailed,
-                    Some(ModelLoadingPhase::MaterializeWeights),
-                    format!("tensor '{}' byte-size computation overflowed", tensor.name),
-                )
-            })?;
-        let (offset, declared_size) = match (tensor.offset_bytes, tensor.size_bytes) {
-            (Some(offset), Some(size)) => (offset, size),
-            _ => {
-                return Err(ModelLoadingError::new(
-                    ModelLoadingErrorCode::MaterializationFailed,
-                    Some(ModelLoadingPhase::MaterializeWeights),
-                    format!(
-                        "tensor '{}' has no declared byte offset/size to read from",
-                        tensor.name
-                    ),
-                ));
-            }
-        };
-        if declared_size != expected_size {
+        let raw = slice_tensor_bytes(tensor, bytes, data_section_start)?;
+        let host_tensor = tensor_from_raw_bytes(tensor, raw)?;
+        weights.insert(tensor.name.clone(), host_tensor);
+    }
+    Ok(weights)
+}
+
+/// The byte-count-per-element this Runtime materializes for a declared
+/// storage dtype, or a structured error for any other dtype (quantized
+/// formats, integer types) -- shared by both the whole-buffer
+/// ([`host_tensors_from_artifact_bytes`]) and streaming
+/// ([`stream_materialize_model_instance_weights`] in `first_native_runtime`)
+/// materialization paths.
+fn bytes_per_element(tensor: &ModelTensorMetadata) -> Result<u64, ModelLoadingError> {
+    match tensor.storage_dtype {
+        ModelDType::F32 => Ok(4),
+        ModelDType::F16 | ModelDType::Bf16 => Ok(2),
+        other => Err(ModelLoadingError::new(
+            ModelLoadingErrorCode::StorageDTypeUnsupported,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!(
+                "tensor '{}' declares unsupported storage dtype {other:?} (only F32, F16, and \
+                 BF16 are supported)",
+                tensor.name
+            ),
+        )),
+    }
+}
+
+/// Locates and slices `tensor`'s declared byte range out of `bytes` (a
+/// complete, already-in-memory artifact/part buffer), relative to
+/// `data_section_start`. This is the whole-buffer materialization path's
+/// own concern -- the streaming path ([`stream_materialize_model_instance_
+/// weights`]) instead receives exactly one tensor's bytes directly from a
+/// bounded [`crate::ProductionArtifactPayloadSource`], with no larger
+/// buffer to slice from.
+fn slice_tensor_bytes<'a>(
+    tensor: &ModelTensorMetadata,
+    bytes: &'a [u8],
+    data_section_start: u64,
+) -> Result<&'a [u8], ModelLoadingError> {
+    let element_count = tensor
+        .shape
+        .iter()
+        .try_fold(1_u64, |count, &dimension| count.checked_mul(dimension))
+        .ok_or_else(|| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!(
+                    "tensor '{}' shape element-count computation overflowed",
+                    tensor.name
+                ),
+            )
+        })?;
+    let expected_size = element_count
+        .checked_mul(bytes_per_element(tensor)?)
+        .ok_or_else(|| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!("tensor '{}' byte-size computation overflowed", tensor.name),
+            )
+        })?;
+    let (offset, declared_size) = match (tensor.offset_bytes, tensor.size_bytes) {
+        (Some(offset), Some(size)) => (offset, size),
+        _ => {
             return Err(ModelLoadingError::new(
                 ModelLoadingErrorCode::MaterializationFailed,
                 Some(ModelLoadingPhase::MaterializeWeights),
                 format!(
-                    "tensor '{}' declares {declared_size} bytes but its shape implies {expected_size}",
+                    "tensor '{}' has no declared byte offset/size to read from",
                     tensor.name
                 ),
             ));
         }
-        let offset = data_section_start.checked_add(offset).ok_or_else(|| {
-            ModelLoadingError::new(
-                ModelLoadingErrorCode::MaterializationFailed,
-                Some(ModelLoadingPhase::MaterializeWeights),
-                format!(
-                    "tensor '{}' data-section-relative offset overflowed",
-                    tensor.name
-                ),
-            )
-        })?;
-        let end = offset.checked_add(declared_size).ok_or_else(|| {
-            ModelLoadingError::new(
-                ModelLoadingErrorCode::MaterializationFailed,
-                Some(ModelLoadingPhase::MaterializeWeights),
-                format!("tensor '{}' byte range overflowed", tensor.name),
-            )
-        })?;
-        let start = usize::try_from(offset).map_err(|_| {
-            ModelLoadingError::new(
-                ModelLoadingErrorCode::MaterializationFailed,
-                Some(ModelLoadingPhase::MaterializeWeights),
-                format!("tensor '{}' byte offset is out of range", tensor.name),
-            )
-        })?;
-        let end = usize::try_from(end).map_err(|_| {
-            ModelLoadingError::new(
-                ModelLoadingErrorCode::MaterializationFailed,
-                Some(ModelLoadingPhase::MaterializeWeights),
-                format!("tensor '{}' byte range is out of range", tensor.name),
-            )
-        })?;
-        let range = bytes.get(start..end).ok_or_else(|| {
-            ModelLoadingError::new(
-                ModelLoadingErrorCode::MaterializationFailed,
-                Some(ModelLoadingPhase::MaterializeWeights),
-                format!(
-                    "tensor '{}' byte range [{start}, {end}) is out of bounds",
-                    tensor.name
-                ),
-            )
-        })?;
-        if tensor.storage_dtype != ModelDType::F32
-            && let Some(expected_digest) = &tensor.digest
-        {
-            expected_digest.verify_bytes(range).map_err(|error| {
-                ModelLoadingError::new(
-                    ModelLoadingErrorCode::MaterializationFailed,
-                    Some(ModelLoadingPhase::MaterializeWeights),
-                    format!(
-                        "tensor '{}' storage bytes do not match its declared content digest: \
-                         {error}",
-                        tensor.name
-                    ),
-                )
-            })?;
-        }
-        let data: Vec<f32> = match tensor.storage_dtype {
-            ModelDType::F32 => range
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|chunk| f32::from_le_bytes(*chunk))
-                .collect(),
-            ModelDType::F16 => range
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|chunk| f16_to_f32(u16::from_le_bytes(*chunk)))
-                .collect(),
-            ModelDType::Bf16 => range
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|chunk| bf16_to_f32(u16::from_le_bytes(*chunk)))
-                .collect(),
-            other => {
-                return Err(ModelLoadingError::new(
-                    ModelLoadingErrorCode::StorageDTypeUnsupported,
-                    Some(ModelLoadingPhase::MaterializeWeights),
-                    format!(
-                        "tensor '{}' declares unsupported storage dtype {other:?}",
-                        tensor.name
-                    ),
-                ));
-            }
-        };
-        let host_tensor = HostTensor::new(tensor.shape.clone(), data).map_err(|error| {
-            ModelLoadingError::new(
-                ModelLoadingErrorCode::MaterializationFailed,
-                Some(ModelLoadingPhase::MaterializeWeights),
-                format!("tensor '{}' failed to materialize: {error}", tensor.name),
-            )
-        })?;
-        weights.insert(tensor.name.clone(), host_tensor);
+    };
+    if declared_size != expected_size {
+        return Err(ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!(
+                "tensor '{}' declares {declared_size} bytes but its shape implies {expected_size}",
+                tensor.name
+            ),
+        ));
     }
-    Ok(weights)
+    let offset = data_section_start.checked_add(offset).ok_or_else(|| {
+        ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!(
+                "tensor '{}' data-section-relative offset overflowed",
+                tensor.name
+            ),
+        )
+    })?;
+    let end = offset.checked_add(declared_size).ok_or_else(|| {
+        ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!("tensor '{}' byte range overflowed", tensor.name),
+        )
+    })?;
+    let start = usize::try_from(offset).map_err(|_| {
+        ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!("tensor '{}' byte offset is out of range", tensor.name),
+        )
+    })?;
+    let end = usize::try_from(end).map_err(|_| {
+        ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!("tensor '{}' byte range is out of range", tensor.name),
+        )
+    })?;
+    bytes.get(start..end).ok_or_else(|| {
+        ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!(
+                "tensor '{}' byte range [{start}, {end}) is out of bounds",
+                tensor.name
+            ),
+        )
+    })
+}
+
+/// Validates and decodes `raw` -- exactly `tensor`'s declared storage
+/// bytes, no more, no less -- into a `HostTensor`, shared by both the
+/// whole-buffer and streaming materialization paths (see
+/// [`slice_tensor_bytes`]'s doc comment for which path supplies `raw` how).
+/// Verifies `raw.len()` against the shape/dtype-implied byte count, verifies
+/// a declared non-F32 digest against `raw` before conversion (Decision 8),
+/// and converts F16/BF16 to F32 explicitly.
+fn tensor_from_raw_bytes(
+    tensor: &ModelTensorMetadata,
+    raw: &[u8],
+) -> Result<HostTensor, ModelLoadingError> {
+    let element_count = tensor
+        .shape
+        .iter()
+        .try_fold(1_u64, |count, &dimension| count.checked_mul(dimension))
+        .ok_or_else(|| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!(
+                    "tensor '{}' shape element-count computation overflowed",
+                    tensor.name
+                ),
+            )
+        })?;
+    let expected_size = element_count
+        .checked_mul(bytes_per_element(tensor)?)
+        .ok_or_else(|| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!("tensor '{}' byte-size computation overflowed", tensor.name),
+            )
+        })?;
+    let actual_size = raw.len() as u64;
+    if actual_size != expected_size {
+        return Err(ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!(
+                "tensor '{}' supplied {actual_size} bytes but its shape implies {expected_size}",
+                tensor.name
+            ),
+        ));
+    }
+    if tensor.storage_dtype != ModelDType::F32
+        && let Some(expected_digest) = &tensor.digest
+    {
+        expected_digest.verify_bytes(raw).map_err(|error| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!(
+                    "tensor '{}' storage bytes do not match its declared content digest: {error}",
+                    tensor.name
+                ),
+            )
+        })?;
+    }
+    let data: Vec<f32> = match tensor.storage_dtype {
+        ModelDType::F32 => raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect(),
+        ModelDType::F16 => raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| f16_to_f32(u16::from_le_bytes(*chunk)))
+            .collect(),
+        ModelDType::Bf16 => raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| bf16_to_f32(u16::from_le_bytes(*chunk)))
+            .collect(),
+        other => {
+            return Err(ModelLoadingError::new(
+                ModelLoadingErrorCode::StorageDTypeUnsupported,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!(
+                    "tensor '{}' declares unsupported storage dtype {other:?}",
+                    tensor.name
+                ),
+            ));
+        }
+    };
+    HostTensor::new(tensor.shape.clone(), data).map_err(|error| {
+        ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!("tensor '{}' failed to materialize: {error}", tensor.name),
+        )
+    })
+}
+
+/// Reads, validates, converts, and returns exactly one tensor's `HostTensor`
+/// content from a bounded [`crate::ProductionArtifactPayloadSource`] --
+/// the per-tensor building block [`crate::first_native_runtime::
+/// stream_materialize_model_instance_weights`] calls in a loop instead of
+/// requiring the entire model to first exist as a whole-model
+/// `BTreeMap<String, HostTensor>` (`implement-production-qwen-model-loading`
+/// task group 6 / "Production Model Loading Supports Bounded Tensor Payload
+/// Access"). The returned `HostTensor` is this function's only allocation
+/// surviving past its own call -- nothing here accumulates state across
+/// tensors, so peak transient host staging stays bounded by whatever the
+/// caller does with each `HostTensor` before requesting the next one.
+pub fn host_tensor_from_payload_source(
+    tensor: &ModelTensorMetadata,
+    payload_source: &dyn crate::ProductionArtifactPayloadSource,
+) -> Result<HostTensor, ModelLoadingError> {
+    let (offset, length) = match (tensor.offset_bytes, tensor.size_bytes) {
+        (Some(offset), Some(size)) => (offset, size),
+        _ => {
+            return Err(ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!(
+                    "tensor '{}' has no declared byte offset/size to read from",
+                    tensor.name
+                ),
+            ));
+        }
+    };
+    let range = crate::ProductionPayloadRange {
+        identity: tensor.name.clone(),
+        offset,
+        length,
+        digest: tensor.digest.clone(),
+    };
+    let raw = payload_source.read_payload(&range).map_err(|error| {
+        ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!("tensor '{}' payload read failed: {error}", tensor.name),
+        )
+    })?;
+    tensor_from_raw_bytes(tensor, &raw)
 }
 
 /// Converts one IEEE 754 binary16 ("half float") value to `f32`, exactly
