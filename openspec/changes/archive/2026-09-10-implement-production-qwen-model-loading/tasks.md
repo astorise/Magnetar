@@ -105,18 +105,18 @@
 - [x] 12.1 Add a tiny deterministic **production-layout** Qwen bundle for per-PR tests: real `config.json`, real tokenizer files, real Safetensors parser input, optional real shard index. It may be small, but it must enter through the production ingestor; no fixture manifest/inventory constructor is allowed.
 - [x] 12.2 E2E Reference CPU: authorized bundle -> ingestion -> trust/integrity -> configurable Component -> ModelInstance -> materialization -> prefill/decode -> output.
 - [x] 12.3 E2E CUDA on real hardware through the same normalized artifact and Component; assert CUDA Provider/Device residency and no silent Reference CPU fallback.
-- [ ] 12.4 Add a real public Qwen-compatible checkpoint smoke test pinned by revision/digest (manual/nightly/hardware profile acceptable if size prevents per-PR execution).
-- [ ] 12.5 Compare CPU/CUDA logits or deterministic output within a documented tolerance.
+- [x] 12.4 Add a real public Qwen-compatible checkpoint smoke test pinned by revision/digest (manual/nightly/hardware profile acceptable if size prevents per-PR execution).
+- [x] 12.5 Compare CPU/CUDA logits or deterministic output within a documented tolerance.
 - [x] 12.6 Assert unload/failure leaves no ModelInstance weight allocation or Provider tensor leak.
 - [x] 12.7 Make GPU CI fail if the required hardware test is skipped or selects `0 tests`.
 - [x] 12.8 Add source guards proving production loading/generation does not call `fixture_model_manifest`, fixture tensor inventory builders, or require literal `qwen-test`.
 - [x] 12.9 Run `cargo test`/clippy/fmt/doc/wasm checks for Runtime and every affected external module.
 - [x] 12.10 Run CUDA hardware suite and capture exact commit/runner evidence.
-- [ ] 12.11 Run `openspec validate --all --strict` and archive only after every task above is complete with linked evidence.
+- [x] 12.11 Run `openspec validate --all --strict` and archive only after every task above is complete with linked evidence.
 
 ## 13. Documentation / cutover declaration
 
-- [ ] 13.1 Update `README.md` production status from "general model loading incomplete" only when tasks 1-12 meet their exit criteria.
+- [x] 13.1 Update `README.md` production status from "general model loading incomplete" only when tasks 1-12 meet their exit criteria.
 - [x] 13.2 Update `SUBMODULES.md` with the production ingestor/tokenizer module pins and compatibility requirements.
 - [x] 13.3 Document supported initial production profile precisely: Qwen + Hugging Face-style config/tokenizer + Safetensors F32/F16/BF16 storage + Reference CPU/CUDA Float32 compute path.
 - [x] 13.4 Document explicit non-support separately: remote hub/cache behavior not yet implemented, native half compute if deferred, GGUF quantized execution, other model families.

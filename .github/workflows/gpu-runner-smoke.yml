@@ -77,5 +77,30 @@ jobs:
         # runs this crate's own `hardware_conformance_actually_ran_not_
         # silently_skipped`, mirroring providers/cuda's -- a GPU CI job
         # must not be able to report success while the CUDA-gated test
-        # above silently skipped.
-        run: cargo test --locked --manifest-path integration-tests/production-loading/Cargo.toml -- --include-ignored
+        # above silently skipped. Filtered to this module: `tests_real_
+        # checkpoint_smoke`'s tests need a downloaded checkpoint (next
+        # step) and would otherwise panic here for a missing env var.
+        run: cargo test --locked --manifest-path integration-tests/production-loading/Cargo.toml tests_production_loading -- --include-ignored
+      - name: Download the pinned real Qwen2.5-0.5B-Instruct checkpoint
+        # implement-production-qwen-model-loading task 12.4/12.5: pinned by
+        # exact revision; `tests_real_checkpoint_smoke.rs` independently
+        # verifies model.safetensors' real sha256 against the digest that
+        # revision declares before trusting it at all.
+        env:
+          REVISION: 7ae557604adf67be50417f59c2c2f167def9a775
+        run: |
+          set -eux
+          dir="$RUNNER_TEMP/qwen2.5-0.5b-instruct-$REVISION"
+          mkdir -p "$dir"
+          for file in config.json generation_config.json tokenizer.json tokenizer_config.json model.safetensors; do
+            curl -fsSL "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/$REVISION/$file" -o "$dir/$file"
+          done
+          echo "MAGNETAR_QWEN_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Test the real public checkpoint on Reference CPU and real CUDA
+        # task 12.4: full production pipeline (real config.json/tokenizer.
+        # json/Safetensors -> real compiled Qwen Component -> real
+        # Reference CPU dispatch) against a real, publicly downloaded
+        # checkpoint, not only tiny synthetic bundles. task 12.5: the same
+        # checkpoint's greedy prefill token/text compared between
+        # Reference CPU and this same real CUDA hardware.
+        run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_checkpoint -- --include-ignored --test-threads=1

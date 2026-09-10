@@ -3388,6 +3388,33 @@ fn dispatch_qwen_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        "add" => {
+            if inputs.len() != 2 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 2 add inputs"),
+                });
+            }
+            let a = inputs.remove(0);
+            let b = inputs.remove(0);
+            // `dispatch_qwen_binary_same_shape` derives each input's
+            // resource descriptor from its own real shape (`node_input_
+            // resource`) and the output descriptor from `a`'s shape alone
+            // -- exactly `ShapeRule::RowBroadcastAdd`'s contract (task
+            // 10.5's sibling QKV bias support: `b` is a real `[dim]`
+            // bias, broadcast by the Kernel itself, e.g. `providers/cpu::
+            // add`). Its name predates this second use; nothing in it
+            // assumes `a` and `b` share a shape.
+            dispatch_qwen_binary_same_shape(
+                ctx,
+                node_id,
+                "add",
+                OperatorFamily::Tensor,
+                a,
+                b,
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "mul" => {
             if inputs.len() != 2 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -3687,6 +3714,7 @@ fn execute_qwen_graph_nodes(
             "matmul"
                 | "attention"
                 | "silu"
+                | "add"
                 | "mul"
                 | "residual-add"
                 | "embedding"
@@ -6713,7 +6741,7 @@ const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:c50eeee444d47584055aac64c798a0599030d244fcdeeac0703b244f76a91cbd";
+    "sha256:c541adfd678321116fa18f6d9572dba89490bbac370392975aab50068472e65c";
 
 /// Test-oracle only (`reach-architecture-freeze-1` task 12.4): the checked-in
 /// real Qwen Component binary, embedded for test fixtures. Production never
@@ -6914,6 +6942,11 @@ fn qwen_weight_shapes_for_config(config: &QwenConfig) -> BTreeMap<String, Vec<u6
             format!("{prefix}.self_attn.v_proj"),
             vec![a.hidden_size, kv_dim],
         );
+        if config.attention_bias {
+            shapes.insert(format!("{prefix}.self_attn.q_bias"), vec![q_dim]);
+            shapes.insert(format!("{prefix}.self_attn.k_bias"), vec![kv_dim]);
+            shapes.insert(format!("{prefix}.self_attn.v_bias"), vec![kv_dim]);
+        }
         shapes.insert(
             format!("{prefix}.self_attn.o_proj"),
             vec![q_dim, a.hidden_size],
@@ -6957,6 +6990,7 @@ fn architecture_config_from_qwen_config(config: &QwenConfig) -> ModelArchitectur
         rope_theta: config.rope.base,
         rope_scaling_factor: config.rope.scale.map(|value| value as f32),
         tie_word_embeddings: config.tied_embeddings,
+        attention_bias: config.attention_bias,
         bos_token_id: None,
         eos_token_id: None,
     }
@@ -6997,6 +7031,7 @@ fn qwen_config_from_architecture_config(
         },
         rmsnorm_epsilon: config.rms_norm_eps,
         tied_embeddings: config.tie_word_embeddings,
+        attention_bias: config.attention_bias,
         require_bos: false,
         require_pad: false,
         expected_added_tokens: None,
@@ -7386,17 +7421,19 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
     manager.set_resource_limits(qwen_component_runtime_limits());
     manager
         .set_trust_store(ComponentTrustStore::default().trust_digest(QWEN_REAL_COMPONENT_DIGEST));
-    // `1.1.0`: the checked-in real Qwen Component now also imports
-    // `model-config` (Decision 6), a purely additive evolution over
-    // `1.0.0`'s `graph-builder`-only world.
+    // `1.2.0`: the checked-in real Qwen Component now also imports
+    // `attention-bias` on `architecture-config` (task 10.5's sibling QKV
+    // bias support), a purely additive evolution over `1.1.0`'s
+    // `model-config` shape, itself additive over `1.0.0`'s
+    // `graph-builder`-only world.
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.1.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.2.0");
     manager.provide_capability(
         graph_builder_interface,
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.1.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.2.0");
     manager.provide_capability(
         model_config_interface,
         model_config_capability.clone() as Arc<dyn HostCapability>,
@@ -7702,18 +7739,24 @@ fn build_first_native_graphs_from_component_output(
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn qwen_component_runtime_limits() -> ComponentResourceLimits {
     ComponentResourceLimits {
-        // 8 MiB: the checksum-only fixture Component fit in 1 MiB, but the
-        // real Qwen Component's wit-bindgen-generated glue (String/Vec
-        // allocations across ~19 real graph-builder calls per graph) needs
-        // more just to instantiate (a real minimum-memory requirement, not
-        // this budget being too tight) -- confirmed by running the real
-        // component and observing its actual instantiation requirement
-        // (17 wasm pages, ~1.1 MiB) before choosing this headroom.
-        max_memory_bytes: Some(1 << 23),
-        execution_deadline_millis: Some(1_000),
+        // 64 MiB: the checksum-only fixture Component fit in 1 MiB, and
+        // the tiny 1-layer test fixture's real graph needed only ~19
+        // graph-builder calls -- but this same singleton runtime also
+        // builds graphs for real production checkpoints (task 12.4/12.5),
+        // whose per-layer call count (and this session's task-10.5/QKV-
+        // bias-support additions) scale with `num_hidden_layers`: a real
+        // 24-layer Qwen2.5-0.5B-Instruct config was observed to trip the
+        // previous 8 MiB/1,000,000-fuel/1000ms budget (`ResourcePolicy`
+        // interruption) building its ~500-call graph. Generous headroom
+        // here (not per-config, since this runtime is a shared, one-time-
+        // initialized singleton across every config it ever builds a
+        // graph for) still fails closed against a genuinely runaway
+        // Component -- it is bounded, not unlimited.
+        max_memory_bytes: Some(1 << 26),
+        execution_deadline_millis: Some(5_000),
         max_concurrent_invocations: Some(1),
         max_instances: Some(1),
-        engine_execution_budget: Some(1_000_000),
+        engine_execution_budget: Some(20_000_000),
         require_memory_limit: true,
     }
 }

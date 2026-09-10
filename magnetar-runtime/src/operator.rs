@@ -186,6 +186,7 @@ pub enum ShapeRule {
     SameShape,
     Matmul,
     RmsNorm,
+    RowBroadcastAdd,
     Rank(u64),
 }
 
@@ -779,7 +780,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::SameShape,
         ),
-        ("add", OperatorFamily::Tensor, 2, 1, ShapeRule::SameShape),
+        (
+            "add",
+            OperatorFamily::Tensor,
+            2,
+            1,
+            ShapeRule::RowBroadcastAdd,
+        ),
         ("mul", OperatorFamily::Tensor, 2, 1, ShapeRule::SameShape),
         (
             "residual-add",
@@ -1071,6 +1078,53 @@ fn validate_shape_rule(
             if weight.as_slice() != [*cols] && weight != input && !row_broadcast_weight {
                 return Err(OperatorError::ShapeMismatch {
                     reason: "RMSNorm weight shape must be [cols], [1, cols], or input-shaped"
+                        .into(),
+                });
+            }
+            Ok(())
+        }
+        // `add`'s second input may either match the first exactly (a
+        // regular elementwise add, e.g. `residual-add`'s reuse of `add`'s
+        // Kernel), or -- mirroring `ShapeRule::RmsNorm`'s already-
+        // permissive weight-row-broadcast convention -- be a single row
+        // (`[cols]`/`[1, cols]`, `cols` the first input's last dimension)
+        // broadcast across every row (real Qwen2/2.5 QKV projection
+        // bias). Additive over strict same-shape: every previously-valid
+        // graph still validates identically.
+        ShapeRule::RowBroadcastAdd => {
+            if inputs.len() < 2 {
+                return Err(OperatorError::InputArityInvalid {
+                    expected: 2,
+                    actual: inputs.len(),
+                });
+            }
+            if outputs.is_empty() {
+                return Err(OperatorError::OutputArityInvalid {
+                    expected: 1,
+                    actual: outputs.len(),
+                });
+            }
+            let a = &inputs[0].shape.dimensions;
+            let b = &inputs[1].shape.dimensions;
+            let output = &outputs[0].shape.dimensions;
+            if output != a {
+                return Err(OperatorError::ShapeMismatch {
+                    reason: "add output shape must match its first input".into(),
+                });
+            }
+            if a == b {
+                return Ok(());
+            }
+            let Some(cols) = a.last() else {
+                return Err(OperatorError::ShapeUnsupported {
+                    reason: "add input must have at least one dimension".into(),
+                });
+            };
+            let row_broadcast = b.len() == 2 && b[0] == 1 && b[1] == *cols;
+            if b.as_slice() != [*cols] && !row_broadcast {
+                return Err(OperatorError::ShapeMismatch {
+                    reason: "add's second input must match the first input's shape, or \
+                             broadcast as [cols] or [1, cols]"
                         .into(),
                 });
             }

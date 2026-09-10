@@ -559,6 +559,12 @@ pub struct ModelArchitectureConfig {
     pub rope_theta: f64,
     pub rope_scaling_factor: Option<f32>,
     pub tie_word_embeddings: bool,
+    /// Whether `self_attn.{q,k,v}_proj` carry an additive bias term, a real
+    /// Hugging Face Qwen2/2.5 architectural default (not `config.json`-
+    /// declared -- every Qwen2-family checkpoint has it, driven by the
+    /// model class itself). `o_proj`/MLP/`lm_head` never carry bias in this
+    /// baseline.
+    pub attention_bias: bool,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
 }

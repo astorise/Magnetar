@@ -26,3 +26,5 @@ mod test_support;
 mod tests_production_loading_cuda_e2e;
 #[cfg(test)]
 mod tests_production_loading_e2e;
+#[cfg(test)]
+mod tests_real_checkpoint_smoke;

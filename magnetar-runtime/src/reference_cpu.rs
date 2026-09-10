@@ -643,13 +643,55 @@ pub fn gelu(input: &HostTensor) -> HostTensor {
     }
 }
 
+/// `a + b`, element-wise. `b` may either exactly match `a`'s shape, or --
+/// mirroring `rmsnorm`'s row-broadcast convention -- be a single row
+/// (`b.shape == [cols]` or `[1, cols]` where `cols` is `a`'s last
+/// dimension) broadcast across every row of `a` (real Qwen2/2.5 QKV
+/// projection bias: `[seq, dim] + [dim] -> [seq, dim]`; `providers/cpu`'s
+/// externalized copy of this function carries the identical extension).
+/// Purely additive over the prior same-shape-only behavior.
 pub fn add(a: &HostTensor, b: &HostTensor) -> Result<HostTensor, ReferenceCpuError> {
-    same_shape(a, b)?;
+    if a.shape == b.shape {
+        let data = a
+            .data
+            .iter()
+            .zip(&b.data)
+            .map(|(x, y)| x + y)
+            .collect::<Vec<_>>();
+        return Ok(HostTensor {
+            shape: a.shape.clone(),
+            data,
+        });
+    }
+    let cols = *a.shape.last().ok_or_else(|| {
+        ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "add expects at least one dimension",
+        )
+    })?;
+    if b.shape != [cols] && b.shape != [1, cols] {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "add expects b to match a's shape {:?} or broadcast as [{cols}]/[1, {cols}], got {:?}",
+                a.shape, b.shape
+            ),
+        ));
+    }
+    if !a.data.len().is_multiple_of(cols as usize) {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "add data length {} is not divisible by broadcast dimension {cols}",
+                a.data.len()
+            ),
+        ));
+    }
     let data = a
         .data
         .iter()
-        .zip(&b.data)
-        .map(|(x, y)| x + y)
+        .enumerate()
+        .map(|(index, value)| value + b.data[index % cols as usize])
         .collect::<Vec<_>>();
     Ok(HostTensor {
         shape: a.shape.clone(),

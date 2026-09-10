@@ -111,5 +111,5 @@ An embedder crate depends on:
 
 See README's "Qwen production loading" section for exactly what this
 profile supports today and what it explicitly does not yet (multi-step CUDA
-decode, tied-embedding `lm_head` derivation, native CUDA F16/BF16 compute, a
-real multi-gigabyte checkpoint run through this path).
+decode, native CUDA F16/BF16 compute, GGUF/quantized/LoRA/non-Qwen
+architectures, remote model hub download).

@@ -65,9 +65,21 @@ impl SamplingRequest {
         scores: Vec<f32>,
         tokenizer: TokenizerMetadata,
     ) -> Self {
+        // The real logits array's own length, not `tokenizer.vocabulary_
+        // size`: a model's embedding table is commonly padded past the
+        // tokenizer's real vocabulary (e.g. real Qwen2.5-0.5B-Instruct:
+        // 151936 logits, 151665 real tokenizer vocabulary), so these two
+        // counts are not always equal. `validate` separately checks that
+        // `tokenizer.vocabulary_size` does not *exceed* this value (a
+        // genuine incompatibility), and `validate_logits_shape` checks
+        // this declared count against the real array length -- deriving
+        // it from `scores` itself here keeps those two checks consistent
+        // with what was actually supplied, for every caller, not only
+        // ones whose tokenizer and logits width happen to already match.
+        let vocabulary_size = scores.len() as u32;
         Self {
             request_id,
-            vocabulary_size: tokenizer.vocabulary_size,
+            vocabulary_size,
             logits: Some(LogitsReference::HostScores(scores)),
             step_index: 0,
             token_history: Vec::new(),
@@ -97,7 +109,21 @@ impl SamplingRequest {
                 .map_err(|error| SamplingError::TokenizerMetadataMissing {
                     message: error.to_string(),
                 })?;
-            if tokenizer.vocabulary_size != self.vocabulary_size {
+            // `self.vocabulary_size` is the real logits array's length --
+            // a model's embedding table is commonly padded past the
+            // tokenizer's real vocabulary to a hardware-friendly round
+            // number (e.g. real Qwen2.5-0.5B-Instruct: tokenizer
+            // vocabulary 151665, logits width 151936), so
+            // `tokenizer.vocabulary_size < self.vocabulary_size` is real
+            // and expected, not an error -- sampling scans every logit
+            // position regardless, exactly like every production LLM
+            // serving stack that uses a padded embedding table; a
+            // trained model's padding channels are not competitive
+            // logits in practice. Only `tokenizer.vocabulary_size >
+            // self.vocabulary_size` is a genuine incompatibility: the
+            // tokenizer could then produce a token id no logit exists
+            // for.
+            if tokenizer.vocabulary_size > self.vocabulary_size {
                 return Err(SamplingError::VocabularyMismatch {
                     expected: tokenizer.vocabulary_size,
                     actual: self.vocabulary_size,

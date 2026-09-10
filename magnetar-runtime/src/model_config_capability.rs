@@ -101,6 +101,10 @@ fn encode_architecture_config(config: &ModelArchitectureConfig) -> ComponentValu
             "tie-word-embeddings",
             ComponentValue::Bool(config.tie_word_embeddings),
         ),
+        field(
+            "attention-bias",
+            ComponentValue::Bool(config.attention_bias),
+        ),
     ])
 }
 
@@ -164,6 +168,7 @@ mod tests {
             rope_theta: 1_000_000.0,
             rope_scaling_factor: None,
             tie_word_embeddings: true,
+            attention_bias: true,
             bos_token_id: None,
             eos_token_id: Some(151643),
         }
@@ -201,6 +206,7 @@ mod tests {
         assert_eq!(field("num-attention-heads"), ComponentValue::U32(14));
         assert_eq!(field("num-key-value-heads"), ComponentValue::U32(2));
         assert_eq!(field("tie-word-embeddings"), ComponentValue::Bool(true));
+        assert_eq!(field("attention-bias"), ComponentValue::Bool(true));
         assert_eq!(field("rope-scaling-factor"), ComponentValue::Option(None));
     }
 

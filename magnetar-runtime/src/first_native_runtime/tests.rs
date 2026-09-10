@@ -4011,6 +4011,7 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
         },
         rmsnorm_epsilon: 1e-6,
         tied_embeddings: false,
+        attention_bias: false,
         require_bos: false,
         require_pad: false,
         expected_added_tokens: None,

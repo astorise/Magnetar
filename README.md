@@ -10,10 +10,13 @@ it grows.
 
 Reference CPU execution is implemented, and an external CUDA Provider is now
 integrated and validated through real-hardware first-native end-to-end tests.
-Magnetar is **not yet a general production model runtime**: caller-facing Qwen
-execution is still centered on the built-in `qwen-test` path, and arbitrary
-production model artifact loading (for example general `config.json` +
-Safetensors/tokenizer inputs) remains incomplete.
+Production Qwen model artifact loading -- real `config.json` +
+Safetensors/tokenizer inputs, not only the built-in `qwen-test` path -- is
+implemented and verified end to end, including against a real, publicly
+downloaded Qwen2.5-0.5B-Instruct checkpoint on both Reference CPU and real
+CUDA hardware. Magnetar is **still not a general production model runtime**:
+see the "Qwen production loading" subsection below for the precise profile
+this covers and what it does not yet.
 
 ## Architecture
 
@@ -175,13 +178,32 @@ hardware:
   including grouped-query (distinct attention/KV head counts) configurations
 - Real `config.json` parsing and validation (rejects missing/zero/
   inconsistent architecture values structurally)
-- Single-file and Hugging Face-style indexed sharded Safetensors, `F32`
-  storage, real per-tensor Safetensors parsing (`formats/safetensors`, no
-  second parser)
+- Single-file and Hugging Face-style indexed sharded Safetensors, `F32`/`F16`/
+  `BF16` storage (decoded and converted to `F32` for compute), real
+  per-tensor Safetensors parsing (`formats/safetensors`, no second parser)
 - Real `tokenizer.json` (via the `tokenizers` crate) plus
-  `tokenizer_config.json`/`generation_config.json` normalization
+  `tokenizer_config.json`/`generation_config.json` normalization, including a
+  tokenizer vocabulary smaller than the model's declared `vocab_size` (a real,
+  common Hugging Face convention: the embedding table is padded to a
+  hardware-friendly round number past the tokenizer's actual vocabulary)
+- Tied-embedding (`tie_word_embeddings: true`) checkpoints: `lm_head` is
+  derived from `token_embedding` at load time, driven by real config/tensor
+  metadata (untied checkpoints, which declare their own `lm_head.weight`
+  tensor, are unaffected)
+- Real Qwen2/2.5 attention bias: `self_attn.{q,k,v}_proj` bias terms (an
+  architectural default of the model class, not a `config.json` field) are
+  ingested and applied via a broadcast add on both Reference CPU and CUDA;
+  `o_proj` and every MLP/`lm_head` projection never carry one in this baseline
 - An authorized local or Tachyon-sourced bundle (a caller-supplied,
   already-authorized source; Magnetar does not fetch or discover one itself)
+- A real, publicly downloaded Qwen checkpoint
+  ([`Qwen/Qwen2.5-0.5B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct),
+  pinned by revision and content digest), not only tiny synthetic-content
+  bundles: verified loading and real decoded-text generation on Reference CPU,
+  and a matching greedy prefill token/text between Reference CPU and real CUDA
+  hardware within an exact-match tolerance (see
+  `integration-tests/production-loading`'s `tests_real_checkpoint_smoke.rs`,
+  a manual/nightly-profile test given its ~1GB download)
 
 Explicitly not yet supported by this profile:
 
@@ -193,15 +215,6 @@ Explicitly not yet supported by this profile:
   `CudaProvider::read_tensor_value` deliberately never does this by design
   (only `read_tensor` explicitly downloads) -- a real, pre-existing gap this
   profile's CUDA path does not paper over
-- Tied-embedding (`tie_word_embeddings: true`) checkpoints: production loading
-  does not yet derive `lm_head` from `token_embedding` at load time the way
-  the canonical fixture path already does (untied checkpoints, which declare
-  their own `lm_head.weight` tensor, are unaffected)
-- A real, publicly downloaded multi-gigabyte Qwen checkpoint has not yet been
-  run through this path; verification so far uses tiny (kilobyte-scale),
-  synthetic-content bundles in the real production file layout, through the
-  real production parser and Component -- not a fixture manifest, but also
-  not yet a real published model's actual weights
 - GGUF, quantized (`Q4_K`/`Q5_K`/`Q8_0`/GPTQ/AWQ/BitsAndBytes) execution, LoRA
   adapters, and non-Qwen architecture families
 - Remote model hub download, OCI distribution, and credential/retry handling
@@ -232,16 +245,15 @@ CUDA-device, memory-capacity, or dtype-support models of its own. If a local
 inference capability needed by Tachyon is missing, the capability belongs in
 Magnetar.
 
-**Qwen production loading cutover criterion**: Tachyon may remove any
-fail-closed placeholder standing in for real Qwen model loading only once the
-public production loading/generation surface (`load_production_qwen_instance`/
+**Qwen production loading cutover criterion**: `implement-production-qwen-model-loading`
+task group 12 (Reference CPU and CUDA prefill proofs, the real public
+checkpoint smoke test, CPU/CUDA output comparison, and release-gate
+hardening) is now closed, so Tachyon may remove any fail-closed placeholder
+standing in for real Qwen model loading and route through the public
+production loading/generation surface (`load_production_qwen_instance`/
 `run_production_qwen_generation` and their Provider-generic variants,
 `ProductionModelArtifactIngestor`, and the `loaders/huggingface` external
-ingestor) has closed every item in `implement-production-qwen-model-loading`
-task group 12 -- not merely the Reference CPU and CUDA prefill proofs above,
-but also the real public checkpoint smoke test, CPU/CUDA output comparison,
-and release-gate hardening that change's own tasks 12.4-12.11 still track as
-open. Tachyon should keep parsing no model formats and managing no weight
+ingestor) instead. Tachyon should keep parsing no model formats and managing no weight
 resources itself either way (see "Public embedder / Tachyon loading surface"
 in that change's proposal); this criterion is about when its fallback path
 becomes safe to delete, not about which side does the parsing.

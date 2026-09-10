@@ -357,6 +357,9 @@ pub struct QwenConfig {
     pub rope: QwenRopeConfig,
     pub rmsnorm_epsilon: f32,
     pub tied_embeddings: bool,
+    /// Whether `self_attn.{q,k,v}_proj` carry an additive bias term -- see
+    /// [`crate::ModelArchitectureConfig::attention_bias`]'s doc comment.
+    pub attention_bias: bool,
     /// Whether tokenizer compatibility SHALL require a BOS special token.
     pub require_bos: bool,
     /// Whether tokenizer compatibility SHALL require a pad special token.
@@ -375,6 +378,7 @@ impl QwenConfig {
             rope,
             rmsnorm_epsilon: 1e-6,
             tied_embeddings: false,
+            attention_bias: false,
             require_bos: false,
             require_pad: false,
             expected_added_tokens: None,
@@ -742,6 +746,13 @@ pub fn qwen_expected_tensor_shape(name: &str, config: &QwenConfig) -> Option<Vec
         "input_norm" | "post_attn_norm" => Some(vec![a.hidden_size]),
         "self_attn.q_proj" => Some(vec![a.hidden_size, q_dim]),
         "self_attn.k_proj" | "self_attn.v_proj" => Some(vec![a.hidden_size, kv_dim]),
+        // Optional: real Qwen2/2.5 checkpoints declare these (an
+        // architectural default, not config-driven -- see
+        // `ModelArchitectureConfig::attention_bias`'s doc comment); never
+        // required by `qwen_expected_tensor_names`, so an untied/no-bias
+        // configuration is unaffected. Checked here only when present.
+        "self_attn.q_bias" => Some(vec![q_dim]),
+        "self_attn.k_bias" | "self_attn.v_bias" => Some(vec![kv_dim]),
         "self_attn.o_proj" => Some(vec![q_dim, a.hidden_size]),
         "mlp.gate_proj" | "mlp.up_proj" => Some(vec![a.hidden_size, a.intermediate_size]),
         // Fused gate/up projection (`define-provider-prepared-kernel-
