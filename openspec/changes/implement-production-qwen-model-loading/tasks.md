@@ -89,7 +89,7 @@
 - [x] 10.2 Remove any production condition that requires `model_ref == "qwen-test"`.
 - [x] 10.3 Keep `qwen-test` as fixture/demo/conformance only.
 - [x] 10.4 Remove `fixture_model_manifest` / hand-built tensor inventory from local production model loading.
-- [ ] 10.5 Ensure tied `lm_head` derivation remains a load-time operation and is driven by real config/tensor metadata.
+- [x] 10.5 Ensure tied `lm_head` derivation remains a load-time operation and is driven by real config/tensor metadata.
 - [x] 10.6 Verify Provider/Device selection remains Runtime-owned and the same loaded artifact can target Reference CPU or CUDA according to policy/capabilities.
 
 ## 11. Public embedder / Tachyon loading surface
