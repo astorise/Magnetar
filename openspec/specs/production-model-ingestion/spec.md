@@ -1,7 +1,7 @@
 # production-model-ingestion Specification
 
 ## Purpose
-TBD - created by archiving change implement-production-qwen-model-loading. Update Purpose after archive.
+This specification defines the Runtime-owned, format-neutral contract external ingestors implement to convert an already-authorized production model source (e.g. a Hugging Face-style bundle) into normalized artifact/config/tokenizer metadata plus bounded payload access, without granting trust and without introducing a concrete format/source dependency into `magnetar-runtime` itself.
 ## Requirements
 ### Requirement: Production Model Artifact Ingestion Contract
 
