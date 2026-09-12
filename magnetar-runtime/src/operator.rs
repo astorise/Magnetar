@@ -187,6 +187,7 @@ pub enum ShapeRule {
     Matmul,
     RmsNorm,
     RowBroadcastAdd,
+    RowConcat,
     Rank(u64),
 }
 
@@ -789,6 +790,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         ),
         ("mul", OperatorFamily::Tensor, 2, 1, ShapeRule::SameShape),
         (
+            "concat",
+            OperatorFamily::Tensor,
+            2,
+            1,
+            ShapeRule::RowConcat,
+        ),
+        (
             "residual-add",
             OperatorFamily::Tensor,
             2,
@@ -1125,6 +1133,56 @@ fn validate_shape_rule(
                 return Err(OperatorError::ShapeMismatch {
                     reason: "add's second input must match the first input's shape, or \
                              broadcast as [cols] or [1, cols]"
+                        .into(),
+                });
+            }
+            Ok(())
+        }
+        // Row-wise concatenation: both inputs must share the same column
+        // count (last dimension), and the output's row count must equal
+        // the sum of both inputs' row counts -- KV-history concatenation's
+        // exact contract (`implement-device-resident-multi-step-cuda-
+        // decode`). Deliberately does not validate against a graph edge's
+        // own *declared* shape (a decode KV edge legitimately declares
+        // `[1, kv_dim]` while the real dispatched shape grows every step,
+        // the same permissive posture `ShapeRule::RowBroadcastAdd` already
+        // takes) -- only the invocation's own real inputs/output are
+        // checked against each other here.
+        ShapeRule::RowConcat => {
+            if inputs.len() < 2 {
+                return Err(OperatorError::InputArityInvalid {
+                    expected: 2,
+                    actual: inputs.len(),
+                });
+            }
+            if outputs.is_empty() {
+                return Err(OperatorError::OutputArityInvalid {
+                    expected: 1,
+                    actual: outputs.len(),
+                });
+            }
+            let a = &inputs[0].shape.dimensions;
+            let b = &inputs[1].shape.dimensions;
+            let output = &outputs[0].shape.dimensions;
+            let (Some((&a_rows, a_rest)), Some((&b_rows, b_rest))) =
+                (a.split_first(), b.split_first())
+            else {
+                return Err(OperatorError::ShapeUnsupported {
+                    reason: "concat inputs must have at least one dimension".into(),
+                });
+            };
+            if a_rest != b_rest {
+                return Err(OperatorError::ShapeMismatch {
+                    reason: "concat inputs must share the same trailing dimensions".into(),
+                });
+            }
+            let expected_output: Vec<u64> = std::iter::once(a_rows + b_rows)
+                .chain(a_rest.iter().copied())
+                .collect();
+            if output.as_slice() != expected_output.as_slice() {
+                return Err(OperatorError::ShapeMismatch {
+                    reason: "concat output row count must equal the sum of both inputs' row \
+                             counts, with matching trailing dimensions"
                         .into(),
                 });
             }

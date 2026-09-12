@@ -560,3 +560,37 @@ fn split_last_dim_in_half_rejects_zero_rank() {
         ReferenceCpuErrorCode::ShapeUnsupported
     );
 }
+
+/// `implement-device-resident-multi-step-cuda-decode` task 2.3: KV-history
+/// concatenation's exact contract -- `a`'s rows stacked above `b`'s rows,
+/// trailing dimensions preserved.
+#[test]
+fn concat_stacks_a_rows_above_b_rows() {
+    let a = HostTensor::new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let b = HostTensor::new([1, 3], [7.0, 8.0, 9.0]).unwrap();
+    let result = concat(&a, &b).unwrap();
+    assert_eq!(result.shape, vec![3, 3]);
+    assert_eq!(
+        result.data,
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    );
+}
+
+#[test]
+fn concat_rejects_a_trailing_dimension_mismatch() {
+    let a = HostTensor::new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let b = HostTensor::new([1, 4], [7.0, 8.0, 9.0, 10.0]).unwrap();
+    assert_eq!(
+        concat(&a, &b).unwrap_err().code,
+        ReferenceCpuErrorCode::ShapeUnsupported
+    );
+}
+
+#[test]
+fn concat_handles_rank_one_input() {
+    let a = HostTensor::new([2], [1.0, 2.0]).unwrap();
+    let b = HostTensor::new([3], [3.0, 4.0, 5.0]).unwrap();
+    let result = concat(&a, &b).unwrap();
+    assert_eq!(result.shape, vec![5]);
+    assert_eq!(result.data, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+}

@@ -132,3 +132,65 @@ fn operator_validation_rejects_shape_dtype_layout_errors() {
 fn opaque_layout_is_not_component_visible() {
     assert!(!TensorLayoutKind::ProviderOpaque.component_visible());
 }
+
+/// `implement-device-resident-multi-step-cuda-decode` task 1.3:
+/// `ShapeRule::RowConcat` accepts a valid row-concatenation (same trailing
+/// dimensions, output row count additive) and rejects a trailing-dimension
+/// mismatch -- KV-history concatenation's exact contract, mirroring
+/// `ShapeRule::RowBroadcastAdd`'s own precedent for testing a purpose-built
+/// shape rule directly against the catalog.
+#[test]
+fn concat_shape_rule_accepts_additive_rows_and_rejects_column_mismatch() {
+    let catalog = initial_operator_catalog();
+    let concat = catalog
+        .get(&OperatorId::magnetar("concat", 1, OperatorFamily::Tensor))
+        .unwrap();
+
+    let a = TensorDescriptor::materialized(
+        ShapeDescriptor::new([3, 4]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let b = TensorDescriptor::materialized(
+        ShapeDescriptor::new([1, 4]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let valid_output = TensorDescriptor::materialized(
+        ShapeDescriptor::new([4, 4]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    assert!(
+        concat
+            .validate_invocation(&[a.clone(), b.clone()], &[valid_output], &BTreeMap::new())
+            .is_ok()
+    );
+
+    let wrong_row_count_output = TensorDescriptor::materialized(
+        ShapeDescriptor::new([3, 4]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    assert!(matches!(
+        concat.validate_invocation(
+            &[a.clone(), b.clone()],
+            &[wrong_row_count_output],
+            &BTreeMap::new()
+        ),
+        Err(OperatorError::ShapeMismatch { .. })
+    ));
+
+    let mismatched_columns = TensorDescriptor::materialized(
+        ShapeDescriptor::new([1, 5]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let output_for_mismatch = TensorDescriptor::materialized(
+        ShapeDescriptor::new([4, 4]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    assert!(matches!(
+        concat.validate_invocation(
+            &[a, mismatched_columns],
+            &[output_for_mismatch],
+            &BTreeMap::new()
+        ),
+        Err(OperatorError::ShapeMismatch { .. })
+    ));
+}

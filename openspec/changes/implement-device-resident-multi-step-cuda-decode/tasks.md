@@ -1,21 +1,21 @@
 ## 1. `concat` Operator catalog entry
 
-- [ ] 1.1 Add `ShapeRule::RowConcat` to `magnetar-runtime/src/operator.rs`: both inputs share the same column count; output row count equals the sum of both inputs' row counts. Mirror `ShapeRule::RowBroadcastAdd`'s existing match-arm structure.
-- [ ] 1.2 Add `("concat", OperatorFamily::Tensor, 2, 1, ShapeRule::RowConcat)` to the Operator catalog.
-- [ ] 1.3 Add a unit test proving `ShapeRule::RowConcat` accepts a valid pair (same columns, additive rows) and rejects a column mismatch, mirroring the existing `ShapeRule::RowBroadcastAdd` tests.
+- [x] 1.1 Add `ShapeRule::RowConcat` to `magnetar-runtime/src/operator.rs`: both inputs share the same column count; output row count equals the sum of both inputs' row counts. Mirror `ShapeRule::RowBroadcastAdd`'s existing match-arm structure.
+- [x] 1.2 Add `("concat", OperatorFamily::Tensor, 2, 1, ShapeRule::RowConcat)` to the Operator catalog.
+- [x] 1.3 Add a unit test proving `ShapeRule::RowConcat` accepts a valid pair (same columns, additive rows) and rejects a column mismatch, mirroring the existing `ShapeRule::RowBroadcastAdd` tests.
 
 ## 2. Reference CPU `concat` implementation
 
-- [ ] 2.1 Implement `concat` in `magnetar-runtime/src/reference_cpu.rs` (the in-crate double): row-major byte concatenation of two same-column tensors into `[a_rows + b_rows, cols]`, reusing the existing `concat_rows` logic in `first_native_runtime.rs` (extract it to a shared location if both call sites need it, or duplicate the ~10-line function -- match whatever `add`'s broadcast logic did when it needed the same logic in two places this session).
-- [ ] 2.2 Implement `concat` identically in the `providers/cpu` submodule (`astorise/Magnetar-provider-CPU`), for CPU/CUDA conformance parity.
-- [ ] 2.3 Add tests proving `concat` produces the correct concatenated tensor and rejects a column-count mismatch, in both implementations.
+- [x] 2.1 Implement `concat` in `magnetar-runtime/src/reference_cpu.rs` (the in-crate double): row-major byte concatenation of two same-trailing-dimension tensors into `[a_rows + b_rows, ..rest]`, dispatched via a new `"concat"` match arm (mirroring `"add"`/`"mul"`) and advertised via `baseline_advertisement("concat", OperatorFamily::Tensor)`. (Duplicated rather than sharing `first_native_runtime.rs`'s own `concat_rows` -- that one stays as the KV-append block's own removed-in-task-5 helper; this is `reference_cpu.rs`'s independent generic-Operator double, matching how `add`'s broadcast logic already exists independently in both places.)
+- [x] 2.2 Implement `concat` identically in the `providers/cpu` submodule (`astorise/Magnetar-provider-CPU`), for CPU/CUDA conformance parity.
+- [x] 2.3 Add tests proving `concat` produces the correct concatenated tensor and rejects a trailing-dimension mismatch, in both implementations.
 
 ## 3. CUDA `concat` implementation
 
-- [ ] 3.1 Implement `CudaKernels::concat` in `providers/cuda/src/kernels.rs`: allocate a fresh `[a_rows + b_rows, cols]` device buffer (`alloc_zeros`) and copy each input's bytes into it at the correct offset via device-to-device copies (the same `clone_dtod`-class primitive `rope` already uses at `kernels.rs:388`); validate column-count equality before allocating.
-- [ ] 3.2 Dispatch `"concat"` in `CudaExecutor::run_invocation`'s operator match (`providers/cuda/src/executor.rs`).
-- [ ] 3.3 Advertise `"concat"` in `cuda_kernel_advertisements` (`providers/cuda/src/advertisements.rs`).
-- [ ] 3.4 Add `concat_matches_reference_cpu` to `tests_conformance.rs`, run on real CUDA hardware, proving byte-identical output against Reference CPU for the same two input tensors.
+- [x] 3.1 Implement `CudaKernels::concat` in `providers/cuda/src/kernels.rs`: allocate a fresh `[a_rows + b_rows, ..rest]` device buffer (`alloc_zeros`) and copy each input directly into its own non-overlapping mutable view (`CudaSlice::split_at_mut` + `CudaStream::memcpy_dtod`) -- no `.cu` kernel needed, confirming the design's prediction.
+- [x] 3.2 Dispatch `"concat"` in `CudaExecutor::run_invocation`'s operator match (`providers/cuda/src/executor.rs`).
+- [x] 3.3 Advertise `"concat"` in `cuda_kernel_advertisements` (`providers/cuda/src/advertisements.rs`); updated `kernel_advertisements_agree_with_availability`'s hardcoded count/name-set test (10 -> 11, `"concat"` added).
+- [x] 3.4 Added `concat_matches_reference_cpu` to `tests_conformance.rs`, run and passing on real CUDA hardware (RTX 3070 Ti), byte-identical against `magnetar_provider_cpu::concat` for the same two input tensors. Full `providers/cuda` suite (34 tests, `--include-ignored`) passes on real hardware.
 
 ## 4. `copy_tensor_admitted`: host-free Tensor Resource duplication
 
