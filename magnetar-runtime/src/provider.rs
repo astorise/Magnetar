@@ -830,6 +830,40 @@ pub trait ProviderExecutionApi: Send + Sync {
         ))
     }
 
+    /// Duplicates `from`'s current bytes to a fresh, caller-chosen identity
+    /// `to`, without requiring host-visible bytes to exist at any point
+    /// during the copy for a Provider that holds `from` device-resident
+    /// (`implement-device-resident-multi-step-cuda-decode`). Replaces (and
+    /// releases) whatever allocation `to` previously held, exactly like
+    /// [`Self::write_tensor_value_admitted`] already does for a fresh
+    /// write. Closes the KV-history commit/pending round-trip that would
+    /// otherwise download `from` to host and re-upload it as `to` for no
+    /// reason other than changing its identity.
+    ///
+    /// The default implementation fails closed, matching
+    /// [`Self::write_tensor_value_admitted`]'s own default: a generic
+    /// default has no way to know this Provider's own identity for
+    /// [`crate::memory::MemoryPlacement::ProviderOwnedOpaque`]/`Device`, so
+    /// it cannot safely admit on a Provider's behalf. A concrete Provider
+    /// that knows its own identity and storage (Reference CPU, CUDA)
+    /// overrides this with a real copy -- a `HostTensor` clone for
+    /// Reference CPU, a real device-to-device copy for CUDA.
+    fn copy_tensor_admitted(
+        &self,
+        memory: &mut crate::memory::MemoryManager,
+        from: &TensorResourceId,
+        to: TensorResourceId,
+        class: crate::memory::MemoryAllocationClass,
+        owner: crate::memory::MemoryAllocationOwner,
+    ) -> Result<(), TensorValueAdmissionError> {
+        let _ = (memory, from, to, class, owner);
+        Err(TensorValueAdmissionError::Memory(
+            crate::memory::MemoryError::AllocationDenied {
+                reason: "this Provider does not implement admitted tensor resource copies".into(),
+            },
+        ))
+    }
+
     /// Requests scratch-space workspace through the Runtime's
     /// [`crate::memory::MemoryManager`] for a Kernel that advertises a
     /// required workspace. See [`Self::write_tensor`]'s documentation for

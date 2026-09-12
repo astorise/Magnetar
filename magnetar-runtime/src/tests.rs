@@ -7711,6 +7711,115 @@ fn reference_cpu_write_tensor_admitted_releases_previous_allocation_for_same_res
     );
 }
 
+/// `implement-device-resident-multi-step-cuda-decode` task 4.4:
+/// `copy_tensor_admitted` duplicates a resource's bytes to a fresh
+/// identity, admitted the same way `write_tensor_admitted` already is.
+#[test]
+fn reference_cpu_copy_tensor_admitted_duplicates_bytes_to_a_fresh_identity() {
+    let executor = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let source_id = TensorResourceId::new("copy-source");
+    executor
+        .write_tensor_admitted(
+            &mut memory,
+            source_id.clone(),
+            reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session("test-session".into()),
+        )
+        .expect("source write succeeds");
+
+    let dest_id = TensorResourceId::new("copy-destination");
+    executor
+        .copy_tensor_admitted(
+            &mut memory,
+            &source_id,
+            dest_id.clone(),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session("test-session".into()),
+        )
+        .expect("copy succeeds");
+
+    assert_eq!(
+        executor
+            .read_tensor(&dest_id)
+            .expect("destination resource is present")
+            .data,
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+}
+
+/// A second copy to the same destination identity replaces (and releases)
+/// the first, matching `write_tensor_admitted`'s own replacement
+/// discipline -- the exact bounded-growth requirement the KV pending/
+/// commit paths depend on.
+#[test]
+fn reference_cpu_copy_tensor_admitted_replaces_a_previous_allocation_at_the_same_destination() {
+    let executor = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let source_id = TensorResourceId::new("copy-source-2");
+    executor
+        .write_tensor_admitted(
+            &mut memory,
+            source_id.clone(),
+            reference_cpu_host_tensor([2], [1.0, 2.0]),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session("test-session".into()),
+        )
+        .expect("source write succeeds");
+
+    let dest_id = TensorResourceId::new("copy-destination-stable");
+    executor
+        .copy_tensor_admitted(
+            &mut memory,
+            &source_id,
+            dest_id.clone(),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session("test-session".into()),
+        )
+        .expect("first copy succeeds");
+    let active_after_first_copy = memory
+        .allocations()
+        .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+        .count();
+
+    for _ in 0..4 {
+        executor
+            .copy_tensor_admitted(
+                &mut memory,
+                &source_id,
+                dest_id.clone(),
+                MemoryAllocationClass::Tensor,
+                MemoryAllocationOwner::Session("test-session".into()),
+            )
+            .expect("repeated copy to the same destination succeeds");
+    }
+    let active_after_repeated_copies = memory
+        .allocations()
+        .filter(|allocation| allocation.state == MemoryAllocationState::Active)
+        .count();
+    assert_eq!(
+        active_after_repeated_copies, active_after_first_copy,
+        "repeated copies to the same destination id must not accumulate allocations"
+    );
+}
+
+#[test]
+fn reference_cpu_copy_tensor_admitted_rejects_a_missing_source() {
+    let executor = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let error = executor
+        .copy_tensor_admitted(
+            &mut memory,
+            &TensorResourceId::new("does-not-exist"),
+            TensorResourceId::new("copy-destination-3"),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session("test-session".into()),
+        )
+        .expect_err("copying a nonexistent source must fail structurally");
+    assert!(matches!(error, TensorValueAdmissionError::Memory(_)));
+}
+
 #[test]
 fn reference_cpu_releases_admitted_output_reservation_when_kernel_execution_fails() {
     let provider = ReferenceCpuProvider::new();

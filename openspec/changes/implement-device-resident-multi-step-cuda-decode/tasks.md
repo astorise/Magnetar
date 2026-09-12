@@ -19,10 +19,10 @@
 
 ## 4. `copy_tensor_admitted`: host-free Tensor Resource duplication
 
-- [ ] 4.1 Add `fn copy_tensor_admitted(&self, memory: &mut MemoryManager, from: &TensorResourceId, to: TensorResourceId, class: MemoryAllocationClass, owner: MemoryAllocationOwner) -> Result<(), TensorValueAdmissionError>` to `ProviderExecutionApi` (`magnetar-runtime/src/provider.rs`), documented as duplicating `from`'s current bytes to `to` without requiring host materialization, replacing (and releasing) whatever `to` previously held.
-- [ ] 4.2 Implement it on Reference CPU (`reference_cpu.rs` and `providers/cpu`) as a `HostTensor` clone under the new id, admitted the same way `write_tensor_value_admitted` already is.
-- [ ] 4.3 Implement it on CUDA (`providers/cuda`) as a device-to-device buffer copy under the new id, admitted the same way, replacing any existing allocation at `to`.
-- [ ] 4.4 Add tests (both implementations) proving: the copy is byte-correct; a second copy to the same `to` id releases the first allocation (active allocation count does not grow); copying a nonexistent `from` id fails structurally, not silently.
+- [x] 4.1 Add `fn copy_tensor_admitted(&self, memory: &mut MemoryManager, from: &TensorResourceId, to: TensorResourceId, class: MemoryAllocationClass, owner: MemoryAllocationOwner) -> Result<(), TensorValueAdmissionError>` to `ProviderExecutionApi` (`magnetar-runtime/src/provider.rs`), documented as duplicating `from`'s current bytes to `to` without requiring host materialization, replacing (and releasing) whatever `to` previously held. Default implementation fails closed, mirroring `write_tensor_value_admitted`'s own default.
+- [x] 4.2 Implemented on Reference CPU (`reference_cpu.rs` and `providers/cpu`) as a `HostTensor` clone under the new id, admitted the same way `write_tensor_admitted` already is; wired into both crates' `ProviderExecutionApi` trait impls.
+- [x] 4.3 Implemented on CUDA (`providers/cuda`) as a real device-to-device buffer copy (`CudaKernels::clone_buffer`, `cudarc`'s `clone_dtod`) under the new id, admitted the same way (mirroring `write_tensor_admitted`'s admit-then-write-with-rollback shape), replacing any existing allocation at `to`; wired into the trait impl.
+- [x] 4.4 Added tests in all three implementations (magnetar-runtime, providers/cpu, providers/cuda -- the last run and passing on real CUDA hardware) proving: the copy is byte-correct (verified by downloading only the destination, never the source); a second/repeated copy to the same `to` id does not grow the active allocation count beyond the source's own plus one stable destination allocation; copying a nonexistent `from` id fails structurally (`TensorValueAdmissionError`), not silently. Full suites re-run clean: magnetar-runtime (1249+173), providers/cpu (21), providers/cuda (37, real hardware).
 
 ## 5. Wire `concat` into KV-history-append, eliminating the blocking read
 
