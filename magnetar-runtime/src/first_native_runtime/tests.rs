@@ -2730,6 +2730,27 @@ fn production_chat_formatted_generation_entry_point_is_public() {
     );
 }
 
+/// Static guard (`expose-production-generation-parameters` task 2.3):
+/// `run_production_qwen_generation_for_provider_with_request`, the only
+/// production entry point that accepts caller-supplied
+/// `GenerationParameters`/`StopConditions` instead of the hardcoded
+/// greedy/default values every other entry point in this family still
+/// passes, must stay reachable through this crate's public API alone.
+/// Mirrors the sibling guard above for the same structural reason: a
+/// `#[test]` inside this crate cannot otherwise distinguish `pub fn` from
+/// `pub(crate)`/`pub(super)`/private, and only source inspection proves it.
+#[test]
+fn production_request_generation_entry_point_is_public() {
+    let source = include_str!("../first_native_runtime.rs");
+    assert!(
+        source.contains("pub fn run_production_qwen_generation_for_provider_with_request("),
+        "run_production_qwen_generation_for_provider_with_request must be declared `pub fn` -- \
+         it is the only production entry point through which an external caller (e.g. Tachyon \
+         translating an OpenAI-shaped request) can supply real GenerationParameters/StopConditions, \
+         and a narrower visibility would make that surface unreachable from outside this crate"
+    );
+}
+
 /// `register_qwen_component_artifact` must be safe to call unconditionally,
 /// every time a caller might need first-native generation, without the
 /// caller tracking its own "have I registered yet" state (task 12.4's

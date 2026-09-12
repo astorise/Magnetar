@@ -7521,12 +7521,77 @@ pub fn run_production_qwen_generation_for_provider_with_prompt(
     chat_formatter: Option<&dyn ChatTemplateFormatter>,
     provider: Arc<dyn Provider>,
 ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
-    let max_tokens = fixture
-        .manifest
-        .generation
-        .as_ref()
-        .and_then(|defaults| defaults.max_tokens)
-        .unwrap_or(64);
+    run_production_qwen_generation_for_provider_with_request(
+        fixture,
+        payload_source,
+        trust_store,
+        ProductionGenerationRequest {
+            prompt,
+            parameters: GenerationParameters::greedy(),
+            stop_conditions: StopConditions::default(),
+            max_new_tokens: None,
+        },
+        chat_formatter,
+        provider,
+    )
+}
+
+/// Caller-supplied generation configuration for production Qwen generation
+/// (`expose-production-generation-parameters`): the shape an embedder
+/// (e.g. Tachyon translating an OpenAI-style request) fills in to reach
+/// the real sampling/stop-matching contract every other Runtime
+/// generation path already honors, without reimplementing any of it.
+///
+/// `max_new_tokens: None` preserves the checkpoint manifest's own
+/// configured default (`fixture.manifest.generation.max_tokens`,
+/// falling back to 64); `Some(n)` overrides it.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[derive(Clone, Debug)]
+pub struct ProductionGenerationRequest {
+    pub prompt: PromptInput,
+    pub parameters: GenerationParameters,
+    pub stop_conditions: StopConditions,
+    pub max_new_tokens: Option<usize>,
+}
+
+/// [`run_production_qwen_generation_for_provider_with_prompt`],
+/// generalized to accept caller-supplied [`GenerationParameters`] and
+/// [`StopConditions`] instead of the hardcoded greedy/default values
+/// every other entry point in this family still passes
+/// (`expose-production-generation-parameters`). `run_production_qwen_generation_for_provider_with_prompt`
+/// is now a thin wrapper over this function reproducing its exact prior
+/// hardcoded defaults, so no existing caller's behavior changes.
+///
+/// Text stop sequences (`request.stop_conditions.stop_text_sequences`)
+/// are prepared against the real tokenizer here via
+/// [`prepare_stop_sequences`] before generation starts -- a caller
+/// supplies plain strings (e.g. an OpenAI `stop: ["END"]` list) and
+/// never needs to construct the tokenizer-aware `prepared_stop_sequences`
+/// form itself.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn run_production_qwen_generation_for_provider_with_request(
+    fixture: E2eFixture,
+    payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
+    trust_store: ModelTrustStore,
+    request: ProductionGenerationRequest,
+    chat_formatter: Option<&dyn ChatTemplateFormatter>,
+    provider: Arc<dyn Provider>,
+) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+    let ProductionGenerationRequest {
+        prompt,
+        parameters,
+        mut stop_conditions,
+        max_new_tokens,
+    } = request;
+
+    let max_tokens = max_new_tokens.unwrap_or_else(|| {
+        fixture
+            .manifest
+            .generation
+            .as_ref()
+            .and_then(|defaults| defaults.max_tokens)
+            .unwrap_or(64) as usize
+    });
     if max_tokens > 1 && !provider.supports_multi_step_decode() {
         return Err(InferenceApiError::Unsupported {
             reason: format!(
@@ -7569,7 +7634,7 @@ pub fn run_production_qwen_generation_for_provider_with_prompt(
     let session_request = SessionCreationRequest {
         model: GenerationModelReference::ModelInstance(instance.clone()),
         tokenizer: generation_tokenizer_reference(&fixture),
-        generation_defaults: GenerationParameters::greedy(),
+        generation_defaults: parameters.clone(),
         policy: SessionPolicy::default(),
         memory: SessionMemoryBudget::default(),
         allowed_capabilities: BTreeSet::new(),
@@ -7583,6 +7648,16 @@ pub fn run_production_qwen_generation_for_provider_with_prompt(
         TokenizationRequest::new(prompt),
         chat_formatter,
     )?;
+    stop_conditions.prepared_stop_sequences = stop_conditions
+        .stop_text_sequences
+        .iter()
+        .map(|text| fixture.tokenizer.resolve_stop_sequence(text))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(
+            |error: TokenizerError| InferenceApiError::TokenizationFailed {
+                reason: error.to_string(),
+            },
+        )?;
     let mut observer = InferenceApiObserver::new();
 
     let (component_graphs, _definition, _component_instance) =
@@ -7610,9 +7685,9 @@ pub fn run_production_qwen_generation_for_provider_with_prompt(
         GenerationModelReference::ModelInstance(instance.clone()),
         generation_tokenizer_reference(&fixture),
         tokenized,
-        max_tokens as usize,
-        GenerationParameters::greedy(),
-        StopConditions::default(),
+        max_tokens,
+        parameters,
+        stop_conditions,
         StreamingMode::TokenIds,
     );
     let request = prepare_generation(&runtime, request)?;

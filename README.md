@@ -240,6 +240,19 @@ hardware:
   `decode_duration_millis` generation usage metadata, for both Reference
   CPU and real CUDA hardware, from actual wall-clock timing (verified on
   both) rather than left unset
+- Caller-supplied generation parameters and stop conditions on the production
+  entry point: `run_production_qwen_generation_for_provider_with_request`
+  accepts a `ProductionGenerationRequest` carrying real `GenerationParameters`
+  (temperature, top_p, top_k, min_p, typical_p, penalties, seed, banned/
+  allowed tokens) and `StopConditions` (token-id and text stop sequences,
+  the latter prepared against the real tokenizer internally) and forwards
+  them to the same sampling/stop-matching contract every other Runtime
+  generation path already uses, plus an optional `max_new_tokens` override
+  of the checkpoint manifest's own token budget. Every existing entry point
+  (`run_production_qwen_generation`, `_for_provider`, `_for_provider_with_prompt`)
+  is now a thin wrapper over this one, reproducing its exact prior greedy/
+  default-stop/manifest-token-budget behavior, so no existing caller's
+  behavior changes (`expose-production-generation-parameters`)
 
 Explicitly not yet supported by this profile:
 
@@ -302,10 +315,17 @@ explicit `Unsupported` signal for a decode shape a Provider cannot perform,
 plus real `tokens_per_second` measurement), and
 `implement-device-resident-multi-step-cuda-decode` closed the third
 (device-resident multi-step CUDA decode itself, see "Qwen production
-loading" above). Everything else the charter frames as future work remains
-exactly that: multi-device execution, quantization support, wiring
-`formats/gguf` into Model Loading, native CUDA `F16`/`BF16` compute, and
-additional Providers (Metal/ROCm/NPU/TPU) or Model Components
+loading" above). A follow-up Tachyon-authored review of the OpenAI-compatible
+integration surface (not the original charter) found two further P1 gaps in
+the production generation entry point specifically: it accepted no caller-
+supplied generation parameters or stop conditions, and returned only a final
+result rather than incremental streaming events.
+`expose-production-generation-parameters` closed the first (see "Qwen
+production loading" above); incremental production streaming is a separate,
+not-yet-started follow-up. Everything the original charter frames as future
+work remains exactly that: multi-device execution, quantization support,
+wiring `formats/gguf` into Model Loading, native CUDA `F16`/`BF16` compute,
+and additional Providers (Metal/ROCm/NPU/TPU) or Model Components
 (Llama/Mistral/Gemma).
 
 ## Terminology

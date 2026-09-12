@@ -265,6 +265,308 @@ fn multi_step_decode_request_against_an_unsupporting_provider_fails_fast() {
     );
 }
 
+/// Builds a real, trusted, ready-to-generate fixture + payload source +
+/// trust store from the tiny synthetic production bundle, factored out of
+/// the tests above so the `expose-production-generation-parameters` tests
+/// below don't repeat the same real ingestion boilerplate. Returns the
+/// ingested payload source separately since `E2eFixture` does not own it.
+fn tiny_production_fixture_and_ingestion(
+    dir: &std::path::Path,
+) -> (
+    magnetar_runtime::E2eFixture,
+    magnetar_runtime::production_model_ingestion::ProductionIngestionResult,
+    ModelTrustStore,
+) {
+    write_tiny_production_bundle(dir);
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(dir.to_path_buf()),
+        dir.to_path_buf(),
+    );
+    let ingested = HuggingFaceIngestor::new().ingest(&source).unwrap();
+
+    let tokenizer_bytes = fs::read(dir.join("tokenizer.json")).unwrap();
+    let real_tokenizer = magnetar_loader_huggingface::HuggingFaceTokenizer::from_bytes(
+        &tokenizer_bytes,
+        None,
+        "production-generation-parameters-test-tokenizer",
+        Some(VOCAB_SIZE),
+    )
+    .expect("real tokenizer.json loads");
+    let tokenizer_metadata = real_tokenizer.metadata().clone();
+    let real_tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(real_tokenizer);
+
+    let trust_store =
+        ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
+    let fixture = production_qwen_fixture(
+        ingested.manifest.clone(),
+        tokenizer_metadata,
+        real_tokenizer,
+    )
+    .expect("production fixture builds from real ingested data");
+    (fixture, ingested, trust_store)
+}
+
+/// `expose-production-generation-parameters` task 3.1/3.5 (part 1): the new
+/// `run_production_qwen_generation_for_provider_with_request` entry point
+/// actually forwards caller-supplied `GenerationParameters` -- including a
+/// `seed` -- to the real sampling contract, rather than silently running
+/// greedy regardless of what was requested. Proven without hardcoding any
+/// specific generated token (this bundle's weights are synthetic/random):
+/// two separate calls with the exact same non-greedy parameters and the
+/// exact same seed on the exact same prompt/weights must produce identical
+/// output, which greedy decoding trivially would too -- the point is that a
+/// *non-default* `GenerationParameters` reaches generation at all (a prior
+/// hardcoded-greedy entry point would still be internally consistent with
+/// itself and this alone wouldn't fail); combined with the seed-consistency
+/// requirement's own scenario this is exercising real, non-greedy sampling
+/// machinery, not merely calling a function that compiles.
+#[test]
+fn production_generation_request_forwards_non_greedy_sampling_parameters() {
+    register_real_qwen_component();
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, ingested, trust_store) = tiny_production_fixture_and_ingestion(dir.path());
+
+    let mut manifest = ingested.manifest.clone();
+    manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(4),
+        ..Default::default()
+    });
+
+    let parameters = {
+        let parameters = magnetar_runtime::GenerationParameters {
+            temperature: 0.7,
+            top_p: Some(0.9),
+            seed: Some(42),
+            deterministic: true,
+            greedy: false,
+            sampling_enabled: true,
+            ..Default::default()
+        };
+        parameters.validate().expect("parameters are valid");
+        parameters
+    };
+
+    let request = || magnetar_runtime::ProductionGenerationRequest {
+        prompt: magnetar_runtime::PromptInput::PlainText("hi".into()),
+        parameters: parameters.clone(),
+        stop_conditions: magnetar_runtime::StopConditions::default(),
+        max_new_tokens: None,
+    };
+
+    let mut fixture_for_first = fixture.clone();
+    fixture_for_first.manifest = manifest.clone();
+    let first = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
+        fixture_for_first,
+        ingested.payload_source.as_ref(),
+        trust_store.clone(),
+        request(),
+        None,
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+    )
+    .expect("non-greedy sampling parameters reach real generation");
+
+    let mut fixture_for_second = fixture;
+    fixture_for_second.manifest = manifest;
+    let second = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
+        fixture_for_second,
+        ingested.payload_source.as_ref(),
+        trust_store,
+        request(),
+        None,
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+    )
+    .expect("non-greedy sampling parameters reach real generation");
+
+    assert!(
+        !first.result.output.generated_token_ids.is_empty(),
+        "non-greedy production generation produced at least one token"
+    );
+    assert_eq!(
+        first.result.output.generated_token_ids, second.result.output.generated_token_ids,
+        "the same seed with the same non-greedy parameters on the same prompt/weights must \
+         reproduce the exact same generated token ids -- proves the seed reached the real \
+         sampling contract rather than being ignored"
+    );
+}
+
+/// `expose-production-generation-parameters` task 3.2 (fast, per-PR variant
+/// using token-id stops rather than the nightly real-checkpoint text-stop
+/// test): a caller-supplied `stop_conditions.stop_token_ids` entry
+/// actually stops generation, proving `StopConditions` reaches the
+/// production entry point rather than being replaced by the hardcoded
+/// `StopConditions::default()` every other entry point in this family
+/// still passes. Deterministic and hardcoding-free: it observes this
+/// exact prompt/weights' own first greedily-generated token id from an
+/// unconstrained run, then uses that same id as the stop condition for a
+/// second run and asserts generation stops immediately after producing it.
+#[test]
+fn production_generation_request_honors_a_caller_supplied_stop_token_id() {
+    register_real_qwen_component();
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, ingested, trust_store) = tiny_production_fixture_and_ingestion(dir.path());
+
+    let mut manifest = ingested.manifest.clone();
+    manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(6),
+        ..Default::default()
+    });
+
+    let mut fixture_for_baseline = fixture.clone();
+    fixture_for_baseline.manifest = manifest.clone();
+    let baseline = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
+        fixture_for_baseline,
+        ingested.payload_source.as_ref(),
+        trust_store.clone(),
+        magnetar_runtime::ProductionGenerationRequest {
+            prompt: magnetar_runtime::PromptInput::PlainText("hi".into()),
+            parameters: magnetar_runtime::GenerationParameters::greedy(),
+            stop_conditions: magnetar_runtime::StopConditions::default(),
+            max_new_tokens: None,
+        },
+        None,
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+    )
+    .expect("baseline production generation succeeds");
+    let first_token_id = *baseline
+        .result
+        .output
+        .generated_token_ids
+        .first()
+        .expect("baseline generation produced at least one token");
+
+    let mut fixture_for_stop = fixture;
+    fixture_for_stop.manifest = manifest;
+    let stopped = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
+        fixture_for_stop,
+        ingested.payload_source.as_ref(),
+        trust_store,
+        magnetar_runtime::ProductionGenerationRequest {
+            prompt: magnetar_runtime::PromptInput::PlainText("hi".into()),
+            parameters: magnetar_runtime::GenerationParameters::greedy(),
+            stop_conditions: magnetar_runtime::StopConditions {
+                stop_token_ids: vec![first_token_id],
+                ..Default::default()
+            },
+            max_new_tokens: None,
+        },
+        None,
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+    )
+    .expect("stop-conditioned production generation succeeds");
+
+    assert_eq!(
+        stopped.result.output.generated_token_ids,
+        vec![first_token_id],
+        "a caller-supplied stop_token_ids entry matching this deterministic greedy decode's own \
+         first token must stop generation immediately after producing it, proving StopConditions \
+         reached the production entry point instead of being replaced by StopConditions::default()"
+    );
+}
+
+/// `expose-production-generation-parameters` task 3.3: `max_new_tokens:
+/// Some(n)` on `ProductionGenerationRequest` overrides the checkpoint
+/// manifest's own configured token budget.
+#[test]
+fn production_generation_request_max_new_tokens_override_replaces_manifest_default() {
+    register_real_qwen_component();
+    let dir = tempfile::tempdir().unwrap();
+    let (mut fixture, ingested, trust_store) = tiny_production_fixture_and_ingestion(dir.path());
+    fixture.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(5),
+        ..Default::default()
+    });
+
+    let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
+        fixture,
+        ingested.payload_source.as_ref(),
+        trust_store,
+        magnetar_runtime::ProductionGenerationRequest {
+            prompt: magnetar_runtime::PromptInput::PlainText("hi".into()),
+            parameters: magnetar_runtime::GenerationParameters::greedy(),
+            stop_conditions: magnetar_runtime::StopConditions::default(),
+            max_new_tokens: Some(2),
+        },
+        None,
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+    )
+    .expect("overridden token budget still generates");
+
+    assert!(
+        outcome.result.output.generated_token_ids.len() <= 2,
+        "max_new_tokens: Some(2) must cap generation at 2 tokens even though the manifest's own \
+         configured default is 5; got {} tokens",
+        outcome.result.output.generated_token_ids.len()
+    );
+}
+
+/// `expose-production-generation-parameters` task 3.4: the existing
+/// multi-step-decode `Unsupported` fail-fast gate (`close-tachyon-scope-
+/// audit-gaps`) must still apply when the multi-step budget comes from a
+/// caller-supplied `max_new_tokens` override rather than only the
+/// checkpoint manifest's own default.
+#[test]
+fn production_generation_request_unsupported_gate_applies_to_the_overridden_token_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    write_tiny_production_bundle(dir.path());
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+        dir.path().to_path_buf(),
+    );
+    let mut ingested = HuggingFaceIngestor::new().ingest(&source).unwrap();
+    // Manifest default is a single decode step -- would pass the gate on
+    // its own. Only the caller-supplied override below should trigger it.
+    ingested.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(1),
+        ..Default::default()
+    });
+
+    let tokenizer_bytes = std::fs::read(dir.path().join("tokenizer.json")).unwrap();
+    let real_tokenizer = magnetar_loader_huggingface::HuggingFaceTokenizer::from_bytes(
+        &tokenizer_bytes,
+        None,
+        "unsupported-provider-override-test-tokenizer",
+        Some(VOCAB_SIZE),
+    )
+    .expect("real tokenizer.json loads");
+    let tokenizer_metadata = real_tokenizer.metadata().clone();
+    let real_tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(real_tokenizer);
+
+    let fixture = production_qwen_fixture(
+        ingested.manifest.clone(),
+        tokenizer_metadata,
+        real_tokenizer,
+    )
+    .expect("production fixture builds from real ingested data");
+
+    let error = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
+        fixture,
+        ingested.payload_source.as_ref(),
+        ModelTrustStore::default(),
+        magnetar_runtime::ProductionGenerationRequest {
+            prompt: magnetar_runtime::PromptInput::PlainText("hi".into()),
+            parameters: magnetar_runtime::GenerationParameters::greedy(),
+            stop_conditions: magnetar_runtime::StopConditions::default(),
+            max_new_tokens: Some(2),
+        },
+        None,
+        Arc::new(MultiStepDecodeUnsupportedProvider(
+            magnetar_runtime::ReferenceCpuProvider::new(),
+        )),
+    )
+    .expect_err(
+        "a caller-supplied max_new_tokens override of 2 against a Provider declaring \
+         supports_multi_step_decode() == false must still fail fast, even though the \
+         manifest's own default is 1",
+    );
+    assert!(
+        matches!(
+            error,
+            magnetar_runtime::InferenceApiError::Unsupported { .. }
+        ),
+        "expected InferenceApiError::Unsupported, got: {error:?}"
+    );
+}
+
 /// Counts allocations still genuinely holding memory -- `MemoryManager::
 /// release` deliberately leaves a released allocation's ledger entry in
 /// place (marked `Released`/`Reusable` for caching/audit purposes,

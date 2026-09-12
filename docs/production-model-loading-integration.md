@@ -138,6 +138,53 @@ An embedder crate depends on:
    behavior unaffected -- this is an additive, opt-in path, not a
    behavior change for a caller not using it.
 
+8. **Supply real generation parameters and stop conditions (optional).**
+   Translating an OpenAI-shaped request (`temperature`, `top_p`, `seed`,
+   `stop`, ...) requires reaching the real sampling/stop-matching contract,
+   not reimplementing it. Use
+   `run_production_qwen_generation_for_provider_with_request` instead of any
+   of the entry points above:
+
+   ```rust
+   let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
+       fixture,
+       ingested.payload_source.as_ref(),
+       trust_store,
+       magnetar_runtime::ProductionGenerationRequest {
+           prompt: magnetar_runtime::PromptInput::PlainText("The capital of France is".into()),
+           parameters: magnetar_runtime::GenerationParameters {
+               temperature: 0.7,
+               top_p: Some(0.9),
+               seed: Some(42),
+               deterministic: true,
+               greedy: false,
+               sampling_enabled: true,
+               ..Default::default()
+           },
+           stop_conditions: magnetar_runtime::StopConditions {
+               stop_text_sequences: vec!["END".into()],
+               ..Default::default()
+           },
+           max_new_tokens: Some(128),
+       },
+       None,
+       provider,
+   )?;
+   ```
+
+   `parameters` and `stop_conditions` reach the same `GenerationRequest`/
+   sampling contract every other Runtime generation path already uses --
+   temperature/top_p/top_k/min_p/typical_p/penalties/seed/banned-and-allowed
+   tokens, and both token-id and text stop sequences (`stop_text_sequences`
+   is prepared against the real tokenizer internally; the embedder never
+   constructs the tokenizer-aware `prepared_stop_sequences` form itself).
+   `max_new_tokens: None` preserves the checkpoint manifest's own configured
+   token budget; `Some(n)` overrides it. Every entry point above
+   (`run_production_qwen_generation(_for_provider)(_with_prompt)`) is a thin
+   wrapper over this one, passing `GenerationParameters::greedy()`,
+   `StopConditions::default()`, and `max_new_tokens: None` -- their behavior
+   is unaffected by this option existing.
+
 ## What the embedder never does
 
 - Parse Safetensors bytes itself (the ingestor does, via
