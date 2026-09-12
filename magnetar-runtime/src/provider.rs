@@ -497,6 +497,22 @@ pub trait Provider: Send + Sync {
     ) -> Option<&dyn crate::kernel_compilation::ProviderKernelCompilationApi> {
         None
     }
+    /// Whether this Provider can service a generation request needing more
+    /// than one decode step (`close-tachyon-scope-audit-gaps` task group
+    /// 4). Defaults to `true` so every existing implementor's behavior is
+    /// unchanged unless it explicitly overrides this -- the same pattern
+    /// this trait already uses for [`Self::health`]/[`Self::devices`]. A
+    /// Provider whose KV history is not host-readable (a genuinely
+    /// device-resident-only Provider, e.g. `CudaProvider`) SHALL override
+    /// this to `false`, so the generic first-native generation entry point
+    /// can fail a multi-step decode request early and explicitly with
+    /// [`crate::inference_api::InferenceApiError::Unsupported`] before any
+    /// real prefill work runs, instead of the request failing several
+    /// layers deeper inside KV-history concatenation once it is already
+    /// too late to avoid paying for that work.
+    fn supports_multi_step_decode(&self) -> bool {
+        true
+    }
 }
 
 /// A Provider-agnostic tensor value (`define-provider-prepared-kernel-execution-contract`):

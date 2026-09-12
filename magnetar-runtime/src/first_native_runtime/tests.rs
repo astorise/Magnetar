@@ -2703,6 +2703,33 @@ fn qwen_component_production_loader_has_no_embedded_fixture() {
     );
 }
 
+/// Static guard (`close-tachyon-scope-audit-gaps` task 3.3): the real
+/// chat-template rendering path added by task group 3 --
+/// `run_production_qwen_generation_for_provider_with_prompt`, the only
+/// production entry point that accepts a caller-supplied
+/// `ChatTemplateFormatter` -- must stay reachable through this crate's
+/// public API alone. Source-inspects `first_native_runtime.rs` for the
+/// exact `pub fn` declaration rather than asserting on run-time behavior,
+/// since the property being enforced (this function is not accidentally
+/// `pub(crate)`, `pub(super)`, or private) is a visibility fact a
+/// `#[test]` inside the same crate cannot otherwise distinguish -- an
+/// external caller in a different crate can call a `pub fn` here but
+/// not a `pub(crate)` one, so only source inspection actually proves
+/// this. Mirrors the sibling guards above, which use the same technique
+/// for the same structural reason.
+#[test]
+fn production_chat_formatted_generation_entry_point_is_public() {
+    let source = include_str!("../first_native_runtime.rs");
+    assert!(
+        source.contains("pub fn run_production_qwen_generation_for_provider_with_prompt("),
+        "run_production_qwen_generation_for_provider_with_prompt must be declared `pub fn` -- \
+         it is the only production entry point through which an external caller can render \
+         PromptInput::ChatMessages via a real, artifact-declared ChatTemplateFormatter, and a \
+         narrower visibility would make the real chat-template path unreachable from outside \
+         this crate"
+    );
+}
+
 /// `register_qwen_component_artifact` must be safe to call unconditionally,
 /// every time a caller might need first-native generation, without the
 /// caller tracking its own "have I registered yet" state (task 12.4's

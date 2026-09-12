@@ -102,6 +102,93 @@ fn real_production_ingestion_generates_on_real_cuda_hardware() {
     // qwen_generation_for_provider), so a successful dispatch could only
     // have gone through CUDA -- there was nothing else for it to fall
     // back to.
+
+    // `close-tachyon-scope-audit-gaps` task 5.2: the shared generation
+    // loop measures real wall-clock time identically for every Provider,
+    // with zero CUDA-specific code -- proven here on real CUDA hardware
+    // itself, not merely assumed by symmetry with the Reference CPU test.
+    assert!(
+        outcome.result.output.usage.tokens_per_second.is_some(),
+        "real CUDA generation that produced at least one token must report real measured \
+         tokens_per_second, not None"
+    );
+    assert!(
+        outcome.result.output.usage.prefill_duration_millis.is_some(),
+        "real CUDA generation must report real measured prefill duration"
+    );
+}
+
+/// `close-tachyon-scope-audit-gaps` task 4.6: on real CUDA hardware, a
+/// generation request needing more than one decode step now fails with
+/// the new, explicit `InferenceApiError::Unsupported` -- checked before
+/// any real prefill work runs -- instead of the internal
+/// `TensorError::ResidencyUnavailable` that `real_production_ingestion_
+/// generates_on_real_cuda_hardware` above works around today by pinning
+/// `max_tokens: 1`. Same real ingested bundle/tokenizer/Component, same
+/// real `CudaProvider`; only `max_tokens` differs.
+#[test]
+#[ignore = "requires real CUDA hardware; run via gpu-runner-smoke.yml (task 4.6)"]
+fn multi_step_decode_on_real_cuda_hardware_fails_with_explicit_unsupported() {
+    let provider = CudaProvider::new();
+    if !provider.is_available() {
+        return;
+    }
+    register_real_qwen_component();
+
+    let dir = tempfile::tempdir().unwrap();
+    write_tiny_production_bundle(dir.path());
+
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::Tachyon(
+            "tachyon-node-7:cuda-unsupported-decode-integration-test-bundle".into(),
+        ),
+        dir.path().to_path_buf(),
+    );
+    let mut ingested = HuggingFaceIngestor::new()
+        .ingest(&source)
+        .expect("real production ingestion succeeds");
+    ingested.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(2),
+        ..Default::default()
+    });
+
+    let tokenizer_bytes = std::fs::read(dir.path().join("tokenizer.json")).unwrap();
+    let real_tokenizer = magnetar_loader_huggingface::HuggingFaceTokenizer::from_bytes(
+        &tokenizer_bytes,
+        None,
+        "cuda-unsupported-decode-test-tokenizer",
+        Some(VOCAB_SIZE),
+    )
+    .expect("real tokenizer.json loads");
+    let tokenizer_metadata = real_tokenizer.metadata().clone();
+    let real_tokenizer: Arc<dyn magnetar_runtime::tokenizer::Tokenizer + Send + Sync> =
+        Arc::new(real_tokenizer);
+
+    let trust_store =
+        ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
+    let fixture = production_qwen_fixture(
+        ingested.manifest.clone(),
+        tokenizer_metadata,
+        real_tokenizer,
+    )
+    .expect("production fixture builds from real ingested data");
+
+    let error = magnetar_runtime::run_production_qwen_generation_for_provider(
+        fixture,
+        ingested.payload_source.as_ref(),
+        trust_store,
+        "hi",
+        Arc::new(CudaProvider::new()),
+    )
+    .expect_err(
+        "a 2-decode-step request against the real CudaProvider must fail with an explicit \
+         Unsupported error, not succeed and not fail with an internal residency error",
+    );
+    assert!(
+        matches!(error, magnetar_runtime::InferenceApiError::Unsupported { .. }),
+        "expected InferenceApiError::Unsupported (not TensorError::ResidencyUnavailable \
+         surfacing some other way), got: {error:?}"
+    );
 }
 
 /// Task 12.7: a GPU CI job that dispatches this crate's tests must not be

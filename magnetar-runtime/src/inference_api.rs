@@ -1204,6 +1204,19 @@ pub struct RuntimeGenerationExecutionPlans<'a> {
     pub decode: &'a mut PreparedExecutionPlan,
 }
 
+/// Real measured generation throughput (`close-tachyon-scope-audit-gaps`
+/// task group 5): `generated_token_count` over `total_millis` of real
+/// wall-clock prefill+decode time, not an estimate from a fixed assumed
+/// rate. `None` when nothing was generated or no time was measured (a
+/// cancellation before any step ran) -- there is no real rate to report
+/// in either case, and `0/0` would misleadingly read as `Some(0)`.
+fn measured_tokens_per_second(generated_token_count: usize, total_millis: u64) -> Option<u64> {
+    if generated_token_count == 0 || total_millis == 0 {
+        return None;
+    }
+    Some((generated_token_count as u64).saturating_mul(1000) / total_millis)
+}
+
 fn runtime_generation_plan_error(error: PreparedExecutionPlanError) -> InferenceApiError {
     InferenceApiError::KernelUnavailable {
         reason: format!("prepared execution plan unavailable: {error}"),
@@ -1583,6 +1596,9 @@ fn run_generation_loop_inner(
 
     let mut generated: Vec<TokenId> = Vec::new();
     let mut rng_state: Option<SamplingRngState> = None;
+    let mut prefill_millis: Option<u64> = None;
+    let mut decode_millis_total: u64 = 0;
+    let mut decode_step_ran = false;
     let finish_reason = loop {
         if should_cancel(&generated) {
             observer.observe(
@@ -1648,6 +1664,8 @@ fn run_generation_loop_inner(
                 &mut *plans.decode
             }
         });
+        let is_prefill_step = generated.is_empty();
+        let step_started_at = std::time::Instant::now();
         let runtime_step =
             match executor.execute_generation_step(runtime, request, &generated, execution_plan) {
                 Ok(runtime_step) => runtime_step,
@@ -1656,6 +1674,13 @@ fn run_generation_loop_inner(
                     return Err(error);
                 }
             };
+        let step_millis = step_started_at.elapsed().as_millis() as u64;
+        if is_prefill_step {
+            prefill_millis = Some(step_millis);
+        } else {
+            decode_step_ran = true;
+            decode_millis_total = decode_millis_total.saturating_add(step_millis);
+        }
         if runtime_step.evidence.model_instance_ready {
             observer.observe(
                 InferenceApiObservationKind::ModelInstanceReady,
@@ -1876,7 +1901,14 @@ fn run_generation_loop_inner(
         }
     };
 
-    let output = GenerationOutput::new(request, generated, finish_reason);
+    let mut output = GenerationOutput::new(request, generated, finish_reason);
+    output.usage.prefill_duration_millis = prefill_millis;
+    output.usage.decode_duration_millis = decode_step_ran.then_some(decode_millis_total);
+    let total_measured_millis = prefill_millis
+        .unwrap_or(0)
+        .saturating_add(decode_millis_total);
+    output.usage.tokens_per_second =
+        measured_tokens_per_second(output.usage.generated_tokens, total_measured_millis);
     if finish_reason != FinishReason::Cancelled {
         observer.observe(
             InferenceApiObservationKind::GenerationCompleted,
@@ -2514,46 +2546,123 @@ impl InferenceApiObserver {
 /// contract-level error types behind a stable, caller-facing category.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InferenceApiError {
-    InferenceApiUnavailable { reason: String },
-    ModelReferenceInvalid { reason: String },
-    ModelResolutionFailed { reason: String },
-    ModelLoadingFailed { reason: String },
-    ModelInstanceNotReady { reason: String },
-    ModelInstanceUnavailable { reason: String },
-    ModelComponentUnavailable { reason: String },
-    TokenizerUnavailable { reason: String },
-    TokenizerIncompatible { reason: String },
-    TokenizationFailed { reason: String },
-    SessionCreationFailed { reason: String },
+    InferenceApiUnavailable {
+        reason: String,
+    },
+    ModelReferenceInvalid {
+        reason: String,
+    },
+    ModelResolutionFailed {
+        reason: String,
+    },
+    ModelLoadingFailed {
+        reason: String,
+    },
+    ModelInstanceNotReady {
+        reason: String,
+    },
+    ModelInstanceUnavailable {
+        reason: String,
+    },
+    ModelComponentUnavailable {
+        reason: String,
+    },
+    TokenizerUnavailable {
+        reason: String,
+    },
+    TokenizerIncompatible {
+        reason: String,
+    },
+    TokenizationFailed {
+        reason: String,
+    },
+    SessionCreationFailed {
+        reason: String,
+    },
     SessionNotFound,
     SessionClosed,
-    GenerationRejected { reason: String },
+    GenerationRejected {
+        reason: String,
+    },
     GenerationQueued,
     GenerationTimeout,
     GenerationCancelled,
-    GenerationFailed { reason: String },
-    SamplingFailed { reason: String },
-    StopConditionInvalid { reason: String },
-    AdapterActivationFailed { reason: String },
-    KvCacheUnavailable { reason: String },
-    PrefixCacheUnavailable { reason: String },
-    MemoryAdmissionFailed { reason: String },
-    WeightContentDigestMismatch { reason: String },
-    WeightShapeOrDtypeMismatch { reason: String },
-    ProviderTensorWriteFailed { reason: String },
-    ProviderTensorReleaseFailed { reason: String },
-    ProviderUnavailable { reason: String },
-    DeviceUnavailable { reason: String },
-    KernelUnavailable { reason: String },
-    OperatorUnsupported { reason: String },
-    GraphPlanningFailed { reason: String },
-    PolicyDenied { reason: String },
-    CancellationUnsupported { reason: String },
-    StreamingUnavailable { reason: String },
-    StreamingInterrupted { reason: String },
+    GenerationFailed {
+        reason: String,
+    },
+    SamplingFailed {
+        reason: String,
+    },
+    StopConditionInvalid {
+        reason: String,
+    },
+    AdapterActivationFailed {
+        reason: String,
+    },
+    KvCacheUnavailable {
+        reason: String,
+    },
+    PrefixCacheUnavailable {
+        reason: String,
+    },
+    MemoryAdmissionFailed {
+        reason: String,
+    },
+    WeightContentDigestMismatch {
+        reason: String,
+    },
+    WeightShapeOrDtypeMismatch {
+        reason: String,
+    },
+    ProviderTensorWriteFailed {
+        reason: String,
+    },
+    ProviderTensorReleaseFailed {
+        reason: String,
+    },
+    ProviderUnavailable {
+        reason: String,
+    },
+    DeviceUnavailable {
+        reason: String,
+    },
+    KernelUnavailable {
+        reason: String,
+    },
+    OperatorUnsupported {
+        reason: String,
+    },
+    GraphPlanningFailed {
+        reason: String,
+    },
+    PolicyDenied {
+        reason: String,
+    },
+    CancellationUnsupported {
+        reason: String,
+    },
+    StreamingUnavailable {
+        reason: String,
+    },
+    StreamingInterrupted {
+        reason: String,
+    },
     DiagnosticsRedacted,
-    BrowserFeatureUnsupported { feature: String },
-    InternalInferenceApiError { reason: String },
+    BrowserFeatureUnsupported {
+        feature: String,
+    },
+    InternalInferenceApiError {
+        reason: String,
+    },
+    /// A request shape the bound Provider structurally cannot perform, as
+    /// opposed to a transient fault (`ProviderUnavailable`) or a policy
+    /// decision (`PolicyDenied`) -- e.g. a multi-step decode request
+    /// against a Provider whose KV history is not host-readable
+    /// (`close-tachyon-scope-audit-gaps` task group 4). `reason` names the
+    /// real, specific constraint, not a generic "unsupported" message.
+    Unsupported {
+        reason: String,
+    },
 }
 
 impl fmt::Display for InferenceApiError {
@@ -2643,6 +2752,7 @@ impl fmt::Display for InferenceApiError {
             Self::InternalInferenceApiError { reason } => {
                 write!(f, "internal inference api error: {reason}")
             }
+            Self::Unsupported { reason } => write!(f, "unsupported: {reason}"),
         }
     }
 }

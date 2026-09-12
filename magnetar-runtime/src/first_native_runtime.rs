@@ -7235,6 +7235,55 @@ pub fn run_production_qwen_generation_for_provider(
     prompt: &str,
     provider: Arc<dyn Provider>,
 ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+    run_production_qwen_generation_for_provider_with_prompt(
+        fixture,
+        payload_source,
+        trust_store,
+        PromptInput::PlainText(prompt.into()),
+        None,
+        provider,
+    )
+}
+
+/// [`run_production_qwen_generation_for_provider`], generalized to accept
+/// any [`PromptInput`] and an optional [`ChatTemplateFormatter`]
+/// (`close-tachyon-scope-audit-gaps` task group 3): a caller whose
+/// ingested manifest declares a real chat template renders
+/// `PromptInput::ChatMessages` through it here, closing the gap where
+/// every production generation call previously sent a bare, unformatted
+/// prompt string even to an Instruct-tuned checkpoint expecting real chat
+/// markup (a real Qwen2.5-Instruct checkpoint's own incoherent output on
+/// a plain-text prompt is what this closes). `chat_formatter` is
+/// consulted only for `PromptInput::ChatMessages`, matching
+/// `tokenize_prompt_input`'s existing Prompt Input Boundary; passing
+/// `PromptInput::PlainText` and `None` reproduces
+/// `run_production_qwen_generation_for_provider`'s exact prior behavior,
+/// which is exactly what that function's own thin wrapper above now does.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn run_production_qwen_generation_for_provider_with_prompt(
+    fixture: E2eFixture,
+    payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
+    trust_store: ModelTrustStore,
+    prompt: PromptInput,
+    chat_formatter: Option<&dyn ChatTemplateFormatter>,
+    provider: Arc<dyn Provider>,
+) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+    let max_tokens = fixture
+        .manifest
+        .generation
+        .as_ref()
+        .and_then(|defaults| defaults.max_tokens)
+        .unwrap_or(64);
+    if max_tokens > 1 && !provider.supports_multi_step_decode() {
+        return Err(InferenceApiError::Unsupported {
+            reason: format!(
+                "provider '{}' does not support multi-step decode (its KV history is not \
+                 host-readable), but this request needs {max_tokens} decode steps",
+                provider.metadata().name
+            ),
+        });
+    }
+
     let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
     let mut runtime = Runtime::builder()
         .register_provider(provider.clone())
@@ -7278,8 +7327,8 @@ pub fn run_production_qwen_generation_for_provider(
 
     let tokenized = tokenize_prompt_input(
         &fixture.tokenizer,
-        TokenizationRequest::new(PromptInput::PlainText(prompt.into())),
-        None,
+        TokenizationRequest::new(prompt),
+        chat_formatter,
     )?;
     let mut observer = InferenceApiObserver::new();
 
@@ -7308,12 +7357,7 @@ pub fn run_production_qwen_generation_for_provider(
         GenerationModelReference::ModelInstance(instance.clone()),
         generation_tokenizer_reference(&fixture),
         tokenized,
-        fixture
-            .manifest
-            .generation
-            .as_ref()
-            .and_then(|defaults| defaults.max_tokens)
-            .unwrap_or(64) as usize,
+        max_tokens as usize,
         GenerationParameters::greedy(),
         StopConditions::default(),
         StreamingMode::TokenIds,
@@ -8009,9 +8053,22 @@ fn prepare_first_native_plan_for_graph(
     plan.set_resource_plan(ResourceBindingPlan::default())?;
     plan.set_memory_requirements(PlanMemoryRequirements::default())?;
     plan.add_guard(PlanGuard::Phase(phase));
+    // `max` must be at least `token_count`: this Plan's own node bindings
+    // and edge shapes were built for exactly `token_count` tokens (see the
+    // node-binding loop above), so a workload of that same size must
+    // always be self-consistent. `E2E_FIXTURE_CONTEXT` is only a floor,
+    // preserving every existing tiny-synthetic-fixture test's behavior
+    // (built for well under 32 tokens); a real production prompt (e.g. one
+    // rendered through a real chat template, routinely 30-100+ tokens)
+    // needs the ceiling to actually cover its own real length instead of
+    // being rejected by an unrelated fixture-sized cap
+    // (`close-tachyon-scope-audit-gaps` task 3.2: found by this change's
+    // own end-to-end real-chat-template test, which failed here before
+    // this fix even though the chat-template rendering itself was
+    // already correct).
     plan.add_guard(PlanGuard::SequenceRange {
         min: 1,
-        max: E2E_FIXTURE_CONTEXT,
+        max: token_count.max(E2E_FIXTURE_CONTEXT),
     });
     plan.add_guard(PlanGuard::Readiness);
     plan.add_guard(PlanGuard::AffinityRequired);

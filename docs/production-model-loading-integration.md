@@ -93,6 +93,51 @@ An embedder crate depends on:
    `magnetar-runtime` never imports or references a concrete non-Reference-
    CPU Provider crate.
 
+7. **Use the artifact's own real chat template (optional).** When the
+   ingested `manifest.chat_template` is `Some` (the bundle's
+   `tokenizer_config.json` declared one), build a real formatter and render
+   `PromptInput::ChatMessages` through it instead of sending a bare
+   plain-text prompt to an Instruct-tuned checkpoint (which is trained to
+   expect its own chat markup, e.g. Qwen2.5-Instruct's
+   `<|im_start|>`/`<|im_end|>`, and produces incoherent output otherwise):
+
+   ```rust
+   let chat_template = /* read the manifest.chat_template part's bytes
+                           from the same source the embedder ingested
+                           from -- e.g. the raw tokenizer_config.json's
+                           chat_template string, already parsed once via
+                           magnetar_loader_huggingface::parse_tokenizer_config */;
+   let formatter = magnetar_loader_huggingface::HuggingFaceChatTemplateFormatter::new(
+       chat_template,
+   )?;
+   let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_with_prompt(
+       fixture,
+       ingested.payload_source.as_ref(),
+       trust_store,
+       magnetar_runtime::PromptInput::ChatMessages(vec![
+           magnetar_runtime::ChatMessage::new("user", "What is the capital of France?"),
+       ]),
+       Some(&formatter),
+       provider,
+   )?;
+   ```
+
+   `HuggingFaceChatTemplateFormatter` renders the real subset of Jinja2
+   real Hugging Face chat templates use (variable substitution, `{% for
+   %}` over messages, `{% if %}`/`{% elif %}` on loop/message state, `{%
+   set %}`, `tojson`, the `defined` test, whitespace-control tags, and both
+   `message.role`/`message['role']` attribute-access forms) via `minijinja`
+   -- kept entirely in `loaders/huggingface`, never a `magnetar-runtime`
+   dependency. A syntactically invalid template is rejected at
+   construction (`HuggingFaceChatTemplateFormatter::new` returns `Err`); a
+   syntactically valid template referencing an unsupported construct (an
+   unknown filter, for instance) fails closed at first render instead,
+   with a structured `InferenceApiError::TokenizationFailed`, never a
+   silently wrong render. `PromptInput::PlainText` and `None` reproduce
+   `run_production_qwen_generation_for_provider`'s exact existing
+   behavior unaffected -- this is an additive, opt-in path, not a
+   behavior change for a caller not using it.
+
 ## What the embedder never does
 
 - Parse Safetensors bytes itself (the ingestor does, via
@@ -113,3 +158,23 @@ See README's "Qwen production loading" section for exactly what this
 profile supports today and what it explicitly does not yet (multi-step CUDA
 decode, native CUDA F16/BF16 compute, GGUF/quantized/LoRA/non-Qwen
 architectures, remote model hub download).
+
+A Provider whose KV history is not host-readable (today: `CudaProvider`,
+device-resident by design) cannot service a request needing more than one
+decode step. Rather than discovering this deep inside decode after paying
+for a real prefill, the bound Provider's `supports_multi_step_decode()`
+(a `Provider` trait method, `true` by default) is checked once, before any
+real execution work, when the request needs more than one decode step; a
+Provider declaring `false` fails the request immediately with a structured
+`InferenceApiError::Unsupported { reason }` naming the real constraint. An
+embedder calling `run_production_qwen_generation_for_provider(_with_prompt)`
+with a Provider it does not control the implementation of should match on
+this variant to distinguish "this Provider cannot do this" from a
+transient fault (`ProviderUnavailable`) or a policy decision
+(`PolicyDenied`).
+
+`GenerationResult.output.usage.tokens_per_second` (and
+`prefill_duration_millis`/`decode_duration_millis`) reflect real measured
+wall-clock time for every Provider once at least one token was generated,
+not an estimate or a fixed assumed rate -- `None` only when generation
+produced no token at all (e.g. cancelled before the first step ran).

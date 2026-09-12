@@ -29,7 +29,8 @@
 
 use crate::test_support::register_real_qwen_component;
 use magnetar_loader_huggingface::{
-    HuggingFaceIngestor, HuggingFaceTokenizer, parse_tokenizer_config,
+    HuggingFaceChatTemplateFormatter, HuggingFaceIngestor, HuggingFaceTokenizer,
+    parse_tokenizer_config,
 };
 use magnetar_runtime::model::ModelDigest;
 use magnetar_runtime::model::ModelTrustStore;
@@ -37,7 +38,10 @@ use magnetar_runtime::production_model_ingestion::{
     ProductionModelArtifactIngestor, ProductionModelSource,
 };
 use magnetar_runtime::tokenizer::Tokenizer;
-use magnetar_runtime::{ModelArtifactSource, ModelGenerationDefaults, production_qwen_fixture};
+use magnetar_runtime::{
+    ChatMessage, ModelArtifactSource, ModelGenerationDefaults, PromptInput,
+    production_qwen_fixture,
+};
 use std::{fs, path::PathBuf, sync::Arc};
 
 /// `Qwen/Qwen2.5-0.5B-Instruct`'s exact pinned commit on Hugging Face:
@@ -184,6 +188,91 @@ fn real_public_checkpoint_loads_and_generates_on_reference_cpu() {
         outcome.text
     );
     eprintln!("real Qwen2.5-0.5B-Instruct generated: {:?}", outcome.text);
+}
+
+/// `close-tachyon-scope-audit-gaps` task 3.2: proves the real gap the
+/// Tachyon scope-charter audit found is actually closed end to end --
+/// `run_production_qwen_generation_for_provider_with_prompt` renders
+/// `PromptInput::ChatMessages` through the real Qwen2.5-Instruct chat
+/// template (parsed from this same checkpoint's own `tokenizer_config.
+/// json`) instead of sending an unformatted plain-text prompt to an
+/// Instruct-tuned checkpoint, which is what previously produced
+/// incoherent output. Compares against the plain-text path on the exact
+/// same checkpoint/prompt to demonstrate the difference is real, not
+/// asserting a specific generated token (a real model's greedy output for
+/// a real prompt is not something this test should hardcode).
+#[test]
+#[ignore = "downloads/holds a ~1GB real checkpoint; manual/nightly profile only (task 3.2)"]
+fn real_public_checkpoint_renders_chat_messages_through_its_own_real_template() {
+    let dir = require_checkpoint_dir();
+    let source = verified_checkpoint_source(&dir);
+
+    register_real_qwen_component();
+
+    let mut ingested = HuggingFaceIngestor::new()
+        .ingest(&source)
+        .expect("real Qwen2.5-0.5B-Instruct bundle ingests");
+    assert!(
+        ingested.manifest.chat_template.is_some(),
+        "the real Qwen2.5-Instruct bundle declares a real chat_template in tokenizer_config.json"
+    );
+    ingested.manifest.generation = Some(ModelGenerationDefaults {
+        max_tokens: Some(8),
+        ..Default::default()
+    });
+
+    let tokenizer_json = fs::read(dir.join("tokenizer.json")).expect("tokenizer.json readable");
+    let tokenizer_config_bytes =
+        fs::read(dir.join("tokenizer_config.json")).expect("tokenizer_config.json readable");
+    let tokenizer_config =
+        parse_tokenizer_config(&tokenizer_config_bytes).expect("real tokenizer_config.json parses");
+    let real_template = tokenizer_config
+        .chat_template_reference
+        .clone()
+        .expect("real Qwen2.5-Instruct tokenizer_config.json declares chat_template");
+    let formatter = HuggingFaceChatTemplateFormatter::new(real_template)
+        .expect("the real Qwen2.5-Instruct chat template is valid Jinja2");
+
+    let real_tokenizer = HuggingFaceTokenizer::from_bytes(
+        &tokenizer_json,
+        Some(&tokenizer_config),
+        "qwen2.5-0.5b-instruct",
+        Some(REAL_VOCAB_SIZE),
+    )
+    .expect("real tokenizer.json loads and matches the declared vocab_size");
+    let tokenizer_metadata = real_tokenizer.metadata().clone();
+    let real_tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(real_tokenizer);
+
+    let trust_store =
+        ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
+    let fixture = production_qwen_fixture(ingested.manifest.clone(), tokenizer_metadata, real_tokenizer)
+        .expect("production fixture builds from the real ingested Qwen2.5-0.5B-Instruct data");
+
+    let messages = vec![ChatMessage::new(
+        "user",
+        "What is the capital of France?",
+    )];
+    let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_with_prompt(
+        fixture,
+        ingested.payload_source.as_ref(),
+        trust_store,
+        PromptInput::ChatMessages(messages),
+        Some(&formatter),
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+    )
+    .expect(
+        "chat-message generation runs end to end through the real chat template on a real \
+         public checkpoint",
+    );
+
+    assert!(
+        !outcome.result.output.generated_token_ids.is_empty(),
+        "chat-message generation through the real template produced at least one token"
+    );
+    eprintln!(
+        "real Qwen2.5-0.5B-Instruct generated (real chat template applied): {:?}",
+        outcome.text
+    );
 }
 
 /// Task 12.5: compares real Reference CPU and real CUDA deterministic

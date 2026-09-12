@@ -204,6 +204,26 @@ hardware:
   hardware within an exact-match tolerance (see
   `integration-tests/production-loading`'s `tests_real_checkpoint_smoke.rs`,
   a manual/nightly-profile test given its ~1GB download)
+- A real, artifact-declared chat template: when the ingested bundle's
+  `tokenizer_config.json` declares one, `loaders/huggingface`'s
+  `HuggingFaceChatTemplateFormatter` renders `PromptInput::ChatMessages`
+  through the real Jinja2 template (verified byte-exact against a real
+  Qwen2.5-Instruct template, and separately against a real Phi-3-mini
+  template's materially different markup) instead of a plain-text
+  placeholder -- verified on the real public checkpoint: the same real
+  weights produce the incoherent `" 1000000"` for an unformatted plain-text
+  prompt but a coherent `"The capital of France, France."` once rendered
+  through the checkpoint's own real template for the same question
+- An explicit, checked-early `InferenceApiError::Unsupported` when a
+  generation request needs more than one decode step against a Provider
+  that declares (`Provider::supports_multi_step_decode`) it cannot supply
+  host-readable KV history for it -- checked before any real execution
+  work, not discovered as an internal residency error partway through a
+  real prefill
+- Real measured `tokens_per_second`/`prefill_duration_millis`/
+  `decode_duration_millis` generation usage metadata, for both Reference
+  CPU and real CUDA hardware, from actual wall-clock timing (verified on
+  both) rather than left unset
 
 Explicitly not yet supported by this profile:
 
@@ -214,10 +234,20 @@ Explicitly not yet supported by this profile:
   to host memory for historical-KV-history concatenation, and
   `CudaProvider::read_tensor_value` deliberately never does this by design
   (only `read_tensor` explicitly downloads) -- a real, pre-existing gap this
-  profile's CUDA path does not paper over
+  profile's CUDA path does not paper over. A caller now learns this
+  immediately as a structured `Unsupported` error (see above) instead of an
+  internal residency error after paying for a real prefill; the decode
+  itself remains unimplemented, tracked separately
+  (`implement-device-resident-multi-step-cuda-decode`)
 - GGUF, quantized (`Q4_K`/`Q5_K`/`Q8_0`/GPTQ/AWQ/BitsAndBytes) execution, LoRA
   adapters, and non-Qwen architecture families
 - Remote model hub download, OCI distribution, and credential/retry handling
+- Wiring `magnetar-cli` to run generation against a production-loaded
+  instance at all: `magnetar model load --file` proves real ingestion and
+  loading, but no CLI command then generates from that instance -- `magnetar
+  run`/`magnetar chat` remain bound to the separate `qwen-test` Component
+  fixture. A real, separate CLI feature, not attempted by
+  `close-tachyon-scope-audit-gaps` (see that change's proposal Non-Goals)
 
 ## Magnetar and Tachyon
 
@@ -257,6 +287,18 @@ ingestor) instead. Tachyon should keep parsing no model formats and managing no 
 resources itself either way (see "Public embedder / Tachyon loading surface"
 in that change's proposal); this criterion is about when its fallback path
 becomes safe to delete, not about which side does the parsing.
+
+**Tachyon scope charter reconciliation**: reconciling the shipped code against
+a Tachyon-authored Magnetar scope charter found the large majority of it
+already real and verified; `close-tachyon-scope-audit-gaps` closed the two
+concrete gaps that reconciliation found (real chat template rendering; an
+explicit `Unsupported` signal for a decode shape a Provider cannot perform,
+plus real `tokens_per_second` measurement). Everything else the charter
+frames as future work remains exactly that: multi-device execution,
+quantization support, wiring `formats/gguf` into Model Loading, native CUDA
+`F16`/`BF16` compute, additional Providers (Metal/ROCm/NPU/TPU) or Model
+Components (Llama/Mistral/Gemma), and device-resident multi-step CUDA decode
+itself (tracked separately, `implement-device-resident-multi-step-cuda-decode`).
 
 ## Terminology
 
