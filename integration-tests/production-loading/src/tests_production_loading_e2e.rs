@@ -113,16 +113,15 @@ fn tachyon_shaped_real_production_ingestion_loads_through_the_real_qwen_componen
         usage.prefill_duration_millis.is_some(),
         "real generation must report real measured prefill duration"
     );
-    let total_millis = usage.prefill_duration_millis.unwrap_or(0)
-        + usage.decode_duration_millis.unwrap_or(0);
+    let total_millis =
+        usage.prefill_duration_millis.unwrap_or(0) + usage.decode_duration_millis.unwrap_or(0);
     assert!(
         total_millis > 0,
         "real generation work must take measurable wall-clock time"
     );
     // Consistent with generated token count and measured duration: within
     // integer-division rounding of generated_tokens * 1000 / total_millis.
-    let expected_tokens_per_second =
-        (usage.generated_tokens as u64 * 1000) / total_millis;
+    let expected_tokens_per_second = (usage.generated_tokens as u64 * 1000) / total_millis;
     assert_eq!(
         usage.tokens_per_second,
         Some(expected_tokens_per_second),
@@ -258,7 +257,10 @@ fn multi_step_decode_request_against_an_unsupporting_provider_fails_fast() {
          supports_multi_step_decode() == false must fail before any real execution work runs",
     );
     assert!(
-        matches!(error, magnetar_runtime::InferenceApiError::Unsupported { .. }),
+        matches!(
+            error,
+            magnetar_runtime::InferenceApiError::Unsupported { .. }
+        ),
         "expected InferenceApiError::Unsupported, got: {error:?}"
     );
 }

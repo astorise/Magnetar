@@ -1273,6 +1273,15 @@ impl ReferenceCpuExecutor {
         self.read_tensor(id).map(TensorValue::Host)
     }
 
+    /// See [`ProviderExecutionApi::resident_shape`].
+    pub fn resident_shape(&self, id: &TensorResourceId) -> Option<Vec<u64>> {
+        self.storage
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|tensor| tensor.shape.clone())
+    }
+
     /// See [`ProviderExecutionApi::copy_tensor_admitted`]: a `HostTensor`
     /// clone under the new id, admitted exactly like
     /// [`Self::write_tensor_admitted`] already admits any other write.
@@ -2276,6 +2285,10 @@ impl ProviderExecutionApi for ReferenceCpuExecutor {
 
     fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
         ReferenceCpuExecutor::read_tensor_value(self, id)
+    }
+
+    fn resident_shape(&self, id: &TensorResourceId) -> Option<Vec<u64>> {
+        ReferenceCpuExecutor::resident_shape(self, id)
     }
 
     fn write_tensor_value(

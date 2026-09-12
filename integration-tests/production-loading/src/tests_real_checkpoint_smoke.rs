@@ -39,8 +39,7 @@ use magnetar_runtime::production_model_ingestion::{
 };
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
-    ChatMessage, ModelArtifactSource, ModelGenerationDefaults, PromptInput,
-    production_qwen_fixture,
+    ChatMessage, ModelArtifactSource, ModelGenerationDefaults, PromptInput, production_qwen_fixture,
 };
 use std::{fs, path::PathBuf, sync::Arc};
 
@@ -245,13 +244,14 @@ fn real_public_checkpoint_renders_chat_messages_through_its_own_real_template() 
 
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
-    let fixture = production_qwen_fixture(ingested.manifest.clone(), tokenizer_metadata, real_tokenizer)
-        .expect("production fixture builds from the real ingested Qwen2.5-0.5B-Instruct data");
+    let fixture = production_qwen_fixture(
+        ingested.manifest.clone(),
+        tokenizer_metadata,
+        real_tokenizer,
+    )
+    .expect("production fixture builds from the real ingested Qwen2.5-0.5B-Instruct data");
 
-    let messages = vec![ChatMessage::new(
-        "user",
-        "What is the capital of France?",
-    )];
+    let messages = vec![ChatMessage::new("user", "What is the capital of France?")];
     let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_with_prompt(
         fixture,
         ingested.payload_source.as_ref(),
@@ -275,25 +275,26 @@ fn real_public_checkpoint_renders_chat_messages_through_its_own_real_template() 
     );
 }
 
-/// Task 12.5: compares real Reference CPU and real CUDA deterministic
+/// Task 12.5, generalized by `implement-device-resident-multi-step-cuda-
+/// decode`: compares real Reference CPU and real CUDA deterministic
 /// output on the same real checkpoint, same real ingested manifest, and
-/// same prompt. Prefill-only (`max_tokens: 1`, matching `tests_
-/// production_loading_cuda_e2e.rs`'s own documented reason: multi-step
-/// decode's historical-KV-history concatenation needs host-readable
-/// tensor bytes, which `CudaProvider::read_tensor_value` deliberately
-/// never provides). Greedy sampling on identical input is expected to
-/// pick the same argmax token on both Providers even though CPU/GPU
-/// floating-point accumulation order differs (their real numeric
-/// difference, if any, lands far below what would flip an already
-/// well-separated real-word logit distribution's argmax); a documented
-/// tolerance of "exactly the same decoded token id and text" is used
-/// rather than a numeric logit tolerance because neither Provider's
-/// generation output exposes raw logits at this public boundary. Skips
-/// (does not fail) when no CUDA-capable device is available, matching
-/// this crate's other CUDA test.
+/// same prompt, across a real multi-token decode (`max_tokens: 4`, 3 real
+/// decode steps beyond prefill) -- historical KV concatenation across
+/// decode steps now dispatches through a real, device-resident "concat"
+/// Kernel instead of requiring host-readable tensor bytes, so CUDA
+/// genuinely supports this shape now, not just prefill. Greedy sampling on
+/// identical input is expected to pick the same argmax token at every step
+/// on both Providers even though CPU/GPU floating-point accumulation order
+/// differs (their real numeric difference, if any, lands far below what
+/// would flip an already well-separated real-word logit distribution's
+/// argmax); a documented tolerance of "exactly the same decoded token ids
+/// and text" is used rather than a numeric logit tolerance because neither
+/// Provider's generation output exposes raw logits at this public
+/// boundary. Skips (does not fail) when no CUDA-capable device is
+/// available, matching this crate's other CUDA test.
 #[test]
 #[ignore = "downloads/holds a ~1GB real checkpoint; manual/nightly hardware profile only (task 12.5)"]
-fn real_public_checkpoint_prefill_output_matches_between_cpu_and_cuda() {
+fn real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda() {
     let provider = magnetar_provider_cuda::CudaProvider::new();
     if !provider.is_available() {
         return;
@@ -306,7 +307,7 @@ fn real_public_checkpoint_prefill_output_matches_between_cpu_and_cuda() {
         .ingest(&source)
         .expect("real Qwen2.5-0.5B-Instruct bundle ingests");
     ingested.manifest.generation = Some(ModelGenerationDefaults {
-        max_tokens: Some(1),
+        max_tokens: Some(4),
         ..Default::default()
     });
 
@@ -357,17 +358,22 @@ fn real_public_checkpoint_prefill_output_matches_between_cpu_and_cuda() {
     .expect("CUDA generation runs end to end on the real checkpoint");
 
     assert_eq!(
+        cpu_outcome.result.output.generated_token_ids.len(),
+        4,
+        "Reference CPU must generate all 4 requested tokens (prefill + 3 real decode steps)"
+    );
+    assert_eq!(
         cpu_outcome.result.output.generated_token_ids,
         cuda_outcome.result.output.generated_token_ids,
-        "Reference CPU and CUDA must select the same greedy prefill token on identical real \
-         checkpoint/config/tokenizer/prompt input"
+        "Reference CPU and CUDA must select the same greedy tokens at every step (prefill and \
+         every real decode step) on identical real checkpoint/config/tokenizer/prompt input"
     );
     assert_eq!(
         cpu_outcome.text, cuda_outcome.text,
         "Reference CPU and CUDA must decode to the same real text"
     );
     eprintln!(
-        "real Qwen2.5-0.5B-Instruct prefill token matched on CPU and CUDA: {:?}",
+        "real Qwen2.5-0.5B-Instruct multi-token decode matched on CPU and CUDA: {:?}",
         cpu_outcome.text
     );
 }

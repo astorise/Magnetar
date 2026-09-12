@@ -766,6 +766,22 @@ pub trait ProviderExecutionApi: Send + Sync {
         None
     }
 
+    /// The shape of the Tensor Resource `id` currently holds, without
+    /// requiring host-visible bytes. Shape is structural metadata, not
+    /// private tensor content -- unlike [`Self::read_tensor_value`], a
+    /// Provider that declines host materialization for `id`
+    /// ([`TensorValue::Opaque`]) can still answer this directly from its
+    /// own device allocation record. `None` when `id` is not currently
+    /// held by this Provider. Needed by a caller (KV-history
+    /// concatenation, `implement-device-resident-multi-step-cuda-decode`)
+    /// that holds only a `TensorResourceId` for a resource from a prior
+    /// step and needs its real shape to build a dispatch input, without
+    /// downloading it merely to learn that shape.
+    fn resident_shape(&self, id: &TensorResourceId) -> Option<Vec<u64>> {
+        let _ = id;
+        None
+    }
+
     /// Writes a Provider-agnostic tensor value, unadmitted -- the
     /// [`TensorValue`] counterpart to [`Self::write_tensor`]. The default
     /// implementation does nothing and succeeds; a Provider that only

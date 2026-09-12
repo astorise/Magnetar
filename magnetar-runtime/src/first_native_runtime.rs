@@ -2641,6 +2641,188 @@ fn dispatch_qwen_matmul(
     )
 }
 
+/// Dispatches the "concat" Operator -- KV-history concatenation
+/// (`implement-device-resident-multi-step-cuda-decode`): stacks `a`'s rows
+/// above `b`'s rows through the exact same generic dispatch machinery
+/// every other Qwen graph node uses, instead of downloading both to host
+/// and concatenating in Rust (`concat_rows`, this function's predecessor
+/// in the KV-history-append block). `a` is the previous steps' historical
+/// K/V, `b` is this step's newly computed K/V; mirrors
+/// `dispatch_qwen_matmul`'s own pattern of computing an output shape that
+/// differs from either input's own shape.
+/// Dispatches the "concat" Operator for KV-history concatenation
+/// (`implement-device-resident-multi-step-cuda-decode`): stacks `a`'s rows
+/// above `b`'s rows through a real Kernel Registry selection and real
+/// Provider dispatch, instead of downloading both to host and
+/// concatenating in Rust (`concat_rows`, this function's predecessor in
+/// the KV-history-append block).
+///
+/// Deliberately does *not* go through `dispatch_reference_cpu_operator[_
+/// multi/_pre_admitted]`: this is Runtime-internal bookkeeping tied to
+/// `real_node`'s own output edge, not itself a node the static graph
+/// declares, so there is no `PreparedExecutionPlan` node binding for it
+/// under any id -- attempting one either fails outright (a synthetic id
+/// the graph never declared) or would silently resolve `real_node`'s own
+/// *original* Kernel binding (e.g. "rope") instead of "concat" (`prepare_
+/// node_execution` binds purely by node id, not by requested operator).
+/// This performs a real, live Kernel Registry selection instead -- the
+/// same selection logic `dispatch_reference_cpu_operator_multi`'s own
+/// `(None, _)` branch already uses for a caller with no Prepared Plan at
+/// all, not `prepared_candidate_for_operation`'s synthetic always-
+/// compatible path -- using `real_node`'s own already-resolved,
+/// already-correct resource affinity (from its real Prepared Plan
+/// binding) so the selection targets the actual bound Provider (CUDA or
+/// Reference CPU), not a hardcoded/default one. Never participates in the
+/// per-node causal-chain contract (`GraphNodeReady`/`PlanBindingResolved`
+/// etc., `validate_e2e_per_node_causal_chain`) -- the same posture the
+/// plain-Rust `concat_rows` this replaces already had (zero node-level
+/// observability); what changed is that this now runs against the actual
+/// bound Provider's real Kernel instead of Rust host code, not the
+/// observability shape.
+fn dispatch_qwen_concat(
+    ctx: &mut QwenDispatchContext<'_>,
+    operation_id: &str,
+    real_node: &ExecutionNodeId,
+    a: NodeValue,
+    b: NodeValue,
+    output_target: Option<OutputTarget>,
+) -> Result<NodeValue, InferenceApiError> {
+    let (a_rows, a_cols) = a.rows_cols()?;
+    let (b_rows, b_cols) = b.rows_cols()?;
+    if a_cols != b_cols {
+        return Err(InferenceApiError::GraphPlanningFailed {
+            reason: format!(
+                "graph node '{operation_id}' (operator 'concat') expects both inputs to share \
+                 the same column count, got {a_cols} and {b_cols}"
+            ),
+        });
+    }
+    let output_descriptor = f32_tensor_descriptor_from_shape(&[a_rows + b_rows, a_cols]);
+    let affinity = resolved_resource_affinity(
+        ctx.prepared_plan.as_deref(),
+        real_node,
+        ctx.runtime.context().id(),
+    );
+    let memory_class = resolved_kernel_memory_class(ctx.prepared_plan.as_deref(), real_node);
+    let (output_id, output_descriptor) =
+        resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
+    let output_resource =
+        TensorResourceDescriptor::new(output_id.clone(), output_descriptor, affinity.clone());
+    let mut selection_request = KernelSelectionRequest::new(
+        format!("e2e-runtime-{operation_id}"),
+        dispatch_operator_id("concat", OperatorFamily::Tensor),
+        affinity.clone(),
+    )
+    .with_output(KernelResource::new(output_resource.clone(), memory_class));
+    let inputs = [
+        node_input_resource(operation_id, "a", a),
+        node_input_resource(operation_id, "b", b),
+    ];
+    for input in inputs {
+        let resource = match input {
+            NodeInputResource::Fresh(id, descriptor, tensor) => {
+                let resource =
+                    TensorResourceDescriptor::new(id.clone(), descriptor, affinity.clone());
+                ctx.provider.write_tensor(id, tensor).map_err(|error| {
+                    InferenceApiError::ProviderTensorWriteFailed {
+                        reason: error.to_string(),
+                    }
+                })?;
+                resource
+            }
+            NodeInputResource::Resident(id, descriptor) => {
+                let resolved_affinity =
+                    resident_resource_affinity(ctx.runtime.memory(), &id, &affinity, real_node)?;
+                TensorResourceDescriptor::new(id, descriptor, resolved_affinity)
+            }
+        };
+        selection_request =
+            selection_request.with_input(KernelResource::new(resource, memory_class));
+    }
+    let selection = ctx
+        .runtime
+        .kernel_registry()
+        .select(&selection_request)
+        .map_err(|error| InferenceApiError::KernelUnavailable {
+            reason: format!("{operation_id}: {error}"),
+        })?;
+    let candidate = selection
+        .selected
+        .ok_or_else(|| InferenceApiError::KernelUnavailable {
+            reason: format!("Kernel Registry selected no candidate for {operation_id}"),
+        })?;
+    let advertisement = ctx
+        .runtime
+        .kernel_registry()
+        .active_advertisement(&candidate.kernel)
+        .ok_or_else(|| InferenceApiError::KernelUnavailable {
+            reason: format!("selected advertisement for {operation_id} is no longer active"),
+        })?
+        .clone();
+    let mut plan = KernelDispatchPlan::from_selection(
+        KernelDispatchPlanId::new(format!("e2e-runtime-{operation_id}-dispatch")),
+        &selection_request,
+        &candidate,
+        &advertisement,
+        KernelInvocationId::new(format!("e2e-runtime-{operation_id}-invocation")),
+    )
+    .map_err(|error| InferenceApiError::KernelUnavailable {
+        reason: format!("{error:?}"),
+    })?;
+    let handle = ctx
+        .provider
+        .submit_kernel(
+            &advertisement,
+            initial_operator_catalog()
+                .get(&advertisement.implemented_operator)
+                .map_err(|error| InferenceApiError::KernelUnavailable {
+                    reason: error.to_string(),
+                })?,
+            &plan.invocation,
+            ctx.runtime.memory_mut(),
+        )
+        .map_err(|error| InferenceApiError::ProviderUnavailable {
+            reason: format!(
+                "Reference CPU dispatch for {operation_id} could not be submitted: {error}"
+            ),
+        })?;
+    if let Some(workspace) = plan.workspace_reservation.take() {
+        let _ = ctx.runtime.memory_mut().release(workspace);
+    }
+    let kernel_result = ctx.provider.complete_kernel(&handle).map_err(|error| {
+        InferenceApiError::ProviderUnavailable {
+            reason: format!(
+                "Reference CPU dispatch for {operation_id} could not be completed: {error}"
+            ),
+        }
+    })?;
+    let dispatch_result = KernelDispatchResult::from_kernel_result(&plan, kernel_result);
+    if dispatch_result.status != KernelResultStatus::Succeeded {
+        return Err(InferenceApiError::ProviderUnavailable {
+            reason: format!(
+                "Reference CPU dispatch for {operation_id} failed: {:?}",
+                dispatch_result.error
+            ),
+        });
+    }
+    let value = ctx
+        .provider
+        .read_tensor_value(&output_resource.id)
+        .ok_or_else(|| InferenceApiError::GenerationFailed {
+            reason: format!(
+                "Reference CPU dispatch for {operation_id} produced no output for resource '{}'",
+                output_resource.id
+            ),
+        })?;
+    Ok(match value {
+        TensorValue::Host(tensor) => NodeValue::Host(tensor),
+        TensorValue::Opaque => NodeValue::Resident {
+            id: output_resource.id.clone(),
+            shape: output_resource.descriptor.shape.dimensions.clone(),
+        },
+    })
+}
+
 fn dispatch_qwen_unary(
     ctx: &mut QwenDispatchContext<'_>,
     operation_id: &str,
@@ -2899,6 +3081,13 @@ fn dispatch_qwen_attention(
     )
 }
 
+/// Test-oracle only (`implement-device-resident-multi-step-cuda-decode`):
+/// production's own KV-history concatenation now dispatches through the
+/// portable "concat" Operator (`dispatch_qwen_concat`) instead of this
+/// plain-Rust helper; this survives only as
+/// `execute_qwen_decode_hidden_states_through_dispatch`'s (also
+/// `#[cfg(test)]`) own independent cross-check implementation.
+#[cfg(test)]
 fn concat_rows(a: &HostTensor, b: &HostTensor) -> Result<HostTensor, InferenceApiError> {
     let (a_rows, a_cols) = a.rows_cols().map_err(runtime_generation_failed)?;
     let (b_rows, b_cols) = b.rows_cols().map_err(runtime_generation_failed)?;
@@ -3834,45 +4023,64 @@ fn execute_qwen_graph_nodes(
                         KvRole::K => &historical.k,
                         KvRole::V => &historical.v,
                     };
-                    // Historical KV data is read back from the registered
-                    // Provider's storage by resource id (task 7.2/7.3), not from
-                    // a raw tensor an executor-private map handed the caller.
-                    // KV-history concatenation boundary: `concat_rows` is plain
-                    // Rust over `Vec<f32>`, so this materializes to host bytes
-                    // explicitly here rather than carrying an opaque value in.
-                    let historical_value = dispatch_ctx
+                    // Historical KV data stays wherever the registered
+                    // Provider already holds it (task 7.2/7.3): a device-
+                    // resident Provider (CUDA) is never asked to produce
+                    // host-visible bytes for it -- `resident_shape` reads
+                    // only structural metadata, and the "concat" Operator
+                    // dispatch below runs through the exact same generic
+                    // Kernel Registry path every other graph node uses,
+                    // targeting this edge's own stable identity directly
+                    // (`implement-device-resident-multi-step-cuda-decode`,
+                    // replacing this block's former `read_tensor_value(..)
+                    // .into_host(..)` + Rust-computed `concat_rows`).
+                    let historical_shape = dispatch_ctx
                         .provider
-                        .read_tensor_value(historical_resource)
+                        .resident_shape(historical_resource)
                         .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                             reason: format!("no materialized historical KV data for layer {layer}"),
                         })?;
-                    let historical_tensor = historical_value
-                    .into_host(historical_resource)
-                    .map_err(|error| InferenceApiError::KvCacheUnavailable {
-                        reason: format!(
-                            "historical KV data for layer {layer} (resource '{historical_resource}'): {error}"
-                        ),
-                    })?;
-                    // Genuinely new, host-computed data -- the edge no longer
-                    // holds what the Kernel itself wrote (if anything), so it
-                    // must be explicitly (re-)written below.
-                    output_tensor = NodeValue::Host(concat_rows(
-                        &historical_tensor,
-                        &output_tensor.clone().into_host(&dispatch_ctx.provider)?,
-                    )?);
-                    needs_explicit_edge_write = true;
+                    let historical_value = NodeValue::Resident {
+                        id: historical_resource.clone(),
+                        shape: historical_shape,
+                    };
+                    let concat_output_target: OutputTarget = (
+                        output_resource_id.clone(),
+                        resolved_output_placement(dispatch_ctx.prepared_plan.as_deref(), node_id),
+                        MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                    );
+                    let concatenated = dispatch_qwen_concat(
+                        &mut dispatch_ctx,
+                        &format!("{node_id}.kv-append"),
+                        node_id,
+                        historical_value,
+                        output_tensor.clone(),
+                        Some(concat_output_target),
+                    )?;
+                    // The concat dispatch pre-admitted its output directly
+                    // under `output_resource_id` (mirroring Decision 3's
+                    // existing optimization for every other node kind), so
+                    // the edge is already correctly written -- no explicit
+                    // (re-)write, and critically no `into_host` round trip,
+                    // needed below.
+                    output_tensor = concatenated;
+                    needs_explicit_edge_write = false;
                 }
                 // Written under a *pending* resource id (task 7.4 prepare):
                 // this generation step's KV update becomes Runtime-owned only
                 // once `commit_generation_step` promotes it after sampling and
                 // token commit succeed; a failure or cancellation before then
-                // simply leaves this pending write unpromoted. Always a real
-                // host-typed write here (unlike the edge-level write below):
-                // the pending resource is a *different* identity than
-                // `output_resource_id`, so a `Resident` value must materialize
-                // to reach it -- this specific KV-pending round-trip is not
-                // part of Decision 3's scope (`unify-provider-output-admission-
-                // and-residency`'s design.md).
+                // simply leaves this pending write unpromoted. When
+                // `output_tensor` is already `Resident` (decode's KV-append
+                // case always is, after the concat dispatch above; prefill's
+                // "Output" case is whenever the producing Kernel itself wrote
+                // directly into `output_resource_id`), this is a real
+                // Provider-side copy (`copy_tensor_admitted`) to the pending
+                // resource's own, separate, stable identity -- never a host
+                // round trip (`implement-device-resident-multi-step-cuda-
+                // decode`). Only a genuinely `Host`-typed value (e.g. "rope",
+                // which has no Kernel-level output identity to begin with)
+                // still needs an explicit host-typed admitted write here.
                 let role_str = match role {
                     KvRole::K => "k",
                     KvRole::V => "v",
@@ -3880,25 +4088,39 @@ fn execute_qwen_graph_nodes(
                 let pending_resource = TensorResourceId::new(format!(
                     "kv.{kv_cache_id}.layer{layer}.{role_str}.pending"
                 ));
-                let pending_tensor = output_tensor.clone().into_host(&dispatch_ctx.provider)?;
-                // Correctif 1: admitted (via `write_tensor_admitted`), not a
-                // bare `write_tensor` -- this id is stable across every decode
-                // step for this layer/role, so admission replaces (and
-                // releases) whatever allocation the previous step's pending
-                // write held for it, the same reasoning as the graph-edge
-                // writes above. `discard_pending_kv_state` releases this
-                // through `release_admitted_tensor` when a step is cancelled or
-                // fails before commit.
-                dispatch_ctx
-                .provider
-                .write_tensor_value_admitted(
-                    dispatch_ctx.runtime.memory_mut(),
-                    pending_resource.clone(),
-                    TensorValue::Host(pending_tensor),
-                    MemoryAllocationClass::Tensor,
-                    MemoryAllocationOwner::Session(kv_cache_id.to_string()),
-                )
-                .map_err(|error| match error {
+                let pending_write_result: Result<(), TensorValueAdmissionError> =
+                    match &output_tensor {
+                        NodeValue::Resident { id, .. } => {
+                            dispatch_ctx.provider.copy_tensor_admitted(
+                                dispatch_ctx.runtime.memory_mut(),
+                                id,
+                                pending_resource.clone(),
+                                MemoryAllocationClass::Tensor,
+                                MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                            )
+                        }
+                        NodeValue::Host(_) => {
+                            let pending_tensor =
+                                output_tensor.clone().into_host(&dispatch_ctx.provider)?;
+                            dispatch_ctx.provider.write_tensor_value_admitted(
+                                dispatch_ctx.runtime.memory_mut(),
+                                pending_resource.clone(),
+                                TensorValue::Host(pending_tensor),
+                                MemoryAllocationClass::Tensor,
+                                MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                            )
+                        }
+                    };
+                // Correctif 1: admitted (via `write_tensor_admitted`/
+                // `copy_tensor_admitted`), not a bare `write_tensor` -- this
+                // id is stable across every decode step for this layer/role,
+                // so admission replaces (and releases) whatever allocation
+                // the previous step's pending write held for it, the same
+                // reasoning as the graph-edge writes above.
+                // `discard_pending_kv_state` releases this through
+                // `release_admitted_tensor` when a step is cancelled or fails
+                // before commit.
+                pending_write_result.map_err(|error| match error {
                     TensorValueAdmissionError::Memory(error) => {
                         InferenceApiError::MemoryAdmissionFailed {
                             reason: format!(
