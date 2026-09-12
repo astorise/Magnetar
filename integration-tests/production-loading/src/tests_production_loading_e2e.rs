@@ -567,6 +567,318 @@ fn production_generation_request_unsupported_gate_applies_to_the_overridden_toke
     );
 }
 
+/// `stream-production-generation-events` task 3.1: a multi-token streaming
+/// production generation delivers ordered `Token` events (in production
+/// order) followed by exactly one `Finished` event.
+#[test]
+fn production_generation_request_streaming_delivers_ordered_events_then_finished() {
+    register_real_qwen_component();
+    let dir = tempfile::tempdir().unwrap();
+    let (mut fixture, ingested, trust_store) = tiny_production_fixture_and_ingestion(dir.path());
+    fixture.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(4),
+        ..Default::default()
+    });
+
+    let mut events = Vec::new();
+    let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_streaming(
+        fixture,
+        ingested.payload_source.as_ref(),
+        trust_store,
+        magnetar_runtime::ProductionGenerationRequest {
+            prompt: magnetar_runtime::PromptInput::PlainText("hi".into()),
+            parameters: magnetar_runtime::GenerationParameters::greedy(),
+            stop_conditions: magnetar_runtime::StopConditions::default(),
+            max_new_tokens: None,
+        },
+        None,
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+        &mut |event| {
+            events.push(event);
+            std::ops::ControlFlow::Continue(())
+        },
+    )
+    .expect("streaming production generation succeeds");
+
+    let (token_events, finished_events): (Vec<_>, Vec<_>) = events
+        .iter()
+        .partition(|event| matches!(event, magnetar_runtime::GenerationStreamEvent::Token { .. }));
+    assert_eq!(
+        finished_events.len(),
+        1,
+        "exactly one Finished event must be delivered, got: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(magnetar_runtime::GenerationStreamEvent::Finished { .. })
+        ),
+        "Finished must be the last delivered event, got: {events:?}"
+    );
+
+    let delivered_token_ids: Vec<_> = token_events
+        .iter()
+        .map(|event| match event {
+            magnetar_runtime::GenerationStreamEvent::Token { token_id, .. } => *token_id,
+            magnetar_runtime::GenerationStreamEvent::Finished { .. } => unreachable!(),
+        })
+        .collect();
+    assert_eq!(
+        delivered_token_ids, outcome.result.output.generated_token_ids,
+        "delivered Token events must carry every generated token id, in production order"
+    );
+}
+
+/// `stream-production-generation-events` task 3.2: concatenating every
+/// delivered `text_delta` in order equals the non-streaming entry point's
+/// decoded text for the exact same request/prompt/weights.
+#[test]
+fn production_generation_request_streaming_text_deltas_reconstruct_the_non_streaming_result() {
+    register_real_qwen_component();
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, ingested, trust_store) = tiny_production_fixture_and_ingestion(dir.path());
+
+    let mut manifest = ingested.manifest.clone();
+    manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(4),
+        ..Default::default()
+    });
+    let request = || magnetar_runtime::ProductionGenerationRequest {
+        prompt: magnetar_runtime::PromptInput::PlainText("hi".into()),
+        parameters: magnetar_runtime::GenerationParameters::greedy(),
+        stop_conditions: magnetar_runtime::StopConditions::default(),
+        max_new_tokens: None,
+    };
+
+    let mut fixture_for_non_streaming = fixture.clone();
+    fixture_for_non_streaming.manifest = manifest.clone();
+    let non_streaming = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
+        fixture_for_non_streaming,
+        ingested.payload_source.as_ref(),
+        trust_store.clone(),
+        request(),
+        None,
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+    )
+    .expect("non-streaming production generation succeeds");
+
+    let mut fixture_for_streaming = fixture;
+    fixture_for_streaming.manifest = manifest;
+    let mut reconstructed_text = String::new();
+    let streamed = magnetar_runtime::run_production_qwen_generation_for_provider_streaming(
+        fixture_for_streaming,
+        ingested.payload_source.as_ref(),
+        trust_store,
+        request(),
+        None,
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+        &mut |event| {
+            if let magnetar_runtime::GenerationStreamEvent::Token { text_delta, .. } = event
+                && let Some(text_delta) = text_delta
+            {
+                reconstructed_text.push_str(&text_delta);
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+    )
+    .expect("streaming production generation succeeds");
+
+    assert_eq!(
+        streamed.result.output.generated_token_ids,
+        non_streaming.result.output.generated_token_ids,
+        "same deterministic greedy request against the same prompt/weights must generate the \
+         same tokens whether streamed or not"
+    );
+    assert_eq!(
+        reconstructed_text, non_streaming.text,
+        "concatenating every delivered text_delta in order must exactly reconstruct the \
+         non-streaming entry point's own decoded text -- no duplicated or missing text"
+    );
+}
+
+/// `stream-production-generation-events` task 3.3: the `Finished` event's
+/// finish reason and usage match the non-streaming entry point's own
+/// `generation_result.output` for the same request.
+#[test]
+fn production_generation_request_streaming_finished_event_matches_non_streaming_usage() {
+    register_real_qwen_component();
+    let dir = tempfile::tempdir().unwrap();
+    let (mut fixture, ingested, trust_store) = tiny_production_fixture_and_ingestion(dir.path());
+    fixture.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(3),
+        ..Default::default()
+    });
+
+    let mut finished = None;
+    let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_streaming(
+        fixture,
+        ingested.payload_source.as_ref(),
+        trust_store,
+        magnetar_runtime::ProductionGenerationRequest {
+            prompt: magnetar_runtime::PromptInput::PlainText("hi".into()),
+            parameters: magnetar_runtime::GenerationParameters::greedy(),
+            stop_conditions: magnetar_runtime::StopConditions::default(),
+            max_new_tokens: None,
+        },
+        None,
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+        &mut |event| {
+            if let magnetar_runtime::GenerationStreamEvent::Finished {
+                finish_reason,
+                usage,
+            } = event
+            {
+                finished = Some((finish_reason, usage));
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+    )
+    .expect("streaming production generation succeeds");
+
+    let (finish_reason, usage) = finished.expect("a Finished event was delivered");
+    assert_eq!(
+        finish_reason, outcome.result.output.finish_reason,
+        "Finished.finish_reason must match the entry point's own returned finish reason"
+    );
+    assert_eq!(
+        usage, outcome.result.output.usage,
+        "Finished.usage must match the entry point's own returned usage"
+    );
+}
+
+/// `stream-production-generation-events` task 3.4: a callback that returns
+/// `ControlFlow::Break` after the first token stops generation at exactly
+/// one token, delivers `Finished` with a cancelled finish reason, and the
+/// entry point's own resource cleanup (session close, instance unload)
+/// still runs -- proven by the call returning `Ok`, not an error, since
+/// cleanup failing would surface as `Err` from `close_inference_session`/
+/// `unload_model_instance`.
+#[test]
+fn production_generation_request_streaming_callback_cancellation_stops_cleanly() {
+    register_real_qwen_component();
+    let dir = tempfile::tempdir().unwrap();
+    let (mut fixture, ingested, trust_store) = tiny_production_fixture_and_ingestion(dir.path());
+    fixture.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(6),
+        ..Default::default()
+    });
+
+    let mut token_events = 0;
+    let mut finish_reason = None;
+    let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_streaming(
+        fixture,
+        ingested.payload_source.as_ref(),
+        trust_store,
+        magnetar_runtime::ProductionGenerationRequest {
+            prompt: magnetar_runtime::PromptInput::PlainText("hi".into()),
+            parameters: magnetar_runtime::GenerationParameters::greedy(),
+            stop_conditions: magnetar_runtime::StopConditions::default(),
+            max_new_tokens: None,
+        },
+        None,
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+        &mut |event| match event {
+            magnetar_runtime::GenerationStreamEvent::Token { .. } => {
+                token_events += 1;
+                std::ops::ControlFlow::Break(())
+            }
+            magnetar_runtime::GenerationStreamEvent::Finished { finish_reason: fr, .. } => {
+                finish_reason = Some(fr);
+                std::ops::ControlFlow::Continue(())
+            }
+        },
+    )
+    .expect(
+        "callback-requested cancellation must terminate generation cleanly, not propagate a \
+         hard error -- including resource cleanup (session close, instance unload) succeeding",
+    );
+
+    assert_eq!(
+        token_events, 1,
+        "generation must stop immediately after the first token once the callback breaks"
+    );
+    assert_eq!(
+        outcome.result.output.generated_token_ids.len(),
+        1,
+        "exactly one token must have been generated before cancellation took effect"
+    );
+    assert_eq!(
+        finish_reason,
+        Some(magnetar_runtime::FinishReason::Cancelled),
+        "the Finished event must report the cancelled finish reason"
+    );
+}
+
+/// `stream-production-generation-events` task 3.5: the multi-step-decode
+/// `Unsupported` gate still applies to the streaming entry point, and the
+/// callback is never invoked when generation is rejected before it starts.
+#[test]
+fn production_generation_request_streaming_unsupported_gate_never_invokes_the_callback() {
+    let dir = tempfile::tempdir().unwrap();
+    write_tiny_production_bundle(dir.path());
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(dir.path().to_path_buf()),
+        dir.path().to_path_buf(),
+    );
+    let mut ingested = HuggingFaceIngestor::new().ingest(&source).unwrap();
+    ingested.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(2),
+        ..Default::default()
+    });
+
+    let tokenizer_bytes = std::fs::read(dir.path().join("tokenizer.json")).unwrap();
+    let real_tokenizer = magnetar_loader_huggingface::HuggingFaceTokenizer::from_bytes(
+        &tokenizer_bytes,
+        None,
+        "unsupported-provider-streaming-test-tokenizer",
+        Some(VOCAB_SIZE),
+    )
+    .expect("real tokenizer.json loads");
+    let tokenizer_metadata = real_tokenizer.metadata().clone();
+    let real_tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(real_tokenizer);
+
+    let fixture = production_qwen_fixture(
+        ingested.manifest.clone(),
+        tokenizer_metadata,
+        real_tokenizer,
+    )
+    .expect("production fixture builds from real ingested data");
+
+    let mut callback_invoked = false;
+    let error = magnetar_runtime::run_production_qwen_generation_for_provider_streaming(
+        fixture,
+        ingested.payload_source.as_ref(),
+        ModelTrustStore::default(),
+        magnetar_runtime::ProductionGenerationRequest {
+            prompt: magnetar_runtime::PromptInput::PlainText("hi".into()),
+            parameters: magnetar_runtime::GenerationParameters::greedy(),
+            stop_conditions: magnetar_runtime::StopConditions::default(),
+            max_new_tokens: None,
+        },
+        None,
+        Arc::new(MultiStepDecodeUnsupportedProvider(
+            magnetar_runtime::ReferenceCpuProvider::new(),
+        )),
+        &mut |_event| {
+            callback_invoked = true;
+            std::ops::ControlFlow::Continue(())
+        },
+    )
+    .expect_err("a 2-decode-step request against an unsupporting Provider must fail before any real execution work runs, streaming entry point included");
+
+    assert!(
+        matches!(
+            error,
+            magnetar_runtime::InferenceApiError::Unsupported { .. }
+        ),
+        "expected InferenceApiError::Unsupported, got: {error:?}"
+    );
+    assert!(
+        !callback_invoked,
+        "the streaming callback must never be invoked when generation is rejected before it starts"
+    );
+}
+
 /// Counts allocations still genuinely holding memory -- `MemoryManager::
 /// release` deliberately leaves a released allocation's ledger entry in
 /// place (marked `Released`/`Reusable` for caching/audit purposes,

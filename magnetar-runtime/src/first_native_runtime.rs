@@ -7577,6 +7577,73 @@ pub fn run_production_qwen_generation_for_provider_with_request(
     chat_formatter: Option<&dyn ChatTemplateFormatter>,
     provider: Arc<dyn Provider>,
 ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+    let mut prepared = prepare_production_generation(
+        fixture,
+        payload_source,
+        trust_store,
+        request,
+        chat_formatter,
+        provider,
+    )?;
+
+    let mut execution_plans = RuntimeGenerationExecutionPlans {
+        prefill: &mut prepared.prepared_plans.prefill,
+        decode: &mut prepared.prepared_plans.decode,
+    };
+    let generation_result = run_generation_loop_with_execution_plans(
+        &mut prepared.runtime,
+        &prepared.generation_request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated_so_far| false,
+        &mut prepared.observer,
+        &mut execution_plans,
+    )?;
+
+    finish_production_generation(
+        prepared.runtime,
+        &prepared.fixture,
+        &prepared.instance,
+        &prepared.session,
+        generation_result,
+        prepared.observer,
+    )
+}
+
+/// Every field [`run_production_qwen_generation_for_provider_with_request`]
+/// and [`run_production_qwen_generation_for_provider_streaming`] both need
+/// after setup (session creation, tokenization, graph/plan preparation)
+/// completes -- extracted so the two entry points share exactly one setup
+/// path rather than risking drift between a streaming and non-streaming
+/// generation of the same request (`stream-production-generation-events`).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+struct PreparedProductionGeneration {
+    fixture: E2eFixture,
+    runtime: Runtime,
+    instance: ModelInstanceId,
+    session: InferenceSessionId,
+    generation_request: GenerationRequest,
+    prepared_plans: FirstNativePreparedPlans,
+    observer: InferenceApiObserver,
+}
+
+/// Shared setup for every production generation entry point from
+/// `run_production_qwen_generation_for_provider_with_request` onward:
+/// resolves the token budget and the multi-step-decode `Unsupported` gate,
+/// builds the `Runtime`, loads the Model Instance, creates the session,
+/// tokenizes the prompt, resolves stop sequences against the real
+/// tokenizer, and prepares prefill/decode execution plans -- everything
+/// up to but not including running the generation loop itself, since the
+/// streaming and non-streaming callers run that loop differently.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn prepare_production_generation(
+    fixture: E2eFixture,
+    payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
+    trust_store: ModelTrustStore,
+    request: ProductionGenerationRequest,
+    chat_formatter: Option<&dyn ChatTemplateFormatter>,
+    provider: Arc<dyn Provider>,
+) -> Result<PreparedProductionGeneration, InferenceApiError> {
     let ProductionGenerationRequest {
         prompt,
         parameters,
@@ -7658,7 +7725,7 @@ pub fn run_production_qwen_generation_for_provider_with_request(
                 reason: error.to_string(),
             },
         )?;
-    let mut observer = InferenceApiObserver::new();
+    let observer = InferenceApiObserver::new();
 
     let (component_graphs, _definition, _component_instance) =
         build_first_native_graphs_from_real_qwen_component(
@@ -7668,7 +7735,7 @@ pub fn run_production_qwen_generation_for_provider_with_request(
         .map_err(|error| InferenceApiError::GraphPlanningFailed {
             reason: error.to_string(),
         })?;
-    let mut prepared_plans = prepare_first_native_execution_plans_for_provider(
+    let prepared_plans = prepare_first_native_execution_plans_for_provider(
         &runtime,
         &instance,
         component_graphs,
@@ -7679,7 +7746,7 @@ pub fn run_production_qwen_generation_for_provider_with_request(
         reason: error.to_string(),
     })?;
 
-    let request = build_generation_request(
+    let generation_request = build_generation_request(
         GenerationRequestId::new("production-generation")?,
         Some(session.clone()),
         GenerationModelReference::ModelInstance(instance.clone()),
@@ -7690,22 +7757,33 @@ pub fn run_production_qwen_generation_for_provider_with_request(
         stop_conditions,
         StreamingMode::TokenIds,
     );
-    let request = prepare_generation(&runtime, request)?;
+    let generation_request = prepare_generation(&runtime, generation_request)?;
 
-    let mut execution_plans = RuntimeGenerationExecutionPlans {
-        prefill: &mut prepared_plans.prefill,
-        decode: &mut prepared_plans.decode,
-    };
-    let generation_result = run_generation_loop_with_execution_plans(
-        &mut runtime,
-        &request,
-        SamplingPolicy::default(),
-        CacheUsageSummary::default(),
-        |_generated_so_far| false,
-        &mut observer,
-        &mut execution_plans,
-    )?;
+    Ok(PreparedProductionGeneration {
+        fixture,
+        runtime,
+        instance,
+        session,
+        generation_request,
+        prepared_plans,
+        observer,
+    })
+}
 
+/// Shared tail for every production generation entry point: decodes the
+/// final text, closes the session, unloads the Model Instance, and builds
+/// the returned [`FirstNativeFixtureGeneration`] -- run identically after
+/// either the streaming or non-streaming generation loop, so both report
+/// the same usage/finish-reason shape for an otherwise-identical request.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn finish_production_generation(
+    mut runtime: Runtime,
+    fixture: &E2eFixture,
+    instance: &ModelInstanceId,
+    session: &InferenceSessionId,
+    generation_result: GenerationResult,
+    observer: InferenceApiObserver,
+) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
     let decoded_text = decode_tokens_streaming(
         &fixture.tokenizer,
         StreamingDecodeRequest::new(generation_result.output.generated_token_ids.clone()),
@@ -7723,10 +7801,10 @@ pub fn run_production_qwen_generation_for_provider_with_request(
     });
     let generation_result = generation_result.with_decoded_text(decoded_text);
 
-    close_inference_session(&mut runtime, &session)?;
+    close_inference_session(&mut runtime, session)?;
     unload_model_instance(
         &mut runtime,
-        &instance,
+        instance,
         ModelInstanceUnloadPolicy::DrainActiveUse,
     )?;
 
@@ -7740,6 +7818,127 @@ pub fn run_production_qwen_generation_for_provider_with_request(
         result: generation_result,
         observer,
     })
+}
+
+/// An incrementally-delivered production generation event
+/// (`stream-production-generation-events`): `Token` is delivered once per
+/// produced token, in production order, carrying an incremental,
+/// tokenizer-decoded text delta (`Tokenizer::streaming_decode`'s own
+/// UTF-8-boundary-safe accumulation -- never a duplicated or truncated
+/// character); `Finished` is delivered exactly once, after the last
+/// `Token`, whether generation ended by a stop condition, the token
+/// budget, or caller-requested cancellation.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[derive(Clone, Debug, PartialEq)]
+pub enum GenerationStreamEvent {
+    Token {
+        token_id: TokenId,
+        text_delta: Option<String>,
+    },
+    Finished {
+        finish_reason: FinishReason,
+        usage: GenerationUsage,
+    },
+}
+
+/// [`run_production_qwen_generation_for_provider_with_request`], delivering
+/// each produced token to `on_event` as it happens instead of only
+/// returning a final result (`stream-production-generation-events`,
+/// MAG-P1-2). `on_event` returning `std::ops::ControlFlow::Break(())`
+/// requests that generation stop after the token just delivered; it stops
+/// cleanly (the exact same `FinishReason::Cancelled` path and resource
+/// cleanup any other generation completion uses), not with a hard error.
+/// Also returns the same `Result<FirstNativeFixtureGeneration, _>` shape
+/// every other production entry point returns, once generation finishes,
+/// for a caller that wants the aggregate result in addition to (or
+/// instead of processing) the live stream.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn run_production_qwen_generation_for_provider_streaming(
+    fixture: E2eFixture,
+    payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
+    trust_store: ModelTrustStore,
+    request: ProductionGenerationRequest,
+    chat_formatter: Option<&dyn ChatTemplateFormatter>,
+    provider: Arc<dyn Provider>,
+    on_event: &mut dyn FnMut(GenerationStreamEvent) -> std::ops::ControlFlow<()>,
+) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+    let mut prepared = prepare_production_generation(
+        fixture,
+        payload_source,
+        trust_store,
+        request,
+        chat_formatter,
+        provider,
+    )?;
+
+    // Not built on `Tokenizer::streaming_decode`/`StreamingDecodeState`:
+    // the real production tokenizer (`loaders/huggingface`'s
+    // `HuggingFaceTokenizer`, reached through `FixtureTokenizer`'s
+    // delegate) does not implement genuine incremental decode -- its
+    // `decode()` ignores `streaming_state` entirely and simply decodes
+    // whatever token slice it is given, discovered via this change's own
+    // multi-token streaming test producing "!chi!" (per-token decode,
+    // losing the underlying BPE decoder's inter-token joining) instead of
+    // the correct "! c hi !" (whole-sequence decode). Full-redecoding the
+    // cumulative token list every step and diffing against the
+    // previously emitted text is slower (`O(n)` work per step) but is
+    // correct for any `Tokenizer` implementation, including one that
+    // (like the real production tokenizer today) carries no genuine
+    // incremental state at all.
+    let prepared_tokenizer = prepared.fixture.tokenizer.clone();
+    let mut generated_so_far: Vec<TokenId> = Vec::new();
+    let mut previously_emitted_text = String::new();
+    let mut on_token = |token_id: TokenId| -> std::ops::ControlFlow<()> {
+        generated_so_far.push(token_id);
+        let full_text = decode_tokens_streaming(
+            &prepared_tokenizer,
+            StreamingDecodeRequest::new(generated_so_far.clone()),
+        )
+        .map(|decoded| decoded.text)
+        .ok();
+        let text_delta = full_text.as_ref().and_then(|full_text| {
+            full_text
+                .strip_prefix(previously_emitted_text.as_str())
+                .filter(|delta| !delta.is_empty())
+                .map(str::to_string)
+        });
+        if let Some(full_text) = full_text {
+            previously_emitted_text = full_text;
+        }
+        on_event(GenerationStreamEvent::Token {
+            token_id,
+            text_delta,
+        })
+    };
+
+    let mut execution_plans = RuntimeGenerationExecutionPlans {
+        prefill: &mut prepared.prepared_plans.prefill,
+        decode: &mut prepared.prepared_plans.decode,
+    };
+    let generation_result = run_generation_loop_with_execution_plans_streaming(
+        &mut prepared.runtime,
+        &prepared.generation_request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated_so_far| false,
+        &mut prepared.observer,
+        &mut execution_plans,
+        &mut on_token,
+    )?;
+
+    let _ = on_event(GenerationStreamEvent::Finished {
+        finish_reason: generation_result.output.finish_reason,
+        usage: generation_result.output.usage.clone(),
+    });
+
+    finish_production_generation(
+        prepared.runtime,
+        &prepared.fixture,
+        &prepared.instance,
+        &prepared.session,
+        generation_result,
+        prepared.observer,
+    )
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]

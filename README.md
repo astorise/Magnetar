@@ -253,6 +253,33 @@ hardware:
   is now a thin wrapper over this one, reproducing its exact prior greedy/
   default-stop/manifest-token-budget behavior, so no existing caller's
   behavior changes (`expose-production-generation-parameters`)
+- Incremental production generation streaming:
+  `run_production_qwen_generation_for_provider_streaming` delivers each
+  produced token to a caller-supplied callback as it happens (an ordered
+  `GenerationStreamEvent::Token { token_id, text_delta }` per token,
+  followed by exactly one `Finished { finish_reason, usage }`), instead of
+  only returning a final result after decode completes -- real
+  time-to-first-token, not the entire generation chopped up after the fact.
+  The callback can request clean cancellation
+  (`std::ops::ControlFlow::Break`), which stops decode immediately and
+  still runs the same session-close/instance-unload cleanup any other
+  completion does. Text deltas are produced by re-decoding the accumulated
+  token sequence each step and diffing against the previous step's text
+  (not `Tokenizer::streaming_decode`/`StreamingDecodeState` -- see the next
+  bullet), verified to reconstruct the non-streaming path's decoded text
+  exactly (`stream-production-generation-events`)
+- **Known gap surfaced while building the above**: `HuggingFaceTokenizer::decode`
+  (`loaders/huggingface`, the tokenizer that actually backs every real
+  production checkpoint) ignores `DecodeInput.streaming_state` entirely --
+  it always returns `pending_partial_state: None` and decodes exactly the
+  token slice it is given, regardless of `StreamingDecodeState`. Only
+  `FixtureTokenizer`'s own non-delegating byte-fallback path genuinely
+  implements the `Tokenizer` Contract's incremental-decode state. This
+  does not affect the streaming entry point above (which does not rely on
+  `streaming_state`), but means `Tokenizer::streaming_decode` itself is
+  not a working incremental-decode primitive for a real production
+  tokenizer today -- a real, separate gap for a future `loaders/huggingface`
+  change, not fixed here
 
 Explicitly not yet supported by this profile:
 
@@ -320,12 +347,13 @@ integration surface (not the original charter) found two further P1 gaps in
 the production generation entry point specifically: it accepted no caller-
 supplied generation parameters or stop conditions, and returned only a final
 result rather than incremental streaming events.
-`expose-production-generation-parameters` closed the first (see "Qwen
-production loading" above); incremental production streaming is a separate,
-not-yet-started follow-up. Everything the original charter frames as future
-work remains exactly that: multi-device execution, quantization support,
-wiring `formats/gguf` into Model Loading, native CUDA `F16`/`BF16` compute,
-and additional Providers (Metal/ROCm/NPU/TPU) or Model Components
+`expose-production-generation-parameters` closed the first and
+`stream-production-generation-events` closed the second (see "Qwen
+production loading" above) -- both P1s from that follow-up review are now
+closed. Everything the original charter frames as future work remains
+exactly that: multi-device execution, quantization support, wiring
+`formats/gguf` into Model Loading, native CUDA `F16`/`BF16` compute, and
+additional Providers (Metal/ROCm/NPU/TPU) or Model Components
 (Llama/Mistral/Gemma).
 
 ## Terminology

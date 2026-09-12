@@ -1433,6 +1433,7 @@ pub fn run_generation_loop(
         &mut should_cancel,
         observer,
         None,
+        None,
     )
 }
 
@@ -1459,9 +1460,45 @@ pub fn run_generation_loop_with_execution_plans(
         &mut should_cancel,
         observer,
         Some(execution_plans),
+        None,
     )
 }
 
+/// [`run_generation_loop_with_execution_plans`], additionally delivering
+/// each produced token to `on_token` as it happens
+/// (`stream-production-generation-events`). Returning
+/// `std::ops::ControlFlow::Break(())` from `on_token` stops generation
+/// immediately after that token, reusing the exact same
+/// `FinishReason::Cancelled` path and cleanup every other cancellation
+/// already uses -- not a new termination state. `on_token` receives only
+/// the raw [`TokenId`]: this loop only knows a [`GenerationTokenizerReference`]
+/// (an opaque reference), not an actual `&dyn Tokenizer`, so incremental
+/// text decode is intentionally left to a caller that holds the real
+/// tokenizer (see `run_production_qwen_generation_for_provider_streaming`).
+#[allow(clippy::too_many_arguments)]
+pub fn run_generation_loop_with_execution_plans_streaming(
+    runtime: &mut Runtime,
+    request: &GenerationRequest,
+    sampling_policy: SamplingPolicy,
+    cache_usage: CacheUsageSummary,
+    mut should_cancel: impl FnMut(&[TokenId]) -> bool,
+    observer: &mut InferenceApiObserver,
+    execution_plans: &mut RuntimeGenerationExecutionPlans<'_>,
+    on_token: &mut dyn FnMut(TokenId) -> std::ops::ControlFlow<()>,
+) -> Result<GenerationResult, InferenceApiError> {
+    run_generation_loop_inner(
+        runtime,
+        request,
+        sampling_policy,
+        cache_usage,
+        &mut should_cancel,
+        observer,
+        Some(execution_plans),
+        Some(on_token),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_generation_loop_inner(
     runtime: &mut Runtime,
     request: &GenerationRequest,
@@ -1470,6 +1507,7 @@ fn run_generation_loop_inner(
     should_cancel: &mut impl FnMut(&[TokenId]) -> bool,
     observer: &mut InferenceApiObserver,
     mut execution_plans: Option<&mut RuntimeGenerationExecutionPlans<'_>>,
+    mut on_token: Option<&mut dyn FnMut(TokenId) -> std::ops::ControlFlow<()>>,
 ) -> Result<GenerationResult, InferenceApiError> {
     let correlation_id = request.correlation_id.clone();
     observer.observe(
@@ -1896,6 +1934,21 @@ fn run_generation_loop_inner(
             observation_message("token committed", &token_context),
             correlation_id.clone(),
         );
+        if let Some(on_token) = on_token.as_deref_mut()
+            && on_token(step.token_id).is_break()
+        {
+            observer.observe(
+                InferenceApiObservationKind::GenerationCancelled,
+                "generation cancelled by streaming consumer",
+                correlation_id.clone(),
+            );
+            observer.observe(
+                InferenceApiObservationKind::StreamInterrupted,
+                "stream interrupted by streaming consumer cancellation",
+                correlation_id.clone(),
+            );
+            break FinishReason::Cancelled;
+        }
         if let Some(reason) = step.finish_reason {
             break reason;
         }

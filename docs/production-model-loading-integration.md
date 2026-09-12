@@ -185,6 +185,63 @@ An embedder crate depends on:
    `StopConditions::default()`, and `max_new_tokens: None` -- their behavior
    is unaffected by this option existing.
 
+9. **Stream generation incrementally instead of waiting for the final
+   result (optional).** For `"stream": true`-shaped requests, use
+   `run_production_qwen_generation_for_provider_streaming` instead --
+   otherwise identical to step 8's `_with_request`, plus a callback invoked
+   once per produced token:
+
+   ```rust
+   let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_streaming(
+       fixture,
+       ingested.payload_source.as_ref(),
+       trust_store,
+       production_generation_request, // same ProductionGenerationRequest shape as step 8
+       None,
+       provider,
+       &mut |event| {
+           match event {
+               magnetar_runtime::GenerationStreamEvent::Token { token_id, text_delta } => {
+                   // forward `text_delta` (an OpenAI chat.completion.chunk's
+                   // `delta.content`, e.g.) to the embedder's own transport
+                   // (SSE/WebSocket/gRPC) here, as it happens
+                   let _ = token_id;
+                   let _ = text_delta;
+               }
+               magnetar_runtime::GenerationStreamEvent::Finished { finish_reason, usage } => {
+                   // send the terminal chunk/usage summary here
+                   let _ = finish_reason;
+                   let _ = usage;
+               }
+           }
+           std::ops::ControlFlow::Continue(()) // or Break(()) to cancel, e.g. on client disconnect
+       },
+   )?;
+   ```
+
+   `Token` events are delivered in production order, one per generated
+   token, with an incremental text delta already decoded through the real
+   tokenizer -- concatenating every delivered `text_delta` reconstructs
+   `outcome.text` exactly. Exactly one `Finished` event follows the last
+   `Token`, carrying the same `finish_reason`/`usage` `outcome.result.output`
+   itself reports, regardless of whether generation ended by a stop
+   condition, the token budget, or the callback requesting cancellation.
+   Returning `std::ops::ControlFlow::Break(())` from the callback (e.g. on
+   a client disconnect Tachyon observes) stops decode immediately after
+   the token just delivered and completes cleanly -- the same
+   session-close/instance-unload cleanup any other completion runs, not a
+   hard error. `outcome` is still returned afterward with the same shape
+   step 8 returns, for a caller that also wants the aggregate result.
+
+   The text delta is produced by re-decoding the accumulated token
+   sequence each step and diffing against the previous step's decoded
+   text, not `Tokenizer::streaming_decode`/`StreamingDecodeState` --
+   `HuggingFaceTokenizer::decode` (the tokenizer backing every real
+   production checkpoint) does not honor `streaming_state` at all, so a
+   per-token `streaming_decode` call produces wrong text (loses the
+   underlying BPE decoder's inter-token joining). See README's "Known gap"
+   note under "Qwen production loading".
+
 ## What the embedder never does
 
 - Parse Safetensors bytes itself (the ingestor does, via
