@@ -104,7 +104,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install cargo-deny
-        uses: taiki-e/install-action@5724fe4561a201b0d36bddf13177e3557b43787b # cargo-deny
+        uses: taiki-e/install-action@c02248eec042a8a90b2335f60bb37dc287b54068 # cargo-deny
       - name: Check advisories, bans, licenses and sources
         run: cargo deny --all-features check
 
@@ -186,7 +186,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install wasm-tools
-        uses: taiki-e/install-action@0c84a37060110d66b187db00930682daff98567e # wasm-tools
+        uses: taiki-e/install-action@a9b972890f257fba4e3c835bb162df90343328c6 # wasm-tools
       - name: Validate WIT packages
         shell: bash
         run: |
@@ -375,7 +375,7 @@ jobs:
       - name: "Build and test the CUDA Provider (GPU-less here: exercises its graceful-unavailability path)"
         run: cargo test --locked --manifest-path providers/cuda/Cargo.toml
       - name: Install cargo-deny
-        uses: taiki-e/install-action@5724fe4561a201b0d36bddf13177e3557b43787b # cargo-deny
+        uses: taiki-e/install-action@c02248eec042a8a90b2335f60bb37dc287b54068 # cargo-deny
       # The root `deny` job above never sees this submodule (it checks out
       # without submodules by design, `externalize-runtime-extension-
       # modules`'s "zero compile-time dependency on any externalized
@@ -531,7 +531,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@4e14a60b36eb62630dcc25614f0be0659ab8830c # cargo-llvm-cov
+        uses: taiki-e/install-action@212e92b595ceefa6daaad2cda95b921ed5da4cd4 # cargo-llvm-cov
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Prepare coverage output
