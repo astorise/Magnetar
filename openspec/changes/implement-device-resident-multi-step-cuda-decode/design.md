@@ -1,0 +1,64 @@
+## Context
+
+Real investigation of the current code (not speculation) found the entire CUDA multi-step decode blocker collapses to three host round-trips inside `magnetar-runtime/src/first_native_runtime.rs`'s `execute_qwen_graph_nodes` (decode's per-node output loop, `:3794-3969`) and `promote_pending_kv_layer_role` (`:5214-5272`), all triggered only when a graph edge is KV-tagged `GraphKvCacheBehavior::Append` (decode only; prefill uses `Output`, which is unaffected):
+
+1. **The blocking one** (`:3843-3855`): historical K/V from the *previous* decode step is read via `provider.read_tensor_value(historical_resource)` then `.into_host(..)`. `CudaProvider::read_tensor_value` correctly, deliberately returns `TensorValue::Opaque` for anything it holds device-resident (`providers/cuda/src/executor.rs:162-171`) -- it never silently downloads. `TensorValue::into_host` on `Opaque` is `Err(TensorError::ResidencyUnavailable)` by design (`provider.rs:545-555`). This is the one call that actually fails today, surfaced as `InferenceApiError::KvCacheUnavailable`, and is why `close-tachyon-scope-audit-gaps` added a fail-fast `Unsupported` gate before this is ever reached.
+2. **A non-fatal but wasteful one** (`:3883`): the freshly concatenated K/V, before being written under a stable `pending` resource id, is downloaded via `NodeValue::into_host` (which calls the *host-typed* `read_tensor`, which CUDA does implement and does succeed at -- this call was never blocked, just expensive) and re-uploaded.
+3. **A second non-fatal but wasteful one** (`promote_pending_kv_layer_role`, `:5223`/`:5258`): committing a decode step's KV update downloads the pending resource's bytes and re-uploads them under the committed resource id, so the commit step alone is a full D2H+H2D of the entire per-layer KV state, every step.
+
+The CUDA attention kernel itself needs no change: `providers/cuda/src/kernels.rs:529-556` already computes `query_position_offset = kv_seq_len - seq_len` and dispatches correctly whenever `kv_seq_len > seq_len`, which is exactly decode's shape. The KV cache's own persistent types (`kv_cache.rs`'s `KvCache`/`KvLayerResourceBinding`, `first_native_runtime.rs`'s `FirstNativeLayerKvState`/`FirstNativeExecutionKvState`) are already `TensorResourceId`-keyed, never `HostTensor`-typed -- the host-bytes assumption is confined to the three call sites above, not baked into the KV abstraction.
+
+The codebase already has a Provider-agnostic, host-free, resource-id-addressed kernel dispatch mechanism that every other Qwen graph node uses (`ProviderExecutionApi::submit_kernel`/`complete_kernel`, `KernelInvocation` addressed by `TensorResourceId`) -- and an established precedent (`"split"`, this session's `"add"` row-broadcast) for adding a small, purpose-built portable Operator to the catalog to close exactly this kind of structural gap, rather than a one-off KV-specific trait method.
+
+## Goals / Non-Goals
+
+**Goals:**
+- A CUDA generation request needing more than one decode step succeeds, produces real, correct multi-token output, and matches Reference CPU's greedy output exactly on the same real checkpoint/prompt.
+- Historical KV concatenation, and both the pending-write and commit steps that follow it, complete without a Provider that holds KV device-resident ever being asked to produce host-visible bytes for it.
+- Bounded Device memory growth across decode steps: exactly one live allocation per layer per role per KV identity (edge, pending, committed) at a time, matching Reference CPU's existing growing-fresh-buffer-per-step semantics (this is not introducing a new memory discipline, just making CUDA satisfy the one that already exists and is already tested for Reference CPU).
+- Zero new WIT/Component-visible surface, zero change to the Qwen Component's declared graph shapes or fingerprint.
+
+**Non-Goals:**
+- A ring-buffer or pre-allocated-capacity KV cache (an efficiency optimization over today's "concatenate into a fresh, larger buffer every step" semantics, which both Reference CPU and this change's CUDA fix share). Real, bounded, not maximally efficient; tracked as possible future work, not attempted here.
+- Native CUDA FP16/BF16 compute, paged KV cache, multi-device/tensor-parallel decode, quantization, GGUF, additional Providers or Model Components -- all separately scoped, unaffected by this change.
+- Renegotiating `Provider::supports_multi_step_decode`'s shape (`close-tachyon-scope-audit-gaps`): the method and its default stay exactly as they are; CUDA simply stops overriding it to `false`.
+
+## Decisions
+
+### A new portable `concat` Operator, dispatched like every other graph node -- not a KV-specific trait method
+
+Add `("concat", OperatorFamily::Tensor, 2, 1, ShapeRule::RowConcat)` to the Operator catalog (`magnetar-runtime/src/operator.rs`), where `ShapeRule::RowConcat` validates: both inputs share the same column count, and the output's row count equals the sum of both inputs' row counts (mirroring this session's `ShapeRule::RowBroadcastAdd` precedent for a small, purpose-built shape contract). `execute_qwen_graph_nodes`'s KV-history-append block dispatches through this Operator via the same pre-admitted-output-target mechanism every other Qwen node already uses (the pattern `dispatch_qwen_binary_same_shape` established for "add"/"mul" this session), targeting `output_resource_id` (the edge's own stable identity) directly as the concat's output -- exactly like a real Kernel's output would land there. This makes `needs_explicit_edge_write` false for the KV-Append case (matching Decision 3's existing optimization for every other node kind), eliminating the historical-KV-read round-trip *and* the subsequent unconditional `output_tensor.into_host(..)` at `:3942` that currently re-downloads it regardless.
+
+Implemented on Reference CPU (both `magnetar-runtime`'s in-crate double and `providers/cpu`, for conformance) as the existing `concat_rows` logic (row-major byte concatenation), and on CUDA (`providers/cuda`) as a device-to-device buffer copy: allocate a fresh `[a_rows + b_rows, cols]` device buffer and copy each input's bytes into it at the right offset, using the same `clone_dtod`-class primitive `rope`'s kernel already uses (`kernels.rs:388`) -- no new `.cu` kernel is required, this is `cudarc` buffer plumbing.
+
+**Alternative considered**: a dedicated `ProviderExecutionApi::append_kv_history(..)` method. Rejected: it would bypass the Kernel Registry / `PreparedExecutionPlan` / advertisement / per-node observability chain every other operation goes through (`validate_e2e_no_shortcuts` and the conformance gates would need special-casing for it), and it adds KV-specific vocabulary to a trait `provider.rs` already documents as "should stay genuinely portable." A generic Operator is strictly more consistent with the architecture and immediately gets CPU/CUDA conformance testing for free through the existing harness.
+
+**Alternative considered**: give `concat` a fully general `axis` attribute (matching `compute.rs`'s pre-existing, unrelated `tensor.concat` *compute-catalog* entry, a different, broader mechanism not wired to any Operator dispatch today). Rejected as unnecessary scope: the only real caller is row-wise KV concatenation with a fixed column count; a general N-axis concat Operator can be added later against a real second caller if one ever appears, per the "no speculative generality" project convention.
+
+### A new `ProviderExecutionApi::copy_tensor_admitted` primitive closes the two remaining round-trips
+
+Add `fn copy_tensor_admitted(&self, memory: &mut MemoryManager, from: &TensorResourceId, to: TensorResourceId, class: MemoryAllocationClass, owner: MemoryAllocationOwner) -> Result<(), TensorValueAdmissionError>`: duplicates `from`'s current bytes to a fresh identity `to`, replacing (and releasing, exactly like `write_tensor_value_admitted` already does) whatever `to` previously held, without ever producing or requiring host-visible bytes. Used in two places:
+- The KV pending-write (`:3883-3916`): replaces `output_tensor.clone().into_host(..)` + `write_tensor_value_admitted(.., TensorValue::Host(..))` with `copy_tensor_admitted(.., &output_resource_id, pending_resource, ..)`.
+- `promote_pending_kv_layer_role`'s commit (`:5223`/`:5258`): replaces `read_tensor` + `write_tensor` with `copy_tensor_admitted(.., &pending_resource, committed_resource, ..)`.
+
+Reference CPU implements it as a `HostTensor` clone under the new id (behaviorally identical to what it already effectively does); CUDA implements it as a device-to-device buffer copy. This is a genuinely generic capability (any caller needing "this resource's current bytes, but addressable under a different, caller-chosen, possibly-longer-lived id" benefits from it), not KV-specific, so it belongs on `ProviderExecutionApi` itself rather than bolted onto the KV commit path alone.
+
+**Alternative considered**: keep the pending/commit round-trips (fix only the blocking read). Rejected: both external audits and the Tachyon scope charter explicitly name "no historical-KV host round-trip" as the acceptance bar for Tachyon-Mesh cutover, not merely "does not error." Leaving two D2H+H2D crossings of the whole per-layer KV state per decode step would make this fix technically-passing but not the real thing the charter asked for.
+
+### `MemoryPlacement` reconciliation for CUDA KV commit
+
+`promote_pending_kv_layer_role` records the committed KV resource under `MemoryPlacement::ProviderOwnedOpaque(provider_binding)` (`:5239`) regardless of Provider, while every other CUDA Device-resident write records `MemoryPlacement::Device(device_binding)` (`executor.rs:133`). Reconciled to record `Device` for a Provider that actually reports one (CUDA), keeping `ProviderOwnedOpaque` only for a Provider with no concrete Device identity to report. A real, small, adjacent correctness fix found while implementing this change, not a new requirement in its own right -- Memory Manager accounting for CUDA KV state should live in the same bucket as every other CUDA Device-resident allocation.
+
+### Bounded memory growth is verified, not merely assumed
+
+Both `write_tensor_value_admitted` (existing) and the new `copy_tensor_admitted` replace-and-release whatever the target id previously held, the same discipline `KvUpdateTransaction::commit` already relies on for Reference CPU. This change adds a real-hardware test that decodes a real multi-token sequence on CUDA and asserts the Memory Manager's *active* allocation count for KV resources stays constant across steps (one per layer per role per identity), not merely "less than an arbitrary bound" -- mirroring `close-tachyon-scope-audit-gaps`'s own `unloading_a_real_production_instance_leaves_no_memory_manager_allocation` pattern (active vs. ever-allocated).
+
+## Risks / Trade-offs
+
+- [`ShapeRule::RowConcat` starts validating the graph edge's own *declared* shape (`[1, kv_dim]` for a decode KV edge) against the *actual* runtime shape (`[history + 1, kv_dim]`), which have always legitimately differed and were never previously cross-checked] → `ShapeRule::RowConcat` validates the concat dispatch's own two real inputs and one real output against each other (column-count-equal, row-count-additive), never against the graph edge's own static declaration -- the same posture `ShapeRule::RowBroadcastAdd` already takes for "add". No Component change, no fingerprint change.
+- [A future caller of `copy_tensor_admitted` assumes it works across two different Providers] → Documented as same-Provider only (the same posture `write_tensor_value_admitted`'s `Opaque`-passthrough already takes); cross-Provider tensor migration is a different, unaddressed problem, not something this method claims to solve.
+- [The device-to-device concat buffer copy on CUDA silently corrupts data on a boundary/offset error, undetected without careful testing] → CPU/CUDA conformance testing (the existing harness every other Operator already goes through) runs `concat` against Reference CPU's own output for the exact same inputs before any real-checkpoint test is attempted; the real multi-token CPU/CUDA parity test then catches any subtler, only-visible-under-real-attention-shapes error.
+
+## Migration Plan
+
+Purely additive at the API/WIT level (`concat` and `copy_tensor_admitted` are new; nothing existing changes signature). Behavior change is scoped to CUDA: `supports_multi_step_decode()` reverting to `true` is the one caller-visible behavior flip, and it only ever makes a previously-`Unsupported`-rejected request succeed -- no existing passing call path changes outcome. Rollback is a plain revert (re-add the `false` override) with no persisted-state migration, since no on-disk or cross-process KV state exists to migrate.
