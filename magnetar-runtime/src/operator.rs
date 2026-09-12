@@ -789,13 +789,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             ShapeRule::RowBroadcastAdd,
         ),
         ("mul", OperatorFamily::Tensor, 2, 1, ShapeRule::SameShape),
-        (
-            "concat",
-            OperatorFamily::Tensor,
-            2,
-            1,
-            ShapeRule::RowConcat,
-        ),
+        ("concat", OperatorFamily::Tensor, 2, 1, ShapeRule::RowConcat),
         (
             "residual-add",
             OperatorFamily::Tensor,
