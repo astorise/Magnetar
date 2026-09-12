@@ -42,10 +42,16 @@ fn real_production_ingestion_generates_on_real_cuda_hardware() {
     // dispatches through a real, device-resident "concat" Kernel instead
     // of requiring host-readable tensor bytes, so this Provider genuinely
     // supports more than the one token prefill alone produces --
-    // `max_tokens: 4` exercises 3 real decode steps beyond prefill, not
-    // just the prefill-only shape task 12.3 originally proved.
+    // `max_tokens: 8` (matching the audit's own "8/16+ generated tokens"
+    // bar) exercises 7 real decode steps beyond prefill, not just the
+    // prefill-only shape task 12.3 originally proved. Each step's KV
+    // pending-write and commit reuse the *same* stable resource identity
+    // (replaced, not accumulated -- verified in isolation by
+    // `copy_tensor_admitted_replaces_a_previous_allocation_at_the_same_
+    // destination` on real hardware), so more steps here is real,
+    // additional stress on that property, not merely a bigger number.
     ingested.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
-        max_tokens: Some(4),
+        max_tokens: Some(8),
         ..Default::default()
     });
 
@@ -85,9 +91,9 @@ fn real_production_ingestion_generates_on_real_cuda_hardware() {
 
     assert_eq!(
         outcome.result.output.generated_token_ids.len(),
-        4,
-        "real production ingestion + loading + generation on CUDA produced all 4 requested \
-         tokens (prefill + 3 real decode steps), not just a prefill-only shape"
+        8,
+        "real production ingestion + loading + generation on CUDA produced all 8 requested \
+         tokens (prefill + 7 real decode steps), not just a prefill-only shape"
     );
     assert!(
         !outcome.text.starts_with("[generated token ids:"),

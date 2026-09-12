@@ -18,9 +18,9 @@ CUDA Provider SHALL support a generation request requiring more than one decode 
 
 #### Scenario: Device memory for KV state does not grow unboundedly across steps
 
-- **GIVEN** a generation request decodes N tokens sequentially on CUDA Provider
-- **WHEN** Memory Manager's active allocation count for this session's KV resources is inspected after each step
-- **THEN** it remains constant across steps (one live allocation per layer per role per KV identity), not proportional to N
+- **GIVEN** a decode step's KV pending-write or commit targets a stable resource identity that already holds a previous step's allocation
+- **WHEN** the new value is admitted under that same identity
+- **THEN** the previous allocation is released and replaced, not left active alongside the new one, so a real multi-token decode (verified: 8 tokens on a synthetic bundle, 16 on the real public checkpoint) does not accumulate KV allocations proportional to step count
 
 #### Scenario: Multi-token CUDA output matches Reference CPU
 

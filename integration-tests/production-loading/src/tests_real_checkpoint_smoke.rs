@@ -278,7 +278,8 @@ fn real_public_checkpoint_renders_chat_messages_through_its_own_real_template() 
 /// Task 12.5, generalized by `implement-device-resident-multi-step-cuda-
 /// decode`: compares real Reference CPU and real CUDA deterministic
 /// output on the same real checkpoint, same real ingested manifest, and
-/// same prompt, across a real multi-token decode (`max_tokens: 4`, 3 real
+/// same prompt, across a real multi-token decode (`max_tokens: 16`,
+/// matching the audit's own "8/16+ generated tokens" bar -- 15 real
 /// decode steps beyond prefill) -- historical KV concatenation across
 /// decode steps now dispatches through a real, device-resident "concat"
 /// Kernel instead of requiring host-readable tensor bytes, so CUDA
@@ -307,7 +308,7 @@ fn real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda() {
         .ingest(&source)
         .expect("real Qwen2.5-0.5B-Instruct bundle ingests");
     ingested.manifest.generation = Some(ModelGenerationDefaults {
-        max_tokens: Some(4),
+        max_tokens: Some(16),
         ..Default::default()
     });
 
@@ -359,8 +360,8 @@ fn real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda() {
 
     assert_eq!(
         cpu_outcome.result.output.generated_token_ids.len(),
-        4,
-        "Reference CPU must generate all 4 requested tokens (prefill + 3 real decode steps)"
+        16,
+        "Reference CPU must generate all 16 requested tokens (prefill + 15 real decode steps)"
     );
     assert_eq!(
         cpu_outcome.result.output.generated_token_ids,

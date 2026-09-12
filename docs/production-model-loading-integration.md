@@ -155,22 +155,30 @@ An embedder crate depends on:
 ## Current profile and limits
 
 See README's "Qwen production loading" section for exactly what this
-profile supports today and what it explicitly does not yet (multi-step CUDA
-decode, native CUDA F16/BF16 compute, GGUF/quantized/LoRA/non-Qwen
-architectures, remote model hub download).
+profile supports today and what it explicitly does not yet (native CUDA
+F16/BF16 compute, GGUF/quantized/LoRA/non-Qwen architectures, remote model
+hub download).
 
-A Provider whose KV history is not host-readable (today: `CudaProvider`,
-device-resident by design) cannot service a request needing more than one
-decode step. Rather than discovering this deep inside decode after paying
-for a real prefill, the bound Provider's `supports_multi_step_decode()`
+Multi-step CUDA decode is real: historical KV concatenation across decode
+steps dispatches through a device-resident `concat` Kernel and a
+`copy_tensor_admitted` Provider-side copy, never downloading KV history to
+host. `run_production_qwen_generation_for_provider(_with_prompt)` needs no
+different call shape for CUDA than for Reference CPU to reach this --
+`PromptInput`/`max_tokens` are unchanged either way.
+
+A Provider whose KV history is genuinely not host-readable in some other
+way still has a real, generic escape hatch: `supports_multi_step_decode()`
 (a `Provider` trait method, `true` by default) is checked once, before any
 real execution work, when the request needs more than one decode step; a
 Provider declaring `false` fails the request immediately with a structured
-`InferenceApiError::Unsupported { reason }` naming the real constraint. An
-embedder calling `run_production_qwen_generation_for_provider(_with_prompt)`
-with a Provider it does not control the implementation of should match on
-this variant to distinguish "this Provider cannot do this" from a
-transient fault (`ProviderUnavailable`) or a policy decision
+`InferenceApiError::Unsupported { reason }` naming the real constraint,
+instead of the request failing deep inside decode after a real prefill
+already ran. CUDA no longer declares `false` (it now supports this shape),
+but the mechanism itself remains real for a future Provider that needs it.
+An embedder calling `run_production_qwen_generation_for_provider
+(_with_prompt)` with a Provider it does not control the implementation of
+should match on this variant to distinguish "this Provider cannot do this"
+from a transient fault (`ProviderUnavailable`) or a policy decision
 (`PolicyDenied`).
 
 `GenerationResult.output.usage.tokens_per_second` (and

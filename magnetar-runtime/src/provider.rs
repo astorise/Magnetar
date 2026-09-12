@@ -856,6 +856,19 @@ pub trait ProviderExecutionApi: Send + Sync {
     /// otherwise download `from` to host and re-upload it as `to` for no
     /// reason other than changing its identity.
     ///
+    /// Returns the fresh [`crate::memory::MemoryAllocationId`] this copy
+    /// admitted `to` under -- unlike [`Self::write_tensor_value_admitted`],
+    /// a caller here has no `TensorValue` of its own to have already
+    /// derived a byte size or allocation from, and no Runtime-side
+    /// `TensorResidency` record generically maps an arbitrary resource id
+    /// back to the allocation a Provider-internal admit-then-copy created
+    /// for it (that bookkeeping is Provider-private, e.g. a `TensorResourceId
+    /// -> MemoryAllocationId` table each concrete Provider already keeps
+    /// for its own admitted writes) -- so a caller that needs the
+    /// allocation id (e.g. to release it later, or to record it in a
+    /// binding of its own) can only get it back as this call's own return
+    /// value.
+    ///
     /// The default implementation fails closed, matching
     /// [`Self::write_tensor_value_admitted`]'s own default: a generic
     /// default has no way to know this Provider's own identity for
@@ -871,7 +884,7 @@ pub trait ProviderExecutionApi: Send + Sync {
         to: TensorResourceId,
         class: crate::memory::MemoryAllocationClass,
         owner: crate::memory::MemoryAllocationOwner,
-    ) -> Result<(), TensorValueAdmissionError> {
+    ) -> Result<crate::memory::MemoryAllocationId, TensorValueAdmissionError> {
         let _ = (memory, from, to, class, owner);
         Err(TensorValueAdmissionError::Memory(
             crate::memory::MemoryError::AllocationDenied {

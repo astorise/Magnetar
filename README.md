@@ -200,10 +200,24 @@ hardware:
   ([`Qwen/Qwen2.5-0.5B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct),
   pinned by revision and content digest), not only tiny synthetic-content
   bundles: verified loading and real decoded-text generation on Reference CPU,
-  and a matching greedy prefill token/text between Reference CPU and real CUDA
-  hardware within an exact-match tolerance (see
-  `integration-tests/production-loading`'s `tests_real_checkpoint_smoke.rs`,
-  a manual/nightly-profile test given its ~1GB download)
+  and a matching greedy 16-token decode (text and every generated token id)
+  between Reference CPU and real CUDA hardware within an exact-match
+  tolerance (see `integration-tests/production-loading`'s
+  `tests_real_checkpoint_smoke.rs`, a manual/nightly-profile test given its
+  ~1GB download)
+- Real device-resident multi-step CUDA decode: a generation request needing
+  more than one decode step now succeeds on CUDA, not just prefill.
+  Historical KV concatenation across decode steps dispatches through a real,
+  device-resident `concat` Kernel (a live Kernel Registry selection, since
+  this Runtime-side bookkeeping is not itself a graph node with a Prepared
+  Plan binding) instead of downloading the historical KV tensor to host, and
+  the KV pending-write/commit lifecycle uses a new
+  `ProviderExecutionApi::copy_tensor_admitted` primitive (a real
+  device-to-device copy) instead of a download-then-reupload round trip --
+  verified byte-for-byte identical against Reference CPU on both a synthetic
+  bundle (8 tokens) and the real public Qwen2.5-0.5B-Instruct checkpoint (16
+  tokens), on real CUDA hardware
+  (`implement-device-resident-multi-step-cuda-decode`)
 - A real, artifact-declared chat template: when the ingested bundle's
   `tokenizer_config.json` declares one, `loaders/huggingface`'s
   `HuggingFaceChatTemplateFormatter` renders `PromptInput::ChatMessages`
@@ -219,7 +233,9 @@ hardware:
   that declares (`Provider::supports_multi_step_decode`) it cannot supply
   host-readable KV history for it -- checked before any real execution
   work, not discovered as an internal residency error partway through a
-  real prefill
+  real prefill. CUDA itself now declares support (see above); this remains
+  a real, generic mechanism for a future Provider that genuinely cannot
+  support the shape
 - Real measured `tokens_per_second`/`prefill_duration_millis`/
   `decode_duration_millis` generation usage metadata, for both Reference
   CPU and real CUDA hardware, from actual wall-clock timing (verified on
@@ -229,16 +245,6 @@ Explicitly not yet supported by this profile:
 
 - `F16`/`BF16` weight storage is decoded and converted to `F32` at Model
   Loading time, but native CUDA `F16`/`BF16` compute kernels do not exist yet
-- Multi-step CUDA decode: a generation request beyond one new token (prefill
-  only) requires reading back previous steps' Device-resident KV cache state
-  to host memory for historical-KV-history concatenation, and
-  `CudaProvider::read_tensor_value` deliberately never does this by design
-  (only `read_tensor` explicitly downloads) -- a real, pre-existing gap this
-  profile's CUDA path does not paper over. A caller now learns this
-  immediately as a structured `Unsupported` error (see above) instead of an
-  internal residency error after paying for a real prefill; the decode
-  itself remains unimplemented, tracked separately
-  (`implement-device-resident-multi-step-cuda-decode`)
 - GGUF, quantized (`Q4_K`/`Q5_K`/`Q8_0`/GPTQ/AWQ/BitsAndBytes) execution, LoRA
   adapters, and non-Qwen architecture families
 - Remote model hub download, OCI distribution, and credential/retry handling
@@ -290,15 +296,17 @@ becomes safe to delete, not about which side does the parsing.
 
 **Tachyon scope charter reconciliation**: reconciling the shipped code against
 a Tachyon-authored Magnetar scope charter found the large majority of it
-already real and verified; `close-tachyon-scope-audit-gaps` closed the two
+already real and verified. `close-tachyon-scope-audit-gaps` closed two
 concrete gaps that reconciliation found (real chat template rendering; an
 explicit `Unsupported` signal for a decode shape a Provider cannot perform,
-plus real `tokens_per_second` measurement). Everything else the charter
-frames as future work remains exactly that: multi-device execution,
-quantization support, wiring `formats/gguf` into Model Loading, native CUDA
-`F16`/`BF16` compute, additional Providers (Metal/ROCm/NPU/TPU) or Model
-Components (Llama/Mistral/Gemma), and device-resident multi-step CUDA decode
-itself (tracked separately, `implement-device-resident-multi-step-cuda-decode`).
+plus real `tokens_per_second` measurement), and
+`implement-device-resident-multi-step-cuda-decode` closed the third
+(device-resident multi-step CUDA decode itself, see "Qwen production
+loading" above). Everything else the charter frames as future work remains
+exactly that: multi-device execution, quantization support, wiring
+`formats/gguf` into Model Loading, native CUDA `F16`/`BF16` compute, and
+additional Providers (Metal/ROCm/NPU/TPU) or Model Components
+(Llama/Mistral/Gemma).
 
 ## Terminology
 

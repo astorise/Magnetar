@@ -61,7 +61,10 @@ use sha2::{Digest as ShaDigest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -4090,15 +4093,16 @@ fn execute_qwen_graph_nodes(
                 ));
                 let pending_write_result: Result<(), TensorValueAdmissionError> =
                     match &output_tensor {
-                        NodeValue::Resident { id, .. } => {
-                            dispatch_ctx.provider.copy_tensor_admitted(
+                        NodeValue::Resident { id, .. } => dispatch_ctx
+                            .provider
+                            .copy_tensor_admitted(
                                 dispatch_ctx.runtime.memory_mut(),
                                 id,
                                 pending_resource.clone(),
                                 MemoryAllocationClass::Tensor,
                                 MemoryAllocationOwner::Session(kv_cache_id.to_string()),
                             )
-                        }
+                            .map(|_allocation_id| ()),
                         NodeValue::Host(_) => {
                             let pending_tensor =
                                 output_tensor.clone().into_host(&dispatch_ctx.provider)?;
@@ -5432,6 +5436,22 @@ fn promote_pending_kv_layer(
     })
 }
 
+/// Monotonic source of attempt-unique KV commit resource-id suffixes
+/// (`implement-device-resident-multi-step-cuda-decode`): previously this
+/// promotion used the freshly-created `MemoryAllocationId` for uniqueness,
+/// but `copy_tensor_admitted` (used below to avoid a host round trip)
+/// must be told the destination resource id *before* it admits anything,
+/// so no allocation id exists yet to derive a name from. Global and
+/// process-wide rather than per-cache/per-layer is deliberate: the only
+/// property this needs is "never repeats," which a single counter
+/// trivially guarantees, and every real caller commits layers one at a
+/// time anyway (no cross-layer parallelism to race).
+static KV_COMMIT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn next_kv_commit_generation() -> u64 {
+    KV_COMMIT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn promote_pending_kv_layer_role(
     runtime: &mut Runtime,
@@ -5442,32 +5462,8 @@ fn promote_pending_kv_layer_role(
     role: &str,
     pending_resource: &TensorResourceId,
 ) -> Result<(TensorResourceId, MemoryAllocationId), InferenceApiError> {
-    let tensor = executor.read_tensor(pending_resource).ok_or_else(|| {
-        InferenceApiError::KvCacheUnavailable {
-            reason: format!(
-                "no pending KV data to commit for layer {layer} ({role}); already committed or aborted?"
-            ),
-        }
-    })?;
-    let byte_size = tensor.data.len() as u64 * std::mem::size_of::<f32>() as u64;
-    // Admission SHALL precede Provider materialization: reserve the
-    // committed resource's memory before writing its bytes into
-    // Provider-owned storage, not after.
-    let allocation = runtime
-        .memory_mut()
-        .allocate(MemoryAllocationRequest::new(
-            MemoryAllocationClass::Tensor,
-            byte_size,
-            MemoryPlacement::ProviderOwnedOpaque(provider_binding.clone()),
-            MemoryAllocationOwner::Session(cache.to_string()),
-        ))
-        .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
-            reason: format!(
-                "failed to account committed KV resource for layer {layer} ({role}): {error}"
-            ),
-        })?;
-    // The resource id is unique to this promotion attempt (keyed by the
-    // allocation id, itself unique), not the stable
+    // The resource id is unique to this promotion attempt (keyed by a
+    // monotonic generation counter), not the stable
     // `kv.{cache}.layer{N}.{role}` name a naive implementation might reuse
     // across decode steps -- reusing a stable id would mean this write
     // destructively overwrites the previous step's still-valid committed
@@ -5475,22 +5471,57 @@ fn promote_pending_kv_layer_role(
     // succeeds, making rollback impossible to do correctly (Correctif 11).
     let committed_resource = TensorResourceId::new(format!(
         "kv.{cache}.layer{layer}.{role}.gen{}",
-        allocation.id
+        next_kv_commit_generation()
     ));
-    if let Err(error) = executor.write_tensor(committed_resource.clone(), tensor) {
-        // The allocation above already admitted successfully: release it
-        // before propagating, so this failed promotion leaves no trace in
-        // the Memory Manager ledger (same rollback shape as
-        // `WeightMaterializationTransaction::stage_weight`'s own
-        // admission-then-write-or-residency-failure handling).
-        let _ = runtime.memory_mut().release(allocation.id);
-        return Err(InferenceApiError::ProviderTensorWriteFailed {
+    // Checked explicitly, before attempting the copy: a missing pending
+    // resource (already committed, aborted, or sabotaged mid-commit by a
+    // partial-layer-failure test) is a `KvCacheUnavailable` case this
+    // caller already has a specific, tested contract for -- not a
+    // `copy_tensor_admitted` failure, whose own error shape does not
+    // reliably distinguish "missing" from a genuine device-copy failure
+    // across every Provider. `read_tensor_value` is a pure presence check
+    // (never downloads, per its own contract), so this costs nothing on a
+    // device-resident Provider.
+    if executor.read_tensor_value(pending_resource).is_none() {
+        return Err(InferenceApiError::KvCacheUnavailable {
             reason: format!(
-                "failed to write committed KV resource for layer {layer} ({role}): {error}"
+                "no pending KV data to commit for layer {layer} ({role}); already committed or aborted?"
             ),
         });
     }
-    Ok((committed_resource, allocation.id))
+    // Real Provider-side copy: admits and copies in one call (mirroring
+    // `write_tensor_admitted`'s own admit-then-write shape), never
+    // downloading the pending resource to host merely to change its
+    // identity (`implement-device-resident-multi-step-cuda-decode`).
+    // `provider_binding` is threaded through purely for its own error-
+    // reason formatting below; `copy_tensor_admitted` derives the real
+    // Memory Placement (Device or ProviderOwnedOpaque) from the resolved
+    // Provider itself, exactly like `write_tensor_admitted` already does.
+    let allocation_id = executor
+        .copy_tensor_admitted(
+            runtime.memory_mut(),
+            pending_resource,
+            committed_resource.clone(),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session(cache.to_string()),
+        )
+        .map_err(|error| match error {
+            TensorValueAdmissionError::Memory(error) => InferenceApiError::MemoryAdmissionFailed {
+                reason: format!(
+                    "failed to account committed KV resource for layer {layer} ({role}) on \
+                     provider '{provider_binding}': {error}"
+                ),
+            },
+            TensorValueAdmissionError::Provider(error) => {
+                InferenceApiError::ProviderTensorWriteFailed {
+                    reason: format!(
+                        "failed to commit KV resource for layer {layer} ({role}) on provider \
+                         '{provider_binding}': {error}"
+                    ),
+                }
+            }
+        })?;
+    Ok((committed_resource, allocation_id))
 }
 
 impl E2eRuntimeModelExecutionEngine {
