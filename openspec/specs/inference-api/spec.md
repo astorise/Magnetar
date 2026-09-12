@@ -170,7 +170,9 @@ When Runtime prepares input
 Then chat-template formatting occurs only through authorized Runtime prompt
 contracts.
 
----
+#### Scenario: Chat messages rendered through a real artifact-declared template
+- **WHEN** chat messages are submitted for a Model Instance whose Model Artifact declares a real chat template
+- **THEN** Runtime renders those messages through that real template before tokenization, not through a generic placeholder that ignores the artifact's own template.
 
 ### Requirement: Generation API
 
