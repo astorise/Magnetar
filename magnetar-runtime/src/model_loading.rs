@@ -1482,6 +1482,122 @@ pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
+/// Converts one `f32` value to IEEE 754 binary16 ("half float"), rounding
+/// to nearest with ties to even -- the inverse of [`f16_to_f32`], needed by
+/// a native half-precision device buffer to convert host `f32` values into
+/// on-device `f16` bytes. Handles every class explicitly: `+0.0`/`-0.0`
+/// preserve sign, a magnitude below `f16`'s smallest subnormal flushes to
+/// (signed) zero, a magnitude at or above `f16`'s subnormal range rounds
+/// into a subnormal `f16` (rounding up through the subnormal/normal
+/// boundary lands on the correct smallest-normal bit pattern automatically,
+/// since IEEE 754's subnormal and normal encodings are bit-contiguous by
+/// design), a magnitude beyond `f16`'s largest finite value rounds to
+/// infinity, `f32` infinities map to `f16` infinities, and `f32` `NaN`
+/// leaves a non-zero payload (never accidentally collapsing to infinity).
+///
+/// Unused outside tests today: this is Phase 1 groundwork for a future
+/// native half-precision device buffer (`add-native-cuda-half-precision-
+/// compute` design.md's Phase 2), which will convert host `f32` values to
+/// on-device `f16` bytes at the upload boundary.
+#[allow(dead_code)]
+pub(crate) fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mantissa_f32 = bits & 0x007F_FFFF;
+    let exp_f32 = ((bits >> 23) & 0xFF) as i32;
+
+    if exp_f32 == 0xFF {
+        if mantissa_f32 == 0 {
+            return sign | 0x7C00;
+        }
+        let payload = (mantissa_f32 >> 13) as u16;
+        let payload = if payload == 0 { 1 } else { payload };
+        return sign | 0x7C00 | payload;
+    }
+
+    let unbiased = exp_f32 - 127;
+
+    if unbiased > 15 {
+        return sign | 0x7C00;
+    }
+
+    if unbiased < -14 {
+        // Subnormal (or flush-to-zero, or rounds up into the smallest
+        // normal) f16 output. `significand` includes the implicit leading
+        // one (absent when `exp_f32 == 0`, i.e. the input itself was
+        // already an `f32` subnormal).
+        let significand = if exp_f32 == 0 {
+            mantissa_f32
+        } else {
+            mantissa_f32 | 0x0080_0000
+        };
+        if significand == 0 {
+            return sign;
+        }
+        let shift = (-(unbiased + 1)) as u32;
+        if shift >= 32 {
+            return sign;
+        }
+        let half = 1u32 << (shift - 1);
+        let mask = (1u32 << shift) - 1;
+        let truncated = significand >> shift;
+        let remainder = significand & mask;
+        let mut result = truncated;
+        if remainder > half || (remainder == half && (result & 1) == 1) {
+            result += 1;
+        }
+        return sign | (result as u16);
+    }
+
+    // Normal f16 output: round `mantissa_f32`'s top 10 bits (no implicit
+    // bit -- f16, like f32, never stores it) to nearest-even.
+    let half = 1u32 << 12;
+    let mask = (1u32 << 13) - 1;
+    let truncated = mantissa_f32 >> 13;
+    let remainder = mantissa_f32 & mask;
+    let mut mantissa10 = truncated;
+    if remainder > half || (remainder == half && (mantissa10 & 1) == 1) {
+        mantissa10 += 1;
+    }
+    let exp16 = (unbiased + 15) as u32;
+    if mantissa10 == 0x400 {
+        let new_exp = exp16 + 1;
+        if new_exp >= 0x1F {
+            return sign | 0x7C00;
+        }
+        return sign | ((new_exp as u16) << 10);
+    }
+    sign | ((exp16 as u16) << 10) | (mantissa10 as u16)
+}
+
+/// Converts one `f32` value to `bfloat16`, rounding to nearest with ties to
+/// even -- the inverse of [`bf16_to_f32`]. `bfloat16` truncates `f32`'s
+/// sign/exponent/top-7-mantissa-bits to 16 bits, so rounding is the
+/// standard "add a rounding bias, then truncate" trick: adding `0x7FFF`
+/// plus the bit that would become the rounded result's LSB, then
+/// right-shifting away the low 16 bits, rounds to nearest and breaks exact
+/// ties toward an even mantissa -- with no case analysis needed, exactly
+/// like [`bf16_to_f32`]'s own unconditional shift, because this bias
+/// addition cannot overflow into the sign bit for any finite input (the
+/// worst case, `f32::MAX`, still leaves headroom below `f32`'s all-ones
+/// exponent field). `NaN` is handled explicitly so a `NaN` whose rounded
+/// mantissa would truncate to zero cannot collapse into infinity.
+///
+/// Unused outside tests today: Phase 1 groundwork, same as [`f32_to_f16`].
+#[allow(dead_code)]
+pub(crate) fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    if value.is_nan() {
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let mantissa7 = ((bits >> 16) as u16) & 0x7F;
+        let mantissa7 = if mantissa7 == 0 { 0x40 } else { mantissa7 };
+        return sign | 0x7F80 | mantissa7;
+    }
+    let rounding_bias = 0x0000_7FFFu32 + ((bits >> 16) & 1);
+    let rounded = bits.wrapping_add(rounding_bias);
+    (rounded >> 16) as u16
+}
+
 pub fn invalidates_kv_cache_on_unload(policy: ModelLoadingCachePolicy) -> bool {
     matches!(policy, ModelLoadingCachePolicy::InvalidateKvCacheOnUnload)
 }

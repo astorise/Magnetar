@@ -21970,6 +21970,86 @@ fn bf16_to_f32_handles_every_numeric_class_exactly() {
     assert!(bf16_to_f32(0x7FC0).is_nan());
 }
 
+/// `add-native-cuda-half-precision-compute` task 2.3: a handful of named
+/// values for readability. Not load-bearing on its own -- the exhaustive
+/// round-trip tests below already cover every possible bit pattern -- but
+/// documents intent for a reader who does not want to reason through that
+/// exhaustive coverage.
+#[test]
+fn f32_to_f16_handles_named_numeric_classes() {
+    assert_eq!(f32_to_f16(0.0), 0x0000);
+    assert_eq!(f32_to_f16(-0.0), 0x8000);
+    assert_eq!(f32_to_f16(1.0), 0x3C00);
+    assert_eq!(f32_to_f16(2f32.powi(-24)), 0x0001); // smallest subnormal
+    assert_eq!(f32_to_f16(2f32.powi(-14)), 0x0400); // smallest normal
+    assert_eq!(f32_to_f16(65504.0), 0x7BFF); // largest finite
+    assert_eq!(f32_to_f16(-65504.0), 0xFBFF);
+    assert_eq!(f32_to_f16(70000.0), 0x7C00); // overflow -> +Inf
+    assert_eq!(f32_to_f16(f32::INFINITY), 0x7C00);
+    assert_eq!(f32_to_f16(f32::NEG_INFINITY), 0xFC00);
+    assert!(f16_to_f32(f32_to_f16(f32::NAN)).is_nan());
+}
+
+#[test]
+fn f32_to_bf16_handles_named_numeric_classes() {
+    assert_eq!(f32_to_bf16(0.0), 0x0000);
+    assert_eq!(f32_to_bf16(-0.0), 0x8000);
+    assert_eq!(f32_to_bf16(1.0), 0x3F80);
+    assert_eq!(f32_to_bf16(-2.0), 0xC000);
+    assert_eq!(f32_to_bf16(f32::INFINITY), 0x7F80);
+    assert_eq!(f32_to_bf16(f32::NEG_INFINITY), 0xFF80);
+    assert!(bf16_to_f32(f32_to_bf16(f32::NAN)).is_nan());
+}
+
+/// The load-bearing verification: every one of the 65,536 possible `u16`
+/// bit patterns is, by construction, an exactly representable `f16` value.
+/// Decoding it via the already-trusted `f16_to_f32`
+/// (`f16_to_f32_handles_every_numeric_class_exactly`) and re-encoding via
+/// `f32_to_f16` must reproduce the original bit pattern exactly -- a round
+/// trip starting from an exact value should never observe any rounding.
+/// `NaN` is the sole exception (IEEE 754 does not mandate any specific
+/// payload survive a round trip): only "still NaN" is checked for those.
+#[test]
+fn f32_to_f16_round_trips_every_possible_f16_bit_pattern_exactly() {
+    for bits in 0u32..=0xFFFF {
+        let bits = bits as u16;
+        let decoded = f16_to_f32(bits);
+        let reencoded = f32_to_f16(decoded);
+        if decoded.is_nan() {
+            assert!(
+                f16_to_f32(reencoded).is_nan(),
+                "f16 bit pattern {bits:#06x} decoded to NaN {decoded:?} must re-encode to a NaN, got {reencoded:#06x}"
+            );
+        } else {
+            assert_eq!(
+                reencoded, bits,
+                "f16 bit pattern {bits:#06x} (decoded {decoded:?}) did not round-trip: got {reencoded:#06x}"
+            );
+        }
+    }
+}
+
+/// Same exhaustive round-trip proof for `bfloat16`.
+#[test]
+fn f32_to_bf16_round_trips_every_possible_bf16_bit_pattern_exactly() {
+    for bits in 0u32..=0xFFFF {
+        let bits = bits as u16;
+        let decoded = bf16_to_f32(bits);
+        let reencoded = f32_to_bf16(decoded);
+        if decoded.is_nan() {
+            assert!(
+                bf16_to_f32(reencoded).is_nan(),
+                "bf16 bit pattern {bits:#06x} decoded to NaN {decoded:?} must re-encode to a NaN, got {reencoded:#06x}"
+            );
+        } else {
+            assert_eq!(
+                reencoded, bits,
+                "bf16 bit pattern {bits:#06x} (decoded {decoded:?}) did not round-trip: got {reencoded:#06x}"
+            );
+        }
+    }
+}
+
 #[test]
 fn host_tensors_from_artifact_bytes_converts_f16_storage_to_f32() {
     // 1.0, -2.0, 0.5, 0.0 as IEEE754 binary16 bit patterns.
