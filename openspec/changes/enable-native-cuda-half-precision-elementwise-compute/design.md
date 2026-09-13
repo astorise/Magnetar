@@ -1,0 +1,28 @@
+## Context
+
+`add-native-cuda-half-precision-compute`'s `design.md` sketched this as "Phase 2": a real native half-precision device buffer and at least one elementwise kernel in `providers/cuda`, using this repo's own conversion primitives at the upload/download boundary rather than retyping `HostTensor` or the existing `CudaDeviceBuffer`. This change implements that sketch.
+
+## Goals / Non-Goals
+
+**Goals:**
+- Real, on-device 2-byte `F16`/`bfloat16` storage (not `f32` promoted and labeled).
+- Real compute on that storage: `add`/`mul`, the two simplest existing kernels, chosen the same way `rope`'s `head_count` parameter and the `concat` kernel were each scoped as one narrow, real, independently-verifiable increment in prior chantiers.
+- Verify on real hardware against a model that faithfully captures half-precision's real, lossy rounding -- not a tolerance-based approximation.
+
+**Non-Goals (this change):**
+- Retyping `CudaDeviceBuffer` or `HostTensor`.
+- Any Kernel Registry advertisement / Runtime planner integration (Phase 3, still not designed in detail).
+- Every other kernel (`matmul`, `rmsnorm`, `rope`, `attention`, ...) gaining a half-precision variant. `add`/`mul` first; whether and how to extend further is a future decision informed by whether this primitive turns out to be useful once something can actually select it (Phase 3).
+
+## Decisions
+
+- **A new, separate `CudaHalfBuffer` type, not a variant folded into the existing `CudaDeviceBuffer`.** Investigated first: `CudaDeviceBuffer.slice: CudaSlice<f32>` is used directly (41 call sites, confined to `kernels.rs`) by every one of the 10 existing kernel wrapper methods. Turning it into a dtype-tagged enum would force every one of those methods to branch on a dtype only two of them (the new `add_half`/`mul_half`) actually need. A separate, additive type keeps the blast radius to exactly the new code; nothing existing changes at all -- confirmed by `cargo test --lib` (all 44 pre-existing + 8 new tests) and `clippy`/`fmt`/`cargo doc` all clean with zero changes to any pre-existing function body.
+- **Conversion happens on the host, at `upload_half`/`download_half`, using this change's own `half_precision` module -- not inside a kernel that reads `f32` and writes half bytes.** This mirrors exactly how `magnetar-runtime`'s Phase 1 conversion primitives are meant to be used (per that change's own design.md): `HostTensor` stays `f32`-only; a Provider converts at its own upload/download boundary. The device-side kernels themselves only ever see half-precision bytes in, half-precision bytes out.
+- **No `cuda_fp16.h`/`cuda_bf16.h`.** `kernels.cu`'s own header comment already documents NVRTC's minimal preprocessor environment as a real risk for headers beyond what it demonstrably already compiles (`__int_as_float`/`__float_as_int`, used by the pre-existing `neg_inf()`). The four new device-side conversion functions (`half_bits_to_float`, `float_to_half_bits`, `bf16_bits_to_float`, `float_to_bf16_bits`) use the identical bit-manipulation algorithm as this change's own Rust `half_precision.rs` (itself ported from `magnetar-runtime`'s exhaustively-tested original) -- verified, not merely assumed, by real-hardware tests that compare the GPU kernel's output against that same Rust algorithm run on the host, bit-for-bit.
+- **Verification computes an exact expected value via the same conversion model the kernel itself implements, rather than a tolerance band against the `f32` reference.** For `add`/`mul` on values already rounded to half precision, the mathematically correct answer to "what should a compliant half-precision `add` produce" is exactly `decode(encode(decode(encode(a)) op decode(encode(b))))` -- not `f32_add(a, b)` decoded loosely, which would make a tolerance an unprincipled fudge factor hiding whether the device's bit manipulation is actually right. Using the reference conversion model as the oracle instead makes every one of the 4 correctness tests an exact-equality assertion, and all 4 passed against real hardware on the first run -- strong evidence the CUDA kernel's manual bit manipulation matches the Rust implementation exactly, not just approximately.
+- **No `KernelAdvertisement` in this change.** Advertising `ComputeDType::Float16`/`BrainFloat16` for the existing `"add"`/`"mul"` `OperatorId` would either require those advertisements' single Kernel implementation to itself become dtype-polymorphic (reintroducing the `CudaDeviceBuffer` retyping this change avoids), or a second alternative-implementation advertisement under the same Operator with a distinct name -- a real design question (does the Kernel Registry already support two same-Provider implementations of one Operator distinguished only by dtype? unconfirmed) deliberately left to Phase 3, once there is an actual planner-side consumer to design the advertisement contract around.
+
+## Risks / Trade-offs
+
+- **This capability is currently unreachable from any production graph.** It exists, is real, and is verified -- but nothing in the Qwen generation path can select it yet. Accepted, matching this session's established pattern of landing a verified capability before the change that wires it into production use (dequantization landing before the loader's transpose-sequencing fix; Phase 1's conversion primitives landing before this Phase 2).
+- **Only `add`/`mul` gained a half-precision path; `matmul` (where most real compute time is spent) did not.** A `matmul` half-precision kernel is meaningfully more complex (tiling/accumulation-precision decisions) and was deliberately deferred rather than rushed into this change's scope.
