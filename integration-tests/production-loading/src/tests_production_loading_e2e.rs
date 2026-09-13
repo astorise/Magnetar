@@ -684,8 +684,7 @@ fn production_generation_request_streaming_text_deltas_reconstruct_the_non_strea
     .expect("streaming production generation succeeds");
 
     assert_eq!(
-        streamed.result.output.generated_token_ids,
-        non_streaming.result.output.generated_token_ids,
+        streamed.result.output.generated_token_ids, non_streaming.result.output.generated_token_ids,
         "same deterministic greedy request against the same prompt/weights must generate the \
          same tokens whether streamed or not"
     );
@@ -782,7 +781,9 @@ fn production_generation_request_streaming_callback_cancellation_stops_cleanly()
                 token_events += 1;
                 std::ops::ControlFlow::Break(())
             }
-            magnetar_runtime::GenerationStreamEvent::Finished { finish_reason: fr, .. } => {
+            magnetar_runtime::GenerationStreamEvent::Finished {
+                finish_reason: fr, ..
+            } => {
                 finish_reason = Some(fr);
                 std::ops::ControlFlow::Continue(())
             }

@@ -51,7 +51,7 @@ fn tensor_value(seed: u64) -> f32 {
     ((x % 1000) as f32 / 1000.0) - 0.5
 }
 
-fn tensor_values(name: &str, element_count: u64) -> Vec<f32> {
+pub(crate) fn tensor_values(name: &str, element_count: u64) -> Vec<f32> {
     let mut hash: u64 = 0xCBF2_9CE4_8422_2325;
     for byte in name.bytes() {
         hash ^= u64::from(byte);

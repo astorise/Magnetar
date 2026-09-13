@@ -207,7 +207,11 @@ fn production_generation_request_forwards_parameters_and_stop_conditions_on_real
         )
         .expect("non-greedy sampling parameters reach real CUDA dispatch");
     assert!(
-        !non_greedy_outcome.result.output.generated_token_ids.is_empty(),
+        !non_greedy_outcome
+            .result
+            .output
+            .generated_token_ids
+            .is_empty(),
         "non-greedy production generation on real CUDA hardware produced at least one token"
     );
 
@@ -380,9 +384,7 @@ fn production_generation_request_streaming_matches_non_streaming_on_real_cuda_ha
     let reconstructed_text: String = events
         .iter()
         .filter_map(|event| match event {
-            magnetar_runtime::GenerationStreamEvent::Token { text_delta, .. } => {
-                text_delta.clone()
-            }
+            magnetar_runtime::GenerationStreamEvent::Token { text_delta, .. } => text_delta.clone(),
             magnetar_runtime::GenerationStreamEvent::Finished { .. } => None,
         })
         .collect();

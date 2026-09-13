@@ -19,3 +19,6 @@
 [submodule "loaders/huggingface"]
 	path = loaders/huggingface
 	url = https://github.com/astorise/Magnetar-loader-HuggingFace.git
+[submodule "loaders/gguf"]
+	path = loaders/gguf
+	url = https://github.com/astorise/Magnetar-loader-GGUF.git

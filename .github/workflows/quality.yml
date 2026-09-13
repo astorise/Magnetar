@@ -417,6 +417,7 @@ jobs:
             providers/cpu/Cargo.toml \
             providers/cuda/Cargo.toml \
             loaders/huggingface/Cargo.toml \
+            loaders/gguf/Cargo.toml \
             integration-tests/production-loading/Cargo.toml
           do
             echo "::group::$manifest"
@@ -465,8 +466,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if grep -rlE 'fixture_model_manifest|"qwen-test"' loaders/huggingface/src/; then
-            echo "::error::loaders/huggingface (the production ingestor) must never reference fixture_model_manifest or the literal qwen-test model reference"
+          if grep -rlE 'fixture_model_manifest|"qwen-test"' loaders/huggingface/src/ loaders/gguf/src/; then
+            echo "::error::a production ingestor (loaders/huggingface, loaders/gguf) must never reference fixture_model_manifest or the literal qwen-test model reference"
             exit 1
           fi
           local_file_fn="$(awk '/^fn cmd_model_load_local_file/,/^}/' magnetar-cli/src/commands.rs)"
