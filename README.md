@@ -280,13 +280,40 @@ hardware:
   not a working incremental-decode primitive for a real production
   tokenizer today -- a real, separate gap for a future `loaders/huggingface`
   change, not fixed here
+- A real, external, pinned GGUF file ingestor (`loaders/gguf`), for
+  `general.architecture: "qwen2"` and unquantized `F32`/`F16`/`BF16`
+  tensors: real architecture-config extraction from GGUF key-value
+  metadata, tensor renaming into the same canonical names
+  `loaders/huggingface` produces, the same projection-weight transpose and
+  tied-`lm_head` derivation `loaders/huggingface` implements for the
+  equivalent Safetensors case, and a real byte-level-BPE tokenizer built
+  from the GGUF file's own embedded vocabulary -- verified numerically
+  identical to `loaders/huggingface`'s output for the same real weight
+  values, and against the real public `Qwen2.5-0.5B-Instruct-GGUF`
+  checkpoint (`wire-gguf-into-model-loading`)
+- Real dequantization of GGUF's `Q8_0`/`Q4_K`/`Q5_K` block-quantized
+  tensors to `F32` at Model Loading time (ported bit-for-bit from
+  `ggml-org/llama.cpp`'s real dequantization source, including the
+  historically error-prone K-quant sub-block scale/min packing), exactly
+  mirroring how `F16`/`BF16` storage is already converted explicitly --
+  **not yet reachable from a real quantized GGUF file**, though: see the
+  next bullet (`support-gguf-quantized-tensor-dequantization`)
 
 Explicitly not yet supported by this profile:
 
+- **A real quantized GGUF checkpoint cannot be loaded end to end yet**,
+  even though Model Loading can now dequantize `Q8_0`/`Q4_K`/`Q5_K` (see
+  above): `loaders/gguf`'s projection-weight transpose operates on raw
+  bytes assuming a flat per-element byte width, which would silently
+  corrupt a block-quantized tensor's structure if applied directly --
+  correctly sequencing dequantize-then-transpose inside the loader is a
+  real, identified, not-yet-implemented follow-up, not silently broken or
+  silently ignored. GPTQ/AWQ/BitsAndBytes (Hugging Face/Safetensors-shaped
+  quantization schemes, unrelated to GGUF's block format) remain entirely
+  unaddressed
 - `F16`/`BF16` weight storage is decoded and converted to `F32` at Model
   Loading time, but native CUDA `F16`/`BF16` compute kernels do not exist yet
-- GGUF, quantized (`Q4_K`/`Q5_K`/`Q8_0`/GPTQ/AWQ/BitsAndBytes) execution, LoRA
-  adapters, and non-Qwen architecture families
+- LoRA adapters and non-Qwen architecture families
 - Remote model hub download, OCI distribution, and credential/retry handling
 - Wiring `magnetar-cli` to run generation against a production-loaded
   instance at all: `magnetar model load --file` proves real ingestion and
@@ -350,11 +377,17 @@ result rather than incremental streaming events.
 `expose-production-generation-parameters` closed the first and
 `stream-production-generation-events` closed the second (see "Qwen
 production loading" above) -- both P1s from that follow-up review are now
-closed. Everything the original charter frames as future work remains
-exactly that: multi-device execution, quantization support, wiring
-`formats/gguf` into Model Loading, native CUDA `F16`/`BF16` compute, and
-additional Providers (Metal/ROCm/NPU/TPU) or Model Components
-(Llama/Mistral/Gemma).
+closed. Of the original charter's future-work items, two have since
+started: `wire-gguf-into-model-loading` wired `formats/gguf` into Model
+Loading for real (unquantized checkpoints, see above), and
+`support-gguf-quantized-tensor-dequantization` made GGUF's `Q8_0`/`Q4_K`/
+`Q5_K` quantization real at the Model Loading layer specifically -- a real
+quantized GGUF file cannot be loaded end to end yet (see above), so
+quantization support remains genuinely partial, not closed. Everything
+else the original charter frames as future work remains exactly that:
+multi-device execution, GPTQ/AWQ/BitsAndBytes quantization, native CUDA
+`F16`/`BF16` compute, and additional Providers (Metal/ROCm/NPU/TPU) or
+Model Components (Llama/Mistral/Gemma).
 
 ## Terminology
 

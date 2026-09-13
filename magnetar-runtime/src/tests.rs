@@ -11087,7 +11087,13 @@ fn materialize_model_instance_weights_rejects_shape_mismatch() {
 /// `materialize_model_instance_weights_accepts_f16_and_bf16_declared_dtype`.
 #[test]
 fn materialize_model_instance_weights_rejects_quantized_declared_dtype() {
-    let manifest = manifest_with_one_tensor(vec![2, 2], ModelDType::Q8);
+    // I8 (not F32/F16/BF16/Q8_0/Q4_K/Q5_K) stays genuinely unsupported --
+    // Q8_0/Q4_K/Q5_K moved to their own dedicated dequantization coverage
+    // once `support-gguf-quantized-tensor-dequantization` added real support for
+    // them (a declared Q8_0/Q4_K/Q5_K tensor backed by already-dequantized
+    // F32 content, exactly like F16/BF16 already worked, is now valid,
+    // not a mismatch).
+    let manifest = manifest_with_one_tensor(vec![2, 2], ModelDType::I8);
     let mut coordinator = ModelLoadingCoordinator::new();
     coordinator.register_architecture(ModelArchitectureImplementation {
         architecture: manifest.architecture.clone(),
@@ -11181,6 +11187,65 @@ fn materialize_model_instance_weights_accepts_matching_shape_and_dtype() {
         runtime.model_instance(&instance).unwrap().lifecycle(),
         ModelInstanceLifecycleState::Ready
     );
+}
+
+/// `support-gguf-quantized-tensor-dequantization`: a manifest declaring a quantized
+/// storage dtype (`Q8_0`/`Q4_K`/`Q5_K`) backed by already-dequantized F32
+/// content -- exactly the shape `host_tensors_from_artifact_bytes`
+/// produces for a real quantized GGUF tensor -- materializes successfully
+/// through the same shape/dtype whitelist `materialize_model_instance_
+/// weights_rejects_quantized_declared_dtype` proves still rejects a
+/// genuinely unsupported dtype, mirroring F16/BF16's own already-working
+/// "declared non-F32, content already F32" acceptance.
+#[test]
+fn materialize_model_instance_weights_accepts_dequantized_content_for_a_quantized_declared_dtype() {
+    for quantized_dtype in [ModelDType::Q8, ModelDType::Q4K, ModelDType::Q5K] {
+        let manifest = manifest_with_one_tensor(vec![2, 2], quantized_dtype);
+        let mut coordinator = ModelLoadingCoordinator::new();
+        coordinator.register_architecture(ModelArchitectureImplementation {
+            architecture: manifest.architecture.clone(),
+            kind: ModelArchitectureImplementationKind::TestFixture,
+            required_capabilities: Vec::new(),
+        });
+        let mut runtime = Runtime::builder()
+            .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+            .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+            .build()
+            .unwrap();
+        let core =
+            ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+        let loaded = load_model(
+            &mut coordinator,
+            &mut runtime,
+            ModelLoadingApiRequest::new(core),
+            &manifest,
+        )
+        .unwrap();
+        let instance = runtime
+            .create_model_instance(
+                &loaded,
+                ModelArchitectureImplementation {
+                    architecture: manifest.architecture.clone(),
+                    kind: ModelArchitectureImplementationKind::TestFixture,
+                    required_capabilities: Vec::new(),
+                },
+                ResourceAffinity::new(FallbackClass::Transparent),
+            )
+            .unwrap();
+
+        let dequantized_weights = BTreeMap::from([(
+            "the-only-tensor".to_string(),
+            HostTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+        )]);
+        materialize_model_instance_weights(&mut runtime, &instance, "test", &dequantized_weights)
+            .unwrap_or_else(|error| {
+                panic!("{quantized_dtype:?} declared dtype with dequantized F32 content must materialize, got: {error}")
+            });
+        assert_eq!(
+            runtime.model_instance(&instance).unwrap().lifecycle(),
+            ModelInstanceLifecycleState::Ready
+        );
+    }
 }
 
 /// `implement-production-qwen-model-loading` task 5.4: an F16/BF16 storage
@@ -21833,10 +21898,14 @@ fn host_tensors_from_artifact_bytes_honors_nonzero_data_section_start() {
 #[test]
 fn host_tensors_from_artifact_bytes_rejects_unsupported_dtype() {
     let (mut metadata, bytes) = artifact_bytes_test_tensor("weight.a", vec![1], &[1.0]);
-    metadata.storage_dtype = ModelDType::Q8;
+    // I8 (not F32/F16/BF16/Q8_0/Q4_K/Q5_K) stays genuinely unsupported --
+    // Q8_0/Q4_K/Q5_K moved to their own dedicated dequantization tests
+    // once `support-gguf-quantized-tensor-dequantization` added real support for
+    // them (they no longer belong in this "still rejected" test).
+    metadata.storage_dtype = ModelDType::I8;
 
     let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
-        .expect_err("a quantized/unsupported dtype must be rejected");
+        .expect_err("an unsupported dtype must be rejected");
     assert_eq!(error.code, ModelLoadingErrorCode::StorageDTypeUnsupported);
 }
 
@@ -21929,6 +21998,124 @@ fn host_tensors_from_artifact_bytes_converts_bf16_storage_to_f32() {
         .expect("BF16 tensor materializes");
     let tensor = weights.get("weight.a").expect("tensor present");
     assert_eq!(tensor.data, vec![1.0, -2.0]);
+}
+
+fn quantized_tensor_metadata(
+    name: &str,
+    dtype: ModelDType,
+    element_count: u64,
+    byte_len: usize,
+) -> ModelTensorMetadata {
+    ModelTensorMetadata {
+        name: name.to_string(),
+        shape: vec![element_count],
+        storage_dtype: dtype,
+        layout: None,
+        shard: None,
+        offset_bytes: Some(0),
+        size_bytes: Some(byte_len as u64),
+        quantization: None,
+        expected_compute_dtype: None,
+        digest: None,
+    }
+}
+
+/// GGUF `block_q8_0` (`ggml-quants.c`'s `dequantize_row_q8_0`, verified
+/// against real upstream source, not recalled from memory --
+/// `support-gguf-quantized-tensor-dequantization` design.md): `value[i] = d * qs[i]`,
+/// `d` the block's `f16` scale, `qs[i]` a signed `int8` taken as-is.
+#[test]
+fn host_tensors_from_artifact_bytes_dequantizes_q8_0() {
+    let mut block = Vec::with_capacity(34);
+    block.extend_from_slice(&0x4000u16.to_le_bytes()); // d = 2.0 (f16)
+    let qs: Vec<i8> = (-16..16).collect(); // 32 values, -16..=15
+    block.extend(qs.iter().map(|&value| value as u8));
+    assert_eq!(block.len(), 34);
+
+    let metadata = quantized_tensor_metadata("weight.a", ModelDType::Q8, 32, block.len());
+    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &block, 0)
+        .expect("Q8_0 tensor materializes");
+    let expected: Vec<f32> = qs.iter().map(|&value| 2.0 * f32::from(value)).collect();
+    assert_eq!(weights.get("weight.a").unwrap().data, expected);
+}
+
+/// GGUF `block_q4_K` (`ggml-quants.c`'s `dequantize_row_q4_K`, verified
+/// against real upstream source): exercises both branches of the shared
+/// 12-byte 6-bit scale/min packing (`get_scale_min_k4`, sub-blocks 0-3
+/// read directly, sub-blocks 4-7 split across two bytes -- the detail
+/// most reimplementations get wrong) and the low/high-nibble-across-two-
+/// sub-blocks-per-64-chunk interleaving.
+#[test]
+fn host_tensors_from_artifact_bytes_dequantizes_q4_k() {
+    let mut block = Vec::with_capacity(144);
+    block.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+    block.extend_from_slice(&0x3C00u16.to_le_bytes()); // dmin = 1.0
+    // scales[12]: sub-block 0 -> (d=1, m=0); sub-block 1 -> (d=2, m=3);
+    // sub-block 4 -> (d=5, m=2) via the split-byte branch; sub-block 5 ->
+    // (d=7, m=3) likewise; sub-blocks 2/3/6/7 left at (0, 0).
+    let scales: [u8; 12] = [1, 2, 0, 0, 0, 3, 0, 0, 0x25, 0x37, 0, 0];
+    block.extend_from_slice(&scales);
+    // qs[128]: bytes 0..32 -> sub-blocks 0/1 (elements 0..64); bytes
+    // 32..64 -> sub-blocks 2/3 (elements 64..128, scale 0 either way);
+    // bytes 64..96 -> sub-blocks 4/5 (elements 128..192); bytes 96..128
+    // -> sub-blocks 6/7 (elements 192..256, scale 0 either way).
+    block.extend(std::iter::repeat_n(0x21u8, 32)); // low nibble 1, high nibble 2
+    block.extend(std::iter::repeat_n(0x00u8, 32));
+    block.extend(std::iter::repeat_n(0x21u8, 32));
+    block.extend(std::iter::repeat_n(0x00u8, 32));
+    assert_eq!(block.len(), 144);
+
+    let metadata = quantized_tensor_metadata("weight.a", ModelDType::Q4K, 256, block.len());
+    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &block, 0)
+        .expect("Q4_K tensor materializes");
+    let mut expected = Vec::with_capacity(256);
+    // Each element's value is d_sb * nibble_value - m_sb, where d_sb =
+    // block_d * sub_scale and m_sb = block_dmin * sub_min (block_d =
+    // block_dmin = 1.0 here) -- not d_sb - m_sb alone; the nibble value
+    // (1 for a 0x21 byte's low nibble, 2 for its high nibble) is a real
+    // factor, easy to drop by mistake when hand-computing this.
+    expected.extend(std::iter::repeat_n(1.0f32 * 1.0 - 0.0, 32)); // sub-block 0: d_sb=1*1=1, nibble=1, m_sb=1*0=0 -> 1*1-0
+    expected.extend(std::iter::repeat_n(2.0f32 * 2.0 - 3.0, 32)); // sub-block 1: d_sb=1*2=2, nibble=2, m_sb=1*3=3 -> 2*2-3
+    expected.extend(std::iter::repeat_n(0.0f32, 64)); // sub-blocks 2/3: scale/min 0
+    expected.extend(std::iter::repeat_n(5.0f32 * 1.0 - 2.0, 32)); // sub-block 4: d_sb=1*5=5, nibble=1, m_sb=1*2=2 -> 5*1-2
+    expected.extend(std::iter::repeat_n(7.0f32 * 2.0 - 3.0, 32)); // sub-block 5: d_sb=1*7=7, nibble=2, m_sb=1*3=3 -> 7*2-3
+    expected.extend(std::iter::repeat_n(0.0f32, 64)); // sub-blocks 6/7: scale/min 0
+    assert_eq!(weights.get("weight.a").unwrap().data, expected);
+}
+
+/// GGUF `block_q5_K` (`ggml-quants.c`'s `dequantize_row_q5_K`): shares
+/// `block_q4_K`'s scale/min packing (already exercised above) -- this
+/// test isolates the one thing unique to Q5_K, the `qh` high-bit plane
+/// reconstructing a 5-bit value (`q5 = (ql & 0xF) | (qh & bit ? 16 : 0)`).
+#[test]
+fn host_tensors_from_artifact_bytes_dequantizes_q5_k() {
+    let mut block = Vec::with_capacity(176);
+    block.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+    block.extend_from_slice(&0x3C00u16.to_le_bytes()); // dmin = 1.0
+    // Only sub-block 0 carries a nonzero scale (d=1, m=0); every other
+    // sub-block's scale/min stays 0, so its elements are 0 regardless of
+    // ql/qh content.
+    let scales: [u8; 12] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    block.extend_from_slice(&scales);
+    // qh[32]: only element 0's high bit is set (bit 0, matching u1=1 for
+    // the first 64-chunk's first sub-block).
+    let mut qh = [0u8; 32];
+    qh[0] = 0x01;
+    block.extend_from_slice(&qh);
+    // qs[128]: only element 0's low nibble is 1; every other low nibble
+    // (and every high nibble, which belongs to sub-block 1, scale 0) is 0.
+    let mut qs = [0u8; 128];
+    qs[0] = 0x01;
+    block.extend_from_slice(&qs);
+    assert_eq!(block.len(), 176);
+
+    let metadata = quantized_tensor_metadata("weight.a", ModelDType::Q5K, 256, block.len());
+    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &block, 0)
+        .expect("Q5_K tensor materializes");
+    let mut expected = vec![0.0f32; 256];
+    // element 0: q5 = (1 & 0xF) | 16 = 17 -> 1.0 * 17 - 0.0 = 17.0
+    expected[0] = 17.0;
+    assert_eq!(weights.get("weight.a").unwrap().data, expected);
 }
 
 /// Decision 8: a declared tensor digest is verified against the *original*

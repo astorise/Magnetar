@@ -6642,13 +6642,14 @@ impl WeightMaterializationTransaction {
         tensor: &HostTensor,
     ) -> Result<(), InferenceApiError> {
         // Shape/dtype agreement precedes even the content digest check:
-        // a tensor the artifact declares quantized has no digest (digests
-        // are F32/F16/BF16-only, mirroring `host_tensors_from_artifact_
-        // bytes`'s own materialization limit), so without this check a
-        // caller could fabricate F32 content under a quantized tensor's
-        // name and have nothing reject it. This applies to every tensor
-        // with a declared shape, independent of whether that tensor also
-        // has a declared digest -- the two checks guard different things
+        // a declared storage dtype this Runtime cannot materialize at all
+        // (anything outside F32/F16/BF16/Q8_0/Q4_K/Q5_K) has no digest
+        // check reachable here regardless of what bytes a caller supplies
+        // under its name, so without this check a caller could fabricate
+        // F32 content under such a tensor's name and have nothing reject
+        // it. This applies to every tensor with a declared shape,
+        // independent of whether that tensor also has a declared digest
+        // -- the two checks guard different things
         // (`seal-runtime-model-trust-and-provenance-authority`).
         let declared_storage_dtype = runtime
             .model_instance(instance)
@@ -6661,7 +6662,12 @@ impl WeightMaterializationTransaction {
             && (tensor.shape != expected_shape
                 || !matches!(
                     expected_dtype,
-                    ModelDType::F32 | ModelDType::F16 | ModelDType::Bf16
+                    ModelDType::F32
+                        | ModelDType::F16
+                        | ModelDType::Bf16
+                        | ModelDType::Q8
+                        | ModelDType::Q4K
+                        | ModelDType::Q5K
                 ))
         {
             return Err(InferenceApiError::WeightShapeOrDtypeMismatch {

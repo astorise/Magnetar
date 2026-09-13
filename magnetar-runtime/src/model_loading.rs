@@ -976,21 +976,29 @@ impl ModelLoadingCoordinator {
 /// converted to `F32` (`implement-production-qwen-model-loading` Decision
 /// 8 -- storage dtype and compute dtype remain distinct, and any
 /// conversion is explicit here, never inferred from a source annotation
-/// such as `torch_dtype`). A tensor declaring any other storage dtype
-/// (quantized formats, integer types) is rejected with
+/// such as `torch_dtype`). `ModelDType::Q8`/`Q4K`/`Q5K` (GGUF's
+/// `block_q8_0`/`block_q4_K`/`block_q5_K` block quantization) are likewise
+/// dequantized to `F32` here, ported bit-for-bit from `ggml-org/llama.cpp`'s
+/// real `ggml-quants.c` (`support-gguf-quantized-tensor-dequantization` design.md) --
+/// this is dequantization-at-load, not quantized compute: every kernel
+/// downstream still only ever sees `F32` `HostTensor` content, exactly as
+/// for F16/BF16 today, real quantized compute kernels remaining a
+/// separate, not-yet-implemented chantier. A tensor declaring any other
+/// storage dtype (GPTQ/AWQ/BitsAndBytes, integer types) is rejected with
 /// `StorageDTypeUnsupported` rather than reinterpreting its bytes.
 ///
-/// For an `F16`/`Bf16` tensor whose metadata declares a content digest,
-/// that digest is verified against the *original* storage bytes before
-/// conversion, not against the converted `F32` representation (Decision
-/// 8's "tensor content integrity is verified against the original storage
-/// bytes before conversion") -- a digest computed over 2-byte source
-/// elements could never match a 4-byte converted representation, so
-/// checking anywhere else would be structurally wrong, not merely
-/// stricter. `F32` tensors keep their existing digest-check location
-/// (`InferenceApiError::WeightContentDigestMismatch`, checked once the
-/// `HostTensor` is bound) unchanged, since for `F32` storage the in-memory
-/// bytes and the original storage bytes are identical either way.
+/// For an `F16`/`Bf16`/`Q8`/`Q4K`/`Q5K` tensor whose metadata declares a
+/// content digest, that digest is verified against the *original* storage
+/// bytes before conversion, not against the converted `F32` representation
+/// (Decision 8's "tensor content integrity is verified against the
+/// original storage bytes before conversion") -- a digest computed over
+/// the source storage representation could never match the converted `F32`
+/// representation's different byte count, so checking anywhere else would
+/// be structurally wrong, not merely stricter. `F32` tensors keep their
+/// existing digest-check location (`InferenceApiError::WeightContentDigestMismatch`,
+/// checked once the `HostTensor` is bound) unchanged, since for `F32`
+/// storage the in-memory bytes and the original storage bytes are
+/// identical either way.
 pub fn host_tensors_from_artifact_bytes(
     tensors: &[ModelTensorMetadata],
     bytes: &[u8],
@@ -1005,26 +1013,185 @@ pub fn host_tensors_from_artifact_bytes(
     Ok(weights)
 }
 
-/// The byte-count-per-element this Runtime materializes for a declared
-/// storage dtype, or a structured error for any other dtype (quantized
-/// formats, integer types) -- shared by both the whole-buffer
+/// GGUF `block_q8_0`: 32 elements, 34 bytes (`ggml_half d` then 32
+/// signed `int8` quants), no padding. Verified against `ggml-org/llama.cpp`'s
+/// real `ggml-common.h`/`ggml-quants.c` (`support-gguf-quantized-tensor-dequantization`
+/// design.md), not recalled from memory alone.
+const Q8_0_BLOCK_ELEMENTS: u64 = 32;
+const Q8_0_BLOCK_BYTES: u64 = 34;
+/// GGUF K-quant super-block element count (`QK_K` upstream): 8 sub-blocks
+/// of 32 elements each, shared by `block_q4_K` and `block_q5_K`.
+const QK_BLOCK_ELEMENTS: u64 = 256;
+/// `block_q4_K`: `2 (d) + 2 (dmin) + 12 (scales) + 128 (qs) = 144` bytes.
+const Q4_K_BLOCK_BYTES: u64 = 144;
+/// `block_q5_K`: `2 (d) + 2 (dmin) + 12 (scales) + 32 (qh) + 128 (qs) = 176` bytes.
+const Q5_K_BLOCK_BYTES: u64 = 176;
+/// Both K-quant formats' shared 12-byte packed 6-bit scale/min encoding.
+const K_SCALE_SIZE: usize = 12;
+
+/// The total byte count this Runtime expects for `element_count` elements
+/// of a declared storage dtype, or a structured error for any other dtype
+/// (integer types) -- shared by both the whole-buffer
 /// ([`host_tensors_from_artifact_bytes`]) and streaming
 /// ([`stream_materialize_model_instance_weights`] in `first_native_runtime`)
-/// materialization paths.
-fn bytes_per_element(tensor: &ModelTensorMetadata) -> Result<u64, ModelLoadingError> {
+/// materialization paths. Not a flat "bytes per element" for the
+/// block-quantized formats (`Q8_0`/`Q4_K`/`Q5_K`): each ggml block covers a
+/// fixed element count at a fixed byte size, so `element_count` must divide
+/// evenly by that block's element count.
+fn expected_storage_bytes(
+    element_count: u64,
+    tensor: &ModelTensorMetadata,
+) -> Result<u64, ModelLoadingError> {
+    let overflow = || {
+        ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!("tensor '{}' byte-size computation overflowed", tensor.name),
+        )
+    };
+    let block_based = |block_elements: u64, block_bytes: u64, format_name: &str| {
+        if !element_count.is_multiple_of(block_elements) {
+            return Err(ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!(
+                    "tensor '{}' element count {element_count} is not a multiple of \
+                     {format_name}'s block size {block_elements}",
+                    tensor.name
+                ),
+            ));
+        }
+        (element_count / block_elements)
+            .checked_mul(block_bytes)
+            .ok_or_else(overflow)
+    };
     match tensor.storage_dtype {
-        ModelDType::F32 => Ok(4),
-        ModelDType::F16 | ModelDType::Bf16 => Ok(2),
+        ModelDType::F32 => element_count.checked_mul(4).ok_or_else(overflow),
+        ModelDType::F16 | ModelDType::Bf16 => element_count.checked_mul(2).ok_or_else(overflow),
+        ModelDType::Q8 => block_based(Q8_0_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, "Q8_0"),
+        ModelDType::Q4K => block_based(QK_BLOCK_ELEMENTS, Q4_K_BLOCK_BYTES, "Q4_K"),
+        ModelDType::Q5K => block_based(QK_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, "Q5_K"),
         other => Err(ModelLoadingError::new(
             ModelLoadingErrorCode::StorageDTypeUnsupported,
             Some(ModelLoadingPhase::MaterializeWeights),
             format!(
-                "tensor '{}' declares unsupported storage dtype {other:?} (only F32, F16, and \
-                 BF16 are supported)",
+                "tensor '{}' declares unsupported storage dtype {other:?} (only F32, F16, BF16, \
+                 Q8_0, Q4_K, and Q5_K are supported)",
                 tensor.name
             ),
         )),
     }
+}
+
+/// Unpacks one K-quant sub-block's 6-bit scale and 6-bit min from the
+/// shared 12-byte packed `scales` field (`block_q4_K`/`block_q5_K` both use
+/// this exact encoding) -- `j` is the sub-block index (0..7). Ports
+/// `ggml-quants.c`'s `get_scale_min_k4` bit-for-bit: sub-blocks 0-3 read
+/// their 6 bits directly from `scales[j]`/`scales[j+4]`; sub-blocks 4-7
+/// split across a low nibble in `scales[j+4]` and the top 2 bits of
+/// `scales[j-4]`/`scales[j]` respectively. This packing is the detail most
+/// reimplementations get wrong -- verified against the real upstream
+/// source directly, not recalled from memory (design.md).
+fn get_scale_min_k4(j: usize, scales: &[u8; K_SCALE_SIZE]) -> (u8, u8) {
+    if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        (
+            (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4),
+            (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4),
+        )
+    }
+}
+
+/// Dequantizes one `block_q8_0` region (`raw.len()` a multiple of 34
+/// bytes) into `f32` values: `value[i] = d * qs[i]`, `d` the block's `f16`
+/// scale, `qs[i]` a signed `int8` quant taken as-is (`ggml-quants.c`'s
+/// `dequantize_row_q8_0`).
+fn dequantize_q8_0(raw: &[u8]) -> Vec<f32> {
+    raw.as_chunks::<{ Q8_0_BLOCK_BYTES as usize }>()
+        .0
+        .iter()
+        .flat_map(|block| {
+            let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            block[2..].iter().map(move |&q| d * f32::from(q as i8))
+        })
+        .collect()
+}
+
+/// Dequantizes one `block_q4_K` region (`raw.len()` a multiple of 144
+/// bytes) into `f32` values, porting `ggml-quants.c`'s
+/// `dequantize_row_q4_K` bit-for-bit. Each 256-element super-block has 8
+/// sub-blocks of 32 elements; for sub-block `sb`, `d_sb = d * scale6[sb]`
+/// and `m_sb = dmin * min6[sb]`, and `value[i] = d_sb * q4[i] - m_sb` where
+/// `q4[i]` is the raw unsigned 4-bit nibble (0-15). The 128-byte `qs`
+/// array is walked in 32-byte strides shared by *two* sub-blocks per
+/// stride: that stride's low nibbles form the first sub-block, its high
+/// nibbles form the second -- not two independent contiguous halves.
+fn dequantize_q4_k(raw: &[u8]) -> Vec<f32> {
+    let mut out =
+        Vec::with_capacity(raw.len() / Q4_K_BLOCK_BYTES as usize * QK_BLOCK_ELEMENTS as usize);
+    for block in raw.as_chunks::<{ Q4_K_BLOCK_BYTES as usize }>().0 {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales: [u8; K_SCALE_SIZE] = block[4..4 + K_SCALE_SIZE].try_into().unwrap();
+        let qs = &block[4 + K_SCALE_SIZE..4 + K_SCALE_SIZE + 128];
+
+        let mut is = 0usize;
+        for chunk_start in (0..QK_BLOCK_ELEMENTS as usize).step_by(64) {
+            let (sc1, m1) = get_scale_min_k4(is, &scales);
+            let (d1, min1) = (d * f32::from(sc1), dmin * f32::from(m1));
+            let (sc2, m2) = get_scale_min_k4(is + 1, &scales);
+            let (d2, min2) = (d * f32::from(sc2), dmin * f32::from(m2));
+            let q = &qs[chunk_start / 2..chunk_start / 2 + 32];
+            out.extend(q.iter().map(|&byte| d1 * f32::from(byte & 0xF) - min1));
+            out.extend(q.iter().map(|&byte| d2 * f32::from(byte >> 4) - min2));
+            is += 2;
+        }
+    }
+    out
+}
+
+/// Dequantizes one `block_q5_K` region (`raw.len()` a multiple of 176
+/// bytes) into `f32` values, porting `ggml-quants.c`'s
+/// `dequantize_row_q5_K` bit-for-bit. Identical sub-block scale/min
+/// structure to [`dequantize_q4_k`], plus a 32-byte `qh` high-bit plane
+/// (fixed across the whole 256-element super-block, never advanced per
+/// 64-chunk) reconstructing a 5-bit value: `q5[i] = (ql[i] & 0xF) | (qh[i]
+/// & bit ? 16 : 0)`, `value[i] = d_sb * q5[i] - m_sb`. The selected `qh`
+/// bit-pair rotates `(1,2) -> (4,8) -> (16,32) -> (64,128)` across the four
+/// 64-element chunks.
+fn dequantize_q5_k(raw: &[u8]) -> Vec<f32> {
+    let mut out =
+        Vec::with_capacity(raw.len() / Q5_K_BLOCK_BYTES as usize * QK_BLOCK_ELEMENTS as usize);
+    for block in raw.as_chunks::<{ Q5_K_BLOCK_BYTES as usize }>().0 {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales: [u8; K_SCALE_SIZE] = block[4..4 + K_SCALE_SIZE].try_into().unwrap();
+        let qh = &block[4 + K_SCALE_SIZE..4 + K_SCALE_SIZE + 32];
+        let qs = &block[4 + K_SCALE_SIZE + 32..4 + K_SCALE_SIZE + 32 + 128];
+
+        let mut is = 0usize;
+        let (mut u1, mut u2) = (1u8, 2u8);
+        for chunk_start in (0..QK_BLOCK_ELEMENTS as usize).step_by(64) {
+            let (sc1, m1) = get_scale_min_k4(is, &scales);
+            let (d1, min1) = (d * f32::from(sc1), dmin * f32::from(m1));
+            let (sc2, m2) = get_scale_min_k4(is + 1, &scales);
+            let (d2, min2) = (d * f32::from(sc2), dmin * f32::from(m2));
+            let ql = &qs[chunk_start / 2..chunk_start / 2 + 32];
+            out.extend(ql.iter().zip(qh).map(|(&byte, &high)| {
+                let value = (byte & 0xF) | if high & u1 != 0 { 16 } else { 0 };
+                d1 * f32::from(value) - min1
+            }));
+            out.extend(ql.iter().zip(qh).map(|(&byte, &high)| {
+                let value = (byte >> 4) | if high & u2 != 0 { 16 } else { 0 };
+                d2 * f32::from(value) - min2
+            }));
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    out
 }
 
 /// Locates and slices `tensor`'s declared byte range out of `bytes` (a
@@ -1053,15 +1220,7 @@ fn slice_tensor_bytes<'a>(
                 ),
             )
         })?;
-    let expected_size = element_count
-        .checked_mul(bytes_per_element(tensor)?)
-        .ok_or_else(|| {
-            ModelLoadingError::new(
-                ModelLoadingErrorCode::MaterializationFailed,
-                Some(ModelLoadingPhase::MaterializeWeights),
-                format!("tensor '{}' byte-size computation overflowed", tensor.name),
-            )
-        })?;
+    let expected_size = expected_storage_bytes(element_count, tensor)?;
     let (offset, declared_size) = match (tensor.offset_bytes, tensor.size_bytes) {
         (Some(offset), Some(size)) => (offset, size),
         _ => {
@@ -1153,15 +1312,7 @@ fn tensor_from_raw_bytes(
                 ),
             )
         })?;
-    let expected_size = element_count
-        .checked_mul(bytes_per_element(tensor)?)
-        .ok_or_else(|| {
-            ModelLoadingError::new(
-                ModelLoadingErrorCode::MaterializationFailed,
-                Some(ModelLoadingPhase::MaterializeWeights),
-                format!("tensor '{}' byte-size computation overflowed", tensor.name),
-            )
-        })?;
+    let expected_size = expected_storage_bytes(element_count, tensor)?;
     let actual_size = raw.len() as u64;
     if actual_size != expected_size {
         return Err(ModelLoadingError::new(
@@ -1206,6 +1357,9 @@ fn tensor_from_raw_bytes(
             .iter()
             .map(|chunk| bf16_to_f32(u16::from_le_bytes(*chunk)))
             .collect(),
+        ModelDType::Q8 => dequantize_q8_0(raw),
+        ModelDType::Q4K => dequantize_q4_k(raw),
+        ModelDType::Q5K => dequantize_q5_k(raw),
         other => {
             return Err(ModelLoadingError::new(
                 ModelLoadingErrorCode::StorageDTypeUnsupported,
