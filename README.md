@@ -313,22 +313,29 @@ hardware:
   `add`/`mul`: genuine 2-byte device-resident half-precision buffers, not
   `f32` promoted and labeled, computed via a real on-device kernel and
   verified against an exact reference conversion model (not a tolerance
-  band) on real RTX 3070 Ti hardware
-  (`add-native-cuda-half-precision-compute`,
-  `enable-native-cuda-half-precision-elementwise-compute`). Not yet
-  reachable from any production graph -- it is a directly-callable Provider
-  primitive, not yet advertised through the Kernel Registry, and not yet
-  extended beyond `add`/`mul` to `matmul`/`rmsnorm`/`rope`/`attention`
+  band) on real RTX 3070 Ti hardware. Selectable and dispatchable through
+  the same Kernel Registry/dispatch contract every other Kernel uses -- a
+  `Float16`/`BrainFloat16` `KernelSelectionRequest` selects it in
+  preference to the `f32`-only `add`/`mul`, not merely a directly-callable
+  Provider primitive anymore (`add-native-cuda-half-precision-compute`,
+  `enable-native-cuda-half-precision-elementwise-compute`,
+  `wire-cuda-half-precision-into-kernel-registry-dispatch`). Still not
+  reachable from any production graph -- nothing requests `Float16`/
+  `BrainFloat16` compute for a real generation step -- a half-precision
+  resource is not device-resident between separate Kernel invocations the
+  way `f32` resources are, and this is not extended beyond `add`/`mul` to
+  `matmul`/`rmsnorm`/`rope`/`attention`
 
 Explicitly not yet supported by this profile:
 
 - GPTQ/AWQ/BitsAndBytes quantization (see above -- distinct from and
   unaddressed by GGUF's now-real `Q8_0`/`Q4_K`/`Q5_K` support)
 - Native CUDA `F16`/`bfloat16` compute exists for elementwise `add`/`mul`
-  only (see above); `matmul`/`rmsnorm`/`rope`/`attention` still promote
+  only (see above, now genuinely dispatchable through the Kernel Registry,
+  but not device-resident between calls and not requested by any
+  production graph); `matmul`/`rmsnorm`/`rope`/`attention` still promote
   `F16`/`BF16` weight storage to `F32` at Model Loading time and compute
-  there, and nothing yet wires a compute-dtype choice into the Runtime's
-  planner
+  there
 - LoRA adapters and non-Qwen architecture families
 - Remote model hub download, OCI distribution, and credential/retry handling
 - Wiring `magnetar-cli` to run generation against a production-loaded
@@ -404,14 +411,18 @@ end (see above). GPTQ/AWQ/BitsAndBytes (a different quantization family
 entirely, unrelated to GGUF) remain unaddressed, so "quantization
 support" as the charter names it broadly is still partial, even though
 GGUF's own quantization is now real. Native CUDA `F16`/`BF16` compute has
-also begun: `add-native-cuda-half-precision-compute` landed the conversion
-primitives, and `enable-native-cuda-half-precision-elementwise-compute`
-landed a real, hardware-verified on-device `F16`/`bfloat16` `add`/`mul`
-kernel pair -- but this is a narrow first slice, not the charter's full
-"native CUDA F16/BF16 compute" item: `matmul`/`rmsnorm`/`rope`/`attention`
-still compute in `F32` only, and nothing yet wires a compute-dtype choice
-into the Runtime's planner, so this capability is not yet reachable from
-any production graph. Everything else the original charter frames as
+also progressed through three phases: `add-native-cuda-half-precision-
+compute` landed the conversion primitives,
+`enable-native-cuda-half-precision-elementwise-compute` landed a real,
+hardware-verified on-device `F16`/`bfloat16` `add`/`mul` kernel pair, and
+`wire-cuda-half-precision-into-kernel-registry-dispatch` made that pair
+selectable and dispatchable through the real Kernel Registry contract --
+but this remains a narrow slice, not the charter's full "native CUDA
+F16/BF16 compute" item: `matmul`/`rmsnorm`/`rope`/`attention` still
+compute in `F32` only, a half-precision resource does not stay
+device-resident between separate Kernel invocations the way `f32`
+resources do, and no production graph requests half-precision compute for
+any real generation step. Everything else the original charter frames as
 future work remains exactly that: multi-device execution,
 GPTQ/AWQ/BitsAndBytes quantization, and additional Providers
 (Metal/ROCm/NPU/TPU) or Model Components (Llama/Mistral/Gemma).
