@@ -16,16 +16,8 @@ use serde_json::Value;
 use std::{
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
-
-const DEFAULT_COMPONENT_BYTES: &[u8] =
-    include_bytes!("../../magnetar-runtime/fixtures/components/qwen-real.component.wasm");
-const DEFAULT_COMPONENT_MANIFEST_BYTES: &[u8] = include_bytes!(
-    "../../magnetar-runtime/fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
-);
-
-static DEFAULT_COMPONENT_REGISTERED: OnceLock<()> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InferenceComponentPlacement {
@@ -102,6 +94,41 @@ impl InferenceComponentSource {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct InferenceComponentArtifact {
+    component_bytes: Vec<u8>,
+    manifest_bytes: Vec<u8>,
+}
+
+impl InferenceComponentArtifact {
+    pub fn from_bytes(component_bytes: Vec<u8>, manifest_bytes: Vec<u8>) -> Self {
+        Self {
+            component_bytes,
+            manifest_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ArtifactTrustPolicy {
+    model_trust_store: ModelTrustStore,
+}
+
+impl ArtifactTrustPolicy {
+    pub fn trust_digest(mut self, digest: &str) -> Self {
+        self.model_trust_store = self.model_trust_store.trust_digest(digest);
+        self
+    }
+
+    fn model_trust_store(&self) -> &ModelTrustStore {
+        &self.model_trust_store
+    }
+
+    fn into_model_trust_store(self) -> ModelTrustStore {
+        self.model_trust_store
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceComponentUsage {
     pub prompt_tokens: usize,
@@ -163,11 +190,12 @@ impl fmt::Debug for LoadedInferenceComponent {
 impl LoadedInferenceComponent {
     pub fn load(
         name: &str,
+        artifact: InferenceComponentArtifact,
         source: InferenceComponentSource,
-        trust_store: ModelTrustStore,
+        trust_policy: ArtifactTrustPolicy,
         placement: InferenceComponentPlacement,
     ) -> Result<Self> {
-        register_default_component();
+        register_component_artifact(artifact);
 
         let production_source = ProductionModelSource::authorized_local_bundle(
             ModelArtifactSource::Tachyon(source.provenance.clone()),
@@ -224,7 +252,9 @@ impl LoadedInferenceComponent {
         let tokenizer_metadata = real_tokenizer.metadata().clone();
         let real_tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(real_tokenizer);
 
-        let trust_decision = trust_store.evaluate(&ingested.manifest);
+        let trust_decision = trust_policy
+            .model_trust_store()
+            .evaluate(&ingested.manifest);
         if trust_decision.status() != ModelTrustStatus::Trusted {
             bail!(
                 "Magnetar inference Component artifact trust rejected for `{name}`: {}",
@@ -244,7 +274,7 @@ impl LoadedInferenceComponent {
         let loaded_model = magnetar_runtime::ProductionQwenLoadedModel::load(
             fixture,
             ingested.payload_source.as_ref(),
-            trust_store,
+            trust_policy.into_model_trust_store(),
             provider_for_generation,
         )
         .with_context(|| {
@@ -341,13 +371,11 @@ impl LoadedInferenceComponent {
     }
 }
 
-fn register_default_component() {
-    DEFAULT_COMPONENT_REGISTERED.get_or_init(|| {
-        magnetar_runtime::register_qwen_component_artifact(
-            DEFAULT_COMPONENT_BYTES.to_vec(),
-            DEFAULT_COMPONENT_MANIFEST_BYTES.to_vec(),
-        );
-    });
+fn register_component_artifact(artifact: InferenceComponentArtifact) {
+    magnetar_runtime::register_qwen_component_artifact(
+        artifact.component_bytes,
+        artifact.manifest_bytes,
+    );
 }
 
 fn capability_advertisement(
