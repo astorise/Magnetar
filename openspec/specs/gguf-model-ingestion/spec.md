@@ -19,22 +19,6 @@ The GGUF ingestor SHALL accept only GGUF files declaring `general.architecture` 
 
 ---
 
-### Requirement: GGUF Ingestion Rejects Quantized Tensors Structurally
-
-The GGUF ingestor SHALL reject any tensor whose declared storage carries quantization metadata with a structured error naming the tensor and its quantization format, rather than accepting it for later failure during weight materialization or silently misinterpreting its bytes.
-
-#### Scenario: A quantized tensor is rejected before materialization
-
-- **WHEN** a GGUF file declares a tensor with a quantized `ggml_type` (for example `Q4_K`, `Q5_K`, or `Q8_0`)
-- **THEN** ingestion returns a structured error naming that tensor and its quantization format, and no payload access for it is attempted
-
-#### Scenario: Unquantized tensors of a mixed file still ingest
-
-- **WHEN** a GGUF file's tensors are entirely unquantized (`F32`/`F16`/`BF16`)
-- **THEN** ingestion proceeds normally
-
----
-
 ### Requirement: GGUF Tensor Shape And Layout Match The Runtime's Existing Convention
 
 The GGUF ingestor SHALL normalize each tensor's shape and, where applicable, byte layout to exactly the same convention the existing Hugging Face/Safetensors ingestion path produces for the equivalent tensor, so the Runtime and Model Component require no format-specific handling.
@@ -85,4 +69,23 @@ The GGUF ingestor's tokenizer construction SHALL build a real tokenizer directly
 
 - **WHEN** a GGUF file declares the same token id for both its beginning-of-sequence and end-of-sequence special tokens
 - **THEN** tokenizer construction succeeds, registering that id under one role rather than failing on a special-token conflict
+
+### Requirement: GGUF Ingestion Dequantizes Supported Block Formats
+
+The GGUF ingestor SHALL dequantize a tensor whose declared storage uses a supported GGUF block quantization format (`Q8_0`, `Q4_K`, or `Q5_K`) to `F32` before that tensor's shape/layout normalization (including any projection-weight transpose) runs, and SHALL report that tensor's dequantized `F32` storage dtype, byte size, and absence of quantization metadata in the returned Model Artifact -- never the original quantized values. Any GGUF `ggml_type` this ingestor's underlying parser does not itself recognize continues to fail at the parser layer, before this ingestor ever sees such a tensor.
+
+#### Scenario: A supported quantized tensor dequantizes before materialization
+
+- **WHEN** a GGUF file declares a tensor with a supported quantized `ggml_type` (`Q4_K`, `Q5_K`, or `Q8_0`)
+- **THEN** the returned tensor's storage dtype is `F32`, its byte size matches its dequantized element count, it carries no quantization metadata, and reading its payload returns the real dequantized values
+
+#### Scenario: A quantized projection weight transposes correctly
+
+- **WHEN** a supported quantized tensor is also a 2D projection weight subject to this ingestor's existing projection-weight transpose
+- **THEN** dequantization completes before the transpose runs, and the transposed result matches what transposing the equivalent already-`F32` values would produce
+
+#### Scenario: Unquantized tensors of a mixed file still ingest
+
+- **WHEN** a GGUF file's tensors are entirely unquantized (`F32`/`F16`/`BF16`)
+- **THEN** ingestion proceeds normally, unaffected by dequantization support existing for other tensors
 
