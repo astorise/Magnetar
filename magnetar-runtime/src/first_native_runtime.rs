@@ -7536,6 +7536,7 @@ pub fn run_production_qwen_generation_for_provider_with_prompt(
             parameters: GenerationParameters::greedy(),
             stop_conditions: StopConditions::default(),
             max_new_tokens: None,
+            max_generation_millis: None,
         },
         chat_formatter,
         provider,
@@ -7558,6 +7559,7 @@ pub struct ProductionGenerationRequest {
     pub parameters: GenerationParameters,
     pub stop_conditions: StopConditions,
     pub max_new_tokens: Option<usize>,
+    pub max_generation_millis: Option<u64>,
 }
 
 /// [`run_production_qwen_generation_for_provider_with_prompt`],
@@ -7596,12 +7598,19 @@ pub fn run_production_qwen_generation_for_provider_with_request(
         prefill: &mut prepared.prepared_plans.prefill,
         decode: &mut prepared.prepared_plans.decode,
     };
+    let deadline_started_at = std::time::Instant::now();
+    let max_generation_duration = prepared
+        .max_generation_millis
+        .map(std::time::Duration::from_millis);
     let generation_result = run_generation_loop_with_execution_plans(
         &mut prepared.runtime,
         &prepared.generation_request,
         SamplingPolicy::default(),
         CacheUsageSummary::default(),
-        |_generated_so_far| false,
+        |_generated_so_far| {
+            max_generation_duration
+                .is_some_and(|deadline| deadline_started_at.elapsed() >= deadline)
+        },
         &mut prepared.observer,
         &mut execution_plans,
     )?;
@@ -7631,6 +7640,7 @@ struct PreparedProductionGeneration {
     generation_request: GenerationRequest,
     prepared_plans: FirstNativePreparedPlans,
     observer: InferenceApiObserver,
+    max_generation_millis: Option<u64>,
 }
 
 /// Shared setup for every production generation entry point from
@@ -7655,6 +7665,7 @@ fn prepare_production_generation(
         parameters,
         mut stop_conditions,
         max_new_tokens,
+        max_generation_millis,
     } = request;
 
     let max_tokens = max_new_tokens.unwrap_or_else(|| {
@@ -7773,6 +7784,7 @@ fn prepare_production_generation(
         generation_request,
         prepared_plans,
         observer,
+        max_generation_millis,
     })
 }
 
@@ -7824,6 +7836,311 @@ fn finish_production_generation(
         result: generation_result,
         observer,
     })
+}
+
+/// Production Qwen model state loaded once into a Magnetar [`Runtime`].
+/// Embedders with an external model registry keep this object behind their
+/// own `LoadedModel` lifecycle and create per-request sessions on top of the
+/// same ready [`ModelInstanceId`].
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub struct ProductionQwenLoadedModel {
+    fixture: E2eFixture,
+    runtime: Runtime,
+    instance: ModelInstanceId,
+    provider_binding: ProviderBinding,
+    provider_supports_multi_step_decode: bool,
+    materialization_count: usize,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+impl ProductionQwenLoadedModel {
+    pub fn load(
+        fixture: E2eFixture,
+        payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
+        trust_store: ModelTrustStore,
+        provider: Arc<dyn Provider>,
+    ) -> Result<Self, InferenceApiError> {
+        let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
+        let provider_supports_multi_step_decode = provider.supports_multi_step_decode();
+        let mut runtime = Runtime::builder()
+            .register_provider(provider.clone())
+            .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
+                fixture: fixture.clone(),
+                kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+                pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+                #[cfg(test)]
+                forced_token: None,
+            }))
+            .trust_store(trust_store)
+            .build()
+            .map_err(|error| InferenceApiError::InferenceApiUnavailable {
+                reason: error.to_string(),
+            })?;
+        register_prepared_kernels_for_provider(&mut runtime, &*provider).map_err(|error| {
+            InferenceApiError::KernelUnavailable {
+                reason: error.to_string(),
+            }
+        })?;
+        let instance = load_production_qwen_instance_for_provider(
+            &mut runtime,
+            &fixture.manifest,
+            payload_source,
+            &provider_binding,
+        )?;
+        require_ready_first_native_instance(&runtime, &instance)?;
+        Ok(Self {
+            fixture,
+            runtime,
+            instance,
+            provider_binding,
+            provider_supports_multi_step_decode,
+            materialization_count: 1,
+        })
+    }
+
+    pub fn model_instance_id(&self) -> &ModelInstanceId {
+        &self.instance
+    }
+
+    pub fn materialization_count(&self) -> usize {
+        self.materialization_count
+    }
+
+    pub fn generate(
+        &mut self,
+        request: ProductionGenerationRequest,
+        chat_formatter: Option<&dyn ChatTemplateFormatter>,
+    ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+        let mut prepared = self.prepare_generation(request, chat_formatter)?;
+        let mut execution_plans = RuntimeGenerationExecutionPlans {
+            prefill: &mut prepared.prepared_plans.prefill,
+            decode: &mut prepared.prepared_plans.decode,
+        };
+        let deadline_started_at = std::time::Instant::now();
+        let max_generation_duration = prepared
+            .max_generation_millis
+            .map(std::time::Duration::from_millis);
+        let generation_result = run_generation_loop_with_execution_plans(
+            &mut self.runtime,
+            &prepared.generation_request,
+            SamplingPolicy::default(),
+            CacheUsageSummary::default(),
+            |_generated_so_far| {
+                max_generation_duration
+                    .is_some_and(|deadline| deadline_started_at.elapsed() >= deadline)
+            },
+            &mut prepared.observer,
+            &mut execution_plans,
+        )?;
+        self.finish_generation(prepared.session, generation_result, prepared.observer)
+    }
+
+    pub fn generate_streaming(
+        &mut self,
+        request: ProductionGenerationRequest,
+        chat_formatter: Option<&dyn ChatTemplateFormatter>,
+        on_event: &mut dyn FnMut(GenerationStreamEvent) -> std::ops::ControlFlow<()>,
+    ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+        let mut prepared = self.prepare_generation(request, chat_formatter)?;
+        let prepared_tokenizer = self.fixture.tokenizer.clone();
+        let mut generated_so_far: Vec<TokenId> = Vec::new();
+        let mut previously_emitted_text = String::new();
+        let mut on_token = |token_id: TokenId| -> std::ops::ControlFlow<()> {
+            generated_so_far.push(token_id);
+            let full_text = decode_tokens_streaming(
+                &prepared_tokenizer,
+                StreamingDecodeRequest::new(generated_so_far.clone()),
+            )
+            .map(|decoded| decoded.text)
+            .ok();
+            let text_delta = full_text.as_ref().and_then(|full_text| {
+                full_text
+                    .strip_prefix(previously_emitted_text.as_str())
+                    .filter(|delta| !delta.is_empty())
+                    .map(str::to_string)
+            });
+            if let Some(full_text) = full_text {
+                previously_emitted_text = full_text;
+            }
+            on_event(GenerationStreamEvent::Token {
+                token_id,
+                text_delta,
+            })
+        };
+        let mut execution_plans = RuntimeGenerationExecutionPlans {
+            prefill: &mut prepared.prepared_plans.prefill,
+            decode: &mut prepared.prepared_plans.decode,
+        };
+        let deadline_started_at = std::time::Instant::now();
+        let max_generation_duration = prepared
+            .max_generation_millis
+            .map(std::time::Duration::from_millis);
+        let generation_result = run_generation_loop_with_execution_plans_streaming(
+            &mut self.runtime,
+            &prepared.generation_request,
+            SamplingPolicy::default(),
+            CacheUsageSummary::default(),
+            |_generated_so_far| {
+                max_generation_duration
+                    .is_some_and(|deadline| deadline_started_at.elapsed() >= deadline)
+            },
+            &mut prepared.observer,
+            &mut execution_plans,
+            &mut on_token,
+        )?;
+        let _ = on_event(GenerationStreamEvent::Finished {
+            finish_reason: generation_result.output.finish_reason,
+            usage: generation_result.output.usage.clone(),
+        });
+        self.finish_generation(prepared.session, generation_result, prepared.observer)
+    }
+
+    pub fn unload(mut self) -> Result<(), InferenceApiError> {
+        unload_model_instance(
+            &mut self.runtime,
+            &self.instance,
+            ModelInstanceUnloadPolicy::DrainActiveUse,
+        )
+        .map(|_| ())
+    }
+
+    fn prepare_generation(
+        &mut self,
+        request: ProductionGenerationRequest,
+        chat_formatter: Option<&dyn ChatTemplateFormatter>,
+    ) -> Result<PreparedResidentProductionGeneration, InferenceApiError> {
+        let ProductionGenerationRequest {
+            prompt,
+            parameters,
+            mut stop_conditions,
+            max_new_tokens,
+            max_generation_millis,
+        } = request;
+        let max_tokens = max_new_tokens.unwrap_or_else(|| {
+            self.fixture
+                .manifest
+                .generation
+                .as_ref()
+                .and_then(|defaults| defaults.max_tokens)
+                .unwrap_or(64) as usize
+        });
+        if max_tokens > 1 && !self.provider_supports_multi_step_decode {
+            return Err(InferenceApiError::Unsupported {
+                reason: format!(
+                    "provider '{}' does not support multi-step decode, but this request needs {max_tokens} decode steps",
+                    self.provider_binding.as_str()
+                ),
+            });
+        }
+        let session_request = SessionCreationRequest {
+            model: GenerationModelReference::ModelInstance(self.instance.clone()),
+            tokenizer: generation_tokenizer_reference(&self.fixture),
+            generation_defaults: parameters.clone(),
+            policy: SessionPolicy::default(),
+            memory: SessionMemoryBudget::default(),
+            allowed_capabilities: BTreeSet::new(),
+            correlation_id: None,
+            created_at_millis: 0,
+        };
+        let session = create_inference_session(&mut self.runtime, session_request)?;
+        let tokenized = tokenize_prompt_input(
+            &self.fixture.tokenizer,
+            TokenizationRequest::new(prompt),
+            chat_formatter,
+        )?;
+        stop_conditions.prepared_stop_sequences = stop_conditions
+            .stop_text_sequences
+            .iter()
+            .map(|text| self.fixture.tokenizer.resolve_stop_sequence(text))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(
+                |error: TokenizerError| InferenceApiError::TokenizationFailed {
+                    reason: error.to_string(),
+                },
+            )?;
+        let observer = InferenceApiObserver::new();
+        let (component_graphs, _definition, _component_instance) =
+            build_first_native_graphs_from_real_qwen_component(
+                &self.fixture,
+                tokenized.token_ids.len() as u64,
+            )
+            .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                reason: error.to_string(),
+            })?;
+        let prepared_plans = prepare_first_native_execution_plans_for_provider(
+            &self.runtime,
+            &self.instance,
+            component_graphs,
+            tokenized.token_ids.len() as u64,
+            &self.provider_binding,
+        )
+        .map_err(|error| InferenceApiError::GraphPlanningFailed {
+            reason: error.to_string(),
+        })?;
+        let generation_request = build_generation_request(
+            GenerationRequestId::new("production-generation")?,
+            Some(session.clone()),
+            GenerationModelReference::ModelInstance(self.instance.clone()),
+            generation_tokenizer_reference(&self.fixture),
+            tokenized,
+            max_tokens,
+            parameters,
+            stop_conditions,
+            StreamingMode::TokenIds,
+        );
+        let generation_request = prepare_generation(&self.runtime, generation_request)?;
+        Ok(PreparedResidentProductionGeneration {
+            session,
+            generation_request,
+            prepared_plans,
+            observer,
+            max_generation_millis,
+        })
+    }
+
+    fn finish_generation(
+        &mut self,
+        session: InferenceSessionId,
+        generation_result: GenerationResult,
+        observer: InferenceApiObserver,
+    ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+        let decoded_text = decode_tokens_streaming(
+            &self.fixture.tokenizer,
+            StreamingDecodeRequest::new(generation_result.output.generated_token_ids.clone()),
+        )
+        .map(|decoded| decoded.text)
+        .unwrap_or_else(|_| {
+            let tokens = generation_result
+                .output
+                .generated_token_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("[generated token ids: {tokens}]")
+        });
+        let generation_result = generation_result.with_decoded_text(decoded_text);
+        close_inference_session(&mut self.runtime, &session)?;
+        let text = generation_result.decoded_text.clone().ok_or_else(|| {
+            InferenceApiError::GenerationFailed {
+                reason: "production generation produced no decoded text".into(),
+            }
+        })?;
+        Ok(FirstNativeFixtureGeneration {
+            text,
+            result: generation_result,
+            observer,
+        })
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+struct PreparedResidentProductionGeneration {
+    session: InferenceSessionId,
+    generation_request: GenerationRequest,
+    prepared_plans: FirstNativePreparedPlans,
+    observer: InferenceApiObserver,
+    max_generation_millis: Option<u64>,
 }
 
 /// An incrementally-delivered production generation event

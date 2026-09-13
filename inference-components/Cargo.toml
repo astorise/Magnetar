@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "magnetar-inference-component"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+cuda = ["dep:magnetar-provider-cuda"]
+
+[dependencies]
+anyhow = "1"
+magnetar-loader-huggingface = { path = "../loaders/huggingface" }
+magnetar-provider-cpu = { path = "../providers/cpu" }
+magnetar-provider-cuda = { path = "../providers/cuda", optional = true }
+magnetar-runtime = { path = "../magnetar-runtime", features = ["wasmtime-component-engine"] }
+serde_json = "1"
