@@ -3122,14 +3122,30 @@ fn e2e_qwen_component_digest_mismatch_fails_before_planning() {
 // (`wire-generic-inference-component-runtime`)
 // ---------------------------------------------------------------------------
 
+/// Consolidates every assertion that depends on `QWEN_REAL_COMPONENT_BYTES`'s
+/// digest into one sequential test, deliberately -- not split across
+/// several `#[test]` functions. `REGISTERED_COMPONENT_RUNTIMES` is one
+/// process-wide registry shared by every test in this binary, keyed by real
+/// content digest; every one of these assertions registers (or attempts to
+/// register) the *same* fixture bytes, so the same digest. Splitting them
+/// into separate `#[test]` functions is genuinely racy under Rust's default
+/// parallel test execution: whichever test's *trusted* registration runs
+/// first populates the shared cache entry, after which a *later*,
+/// deliberately-untrusted registration attempt for that same digest would
+/// hit the idempotent-return fast path before ever re-evaluating trust,
+/// making the "untrusted artifacts are rejected" assertion pass or fail
+/// based on test scheduling instead of behavior -- caught by a real CI
+/// failure (this exact race), not found by inspection.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
-fn register_inference_component_artifact_computes_real_digest_and_enforces_caller_trust() {
+fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matches_the_singleton_path()
+ {
     let expected_digest = ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES);
 
     // No trust granted at all: real bytes, real (matching) declared digest,
     // but an empty ComponentTrustStore -- must be rejected, never silently
-    // accepted just because the artifact is well-formed.
+    // accepted just because the artifact is well-formed. Must run before
+    // any trusted registration below (see this test's own doc comment).
     let untrusted = register_inference_component_artifact(
         QWEN_REAL_COMPONENT_BYTES.to_vec(),
         QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
@@ -3153,51 +3169,27 @@ fn register_inference_component_artifact_computes_real_digest_and_enforces_calle
         digest, expected_digest,
         "the registry must key by the artifact's own real sha256, not a claim"
     );
-}
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-#[test]
-fn register_inference_component_artifact_is_idempotent_per_digest() {
-    let trust = ComponentTrustStore::default()
-        .trust_digest(&ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES).value);
-    let first = register_inference_component_artifact(
-        QWEN_REAL_COMPONENT_BYTES.to_vec(),
-        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
-        &trust,
-    )
-    .expect("first registration succeeds");
+    // Idempotent: re-registering the identical bytes under the same trust
+    // is a harmless no-op, not an error, and returns the same digest.
     let second = register_inference_component_artifact(
         QWEN_REAL_COMPONENT_BYTES.to_vec(),
         QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
         &trust,
     )
     .expect("re-registering the same bytes is a harmless no-op, not an error");
-    assert_eq!(first, second);
-}
+    assert_eq!(digest, second);
 
-/// The load-bearing correctness proof for this generic registry: a
-/// Component registered through [`register_inference_component_artifact`]
-/// (a caller-supplied digest/trust, no hardcoded Qwen constant anywhere in
-/// the call) produces *exactly* the same graphs -- same operator-sequence
-/// hashes, not just the same node counts -- as the pre-existing, hardcoded
-/// single-Qwen-singleton path
-/// ([`build_first_native_graphs_from_real_qwen_component`]) does for the
-/// identical underlying Component bytes and the identical fixture
-/// config/identity. Graph production itself was never Qwen-specific; this
-/// proves the generic entry point reaches the exact same real behavior, not
-/// a parallel implementation that merely looks similar.
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-#[test]
-fn build_first_native_graphs_from_named_component_matches_the_real_qwen_component_path() {
-    let trust = ComponentTrustStore::default()
-        .trust_digest(&ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES).value);
-    let digest = register_inference_component_artifact(
-        QWEN_REAL_COMPONENT_BYTES.to_vec(),
-        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
-        &trust,
-    )
-    .expect("registration succeeds");
-
+    // The load-bearing correctness proof for this generic registry: a
+    // Component registered above (a caller-supplied digest/trust, no
+    // hardcoded Qwen constant anywhere in the call) produces *exactly* the
+    // same graphs -- same operator-sequence hashes, not just the same node
+    // counts -- as the pre-existing, hardcoded single-Qwen-singleton path
+    // (`build_first_native_graphs_from_real_qwen_component`) does for the
+    // identical underlying Component bytes and the identical fixture
+    // config/identity. Graph production itself was never Qwen-specific;
+    // this proves the generic entry point reaches the exact same real
+    // behavior, not a parallel implementation that merely looks similar.
     let fixture = e2e_fixture().expect("fixture builds");
     let prompt_token_count = 2u64;
 
