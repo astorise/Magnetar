@@ -3117,6 +3117,143 @@ fn e2e_qwen_component_digest_mismatch_fails_before_planning() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Generic, multi-Component runtime registry
+// (`wire-generic-inference-component-runtime`)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn register_inference_component_artifact_computes_real_digest_and_enforces_caller_trust() {
+    let expected_digest = ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES);
+
+    // No trust granted at all: real bytes, real (matching) declared digest,
+    // but an empty ComponentTrustStore -- must be rejected, never silently
+    // accepted just because the artifact is well-formed.
+    let untrusted = register_inference_component_artifact(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &ComponentTrustStore::default(),
+    );
+    assert!(
+        untrusted.is_err(),
+        "an artifact trusted by nothing must not register: {untrusted:?}"
+    );
+
+    // The caller's own trust store, naming this artifact's real digest --
+    // never `QWEN_REAL_COMPONENT_DIGEST` or any other hardcoded constant.
+    let trust = ComponentTrustStore::default().trust_digest(&expected_digest.value);
+    let digest = register_inference_component_artifact(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &trust,
+    )
+    .expect("a caller-trusted, well-formed artifact must register");
+    assert_eq!(
+        digest, expected_digest,
+        "the registry must key by the artifact's own real sha256, not a claim"
+    );
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn register_inference_component_artifact_is_idempotent_per_digest() {
+    let trust = ComponentTrustStore::default()
+        .trust_digest(&ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES).value);
+    let first = register_inference_component_artifact(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &trust,
+    )
+    .expect("first registration succeeds");
+    let second = register_inference_component_artifact(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &trust,
+    )
+    .expect("re-registering the same bytes is a harmless no-op, not an error");
+    assert_eq!(first, second);
+}
+
+/// The load-bearing correctness proof for this generic registry: a
+/// Component registered through [`register_inference_component_artifact`]
+/// (a caller-supplied digest/trust, no hardcoded Qwen constant anywhere in
+/// the call) produces *exactly* the same graphs -- same operator-sequence
+/// hashes, not just the same node counts -- as the pre-existing, hardcoded
+/// single-Qwen-singleton path
+/// ([`build_first_native_graphs_from_real_qwen_component`]) does for the
+/// identical underlying Component bytes and the identical fixture
+/// config/identity. Graph production itself was never Qwen-specific; this
+/// proves the generic entry point reaches the exact same real behavior, not
+/// a parallel implementation that merely looks similar.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn build_first_native_graphs_from_named_component_matches_the_real_qwen_component_path() {
+    let trust = ComponentTrustStore::default()
+        .trust_digest(&ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES).value);
+    let digest = register_inference_component_artifact(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &trust,
+    )
+    .expect("registration succeeds");
+
+    let fixture = e2e_fixture().expect("fixture builds");
+    let prompt_token_count = 2u64;
+
+    let (via_named, _definition, _instance) = build_first_native_graphs_from_named_component(
+        &digest,
+        &fixture.config,
+        &fixture.identity,
+        prompt_token_count,
+    )
+    .expect("named-component graph production succeeds");
+    let (via_singleton, _definition, _instance) =
+        build_first_native_graphs_from_real_qwen_component(&fixture, prompt_token_count)
+            .expect("singleton-path graph production succeeds");
+
+    assert_eq!(
+        via_named.prefill_node_count,
+        via_singleton.prefill_node_count
+    );
+    assert_eq!(via_named.decode_node_count, via_singleton.decode_node_count);
+    let named_prefill_hash =
+        qwen_operator_sequence_hash(&qwen_graph_operator_codes(&via_named.prefill).unwrap());
+    let singleton_prefill_hash =
+        qwen_operator_sequence_hash(&qwen_graph_operator_codes(&via_singleton.prefill).unwrap());
+    assert_eq!(named_prefill_hash, singleton_prefill_hash);
+    let named_decode_hash =
+        qwen_operator_sequence_hash(&qwen_graph_operator_codes(&via_named.decode).unwrap());
+    let singleton_decode_hash =
+        qwen_operator_sequence_hash(&qwen_graph_operator_codes(&via_singleton.decode).unwrap());
+    assert_eq!(named_decode_hash, singleton_decode_hash);
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn build_first_native_graphs_from_named_component_fails_closed_for_an_unregistered_digest() {
+    let never_registered = ComponentDigest::parse(
+        "sha256",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    let fixture = e2e_fixture().expect("fixture builds");
+    let result = build_first_native_graphs_from_named_component(
+        &never_registered,
+        &fixture.config,
+        &fixture.identity,
+        2,
+    );
+    match result {
+        Err(E2eConformanceError::ModelComponentFailed { .. }) => {}
+        Err(other) => panic!(
+            "an unregistered digest must fail with ModelComponentFailed, got a different error: {other:?}"
+        ),
+        Ok(_) => {
+            panic!("an unregistered digest must fail closed, not silently build a fallback graph")
+        }
+    }
+}
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
 fn e2e_qwen_component_fuel_exhaustion_fails_before_planning() {

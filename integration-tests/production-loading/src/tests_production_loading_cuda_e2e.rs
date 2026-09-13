@@ -201,6 +201,7 @@ fn production_generation_request_forwards_parameters_and_stop_conditions_on_real
                 },
                 stop_conditions: magnetar_runtime::StopConditions::default(),
                 max_new_tokens: None,
+                max_generation_millis: None,
             },
             None,
             Arc::new(CudaProvider::new()),
@@ -231,6 +232,7 @@ fn production_generation_request_forwards_parameters_and_stop_conditions_on_real
             parameters: magnetar_runtime::GenerationParameters::greedy(),
             stop_conditions: magnetar_runtime::StopConditions::default(),
             max_new_tokens: None,
+            max_generation_millis: None,
         },
         None,
         Arc::new(CudaProvider::new()),
@@ -258,6 +260,7 @@ fn production_generation_request_forwards_parameters_and_stop_conditions_on_real
                 ..Default::default()
             },
             max_new_tokens: None,
+            max_generation_millis: None,
         },
         None,
         Arc::new(CudaProvider::new()),
@@ -322,6 +325,7 @@ fn production_generation_request_streaming_matches_non_streaming_on_real_cuda_ha
         parameters: magnetar_runtime::GenerationParameters::greedy(),
         stop_conditions: magnetar_runtime::StopConditions::default(),
         max_new_tokens: None,
+        max_generation_millis: None,
     };
 
     let (tokenizer_metadata, real_tokenizer) = load_tokenizer();

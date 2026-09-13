@@ -8350,6 +8350,188 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
     Ok(RUNTIME.get().expect("just set or set by a racing caller"))
 }
 
+// ---------------------------------------------------------------------------
+// Generic, multi-Component runtime registry
+// (`wire-generic-inference-component-runtime`)
+// ---------------------------------------------------------------------------
+//
+// `qwen_real_component_runtime` above is a single, process-wide, hardcoded-
+// digest slot: exactly one Component can ever be cached, and only a
+// Component whose bytes hash to the one baked-in `QWEN_REAL_COMPONENT_DIGEST`
+// constant is ever accepted, regardless of what a caller (e.g. an embedder
+// like `magnetar-inference-component` acting on Tachyon's behalf) actually
+// registers via `register_qwen_component_artifact`. That is deliberately
+// left untouched here -- it is the CLI's own `"qwen-test"` self-test/demo
+// alias, and a large existing test suite depends on its exact singleton
+// timing and caching behavior.
+//
+// This section is the generic replacement an external embedder should use
+// instead: an arbitrary number of distinct Components can be registered
+// concurrently, each keyed by its own REAL digest (computed from its actual
+// bytes via `ComponentDigest::sha256`, never a caller-supplied claim taken
+// on faith), and trust is evaluated against a caller-supplied
+// `ComponentTrustStore` -- never a hardcoded constant. Graph production
+// itself (`build_first_native_graphs_with_runtime`) is unchanged and shared
+// with the Qwen singleton path: nothing about building a graph from a
+// Component was ever Qwen-specific, only *which* compiled Component and
+// *whose* trust decision gated using it.
+
+/// One caller-registered Component's compiled artifact and its registered
+/// [`GraphBuilderCapability`]/[`ModelConfigCapability`], analogous to
+/// [`QwenRealComponentRuntime`] but keyed by real digest in
+/// [`register_inference_component_artifact`]'s registry rather than being a
+/// single global slot.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+struct RegisteredComponentRuntime {
+    manager: Mutex<ComponentManager>,
+    capability: Arc<GraphBuilderCapability>,
+    model_config_capability: Arc<ModelConfigCapability>,
+    definition: ComponentDefinitionId,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+static REGISTERED_COMPONENT_RUNTIMES: std::sync::OnceLock<
+    Mutex<BTreeMap<String, Arc<RegisteredComponentRuntime>>>,
+> = std::sync::OnceLock::new();
+
+/// Registers an arbitrary Component artifact for generic first-native graph
+/// production, trusted against `trust` (the caller's own
+/// [`ComponentTrustStore`], never a hardcoded digest) rather than the single
+/// `QWEN_REAL_COMPONENT_DIGEST` constant [`register_qwen_component_artifact`]
+/// always uses. The returned [`ComponentDigest`] is computed from
+/// `component_bytes` themselves (`ComponentDigest::sha256`) -- never a
+/// caller-supplied claim -- and doubles as the handle
+/// [`build_first_native_graphs_from_named_component`] looks the registered
+/// runtime back up by, so a caller never needs to invent or track its own
+/// separate identifier for "the Component I just registered."
+///
+/// Idempotent per digest, like [`register_qwen_component_artifact`]: a
+/// second registration of bytes that hash to a digest already present in the
+/// registry is a harmless no-op (the existing compiled runtime is kept,
+/// never recompiled), so a caller can register unconditionally on every
+/// load rather than tracking its own "have I already registered this one"
+/// state. Distinct Components (distinct digests) coexist in the registry
+/// simultaneously -- unlike the Qwen singleton, this is not a "last one
+/// wins" slot.
+///
+/// Fails closed, exactly like every other Component loading path in this
+/// crate: untrusted bytes (`trust` does not trust this digest), a
+/// manifest whose own embedded digest does not match the real bytes, or a
+/// manifest outside inference scope are all rejected by
+/// [`ComponentManager::prepare_pushed_package`] before anything is cached,
+/// not silently accepted.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn register_inference_component_artifact(
+    component_bytes: Vec<u8>,
+    manifest_bytes: Vec<u8>,
+    trust: &ComponentTrustStore,
+) -> Result<ComponentDigest, E2eConformanceError> {
+    let digest = ComponentDigest::sha256(&component_bytes);
+    let registry = REGISTERED_COMPONENT_RUNTIMES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    {
+        let existing = registry.lock().unwrap();
+        if existing.contains_key(&digest.value) {
+            return Ok(digest);
+        }
+    }
+    let capability = Arc::new(GraphBuilderCapability::new());
+    let model_config_capability = Arc::new(ModelConfigCapability::new());
+    let mut manager = ComponentManager::with_engine(Box::new(
+        crate::component_wasmtime::WasmtimeComponentEngine::new().map_err(|error| {
+            E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            }
+        })?,
+    ));
+    manager.set_resource_limits(qwen_component_runtime_limits());
+    manager.set_trust_store(trust.clone());
+    let graph_builder_interface =
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.2.0");
+    manager.provide_capability(
+        graph_builder_interface,
+        capability.clone() as Arc<dyn HostCapability>,
+    );
+    let model_config_interface =
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.2.0");
+    manager.provide_capability(
+        model_config_interface,
+        model_config_capability.clone() as Arc<dyn HostCapability>,
+    );
+    let package = ComponentArtifactPackage::new(
+        component_bytes,
+        manifest_bytes,
+        digest.clone(),
+        ComponentDistributionSource::new(
+            ComponentDistributionSourceKind::ClientProvided,
+            format!("component:{}", digest.value),
+        ),
+    );
+    let definition = manager.prepare_pushed_package(package).map_err(|error| {
+        E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        }
+    })?;
+    let mut registry = registry.lock().unwrap();
+    // A racing caller may have finished registering the same digest first
+    // while this thread was compiling -- keep whichever won, exactly like
+    // `qwen_real_component_runtime`'s own `OnceLock::set` race handling.
+    registry.entry(digest.value.clone()).or_insert_with(|| {
+        Arc::new(RegisteredComponentRuntime {
+            manager: Mutex::new(manager),
+            capability,
+            model_config_capability,
+            definition,
+        })
+    });
+    Ok(digest)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn named_component_runtime(
+    digest: &ComponentDigest,
+) -> Result<Arc<RegisteredComponentRuntime>, E2eConformanceError> {
+    REGISTERED_COMPONENT_RUNTIMES
+        .get()
+        .and_then(|registry| registry.lock().unwrap().get(&digest.value).cloned())
+        .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
+            reason: format!(
+                "no Component is registered for digest '{}'; call \
+                 register_inference_component_artifact first",
+                digest.value
+            ),
+        })
+}
+
+/// [`build_first_native_graphs_from_real_qwen_component`]'s generic
+/// counterpart: builds prefill/decode graphs from whichever Component
+/// [`register_inference_component_artifact`] registered under `digest`,
+/// instead of the single hardcoded Qwen singleton.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn build_first_native_graphs_from_named_component(
+    digest: &ComponentDigest,
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+    prompt_token_count: u64,
+) -> Result<
+    (
+        FirstNativeComponentGraphs,
+        ComponentDefinitionId,
+        ComponentInstanceId,
+    ),
+    E2eConformanceError,
+> {
+    let runtime = named_component_runtime(digest)?;
+    build_first_native_graphs_with_runtime(
+        &runtime.manager,
+        &runtime.capability,
+        &runtime.model_config_capability,
+        runtime.definition,
+        config,
+        identity,
+        prompt_token_count,
+    )
+}
+
 /// Builds prefill and decode Execution Graphs by instantiating the real
 /// Qwen Model Component (`QWEN_REAL_COMPONENT_BYTES`, compiled once and
 /// cached -- see `qwen_real_component_runtime`) and calling its
@@ -8409,10 +8591,48 @@ fn build_first_native_graphs_for_config(
     E2eConformanceError,
 > {
     let runtime = qwen_real_component_runtime()?;
-    let mut manager = runtime.manager.lock().unwrap();
-    let capability = &runtime.capability;
-    let model_config_capability = &runtime.model_config_capability;
-    let definition = runtime.definition;
+    build_first_native_graphs_with_runtime(
+        &runtime.manager,
+        &runtime.capability,
+        &runtime.model_config_capability,
+        runtime.definition,
+        config,
+        identity,
+        prompt_token_count,
+    )
+}
+
+/// [`build_first_native_graphs_for_config`]'s actual body, decoupled from
+/// *which* compiled Component runtime it operates against
+/// (`wire-generic-inference-component-runtime`): identical behavior to the
+/// pre-existing single-Qwen-singleton version, just taking the runtime's
+/// four pieces as parameters instead of always reading them off
+/// [`qwen_real_component_runtime`]'s one process-wide slot. This is what
+/// [`build_first_native_graphs_from_named_component`] calls for an
+/// arbitrary caller-registered Component (`register_inference_component_
+/// artifact`) instead of the single hardcoded-digest Qwen one -- nothing
+/// about graph production itself is Qwen-specific: `config`/`identity`
+/// already fully parameterize it, exactly as they did before this
+/// extraction.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[allow(clippy::too_many_arguments)]
+fn build_first_native_graphs_with_runtime(
+    manager: &Mutex<ComponentManager>,
+    capability: &GraphBuilderCapability,
+    model_config_capability: &ModelConfigCapability,
+    definition: ComponentDefinitionId,
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+    prompt_token_count: u64,
+) -> Result<
+    (
+        FirstNativeComponentGraphs,
+        ComponentDefinitionId,
+        ComponentInstanceId,
+    ),
+    E2eConformanceError,
+> {
+    let mut manager = manager.lock().unwrap();
 
     let instance = manager
         .instantiate_prepared_component(definition)

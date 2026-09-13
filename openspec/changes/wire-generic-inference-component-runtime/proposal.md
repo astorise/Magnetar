@@ -1,0 +1,26 @@
+## Why
+
+A Tachyon-authored integration audit (`audit-magnetar-integration-tachyon.md`, NO-GO verdict) found that `inference-components::LoadedInferenceComponent` -- the facade meant to let Magnetar run an arbitrary caller-supplied inference Component -- registers whatever bytes it receives via `register_qwen_component_artifact`, but that function stamps every artifact with the single hardcoded `QWEN_REAL_COMPONENT_DIGEST` constant and caches it in one process-wide `OnceLock`. Investigating before implementing (this session's established practice) confirmed the real severity: a genuinely different Component's bytes would fail digest verification the first time generation actually reached the Component (`qwen_real_component_runtime`), and only ever one Component can be cached at a time. Concretely, Magnetar has no execution path today that accepts an arbitrary Component with its own real digest and its own caller-supplied trust decision -- every real path is hardcoded to one specific Qwen Component binary.
+
+This is Phase A of closing that gap: a generic, keyed Component-artifact registry in `magnetar-runtime`, so multiple distinct Components can be registered and used concurrently, each trusted by the caller's own `ComponentTrustStore`, keyed by the artifact's own real digest -- never a hardcoded constant. The pre-existing single-Qwen-singleton path (`qwen_real_component_runtime`, `register_qwen_component_artifact`, the CLI's `"qwen-test"` self-test alias) is left completely untouched, since a large existing test suite depends on its exact behavior; this change is purely additive.
+
+## What Changes
+
+- `magnetar-runtime` gains `register_inference_component_artifact(component_bytes, manifest_bytes, trust: &ComponentTrustStore) -> Result<ComponentDigest, E2eConformanceError>`: computes the artifact's real digest (`ComponentDigest::sha256`), evaluates it against the caller's own trust store (never a hardcoded digest), and caches a compiled, ready-to-instantiate Component runtime keyed by that digest. Idempotent per digest; distinct digests coexist in the registry simultaneously (unlike the single-slot Qwen singleton).
+- `build_first_native_graphs_from_named_component(digest, config, identity, prompt_token_count)`: the generic counterpart to `build_first_native_graphs_from_real_qwen_component`, building prefill/decode Execution Graphs from whichever Component was registered under `digest`. Graph production itself required no change -- `build_first_native_graphs_for_config`'s existing body was already fully parameterized by `config`/`identity`, never Qwen-binary-specific; it was extracted into a shared `build_first_native_graphs_with_runtime` helper both the old singleton path and this new generic path call.
+- **BREAKING**: none. `qwen_real_component_runtime`, `register_qwen_component_artifact`, `build_first_native_graphs_from_real_qwen_component`, `run_first_native_generation`, and every existing test are unchanged.
+
+## Capabilities
+
+### New Capabilities
+(none -- extends the existing `model-component-graph-contract`/Component-loading surface)
+
+### Modified Capabilities
+- `provider` / Component loading: adds a requirement that an embedder can register an arbitrary Component artifact under its own trust decision and real digest, independent of the CLI's single built-in Qwen self-test Component.
+
+## Impact
+
+- `magnetar-runtime/src/first_native_runtime.rs`: `RegisteredComponentRuntime`, `REGISTERED_COMPONENT_RUNTIMES` (keyed registry), `register_inference_component_artifact`, `named_component_runtime`, `build_first_native_graphs_from_named_component`, and the `build_first_native_graphs_with_runtime` extraction.
+- Tests: 4 new tests proving real-digest computation, caller-supplied trust enforcement (both accept and reject), idempotent re-registration, fail-closed behavior for an unregistered digest, and -- the load-bearing correctness proof -- that graphs built via the new generic path exactly match (same operator-sequence hashes, not just node counts) graphs built via the pre-existing hardcoded singleton path for the identical underlying Component bytes. All passed on the first run. Full regression (1262 tests), `clippy --all-targets -- -D warnings`, and `fmt --check` all clean.
+- `integration-tests/production-loading`: fixed 14 `ProductionGenerationRequest` struct literals broken by the `codex/tachyon-component-boundary` branch's `max_generation_millis` field addition, surfaced by CI after reconciling that branch with `main` (a prerequisite commit to this change, not part of it).
+- **Deliberately not done in this change** (see `design.md`): `inference-components::LoadedInferenceComponent` does not yet call any of this -- it still uses `register_qwen_component_artifact`/`ProductionQwenLoadedModel`. Wiring it to the new generic registry (closing the audit's MAG-01/02/03 for real) is a separate, follow-up phase.

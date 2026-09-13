@@ -351,6 +351,7 @@ fn production_generation_request_forwards_non_greedy_sampling_parameters() {
         parameters: parameters.clone(),
         stop_conditions: magnetar_runtime::StopConditions::default(),
         max_new_tokens: None,
+        max_generation_millis: None,
     };
 
     let mut fixture_for_first = fixture.clone();
@@ -422,6 +423,7 @@ fn production_generation_request_honors_a_caller_supplied_stop_token_id() {
             parameters: magnetar_runtime::GenerationParameters::greedy(),
             stop_conditions: magnetar_runtime::StopConditions::default(),
             max_new_tokens: None,
+            max_generation_millis: None,
         },
         None,
         Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
@@ -448,6 +450,7 @@ fn production_generation_request_honors_a_caller_supplied_stop_token_id() {
                 ..Default::default()
             },
             max_new_tokens: None,
+            max_generation_millis: None,
         },
         None,
         Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
@@ -485,6 +488,7 @@ fn production_generation_request_max_new_tokens_override_replaces_manifest_defau
             parameters: magnetar_runtime::GenerationParameters::greedy(),
             stop_conditions: magnetar_runtime::StopConditions::default(),
             max_new_tokens: Some(2),
+            max_generation_millis: None,
         },
         None,
         Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
@@ -547,6 +551,7 @@ fn production_generation_request_unsupported_gate_applies_to_the_overridden_toke
             parameters: magnetar_runtime::GenerationParameters::greedy(),
             stop_conditions: magnetar_runtime::StopConditions::default(),
             max_new_tokens: Some(2),
+            max_generation_millis: None,
         },
         None,
         Arc::new(MultiStepDecodeUnsupportedProvider(
@@ -590,6 +595,7 @@ fn production_generation_request_streaming_delivers_ordered_events_then_finished
             parameters: magnetar_runtime::GenerationParameters::greedy(),
             stop_conditions: magnetar_runtime::StopConditions::default(),
             max_new_tokens: None,
+            max_generation_millis: None,
         },
         None,
         Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
@@ -648,6 +654,7 @@ fn production_generation_request_streaming_text_deltas_reconstruct_the_non_strea
         parameters: magnetar_runtime::GenerationParameters::greedy(),
         stop_conditions: magnetar_runtime::StopConditions::default(),
         max_new_tokens: None,
+        max_generation_millis: None,
     };
 
     let mut fixture_for_non_streaming = fixture.clone();
@@ -718,6 +725,7 @@ fn production_generation_request_streaming_finished_event_matches_non_streaming_
             parameters: magnetar_runtime::GenerationParameters::greedy(),
             stop_conditions: magnetar_runtime::StopConditions::default(),
             max_new_tokens: None,
+            max_generation_millis: None,
         },
         None,
         Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
@@ -773,6 +781,7 @@ fn production_generation_request_streaming_callback_cancellation_stops_cleanly()
             parameters: magnetar_runtime::GenerationParameters::greedy(),
             stop_conditions: magnetar_runtime::StopConditions::default(),
             max_new_tokens: None,
+            max_generation_millis: None,
         },
         None,
         Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
@@ -855,6 +864,7 @@ fn production_generation_request_streaming_unsupported_gate_never_invokes_the_ca
             parameters: magnetar_runtime::GenerationParameters::greedy(),
             stop_conditions: magnetar_runtime::StopConditions::default(),
             max_new_tokens: None,
+            max_generation_millis: None,
         },
         None,
         Arc::new(MultiStepDecodeUnsupportedProvider(
