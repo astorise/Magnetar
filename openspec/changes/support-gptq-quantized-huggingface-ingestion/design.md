@@ -1,0 +1,28 @@
+## Context
+
+`loaders/gguf` already established the real pattern for "supporting" a quantization format in this repository: dequantize to `F32` at the ingestion layer, before any downstream code (transpose, tied-embedding derivation, Model Loading, the Component's own graph) ever needs to know the tensor was ever quantized. `qwen-model-component`'s own "Qwen Quantization Rejection" requirement explicitly frames this as the intended resolution path ("the baseline MAY reject quantized artifacts unless explicit dequantization or quantized execution is implemented"). GPTQ is a real, well-documented on-disk convention, but one with a genuinely fragile detail: a well-known "+1" zero-point offset bug that many independent reimplementations get wrong on a first attempt, and multiple real packing variants across the wider GPTQ ecosystem (different bit widths, `desc_act` activation-order permutation, symmetric vs. asymmetric). Verifying against real checkpoint bytes rather than documentation alone was the only way to be confident the convention implemented here is the one the public checkpoints actually use.
+
+## Goals / Non-Goals
+
+**Goals:**
+- Real GPTQ 4-bit dequantization, verified against real bytes from a public checkpoint, not merely self-consistent round-trip tests.
+- Correctly handle `desc_act: true` (activation-order-permuted) checkpoints too, not only the common sequential-group case -- achieved for free by reading `g_idx` directly rather than assuming a sequential group derivation.
+- Full `ingest()`-level wiring, not just the low-level dequantization function in isolation.
+
+**Non-Goals:**
+- AWQ or BitsAndBytes. Both are real, separate on-disk conventions with their own packing quirks (AWQ's reorder lookup table; BitsAndBytes' NF4 codebook and version-fragile `quant_state` serialization) that would each need their own real-checkpoint verification the same way this change did for GPTQ -- left for future, separately-scoped chantiers.
+- 2-bit/3-bit/8-bit GPTQ. Real but rarer; 3-bit packing in particular straddles `i32` boundaries in a way 4-bit's clean 8-codes-per-`i32` packing does not. Explicitly rejected with a structured error (`ProductionIngestionError::UnsupportedFormat`) rather than silently mis-decoded.
+- A full, real, downloaded-checkpoint end-to-end *generation* proof (ingest a complete GPTQ checkpoint, load it, generate real tokens). This change proves dequantization correctness and ingestion-layer wiring -- the same scope `support-gguf-quantized-tensor-dequantization` closed for GGUF before a later, separate chantier (`resolve-gguf-quantized-projection-transpose-sequencing`) closed the remaining loader-side gap and `wire-gguf-into-model-loading` proved real end-to-end generation. A full GPTQ generation proof would need either downloading a complete real checkpoint (hundreds of MB, all 24 layers' worth of quantized tensors) or hand-building a much larger synthetic bundle; left as real, tracked follow-up work rather than blocking this chantier.
+- Reading `quantization_config` from `config.json`. Detection is purely tensor-shape/name driven (presence of a `.qweight` sibling), which is simpler, self-contained, and robust to `config.json` variations across different real GPTQ tooling (AutoGPTQ, GPTQModel, exllama-oriented exports) that may format `quantization_config` slightly differently.
+
+## Decisions
+
+- **Verify against real, targeted HTTP Range-fetched checkpoint bytes**, not a hand-built fixture alone. `Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4`'s `self_attn.v_proj` (the smallest real projection in that checkpoint) and the equivalent unquantized weight from `Qwen/Qwen2.5-0.5B-Instruct` were fetched via safetensors' own header + byte-offset addressing, avoiding a full multi-hundred-MB download. This is what actually caught the "+1" zero-point offset question empirically (mean error 0.0014 with it, 0.0048 without -- a clear, unambiguous, non-overlapping separation) rather than trusting a documentation description that many independent GPTQ reimplementations have historically gotten wrong on a first attempt.
+- **Read `g_idx` directly rather than assuming sequential groups.** Costs nothing (the tensor is already present in every real GPTQ checkpoint, sequential or not) and correctly handles `desc_act: true` checkpoints for free, not merely the common case this specific verification checkpoint happens to use.
+- **Detect GPTQ tensors structurally (presence of `.qweight`), not via `config.json`'s `quantization_config`.** Keeps the change self-contained and avoids coupling to a JSON shape that varies across the real GPTQ tooling ecosystem.
+- **Extend, don't overwrite, `payload_source.locations` in the rename step.** A real bug (caught by this change's own new end-to-end `ingest()`-level test, not by the lower-level dequantization tests): the raw GPTQ sibling tensors are deliberately left out of the tensor-name renaming loop (so `naming.rs` never sees their unrecognized `.qweight`/`.qzeros`/`.g_idx` suffixes), but the loop's final `payload_source.locations = renamed_locations` unconditionally replaced the whole map, discarding those untouched raw entries. Fixed to `extend` instead.
+
+## Risks / Trade-offs
+
+- **AWQ and BitsAndBytes remain unaddressed** -- "quantization support" as the original charter names it broadly is still partial. Explicitly scoped out (see Non-Goals), each would need the same real-checkpoint verification rigor this change used for GPTQ, not a documentation-only port.
+- **No real end-to-end GPTQ generation proof yet.** The dequantization math and ingestion-layer wiring are both real and verified; a full downloaded-checkpoint generation run is real, tracked follow-up work, not silently dropped.
