@@ -519,10 +519,26 @@ accelerator rather than Google Cloud TPU (a cloud service with no local
 device to discover) -- both gracefully unavailable everywhere this
 repository's tooling can verify, with every FFI declaration transcribed
 directly from each API's real, public header rather than guessed.
-Multi-device execution policy remains future work (`multi-device-placement`
-is still at the contract-only stage, and this repository has only one real
-GPU to verify placement against even once implemented), as does
-Mistral/Gemma Model Components.
+`add-multi-device-cpu-cuda-execution-proof` closed the multi-device
+execution item as far as this repository's own hardware allows: a real,
+hardware-verified foundational proof (`integration-tests/multi-device-
+cpu-cuda`) that a single Runtime can register two heterogeneous real
+Providers (Reference CPU and CUDA) simultaneously and dispatch one
+logical computation across both real Devices, with explicit host-staged
+cross-Device movement between stages, verified both in regular CI
+(gracefully skipping without a GPU) and on the real self-hosted GPU
+runner. It also found and documented a real Kernel Registry behavior no
+single-Provider test could have surfaced: candidate selection ranks
+every compatible candidate across every registered Provider by cost --
+it does not filter by the requesting Provider, so a caller wanting a
+specific Provider must select it explicitly. `magnetar-runtime`'s
+existing `multi_device_placement` data-model types were tied to a real
+execution's own data for the first time, though full production
+`ModelInstance`-level placement across more than one real GPU remains
+unimplemented -- `ModelInstancePlacement` still structurally binds one
+Provider/Device per instance, and this repository has only one real GPU
+to verify a multi-GPU case against even once implemented. Mistral/Gemma
+Model Components remain future work.
 
 **Tachyon integration audit** (`docs/audits/audit-magnetar-integration-
 tachyon-2026-09-13.md`, a separate review from the scope-charter
