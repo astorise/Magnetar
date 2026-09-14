@@ -105,6 +105,14 @@ Implemented today:
   verify real Metal FFI, and `simdgroup_matrix`/AMX/MPS access `wgpu` cannot
   reach remains real future work there specifically for compute-bound
   (prefill) kernels; contributors with real Apple Silicon hardware welcome.
+  External NPU Provider (`providers/npu`): real device discovery only, via
+  Intel's oneAPI Level Zero API (`ZE_INIT_FLAG_VPU_ONLY`), gracefully
+  unavailable everywhere this repository's tooling can verify (no Intel
+  NPU hardware). External TPU Provider (`providers/tpu`): real device
+  discovery only, via Google Coral's `libedgetpu` API, targeting the real
+  local Edge TPU accelerator (not Google Cloud TPU, a cloud service with
+  no local device), gracefully unavailable everywhere this repository's
+  tooling can verify (no Coral hardware).
 - Model Artifact, Model Loading, Model Instance, Tokenizer, Generation,
   Sampling, Session, KV Cache, Prefix Cache, Continuous Batching, Runtime
   Inference API, and E2E conformance contract surfaces
@@ -165,6 +173,13 @@ Deferred or unsupported for v0.1:
 - ROCm compute Kernels (`providers/rocm` does real device discovery only
   -- no AMD hardware exists in this repository's tooling to implement or
   verify compute)
+- NPU compute Kernels (`providers/npu` does real device discovery only,
+  via Intel's oneAPI Level Zero API -- no Intel NPU hardware exists in
+  this repository's tooling to implement or verify compute)
+- TPU compute Kernels (`providers/tpu` does real device discovery only,
+  via Google Coral's `libedgetpu` API, targeting the real local Edge TPU
+  accelerator, not Google Cloud TPU -- no Coral hardware exists in this
+  repository's tooling to implement or verify compute)
 - production server/API transport
 - general model hub downloads
 - agent and tool execution inside the Runtime
@@ -494,8 +509,20 @@ repository can test; `providers/metal` is an honest, unconditionally-
 unavailable placeholder, kept alive as real future work for the
 `simdgroup_matrix`/AMX/MPS-reliant compute-bound (prefill) kernels `wgpu`
 structurally cannot reach on Apple Silicon, with a call for contributors on
-real hardware. NPU/TPU Providers and multi-device execution policy remain
-future work, as does Mistral/Gemma Model Components.
+real hardware. `add-npu-and-tpu-provider-skeletons` closed the remaining
+two additional-Providers items the same honest way: `providers/npu` is a
+real device-discovery skeleton via Intel's oneAPI Level Zero API
+(`ZE_INIT_FLAG_VPU_ONLY` scopes discovery to NPU/VPU-class devices
+specifically), and `providers/tpu` is a real device-discovery skeleton via
+Google Coral's `libedgetpu` API, targeting the real local Edge TPU
+accelerator rather than Google Cloud TPU (a cloud service with no local
+device to discover) -- both gracefully unavailable everywhere this
+repository's tooling can verify, with every FFI declaration transcribed
+directly from each API's real, public header rather than guessed.
+Multi-device execution policy remains future work (`multi-device-placement`
+is still at the contract-only stage, and this repository has only one real
+GPU to verify placement against even once implemented), as does
+Mistral/Gemma Model Components.
 
 **Tachyon integration audit** (`docs/audits/audit-magnetar-integration-
 tachyon-2026-09-13.md`, a separate review from the scope-charter
