@@ -3140,6 +3140,14 @@ fn e2e_qwen_component_digest_mismatch_fails_before_planning() {
 /// making the "untrusted artifacts are rejected" assertion pass or fail
 /// based on test scheduling instead of behavior -- caught by a real CI
 /// failure (this exact race), not found by inspection.
+///
+/// This same reasoning is why the Tachyon integration audit MAG-07 proof
+/// (two distinct, independently-registered Components served at once) lives
+/// at the end of this function instead of its own `#[test]`: a second test
+/// that trusts and registers `QWEN_REAL_COMPONENT_BYTES` under its own
+/// fresh `ComponentTrustStore` races this function's own untrusted-rejection
+/// assertion above by the identical mechanism (confirmed by a real,
+/// reproduced local failure before consolidating).
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
 fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matches_the_singleton_path()
@@ -3223,6 +3231,63 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     let singleton_decode_hash =
         qwen_operator_sequence_hash(&qwen_graph_operator_codes(&via_singleton.decode).unwrap());
     assert_eq!(named_decode_hash, singleton_decode_hash);
+
+    // Tachyon integration audit MAG-07: the registry must genuinely serve a
+    // *second*, structurally unrelated Component at the same time as the
+    // real Qwen Component registered above -- not merely accept a
+    // caller-supplied digest that happens to resolve to the one hardcoded
+    // Qwen singleton. `SYNTHETIC_MINIMAL_COMPONENT_BYTES` implements the
+    // same `model-component-graph-producer` world but with every decoder
+    // layer omitted (`embedding -> rmsnorm -> matmul`), so its node count
+    // and operator-sequence hash can never coincide with Qwen's.
+    let synthetic_digest = ComponentDigest::sha256(SYNTHETIC_MINIMAL_COMPONENT_BYTES);
+    assert_ne!(
+        synthetic_digest, expected_digest,
+        "the two fixtures must be genuinely distinct artifacts"
+    );
+    let synthetic_trust = ComponentTrustStore::default().trust_digest(&synthetic_digest.value);
+    let registered_synthetic_digest = register_inference_component_artifact(
+        SYNTHETIC_MINIMAL_COMPONENT_BYTES.to_vec(),
+        SYNTHETIC_MINIMAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &synthetic_trust,
+    )
+    .expect("the synthetic minimal Component must also register, alongside Qwen");
+    assert_eq!(registered_synthetic_digest, synthetic_digest);
+
+    let (synthetic_graphs, _definition, _instance) =
+        build_first_native_graphs_from_named_component(
+            &synthetic_digest,
+            &fixture.config,
+            &fixture.identity,
+            prompt_token_count,
+        )
+        .expect("named-component graph production succeeds for the synthetic Component too");
+    assert_ne!(
+        via_named.prefill_node_count, synthetic_graphs.prefill_node_count,
+        "a full Qwen layer's worth of nodes must never coincide with the layer-less synthetic graph"
+    );
+    assert_ne!(
+        via_named.decode_node_count,
+        synthetic_graphs.decode_node_count
+    );
+    let synthetic_prefill_hash =
+        qwen_operator_sequence_hash(&qwen_graph_operator_codes(&synthetic_graphs.prefill).unwrap());
+    assert_ne!(named_prefill_hash, synthetic_prefill_hash);
+
+    // Building the synthetic Component's graphs must not disturb the real
+    // Qwen Component's own registered runtime: building from the Qwen
+    // digest again still succeeds and still matches the singleton path.
+    let (qwen_graphs_again, _definition, _instance) = build_first_native_graphs_from_named_component(
+        &digest,
+        &fixture.config,
+        &fixture.identity,
+        prompt_token_count,
+    )
+    .expect("the real Qwen Component's own runtime remains usable after another Component registers");
+    let qwen_again_prefill_hash = qwen_operator_sequence_hash(
+        &qwen_graph_operator_codes(&qwen_graphs_again.prefill).unwrap(),
+    );
+    assert_eq!(qwen_again_prefill_hash, singleton_prefill_hash);
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]

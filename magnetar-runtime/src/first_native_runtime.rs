@@ -7042,6 +7042,31 @@ const QWEN_REAL_COMPONENT_BYTES: &[u8] =
 const QWEN_REAL_COMPONENT_MANIFEST_BYTES: &[u8] =
     include_bytes!("../fixtures/components/qwen-real.component.wasm.magnetar-component.yaml");
 
+/// Test-oracle only (Tachyon integration audit MAG-07): a second, real,
+/// structurally distinct Component implementing the same
+/// `model-component-graph-producer` world -- `embedding -> rmsnorm ->
+/// matmul`, with every decoder layer omitted, so its node count and
+/// operator-sequence hash can never coincide with the real Qwen Component's.
+/// Exists to prove [`register_inference_component_artifact`]'s registry
+/// genuinely supports two independently-registered Components at once, not
+/// just one hardcoded Qwen singleton wearing a generic-looking API. Never a
+/// production Model Component; production never reads this.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    test
+))]
+const SYNTHETIC_MINIMAL_COMPONENT_BYTES: &[u8] =
+    include_bytes!("../fixtures/components/synthetic-minimal.component.wasm");
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    test
+))]
+const SYNTHETIC_MINIMAL_COMPONENT_MANIFEST_BYTES: &[u8] = include_bytes!(
+    "../fixtures/components/synthetic-minimal.component.wasm.magnetar-component.yaml"
+);
+
 #[cfg(all(
     not(target_arch = "wasm32"),
     feature = "wasmtime-component-engine",

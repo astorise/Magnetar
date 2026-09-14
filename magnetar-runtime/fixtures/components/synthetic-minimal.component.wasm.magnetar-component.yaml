@@ -1,0 +1,40 @@
+schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "sha256:467bfdf663fcdb6034294599f6a079a9e0af05c1d0be2e8996afe1c2ef463854"
+component:
+  name: "magnetar.test.synthetic-minimal"
+  version: "0.1.0"
+  description: "Test-only Model Component: a deliberately minimal, structurally distinct graph (embedding -> rmsnorm -> matmul, no decoder layers at all) proving the generic Component registry (wire-generic-inference-component-runtime) genuinely supports two independently-registered, behaviorally distinct Components at once. Never a production Model Component."
+  role: "qwen-model-component"
+runtime:
+  magnetar:
+    min_version: "0.1.0"
+wit:
+  imports:
+    - package: "magnetar:model-component-graph"
+      interface: "graph-builder"
+      version: "1.2.0"
+    - package: "magnetar:model-component-graph"
+      interface: "model-config"
+      version: "1.2.0"
+  exports: []
+capabilities:
+  requires: []
+authority:
+  requires: []
+engine:
+  profile: "native"
+  features:
+    - component-model
+    - resource-limits
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./fixtures/components/synthetic-minimal.component.wasm"
+signatures: []
