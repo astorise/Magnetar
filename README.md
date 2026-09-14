@@ -92,6 +92,19 @@ Implemented today:
 - Reference CPU Provider execution
 - External CUDA Provider baseline, with CUDA implementation details kept out of
   `magnetar-runtime`
+- External WGPU Provider baseline (`providers/wgpu`): real, hardware-verified
+  cross-platform GPU device discovery and one real compute Kernel (`add`) via
+  `wgpu` (Vulkan/Metal/DX12) -- Magnetar's real path to Apple GPU support
+  today, verified on real Vulkan-backed hardware, not yet wired into the
+  `ProviderExecutionApi`/Kernel Registry dispatch contract. External ROCm
+  Provider (`providers/rocm`): real device discovery only, via dynamic HIP
+  runtime loading, gracefully unavailable everywhere this repository's
+  tooling can verify (no AMD hardware). External Metal Provider
+  (`providers/metal`): an honest, unconditionally-unavailable placeholder --
+  no macOS environment exists in this repository's tooling to implement or
+  verify real Metal FFI, and `simdgroup_matrix`/AMX/MPS access `wgpu` cannot
+  reach remains real future work there specifically for compute-bound
+  (prefill) kernels; contributors with real Apple Silicon hardware welcome.
 - Model Artifact, Model Loading, Model Instance, Tokenizer, Generation,
   Sampling, Session, KV Cache, Prefix Cache, Continuous Batching, Runtime
   Inference API, and E2E conformance contract surfaces
@@ -144,7 +157,14 @@ Implemented only as a baseline, fixture, or incomplete production surface:
 
 Deferred or unsupported for v0.1:
 
-- ROCm, Metal, OpenVINO, QNN, Vulkan, and WebGPU Providers
+- OpenVINO and QNN Providers
+- Native Metal FFI (`providers/metal` is an honest, unconditionally-
+  unavailable placeholder -- no macOS environment exists in this
+  repository's tooling to implement or verify it; `providers/wgpu`
+  below is the real near-term path to Apple GPUs)
+- ROCm compute Kernels (`providers/rocm` does real device discovery only
+  -- no AMD hardware exists in this repository's tooling to implement or
+  verify compute)
 - production server/API transport
 - general model hub downloads
 - agent and tool execution inside the Runtime
@@ -460,10 +480,22 @@ downloaded checkpoint actually generating text) is not yet proven --
 unmodified, but that has not been verified against a real one.
 `support-gptq-quantized-huggingface-ingestion` and
 `support-awq-and-bitsandbytes-quantized-huggingface-ingestion` closed the
-quantization item in full (see above). Everything else the original
-charter frames as future work remains exactly that: multi-device
-execution, and additional Providers (Metal/ROCm/NPU/TPU) or Model
-Components (Mistral/Gemma).
+quantization item in full (see above).
+`add-rocm-metal-provider-skeletons-and-real-wgpu-provider` closed the
+additional-Providers item as far as this repository's own hardware allows:
+this repository's tooling has exactly one real GPU (an NVIDIA laptop GPU)
+and no Apple Silicon, AMD, NPU, or TPU hardware anywhere, so "verify on real
+hardware" the way `providers/cpu`/`providers/cuda` were could not be
+followed literally for Metal or ROCm. `providers/wgpu` is real and
+hardware-verified (device discovery plus one compute Kernel, on this
+repository's real GPU via the real Vulkan backend); `providers/rocm` is a
+real device-discovery skeleton, gracefully unavailable everywhere this
+repository can test; `providers/metal` is an honest, unconditionally-
+unavailable placeholder, kept alive as real future work for the
+`simdgroup_matrix`/AMX/MPS-reliant compute-bound (prefill) kernels `wgpu`
+structurally cannot reach on Apple Silicon, with a call for contributors on
+real hardware. NPU/TPU Providers and multi-device execution policy remain
+future work, as does Mistral/Gemma Model Components.
 
 **Tachyon integration audit** (`docs/audits/audit-magnetar-integration-
 tachyon-2026-09-13.md`, a separate review from the scope-charter
