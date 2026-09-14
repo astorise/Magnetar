@@ -182,14 +182,18 @@ pub fn local_bundle_manifest_digest(root: impl Into<PathBuf>) -> Result<String> 
         ModelArtifactSource::Tachyon("tachyon:test-fixture".to_owned()),
         root.clone(),
     );
-    let ingested = HuggingFaceIngestor::new()
-        .ingest(&source)
-        .with_context(|| {
-            format!(
-                "Magnetar failed to inspect inference Component bundle at `{}`",
-                root.display()
-            )
-        })?;
+    let is_gguf = root.join(magnetar_loader_gguf::GGUF_FILE_NAME).is_file();
+    let ingested = if is_gguf {
+        magnetar_loader_gguf::GgufIngestor::new().ingest(&source)
+    } else {
+        HuggingFaceIngestor::new().ingest(&source)
+    }
+    .with_context(|| {
+        format!(
+            "Magnetar failed to inspect inference Component bundle at `{}`",
+            root.display()
+        )
+    })?;
     Ok(ingested.manifest.id.digest.value)
 }
 
@@ -237,60 +241,98 @@ impl LoadedInferenceComponent {
             anyhow!("Magnetar rejected inference Component artifact for `{name}`: {error}")
         })?;
 
+        // Format detection: a bundle is GGUF-shaped if it declares the
+        // single file `loaders/gguf`'s own ingestor looks for, Hugging-
+        // Face-shaped otherwise -- the only two real ingestors this crate
+        // has (Tachyon integration audit MAG-01: the generic adapter no
+        // longer hardcodes one format). Adding a third real ingestor to
+        // this codebase would extend this same match, not require
+        // touching every call site below -- both branches converge on the
+        // same `ProductionIngestionResult`/`Arc<dyn Tokenizer>`/`Option<
+        // String>` (raw chat template text) shapes.
+        let is_gguf = source
+            .root
+            .join(magnetar_loader_gguf::GGUF_FILE_NAME)
+            .is_file();
+
         let production_source = ProductionModelSource::authorized_local_bundle(
             ModelArtifactSource::Tachyon(source.provenance.clone()),
             source.root.clone(),
         );
-        let ingested = HuggingFaceIngestor::new()
-            .ingest(&production_source)
+        let ingested: magnetar_runtime::production_model_ingestion::ProductionIngestionResult =
+            if is_gguf {
+                magnetar_loader_gguf::GgufIngestor::new().ingest(&production_source)
+            } else {
+                HuggingFaceIngestor::new().ingest(&production_source)
+            }
             .with_context(|| {
                 format!(
                     "Magnetar failed to ingest inference Component bundle at `{}`",
                     source.root.display()
                 )
             })?;
+        let vocab_size = ingested
+            .manifest
+            .architecture_config
+            .as_ref()
+            .map(|config| config.vocab_size);
 
-        let tokenizer_path = source.root.join("tokenizer.json");
-        let tokenizer_bytes = std::fs::read(&tokenizer_path)
-            .with_context(|| format!("failed to read `{}`", tokenizer_path.display()))?;
-        let tokenizer_config_path = source.root.join("tokenizer_config.json");
-        let tokenizer_config_bytes =
-            if tokenizer_config_path.is_file() {
+        let (real_tokenizer, chat_template_text): (
+            Arc<dyn Tokenizer + Send + Sync>,
+            Option<String>,
+        ) = if is_gguf {
+            let tokenizer = magnetar_loader_gguf::load_gguf_tokenizer(
+                &production_source,
+                format!("{name}-tokenizer"),
+                vocab_size,
+            )
+            .with_context(|| format!("Magnetar failed to load tokenizer for Component `{name}`"))?;
+            let chat_template_text =
+                magnetar_loader_gguf::load_gguf_chat_template(&production_source).with_context(
+                    || format!("Magnetar failed to load chat template for Component `{name}`"),
+                )?;
+            (Arc::new(tokenizer), chat_template_text)
+        } else {
+            let tokenizer_path = source.root.join("tokenizer.json");
+            let tokenizer_bytes = std::fs::read(&tokenizer_path)
+                .with_context(|| format!("failed to read `{}`", tokenizer_path.display()))?;
+            let tokenizer_config_path = source.root.join("tokenizer_config.json");
+            let tokenizer_config_bytes = if tokenizer_config_path.is_file() {
                 Some(std::fs::read(&tokenizer_config_path).with_context(|| {
                     format!("failed to read `{}`", tokenizer_config_path.display())
                 })?)
             } else {
                 None
             };
-        let tokenizer_config_metadata = tokenizer_config_bytes
-            .as_deref()
-            .map(parse_tokenizer_config)
-            .transpose()
-            .with_context(|| {
-                format!("Magnetar failed to parse tokenizer configuration for Component `{name}`")
-            })?;
-        let chat_formatter = tokenizer_config_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.chat_template_reference.as_deref())
+            let tokenizer_config_metadata = tokenizer_config_bytes
+                .as_deref()
+                .map(parse_tokenizer_config)
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "Magnetar failed to parse tokenizer configuration for Component `{name}`"
+                    )
+                })?;
+            let chat_template_text = tokenizer_config_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.chat_template_reference.clone());
+            let tokenizer = magnetar_loader_huggingface::HuggingFaceTokenizer::from_bytes(
+                &tokenizer_bytes,
+                tokenizer_config_metadata.as_ref(),
+                format!("{name}-tokenizer"),
+                vocab_size,
+            )
+            .with_context(|| format!("Magnetar failed to load tokenizer for Component `{name}`"))?;
+            (Arc::new(tokenizer), chat_template_text)
+        };
+        let tokenizer_metadata = real_tokenizer.metadata().clone();
+        let chat_formatter = chat_template_text
             .map(HuggingFaceChatTemplateFormatter::new)
             .transpose()
             .with_context(|| {
                 format!("Magnetar failed to load chat template for Component `{name}`")
             })?
             .map(Arc::new);
-        let real_tokenizer = magnetar_loader_huggingface::HuggingFaceTokenizer::from_bytes(
-            &tokenizer_bytes,
-            tokenizer_config_metadata.as_ref(),
-            format!("{name}-tokenizer"),
-            ingested
-                .manifest
-                .architecture_config
-                .as_ref()
-                .map(|config| config.vocab_size),
-        )
-        .with_context(|| format!("Magnetar failed to load tokenizer for Component `{name}`"))?;
-        let tokenizer_metadata = real_tokenizer.metadata().clone();
-        let real_tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(real_tokenizer);
 
         let trust_decision = trust_policy
             .model_trust_store()

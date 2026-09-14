@@ -12,6 +12,7 @@ cuda = ["dep:magnetar-provider-cuda"]
 
 [dependencies]
 anyhow = "1"
+magnetar-loader-gguf = { path = "../loaders/gguf" }
 magnetar-loader-huggingface = { path = "../loaders/huggingface" }
 magnetar-provider-cpu = { path = "../providers/cpu" }
 magnetar-provider-cuda = { path = "../providers/cuda", optional = true }

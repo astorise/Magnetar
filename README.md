@@ -446,14 +446,22 @@ Component trust from Model Artifact trust for real (closing MAG-03), and
 a caller-registered Component genuinely drives generation end to end via
 `ProductionQwenLoadedModel::load_with_component` (closing MAG-02),
 verified by a test asserting identical generated tokens between the new
-path and the pre-existing hardcoded-singleton path. MAG-01 remains open:
-`inference-components` still hardcodes HuggingFace ingestion (GGUF exists
-as a real alternative ingestor in this codebase, `loaders/gguf`, but is
-not yet wired in as a pluggable choice here). MAG-06 (the concurrent-
-generation model) and MAG-07 (a test proving two genuinely distinct
-Components run on the same Magnetar) also remain open -- the latter
-because only one real Component fixture implementing the
-`model-component-graph-producer` world exists in this repo today.
+path and the pre-existing hardcoded-singleton path.
+`enable-pluggable-model-ingestion-in-inference-components` then closed
+MAG-01: `inference-components` selects between `GgufIngestor` and
+`HuggingFaceIngestor` (both already implementing the same format-neutral
+`ProductionModelArtifactIngestor` contract) by inspecting the bundle it
+was given, instead of hardcoding Hugging Face as the only reachable
+format -- chat-template rendering needed no format-specific code at all,
+since `loaders/gguf`'s own chat-template loader already returns raw text
+for the same generic formatter Hugging Face's path already used. MAG-06
+(the concurrent-generation model) and MAG-07 (a test proving two
+genuinely distinct Components run on the same Magnetar) remain open --
+the latter because only one real Component fixture implementing the
+`model-component-graph-producer` world exists in this repo today. No
+dedicated `inference-components`-crate-level integration test drives
+`LoadedInferenceComponent::load` end to end for either format -- a
+pre-existing gap this session's changes have not yet closed.
 
 ## Terminology
 
