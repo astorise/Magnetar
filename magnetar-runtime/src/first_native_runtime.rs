@@ -8596,6 +8596,35 @@ pub fn build_first_native_graphs_from_named_component(
     )
 }
 
+/// No Component Engine exists on this build target/feature combination
+/// (`wasm32`, or `wasmtime-component-engine` disabled) -- fails closed,
+/// structurally, exactly like [`first_native_component_graphs_for_prompt`]'s
+/// own non-test fallback for the same reason. `E2eRuntimeModelExecutionEngine::
+/// execute_generation_step` and `ProductionQwenLoadedModel::prepare_generation`
+/// both reach this whenever `component_digest` is `Some` on such a build,
+/// so a `None`-digest instance (the pre-existing singleton path, unaffected
+/// by this fallback) remains the only thing that can ever run here.
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")))]
+pub fn build_first_native_graphs_from_named_component(
+    _digest: &ComponentDigest,
+    _config: &QwenConfig,
+    _identity: &ModelComponentIdentity,
+    _prompt_token_count: u64,
+) -> Result<
+    (
+        FirstNativeComponentGraphs,
+        ComponentDefinitionId,
+        ComponentInstanceId,
+    ),
+    E2eConformanceError,
+> {
+    Err(E2eConformanceError::ModelComponentFailed {
+        reason: "no Component engine is available on this build target; a caller-registered \
+                 Component cannot be used here"
+            .into(),
+    })
+}
+
 /// Builds prefill and decode Execution Graphs by instantiating the real
 /// Qwen Model Component (`QWEN_REAL_COMPONENT_BYTES`, compiled once and
 /// cached -- see `qwen_real_component_runtime`) and calling its
