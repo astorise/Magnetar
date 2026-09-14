@@ -454,12 +454,18 @@ MAG-01: `inference-components` selects between `GgufIngestor` and
 was given, instead of hardcoding Hugging Face as the only reachable
 format -- chat-template rendering needed no format-specific code at all,
 since `loaders/gguf`'s own chat-template loader already returns raw text
-for the same generic formatter Hugging Face's path already used. MAG-06
-(the concurrent-generation model) and MAG-07 (a test proving two
-genuinely distinct Components run on the same Magnetar) remain open --
-the latter because only one real Component fixture implementing the
-`model-component-graph-producer` world exists in this repo today. No
-dedicated `inference-components`-crate-level integration test drives
+for the same generic formatter Hugging Face's path already used.
+`document-inference-component-concurrency-model` then closed MAG-06:
+investigating first (rather than picking a policy from scratch) found
+`ProductionQwenLoadedModel::generate`/`generate_streaming` already take
+`&mut self`, so one generation in flight per resident instance was
+already compiler-enforced, not an open design question -- this change
+states that explicitly at `LoadedInferenceComponent`'s own API surface,
+changing zero non-comment lines. MAG-07 (a test proving two genuinely
+distinct Components run on the same Magnetar) remains open, because only
+one real Component fixture implementing the `model-component-graph-
+producer` world exists in this repo today. No dedicated
+`inference-components`-crate-level integration test drives
 `LoadedInferenceComponent::load` end to end for either format -- a
 pre-existing gap this session's changes have not yet closed.
 

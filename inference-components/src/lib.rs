@@ -168,6 +168,30 @@ pub struct InferenceComponentOutput {
     pub usage: InferenceComponentUsage,
 }
 
+/// One resident, loaded inference Component instance.
+///
+/// # Concurrency model (Tachyon integration audit MAG-06)
+///
+/// **One active generation at a time per instance.** `invoke_payload`/
+/// `invoke_payload_streaming` acquire `loaded_model`'s lock for the full
+/// duration of a generation call (prefill through the last decode step);
+/// a second call arriving while one is already in flight *blocks* until
+/// the first finishes -- it is never rejected, dropped, or run
+/// concurrently against the same `Runtime`/`ModelInstance`. This is a
+/// deliberate choice, not an oversight: `ProductionQwenLoadedModel` owns
+/// one `Runtime` and one KV-cache-bearing `ModelInstance`, and
+/// `magnetar-runtime`'s generation loop is not designed for two
+/// generations to interleave their KV state within a single instance.
+///
+/// This is a per-*instance* constraint, not a process-wide one: an
+/// embedder that wants concurrent generation across independent requests
+/// loads multiple `LoadedInferenceComponent` instances (one `load()` call
+/// each -- nothing here prevents that) and routes requests across them,
+/// exactly the same way it would route across multiple model replicas on
+/// separate hardware. This crate does not itself provide a scheduler,
+/// batching, or an instance pool -- an embedder that needs one builds it
+/// on top of this per-instance primitive; nothing here silently batches
+/// requests together or reorders them.
 pub struct LoadedInferenceComponent {
     name: String,
     root: PathBuf,
@@ -399,6 +423,9 @@ impl LoadedInferenceComponent {
         ))
     }
 
+    /// Blocks until any generation already in flight on this instance
+    /// finishes -- see [`LoadedInferenceComponent`]'s own "Concurrency
+    /// model" doc comment.
     pub fn invoke_payload(&self, payload: &[u8]) -> Result<InferenceComponentOutput> {
         let request = InvocationPayload::parse(payload)?.into_generation_request()?;
         let outcome = self
@@ -427,6 +454,9 @@ impl LoadedInferenceComponent {
         })
     }
 
+    /// Blocks until any generation already in flight on this instance
+    /// finishes -- see [`LoadedInferenceComponent`]'s own "Concurrency
+    /// model" doc comment.
     pub fn invoke_payload_streaming(
         &self,
         payload: &[u8],
