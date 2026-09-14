@@ -455,6 +455,7 @@ jobs:
             loaders/huggingface/Cargo.toml \
             loaders/gguf/Cargo.toml \
             integration-tests/production-loading/Cargo.toml \
+            integration-tests/multi-device-cpu-cuda/Cargo.toml \
             inference-components/Cargo.toml
           do
             echo "::group::$manifest"

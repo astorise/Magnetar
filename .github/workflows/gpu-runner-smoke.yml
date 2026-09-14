@@ -69,6 +69,15 @@ jobs:
         # is a run where that must never happen (`docs/audits/cuda-provider-full-audit-2026-09-05.md`'s
         # P1 "explicit provider-hardware-cuda == Passed signal" finding).
         run: cargo test --locked --manifest-path providers/cuda/Cargo.toml -- --include-ignored
+      - name: Build and test real multi-Device execution (Reference CPU + real CUDA, one Runtime)
+        # add-multi-device-cpu-cuda-execution-proof: the first real proof a
+        # single Runtime can register two heterogeneous real Providers
+        # simultaneously and dispatch one logical computation across both
+        # real Devices -- gracefully skips (this test's own tolerance, not
+        # a workflow concern) if no compatible CUDA device is found, so
+        # this step's real value is specifically a real run against this
+        # runner's real GPU, not just a compile check.
+        run: cargo test --locked --manifest-path integration-tests/multi-device-cpu-cuda/Cargo.toml
       - name: Build and test real production Qwen loading on CUDA
         # implement-production-qwen-model-loading task 12.3/12.7: the same
         # real ingested Hugging Face bundle, real tokenizer, and real

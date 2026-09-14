@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "magnetar-integration-multi-device-cpu-cuda"
+version = "0.1.0"
+edition = "2024"
+# Never published: this crate exists only to prove a single Runtime can
+# register two real, heterogeneous Providers (Reference CPU +  CUDA)
+# simultaneously and dispatch a real computation across both -- something
+# neither Provider crate can prove on its own without one importing the
+# other, and something magnetar-runtime itself must never depend on either
+# of to prove (Providers are external, optional extensions,
+# `externalize-runtime-extension-modules`). Mirrors
+# `integration-tests/cuda-first-native`'s own reason for existing as a
+# separate crate.
+publish = false
+
+[dev-dependencies]
+magnetar-runtime = { path = "../../magnetar-runtime" }
+magnetar-provider-cpu = { path = "../../providers/cpu" }
+magnetar-provider-cuda = { path = "../../providers/cuda" }
+sha2 = "0.10"
