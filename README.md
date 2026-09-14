@@ -306,9 +306,17 @@ hardware:
   than silently corrupting the tensor). Verified against the real public
   `Qwen2.5-0.5B-Instruct-GGUF` checkpoint's actual `Q8_0` export: it loads
   and generates the exact same output as its unquantized F16 GGUF export
-  and Safetensors counterpart, for the same prompt. GPTQ/AWQ/BitsAndBytes
-  (Hugging Face/Safetensors-shaped quantization schemes, unrelated to
-  GGUF's block format) remain entirely unaddressed
+  and Safetensors counterpart, for the same prompt.
+  `support-gptq-quantized-huggingface-ingestion` gives `loaders/huggingface`
+  real GPTQ 4-bit dequantization (a Hugging Face/Safetensors-shaped
+  quantization scheme, unrelated to GGUF's block format): a GPTQ-quantized
+  projection's raw `qweight`/`qzeros`/`scales`/`g_idx` tensors dequantize
+  to plain `F32` at ingestion time, verified against real bytes from the
+  public `Qwen2.5-0.5B-Instruct-GPTQ-Int4` checkpoint compared
+  element-by-element against its own unquantized counterpart -- not a
+  full downloaded-checkpoint generation proof yet, only dequantization
+  correctness and ingestion-layer wiring. AWQ/BitsAndBytes remain
+  unaddressed
 - Real native `F16`/`bfloat16` compute on `providers/cuda`, for elementwise
   `add`/`mul`: genuine 2-byte device-resident half-precision buffers, not
   `f32` promoted and labeled, computed via a real on-device kernel and
@@ -328,8 +336,8 @@ hardware:
 
 Explicitly not yet supported by this profile:
 
-- GPTQ/AWQ/BitsAndBytes quantization (see above -- distinct from and
-  unaddressed by GGUF's now-real `Q8_0`/`Q4_K`/`Q5_K` support)
+- AWQ/BitsAndBytes quantization (see above -- GPTQ's own dequantization is
+  now real; GGUF's `Q8_0`/`Q4_K`/`Q5_K` support was already real)
 - Native CUDA `F16`/`bfloat16` compute exists for elementwise `add`/`mul`
   only (see above, now genuinely dispatchable through the Kernel Registry,
   but not device-resident between calls and not requested by any
@@ -407,10 +415,17 @@ tensor-dequantization` made GGUF's `Q8_0`/`Q4_K`/`Q5_K` quantization real
 at the Model Loading layer, and `resolve-gguf-quantized-projection-
 transpose-sequencing` closed the remaining loader-side gap -- a real,
 genuinely quantized public GGUF checkpoint now loads and generates end to
-end (see above). GPTQ/AWQ/BitsAndBytes (a different quantization family
-entirely, unrelated to GGUF) remain unaddressed, so "quantization
-support" as the charter names it broadly is still partial, even though
-GGUF's own quantization is now real. Native CUDA `F16`/`BF16` compute has
+end (see above).
+`support-gptq-quantized-huggingface-ingestion` then gave `loaders/
+huggingface` real GPTQ 4-bit dequantization -- a Hugging Face/Safetensors-
+shaped scheme entirely unrelated to GGUF's block format -- verified
+against real bytes from the public `Qwen2.5-0.5B-Instruct-GPTQ-Int4`
+checkpoint compared element-by-element against its own unquantized
+counterpart (dequantization correctness and ingestion-layer wiring, not
+yet a full downloaded-checkpoint generation proof). AWQ/BitsAndBytes
+remain unaddressed, so "quantization support" as the charter names it
+broadly is still partial, even though GGUF's and GPTQ's own quantization
+are now both real. Native CUDA `F16`/`BF16` compute has
 also progressed through three phases: `add-native-cuda-half-precision-
 compute` landed the conversion primitives,
 `enable-native-cuda-half-precision-elementwise-compute` landed a real,
@@ -435,11 +450,12 @@ different graph for a bias-bearing config, driven entirely by
 `model-config`. Real end-to-end Llama checkpoint ingestion (a real
 downloaded checkpoint actually generating text) is not yet proven --
 `loaders/huggingface` should already accept a Llama-shaped bundle
-unmodified, but that has not been verified against a real one. Everything
-else the original charter frames as future work remains exactly that:
-multi-device execution, GPTQ/AWQ/BitsAndBytes quantization, and
-additional Providers (Metal/ROCm/NPU/TPU) or Model Components
-(Mistral/Gemma).
+unmodified, but that has not been verified against a real one.
+`support-gptq-quantized-huggingface-ingestion` closed the GPTQ portion of
+the quantization item (see above). Everything else the original charter
+frames as future work remains exactly that: multi-device execution,
+AWQ/BitsAndBytes quantization, and additional Providers (Metal/ROCm/NPU/
+TPU) or Model Components (Mistral/Gemma).
 
 **Tachyon integration audit** (`docs/audits/audit-magnetar-integration-
 tachyon-2026-09-13.md`, a separate review from the scope-charter
