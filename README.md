@@ -476,12 +476,24 @@ runs the full Quality CI matrix, verified green before and after every
 chantier in this list -- what remains outside this repository's scope is
 Tachyon actually consuming a post-reconciliation `main` commit, which is
 an action on Tachyon's side, not a further Magnetar fix. The Tachyon
-audit's full scope (MAG-01 through MAG-07) is closed. Outstanding, noted
-for the record but outside that audit's strict scope: no dedicated
-`inference-components`-crate-level integration test drives
-`LoadedInferenceComponent::load` end to end for either format yet (the
-equivalent `magnetar-runtime` path is tested via
-`production_qwen_loaded_model_load_with_component_matches_the_singleton_path`).
+audit's full scope (MAG-01 through MAG-07) is closed.
+`add-inference-components-integration-test-and-ci-coverage` then closed
+the one remaining note left on record: a real, completely-specified
+Hugging Face-shaped bundle now drives `LoadedInferenceComponent::load`
+through a real generation end to end, proving this crate's own
+orchestration (format selection, tokenizer construction, Component
+registration, trust evaluation, `load_with_component` wiring) rather than
+only the `magnetar-runtime` layer underneath it. Writing that test
+surfaced a separate, more serious finding: `inference-components` is its
+own `[workspace]` (like `magnetar-cli`, moved out of the root workspace
+for the same submodule-dependency reason) but, unlike `magnetar-cli`, was
+wired into no CI job at all -- the crate the audit reviewed most closely
+had never been built or tested in CI. Fixed by adding it to
+`submodule-integration`, with the same format/clippy steps `magnetar-cli`
+already has, verified green on the real Linux runner. Outstanding, noted
+for the record: a GGUF-shaped equivalent of this end-to-end test (the
+`is_gguf` branch itself remains covered separately by `loaders/gguf`'s
+own tests and the `magnetar-runtime` singleton/named-component tests).
 
 ## Terminology
 
