@@ -22,3 +22,12 @@
 [submodule "loaders/gguf"]
 	path = loaders/gguf
 	url = https://github.com/astorise/Magnetar-loader-GGUF.git
+[submodule "providers/metal"]
+	path = providers/metal
+	url = https://github.com/astorise/Magnetar-provider-Metal.git
+[submodule "providers/rocm"]
+	path = providers/rocm
+	url = https://github.com/astorise/Magnetar-provider-ROCm.git
+[submodule "providers/wgpu"]
+	path = providers/wgpu
+	url = https://github.com/astorise/Magnetar-provider-WGPU.git

@@ -365,7 +365,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Checkout Provider submodules
-        run: git submodule update --init -- providers/cpu providers/cuda
+        run: git submodule update --init -- providers/cpu providers/cuda providers/rocm providers/metal providers/wgpu
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
@@ -374,6 +374,20 @@ jobs:
         run: cargo test --locked --manifest-path providers/cpu/Cargo.toml
       - name: "Build and test the CUDA Provider (GPU-less here: exercises its graceful-unavailability path)"
         run: cargo test --locked --manifest-path providers/cuda/Cargo.toml
+      - name: "Build and test the ROCm Provider (GPU-less here: exercises its graceful-unavailability path)"
+        run: cargo test --locked --manifest-path providers/rocm/Cargo.toml
+      - name: "Build and test the Metal Provider (unconditionally unavailable on every non-macOS platform)"
+        run: cargo test --locked --manifest-path providers/metal/Cargo.toml
+      # `mesa-vulkan-drivers` provides `llvmpipe`, a real (CPU-backed)
+      # software Vulkan ICD -- lets this genuinely GPU-less runner still
+      # exercise the WGPU Provider's real device-discovery and real
+      # compute-kernel dispatch path, not only its graceful-
+      # unavailability fallback (`providers/wgpu`'s own tests gracefully
+      # skip, rather than fail, if this does not yield a usable adapter).
+      - name: Install a software Vulkan driver (llvmpipe) for the WGPU Provider
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - name: Build and test the WGPU Provider
+        run: cargo test --locked --manifest-path providers/wgpu/Cargo.toml
       - name: Install cargo-deny
         uses: taiki-e/install-action@5724fe4561a201b0d36bddf13177e3557b43787b # cargo-deny
       # The root `deny` job above never sees this submodule (it checks out
@@ -383,8 +397,15 @@ jobs:
       # native-library-adjacent dependency -- never entered any `cargo deny`
       # graph until this step (`docs/audits/cuda-provider-full-audit-2026-09-05.md`'s
       # P2 finding; `providers/cuda/deny.toml` carries the rationale).
+      # `providers/rocm`'s `libloading` and `providers/wgpu`'s `wgpu`/
+      # `pollster` are the identical class of new, dynamic-library-adjacent
+      # dependency, each with their own `deny.toml` for the same reason.
       - name: Check the CUDA Provider's own dependency graph (advisories, bans, licenses, sources)
         run: cargo deny --manifest-path providers/cuda/Cargo.toml check
+      - name: Check the ROCm Provider's own dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path providers/rocm/Cargo.toml check
+      - name: Check the WGPU Provider's own dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path providers/wgpu/Cargo.toml check
 
   # Full conformance (task 15.9): the original, unsplit job -- checks out
   # every submodule via `submodules: recursive` and re-runs the same
@@ -416,6 +437,9 @@ jobs:
             formats/safetensors/Cargo.toml \
             providers/cpu/Cargo.toml \
             providers/cuda/Cargo.toml \
+            providers/rocm/Cargo.toml \
+            providers/metal/Cargo.toml \
+            providers/wgpu/Cargo.toml \
             loaders/huggingface/Cargo.toml \
             loaders/gguf/Cargo.toml \
             integration-tests/production-loading/Cargo.toml \
