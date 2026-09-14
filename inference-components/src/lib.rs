@@ -865,3 +865,270 @@ mod tests {
         assert!(is_invalid_component_invocation(&error));
     }
 }
+
+/// This crate's own end-to-end integration test for `LoadedInferenceComponent::
+/// load` (the noted gap left after the Tachyon integration audit closure: the
+/// equivalent `magnetar-runtime` path is exercised by
+/// `production_qwen_loaded_model_load_with_component_matches_the_singleton_path`,
+/// but that test lives inside `magnetar-runtime` and never drives this
+/// crate's own orchestration -- format detection, tokenizer construction,
+/// Component registration, trust evaluation, `load_with_component` wiring --
+/// through `LoadedInferenceComponent::load` itself). Builds a real,
+/// completely-specified Hugging Face-shaped bundle on disk (every tensor the
+/// real Qwen Component's graph resolves, at the exact shapes
+/// `magnetar_runtime::qwen_expected_tensor_shape` expects) and runs a real
+/// generation through `invoke_payload`, the same call shape a real embedder
+/// (e.g. Tachyon) uses.
+#[cfg(test)]
+mod load_end_to_end_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn qwen_component_bytes() -> &'static [u8] {
+        include_bytes!("../../magnetar-runtime/fixtures/components/qwen-real.component.wasm")
+    }
+
+    fn qwen_component_manifest_bytes() -> &'static [u8] {
+        include_bytes!(
+            "../../magnetar-runtime/fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
+        )
+    }
+
+    fn tiny_config_json() -> Vec<u8> {
+        serde_json::json!({
+            "architectures": ["Qwen2ForCausalLM"],
+            "model_type": "qwen2",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "vocab_size": 4,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": false,
+            "torch_dtype": "float32",
+            "bos_token_id": 0,
+            "eos_token_id": 1
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// A tiny, real `tokenizer.json` (WordLevel over a 4-token vocabulary,
+    /// matching `tiny_config_json`'s `vocab_size`) -- the same recipe
+    /// `loaders/huggingface`'s own tokenizer tests use, real `tokenizers`-
+    /// crate input that round-trips "hello world" deterministically,
+    /// unlike a byte-level BPE vocabulary too small to round-trip arbitrary
+    /// text (a real failure hit and worked around earlier in this session's
+    /// `loaders/gguf` tokenizer test).
+    fn tiny_tokenizer_json() -> Vec<u8> {
+        serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                {
+                    "id": 0, "content": "<bos>", "special": true,
+                    "single_word": false, "lstrip": false, "rstrip": false, "normalized": false
+                },
+                {
+                    "id": 1, "content": "<eos>", "special": true,
+                    "single_word": false, "lstrip": false, "rstrip": false, "normalized": false
+                }
+            ],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<bos>": 0, "<eos>": 1, "hello": 2, "world": 3},
+                "unk_token": "hello"
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn write_safetensors(path: &Path, tensors: &[(&str, Vec<u64>, Vec<f32>)]) {
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, shape, values) in tensors {
+            let expected_elements: u64 = shape.iter().product();
+            assert_eq!(
+                expected_elements as usize,
+                values.len(),
+                "{name} declared shape does not match the number of values supplied"
+            );
+            let start = data.len() as u64;
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            let end = data.len() as u64;
+            header.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, end]}),
+            );
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header_bytes).unwrap();
+        file.write_all(&data).unwrap();
+    }
+
+    /// Small, deterministic, bounded-magnitude values -- this test's only
+    /// concern is that a real generation runs end to end through this
+    /// crate's own orchestration, not numerical correctness (already
+    /// covered by `magnetar-runtime`'s own equivalent test); values just
+    /// need to be finite and not degenerate (e.g. all-zero, which would
+    /// make RMSNorm divide a zero vector by its own near-zero norm).
+    fn filled(len: usize, seed: f32) -> Vec<f32> {
+        (0..len)
+            .map(|index| (((index as f32) * 0.037 + seed) % 1.0 - 0.5) * 0.1)
+            .collect()
+    }
+
+    /// Every tensor name/shape here matches `magnetar_runtime::
+    /// qwen_expected_tensor_shape`'s HF-stored (pre-transpose) convention
+    /// exactly for `tiny_config_json`'s dimensions: hidden_size=8,
+    /// intermediate_size=16, num_hidden_layers=1, num_attention_heads=
+    /// num_key_value_heads=2 (head_dim=4, so q/k/v_dim=8), vocab_size=4,
+    /// untied embeddings (so `lm_head.weight` is declared explicitly,
+    /// avoiding the separate tied-embedding derivation path).
+    fn write_tiny_qwen_bundle(dir: &Path) {
+        std::fs::write(dir.join("config.json"), tiny_config_json()).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), tiny_tokenizer_json()).unwrap();
+        let tensors: Vec<(&str, Vec<u64>, Vec<f32>)> = vec![
+            ("model.embed_tokens.weight", vec![4, 8], filled(32, 0.10)),
+            ("model.norm.weight", vec![8], filled(8, 0.20)),
+            (
+                "model.layers.0.input_layernorm.weight",
+                vec![8],
+                filled(8, 0.30),
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![8, 8],
+                filled(64, 0.40),
+            ),
+            (
+                "model.layers.0.self_attn.k_proj.weight",
+                vec![8, 8],
+                filled(64, 0.50),
+            ),
+            (
+                "model.layers.0.self_attn.v_proj.weight",
+                vec![8, 8],
+                filled(64, 0.60),
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight",
+                vec![8, 8],
+                filled(64, 0.70),
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                vec![8],
+                filled(8, 0.80),
+            ),
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![16, 8],
+                filled(128, 0.90),
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                vec![16, 8],
+                filled(128, 1.00),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![8, 16],
+                filled(128, 1.10),
+            ),
+            ("lm_head.weight", vec![4, 8], filled(32, 1.20)),
+        ];
+        write_safetensors(&dir.join("model.safetensors"), &tensors);
+    }
+
+    #[test]
+    fn loaded_inference_component_load_runs_a_real_huggingface_bundle_end_to_end() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_qwen_bundle(dir.path());
+
+        // The real Model Artifact digest computed from the real bundle just
+        // written -- never a hardcoded value -- via this crate's own
+        // `local_bundle_manifest_digest`, the same helper a real embedder
+        // uses to learn what to trust before calling `load`.
+        let model_digest =
+            local_bundle_manifest_digest(dir.path()).expect("the bundle inspects cleanly");
+        // The real Component artifact digest, computed from the real
+        // checked-in Qwen Component bytes -- never `QWEN_REAL_COMPONENT_
+        // DIGEST` or any other hardcoded constant (Tachyon integration
+        // audit MAG-03: Component trust is independent of Model Artifact
+        // trust, and both are named explicitly here).
+        let component_digest = magnetar_runtime::ComponentDigest::sha256(qwen_component_bytes());
+
+        let trust_policy = ArtifactTrustPolicy::default()
+            .trust_digest(&model_digest)
+            .trust_component_digest(&component_digest.value);
+
+        let component = LoadedInferenceComponent::load(
+            "test-qwen",
+            InferenceComponentArtifact::from_bytes(
+                qwen_component_bytes().to_vec(),
+                qwen_component_manifest_bytes().to_vec(),
+            ),
+            InferenceComponentSource::authorized_local_bundle("test-fixture", dir.path()),
+            trust_policy,
+            InferenceComponentPlacement::ReferenceCpu,
+        )
+        .expect(
+            "a real, completely-specified Hugging Face-shaped bundle must load end to end \
+             through this crate's own orchestration",
+        );
+
+        let output = component
+            .invoke_payload(br#"{"prompt":"hello world","max_new_tokens":1}"#)
+            .expect(
+                "generation must run end to end through the real load()-produced instance, \
+                 the same call shape a real embedder uses",
+            );
+        assert_eq!(
+            output.usage.prompt_tokens, 2,
+            "\"hello world\" tokenizes to exactly 2 real tokens under this bundle's own tokenizer"
+        );
+        assert_eq!(output.usage.generated_tokens, 1);
+    }
+
+    #[test]
+    fn loaded_inference_component_load_rejects_a_bundle_trusted_by_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_qwen_bundle(dir.path());
+        let component_digest = magnetar_runtime::ComponentDigest::sha256(qwen_component_bytes());
+        // The Component itself is trusted, but the Model Artifact is not --
+        // MAG-03's own independence guarantee, checked from this crate's
+        // actual public `load` entry point rather than only at the
+        // `magnetar-runtime` layer underneath it.
+        let trust_policy =
+            ArtifactTrustPolicy::default().trust_component_digest(&component_digest.value);
+
+        let error = LoadedInferenceComponent::load(
+            "test-qwen",
+            InferenceComponentArtifact::from_bytes(
+                qwen_component_bytes().to_vec(),
+                qwen_component_manifest_bytes().to_vec(),
+            ),
+            InferenceComponentSource::authorized_local_bundle("test-fixture", dir.path()),
+            trust_policy,
+            InferenceComponentPlacement::ReferenceCpu,
+        )
+        .expect_err(
+            "a Model Artifact trusted by nothing must not load, even with a trusted Component",
+        );
+        assert!(error.to_string().contains("Model Artifact trust rejected"));
+    }
+}

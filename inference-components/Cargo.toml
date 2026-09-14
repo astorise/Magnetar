@@ -18,3 +18,6 @@ magnetar-provider-cpu = { path = "../providers/cpu" }
 magnetar-provider-cuda = { path = "../providers/cuda", optional = true }
 magnetar-runtime = { path = "../magnetar-runtime", features = ["wasmtime-component-engine"] }
 serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

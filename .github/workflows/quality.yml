@@ -418,7 +418,8 @@ jobs:
             providers/cuda/Cargo.toml \
             loaders/huggingface/Cargo.toml \
             loaders/gguf/Cargo.toml \
-            integration-tests/production-loading/Cargo.toml
+            integration-tests/production-loading/Cargo.toml \
+            inference-components/Cargo.toml
           do
             echo "::group::$manifest"
             cargo test --locked --manifest-path "$manifest"
@@ -450,6 +451,21 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --manifest-path magnetar-cli/Cargo.toml --no-deps
+      # `inference-components` (the Tachyon-facing `LoadedInferenceComponent`
+      # boundary the Tachyon integration audit itself reviewed) has the same
+      # shape as `magnetar-cli` above: its own `[workspace]`, moved out of
+      # the repository root because it depends on `loaders/gguf`/`loaders/
+      # huggingface`/`providers/cpu` submodules absent from a plain
+      # root-level build. Before this step it was built and tested nowhere
+      # in CI at all -- found while closing the audit's own outstanding
+      # gap (no integration test drove `LoadedInferenceComponent::load`
+      # itself), added here rather than silently left uncovered.
+      - name: Format-check inference-components
+        shell: bash
+        run: cargo fmt --manifest-path inference-components/Cargo.toml --all -- --check
+      - name: Clippy inference-components
+        shell: bash
+        run: cargo clippy --locked --manifest-path inference-components/Cargo.toml --all-targets -- -D warnings
       # `implement-production-qwen-model-loading` task 12.8: production
       # loading/generation SHALL NOT call `fixture_model_manifest`, a
       # fixture tensor inventory builder, or require the literal
