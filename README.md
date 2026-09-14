@@ -422,10 +422,24 @@ F16/BF16 compute" item: `matmul`/`rmsnorm`/`rope`/`attention` still
 compute in `F32` only, a half-precision resource does not stay
 device-resident between separate Kernel invocations the way `f32`
 resources do, and no production graph requests half-precision compute for
-any real generation step. Everything else the original charter frames as
-future work remains exactly that: multi-device execution,
-GPTQ/AWQ/BitsAndBytes quantization, and additional Providers
-(Metal/ROCm/NPU/TPU) or Model Components (Llama/Mistral/Gemma).
+any real generation step. `add-real-llama-model-component` closed one
+more: `components/llama` -- an empty template since early in this
+repository's history -- now implements the real
+`model-component-graph-contract`, with graph-building logic structurally
+identical to `components/qwen`'s own (Llama and Qwen2 are both real
+instances of the same pre-norm/RoPE/grouped-query-attention/SwiGLU
+decoder block). Verified against the real Qwen Component: for the same
+`architecture-config` the two independently-compiled binaries produce
+byte-identical graphs, and the same Llama binary produces a genuinely
+different graph for a bias-bearing config, driven entirely by
+`model-config`. Real end-to-end Llama checkpoint ingestion (a real
+downloaded checkpoint actually generating text) is not yet proven --
+`loaders/huggingface` should already accept a Llama-shaped bundle
+unmodified, but that has not been verified against a real one. Everything
+else the original charter frames as future work remains exactly that:
+multi-device execution, GPTQ/AWQ/BitsAndBytes quantization, and
+additional Providers (Metal/ROCm/NPU/TPU) or Model Components
+(Mistral/Gemma).
 
 **Tachyon integration audit** (`docs/audits/audit-magnetar-integration-
 tachyon-2026-09-13.md`, a separate review from the scope-charter

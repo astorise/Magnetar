@@ -289,3 +289,9 @@ Graph production for a registered artifact SHALL follow the same `model-componen
 - **WHEN** graph production is requested against each registered digest, in either order
 - **THEN** each produces its own distinct graphs (different node counts and operator-sequence hashes from the other), and requesting graphs from one registered Component does not alter, evict, or otherwise disturb the other's continued correct behavior
 
+#### Scenario: A genuine second real architecture family registers and coexists with Qwen
+
+- **GIVEN** the real, independently-compiled Llama Model Component registered under its own real digest, alongside the real Qwen Model Component already registered
+- **WHEN** graph production is requested against the Llama digest
+- **THEN** it succeeds, produces graphs consistent with the same generic contract, and does not disturb the Qwen Component's own continued correct behavior -- the registry's multiplicity holds for a real second production architecture family, not only a caller-supplied digest that always resolves back to Qwen or a synthetic fixture
+
