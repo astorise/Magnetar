@@ -1,0 +1,31 @@
+## Context
+
+`wire-generic-inference-component-runtime`'s own design.md named this exact follow-up: wiring `inference-components::LoadedInferenceComponent` to the new generic registry, since that adapter is the one the Tachyon audit actually reviewed and flagged NO-GO. Investigating the real call chain before implementing (this session's established practice) found the fix touches two distinct places that must stay in lockstep:
+
+1. `prepare_generation` (`ProductionQwenLoadedModel`) builds the *plan* -- its `graph_fingerprint` is computed once, at plan-preparation time, from whichever graph source is chosen.
+2. `execute_generation_step` (`E2eRuntimeModelExecutionEngine`) builds the graph *again* at actual dispatch time and must reproduce the identical graph, or `PreparedExecutionPlanExecutor::prepare_node_execution`'s exact-match fingerprint check fails closed (`PlanValidationFailed`) -- by design, not a bug: task 11.5's own comment states this check is deliberately exact-match, never semantic.
+
+Both therefore need the *same* digest, threaded independently into each (`ProductionQwenLoadedModel.component_digest` and `E2eRuntimeModelExecutionEngine.component_digest`), rather than one shared piece of state -- `E2eRuntimeModelExecutionEngine` lives inside the `Runtime` behind an `Arc<dyn RuntimeModelExecutionEngine>` and outlives any single `prepare_generation` call, so it needs its own copy set once at construction.
+
+## Goals / Non-Goals
+
+**Goals:**
+- `LoadedInferenceComponent::load` registers the caller's Component under the caller's own trust, and that registered Component genuinely drives this instance's generation end to end.
+- `ArtifactTrustPolicy` makes Component trust and Model trust two independent, explicit decisions.
+- Zero behavior change for the pre-existing `ProductionQwenLoadedModel::load`/CLI `"qwen-test"` singleton path.
+
+**Non-Goals (still out of scope, unchanged from `wire-generic-inference-component-runtime`):**
+- MAG-01's format-agnosticism: `inference-components` still hardcodes `HuggingFaceIngestor`/`HuggingFaceChatTemplateFormatter`/`HuggingFaceTokenizer`. This change closes the *Component execution* half of the audit's findings (MAG-02/MAG-03), not the *model format* half. GGUF ingestion already exists in this codebase (`loaders/gguf`) as a real alternative `ProductionModelArtifactIngestor`, which is what a future change closing MAG-01 fully would plug in as a pluggable choice -- not attempted here.
+- A dedicated `inference-components`-level integration test driving `LoadedInferenceComponent::load` against a real local bundle end to end. See Risks below.
+
+## Decisions
+
+- **`ProductionQwenLoadedModel::load` becomes a thin wrapper over a new `load_with_component(..., component_digest: Option<ComponentDigest>)`**, rather than changing `load`'s own signature. `load` has exactly one external caller (`inference-components`, confirmed by investigation) and dozens of internal test call sites for `E2eRuntimeModelExecutionEngine`'s own construction -- keeping `load`'s signature frozen and adding the new capability as a sibling entry point is strictly additive, verified by the full existing test suite passing unmodified (1261 tests, zero regressions).
+- **`E2eRuntimeModelExecutionEngine` gains the same `Option<ComponentDigest>` field, `None` at all 6 other construction sites.** Investigated first: exactly 7 construction sites exist in the whole crate, 6 of them `#[cfg(test)]`-only fixture-building helpers. Threading `None` through those 6 preserves their exact existing behavior (verified: full suite green); only `ProductionQwenLoadedModel::load_with_component`'s own construction passes `Some`.
+- **Verification compares real generated token ids, not just graph shape.** `wire-generic-inference-component-runtime`'s own test already proved graph-construction equality (operator-sequence hashes); this change's new test (`production_qwen_loaded_model_load_with_component_matches_the_singleton_path`) goes one step further and runs full `ProductionQwenLoadedModel::generate` through both paths, asserting identical `generated_token_ids` -- the strongest available proof this wiring is correct end to end, not merely that the two graph-production call sites individually look right.
+- **The test's manifest is hand-built (not `e2e_fixture()`'s own manifest), with `tied_embeddings: false`.** Investigated by hitting the real failure first: `e2e_fixture()`'s manifest has no declared per-tensor byte offset/size (it is shaped for the in-memory-only fixture path, `E2eRuntimeModelExecutionEngine` reading straight from `fixture.weights`), and its `tied_embeddings: true` requires an ingestion-layer lm_head-derivation shim (`loaders/huggingface::append_synthetic_lm_head_if_tied`) this raw-manifest test path does not run. Both are pre-existing facts about the fixture infrastructure, not new problems -- fixed by following the exact same hand-built-manifest, `tied_embeddings: false` recipe `production_loading_generates_end_to_end_with_a_non_canonical_qwen_config` already established for the same reason.
+
+## Risks / Trade-offs
+
+- **No dedicated `inference-components`-crate-level test for `LoadedInferenceComponent::load` itself.** This was already true before this change (grep confirms zero existing tests exercise it), and building one needs a real local HuggingFace-shaped bundle (tokenizer.json/config.json/weights) plus the checked-in `qwen-real.component.wasm` fixture reachable from this crate's own test directory -- meaningful new test infrastructure, not a quick addition, deferred as explicit future work rather than rushed. The `magnetar-runtime`-level test exercises the identical underlying `load_with_component`/registry code this crate now calls, which substantially de-risks (though does not fully replace) this gap.
+- **`inference-components`'s own error message wording changed** ("Magnetar inference Component artifact trust rejected" -> "Magnetar Model Artifact trust rejected", for the pre-existing model-trust check) to stop conflating Component trust with Model trust even in prose, now that both exist as genuinely separate checks. Any caller pattern-matching on that exact string (none known) would need updating.

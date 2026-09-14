@@ -4362,3 +4362,166 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
     )
     .expect("model instance unloads cleanly, no leaked resources");
 }
+
+/// The load-bearing correctness proof for `ProductionQwenLoadedModel::
+/// load_with_component` (`wire-generic-inference-component-runtime`'s
+/// follow-up phase, closing the Tachyon integration audit's MAG-02): a
+/// model loaded against an *explicitly registered* Component digest
+/// generates *exactly* the same tokens as the same model loaded through
+/// [`ProductionQwenLoadedModel::load`]'s pre-existing hardcoded-singleton
+/// path, for the identical underlying Component bytes. This proves the
+/// registered Component genuinely drives generation end to end (plan
+/// production in `prepare_generation` and dispatch-time graph production in
+/// `E2eRuntimeModelExecutionEngine::execute_generation_step` both honor the
+/// same digest), not merely that graph construction alone matches (already
+/// proven by `register_inference_component_artifact_enforces_trust_is_
+/// idempotent_and_matches_the_singleton_path`).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn production_qwen_loaded_model_load_with_component_matches_the_singleton_path() {
+    // `e2e_fixture()`'s own manifest is shaped for the in-memory,
+    // fixture-only `E2eRuntimeModelExecutionEngine` path (no declared
+    // per-tensor byte offset/size) -- `load_production_qwen_instance_for_
+    // provider` (the real production-loading path `ProductionQwenLoadedModel::
+    // load` drives) requires those, so this test builds its own
+    // production-shaped manifest around the same canonical config, exactly
+    // like `production_loading_generates_end_to_end_with_a_non_canonical_
+    // qwen_config` does for its own deliberately-different config.
+    // `tied_embeddings: false` (unlike the canonical fixture's own `true`):
+    // this test drives loading through the real production path
+    // (`load_production_qwen_instance_for_provider`), which expects a
+    // literal `lm_head` weight resource bound -- tied-embedding derivation
+    // is an ingestion-layer concern (`loaders/huggingface`'s
+    // `append_synthetic_lm_head_if_tied`) this hand-built manifest
+    // deliberately bypasses, exactly like `production_loading_generates_
+    // end_to_end_with_a_non_canonical_qwen_config`'s own config already
+    // does. Otherwise identical to the canonical fixture the real
+    // `qwen-real.component.wasm` Component already exercises elsewhere.
+    let mut config = e2e_fixture_config();
+    config.tied_embeddings = false;
+    let weights = e2e_fixture_weights(&config).expect("synthetic weights build");
+    let tensors = e2e_fixture_weight_inventory(&config).expect("tensor inventory builds");
+    let mut bytes_by_name = BTreeMap::new();
+    for tensor in &tensors {
+        let host_tensor = weights
+            .get(&tensor.name)
+            .expect("a weight exists for every inventory tensor");
+        let mut bytes = Vec::with_capacity(host_tensor.data.len() * 4);
+        for value in &host_tensor.data {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes_by_name.insert(tensor.name.clone(), bytes);
+    }
+    let payload_source = ProductionIntegrationPayloadSource { bytes_by_name };
+
+    let digest_seed = ModelDigest::parse(format!("sha256:{}", "a".repeat(64))).unwrap();
+    let id = ModelArtifactId::new(
+        ModelArtifactKind::ModelBundle,
+        ModelName::new("load-with-component-test").unwrap(),
+        ModelRevision::new("r1").unwrap(),
+        digest_seed,
+    );
+    let mut parts = BTreeMap::new();
+    parts.insert(
+        "weights".to_string(),
+        ModelArtifactPart {
+            name: "weights".to_string(),
+            kind: ModelArtifactKind::ModelWeights,
+            digest: ModelDigest::parse(format!("sha256:{}", "b".repeat(64))).unwrap(),
+            size_bytes: None,
+            required: true,
+        },
+    );
+    parts.insert(
+        "config".to_string(),
+        ModelArtifactPart {
+            name: "config".to_string(),
+            kind: ModelArtifactKind::ModelConfig,
+            digest: ModelDigest::parse(format!("sha256:{}", "c".repeat(64))).unwrap(),
+            size_bytes: None,
+            required: true,
+        },
+    );
+    let manifest = ModelManifest {
+        schema_version: crate::MODEL_ARTIFACT_SCHEMA_VERSION,
+        id,
+        architecture: ModelArchitecture::new("qwen", "load-with-component-test"),
+        parts,
+        storage_dtype: Some(ModelDType::F32),
+        compute_dtype: None,
+        supported_compute_dtypes: BTreeSet::from([ModelDType::F32]),
+        tensors,
+        tokenizer: None,
+        tokenizer_config: None,
+        chat_template: None,
+        prompt_template: None,
+        generation: None,
+        quantization: None,
+        shards: Vec::new(),
+        runtime_features: BTreeSet::new(),
+        memory_features: BTreeSet::new(),
+        provider_capabilities: Vec::new(),
+        component: None,
+        license: None,
+        provenance: None,
+        signatures: Vec::new(),
+        source: None,
+        architecture_config: Some(architecture_config_from_qwen_config(&config)),
+    };
+
+    let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
+    let delegate_tokenizer: std::sync::Arc<dyn crate::tokenizer::Tokenizer + Send + Sync> =
+        std::sync::Arc::new(e2e_fixture_tokenizer().unwrap());
+    let fixture = production_qwen_fixture(manifest, tokenizer_metadata, delegate_tokenizer)
+        .expect("production fixture builds against the canonical config");
+
+    let component_trust = ComponentTrustStore::default()
+        .trust_digest(&ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES).value);
+    let digest = register_inference_component_artifact(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &component_trust,
+    )
+    .expect("registration succeeds");
+
+    let model_trust =
+        || ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone());
+    let request = || ProductionGenerationRequest {
+        prompt: PromptInput::PlainText("hi".into()),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(2),
+        max_generation_millis: None,
+    };
+
+    let mut via_singleton = ProductionQwenLoadedModel::load(
+        fixture.clone(),
+        &payload_source,
+        model_trust(),
+        Arc::new(ReferenceCpuProvider::new()),
+    )
+    .expect("singleton-path loading succeeds");
+    let singleton_result = via_singleton
+        .generate(request(), None)
+        .expect("singleton-path generation succeeds");
+
+    let mut via_named = ProductionQwenLoadedModel::load_with_component(
+        fixture.clone(),
+        &payload_source,
+        model_trust(),
+        Arc::new(ReferenceCpuProvider::new()),
+        Some(digest),
+    )
+    .expect("named-component loading succeeds");
+    let named_result = via_named
+        .generate(request(), None)
+        .expect("named-component generation succeeds");
+
+    assert_eq!(
+        singleton_result.result.output.generated_token_ids,
+        named_result.result.output.generated_token_ids,
+        "loading via an explicitly registered Component digest must produce identical \
+         generation to the hardcoded singleton path, for the identical underlying Component \
+         bytes"
+    );
+}

@@ -1366,6 +1366,13 @@ struct E2eRuntimeModelExecutionEngine {
     fixture: E2eFixture,
     kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
     pending_kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
+    /// See [`ProductionQwenLoadedModel::component_digest`]'s doc comment --
+    /// must stay in lockstep with the same instance's `prepare_generation`
+    /// digest so a published plan's fingerprint matches what dispatch here
+    /// actually builds. `None` (every construction site but
+    /// `ProductionQwenLoadedModel::load`) preserves the pre-existing
+    /// hardcoded-singleton behavior exactly.
+    component_digest: Option<ComponentDigest>,
     #[cfg(test)]
     forced_token: Option<TokenId>,
 }
@@ -5107,18 +5114,29 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // prepare_node_execution`'s fingerprint check below with
             // `PlanValidationFailed`, since that check is deliberately
             // exact-match, not semantic.
-            // `first_native_component_graphs_for_prompt` is that same
-            // recipe (real Qwen Component under the strict, default build;
-            // a structured fail-closed error in production otherwise; the
-            // Rust-synthesized recipe only in a test build without a
-            // strict engine) -- deterministic for a given `(fixture,
-            // prompt_token_count)` whenever it succeeds at all, so calling
-            // it again here reproduces the identical graph the plan was
-            // prepared against.
-            let component_graphs = first_native_component_graphs_for_prompt(
-                &self.fixture,
-                request.input_token_ids.len() as u64,
-            )
+            // `first_native_component_graphs_for_prompt` (or, when this
+            // instance carries a caller-registered Component digest,
+            // `build_first_native_graphs_from_named_component`) is that
+            // same recipe (real Qwen Component under the strict, default
+            // build; a structured fail-closed error in production
+            // otherwise; the Rust-synthesized recipe only in a test build
+            // without a strict engine) -- deterministic for a given
+            // `(fixture, prompt_token_count)` whenever it succeeds at all,
+            // so calling it again here reproduces the identical graph the
+            // plan was prepared against. Must match `prepare_generation`'s
+            // own choice of digest exactly -- see
+            // `ProductionQwenLoadedModel::component_digest`'s doc comment.
+            let prompt_token_count = request.input_token_ids.len() as u64;
+            let component_graphs = match &self.component_digest {
+                Some(digest) => build_first_native_graphs_from_named_component(
+                    digest,
+                    &self.fixture.config,
+                    &self.fixture.identity,
+                    prompt_token_count,
+                )
+                .map(|(graphs, _definition, _instance)| graphs),
+                None => first_native_component_graphs_for_prompt(&self.fixture, prompt_token_count),
+            }
             .map_err(|error| InferenceApiError::GraphPlanningFailed {
                 reason: error.to_string(),
             })?;
@@ -5707,6 +5725,7 @@ fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
             fixture: fixture.clone(),
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            component_digest: None,
             #[cfg(test)]
             forced_token: None,
         }))
@@ -5741,6 +5760,7 @@ fn build_runtime_with_model_execution_engine_and_provider(
             fixture: fixture.clone(),
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            component_digest: None,
             #[cfg(test)]
             forced_token: None,
         }))
@@ -5766,6 +5786,7 @@ fn build_runtime_with_model_execution_engine_and_forced_token(
             fixture: fixture.clone(),
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            component_digest: None,
             forced_token,
         }))
         .trust_store(
@@ -7693,6 +7714,7 @@ fn prepare_production_generation(
             fixture: fixture.clone(),
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            component_digest: None,
             #[cfg(test)]
             forced_token: None,
         }))
@@ -7850,6 +7872,17 @@ pub struct ProductionQwenLoadedModel {
     provider_binding: ProviderBinding,
     provider_supports_multi_step_decode: bool,
     materialization_count: usize,
+    /// `Some(digest)` when this instance was loaded against a caller-
+    /// registered Component (`register_inference_component_artifact`,
+    /// `wire-generic-inference-component-runtime`) instead of the CLI's
+    /// single built-in `"qwen-test"` singleton -- threaded into both
+    /// `prepare_generation` (plan production) and this instance's
+    /// `E2eRuntimeModelExecutionEngine` (dispatch-time production), which
+    /// must stay in lockstep: a plan's `graph_fingerprint` only matches the
+    /// graph actually dispatched if both steps built it from the exact same
+    /// Component. `None` preserves the pre-existing hardcoded-singleton
+    /// behavior exactly, unchanged.
+    component_digest: Option<ComponentDigest>,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -7860,6 +7893,25 @@ impl ProductionQwenLoadedModel {
         trust_store: ModelTrustStore,
         provider: Arc<dyn Provider>,
     ) -> Result<Self, InferenceApiError> {
+        Self::load_with_component(fixture, payload_source, trust_store, provider, None)
+    }
+
+    /// [`Self::load`], additionally accepting which registered Component
+    /// (`register_inference_component_artifact`) this instance's graph
+    /// production should use instead of the CLI's single built-in
+    /// `"qwen-test"` singleton. `None` reproduces [`Self::load`]'s exact
+    /// existing behavior; `Some(digest)` is threaded into both this
+    /// instance (`prepare_generation`) and its `E2eRuntimeModelExecutionEngine`
+    /// (`execute_generation_step`), which must stay in lockstep for a
+    /// published plan's `graph_fingerprint` to match what dispatch actually
+    /// builds.
+    pub fn load_with_component(
+        fixture: E2eFixture,
+        payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
+        trust_store: ModelTrustStore,
+        provider: Arc<dyn Provider>,
+        component_digest: Option<ComponentDigest>,
+    ) -> Result<Self, InferenceApiError> {
         let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
         let provider_supports_multi_step_decode = provider.supports_multi_step_decode();
         let mut runtime = Runtime::builder()
@@ -7868,6 +7920,7 @@ impl ProductionQwenLoadedModel {
                 fixture: fixture.clone(),
                 kv_states: Arc::new(Mutex::new(BTreeMap::new())),
                 pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+                component_digest: component_digest.clone(),
                 #[cfg(test)]
                 forced_token: None,
             }))
@@ -7895,6 +7948,7 @@ impl ProductionQwenLoadedModel {
             provider_binding,
             provider_supports_multi_step_decode,
             materialization_count: 1,
+            component_digest,
         })
     }
 
@@ -8059,14 +8113,24 @@ impl ProductionQwenLoadedModel {
                 },
             )?;
         let observer = InferenceApiObserver::new();
-        let (component_graphs, _definition, _component_instance) =
-            build_first_native_graphs_from_real_qwen_component(
-                &self.fixture,
-                tokenized.token_ids.len() as u64,
+        let prompt_token_count = tokenized.token_ids.len() as u64;
+        let component_graphs = match &self.component_digest {
+            Some(digest) => build_first_native_graphs_from_named_component(
+                digest,
+                &self.fixture.config,
+                &self.fixture.identity,
+                prompt_token_count,
             )
-            .map_err(|error| InferenceApiError::GraphPlanningFailed {
-                reason: error.to_string(),
-            })?;
+            .map(|(graphs, _definition, _instance)| graphs),
+            None => build_first_native_graphs_from_real_qwen_component(
+                &self.fixture,
+                prompt_token_count,
+            )
+            .map(|(graphs, _definition, _instance)| graphs),
+        }
+        .map_err(|error| InferenceApiError::GraphPlanningFailed {
+            reason: error.to_string(),
+        })?;
         let prepared_plans = prepare_first_native_execution_plans_for_provider(
             &self.runtime,
             &self.instance,
@@ -13763,6 +13827,7 @@ fn new_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelExecutionEngi
         fixture: fixture.clone(),
         kv_states: Arc::new(Mutex::new(BTreeMap::new())),
         pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+        component_digest: None,
         forced_token: None,
     }
 }

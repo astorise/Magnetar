@@ -427,6 +427,34 @@ future work remains exactly that: multi-device execution,
 GPTQ/AWQ/BitsAndBytes quantization, and additional Providers
 (Metal/ROCm/NPU/TPU) or Model Components (Llama/Mistral/Gemma).
 
+**Tachyon integration audit** (`docs/audits/audit-magnetar-integration-
+tachyon-2026-09-13.md`, a separate review from the scope-charter
+reconciliation above, of the `inference-components` crate a
+`codex/tachyon-component-boundary` branch introduced): found that crate's
+generically-named `LoadedInferenceComponent` facade was Qwen/HuggingFace-
+specific in behavior despite its generic name (MAG-01), that the
+Component WASM artifact it received was registered but never the real
+execution authority for generation (MAG-02), and that Component trust was
+conflated with Model Artifact trust (MAG-03). MAG-04 (the branch had
+diverged from `main`) closed via reconciliation (merge commit `3f101ae`).
+`wire-generic-inference-component-runtime` then landed a real, digest-
+keyed Component registry in `magnetar-runtime`
+(`register_inference_component_artifact`), and
+`wire-inference-component-to-generic-registry` wired
+`inference-components` to it: `ArtifactTrustPolicy` now separates
+Component trust from Model Artifact trust for real (closing MAG-03), and
+a caller-registered Component genuinely drives generation end to end via
+`ProductionQwenLoadedModel::load_with_component` (closing MAG-02),
+verified by a test asserting identical generated tokens between the new
+path and the pre-existing hardcoded-singleton path. MAG-01 remains open:
+`inference-components` still hardcodes HuggingFace ingestion (GGUF exists
+as a real alternative ingestor in this codebase, `loaders/gguf`, but is
+not yet wired in as a pluggable choice here). MAG-06 (the concurrent-
+generation model) and MAG-07 (a test proving two genuinely distinct
+Components run on the same Magnetar) also remain open -- the latter
+because only one real Component fixture implementing the
+`model-component-graph-producer` world exists in this repo today.
+
 ## Terminology
 
 `Backend`, `Plugin`, and `Host` are not primary Magnetar architectural concepts.

@@ -1,0 +1,25 @@
+## 1. Investigation
+
+- [x] 1.1 Traced why plan preparation (`prepare_generation`) and dispatch-time execution (`execute_generation_step`) both need the same registered-Component digest independently: a published plan's `graph_fingerprint` only matches what dispatch actually builds if both steps use the identical graph source -- a deliberately exact-match check (task 11.5), not semantic.
+- [x] 1.2 Confirmed `ProductionQwenLoadedModel::load` has exactly one external caller (`inference-components`) and no test call sites in `magnetar-runtime` itself -- a signature-preserving additive change (`load_with_component` as a new sibling entry point) is low-risk.
+- [x] 1.3 Confirmed exactly 7 `E2eRuntimeModelExecutionEngine` construction sites exist in the whole crate, 6 of them `#[cfg(test)]`-only.
+
+## 2. Implementation
+
+- [x] 2.1 `magnetar-runtime/src/first_native_runtime.rs`: `ProductionQwenLoadedModel::component_digest` field; `load` becomes a thin wrapper over new `load_with_component(..., component_digest: Option<ComponentDigest>)`; `E2eRuntimeModelExecutionEngine::component_digest` field added and threaded through all 7 construction sites (`None` at the 6 pre-existing ones, `component_digest.clone()` at the new `load_with_component` site).
+- [x] 2.2 `prepare_generation` and `execute_generation_step` both branch on their own `component_digest`: `Some(digest)` calls `build_first_native_graphs_from_named_component`, `None` reproduces the pre-existing call exactly.
+- [x] 2.3 `inference-components/src/lib.rs`: `ArtifactTrustPolicy` gains `component_trust_store: ComponentTrustStore` and `trust_component_digest`/`component_trust_store()`, independent of the existing `model_trust_store`/`trust_digest`.
+- [x] 2.4 `LoadedInferenceComponent::load`: replaced `register_component_artifact` (wrapper around `register_qwen_component_artifact`, hardcoded digest) with `register_inference_component_artifact(artifact.component_bytes, artifact.manifest_bytes, trust_policy.component_trust_store())`, failing closed with a clear error on rejection; replaced `ProductionQwenLoadedModel::load` with `load_with_component(..., Some(component_digest))`. Removed the now-unused `register_component_artifact` function. Fixed the pre-existing model-trust-rejection error message's wording ("inference Component artifact trust" -> "Model Artifact trust") now that the two are genuinely separate checks.
+
+## 3. Tests
+
+- [x] 3.1 `production_qwen_loaded_model_load_with_component_matches_the_singleton_path` (`magnetar-runtime`): the load-bearing proof -- a model loaded via `load_with_component(..., Some(digest))` generates *identical* `generated_token_ids` to the same model loaded via the pre-existing `load`, for the identical real `qwen-real.component.wasm` bytes. Two real failures hit and fixed while writing this test (both pre-existing facts about fixture infrastructure, not new bugs): `e2e_fixture()`'s own manifest has no declared per-tensor byte offset/size (shaped for the in-memory-only fixture path, not the real production-loading path this test needed), and its `tied_embeddings: true` requires an ingestion-layer lm_head-derivation shim this raw-manifest path does not run -- fixed by following `production_loading_generates_end_to_end_with_a_non_canonical_qwen_config`'s existing hand-built-manifest, `tied_embeddings: false` recipe.
+- [x] 3.2 Full regression: `cargo test -p magnetar-runtime --lib` (1261 passed, zero regressions), `cargo clippy -p magnetar-runtime --all-targets -- -D warnings` clean, `cargo fmt --check` clean (main workspace).
+- [x] 3.3 `inference-components`: `cargo build`/`cargo clippy --all-targets -- -D warnings`/`cargo test --lib` (existing 3 `InvocationPayload` tests still pass, unaffected)/`cargo fmt --check` all clean.
+- [x] 3.4 **Known gap, honestly documented, not silently skipped** (see `design.md` Risks): no dedicated `inference-components`-crate-level test drives `LoadedInferenceComponent::load` itself end to end (a pre-existing gap -- zero such tests existed before this change either). The `magnetar-runtime`-level test in 3.1 exercises the identical underlying `load_with_component`/registry code this crate now calls, substantially de-risking but not fully replacing a real local-bundle-based integration test, deferred as explicit future work.
+
+## 4. Documentation
+
+- [x] 4.1 `openspec validate wire-inference-component-to-generic-registry --strict` passes.
+- [x] 4.2 Saved the pasted Tachyon-authored audit to `docs/audits/audit-magnetar-integration-tachyon-2026-09-13.md`, matching this repo's established audit-archival convention (`docs/audits/cuda-provider-full-audit-2026-09-05.md` and others), with a closure-tracking section documenting which findings this change (and its `wire-generic-inference-component-runtime` prerequisite) close and which remain open.
+- [x] 4.3 README: new "Tachyon integration audit" paragraph documenting MAG-01 (open)/MAG-02 (closed)/MAG-03 (closed)/MAG-04 (closed)/MAG-06 (open)/MAG-07 (open) status, distinct from the pre-existing scope-charter reconciliation note.

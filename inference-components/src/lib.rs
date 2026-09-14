@@ -9,8 +9,9 @@ use magnetar_runtime::production_model_ingestion::{
 };
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
-    ChatMessage, GenerationParameters, GenerationStreamEvent, ModelArtifactSource,
-    ProductionGenerationRequest, PromptInput, Provider, StopConditions,
+    ChatMessage, ComponentTrustStore, GenerationParameters, GenerationStreamEvent,
+    ModelArtifactSource, ProductionGenerationRequest, PromptInput, Provider, StopConditions,
+    register_inference_component_artifact,
 };
 use serde_json::Value;
 use std::{
@@ -109,19 +110,45 @@ impl InferenceComponentArtifact {
     }
 }
 
+/// Two independent trust decisions (Tachyon integration audit MAG-03: a
+/// Component's own executable trust must never be conflated with the
+/// model/weights it happens to load): `model_trust_store` governs the
+/// ingested Model Artifact (weights, tokenizer, config -- data, never
+/// executed), while `component_trust_store` governs the WASM Component
+/// binary itself (code, actually instantiated and invoked). Trusting one
+/// says nothing about the other; a caller names both explicitly.
 #[derive(Clone, Debug, Default)]
 pub struct ArtifactTrustPolicy {
     model_trust_store: ModelTrustStore,
+    component_trust_store: ComponentTrustStore,
 }
 
 impl ArtifactTrustPolicy {
+    /// Trusts a Model Artifact digest (weights/tokenizer/config bundle) --
+    /// never the Component binary. See [`Self::trust_component_digest`] for
+    /// the separate, Component-specific trust decision.
     pub fn trust_digest(mut self, digest: &str) -> Self {
         self.model_trust_store = self.model_trust_store.trust_digest(digest);
         self
     }
 
+    /// Trusts a Component (WASM) binary's own real content digest -- never
+    /// the Model Artifact it happens to load. This is the digest
+    /// `register_inference_component_artifact` computes from the actual
+    /// bytes (`ComponentDigest::sha256`), not a value this policy invents;
+    /// a caller names it explicitly here (e.g. one it has independently
+    /// verified or pinned) before the artifact is ever registered.
+    pub fn trust_component_digest(mut self, digest: &str) -> Self {
+        self.component_trust_store = self.component_trust_store.trust_digest(digest);
+        self
+    }
+
     fn model_trust_store(&self) -> &ModelTrustStore {
         &self.model_trust_store
+    }
+
+    fn component_trust_store(&self) -> &ComponentTrustStore {
+        &self.component_trust_store
     }
 
     fn into_model_trust_store(self) -> ModelTrustStore {
@@ -195,7 +222,20 @@ impl LoadedInferenceComponent {
         trust_policy: ArtifactTrustPolicy,
         placement: InferenceComponentPlacement,
     ) -> Result<Self> {
-        register_component_artifact(artifact);
+        // The Component's own real digest (computed from its actual bytes,
+        // never a claim) evaluated against this policy's `component_trust_
+        // store` -- independent of the Model Artifact trust evaluated
+        // below (Tachyon integration audit MAG-03). Fails closed here,
+        // before any model ingestion happens, if this Component binary is
+        // not one the caller has explicitly named as trusted.
+        let component_digest = register_inference_component_artifact(
+            artifact.component_bytes,
+            artifact.manifest_bytes,
+            trust_policy.component_trust_store(),
+        )
+        .map_err(|error| {
+            anyhow!("Magnetar rejected inference Component artifact for `{name}`: {error}")
+        })?;
 
         let production_source = ProductionModelSource::authorized_local_bundle(
             ModelArtifactSource::Tachyon(source.provenance.clone()),
@@ -257,7 +297,7 @@ impl LoadedInferenceComponent {
             .evaluate(&ingested.manifest);
         if trust_decision.status() != ModelTrustStatus::Trusted {
             bail!(
-                "Magnetar inference Component artifact trust rejected for `{name}`: {}",
+                "Magnetar Model Artifact trust rejected for `{name}`: {}",
                 trust_decision.reason()
             );
         }
@@ -271,11 +311,21 @@ impl LoadedInferenceComponent {
         })?;
         let provider = capability_advertisement(placement)?;
         let provider_for_generation = provider_for_placement(placement, name)?;
-        let loaded_model = magnetar_runtime::ProductionQwenLoadedModel::load(
+        // Threads the caller-registered Component's own digest through to
+        // generation: `load_with_component` makes this specific Component
+        // (not the CLI's hardcoded `"qwen-test"` singleton) the real graph-
+        // production authority for both plan preparation and dispatch-time
+        // execution (Tachyon integration audit MAG-02) -- verified to
+        // produce identical generation to the singleton path for identical
+        // Component bytes
+        // (`production_qwen_loaded_model_load_with_component_matches_the_
+        // singleton_path`).
+        let loaded_model = magnetar_runtime::ProductionQwenLoadedModel::load_with_component(
             fixture,
             ingested.payload_source.as_ref(),
             trust_policy.into_model_trust_store(),
             provider_for_generation,
+            Some(component_digest),
         )
         .with_context(|| {
             format!("Magnetar failed to materialize resident inference Component `{name}`")
@@ -369,13 +419,6 @@ impl LoadedInferenceComponent {
             .as_deref()
             .map(|formatter| formatter as &dyn magnetar_runtime::ChatTemplateFormatter)
     }
-}
-
-fn register_component_artifact(artifact: InferenceComponentArtifact) {
-    magnetar_runtime::register_qwen_component_artifact(
-        artifact.component_bytes,
-        artifact.manifest_bytes,
-    );
 }
 
 fn capability_advertisement(
