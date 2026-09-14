@@ -42,12 +42,17 @@ jobs:
         # -- a real gap this workflow had (confirmed by dispatching it: it
         # failed with "failed to read providers/cpu/Cargo.toml" before this
         # fix), not something introduced by CUDA-specific test content.
-        # loaders/huggingface and formats/safetensors are
-        # integration-tests/production-loading's own dependencies (its real
-        # production Hugging Face bundle -> CUDA E2E test, task 12.3).
+        # loaders/huggingface, formats/safetensors, loaders/gguf, and
+        # formats/gguf are integration-tests/production-loading's own
+        # dependencies (its real production Hugging Face bundle -> CUDA
+        # E2E test, task 12.3) -- the latter two were a real, separate gap
+        # this workflow had (found dispatching it for
+        # add-multi-device-cpu-cuda-execution-proof: "failed to read
+        # formats/gguf/Cargo.toml" on the very next step after this one,
+        # unrelated to that change's own content), fixed here alongside.
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors
+          git submodule update --init -- providers/cuda providers/cpu loaders/huggingface formats/safetensors loaders/gguf formats/gguf
       - name: Verify GPU is visible
         run: |
           set -eux
