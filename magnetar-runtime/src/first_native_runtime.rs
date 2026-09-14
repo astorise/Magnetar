@@ -3321,6 +3321,14 @@ fn qwen_operator_kind_code(name: &str) -> Option<u32> {
         "mul" => Some(6),
         "residual-add" => Some(7),
         "split" => Some(8),
+        // The QKV bias-add operator (`config.attention_bias`'s conditional
+        // node in both `components/qwen` and `components/llama`) -- never
+        // exercised by a hash comparison before the real Llama cross-
+        // architecture proof test needed to hash a bias-bearing graph for
+        // the first time, surfacing this table's previously-latent gap
+        // (every other graph-hashing test uses the shared fixture's
+        // default `attention_bias: false`).
+        "add" => Some(9),
         _ => None,
     }
 }
@@ -7066,6 +7074,34 @@ const SYNTHETIC_MINIMAL_COMPONENT_BYTES: &[u8] =
 const SYNTHETIC_MINIMAL_COMPONENT_MANIFEST_BYTES: &[u8] = include_bytes!(
     "../fixtures/components/synthetic-minimal.component.wasm.magnetar-component.yaml"
 );
+
+/// Test-oracle only: the checked-in real Llama Model Component
+/// (`components/llama`), a genuine second production model architecture
+/// family -- not a synthetic/degenerate fixture like
+/// `SYNTHETIC_MINIMAL_COMPONENT_BYTES` above. Its graph-building logic is
+/// structurally identical to the real Qwen Component's own (both real,
+/// well-documented instances of the same pre-norm/RoPE/grouped-query-
+/// attention/SwiGLU decoder block -- Qwen2's architecture is Llama's with
+/// an added QKV bias term, not a different block shape); the two produce
+/// different graphs only because a real Llama `architecture-config` has no
+/// QKV bias while a real Qwen2 one does, driven entirely by `model-config`,
+/// never by a hardcoded branch in either Component. Production never reads
+/// this constant directly -- an embedder registers the real bytes itself,
+/// exactly as it would for Qwen.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    test
+))]
+const LLAMA_REAL_COMPONENT_BYTES: &[u8] =
+    include_bytes!("../fixtures/components/llama-real.component.wasm");
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    test
+))]
+const LLAMA_REAL_COMPONENT_MANIFEST_BYTES: &[u8] =
+    include_bytes!("../fixtures/components/llama-real.component.wasm.magnetar-component.yaml");
 
 #[cfg(all(
     not(target_arch = "wasm32"),

@@ -1,0 +1,40 @@
+schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "sha256:6ac536b0c011db10c128ce4dab43c5d2752d6ae2b574ba6cfc719b9455b4e6d5"
+component:
+  name: "magnetar.llama.real"
+  version: "0.1.0"
+  description: "The configurable, production Llama Model Component"
+  role: "llama-model-component"
+runtime:
+  magnetar:
+    min_version: "0.1.0"
+wit:
+  imports:
+    - package: "magnetar:model-component-graph"
+      interface: "graph-builder"
+      version: "1.2.0"
+    - package: "magnetar:model-component-graph"
+      interface: "model-config"
+      version: "1.2.0"
+  exports: []
+capabilities:
+  requires: []
+authority:
+  requires: []
+engine:
+  profile: "native"
+  features:
+    - component-model
+    - resource-limits
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./fixtures/components/llama-real.component.wasm"
+signatures: []

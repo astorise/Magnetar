@@ -3290,6 +3290,112 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     assert_eq!(qwen_again_prefill_hash, singleton_prefill_hash);
 }
 
+/// Proves the generic Component registry genuinely serves a second,
+/// *real* production model architecture family -- not merely a synthetic
+/// fixture (see the registry test above) or a caller-supplied digest that
+/// always resolves back to the one hardcoded Qwen singleton. The real
+/// Llama Component (`components/llama`) implements graph-building logic
+/// structurally identical to the real Qwen Component's own: both are real
+/// instances of the same pre-norm/RoPE/grouped-query-attention/SwiGLU
+/// decoder block (Qwen2's architecture is Llama's with an added QKV bias
+/// term, not a different block shape), so this test proves two distinct
+/// claims that together justify that design: (1) for the *same*
+/// `architecture-config` the independently-compiled Llama binary produces
+/// byte-identical graphs (node counts and operator-sequence hashes) to the
+/// Qwen binary -- the contract's genericity is real, not merely a
+/// documentation claim; and (2) the same Llama binary produces genuinely
+/// different graphs when `attention-bias` differs, driven entirely by
+/// `model-config`, never by a hardcoded branch in either Component --
+/// a real Llama checkpoint's own bias-free config and a real Qwen2
+/// checkpoint's own bias-bearing config reach this same code path
+/// correctly.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn build_first_native_graphs_from_named_component_serves_a_real_second_architecture_family() {
+    let llama_digest = ComponentDigest::sha256(LLAMA_REAL_COMPONENT_BYTES);
+    let qwen_digest = ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES);
+    assert_ne!(
+        llama_digest, qwen_digest,
+        "independently-compiled Llama and Qwen Component binaries must have distinct real digests"
+    );
+    let trust = ComponentTrustStore::default().trust_digest(&llama_digest.value);
+    let registered = register_inference_component_artifact(
+        LLAMA_REAL_COMPONENT_BYTES.to_vec(),
+        LLAMA_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &trust,
+    )
+    .expect("the real Llama Component must register");
+    assert_eq!(registered, llama_digest);
+
+    // e2e_fixture()'s own config has `attention_bias: false` (`QwenConfig::
+    // new`'s default) -- the same value a real, bias-free Llama checkpoint
+    // would carry, and (not coincidentally) what the pre-existing Qwen
+    // singleton path itself already builds graphs against elsewhere in
+    // this file.
+    let fixture = e2e_fixture().expect("fixture builds");
+    assert!(
+        !fixture.config.attention_bias,
+        "this comparison assumes the fixture's own default (no QKV bias)"
+    );
+    let prompt_token_count = 2u64;
+
+    let (llama_graphs, _definition, _instance) = build_first_native_graphs_from_named_component(
+        &llama_digest,
+        &fixture.config,
+        &fixture.identity,
+        prompt_token_count,
+    )
+    .expect("named-component graph production succeeds for the real Llama Component");
+    let (qwen_singleton_graphs, _definition, _instance) =
+        build_first_native_graphs_from_real_qwen_component(&fixture, prompt_token_count)
+            .expect("singleton-path graph production succeeds");
+
+    assert_eq!(
+        llama_graphs.prefill_node_count, qwen_singleton_graphs.prefill_node_count,
+        "for the same bias-free config, the independently-compiled Llama and Qwen binaries must \
+         produce the same node count -- their graph-building logic is the same generic decoder"
+    );
+    assert_eq!(
+        llama_graphs.decode_node_count,
+        qwen_singleton_graphs.decode_node_count
+    );
+    let llama_prefill_hash =
+        qwen_operator_sequence_hash(&qwen_graph_operator_codes(&llama_graphs.prefill).unwrap());
+    let qwen_singleton_prefill_hash = qwen_operator_sequence_hash(
+        &qwen_graph_operator_codes(&qwen_singleton_graphs.prefill).unwrap(),
+    );
+    assert_eq!(
+        llama_prefill_hash, qwen_singleton_prefill_hash,
+        "the same operator sequence, not just the same node count"
+    );
+
+    // Now prove the same real Llama binary correctly reacts to a
+    // bias-bearing config (what a real Qwen2 checkpoint would carry): more
+    // nodes (one `add` per q/k/v bias), a different operator sequence --
+    // driven entirely by `model-config`, not a hardcoded per-family branch
+    // in the Component.
+    let mut biased_config = fixture.config.clone();
+    biased_config.attention_bias = true;
+    let (llama_biased_graphs, _definition, _instance) =
+        build_first_native_graphs_from_named_component(
+            &llama_digest,
+            &biased_config,
+            &fixture.identity,
+            prompt_token_count,
+        )
+        .expect(
+            "the same real Llama Component binary also handles a bias-bearing config correctly",
+        );
+    assert_ne!(
+        llama_graphs.prefill_node_count, llama_biased_graphs.prefill_node_count,
+        "attention_bias must add one bias node per q/k/v projection, per layer"
+    );
+    let llama_biased_prefill_hash = qwen_operator_sequence_hash(
+        &qwen_graph_operator_codes(&llama_biased_graphs.prefill).unwrap(),
+    );
+    assert_ne!(llama_prefill_hash, llama_biased_prefill_hash);
+}
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
 fn build_first_native_graphs_from_named_component_fails_closed_for_an_unregistered_digest() {
