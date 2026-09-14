@@ -283,3 +283,9 @@ Graph production for a registered artifact SHALL follow the same `model-componen
 - **WHEN** graph production is requested against it
 - **THEN** the request fails with a structured error, and no fallback graph source is substituted
 
+#### Scenario: Two structurally distinct, simultaneously registered Components remain independently usable
+
+- **GIVEN** two Component artifacts implementing the same contract but producing structurally different graphs, both registered under their own real digests and each trusted by the embedder
+- **WHEN** graph production is requested against each registered digest, in either order
+- **THEN** each produces its own distinct graphs (different node counts and operator-sequence hashes from the other), and requesting graphs from one registered Component does not alter, evict, or otherwise disturb the other's continued correct behavior
+

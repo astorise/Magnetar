@@ -461,13 +461,27 @@ investigating first (rather than picking a policy from scratch) found
 `&mut self`, so one generation in flight per resident instance was
 already compiler-enforced, not an open design question -- this change
 states that explicitly at `LoadedInferenceComponent`'s own API surface,
-changing zero non-comment lines. MAG-07 (a test proving two genuinely
-distinct Components run on the same Magnetar) remains open, because only
-one real Component fixture implementing the `model-component-graph-
-producer` world exists in this repo today. No dedicated
+changing zero non-comment lines.
+`add-second-component-fixture-for-registry-multiplicity-proof` then
+closed MAG-07: a second real Component (`synthetic-minimal.component.wasm`,
+built through the same real toolchain as the production Qwen Component
+but with a deliberately degenerate, decoder-layer-free graph) is
+registered alongside the real Qwen Component in the same test, proving
+the registry serves two structurally distinct Components at once --
+different graphs, neither disturbing the other -- rather than merely
+accepting a caller-supplied digest that always resolves back to one
+hardcoded singleton. MAG-05 (CI on the consumed commit) is structurally
+already satisfied -- every commit pushed to `main`, including this one,
+runs the full Quality CI matrix, verified green before and after every
+chantier in this list -- what remains outside this repository's scope is
+Tachyon actually consuming a post-reconciliation `main` commit, which is
+an action on Tachyon's side, not a further Magnetar fix. The Tachyon
+audit's full scope (MAG-01 through MAG-07) is closed. Outstanding, noted
+for the record but outside that audit's strict scope: no dedicated
 `inference-components`-crate-level integration test drives
-`LoadedInferenceComponent::load` end to end for either format -- a
-pre-existing gap this session's changes have not yet closed.
+`LoadedInferenceComponent::load` end to end for either format yet (the
+equivalent `magnetar-runtime` path is tested via
+`production_qwen_loaded_model_load_with_component_matches_the_singleton_path`).
 
 ## Terminology
 
