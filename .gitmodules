@@ -31,3 +31,9 @@
 [submodule "providers/wgpu"]
 	path = providers/wgpu
 	url = https://github.com/astorise/Magnetar-provider-WGPU.git
+[submodule "providers/npu"]
+	path = providers/npu
+	url = https://github.com/astorise/Magnetar-provider-NPU.git
+[submodule "providers/tpu"]
+	path = providers/tpu
+	url = https://github.com/astorise/Magnetar-provider-TPU.git
