@@ -582,6 +582,48 @@ jobs:
             echo "::error file=magnetar-runtime/Cargo.toml::magnetar-runtime's resolved dependency graph includes an externalized Component/Provider/Format crate"
             exit 1
           fi
+      # #59: the root `deny` job above checks out without submodules by
+      # design (`externalize-runtime-extension-modules`'s "zero
+      # compile-time dependency on any externalized module"), so it never
+      # sees `magnetar-cli`'s ~200-crate dependency graph (through
+      # `loaders/huggingface` -> `tokenizers`) or any of the crates below --
+      # the same gap `provider-integration`'s own `cargo deny` steps closed
+      # for the Provider submodules. This job already checks out every
+      # submodule recursively, so it is the natural place to close the
+      # rest.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@5724fe4561a201b0d36bddf13177e3557b43787b # cargo-deny
+      - name: Check magnetar-cli's own dependency graph (advisories, bans, licenses, sources)
+        # `--allow wildcard --allow unlicensed`: `magnetar-format-safetensors`
+        # and `magnetar-loader-huggingface` (external submodules this
+        # repository does not own) declare neither `license` nor
+        # `publish = false` in their own Cargo.toml, which trips
+        # cargo-deny's `unlicensed` check and its `wildcard` check
+        # (`allow-wildcard-paths` only exempts a crate cargo-deny can see
+        # is unpublishable). Not fixable from this repository; scoped to
+        # exactly these two lint classes so a real license/bans/advisories/
+        # sources regression elsewhere in this 200-crate graph still fails
+        # the build.
+        run: cargo deny --manifest-path magnetar-cli/Cargo.toml check --allow wildcard --allow unlicensed
+      - name: Check inference-components' own dependency graph (advisories, bans, licenses, sources)
+        # Same exception, for the same reason -- this crate also reaches
+        # `magnetar-format-safetensors`, plus `magnetar-format-gguf`/
+        # `magnetar-loader-gguf`/`magnetar-provider-cpu`, all missing the
+        # same metadata.
+        run: cargo deny --manifest-path inference-components/Cargo.toml check --allow wildcard --allow unlicensed
+      - name: Check loaders/huggingface's own dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path loaders/huggingface/Cargo.toml check --allow wildcard --allow unlicensed
+      - name: Check loaders/gguf's own dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path loaders/gguf/Cargo.toml check --allow wildcard --allow unlicensed
+      # These three integration-test crates reach none of the
+      # still-unlicensed external submodules above, so no exception is
+      # needed -- a real regression here fails outright.
+      - name: Check integration-tests/production-loading's own dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path integration-tests/production-loading/Cargo.toml check
+      - name: Check integration-tests/multi-device-cpu-cuda's own dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path integration-tests/multi-device-cpu-cuda/Cargo.toml check
+      - name: Check integration-tests/cuda-first-native's own dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path integration-tests/cuda-first-native/Cargo.toml check
 
   coverage:
     name: quality / coverage

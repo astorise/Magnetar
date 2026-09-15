@@ -4,6 +4,7 @@
 name = "magnetar-integration-multi-device-cpu-cuda"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 # Never published: this crate exists only to prove a single Runtime can
 # register two real, heterogeneous Providers (Reference CPU +  CUDA)
 # simultaneously and dispatch a real computation across both -- something

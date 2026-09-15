@@ -4,6 +4,7 @@
 name = "magnetar-integration-cuda-first-native"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 # Never published: this crate exists only to run the real first-native
 # pipeline (magnetar-runtime) against a real CUDA Provider
 # (magnetar-provider-cuda) end to end -- something neither crate can prove

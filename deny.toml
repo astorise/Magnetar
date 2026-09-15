@@ -8,7 +8,17 @@
 # dependency graph. Exceptions belong here, with a reason, never as a silenced
 # CI step.
 yanked = "deny"
-ignore = []
+ignore = [
+    # RUSTSEC-2024-0436 (`paste`, unmaintained): pulled in transitively via
+    # `tokenizers` (`loaders/huggingface`'s real tokenizer.json backend --
+    # see #59, which wired `cargo deny` into the crates that reach this
+    # dependency for the first time and surfaced this). Not a vulnerability,
+    # a proc-macro crate whose author archived it; the advisory itself
+    # states "No safe upgrade is available" and this repository does not
+    # control `tokenizers`' own dependency choice. Revisit when `tokenizers`
+    # moves off it (or when the suggested `pastey` fork is viable).
+    "RUSTSEC-2024-0436",
+]
 
 [bans]
 # Several copies of one crate bloat build time and can mean two incompatible

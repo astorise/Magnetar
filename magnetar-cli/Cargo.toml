@@ -9,6 +9,13 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "First-party client/workspace/agent runtime around Magnetar inference (magnetar-cli inference boundary)."
+# Never published: the binary this repository ships, not a library other
+# crates depend on. Without this, cargo-deny's wildcard-path-dependency ban
+# fired on magnetar-cli's own path dependencies below -- `allow-wildcard-paths`
+# (deny.toml) only exempts a crate cargo-deny can see is not publishable,
+# since crates.io itself disallows path dependencies in a published crate
+# (#59).
+publish = false
 
 [dependencies]
 magnetar-runtime = { path = "../magnetar-runtime", version = "0.1.0" }

@@ -4,6 +4,7 @@
 name = "magnetar-integration-production-loading"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 # Never published: this crate exists only to run the real production
 # Qwen loading pipeline end to end against a real external ingestor
 # (loaders/huggingface) and the real Model Loading/Model Component
