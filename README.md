@@ -558,11 +558,23 @@ unchanged. `integration-tests/multi-device-cpu-cuda` gained a real
 two-GPU test genuinely executing a chained computation across two
 physically distinct real GPUs (verified on `arc-gpu-magnetar`, gracefully
 skipping on this repository's own single-GPU development workstation and
-most other hosts). Real peer-to-peer GPU-to-GPU movement (both real GPUs
-here move data via an explicit host round trip, not peer access) and
-per-Device memory feasibility ranking against a genuinely heterogeneous
-budget (the two real GPUs available are identical) remain unverified.
-Mistral/Gemma Model Components remain future work.
+most other hosts).
+
+`add-real-peer-to-peer-gpu-movement` closed the peer-access gap the same
+way: `providers/cuda` gained a real `peer` module wrapping the real
+`cuDeviceCanAccessPeer`/`cuCtxEnablePeerAccess` driver entry points
+directly (`cudarc` itself has no safe wrapper for either), and
+`CudaExecutor::copy_tensor_from_peer_admitted`, a real cross-GPU
+device-to-device copy (`cuMemcpyPeerAsync`) that never touches host
+memory -- structurally distinct from every other cross-Device movement in
+this repository, which all explicitly stage through the host. Verified
+genuinely executing (not skipped) on the real two-GPU CI node: the real
+peer-capability query returned true, real peer access was enabled, and
+the real cross-GPU copy produced a byte-identical result. Per-Device
+memory feasibility ranking against a genuinely heterogeneous budget (the
+two real GPUs available are identical) and Device-loss/degraded-replan
+behavior (no real way to simulate hard Device loss safely) remain
+unverified. Mistral/Gemma Model Components remain future work.
 
 **Tachyon integration audit** (`docs/audits/audit-magnetar-integration-
 tachyon-2026-09-13.md`, a separate review from the scope-charter
