@@ -19,9 +19,18 @@
 //! as this repository's precedent for exercising the generic dispatch
 //! contract without the Qwen-specific machinery built on top of it.
 //!
-//! What this test proves, for real, on this repository's own hardware
-//! (Reference CPU + a real NVIDIA GPU -- no second GPU exists anywhere in
-//! this repository's tooling):
+//! Two `#[test]` functions live here: one CPU+CUDA (verified on this
+//! development workstation's single real GPU, and gracefully on any
+//! GPU-less CI runner), and one real two-CUDA-GPU proof
+//! (`add-real-second-gpu-cuda-provider`) -- verified on `arc-gpu-magnetar`'s
+//! CI node, which genuinely has two real GPUs, once its per-job Kubernetes
+//! pod resource request (`nvidia.com/gpu`) was raised from 1 to 2, a real,
+//! separate infrastructure fix this change's own verification found
+//! necessary. This development workstation itself has only one real GPU,
+//! so the two-GPU test gracefully skips here -- see its own doc comment.
+//!
+//! What the CPU+CUDA test proves, for real, on this repository's own
+//! hardware:
 //!
 //! - A single `Runtime` can hold two real Providers' Kernels in one shared
 //!   Kernel Registry at once (nothing in `Runtime::register_provider`
@@ -67,15 +76,18 @@
 //!   drove or gated that execution, which nothing in this codebase
 //!   currently consults `MultiDevicePlacementPlan` to do.
 //!
-//! What this deliberately does **not** attempt (real future work, not
-//! silently assumed): peer-to-peer GPU-to-GPU movement or per-Device memory
-//! feasibility ranking against a real multi-GPU budget (no second GPU
-//! exists here to exercise either against), Device-loss/degraded-replan
-//! behavior, placement-generation republishing under live in-flight
-//! traffic, having `MultiDevicePlacementPlan` actually gate or drive
-//! dispatch (nothing in this codebase consults it today -- it remains a
-//! real, structurally-validated record, not yet an enforced contract), or
-//! wiring any of this into `ModelInstance`/production Qwen graph execution.
+//! What neither test attempts (real future work, not silently assumed):
+//! real peer-to-peer GPU-to-GPU memory access (both tests move data between
+//! Devices via a real, explicit host round trip -- CUDA peer access APIs
+//! are not implemented anywhere in this repository), per-Device memory
+//! feasibility ranking against a genuinely heterogeneous multi-GPU budget
+//! (the two-GPU test's real GPUs happen to be identical), Device-loss/
+//! degraded-replan behavior, placement-generation republishing under live
+//! in-flight traffic, having `MultiDevicePlacementPlan` actually gate or
+//! drive dispatch (nothing in this codebase consults it today -- it
+//! remains a real, structurally-validated record, not yet an enforced
+//! contract), or wiring any of this into `ModelInstance`/production Qwen
+//! graph execution.
 
 use std::sync::Arc;
 
@@ -131,6 +143,40 @@ struct Stage {
     /// Kernel with `KernelMemoryClassUnsupported`, found running this test
     /// for the first time.
     kernel_memory_class: KernelMemoryClass,
+}
+
+/// Builds a [`Stage`] from a real, already-registered Provider's own
+/// discovered Device -- never hand-constructed. Returns the real `Device`
+/// handle too (callers need it for `DeviceSetMember::new`).
+fn stage_from_provider(
+    provider: &dyn Provider,
+    output_placement: MemoryPlacement,
+    kernel_memory_class: KernelMemoryClass,
+) -> (Stage, Arc<dyn magnetar_runtime::Device>) {
+    let device = provider
+        .devices()
+        .into_iter()
+        .next()
+        .expect("this helper is only used for Providers that report exactly one Device");
+    let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
+    let device_binding = DeviceBinding::new(device.id().clone());
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(provider_binding.clone())
+        .with_device(device_binding.clone());
+    let executor = provider
+        .execution_api()
+        .expect("this helper is only used for Providers already confirmed available");
+    (
+        Stage {
+            executor,
+            affinity,
+            provider_binding,
+            device_binding,
+            output_placement,
+            kernel_memory_class,
+        },
+        device,
+    )
 }
 
 /// Dispatches a real `add` Kernel invocation for `stage`, through the exact
@@ -535,5 +581,260 @@ fn cpu_and_cuda_providers_execute_one_chained_add_across_two_real_devices_in_one
     // A real, stable, non-empty fingerprint over this real Plan's own
     // content -- the same `sha256:`-prefixed digest format every other
     // fingerprint in this module uses.
+    assert!(plan.fingerprint().as_str().starts_with("sha256:"));
+}
+
+/// The real, two-real-GPU counterpart to the CPU+CUDA test above --
+/// `add-real-second-gpu-cuda-provider` made this possible by teaching
+/// `CudaProvider` to bind a specific real GPU ordinal under its own
+/// distinct Provider name (`Runtime`'s `ProviderLoader` otherwise rejects a
+/// second `register_provider` call under an already-registered name
+/// outright, so two `CudaProvider::new()` instances could never coexist in
+/// one Runtime before this).
+///
+/// Gracefully skips on any host with fewer than two real, compatible CUDA
+/// devices (this repository's own development workstation included -- one
+/// real GPU only) -- genuinely exercises two real, physically distinct
+/// GPUs only on a host that actually has them
+/// (`arc-gpu-magnetar`'s CI node, after its `nvidia.com/gpu` job-pod
+/// resource request was raised from 1 to 2, a real, separate infrastructure
+/// fix this change's own verification found necessary and applied).
+///
+/// What this proves beyond the CPU+CUDA test: two *homogeneous* Provider
+/// instances (same crate, same Kernel implementation, same driver) can
+/// coexist in one Kernel Registry without their advertisements colliding,
+/// and the shared registry still discriminates correctly between them by
+/// Device, not just by Provider identity/dtype -- a real, distinct
+/// verification `KernelDispatchPlan::from_selection`'s per-invocation
+/// `device: Option<DeviceBinding>` this file's own `dispatch_add` already
+/// asserts is respected.
+///
+/// What this deliberately still does not attempt: real peer-to-peer
+/// GPU-to-GPU memory access (movement between the two GPUs below is a real,
+/// explicit host round trip through `read_tensor`/`write_tensor_admitted`,
+/// exactly like the CPU+CUDA test's CPU->CUDA crossing -- CUDA peer access
+/// APIs are not implemented anywhere in this repository), and per-Device
+/// memory feasibility ranking against each GPU's own real capacity (both
+/// GPUs here happen to be identical RTX 3060s with identical budgets on
+/// the one host that can run this for real; a genuinely heterogeneous
+/// two-GPU case remains unverified).
+#[test]
+fn two_real_cuda_gpus_execute_one_chained_add_across_two_real_devices_in_one_runtime() {
+    let gpu0_probe = CudaProvider::new();
+    if !gpu0_probe.is_available() {
+        eprintln!("skipping: no compatible CUDA device found on this host at all");
+        return;
+    }
+    let gpu1_probe = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    if !gpu1_probe.is_available() {
+        eprintln!(
+            "skipping: this host has only one real CUDA device -- a genuine second real \
+             GPU is required to prove anything this test is specifically for"
+        );
+        return;
+    }
+
+    let gpu0_provider: Arc<CudaProvider> = Arc::new(gpu0_probe);
+    let gpu1_provider: Arc<CudaProvider> = Arc::new(gpu1_probe);
+
+    let (gpu0_stage, gpu0_device) = stage_from_provider(
+        gpu0_provider.as_ref(),
+        MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+            gpu0_provider.metadata().name.clone(),
+        )),
+        KernelMemoryClass::Device,
+    );
+    let (gpu1_stage, gpu1_device) = stage_from_provider(
+        gpu1_provider.as_ref(),
+        MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+            gpu1_provider.metadata().name.clone(),
+        )),
+        KernelMemoryClass::Device,
+    );
+    assert_ne!(
+        gpu0_stage.device_binding, gpu1_stage.device_binding,
+        "ordinal 0 and ordinal 1 must be two genuinely distinct real Devices"
+    );
+    assert_ne!(
+        gpu0_stage.provider_binding, gpu1_stage.provider_binding,
+        "the two CudaProvider instances must register under two distinct names"
+    );
+
+    // The real proof this test exists for: two CudaProvider instances,
+    // each bound to a different real GPU ordinal under its own distinct
+    // name, registering into the same Runtime together without the
+    // ProviderAlreadyRegistered collision a shared name would cause.
+    let mut runtime = Runtime::builder()
+        .register_provider(gpu0_provider.clone())
+        .register_provider(gpu1_provider.clone())
+        .build()
+        .expect("two CudaProviders under two distinct names must both register successfully");
+
+    let a = HostTensor::new([3], [1.0, 2.0, 3.0]).unwrap();
+    let b = HostTensor::new([3], [10.0, 20.0, 30.0]).unwrap();
+    let c = HostTensor::new([3], [100.0, 200.0, 300.0]).unwrap();
+    let expected = [111.0f32, 222.0, 333.0];
+
+    let a_id = TensorResourceId::new("multi-gpu-a");
+    let b_id = TensorResourceId::new("multi-gpu-b");
+    let c_id = TensorResourceId::new("multi-gpu-c");
+    let stage1_output_id = TensorResourceId::new("multi-gpu-stage1-output");
+    let stage2_output_id = TensorResourceId::new("multi-gpu-stage2-output");
+
+    gpu0_stage
+        .executor
+        .write_tensor_value_admitted(
+            runtime.memory_mut(),
+            a_id.clone(),
+            magnetar_runtime::TensorValue::Host(a),
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("admitting operand 'a' on real GPU 0 must succeed");
+    gpu0_stage
+        .executor
+        .write_tensor_value_admitted(
+            runtime.memory_mut(),
+            b_id.clone(),
+            magnetar_runtime::TensorValue::Host(b),
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("admitting operand 'b' on real GPU 0 must succeed");
+
+    // Stage 1: `a + b` on real GPU 0. Proves the shared Kernel Registry
+    // selects GPU 0's own candidate, not GPU 1's, even though both
+    // Providers advertise an identical `add` Kernel shape.
+    let stage1_result = dispatch_add(
+        &mut runtime,
+        &gpu0_stage,
+        "stage1-gpu0-add",
+        a_id.clone(),
+        b_id.clone(),
+        3,
+        stage1_output_id.clone(),
+    );
+    assert_eq!(
+        stage1_result.data,
+        vec![11.0, 22.0, 33.0],
+        "stage 1 (real GPU 0 add) produced an incorrect result"
+    );
+
+    // Explicit cross-Device movement, GPU 0 -> GPU 1: a real host round
+    // trip, not peer access (unimplemented anywhere in this repository --
+    // see this test's own doc comment).
+    gpu1_stage
+        .executor
+        .write_tensor_value_admitted(
+            runtime.memory_mut(),
+            stage1_output_id.clone(),
+            magnetar_runtime::TensorValue::Host(stage1_result),
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("admitting stage 1's result on real GPU 1 must succeed");
+    gpu1_stage
+        .executor
+        .write_tensor_value_admitted(
+            runtime.memory_mut(),
+            c_id.clone(),
+            magnetar_runtime::TensorValue::Host(c),
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("admitting operand 'c' on real GPU 1 must succeed");
+
+    // Stage 2: `(a + b) + c` on real GPU 1 -- a genuinely different
+    // physical device from stage 1's.
+    let stage2_result = dispatch_add(
+        &mut runtime,
+        &gpu1_stage,
+        "stage2-gpu1-add",
+        stage1_output_id.clone(),
+        c_id.clone(),
+        3,
+        stage2_output_id.clone(),
+    );
+    assert_eq!(
+        stage2_result.data, expected,
+        "stage 2 (real GPU 1 add) produced an incorrect result -- the final, \
+         real, GPU-computed value must equal the hand-computed a + b + c"
+    );
+
+    // Same real `multi_device_placement` wiring as the CPU+CUDA test,
+    // built from these two real, physically distinct GPUs' own metadata.
+    let device_set = DeviceSet::new(
+        DeviceSetId::new("multi-gpu-cuda-proof").unwrap(),
+        [
+            DeviceSetMember::new(gpu0_device.metadata().clone(), gpu0_device.availability()),
+            DeviceSetMember::new(gpu1_device.metadata().clone(), gpu1_device.availability()),
+        ],
+    )
+    .expect("two real, distinct GPU Devices form a valid DeviceSet");
+
+    let mut plan = MultiDevicePlacementPlan::new(
+        MultiDevicePlacementPlanId::new("gpu0-then-gpu1-add-chain").unwrap(),
+        MultiDevicePlacementGeneration::new(1),
+        real_fingerprint("stage1:gpu0:add|stage2:gpu1:add"),
+        1,
+        device_set,
+        "multi-gpu-cuda-proof-v1",
+    )
+    .expect("real, non-zero-generation Plan construction must succeed");
+    assert_eq!(plan.state, MultiDevicePlacementState::Building);
+
+    let gpu0_binding = PlacementBinding::new(
+        gpu0_stage.provider_binding.clone(),
+        gpu0_stage.device_binding.clone(),
+        MemoryDomain::DeviceLocal(gpu0_stage.device_binding.clone()),
+    )
+    .expect("GPU 0 binding with a matching device-local memory domain must succeed");
+    let gpu1_binding = PlacementBinding::new(
+        gpu1_stage.provider_binding.clone(),
+        gpu1_stage.device_binding.clone(),
+        MemoryDomain::DeviceLocal(gpu1_stage.device_binding.clone()),
+    )
+    .expect("GPU 1 binding with a matching device-local memory domain must succeed");
+
+    plan.stages.push(
+        PipelineStage::new(
+            "stage1-gpu0-add",
+            [ExecutionNodeId::new("stage1-gpu0-add")],
+            gpu0_binding.clone(),
+            0,
+        )
+        .unwrap()
+        .with_input(a_id)
+        .with_input(b_id)
+        .with_output(stage1_output_id.clone()),
+    );
+    plan.stages.push(
+        PipelineStage::new(
+            "stage2-gpu1-add",
+            [ExecutionNodeId::new("stage2-gpu1-add")],
+            gpu1_binding.clone(),
+            1,
+        )
+        .unwrap()
+        .with_input(stage1_output_id.clone())
+        .with_input(c_id)
+        .with_output(stage2_output_id),
+    );
+    plan.movement_edges.push(
+        StageMovementEdge::new(
+            "stage1-gpu0-add",
+            "stage2-gpu1-add",
+            stage1_output_id,
+            gpu0_binding,
+            gpu1_binding,
+            HostStagingPolicy::Permit,
+        )
+        .expect("a movement edge between two genuinely different Devices must succeed"),
+    );
+    plan.mark_ready()
+        .expect("a Plan with real stages must reach Ready");
+    assert_eq!(plan.state, MultiDevicePlacementState::Ready);
+    assert_eq!(plan.stages.len(), 2);
+    assert_eq!(plan.movement_edges.len(), 1);
     assert!(plan.fingerprint().as_str().starts_with("sha256:"));
 }
