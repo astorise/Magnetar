@@ -578,13 +578,26 @@ eligible` eligibility-and-ranking logic (real since before this session,
 but only ever exercised by its own synthetic unit-test fixtures) with a
 real GPU's real, full memory capacity for the first time, verified
 genuinely on the CI node's real hardware -- also proving eligibility is
-checked before cost ranking, using real candidate data. Memory-feasibility
-ranking against a *genuinely heterogeneous* real budget (the two real
-GPUs available are identical, so the infeasibility case uses one
-deliberately, honestly constrained artificial budget instead) and
-Device-loss/degraded-replan behavior (no real way to simulate hard Device
-loss safely) remain unverified. Mistral/Gemma Model Components remain
-future work.
+checked before cost ranking, using real candidate data.
+
+`add-real-device-loss-degraded-replan-state-machine` closed the fourth
+and last of these follow-up items: a real, two-real-GPU-derived
+`MultiDevicePlacementPlan` is transitioned to `Invalidated` and the real,
+unmodified state machine is confirmed to refuse reverting it back to
+`Ready` in place, verified genuinely on the CI node. Honestly, explicitly
+**not** a hardware-failure-injection test -- this repository's tooling has
+no safe way to force a real GPU to disappear on shared CI infrastructure,
+so the "loss" event itself is a real, caller-driven transition, not a
+hardware-detected one; what is real is the Plan's own Device-derived data
+and the state-machine code itself.
+
+Memory-feasibility ranking against a *genuinely heterogeneous* real
+budget (the two real GPUs available are identical, so the infeasibility
+case uses one deliberately, honestly constrained artificial budget
+instead) and real hardware-failure-injection for Device loss (no safe
+mechanism exists) remain unverified -- both are permanent limitations of
+this repository's current hardware/tooling, not open chantiers. Mistral/
+Gemma Model Components remain future work.
 
 **Tachyon integration audit** (`docs/audits/audit-magnetar-integration-
 tachyon-2026-09-13.md`, a separate review from the scope-charter
