@@ -127,6 +127,29 @@ mod tests {
         assert_eq!(config.write_policy, agent::WorkspacePolicy::Deny);
     }
 
+    /// #55: `NetworkPolicy`/`ProcessPolicy`'s own `#[default]` is `Deny`,
+    /// but that is not the effective default any real invocation sees --
+    /// `CliConfig::default()` overrides both to `AllowExplicit`. Asserting
+    /// the composed default directly (rather than only each policy type in
+    /// isolation, as the type-level tests in `network.rs`/`process.rs` do)
+    /// is what would have caught the two layers disagreeing.
+    #[test]
+    fn effective_default_config_allows_network_and_tool_access_despite_each_policys_own_deny_default()
+     {
+        assert_eq!(
+            process::ProcessPolicy::default(),
+            process::ProcessPolicy::Deny
+        );
+        assert_eq!(
+            network::NetworkPolicy::default(),
+            network::NetworkPolicy::Deny
+        );
+
+        let config = CliConfig::default();
+        assert_eq!(config.tool_policy, process::ProcessPolicy::AllowExplicit);
+        assert_eq!(config.network_policy, network::NetworkPolicy::AllowExplicit);
+    }
+
     #[test]
     fn resolve_model_ref_arg_prefers_positional_argument_over_config_default() {
         let config = CliConfig {

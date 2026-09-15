@@ -25,9 +25,19 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 /// CLI-owned network access policy (§10/§21 "Keep network policy in CLI").
-/// Deny by default: network access only happens when both this policy
-/// allows it and the caller explicitly requests it (e.g. `magnetar run
-/// --url <url>`).
+/// Network access only ever happens when both this policy allows it and
+/// the caller explicitly requests it (e.g. `magnetar run --url <url>`) --
+/// a flag alone is never sufficient.
+///
+/// This type's own [`Default`] is [`Self::Deny`], but that is not what
+/// ships: [`crate::config::CliConfig::default`] sets `network_policy` to
+/// [`Self::AllowExplicit`], so `--url` works out of the box today (see
+/// that type's doc comment for why, and #55 for the discrepancy between
+/// this comment's previous "deny by default" framing and the actually
+/// shipped, permissive default). `Self::Deny` is real and reachable --
+/// once a persistent configuration mechanism exists, setting it there
+/// disables `--url` regardless of the flag -- it is simply not selected by
+/// anything today.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum NetworkPolicy {
     #[default]
