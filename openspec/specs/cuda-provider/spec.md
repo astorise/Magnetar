@@ -1,7 +1,7 @@
 # cuda-provider Specification
 
 ## Purpose
-Defines the CUDA Provider's baseline contract: identity, graceful unavailability without compatible hardware, device discovery, Kernel advertisements and their correctness against Reference CPU, explicit data movement and Memory Manager integration (including caller-owned output pre-admission and Device-resident chaining between Kernels), synchronous execution, error categories, and conformance scope -- including native multi-head RoPE rotation.
+Defines the CUDA Provider's baseline contract: identity, graceful unavailability without compatible hardware, device discovery, Kernel advertisements and their correctness against Reference CPU, explicit data movement and Memory Manager integration (including caller-owned output pre-admission and Device-resident chaining between Kernels), synchronous execution, error categories, and conformance scope -- including native multi-head RoPE rotation and binding to a specific real GPU ordinal under a distinct Provider name so more than one instance can coexist in one Runtime (`add-real-second-gpu-cuda-provider`).
 ## Requirements
 ### Requirement: CUDA RoPE Kernel Supports Native Multi-Head Rotation
 
@@ -397,4 +397,39 @@ CUDA Provider SHALL offer real, on-device `F16`/`bfloat16` storage and elementwi
 - **GIVEN** a `KernelSelectionRequest` for the `add` (or `mul`) Operator whose input/output resources declare `Float16` (or `BrainFloat16`) as their `ComputeDType`
 - **WHEN** the Kernel Registry selects a candidate and the resulting invocation is dispatched through `ProviderExecutionApi::submit_kernel`/`complete_kernel`
 - **THEN** the native half-precision Kernel is selected in preference to the `f32`-only one, and the dispatched result matches the same reference conversion model the direct-call scenarios above already establish
+
+### Requirement: CUDA Provider Can Bind to a Specific Real Device Ordinal Under a Distinct Name
+
+The CUDA Provider SHALL support construction bound to a caller-specified real device ordinal, registering under a caller-specified Provider name distinct from the default. The default constructor SHALL be behaviorally identical to binding ordinal 0 under the default name.
+
+#### Scenario: Default construction is unchanged
+
+- **GIVEN** the CUDA Provider's default constructor and its ordinal-0/default-name constructor
+- **WHEN** both are constructed on the same host
+- **THEN** they report identical availability, health, and Device identity
+
+#### Scenario: A second real GPU ordinal is requested under its own name
+
+- **GIVEN** a host with two or more real, compatible CUDA devices
+- **WHEN** the CUDA Provider is constructed bound to ordinal 1 under a distinct Provider name
+- **THEN** it reports `ProviderHealth::Available`
+- **AND** its one reported Device has an identity distinct from ordinal 0's
+
+#### Scenario: An out-of-range ordinal is requested
+
+- **GIVEN** a host with fewer real CUDA devices than the requested ordinal plus one
+- **WHEN** the CUDA Provider is constructed bound to that ordinal
+- **THEN** construction succeeds
+- **AND** it reports `ProviderHealth::Unavailable`, never a construction error or panic
+
+### Requirement: Two Distinctly-Named CUDA Providers Register Into One Runtime Together
+
+Two CUDA Provider instances bound to two different real device ordinals, each registered under its own distinct Provider name, SHALL both register successfully into the same Runtime.
+
+#### Scenario: Two real GPUs registered together
+
+- **GIVEN** two CUDA Provider instances bound to two different real device ordinals under two distinct names
+- **WHEN** both are registered into the same Runtime
+- **THEN** Runtime construction succeeds
+- **AND** both Providers' Devices and Kernels are present in that Runtime
 

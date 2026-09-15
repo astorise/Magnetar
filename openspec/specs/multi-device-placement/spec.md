@@ -1,7 +1,7 @@
 # multi-device-placement Specification
 
 ## Purpose
-Defines Magnetar's local multi-Device placement contract: Runtime-owned placement decisions, explicit placement plans, eligibility-before-ranking, explicit cross-Device movement, and heterogeneous-Device support -- plus, as of `add-multi-device-cpu-cuda-execution-proof`, the real, hardware-verified facts this repository has actually confirmed about it: concurrent multi-Provider Runtime registration, the Kernel Registry's real Provider-ranking (not Provider-filtering) candidate selection, and a `MultiDevicePlacementPlan` buildable as an explicit record from a real execution's own data. Full production `ModelInstance`-level placement across more than one real GPU remains unimplemented and unverified -- this repository's own tooling has exactly one real GPU.
+Defines Magnetar's local multi-Device placement contract: Runtime-owned placement decisions, explicit placement plans, eligibility-before-ranking, explicit cross-Device movement, and heterogeneous-Device support -- plus the real, hardware-verified facts this repository has actually confirmed about it: concurrent multi-Provider Runtime registration, the Kernel Registry's real Provider-ranking (not Provider-filtering) candidate selection, a `MultiDevicePlacementPlan` buildable as an explicit record from a real execution's own data (`add-multi-device-cpu-cuda-execution-proof`, CPU+CUDA), and a real chained computation genuinely executing across two physically distinct real GPUs in one Runtime (`add-real-second-gpu-cuda-provider`, verified on `arc-gpu-magnetar`'s CI node). Full production `ModelInstance`-level placement across more than one real GPU remains unimplemented -- `ModelInstancePlacement` still structurally binds one Provider/Device per instance -- and real peer-to-peer GPU-to-GPU movement, per-Device memory feasibility ranking against a genuinely heterogeneous budget, and Device-loss/degraded-replan behavior remain unverified.
 ## Requirements
 ### Requirement: Runtime Owns Multi Device Placement
 
@@ -210,4 +210,20 @@ A `MultiDevicePlacementPlan` SHALL be permitted to exist purely as a descriptive
 - **GIVEN** a real cross-Device execution driven directly through `KernelSelectionRequest`/`KernelDispatchPlan`/`KernelDispatcher`
 - **WHEN** a `MultiDevicePlacementPlan` is built afterward to describe what happened
 - **THEN** the execution's own success or failure did not depend on that Plan's existence, content, or state
+
+### Requirement: A Real Chained Computation Can Execute Across Two Physically Distinct Real GPUs
+
+Given two available, distinctly-named CUDA Provider instances bound to two different real GPU ordinals registered into one Runtime, a caller SHALL be able to dispatch a multi-stage computation across both real Devices, with each stage's output explicitly, physically movable to the other Device via an explicit host round trip.
+
+#### Scenario: Two-stage computation across two real GPUs
+
+- **GIVEN** two real, physically distinct GPUs, each with its own registered CUDA Provider instance
+- **WHEN** stage one executes on the first real GPU, its result is read back to the host, and admitted fresh into the second real GPU's memory domain for stage two
+- **THEN** stage two's real, GPU-computed result matches the expected value for the full chained computation
+
+#### Scenario: Homogeneous real Devices are still tracked as distinct
+
+- **GIVEN** two real GPUs of the identical model and identical memory capacity
+- **WHEN** a `DeviceSet` is built from both Devices' own real metadata
+- **THEN** the two Devices are recognized as distinct members, not deduplicated by shared architecture/vendor/capacity
 
