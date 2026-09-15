@@ -1,7 +1,7 @@
 # cuda-provider Specification
 
 ## Purpose
-Defines the CUDA Provider's baseline contract: identity, graceful unavailability without compatible hardware, device discovery, Kernel advertisements and their correctness against Reference CPU, explicit data movement and Memory Manager integration (including caller-owned output pre-admission and Device-resident chaining between Kernels), synchronous execution, error categories, and conformance scope -- including native multi-head RoPE rotation and binding to a specific real GPU ordinal under a distinct Provider name so more than one instance can coexist in one Runtime (`add-real-second-gpu-cuda-provider`).
+Defines the CUDA Provider's baseline contract: identity, graceful unavailability without compatible hardware, device discovery, Kernel advertisements and their correctness against Reference CPU, explicit data movement and Memory Manager integration (including caller-owned output pre-admission and Device-resident chaining between Kernels), synchronous execution, error categories, and conformance scope -- including native multi-head RoPE rotation, binding to a specific real GPU ordinal under a distinct Provider name so more than one instance can coexist in one Runtime (`add-real-second-gpu-cuda-provider`), and real peer-to-peer device-to-device movement between two such instances, gated by an explicit, never-assumed peer-capability query (`add-real-peer-to-peer-gpu-movement`).
 ## Requirements
 ### Requirement: CUDA RoPE Kernel Supports Native Multi-Head Rotation
 
@@ -432,4 +432,35 @@ Two CUDA Provider instances bound to two different real device ordinals, each re
 - **WHEN** both are registered into the same Runtime
 - **THEN** Runtime construction succeeds
 - **AND** both Providers' Devices and Kernels are present in that Runtime
+
+### Requirement: CUDA Provider Exposes a Real, Explicit Peer-Capability Query
+
+The CUDA Provider SHALL expose a real, explicit query for whether one real GPU Device can directly access another real GPU Device's memory. This query SHALL NOT infer or assume the result from Device similarity (shared vendor, architecture, or memory capacity).
+
+#### Scenario: Two real GPUs are queried for peer capability
+
+- **GIVEN** two real, available CUDA Devices
+- **WHEN** the peer-capability query is called for that pair
+- **THEN** it returns the real, driver-reported capability, not an assumption derived from the two Devices' own metadata
+
+### Requirement: CUDA Provider Supports Enabling Real Peer Access
+
+The CUDA Provider SHALL support enabling one real GPU Device's context to directly access another real GPU Device's memory, and SHALL NOT perform this without a caller having first obtained a positive result from the peer-capability query for that same pair.
+
+#### Scenario: Peer access is enabled after a positive capability query
+
+- **GIVEN** a peer-capability query that returned true for a real Device pair
+- **WHEN** peer access is enabled for that pair
+- **THEN** the operation succeeds, including when called more than once for the same pair
+
+### Requirement: CUDA Provider Supports a Real Cross-Device Copy That Never Touches Host Memory
+
+The CUDA Provider SHALL support copying a Tensor Resource's current device allocation directly from one real GPU Device's own storage into another's, via a real device-to-device transfer, without host materialization at any point in the call path.
+
+#### Scenario: A tensor is moved between two real GPUs
+
+- **GIVEN** a tensor resource resident on one real GPU Device, and peer access already enabled between it and a second real GPU Device
+- **WHEN** the cross-Device copy is invoked with the second Device's own executor as the destination
+- **THEN** the tensor's bytes are readable back from the second Device
+- **AND** they are bit-identical to the source
 

@@ -1,7 +1,7 @@
 # multi-device-placement Specification
 
 ## Purpose
-Defines Magnetar's local multi-Device placement contract: Runtime-owned placement decisions, explicit placement plans, eligibility-before-ranking, explicit cross-Device movement, and heterogeneous-Device support -- plus the real, hardware-verified facts this repository has actually confirmed about it: concurrent multi-Provider Runtime registration, the Kernel Registry's real Provider-ranking (not Provider-filtering) candidate selection, a `MultiDevicePlacementPlan` buildable as an explicit record from a real execution's own data (`add-multi-device-cpu-cuda-execution-proof`, CPU+CUDA), and a real chained computation genuinely executing across two physically distinct real GPUs in one Runtime (`add-real-second-gpu-cuda-provider`, verified on `arc-gpu-magnetar`'s CI node). Full production `ModelInstance`-level placement across more than one real GPU remains unimplemented -- `ModelInstancePlacement` still structurally binds one Provider/Device per instance -- and real peer-to-peer GPU-to-GPU movement, per-Device memory feasibility ranking against a genuinely heterogeneous budget, and Device-loss/degraded-replan behavior remain unverified.
+Defines Magnetar's local multi-Device placement contract: Runtime-owned placement decisions, explicit placement plans, eligibility-before-ranking, explicit cross-Device movement, and heterogeneous-Device support -- plus the real, hardware-verified facts this repository has actually confirmed about it: concurrent multi-Provider Runtime registration, the Kernel Registry's real Provider-ranking (not Provider-filtering) candidate selection, a `MultiDevicePlacementPlan` buildable as an explicit record from a real execution's own data (`add-multi-device-cpu-cuda-execution-proof`, CPU+CUDA), and a real chained computation genuinely executing across two physically distinct real GPUs in one Runtime (`add-real-second-gpu-cuda-provider`, verified on `arc-gpu-magnetar`'s CI node). `add-real-peer-to-peer-gpu-movement` closed the peer-access gap: a real, explicit `cuDeviceCanAccessPeer` query and `cuCtxEnablePeerAccess` enable step, and a real cross-GPU device-to-device copy that never touches host memory, verified genuinely executing on two real, physically distinct, peer-capable GPUs. Full production `ModelInstance`-level placement across more than one real GPU remains unimplemented -- `ModelInstancePlacement` still structurally binds one Provider/Device per instance -- and per-Device memory feasibility ranking against a genuinely heterogeneous budget and Device-loss/degraded-replan behavior remain unverified (only identical GPUs and no real Device-failure scenario have been available to test against).
 ## Requirements
 ### Requirement: Runtime Owns Multi Device Placement
 
@@ -226,4 +226,20 @@ Given two available, distinctly-named CUDA Provider instances bound to two diffe
 - **GIVEN** two real GPUs of the identical model and identical memory capacity
 - **WHEN** a `DeviceSet` is built from both Devices' own real metadata
 - **THEN** the two Devices are recognized as distinct members, not deduplicated by shared architecture/vendor/capacity
+
+### Requirement: Real Peer Access, Once Confirmed Available, Can Genuinely Move a Resource Without Host Staging
+
+When two real Devices report genuine peer-access capability, a caller SHALL be able to move a Tensor Resource between them without host staging, and this movement SHALL be representable with `HostStagingPolicy::Forbid` truthfully -- distinct from a host-staged crossing, which SHALL be represented with `HostStagingPolicy::Permit`.
+
+#### Scenario: A real peer movement is represented as Forbid
+
+- **GIVEN** a real cross-Device movement that used direct peer-to-peer device memory access, never touching host memory
+- **WHEN** a `StageMovementEdge` is built to describe it
+- **THEN** its `host_staging_policy` is `Forbid`, honestly reflecting that no host staging occurred
+
+#### Scenario: Peer capability absent falls back to explicit host staging
+
+- **GIVEN** two real Devices whose peer-capability query returns false
+- **WHEN** a caller needs to move a resource between them
+- **THEN** the caller uses an explicit host-staged crossing instead, represented with `HostStagingPolicy::Permit`, never a silent assumption of peer access
 
