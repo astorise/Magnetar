@@ -1,7 +1,7 @@
 # multi-device-placement Specification
 
 ## Purpose
-Defines Magnetar's local multi-Device placement contract: Runtime-owned placement decisions, explicit placement plans, eligibility-before-ranking, explicit cross-Device movement, and heterogeneous-Device support -- plus the real, hardware-verified facts this repository has actually confirmed about it: concurrent multi-Provider Runtime registration, the Kernel Registry's real Provider-ranking (not Provider-filtering) candidate selection, a `MultiDevicePlacementPlan` buildable as an explicit record from a real execution's own data (`add-multi-device-cpu-cuda-execution-proof`, CPU+CUDA), and a real chained computation genuinely executing across two physically distinct real GPUs in one Runtime (`add-real-second-gpu-cuda-provider`, verified on `arc-gpu-magnetar`'s CI node). `add-real-peer-to-peer-gpu-movement` closed the peer-access gap: a real, explicit `cuDeviceCanAccessPeer` query and `cuCtxEnablePeerAccess` enable step, and a real cross-GPU device-to-device copy that never touches host memory, verified genuinely executing on two real, physically distinct, peer-capable GPUs. Full production `ModelInstance`-level placement across more than one real GPU remains unimplemented -- `ModelInstancePlacement` still structurally binds one Provider/Device per instance -- and per-Device memory feasibility ranking against a genuinely heterogeneous budget and Device-loss/degraded-replan behavior remain unverified (only identical GPUs and no real Device-failure scenario have been available to test against).
+Defines Magnetar's local multi-Device placement contract: Runtime-owned placement decisions, explicit placement plans, eligibility-before-ranking, explicit cross-Device movement, and heterogeneous-Device support -- plus the real, hardware-verified facts this repository has actually confirmed about it: concurrent multi-Provider Runtime registration, the Kernel Registry's real Provider-ranking (not Provider-filtering) candidate selection, a `MultiDevicePlacementPlan` buildable as an explicit record from a real execution's own data (`add-multi-device-cpu-cuda-execution-proof`, CPU+CUDA), and a real chained computation genuinely executing across two physically distinct real GPUs in one Runtime (`add-real-second-gpu-cuda-provider`, verified on `arc-gpu-magnetar`'s CI node). `add-real-peer-to-peer-gpu-movement` closed the peer-access gap: a real, explicit `cuDeviceCanAccessPeer` query and `cuCtxEnablePeerAccess` enable step, and a real cross-GPU device-to-device copy that never touches host memory, verified genuinely executing on two real, physically distinct, peer-capable GPUs. `add-real-per-device-memory-feasibility-ranking` drove the existing `PlacementCandidate`/`select_lowest_cost_eligible` eligibility-and-ranking logic with a real Device's real memory capacity for the first time, verified genuinely on the CI node's real GPU. Full production `ModelInstance`-level placement across more than one real GPU remains unimplemented -- `ModelInstancePlacement` still structurally binds one Provider/Device per instance -- and memory-feasibility ranking against a genuinely heterogeneous real budget and Device-loss/degraded-replan behavior remain unverified (only identical GPUs and no real Device-failure scenario have been available to test against).
 ## Requirements
 ### Requirement: Runtime Owns Multi Device Placement
 
@@ -242,4 +242,15 @@ When two real Devices report genuine peer-access capability, a caller SHALL be a
 - **GIVEN** two real Devices whose peer-capability query returns false
 - **WHEN** a caller needs to move a resource between them
 - **THEN** the caller uses an explicit host-staged crossing instead, represented with `HostStagingPolicy::Permit`, never a silent assumption of peer access
+
+### Requirement: Per-Device Memory Feasibility Ranking Is Verified Against Real Device Capacity
+
+The existing `PlacementCandidate`/`select_lowest_cost_eligible` eligibility-and-ranking logic SHALL be exercised with at least one real Device's own real, discovered memory capacity, not only synthetic fixture values, and SHALL correctly reject a candidate whose required bytes exceed its available budget regardless of that candidate's own ranking cost.
+
+#### Scenario: A real feasible candidate is selected over a cheaper infeasible one
+
+- **GIVEN** two placement candidates for the same required byte size -- one backed by a real Device's real, sufficient memory capacity, one backed by an insufficient budget -- where the insufficient candidate has a lower ranking cost
+- **WHEN** the candidates are evaluated
+- **THEN** the real, sufficient candidate is selected
+- **AND** the insufficient candidate is rejected specifically for memory infeasibility, not any other reason
 
