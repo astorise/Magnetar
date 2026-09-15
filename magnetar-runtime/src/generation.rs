@@ -200,8 +200,23 @@ impl GenerationParameters {
                 validate_probability(name, value, false)?;
             }
         }
+        // `repetition_penalty` is applied multiplicatively (see
+        // `sampling::apply_penalties`: `score / penalty` for a positive
+        // score, `score * penalty` otherwise, matching Hugging Face's
+        // `RepetitionPenaltyLogitsProcessor` convention where `1.0` is the
+        // no-op value). A value of `0.0` is meaningless there -- it would
+        // divide a positive score by zero and always sends a non-positive
+        // score to exactly `0.0` -- so it is rejected strictly, unlike the
+        // two additive penalties below where `0.0` is a genuine no-op.
+        if let Some(value) = self.repetition_penalty
+            && (!value.is_finite() || value <= 0.0)
+        {
+            return Err(GenerationError::ParameterInvalid {
+                parameter: "repetition penalty",
+                message: "repetition penalty must be finite and greater than zero".into(),
+            });
+        }
         for (name, value) in [
-            ("repetition penalty", self.repetition_penalty),
             ("frequency penalty", self.frequency_penalty),
             ("presence penalty", self.presence_penalty),
         ] {

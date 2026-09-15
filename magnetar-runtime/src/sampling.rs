@@ -841,12 +841,27 @@ fn apply_penalties(
             continue;
         }
         if let Some(penalty) = request.parameters.repetition_penalty {
-            if penalty < 0.0 || !penalty.is_finite() {
+            if penalty <= 0.0 || !penalty.is_finite() {
                 return Err(SamplingError::RepetitionPenaltyInvalid);
             }
-            if penalty > 0.0 {
-                candidate.score -= penalty;
-            }
+            // Multiplicative, matching Hugging Face's
+            // `RepetitionPenaltyLogitsProcessor`: `1.0` is the no-op value
+            // (dividing/multiplying by 1.0 leaves the score unchanged), a
+            // value above `1.0` discourages the token, and a value below
+            // `1.0` encourages it. A positive score is divided down toward
+            // zero (never sign-flipped by the penalty); a non-positive
+            // score is multiplied, which pushes it further negative --
+            // both directions make a repeated token less attractive
+            // without an additive constant that would need its own scale
+            // relative to the model's logits (#52: the previous `score -=
+            // penalty` had no no-op value other than `0.0`, so the
+            // conventional "no penalty" value `1.0` silently degraded
+            // every generation that passed it).
+            candidate.score = if candidate.score > 0.0 {
+                candidate.score / penalty
+            } else {
+                candidate.score * penalty
+            };
         }
         if let Some(penalty) = request.parameters.frequency_penalty {
             if penalty < 0.0 || !penalty.is_finite() {
