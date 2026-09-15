@@ -87,15 +87,29 @@
 //! host memory -- structurally distinct from the two tests above, which
 //! both move data via an explicit host round trip.
 //!
+//! A fourth test,
+//! `per_device_memory_feasibility_ranking_rejects_an_infeasible_real_gpu_
+//! and_accepts_a_feasible_one`
+//! (`add-real-per-device-memory-feasibility-ranking`), drives
+//! `magnetar-runtime`'s existing `PlacementCandidate`/`select_lowest_cost_
+//! eligible` -- unit-tested against synthetic fixtures since before this
+//! session began, never driven by a real Device's own real capacity
+//! numbers until now -- using one real GPU's real, full memory capacity
+//! and one deliberately, honestly constrained artificial budget (this
+//! repository's own two real GPUs are identical, so no genuinely
+//! heterogeneous real budget exists to test infeasibility against), also
+//! proving eligibility is checked before cost ranking.
+//!
 //! What no test here attempts (real future work, not silently assumed):
-//! per-Device memory feasibility ranking against a genuinely heterogeneous
-//! multi-GPU budget (the two-GPU tests' real GPUs happen to be identical),
-//! Device-loss/degraded-replan behavior, placement-generation republishing
-//! under live in-flight traffic, having `MultiDevicePlacementPlan`
-//! actually gate or drive dispatch (nothing in this codebase consults it
-//! today -- it remains a real, structurally-validated record, not yet an
-//! enforced contract), or wiring any of this into `ModelInstance`/
-//! production Qwen graph execution.
+//! per-Device memory feasibility ranking against a *genuinely*
+//! heterogeneous real multi-GPU budget (this repository's own two real
+//! GPUs are identical), Device-loss/degraded-replan behavior,
+//! placement-generation republishing under live in-flight traffic, having
+//! `MultiDevicePlacementPlan` actually gate or drive dispatch (nothing in
+//! this codebase consults it today -- it remains a real,
+//! structurally-validated record, not yet an enforced contract), or
+//! wiring any of this into `ModelInstance`/production Qwen graph
+//! execution.
 
 use std::sync::Arc;
 
@@ -105,11 +119,13 @@ use magnetar_runtime::{
     ExecutionNodeId, FallbackClass, HostStagingPolicy, HostTensor, KernelDispatchPlan,
     KernelDispatchPlanId, KernelDispatcher, KernelInvocationId, KernelMemoryClass, KernelResource,
     KernelResultStatus, KernelSelectionRequest, LayoutDescriptor, MemoryAllocationOwner,
-    MemoryDomain, MemoryPlacement, MultiDevicePlacementFingerprint, MultiDevicePlacementGeneration,
-    MultiDevicePlacementPlan, MultiDevicePlacementPlanId, MultiDevicePlacementState,
-    OperatorFamily, OperatorId, PipelineStage, PlacementBinding, ProviderBinding,
-    ProviderExecutionApi, ResourceAffinity, Runtime, ShapeDescriptor, StageMovementEdge,
+    MemoryDomain, MemoryPlacement, MultiDevicePlacementErrorCode, MultiDevicePlacementFingerprint,
+    MultiDevicePlacementGeneration, MultiDevicePlacementPlan, MultiDevicePlacementPlanId,
+    MultiDevicePlacementState, OperatorFamily, OperatorId, PipelineStage, PlacementBinding,
+    PlacementCandidate, PlacementScope, ProviderBinding, ProviderExecutionApi,
+    ProviderPressureLevel, ResourceAffinity, Runtime, ShapeDescriptor, StageMovementEdge,
     TensorDescriptor, TensorResourceDescriptor, TensorResourceId, initial_operator_catalog,
+    select_lowest_cost_eligible,
 };
 
 use magnetar_provider_cpu::ReferenceCpuProvider;
@@ -1006,4 +1022,151 @@ fn two_real_cuda_gpus_move_a_tensor_via_real_peer_to_peer_copy_not_host_staging(
     )
     .expect("a movement edge between two genuinely different Devices must succeed");
     assert_eq!(movement_edge.host_staging_policy, HostStagingPolicy::Forbid);
+}
+
+/// Real per-Device memory feasibility ranking
+/// (`add-real-per-device-memory-feasibility-ranking`, `multi-device-
+/// placement`'s own "Per Device Memory Feasibility" requirement: "Every
+/// Device binding SHALL satisfy its own Memory Manager capacity policy"),
+/// using two real GPUs' own real, discovered memory capacity via
+/// `magnetar-runtime`'s existing, previously execution-unwired
+/// `PlacementCandidate`/`select_lowest_cost_eligible` -- unit-tested
+/// against synthetic fixtures since before this session began, never
+/// driven by a real Device's own real capacity numbers until now.
+///
+/// This repository's own real hardware has exactly two identical GPUs
+/// (same real memory capacity), so there is no genuinely heterogeneous
+/// real budget to test infeasibility against -- one candidate's
+/// `available_memory_bytes` is deliberately, honestly constrained to a
+/// small artificial value for this reason, the same "constrain a real
+/// budget to force a deterministic outcome" convention this repository's
+/// own `check_weight_materialization_failure_never_reaches_ready` test
+/// already established. The *other* candidate uses its real GPU's real,
+/// full, unmodified capacity -- a real value, not synthetic. The
+/// constrained candidate is also given a deliberately *lower* cost
+/// (zero latency/transfer/pressure penalty) than the real, feasible one,
+/// so this test also proves eligibility is checked before cost ranking,
+/// not the other way around: a cheaper-looking but infeasible candidate
+/// must still lose.
+///
+/// Gracefully skips, like the other tests in this file, on any host with
+/// fewer than two real CUDA devices.
+#[test]
+fn per_device_memory_feasibility_ranking_rejects_an_infeasible_real_gpu_and_accepts_a_feasible_one()
+{
+    let gpu0_probe = CudaProvider::new();
+    if !gpu0_probe.is_available() {
+        eprintln!("skipping: no compatible CUDA device found on this host at all");
+        return;
+    }
+    let gpu1_probe = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    if !gpu1_probe.is_available() {
+        eprintln!(
+            "skipping: this host has only one real CUDA device -- a genuine second real \
+             GPU is required to prove anything this test is specifically for"
+        );
+        return;
+    }
+
+    let gpu0_device = gpu0_probe
+        .devices()
+        .into_iter()
+        .next()
+        .expect("an available CudaProvider reports exactly one Device");
+    let gpu1_device = gpu1_probe
+        .devices()
+        .into_iter()
+        .next()
+        .expect("an available CudaProvider reports exactly one Device");
+
+    let gpu0_capacity = gpu0_device.metadata().memory_capacity;
+    assert!(
+        gpu0_capacity > 0,
+        "a real CUDA device always reports non-zero total memory"
+    );
+
+    // A real, realistic requirement -- 64 MiB -- comfortably smaller than
+    // any real GPU's own total memory, but far larger than the artificial
+    // budget the "infeasible" candidate below is deliberately given.
+    let required_bytes: u64 = 64 * 1024 * 1024;
+
+    let gpu0_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu0_probe.metadata().name.clone()),
+        DeviceBinding::new(gpu0_device.id().clone()),
+        MemoryDomain::DeviceLocal(DeviceBinding::new(gpu0_device.id().clone())),
+    )
+    .expect("GPU 0 binding with a matching device-local memory domain must succeed");
+    let gpu1_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu1_probe.metadata().name.clone()),
+        DeviceBinding::new(gpu1_device.id().clone()),
+        MemoryDomain::DeviceLocal(DeviceBinding::new(gpu1_device.id().clone())),
+    )
+    .expect("GPU 1 binding with a matching device-local memory domain must succeed");
+
+    let feasible_candidate = PlacementCandidate {
+        scope: PlacementScope::operator_group("feasible-real-gpu0")
+            .expect("a real operator group name must be valid"),
+        binding: gpu0_binding.clone(),
+        required_kernel: None,
+        required_memory_bytes: required_bytes,
+        available_memory_bytes: gpu0_capacity,
+        required_memory_class: KernelMemoryClass::Device,
+        provider_capable: true,
+        device_capable: true,
+        kernel_available: true,
+        resource_affinity_valid: true,
+        transfer_permitted: true,
+        host_staging_permitted: true,
+        latency_micros: 500,
+        throughput_units: 0,
+        transfer_cost_micros: 200,
+        pressure: ProviderPressureLevel::Low,
+        stability_penalty_micros: 0,
+    };
+    let infeasible_candidate = PlacementCandidate {
+        scope: PlacementScope::operator_group("infeasible-constrained-gpu1")
+            .expect("a real operator group name must be valid"),
+        binding: gpu1_binding.clone(),
+        required_kernel: None,
+        required_memory_bytes: required_bytes,
+        // Deliberately, honestly constrained: this real GPU's own real
+        // capacity is actually far larger (identical to GPU 0's), but no
+        // genuinely heterogeneous real budget exists on this repository's
+        // hardware to test infeasibility against -- see this test's own
+        // doc comment.
+        available_memory_bytes: 1024,
+        required_memory_class: KernelMemoryClass::Device,
+        provider_capable: true,
+        device_capable: true,
+        kernel_available: true,
+        resource_affinity_valid: true,
+        transfer_permitted: true,
+        host_staging_permitted: true,
+        // Deliberately cheaper-looking than the feasible candidate, to
+        // prove eligibility is checked before cost ranking.
+        latency_micros: 0,
+        throughput_units: 0,
+        transfer_cost_micros: 0,
+        pressure: ProviderPressureLevel::Low,
+        stability_penalty_micros: 0,
+    };
+
+    let (selected, report) =
+        select_lowest_cost_eligible([feasible_candidate, infeasible_candidate.clone()])
+            .expect("the real, sufficiently large real GPU 0 candidate must be feasible");
+
+    assert_eq!(
+        selected.binding.device, gpu0_binding.device,
+        "the real, sufficiently large real GPU must be selected, despite the artificially \
+         constrained candidate's lower cost"
+    );
+    assert_eq!(report.evaluated, 2);
+    assert_eq!(report.rejected.len(), 1);
+    assert_eq!(report.rejected[0].device, gpu1_binding.device);
+    assert_eq!(
+        report.rejected[0].reason,
+        MultiDevicePlacementErrorCode::MemoryInfeasible,
+        "the artificially constrained candidate must be rejected specifically for memory \
+         infeasibility, not any other reason"
+    );
 }
