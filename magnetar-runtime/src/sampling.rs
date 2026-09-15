@@ -537,10 +537,19 @@ pub fn select_next_token(request: &SamplingRequest) -> Result<SamplingResult, Sa
         SamplingSelectionMode::Stochastic
     };
     let selected_index = match selection_mode {
+        // Uses `candidate_order` -- the same best-first, lowest-token-id-
+        // breaks-ties ordering every other candidate cut (top-k, top-p) and
+        // `rank_for` use -- rather than a bare score comparison. `max_by`
+        // over a plain score comparison would resolve a tie to the *last*
+        // (highest-token-id) maximum, which both contradicts the documented
+        // tie-break rule below and produces a `token_rank` other than 1 for
+        // the token this branch just selected as "the best" (#51).
         SamplingSelectionMode::Greedy | SamplingSelectionMode::ProviderAssisted => probabilities
             .iter()
             .enumerate()
-            .max_by(|(_, left), (_, right)| compare_f32(left.score, right.score))
+            .min_by(|(_, left), (_, right)| {
+                candidate_order((left.score, left.token_id), (right.score, right.token_id))
+            })
             .map(|(index, _)| index)
             .expect("eligible set is non-empty"),
         SamplingSelectionMode::Stochastic => {

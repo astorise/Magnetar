@@ -74,6 +74,22 @@ fn sampling_greedy_selects_highest_valid_token_without_decoding() {
     );
 }
 
+/// #51: a score tie must resolve the same way greedy selection, the top-k
+/// cut, the top-p cut, and `token_rank` all already agree on internally --
+/// lowest token id wins -- so the reported rank of the selected token is
+/// always 1, never a rank contradicting the selection it describes.
+#[test]
+fn sampling_greedy_breaks_a_score_tie_toward_the_lower_token_id() {
+    let mut request = request(vec![0.0, 0.0, 0.0, 0.0, 7.0, 1.0, 7.0, 0.0]);
+    request.policy.allow_probability_metadata = true;
+
+    let result = select_next_token(&request).unwrap();
+
+    assert_eq!(result.selected_token_id, 4);
+    assert_eq!(result.selection_mode, SamplingSelectionMode::Greedy);
+    assert_eq!(result.token_rank, Some(1));
+}
+
 #[test]
 fn sampling_validates_temperature_and_reserved_modes() {
     let mut invalid_temperature = request(vec![0.0; 8]);
