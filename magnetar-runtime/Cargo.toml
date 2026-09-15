@@ -9,6 +9,19 @@ readme = "../README.md"
 keywords = ["ai", "inference", "runtime", "wasm", "webassembly"]
 categories = ["science", "wasm"]
 rust-version = "1.98"
+# #66: with no `include`, `cargo package` fell back to "every git-tracked
+# file under this directory", which happened to already be exactly what
+# `cargo publish`'s default verification step needs (it builds and tests
+# the packaged tarball, including every `#[cfg(test)]` path -- `tests/`
+# and `fixtures/` are genuinely load-bearing for that, not incidental
+# bloat a stricter list could drop without breaking `cargo publish`).
+# Declaring the same set explicitly turns that "whatever happens to be
+# tracked" default into a reviewable, intentional policy: a future file
+# added under this crate's directory for an unrelated reason (a scratch
+# note, a generated report, anything outside these four patterns) no
+# longer silently ships in the published tarball just because git tracks
+# it.
+include = ["src/**/*.rs", "tests/**/*.rs", "fixtures/**", "wit/**/*.wit"]
 
 [features]
 default = ["wasmtime-component-engine"]
