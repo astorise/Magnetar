@@ -535,8 +535,18 @@ fn cmd_agent(args: &[String], observer: &mut CliObserver) -> Result<(), CliBound
         CliObservationKind::RuntimeRequestSubmitted,
         "agent: starting agent loop",
     );
-    let options = agent::AgentOptions { steps, tool, write };
-    agent::run_agent_loop(&model_ref, &goal, &options)?;
+    // §13/§21: `tool_policy`/`write_policy` come from CLI config, exactly as
+    // `cmd_run` threads `config.tool_policy` into its own `--tool` handling
+    // -- a flag alone is not sufficient for either capability (#53).
+    let config = config::CliConfig::default();
+    let options = agent::AgentOptions {
+        steps,
+        tool,
+        write,
+        tool_policy: config.tool_policy,
+        write_policy: config.write_policy,
+    };
+    agent::run_agent_loop(&model_ref, &goal, &options, observer)?;
     Ok(())
 }
 

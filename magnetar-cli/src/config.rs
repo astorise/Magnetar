@@ -18,7 +18,7 @@
 //! [`resolve_model_ref_arg`], called from `commands::cmd_run` /
 //! `commands::cmd_chat`.
 
-use crate::{network, pipeline, process};
+use crate::{agent, network, pipeline, process};
 
 /// CLI-owned output formatting choice. Deliberately just an enum with no
 /// formatting engine behind it in this increment -- it exists to give
@@ -70,6 +70,16 @@ pub struct CliConfig {
     /// CLI"), the network sibling of `tool_policy` above -- same default
     /// and same reasoning.
     pub network_policy: network::NetworkPolicy,
+    /// CLI-owned workspace-mutation policy (§14/§21 "Keep workspace
+    /// mutation in CLI"), consulted by `commands::cmd_agent` alongside its
+    /// `--write` flag. Unlike `tool_policy`/`network_policy` above, this
+    /// defaults to `Deny`: `--write` is the one capability in this CLI that
+    /// mutates the filesystem, and until this change (#53) it had no
+    /// policy gate at all -- introducing the gate deny-by-default is the
+    /// safe choice for a new, previously-unchecked mutating capability,
+    /// rather than reproducing `tool_policy`/`network_policy`'s permissive
+    /// out-of-the-box default (see #55 for that default's own review).
+    pub write_policy: agent::WorkspacePolicy,
 }
 
 impl Default for CliConfig {
@@ -80,6 +90,7 @@ impl Default for CliConfig {
             output_format: OutputFormat::default(),
             tool_policy: process::ProcessPolicy::AllowExplicit,
             network_policy: network::NetworkPolicy::AllowExplicit,
+            write_policy: agent::WorkspacePolicy::default(),
         }
     }
 }
@@ -113,6 +124,7 @@ mod tests {
         assert_eq!(config.output_format, OutputFormat::Text);
         assert_eq!(config.tool_policy, process::ProcessPolicy::AllowExplicit);
         assert_eq!(config.network_policy, network::NetworkPolicy::AllowExplicit);
+        assert_eq!(config.write_policy, agent::WorkspacePolicy::Deny);
     }
 
     #[test]
