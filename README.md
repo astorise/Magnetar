@@ -570,11 +570,21 @@ memory -- structurally distinct from every other cross-Device movement in
 this repository, which all explicitly stage through the host. Verified
 genuinely executing (not skipped) on the real two-GPU CI node: the real
 peer-capability query returned true, real peer access was enabled, and
-the real cross-GPU copy produced a byte-identical result. Per-Device
-memory feasibility ranking against a genuinely heterogeneous budget (the
-two real GPUs available are identical) and Device-loss/degraded-replan
-behavior (no real way to simulate hard Device loss safely) remain
-unverified. Mistral/Gemma Model Components remain future work.
+the real cross-GPU copy produced a byte-identical result.
+
+`add-real-per-device-memory-feasibility-ranking` drove
+`magnetar-runtime`'s existing `PlacementCandidate`/`select_lowest_cost_
+eligible` eligibility-and-ranking logic (real since before this session,
+but only ever exercised by its own synthetic unit-test fixtures) with a
+real GPU's real, full memory capacity for the first time, verified
+genuinely on the CI node's real hardware -- also proving eligibility is
+checked before cost ranking, using real candidate data. Memory-feasibility
+ranking against a *genuinely heterogeneous* real budget (the two real
+GPUs available are identical, so the infeasibility case uses one
+deliberately, honestly constrained artificial budget instead) and
+Device-loss/degraded-replan behavior (no real way to simulate hard Device
+loss safely) remain unverified. Mistral/Gemma Model Components remain
+future work.
 
 **Tachyon integration audit** (`docs/audits/audit-magnetar-integration-
 tachyon-2026-09-13.md`, a separate review from the scope-charter
