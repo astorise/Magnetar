@@ -1,0 +1,29 @@
+# Code owners for zones with different review stakes than an ordinary
+# runtime-module change: architecture/spec, the quality gates themselves,
+# release/coverage policy, security posture, and submodule pins.
+#
+# See https://docs.github.com/articles/about-code-owners for syntax. Later
+# patterns take precedence over earlier ones.
+
+# Specification-first architecture (CONTRIBUTING.md: "Magnetar is
+# specification-driven. Architecture and behaviour are defined in openspec/
+# and docs/architecture/ before they are implemented").
+/openspec/                 @astorise
+/docs/architecture/        @astorise
+
+# The quality gates themselves -- a change here alters what every other PR
+# must pass.
+/.github/workflows/        @astorise
+
+# Release and coverage policy.
+/quality/                  @astorise
+/release/                  @astorise
+/RELEASE_NOTES.md          @astorise
+
+# Security posture.
+/SECURITY.md               @astorise
+
+# Submodule pins (formats/*, components/*, providers/*, loaders/*) --
+# bumping one changes what every downstream job builds and tests against.
+/.gitmodules                @astorise
+/SUBMODULES.md              @astorise
