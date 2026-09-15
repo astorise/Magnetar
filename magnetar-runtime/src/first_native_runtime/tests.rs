@@ -2672,21 +2672,30 @@ fn qwen_component_production_loader_has_no_embedded_fixture() {
     let production_loader_start = source
         .find("not(test)\n))]\nfn qwen_real_component_package()")
         .expect("the production (not(test)) qwen_real_component_package overload exists");
-    // Covers both qwen_real_component_package's thin not(test) wrapper and
-    // its sibling resolve_qwen_component_from_env_var (immediately after
-    // it in the source, factored out so the actual env-var/file-read logic
+    // Covers qwen_real_component_package's thin not(test) wrapper and its
+    // two siblings immediately after it in the source:
+    // resolve_qwen_component_from_env_var (the std::env::var read) and
+    // resolve_qwen_component_from_lookup (the std::fs::read logic, split
+    // out of resolve_qwen_component_from_env_var by #68 so tests can
+    // supply a lookup result directly instead of mutating the real process
+    // environment) -- factored out so the actual env-var/file-read logic
     // stays directly testable rather than living inside a not(test) cfg
-    // that no #[test] could ever reach) -- the second `\n}\n` closes that
-    // sibling function.
+    // that no #[test] could ever reach. The third `\n}\n` closes the last
+    // of the three.
     let first_fn_end = production_loader_start
         + source[production_loader_start..]
             .find("\n}\n")
             .expect("qwen_real_component_package has a closing brace")
         + "\n}\n".len();
-    let production_loader_end = first_fn_end
+    let second_fn_end = first_fn_end
         + source[first_fn_end..]
             .find("\n}\n")
-            .expect("resolve_qwen_component_from_env_var has a closing brace");
+            .expect("resolve_qwen_component_from_env_var has a closing brace")
+        + "\n}\n".len();
+    let production_loader_end = second_fn_end
+        + source[second_fn_end..]
+            .find("\n}\n")
+            .expect("resolve_qwen_component_from_lookup has a closing brace");
     let production_loader_source = &source[production_loader_start..production_loader_end];
     assert!(
         !production_loader_source.contains("include_bytes!"),
@@ -2774,13 +2783,21 @@ fn register_qwen_component_artifact_is_idempotent() {
     );
 }
 
-/// `resolve_qwen_component_from_env_var` is the extracted, directly
+/// `resolve_qwen_component_from_lookup` is the extracted, directly
 /// testable logic behind `qwen_real_component_package`'s production
 /// fallback branch, which is itself `not(test)` and so can never be
-/// invoked from a `#[test]` at all -- each of these tests uses its own
-/// uniquely-named env var (never `MAGNETAR_QWEN_COMPONENT_PATH` itself,
-/// the one a real production process would set) so parallel test threads
-/// mutating process-wide environment state cannot race each other.
+/// invoked from a `#[test]` at all. #68: previously these tests drove
+/// `resolve_qwen_component_from_env_var` and mutated the real process
+/// environment (`std::env::set_var`/`remove_var`, `unsafe` in Rust 2024
+/// precisely because they race with any *concurrent* environment access on
+/// another thread) to fake each scenario; each test used its own
+/// uniquely-named variable, which avoided colliding on the same key but
+/// not the actual hazard of a concurrent access on another thread during
+/// `cargo test`'s parallel execution. Supplying the lookup result directly
+/// removes the hazard entirely rather than working around it. Filesystem
+/// paths are still real temp files (each test uses its own uniquely-named
+/// path, and writes to distinct paths from different threads are not a
+/// hazard the way concurrent environment mutation is).
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 mod resolve_qwen_component_from_env_var_tests {
     use super::*;
@@ -2788,10 +2805,9 @@ mod resolve_qwen_component_from_env_var_tests {
     #[test]
     fn rejects_a_missing_env_var() {
         let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_UNSET_CASE";
-        unsafe {
-            std::env::remove_var(var_name);
-        }
-        let error = resolve_qwen_component_from_env_var(var_name).unwrap_err();
+        let error =
+            resolve_qwen_component_from_lookup(var_name, Err(std::env::VarError::NotPresent))
+                .unwrap_err();
         assert!(matches!(
             error,
             E2eConformanceError::ModelComponentFailed { reason } if reason.contains(var_name)
@@ -2802,13 +2818,9 @@ mod resolve_qwen_component_from_env_var_tests {
     fn rejects_a_nonexistent_component_file() {
         let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_MISSING_FILE_CASE";
         let path = std::env::temp_dir().join("magnetar-test-qwen-component-does-not-exist.wasm");
-        unsafe {
-            std::env::set_var(var_name, &path);
-        }
-        let error = resolve_qwen_component_from_env_var(var_name).unwrap_err();
-        unsafe {
-            std::env::remove_var(var_name);
-        }
+        let error =
+            resolve_qwen_component_from_lookup(var_name, Ok(path.to_str().unwrap().to_string()))
+                .unwrap_err();
         assert!(matches!(
             error,
             E2eConformanceError::ModelComponentFailed { reason }
@@ -2821,13 +2833,9 @@ mod resolve_qwen_component_from_env_var_tests {
         let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_MISSING_MANIFEST_CASE";
         let path = std::env::temp_dir().join("magnetar-test-qwen-component-no-manifest.wasm");
         std::fs::write(&path, b"pretend-component-bytes").expect("write test component file");
-        unsafe {
-            std::env::set_var(var_name, &path);
-        }
-        let error = resolve_qwen_component_from_env_var(var_name).unwrap_err();
-        unsafe {
-            std::env::remove_var(var_name);
-        }
+        let error =
+            resolve_qwen_component_from_lookup(var_name, Ok(path.to_str().unwrap().to_string()))
+                .unwrap_err();
         let _ = std::fs::remove_file(&path);
         assert!(matches!(
             error,
@@ -2845,13 +2853,9 @@ mod resolve_qwen_component_from_env_var_tests {
         std::fs::write(&path, b"pretend-component-bytes").expect("write test component file");
         std::fs::write(&manifest_path, b"pretend-manifest-bytes")
             .expect("write test manifest file");
-        unsafe {
-            std::env::set_var(var_name, &path);
-        }
-        let package = resolve_qwen_component_from_env_var(var_name).expect("resolves successfully");
-        unsafe {
-            std::env::remove_var(var_name);
-        }
+        let package =
+            resolve_qwen_component_from_lookup(var_name, Ok(path.to_str().unwrap().to_string()))
+                .expect("resolves successfully");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&manifest_path);
         assert_eq!(package.component_bytes, b"pretend-component-bytes");
@@ -2860,6 +2864,22 @@ mod resolve_qwen_component_from_env_var_tests {
             package.source.kind,
             ComponentDistributionSourceKind::LocalDirectory
         );
+    }
+
+    /// One narrow check that `resolve_qwen_component_from_env_var` is
+    /// genuinely wired to `std::env::var`, not only
+    /// `resolve_qwen_component_from_lookup` in isolation -- reads a
+    /// variable this test never sets (a plain read, with no concurrent
+    /// writer, carries none of `set_var`/`remove_var`'s hazard) rather
+    /// than reintroducing environment mutation.
+    #[test]
+    fn env_var_wrapper_reports_a_variable_that_is_genuinely_absent() {
+        let var_name = "MAGNETAR_TEST_QWEN_COMPONENT_PATH_GENUINELY_ABSENT_7f2e9c";
+        let error = resolve_qwen_component_from_env_var(var_name).unwrap_err();
+        assert!(matches!(
+            error,
+            E2eConformanceError::ModelComponentFailed { reason } if reason.contains(var_name)
+        ));
     }
 }
 

@@ -7205,15 +7205,31 @@ fn qwen_real_component_package() -> Result<ComponentArtifactPackage, E2eConforma
 fn resolve_qwen_component_from_env_var(
     env_var_name: &str,
 ) -> Result<ComponentArtifactPackage, E2eConformanceError> {
-    let component_path =
-        std::env::var(env_var_name).map_err(|_| E2eConformanceError::ModelComponentFailed {
-            reason: format!(
-                "no Qwen Component artifact was registered (see \
-                 register_qwen_component_artifact) and {env_var_name} is not set; production \
-                 first-native generation requires an externally provided Qwen Model Component \
-                 artifact and has no embedded development fixture of its own to fall back to"
-            ),
-        })?;
+    resolve_qwen_component_from_lookup(env_var_name, std::env::var(env_var_name))
+}
+
+/// The pure part of [`resolve_qwen_component_from_env_var`]'s logic,
+/// split out so tests can supply `lookup` directly (`Ok(path)` or
+/// `Err(VarError::NotPresent)`) instead of mutating the real process
+/// environment via `std::env::set_var`/`remove_var` (#68: those are
+/// `unsafe` in Rust 2024 precisely because they race with any *concurrent*
+/// environment access on another thread, and `cargo test` runs tests in
+/// parallel threads within one process -- each test previously using its
+/// own uniquely-named variable avoided colliding on the same key, but not
+/// the actual hazard, which is any concurrent access at all).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn resolve_qwen_component_from_lookup(
+    env_var_name: &str,
+    lookup: Result<String, std::env::VarError>,
+) -> Result<ComponentArtifactPackage, E2eConformanceError> {
+    let component_path = lookup.map_err(|_| E2eConformanceError::ModelComponentFailed {
+        reason: format!(
+            "no Qwen Component artifact was registered (see \
+             register_qwen_component_artifact) and {env_var_name} is not set; production \
+             first-native generation requires an externally provided Qwen Model Component \
+             artifact and has no embedded development fixture of its own to fall back to"
+        ),
+    })?;
     let component_bytes = std::fs::read(&component_path).map_err(|error| {
         E2eConformanceError::ModelComponentFailed {
             reason: format!(
