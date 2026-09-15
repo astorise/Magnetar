@@ -6,10 +6,21 @@ name: GPU Runner Smoke Test
 # device-resident allocation table and explicit host/device data movement
 # (`enable-device-resident-kernel-chaining`), and the `provider-core`/
 # `provider-compute`/`provider-data-movement` conformance profiles against
-# real hardware. Manual only: not gated per-PR because it needs a live GPU
-# runner, not because there is nothing CUDA-specific to test.
+# real hardware. Not gated per-PR because it needs a live GPU runner, not
+# because there is nothing CUDA-specific to test -- per-PR CI
+# (`quality.yml`'s `provider-integration`) only ever runs `providers/cuda`
+# on a GPU-less runner, exercising its graceful-unavailability branch, not
+# this real-hardware path (#61: this workflow used to be `workflow_dispatch`
+# only, so nothing verified the CUDA path on `main` unless a human
+# remembered to press a button -- there was no record of when it last
+# passed). The daily schedule below is the automatic floor; `workflow_dispatch`
+# stays for an on-demand run. `concurrency.cancel-in-progress: false` below
+# already serializes every trigger of this workflow onto the one self-hosted
+# runner, so the schedule cannot pile up runs alongside a manual dispatch.
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
 
 concurrency:
   group: gpu-runner-smoke
@@ -110,9 +121,20 @@ jobs:
         # implement-production-qwen-model-loading task 12.4/12.5: pinned by
         # exact revision; `tests_real_checkpoint_smoke.rs` independently
         # verifies model.safetensors' real sha256 against the digest that
-        # revision declares before trusting it at all.
+        # revision declares before trusting it at all. #61: the other four
+        # files were previously fetched by revision with no digest check at
+        # all, so a Hugging Face-side change to any of them (the repository
+        # allows non-LFS files to be edited without a new revision tag)
+        # would silently change what this job tests. Pinned here the same
+        # way, against the sha256 each file actually had when these digests
+        # were recorded (`sha256sum <file>` against a real download of this
+        # exact revision).
         env:
           REVISION: 7ae557604adf67be50417f59c2c2f167def9a775
+          CONFIG_JSON_SHA256: 18e18afcaccafade98daf13a54092927904649e1dd4eba8299ab717d5d94ff45
+          GENERATION_CONFIG_JSON_SHA256: e558847a8b4402616f1273797b015104dc266fe4b520056fca88823ba8f8ebe6
+          TOKENIZER_JSON_SHA256: c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539
+          TOKENIZER_CONFIG_JSON_SHA256: 5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583
         run: |
           set -eux
           dir="$RUNNER_TEMP/qwen2.5-0.5b-instruct-$REVISION"
@@ -120,6 +142,19 @@ jobs:
           for file in config.json generation_config.json tokenizer.json tokenizer_config.json model.safetensors; do
             curl -fsSL "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/$REVISION/$file" -o "$dir/$file"
           done
+          verify() {
+            local file="$1" expected="$2"
+            local actual
+            actual="$(sha256sum "$dir/$file" | cut -d' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$file sha256 mismatch: expected $expected, got $actual"
+              exit 1
+            fi
+          }
+          verify config.json "$CONFIG_JSON_SHA256"
+          verify generation_config.json "$GENERATION_CONFIG_JSON_SHA256"
+          verify tokenizer.json "$TOKENIZER_JSON_SHA256"
+          verify tokenizer_config.json "$TOKENIZER_CONFIG_JSON_SHA256"
           echo "MAGNETAR_QWEN_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
       - name: Test the real public checkpoint on Reference CPU and real CUDA
         # task 12.4: full production pipeline (real config.json/tokenizer.
