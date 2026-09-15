@@ -100,13 +100,25 @@
 //! heterogeneous real budget exists to test infeasibility against), also
 //! proving eligibility is checked before cost ranking.
 //!
+//! A fifth test,
+//! `a_real_two_gpu_plan_correctly_invalidates_and_refuses_to_revert`
+//! (`add-real-device-loss-degraded-replan-state-machine`), drives a real,
+//! two-real-GPU-derived `MultiDevicePlacementPlan` through its real
+//! `Ready` -> `Invalidated` state transition and confirms the real state
+//! machine refuses to silently revert it -- honestly, explicitly *not* a
+//! real hardware-failure-injection test (this repository's tooling has no
+//! safe way to force an actual GPU to disappear mid-test); the "loss"
+//! event is caller-driven, only the Plan's own source data and the state
+//! machine itself are real. See that test's own doc comment.
+//!
 //! What no test here attempts (real future work, not silently assumed):
 //! per-Device memory feasibility ranking against a *genuinely*
 //! heterogeneous real multi-GPU budget (this repository's own two real
-//! GPUs are identical), Device-loss/degraded-replan behavior,
-//! placement-generation republishing under live in-flight traffic, having
-//! `MultiDevicePlacementPlan` actually gate or drive dispatch (nothing in
-//! this codebase consults it today -- it remains a real,
+//! GPUs are identical), real hardware-failure-injection for Device loss
+//! (no safe mechanism exists), placement-generation republishing under
+//! live in-flight traffic, having `MultiDevicePlacementPlan` actually
+//! gate or drive dispatch (nothing in this codebase consults it today --
+//! it remains a real,
 //! structurally-validated record, not yet an enforced contract), or
 //! wiring any of this into `ModelInstance`/production Qwen graph
 //! execution.
@@ -119,13 +131,13 @@ use magnetar_runtime::{
     ExecutionNodeId, FallbackClass, HostStagingPolicy, HostTensor, KernelDispatchPlan,
     KernelDispatchPlanId, KernelDispatcher, KernelInvocationId, KernelMemoryClass, KernelResource,
     KernelResultStatus, KernelSelectionRequest, LayoutDescriptor, MemoryAllocationOwner,
-    MemoryDomain, MemoryPlacement, MultiDevicePlacementErrorCode, MultiDevicePlacementFingerprint,
-    MultiDevicePlacementGeneration, MultiDevicePlacementPlan, MultiDevicePlacementPlanId,
-    MultiDevicePlacementState, OperatorFamily, OperatorId, PipelineStage, PlacementBinding,
-    PlacementCandidate, PlacementScope, ProviderBinding, ProviderExecutionApi,
-    ProviderPressureLevel, ResourceAffinity, Runtime, ShapeDescriptor, StageMovementEdge,
-    TensorDescriptor, TensorResourceDescriptor, TensorResourceId, initial_operator_catalog,
-    select_lowest_cost_eligible,
+    MemoryDomain, MemoryPlacement, MultiDevicePlacementError, MultiDevicePlacementErrorCode,
+    MultiDevicePlacementFingerprint, MultiDevicePlacementGeneration, MultiDevicePlacementPlan,
+    MultiDevicePlacementPlanId, MultiDevicePlacementState, OperatorFamily, OperatorId,
+    PipelineStage, PlacementBinding, PlacementCandidate, PlacementScope, ProviderBinding,
+    ProviderExecutionApi, ProviderPressureLevel, ResourceAffinity, Runtime, ShapeDescriptor,
+    StageMovementEdge, TensorDescriptor, TensorResourceDescriptor, TensorResourceId,
+    initial_operator_catalog, select_lowest_cost_eligible,
 };
 
 use magnetar_provider_cpu::ReferenceCpuProvider;
@@ -1168,5 +1180,139 @@ fn per_device_memory_feasibility_ranking_rejects_an_infeasible_real_gpu_and_acce
         MultiDevicePlacementErrorCode::MemoryInfeasible,
         "the artificially constrained candidate must be rejected specifically for memory \
          infeasibility, not any other reason"
+    );
+}
+
+/// Real Device-loss / degraded-placement state-machine exercise
+/// (`add-real-device-loss-degraded-replan-state-machine`,
+/// `multi-device-placement`'s own "Device Loss Invalidates Dependent
+/// Placement" and "Degraded Placement Requires Valid Plan" requirements).
+///
+/// # Honesty about what this does and does not prove
+///
+/// This repository's tooling has no real, safe way to force an actual
+/// physical GPU to disappear from a live CI runner mid-test -- unlike
+/// every other test in this file, the "loss" event here is a real,
+/// explicit, caller-driven state transition, not a hardware-detected
+/// failure. What genuinely is real: the `MultiDevicePlacementPlan` this
+/// test invalidates is built from two real GPUs' own real Device
+/// metadata (not synthetic fixtures), and the state machine itself
+/// (`MultiDevicePlacementState::can_transition_to`) is Magnetar's real,
+/// unmodified production code -- the same code path this file's other
+/// tests' own `Ready` plans already reach, now also driven past `Ready`
+/// for the first time in this repository's history with a real,
+/// hardware-derived Plan (`multi_device_placement.rs`'s own 24
+/// pre-existing unit tests already cover this same state machine, but
+/// only against synthetic Device data).
+///
+/// Gracefully skips, like the other tests in this file, on any host with
+/// fewer than two real CUDA devices.
+#[test]
+fn a_real_two_gpu_plan_correctly_invalidates_and_refuses_to_revert() {
+    let gpu0_probe = CudaProvider::new();
+    if !gpu0_probe.is_available() {
+        eprintln!("skipping: no compatible CUDA device found on this host at all");
+        return;
+    }
+    let gpu1_probe = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    if !gpu1_probe.is_available() {
+        eprintln!(
+            "skipping: this host has only one real CUDA device -- a genuine second real \
+             GPU is required to prove anything this test is specifically for"
+        );
+        return;
+    }
+
+    let gpu0_device = gpu0_probe
+        .devices()
+        .into_iter()
+        .next()
+        .expect("an available CudaProvider reports exactly one Device");
+    let gpu1_device = gpu1_probe
+        .devices()
+        .into_iter()
+        .next()
+        .expect("an available CudaProvider reports exactly one Device");
+
+    let device_set = DeviceSet::new(
+        DeviceSetId::new("device-loss-proof").unwrap(),
+        [
+            DeviceSetMember::new(gpu0_device.metadata().clone(), gpu0_device.availability()),
+            DeviceSetMember::new(gpu1_device.metadata().clone(), gpu1_device.availability()),
+        ],
+    )
+    .expect("two real, distinct GPU Devices form a valid DeviceSet");
+
+    let mut plan = MultiDevicePlacementPlan::new(
+        MultiDevicePlacementPlanId::new("device-loss-plan").unwrap(),
+        MultiDevicePlacementGeneration::new(1),
+        real_fingerprint("device-loss-proof"),
+        1,
+        device_set,
+        "device-loss-proof-v1",
+    )
+    .expect("real, non-zero-generation Plan construction must succeed");
+
+    let gpu0_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu0_probe.metadata().name.clone()),
+        DeviceBinding::new(gpu0_device.id().clone()),
+        MemoryDomain::DeviceLocal(DeviceBinding::new(gpu0_device.id().clone())),
+    )
+    .expect("GPU 0 binding with a matching device-local memory domain must succeed");
+    let gpu1_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu1_probe.metadata().name.clone()),
+        DeviceBinding::new(gpu1_device.id().clone()),
+        MemoryDomain::DeviceLocal(DeviceBinding::new(gpu1_device.id().clone())),
+    )
+    .expect("GPU 1 binding with a matching device-local memory domain must succeed");
+
+    plan.add_binding(
+        PlacementScope::operator_group("gpu0-stage")
+            .expect("a real operator group name must be valid"),
+        gpu0_binding,
+    )
+    .expect("GPU 0's binding must reference a Device inside this Plan's own DeviceSet");
+    plan.add_binding(
+        PlacementScope::operator_group("gpu1-stage")
+            .expect("a real operator group name must be valid"),
+        gpu1_binding,
+    )
+    .expect("GPU 1's binding must reference a Device inside this Plan's own DeviceSet");
+
+    plan.mark_ready()
+        .expect("a Plan with two real bindings must reach Ready");
+    assert_eq!(plan.state, MultiDevicePlacementState::Ready);
+    assert!(plan.state.accepts_new_work());
+
+    // The real, caller-driven "Device lost" signal this test's own doc
+    // comment is honest about: no real hardware failure occurs here.
+    plan.transition_to(MultiDevicePlacementState::Invalidated)
+        .expect("Ready -> Invalidated is a real, valid transition");
+    assert_eq!(plan.state, MultiDevicePlacementState::Invalidated);
+    assert!(
+        !plan.state.accepts_new_work(),
+        "an Invalidated Plan must never accept new work -- \"Degraded Placement Requires \
+         Valid Plan\""
+    );
+
+    // The real state machine must refuse to silently revert an
+    // Invalidated Plan back to Ready -- a caller needing to resume must
+    // build an entirely new Plan generation instead, matching "Placement
+    // Change Uses New Plan Generation".
+    let revert_attempt = plan.transition_to(MultiDevicePlacementState::Ready);
+    assert!(
+        matches!(
+            revert_attempt,
+            Err(MultiDevicePlacementError::InvalidStateTransition {
+                from: MultiDevicePlacementState::Invalidated,
+                to: MultiDevicePlacementState::Ready,
+            })
+        ),
+        "an Invalidated Plan must not be revertible to Ready in place: got {revert_attempt:?}"
+    );
+    assert_eq!(
+        plan.state,
+        MultiDevicePlacementState::Invalidated,
+        "a rejected transition must leave the Plan's real state unchanged"
     );
 }
