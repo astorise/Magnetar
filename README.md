@@ -536,9 +536,33 @@ existing `multi_device_placement` data-model types were tied to a real
 execution's own data for the first time, though full production
 `ModelInstance`-level placement across more than one real GPU remains
 unimplemented -- `ModelInstancePlacement` still structurally binds one
-Provider/Device per instance, and this repository has only one real GPU
-to verify a multi-GPU case against even once implemented. Mistral/Gemma
-Model Components remain future work.
+Provider/Device per instance.
+
+`add-real-second-gpu-cuda-provider` corrected that "only one real GPU"
+premise for CI specifically: the user identified that `arc-gpu-magnetar`'s
+CI node genuinely has two real GPUs, and the reason they were not both
+visible turned out to be a real, isolated infrastructure gap -- its
+per-job Kubernetes pod resource request (`nvidia.com/gpu`, in the separate
+`talos` cluster-config repository, outside this repository's own git
+history) asked for only 1, while sibling job hooks on the same cluster
+already asked for 2. Raised and applied directly to the live cluster,
+re-verified via a real `gpu-runner-smoke.yml` dispatch showing both GPUs
+in `nvidia-smi`'s own output. `providers/cuda` gained
+`CudaProvider::for_device(ordinal, provider_name)`, binding to a specific
+real GPU ordinal under a distinct Provider name -- required because
+`Runtime`'s `ProviderLoader` rejects a second `register_provider` call
+under an already-registered name outright, so two `CudaProvider`s bound
+to two different real GPUs could not coexist in one Runtime before this;
+`new()` remains exactly `for_device(0, CUDA_PROVIDER_NAME)`, verified
+unchanged. `integration-tests/multi-device-cpu-cuda` gained a real
+two-GPU test genuinely executing a chained computation across two
+physically distinct real GPUs (verified on `arc-gpu-magnetar`, gracefully
+skipping on this repository's own single-GPU development workstation and
+most other hosts). Real peer-to-peer GPU-to-GPU movement (both real GPUs
+here move data via an explicit host round trip, not peer access) and
+per-Device memory feasibility ranking against a genuinely heterogeneous
+budget (the two real GPUs available are identical) remain unverified.
+Mistral/Gemma Model Components remain future work.
 
 **Tachyon integration audit** (`docs/audits/audit-magnetar-integration-
 tachyon-2026-09-13.md`, a separate review from the scope-charter
