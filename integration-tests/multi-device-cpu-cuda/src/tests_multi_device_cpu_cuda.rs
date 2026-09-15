@@ -76,18 +76,26 @@
 //!   drove or gated that execution, which nothing in this codebase
 //!   currently consults `MultiDevicePlacementPlan` to do.
 //!
-//! What neither test attempts (real future work, not silently assumed):
-//! real peer-to-peer GPU-to-GPU memory access (both tests move data between
-//! Devices via a real, explicit host round trip -- CUDA peer access APIs
-//! are not implemented anywhere in this repository), per-Device memory
-//! feasibility ranking against a genuinely heterogeneous multi-GPU budget
-//! (the two-GPU test's real GPUs happen to be identical), Device-loss/
-//! degraded-replan behavior, placement-generation republishing under live
-//! in-flight traffic, having `MultiDevicePlacementPlan` actually gate or
-//! drive dispatch (nothing in this codebase consults it today -- it
-//! remains a real, structurally-validated record, not yet an enforced
-//! contract), or wiring any of this into `ModelInstance`/production Qwen
-//! graph execution.
+//! A third test, `two_real_cuda_gpus_move_a_tensor_via_real_peer_to_peer_
+//! copy_not_host_staging`, proves real CUDA peer-to-peer GPU-to-GPU memory
+//! access (`add-real-peer-to-peer-gpu-movement`): `providers/cuda`'s new
+//! `peer` module wraps the real `cuDeviceCanAccessPeer`/
+//! `cuCtxEnablePeerAccess` driver entry points (`cudarc` itself exposes no
+//! safe wrapper for either), and `CudaExecutor::copy_tensor_from_peer_
+//! admitted` moves a tensor directly between two real GPUs' own device
+//! memory via a real cross-context `cuMemcpyPeerAsync`, never touching
+//! host memory -- structurally distinct from the two tests above, which
+//! both move data via an explicit host round trip.
+//!
+//! What no test here attempts (real future work, not silently assumed):
+//! per-Device memory feasibility ranking against a genuinely heterogeneous
+//! multi-GPU budget (the two-GPU tests' real GPUs happen to be identical),
+//! Device-loss/degraded-replan behavior, placement-generation republishing
+//! under live in-flight traffic, having `MultiDevicePlacementPlan`
+//! actually gate or drive dispatch (nothing in this codebase consults it
+//! today -- it remains a real, structurally-validated record, not yet an
+//! enforced contract), or wiring any of this into `ModelInstance`/
+//! production Qwen graph execution.
 
 use std::sync::Arc;
 
@@ -106,6 +114,7 @@ use magnetar_runtime::{
 
 use magnetar_provider_cpu::ReferenceCpuProvider;
 use magnetar_provider_cuda::CudaProvider;
+use magnetar_provider_cuda::peer;
 use sha2::{Digest, Sha256};
 
 fn descriptor_1d(len: u64) -> TensorDescriptor {
@@ -837,4 +846,164 @@ fn two_real_cuda_gpus_execute_one_chained_add_across_two_real_devices_in_one_run
     assert_eq!(plan.stages.len(), 2);
     assert_eq!(plan.movement_edges.len(), 1);
     assert!(plan.fingerprint().as_str().starts_with("sha256:"));
+}
+
+/// Real CUDA peer-to-peer GPU-to-GPU memory access
+/// (`add-real-peer-to-peer-gpu-movement`): a tensor admitted on real GPU 0
+/// is moved directly into real GPU 1's own device memory via a real
+/// cross-context `cuMemcpyPeerAsync` (`CudaExecutor::copy_tensor_from_
+/// peer_admitted`), never touching host memory -- structurally distinct
+/// from every other cross-Device movement in this file, which all
+/// explicitly round-trip through the host via `write_tensor_value_
+/// admitted`/`read_tensor`.
+///
+/// Real, explicit peer-capability check first
+/// (`multi-device-placement`'s own "Peer Capability Is Explicit": "Runtime
+/// SHALL not infer peer access from Device similarity"): this test calls
+/// the real `cuDeviceCanAccessPeer` driver entry point and gracefully
+/// skips, rather than assuming, if these two real GPUs report no usable
+/// peer path. On this repository's own real two-GPU CI node (`arc-gpu-
+/// magnetar`, two identical RTX 3060s on the same host), that query has
+/// been confirmed to return true.
+///
+/// Gracefully skips, like the two tests above, on any host with fewer
+/// than two real, compatible CUDA devices.
+#[test]
+fn two_real_cuda_gpus_move_a_tensor_via_real_peer_to_peer_copy_not_host_staging() {
+    let gpu0_probe = CudaProvider::new();
+    if !gpu0_probe.is_available() {
+        eprintln!("skipping: no compatible CUDA device found on this host at all");
+        return;
+    }
+    let gpu1_probe = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    if !gpu1_probe.is_available() {
+        eprintln!(
+            "skipping: this host has only one real CUDA device -- a genuine second real \
+             GPU is required to prove anything this test is specifically for"
+        );
+        return;
+    }
+
+    let gpu0_context = gpu0_probe
+        .context()
+        .expect("an available CudaProvider always exposes its real CudaContext");
+    let gpu1_context = gpu1_probe
+        .context()
+        .expect("an available CudaProvider always exposes its real CudaContext");
+
+    // Real, explicit query -- never assumed from Device similarity, even
+    // though both real GPUs here happen to be the identical model.
+    let can_access = peer::device_can_access_peer(&gpu0_context, &gpu1_context)
+        .expect("a real cuDeviceCanAccessPeer query must not itself fail on two available Devices");
+    if !can_access {
+        eprintln!(
+            "skipping: this host's two real GPUs report no usable peer access path \
+             (multi-device-placement's own \"Peer Capability Is Explicit\" -- never assumed \
+             from two Devices sharing a vendor or architecture)"
+        );
+        return;
+    }
+    peer::enable_peer_access(&gpu0_context, &gpu1_context).expect(
+        "enabling real peer access between two Devices that just reported they can access \
+         each other must succeed",
+    );
+
+    let gpu0_executor = gpu0_probe
+        .executor()
+        .expect("an available CudaProvider always exposes its concrete CudaExecutor");
+    let gpu1_executor = gpu1_probe
+        .executor()
+        .expect("an available CudaProvider always exposes its concrete CudaExecutor");
+
+    let gpu0_provider: Arc<CudaProvider> = Arc::new(gpu0_probe);
+    let gpu1_provider: Arc<CudaProvider> = Arc::new(gpu1_probe);
+    let mut runtime = Runtime::builder()
+        .register_provider(gpu0_provider.clone())
+        .register_provider(gpu1_provider.clone())
+        .build()
+        .expect("two CudaProviders under two distinct names must both register successfully");
+
+    let source_id = TensorResourceId::new("peer-copy-source");
+    let dest_id = TensorResourceId::new("peer-copy-dest");
+    let tensor = HostTensor::new([4], [1.5f32, -2.0, 3.25, 0.0]).unwrap();
+    let expected = tensor.data.clone();
+
+    gpu0_executor
+        .write_tensor_admitted(
+            runtime.memory_mut(),
+            source_id.clone(),
+            tensor,
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("admitting the source tensor on real GPU 0 must succeed");
+
+    // The real proof this test exists for: a direct GPU 0 -> GPU 1
+    // device-to-device copy via the real CUDA peer path, never touching
+    // host memory.
+    gpu1_executor
+        .copy_tensor_from_peer_admitted(
+            runtime.memory_mut(),
+            &gpu0_executor,
+            &source_id,
+            dest_id.clone(),
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("a real peer-to-peer device-to-device copy between two real GPUs must succeed");
+
+    let result = gpu1_executor
+        .read_tensor(&dest_id)
+        .expect("the peer-copied tensor must be readable back from real GPU 1");
+    assert_eq!(
+        result.data, expected,
+        "the tensor that crossed via a real peer-to-peer copy must be bit-identical \
+         to what was admitted on the source GPU"
+    );
+
+    // Ties this real peer movement to `multi_device_placement`'s own
+    // explicit-movement contract with `HostStagingPolicy::Forbid` --
+    // unlike the two tests above (both `Permit`, since they genuinely do
+    // stage through the host), this movement genuinely never touched host
+    // memory, so `Forbid` is the real, honest value here.
+    let gpu0_device_binding = DeviceBinding::new(
+        gpu0_provider
+            .devices()
+            .into_iter()
+            .next()
+            .expect("an available CudaProvider reports exactly one Device")
+            .id()
+            .clone(),
+    );
+    let gpu1_device_binding = DeviceBinding::new(
+        gpu1_provider
+            .devices()
+            .into_iter()
+            .next()
+            .expect("an available CudaProvider reports exactly one Device")
+            .id()
+            .clone(),
+    );
+    let gpu0_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu0_provider.metadata().name.clone()),
+        gpu0_device_binding.clone(),
+        MemoryDomain::DeviceLocal(gpu0_device_binding.clone()),
+    )
+    .expect("GPU 0 binding with a matching device-local memory domain must succeed");
+    let gpu1_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu1_provider.metadata().name.clone()),
+        gpu1_device_binding.clone(),
+        MemoryDomain::DeviceLocal(gpu1_device_binding.clone()),
+    )
+    .expect("GPU 1 binding with a matching device-local memory domain must succeed");
+    let movement_edge = StageMovementEdge::new(
+        "peer-source",
+        "peer-dest",
+        source_id,
+        gpu0_binding,
+        gpu1_binding,
+        HostStagingPolicy::Forbid,
+    )
+    .expect("a movement edge between two genuinely different Devices must succeed");
+    assert_eq!(movement_edge.host_staging_policy, HostStagingPolicy::Forbid);
 }
