@@ -440,6 +440,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # `integration-tests/cuda-first-native` was previously in no
+          # workflow at all (not merely GPU-gated -- #58): this GPU-less
+          # runner exercises its graceful `!provider.is_available()`
+          # early-return path, the same shape `multi-device-cpu-cuda`
+          # already covers here; the real CUDA-hardware run happens on
+          # `gpu-runner-smoke.yml`.
           for manifest in \
             components/qwen/Cargo.toml \
             components/llama/Cargo.toml \
@@ -456,6 +462,7 @@ jobs:
             loaders/gguf/Cargo.toml \
             integration-tests/production-loading/Cargo.toml \
             integration-tests/multi-device-cpu-cuda/Cargo.toml \
+            integration-tests/cuda-first-native/Cargo.toml \
             inference-components/Cargo.toml
           do
             echo "::group::$manifest"

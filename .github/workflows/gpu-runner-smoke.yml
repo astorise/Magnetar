@@ -74,6 +74,17 @@ jobs:
         # is a run where that must never happen (`docs/audits/cuda-provider-full-audit-2026-09-05.md`'s
         # P1 "explicit provider-hardware-cuda == Passed signal" finding).
         run: cargo test --locked --manifest-path providers/cuda/Cargo.toml -- --include-ignored
+      - name: Build and test the real first-native Qwen Component against a real CudaProvider
+        # #58: `integration-tests/cuda-first-native` runs the real
+        # first-native pipeline (magnetar-runtime, driven by the checked-in
+        # compiled qwen-real.component.wasm Component) against a real
+        # CudaProvider end to end -- something neither crate can prove
+        # importing the other, per that crate's own Cargo.toml comment.
+        # Previously in no workflow at all (not merely GPU-gated): the
+        # `submodule-integration` job in quality.yml exercises its graceful
+        # `!provider.is_available()` early-return path on every PR; this is
+        # the one place its real-hardware path actually runs.
+        run: cargo test --locked --manifest-path integration-tests/cuda-first-native/Cargo.toml
       - name: Build and test real multi-Device execution (Reference CPU + real CUDA, one Runtime)
         # add-multi-device-cpu-cuda-execution-proof: the first real proof a
         # single Runtime can register two heterogeneous real Providers
