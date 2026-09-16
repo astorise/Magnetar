@@ -9193,10 +9193,10 @@ fn build_first_native_prefill_graph_segment_with_runtime(
     result.map(|graph| (graph, definition, instance))
 }
 
-/// [`build_first_native_prefill_graph_segment_with_runtime`], bound to the
+/// `build_first_native_prefill_graph_segment_with_runtime`, bound to the
 /// single real, checked-in Qwen Component singleton
 /// (`qwen_real_component_runtime`) -- the segment-graph counterpart of
-/// [`build_first_native_graphs_for_config`].
+/// `build_first_native_graphs_for_config`.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub fn build_first_native_prefill_graph_segment_for_config(
     config: &QwenConfig,
