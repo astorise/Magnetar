@@ -3032,6 +3032,16 @@ fn e2e_repeated_load_unload_does_not_accumulate_weight_storage() {
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
+fn e2e_two_segment_split_produces_identical_output_to_full_graph() {
+    check_two_segment_split_produces_identical_output_to_full_graph().expect(
+        "splitting a real forward pass into two segment Model Instances, bridged \
+                  through a real hidden-state hand-off, must bit-for-bit match running the \
+                  same prompt through the one full graph",
+    );
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
 fn e2e_qwen_component_artifact_trust_is_validated_before_planning() {
     validate_and_instantiate_trusted_qwen_component_before_first_native_planning()
         .expect("trusted Qwen Component fixture validates before planning");

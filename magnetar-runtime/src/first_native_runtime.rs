@@ -4212,8 +4212,22 @@ fn execute_qwen_graph_nodes(
         last_dispatch = Some(dispatch_result);
     }
 
+    // `0..layer_count` (the *full architecture's* layer count, `fixture`'s
+    // only use in this function), not merely "however many layers this
+    // particular graph touched" -- true for every graph before segment
+    // graphs existed, since a full graph always has nodes for every layer.
+    // A prefill-*segment* graph (`add-real-multi-device-model-instance-
+    // placement`) only touches its own `[start_layer, end_layer)` range, so
+    // layers outside it never populate `layer_k`/`layer_v` at all; skipping
+    // those (rather than hard-failing on them) generalizes this loop to
+    // segment graphs with zero behavior change for a full graph, which
+    // still populates every index here exactly as before.
     let mut updated_layer_kv = Vec::with_capacity(layer_count);
     for layer in 0..layer_count {
+        let touched = layer_k[layer].is_some() || layer_v[layer].is_some();
+        if !touched {
+            continue;
+        }
         let k = layer_k[layer]
             .take()
             .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
@@ -7029,7 +7043,7 @@ const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:92330d3187d109e3441916bba1244c6f951f787f5047a5a603a340a5e6790f41";
+    "sha256:cd10b875f12d70e025b27765a0abcc655d630b4150e1e29f944536f648d352a5";
 
 /// Test-oracle only (`reach-architecture-freeze-1` task 12.4): the checked-in
 /// real Qwen Component binary, embedded for test fixtures. Production never
@@ -8876,6 +8890,209 @@ fn build_first_native_graphs_with_runtime(
     })();
     let _ = manager.destroy_instance(instance);
     result.map(|graphs| (graphs, definition, instance))
+}
+
+/// [`build_first_native_graphs_with_runtime`]'s per-Device pipeline-
+/// placement counterpart (`add-real-multi-device-model-instance-
+/// placement`): builds a real *prefill-segment* Execution Graph for decoder
+/// layer range `[start_layer, end_layer)` only, via `build-prefill-graph-
+/// segment` (`model-component-graph.wit` 1.3.0) instead of `build-prefill-
+/// graph`'s always-whole-stack shape. Prefill-only for now -- decode-
+/// segment wiring (`build-decode-graph-segment`) is deferred to whichever
+/// phase first needs multi-step segment decode.
+///
+/// The produced graph's declared output edge is renamed to `"logits"`
+/// exactly like a full graph's (via the same `SessionContext::
+/// output_edge_name`), *whether or not* this segment actually reaches the
+/// real lm-head -- so a caller reads a segment's real output the same way
+/// regardless of range, a raw post-layer hidden state for an internal
+/// segment or real logits for one ending at `num_hidden_layers`.
+///
+/// `#[cfg(test)]` for now: its only caller today is
+/// `forward_segment_logits_with_weights` (Phase B.1's segment-split
+/// correctness proof). A later phase wiring a real two-`ModelInstance`
+/// production orchestrator on top of it should widen this back to the
+/// same production-shaped cfg as `build_first_native_graphs_with_runtime`
+/// once that real caller exists, rather than leaving it compiled into
+/// every build unused.
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+#[allow(clippy::too_many_arguments)]
+fn build_first_native_prefill_graph_segment_with_runtime(
+    manager: &Mutex<ComponentManager>,
+    capability: &GraphBuilderCapability,
+    model_config_capability: &ModelConfigCapability,
+    definition: ComponentDefinitionId,
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+    prompt_token_count: u64,
+    start_layer: u32,
+    end_layer: u32,
+) -> Result<(ExecutionGraph, ComponentDefinitionId, ComponentInstanceId), E2eConformanceError> {
+    let mut manager = manager.lock().unwrap();
+
+    let instance = manager
+        .instantiate_prepared_component(definition)
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let result = (|| {
+        let engine_key = manager
+            .engine_instance_key(instance)
+            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
+                reason: "component instance has no engine key".into(),
+            })?
+            .to_string();
+
+        let export_interface = WitInterface::new(
+            "magnetar:model-component-graph/model-component-graph-producer",
+            "1.0.0",
+        );
+        let weight_shapes = qwen_weight_shapes_for_config(config);
+        let compatibility_key = qwen_component_compatibility_key(identity);
+        let session_context = SessionContext {
+            component_id: identity.id.as_str().to_string(),
+            compatibility_key,
+            kv_namespace: "qwen".to_string(),
+            weight_shapes,
+            output_edge_name: "logits".to_string(),
+        };
+
+        model_config_capability
+            .bind_config(&engine_key, architecture_config_from_qwen_config(config));
+        capability.prepare_session(&engine_key, session_context);
+        let segment_result = manager
+            .invoke(
+                ComponentInvocation::new(instance, export_interface, "build-prefill-graph-segment")
+                    .with_arguments(vec![
+                        ComponentValue::S64(prompt_token_count.max(1) as i64),
+                        ComponentValue::U32(start_layer),
+                        ComponentValue::U32(end_layer),
+                    ]),
+            )
+            .map_err(|error| E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            })?;
+        let segment_handle =
+            expect_single_string_invocation_result(&segment_result, "build-prefill-graph-segment")?;
+        let segment = capability
+            .take_graph(&engine_key, &segment_handle)
+            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
+                reason: "build-prefill-graph-segment handle did not resolve to a finished graph"
+                    .into(),
+            })?;
+
+        validate_first_scope_graph(&segment)?;
+        capability.clear_session(&engine_key);
+        model_config_capability.clear_config(&engine_key);
+        Ok(segment)
+    })();
+    let _ = manager.destroy_instance(instance);
+    result.map(|graph| (graph, definition, instance))
+}
+
+/// [`build_first_native_prefill_graph_segment_with_runtime`], bound to the
+/// single real, checked-in Qwen Component singleton
+/// (`qwen_real_component_runtime`) -- the segment-graph counterpart of
+/// [`build_first_native_graphs_for_config`]. `#[cfg(test)]` for the same
+/// reason as [`build_first_native_prefill_graph_segment_with_runtime`].
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+fn build_first_native_prefill_graph_segment_for_config(
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+    prompt_token_count: u64,
+    start_layer: u32,
+    end_layer: u32,
+) -> Result<(ExecutionGraph, ComponentDefinitionId, ComponentInstanceId), E2eConformanceError> {
+    let runtime = qwen_real_component_runtime()?;
+    build_first_native_prefill_graph_segment_with_runtime(
+        &runtime.manager,
+        &runtime.capability,
+        &runtime.model_config_capability,
+        runtime.definition,
+        config,
+        identity,
+        prompt_token_count,
+        start_layer,
+        end_layer,
+    )
+}
+
+/// True when `tensor_name` (a manifest tensor's logical name, matching the
+/// real Qwen Component's own `weight-edge` naming convention -- see
+/// `components/qwen/src/lib.rs`'s `weight_tensor_name`) is one
+/// `build-prefill-graph-segment`/`build-decode-graph-segment` actually
+/// references for decoder layer range `[start_layer, end_layer)`: either a
+/// `"layers.{n}."`-prefixed per-layer weight with `start_layer <= n <
+/// end_layer`, the token embedding (only when `start_layer == 0`, matching
+/// the segment's `token_ids`-vs-`hidden_states_in` starting edge), or the
+/// final norm/lm-head projection (only when `end_layer ==
+/// num_hidden_layers`) -- see `model-component-graph.wit` 1.3.0's doc
+/// comment for the same boundary semantics on the Component side.
+///
+/// `#[cfg(test)]` for the same reason as
+/// `build_first_native_prefill_graph_segment_with_runtime`.
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+fn qwen_weight_name_in_layer_range(
+    tensor_name: &str,
+    start_layer: u32,
+    end_layer: u32,
+    num_hidden_layers: u32,
+) -> bool {
+    if let Some(rest) = tensor_name.strip_prefix("layers.") {
+        let layer_index = rest
+            .split('.')
+            .next()
+            .and_then(|text| text.parse::<u32>().ok());
+        return matches!(layer_index, Some(index) if index >= start_layer && index < end_layer);
+    }
+    match tensor_name {
+        "token_embedding" => start_layer == 0,
+        "final_norm" | "lm_head" => end_layer == num_hidden_layers,
+        _ => false,
+    }
+}
+
+/// [`load_production_qwen_instance_for_provider`], restricted to decoder
+/// layer range `[start_layer, end_layer)` (`add-real-multi-device-model-
+/// instance-placement`, the "two `ModelInstance`s + explicit movement"
+/// design): filters `manifest`'s own tensor inventory
+/// (`qwen_weight_name_in_layer_range`) down to exactly the weights that
+/// range's segment graph references, so this Model Instance's readiness
+/// (`ModelInstanceDefinition::required_weight_names`, derived from
+/// whatever manifest `load_model` receives) reflects only its own real
+/// subset -- never the full architecture -- and materialization loads only
+/// that subset's real bytes, never the other segment's.
+///
+/// `#[cfg(test)]` for the same reason as
+/// `build_first_native_prefill_graph_segment_with_runtime`.
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+fn filter_manifest_for_layer_range(
+    manifest: &ModelManifest,
+    start_layer: u32,
+    end_layer: u32,
+    num_hidden_layers: u32,
+) -> ModelManifest {
+    let mut filtered = manifest.clone();
+    filtered.tensors.retain(|tensor| {
+        qwen_weight_name_in_layer_range(&tensor.name, start_layer, end_layer, num_hidden_layers)
+    });
+    filtered
 }
 
 #[cfg(all(
@@ -11639,6 +11856,247 @@ fn forward_logits_with_weights(
             reason: "first-native graph produced no logits output".into(),
         })?;
     Ok(logits.data)
+}
+
+/// [`forward_logits_with_weights`]'s per-Device pipeline-placement
+/// counterpart (`add-real-multi-device-model-instance-placement`): loads a
+/// segment-only Model Instance for decoder layer range `[start_layer,
+/// end_layer)` (`filter_manifest_for_layer_range`/
+/// `qwen_weight_name_in_layer_range`), builds its real prefill-segment
+/// graph through the real Qwen Component
+/// (`build_first_native_prefill_graph_segment_for_config`), and runs it
+/// with `boundary_hidden` bound to `input.hidden_states_in` when
+/// `start_layer != 0` (`input.token_ids` otherwise, exactly like a full
+/// graph's own first segment) -- returning the segment's own `"logits"`-
+/// named output tensor (a raw post-layer hidden state for an internal
+/// segment, real logits for one reaching `num_hidden_layers`).
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+#[allow(clippy::too_many_arguments)]
+fn forward_segment_logits_with_weights(
+    fixture: &E2eFixture,
+    weights: &BTreeMap<String, HostTensor>,
+    prompt: &[TokenId],
+    start_layer: u32,
+    end_layer: u32,
+    boundary_hidden: Option<HostTensor>,
+) -> Result<HostTensor, E2eConformanceError> {
+    let num_hidden_layers = fixture.config.architecture.layer_count as u32;
+    let segment_manifest = filter_manifest_for_layer_range(
+        &fixture.manifest,
+        start_layer,
+        end_layer,
+        num_hidden_layers,
+    );
+    // Derived from the *full* weight set (needs `token_embedding`, which a
+    // segment starting mid-stack never itself carries) before filtering
+    // down to this segment's own subset -- mirrors `load_fixture_instance_
+    // with_weights`'s own ordering for the exact same reason (tied
+    // embeddings' `lm_head` is never a separately declared manifest tensor;
+    // see `qwen_expected_tensor_names`).
+    let mut segment_weights = weights.clone();
+    qwen_weights_with_derived_lm_head(fixture, &mut segment_weights)?;
+    segment_weights.retain(|name, _| {
+        qwen_weight_name_in_layer_range(name, start_layer, end_layer, num_hidden_layers)
+    });
+
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(fixture.architecture_implementation.clone());
+    let mut request = ModelLoadingRequest::new(
+        ModelLoadingRequestId::new(format!("test-segment-load-{start_layer}-{end_layer}")),
+        segment_manifest.id.clone(),
+    );
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(request),
+        &segment_manifest,
+    )?;
+    let instance = create_model_instance(
+        &mut runtime,
+        &loaded,
+        fixture.architecture_implementation.clone(),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )?;
+    materialize_model_instance_weights(
+        &mut runtime,
+        &instance,
+        segment_manifest.id.name.as_str(),
+        &segment_weights,
+    )?;
+
+    let provider_binding = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+    let status = require_ready_first_native_instance(&runtime, &instance)?;
+    let mutation_version = status.status().mutation_version;
+    let (segment_graph, _definition, _instance_handle) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            prompt.len() as u64,
+            start_layer,
+            end_layer,
+        )?;
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &segment_graph,
+        &instance,
+        mutation_version,
+        prompt.len() as u64,
+        PreparedExecutionPlanGeneration::new(1),
+        &provider_binding,
+    )?;
+
+    let initial_bindings = if start_layer == 0 {
+        let ids = HostTensor::new(
+            [prompt.len() as u64],
+            prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+        )?;
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)])
+    } else {
+        let hidden = boundary_hidden.ok_or_else(|| E2eConformanceError::FixtureInvalid {
+            reason: "segment starting mid-stack requires a boundary hidden-state tensor".into(),
+        })?;
+        BTreeMap::from([(TensorEdgeId::new("input.hidden_states_in"), hidden)])
+    };
+    let cache_id = KvCacheId::new(format!("test-segment-cache-{start_layer}-{end_layer}"))?;
+    let (_dispatch, mut bindings, _layer_kv, _provider) = execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &segment_graph,
+        &mut plan,
+        initial_bindings,
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )?;
+    bindings
+        .remove(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "segment graph produced no logits-named output".into(),
+        })
+}
+
+/// A small, real 2-decoder-layer Qwen fixture, independent of the canonical
+/// 1-layer `E2E_FIXTURE_*` constants (too small to split into two non-
+/// trivial segments) -- built from `e2e_fixture_manifest_from_weights`
+/// (self-consistent digests for an arbitrary `QwenConfig`, not tied to the
+/// checked-in canonical Safetensors fixture), exactly like `e2e_fixture()`
+/// itself, just with `layer_count: 2`.
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+fn two_layer_segment_test_fixture() -> Result<E2eFixture, E2eConformanceError> {
+    let architecture = qwen_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
+    let mut config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    config.tied_embeddings = true;
+    let identity = qwen_component_identity(
+        ModelComponentId::new("segment-split-fixture").expect("static id is valid"),
+        ModelComponentVersion::new(1, 0, 0),
+        ModelComponentImplementationKind::WebAssemblyComponent,
+    );
+    config.validate(&identity)?;
+    let architecture_implementation = qwen_model_component::qwen_architecture_implementation(
+        &identity,
+        ModelArchitectureImplementationKind::ComponentBased,
+    );
+    let weights = e2e_fixture_weights(&config)?;
+    let manifest = e2e_fixture_manifest_from_weights(
+        &config,
+        &architecture_implementation.architecture,
+        &weights,
+    )?;
+    let tokenizer = e2e_fixture_tokenizer()?;
+
+    let descriptor = qwen_component_descriptor(identity.clone(), &config)?;
+    qwen_validate_model_artifact(&descriptor, &config, &manifest)?;
+
+    Ok(E2eFixture {
+        config,
+        identity,
+        architecture_implementation,
+        manifest,
+        tokenizer,
+        weights,
+    })
+}
+
+/// `add-real-multi-device-model-instance-placement`, Phase B.1's central
+/// correctness proof: splitting a real Qwen forward pass into two
+/// sequential, independently-loaded segment Model Instances (layers
+/// `[0, mid)` then `[mid, num_hidden_layers)`, the boundary hidden state
+/// handed from the first segment's real output into the second segment's
+/// `hidden_states_in` input) SHALL produce bit-for-bit the same final
+/// output as running the exact same prompt through the one, full,
+/// unsegmented graph -- proof the segmentation itself (weight-range
+/// filtering, `build-*-graph-segment`, and the host-bridged tensor hand-
+/// off) is a pure decomposition of the same computation, not an
+/// approximation, before any real cross-Device movement
+/// (`CudaExecutor::copy_tensor_from_peer_admitted`, already proven
+/// elsewhere) is layered on top of it in a later phase.
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+fn check_two_segment_split_produces_identical_output_to_full_graph()
+-> Result<(), E2eConformanceError> {
+    let fixture = two_layer_segment_test_fixture()?;
+    let num_hidden_layers = fixture.config.architecture.layer_count as u32;
+    let mid = num_hidden_layers / 2;
+    if mid == 0 || mid == num_hidden_layers {
+        return Err(E2eConformanceError::FixtureInvalid {
+            reason: "segment split test fixture must have at least 2 decoder layers".into(),
+        });
+    }
+    let prompt: [TokenId; 3] = [3, 5, 7];
+
+    let full_logits = forward_logits_with_weights(&fixture, &fixture.weights, &prompt)?;
+
+    let segment_one_hidden =
+        forward_segment_logits_with_weights(&fixture, &fixture.weights, &prompt, 0, mid, None)?;
+    let segment_two_logits = forward_segment_logits_with_weights(
+        &fixture,
+        &fixture.weights,
+        &prompt,
+        mid,
+        num_hidden_layers,
+        Some(segment_one_hidden.clone()),
+    )?;
+
+    if full_logits != segment_two_logits.data {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "two-segment split output does not bit-for-bit match the full single-graph \
+                 output: full={full_logits:?} segmented={:?}",
+                segment_two_logits.data
+            ),
+        });
+    }
+
+    // Sanity check against a vacuously-always-equal comparison: the first
+    // segment's own raw hidden-state output must genuinely differ from the
+    // full graph's final logits (different shapes/semantics -- a
+    // pre-lm-head hidden state, not a vocabulary distribution), so the
+    // equality above is proof the *second* segment's real computation
+    // matches, not an accidental identity somewhere upstream.
+    if segment_one_hidden.data == full_logits {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "first segment's raw hidden-state output unexpectedly equals the full \
+                      graph's final logits; the two-segment test is not exercising a real \
+                      mid-stack boundary"
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 /// Correctif 6 / task 8.7: a single changed weight byte in the Artifact

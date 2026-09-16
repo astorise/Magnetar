@@ -4,10 +4,10 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:92330d3187d109e3441916bba1244c6f951f787f5047a5a603a340a5e6790f41"
+    value: "sha256:cd10b875f12d70e025b27765a0abcc655d630b4150e1e29f944536f648d352a5"
 component:
   name: "magnetar.qwen.real"
-  version: "0.4.0"
+  version: "0.4.1"
   description: "The configurable, production Qwen Model Component"
   role: "qwen-model-component"
 runtime:
