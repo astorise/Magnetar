@@ -124,9 +124,20 @@
 //! full, unsegmented graph on a single real GPU. See that test's own doc
 //! comment for how this differs from `ModelInstancePlacement` itself
 //! (still structurally single-Device -- two separate Model Instances, not
-//! one Instance spanning two Devices) and from real CUDA peer-to-peer
-//! (proven possible above, not yet used for this specific boundary
-//! tensor).
+//! one Instance spanning two Devices).
+//!
+//! A seventh test,
+//! `two_real_cuda_gpus_run_one_real_qwen_forward_pass_with_real_peer_to_
+//! peer_boundary_movement` (`add-real-peer-to-peer-segment-boundary-
+//! movement`), closes the gap the sixth test's own doc comment used to
+//! name as future work: the same two-segment split, but the boundary
+//! hidden state moves via the already-proven zero-Host-round-trip
+//! `CudaExecutor::copy_tensor_from_peer_admitted` Device-to-Device copy
+//! instead of a Host round trip, using the new
+//! `QwenSegmentBoundaryInput::Resident` variant. Verified on the real
+//! two-GPU CI node with no skip, producing the same real logits (within
+//! tolerance) as the sixth test's Host-staged path and as the full,
+//! unsegmented graph.
 //!
 //! What no test here attempts (real future work, not silently assumed):
 //! per-Device memory feasibility ranking against a *genuinely*
@@ -136,10 +147,10 @@
 //! live in-flight traffic, having `MultiDevicePlacementPlan` actually
 //! gate or drive dispatch (nothing in this codebase consults it today --
 //! it remains a real, structurally-validated record, not yet an enforced
-//! contract), replacing the sixth test's Host round trip with a real
-//! zero-Host-round-trip Device-to-Device move for its specific boundary
-//! tensor, or a real production checkpoint (Qwen2.5-0.5B or similar)
-//! actually split and generating real text this way end to end.
+//! contract), or a real production checkpoint (Qwen2.5-0.5B or similar)
+//! actually split and generating real text this way end to end (the
+//! separate `tests_real_checkpoint_multi_gpu_segment.rs` does the latter,
+//! still via the Host-staged path).
 
 use std::sync::Arc;
 

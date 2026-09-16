@@ -600,7 +600,8 @@ generalizing `ctx.provider` at 30+ dispatch call sites is two separate,
 ordinary `ModelInstance`s, each bound to its own real Provider/Device
 and materializing only its own real decoder-layer range's weights, with
 the boundary hidden-state tensor moved between them via an explicit
-Host round trip. `model-component-graph.wit` gained `1.3.0`'s
+Host round trip (later replaced -- see below -- by a real zero-Host-
+round-trip peer-to-peer copy). `model-component-graph.wit` gained `1.3.0`'s
 `build-prefill-graph-segment`/`build-decode-graph-segment` (purely
 additive) so the real Qwen Component can build a graph for one layer
 range instead of always the whole stack. Verified in three real,
@@ -618,10 +619,16 @@ owning the embedding lookup, and a `magnetar-runtime` per-layer KV-state
 bug (a `Vec`'s position silently stopped meaning "real layer number"
 the moment a graph could touch an arbitrary layer range, not just
 `0..N`) -- both fixed before any real-hardware dispatch was attempted
-against them. Replacing the explicit Host round trip with the already-
-proven zero-Host-round-trip `CudaExecutor::copy_tensor_from_peer_
-admitted` primitive for this specific boundary tensor remains real,
-well-scoped follow-up work, not a correctness gap.
+against them. The explicit Host round trip for the boundary tensor has
+since been replaced with the already-proven zero-Host-round-trip
+`CudaExecutor::copy_tensor_from_peer_admitted` primitive: a new
+`QwenSegmentBoundaryInput::Resident` path lets a segment's
+`input.hidden_states_in` edge be satisfied by a real Device-resident
+peer copy instead of a Host-staged write, with the pre-existing
+Host-staged path (`QwenSegmentBoundaryInput::Host`) kept unchanged
+for every other caller. Verified on two real, physically distinct
+GPUs -- genuine peer-to-peer, no skip -- producing logits identical
+to the unsegmented full-graph reference.
 
 Memory-feasibility ranking against a *genuinely heterogeneous* real
 budget (the two real GPUs available are identical, so the infeasibility
