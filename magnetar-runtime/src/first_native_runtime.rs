@@ -7029,7 +7029,7 @@ const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:c541adfd678321116fa18f6d9572dba89490bbac370392975aab50068472e65c";
+    "sha256:92330d3187d109e3441916bba1244c6f951f787f5047a5a603a340a5e6790f41";
 
 /// Test-oracle only (`reach-architecture-freeze-1` task 12.4): the checked-in
 /// real Qwen Component binary, embedded for test fixtures. Production never
@@ -8440,19 +8440,21 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
     manager.set_resource_limits(qwen_component_runtime_limits());
     manager
         .set_trust_store(ComponentTrustStore::default().trust_digest(QWEN_REAL_COMPONENT_DIGEST));
-    // `1.2.0`: the checked-in real Qwen Component now also imports
-    // `attention-bias` on `architecture-config` (task 10.5's sibling QKV
-    // bias support), a purely additive evolution over `1.1.0`'s
+    // `1.3.0`: the checked-in real Qwen Component now also exports
+    // `build-prefill-graph-segment`/`build-decode-graph-segment`
+    // (`add-real-multi-device-model-instance-placement`), a purely
+    // additive evolution over `1.2.0`'s `attention-bias` field (task
+    // 10.5's sibling QKV bias support), itself additive over `1.1.0`'s
     // `model-config` shape, itself additive over `1.0.0`'s
     // `graph-builder`-only world.
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.2.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.3.0");
     manager.provide_capability(
         graph_builder_interface,
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.2.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.3.0");
     manager.provide_capability(
         model_config_interface,
         model_config_capability.clone() as Arc<dyn HostCapability>,
@@ -8570,18 +8572,26 @@ pub fn register_inference_component_artifact(
     ));
     manager.set_resource_limits(qwen_component_runtime_limits());
     manager.set_trust_store(trust.clone());
-    let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.2.0");
-    manager.provide_capability(
-        graph_builder_interface,
-        capability.clone() as Arc<dyn HostCapability>,
-    );
-    let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.2.0");
-    manager.provide_capability(
-        model_config_interface,
-        model_config_capability.clone() as Arc<dyn HostCapability>,
-    );
+    // This generic registry serves distinct, independently-compiled
+    // Components concurrently (Llama and the synthetic-minimal test fixture
+    // remain compiled against `1.2.0`, since the `1.3.0` bump
+    // (`add-real-multi-device-model-instance-placement`) only added new
+    // world exports neither of them needs -- see `model-component-graph.wit`
+    // 1.3.0's doc comment). A compiled Component's real executable imports
+    // are checked against its manifest's declared version, so the host must
+    // keep authorizing `1.2.0` alongside `1.3.0` here, not merely replace
+    // one with the other, or every still-`1.2.0`-compiled Component fails
+    // `UnauthorizedImport`/`CapabilityVersionMismatch`.
+    for version in ["1.2.0", "1.3.0"] {
+        manager.provide_capability(
+            WitInterface::new("magnetar:model-component-graph/graph-builder", version),
+            capability.clone() as Arc<dyn HostCapability>,
+        );
+        manager.provide_capability(
+            WitInterface::new("magnetar:model-component-graph/model-config", version),
+            model_config_capability.clone() as Arc<dyn HostCapability>,
+        );
+    }
     let package = ComponentArtifactPackage::new(
         component_bytes,
         manifest_bytes,
