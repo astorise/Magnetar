@@ -1395,8 +1395,14 @@ struct FirstNativeExecutionKvState {
 /// *pending* resources this generation step wrote but sampling/token commit
 /// has not yet accepted; after commit, they match the
 /// `KvCache.layer_resources` bindings Runtime now owns (task 7.1/7.3).
+///
+/// `pub` (`add-real-multi-device-model-instance-placement`): reachable
+/// through [`FirstNativeProviderRunOutcome::layer_kv`]
+/// (`QwenLayerKvMap`), which an external multi-step segment decode loop
+/// must be able to hold onto and thread from one step's outcome into the
+/// next step's `kv_history` argument.
 #[derive(Clone, Debug)]
-struct FirstNativeLayerKvState {
+pub struct FirstNativeLayerKvState {
     k: TensorResourceId,
     v: TensorResourceId,
 }
@@ -3752,7 +3758,7 @@ type QwenGraphExecutionOutput = (
 /// cannot represent that without silently misaligning "Vec index" against
 /// "real layer number" the moment a graph does not touch layer 0..N
 /// contiguously from zero.
-type QwenLayerKvMap = BTreeMap<usize, FirstNativeLayerKvState>;
+pub type QwenLayerKvMap = BTreeMap<usize, FirstNativeLayerKvState>;
 
 /// [`execute_qwen_graph_nodes`]'s own return shape -- the same as
 /// [`QwenGraphExecutionOutput`] minus the resolved [`ProviderBinding`],
@@ -6081,6 +6087,13 @@ pub struct FirstNativeProviderRunOutcome {
     pub dispatch: KernelDispatchResult,
     pub bindings: BTreeMap<TensorEdgeId, HostTensor>,
     pub resolved_provider: ProviderBinding,
+    /// This dispatch's own updated per-layer KV state, keyed by real layer
+    /// number (`QwenLayerKvMap`) -- ignored by every pre-existing single-
+    /// dispatch caller in this family, and consumed by a caller threading
+    /// it into a later decode step against the *same* Model Instance/
+    /// Provider (`add-real-multi-device-model-instance-placement`'s
+    /// segment decode loop).
+    pub layer_kv: QwenLayerKvMap,
 }
 
 /// Runs one real first-native dispatch -- real Model Loading, real weight
@@ -6199,7 +6212,7 @@ fn run_first_native_graph_dispatch(
         reason: error.to_string(),
     })?;
     let mut node_events = Vec::new();
-    let (dispatch, bindings, _layer_kv, resolved_provider) = execute_qwen_graph(
+    let (dispatch, bindings, layer_kv, resolved_provider) = execute_qwen_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -6218,6 +6231,7 @@ fn run_first_native_graph_dispatch(
         dispatch,
         bindings,
         resolved_provider,
+        layer_kv,
     })
 }
 
@@ -6282,7 +6296,7 @@ fn load_fixture_instance_segment_with_weights_for_provider(
     Ok(instance)
 }
 
-/// [`run_first_native_graph_dispatch`], restricted to decoder layer range
+/// `run_first_native_graph_dispatch`, restricted to decoder layer range
 /// `[start_layer, end_layer)` (`add-real-multi-device-model-instance-
 /// placement`): binds `token_ids` to `input.token_ids` when `start_layer
 /// == 0` (a segment's own first, leftmost range), exactly like a full
@@ -6292,9 +6306,17 @@ fn load_fixture_instance_segment_with_weights_for_provider(
 /// comment on why this is a Host round-trip rather than a real Device-to-
 /// Device move) to `input.hidden_states_in`, matching `model-component-
 /// graph.wit` 1.3.0's segment boundary semantics.
+/// `kv_history` is this SAME segment's own prior-step KV state (`None` for
+/// a prefill-segment graph, `Some` for a decode-segment graph continuing a
+/// prior prefill or decode step against this segment); `absolute_position_
+/// override` is the real absolute token position this dispatch's RoPE
+/// terms must use (`0` for prefill, the real count of already-committed
+/// tokens for decode) -- both threaded straight through to
+/// `execute_qwen_graph`, exactly like the full-model dispatch family
+/// already does.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[allow(clippy::too_many_arguments)]
-fn run_first_native_graph_segment_dispatch(
+pub fn run_first_native_graph_segment_dispatch(
     mut runtime: Runtime,
     fixture: &E2eFixture,
     instance: ModelInstanceId,
@@ -6304,6 +6326,8 @@ fn run_first_native_graph_segment_dispatch(
     token_ids: &[u32],
     start_layer: u32,
     boundary_input: Option<HostTensor>,
+    kv_history: Option<&QwenLayerKvMap>,
+    absolute_position_override: Option<u64>,
 ) -> Result<FirstNativeProviderRunOutcome, E2eConformanceError> {
     let status = require_ready_first_native_instance(&runtime, &instance)?;
     let mutation_version = status.status().mutation_version;
@@ -6344,7 +6368,7 @@ fn run_first_native_graph_segment_dispatch(
         BTreeMap::from([(TensorEdgeId::new("input.hidden_states_in"), hidden)])
     };
     let mut node_events = Vec::new();
-    let (dispatch, bindings, _layer_kv, resolved_provider) = execute_qwen_graph(
+    let (dispatch, bindings, layer_kv, resolved_provider) = execute_qwen_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -6352,8 +6376,8 @@ fn run_first_native_graph_segment_dispatch(
         graph,
         &mut plan,
         initial_bindings,
-        None,
-        Some(0),
+        kv_history,
+        absolute_position_override,
         &mut node_events,
     )
     .map_err(E2eConformanceError::from)?;
@@ -6363,6 +6387,7 @@ fn run_first_native_graph_segment_dispatch(
         dispatch,
         bindings,
         resolved_provider,
+        layer_kv,
     })
 }
 
@@ -6395,6 +6420,15 @@ fn run_first_native_graph_segment_dispatch(
 /// either way (proven bit-for-bit by Phase B.1's own single-Provider
 /// segment-split correctness check), only *how* they cross Devices
 /// differs.
+///
+/// A single-shot convenience wrapper (loads a fresh segment Model
+/// Instance, then runs exactly one dispatch): fine for a one-off prefill,
+/// but a real multi-step decode loop across many steps needs to load
+/// *once* and dispatch *repeatedly* against the same Instance instead --
+/// see [`load_first_native_segment_with_provider_and_weights`] (load
+/// only) and [`run_first_native_graph_segment_dispatch`] (pub, reusable
+/// per-step dispatch that hands its own `runtime`/`instance` back on
+/// [`FirstNativeProviderRunOutcome`] for the next call).
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[allow(clippy::too_many_arguments)]
 pub fn run_first_native_graph_segment_with_provider_and_weights(
@@ -6408,16 +6442,14 @@ pub fn run_first_native_graph_segment_with_provider_and_weights(
     end_layer: u32,
     boundary_input: Option<HostTensor>,
 ) -> Result<FirstNativeProviderRunOutcome, E2eConformanceError> {
-    let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
-    let mut runtime = build_runtime_with_model_execution_engine_and_provider(fixture, provider)?;
-    let instance = load_fixture_instance_segment_with_weights_for_provider(
-        fixture,
-        &mut runtime,
-        &provider_binding,
-        weights,
-        start_layer,
-        end_layer,
-    )?;
+    let (runtime, instance, provider_binding) =
+        load_first_native_segment_with_provider_and_weights(
+            provider,
+            fixture,
+            weights,
+            start_layer,
+            end_layer,
+        )?;
     run_first_native_graph_segment_dispatch(
         runtime,
         fixture,
@@ -6428,7 +6460,40 @@ pub fn run_first_native_graph_segment_with_provider_and_weights(
         token_ids,
         start_layer,
         boundary_input,
+        None,
+        Some(0),
     )
+}
+
+/// Loads a segment-only Model Instance (`load_fixture_instance_segment_
+/// with_weights_for_provider`) against a real, caller-constructed
+/// `provider`, without dispatching anything yet -- the "load once" half
+/// [`run_first_native_graph_segment_with_provider_and_weights`]'s single-
+/// shot convenience wrapper conflates with its one dispatch. A real
+/// multi-step decode loop across many steps calls this once, then
+/// [`run_first_native_graph_segment_dispatch`] repeatedly against the
+/// returned `(Runtime, ModelInstanceId, ProviderBinding)`, threading each
+/// step's own `FirstNativeProviderRunOutcome::{runtime, layer_kv}`
+/// forward into the next call.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn load_first_native_segment_with_provider_and_weights(
+    provider: Arc<dyn Provider>,
+    fixture: &E2eFixture,
+    weights: &BTreeMap<String, HostTensor>,
+    start_layer: u32,
+    end_layer: u32,
+) -> Result<(Runtime, ModelInstanceId, ProviderBinding), E2eConformanceError> {
+    let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
+    let mut runtime = build_runtime_with_model_execution_engine_and_provider(fixture, provider)?;
+    let instance = load_fixture_instance_segment_with_weights_for_provider(
+        fixture,
+        &mut runtime,
+        &provider_binding,
+        weights,
+        start_layer,
+        end_layer,
+    )?;
+    Ok((runtime, instance, provider_binding))
 }
 
 /// `transactional-weight-materialization`: a Model Instance whose weight
@@ -7765,6 +7830,75 @@ pub fn load_production_qwen_instance_for_provider(
         &instance,
         manifest.id.name.as_str(),
         &manifest.tensors,
+        payload_source,
+    )?;
+    Ok(instance)
+}
+
+/// [`load_production_qwen_instance_for_provider`], restricted to decoder
+/// layer range `[start_layer, end_layer)` (`add-real-multi-device-model-
+/// instance-placement`): filters `manifest`'s own real tensor inventory
+/// (`filter_manifest_for_layer_range`) down to exactly this segment's own
+/// subset before streaming materialization, so only that subset's real
+/// bytes are ever read from `payload_source` -- the other segment's
+/// weights are never fetched, buffered, or admitted at all. Unlike the
+/// fixture-based segment loader (`load_fixture_instance_segment_with_
+/// weights_for_provider`), a real ingested production manifest already
+/// carries a real, independently materializable `lm_head` tensor entry
+/// when tied (the Hugging Face loader's own `DerivedLmHeadPayloadSource`
+/// derives it once, ahead of this call), so no separate lm-head-
+/// derivation step is needed here.
+pub fn load_production_qwen_instance_segment_for_provider(
+    runtime: &mut Runtime,
+    manifest: &ModelManifest,
+    payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
+    provider_binding: &ProviderBinding,
+    start_layer: u32,
+    end_layer: u32,
+) -> Result<ModelInstanceId, InferenceApiError> {
+    let num_hidden_layers = manifest
+        .architecture_config
+        .as_ref()
+        .ok_or_else(|| InferenceApiError::ModelLoadingFailed {
+            reason: "manifest has no Runtime-authorized architecture configuration bound to it \
+                      -- segment loading needs its real num_hidden_layers"
+                .into(),
+        })?
+        .num_hidden_layers;
+    let segment_manifest =
+        filter_manifest_for_layer_range(manifest, start_layer, end_layer, num_hidden_layers);
+    let mut coordinator = ModelLoadingCoordinator::new();
+    let architecture_implementation = ModelArchitectureImplementation {
+        architecture: segment_manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::ComponentBased,
+        required_capabilities: Vec::new(),
+    };
+    coordinator.register_architecture(architecture_implementation.clone());
+    let mut request = ModelLoadingRequest::new(
+        ModelLoadingRequestId::new(format!(
+            "production-{}-segment-{start_layer}-{end_layer}",
+            segment_manifest.id.name.as_str()
+        )),
+        segment_manifest.id.clone(),
+    );
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = load_model(
+        &mut coordinator,
+        runtime,
+        ModelLoadingApiRequest::new(request),
+        &segment_manifest,
+    )?;
+    let instance = create_model_instance(
+        runtime,
+        &loaded,
+        architecture_implementation,
+        ResourceAffinity::new(FallbackClass::Transparent).with_provider(provider_binding.clone()),
+    )?;
+    stream_materialize_model_instance_weights(
+        runtime,
+        &instance,
+        segment_manifest.id.name.as_str(),
+        &segment_manifest.tensors,
         payload_source,
     )?;
     Ok(instance)
@@ -9233,6 +9367,116 @@ pub fn build_first_native_prefill_graph_segment_for_config(
         config,
         identity,
         prompt_token_count,
+        start_layer,
+        end_layer,
+    )
+}
+
+/// [`build_first_native_prefill_graph_segment_with_runtime`]'s decode
+/// counterpart: builds a real *decode-segment* Execution Graph for decoder
+/// layer range `[start_layer, end_layer)`, via `build-decode-graph-
+/// segment` (`model-component-graph.wit` 1.3.0). `cached_token_count` is
+/// this segment's own real count of already-committed historical tokens
+/// (the same value a full graph's `build-decode-graph` receives), used by
+/// the Component to size RoPE position/KV-append offsets correctly --
+/// identical for every segment of one pipeline step, since every segment
+/// advances through the same token positions together.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[allow(clippy::too_many_arguments)]
+fn build_first_native_decode_graph_segment_with_runtime(
+    manager: &Mutex<ComponentManager>,
+    capability: &GraphBuilderCapability,
+    model_config_capability: &ModelConfigCapability,
+    definition: ComponentDefinitionId,
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+    cached_token_count: u64,
+    start_layer: u32,
+    end_layer: u32,
+) -> Result<(ExecutionGraph, ComponentDefinitionId, ComponentInstanceId), E2eConformanceError> {
+    let mut manager = manager.lock().unwrap();
+
+    let instance = manager
+        .instantiate_prepared_component(definition)
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let result = (|| {
+        let engine_key = manager
+            .engine_instance_key(instance)
+            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
+                reason: "component instance has no engine key".into(),
+            })?
+            .to_string();
+
+        let export_interface = WitInterface::new(
+            "magnetar:model-component-graph/model-component-graph-producer",
+            "1.0.0",
+        );
+        let weight_shapes = qwen_weight_shapes_for_config(config);
+        let compatibility_key = qwen_component_compatibility_key(identity);
+        let session_context = SessionContext {
+            component_id: identity.id.as_str().to_string(),
+            compatibility_key,
+            kv_namespace: "qwen".to_string(),
+            weight_shapes,
+            output_edge_name: "logits".to_string(),
+        };
+
+        model_config_capability
+            .bind_config(&engine_key, architecture_config_from_qwen_config(config));
+        capability.prepare_session(&engine_key, session_context);
+        let segment_result = manager
+            .invoke(
+                ComponentInvocation::new(instance, export_interface, "build-decode-graph-segment")
+                    .with_arguments(vec![
+                        ComponentValue::S64(cached_token_count as i64),
+                        ComponentValue::U32(start_layer),
+                        ComponentValue::U32(end_layer),
+                    ]),
+            )
+            .map_err(|error| E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            })?;
+        let segment_handle =
+            expect_single_string_invocation_result(&segment_result, "build-decode-graph-segment")?;
+        let segment = capability
+            .take_graph(&engine_key, &segment_handle)
+            .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
+                reason: "build-decode-graph-segment handle did not resolve to a finished graph"
+                    .into(),
+            })?;
+
+        validate_first_scope_graph(&segment)?;
+        capability.clear_session(&engine_key);
+        model_config_capability.clear_config(&engine_key);
+        Ok(segment)
+    })();
+    let _ = manager.destroy_instance(instance);
+    result.map(|graph| (graph, definition, instance))
+}
+
+/// `build_first_native_decode_graph_segment_with_runtime`, bound to the
+/// single real, checked-in Qwen Component singleton
+/// (`qwen_real_component_runtime`) -- the decode-segment counterpart of
+/// [`build_first_native_prefill_graph_segment_for_config`].
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn build_first_native_decode_graph_segment_for_config(
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+    cached_token_count: u64,
+    start_layer: u32,
+    end_layer: u32,
+) -> Result<(ExecutionGraph, ComponentDefinitionId, ComponentInstanceId), E2eConformanceError> {
+    let runtime = qwen_real_component_runtime()?;
+    build_first_native_decode_graph_segment_with_runtime(
+        &runtime.manager,
+        &runtime.capability,
+        &runtime.model_config_capability,
+        runtime.definition,
+        config,
+        identity,
+        cached_token_count,
         start_layer,
         end_layer,
     )
