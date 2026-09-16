@@ -111,6 +111,23 @@
 //! event is caller-driven, only the Plan's own source data and the state
 //! machine itself are real. See that test's own doc comment.
 //!
+//! A sixth test,
+//! `two_real_cuda_gpus_run_one_real_qwen_forward_pass_split_across_two_
+//! segment_model_instances` (`add-real-multi-device-model-instance-
+//! placement`), is the one that *does* wire this into real Qwen
+//! `ModelInstance`/graph execution, the gap every test above left open: a
+//! real Qwen forward pass split into two segment `ModelInstance`s (real
+//! GPU 0 for decoder layers `[0, mid)`, real GPU 1 for `[mid,
+//! num_hidden_layers)`), the boundary hidden state moved between them via
+//! an explicit Host round trip, producing the same real logits (within
+//! numeric tolerance) as running the identical prompt through the one,
+//! full, unsegmented graph on a single real GPU. See that test's own doc
+//! comment for how this differs from `ModelInstancePlacement` itself
+//! (still structurally single-Device -- two separate Model Instances, not
+//! one Instance spanning two Devices) and from real CUDA peer-to-peer
+//! (proven possible above, not yet used for this specific boundary
+//! tensor).
+//!
 //! What no test here attempts (real future work, not silently assumed):
 //! per-Device memory feasibility ranking against a *genuinely*
 //! heterogeneous real multi-GPU budget (this repository's own two real
@@ -118,26 +135,37 @@
 //! (no safe mechanism exists), placement-generation republishing under
 //! live in-flight traffic, having `MultiDevicePlacementPlan` actually
 //! gate or drive dispatch (nothing in this codebase consults it today --
-//! it remains a real,
-//! structurally-validated record, not yet an enforced contract), or
-//! wiring any of this into `ModelInstance`/production Qwen graph
-//! execution.
+//! it remains a real, structurally-validated record, not yet an enforced
+//! contract), replacing the sixth test's Host round trip with a real
+//! zero-Host-round-trip Device-to-Device move for its specific boundary
+//! tensor, or a real production checkpoint (Qwen2.5-0.5B or similar)
+//! actually split and generating real text this way end to end.
 
 use std::sync::Arc;
 
 use magnetar_runtime::provider::Provider;
+use magnetar_runtime::qwen_model_component::{
+    qwen_architecture_implementation, qwen_architecture_metadata, qwen_component_descriptor,
+    qwen_component_identity, qwen_validate_model_artifact,
+};
 use magnetar_runtime::{
     ComputeDType, DTypeDescriptor, DeviceBinding, DeviceSet, DeviceSetId, DeviceSetMember,
-    ExecutionNodeId, FallbackClass, HostStagingPolicy, HostTensor, KernelDispatchPlan,
+    E2eFixture, ExecutionNodeId, FallbackClass, HostStagingPolicy, HostTensor, KernelDispatchPlan,
     KernelDispatchPlanId, KernelDispatcher, KernelInvocationId, KernelMemoryClass, KernelResource,
-    KernelResultStatus, KernelSelectionRequest, LayoutDescriptor, MemoryAllocationOwner,
-    MemoryDomain, MemoryPlacement, MultiDevicePlacementError, MultiDevicePlacementErrorCode,
-    MultiDevicePlacementFingerprint, MultiDevicePlacementGeneration, MultiDevicePlacementPlan,
-    MultiDevicePlacementPlanId, MultiDevicePlacementState, OperatorFamily, OperatorId,
-    PipelineStage, PlacementBinding, PlacementCandidate, PlacementScope, ProviderBinding,
-    ProviderExecutionApi, ProviderPressureLevel, ResourceAffinity, Runtime, ShapeDescriptor,
-    StageMovementEdge, TensorDescriptor, TensorResourceDescriptor, TensorResourceId,
-    initial_operator_catalog, select_lowest_cost_eligible,
+    KernelResultStatus, KernelSelectionRequest, KvCacheId, LayoutDescriptor, MemoryAllocationOwner,
+    MemoryDomain, MemoryPlacement, ModelArchitectureImplementationKind, ModelComponentId,
+    ModelComponentImplementationKind, ModelComponentVersion, MultiDevicePlacementError,
+    MultiDevicePlacementErrorCode, MultiDevicePlacementFingerprint, MultiDevicePlacementGeneration,
+    MultiDevicePlacementPlan, MultiDevicePlacementPlanId, MultiDevicePlacementState,
+    OperatorFamily, OperatorId, PipelineStage, PlacementBinding, PlacementCandidate,
+    PlacementScope, ProviderBinding, ProviderExecutionApi, ProviderPressureLevel, QwenConfig,
+    QwenRopeConfig, ResourceAffinity, Runtime, ShapeDescriptor, StageMovementEdge,
+    TensorDescriptor, TensorEdgeId, TensorResourceDescriptor, TensorResourceId,
+    build_first_native_graphs_from_real_qwen_component,
+    build_first_native_prefill_graph_segment_for_config, e2e_fixture_manifest_from_weights,
+    e2e_fixture_tokenizer, e2e_fixture_weights, initial_operator_catalog,
+    register_qwen_component_artifact, run_first_native_graph_segment_with_provider_and_weights,
+    run_first_native_graph_with_provider_and_weights, select_lowest_cost_eligible,
 };
 
 use magnetar_provider_cpu::ReferenceCpuProvider;
@@ -1315,4 +1343,240 @@ fn a_real_two_gpu_plan_correctly_invalidates_and_refuses_to_revert() {
         MultiDevicePlacementState::Invalidated,
         "a rejected transition must leave the Plan's real state unchanged"
     );
+}
+
+/// Reads the checked-in, real Qwen Component artifact this repository
+/// ships (`magnetar-runtime`'s own fixture) from disk and registers it for
+/// production first-native generation to use -- the same real, non-test-
+/// shortcut call path `magnetar-cli` and `integration-tests/cuda-first-
+/// native` both use.
+fn register_real_qwen_component() {
+    let component_bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../magnetar-runtime/fixtures/components/qwen-real.component.wasm"
+    ))
+    .expect("checked-in real Qwen Component .wasm is readable");
+    let manifest_bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../magnetar-runtime/fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
+    ))
+    .expect("checked-in real Qwen Component manifest is readable");
+    register_qwen_component_artifact(component_bytes, manifest_bytes);
+}
+
+/// A small, real 2-decoder-layer Qwen fixture -- the one canonical E2E
+/// fixture this repository ships has only one decoder layer (too small to
+/// split into two non-trivial segments), so this is built the same way
+/// `genuinely_gqa_shaped_rope_dispatches_on_cuda_device_resident_with_
+/// distinct_head_counts` (`integration-tests/cuda-first-native`) builds
+/// its own non-canonical fixture: entirely from `magnetar-runtime`'s own
+/// public fixture-building primitives.
+fn two_layer_fixture() -> E2eFixture {
+    let architecture = qwen_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
+    let identity = qwen_component_identity(
+        ModelComponentId::new("multi-gpu-segment-fixture").expect("static id is valid"),
+        ModelComponentVersion::new(1, 0, 0),
+        ModelComponentImplementationKind::WebAssemblyComponent,
+    );
+    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    config
+        .validate(&identity)
+        .expect("2-layer config validates");
+    let architecture_implementation = qwen_architecture_implementation(
+        &identity,
+        ModelArchitectureImplementationKind::ComponentBased,
+    );
+    let weights = e2e_fixture_weights(&config).expect("2-layer fixture weights build");
+    let manifest = e2e_fixture_manifest_from_weights(
+        &config,
+        &architecture_implementation.architecture,
+        &weights,
+    )
+    .expect("2-layer fixture manifest builds");
+    let tokenizer = e2e_fixture_tokenizer().expect("fixture tokenizer builds");
+    let descriptor = qwen_component_descriptor(identity.clone(), &config)
+        .expect("2-layer component descriptor builds");
+    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+        .expect("2-layer manifest matches its own descriptor");
+    E2eFixture {
+        config,
+        identity,
+        architecture_implementation,
+        manifest,
+        tokenizer,
+        weights,
+    }
+}
+
+/// `add-real-multi-device-model-instance-placement`'s own real, two-real-
+/// GPU proof: a real Qwen forward pass, split into two segment
+/// `ModelInstance`s -- layers `[0, mid)` loaded and executed on real GPU
+/// 0, layers `[mid, num_hidden_layers)` loaded and executed on real GPU
+/// 1, the boundary hidden state moved between them via an explicit Host
+/// round trip (`run_first_native_graph_segment_with_provider_and_weights`'s
+/// own doc comment on why this, not yet real CUDA peer-to-peer, bridges
+/// the two segments) -- produces the same real logits, within numeric
+/// tolerance, as running the identical prompt through the one, full,
+/// unsegmented graph on a single real GPU. Phase B.1
+/// (`magnetar-runtime`'s own in-crate `check_two_segment_split_produces_
+/// identical_output_to_full_graph`) already proved this split is bit-for-
+/// bit exact on Reference CPU; this is the same real proof extended to
+/// two genuinely distinct real Devices instead of one Provider running
+/// twice -- the "real Multi-Device `ModelInstance` placement" the
+/// project's own scope charter named as its last unimplemented item, and
+/// this repository's `tests_multi_device_cpu_cuda.rs` module doc
+/// previously listed under "What no test here attempts".
+///
+/// Skips cleanly on any host without two real CUDA devices, matching
+/// every other real-hardware-gated test in this crate.
+#[test]
+fn two_real_cuda_gpus_run_one_real_qwen_forward_pass_split_across_two_segment_model_instances() {
+    let gpu0_probe = CudaProvider::new();
+    if !gpu0_probe.is_available() {
+        eprintln!("skipping: no compatible CUDA device found on this host at all");
+        return;
+    }
+    let gpu1_probe = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    if !gpu1_probe.is_available() {
+        eprintln!(
+            "skipping: this host has only one real CUDA device -- a genuine second real \
+             GPU is required to prove anything this test is specifically for"
+        );
+        return;
+    }
+
+    register_real_qwen_component();
+    let fixture = two_layer_fixture();
+    let num_hidden_layers = fixture.config.architecture.layer_count as u32;
+    let mid = num_hidden_layers / 2;
+    assert!(
+        mid > 0 && mid < num_hidden_layers,
+        "this fixture must have at least 2 decoder layers to split into two non-trivial segments"
+    );
+    let token_ids = [3_u32, 5, 7];
+
+    // Ground truth: the real, full, unsegmented graph dispatched on real
+    // GPU 0 alone.
+    let (full_graphs, _definition, _instance) =
+        build_first_native_graphs_from_real_qwen_component(&fixture, token_ids.len() as u64)
+            .expect("the real Qwen Component produces a real full prefill graph");
+    let full_cache_id =
+        KvCacheId::new("multi-gpu-segment-full-graph-cache").expect("cache id is valid");
+    let full_outcome = run_first_native_graph_with_provider_and_weights(
+        Arc::new(CudaProvider::new()),
+        &fixture,
+        &fixture.weights,
+        &full_graphs.prefill,
+        &full_cache_id,
+        &token_ids,
+    )
+    .expect("the real full-graph dispatch against real GPU 0 succeeds");
+    assert_eq!(full_outcome.dispatch.status, KernelResultStatus::Succeeded);
+    let full_logits = full_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .expect("full graph produced a logits-named output")
+        .data
+        .clone();
+
+    // Segment 1: layers [0, mid), real GPU 0, real prefill-segment graph
+    // through the real Qwen Component's build-prefill-graph-segment
+    // export.
+    let (segment_one_graph, _definition, _instance) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            token_ids.len() as u64,
+            0,
+            mid,
+        )
+        .expect("the real Qwen Component produces a real segment-one prefill graph");
+    let segment_one_cache_id =
+        KvCacheId::new("multi-gpu-segment-one-cache").expect("cache id is valid");
+    let segment_one_outcome = run_first_native_graph_segment_with_provider_and_weights(
+        Arc::new(CudaProvider::new()),
+        &fixture,
+        &fixture.weights,
+        &segment_one_graph,
+        &segment_one_cache_id,
+        &token_ids,
+        0,
+        mid,
+        None,
+    )
+    .expect("segment one's real dispatch against real GPU 0 succeeds");
+    assert_eq!(
+        segment_one_outcome.dispatch.status,
+        KernelResultStatus::Succeeded
+    );
+    let boundary_hidden = segment_one_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .expect("segment one produced a logits-named (raw hidden-state) output")
+        .clone();
+    assert_ne!(
+        boundary_hidden.data, full_logits,
+        "segment one's raw hidden-state output must genuinely differ from the full graph's \
+         final logits -- otherwise this test is not exercising a real mid-stack boundary"
+    );
+
+    // Explicit cross-Device movement, real GPU 0 -> real GPU 1: a real
+    // Host round trip (see this test's own doc comment on why not yet
+    // real CUDA peer-to-peer).
+    //
+    // Segment 2: layers [mid, num_hidden_layers), real GPU 1, consuming
+    // segment one's own real boundary output as `hidden_states_in`.
+    let (segment_two_graph, _definition, _instance) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            token_ids.len() as u64,
+            mid,
+            num_hidden_layers,
+        )
+        .expect("the real Qwen Component produces a real segment-two prefill graph");
+    let segment_two_cache_id =
+        KvCacheId::new("multi-gpu-segment-two-cache").expect("cache id is valid");
+    let segment_two_outcome = run_first_native_graph_segment_with_provider_and_weights(
+        Arc::new(gpu1_probe),
+        &fixture,
+        &fixture.weights,
+        &segment_two_graph,
+        &segment_two_cache_id,
+        &token_ids,
+        mid,
+        num_hidden_layers,
+        Some(boundary_hidden),
+    )
+    .expect("segment two's real dispatch against real GPU 1 succeeds");
+    assert_eq!(
+        segment_two_outcome.dispatch.status,
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(
+        segment_two_outcome.resolved_provider.as_str(),
+        "magnetar:provider/cuda:1",
+        "segment two must actually resolve to real GPU 1, not silently fall back elsewhere"
+    );
+    let segment_two_logits = segment_two_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .expect("segment two produced a logits-named output")
+        .data
+        .clone();
+
+    assert_eq!(
+        segment_two_logits.len(),
+        full_logits.len(),
+        "the two-segment split across real GPU 0 + real GPU 1 must produce the same number \
+         of logits as the full graph on real GPU 0 alone"
+    );
+    const TOLERANCE: f32 = 1e-2;
+    for (index, (segmented, full)) in segment_two_logits.iter().zip(&full_logits).enumerate() {
+        assert!(
+            (segmented - full).abs() <= TOLERANCE,
+            "logit {index}: two-real-GPU segmented={segmented} full-graph-on-one-real-GPU={full} \
+             exceeds tolerance {TOLERANCE}"
+        );
+    }
 }

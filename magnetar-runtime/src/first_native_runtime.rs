@@ -6202,6 +6202,216 @@ fn run_first_native_graph_dispatch(
     })
 }
 
+/// [`load_fixture_instance_with_weights_for_provider`], restricted to
+/// decoder layer range `[start_layer, end_layer)`
+/// (`add-real-multi-device-model-instance-placement`): filters both
+/// `fixture.manifest`'s tensor inventory (so `load_model`'s
+/// `required_weight_names` reflects only this segment's own subset,
+/// exactly like [`filter_manifest_for_layer_range`]'s own doc comment)
+/// and `weights` itself (after deriving `lm_head` from the *full* set,
+/// same ordering reason as [`load_fixture_instance_with_weights`]) down
+/// to that same subset before materializing.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn load_fixture_instance_segment_with_weights_for_provider(
+    fixture: &E2eFixture,
+    runtime: &mut Runtime,
+    provider_binding: &ProviderBinding,
+    weights: &BTreeMap<String, HostTensor>,
+    start_layer: u32,
+    end_layer: u32,
+) -> Result<ModelInstanceId, E2eConformanceError> {
+    let num_hidden_layers = fixture.config.architecture.layer_count as u32;
+    let segment_manifest = filter_manifest_for_layer_range(
+        &fixture.manifest,
+        start_layer,
+        end_layer,
+        num_hidden_layers,
+    );
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(fixture.architecture_implementation.clone());
+    let mut request = ModelLoadingRequest::new(
+        ModelLoadingRequestId::new(format!(
+            "first-native-provider-segment-load-{start_layer}-{end_layer}"
+        )),
+        segment_manifest.id.clone(),
+    );
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = load_model(
+        &mut coordinator,
+        runtime,
+        ModelLoadingApiRequest::new(request),
+        &segment_manifest,
+    )?;
+    let instance = create_model_instance(
+        runtime,
+        &loaded,
+        fixture.architecture_implementation.clone(),
+        ResourceAffinity::new(FallbackClass::Transparent).with_provider(provider_binding.clone()),
+    )?;
+    let mut segment_weights = weights.clone();
+    qwen_weights_with_derived_lm_head(fixture, &mut segment_weights)?;
+    segment_weights.retain(|name, _| {
+        qwen_weight_name_in_layer_range(name, start_layer, end_layer, num_hidden_layers)
+    });
+    materialize_model_instance_weights(
+        runtime,
+        &instance,
+        segment_manifest.id.name.as_str(),
+        &segment_weights,
+    )
+    .map_err(E2eConformanceError::from)?;
+    Ok(instance)
+}
+
+/// [`run_first_native_graph_dispatch`], restricted to decoder layer range
+/// `[start_layer, end_layer)` (`add-real-multi-device-model-instance-
+/// placement`): binds `token_ids` to `input.token_ids` when `start_layer
+/// == 0` (a segment's own first, leftmost range), exactly like a full
+/// graph; otherwise binds `boundary_input` (the *previous* segment's own
+/// real, Host-materialized output -- see
+/// [`run_first_native_graph_segment_with_provider_and_weights`]'s doc
+/// comment on why this is a Host round-trip rather than a real Device-to-
+/// Device move) to `input.hidden_states_in`, matching `model-component-
+/// graph.wit` 1.3.0's segment boundary semantics.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[allow(clippy::too_many_arguments)]
+fn run_first_native_graph_segment_dispatch(
+    mut runtime: Runtime,
+    fixture: &E2eFixture,
+    instance: ModelInstanceId,
+    provider_binding: &ProviderBinding,
+    graph: &ExecutionGraph,
+    kv_cache_id: &KvCacheId,
+    token_ids: &[u32],
+    start_layer: u32,
+    boundary_input: Option<HostTensor>,
+) -> Result<FirstNativeProviderRunOutcome, E2eConformanceError> {
+    let status = require_ready_first_native_instance(&runtime, &instance)?;
+    let mutation_version = status.status().mutation_version;
+    let sequence_length = if start_layer == 0 {
+        token_ids.len() as u64
+    } else {
+        boundary_input
+            .as_ref()
+            .and_then(|tensor| tensor.shape.first().copied())
+            .ok_or_else(|| E2eConformanceError::FixtureInvalid {
+                reason: "segment starting mid-stack requires a boundary hidden-state tensor \
+                          with a non-empty shape"
+                    .into(),
+            })?
+    };
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        graph,
+        &instance,
+        mutation_version,
+        sequence_length,
+        PreparedExecutionPlanGeneration::new(1),
+        provider_binding,
+    )?;
+    let initial_bindings = if start_layer == 0 {
+        let ids_tensor = HostTensor::new(
+            [token_ids.len() as u64],
+            token_ids.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+        )
+        .map_err(|error| E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        })?;
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)])
+    } else {
+        let hidden = boundary_input.ok_or_else(|| E2eConformanceError::FixtureInvalid {
+            reason: "segment starting mid-stack requires a boundary hidden-state tensor".into(),
+        })?;
+        BTreeMap::from([(TensorEdgeId::new("input.hidden_states_in"), hidden)])
+    };
+    let mut node_events = Vec::new();
+    let (dispatch, bindings, _layer_kv, resolved_provider) = execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        kv_cache_id,
+        graph,
+        &mut plan,
+        initial_bindings,
+        None,
+        Some(0),
+        &mut node_events,
+    )
+    .map_err(E2eConformanceError::from)?;
+    Ok(FirstNativeProviderRunOutcome {
+        runtime,
+        instance,
+        dispatch,
+        bindings,
+        resolved_provider,
+    })
+}
+
+/// [`run_first_native_graph_with_provider_and_weights`]'s per-Device
+/// pipeline-placement counterpart (`add-real-multi-device-model-instance-
+/// placement`, the "two `ModelInstance`s + explicit movement" design):
+/// runs one decoder-layer-range SEGMENT's graph
+/// (`build_first_native_prefill_graph_segment_for_config`) against a real
+/// `provider`, loading only that segment's own weight subset
+/// (`load_fixture_instance_segment_with_weights_for_provider`).
+///
+/// `boundary_input` is `None` for a segment starting at layer 0 (reads
+/// `token_ids` instead, like a full graph's own first segment); for a
+/// segment starting mid-stack, it is the *previous* segment's own real
+/// `"logits"`-named output tensor (a raw post-layer hidden state, not
+/// real logits -- see `build_first_native_prefill_graph_segment_for_
+/// config`'s doc comment), read from `FirstNativeProviderRunOutcome::
+/// bindings` after `execute_qwen_graph`'s own Host-materialization
+/// boundary.
+///
+/// This crosses through the Host between two segments on two different
+/// Providers/Devices -- a real, explicit, caller-orchestrated data
+/// movement step (the design's own "explicit movement"), but not yet the
+/// real, zero-Host-round-trip Device-to-Device move
+/// `CudaExecutor::copy_tensor_from_peer_admitted` already proves is
+/// possible (`add-real-peer-to-peer-gpu-movement`). Replacing this
+/// Host round-trip with that real primitive for the CUDA-to-CUDA case is
+/// real follow-up work, not something this function's own correctness
+/// depends on: the boundary tensor's real numeric values are identical
+/// either way (proven bit-for-bit by Phase B.1's own single-Provider
+/// segment-split correctness check), only *how* they cross Devices
+/// differs.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[allow(clippy::too_many_arguments)]
+pub fn run_first_native_graph_segment_with_provider_and_weights(
+    provider: Arc<dyn Provider>,
+    fixture: &E2eFixture,
+    weights: &BTreeMap<String, HostTensor>,
+    graph: &ExecutionGraph,
+    kv_cache_id: &KvCacheId,
+    token_ids: &[u32],
+    start_layer: u32,
+    end_layer: u32,
+    boundary_input: Option<HostTensor>,
+) -> Result<FirstNativeProviderRunOutcome, E2eConformanceError> {
+    let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
+    let mut runtime = build_runtime_with_model_execution_engine_and_provider(fixture, provider)?;
+    let instance = load_fixture_instance_segment_with_weights_for_provider(
+        fixture,
+        &mut runtime,
+        &provider_binding,
+        weights,
+        start_layer,
+        end_layer,
+    )?;
+    run_first_native_graph_segment_dispatch(
+        runtime,
+        fixture,
+        instance,
+        &provider_binding,
+        graph,
+        kv_cache_id,
+        token_ids,
+        start_layer,
+        boundary_input,
+    )
+}
+
 /// `transactional-weight-materialization`: a Model Instance whose weight
 /// materialization fails SHALL never have reported Ready in the first
 /// place -- `ModelInstances::create()` leaves it in `Loading`, and only a
@@ -8908,18 +9118,7 @@ fn build_first_native_graphs_with_runtime(
 /// regardless of range, a raw post-layer hidden state for an internal
 /// segment or real logits for one ending at `num_hidden_layers`.
 ///
-/// `#[cfg(test)]` for now: its only caller today is
-/// `forward_segment_logits_with_weights` (Phase B.1's segment-split
-/// correctness proof). A later phase wiring a real two-`ModelInstance`
-/// production orchestrator on top of it should widen this back to the
-/// same production-shaped cfg as `build_first_native_graphs_with_runtime`
-/// once that real caller exists, rather than leaving it compiled into
-/// every build unused.
-#[cfg(all(
-    test,
-    not(target_arch = "wasm32"),
-    feature = "wasmtime-component-engine"
-))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[allow(clippy::too_many_arguments)]
 fn build_first_native_prefill_graph_segment_with_runtime(
     manager: &Mutex<ComponentManager>,
@@ -8997,14 +9196,9 @@ fn build_first_native_prefill_graph_segment_with_runtime(
 /// [`build_first_native_prefill_graph_segment_with_runtime`], bound to the
 /// single real, checked-in Qwen Component singleton
 /// (`qwen_real_component_runtime`) -- the segment-graph counterpart of
-/// [`build_first_native_graphs_for_config`]. `#[cfg(test)]` for the same
-/// reason as [`build_first_native_prefill_graph_segment_with_runtime`].
-#[cfg(all(
-    test,
-    not(target_arch = "wasm32"),
-    feature = "wasmtime-component-engine"
-))]
-fn build_first_native_prefill_graph_segment_for_config(
+/// [`build_first_native_graphs_for_config`].
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn build_first_native_prefill_graph_segment_for_config(
     config: &QwenConfig,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,
@@ -9037,13 +9231,7 @@ fn build_first_native_prefill_graph_segment_for_config(
 /// num_hidden_layers`) -- see `model-component-graph.wit` 1.3.0's doc
 /// comment for the same boundary semantics on the Component side.
 ///
-/// `#[cfg(test)]` for the same reason as
-/// `build_first_native_prefill_graph_segment_with_runtime`.
-#[cfg(all(
-    test,
-    not(target_arch = "wasm32"),
-    feature = "wasmtime-component-engine"
-))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn qwen_weight_name_in_layer_range(
     tensor_name: &str,
     start_layer: u32,
@@ -9075,13 +9263,7 @@ fn qwen_weight_name_in_layer_range(
 /// subset -- never the full architecture -- and materialization loads only
 /// that subset's real bytes, never the other segment's.
 ///
-/// `#[cfg(test)]` for the same reason as
-/// `build_first_native_prefill_graph_segment_with_runtime`.
-#[cfg(all(
-    test,
-    not(target_arch = "wasm32"),
-    feature = "wasmtime-component-engine"
-))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn filter_manifest_for_layer_range(
     manifest: &ModelManifest,
     start_layer: u32,
