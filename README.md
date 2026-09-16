@@ -591,6 +591,38 @@ so the "loss" event itself is a real, caller-driven transition, not a
 hardware-detected one; what is real is the Plan's own Device-derived data
 and the state-machine code itself.
 
+`add-real-multi-device-model-instance-placement` then closed the one
+item every prior sub-chantier above had deliberately deferred: real
+production `ModelInstance`-level placement across more than one real
+GPU. `ModelInstancePlacement` itself remains structurally single-Device
+per instance, untouched -- the "safe" design chosen over invasively
+generalizing `ctx.provider` at 30+ dispatch call sites is two separate,
+ordinary `ModelInstance`s, each bound to its own real Provider/Device
+and materializing only its own real decoder-layer range's weights, with
+the boundary hidden-state tensor moved between them via an explicit
+Host round trip. `model-component-graph.wit` gained `1.3.0`'s
+`build-prefill-graph-segment`/`build-decode-graph-segment` (purely
+additive) so the real Qwen Component can build a graph for one layer
+range instead of always the whole stack. Verified in three real,
+increasingly deep steps, each building on the last: bit-for-bit
+identical to the full graph on Reference CPU against a synthetic
+fixture; on two real, physically distinct GPUs for a real prefill;
+and, finally, on two real GPUs running a real multi-step greedy
+generation loop against the real, public Qwen2.5-0.5B-Instruct
+checkpoint (`tests_real_checkpoint_smoke.rs`'s own checkpoint),
+producing exactly the same generated token ids as the real full,
+unsegmented graph dispatched on one real GPU alone. Along the way, real
+hardware testing caught and fixed two real bugs: a Component-side tied-
+embeddings alias failure for a segment reaching the lm-head without
+owning the embedding lookup, and a `magnetar-runtime` per-layer KV-state
+bug (a `Vec`'s position silently stopped meaning "real layer number"
+the moment a graph could touch an arbitrary layer range, not just
+`0..N`) -- both fixed before any real-hardware dispatch was attempted
+against them. Replacing the explicit Host round trip with the already-
+proven zero-Host-round-trip `CudaExecutor::copy_tensor_from_peer_
+admitted` primitive for this specific boundary tensor remains real,
+well-scoped follow-up work, not a correctness gap.
+
 Memory-feasibility ranking against a *genuinely heterogeneous* real
 budget (the two real GPUs available are identical, so the infeasibility
 case uses one deliberately, honestly constrained artificial budget
