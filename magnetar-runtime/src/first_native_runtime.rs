@@ -1381,7 +1381,7 @@ struct E2eRuntimeModelExecutionEngine {
 struct FirstNativeExecutionKvState {
     cache: KvCacheId,
     compatibility: KvCacheCompatibility,
-    layer_kv: Vec<FirstNativeLayerKvState>,
+    layer_kv: QwenLayerKvMap,
     /// The Provider `execute_qwen_graph` actually resolved and wrote this
     /// step's pending K/V resources under. `None` before the first graph
     /// execution for this state (freshly created by
@@ -1434,7 +1434,7 @@ impl E2eRuntimeModelExecutionEngine {
         Ok(FirstNativeExecutionKvState {
             cache: cache_id,
             compatibility,
-            layer_kv: Vec::new(),
+            layer_kv: QwenLayerKvMap::new(),
             provider: None,
         })
     }
@@ -1523,7 +1523,7 @@ impl E2eRuntimeModelExecutionEngine {
             // `write_tensor_admitted` (Correctif 1), so discarding it must
             // release that allocation too, not just drop the Provider
             // storage entry.
-            for layer in &discarded.layer_kv {
+            for layer in discarded.layer_kv.values() {
                 // Best-effort: this pending state is being discarded
                 // regardless of whether Provider-side release succeeds.
                 let _ = provider.release_admitted_tensor(runtime.memory_mut(), &layer.k);
@@ -3737,9 +3737,22 @@ fn resolve_kernel_execution_provider(
 type QwenGraphExecutionOutput = (
     KernelDispatchResult,
     BTreeMap<TensorEdgeId, HostTensor>,
-    Vec<FirstNativeLayerKvState>,
+    QwenLayerKvMap,
     ProviderBinding,
 );
+
+/// Per-layer KV state, keyed by the *real, global* decoder layer number
+/// (parsed from a graph edge's own `kv_cache.cache_id`, never a positional
+/// index into whatever subset of layers one particular call happened to
+/// touch). A full graph touches every layer `0..layer_count`, so this map
+/// is dense for one; a *segment* graph
+/// (`add-real-multi-device-model-instance-placement`) touches only its own
+/// `[start_layer, end_layer)` range, so this map is correctly sparse (and
+/// correctly keyed) for one -- a plain `Vec<FirstNativeLayerKvState>`
+/// cannot represent that without silently misaligning "Vec index" against
+/// "real layer number" the moment a graph does not touch layer 0..N
+/// contiguously from zero.
+type QwenLayerKvMap = BTreeMap<usize, FirstNativeLayerKvState>;
 
 /// [`execute_qwen_graph_nodes`]'s own return shape -- the same as
 /// [`QwenGraphExecutionOutput`] minus the resolved [`ProviderBinding`],
@@ -3747,7 +3760,7 @@ type QwenGraphExecutionOutput = (
 type QwenGraphNodesOutput = (
     KernelDispatchResult,
     BTreeMap<TensorEdgeId, HostTensor>,
-    Vec<FirstNativeLayerKvState>,
+    QwenLayerKvMap,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -3759,7 +3772,7 @@ fn execute_qwen_graph(
     graph: &ExecutionGraph,
     prepared_plan: &mut PreparedExecutionPlan,
     initial_bindings: BTreeMap<TensorEdgeId, HostTensor>,
-    kv_history: Option<&[FirstNativeLayerKvState]>,
+    kv_history: Option<&QwenLayerKvMap>,
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
 ) -> Result<QwenGraphExecutionOutput, InferenceApiError> {
@@ -3823,7 +3836,7 @@ fn execute_qwen_graph_nodes(
     prepared_plan: &mut PreparedExecutionPlan,
     executor: &Arc<dyn ProviderExecutionApi>,
     initial_bindings: BTreeMap<TensorEdgeId, HostTensor>,
-    kv_history: Option<&[FirstNativeLayerKvState]>,
+    kv_history: Option<&QwenLayerKvMap>,
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
 ) -> Result<QwenGraphNodesOutput, InferenceApiError> {
@@ -4030,7 +4043,7 @@ fn execute_qwen_graph_nodes(
                         kv_history.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                             reason: "decode graph execution requires historical KV state".into(),
                         })?;
-                    let historical = history.get(layer).ok_or_else(|| {
+                    let historical = history.get(&layer).ok_or_else(|| {
                         InferenceApiError::KvCacheUnavailable {
                             reason: format!(
                                 "decode requires historical KV state for layer {layer}"
@@ -4221,8 +4234,11 @@ fn execute_qwen_graph_nodes(
     // layers outside it never populate `layer_k`/`layer_v` at all; skipping
     // those (rather than hard-failing on them) generalizes this loop to
     // segment graphs with zero behavior change for a full graph, which
-    // still populates every index here exactly as before.
-    let mut updated_layer_kv = Vec::with_capacity(layer_count);
+    // still populates every index here exactly as before. Keyed by real
+    // layer number (`QwenLayerKvMap`), not Vec position, so a segment's
+    // necessarily sparse result stays correctly addressable by whichever
+    // real layer a later decode step actually asks for.
+    let mut updated_layer_kv = QwenLayerKvMap::new();
     for layer in 0..layer_count {
         let touched = layer_k[layer].is_some() || layer_v[layer].is_some();
         if !touched {
@@ -4238,7 +4254,7 @@ fn execute_qwen_graph_nodes(
             .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                 reason: format!("first-native graph produced no V state for layer {layer}"),
             })?;
-        updated_layer_kv.push(FirstNativeLayerKvState { k, v });
+        updated_layer_kv.insert(layer, FirstNativeLayerKvState { k, v });
     }
     let dispatch_result = last_dispatch.ok_or_else(|| InferenceApiError::GenerationFailed {
         reason: "first-native graph executed no nodes".into(),
@@ -4894,7 +4910,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             None,
         )?;
         let k_new = k_new.into_host(&dispatch_ctx.provider)?;
-        let historical = &kv_state.layer_kv[layer as usize];
+        let historical = &kv_state.layer_kv[&(layer as usize)];
         let historical_k = dispatch_ctx
             .provider
             .read_tensor(&historical.k)
@@ -5410,8 +5426,8 @@ impl KvUpdateTransaction {
         self,
         runtime: &mut Runtime,
         cache: &KvCacheId,
-    ) -> Result<Vec<FirstNativeLayerKvState>, InferenceApiError> {
-        let mut committed = Vec::with_capacity(self.promoted.len());
+    ) -> Result<QwenLayerKvMap, InferenceApiError> {
+        let mut committed = QwenLayerKvMap::new();
         for promoted_layer in self.promoted {
             if let Some(previous) = promoted_layer.previous {
                 let _ = runtime.memory_mut().release(previous.k_allocation);
@@ -5428,10 +5444,13 @@ impl KvUpdateTransaction {
                 .cache_mut(cache)?
                 .layer_resources
                 .insert(promoted_layer.layer, promoted_layer.binding.clone());
-            committed.push(FirstNativeLayerKvState {
-                k: promoted_layer.binding.k,
-                v: promoted_layer.binding.v,
-            });
+            committed.insert(
+                promoted_layer.layer as usize,
+                FirstNativeLayerKvState {
+                    k: promoted_layer.binding.k,
+                    v: promoted_layer.binding.v,
+                },
+            );
         }
         Ok(committed)
     }
@@ -5573,9 +5592,9 @@ impl E2eRuntimeModelExecutionEngine {
         &self,
         runtime: &mut Runtime,
         state: &FirstNativeExecutionKvState,
-    ) -> Result<Vec<FirstNativeLayerKvState>, InferenceApiError> {
+    ) -> Result<QwenLayerKvMap, InferenceApiError> {
         let mut transaction = KvUpdateTransaction::begin(runtime, state)?;
-        for (layer, pending) in state.layer_kv.iter().enumerate() {
+        for (&layer, pending) in state.layer_kv.iter() {
             if let Err(error) = transaction.promote_layer(runtime, &state.cache, layer, pending) {
                 transaction.abort(runtime);
                 return Err(error);
@@ -12856,7 +12875,12 @@ fn check_incremental_decode_matches_full_sequence_oracle(
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer")?,
         ),
-        layer_kv,
+        // The hand-rolled decode oracle's own return is a plain, densely
+        // 0-indexed `Vec` (it processes every layer unconditionally, never
+        // a segment), so its Vec index already equals the real layer
+        // number here -- `enumerate()` recovers that as an explicit key
+        // for `QwenLayerKvMap`.
+        layer_kv: layer_kv.into_iter().enumerate().collect(),
         provider: None,
     };
 
@@ -12992,7 +13016,7 @@ fn check_graph_executor_matches_full_sequence_oracle(
         &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
     )
     .map_err(E2eConformanceError::from)?;
-    for layer in updated_layer_kv {
+    for layer in updated_layer_kv.values() {
         let k_tensor = executor.read_tensor(&layer.k).ok_or_else(|| {
             E2eConformanceError::GenerationFailed {
                 reason: format!("no materialized K tensor for resource '{}'", layer.k),
@@ -13692,7 +13716,7 @@ fn check_incremental_decode_rejects_missing_layer_kv(
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer")?,
         ),
-        layer_kv: Vec::new(),
+        layer_kv: QwenLayerKvMap::new(),
         provider: None,
     };
     match execute_qwen_decode_hidden_states_through_dispatch(
@@ -14966,7 +14990,7 @@ fn check_kv_partial_layer_failure_during_commit_rolls_back_cleanly(
             pending_kv_states
                 .values()
                 .next()
-                .and_then(|state| state.layer_kv.first())
+                .and_then(|state| state.layer_kv.get(&0))
                 .map(|layer| layer.v.clone())
                 .ok_or_else(|| E2eConformanceError::GenerationFailed {
                     reason: "decode step produced no pending KV state to sabotage".into(),

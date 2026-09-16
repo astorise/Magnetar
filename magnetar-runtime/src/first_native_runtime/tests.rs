@@ -2510,7 +2510,7 @@ fn kv_update_transaction_resolves_the_states_bound_provider() {
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer").unwrap(),
         ),
-        layer_kv: Vec::new(),
+        layer_kv: QwenLayerKvMap::new(),
         provider: Some(mock_provider.clone()),
     };
 
@@ -2535,7 +2535,7 @@ fn kv_update_transaction_falls_back_to_reference_cpu_when_unbound() {
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer").unwrap(),
         ),
-        layer_kv: Vec::new(),
+        layer_kv: QwenLayerKvMap::new(),
         provider: None,
     };
 
