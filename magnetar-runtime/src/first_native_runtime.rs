@@ -3782,6 +3782,47 @@ fn execute_qwen_graph(
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
 ) -> Result<QwenGraphExecutionOutput, InferenceApiError> {
+    execute_qwen_graph_with_resident_input(
+        runtime,
+        fixture,
+        model_instance,
+        kv_cache_id,
+        graph,
+        prepared_plan,
+        initial_bindings,
+        BTreeMap::new(),
+        kv_history,
+        absolute_position_override,
+        node_events,
+    )
+}
+
+/// [`execute_qwen_graph`], generalized to additionally accept graph inputs
+/// that are ALREADY resident in the executing Provider's own storage
+/// (`resident_bindings`) rather than requiring every input to arrive as a
+/// fresh `HostTensor` (`add-real-multi-device-model-instance-placement`):
+/// the real, zero-Host-round-trip counterpart of a segment's own
+/// `input.hidden_states_in` boundary, written directly by a real cross-
+/// Device move (`CudaExecutor::copy_tensor_from_peer_admitted`,
+/// `add-real-peer-to-peer-gpu-movement`) before this call, instead of a
+/// `HostTensor` staged through `initial_bindings`. `execute_qwen_graph`
+/// itself is a thin wrapper over this function passing an empty
+/// `resident_bindings` map, unchanged in behavior for every one of its
+/// existing callers.
+#[allow(clippy::too_many_arguments)]
+fn execute_qwen_graph_with_resident_input(
+    runtime: &mut Runtime,
+    fixture: &E2eFixture,
+    model_instance: &ModelInstanceId,
+    kv_cache_id: &KvCacheId,
+    graph: &ExecutionGraph,
+    prepared_plan: &mut PreparedExecutionPlan,
+    initial_bindings: BTreeMap<TensorEdgeId, HostTensor>,
+    resident_bindings: BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)>,
+    kv_history: Option<&QwenLayerKvMap>,
+    absolute_position_override: Option<u64>,
+    node_events: &mut Vec<PerNodeCausalEvent>,
+) -> Result<QwenGraphExecutionOutput, InferenceApiError> {
     let order = qwen_graph_execution_order(graph)?;
     // Every node in this graph binds to the same Provider; any binding names
     // it (task 5.2: resolve the executing Provider from Runtime provider
@@ -3824,6 +3865,7 @@ fn execute_qwen_graph(
         prepared_plan,
         &executor,
         initial_bindings,
+        resident_bindings,
         kv_history,
         absolute_position_override,
         node_events,
@@ -3842,6 +3884,7 @@ fn execute_qwen_graph_nodes(
     prepared_plan: &mut PreparedExecutionPlan,
     executor: &Arc<dyn ProviderExecutionApi>,
     initial_bindings: BTreeMap<TensorEdgeId, HostTensor>,
+    resident_bindings: BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)>,
     kv_history: Option<&QwenLayerKvMap>,
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
@@ -3914,6 +3957,14 @@ fn execute_qwen_graph_nodes(
             })?;
         bindings.insert(edge_id, (resource_id, shape));
     }
+    // Graph inputs ALREADY resident in this executing Provider's own
+    // storage (`add-real-multi-device-model-instance-placement`'s real
+    // peer-to-peer segment boundary, `CudaExecutor::copy_tensor_from_
+    // peer_admitted` having already written the caller-chosen resource id
+    // directly -- no Host round trip, no write here at all): just record
+    // which resource each such edge resolves to, exactly like a freshly-
+    // written `initial_bindings` entry above once it has been written.
+    bindings.extend(resident_bindings);
     let mut layer_k: Vec<Option<TensorResourceId>> = vec![None; layer_count];
     let mut layer_v: Vec<Option<TensorResourceId>> = vec![None; layer_count];
     let mut last_dispatch: Option<KernelDispatchResult> = None;
@@ -6296,16 +6347,36 @@ fn load_fixture_instance_segment_with_weights_for_provider(
     Ok(instance)
 }
 
+/// A segment graph's own starting boundary input for a segment not
+/// beginning at layer 0 (`input.hidden_states_in`, `model-component-
+/// graph.wit` 1.3.0) -- `add-real-multi-device-model-instance-placement`'s
+/// real, zero-Host-round-trip counterpart of the original Host-only
+/// boundary.
+pub enum QwenSegmentBoundaryInput {
+    /// A Host-resident tensor, written into this segment's own Provider
+    /// storage the same way any other graph input is -- a real, explicit
+    /// data movement step, but one that stages through the Host.
+    Host(HostTensor),
+    /// A tensor ALREADY resident in this segment's own Provider storage
+    /// under `resource_id`, real shape `shape` -- e.g. written directly by
+    /// a real, zero-Host-round-trip Device-to-Device move
+    /// (`CudaExecutor::copy_tensor_from_peer_admitted`, `add-real-peer-to-
+    /// peer-gpu-movement`) before this dispatch. No write happens here at
+    /// all; the resource id is simply recorded as this edge's own binding.
+    Resident {
+        resource_id: TensorResourceId,
+        shape: Vec<u64>,
+    },
+}
+
 /// `run_first_native_graph_dispatch`, restricted to decoder layer range
 /// `[start_layer, end_layer)` (`add-real-multi-device-model-instance-
 /// placement`): binds `token_ids` to `input.token_ids` when `start_layer
 /// == 0` (a segment's own first, leftmost range), exactly like a full
 /// graph; otherwise binds `boundary_input` (the *previous* segment's own
-/// real, Host-materialized output -- see
-/// [`run_first_native_graph_segment_with_provider_and_weights`]'s doc
-/// comment on why this is a Host round-trip rather than a real Device-to-
-/// Device move) to `input.hidden_states_in`, matching `model-component-
-/// graph.wit` 1.3.0's segment boundary semantics.
+/// real output, either Host-staged or already Device-resident -- see
+/// [`QwenSegmentBoundaryInput`]) to `input.hidden_states_in`, matching
+/// `model-component-graph.wit` 1.3.0's segment boundary semantics.
 /// `kv_history` is this SAME segment's own prior-step KV state (`None` for
 /// a prefill-segment graph, `Some` for a decode-segment graph continuing a
 /// prior prefill or decode step against this segment); `absolute_position_
@@ -6325,7 +6396,7 @@ pub fn run_first_native_graph_segment_dispatch(
     kv_cache_id: &KvCacheId,
     token_ids: &[u32],
     start_layer: u32,
-    boundary_input: Option<HostTensor>,
+    boundary_input: Option<QwenSegmentBoundaryInput>,
     kv_history: Option<&QwenLayerKvMap>,
     absolute_position_override: Option<u64>,
 ) -> Result<FirstNativeProviderRunOutcome, E2eConformanceError> {
@@ -6334,9 +6405,13 @@ pub fn run_first_native_graph_segment_dispatch(
     let sequence_length = if start_layer == 0 {
         token_ids.len() as u64
     } else {
-        boundary_input
-            .as_ref()
-            .and_then(|tensor| tensor.shape.first().copied())
+        let shape = match &boundary_input {
+            Some(QwenSegmentBoundaryInput::Host(tensor)) => Some(&tensor.shape),
+            Some(QwenSegmentBoundaryInput::Resident { shape, .. }) => Some(shape),
+            None => None,
+        };
+        shape
+            .and_then(|shape| shape.first().copied())
             .ok_or_else(|| E2eConformanceError::FixtureInvalid {
                 reason: "segment starting mid-stack requires a boundary hidden-state tensor \
                           with a non-empty shape"
@@ -6352,7 +6427,7 @@ pub fn run_first_native_graph_segment_dispatch(
         PreparedExecutionPlanGeneration::new(1),
         provider_binding,
     )?;
-    let initial_bindings = if start_layer == 0 {
+    let (initial_bindings, resident_bindings) = if start_layer == 0 {
         let ids_tensor = HostTensor::new(
             [token_ids.len() as u64],
             token_ids.iter().map(|id| *id as f32).collect::<Vec<_>>(),
@@ -6360,15 +6435,29 @@ pub fn run_first_native_graph_segment_dispatch(
         .map_err(|error| E2eConformanceError::GenerationFailed {
             reason: error.to_string(),
         })?;
-        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)])
+        (
+            BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)]),
+            BTreeMap::new(),
+        )
     } else {
-        let hidden = boundary_input.ok_or_else(|| E2eConformanceError::FixtureInvalid {
+        match boundary_input.ok_or_else(|| E2eConformanceError::FixtureInvalid {
             reason: "segment starting mid-stack requires a boundary hidden-state tensor".into(),
-        })?;
-        BTreeMap::from([(TensorEdgeId::new("input.hidden_states_in"), hidden)])
+        })? {
+            QwenSegmentBoundaryInput::Host(hidden) => (
+                BTreeMap::from([(TensorEdgeId::new("input.hidden_states_in"), hidden)]),
+                BTreeMap::new(),
+            ),
+            QwenSegmentBoundaryInput::Resident { resource_id, shape } => (
+                BTreeMap::new(),
+                BTreeMap::from([(
+                    TensorEdgeId::new("input.hidden_states_in"),
+                    (resource_id, shape),
+                )]),
+            ),
+        }
     };
     let mut node_events = Vec::new();
-    let (dispatch, bindings, layer_kv, resolved_provider) = execute_qwen_graph(
+    let (dispatch, bindings, layer_kv, resolved_provider) = execute_qwen_graph_with_resident_input(
         &mut runtime,
         fixture,
         &instance,
@@ -6376,6 +6465,7 @@ pub fn run_first_native_graph_segment_dispatch(
         graph,
         &mut plan,
         initial_bindings,
+        resident_bindings,
         kv_history,
         absolute_position_override,
         &mut node_events,
@@ -6408,18 +6498,17 @@ pub fn run_first_native_graph_segment_dispatch(
 /// bindings` after `execute_qwen_graph`'s own Host-materialization
 /// boundary.
 ///
-/// This crosses through the Host between two segments on two different
-/// Providers/Devices -- a real, explicit, caller-orchestrated data
-/// movement step (the design's own "explicit movement"), but not yet the
-/// real, zero-Host-round-trip Device-to-Device move
-/// `CudaExecutor::copy_tensor_from_peer_admitted` already proves is
-/// possible (`add-real-peer-to-peer-gpu-movement`). Replacing this
-/// Host round-trip with that real primitive for the CUDA-to-CUDA case is
-/// real follow-up work, not something this function's own correctness
-/// depends on: the boundary tensor's real numeric values are identical
-/// either way (proven bit-for-bit by Phase B.1's own single-Provider
-/// segment-split correctness check), only *how* they cross Devices
-/// differs.
+/// This single-shot convenience wrapper always crosses through the Host
+/// between two segments -- fine for a quick prefill-only proof (Phase
+/// B.1/B.2's own single-dispatch tests). A caller wanting the real,
+/// zero-Host-round-trip Device-to-Device move
+/// (`CudaExecutor::copy_tensor_from_peer_admitted`, `add-real-peer-to-
+/// peer-gpu-movement`) for this boundary instead should call
+/// [`run_first_native_graph_segment_dispatch`] directly with
+/// [`QwenSegmentBoundaryInput::Resident`], after writing the peer-copied
+/// data into this segment's own Provider storage themselves -- the
+/// generalization this wrapper's own single-`HostTensor` shape does not
+/// expose.
 ///
 /// A single-shot convenience wrapper (loads a fresh segment Model
 /// Instance, then runs exactly one dispatch): fine for a one-off prefill,
@@ -6459,7 +6548,7 @@ pub fn run_first_native_graph_segment_with_provider_and_weights(
         kv_cache_id,
         token_ids,
         start_layer,
-        boundary_input,
+        boundary_input.map(QwenSegmentBoundaryInput::Host),
         None,
         Some(0),
     )
@@ -12699,7 +12788,7 @@ fn check_two_segment_split_decode_step_matches_full_graph_decode() -> Result<(),
         &segment_cache,
         &prompt,
         mid,
-        Some(segment_one_prefill_hidden),
+        Some(QwenSegmentBoundaryInput::Host(segment_one_prefill_hidden)),
         None,
         Some(0),
     )?;
@@ -12750,7 +12839,7 @@ fn check_two_segment_split_decode_step_matches_full_graph_decode() -> Result<(),
         &segment_cache,
         &[admitted],
         mid,
-        Some(segment_one_decode_hidden),
+        Some(QwenSegmentBoundaryInput::Host(segment_one_decode_hidden)),
         Some(&segment_two_prefill_outcome.layer_kv),
         Some(prompt_len),
     )?;

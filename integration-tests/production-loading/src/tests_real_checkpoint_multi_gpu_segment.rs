@@ -339,7 +339,9 @@ fn real_public_checkpoint_multi_gpu_segment_decode_matches_full_graph_on_one_gpu
             &gpu1_cache,
             &step_token_ids,
             mid,
-            Some(boundary_hidden),
+            Some(magnetar_runtime::QwenSegmentBoundaryInput::Host(
+                boundary_hidden,
+            )),
             gpu1_kv_history,
             Some(gpu1_position),
         )
