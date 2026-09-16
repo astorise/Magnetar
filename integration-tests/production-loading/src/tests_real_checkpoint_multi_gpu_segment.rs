@@ -352,7 +352,19 @@ fn real_public_checkpoint_multi_gpu_segment_decode_matches_full_graph_on_one_gpu
             .get(&magnetar_runtime::TensorEdgeId::new("logits"))
             .expect("real GPU 1's own segment produced the real logits output");
 
-        let next_token = argmax(&logits.data);
+        // `logits.shape` is `[sequence_length, vocab_size]` -- prefill's
+        // sequence_length is the real prompt length (every row a real
+        // position's own distribution), so only the LAST row is this
+        // step's actual next-token prediction. Sampling over the whole
+        // flattened multi-row tensor (as if it were one row) is wrong for
+        // any sequence_length > 1: the resulting flat index can exceed
+        // vocab_size and is not a valid token id at all.
+        let vocab_size = *logits
+            .shape
+            .last()
+            .expect("logits tensor has a non-empty shape") as usize;
+        let last_row_start = logits.data.len() - vocab_size;
+        let next_token = argmax(&logits.data[last_row_start..]);
         generated_token_ids.push(next_token);
     }
 
