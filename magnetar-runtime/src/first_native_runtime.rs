@@ -7848,6 +7848,7 @@ pub fn load_production_qwen_instance_for_provider(
 /// when tied (the Hugging Face loader's own `DerivedLmHeadPayloadSource`
 /// derives it once, ahead of this call), so no separate lm-head-
 /// derivation step is needed here.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub fn load_production_qwen_instance_segment_for_provider(
     runtime: &mut Runtime,
     manifest: &ModelManifest,
@@ -12539,6 +12540,235 @@ fn check_two_segment_split_produces_identical_output_to_full_graph()
                       graph's final logits; the two-segment test is not exercising a real \
                       mid-stack boundary"
                 .into(),
+        });
+    }
+    Ok(())
+}
+
+/// Phase C's own real correctness proof, cheap and Reference-CPU-only
+/// (`add-real-multi-device-model-instance-placement`): a real DECODE step
+/// split across two segment Model Instances -- each loaded *once*
+/// (`load_first_native_segment_with_provider_and_weights`) and dispatched
+/// *twice* (a real prefill, then a real decode step reusing the same
+/// Instance and threading its own `FirstNativeProviderRunOutcome::
+/// layer_kv` forward via `run_first_native_graph_segment_dispatch`'s
+/// `kv_history` parameter, exactly like a real multi-step generation loop
+/// would) -- SHALL produce bit-for-bit the same decode logits as running
+/// the identical prompt and follow-up token through the one, full,
+/// unsegmented graph's own prefill-then-decode pair. Phase B.1/B.2 above
+/// only ever proved a single prefill dispatch; this is the first
+/// (cheap, always-run, not `#[ignore]`d) proof that segment DECODE --
+/// `build_first_native_decode_graph_segment_for_config` and the
+/// `kv_history`/`absolute_position_override` threading
+/// `run_first_native_graph_segment_dispatch` gained for Phase C -- is
+/// correct, independent of and much cheaper than the real ~1GB-checkpoint,
+/// two-real-GPU proof in `integration-tests/production-loading`.
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+fn check_two_segment_split_decode_step_matches_full_graph_decode() -> Result<(), E2eConformanceError>
+{
+    let fixture = two_layer_segment_test_fixture()?;
+    let num_hidden_layers = fixture.config.architecture.layer_count as u32;
+    let mid = num_hidden_layers / 2;
+    if mid == 0 || mid == num_hidden_layers {
+        return Err(E2eConformanceError::FixtureInvalid {
+            reason: "segment split test fixture must have at least 2 decoder layers".into(),
+        });
+    }
+    let prompt: [TokenId; 3] = [3, 5, 7];
+    let admitted: TokenId = 9;
+    let prompt_len = prompt.len() as u64;
+
+    // Reference: the real, full, unsegmented graph's own prefill-then-
+    // decode pair, exactly like `check_graph_executor_matches_full_
+    // sequence_oracle`'s own pattern.
+    let mut full_runtime = build_runtime_trusting_fixture(&fixture);
+    let full_instance =
+        load_fixture_instance_with_weights(&fixture, &mut full_runtime, &fixture.weights)?;
+    let mut full_plans =
+        first_native_plans_for_prompt(&full_runtime, &fixture, &full_instance, prompt_len)?;
+    let full_graphs = first_native_component_graphs_for_prompt(&fixture, prompt_len)?;
+    let full_cache = KvCacheId::new("segment-decode-coverage-full-cache")?;
+    let prompt_ids = HostTensor::new(
+        [prompt_len],
+        prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+    )?;
+    let (_prefill_dispatch, _prefill_bindings, full_layer_kv, _provider) = execute_qwen_graph(
+        &mut full_runtime,
+        &fixture,
+        &full_instance,
+        &full_cache,
+        &full_graphs.prefill,
+        &mut full_plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), prompt_ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let admitted_ids = HostTensor::new([1], vec![admitted as f32])?;
+    let (_decode_dispatch, full_decode_bindings, _updated_layer_kv, _provider) =
+        execute_qwen_graph(
+            &mut full_runtime,
+            &fixture,
+            &full_instance,
+            &full_cache,
+            &full_graphs.decode,
+            &mut full_plans.decode,
+            BTreeMap::from([(TensorEdgeId::new("input.token_ids"), admitted_ids)]),
+            Some(&full_layer_kv),
+            Some(prompt_len),
+            &mut Vec::new(),
+        )
+        .map_err(E2eConformanceError::from)?;
+    let full_decode_logits = full_decode_bindings
+        .get(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "full graph decode produced no logits output".into(),
+        })?
+        .data
+        .clone();
+
+    // Segmented: each segment's own Model Instance loaded once, dispatched
+    // twice (prefill, then decode reusing its own updated `layer_kv`).
+    let provider: Arc<dyn Provider> = Arc::new(ReferenceCpuProvider::new());
+    let (segment_one_runtime, segment_one_instance, segment_one_binding) =
+        load_first_native_segment_with_provider_and_weights(
+            provider.clone(),
+            &fixture,
+            &fixture.weights,
+            0,
+            mid,
+        )?;
+    let (segment_two_runtime, segment_two_instance, segment_two_binding) =
+        load_first_native_segment_with_provider_and_weights(
+            provider,
+            &fixture,
+            &fixture.weights,
+            mid,
+            num_hidden_layers,
+        )?;
+    let segment_cache = KvCacheId::new("segment-decode-coverage-segment-cache")?;
+
+    let (segment_one_prefill_graph, _definition, _instance) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            prompt_len,
+            0,
+            mid,
+        )?;
+    let segment_one_prefill_outcome = run_first_native_graph_segment_dispatch(
+        segment_one_runtime,
+        &fixture,
+        segment_one_instance,
+        &segment_one_binding,
+        &segment_one_prefill_graph,
+        &segment_cache,
+        &prompt,
+        0,
+        None,
+        None,
+        Some(0),
+    )?;
+    let segment_one_prefill_hidden = segment_one_prefill_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "segment one prefill produced no logits-named output".into(),
+        })?
+        .clone();
+
+    let (segment_two_prefill_graph, _definition, _instance) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            prompt_len,
+            mid,
+            num_hidden_layers,
+        )?;
+    let segment_two_prefill_outcome = run_first_native_graph_segment_dispatch(
+        segment_two_runtime,
+        &fixture,
+        segment_two_instance,
+        &segment_two_binding,
+        &segment_two_prefill_graph,
+        &segment_cache,
+        &prompt,
+        mid,
+        Some(segment_one_prefill_hidden),
+        None,
+        Some(0),
+    )?;
+
+    let (segment_one_decode_graph, _definition, _instance) =
+        build_first_native_decode_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            prompt_len,
+            0,
+            mid,
+        )?;
+    let segment_one_decode_outcome = run_first_native_graph_segment_dispatch(
+        segment_one_prefill_outcome.runtime,
+        &fixture,
+        segment_one_prefill_outcome.instance,
+        &segment_one_binding,
+        &segment_one_decode_graph,
+        &segment_cache,
+        &[admitted],
+        0,
+        None,
+        Some(&segment_one_prefill_outcome.layer_kv),
+        Some(prompt_len),
+    )?;
+    let segment_one_decode_hidden = segment_one_decode_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "segment one decode produced no logits-named output".into(),
+        })?
+        .clone();
+
+    let (segment_two_decode_graph, _definition, _instance) =
+        build_first_native_decode_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            prompt_len,
+            mid,
+            num_hidden_layers,
+        )?;
+    let segment_two_decode_outcome = run_first_native_graph_segment_dispatch(
+        segment_two_prefill_outcome.runtime,
+        &fixture,
+        segment_two_prefill_outcome.instance,
+        &segment_two_binding,
+        &segment_two_decode_graph,
+        &segment_cache,
+        &[admitted],
+        mid,
+        Some(segment_one_decode_hidden),
+        Some(&segment_two_prefill_outcome.layer_kv),
+        Some(prompt_len),
+    )?;
+    let segmented_decode_logits = segment_two_decode_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "segment two decode produced no logits output".into(),
+        })?
+        .data
+        .clone();
+
+    if full_decode_logits != segmented_decode_logits {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "two-segment decode step does not bit-for-bit match the full graph's own \
+                 decode step: full={full_decode_logits:?} segmented={segmented_decode_logits:?}"
+            ),
         });
     }
     Ok(())

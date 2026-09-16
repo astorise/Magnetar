@@ -3042,6 +3042,16 @@ fn e2e_two_segment_split_produces_identical_output_to_full_graph() {
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
+fn e2e_two_segment_split_decode_step_matches_full_graph_decode() {
+    check_two_segment_split_decode_step_matches_full_graph_decode().expect(
+        "a real decode step split across two segment Model Instances, each dispatched twice \
+         (prefill then decode) with its own KV state threaded forward, must bit-for-bit match \
+         the full, unsegmented graph's own decode step",
+    );
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
 fn e2e_qwen_component_artifact_trust_is_validated_before_planning() {
     validate_and_instantiate_trusted_qwen_component_before_first_native_planning()
         .expect("trusted Qwen Component fixture validates before planning");
