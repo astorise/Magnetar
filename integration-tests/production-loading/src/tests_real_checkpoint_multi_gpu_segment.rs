@@ -150,11 +150,19 @@ fn real_public_checkpoint_multi_gpu_segment_decode_matches_full_graph_on_one_gpu
         Arc::new(magnetar_provider_cuda::CudaProvider::new()),
     )
     .expect("the real full-graph reference generation runs end to end on real GPU 0 alone");
+    let reference_token_ids = reference_outcome.result.output.generated_token_ids.clone();
     assert_eq!(
-        reference_outcome.result.output.generated_token_ids.len(),
+        reference_token_ids.len(),
         MAX_TOKENS,
         "the real single-GPU reference must generate all requested tokens"
     );
+    // Release the reference run's own real GPU 0 Runtime (and everything
+    // it holds resident -- the full checkpoint's real weights) before the
+    // segmented pipeline below opens its own, separate real GPU 0 Runtime
+    // -- debugging real hardware contention between two concurrently live
+    // CUDA contexts on the same physical Device, not something this
+    // pipeline's own correctness should ever depend on.
+    drop(reference_outcome);
 
     // The two-real-GPU segmented pipeline, against the same real ingested
     // checkpoint/tokenizer/prompt.
@@ -354,7 +362,7 @@ fn real_public_checkpoint_multi_gpu_segment_decode_matches_full_graph_on_one_gpu
         "the two-real-GPU segmented pipeline must generate all requested tokens"
     );
     assert_eq!(
-        generated_token_ids, reference_outcome.result.output.generated_token_ids,
+        generated_token_ids, reference_token_ids,
         "the two-real-GPU segmented pipeline must select exactly the same real greedy tokens, \
          at every real step (prefill and every real decode step), as the real full graph \
          dispatched on one real GPU alone"
