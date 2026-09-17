@@ -6241,6 +6241,7 @@ fn qwen_real_component_package() -> Result<ComponentArtifactPackage, E2eConforma
 /// polluting -- the real process environment. `env_var_name` names the
 /// Component `.wasm` file itself; its manifest is expected alongside it as
 /// `<path>.magnetar-component.yaml`.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn resolve_qwen_component_from_env_var(
     env_var_name: &str,
 ) -> Result<ComponentArtifactPackage, E2eConformanceError> {
