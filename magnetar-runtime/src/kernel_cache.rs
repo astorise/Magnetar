@@ -842,3 +842,6 @@ pub fn run_kernel_cache_conformance() -> KernelCacheConformanceReport {
 
     KernelCacheConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;

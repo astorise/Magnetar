@@ -4457,3 +4457,6 @@ pub fn run_kernel_artifact_manifest_conformance() -> KernelManifestConformanceRe
 
     KernelManifestConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;

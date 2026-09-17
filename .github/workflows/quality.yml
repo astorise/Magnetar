@@ -233,13 +233,16 @@ jobs:
   # their own doc comments); `first_native_implementation_cut.rs` and
   # `e2e_conformance.rs` are explicitly scoped to the first-native
   # (currently Qwen) cut and to test/conformance fixtures respectively, not
-  # generic Core; `model_format_roadmap.rs`, `model_source_cache_roadmap.rs`,
-  # `provider_roadmap.rs`, `release_cutover.rs`, `release_packaging.rs`, and
-  # `release_security.rs` are roadmap/release-process files whose explicit
+  # generic Core. The roadmap/release-process files this guard used to name
+  # here (`model_format_roadmap.rs`, `model_source_cache_roadmap.rs`,
+  # `provider_roadmap.rs`, `release_cutover.rs`, `release_packaging.rs`,
+  # `release_security.rs`) no longer live in `magnetar-runtime/src/` at all
+  # -- they moved to the `roadmap-contracts/` crate (#62), whose explicit
   # purpose is to name specific model families (planned format/provider
-  # support, the current release's own Qwen-baseline scope) -- naming a
+  # support, the current release's own Qwen-baseline scope); naming a
   # family there is the point, not a leak, so this guard does not apply to
-  # them. `tests.rs` and other `#[cfg(test)]`-only modules are exempt for
+  # them, and now can't even see them. `tests.rs` and other
+  # `#[cfg(test)]`-only modules are exempt for
   # the same reason as the "explicitly isolated tests/oracles" carve-out in
   # the tracking issue: a fixture identifier string is not live Core logic.
   model-family-isolation:
@@ -283,6 +286,58 @@ jobs:
               fail=1
             fi
           done
+          exit "$fail"
+
+  # #54/#63: the whole point of moving unit tests out of magnetar-runtime's
+  # production files and into per-module `tests.rs` siblings was to stop
+  # coverage tooling (and human readers) from having to see test code mixed
+  # into production source -- a blocking gate is what actually keeps that
+  # property, since a warning-only check would let exactly the same
+  # inline-test debt this effort just removed grow back one PR at a time.
+  # Scoped to magnetar-runtime/src and roadmap-contracts/src (#62's
+  # extraction target), both of which this effort already brought to zero
+  # violations -- deliberately NOT magnetar-cli/src, which has its own
+  # separate, established inline `mod tests { ... }` convention that was
+  # never part of this effort and this guard has no mandate to break.
+  #
+  # Two independent rules, each precise enough to avoid flagging the
+  # legitimate `#[cfg(test)]` uses #54/#63's own inventory found and chose
+  # to keep (see the tracking issue): cfg-gated build-variant dispatch
+  # (multiple `fn` bodies for the same signature, selected by target/feature
+  # config) and cfg-gated statements inside an otherwise-production function
+  # that call into a `tests` submodule. Neither rule below touches those --
+  # only an actual `#[test]` function body, or an inline `mod tests { ... }`
+  # block, living directly in a file that is not itself a dedicated test
+  # file:
+  #   1. `#[test]` found in a file whose name is not `tests.rs` /
+  #      `*_tests.rs` / `*-tests.rs`.
+  #   2. `mod tests { ... }` (a body) rather than the canonical
+  #      `#[cfg(test)] mod tests;` pointer to a sibling file.
+  test-code-placement:
+    name: quality / test code placement
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Reject inline test implementations outside dedicated tests.rs files
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r -d '' file; do
+            base="$(basename "$file")"
+            case "$base" in
+              tests.rs|*_tests.rs|*-tests.rs) continue ;;
+            esac
+            if grep -nE '^\s*#\[test\]' "$file" >/dev/null; then
+              echo "::error file=$file::#[test] function found outside a dedicated tests.rs file -- move it to this module's sibling tests.rs (see #54/#63)"
+              fail=1
+            fi
+            if grep -nE '^\s*mod\s+tests\s*\{' "$file" >/dev/null; then
+              echo "::error file=$file::inline 'mod tests { ... }' found -- move its body to a sibling tests.rs and declare 'mod tests;' here instead (see #54/#63)"
+              fail=1
+            fi
+          done < <(find magnetar-runtime/src roadmap-contracts/src -name '*.rs' -print0)
           exit "$fail"
 
   # Component integration (task 15.6): Component submodules only, sparse
@@ -453,56 +508,50 @@ jobs:
             providers/npu/Cargo.toml \
             providers/tpu/Cargo.toml \
             loaders/huggingface/Cargo.toml \
-            loaders/gguf/Cargo.toml \
-            integration-tests/production-loading/Cargo.toml \
-            integration-tests/multi-device-cpu-cuda/Cargo.toml \
-            inference-components/Cargo.toml
+            loaders/gguf/Cargo.toml
           do
             echo "::group::$manifest"
             cargo test --locked --manifest-path "$manifest"
             echo "::endgroup::"
           done
-      # `magnetar-cli` moved out of the repository root's `[workspace]`
-      # (`implement-production-qwen-model-loading` task 10.4): it depends
-      # on `loaders/huggingface`, so a plain root-level `cargo check`/
-      # `clippy`/`test`/`fmt --all` (which run with submodules absent) can
-      # no longer cover it. This is the one job that checks it out
-      # recursively, so it is the one job that builds, tests, formats, and
-      # lints `magnetar-cli` now -- not merely `cargo test` like the other
-      # submodule crates above, since `magnetar-cli` is first-party code
-      # this repository owns directly, not an externalized module.
-      - name: Format-check magnetar-cli
+      # `magnetar-cli`, `inference-components`, and the three
+      # `integration-tests/*` crates are first-party code this repository
+      # owns directly (not externalized modules), but each depends on a
+      # submodule absent from a plain root-level build (`loaders/
+      # huggingface`, `loaders/gguf`, `providers/cpu`, `providers/cuda`) --
+      # `implement-production-qwen-model-loading` task 10.4 moved
+      # `magnetar-cli` out of the repository root's `[workspace]` for
+      # exactly this reason, and the other four followed the same pattern
+      # independently over time (#64: five separate `[workspace]` tables,
+      # five separate `Cargo.lock`s, three of the five never even covered
+      # by a `cargo fmt`/`clippy` step -- `integration-tests/cuda-first-
+      # native` was in no workflow at all before #58,
+      # `inference-components` was built and tested nowhere before this
+      # job first added it). All five now share one `[workspace]` in
+      # `submodule-workspace/Cargo.toml` (each declares
+      # `package.workspace = "../submodule-workspace"` or
+      # `"../../submodule-workspace"` instead of its own `[workspace]`
+      # table), so this is the one job that checks them out recursively
+      # and the one place that now builds, tests, formats, and lints all
+      # five together, in the same `--workspace` shape the root-level jobs
+      # above use for `magnetar-runtime`.
+      - name: Format-check the submodule workspace
         shell: bash
-        run: cargo fmt --manifest-path magnetar-cli/Cargo.toml --all -- --check
-      - name: Check and test magnetar-cli
+        run: cargo fmt --manifest-path submodule-workspace/Cargo.toml --all -- --check
+      - name: Check and test the submodule workspace
         shell: bash
         run: |
           set -euo pipefail
-          cargo check --locked --manifest-path magnetar-cli/Cargo.toml --all-targets --all-features
-          cargo test --locked --manifest-path magnetar-cli/Cargo.toml --all-targets
-      - name: Clippy magnetar-cli
+          cargo check --locked --manifest-path submodule-workspace/Cargo.toml --workspace --all-targets --all-features
+          cargo test --locked --manifest-path submodule-workspace/Cargo.toml --workspace --all-targets --all-features
+      - name: Clippy the submodule workspace
         shell: bash
-        run: cargo clippy --locked --manifest-path magnetar-cli/Cargo.toml --all-targets --all-features -- -D warnings
-      - name: Build magnetar-cli documentation
+        run: cargo clippy --locked --manifest-path submodule-workspace/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+      - name: Build submodule workspace documentation
         shell: bash
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --manifest-path magnetar-cli/Cargo.toml --no-deps
-      # `inference-components` (the Tachyon-facing `LoadedInferenceComponent`
-      # boundary the Tachyon integration audit itself reviewed) has the same
-      # shape as `magnetar-cli` above: its own `[workspace]`, moved out of
-      # the repository root because it depends on `loaders/gguf`/`loaders/
-      # huggingface`/`providers/cpu` submodules absent from a plain
-      # root-level build. Before this step it was built and tested nowhere
-      # in CI at all -- found while closing the audit's own outstanding
-      # gap (no integration test drove `LoadedInferenceComponent::load`
-      # itself), added here rather than silently left uncovered.
-      - name: Format-check inference-components
-        shell: bash
-        run: cargo fmt --manifest-path inference-components/Cargo.toml --all -- --check
-      - name: Clippy inference-components
-        shell: bash
-        run: cargo clippy --locked --manifest-path inference-components/Cargo.toml --all-targets -- -D warnings
+        run: cargo doc --locked --manifest-path submodule-workspace/Cargo.toml --workspace --no-deps
       # `implement-production-qwen-model-loading` task 12.8: production
       # loading/generation SHALL NOT call `fixture_model_manifest`, a
       # fixture tensor inventory builder, or require the literal
@@ -575,6 +624,68 @@ jobs:
             echo "::error file=magnetar-runtime/Cargo.toml::magnetar-runtime's resolved dependency graph includes an externalized Component/Provider/Format crate"
             exit 1
           fi
+      # #59: the root `deny` job above checks out without submodules by
+      # design (`externalize-runtime-extension-modules`'s "zero
+      # compile-time dependency on any externalized module"), so it never
+      # sees `magnetar-cli`'s ~200-crate dependency graph (through
+      # `loaders/huggingface` -> `tokenizers`) or any of the crates below --
+      # the same gap `provider-integration`'s own `cargo deny` steps closed
+      # for the Provider submodules. This job already checks out every
+      # submodule recursively, so it is the natural place to close the
+      # rest.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@5724fe4561a201b0d36bddf13177e3557b43787b # cargo-deny
+      - name: Check the submodule workspace's dependency graph (advisories, bans, licenses, sources)
+        # `--allow wildcard --allow unlicensed`: `magnetar-format-safetensors`
+        # and `magnetar-loader-huggingface` (external submodules this
+        # repository does not own) declare neither `license` nor
+        # `publish = false` in their own Cargo.toml, which trips
+        # cargo-deny's `unlicensed` check and its `wildcard` check
+        # (`allow-wildcard-paths` only exempts a crate cargo-deny can see
+        # is unpublishable). Not fixable from this repository; scoped to
+        # exactly these two lint classes so a real license/bans/advisories/
+        # sources regression elsewhere in this graph still fails the
+        # build. `--manifest-path submodule-workspace/Cargo.toml` checks
+        # all five of `magnetar-cli`/`inference-components`/the three
+        # `integration-tests/*` crates in one resolved graph (#64) --
+        # cargo-deny's own default scope for a workspace manifest is every
+        # member, so this replaces what used to be five separate steps.
+        run: cargo deny --manifest-path submodule-workspace/Cargo.toml check --allow wildcard --allow unlicensed
+      - name: Check loaders/huggingface's own dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path loaders/huggingface/Cargo.toml check --allow wildcard --allow unlicensed
+      - name: Check loaders/gguf's own dependency graph (advisories, bans, licenses, sources)
+        run: cargo deny --manifest-path loaders/gguf/Cargo.toml check --allow wildcard --allow unlicensed
+
+  # #54's own separate request: a re-baseline should record *why* in a
+  # structured field, not only as prose appended to `notes` (which had grown
+  # to a single ~4 KB ever-growing string). tools/check_coverage_baseline_history.py
+  # enforces that going forward: if a PR changes quality/coverage-baseline.json's
+  # recorded line_coverage_percent/function_coverage_percent, its
+  # rebaseline_history array must have gained a new entry whose own
+  # `recorded` figures match and which carries a non-empty `reason`. Only
+  # runs on pull_request (needs the PR's base commit to diff against); a
+  # direct push to main skips it.
+  coverage-baseline-history:
+    name: quality / coverage baseline history
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Require a structured rebaseline_history entry when the recorded percentages change
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "$BASE_SHA"
+          if git diff --quiet "$BASE_SHA" -- quality/coverage-baseline.json; then
+            echo "quality/coverage-baseline.json unchanged in this PR"
+            exit 0
+          fi
+          git show "$BASE_SHA:quality/coverage-baseline.json" > /tmp/base-coverage-baseline.json
+          python3 tools/check_coverage_baseline_history.py \
+            quality/coverage-baseline.json /tmp/base-coverage-baseline.json
 
   coverage:
     name: quality / coverage
@@ -591,8 +702,19 @@ jobs:
       - name: Prepare coverage output
         run: mkdir -p target/llvm-cov
       - name: Generate coverage
+        # `--exclude-from-report magnetar-roadmap-contracts`: that crate
+        # still builds and its own tests still run here (part of
+        # `--workspace`), but its ~17,500 lines of executable roadmap/
+        # release-process contracts (#62) are near-100%-covered by
+        # construction (they're conformance tests for their own module) and
+        # would otherwise reinflate this ratchet the same way #54 found
+        # them doing when they lived inside magnetar-runtime itself --
+        # `roadmap_contracts` (crate name, not package name) since
+        # `--exclude-from-report`/`--exclude` match the library/binary
+        # name cargo-llvm-cov resolves per-crate, not the `[package] name`.
         run: >
           cargo llvm-cov --locked --workspace --all-targets --all-features
+          --exclude-from-report magnetar-roadmap-contracts
           --ignore-filename-regex '(^|/)(target|tests?)/'
           --json --summary-only --output-path target/llvm-cov/coverage.json
       - name: Generate LCOV artifact

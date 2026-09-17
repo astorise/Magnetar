@@ -73,7 +73,7 @@
 //! - [`V0_1_FINAL_RELEASE_STATEMENT`] / [`validate_final_release_statement`]:
 //!   "Final Release Statement".
 //! - [`ReleaseCutoverObservation`] / [`record_release_cutover_observation`]:
-//!   observability, composing [`crate::CorrelationId`] (for gate/target/
+//!   observability, composing [`magnetar_runtime::CorrelationId`] (for gate/target/
 //!   feature-set/artifact correlation) and
 //!   [`crate::release_security::record_release_security_observation`] (for
 //!   default redaction) instead of a third redaction implementation.
@@ -98,17 +98,17 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::{
-    ArtifactChecksum, ArtifactIntegrityStatus, CorrelationId, REQUIRED_RELEASE_GATES,
-    ReleaseArtifactManifest, ReleaseBinaryVersionReport, ReleaseChangelog, ReleaseFeatureFlag,
-    ReleaseFeatureFlagClass, ReleaseFreezeChangeKind, ReleaseFreezeState, ReleaseGateResult,
-    ReleaseSecurityGateInputs, ReleaseSecurityObservation, ReleaseSecurityObservationKind,
-    ReleaseVersion, SecurityException, SecurityReleaseNotes, WitInterface,
-    evaluate_release_security_blocking, record_release_security_observation,
+    ArtifactChecksum, ArtifactIntegrityStatus, REQUIRED_RELEASE_GATES, ReleaseArtifactManifest,
+    ReleaseBinaryVersionReport, ReleaseChangelog, ReleaseFeatureFlag, ReleaseFeatureFlagClass,
+    ReleaseFreezeChangeKind, ReleaseFreezeState, ReleaseGateResult, ReleaseSecurityGateInputs,
+    ReleaseSecurityObservation, ReleaseSecurityObservationKind, ReleaseVersion, SecurityException,
+    SecurityReleaseNotes, evaluate_release_security_blocking, record_release_security_observation,
     reject_change_after_freeze, reject_experimental_flag_enabled_by_default,
     reject_roadmap_feature_as_guarantee, release_may_publish_stable,
     validate_cli_authority_not_delegated_to_runtime, validate_provider_feature_flags_for_v0_1,
     validate_runtime_inference_api_security, verify_checksum_matches_final_artifact,
 };
+use magnetar_runtime::{CorrelationId, WitInterface};
 
 pub const RELEASE_CUTOVER_POLICY_VERSION: &str = "0.1.0";
 
@@ -1162,7 +1162,7 @@ pub fn record_release_cutover_observation(
 /// "CLI boundary gate failed SHALL block release"
 /// (`specs/cli-boundary/spec.md`): composes
 /// [`validate_cli_authority_not_delegated_to_runtime`] (which itself already
-/// composes `crate::cli_boundary::reject_cli_owned_authority`) rather than
+/// composes `magnetar_runtime::cli_boundary::reject_cli_owned_authority`) rather than
 /// importing the CLI boundary module a second time.
 pub fn validate_cutover_cli_boundary(capability: &str) -> Result<(), ReleaseCutoverError> {
     validate_cli_authority_not_delegated_to_runtime(capability).map_err(|error| {
@@ -1175,7 +1175,7 @@ pub fn validate_cutover_cli_boundary(capability: &str) -> Result<(), ReleaseCuto
 /// "Runtime includes tool execution SHALL block release"
 /// (`specs/runtime/spec.md`): composes
 /// [`validate_runtime_inference_api_security`] (which itself already
-/// composes `crate::inference_api::validate_inference_scope`) rather than
+/// composes `magnetar_runtime::inference_api::validate_inference_scope`) rather than
 /// importing the Runtime Inference API module a second time.
 pub fn validate_cutover_runtime_scope(capability: &str) -> Result<(), ReleaseCutoverError> {
     validate_runtime_inference_api_security(capability).map_err(|error| {

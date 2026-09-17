@@ -2,9 +2,9 @@
 //! `openspec/changes/define-post-baseline-model-source-and-cache-roadmap`).
 //!
 //! The baseline Runtime resolves models through a caller-supplied
-//! [`crate::inference_api::ModelRef`] and a [`crate::inference_api::ModelRegistry`],
-//! and stores artifacts through the existing [`crate::model::ModelArtifactSource`]
-//! / [`crate::model::ModelTrustStore`] contracts. This module does not
+//! [`magnetar_runtime::inference_api::ModelRef`] and a [`magnetar_runtime::inference_api::ModelRegistry`],
+//! and stores artifacts through the existing [`magnetar_runtime::model::ModelArtifactSource`]
+//! / [`magnetar_runtime::model::ModelTrustStore`] contracts. This module does not
 //! implement real downloads, a `magnetar model pull` UX, a registry
 //! protocol, a model hub API, a Tachyon distribution protocol, a cache
 //! directory layout, or production credential storage -- the proposal's
@@ -17,26 +17,26 @@
 //!   local-directory-source, external-registry-source, model-hub-source,
 //!   tachyon-provided-source), with [`ModelSourceKind::from_artifact_source`]
 //!   and [`ModelSourceKind::from_resolution_source`] proving they normalize
-//!   onto the *existing* [`crate::model::ModelArtifactSource`] and
-//!   [`crate::inference_api::ModelResolutionSource`] contracts rather than a
+//!   onto the *existing* [`magnetar_runtime::model::ModelArtifactSource`] and
+//!   [`magnetar_runtime::inference_api::ModelResolutionSource`] contracts rather than a
 //!   parallel source type. [`ModelSourceKind::grants_trust`] is always
 //!   `false` -- "Source kind SHALL not imply trust" made structurally
 //!   checkable.
 //! - [`validate_development_fixture_source`] /
 //!   [`development_fixture_requires_explicit_trust_evaluation`),
 //!   [`validate_client_provided_source`], [`validate_local_directory_source`]
-//!   (composing [`crate::model_format_roadmap::validate_local_file_boundary`]
+//!   (composing [`magnetar_runtime::model_format_roadmap::validate_local_file_boundary`]
 //!   rather than duplicating the local-file boundary), and
 //!   [`validate_remote_source_policy`] for the external-registry /
 //!   model-hub / Tachyon-provided source kinds.
 //! - [`CacheKey`]: digest-based cache addressing built on the existing
-//!   [`crate::model::ModelDigest`]. [`CacheEntryRef::redacted_path`] never
+//!   [`magnetar_runtime::model::ModelDigest`]. [`CacheEntryRef::redacted_path`] never
 //!   returns the raw cache path unless a caller explicitly attests
 //!   disclosure is policy-allowed.
 //! - [`CacheEntryMetadata`]: the cache entry metadata fields from the
-//!   proposal, reusing [`crate::model::ModelArtifactId`],
-//!   [`crate::model::ModelShardId`], [`crate::tokenizer::TokenizerArtifactId`],
-//!   and [`crate::adapter::AdapterArtifactId`] rather than parallel identity
+//!   proposal, reusing [`magnetar_runtime::model::ModelArtifactId`],
+//!   [`magnetar_runtime::model::ModelShardId`], [`magnetar_runtime::tokenizer::TokenizerArtifactId`],
+//!   and [`magnetar_runtime::adapter::AdapterArtifactId`] rather than parallel identity
 //!   types.
 //! - [`CacheLifecycleState`]: the thirteen lifecycle states from the
 //!   proposal, with [`reject_non_ready_cache_entry_for_loading`] denying
@@ -45,7 +45,7 @@
 //!   [`validate_cache_shard_integrity`]: "cache presence SHALL not imply
 //!   trust" and "cache integrity SHALL be validated" made checkable --
 //!   cached trust is always re-evaluated through
-//!   [`crate::model::ModelTrustStore`], never trusted blindly.
+//!   [`magnetar_runtime::model::ModelTrustStore`], never trusted blindly.
 //! - [`authorize_cache_mutation`] / [`CacheMutationKind`]: policy-controlled
 //!   cache mutation, denying eviction/pruning of entries with active Model
 //!   Instance references regardless of policy.
@@ -62,7 +62,7 @@
 //!   verified unless validated by policy".
 //! - [`validate_adapter_cache_entry`] / [`validate_tokenizer_cache_entry`]:
 //!   adapter/tokenizer cache compatibility, composing
-//!   [`crate::adapter::AdapterBaseModelCompatibility`] rather than a parallel
+//!   [`magnetar_runtime::adapter::AdapterBaseModelCompatibility`] rather than a parallel
 //!   compatibility type.
 //! - [`cache_presence_implies_memory_residency`]: always `false` -- cache
 //!   storage is bytes and metadata; residency remains owned by Model Loading
@@ -79,15 +79,16 @@
 //! - [`ModelSourceCacheRoadmapConformanceReport`] /
 //!   [`run_model_source_cache_roadmap_conformance`]: a small conformance
 //!   report, in the shape of
-//!   [`crate::model_format_roadmap::ModelFormatRoadmapConformanceReport`],
+//!   [`magnetar_runtime::model_format_roadmap::ModelFormatRoadmapConformanceReport`],
 //!   asserting the roadmap guarantees above hold.
 
-use crate::compute::redact_backend_diagnostic;
-use crate::{
+use magnetar_runtime::{
     AdapterArtifactId, AdapterBaseModelCompatibility, ModelArtifactId, ModelArtifactSource,
     ModelDigest, ModelLicenseMetadata, ModelManifest, ModelResolutionSource, ModelShard,
     ModelShardId, ModelTrustDecision, ModelTrustStatus, ModelTrustStore, TokenizerArtifactId,
+    compute::redact_backend_diagnostic,
 };
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -141,7 +142,7 @@ impl ModelSourceKind {
     /// Whether this source kind implies trust by itself. Always `false` --
     /// "Source kind SHALL not imply trust" is the roadmap's central
     /// invariant; trust always comes from [`evaluate_cache_trust`] /
-    /// [`crate::model::ModelTrustStore`], never from which source produced
+    /// [`magnetar_runtime::model::ModelTrustStore`], never from which source produced
     /// the artifact.
     pub const fn grants_trust(self) -> bool {
         false
@@ -174,7 +175,7 @@ impl ModelSourceKind {
 
     /// Normalizes an existing [`ModelResolutionSource`] into a roadmap
     /// source kind. Returns `None` for [`ModelResolutionSource::LocalRegistry`],
-    /// which names a *lookup mechanism* (the local [`crate::inference_api::ModelRegistry`])
+    /// which names a *lookup mechanism* (the local [`magnetar_runtime::inference_api::ModelRegistry`])
     /// rather than an artifact source kind.
     pub const fn from_resolution_source(source: ModelResolutionSource) -> Option<Self> {
         match source {
@@ -298,17 +299,16 @@ impl CacheEntryRef {
 
 /// "Runtime SHALL not recursively scan arbitrary directories during
 /// inference": composes the existing
-/// [`crate::model_format_roadmap::validate_local_file_boundary`] rather than
+/// [`magnetar_runtime::model_format_roadmap::validate_local_file_boundary`] rather than
 /// duplicating the local-file authorization boundary.
 pub fn validate_local_directory_source(
     source: &ModelArtifactSource,
     authorized: bool,
 ) -> Result<(), ModelSourceCacheRoadmapError> {
-    crate::model_format_roadmap::validate_local_file_boundary(source, authorized).map_err(|error| {
-        ModelSourceCacheRoadmapError::ModelSourceInvalid {
+    magnetar_runtime::model_format_roadmap::validate_local_file_boundary(source, authorized)
+        .map_err(|error| ModelSourceCacheRoadmapError::ModelSourceInvalid {
             reason: error.to_string(),
-        }
-    })
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -331,11 +331,11 @@ pub fn validate_remote_source_policy(
 // ---------------------------------------------------------------------
 
 /// What a `ModelRef` resolution attempt produced, mirroring the proposal's
-/// "ModelRef Resolution" target list. Reuses [`crate::model_instance::ModelInstanceId`]
+/// "ModelRef Resolution" target list. Reuses [`magnetar_runtime::model_instance::ModelInstanceId`]
 /// and [`ModelArtifactId`] rather than introducing parallel identity types.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelRefResolutionOutcome {
-    ExistingInstance(crate::model_instance::ModelInstanceId),
+    ExistingInstance(magnetar_runtime::model_instance::ModelInstanceId),
     CachedArtifact(ModelArtifactId),
     SourceCandidate {
         kind: ModelSourceKind,
@@ -367,7 +367,7 @@ pub fn resolve_model_ref_candidates(
 // ---------------------------------------------------------------------
 
 /// A user-facing model alias, structurally distinct from
-/// [`crate::inference_api::ModelRef`] -- resolving an alias always produces
+/// [`magnetar_runtime::inference_api::ModelRef`] -- resolving an alias always produces
 /// a `ModelRef`, never a loaded model.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ModelAlias(String);
@@ -427,7 +427,7 @@ impl ModelAliasTable {
 
 /// Reports which roadmap-named digest identity fields an already-validated
 /// [`ModelManifest`] carries, mirroring
-/// [`crate::model_format_roadmap::NormalizedManifestCoverage`] -- proving
+/// [`magnetar_runtime::model_format_roadmap::NormalizedManifestCoverage`] -- proving
 /// the *existing* [`ModelArtifactId`]/[`ModelManifest`] contract already
 /// carries the roadmap's identity fields rather than introducing a parallel
 /// identity type.
@@ -666,7 +666,7 @@ fn now_unix_seconds() -> u64 {
 /// "Cache presence SHALL not imply trust" / "policy SHALL determine whether
 /// cached trust is still acceptable" / "revocation checks MAY invalidate
 /// cached trust": always re-evaluates trust through [`ModelTrustStore`];
-/// `revoked` short-circuits to [`crate::model::ModelTrustStatus::Revoked`]
+/// `revoked` short-circuits to [`magnetar_runtime::model::ModelTrustStatus::Revoked`]
 /// regardless of any previously cached trust status.
 pub fn evaluate_cache_trust(
     store: &ModelTrustStore,
@@ -674,7 +674,14 @@ pub fn evaluate_cache_trust(
     revoked: bool,
 ) -> ModelTrustDecision {
     if revoked {
-        return ModelTrustDecision::new(ModelTrustStatus::Revoked, "cached trust was revoked");
+        // Same public path `ModelTrustStore::evaluate` itself uses to reach
+        // `Revoked` (checked before `Trusted`, so this wins regardless of
+        // what `store` already says) -- not `ModelTrustDecision::new`, which
+        // is deliberately `pub(crate)`-only inside magnetar-runtime (see its
+        // struct-level doc comment) and not reachable from this crate.
+        return ModelTrustStore::default()
+            .revoke_digest(manifest.id.digest.value.clone())
+            .evaluate(manifest);
     }
     store.evaluate(manifest)
 }
@@ -943,7 +950,7 @@ impl SourcePolicy {
 /// "License metadata SHALL not be treated as verified unless validated by
 /// policy": requires an explicit `policy_validated` attestation before a
 /// declared license can gate loading, mirroring
-/// [`crate::model_format_roadmap::reject_silent_tokenizer_config_override`]'s
+/// [`magnetar_runtime::model_format_roadmap::reject_silent_tokenizer_config_override`]'s
 /// shape.
 pub fn validate_license_policy(
     license: &ModelLicenseMetadata,
@@ -1030,7 +1037,7 @@ pub fn validate_tokenizer_cache_entry(
 
 /// "Cache presence SHALL not imply artifact is memory-resident": always
 /// `false`. [`CacheEntryMetadata`] has no field through which a
-/// [`crate::tensor::TensorResource`] or [`crate::memory::MemoryAllocation`]
+/// [`magnetar_runtime::tensor::TensorResource`] or [`magnetar_runtime::memory::MemoryAllocation`]
 /// could be represented -- residency is owned exclusively by Model Loading
 /// and Memory Manager.
 pub const fn cache_presence_implies_memory_residency() -> bool {
@@ -1239,7 +1246,7 @@ impl ModelSourceCacheRoadmapObservation {
 // ---------------------------------------------------------------------
 
 /// A single model source/cache roadmap conformance check result, mirroring
-/// [`crate::model_format_roadmap::ModelFormatRoadmapConformanceResult`].
+/// [`magnetar_runtime::model_format_roadmap::ModelFormatRoadmapConformanceResult`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelSourceCacheRoadmapConformanceResult {
     pub requirement: String,
@@ -1412,14 +1419,14 @@ pub fn run_model_source_cache_roadmap_conformance() -> ModelSourceCacheRoadmapCo
         record(
             &mut results,
             "revoked cached trust always wins over stored trust",
-            revoked.status == ModelTrustStatus::Revoked,
+            revoked.status() == ModelTrustStatus::Revoked,
             format!("unexpected trust decision: {revoked:?}"),
         );
         let unrecognized = evaluate_cache_trust(&store, &manifest, false);
         record(
             &mut results,
             "an unrecognized digest is not trusted merely because it is cached",
-            unrecognized.status == ModelTrustStatus::Unknown,
+            unrecognized.status() == ModelTrustStatus::Unknown,
             format!("unexpected trust decision: {unrecognized:?}"),
         );
     }
@@ -1538,11 +1545,11 @@ pub fn run_model_source_cache_roadmap_conformance() -> ModelSourceCacheRoadmapCo
 
 /// A minimal, otherwise-unremarkable manifest used only to probe trust
 /// evaluation in [`run_model_source_cache_roadmap_conformance`].
-fn probe_manifest() -> ModelManifest {
+pub(crate) fn probe_manifest() -> ModelManifest {
     ModelManifest {
-        schema_version: crate::MODEL_ARTIFACT_SCHEMA_VERSION,
+        schema_version: magnetar_runtime::MODEL_ARTIFACT_SCHEMA_VERSION,
         id: probe_artifact_id("source-cache-roadmap-probe"),
-        architecture: crate::ModelArchitecture::new("probe", "probe"),
+        architecture: magnetar_runtime::ModelArchitecture::new("probe", "probe"),
         parts: BTreeMap::new(),
         storage_dtype: None,
         compute_dtype: None,
@@ -1570,9 +1577,9 @@ fn probe_manifest() -> ModelManifest {
 fn probe_artifact_id(name: &str) -> ModelArtifactId {
     let digest = ModelDigest::sha256(name.as_bytes());
     ModelArtifactId::new(
-        crate::ModelArtifactKind::ModelBundle,
-        crate::ModelName::new(name).expect("valid probe name"),
-        crate::ModelRevision::new("v1").expect("valid probe revision"),
+        magnetar_runtime::ModelArtifactKind::ModelBundle,
+        magnetar_runtime::ModelName::new(name).expect("valid probe name"),
+        magnetar_runtime::ModelRevision::new("v1").expect("valid probe revision"),
         digest,
     )
 }

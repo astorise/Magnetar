@@ -31,7 +31,27 @@ use magnetar_runtime::CliBoundaryError;
 /// carries only `name`, so it is always safe to print via
 /// `render::print_error`.
 pub fn read_env_secret(name: &str) -> Result<String, CliBoundaryError> {
-    match std::env::var(name) {
+    map_var_lookup(name, std::env::var(name))
+}
+
+/// The pure mapping from a `std::env::var` lookup result to this module's
+/// structured, redacted error -- split out from [`read_env_secret`] so it
+/// can be tested against constructed `Result` values instead of the real
+/// process environment (#68: `std::env::set_var`/`remove_var` are `unsafe`
+/// in Rust 2024 precisely because they race with any *concurrent*
+/// environment access on another thread, and `cargo test` runs tests in
+/// parallel threads within one process. The previous "SAFETY: test-local,
+/// unique variable name" comments addressed name *collisions*, not the
+/// actual hazard, which is any concurrent access at all -- including a
+/// plain `std::env::var` read inside another test or a dependency racing
+/// with one of these tests' `set_var`/`remove_var` calls. Testing this pure
+/// mapping instead removes the hazard entirely rather than trying to
+/// synchronize around it).
+fn map_var_lookup(
+    name: &str,
+    lookup: Result<String, std::env::VarError>,
+) -> Result<String, CliBoundaryError> {
+    match lookup {
         Ok(value) => Ok(value),
         Err(std::env::VarError::NotPresent) => Err(CliBoundaryError::CliSecretUnavailable {
             reason: format!("environment variable '{name}' is not set"),
@@ -45,29 +65,22 @@ pub fn read_env_secret(name: &str) -> Result<String, CliBoundaryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env::VarError;
 
     #[test]
-    fn read_env_secret_returns_the_value_of_a_present_variable() {
-        let name = "MAGNETAR_CLI_TEST_SECRET_PRESENT";
-        // SAFETY: test-local, unique variable name not read/written by any
-        // other test in this crate.
-        unsafe {
-            std::env::set_var(name, "super-secret-test-value");
-        }
-        let value = read_env_secret(name).expect("variable was set");
+    fn present_variable_returns_its_value() {
+        let value = map_var_lookup(
+            "MAGNETAR_CLI_TEST_SECRET_PRESENT",
+            Ok("super-secret-test-value".to_string()),
+        )
+        .expect("variable was set");
         assert_eq!(value, "super-secret-test-value");
-        unsafe {
-            std::env::remove_var(name);
-        }
     }
 
     #[test]
-    fn read_env_secret_missing_variable_is_cli_secret_unavailable_naming_only_the_var() {
+    fn missing_variable_is_cli_secret_unavailable_naming_only_the_var() {
         let name = "MAGNETAR_CLI_TEST_SECRET_MISSING";
-        unsafe {
-            std::env::remove_var(name);
-        }
-        let error = read_env_secret(name).unwrap_err();
+        let error = map_var_lookup(name, Err(VarError::NotPresent)).unwrap_err();
         match &error {
             CliBoundaryError::CliSecretUnavailable { reason } => {
                 assert!(reason.contains(name));
@@ -76,26 +89,47 @@ mod tests {
         }
     }
 
-    /// Proves the redaction guarantee end to end: a real secret value is
-    /// set in the environment, but the structured error this module builds
-    /// when a *different* (missing) variable is requested never contains
-    /// that value, and `render::print_error`'s rendering of the error is
-    /// built only from the error's `Display` impl, which in turn only ever
-    /// sees the variable name for this variant.
+    /// #68: `VarError::NotUnicode` was previously untested (a real
+    /// non-UTF-8 environment variable is awkward to construct portably in
+    /// a test at all) -- constructing the error value directly makes it
+    /// trivial, and confirms this path is redacted exactly like
+    /// `NotPresent`.
+    #[test]
+    fn non_unicode_variable_is_cli_secret_unavailable_and_never_renders_the_raw_value() {
+        let name = "MAGNETAR_CLI_TEST_SECRET_NON_UNICODE";
+        let raw = std::ffi::OsString::from("definitely-a-secret-marker-9f3c");
+        let error = map_var_lookup(name, Err(VarError::NotUnicode(raw))).unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains(name));
+        assert!(!rendered.contains("definitely-a-secret-marker-9f3c"));
+    }
+
+    /// Proves the redaction guarantee end to end: the structured error
+    /// this module builds for a missing variable's lookup never contains a
+    /// value that happens to look like a secret, and `render::print_error`
+    /// (via `render_error_never_uses_debug_formatting_of_the_boundary_error_itself`)
+    /// separately proves rendering only ever uses this `Display` output.
     #[test]
     fn secret_value_never_leaks_into_a_cli_secret_unavailable_error_for_another_variable() {
-        let present_name = "MAGNETAR_CLI_TEST_SECRET_LEAK_CHECK_PRESENT";
         let missing_name = "MAGNETAR_CLI_TEST_SECRET_LEAK_CHECK_MISSING";
         let secret_value = "definitely-a-secret-marker-9f3c";
-        unsafe {
-            std::env::set_var(present_name, secret_value);
-            std::env::remove_var(missing_name);
-        }
-        let error = read_env_secret(missing_name).unwrap_err();
+        let error = map_var_lookup(missing_name, Err(VarError::NotPresent)).unwrap_err();
         let rendered = error.to_string();
         assert!(!rendered.contains(secret_value));
-        unsafe {
-            std::env::remove_var(present_name);
-        }
+    }
+
+    /// One narrow check that the public entry point is genuinely wired to
+    /// `std::env::var`, not only `map_var_lookup` in isolation --
+    /// deliberately reads a variable this test never sets (a plain read,
+    /// with no concurrent writer, carries none of `set_var`/`remove_var`'s
+    /// hazard) rather than reintroducing environment mutation.
+    #[test]
+    fn read_env_secret_reports_a_variable_that_is_genuinely_absent() {
+        let name = "MAGNETAR_CLI_TEST_SECRET_GENUINELY_ABSENT_7f2e9c";
+        let error = read_env_secret(name).unwrap_err();
+        assert!(matches!(
+            error,
+            CliBoundaryError::CliSecretUnavailable { .. }
+        ));
     }
 }

@@ -70,10 +70,13 @@ Run the Post-Baseline Provider Roadmap contract tests:
 cargo test -p magnetar-runtime provider_roadmap -- --nocapture
 ```
 
-Run the Post-Baseline Server API Roadmap contract tests:
+Run the Post-Baseline Server API Roadmap contract tests (moved out of
+`magnetar-runtime` into `magnetar-roadmap-contracts` by #62; `-p
+magnetar-runtime` above still covers `provider_roadmap` and
+`model_format_roadmap`, the two roadmap modules that stayed):
 
 ```powershell
-cargo test -p magnetar-runtime server_api_roadmap -- --nocapture
+cargo test --manifest-path roadmap-contracts/Cargo.toml server_api_roadmap -- --nocapture
 ```
 
 Build Rust documentation with warnings denied. The docs gate covers the default
@@ -145,6 +148,39 @@ cargo deny --all-features check
 
 The policy lives in `deny.toml`. An exception belongs in that file with a
 reason, never as a skipped CI step.
+
+## Submodule Workspace
+
+The commands above cover the root `[workspace]`
+(`magnetar-runtime`, `roadmap-contracts`, `tools/coverage-ratchet`) --
+crates with no dependency on an externalized submodule, so a plain checkout
+without `submodules: recursive` can build them.
+
+`magnetar-cli`, `inference-components`, and the three `integration-tests/*`
+crates depend on a submodule that is not present in every checkout
+(`loaders/huggingface`, `loaders/gguf`, `providers/cpu`, `providers/cuda`),
+so they live in a second workspace instead: `submodule-workspace/Cargo.toml`
+(#64). Run the same commands against it with `--manifest-path
+submodule-workspace/Cargo.toml --workspace` in place of `--workspace` alone,
+after checking out submodules (`git submodule update --init --recursive`
+covers this whole workspace's dependencies):
+
+```bash
+cargo fmt --manifest-path submodule-workspace/Cargo.toml --all -- --check
+cargo clippy --locked --manifest-path submodule-workspace/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --manifest-path submodule-workspace/Cargo.toml --workspace --all-targets --all-features
+cargo deny --manifest-path submodule-workspace/Cargo.toml check --allow wildcard --allow unlicensed
+```
+
+`--allow wildcard --allow unlicensed` on the `deny` check exists for the same
+reason as `loaders/huggingface`'s own check above: this workspace's resolved
+graph reaches external submodule crates that declare neither `license` nor
+`publish = false`, not fixable from this repository.
+
+`loaders/huggingface` and `loaders/gguf` themselves are externalized
+submodules, not first-party code, so they are not members of this workspace
+-- they keep their own manifests, checked independently (see
+`.github/workflows/quality.yml`'s `submodule-integration` job).
 
 ## Coverage Policy
 

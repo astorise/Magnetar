@@ -1092,3 +1092,6 @@ pub fn provider_conformance_profile_ids(
         .map(|profile| (profile.id().into(), profile.required_by_default()))
         .collect()
 }
+
+#[cfg(test)]
+mod tests;

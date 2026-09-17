@@ -1,0 +1,20 @@
+[workspace]
+# #64: shared workspace root for the crates that are first-party code in
+# this repository but depend on an externalized submodule not present in
+# every checkout (loaders/huggingface, loaders/gguf, providers/cpu,
+# providers/cuda, formats/gguf) -- the same reason each of these five used
+# to declare its own, separate `[workspace]` table (one `Cargo.lock` per
+# crate, none of them covered by a plain root-level `cargo fmt`/`clippy`/
+# `test --workspace`). This directory holds no crate of its own; it exists
+# purely so no one member "owns" the group. Built/tested/linted via
+# `--manifest-path submodule-workspace/Cargo.toml --workspace` in
+# `.github/workflows/quality.yml`'s `submodule-integration` job, the one
+# job that checks out submodules recursively.
+members = [
+    "../magnetar-cli",
+    "../inference-components",
+    "../integration-tests/production-loading",
+    "../integration-tests/multi-device-cpu-cuda",
+    "../integration-tests/cuda-first-native",
+]
+resolver = "2"

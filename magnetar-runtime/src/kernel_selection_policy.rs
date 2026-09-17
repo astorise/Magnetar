@@ -2266,3 +2266,6 @@ pub fn run_kernel_selection_policy_conformance() -> KernelSelectionPolicyConform
 
     KernelSelectionPolicyConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;

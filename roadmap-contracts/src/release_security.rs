@@ -44,41 +44,41 @@
 //! - [`ArtifactIntegrityStatus`]: the "Artifact Integrity" policy.
 //! - [`validate_redaction_gate`] / [`record_release_security_observation`]:
 //!   the "Redaction Gates" and "Observability" policies, composing
-//!   `crate::compute::redact_backend_diagnostic` with the additional
+//!   `magnetar_runtime::compute::redact_backend_diagnostic` with the additional
 //!   secret/credential/prompt-shaped content this change's redaction gate
 //!   covers.
 //! - [`ProviderTrustModel`] / [`DynamicProviderLoadingStatus`] /
 //!   [`validate_dynamic_provider_loading_status`] /
 //!   [`ProviderTrustSignalSource`] /
 //!   [`reject_provider_registration_implies_trust`]: the "Provider Trust
-//!   Boundary" policy, composing [`crate::provider::ProviderLoadingMode`].
+//!   Boundary" policy, composing [`magnetar_runtime::provider::ProviderLoadingMode`].
 //! - [`reject_release_native_handle_exposure`][]: the "Native Handle Boundary"
 //!   policy, composing
 //!   [`crate::release_packaging::reject_release_public_api_handle_exposure`]
-//!   and [`crate::provider_roadmap::reject_provider_specific_handle_capability`]
+//!   and [`magnetar_runtime::provider_roadmap::reject_provider_specific_handle_capability`]
 //!   instead of a third forbidden-fragment list.
 //! - [`validate_component_release_execution_trust`] /
 //!   [`reject_component_release_authority_expansion`]: the "Component
 //!   Artifact Trust Boundary" policy, composing
-//!   [`crate::component::ComponentTrustDecision`] and
-//!   [`crate::inference_api::validate_inference_scope`].
+//!   [`magnetar_runtime::component::ComponentTrustDecision`] and
+//!   [`magnetar_runtime::inference_api::validate_inference_scope`].
 //! - [`validate_model_artifact_release_trust`] / [`FixtureModelTrustPolicy`]
 //!   / [`validate_fixture_model_trust`]: the "Model Artifact Trust Boundary"
-//!   policy, composing [`crate::model::ModelTrustDecision`].
+//!   policy, composing [`magnetar_runtime::model::ModelTrustDecision`].
 //! - [`validate_source_cache_release_trust`] / [`NonTrustCacheSignal`] /
 //!   [`reject_cache_signal_alone_as_trust`]: the "Source Cache Trust
 //!   Boundary" policy, composing
 //!   [`crate::model_source_cache_roadmap::CacheEntryMetadata`].
 //! - [`validate_cli_authority_not_delegated_to_runtime`]: the "CLI Boundary
 //!   Security" policy, composing
-//!   [`crate::cli_boundary::reject_cli_owned_authority`].
+//!   [`magnetar_runtime::cli_boundary::reject_cli_owned_authority`].
 //! - [`validate_runtime_inference_api_security`]: the "Runtime Inference API
 //!   Security" policy, composing
-//!   [`crate::inference_api::validate_inference_scope`].
+//!   [`magnetar_runtime::inference_api::validate_inference_scope`].
 //! - [`UnsafeCodeReview`] / [`UnsafeCodePolicy`] /
 //!   [`magnetar_runtime_unsafe_code_inventory`]: the "Unsafe Code Policy",
 //!   including the concrete real inventory of every `unsafe` fn in this
-//!   crate's required baseline (`crate::provider::ProviderLoader`'s dynamic
+//!   crate's required baseline (`magnetar_runtime::provider::ProviderLoader`'s dynamic
 //!   loading functions).
 //! - [`DependencyFeatureCapability`] / [`DependencyFeatureReview`] /
 //!   [`reject_unexpected_capability_expanding_feature`]: the "Dependency
@@ -105,13 +105,14 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    ArtifactChecksum, CacheEntryMetadata, ComponentTrustDecision, ComponentTrustStatus,
-    ModelTrustDecision, ModelTrustStatus, ProviderLoadingMode,
-    cli_boundary::reject_cli_owned_authority,
-    compute::redact_backend_diagnostic,
-    inference_api::validate_inference_scope,
+    ArtifactChecksum, CacheEntryMetadata, release_packaging::redact_build_metadata,
+    release_packaging::reject_release_public_api_handle_exposure,
+};
+use magnetar_runtime::{
+    ComponentTrustDecision, ComponentTrustStatus, ModelTrustDecision, ModelTrustStatus,
+    ModelTrustStore, ProviderLoadingMode, cli_boundary::reject_cli_owned_authority,
+    compute::redact_backend_diagnostic, inference_api::validate_inference_scope,
     provider_roadmap::reject_provider_specific_handle_capability,
-    release_packaging::{redact_build_metadata, reject_release_public_api_handle_exposure},
 };
 
 pub const RELEASE_SECURITY_POLICY_VERSION: &str = "0.1.0";
@@ -889,7 +890,7 @@ pub fn validate_component_release_execution_trust(
 /// authorized by inference-scoped contracts": composes
 /// [`validate_inference_scope`] (OS-capability authority) and
 /// [`reject_release_native_handle_exposure`] (native handle authority)
-/// against a [`crate::component::ComponentAuthorityRequirement`]'s `kind`
+/// against a [`magnetar_runtime::component::ComponentAuthorityRequirement`]'s `kind`
 /// string, rather than a parallel Component-specific forbidden list.
 pub fn reject_component_release_authority_expansion(
     capability: &str,
@@ -921,9 +922,9 @@ pub fn validate_model_artifact_release_trust(
     recognized_format: bool,
 ) -> Result<(), ReleaseSecurityError> {
     let _ = recognized_format;
-    if decision.status != ModelTrustStatus::Trusted {
+    if decision.status() != ModelTrustStatus::Trusted {
         return Err(ReleaseSecurityError::ModelArtifactUntrusted {
-            reason: decision.reason.clone(),
+            reason: decision.reason().to_string(),
         });
     }
     Ok(())
@@ -1072,10 +1073,10 @@ impl UnsafeCodePolicy {
 /// the only `unsafe` surface in `magnetar-runtime`'s required baseline is
 /// `ProviderLoader::load_dynamic`, `ProviderLoader::load_dynamic_with_policy`,
 /// and `ProviderLoader::discover_and_load` in
-/// [`crate::provider`] -- each already carries a `# Safety` doc comment
+/// [`magnetar_runtime::provider`] -- each already carries a `# Safety` doc comment
 /// justifying it (dynamic Provider loading is inherently an FFI/native-code
 /// boundary) and is call-site-gated by
-/// [`crate::provider::ProviderLoadingPolicy::allows`].
+/// [`magnetar_runtime::provider::ProviderLoadingPolicy::allows`].
 pub fn magnetar_runtime_unsafe_code_inventory() -> UnsafeCodePolicy {
     UnsafeCodePolicy {
         reviews: vec![
@@ -2143,7 +2144,13 @@ pub fn run_release_security_conformance() -> ReleaseSecurityConformanceReport {
     }
 
     {
-        let untrusted = ModelTrustDecision::new(ModelTrustStatus::Unknown, "no policy matched");
+        // `ModelTrustDecision::new` is deliberately `pub(crate)`-only inside
+        // magnetar-runtime (see its struct-level doc comment) and not
+        // reachable from this crate -- `Unknown`/`Trusted` decisions here go
+        // through the same public `ModelTrustStore::evaluate` path any real
+        // caller uses instead.
+        let untrusted_manifest = crate::model_source_cache_roadmap::probe_manifest();
+        let untrusted = ModelTrustStore::default().evaluate(&untrusted_manifest);
         let outcome = validate_model_artifact_release_trust(&untrusted, true);
         record(
             &mut results,
@@ -2154,7 +2161,10 @@ pub fn run_release_security_conformance() -> ReleaseSecurityConformanceReport {
             ),
             format!("unexpected outcome: {outcome:?}"),
         );
-        let trusted = ModelTrustDecision::new(ModelTrustStatus::Trusted, "digest trusted");
+        let trusted_manifest = crate::model_source_cache_roadmap::probe_manifest();
+        let trusted = ModelTrustStore::default()
+            .trust_digest(trusted_manifest.id.digest.value.clone())
+            .evaluate(&trusted_manifest);
         record(
             &mut results,
             "a policy-trusted Model Artifact is accepted",
@@ -2167,7 +2177,10 @@ pub fn run_release_security_conformance() -> ReleaseSecurityConformanceReport {
     }
 
     {
-        let trusted = ModelTrustDecision::new(ModelTrustStatus::Trusted, "fixture trusted");
+        let fixture_manifest = crate::model_source_cache_roadmap::probe_manifest();
+        let trusted = ModelTrustStore::default()
+            .trust_digest(fixture_manifest.id.digest.value.clone())
+            .evaluate(&fixture_manifest);
         let undocumented = FixtureModelTrustPolicy::default();
         let outcome = validate_fixture_model_trust(&trusted, &undocumented);
         record(
@@ -2195,8 +2208,10 @@ pub fn run_release_security_conformance() -> ReleaseSecurityConformanceReport {
 
     {
         use crate::{
-            CacheIntegrityStatus, CacheLifecycleState, CacheValidationStatus, ModelArtifactId,
-            ModelArtifactKind, ModelDigest, ModelName, ModelRevision, ModelSourceKind,
+            CacheIntegrityStatus, CacheLifecycleState, CacheValidationStatus, ModelSourceKind,
+        };
+        use magnetar_runtime::{
+            ModelArtifactId, ModelArtifactKind, ModelDigest, ModelName, ModelRevision,
         };
 
         let mut entry = CacheEntryMetadata::new(

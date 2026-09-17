@@ -1,5 +1,8 @@
 # Magnetar
 
+[![Quality](https://github.com/astorise/Magnetar/actions/workflows/quality.yml/badge.svg)](https://github.com/astorise/Magnetar/actions/workflows/quality.yml)
+[![GPU Runner Smoke Test](https://github.com/astorise/Magnetar/actions/workflows/gpu-runner-smoke.yml/badge.svg)](https://github.com/astorise/Magnetar/actions/workflows/gpu-runner-smoke.yml)
+
 Magnetar is a Rust runtime for portable local AI execution.
 
 The current implementation is a v0.1 local-runtime baseline with real

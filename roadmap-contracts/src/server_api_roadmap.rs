@@ -2,8 +2,8 @@
 //! `openspec/changes/define-post-baseline-server-api-roadmap`).
 //!
 //! Magnetar's first baseline exposes inference only through the in-process
-//! Runtime Inference API (see [`crate::inference_api`]) and the
-//! `magnetar-cli` boundary (see [`crate::cli_boundary`]). This module does
+//! Runtime Inference API (see [`magnetar_runtime::inference_api`]) and the
+//! `magnetar-cli` boundary (see [`magnetar_runtime::cli_boundary`]). This module does
 //! not implement `magnetar serve`, an HTTP server, TLS, production
 //! authentication, or a finalized wire schema -- the change's proposal
 //! "Non-Goals" section rules all of that out explicitly. Instead it defines,
@@ -27,15 +27,15 @@
 //!   load/unload request is only accepted with an explicit proof that Model
 //!   Source, Cache, Model Artifact, Model Loading, trust, integrity,
 //!   compatibility, and policy validation all ran (mirroring how
-//!   [`crate::provider_roadmap::validate_fused_kernel_declaration`] requires
+//!   [`magnetar_runtime::provider_roadmap::validate_fused_kernel_declaration`] requires
 //!   an explicit declaration rather than a boolean rubber stamp), and
 //!   arbitrary local paths are rejected via the existing
-//!   [`crate::model_format_roadmap::validate_local_file_boundary`].
+//!   [`magnetar_runtime::model_format_roadmap::validate_local_file_boundary`].
 //! - [`ServerSessionRequest`] / [`reject_server_session_owned_authority`][]:
 //!   implementing "Session Endpoints Preserve Inference Session Scope" by
-//!   composing [`crate::inference_api::validate_inference_scope`] over
+//!   composing [`magnetar_runtime::inference_api::validate_inference_scope`] over
 //!   [`SessionCreationRequest::allowed_capabilities`], analogous to
-//!   [`crate::cli_boundary::reject_cli_owned_authority`].
+//!   [`magnetar_runtime::cli_boundary::reject_cli_owned_authority`].
 //! - [`ServerGenerationRequest`] / [`ServerGenerationRuntimeContext`] /
 //!   [`build_runtime_generation_request`][]: the illustrative Generation
 //!   Endpoint request surface from the proposal (model/session reference,
@@ -57,7 +57,7 @@
 //!   tensor, KV cache, and handle payload kinds explicitly).
 //! - [`server_cancellation_calls_runtime_cancellation`][]: implementing
 //!   "Cancellation Calls Runtime Cancellation" by composing
-//!   [`crate::inference_api::request_cancellation_at_stage`].
+//!   [`magnetar_runtime::inference_api::request_cancellation_at_stage`].
 //! - [`ServerDiagnosticsSummary`] / [`server_diagnostics_summary`][]:
 //!   implementing "Diagnostics Are Redacted" -- summary/count fields only,
 //!   built from the existing [`RuntimeDiagnostics`].
@@ -69,7 +69,7 @@
 //!   / [`redact_server_diagnostic`][]: implementing "Authentication Is Server
 //!   Boundary" -- an opaque, credential-free authentication marker plus
 //!   reuse of [`crate::model_source_cache_roadmap::reject_credential_in_metadata`]
-//!   and `crate::compute::redact_backend_diagnostic`.
+//!   and `magnetar_runtime::compute::redact_backend_diagnostic`.
 //! - [`ServerAuthorizationScope`] / [`ServerAuthorizationDecision`] /
 //!   [`authorize_server_request`][]: implementing "Authorization Does Not
 //!   Bypass Runtime Policy" -- server authorization and Runtime policy are
@@ -77,10 +77,10 @@
 //! - [`ServerAdmissionLimits`] / [`ServerAdmissionState`] /
 //!   [`evaluate_server_admission`][]: implementing "Admission And Rate
 //!   Policy", deny-by-default like
-//!   [`crate::provider_roadmap::ProviderRoadmapFallbackContext::deny_by_default`].
+//!   [`magnetar_runtime::provider_roadmap::ProviderRoadmapFallbackContext::deny_by_default`].
 //! - [`reject_arbitrary_download_during_generation`][]: implementing "Source
 //!   And Cache Boundary" by reusing
-//!   [`crate::model_format_roadmap::reject_raw_network_model_reference`].
+//!   [`magnetar_runtime::model_format_roadmap::reject_raw_network_model_reference`].
 //! - [`reject_arbitrary_filesystem_path`][]: implementing "Filesystem
 //!   Boundary".
 //! - [`reject_server_tool_shell_git_execution`][]: implementing "Tool/Shell/Git
@@ -94,35 +94,31 @@
 //!   section, with redacted metadata only.
 //! - [`ServerApiRoadmapConformanceReport`] / [`run_server_api_roadmap_conformance`][]:
 //!   a conformance report, in the shape of
-//!   [`crate::CliBoundaryConformanceReport`], asserting the "Conformance"
+//!   [`magnetar_runtime::CliBoundaryConformanceReport`], asserting the "Conformance"
 //!   section's checks hold.
 
-use crate::adapter::AdapterSetId;
-use crate::compute::redact_backend_diagnostic;
-use crate::generation::{
-    CancellationMetadata, GenerationEventKind, GenerationMemoryEstimate, GenerationModelReference,
-    GenerationParameters, GenerationPriority, GenerationRequest, GenerationRequestId,
-    GenerationTokenizerReference, StopConditions, StreamingMode,
-};
-use crate::inference_api::RuntimeDiagnostics;
-use crate::inference_api::{
-    CancellationOutcome, CancellationStage, CancellationToken, GenerationApiRequest,
-    InferenceApiError, ModelRef, PromptInput, request_cancellation_at_stage,
-    validate_inference_scope,
-};
-use crate::kv_cache::KvCachePolicy;
-use crate::memory::MemoryPressureLevel;
-use crate::model::{ModelArtifactSource, ModelDigest};
-use crate::model_format_roadmap::{
-    reject_raw_network_model_reference, validate_local_file_boundary,
-};
 use crate::model_source_cache_roadmap::reject_credential_in_metadata;
-use crate::observability::{CorrelationId, TraceId};
-use crate::session::{InferenceSessionId, SessionCreationRequest, SessionRedactionPolicy};
-use crate::tokenizer::{
-    SpecialToken, SpecialTokenKind, TokenId, TokenIdRange, TokenizerArtifactId, TokenizerFamily,
-    TokenizerId, TokenizerMetadata, TokenizerRevision,
+use magnetar_runtime::{
+    adapter::AdapterSetId, compute::redact_backend_diagnostic, generation::CancellationMetadata,
+    generation::GenerationEventKind, generation::GenerationMemoryEstimate,
+    generation::GenerationModelReference, generation::GenerationParameters,
+    generation::GenerationPriority, generation::GenerationRequest, generation::GenerationRequestId,
+    generation::GenerationTokenizerReference, generation::StopConditions,
+    generation::StreamingMode, inference_api::CancellationOutcome,
+    inference_api::CancellationStage, inference_api::CancellationToken,
+    inference_api::GenerationApiRequest, inference_api::InferenceApiError, inference_api::ModelRef,
+    inference_api::PromptInput, inference_api::RuntimeDiagnostics,
+    inference_api::request_cancellation_at_stage, inference_api::validate_inference_scope,
+    kv_cache::KvCachePolicy, memory::MemoryPressureLevel, model::ModelArtifactSource,
+    model::ModelDigest, model_format_roadmap::reject_raw_network_model_reference,
+    model_format_roadmap::validate_local_file_boundary, observability::CorrelationId,
+    observability::TraceId, session::InferenceSessionId, session::SessionCreationRequest,
+    session::SessionRedactionPolicy, tokenizer::SpecialToken, tokenizer::SpecialTokenKind,
+    tokenizer::TokenId, tokenizer::TokenIdRange, tokenizer::TokenizerArtifactId,
+    tokenizer::TokenizerFamily, tokenizer::TokenizerId, tokenizer::TokenizerMetadata,
+    tokenizer::TokenizerRevision,
 };
+
 use std::{collections::BTreeMap, error::Error, fmt};
 
 pub const SERVER_API_ROADMAP_VERSION: &str = "0.1.0";
@@ -303,7 +299,7 @@ impl ServerModelEndpointOperation {
 /// trust, integrity, compatibility, and policy validation all ran for a
 /// server-initiated model load/unload request. Deny-by-default: every field
 /// defaults to `false`, mirroring
-/// [`crate::provider_roadmap::ProviderRoadmapFallbackContext::deny_by_default`].
+/// [`magnetar_runtime::provider_roadmap::ProviderRoadmapFallbackContext::deny_by_default`].
 /// Implements "Model Endpoints Preserve Loading Validation".
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ModelEndpointLoadingProof {
@@ -389,7 +385,7 @@ pub fn reject_server_arbitrary_model_path(
 /// Runtime Inference API boundary (workspace, Git, shell, tool, network,
 /// secret, ...), implementing "Session Endpoints Preserve Inference Session
 /// Scope" by delegating to [`validate_inference_scope`], analogous to
-/// [`crate::cli_boundary::reject_cli_owned_authority`].
+/// [`magnetar_runtime::cli_boundary::reject_cli_owned_authority`].
 pub fn reject_server_session_owned_authority(
     capability: &str,
 ) -> Result<(), ServerApiRoadmapError> {
@@ -945,7 +941,7 @@ pub fn authorize_server_request(
 /// And Rate Policy" and "Request Size And Prompt Limits" sections.
 /// Deny-by-default: [`ServerAdmissionLimits::deny_by_default`] sets every
 /// limit to zero capacity, mirroring
-/// [`crate::provider_roadmap::ProviderRoadmapFallbackContext::deny_by_default`].
+/// [`magnetar_runtime::provider_roadmap::ProviderRoadmapFallbackContext::deny_by_default`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServerAdmissionLimits {
     pub max_concurrent_requests: u32,
@@ -996,7 +992,7 @@ pub struct ServerAdmissionState {
 /// Evaluates server-side admission before a Runtime call, implementing
 /// "Admission And Rate Policy" and "Request Size And Prompt Limits": server
 /// policy may reject before Runtime is ever called, but Runtime still owns
-/// inference admission independently (see [`crate::memory::MemoryManager`]
+/// inference admission independently (see [`magnetar_runtime::memory::MemoryManager`]
 /// admission).
 pub fn evaluate_server_admission(
     limits: &ServerAdmissionLimits,
@@ -1227,7 +1223,7 @@ impl ServerApiRoadmapError {
     /// Returns the preserved Runtime structured error category, or `None`
     /// for every variant that does not wrap one. Lets callers inspect the
     /// Runtime category without matching the whole enum, mirroring
-    /// [`crate::cli_boundary::CliBoundaryError::runtime_category`].
+    /// [`magnetar_runtime::cli_boundary::CliBoundaryError::runtime_category`].
     pub fn runtime_cause(&self) -> Option<&InferenceApiError> {
         match self {
             Self::ServerModelLoadFailed { runtime_cause, .. }
@@ -1352,7 +1348,7 @@ impl ServerApiRoadmapObservation {
 // ---------------------------------------------------------------------
 
 /// A single Server API roadmap conformance check result, mirroring
-/// [`crate::CliBoundaryConformanceResult`].
+/// [`magnetar_runtime::CliBoundaryConformanceResult`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerApiRoadmapConformanceResult {
     pub requirement: String,
@@ -1547,8 +1543,9 @@ pub fn run_server_api_roadmap_conformance() -> ServerApiRoadmapConformanceReport
                 enabled: false,
                 max_cache_tokens: None,
                 max_cache_memory_bytes: None,
-                sharing: crate::kv_cache::KvCacheSharingPolicy::Deny,
-                retention: crate::kv_cache::KvCacheRetentionPolicy::ReleaseOnSessionClose,
+                sharing: magnetar_runtime::kv_cache::KvCacheSharingPolicy::Deny,
+                retention:
+                    magnetar_runtime::kv_cache::KvCacheRetentionPolicy::ReleaseOnSessionClose,
                 prefix_reuse_allowed: false,
                 privacy_redaction_required: true,
             },

@@ -1326,3 +1326,6 @@ pub(crate) fn scheduler_error_for_device_health(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -1179,3 +1179,6 @@ pub fn run_kernel_artifact_conformance() -> KernelArtifactConformanceReport {
 
     KernelArtifactConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;

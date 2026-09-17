@@ -66,14 +66,14 @@
 //!   guarantees above hold.
 
 use crate::{
-    ComputeDType, DeviceMetadata, DeviceType, KernelDeterminism, KernelFallbackClass,
-    KernelFusionMetadata, KernelKvCacheMetadata, KernelMemoryClass, KernelPrecisionMetadata,
-    KernelQuantizationMetadata, OperatorId, ProviderConformanceProfile,
-    provider_conformance_profile_ids,
+    ComputeDType, DeviceMetadata, DeviceType, FallbackClass, KernelDeterminism,
+    KernelFallbackClass, KernelFusionMetadata, KernelKvCacheMetadata, KernelMemoryClass,
+    KernelPrecisionMetadata, KernelQuantizationMetadata, OperatorId, ProviderConformanceProfile,
+    ResourceAffinity, TensorLayoutKind, compute::redact_backend_diagnostic,
+    inference_api::validate_inference_scope, provider_conformance_profile_ids,
+    reference_cpu::FallbackPolicyContext, reference_cpu::evaluate_fallback,
 };
-use crate::{FallbackClass, ResourceAffinity, reference_cpu::FallbackPolicyContext};
-use crate::{TensorLayoutKind, reference_cpu::evaluate_fallback};
-use crate::{compute::redact_backend_diagnostic, inference_api::validate_inference_scope};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -1536,3 +1536,6 @@ pub fn run_provider_roadmap_conformance() -> ProviderRoadmapConformanceReport {
 
     ProviderRoadmapConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;

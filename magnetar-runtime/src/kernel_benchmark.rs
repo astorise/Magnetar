@@ -462,3 +462,6 @@ pub fn run_kernel_benchmark_conformance() -> KernelBenchmarkConformanceReport {
 
     KernelBenchmarkConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;

@@ -2049,3 +2049,6 @@ pub fn run_kernel_registry_lifecycle_conformance() -> KernelRegistryLifecycleCon
 
     KernelRegistryLifecycleConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;
