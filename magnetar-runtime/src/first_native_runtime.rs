@@ -1220,7 +1220,16 @@ struct E2eRuntimeModelExecutionEngine {
     /// `ProductionQwenLoadedModel::load`) preserves the pre-existing
     /// hardcoded-singleton behavior exactly.
     component_digest: Option<ComponentDigest>,
-    #[cfg(test)]
+    /// Test-only deterministic-token override, read by
+    /// `execute_generation_step`'s forced-shortcut branch. Always `None` at
+    /// every production construction site in this file; only
+    /// `first_native_runtime::tests` ever constructs an instance with
+    /// `Some(..)` (`build_runtime_with_model_execution_engine_and_forced_token`).
+    /// Deliberately not `#[cfg(test)]`-gated: a conditionally-compiled field
+    /// can't be relocated into a sibling `tests.rs` (Rust has no partial /
+    /// extension structs), so the only extraction available for a
+    /// struct-embedded test-only field is dropping the `cfg` and keeping the
+    /// field, and its value, identical in every build.
     forced_token: Option<TokenId>,
 }
 
@@ -4125,10 +4134,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         generated_tokens: &[TokenId],
         execution_plan: Option<&mut PreparedExecutionPlan>,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
-        #[cfg(test)]
         let forced_token = self.forced_token;
-        #[cfg(not(test))]
-        let forced_token: Option<TokenId> = None;
 
         let vocab = self.fixture.config.architecture.vocabulary_size as usize;
         let mut kv_state = if generated_tokens.is_empty() {
@@ -4813,7 +4819,6 @@ fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             component_digest: None,
-            #[cfg(test)]
             forced_token: None,
         }))
         .trust_store(
@@ -4848,7 +4853,6 @@ fn build_runtime_with_model_execution_engine_and_provider(
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             component_digest: None,
-            #[cfg(test)]
             forced_token: None,
         }))
         .trust_store(
@@ -6897,7 +6901,6 @@ fn prepare_production_generation(
             kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             component_digest: None,
-            #[cfg(test)]
             forced_token: None,
         }))
         .trust_store(trust_store)
@@ -7103,7 +7106,6 @@ impl ProductionQwenLoadedModel {
                 kv_states: Arc::new(Mutex::new(BTreeMap::new())),
                 pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
                 component_digest: component_digest.clone(),
-                #[cfg(test)]
                 forced_token: None,
             }))
             .trust_store(trust_store)
