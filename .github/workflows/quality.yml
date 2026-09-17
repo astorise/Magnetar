@@ -288,6 +288,58 @@ jobs:
           done
           exit "$fail"
 
+  # #54/#63: the whole point of moving unit tests out of magnetar-runtime's
+  # production files and into per-module `tests.rs` siblings was to stop
+  # coverage tooling (and human readers) from having to see test code mixed
+  # into production source -- a blocking gate is what actually keeps that
+  # property, since a warning-only check would let exactly the same
+  # inline-test debt this effort just removed grow back one PR at a time.
+  # Scoped to magnetar-runtime/src and roadmap-contracts/src (#62's
+  # extraction target), both of which this effort already brought to zero
+  # violations -- deliberately NOT magnetar-cli/src, which has its own
+  # separate, established inline `mod tests { ... }` convention that was
+  # never part of this effort and this guard has no mandate to break.
+  #
+  # Two independent rules, each precise enough to avoid flagging the
+  # legitimate `#[cfg(test)]` uses #54/#63's own inventory found and chose
+  # to keep (see the tracking issue): cfg-gated build-variant dispatch
+  # (multiple `fn` bodies for the same signature, selected by target/feature
+  # config) and cfg-gated statements inside an otherwise-production function
+  # that call into a `tests` submodule. Neither rule below touches those --
+  # only an actual `#[test]` function body, or an inline `mod tests { ... }`
+  # block, living directly in a file that is not itself a dedicated test
+  # file:
+  #   1. `#[test]` found in a file whose name is not `tests.rs` /
+  #      `*_tests.rs` / `*-tests.rs`.
+  #   2. `mod tests { ... }` (a body) rather than the canonical
+  #      `#[cfg(test)] mod tests;` pointer to a sibling file.
+  test-code-placement:
+    name: quality / test code placement
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Reject inline test implementations outside dedicated tests.rs files
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r -d '' file; do
+            base="$(basename "$file")"
+            case "$base" in
+              tests.rs|*_tests.rs|*-tests.rs) continue ;;
+            esac
+            if grep -nE '^\s*#\[test\]' "$file" >/dev/null; then
+              echo "::error file=$file::#[test] function found outside a dedicated tests.rs file -- move it to this module's sibling tests.rs (see #54/#63)"
+              fail=1
+            fi
+            if grep -nE '^\s*mod\s+tests\s*\{' "$file" >/dev/null; then
+              echo "::error file=$file::inline 'mod tests { ... }' found -- move its body to a sibling tests.rs and declare 'mod tests;' here instead (see #54/#63)"
+              fail=1
+            fi
+          done < <(find magnetar-runtime/src roadmap-contracts/src -name '*.rs' -print0)
+          exit "$fail"
+
   # Component integration (task 15.6): Component submodules only, sparse
   # checkout. Split out from the single consolidated `submodule-integration`
   # job below now that `components/qwen` is real (task group 11);
