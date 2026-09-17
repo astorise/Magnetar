@@ -103,7 +103,7 @@ pub const fn phase_0_migration_inventory() -> &'static [MigrationBypassInventory
         },
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::DirectReferenceCpuExecution,
-            path: "magnetar-runtime/src/first_native_runtime.rs",
+            path: "magnetar-runtime/src/first_native_runtime/tests.rs",
             symbol: "e2e_forward_hidden_states / dispatch_matmul",
             disposition: MigrationBypassDisposition::IsolatedTestOnly,
             final_cut_removal_required: false,
@@ -111,7 +111,8 @@ pub const fn phase_0_migration_inventory() -> &'static [MigrationBypassInventory
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::FullSequenceDecodeShortcut,
             path: "magnetar-runtime/src/first_native_runtime.rs",
-            symbol: "removed; decode uses execute_qwen_decode_hidden_states_through_dispatch",
+            symbol: "removed; decode uses execute_qwen_decode_hidden_states_through_dispatch \
+                     (test oracle now in first_native_runtime/tests.rs)",
             disposition: MigrationBypassDisposition::Deprecated,
             final_cut_removal_required: false,
         },

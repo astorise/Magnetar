@@ -4740,3 +4740,5198 @@ fn production_qwen_loaded_model_load_with_component_matches_the_singleton_path()
          bytes"
     );
 }
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+const QWEN_GRAPH_COMPONENT_NAME: &str = "magnetar.qwen.graph-fixture";
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+const QWEN_GRAPH_COMPONENT_DIGEST: &str =
+    "sha256:a85b9fc4fa182aa1ce2f4a55458b125e7cf4aac06dc9f5e60a2d686292677f7b";
+
+#[cfg(test)]
+fn apply_rope_per_head(
+    tensor: &HostTensor,
+    head_count: u64,
+    head_dimension: u64,
+    rope_config: &QwenRopeConfig,
+) -> Result<HostTensor, E2eConformanceError> {
+    let (rows, cols) = tensor.rows_cols()?;
+    let mut out = vec![0.0_f32; tensor.data.len()];
+    for head in 0..head_count {
+        let start_col = head * head_dimension;
+        let mut head_data = Vec::with_capacity((rows * head_dimension) as usize);
+        for row in 0..rows {
+            let base = (row * cols + start_col) as usize;
+            head_data.extend_from_slice(&tensor.data[base..base + head_dimension as usize]);
+        }
+        let head_tensor = HostTensor::new([rows, head_dimension], head_data)?;
+        let rotated = rope(
+            &head_tensor,
+            rope_config.base as f32,
+            rope_config.scale.unwrap_or(1.0) as f32,
+            rope_config.dimension,
+            0,
+            1,
+        )?;
+        for row in 0..rows {
+            let dst_base = (row * cols + start_col) as usize;
+            let src_base = (row * head_dimension) as usize;
+            out[dst_base..dst_base + head_dimension as usize]
+                .copy_from_slice(&rotated.data[src_base..src_base + head_dimension as usize]);
+        }
+    }
+    HostTensor::new(tensor.shape.clone(), out).map_err(E2eConformanceError::from)
+}
+
+/// Test oracle for the decoder stack. Production first-native generation uses
+/// `execute_qwen_hidden_states_through_dispatch` instead.
+#[cfg(test)]
+fn e2e_forward_hidden_states(
+    fixture: &E2eFixture,
+    token_ids: &[TokenId],
+) -> Result<HostTensor, E2eConformanceError> {
+    if token_ids.is_empty() {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "forward pass requires at least one token".into(),
+        });
+    }
+    let architecture = &fixture.config.architecture;
+    let seq_len = token_ids.len() as u64;
+    let epsilon = fixture.config.rmsnorm_epsilon;
+
+    let ids_tensor = HostTensor::new(
+        [seq_len],
+        token_ids.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+    )?;
+    let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")?;
+    let mut hidden_states = embedding_lookup(token_embedding, &ids_tensor)?;
+
+    for layer in 0..architecture.layer_count {
+        let prefix = format!("layers.{layer}.");
+        let input_norm = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}input_norm"))?;
+        let q_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.q_proj"))?;
+        let k_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.k_proj"))?;
+        let v_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.v_proj"))?;
+        let o_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.o_proj"))?;
+        let post_attn_norm =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}post_attn_norm"))?;
+        let gate_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.gate_proj"))?;
+        let up_weight = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.up_proj"))?;
+        let down_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.down_proj"))?;
+
+        let normed = rmsnorm(&hidden_states, input_norm, epsilon)?;
+        let q = matmul(&normed, q_weight, false, false)?;
+        let k = matmul(&normed, k_weight, false, false)?;
+        let v = matmul(&normed, v_weight, false, false)?;
+        let q = apply_rope_per_head(
+            &q,
+            architecture.attention_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+        )?;
+        let k = apply_rope_per_head(
+            &k,
+            architecture.kv_head_count,
+            architecture.head_dimension,
+            &fixture.config.rope,
+        )?;
+        let attention_out = attention(
+            &q,
+            &k,
+            &v,
+            architecture.attention_head_count,
+            architecture.head_dimension,
+            Some(architecture.kv_head_count),
+            None,
+            true,
+        )?;
+        let attention_proj = matmul(&attention_out, o_weight, false, false)?;
+        hidden_states = residual_add(&attention_proj, &hidden_states)?;
+
+        let normed_mlp = rmsnorm(&hidden_states, post_attn_norm, epsilon)?;
+        let gate = matmul(&normed_mlp, gate_weight, false, false)?;
+        let up = matmul(&normed_mlp, up_weight, false, false)?;
+        let activated = silu(&gate);
+        let gated = mul(&activated, &up)?;
+        let mlp_out = matmul(&gated, down_weight, false, false)?;
+        hidden_states = residual_add(&mlp_out, &hidden_states)?;
+    }
+
+    let final_norm = fixture_tensor_by_name(&fixture.weights, "final_norm")?;
+    rmsnorm(&hidden_states, final_norm, epsilon).map_err(E2eConformanceError::from)
+}
+
+#[cfg(test)]
+/// Test oracle for a deterministic Qwen-like forward pass. This is deliberately
+/// not compiled into the production runtime path; the runtime path executes
+/// operators through Kernel Registry selection and Provider dispatch.
+pub fn e2e_forward(
+    fixture: &E2eFixture,
+    token_ids: &[TokenId],
+) -> Result<Vec<f32>, E2eConformanceError> {
+    let normed_final = e2e_forward_hidden_states(fixture, token_ids)?;
+    let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")?;
+    // Tied embeddings: logits = normed_final @ token_embedding^T.
+    let logits = matmul(&normed_final, token_embedding, false, true)?;
+    // Exercise the softmax kernel for operator-coverage/report purposes;
+    // Sampling owns the authoritative distribution derived from raw logits.
+    let _distribution = softmax_rows(&logits)?;
+
+    let vocab = fixture.config.architecture.vocabulary_size as usize;
+    let last_row_start = (token_ids.len() - 1) * vocab;
+    Ok(logits.data[last_row_start..last_row_start + vocab].to_vec())
+}
+
+#[cfg(test)]
+/// Test-oracle only (`implement-device-resident-multi-step-cuda-decode`):
+/// production's own KV-history concatenation now dispatches through the
+/// portable "concat" Operator (`dispatch_qwen_concat`) instead of this
+/// plain-Rust helper; this survives only as
+/// `execute_qwen_decode_hidden_states_through_dispatch`'s (also
+/// `#[cfg(test)]`) own independent cross-check implementation.
+fn concat_rows(a: &HostTensor, b: &HostTensor) -> Result<HostTensor, InferenceApiError> {
+    let (a_rows, a_cols) = a.rows_cols().map_err(runtime_generation_failed)?;
+    let (b_rows, b_cols) = b.rows_cols().map_err(runtime_generation_failed)?;
+    if a_cols != b_cols {
+        return Err(InferenceApiError::GenerationFailed {
+            reason: format!("cannot concatenate tensors with widths {a_cols} and {b_cols}"),
+        });
+    }
+    let mut data = Vec::with_capacity(a.data.len() + b.data.len());
+    data.extend_from_slice(&a.data);
+    data.extend_from_slice(&b.data);
+    HostTensor::new([a_rows + b_rows, a_cols], data).map_err(runtime_generation_failed)
+}
+
+/// Stable numeric codes for the Operator names the Qwen graph builder emits,
+/// shared between Runtime (deriving the expected sequence from
+/// `ExecutionGraph`) and the Qwen Model Component boundary (which describes
+/// its own graph as this same code sequence -- see
+/// `qwen_graph_operator_codes` and `qwen-graph.component.wat`'s
+/// `prefill-operator-code`/`decode-operator-code` exports). A plain
+/// name-to-code table rather than `OperatorId` equality: the Component
+/// boundary exchanges scalar `u32`s, not portable Operator identities.
+#[cfg(test)]
+fn qwen_operator_kind_code(name: &str) -> Option<u32> {
+    match name {
+        "embedding" => Some(0),
+        "rmsnorm" => Some(1),
+        "matmul" => Some(2),
+        "rope" => Some(3),
+        "attention" => Some(4),
+        "silu" => Some(5),
+        "mul" => Some(6),
+        "residual-add" => Some(7),
+        "split" => Some(8),
+        // The QKV bias-add operator (`config.attention_bias`'s conditional
+        // node in both `components/qwen` and `components/llama`) -- never
+        // exercised by a hash comparison before the real Llama cross-
+        // architecture proof test needed to hash a bias-bearing graph for
+        // the first time, surfacing this table's previously-latent gap
+        // (every other graph-hashing test uses the shared fixture's
+        // default `attention_bias: false`).
+        "add" => Some(9),
+        _ => None,
+    }
+}
+
+/// Derives the expected Operator-kind-code sequence for `graph`, in the same
+/// dependency order `execute_qwen_graph` executes it in: the semantic
+/// content a Qwen Model Component is expected to reproduce when describing
+/// its own graph (see `qwen_operator_kind_code`).
+#[cfg(test)]
+fn qwen_graph_operator_codes(graph: &ExecutionGraph) -> Result<Vec<u32>, E2eConformanceError> {
+    let order = qwen_graph_execution_order(graph)?;
+    order
+        .iter()
+        .map(|node_id| {
+            let node = graph.nodes.get(node_id).ok_or_else(|| {
+                E2eConformanceError::GraphValidationFailed {
+                    reason: format!("first-native graph is missing node '{node_id}'"),
+                }
+            })?;
+            qwen_operator_kind_code(node.operator.name()).ok_or_else(|| {
+                E2eConformanceError::GraphValidationFailed {
+                    reason: format!(
+                        "graph node '{node_id}' uses operator '{}' with no known kind code",
+                        node.operator.name()
+                    ),
+                }
+            })
+        })
+        .collect()
+}
+
+/// A deterministic FNV-1a-style hash over an ordered Operator-kind-code
+/// sequence. The Component boundary's invocation model exchanges only
+/// zero-argument, single-`u32`-result calls (see [`ComponentInvocation`]),
+/// so a component cannot return its full node sequence as a list; instead it
+/// computes this same hash internally (see `qwen-graph.component.wat`'s
+/// `prefill-operator-hash`/`decode-operator-hash` exports, which perform the
+/// identical unrolled XOR/multiply steps over its own hard-coded sequence)
+/// and Runtime compares hashes -- a proof over the actual ordered semantic
+/// content, not just a count.
+#[cfg(test)]
+fn qwen_operator_sequence_hash(codes: &[u32]) -> u32 {
+    const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+    codes.iter().fold(FNV_OFFSET_BASIS, |hash, code| {
+        (hash ^ *code).wrapping_mul(FNV_PRIME)
+    })
+}
+
+#[cfg(test)]
+/// Static guard (`define-provider-prepared-kernel-execution-contract` task
+/// 2.3): [`execute_qwen_graph_nodes`]'s per-node transport migrated fully off
+/// the `HostTensor`-typed [`ProviderExecutionApi`] methods (that Change's
+/// task group 5) -- every read/write in its per-node loop goes through
+/// `read_tensor_value`/`write_tensor_value_admitted` instead, materializing
+/// to `HostTensor` only at the explicit host-materialization boundaries via
+/// `TensorValue::into_host` (weight binding, KV-history concatenation, final
+/// logits extraction, plus each node's own Kernel-input resolution). This
+/// scans the function's own source text so a future edit that reintroduces a
+/// direct `.read_tensor(`/`.write_tensor(`/`.write_tensor_admitted(` call
+/// into that loop fails a test immediately, rather than the two pathways
+/// (`HostTensor`-typed and `TensorValue`-typed) silently coexisting
+/// indefinitely -- design.md's stated risk for that Change. Test-only: this
+/// is a source-level build invariant, not runtime behavior
+/// `run_e2e_local_inference_conformance` needs to check in production.
+fn check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls()
+-> Result<(), E2eConformanceError> {
+    const SOURCE: &str = include_str!("../first_native_runtime.rs");
+    let start = SOURCE.find("fn execute_qwen_graph_nodes(").ok_or_else(|| {
+        E2eConformanceError::Internal {
+            reason: "execute_qwen_graph_nodes not found in first_native_runtime.rs source".into(),
+        }
+    })?;
+    let body_start = SOURCE[start..]
+        .find('{')
+        .map(|offset| start + offset)
+        .ok_or_else(|| E2eConformanceError::Internal {
+            reason: "execute_qwen_graph_nodes has no function body in source".into(),
+        })?;
+    let mut depth = 0i32;
+    let mut body_end = body_start;
+    for (offset, ch) in SOURCE[body_start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    body_end = body_start + offset + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if body_end == body_start {
+        return Err(E2eConformanceError::Internal {
+            reason: "execute_qwen_graph_nodes's function body braces did not balance".into(),
+        });
+    }
+    let body = &SOURCE[body_start..body_end];
+    // Exact-name matches only (immediate `(` after the method name), so the
+    // intended replacements -- `.read_tensor_value(`, `.write_tensor_value(`,
+    // `.write_tensor_value_admitted(` -- do not themselves trip this guard.
+    let host_tensor_typed_call_count =
+        [".read_tensor(", ".write_tensor(", ".write_tensor_admitted("]
+            .iter()
+            .map(|needle| body.matches(needle).count())
+            .sum::<usize>();
+    if host_tensor_typed_call_count != 0 {
+        return Err(E2eConformanceError::Internal {
+            reason: format!(
+                "execute_qwen_graph_nodes's per-node transport has \
+                 {host_tensor_typed_call_count} direct HostTensor-typed \
+                 ProviderExecutionApi call(s); it must read/write through \
+                 TensorValue (read_tensor_value/write_tensor_value_admitted) \
+                 and materialize only at explicit host-materialization \
+                 boundaries via TensorValue::into_host"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+/// The MLP gate/up projection the prefill/decode oracle dispatch sequences
+/// below exercise, split by which graph source `first_native_plans_for_prompt`
+/// actually built its `PreparedExecutionPlan` against (mirrors
+/// [`first_native_component_graphs_for_prompt`]'s own cfg split exactly):
+/// under the strict, default build the Plan comes from the checked-in real
+/// Qwen Component's graph, which still declares two standalone
+/// `gate_proj`/`up_proj` matmul nodes (`components/qwen` is unmodified);
+/// without a strict Component engine, the Plan comes from the Rust-
+/// synthesized fallback recipe (`qwen_model_component::qwen_build_graph`),
+/// which fuses them into one `gate_up_proj` matmul followed by a
+/// genuinely two-output `split` (`define-provider-prepared-kernel-
+/// execution-contract` task group 3). Every oracle dispatch here must use
+/// the identical node-id shape the Plan was actually built from, or Kernel
+/// selection fails closed with "no binding for node ...".
+fn dispatch_qwen_oracle_mlp_gate_up(
+    dispatch_ctx: &mut QwenDispatchContext<'_>,
+    fixture: &E2eFixture,
+    prefix: &str,
+    layer_id: &str,
+    normed_mlp: NodeValue,
+) -> Result<(NodeValue, NodeValue), InferenceApiError> {
+    let gate_weight = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.gate_proj"))
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let up_weight = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.up_proj"))
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (_dispatch, gate) = dispatch_qwen_matmul(
+        dispatch_ctx,
+        &format!("{layer_id}.gate_proj"),
+        normed_mlp.clone(),
+        NodeValue::Host(gate_weight),
+        None,
+    )?;
+    let (_dispatch, up) = dispatch_qwen_matmul(
+        dispatch_ctx,
+        &format!("{layer_id}.up_proj"),
+        normed_mlp,
+        NodeValue::Host(up_weight),
+        None,
+    )?;
+    Ok((gate, up))
+}
+
+#[cfg(all(
+    test,
+    not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))
+))]
+fn dispatch_qwen_oracle_mlp_gate_up(
+    dispatch_ctx: &mut QwenDispatchContext<'_>,
+    fixture: &E2eFixture,
+    prefix: &str,
+    layer_id: &str,
+    normed_mlp: NodeValue,
+) -> Result<(NodeValue, NodeValue), InferenceApiError> {
+    let gate_up_weight =
+        fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.gate_up_proj"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+    let (_dispatch, gate_up) = dispatch_qwen_matmul(
+        dispatch_ctx,
+        &format!("{layer_id}.gate_up_proj"),
+        normed_mlp,
+        NodeValue::Host(gate_up_weight),
+        None,
+    )?;
+    let (_dispatch, split_outputs) = dispatch_qwen_split(
+        dispatch_ctx,
+        &format!("{layer_id}.split"),
+        gate_up,
+        [None, None],
+    )?;
+    let [gate, up]: [NodeValue; 2] =
+        split_outputs
+            .try_into()
+            .map_err(|_| InferenceApiError::GraphPlanningFailed {
+                reason: format!("'{layer_id}.split' produced an unexpected number of outputs"),
+            })?;
+    Ok((gate, up))
+}
+
+#[cfg(test)]
+/// Test-only oracle: a hand-written, hard-coded prefill dispatch sequence
+/// kept only so tests can cross-check `execute_qwen_graph`'s output against
+/// an independently-written recipe. Production first-native execution
+/// cannot reach this function -- it computes logits exclusively through
+/// `execute_qwen_graph` (see `E2eRuntimeModelExecutionEngine::
+/// execute_generation_step`). `prepared_plan` is mandatory (not optional):
+/// the first-native hot path must always look up a published
+/// [`PlanNodeBinding`]/[`PreparedKernelId`] rather than ever falling back to
+/// ad hoc Kernel Registry selection here -- planning-time selection belongs
+/// in [`prepare_first_native_plan_for_graph`], not in this execution path.
+fn execute_qwen_prefill_hidden_states_through_dispatch(
+    runtime: &mut Runtime,
+    fixture: &E2eFixture,
+    token_ids: &[TokenId],
+    prepared_plan: &mut PreparedExecutionPlan,
+) -> Result<
+    (
+        KernelDispatchResult,
+        HostTensor,
+        Vec<FirstNativeLayerKvState>,
+    ),
+    InferenceApiError,
+> {
+    if token_ids.is_empty() {
+        return Err(InferenceApiError::GenerationFailed {
+            reason: "forward pass requires at least one token".into(),
+        });
+    }
+    // Resolved from Runtime's own registration (not a throwaway) so the
+    // decode oracle's separate call can read back the K/V resources this
+    // call writes -- the whole point of testing incremental decode against
+    // the KV state prefill actually produced.
+    let provider = resolve_kernel_execution_provider(
+        runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )?;
+    let mut node_events = Vec::new();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime,
+        provider: provider.clone(),
+        prepared_plan: Some(prepared_plan),
+        graph: None,
+        sequence_length: None,
+        last_provider_execution: None,
+        node_events: &mut node_events,
+    };
+    let architecture = &fixture.config.architecture;
+    let seq_len = token_ids.len() as u64;
+    let epsilon = fixture.config.rmsnorm_epsilon;
+
+    let ids_tensor = HostTensor::new(
+        [seq_len],
+        token_ids.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+    )
+    .map_err(runtime_generation_failed)?;
+    let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (_embedding_dispatch, hidden_states) = dispatch_reference_cpu_operator(
+        &mut dispatch_ctx,
+        "embedding",
+        dispatch_operator_id("embedding", OperatorFamily::Tensor),
+        vec![
+            NodeInputResource::Fresh(
+                TensorResourceId::new("embedding.table"),
+                f32_tensor_descriptor(&token_embedding),
+                token_embedding,
+            ),
+            NodeInputResource::Fresh(
+                TensorResourceId::new("embedding.ids"),
+                f32_tensor_descriptor(&ids_tensor),
+                ids_tensor,
+            ),
+        ],
+        (
+            TensorResourceId::new("embedding.out"),
+            TensorDescriptor::new(
+                ShapeDescriptor::new([seq_len, architecture.hidden_size]),
+                DTypeDescriptor::portable(ComputeDType::Float32),
+                LayoutDescriptor::Contiguous,
+            ),
+        ),
+        BTreeMap::new(),
+    )?;
+    let mut hidden_states = hidden_states.into_host(&dispatch_ctx.provider)?;
+
+    let mut layer_kv = Vec::with_capacity(architecture.layer_count as usize);
+    for layer in 0..architecture.layer_count {
+        let prefix = format!("layers.{layer}.");
+        let input_norm = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}input_norm"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+        let q_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.q_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let k_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.k_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let v_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.v_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let o_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.o_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let post_attn_norm =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}post_attn_norm"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let down_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.down_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+
+        let layer_id = format!("layer{layer}");
+        let (_dispatch, normed) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.input_norm"),
+            NodeValue::Host(hidden_states.clone()),
+            NodeValue::Host(input_norm),
+            epsilon,
+            None,
+        )?;
+        let (_dispatch, q) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.q_proj"),
+            normed.clone(),
+            NodeValue::Host(q_weight),
+            None,
+        )?;
+        let (_dispatch, k) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.k_proj"),
+            normed.clone(),
+            NodeValue::Host(k_weight),
+            None,
+        )?;
+        let (_dispatch, v) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.v_proj"),
+            normed,
+            NodeValue::Host(v_weight),
+            None,
+        )?;
+        let v = v.into_host(&dispatch_ctx.provider)?;
+        let (_dispatch, q) = dispatch_qwen_rope(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_q"),
+            q,
+            architecture.attention_head_count,
+            &fixture.config.rope,
+            0,
+            None,
+        )?;
+        let q = q.into_host(&dispatch_ctx.provider)?;
+        let (_dispatch, k) = dispatch_qwen_rope(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_k"),
+            k,
+            architecture.kv_head_count,
+            &fixture.config.rope,
+            0,
+            None,
+        )?;
+        let k = k.into_host(&dispatch_ctx.provider)?;
+        let k_resource = TensorResourceId::new(format!("oracle-kv.layer{layer}.k"));
+        let v_resource = TensorResourceId::new(format!("oracle-kv.layer{layer}.v"));
+        dispatch_ctx
+            .provider
+            .write_tensor(k_resource.clone(), k.clone())
+            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                reason: error.to_string(),
+            })?;
+        dispatch_ctx
+            .provider
+            .write_tensor(v_resource.clone(), v.clone())
+            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                reason: error.to_string(),
+            })?;
+        layer_kv.push(FirstNativeLayerKvState {
+            k: k_resource,
+            v: v_resource,
+        });
+        let (_dispatch, attention_out) = dispatch_qwen_attention(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.attention"),
+            NodeValue::Host(q),
+            NodeValue::Host(k),
+            NodeValue::Host(v),
+            architecture,
+            None,
+        )?;
+        let (_dispatch, attention_proj) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.o_proj"),
+            attention_out,
+            NodeValue::Host(o_weight),
+            None,
+        )?;
+        let (_dispatch, post_attention) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual1"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            attention_proj,
+            NodeValue::Host(hidden_states),
+            None,
+        )?;
+        let (_dispatch, normed_mlp) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.post_attn_norm"),
+            post_attention.clone(),
+            NodeValue::Host(post_attn_norm),
+            epsilon,
+            None,
+        )?;
+        let (gate, up) = dispatch_qwen_oracle_mlp_gate_up(
+            &mut dispatch_ctx,
+            fixture,
+            &prefix,
+            &layer_id,
+            normed_mlp,
+        )?;
+        let (_dispatch, activated) = dispatch_qwen_unary(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.silu"),
+            "silu",
+            OperatorFamily::Activation,
+            gate,
+            BTreeMap::new(),
+            None,
+        )?;
+        let (_dispatch, gated) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.mul"),
+            "mul",
+            OperatorFamily::Tensor,
+            activated,
+            up,
+            None,
+        )?;
+        let (_dispatch, mlp_out) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.down_proj"),
+            gated,
+            NodeValue::Host(down_weight),
+            None,
+        )?;
+        let (_dispatch, layer_out) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual2"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            mlp_out,
+            post_attention,
+            None,
+        )?;
+        hidden_states = layer_out.into_host(&dispatch_ctx.provider)?;
+    }
+
+    let final_norm = fixture_tensor_by_name(&fixture.weights, "final_norm")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (dispatch, hidden_states) = dispatch_qwen_rmsnorm(
+        &mut dispatch_ctx,
+        "final_norm",
+        NodeValue::Host(hidden_states),
+        NodeValue::Host(final_norm),
+        epsilon,
+        None,
+    )?;
+    let hidden_states = hidden_states.into_host(&dispatch_ctx.provider)?;
+    Ok((dispatch, hidden_states, layer_kv))
+}
+
+#[cfg(test)]
+/// Test-only oracle, kept only for cross-checking `execute_qwen_graph`; see
+/// [`execute_qwen_prefill_hidden_states_through_dispatch`]'s doc comment.
+fn execute_qwen_decode_hidden_states_through_dispatch(
+    runtime: &mut Runtime,
+    fixture: &E2eFixture,
+    token_id: TokenId,
+    kv_state: &FirstNativeExecutionKvState,
+    absolute_position: u64,
+    prepared_plan: &mut PreparedExecutionPlan,
+) -> Result<
+    (
+        KernelDispatchResult,
+        HostTensor,
+        Vec<FirstNativeLayerKvState>,
+    ),
+    InferenceApiError,
+> {
+    // Resolved from Runtime's own registration (not a throwaway) so this
+    // call can read back the K/V resources prefill wrote -- see
+    // `execute_qwen_prefill_hidden_states_through_dispatch`'s doc comment.
+    let provider = resolve_kernel_execution_provider(
+        runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )?;
+    let mut node_events = Vec::new();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime,
+        provider: provider.clone(),
+        prepared_plan: Some(prepared_plan),
+        graph: None,
+        sequence_length: None,
+        last_provider_execution: None,
+        node_events: &mut node_events,
+    };
+    let architecture = &fixture.config.architecture;
+    if kv_state.layer_kv.len() != architecture.layer_count as usize {
+        return Err(InferenceApiError::KvCacheUnavailable {
+            reason: format!(
+                "decode requires {} layer KV entries, found {}",
+                architecture.layer_count,
+                kv_state.layer_kv.len()
+            ),
+        });
+    }
+    let epsilon = fixture.config.rmsnorm_epsilon;
+    let ids_tensor =
+        HostTensor::new([1], vec![token_id as f32]).map_err(runtime_generation_failed)?;
+    let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (_embedding_dispatch, hidden_states) = dispatch_reference_cpu_operator(
+        &mut dispatch_ctx,
+        "decode.embedding",
+        dispatch_operator_id("embedding", OperatorFamily::Tensor),
+        vec![
+            NodeInputResource::Fresh(
+                TensorResourceId::new("decode.embedding.table"),
+                f32_tensor_descriptor(&token_embedding),
+                token_embedding,
+            ),
+            NodeInputResource::Fresh(
+                TensorResourceId::new("decode.embedding.ids"),
+                f32_tensor_descriptor(&ids_tensor),
+                ids_tensor,
+            ),
+        ],
+        (
+            TensorResourceId::new("decode.embedding.out"),
+            TensorDescriptor::new(
+                ShapeDescriptor::new([1, architecture.hidden_size]),
+                DTypeDescriptor::portable(ComputeDType::Float32),
+                LayoutDescriptor::Contiguous,
+            ),
+        ),
+        BTreeMap::new(),
+    )?;
+    let mut hidden_states = hidden_states.into_host(&dispatch_ctx.provider)?;
+
+    let mut updated_layer_kv = Vec::with_capacity(architecture.layer_count as usize);
+    for layer in 0..architecture.layer_count {
+        let prefix = format!("layers.{layer}.");
+        let input_norm = fixture_tensor_by_name(&fixture.weights, &format!("{prefix}input_norm"))
+            .map_err(runtime_generation_failed)?
+            .clone();
+        let q_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.q_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let k_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.k_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let v_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.v_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let o_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}self_attn.o_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let post_attn_norm =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}post_attn_norm"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+        let down_weight =
+            fixture_tensor_by_name(&fixture.weights, &format!("{prefix}mlp.down_proj"))
+                .map_err(runtime_generation_failed)?
+                .clone();
+
+        let layer_id = format!("decode.layer{layer}");
+        let (_dispatch, normed) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.input_norm"),
+            NodeValue::Host(hidden_states.clone()),
+            NodeValue::Host(input_norm),
+            epsilon,
+            None,
+        )?;
+        let (_dispatch, q) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.q_proj"),
+            normed.clone(),
+            NodeValue::Host(q_weight),
+            None,
+        )?;
+        let (_dispatch, k_new) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.k_proj"),
+            normed.clone(),
+            NodeValue::Host(k_weight),
+            None,
+        )?;
+        let (_dispatch, v_new) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.v_proj"),
+            normed,
+            NodeValue::Host(v_weight),
+            None,
+        )?;
+        let v_new = v_new.into_host(&dispatch_ctx.provider)?;
+        let (_dispatch, q) = dispatch_qwen_rope(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_q"),
+            q,
+            architecture.attention_head_count,
+            &fixture.config.rope,
+            absolute_position,
+            None,
+        )?;
+        let q = q.into_host(&dispatch_ctx.provider)?;
+        let (_dispatch, k_new) = dispatch_qwen_rope(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.rope_k"),
+            k_new,
+            architecture.kv_head_count,
+            &fixture.config.rope,
+            absolute_position,
+            None,
+        )?;
+        let k_new = k_new.into_host(&dispatch_ctx.provider)?;
+        let historical = &kv_state.layer_kv[&(layer as usize)];
+        let historical_k = dispatch_ctx
+            .provider
+            .read_tensor(&historical.k)
+            .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                reason: format!("no materialized historical K data for layer {layer}"),
+            })?;
+        let historical_v = dispatch_ctx
+            .provider
+            .read_tensor(&historical.v)
+            .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                reason: format!("no materialized historical V data for layer {layer}"),
+            })?;
+        let k = concat_rows(&historical_k, &k_new)?;
+        let v = concat_rows(&historical_v, &v_new)?;
+        let k_resource = TensorResourceId::new(format!("oracle-kv.layer{layer}.k"));
+        let v_resource = TensorResourceId::new(format!("oracle-kv.layer{layer}.v"));
+        dispatch_ctx
+            .provider
+            .write_tensor(k_resource.clone(), k.clone())
+            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                reason: error.to_string(),
+            })?;
+        dispatch_ctx
+            .provider
+            .write_tensor(v_resource.clone(), v.clone())
+            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                reason: error.to_string(),
+            })?;
+        updated_layer_kv.push(FirstNativeLayerKvState {
+            k: k_resource,
+            v: v_resource,
+        });
+        let (_dispatch, attention_out) = dispatch_qwen_attention(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.attention"),
+            NodeValue::Host(q),
+            NodeValue::Host(k),
+            NodeValue::Host(v),
+            architecture,
+            None,
+        )?;
+        let (_dispatch, attention_proj) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.o_proj"),
+            attention_out,
+            NodeValue::Host(o_weight),
+            None,
+        )?;
+        let (_dispatch, post_attention) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual1"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            attention_proj,
+            NodeValue::Host(hidden_states),
+            None,
+        )?;
+        let (_dispatch, normed_mlp) = dispatch_qwen_rmsnorm(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.post_attn_norm"),
+            post_attention.clone(),
+            NodeValue::Host(post_attn_norm),
+            epsilon,
+            None,
+        )?;
+        let (gate, up) = dispatch_qwen_oracle_mlp_gate_up(
+            &mut dispatch_ctx,
+            fixture,
+            &prefix,
+            &layer_id,
+            normed_mlp,
+        )?;
+        let (_dispatch, activated) = dispatch_qwen_unary(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.silu"),
+            "silu",
+            OperatorFamily::Activation,
+            gate,
+            BTreeMap::new(),
+            None,
+        )?;
+        let (_dispatch, gated) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.mul"),
+            "mul",
+            OperatorFamily::Tensor,
+            activated,
+            up,
+            None,
+        )?;
+        let (_dispatch, mlp_out) = dispatch_qwen_matmul(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.down_proj"),
+            gated,
+            NodeValue::Host(down_weight),
+            None,
+        )?;
+        let (_dispatch, layer_out) = dispatch_qwen_binary_same_shape(
+            &mut dispatch_ctx,
+            &format!("{layer_id}.residual2"),
+            "residual-add",
+            OperatorFamily::Tensor,
+            mlp_out,
+            post_attention,
+            None,
+        )?;
+        hidden_states = layer_out.into_host(&dispatch_ctx.provider)?;
+    }
+
+    let final_norm = fixture_tensor_by_name(&fixture.weights, "final_norm")
+        .map_err(runtime_generation_failed)?
+        .clone();
+    let (dispatch, hidden_states) = dispatch_qwen_rmsnorm(
+        &mut dispatch_ctx,
+        "decode.final_norm",
+        NodeValue::Host(hidden_states),
+        NodeValue::Host(final_norm),
+        epsilon,
+        None,
+    )?;
+    let hidden_states = hidden_states.into_host(&dispatch_ctx.provider)?;
+    Ok((dispatch, hidden_states, updated_layer_kv))
+}
+
+#[cfg(test)]
+/// Test-only oracle, kept only for cross-checking `execute_qwen_graph`; see
+/// [`execute_qwen_prefill_hidden_states_through_dispatch`]'s doc comment.
+fn dispatch_qwen_logits_projection(
+    runtime: &Runtime,
+    fixture: &E2eFixture,
+    hidden_states: &HostTensor,
+    prepared_plan: &PreparedExecutionPlan,
+) -> Result<(KernelDispatchResult, Vec<f32>), InferenceApiError> {
+    let token_embedding =
+        fixture_tensor_by_name(&fixture.weights, "token_embedding").map_err(|error| {
+            InferenceApiError::GenerationFailed {
+                reason: error.to_string(),
+            }
+        })?;
+    let token_embedding_transposed = transpose_rows_cols(token_embedding).map_err(|error| {
+        InferenceApiError::GenerationFailed {
+            reason: error.to_string(),
+        }
+    })?;
+    let (dispatch_result, output) = dispatch_matmul_with_prepared_plan(
+        runtime,
+        hidden_states,
+        &token_embedding_transposed,
+        "lm_head",
+        Some(prepared_plan),
+    )?;
+    let vocab = fixture.config.architecture.vocabulary_size as usize;
+    let output_rows = output.data.len() / vocab;
+    let last_row_start = output_rows.saturating_sub(1) * vocab;
+    Ok((
+        dispatch_result,
+        output.data[last_row_start..last_row_start + vocab].to_vec(),
+    ))
+}
+
+#[cfg(test)]
+fn build_runtime_with_model_execution_engine_and_forced_token(
+    fixture: &E2eFixture,
+    forced_token: Option<TokenId>,
+) -> Runtime {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
+            fixture: fixture.clone(),
+            kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+            component_digest: None,
+            forced_token,
+        }))
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
+        .build()
+        .expect("Reference CPU provider registers cleanly");
+    register_reference_cpu_prepared_kernels(&mut runtime);
+    runtime
+}
+
+#[cfg(test)]
+/// `transactional-weight-materialization`: a Model Instance whose weight
+/// materialization fails SHALL never have reported Ready in the first
+/// place -- `ModelInstances::create()` leaves it in `Loading`, and only a
+/// fully successful `WeightMaterializationTransaction::commit` reaches
+/// Ready. Proven here under a memory budget tight enough to admit `load()`'s
+/// own aggregate allocation but not every subsequent per-tensor weight
+/// admission, and that the failed attempt leaves no weight bound to the
+/// instance (real rollback, not just a lifecycle label).
+///
+/// An earlier version of this test (and the code it tested) had the
+/// instance reach `Ready` immediately on creation, then get demoted after
+/// materialization failed -- a real, since-fixed bug an external audit of
+/// PR #36 correctly identified: nothing prevented a caller from observing
+/// the instance as `Ready` during that window. This test's name and
+/// assertions were rewritten to match the corrected behavior, not just the
+/// corrected code.
+/// Shared by every check that proves a weight's `TensorResidency` record is
+/// gone once its Provider storage and Memory Manager allocation have both
+/// been released -- rollback, unload, and repeated load/unload all assert
+/// this same property (`invalidate-tensor-residency-on-release`); `context`
+/// names which one, for the failure message.
+fn assert_tensor_residency_absent(
+    runtime: &Runtime,
+    resource_id: &TensorResourceId,
+    context: &str,
+) -> Result<(), E2eConformanceError> {
+    if runtime.memory().tensor_residency(resource_id).is_some() {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "weight resource '{resource_id}' still has a TensorResidency record {context}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_weight_materialization_failure_never_reaches_ready(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .config(RuntimeConfig {
+            memory: MemoryManagerConfig {
+                // Generous: `create_model_instance` now releases the
+                // whole-artifact-level planning allocation `load_model`
+                // admits as soon as a real Model Instance exists to track
+                // residency through its own `usage.residency_bytes`
+                // instead (task 12.6's allocation-count-before/after-
+                // unload fix), and the fixture's per-tensor weight total
+                // exactly equals that planning size (both derived from the
+                // same manifest) -- leaving no numeric gap between "tight
+                // enough to still admit the one-time planning allocation"
+                // and "tight enough to fail partway through per-tensor
+                // admission". A manually admitted spacer allocation below,
+                // sized against this same generous budget, recreates that
+                // gap explicitly and controllably instead.
+                max_runtime_bytes: Some(5072 * 3),
+                allow_pending_allocations: false,
+                ..MemoryManagerConfig::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
+        .build()
+        .map_err(|error| E2eConformanceError::SuiteUnavailable {
+            reason: error.to_string(),
+        })?;
+    register_reference_cpu_prepared_kernels(&mut runtime);
+
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(fixture.architecture_implementation.clone());
+    let mut request = ModelLoadingRequest::new(
+        ModelLoadingRequestId::new("e2e-weight-materialization-failure"),
+        fixture.manifest.id.clone(),
+    );
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(request),
+        &fixture.manifest,
+    )?;
+    let instance = create_model_instance(
+        &mut runtime,
+        &loaded,
+        fixture.architecture_implementation.clone(),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )?;
+
+    // Explicit spacer: consumes most of the generous budget above,
+    // leaving enough room for some but not all of the fixture's per-
+    // tensor weight allocations (which sum to exactly the same bytes the
+    // now-released planning allocation used) -- a controlled way to
+    // recreate a tight-budget failure partway through materialization,
+    // now that the planning allocation itself no longer stays resident to
+    // do so implicitly.
+    let spacer = runtime
+        .memory_mut()
+        .allocate(
+            MemoryAllocationRequest::new(
+                MemoryAllocationClass::ModelArtifact,
+                (5072 * 3) - 2500,
+                MemoryPlacement::HostOrdinary,
+                MemoryAllocationOwner::InferenceArtifact("spacer".into()),
+            )
+            .with_alignment(64),
+        )
+        .map_err(|error| E2eConformanceError::SuiteUnavailable {
+            reason: format!("test spacer allocation failed to set up: {error}"),
+        })?;
+    let _ = spacer;
+
+    // Confirm the instance is genuinely NOT Ready immediately after
+    // creation -- the corrected behavior, replacing what used to be an
+    // assertion that it *was* Ready here.
+    let status_before = runtime
+        .model_instance(&instance)
+        .map_err(InferenceApiError::from)?
+        .status();
+    if status_before.lifecycle == ModelInstanceLifecycleState::Ready
+        || status_before.readiness.accepts_generation()
+    {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "expected the instance to NOT be Ready right after creation, before any \
+                 weight materialization has run; got lifecycle {:?} / readiness {:?}",
+                status_before.lifecycle, status_before.readiness
+            ),
+        });
+    }
+
+    match materialize_model_instance_weights(
+        &mut runtime,
+        &instance,
+        fixture.manifest.id.name.as_str(),
+        &fixture.weights,
+    ) {
+        Err(_) => {}
+        Ok(()) => {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: "expected weight materialization to fail under a tight memory budget \
+                          (test miscalibrated, or admission stopped being enforced)"
+                    .into(),
+            });
+        }
+    }
+
+    let status_after = runtime
+        .model_instance(&instance)
+        .map_err(InferenceApiError::from)?
+        .status();
+    if status_after.lifecycle == ModelInstanceLifecycleState::Ready {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "instance is Ready after weight materialization failed".into(),
+        });
+    }
+    if status_after.readiness.accepts_generation() {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "instance readiness accepts generation after weight materialization failed: {:?}",
+                status_after.readiness
+            ),
+        });
+    }
+    if status_after.lifecycle != ModelInstanceLifecycleState::Failed {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "expected the instance to end in Failed after materialization failed; got {:?}",
+                status_after.lifecycle
+            ),
+        });
+    }
+    let bound_weight_count = runtime
+        .model_instance(&instance)
+        .map_err(InferenceApiError::from)?
+        .definition
+        .resource_bindings
+        .weights
+        .len();
+    if bound_weight_count != 0 {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "expected zero weights bound after a failed materialization attempt rolled \
+                 back (real rollback, not just a lifecycle label); found {bound_weight_count}"
+            ),
+        });
+    }
+    // Prove the rollback released Provider-owned storage too, not only the
+    // Model Instance's own bindings -- `WeightMaterializationTransaction::
+    // abort` must have called `release_tensor` for every weight staged
+    // before the failure, for any weight this attempt might have reached.
+    let executor = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(|error| E2eConformanceError::GenerationFailed {
+        reason: error.to_string(),
+    })?;
+    for name in fixture.weights.keys() {
+        let resource_id = TensorResourceId::new(format!("model.{instance}.weight.{name}"));
+        if executor.read_tensor(&resource_id).is_some() {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "weight resource '{resource_id}' remained present in Provider-owned \
+                     storage after a failed materialization attempt was supposed to roll it \
+                     back"
+                ),
+            });
+        }
+        assert_tensor_residency_absent(
+            &runtime,
+            &resource_id,
+            "after a failed materialization attempt was supposed to roll it back",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+const QWEN_GRAPH_COMPONENT_BYTES: &[u8] =
+    include_bytes!("../../fixtures/components/qwen-graph.component.wat");
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+const QWEN_GRAPH_COMPONENT_MANIFEST_BYTES: &[u8] =
+    include_bytes!("../../fixtures/components/qwen-graph.component.wat.magnetar-component.yaml");
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    test
+))]
+/// Test-oracle only (Tachyon integration audit MAG-07): a second, real,
+/// structurally distinct Component implementing the same
+/// `model-component-graph-producer` world -- `embedding -> rmsnorm ->
+/// matmul`, with every decoder layer omitted, so its node count and
+/// operator-sequence hash can never coincide with the real Qwen Component's.
+/// Exists to prove [`register_inference_component_artifact`]'s registry
+/// genuinely supports two independently-registered Components at once, not
+/// just one hardcoded Qwen singleton wearing a generic-looking API. Never a
+/// production Model Component; production never reads this.
+const SYNTHETIC_MINIMAL_COMPONENT_BYTES: &[u8] =
+    include_bytes!("../../fixtures/components/synthetic-minimal.component.wasm");
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    test
+))]
+const SYNTHETIC_MINIMAL_COMPONENT_MANIFEST_BYTES: &[u8] = include_bytes!(
+    "../../fixtures/components/synthetic-minimal.component.wasm.magnetar-component.yaml"
+);
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    test
+))]
+/// Test-oracle only: the checked-in real Llama Model Component
+/// (`components/llama`), a genuine second production model architecture
+/// family -- not a synthetic/degenerate fixture like
+/// `SYNTHETIC_MINIMAL_COMPONENT_BYTES` above. Its graph-building logic is
+/// structurally identical to the real Qwen Component's own (both real,
+/// well-documented instances of the same pre-norm/RoPE/grouped-query-
+/// attention/SwiGLU decoder block -- Qwen2's architecture is Llama's with
+/// an added QKV bias term, not a different block shape); the two produce
+/// different graphs only because a real Llama `architecture-config` has no
+/// QKV bias while a real Qwen2 one does, driven entirely by `model-config`,
+/// never by a hardcoded branch in either Component. Production never reads
+/// this constant directly -- an embedder registers the real bytes itself,
+/// exactly as it would for Qwen.
+const LLAMA_REAL_COMPONENT_BYTES: &[u8] =
+    include_bytes!("../../fixtures/components/llama-real.component.wasm");
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine",
+    test
+))]
+const LLAMA_REAL_COMPONENT_MANIFEST_BYTES: &[u8] =
+    include_bytes!("../../fixtures/components/llama-real.component.wasm.magnetar-component.yaml");
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+fn qwen_graph_component_package() -> ComponentArtifactPackage {
+    ComponentArtifactPackage::new(
+        QWEN_GRAPH_COMPONENT_BYTES.to_vec(),
+        QWEN_GRAPH_COMPONENT_MANIFEST_BYTES.to_vec(),
+        ComponentDigest::parse("sha256", QWEN_GRAPH_COMPONENT_DIGEST),
+        ComponentDistributionSource::new(
+            ComponentDistributionSourceKind::DevelopmentFixture,
+            QWEN_GRAPH_COMPONENT_NAME,
+        ),
+    )
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+#[derive(Debug)]
+struct QwenComponentPreflight {
+    definition: ComponentDefinitionId,
+    instance: ComponentInstanceId,
+    graph_semantics: QwenComponentGraphSemantics,
+    observations: Vec<ComponentObservation>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// What the Qwen Model Component reports about its own prefill/decode
+/// graphs: not just node counts (which a component could satisfy with any
+/// arbitrary set of operators) but a hash of the full ordered
+/// Operator-kind-code sequence (`qwen_operator_sequence_hash`), so
+/// `validate_against_graphs` performs genuine semantic comparison against
+/// the Runtime-built graph rather than proving only that the two graphs
+/// happen to be the same size.
+struct QwenComponentGraphSemantics {
+    prefill_node_count: usize,
+    decode_node_count: usize,
+    prefill_operator_hash: u32,
+    decode_operator_hash: u32,
+}
+
+#[cfg(test)]
+impl QwenComponentGraphSemantics {
+    fn validate_against_graphs(
+        &self,
+        prefill: &ExecutionGraph,
+        decode: &ExecutionGraph,
+    ) -> Result<(), E2eConformanceError> {
+        if self.prefill_node_count != prefill.nodes.len() {
+            return Err(E2eConformanceError::GraphValidationFailed {
+                reason: format!(
+                    "Qwen Component prefill graph declared {} node(s), runtime graph has {}",
+                    self.prefill_node_count,
+                    prefill.nodes.len()
+                ),
+            });
+        }
+        if self.decode_node_count != decode.nodes.len() {
+            return Err(E2eConformanceError::GraphValidationFailed {
+                reason: format!(
+                    "Qwen Component decode graph declared {} node(s), runtime graph has {}",
+                    self.decode_node_count,
+                    decode.nodes.len()
+                ),
+            });
+        }
+        let expected_prefill_hash =
+            qwen_operator_sequence_hash(&qwen_graph_operator_codes(prefill)?);
+        if self.prefill_operator_hash != expected_prefill_hash {
+            return Err(E2eConformanceError::GraphValidationFailed {
+                reason: format!(
+                    "Qwen Component prefill graph declared operator-sequence hash {:#010x}, runtime graph expects {expected_prefill_hash:#010x}",
+                    self.prefill_operator_hash
+                ),
+            });
+        }
+        let expected_decode_hash = qwen_operator_sequence_hash(&qwen_graph_operator_codes(decode)?);
+        if self.decode_operator_hash != expected_decode_hash {
+            return Err(E2eConformanceError::GraphValidationFailed {
+                reason: format!(
+                    "Qwen Component decode graph declared operator-sequence hash {:#010x}, runtime graph expects {expected_decode_hash:#010x}",
+                    self.decode_operator_hash
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn build_first_native_graphs_from_component_output(
+    fixture: &E2eFixture,
+    prompt_token_count: u64,
+    component_graph_semantics: QwenComponentGraphSemantics,
+) -> Result<FirstNativeComponentGraphs, E2eConformanceError> {
+    let prefill = qwen_prefill_graph(
+        &fixture.config,
+        &fixture.identity,
+        prompt_token_count.max(1),
+        true,
+    )?;
+    let decode = qwen_decode_graph(
+        &fixture.config,
+        &fixture.identity,
+        prompt_token_count.max(1),
+    )?;
+    component_graph_semantics.validate_against_graphs(&prefill.graph, &decode.graph)?;
+    validate_first_scope_graph(&prefill.graph)?;
+    validate_first_scope_graph(&decode.graph)?;
+    Ok(FirstNativeComponentGraphs {
+        prefill_node_count: prefill.graph.nodes.len(),
+        decode_node_count: decode.graph.nodes.len(),
+        prefill: prefill.graph,
+        decode: decode.graph,
+    })
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+struct QwenComponentPreflightRequest {
+    component_package: ComponentArtifactPackage,
+    trust_store: ComponentTrustStore,
+    limits: ComponentResourceLimits,
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+impl QwenComponentPreflightRequest {
+    fn default_trusted() -> Self {
+        Self {
+            component_package: qwen_graph_component_package(),
+            trust_store: ComponentTrustStore::default().trust_digest(QWEN_GRAPH_COMPONENT_DIGEST),
+            limits: qwen_component_runtime_limits(),
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+fn invoke_qwen_component_u32(
+    manager: &mut ComponentManager,
+    instance: ComponentInstanceId,
+    interface: &WitInterface,
+    operation: &str,
+) -> Result<u32, E2eConformanceError> {
+    let result = manager
+        .invoke(ComponentInvocation::new(
+            instance,
+            interface.clone(),
+            operation,
+        ))
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    match result.values.as_slice() {
+        [ComponentValue::U32(value)] => Ok(*value),
+        values => Err(E2eConformanceError::GraphValidationFailed {
+            reason: format!(
+                "Qwen Component export '{operation}' returned {values:?}, expected u32"
+            ),
+        }),
+    }
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+fn validate_and_instantiate_qwen_component_before_first_native_planning(
+    request: QwenComponentPreflightRequest,
+) -> Result<QwenComponentPreflight, E2eConformanceError> {
+    let mut manager = ComponentManager::with_engine(Box::new(
+        crate::component_wasmtime::WasmtimeComponentEngine::new().map_err(|error| {
+            E2eConformanceError::ModelComponentFailed {
+                reason: error.to_string(),
+            }
+        })?,
+    ));
+    manager.set_resource_limits(request.limits);
+    manager.set_trust_store(request.trust_store);
+    let definition = manager
+        .prepare_pushed_package(request.component_package)
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let instance = manager
+        .instantiate_prepared_component(definition)
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+    let interface = WitInterface::new("magnetar:qwen/graph-fixture", "1.0.0");
+    let authority = invoke_qwen_component_u32(
+        &mut manager,
+        instance,
+        &interface,
+        "provider-authority-count",
+    )?;
+    if authority != 0 {
+        return Err(E2eConformanceError::BoundaryViolation {
+            reason: "Qwen Component fixture requested Provider authority".into(),
+        });
+    }
+    let graph_semantics = QwenComponentGraphSemantics {
+        prefill_node_count: invoke_qwen_component_u32(
+            &mut manager,
+            instance,
+            &interface,
+            "prefill-node-count",
+        )? as usize,
+        decode_node_count: invoke_qwen_component_u32(
+            &mut manager,
+            instance,
+            &interface,
+            "decode-node-count",
+        )? as usize,
+        prefill_operator_hash: invoke_qwen_component_u32(
+            &mut manager,
+            instance,
+            &interface,
+            "prefill-operator-hash",
+        )?,
+        decode_operator_hash: invoke_qwen_component_u32(
+            &mut manager,
+            instance,
+            &interface,
+            "decode-operator-hash",
+        )?,
+    };
+    Ok(QwenComponentPreflight {
+        definition,
+        instance,
+        graph_semantics,
+        observations: manager.observations().to_vec(),
+    })
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+fn validate_and_instantiate_trusted_qwen_component_before_first_native_planning()
+-> Result<QwenComponentPreflight, E2eConformanceError> {
+    validate_and_instantiate_qwen_component_before_first_native_planning(
+        QwenComponentPreflightRequest::default_trusted(),
+    )
+}
+
+#[cfg(test)]
+/// Builds the portable graph semantics a component describing `config`'s
+/// prefill/decode graphs correctly would report at `prompt_token_count`:
+/// node counts and the full Operator-kind-code sequence
+/// (`qwen_graph_operator_codes`), derived directly from the Runtime-built
+/// graphs. Used wherever a caller needs a known-correct value rather than
+/// one queried across the Component boundary (the non-component fallback
+/// build, and tests not themselves exercising component/graph mismatch
+/// detection).
+fn qwen_component_graph_semantics_for_prompt(
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+    prompt_token_count: u64,
+) -> Result<QwenComponentGraphSemantics, E2eConformanceError> {
+    let prefill = qwen_prefill_graph(config, identity, prompt_token_count.max(1), true)?.graph;
+    let decode = qwen_decode_graph(config, identity, prompt_token_count.max(1))?.graph;
+    Ok(QwenComponentGraphSemantics {
+        prefill_node_count: prefill.nodes.len(),
+        decode_node_count: decode.nodes.len(),
+        prefill_operator_hash: qwen_operator_sequence_hash(&qwen_graph_operator_codes(&prefill)?),
+        decode_operator_hash: qwen_operator_sequence_hash(&qwen_graph_operator_codes(&decode)?),
+    })
+}
+
+#[cfg(test)]
+/// Correctif 17 / task group 17: `validate_e2e_no_shortcuts` (via
+/// `validate_e2e_per_node_causal_chain`) SHALL reject a per-node causal
+/// chain that is *incomplete* for a node that genuinely dispatched, not
+/// only confirm the five global evidence categories occurred somewhere. A
+/// node with `GraphNodeReady` and `PlanBindingResolved`/`PreparedKernelResolved`/
+/// `ProviderSubmitted` but no correlated `ProviderCompleted` or
+/// `TensorResourceProduced` (as if a dispatch died silently between submit
+/// and completion) must be caught, distinctly from the presence-only check
+/// this task group's fix supersedes.
+fn check_e2e_no_shortcuts_rejects_incomplete_per_node_causal_chain()
+-> Result<(), E2eConformanceError> {
+    let node = |kind: InferenceApiObservationKind, name: &str| {
+        InferenceApiObservation::new(kind, format!("per-node causal event; node={name}"), None)
+    };
+    let observations = vec![
+        node(InferenceApiObservationKind::GraphNodeReady, "embedding"),
+        node(
+            InferenceApiObservationKind::PlanBindingResolved,
+            "embedding",
+        ),
+        node(
+            InferenceApiObservationKind::PreparedKernelResolved,
+            "embedding",
+        ),
+        node(InferenceApiObservationKind::ProviderSubmitted, "embedding"),
+        // Deliberately missing: ProviderCompleted / TensorResourceProduced
+        // for "embedding" -- as if the node's dispatch died silently
+        // between submission and completion.
+    ];
+    match validate_e2e_per_node_causal_chain(&observations) {
+        Err(E2eConformanceError::BoundaryViolation { reason })
+            if reason.contains("embedding") && reason.contains("ProviderCompleted") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for an incomplete per-node causal chain: {error}"),
+        }),
+        Ok(()) => Err(E2eConformanceError::GenerationFailed {
+            reason: "validator accepted an incomplete per-node causal chain".into(),
+        }),
+    }
+}
+
+/// Test-oracle only (task 12.6): exercises the Rust-synthesized graph
+/// builder directly to prove it stays internally valid, independent of
+/// whether anything in production ever uses it as a graph source.
+#[cfg(test)]
+pub(crate) fn check_graph_production_and_execution(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    // kv_cache_enabled=true so the prefill graph's K/V edges are actually
+    // marked as cache outputs -- otherwise the decode graph below would
+    // claim 2 cached tokens that this graph never produced.
+    let prefill = qwen_prefill_graph(&fixture.config, &fixture.identity, 2, true)?;
+    if prefill.validation.is_none() {
+        return Err(E2eConformanceError::GraphValidationFailed {
+            reason: "prefill graph was produced without validation".into(),
+        });
+    }
+    // The prefill graph above was built for a 2-token prompt with caching
+    // enabled, so the decode graph represents generating the 3rd token
+    // against those 2 cached ones.
+    let decode = qwen_decode_graph(&fixture.config, &fixture.identity, 2)?;
+    if decode.validation.is_none() {
+        return Err(E2eConformanceError::GraphValidationFailed {
+            reason: "decode graph was produced without validation".into(),
+        });
+    }
+    let policy = GraphPlanningPolicy::default();
+    let catalog = default_graph_catalog();
+    plan_execution_graph(&prefill.graph, &catalog, &policy, None)
+        .map_err(E2eConformanceError::from)?;
+    execute_graph_boundary(&prefill.graph, &catalog, &policy).map_err(E2eConformanceError::from)?;
+    plan_execution_graph(&decode.graph, &catalog, &policy, None)
+        .map_err(E2eConformanceError::from)?;
+    execute_graph_boundary(&decode.graph, &catalog, &policy).map_err(E2eConformanceError::from)?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn check_eos_token_stops_generation(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine_and_forced_token(
+        fixture,
+        Some(E2E_FIXTURE_EOS_TOKEN),
+    );
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let tokenized = tokenize_prompt_input(
+        &fixture.tokenizer,
+        TokenizationRequest::new(PromptInput::PlainText("a".into())),
+        None,
+    )?;
+    let request = build_generation_request(
+        GenerationRequestId::new("e2e-eos-stop")?,
+        None,
+        GenerationModelReference::ModelInstance(instance),
+        generation_tokenizer_reference(fixture),
+        tokenized,
+        4,
+        GenerationParameters::greedy(),
+        StopConditions {
+            eos: EosPolicy {
+                eos_token_ids: vec![E2E_FIXTURE_EOS_TOKEN],
+                ..EosPolicy::default()
+            },
+            ..StopConditions::default()
+        },
+        StreamingMode::Disabled,
+    );
+    let request = prepare_generation(&runtime, request)?;
+    let mut observer = InferenceApiObserver::new();
+    let result = run_generation_loop(
+        &mut runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated_so_far| false,
+        &mut observer,
+    )?;
+    if result.output.finish_reason != FinishReason::EosToken {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "expected FinishReason::EosToken, got {:?}",
+                result.output.finish_reason
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_first_native_generation_requires_ready_model_instance(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    suspend_model_instance(
+        &mut runtime,
+        &instance,
+        ModelInstanceSuspensionReason::AdministrativePolicy,
+    )?;
+
+    match require_ready_first_native_instance(&runtime, &instance) {
+        Err(InferenceApiError::ModelInstanceNotReady { reason })
+            if reason.contains("requires ready ModelInstance") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected readiness error: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "first-native generation accepted a non-ready ModelInstance".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_missing_prepared_plan_fails_closed() -> Result<(), E2eConformanceError> {
+    let context = first_native_plan_context(PreparedExecutionPhase::Prefill, 1);
+    match require_compatible_first_native_plan(None, &context) {
+        Err(PreparedExecutionPlanError::PlanNotFound) => Ok(()),
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected missing-plan error: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "first-native execution accepted missing PreparedExecutionPlan".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_invalidated_prepared_plan_rejects_new_work(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let graphs = build_first_native_graphs_from_component_output(
+        fixture,
+        2,
+        qwen_component_graph_semantics_for_prompt(&fixture.config, &fixture.identity, 2)?,
+    )?;
+    let mut plans = prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)?;
+    plans
+        .decode
+        .hard_invalidate(crate::kernel_execution_plan::PlanRebuildReason::KernelRevoked)?;
+    let context = first_native_plan_context(PreparedExecutionPhase::Decode, 1);
+    match require_compatible_first_native_plan(Some(&mut plans.decode), &context) {
+        Err(PreparedExecutionPlanError::PlanNotReadyForExecution) => Ok(()),
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected invalidated-plan error: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "first-native execution accepted invalidated PreparedExecutionPlan".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_stale_plan_outside_policy_fails_closed(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let graphs = build_first_native_graphs_from_component_output(
+        fixture,
+        2,
+        qwen_component_graph_semantics_for_prompt(&fixture.config, &fixture.identity, 2)?,
+    )?;
+    let mut plans = prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)?;
+    plans.decode.mark_stale(
+        crate::kernel_execution_plan::PlanRebuildReason::KernelRevoked,
+        crate::kernel_execution_plan::PlanRebuildUrgency::RequiredBeforeNewWork,
+    )?;
+    let context = first_native_plan_context(PreparedExecutionPhase::Decode, 1);
+    match require_compatible_first_native_plan(Some(&mut plans.decode), &context) {
+        Err(PreparedExecutionPlanError::PlanStaleOutsidePolicy) => Ok(()),
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected stale-outside-policy error: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "first-native execution accepted a plan stale outside its rebuild policy"
+                .into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_qwen_graph_nodes_have_prepared_kernel_bindings(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let graphs = build_first_native_graphs_from_component_output(
+        fixture,
+        2,
+        qwen_component_graph_semantics_for_prompt(&fixture.config, &fixture.identity, 2)?,
+    )?;
+    let plans = prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)?;
+
+    for (plan, expected_node_count) in [
+        (&plans.prefill, plans.prefill_node_count),
+        (&plans.decode, plans.decode_node_count),
+    ] {
+        if plan.node_bindings.len() != expected_node_count {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "prepared plan has {} bindings for {expected_node_count} graph nodes",
+                    plan.node_bindings.len()
+                ),
+            });
+        }
+        for binding in &plan.node_bindings {
+            if binding.graph_nodes.is_empty() {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan contains a binding without graph nodes".into(),
+                });
+            }
+            if binding.kernel.provider.as_str() != REFERENCE_CPU_PROVIDER_NAME {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan selected a non-Reference CPU provider".into(),
+                });
+            }
+            if binding.provider.as_str() != REFERENCE_CPU_PROVIDER_NAME {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding provider is not Reference CPU".into(),
+                });
+            }
+            if binding.device.as_ref().map(ToString::to_string).as_deref()
+                != Some(REFERENCE_CPU_DEVICE_ID)
+            {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding did not record Reference CPU device identity"
+                        .into(),
+                });
+            }
+            if binding.prepared_kernel.is_none() || binding.prepared_kernel_generation.is_none() {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding lacks PreparedKernelId or generation".into(),
+                });
+            }
+            if binding.qualification_profile.as_deref() != Some(REFERENCE_CPU_CONFORMANCE_PROFILE) {
+                return Err(E2eConformanceError::GenerationFailed {
+                    reason: "prepared plan binding lacks implementation conformance identity"
+                        .into(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_graph_dispatch_rejects_unregistered_provider(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
+    // Every node binding names a Provider Runtime must resolve at execution
+    // time (task 5.2); point them all at a name nothing registers, the
+    // execution-time equivalent of the Provider having been removed from
+    // Runtime's registration between plan preparation and execution.
+    for binding in &mut plans.prefill.node_bindings {
+        binding.provider = ProviderBinding::new("unregistered-provider");
+    }
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let cache_id = KvCacheId::new("test-unregistered-executor-cache")?;
+    match execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    ) {
+        Err(InferenceApiError::ProviderUnavailable { reason })
+            if reason.contains("unregistered-provider") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for an unregistered provider: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "graph executor dispatched through an unregistered provider".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_graph_dispatch_uses_registered_provider_instance(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
+    let provider_binding = plans
+        .prefill
+        .node_bindings
+        .first()
+        .map(|binding| binding.provider.clone())
+        .ok_or_else(|| E2eConformanceError::GraphValidationFailed {
+            reason: "prefill plan has no node bindings".into(),
+        })?;
+    let before = resolve_kernel_execution_provider(&runtime, &provider_binding)
+        .map_err(E2eConformanceError::from)?
+        .observations()
+        .len();
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let cache_id = KvCacheId::new("test-registered-executor-instance-cache")?;
+    execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    // Re-resolving from Runtime provider registration after dispatch (the
+    // same path production execution uses) must observe the *same*
+    // registered instance's growing observation trail -- not a disconnected
+    // throwaway that discarded its own observations when it went out of
+    // scope.
+    let after = resolve_kernel_execution_provider(&runtime, &provider_binding)
+        .map_err(E2eConformanceError::from)?
+        .observations()
+        .len();
+    if after <= before {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason:
+                "graph dispatch did not record observations on the registered provider instance"
+                    .into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_graph_dispatch_accounts_outputs_through_runtime_memory_manager(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let cache_id = KvCacheId::new("test-output-accounting-cache")?;
+    execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let tensor_allocations = runtime
+        .memory()
+        .allocations()
+        .filter(|allocation| allocation.request.class == MemoryAllocationClass::Tensor)
+        .count();
+    if tensor_allocations == 0 {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason:
+                "graph dispatch produced no output tensor allocations in Runtime's MemoryManager"
+                    .into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// `enable-device-resident-kernel-chaining`'s discovered leak fix:
+/// `execute_invocation_with_memory_manager` (both `providers/cpu` and
+/// `providers/cuda`, and this crate's own in-crate `ReferenceCpuExecutor`)
+/// previously admitted a fresh `MemoryAllocationId` for each Kernel-internal
+/// output resource on every single dispatch, without ever releasing the
+/// previous one for that same resource id -- and a Kernel-internal output
+/// id (e.g. `{operation_id}.out`) is derived only from the graph node id,
+/// so it is stable across every separate dispatch of the same graph.
+/// Without the fix, dispatching the identical graph twice would leave the
+/// first run's now-orphaned allocations still `Active` in the Memory
+/// Manager's ledger forever; with it, the second run's admissions replace
+/// (and release) the first's, so the Provider-owned Tensor allocation
+/// count does not grow.
+fn check_graph_dispatch_does_not_leak_kernel_output_allocations_across_repeated_dispatch(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+
+    let provider_owned_active_tensor_count = |runtime: &Runtime| {
+        runtime
+            .memory()
+            .allocations()
+            .filter(|allocation| {
+                allocation.state == MemoryAllocationState::Active
+                    && allocation.request.class == MemoryAllocationClass::Tensor
+                    && matches!(allocation.request.owner, MemoryAllocationOwner::Provider(_))
+            })
+            .count()
+    };
+
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
+    let cache_id_1 = KvCacheId::new("test-leak-fix-cache-one")?;
+    execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id_1,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids.clone())]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let count_after_first_dispatch = provider_owned_active_tensor_count(&runtime);
+
+    // A second, independent dispatch of the *same* graph (same node ids,
+    // hence the same Kernel-internal output resource ids), under a
+    // different KV cache so Session-owned edge resources don't collide --
+    // only the Provider-owned Kernel-internal admissions this fix targets
+    // are being counted above.
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
+    let cache_id_2 = KvCacheId::new("test-leak-fix-cache-two")?;
+    execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id_2,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let count_after_second_dispatch = provider_owned_active_tensor_count(&runtime);
+
+    if count_after_second_dispatch != count_after_first_dispatch {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "expected the Provider-owned Active Tensor allocation count to stay constant \
+                 across a second dispatch of the identical graph (Kernel-internal output ids are \
+                 stable across dispatches, so re-admission must replace, not accumulate): \
+                 {count_after_first_dispatch} after the first dispatch, \
+                 {count_after_second_dispatch} after the second"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Correctif 5: `execute_qwen_graph_nodes`'s node-to-node transport is
+/// Resource-based, not a private `HostTensor` cache -- an *intermediate*
+/// graph edge's value (not just the final returned bindings) must be
+/// independently readable straight from the registered Provider's storage,
+/// under the resource id the executor recorded for it.
+fn check_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
+    let embedding_output_edge = graphs
+        .prefill
+        .nodes
+        .get(&ExecutionNodeId::new("embedding"))
+        .and_then(|node| node.outputs.first())
+        .cloned()
+        .ok_or_else(|| E2eConformanceError::GraphValidationFailed {
+            reason: "prefill graph has no 'embedding' node output edge".into(),
+        })?;
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let cache_id = KvCacheId::new("test-intermediate-edge-resource-cache")?;
+    execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let provider = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let resource_id = TensorResourceId::new(format!("edge.{embedding_output_edge}"));
+    if provider.read_tensor(&resource_id).is_none() {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "intermediate edge '{embedding_output_edge}' is not resolvable from Provider \
+                 storage at resource '{resource_id}'; graph execution must not hold this \
+                 value only in a private, non-Provider-backed cache"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// `define-provider-prepared-kernel-execution-contract` task 3.4: a
+/// genuinely two-output Kernel dispatch ("split", the Rust test-oracle
+/// graph's fused `gate_up_proj` -> `split` -> `gate`/`up` recipe -- see
+/// `qwen_model_component::qwen_build_graph`) must leave *both* declared
+/// output edges independently resolvable from Provider storage, under
+/// *different* resource ids, each holding the correct half of the
+/// pre-split tensor -- not just the first output propagated, the second
+/// silently dropped or aliased onto the first (the historical bug this
+/// task group closes). Builds the graph directly through
+/// `qwen_prefill_graph` rather than `first_native_component_graphs_for_prompt`
+/// so this proof holds regardless of whether a strict Component engine is
+/// available: the "split" node exists only in this Rust-synthesized
+/// recipe (`qwen_expected_tensor_names`'s doc comment), not in the
+/// checked-in real Qwen Component's own graph.
+fn check_two_output_split_dispatch_produces_independently_resolvable_resources(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let prefill = qwen_prefill_graph(&fixture.config, &fixture.identity, 2, true)?.graph;
+    let split_node = prefill
+        .nodes
+        .values()
+        .find(|node| node.operator.name() == "split")
+        .ok_or_else(|| E2eConformanceError::GraphValidationFailed {
+            reason: "prefill graph has no 'split' node".into(),
+        })?;
+    let split_input_edge = split_node.inputs.first().cloned().ok_or_else(|| {
+        E2eConformanceError::GraphValidationFailed {
+            reason: "'split' node has no input edge".into(),
+        }
+    })?;
+    let (gate_edge, up_edge) = match split_node.outputs.as_slice() {
+        [left, right] => (left.clone(), right.clone()),
+        other => {
+            return Err(E2eConformanceError::GraphValidationFailed {
+                reason: format!("'split' node expects exactly 2 output edges, got {other:?}"),
+            });
+        }
+    };
+    let decode = qwen_decode_graph(&fixture.config, &fixture.identity, 2)?.graph;
+    let prefill_graph = prefill.clone();
+    let graphs = FirstNativeComponentGraphs {
+        prefill_node_count: prefill.nodes.len(),
+        prefill,
+        decode_node_count: decode.nodes.len(),
+        decode,
+    };
+    let mut plans = prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)?;
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let cache_id = KvCacheId::new("test-two-output-split-cache")?;
+    execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &prefill_graph,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let provider = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let gate_up_resource = TensorResourceId::new(format!("edge.{split_input_edge}"));
+    let gate_resource = TensorResourceId::new(format!("edge.{gate_edge}"));
+    let up_resource = TensorResourceId::new(format!("edge.{up_edge}"));
+    if gate_resource == up_resource {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: "split's two output edges resolved to the same resource id".into(),
+        });
+    }
+    let gate_up = provider.read_tensor(&gate_up_resource).ok_or_else(|| {
+        E2eConformanceError::MemoryValidationFailed {
+            reason: format!("split's pre-split input '{gate_up_resource}' is not resolvable"),
+        }
+    })?;
+    let gate = provider.read_tensor(&gate_resource).ok_or_else(|| {
+        E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "split's first output '{gate_resource}' is not independently resolvable \
+                 from Provider storage"
+            ),
+        }
+    })?;
+    let up = provider.read_tensor(&up_resource).ok_or_else(|| {
+        E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "split's second output '{up_resource}' is not independently resolvable \
+                 from Provider storage"
+            ),
+        }
+    })?;
+    let cols = *gate_up
+        .shape
+        .last()
+        .ok_or_else(|| E2eConformanceError::MemoryValidationFailed {
+            reason: "split's pre-split input has no dimensions".into(),
+        })? as usize;
+    let half = cols / 2;
+    let rows = gate_up.data.len() / cols;
+    if gate.shape != up.shape || gate.data.len() != rows * half {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "split's two outputs have unexpected shapes: gate={:?}, up={:?}, \
+                 expected each to be the pre-split input's last dimension halved",
+                gate.shape, up.shape
+            ),
+        });
+    }
+    for row in 0..rows {
+        let expected_gate = &gate_up.data[row * cols..row * cols + half];
+        let expected_up = &gate_up.data[row * cols + half..(row + 1) * cols];
+        let actual_gate = &gate.data[row * half..(row + 1) * half];
+        let actual_up = &up.data[row * half..(row + 1) * half];
+        if actual_gate != expected_gate || actual_up != expected_up {
+            return Err(E2eConformanceError::MemoryValidationFailed {
+                reason: format!(
+                    "split's outputs for row {row} do not match the expected halves of its \
+                     pre-split input: gate {actual_gate:?} (expected {expected_gate:?}), \
+                     up {actual_up:?} (expected {expected_up:?})"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_graph_dispatch_releases_workspace_after_use(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    // This fixture's one layer includes an `attention` node, the only
+    // Operator Reference CPU advertises a required workspace for.
+    let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let cache_id = KvCacheId::new("test-workspace-release-cache")?;
+    execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let workspace_allocations: Vec<_> = runtime
+        .memory()
+        .allocations()
+        .filter(|allocation| allocation.request.class == MemoryAllocationClass::TemporaryWorkspace)
+        .collect();
+    if workspace_allocations.is_empty() {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: "attention dispatch requested no workspace allocation to release".into(),
+        });
+    }
+    if workspace_allocations
+        .iter()
+        .any(|allocation| allocation.state == MemoryAllocationState::Active)
+    {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: "workspace allocation was not released after its dispatch completed".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_graph_dispatch_records_memory_feasibility_failure_under_tight_budget(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    // Wide enough for model loading's own resident-bytes allocation and this
+    // fixture's per-tensor weight resources (task 6.2) to be admitted, but
+    // far below `attention`'s required 1 MiB workspace -- so *that*
+    // allocation is what fails admission, not an earlier, unrelated one.
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .config(RuntimeConfig {
+            memory: MemoryManagerConfig {
+                max_runtime_bytes: Some(1 << 16),
+                allow_pending_allocations: false,
+                ..MemoryManagerConfig::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .trust_store(
+            ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        )
+        .build()
+        .map_err(|error| E2eConformanceError::SuiteUnavailable {
+            reason: error.to_string(),
+        })?;
+    register_reference_cpu_prepared_kernels(&mut runtime);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let cache_id = KvCacheId::new("test-tight-budget-cache")?;
+    let result = execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    );
+    // Memory Admission Precedes Provider Materialization: every node's
+    // declared output must be admitted before its Kernel is dispatched, so
+    // the first node this fixture's graph reaches whose output (or, for
+    // `attention`, required workspace) does not fit the tight budget hard-
+    // fails admission and the Kernel is never dispatched for it.
+    match result {
+        Err(
+            InferenceApiError::MemoryAdmissionFailed { reason }
+            | InferenceApiError::GenerationFailed { reason },
+        ) if reason.contains("out of memory") || reason.contains("memory admission failed") => {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error under a tight Runtime memory budget: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "graph dispatch succeeded despite a tight Runtime memory budget".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_weight_binding_rejects_tampered_artifact_bytes(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let mut tampered = fixture.clone();
+    let (_name, tensor) =
+        tampered
+            .weights
+            .iter_mut()
+            .next()
+            .ok_or_else(|| E2eConformanceError::FixtureInvalid {
+                reason: "fixture has no weight tensors to tamper with".into(),
+            })?;
+    tensor.data[0] += 1.0;
+    match load_fixture_instance(&tampered, &mut runtime) {
+        Err(E2eConformanceError::FixtureInvalid { reason }) if reason.contains("digest") => Ok(()),
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for a tampered weight artifact: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "model loading accepted a weight artifact with tampered bytes".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+/// Like `load_fixture_instance`, but binds `weights` directly through
+/// `materialize_model_instance_weights` instead of `bind_qwen_fixture_weights`
+/// -- so a caller can supply a deliberately altered weight map without it
+/// being rejected by the fixture's own digest check (task 6.5's concern,
+/// already covered by `check_weight_binding_rejects_tampered_artifact_bytes`;
+/// not what this is for).
+fn load_fixture_instance_with_weights(
+    fixture: &E2eFixture,
+    runtime: &mut Runtime,
+    weights: &BTreeMap<String, HostTensor>,
+) -> Result<ModelInstanceId, E2eConformanceError> {
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(fixture.architecture_implementation.clone());
+    let mut request = ModelLoadingRequest::new(
+        ModelLoadingRequestId::new("e2e-fixture-load-weight-sensitivity"),
+        fixture.manifest.id.clone(),
+    );
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = load_model(
+        &mut coordinator,
+        runtime,
+        ModelLoadingApiRequest::new(request),
+        &fixture.manifest,
+    )?;
+    let instance = create_model_instance(
+        runtime,
+        &loaded,
+        fixture.architecture_implementation.clone(),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )?;
+    let mut weights = weights.clone();
+    qwen_weights_with_derived_lm_head(fixture, &mut weights)?;
+    materialize_model_instance_weights(
+        runtime,
+        &instance,
+        fixture.manifest.id.name.as_str(),
+        &weights,
+    )?;
+    Ok(instance)
+}
+
+#[cfg(test)]
+/// `bind-materialized-weight-content-to-model-artifact-digests`: proves
+/// the content-digest check at the exact public entrypoint it lives in
+/// (`WeightMaterializationTransaction::stage_weight`, reached through
+/// `materialize_model_instance_weights`), not only through
+/// `bind_qwen_fixture_weights`'s separate, earlier, aggregate in-memory
+/// check (`check_weight_binding_rejects_tampered_artifact_bytes` proves
+/// that one). `fixture.manifest`'s tensor inventory now carries real
+/// per-tensor digests computed from the real checked-in Safetensors file
+/// (`e2e_fixture_manifest`), so tampering one tensor's bytes before
+/// materializing it directly must be rejected with the specific
+/// content-digest-mismatch error, not merely *some* error.
+fn check_materialize_model_instance_weights_rejects_content_digest_mismatch(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let mut tampered_weights = fixture.weights.clone();
+    let (_name, tensor) =
+        tampered_weights
+            .iter_mut()
+            .next()
+            .ok_or_else(|| E2eConformanceError::FixtureInvalid {
+                reason: "fixture has no weight tensors to tamper with".into(),
+            })?;
+    tensor.data[0] += 1.0;
+    match load_fixture_instance_with_weights(fixture, &mut runtime, &tampered_weights) {
+        Err(E2eConformanceError::GenerationFailed { reason })
+            if reason.contains("weight content digest mismatch") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("expected a weight content digest mismatch error, got: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "materialize_model_instance_weights accepted tampered tensor content".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+/// Regression guard for the happy path this Change's check sits directly
+/// in front of: the real, untampered fixture weights (bit-identical to
+/// what their declared digests were computed from) must still materialize
+/// and bind normally through the exact same entrypoint the mismatch test
+/// above uses.
+fn check_materialize_model_instance_weights_accepts_matching_content(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let real_weights = e2e_fixture_weights_from_real_artifact(&fixture.config)?;
+    load_fixture_instance_with_weights(fixture, &mut runtime, &real_weights)?;
+    Ok(())
+}
+
+#[cfg(test)]
+/// Runs a real prefill through the production graph-execution path
+/// (`execute_qwen_graph`, the same one `execute_generation_step` uses) with
+/// `weights` bound to a fresh `ModelInstance`, and returns the "logits"
+/// edge's values.
+fn forward_logits_with_weights(
+    fixture: &E2eFixture,
+    weights: &BTreeMap<String, HostTensor>,
+    prompt: &[TokenId],
+) -> Result<Vec<f32>, E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let instance = load_fixture_instance_with_weights(fixture, &mut runtime, weights)?;
+    let mut plans =
+        first_native_plans_for_prompt(&runtime, fixture, &instance, prompt.len() as u64)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, prompt.len() as u64)?;
+    let ids = HostTensor::new(
+        [prompt.len() as u64],
+        prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+    )?;
+    let cache_id = KvCacheId::new("test-weight-sensitivity-cache")?;
+    let (_dispatch, mut bindings, _layer_kv, _provider) = execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )?;
+    let logits = bindings
+        .remove(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "first-native graph produced no logits output".into(),
+        })?;
+    Ok(logits.data)
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+#[allow(clippy::too_many_arguments)]
+/// [`forward_logits_with_weights`]'s per-Device pipeline-placement
+/// counterpart (`add-real-multi-device-model-instance-placement`): loads a
+/// segment-only Model Instance for decoder layer range `[start_layer,
+/// end_layer)` (`filter_manifest_for_layer_range`/
+/// `qwen_weight_name_in_layer_range`), builds its real prefill-segment
+/// graph through the real Qwen Component
+/// (`build_first_native_prefill_graph_segment_for_config`), and runs it
+/// with `boundary_hidden` bound to `input.hidden_states_in` when
+/// `start_layer != 0` (`input.token_ids` otherwise, exactly like a full
+/// graph's own first segment) -- returning the segment's own `"logits"`-
+/// named output tensor (a raw post-layer hidden state for an internal
+/// segment, real logits for one reaching `num_hidden_layers`).
+fn forward_segment_logits_with_weights(
+    fixture: &E2eFixture,
+    weights: &BTreeMap<String, HostTensor>,
+    prompt: &[TokenId],
+    start_layer: u32,
+    end_layer: u32,
+    boundary_hidden: Option<HostTensor>,
+) -> Result<HostTensor, E2eConformanceError> {
+    let num_hidden_layers = fixture.config.architecture.layer_count as u32;
+    let segment_manifest = filter_manifest_for_layer_range(
+        &fixture.manifest,
+        start_layer,
+        end_layer,
+        num_hidden_layers,
+    );
+    // Derived from the *full* weight set (needs `token_embedding`, which a
+    // segment starting mid-stack never itself carries) before filtering
+    // down to this segment's own subset -- mirrors `load_fixture_instance_
+    // with_weights`'s own ordering for the exact same reason (tied
+    // embeddings' `lm_head` is never a separately declared manifest tensor;
+    // see `qwen_expected_tensor_names`).
+    let mut segment_weights = weights.clone();
+    qwen_weights_with_derived_lm_head(fixture, &mut segment_weights)?;
+    segment_weights.retain(|name, _| {
+        qwen_weight_name_in_layer_range(name, start_layer, end_layer, num_hidden_layers)
+    });
+
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(fixture.architecture_implementation.clone());
+    let mut request = ModelLoadingRequest::new(
+        ModelLoadingRequestId::new(format!("test-segment-load-{start_layer}-{end_layer}")),
+        segment_manifest.id.clone(),
+    );
+    request.quantization_policy = ModelQuantizationPolicy::RejectUnsupported;
+    let loaded = load_model(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(request),
+        &segment_manifest,
+    )?;
+    let instance = create_model_instance(
+        &mut runtime,
+        &loaded,
+        fixture.architecture_implementation.clone(),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )?;
+    materialize_model_instance_weights(
+        &mut runtime,
+        &instance,
+        segment_manifest.id.name.as_str(),
+        &segment_weights,
+    )?;
+
+    let provider_binding = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+    let status = require_ready_first_native_instance(&runtime, &instance)?;
+    let mutation_version = status.status().mutation_version;
+    let (segment_graph, _definition, _instance_handle) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            prompt.len() as u64,
+            start_layer,
+            end_layer,
+        )?;
+    let mut plan = prepare_first_native_plan_for_graph(
+        &runtime,
+        &segment_graph,
+        &instance,
+        mutation_version,
+        prompt.len() as u64,
+        PreparedExecutionPlanGeneration::new(1),
+        &provider_binding,
+    )?;
+
+    let initial_bindings = if start_layer == 0 {
+        let ids = HostTensor::new(
+            [prompt.len() as u64],
+            prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+        )?;
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)])
+    } else {
+        let hidden = boundary_hidden.ok_or_else(|| E2eConformanceError::FixtureInvalid {
+            reason: "segment starting mid-stack requires a boundary hidden-state tensor".into(),
+        })?;
+        BTreeMap::from([(TensorEdgeId::new("input.hidden_states_in"), hidden)])
+    };
+    let cache_id = KvCacheId::new(format!("test-segment-cache-{start_layer}-{end_layer}"))?;
+    let (_dispatch, mut bindings, _layer_kv, _provider) = execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &segment_graph,
+        &mut plan,
+        initial_bindings,
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )?;
+    bindings
+        .remove(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "segment graph produced no logits-named output".into(),
+        })
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+/// A small, real 2-decoder-layer Qwen fixture, independent of the canonical
+/// 1-layer `E2E_FIXTURE_*` constants (too small to split into two non-
+/// trivial segments) -- built from `e2e_fixture_manifest_from_weights`
+/// (self-consistent digests for an arbitrary `QwenConfig`, not tied to the
+/// checked-in canonical Safetensors fixture), exactly like `e2e_fixture()`
+/// itself, just with `layer_count: 2`.
+fn two_layer_segment_test_fixture() -> Result<E2eFixture, E2eConformanceError> {
+    let architecture = qwen_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
+    let mut config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    config.tied_embeddings = true;
+    let identity = qwen_component_identity(
+        ModelComponentId::new("segment-split-fixture").expect("static id is valid"),
+        ModelComponentVersion::new(1, 0, 0),
+        ModelComponentImplementationKind::WebAssemblyComponent,
+    );
+    config.validate(&identity)?;
+    let architecture_implementation = qwen_model_component::qwen_architecture_implementation(
+        &identity,
+        ModelArchitectureImplementationKind::ComponentBased,
+    );
+    let weights = e2e_fixture_weights(&config)?;
+    let manifest = e2e_fixture_manifest_from_weights(
+        &config,
+        &architecture_implementation.architecture,
+        &weights,
+    )?;
+    let tokenizer = e2e_fixture_tokenizer()?;
+
+    let descriptor = qwen_component_descriptor(identity.clone(), &config)?;
+    qwen_validate_model_artifact(&descriptor, &config, &manifest)?;
+
+    Ok(E2eFixture {
+        config,
+        identity,
+        architecture_implementation,
+        manifest,
+        tokenizer,
+        weights,
+    })
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+/// `add-real-multi-device-model-instance-placement`, Phase B.1's central
+/// correctness proof: splitting a real Qwen forward pass into two
+/// sequential, independently-loaded segment Model Instances (layers
+/// `[0, mid)` then `[mid, num_hidden_layers)`, the boundary hidden state
+/// handed from the first segment's real output into the second segment's
+/// `hidden_states_in` input) SHALL produce bit-for-bit the same final
+/// output as running the exact same prompt through the one, full,
+/// unsegmented graph -- proof the segmentation itself (weight-range
+/// filtering, `build-*-graph-segment`, and the host-bridged tensor hand-
+/// off) is a pure decomposition of the same computation, not an
+/// approximation, before any real cross-Device movement
+/// (`CudaExecutor::copy_tensor_from_peer_admitted`, already proven
+/// elsewhere) is layered on top of it in a later phase.
+fn check_two_segment_split_produces_identical_output_to_full_graph()
+-> Result<(), E2eConformanceError> {
+    let fixture = two_layer_segment_test_fixture()?;
+    let num_hidden_layers = fixture.config.architecture.layer_count as u32;
+    let mid = num_hidden_layers / 2;
+    if mid == 0 || mid == num_hidden_layers {
+        return Err(E2eConformanceError::FixtureInvalid {
+            reason: "segment split test fixture must have at least 2 decoder layers".into(),
+        });
+    }
+    let prompt: [TokenId; 3] = [3, 5, 7];
+
+    let full_logits = forward_logits_with_weights(&fixture, &fixture.weights, &prompt)?;
+
+    let segment_one_hidden =
+        forward_segment_logits_with_weights(&fixture, &fixture.weights, &prompt, 0, mid, None)?;
+    let segment_two_logits = forward_segment_logits_with_weights(
+        &fixture,
+        &fixture.weights,
+        &prompt,
+        mid,
+        num_hidden_layers,
+        Some(segment_one_hidden.clone()),
+    )?;
+
+    if full_logits != segment_two_logits.data {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "two-segment split output does not bit-for-bit match the full single-graph \
+                 output: full={full_logits:?} segmented={:?}",
+                segment_two_logits.data
+            ),
+        });
+    }
+
+    // Sanity check against a vacuously-always-equal comparison: the first
+    // segment's own raw hidden-state output must genuinely differ from the
+    // full graph's final logits (different shapes/semantics -- a
+    // pre-lm-head hidden state, not a vocabulary distribution), so the
+    // equality above is proof the *second* segment's real computation
+    // matches, not an accidental identity somewhere upstream.
+    if segment_one_hidden.data == full_logits {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "first segment's raw hidden-state output unexpectedly equals the full \
+                      graph's final logits; the two-segment test is not exercising a real \
+                      mid-stack boundary"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    feature = "wasmtime-component-engine"
+))]
+/// Phase C's own real correctness proof, cheap and Reference-CPU-only
+/// (`add-real-multi-device-model-instance-placement`): a real DECODE step
+/// split across two segment Model Instances -- each loaded *once*
+/// (`load_first_native_segment_with_provider_and_weights`) and dispatched
+/// *twice* (a real prefill, then a real decode step reusing the same
+/// Instance and threading its own `FirstNativeProviderRunOutcome::
+/// layer_kv` forward via `run_first_native_graph_segment_dispatch`'s
+/// `kv_history` parameter, exactly like a real multi-step generation loop
+/// would) -- SHALL produce bit-for-bit the same decode logits as running
+/// the identical prompt and follow-up token through the one, full,
+/// unsegmented graph's own prefill-then-decode pair. Phase B.1/B.2 above
+/// only ever proved a single prefill dispatch; this is the first
+/// (cheap, always-run, not `#[ignore]`d) proof that segment DECODE --
+/// `build_first_native_decode_graph_segment_for_config` and the
+/// `kv_history`/`absolute_position_override` threading
+/// `run_first_native_graph_segment_dispatch` gained for Phase C -- is
+/// correct, independent of and much cheaper than the real ~1GB-checkpoint,
+/// two-real-GPU proof in `integration-tests/production-loading`.
+fn check_two_segment_split_decode_step_matches_full_graph_decode() -> Result<(), E2eConformanceError>
+{
+    let fixture = two_layer_segment_test_fixture()?;
+    let num_hidden_layers = fixture.config.architecture.layer_count as u32;
+    let mid = num_hidden_layers / 2;
+    if mid == 0 || mid == num_hidden_layers {
+        return Err(E2eConformanceError::FixtureInvalid {
+            reason: "segment split test fixture must have at least 2 decoder layers".into(),
+        });
+    }
+    let prompt: [TokenId; 3] = [3, 5, 7];
+    let admitted: TokenId = 9;
+    let prompt_len = prompt.len() as u64;
+
+    // Reference: the real, full, unsegmented graph's own prefill-then-
+    // decode pair, exactly like `check_graph_executor_matches_full_
+    // sequence_oracle`'s own pattern.
+    let mut full_runtime = build_runtime_trusting_fixture(&fixture);
+    let full_instance =
+        load_fixture_instance_with_weights(&fixture, &mut full_runtime, &fixture.weights)?;
+    let mut full_plans =
+        first_native_plans_for_prompt(&full_runtime, &fixture, &full_instance, prompt_len)?;
+    let full_graphs = first_native_component_graphs_for_prompt(&fixture, prompt_len)?;
+    let full_cache = KvCacheId::new("segment-decode-coverage-full-cache")?;
+    let prompt_ids = HostTensor::new(
+        [prompt_len],
+        prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+    )?;
+    let (_prefill_dispatch, _prefill_bindings, full_layer_kv, _provider) = execute_qwen_graph(
+        &mut full_runtime,
+        &fixture,
+        &full_instance,
+        &full_cache,
+        &full_graphs.prefill,
+        &mut full_plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), prompt_ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let admitted_ids = HostTensor::new([1], vec![admitted as f32])?;
+    let (_decode_dispatch, full_decode_bindings, _updated_layer_kv, _provider) =
+        execute_qwen_graph(
+            &mut full_runtime,
+            &fixture,
+            &full_instance,
+            &full_cache,
+            &full_graphs.decode,
+            &mut full_plans.decode,
+            BTreeMap::from([(TensorEdgeId::new("input.token_ids"), admitted_ids)]),
+            Some(&full_layer_kv),
+            Some(prompt_len),
+            &mut Vec::new(),
+        )
+        .map_err(E2eConformanceError::from)?;
+    let full_decode_logits = full_decode_bindings
+        .get(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "full graph decode produced no logits output".into(),
+        })?
+        .data
+        .clone();
+
+    // Segmented: each segment's own Model Instance loaded once, dispatched
+    // twice (prefill, then decode reusing its own updated `layer_kv`).
+    let provider: Arc<dyn Provider> = Arc::new(ReferenceCpuProvider::new());
+    let (segment_one_runtime, segment_one_instance, segment_one_binding) =
+        load_first_native_segment_with_provider_and_weights(
+            provider.clone(),
+            &fixture,
+            &fixture.weights,
+            0,
+            mid,
+        )?;
+    let (segment_two_runtime, segment_two_instance, segment_two_binding) =
+        load_first_native_segment_with_provider_and_weights(
+            provider,
+            &fixture,
+            &fixture.weights,
+            mid,
+            num_hidden_layers,
+        )?;
+    let segment_cache = KvCacheId::new("segment-decode-coverage-segment-cache")?;
+
+    let (segment_one_prefill_graph, _definition, _instance) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            prompt_len,
+            0,
+            mid,
+        )?;
+    let segment_one_prefill_outcome = run_first_native_graph_segment_dispatch(
+        segment_one_runtime,
+        &fixture,
+        segment_one_instance,
+        &segment_one_binding,
+        &segment_one_prefill_graph,
+        &segment_cache,
+        &prompt,
+        0,
+        None,
+        None,
+        Some(0),
+    )?;
+    let segment_one_prefill_hidden = segment_one_prefill_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "segment one prefill produced no logits-named output".into(),
+        })?
+        .clone();
+
+    let (segment_two_prefill_graph, _definition, _instance) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            prompt_len,
+            mid,
+            num_hidden_layers,
+        )?;
+    let segment_two_prefill_outcome = run_first_native_graph_segment_dispatch(
+        segment_two_runtime,
+        &fixture,
+        segment_two_instance,
+        &segment_two_binding,
+        &segment_two_prefill_graph,
+        &segment_cache,
+        &prompt,
+        mid,
+        Some(QwenSegmentBoundaryInput::Host(segment_one_prefill_hidden)),
+        None,
+        Some(0),
+    )?;
+
+    let (segment_one_decode_graph, _definition, _instance) =
+        build_first_native_decode_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            prompt_len,
+            0,
+            mid,
+        )?;
+    let segment_one_decode_outcome = run_first_native_graph_segment_dispatch(
+        segment_one_prefill_outcome.runtime,
+        &fixture,
+        segment_one_prefill_outcome.instance,
+        &segment_one_binding,
+        &segment_one_decode_graph,
+        &segment_cache,
+        &[admitted],
+        0,
+        None,
+        Some(&segment_one_prefill_outcome.layer_kv),
+        Some(prompt_len),
+    )?;
+    let segment_one_decode_hidden = segment_one_decode_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "segment one decode produced no logits-named output".into(),
+        })?
+        .clone();
+
+    let (segment_two_decode_graph, _definition, _instance) =
+        build_first_native_decode_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            prompt_len,
+            mid,
+            num_hidden_layers,
+        )?;
+    let segment_two_decode_outcome = run_first_native_graph_segment_dispatch(
+        segment_two_prefill_outcome.runtime,
+        &fixture,
+        segment_two_prefill_outcome.instance,
+        &segment_two_binding,
+        &segment_two_decode_graph,
+        &segment_cache,
+        &[admitted],
+        mid,
+        Some(QwenSegmentBoundaryInput::Host(segment_one_decode_hidden)),
+        Some(&segment_two_prefill_outcome.layer_kv),
+        Some(prompt_len),
+    )?;
+    let segmented_decode_logits = segment_two_decode_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "segment two decode produced no logits output".into(),
+        })?
+        .data
+        .clone();
+
+    if full_decode_logits != segmented_decode_logits {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "two-segment decode step does not bit-for-bit match the full graph's own \
+                 decode step: full={full_decode_logits:?} segmented={segmented_decode_logits:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Correctif 6 / task 8.7: a single changed weight byte in the Artifact
+/// SHALL change generated logits -- proof the graph-executed path actually
+/// reads and uses the bound weight bytes numerically, rather than (for
+/// example) a cached or hard-coded computation that happens to match the
+/// fixture's usual values. Complements `check_weight_binding_rejects_tampered_artifact_bytes`
+/// (task 8.8), which proves a *digest* mismatch is caught before binding --
+/// this instead proves the bound bytes are not merely checked but actually
+/// consumed.
+fn check_weight_byte_change_alters_generated_logits(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    // This test's own mutated weights would now (correctly) be rejected by
+    // `bind-materialized-weight-content-to-model-artifact-digests`'s
+    // content-digest check if bound against `fixture.manifest`'s real,
+    // digest-bearing tensor inventory -- that rejection is a *different*
+    // property, already proven by `check_weight_binding_rejects_tampered_
+    // artifact_bytes` and the new digest-mismatch tests this Change adds.
+    // This test's own concern is orthogonal: given bytes that *did* bind
+    // (however that happened), are they actually consumed numerically. A
+    // digest-free copy of the fixture keeps that concern isolated rather
+    // than conflating it with the digest check.
+    let mut digest_free_fixture = fixture.clone();
+    for tensor in &mut digest_free_fixture.manifest.tensors {
+        tensor.digest = None;
+    }
+    let prompt = [1, 2];
+    let baseline_logits =
+        forward_logits_with_weights(&digest_free_fixture, &fixture.weights, &prompt)?;
+
+    let mut mutated_weights = fixture.weights.clone();
+    let (_name, tensor) =
+        mutated_weights
+            .iter_mut()
+            .next()
+            .ok_or_else(|| E2eConformanceError::FixtureInvalid {
+                reason: "fixture has no weight tensors to mutate".into(),
+            })?;
+    tensor.data[0] += 1.0;
+    let mutated_logits =
+        forward_logits_with_weights(&digest_free_fixture, &mutated_weights, &prompt)?;
+
+    if baseline_logits == mutated_logits {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "changing one weight byte did not change the generated logits".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_graph_execution_fails_closed_on_missing_weight(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    // Loading bound every declared weight successfully (digest verified);
+    // removing one binding afterward -- without touching the fixture or its
+    // digest -- isolates the "this instance is missing a resource graph
+    // execution needs" failure mode from artifact tampering, which
+    // `check_weight_binding_rejects_tampered_artifact_bytes` already covers.
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .map_err(InferenceApiError::from)?
+        .definition
+        .resource_bindings
+        .weights
+        .remove("token_embedding");
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
+    let ids = HostTensor::new([2], vec![1.0, 2.0])?;
+    let cache_id = KvCacheId::new("test-missing-weight-cache")?;
+    match execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    ) {
+        Err(InferenceApiError::ModelLoadingFailed { reason })
+            if reason.contains("token_embedding") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for a missing weight: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "graph execution succeeded despite a missing required weight".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_weight_resources_are_isolated_per_model_instance(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (first, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let (second, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    if first == second {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "loading the same fixture twice produced the same Model Instance id".into(),
+        });
+    }
+    let first_bindings = runtime
+        .model_instance(&first)
+        .map_err(InferenceApiError::from)?
+        .definition
+        .resource_bindings
+        .weights
+        .clone();
+    let second_bindings = runtime
+        .model_instance(&second)
+        .map_err(InferenceApiError::from)?
+        .definition
+        .resource_bindings
+        .weights
+        .clone();
+    if first_bindings.is_empty() || first_bindings.len() != second_bindings.len() {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "both Model Instances did not bind the same set of weight names".into(),
+        });
+    }
+    for (name, first_resource) in &first_bindings {
+        let second_resource =
+            second_bindings
+                .get(name)
+                .ok_or_else(|| E2eConformanceError::GenerationFailed {
+                    reason: format!("second Model Instance has no binding for weight '{name}'"),
+                })?;
+        if first_resource == second_resource {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "weight '{name}' resolved to the same TensorResourceId for two different Model Instances"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_unload_releases_weight_resource_allocations(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let allocation_ids: Vec<_> = runtime
+        .model_instance(&instance)
+        .map_err(InferenceApiError::from)?
+        .definition
+        .resource_bindings
+        .memory_allocations
+        .iter()
+        .copied()
+        .collect();
+    if allocation_ids.is_empty() {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "loading the fixture bound no weight memory allocations to release".into(),
+        });
+    }
+    // `transactional-weight-materialization` (P0-2-bis): unload must also
+    // release the Provider-owned weight Tensor Resources themselves, not
+    // only Memory Manager accounting -- capture them before unload so they
+    // can be checked against Provider storage afterward.
+    let weight_resource_ids: Vec<TensorResourceId> = runtime
+        .model_instance(&instance)
+        .map_err(InferenceApiError::from)?
+        .definition
+        .resource_bindings
+        .weights
+        .values()
+        .cloned()
+        .collect();
+    if weight_resource_ids.is_empty() {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "loading the fixture bound no weight Tensor Resources to release".into(),
+        });
+    }
+    let executor = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(|error| E2eConformanceError::GenerationFailed {
+        reason: error.to_string(),
+    })?;
+    for resource_id in &weight_resource_ids {
+        if executor.read_tensor(resource_id).is_none() {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "weight resource '{resource_id}' was not actually present in Provider \
+                     storage before unload (test precondition broken)"
+                ),
+            });
+        }
+    }
+    runtime
+        .unload_model_instance(&instance, ModelInstanceUnloadPolicy::RejectActiveUse)
+        .map_err(|error| E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        })?;
+    for allocation_id in allocation_ids {
+        let state = runtime
+            .memory()
+            .allocations()
+            .find(|allocation| allocation.id == allocation_id)
+            .map(|allocation| allocation.state);
+        if state == Some(MemoryAllocationState::Active) {
+            return Err(E2eConformanceError::MemoryValidationFailed {
+                reason: format!(
+                    "weight allocation {allocation_id:?} remained Active after Model Instance unload"
+                ),
+            });
+        }
+    }
+    for resource_id in &weight_resource_ids {
+        if executor.read_tensor(resource_id).is_some() {
+            return Err(E2eConformanceError::MemoryValidationFailed {
+                reason: format!(
+                    "weight resource '{resource_id}' remained present in Provider-owned \
+                     storage after Model Instance unload (P0-2-bis: unload must release \
+                     Provider-owned weight storage, not only Memory Manager accounting)"
+                ),
+            });
+        }
+        assert_tensor_residency_absent(&runtime, resource_id, "after Model Instance unload")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Proves the load/unload cycle does not accumulate Provider-owned weight
+/// storage over repeated cycles -- the audit's own "100x load/unload"
+/// case, done at a smaller, still-meaningful count (each cycle already
+/// proves the property; more repetitions prove only that it does not
+/// degrade with iteration count, which a fixed small count already shows
+/// as well without materially slower test runs).
+fn check_repeated_load_unload_does_not_accumulate_weight_storage(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    const CYCLES: usize = 10;
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    for cycle in 0..CYCLES {
+        let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+        let weight_resource_ids: Vec<TensorResourceId> = runtime
+            .model_instance(&instance)
+            .map_err(InferenceApiError::from)?
+            .definition
+            .resource_bindings
+            .weights
+            .values()
+            .cloned()
+            .collect();
+        if weight_resource_ids.is_empty() {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!("cycle {cycle}: loading the fixture bound no weight resources"),
+            });
+        }
+        runtime
+            .unload_model_instance(&instance, ModelInstanceUnloadPolicy::RejectActiveUse)
+            .map_err(|error| E2eConformanceError::GenerationFailed {
+                reason: format!("cycle {cycle}: unload failed: {error}"),
+            })?;
+        let executor = resolve_kernel_execution_provider(
+            &runtime,
+            &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        )
+        .map_err(|error| E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        })?;
+        for resource_id in &weight_resource_ids {
+            if executor.read_tensor(resource_id).is_some() {
+                return Err(E2eConformanceError::MemoryValidationFailed {
+                    reason: format!(
+                        "cycle {cycle}: weight resource '{resource_id}' still present in \
+                         Provider storage after unload -- storage is accumulating across cycles"
+                    ),
+                });
+            }
+            // Each cycle creates a fresh Model Instance, so a fresh
+            // TensorResourceId per weight -- a residency record surviving
+            // past its own cycle's unload would mean residency metadata
+            // grows unbounded across cycles even though Provider storage
+            // and Memory Manager accounting both look clean
+            // (`invalidate-tensor-residency-on-release`).
+            assert_tensor_residency_absent(
+                &runtime,
+                resource_id,
+                &format!("after unload in cycle {cycle} -- residency metadata is accumulating"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn check_incremental_decode_matches_full_sequence_oracle(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let prompt = vec![1, 2];
+    let admitted = 3;
+    let mut plans =
+        first_native_plans_for_prompt(&runtime, fixture, &instance, prompt.len() as u64)?;
+    let (_prefill_dispatch, _prefill_hidden, layer_kv) =
+        execute_qwen_prefill_hidden_states_through_dispatch(
+            &mut runtime,
+            fixture,
+            &prompt,
+            &mut plans.prefill,
+        )?;
+    let kv_state = FirstNativeExecutionKvState {
+        cache: KvCacheId::new("first-native-oracle-kv").map_err(E2eConformanceError::from)?,
+        compatibility: KvCacheCompatibility::new(
+            GenerationModelReference::LoadedModelContext("qwen-test".into()),
+            TokenizerId::new("qwen-test-tokenizer")?,
+        ),
+        // The hand-rolled decode oracle's own return is a plain, densely
+        // 0-indexed `Vec` (it processes every layer unconditionally, never
+        // a segment), so its Vec index already equals the real layer
+        // number here -- `enumerate()` recovers that as an explicit key
+        // for `QwenLayerKvMap`.
+        layer_kv: layer_kv.into_iter().enumerate().collect(),
+        provider: None,
+    };
+
+    let (_decode_dispatch, decode_hidden, updated_layer_kv) =
+        execute_qwen_decode_hidden_states_through_dispatch(
+            &mut runtime,
+            fixture,
+            admitted,
+            &kv_state,
+            prompt.len() as u64,
+            &mut plans.decode,
+        )?;
+    let (_logits_dispatch, incremental_logits) =
+        dispatch_qwen_logits_projection(&runtime, fixture, &decode_hidden, &plans.decode)?;
+
+    let mut full_sequence = prompt;
+    full_sequence.push(admitted);
+    let oracle_logits = e2e_forward(fixture, &full_sequence)?;
+    for (index, (actual, expected)) in incremental_logits
+        .iter()
+        .zip(oracle_logits.iter())
+        .enumerate()
+    {
+        if (actual - expected).abs() > 1e-4 {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "incremental decode logits diverged at {index}: {actual} != {expected}"
+                ),
+            });
+        }
+    }
+
+    let executor = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(E2eConformanceError::from)?;
+    for layer in updated_layer_kv {
+        let k_tensor = executor.read_tensor(&layer.k).ok_or_else(|| {
+            E2eConformanceError::GenerationFailed {
+                reason: format!("no materialized K tensor for resource '{}'", layer.k),
+            }
+        })?;
+        let v_tensor = executor.read_tensor(&layer.v).ok_or_else(|| {
+            E2eConformanceError::GenerationFailed {
+                reason: format!("no materialized V tensor for resource '{}'", layer.v),
+            }
+        })?;
+        let (k_rows, _) = k_tensor.rows_cols()?;
+        let (v_rows, _) = v_tensor.rows_cols()?;
+        if k_rows != full_sequence.len() as u64 || v_rows != full_sequence.len() as u64 {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: "decode did not append exactly one K/V row per layer".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Proves the graph-driven executor (`execute_qwen_graph`, which production
+/// first-native execution now uses exclusively) produces logits matching the
+/// independent `e2e_forward` oracle, and that its recorded per-layer KV
+/// state carries one row per historical token. Complements
+/// `check_incremental_decode_matches_full_sequence_oracle`, which checks the
+/// same oracle against the retired hand-written dispatch sequence.
+fn check_graph_executor_matches_full_sequence_oracle(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let prompt = vec![1, 2];
+    let admitted = 3;
+    let mut plans =
+        first_native_plans_for_prompt(&runtime, fixture, &instance, prompt.len() as u64)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, prompt.len() as u64)?;
+
+    let cache_id = KvCacheId::new("test-graph-executor-cache")?;
+    let prompt_ids = HostTensor::new(
+        [prompt.len() as u64],
+        prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+    )?;
+    let (_prefill_dispatch, _prefill_bindings, layer_kv, _provider) = execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graphs.prefill,
+        &mut plans.prefill,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), prompt_ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+
+    let admitted_ids = HostTensor::new([1], vec![admitted as f32])?;
+    let (_decode_dispatch, decode_bindings, updated_layer_kv, _provider) = execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graphs.decode,
+        &mut plans.decode,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), admitted_ids)]),
+        Some(&layer_kv),
+        Some(prompt.len() as u64),
+        &mut Vec::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+
+    let logits = decode_bindings
+        .get(&TensorEdgeId::new("logits"))
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "graph executor produced no logits output".into(),
+        })?;
+
+    let mut full_sequence = prompt;
+    full_sequence.push(admitted);
+    let oracle_logits = e2e_forward(fixture, &full_sequence)?;
+    for (index, (actual, expected)) in logits.data.iter().zip(oracle_logits.iter()).enumerate() {
+        if (actual - expected).abs() > 1e-4 {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!(
+                    "graph executor decode logits diverged at {index}: {actual} != {expected}"
+                ),
+            });
+        }
+    }
+
+    let executor = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(E2eConformanceError::from)?;
+    for layer in updated_layer_kv.values() {
+        let k_tensor = executor.read_tensor(&layer.k).ok_or_else(|| {
+            E2eConformanceError::GenerationFailed {
+                reason: format!("no materialized K tensor for resource '{}'", layer.k),
+            }
+        })?;
+        let v_tensor = executor.read_tensor(&layer.v).ok_or_else(|| {
+            E2eConformanceError::GenerationFailed {
+                reason: format!("no materialized V tensor for resource '{}'", layer.v),
+            }
+        })?;
+        let (k_rows, _) = k_tensor.rows_cols()?;
+        let (v_rows, _) = v_tensor.rows_cols()?;
+        if k_rows != full_sequence.len() as u64 || v_rows != full_sequence.len() as u64 {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: "graph executor decode did not append exactly one K/V row per layer".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn parse_absolute_position(message: &str) -> Result<Option<usize>, E2eConformanceError> {
+    let Some(value) = message
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("absolute_position="))
+    else {
+        return Ok(None);
+    };
+    value
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|error| E2eConformanceError::GenerationFailed {
+            reason: format!("invalid absolute_position observation {value:?}: {error}"),
+        })
+}
+
+#[cfg(test)]
+fn check_generation_loop_decode_positions_follow_generated_tokens(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let prompt = vec![1, 2, 3, 4];
+    let tokenized = tokenize_prompt_input(
+        &fixture.tokenizer,
+        TokenizationRequest::new(PromptInput::TokenIds(prompt.clone())),
+        None,
+    )?;
+    let request = build_generation_request(
+        GenerationRequestId::new("e2e-decode-position-oracle")?,
+        None,
+        GenerationModelReference::ModelInstance(instance.clone()),
+        generation_tokenizer_reference(fixture),
+        tokenized,
+        4,
+        GenerationParameters::greedy(),
+        StopConditions::default(),
+        StreamingMode::Disabled,
+    );
+    let request = prepare_generation(&runtime, request)?;
+    let mut observer = InferenceApiObserver::new();
+    let result = run_first_native_generation_loop_with_plans(
+        &mut runtime,
+        fixture,
+        &instance,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated_so_far| false,
+        &mut observer,
+    )?;
+    if result.output.generated_token_count != 4 {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "expected four generated tokens for multi-step decode, got {}",
+                result.output.generated_token_count
+            ),
+        });
+    }
+
+    let mut positions = Vec::new();
+    for observation in observer.observations() {
+        if observation.kind == InferenceApiObservationKind::ProviderCompleted
+            && observation.message.contains("model_input_tokens=1")
+            && let Some(position) = parse_absolute_position(&observation.message)?
+        {
+            positions.push(position);
+        }
+    }
+    let expected = vec![prompt.len(), prompt.len() + 1, prompt.len() + 2];
+    if positions != expected {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "decode absolute positions diverged from generation-loop oracle: {positions:?} != {expected:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn graph_prefill_setup(
+    fixture: &E2eFixture,
+) -> Result<
+    (
+        Runtime,
+        ModelInstanceId,
+        KvCacheId,
+        ExecutionGraph,
+        PreparedExecutionPlan,
+        HostTensor,
+    ),
+    E2eConformanceError,
+> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let prompt = [1, 2];
+    let plans = first_native_plans_for_prompt(&runtime, fixture, &instance, prompt.len() as u64)?;
+    let graphs = first_native_component_graphs_for_prompt(fixture, prompt.len() as u64)?;
+    let ids = HostTensor::new(
+        [prompt.len() as u64],
+        prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
+    )?;
+    let cache_id = KvCacheId::new("test-graph-prefill-setup-cache")?;
+    Ok((
+        runtime,
+        instance,
+        cache_id,
+        graphs.prefill,
+        plans.prefill,
+        ids,
+    ))
+}
+
+#[cfg(test)]
+fn check_graph_executor_rejects_missing_plan_binding(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let (mut runtime, instance, cache_id, graph, mut plan, ids) = graph_prefill_setup(fixture)?;
+    plan.node_bindings.retain(|binding| {
+        !binding
+            .graph_nodes
+            .contains(&ExecutionNodeId::new("embedding"))
+    });
+    match execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graph,
+        &mut plan,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    ) {
+        Err(InferenceApiError::KernelUnavailable { reason }) if reason.contains("embedding") => {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for a missing plan binding: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "graph executor accepted a graph node with no published plan binding".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_graph_executor_rejects_unsupported_operator(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let (mut runtime, instance, cache_id, mut graph, mut plan, ids) = graph_prefill_setup(fixture)?;
+    let node = graph
+        .nodes
+        .get_mut(&ExecutionNodeId::new("embedding"))
+        .ok_or_else(|| E2eConformanceError::GraphValidationFailed {
+            reason: "prefill graph is missing node 'embedding'".into(),
+        })?;
+    node.operator = OperatorId::magnetar("softmax", 1, OperatorFamily::Activation);
+    match execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graph,
+        &mut plan,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    ) {
+        Err(InferenceApiError::OperatorUnsupported { reason }) if reason.contains("softmax") => {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for an unsupported operator: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "graph executor dispatched an operator it does not implement".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_graph_executor_rejects_cyclic_graph(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let (mut runtime, instance, cache_id, _graph, mut plan, _ids) = graph_prefill_setup(fixture)?;
+    let mut graph = ExecutionGraph::new(
+        ExecutionGraphId::new("cyclic-test"),
+        ExecutionGraphPhase::Test,
+    );
+    graph = graph
+        .with_edge(TensorEdge::new(
+            TensorEdgeId::new("a"),
+            f32_tensor_descriptor(&HostTensor::new([1, 1], vec![0.0])?),
+        ))
+        .with_edge(TensorEdge::new(
+            TensorEdgeId::new("b"),
+            f32_tensor_descriptor(&HostTensor::new([1, 1], vec![0.0])?),
+        ))
+        .with_node(
+            ExecutionNode::new(
+                ExecutionNodeId::new("node-a"),
+                OperatorId::magnetar("silu", 1, OperatorFamily::Activation),
+            )
+            .with_input(TensorEdgeId::new("b"))
+            .with_output(TensorEdgeId::new("a")),
+        )
+        .with_node(
+            ExecutionNode::new(
+                ExecutionNodeId::new("node-b"),
+                OperatorId::magnetar("silu", 1, OperatorFamily::Activation),
+            )
+            .with_input(TensorEdgeId::new("a"))
+            .with_output(TensorEdgeId::new("b")),
+        );
+    match execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graph,
+        &mut plan,
+        BTreeMap::new(),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    ) {
+        Err(InferenceApiError::GraphPlanningFailed { reason }) if reason.contains("cycle") => {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for a cyclic graph: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "graph executor accepted a cyclic graph".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_graph_executor_rejects_removed_producer_node(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let (mut runtime, instance, cache_id, mut graph, mut plan, ids) = graph_prefill_setup(fixture)?;
+    // Removing the node that produces `layer0.q` leaves `layer0.rope_q`
+    // depending on an edge nothing in the graph produces -- structurally the
+    // same shape a component or graph-mutation bug would take. `plan` was
+    // built from the graph before this mutation, so
+    // `PreparedExecutionPlanExecutor::prepare_node_execution` (Correctif 4)
+    // now rejects every node's dispatch on the very first one it reaches:
+    // the graph's semantic fingerprint no longer matches the published
+    // Plan's, which is a stronger, earlier rejection of the same
+    // underlying inconsistency than reaching the specific missing-producer
+    // edge deeper into execution.
+    graph.nodes.remove(&ExecutionNodeId::new("layer0.q_proj"));
+    match execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graph,
+        &mut plan,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    ) {
+        Err(InferenceApiError::KernelUnavailable { reason })
+            if reason.contains("PlanValidationFailed") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for a removed producer node: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "graph executor accepted a graph with a removed producer node".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_graph_executor_logits_provenance_requires_declared_output_edge(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let (mut runtime, instance, cache_id, mut graph, mut plan, ids) = graph_prefill_setup(fixture)?;
+    // Removing the `lm_head` node means nothing produces the `logits` edge
+    // this graph declares as its output -- the caller must observe that
+    // absence explicitly rather than reading stale or unrelated data. `plan`
+    // was built from the graph before this mutation, so
+    // `PreparedExecutionPlanExecutor::prepare_node_execution` (Correctif 4)
+    // now fails closed on the graph/Plan fingerprint mismatch before any
+    // node dispatches -- a stronger guarantee against a fabricated `logits`
+    // binding than reaching the end of a partial run and checking its
+    // absence, since no dispatch happens at all.
+    graph.nodes.remove(&ExecutionNodeId::new("lm_head"));
+    match execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graph,
+        &mut plan,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    ) {
+        Err(InferenceApiError::KernelUnavailable { reason })
+            if reason.contains("PlanValidationFailed") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for a missing output-producing node: {error}"),
+        }),
+        Ok((_dispatch, bindings, _layer_kv, _provider)) => {
+            if bindings.contains_key(&TensorEdgeId::new("logits")) {
+                Err(E2eConformanceError::GenerationFailed {
+                    reason: "graph executor produced a 'logits' binding with no producing node"
+                        .into(),
+                })
+            } else {
+                Err(E2eConformanceError::GenerationFailed {
+                    reason: "graph/Plan fingerprint mismatch was not detected".into(),
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+/// Correctif 4, task 4.6: a `PreparedKernelId` a published Plan binds to
+/// SHALL be refused for new dispatch once revoked, rather than the revoked
+/// state being silently ignored because dispatch never actually asked the
+/// Kernel Registry about it.
+fn check_graph_dispatch_rejects_revoked_prepared_kernel(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let (mut runtime, instance, cache_id, graph, mut plan, ids) = graph_prefill_setup(fixture)?;
+    let embedding_kernel = plan
+        .node_bindings
+        .iter()
+        .find(|binding| {
+            binding
+                .graph_nodes
+                .contains(&ExecutionNodeId::new("embedding"))
+        })
+        .map(|binding| binding.kernel.clone())
+        .ok_or_else(|| E2eConformanceError::KernelCoverageMissing {
+            reason: "prefill plan has no binding for node embedding".into(),
+        })?;
+    runtime.kernel_registry_mut().revoke_kernel(
+        &embedding_kernel,
+        "test: simulate revocation after Plan publication",
+    );
+    match execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graph,
+        &mut plan,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    ) {
+        // Revocation deactivates the Kernel's advertisement (Kernel
+        // Registry's `active` flag), which `dispatch_reference_cpu_operator`
+        // rejects immediately after `prepare_node_execution` resolves the
+        // binding -- an active-advertisement lookup is a separate concern
+        // from `PreparedKernel.state`, so this is the correct rejection
+        // point for advertisement-level revocation specifically.
+        Err(InferenceApiError::KernelUnavailable { reason })
+            if reason.contains("no longer active") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for a revoked prepared kernel: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "graph dispatch executed a revoked PreparedKernel".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+/// Correctif 4, task 4.5: once a Plan is published, a Kernel Registry
+/// preference change (e.g. a newer, more attractively-ranked Kernel
+/// registered for the same Operator) SHALL NOT affect that already-
+/// published, ready Plan's dispatch -- `prepare_node_execution` looks up
+/// the specific `PreparedKernelId` the binding already names, it never
+/// re-ranks candidates the way live Kernel Registry selection
+/// (`KernelRegistry::select`) does.
+fn check_graph_dispatch_ignores_kernel_registry_preference_change_after_plan_publication(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let (mut runtime, _instance, _cache_id, graph, mut plan, ids) = graph_prefill_setup(fixture)?;
+    let embedding_kernel = plan
+        .node_bindings
+        .iter()
+        .find(|binding| {
+            binding
+                .graph_nodes
+                .contains(&ExecutionNodeId::new("embedding"))
+        })
+        .map(|binding| binding.kernel.clone())
+        .ok_or_else(|| E2eConformanceError::KernelCoverageMissing {
+            reason: "prefill plan has no binding for node embedding".into(),
+        })?;
+
+    // Register a second, deliberately better-ranked (lower cost, lower
+    // fallback rank) Kernel advertising the same "embedding" Operator
+    // *after* the Plan was already published -- if a live Kernel Registry
+    // selection were consulted instead of the Plan's own binding, this
+    // would be a legitimate, more attractive contender.
+    let mut competitor = reference_cpu_kernel_advertisements()
+        .into_iter()
+        .find(|advertisement| advertisement.implemented_operator.name() == "embedding")
+        .ok_or_else(|| E2eConformanceError::KernelCoverageMissing {
+            reason: "Reference CPU fixture does not advertise embedding".into(),
+        })?;
+    competitor.id.name = format!("{}-cheaper-competitor", competitor.id.name);
+    competitor
+        .performance_hints
+        .insert("estimated-cost".into(), "0".into());
+    competitor
+        .performance_hints
+        .insert("fallback-rank".into(), "0".into());
+    runtime
+        .kernel_registry_mut()
+        .register_fixture_advertisement(competitor)
+        .map_err(|error| E2eConformanceError::KernelCoverageMissing {
+            reason: format!("failed to register competing embedding Kernel: {error}"),
+        })?;
+
+    let provider = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let seq_len = ids.shape.first().copied().unwrap_or(1);
+    let architecture = &fixture.config.architecture;
+    let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")?.clone();
+    let mut node_events = Vec::new();
+    let mut dispatch_ctx = QwenDispatchContext {
+        runtime: &mut runtime,
+        provider: provider.clone(),
+        prepared_plan: Some(&mut plan),
+        graph: Some(&graph),
+        sequence_length: Some(seq_len),
+        last_provider_execution: None,
+        node_events: &mut node_events,
+    };
+    let (dispatch_result, _hidden_states) = dispatch_reference_cpu_operator(
+        &mut dispatch_ctx,
+        "embedding",
+        dispatch_operator_id("embedding", OperatorFamily::Tensor),
+        vec![
+            NodeInputResource::Fresh(
+                TensorResourceId::new("embedding.table"),
+                f32_tensor_descriptor(&token_embedding),
+                token_embedding,
+            ),
+            NodeInputResource::Fresh(
+                TensorResourceId::new("embedding.ids"),
+                f32_tensor_descriptor(&ids),
+                ids.clone(),
+            ),
+        ],
+        (
+            TensorResourceId::new("embedding.out"),
+            TensorDescriptor::new(
+                ShapeDescriptor::new([seq_len, architecture.hidden_size]),
+                DTypeDescriptor::portable(ComputeDType::Float32),
+                LayoutDescriptor::Contiguous,
+            ),
+        ),
+        BTreeMap::new(),
+    )
+    .map_err(E2eConformanceError::from)?;
+
+    if dispatch_result.selected_kernel != embedding_kernel {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "published Plan binding for 'embedding' was bypassed by a newer, \
+                 better-ranked Kernel registration: expected {embedding_kernel:?}, dispatched \
+                 {:?}",
+                dispatch_result.selected_kernel
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Correctif 4, task 4.7: a Plan binding's `PreparedKernelGeneration` SHALL
+/// match the Kernel Registry's active generation for that `PreparedKernelId`
+/// at dispatch time; a stale generation (e.g. left over from before a hot
+/// Kernel replacement) is refused rather than dispatched as if current.
+fn check_graph_dispatch_rejects_stale_prepared_kernel_generation(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let (mut runtime, instance, cache_id, graph, mut plan, ids) = graph_prefill_setup(fixture)?;
+    let binding = plan
+        .node_bindings
+        .iter_mut()
+        .find(|binding| {
+            binding
+                .graph_nodes
+                .contains(&ExecutionNodeId::new("embedding"))
+        })
+        .ok_or_else(|| E2eConformanceError::KernelCoverageMissing {
+            reason: "prefill plan has no binding for node embedding".into(),
+        })?;
+    binding.prepared_kernel_generation = Some(PreparedKernelGeneration::new(u64::MAX));
+    match execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graph,
+        &mut plan,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    ) {
+        Err(InferenceApiError::KernelUnavailable { reason })
+            if reason.contains("PreparedKernelGenerationMismatch") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for a stale prepared kernel generation: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "graph dispatch executed a binding with a stale PreparedKernel generation"
+                .into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+/// Correctif 4, task 4.8: a Plan binding's declared `provider` SHALL match
+/// the Kernel Registry's active `PreparedKernel` provider at dispatch time;
+/// a mismatch (e.g. a binding pointing at a Provider the active Kernel is
+/// no longer registered under) is refused rather than silently dispatched
+/// against whichever Provider the `PreparedKernel` actually belongs to.
+fn check_graph_dispatch_rejects_provider_binding_mismatch(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let (mut runtime, instance, cache_id, graph, mut plan, ids) = graph_prefill_setup(fixture)?;
+    // Mutate the *last* binding, not the first: `execute_qwen_graph` resolves
+    // the Provider it actually dispatches through from `node_bindings.first()`
+    // (every node in a first-native graph binds to the same Provider), so
+    // corrupting that one would fail earlier and coarser, at graph-level
+    // Provider resolution, rather than exercising `prepare_node_execution`'s
+    // own per-binding Provider consistency check this test targets.
+    let binding = plan.node_bindings.last_mut().ok_or_else(|| {
+        E2eConformanceError::KernelCoverageMissing {
+            reason: "prefill plan has no node bindings".into(),
+        }
+    })?;
+    binding.provider = ProviderBinding::new("magnetar:provider/does-not-exist");
+    match execute_qwen_graph(
+        &mut runtime,
+        fixture,
+        &instance,
+        &cache_id,
+        &graph,
+        &mut plan,
+        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids)]),
+        None,
+        Some(0),
+        &mut Vec::new(),
+    ) {
+        Err(InferenceApiError::KernelUnavailable { reason })
+            if reason.contains("PlanProviderUnavailable") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for a Provider binding mismatch: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "graph dispatch executed a binding whose Provider does not match the active PreparedKernel".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_generation_loop_executes_published_plan_bindings(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let prompt = vec![1, 2, 3, 4];
+    let tokenized = tokenize_prompt_input(
+        &fixture.tokenizer,
+        TokenizationRequest::new(PromptInput::TokenIds(prompt.clone())),
+        None,
+    )?;
+    // Must be the same graph source `execute_generation_step` itself will
+    // dispatch against (see that function's own doc comment on this exact
+    // requirement) -- this test only cares about the *binding removal*
+    // below producing the expected failure, not which recipe built the
+    // graph, so it uses the same helper every real dispatch path uses
+    // rather than calling the Rust-synthesized recipe directly.
+    let component_graphs = first_native_component_graphs_for_prompt(fixture, prompt.len() as u64)?;
+    let mut prepared_plans = prepare_first_native_execution_plans(
+        &runtime,
+        &instance,
+        component_graphs,
+        prompt.len() as u64,
+    )?;
+    prepared_plans.prefill.node_bindings.retain(|binding| {
+        !binding
+            .graph_nodes
+            .contains(&ExecutionNodeId::new("lm_head"))
+    });
+
+    let request = build_generation_request(
+        GenerationRequestId::new("e2e-plan-binding-required")?,
+        None,
+        GenerationModelReference::ModelInstance(instance),
+        generation_tokenizer_reference(fixture),
+        tokenized,
+        1,
+        GenerationParameters::greedy(),
+        StopConditions::default(),
+        StreamingMode::Disabled,
+    );
+    let request = prepare_generation(&runtime, request)?;
+    let mut observer = InferenceApiObserver::new();
+    let mut execution_plans = RuntimeGenerationExecutionPlans {
+        prefill: &mut prepared_plans.prefill,
+        decode: &mut prepared_plans.decode,
+    };
+    match run_generation_loop_with_execution_plans(
+        &mut runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated_so_far| false,
+        &mut observer,
+        &mut execution_plans,
+    ) {
+        Err(InferenceApiError::KernelUnavailable { reason }) if reason.contains("lm_head") => {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected prepared binding error: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "generation succeeded despite missing published lm_head binding".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn check_incremental_decode_rejects_missing_layer_kv(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_trusting_fixture(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
+    let kv_state = FirstNativeExecutionKvState {
+        cache: KvCacheId::new("first-native-empty-kv").map_err(E2eConformanceError::from)?,
+        compatibility: KvCacheCompatibility::new(
+            GenerationModelReference::LoadedModelContext("qwen-test".into()),
+            TokenizerId::new("qwen-test-tokenizer")?,
+        ),
+        layer_kv: QwenLayerKvMap::new(),
+        provider: None,
+    };
+    match execute_qwen_decode_hidden_states_through_dispatch(
+        &mut runtime,
+        fixture,
+        3,
+        &kv_state,
+        2,
+        &mut plans.decode,
+    ) {
+        Err(InferenceApiError::KvCacheUnavailable { .. }) => Ok(()),
+        Err(error) => Err(E2eConformanceError::from(error)),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "decode accepted missing layer KV state".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn new_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelExecutionEngine {
+    E2eRuntimeModelExecutionEngine {
+        fixture: fixture.clone(),
+        kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+        pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
+        component_digest: None,
+        forced_token: None,
+    }
+}
+
+#[cfg(test)]
+fn kv_lifecycle_test_request(
+    fixture: &E2eFixture,
+    runtime: &Runtime,
+    instance: &ModelInstanceId,
+    request_id: &str,
+    session: Option<InferenceSessionId>,
+    prompt: &[TokenId],
+) -> Result<GenerationRequest, E2eConformanceError> {
+    let tokenized = tokenize_prompt_input(
+        &fixture.tokenizer,
+        TokenizationRequest::new(PromptInput::TokenIds(prompt.to_vec())),
+        None,
+    )?;
+    let request = build_generation_request(
+        GenerationRequestId::new(request_id)?,
+        session,
+        GenerationModelReference::ModelInstance(instance.clone()),
+        generation_tokenizer_reference(fixture),
+        tokenized,
+        4,
+        GenerationParameters::greedy(),
+        StopConditions::default(),
+        StreamingMode::Disabled,
+    );
+    Ok(prepare_generation(runtime, request)?)
+}
+
+#[cfg(test)]
+fn kv_lifecycle_session_request(
+    fixture: &E2eFixture,
+    instance: &ModelInstanceId,
+) -> SessionCreationRequest {
+    SessionCreationRequest {
+        model: GenerationModelReference::ModelInstance(instance.clone()),
+        tokenizer: generation_tokenizer_reference(fixture),
+        generation_defaults: GenerationParameters::greedy(),
+        policy: SessionPolicy::default(),
+        memory: SessionMemoryBudget::default(),
+        allowed_capabilities: BTreeSet::new(),
+        correlation_id: None,
+        created_at_millis: 0,
+    }
+}
+
+#[cfg(test)]
+fn prefill_cache_id_from_step(
+    step: &RuntimeModelExecutionStep,
+) -> Result<KvCacheId, E2eConformanceError> {
+    match &step.kv_commit {
+        Some(RuntimeKvCacheCommit::PrefillCompleted { cache, .. }) => Ok(cache.clone()),
+        _ => Err(E2eConformanceError::GenerationFailed {
+            reason: "expected a prefill KV commit descriptor".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+/// Proves a generation step's KV write stays *pending* -- never promoted
+/// onto the cache's committed `layer_resources` (task 7.4 prepare) -- when
+/// sampling rejects every candidate after a successful forward pass and
+/// `commit_generation_step` is consequently never called.
+fn check_kv_sampling_failure_leaves_cache_uncommitted(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let engine = new_kv_lifecycle_engine(fixture);
+    let request = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-sampling-failure",
+        None,
+        &[1, 2],
+    )?;
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )?;
+    let step =
+        engine.execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))?;
+    let cache = prefill_cache_id_from_step(&step)?;
+    if !runtime.kv_cache(&cache)?.layer_resources.is_empty() {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "KV cache carries committed layer resources despite no commit call".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Proves a generation step that fails during Provider dispatch (task 5.2's
+/// registered-Provider resolution failing here) never stores a pending KV
+/// state -- there is nothing a later, unrelated commit could wrongly
+/// promote.
+fn check_kv_provider_failure_stores_no_pending_state(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let engine = new_kv_lifecycle_engine(fixture);
+    let request = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-provider-failure",
+        None,
+        &[1, 2],
+    )?;
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )?;
+    for binding in &mut plans.prefill.node_bindings {
+        binding.provider = ProviderBinding::new("unregistered-provider");
+    }
+    match engine.execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill)) {
+        Err(InferenceApiError::ProviderUnavailable { .. }) => {}
+        Err(error) => {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!("unexpected error for an unregistered provider: {error}"),
+            });
+        }
+        Ok(_) => {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: "generation step succeeded despite an unregistered provider".into(),
+            });
+        }
+    }
+    if !engine
+        .pending_kv_states
+        .lock()
+        .map_err(|_| E2eConformanceError::GenerationFailed {
+            reason: "pending KV state lock poisoned".into(),
+        })?
+        .is_empty()
+    {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "a failed generation step left a pending KV state behind".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Proves a decode step's pending KV write never reaches the cache's
+/// committed `layer_resources` when the request is cancelled before
+/// `commit_generation_step` runs -- the committed cache stays exactly what
+/// the prior successful commit left it as.
+fn check_kv_cancelled_decode_does_not_corrupt_committed_cache(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let engine = new_kv_lifecycle_engine(fixture);
+    let request = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-cancel-rollback",
+        None,
+        &[1, 2],
+    )?;
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )?;
+
+    let prefill_step =
+        engine.execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))?;
+    engine.commit_generation_step(&mut runtime, &request, &[], 1, &prefill_step)?;
+    let cache = prefill_cache_id_from_step(&prefill_step)?;
+    let committed_after_prefill = runtime.kv_cache(&cache)?.layer_resources.clone();
+
+    let generated = vec![1];
+    let _decode_step = engine.execute_generation_step(
+        &mut runtime,
+        &request,
+        &generated,
+        Some(&mut plans.decode),
+    )?;
+    let committed_after_cancelled_decode = runtime.kv_cache(&cache)?.layer_resources.clone();
+    if committed_after_cancelled_decode != committed_after_prefill {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "a cancelled decode step's pending KV write altered the committed cache".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Correctif 1 / task 1.8: decode's KV-history-concatenated pending write is
+/// genuinely admitted through `MemoryManager` (via `write_tensor_admitted`),
+/// not left as a bare, unaccounted `write_tensor` -- the admitted
+/// allocation's byte size reflects the *concatenated* (history + new token)
+/// tensor a decode step's `Append` KV behavior produces, not just the newly
+/// dispatched token's own smaller Kernel output.
+fn check_kv_pending_write_is_memory_admitted_for_its_concatenated_size(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let engine = new_kv_lifecycle_engine(fixture);
+    let request = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-pending-admission",
+        None,
+        &[1, 2],
+    )?;
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )?;
+    let prefill_step =
+        engine.execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))?;
+    engine.commit_generation_step(&mut runtime, &request, &[], 1, &prefill_step)?;
+    let cache = prefill_cache_id_from_step(&prefill_step)?;
+
+    let generated = vec![1];
+    engine.execute_generation_step(&mut runtime, &request, &generated, Some(&mut plans.decode))?;
+
+    // This fixture's prefill prompt (`&[1, 2]`) is 2 tokens; decode appends
+    // 1 more, so the pending K/V write's history-concatenated row count is
+    // 3, each row `hidden_size` wide.
+    let expected_bytes =
+        3 * fixture.config.architecture.hidden_size * std::mem::size_of::<f32>() as u64;
+    let matching_allocations = runtime
+        .memory()
+        .allocations()
+        .filter(|allocation| {
+            allocation.state == MemoryAllocationState::Active
+                && allocation.request.owner == MemoryAllocationOwner::Session(cache.to_string())
+                && allocation.request.size_bytes == expected_bytes
+        })
+        .count();
+    // 4, not 2: `execute_qwen_graph_nodes` reassigns `output_tensor` to the
+    // concatenated value *before* the KV-node's `edge.*` write too (so a
+    // later reader of that edge sees the same concatenated value the
+    // pending write does -- see that write site's own doc comment), so
+    // each of K and V produces one concatenated-size allocation for its
+    // `kv.*.pending` resource *and* one for its `edge.*` resource: this
+    // fixture's single layer's K and V nodes together admit 2 + 2.
+    if matching_allocations != 4 {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "expected 4 Active {expected_bytes}-byte allocations (K and V, each with a \
+                 pending-resource and an edge-resource allocation) for the decode step's \
+                 concatenated KV write, owned by cache '{cache}'; found {matching_allocations}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Correctif 1 / task 1.9: discarding a pending KV state
+/// (`discard_pending_kv_state`, invoked automatically at the start of the
+/// next generation step, or directly on cancellation) releases the
+/// `MemoryManager` allocation the pending write admitted (task 1.8's fix),
+/// not just the Provider storage entry -- otherwise every cancelled or
+/// failed decode step would leak one allocation per layer per role forever.
+fn check_kv_pending_write_allocation_is_released_on_discard(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let engine = new_kv_lifecycle_engine(fixture);
+    let request = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-pending-discard-release",
+        None,
+        &[1, 2],
+    )?;
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )?;
+    // Deliberately never committed: the pending write stays pending, so its
+    // allocation is still held when discarded below.
+    let prefill_step =
+        engine.execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))?;
+    let cache = prefill_cache_id_from_step(&prefill_step)?;
+
+    let active_owned_by_cache = |runtime: &Runtime| {
+        runtime
+            .memory()
+            .allocations()
+            .filter(|allocation| {
+                allocation.state == MemoryAllocationState::Active
+                    && allocation.request.owner == MemoryAllocationOwner::Session(cache.to_string())
+            })
+            .count()
+    };
+    let active_before_discard = active_owned_by_cache(&runtime);
+    engine.discard_pending_kv_state(&mut runtime, &request)?;
+    let active_after_discard = active_owned_by_cache(&runtime);
+    let released = active_before_discard.saturating_sub(active_after_discard);
+    // K and V for this fixture's single layer.
+    if released != 2 {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: format!(
+                "expected discard to release exactly 2 (K and V) Active allocations owned by \
+                 cache '{cache}'; released {released} (before: {active_before_discard}, after: \
+                 {active_after_discard})"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Correctif 11 / task group 9: a multi-layer KV commit is atomic. Sabotages
+/// the *second* resource (layer 0's pending V, after K would otherwise
+/// promote successfully) a decode step's commit would promote, and proves
+/// the whole commit fails and the cache's committed state is left exactly
+/// as the prior successful commit produced it -- not with layer 0's K
+/// pointing at this step's data while V still points at the previous
+/// step's.
+fn check_kv_partial_layer_failure_during_commit_rolls_back_cleanly(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let engine = new_kv_lifecycle_engine(fixture);
+    let request = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-partial-layer-failure",
+        None,
+        &[1, 2],
+    )?;
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )?;
+
+    let prefill_step =
+        engine.execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))?;
+    engine.commit_generation_step(&mut runtime, &request, &[], 1, &prefill_step)?;
+    let cache = prefill_cache_id_from_step(&prefill_step)?;
+    let committed_before = runtime.kv_cache(&cache)?.layer_resources.clone();
+    let layer0_before =
+        committed_before
+            .get(&0)
+            .cloned()
+            .ok_or_else(|| E2eConformanceError::GenerationFailed {
+                reason: "prefill commit produced no layer 0 KV binding".into(),
+            })?;
+    let provider_for_prefill_check = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let original_k_value = provider_for_prefill_check
+        .read_tensor(&layer0_before.k)
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "prefill-committed K resource is not resolvable from Provider storage".into(),
+        })?;
+
+    let generated = vec![1];
+    let decode_step = engine.execute_generation_step(
+        &mut runtime,
+        &request,
+        &generated,
+        Some(&mut plans.decode),
+    )?;
+    let pending_v =
+        {
+            let pending_kv_states = engine.pending_kv_states.lock().map_err(|_| {
+                E2eConformanceError::GenerationFailed {
+                    reason: "pending KV state lock poisoned".into(),
+                }
+            })?;
+            pending_kv_states
+                .values()
+                .next()
+                .and_then(|state| state.layer_kv.get(&0))
+                .map(|layer| layer.v.clone())
+                .ok_or_else(|| E2eConformanceError::GenerationFailed {
+                    reason: "decode step produced no pending KV state to sabotage".into(),
+                })?
+        };
+    // Remove layer 0's pending V straight from Provider storage -- exactly
+    // what `promote_pending_kv_layer_role`'s "no pending KV data to commit"
+    // error path detects -- while leaving K's pending resource intact, so
+    // K would promote successfully if the commit were not atomic.
+    let provider = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let _ = provider.release_tensor(&pending_v);
+
+    match engine.commit_generation_step(&mut runtime, &request, &generated, 2, &decode_step) {
+        Err(InferenceApiError::KvCacheUnavailable { .. }) => {}
+        Err(error) => {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: format!("unexpected error for a sabotaged mid-commit resource: {error}"),
+            });
+        }
+        Ok(()) => {
+            return Err(E2eConformanceError::GenerationFailed {
+                reason: "commit succeeded despite a missing pending resource for one layer".into(),
+            });
+        }
+    }
+
+    let committed_after_failed_commit = runtime.kv_cache(&cache)?.layer_resources.clone();
+    if committed_after_failed_commit != committed_before {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "a failed multi-layer KV commit left the cache in a partially-promoted state"
+                .into(),
+        });
+    }
+    // The deeper property a binding-equality check alone cannot see: layer
+    // 0's K would have promoted successfully in isolation (only V was
+    // sabotaged), so a non-atomic implementation could release the
+    // pre-existing K allocation and overwrite its Provider-stored bytes
+    // before ever learning V failed -- leaving `layer_resources` pointing
+    // at an unchanged resource id whose *contents* were nonetheless
+    // destroyed. Both must still be exactly as they were before this
+    // attempt.
+    if !runtime
+        .memory()
+        .allocations()
+        .any(|allocation| allocation.id == layer0_before.k_allocation)
+    {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: "the pre-existing layer 0 K allocation was released despite the commit \
+                     that would have replaced it failing"
+                .into(),
+        });
+    }
+    let provider = resolve_kernel_execution_provider(
+        &runtime,
+        &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+    )
+    .map_err(E2eConformanceError::from)?;
+    let k_value_after_failed_commit = provider.read_tensor(&layer0_before.k).ok_or_else(|| {
+        E2eConformanceError::MemoryValidationFailed {
+            reason: "layer 0's committed K resource is no longer resolvable from Provider \
+                     storage after a failed commit"
+                .into(),
+        }
+    })?;
+    if k_value_after_failed_commit.data != original_k_value.data {
+        return Err(E2eConformanceError::MemoryValidationFailed {
+            reason: "a failed multi-layer KV commit destructively overwrote layer 0's \
+                     still-committed K bytes before the failure was known"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Proves a second `commit_generation_step` call for the same completed
+/// step is rejected rather than silently re-promoting (or double-releasing)
+/// KV resources the first commit already promoted.
+fn check_kv_double_commit_second_call_is_rejected(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let engine = new_kv_lifecycle_engine(fixture);
+    let request = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-double-commit",
+        None,
+        &[1, 2],
+    )?;
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )?;
+    let step =
+        engine.execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))?;
+    engine.commit_generation_step(&mut runtime, &request, &[], 1, &step)?;
+    match engine.commit_generation_step(&mut runtime, &request, &[], 1, &step) {
+        Err(InferenceApiError::KvCacheUnavailable { reason }) if reason.contains("pending") => {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for a double commit: {error}"),
+        }),
+        Ok(()) => Err(E2eConformanceError::GenerationFailed {
+            reason: "a second commit for the same generation step unexpectedly succeeded".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+/// Proves discarding a pending KV state twice in a row (a cancellation
+/// racing a cleanup retry, for example) is idempotent rather than erroring
+/// the second time just because there is nothing left to discard.
+fn check_kv_double_abort_is_idempotent(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let engine = new_kv_lifecycle_engine(fixture);
+    let request = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-double-abort",
+        None,
+        &[1, 2],
+    )?;
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )?;
+    engine.execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))?;
+    engine.discard_pending_kv_state(&mut runtime, &request)?;
+    engine.discard_pending_kv_state(&mut runtime, &request)?;
+    if !engine
+        .pending_kv_states
+        .lock()
+        .map_err(|_| E2eConformanceError::GenerationFailed {
+            reason: "pending KV state lock poisoned".into(),
+        })?
+        .is_empty()
+    {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "pending KV state survived two discard calls".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Proves a stale pending KV write left by an earlier attempt does not
+/// survive a subsequent, *failed* retry for the same request -- and so
+/// cannot later be wrongly promoted by an unrelated commit call. The first
+/// attempt succeeds and leaves a pending write nothing ever commits (as if
+/// a downstream failure occurred); the retry is routed through an
+/// unregistered Provider so it fails too, but must still discard the first
+/// attempt's stale pending entry before doing so.
+fn check_kv_stale_pending_state_does_not_survive_a_failed_retry(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let engine = new_kv_lifecycle_engine(fixture);
+    let request = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-stale-pending",
+        None,
+        &[1, 2],
+    )?;
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )?;
+    let first_step =
+        engine.execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))?;
+
+    for binding in &mut plans.prefill.node_bindings {
+        binding.provider = ProviderBinding::new("unregistered-provider");
+    }
+    if engine
+        .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+        .is_ok()
+    {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "retry with an unregistered provider unexpectedly succeeded".into(),
+        });
+    }
+
+    match engine.commit_generation_step(&mut runtime, &request, &[], 1, &first_step) {
+        Err(InferenceApiError::KvCacheUnavailable { reason }) if reason.contains("pending") => {
+            Ok(())
+        }
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!(
+                "unexpected error committing after a discarded stale pending state: {error}"
+            ),
+        }),
+        Ok(()) => Err(E2eConformanceError::GenerationFailed {
+            reason:
+                "commit succeeded using a stale pending KV state that should have been discarded"
+                    .into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+/// Proves a KV cache committed under one request's compatibility (its
+/// prefix fingerprint is derived from that request's own id) cannot be
+/// reused under a different request/session's compatibility -- Runtime's
+/// `validate_kv_cache_reuse` must reject the mismatch rather than letting
+/// one session's decode read another session's KV state.
+fn check_kv_wrong_session_reuse_is_rejected_by_compatibility(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let engine = new_kv_lifecycle_engine(fixture);
+
+    let session_a = create_inference_session(
+        &mut runtime,
+        kv_lifecycle_session_request(fixture, &instance),
+    )?;
+    let session_b = create_inference_session(
+        &mut runtime,
+        kv_lifecycle_session_request(fixture, &instance),
+    )?;
+
+    let request_a = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-session-a",
+        Some(session_a),
+        &[1, 2],
+    )?;
+    let request_b = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-session-b",
+        Some(session_b),
+        &[1, 2],
+    )?;
+
+    let mut plans_a = first_native_plans_for_prompt(
+        &runtime,
+        fixture,
+        &instance,
+        request_a.input_token_ids.len() as u64,
+    )?;
+    let step_a = engine.execute_generation_step(
+        &mut runtime,
+        &request_a,
+        &[],
+        Some(&mut plans_a.prefill),
+    )?;
+    engine.commit_generation_step(&mut runtime, &request_a, &[], 1, &step_a)?;
+    let cache_a = prefill_cache_id_from_step(&step_a)?;
+
+    let compatibility_b = engine.kv_compatibility(&request_b);
+    match runtime.validate_kv_cache_reuse(&cache_a, &compatibility_b, None) {
+        Err(_) => Ok(()),
+        Ok(()) => Err(E2eConformanceError::GenerationFailed {
+            reason: "session B's compatibility was accepted for reuse of session A's KV cache"
+                .into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+/// Proves a generation step re-checks Model Instance readiness for *itself*
+/// (task 8.1) rather than reusing the one-time check
+/// `prepare_first_native_execution_plans` performed before the generation
+/// loop started: draining the instance between prefill and decode -- which
+/// leaves its weight resource bindings fully intact, only its lifecycle
+/// readiness changes -- must now fail the decode step closed instead of
+/// silently proceeding on stale readiness evidence.
+fn check_generation_step_rechecks_model_instance_readiness(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let mut runtime = build_runtime_with_model_execution_engine(fixture);
+    let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
+    let engine = new_kv_lifecycle_engine(fixture);
+    let request = kv_lifecycle_test_request(
+        fixture,
+        &runtime,
+        &instance,
+        "kv-readiness-recheck",
+        None,
+        &[1, 2],
+    )?;
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )?;
+
+    let prefill_step =
+        engine.execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))?;
+    engine.commit_generation_step(&mut runtime, &request, &[], 1, &prefill_step)?;
+
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .map_err(InferenceApiError::from)?
+        .drain()
+        .map_err(InferenceApiError::from)?;
+
+    let generated = vec![1];
+    match engine.execute_generation_step(
+        &mut runtime,
+        &request,
+        &generated,
+        Some(&mut plans.decode),
+    ) {
+        Err(InferenceApiError::ModelInstanceNotReady { .. }) => Ok(()),
+        Err(error) => Err(E2eConformanceError::GenerationFailed {
+            reason: format!("unexpected error for a drained model instance: {error}"),
+        }),
+        Ok(_) => Err(E2eConformanceError::GenerationFailed {
+            reason: "decode proceeded through a drained (not-ready) model instance".into(),
+        }),
+    }
+}
+
+#[cfg(test)]
+/// Proves the generation-level observation stream (task 8.2) -- which
+/// already carries causal component/graph/plan/provider/resource/KV/
+/// sampling/token-commit evidence -- never carries the raw prompt text or a
+/// native pointer-style marker, across every observation kind a real
+/// forward pass emits, not just the higher-level conformance report JSON
+/// `e2e_observability_emits_only_redacted_report_metadata` already checks.
+fn check_generation_observations_never_carry_raw_prompt_or_handles(
+    fixture: &E2eFixture,
+) -> Result<(), E2eConformanceError> {
+    let prompt = "zzyzx-secret";
+    let outcome = run_success_path_with_prompt(fixture, &ModelRef::new("qwen-test")?, prompt)?;
+    if outcome.observer.observations().is_empty() {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "success path emitted no observations to check for redaction".into(),
+        });
+    }
+    for observation in outcome.observer.observations() {
+        if observation.message.contains(prompt) {
+            return Err(E2eConformanceError::BoundaryViolation {
+                reason: format!(
+                    "observation {:?} carried raw prompt text: {}",
+                    observation.kind, observation.message
+                ),
+            });
+        }
+        if observation.message.contains("0x")
+            || observation
+                .message
+                .to_ascii_lowercase()
+                .contains("native_handle")
+        {
+            return Err(E2eConformanceError::BoundaryViolation {
+                reason: format!(
+                    "observation {:?} carried a native handle or pointer marker: {}",
+                    observation.kind, observation.message
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Proves `FirstNativeChatSession::close` (task 8.3/8.4) genuinely releases
+/// both the KV cache a chat turn created and the Model Instance it ran
+/// against -- not just returning `Ok(())` without having done the
+/// underlying work. The KV cache a chat turn creates gets
+/// `KvCacheRetentionPolicy::ReleaseOnSessionClose` (the `KvCachePolicy`
+/// default) and is scoped to this chat session's own `InferenceSessionId`,
+/// so closing that *same* session is what must release it.
+fn check_chat_session_close_releases_kv_cache_and_model_instance() -> Result<(), E2eConformanceError>
+{
+    let model_ref = ModelRef::new("qwen-test")?;
+    let mut chat = FirstNativeChatSession::open(&model_ref).map_err(|error| {
+        E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        }
+    })?;
+    chat.turn("hi", 1)
+        .map_err(|error| E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        })?;
+
+    let session = chat.session.clone();
+    let instance = chat.instance.clone();
+    let cache_id = chat
+        .runtime
+        .kv_caches()
+        .caches()
+        .find(|cache| cache.session.as_ref() == Some(&session))
+        .map(|cache| cache.id.clone())
+        .ok_or_else(|| E2eConformanceError::GenerationFailed {
+            reason: "chat turn created no session-scoped KV cache".into(),
+        })?;
+    if chat.runtime.kv_cache(&cache_id)?.lifecycle == KvCacheLifecycleState::Released {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "chat turn's KV cache was already released before session close".into(),
+        });
+    }
+    if chat.runtime.kv_cache(&cache_id)?.policy.retention
+        != KvCacheRetentionPolicy::ReleaseOnSessionClose
+    {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "chat turn's KV cache does not use the expected session-close retention policy"
+                .into(),
+        });
+    }
+
+    // The same two steps `FirstNativeChatSession::close` performs, kept
+    // `&mut` here (rather than calling the consuming public `close`) so
+    // this test can inspect `chat.runtime` immediately afterward and prove
+    // cleanup targeted the *same* session and instance a turn actually
+    // used.
+    close_inference_session(&mut chat.runtime, &session).map_err(E2eConformanceError::from)?;
+    unload_model_instance(
+        &mut chat.runtime,
+        &instance,
+        ModelInstanceUnloadPolicy::DrainActiveUse,
+    )
+    .map_err(E2eConformanceError::from)?;
+
+    if chat.runtime.kv_cache(&cache_id)?.lifecycle != KvCacheLifecycleState::Released {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "closing the chat session did not release its KV cache".into(),
+        });
+    }
+    if chat
+        .runtime
+        .model_instance_status(&instance)
+        .map_err(E2eConformanceError::from)?
+        .readiness
+        .accepts_generation()
+    {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "unloading the chat session's model instance left it accepting generation"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+/// Proves two `FirstNativeChatSession`s opened for the same model are
+/// isolated (task 8.4): distinct `InferenceSessionId`s and distinct,
+/// independently scoped KV caches -- one session's turn cannot be confused
+/// with, or leak state into, another's.
+fn check_chat_sessions_are_isolated_from_each_other() -> Result<(), E2eConformanceError> {
+    let model_ref = ModelRef::new("qwen-test")?;
+    let mut chat_a = FirstNativeChatSession::open(&model_ref).map_err(|error| {
+        E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        }
+    })?;
+    let mut chat_b = FirstNativeChatSession::open(&model_ref).map_err(|error| {
+        E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        }
+    })?;
+
+    if chat_a.session_id() == chat_b.session_id() {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "two independently opened chat sessions were assigned the same session id"
+                .into(),
+        });
+    }
+
+    chat_a
+        .turn("hello from a", 1)
+        .map_err(|error| E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        })?;
+    chat_b
+        .turn("hello from b", 1)
+        .map_err(|error| E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        })?;
+
+    let session_a = chat_a.session.clone();
+    let cache_a_belongs_to_a = chat_a
+        .runtime
+        .kv_caches()
+        .caches()
+        .any(|cache| cache.session.as_ref() == Some(&session_a));
+    if !cache_a_belongs_to_a {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "chat session A's own Runtime recorded no KV cache scoped to its session"
+                .into(),
+        });
+    }
+    // Session A's Runtime is entirely separate from session B's -- there is
+    // no shared KV cache manager, memory manager, or session table between
+    // them, so B's session id cannot appear in A's cache table at all.
+    let session_b = chat_b.session_id().clone();
+    if chat_a
+        .runtime
+        .kv_caches()
+        .caches()
+        .any(|cache| cache.session.as_ref() == Some(&session_b))
+    {
+        return Err(E2eConformanceError::GenerationFailed {
+            reason: "chat session A's Runtime recorded a KV cache scoped to session B".into(),
+        });
+    }
+
+    chat_a
+        .close()
+        .map_err(|error| E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        })?;
+    chat_b
+        .close()
+        .map_err(|error| E2eConformanceError::GenerationFailed {
+            reason: error.to_string(),
+        })?;
+    Ok(())
+}

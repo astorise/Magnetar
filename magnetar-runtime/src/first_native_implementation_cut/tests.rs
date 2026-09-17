@@ -158,7 +158,12 @@ fn first_native_decode_does_not_materialize_full_history() {
             "{forbidden} must not appear in the normal first-native decode path"
         );
     }
-    assert!(source.contains("execute_qwen_decode_hidden_states_through_dispatch"));
+    // `execute_qwen_decode_hidden_states_through_dispatch` is the test-only
+    // oracle this check cross-references -- moved to the sibling
+    // `first_native_runtime/tests.rs` (#54/#63), not this production file,
+    // so it is checked there instead.
+    let tests_source = read_workspace_file("magnetar-runtime/src/first_native_runtime/tests.rs");
+    assert!(tests_source.contains("execute_qwen_decode_hidden_states_through_dispatch"));
     assert!(source.contains("model_input_tokens={model_input_token_count}"));
     assert!(source.contains("fn commit_generation_step"));
     assert!(source.contains("runtime.append_decode_kv_cache(&state.cache, 1)"));
