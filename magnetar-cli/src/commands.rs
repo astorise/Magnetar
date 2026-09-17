@@ -36,18 +36,34 @@ use magnetar_runtime::{
 use crate::observability::{CliObservationKind, CliObserver};
 use crate::{agent, aliases, config, network, pipeline, render, secrets, serve, tools};
 
-pub fn dispatch(args: &[String]) -> Result<(), CliBoundaryError> {
-    // `-v`/`--verbose` is a global flag: recognized anywhere in `args`,
-    // stripped before subcommand parsing, and controls only whether a
-    // one-line CLI observability summary (counts only, see
-    // `observability.rs`'s redaction guarantee) is printed at the end.
-    // Default output is unchanged when it is absent.
-    let verbose = args.iter().any(|arg| arg == "--verbose" || arg == "-v");
-    let filtered: Vec<String> = args
+/// Splits a global `-v`/`--verbose` flag out of `args`, returning whether it
+/// was present and the remaining arguments with it removed. Recognizes the
+/// flag anywhere *before* a bare `--`, but never after: `run` and `agent`
+/// both treat `--` as ending their own flag parsing so a prompt/goal word
+/// that genuinely starts with `--verbose` can still be passed through (see
+/// `parse_run_flags`, `cmd_agent`) -- scanning past that same `--` would let
+/// this global flag shadow that convention by consuming a literal
+/// `--verbose` meant as positional text.
+fn split_global_verbose_flag(args: &[String]) -> (bool, Vec<String>) {
+    let split_at = args.iter().position(|arg| arg == "--");
+    let (scanned, passthrough) = match split_at {
+        Some(idx) => args.split_at(idx),
+        None => (args, [].as_slice()),
+    };
+    let verbose = scanned.iter().any(|arg| arg == "--verbose" || arg == "-v");
+    let filtered = scanned
         .iter()
         .filter(|arg| arg.as_str() != "--verbose" && arg.as_str() != "-v")
         .cloned()
+        .chain(passthrough.iter().cloned())
         .collect();
+    (verbose, filtered)
+}
+
+pub fn dispatch(args: &[String]) -> Result<(), CliBoundaryError> {
+    // Default output is unchanged when `--verbose`/`-v` is absent; see
+    // `split_global_verbose_flag`'s doc comment for the flag's exact scope.
+    let (verbose, filtered) = split_global_verbose_flag(args);
 
     let mut observer = CliObserver::new();
     observer.observe(
@@ -1058,6 +1074,38 @@ mod tests {
         assert!(!flags.git_diff);
         assert!(flags.env_secret.is_none());
         assert_eq!(rest, args);
+    }
+
+    #[test]
+    fn split_global_verbose_flag_recognizes_verbose_before_any_dashdash() {
+        let args = vec![
+            "run".to_string(),
+            "--verbose".to_string(),
+            "model-ref".to_string(),
+        ];
+        let (verbose, filtered) = split_global_verbose_flag(&args);
+        assert!(verbose);
+        assert_eq!(filtered, vec!["run".to_string(), "model-ref".to_string()]);
+    }
+
+    /// A Codex review finding on this PR: `dispatch`'s global `--verbose`
+    /// scan previously ran over the whole argument list, so
+    /// `magnetar run qwen-test -- --verbose flag` both incorrectly enabled
+    /// global verbose output and dropped the literal `--verbose` token that
+    /// `parse_run_flags`'s own `--` convention is supposed to preserve as
+    /// prompt text. The scan must stop at the first bare `--`.
+    #[test]
+    fn split_global_verbose_flag_does_not_consume_verbose_after_dashdash() {
+        let args = vec![
+            "run".to_string(),
+            "model-ref".to_string(),
+            "--".to_string(),
+            "--verbose".to_string(),
+            "flag".to_string(),
+        ];
+        let (verbose, filtered) = split_global_verbose_flag(&args);
+        assert!(!verbose);
+        assert_eq!(filtered, args);
     }
 
     /// #56: a value-taking flag given as the last argument is rejected,
