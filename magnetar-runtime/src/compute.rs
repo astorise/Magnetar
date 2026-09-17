@@ -3872,3 +3872,6 @@ pub fn compute_capability() -> Capability {
         ),
     )
 }
+
+#[cfg(test)]
+mod tests;

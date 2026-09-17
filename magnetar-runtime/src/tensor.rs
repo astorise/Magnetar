@@ -813,3 +813,6 @@ impl From<ReferenceCpuError> for KernelError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

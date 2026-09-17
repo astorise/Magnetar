@@ -3433,3 +3433,6 @@ impl Error for ComponentError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

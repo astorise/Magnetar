@@ -1536,3 +1536,6 @@ pub fn run_provider_roadmap_conformance() -> ProviderRoadmapConformanceReport {
 
     ProviderRoadmapConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;

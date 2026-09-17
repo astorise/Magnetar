@@ -5012,3 +5012,6 @@ fn contains_native_handle_marker(value: &str) -> bool {
     .iter()
     .any(|marker| lowered.contains(marker))
 }
+
+#[cfg(test)]
+mod tests;

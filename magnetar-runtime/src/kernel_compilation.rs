@@ -1670,3 +1670,6 @@ pub fn run_kernel_compilation_conformance() -> KernelCompilationConformanceRepor
 
     KernelCompilationConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;

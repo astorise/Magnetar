@@ -594,3 +594,74 @@ fn concat_handles_rank_one_input() {
     assert_eq!(result.shape, vec![5]);
     assert_eq!(result.data, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
 }
+
+use crate::affinity::{FallbackClass, ResourceAffinity};
+use crate::compute::ComputeDType;
+use crate::device::DeviceType;
+use crate::kernel::{KernelImplementationFamily, KernelObservationKind};
+use crate::tensor::HostTensor;
+
+fn reference_cpu_host_tensor(shape: impl Into<Vec<u64>>, data: impl Into<Vec<f32>>) -> HostTensor {
+    HostTensor::new(shape, data).unwrap()
+}
+
+#[test]
+fn reference_cpu_provider_identity_and_device_are_stable() {
+    let provider = ReferenceCpuProvider::new();
+    let metadata = provider.metadata();
+    assert_eq!(metadata.name, REFERENCE_CPU_PROVIDER_NAME);
+    assert_eq!(metadata.vendor, REFERENCE_CPU_PROVIDER_VENDOR);
+
+    let devices = provider.devices();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].id().as_str(), REFERENCE_CPU_DEVICE_ID);
+    assert_eq!(devices[0].device_type(), DeviceType::Cpu);
+
+    let (min, max) = REFERENCE_CPU_SUPPORTED_RUNTIME_VERSION_RANGE;
+    assert!(min <= max);
+    assert_eq!(
+        REFERENCE_CPU_KERNEL_FAMILY,
+        KernelImplementationFamily::CpuScalar
+    );
+}
+
+#[test]
+fn reference_cpu_conformance_report_passes_and_is_observed() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let report = executor.run_conformance_checks();
+    assert!(
+        report.is_conformant(),
+        "Reference CPU conformance checks failed: {:?}",
+        report.checks
+    );
+    assert_eq!(report.profile, REFERENCE_CPU_CONFORMANCE_PROFILE);
+    assert!(
+        executor
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == KernelObservationKind::KernelConformanceResult)
+    );
+}
+
+#[test]
+fn reference_cpu_dtype_conversion_rejects_non_f32() {
+    let input = reference_cpu_host_tensor([1], [1.0]);
+    assert!(dtype_conversion(&input, ComputeDType::Float32, ComputeDType::Float32).is_ok());
+    assert!(dtype_conversion(&input, ComputeDType::Float16, ComputeDType::Float32).is_err());
+}
+
+#[test]
+fn reference_cpu_fallback_denied_when_dtype_or_layout_conversion_forbidden() {
+    let transparent = ResourceAffinity::new(FallbackClass::Transparent);
+    let dtype_denied = FallbackPolicyContext::new(true).with_dtype_conversion(true, false);
+    assert!(evaluate_fallback(&transparent, &dtype_denied).is_err());
+
+    let layout_denied = FallbackPolicyContext::new(true).with_layout_conversion(true, false);
+    assert!(evaluate_fallback(&transparent, &layout_denied).is_err());
+
+    let both_allowed = FallbackPolicyContext::new(true)
+        .with_dtype_conversion(true, true)
+        .with_layout_conversion(true, true);
+    assert!(evaluate_fallback(&transparent, &both_allowed).is_ok());
+}

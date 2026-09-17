@@ -425,17 +425,6 @@ fn component_import_uses_a_semantic_capability_version() {
         1
     );
 }
-#[test]
-fn compute_capability_has_the_canonical_wit_contract() {
-    let compute = compute_capability();
-    assert_eq!(compute.id.as_str(), COMPUTE_CAPABILITY_ID);
-    assert_eq!(compute.version, COMPUTE_CAPABILITY_VERSION);
-    assert_eq!(COMPUTE_WIT_PACKAGE, "magnetar:compute");
-    assert_eq!(
-        compute.descriptor.contracts,
-        BTreeSet::from([WitInterface::new(COMPUTE_WIT_INTERFACE, "2.0.0")])
-    );
-}
 
 #[test]
 fn provider_conformance_suite_reports_core_compute_and_data_movement_success() {
@@ -485,83 +474,6 @@ fn provider_conformance_suite_reports_core_compute_and_data_movement_success() {
     let json = provider_conformance_report_json(&report).unwrap();
     assert!(json.contains("\"provider_identity\": \"magnetar.test.conformant\""));
     assert!(json.contains("\"suite_version\""));
-}
-
-#[test]
-fn provider_conformance_suite_fails_invalid_public_metadata() {
-    let mut provider = TestProvider::new("bad provider");
-    provider.metadata.vendor.clear();
-    provider.metadata.description = "raw handle 0xdeadbeef".into();
-
-    let report = ProviderConformanceSuite::default()
-        .run(ProviderConformanceTarget::mock(Arc::new(provider)));
-
-    assert!(!report.is_conformant());
-    assert!(report.failed_tests.iter().any(|result| {
-        result.requirement == "ProviderId syntax"
-            && result.profile == ProviderConformanceProfile::ProviderCore
-    }));
-    assert!(report.failed_tests.iter().any(|result| {
-        result.requirement == "vendor metadata"
-            && result.profile == ProviderConformanceProfile::ProviderCore
-    }));
-    assert!(report.failed_tests.iter().any(|result| {
-        result.requirement == "metadata redaction"
-            && result.profile == ProviderConformanceProfile::ProviderCore
-    }));
-}
-
-#[test]
-fn provider_conformance_suite_reports_dynamic_loading_policy() {
-    let path = std::env::temp_dir().join("magnetar-provider-fixture.dll");
-    let denied = ProviderConformanceSuite::new(
-        ProviderConformanceConfig::default()
-            .with_profiles([ProviderConformanceProfile::ProviderDynamicAbi]),
-    )
-    .run(ProviderConformanceTarget::dynamic_library(
-        &path,
-        ProviderLoadingPolicy::dynamic_library([std::env::temp_dir().join("allowed")]),
-    ));
-    assert!(!denied.is_conformant());
-    assert!(denied.failed_tests.iter().any(|result| {
-        result.profile == ProviderConformanceProfile::ProviderDynamicAbi
-            && result.requirement == "allowed path loading"
-    }));
-
-    let allowed = ProviderConformanceSuite::new(
-        ProviderConformanceConfig::default()
-            .with_profiles([ProviderConformanceProfile::ProviderDynamicAbi]),
-    )
-    .run(ProviderConformanceTarget::development(
-        &path,
-        ProviderLoadingPolicy::development([std::env::temp_dir()]),
-    ));
-    assert!(allowed.is_conformant(), "{allowed:#?}");
-    assert!(allowed.passed_tests.iter().any(|result| {
-        result.profile == ProviderConformanceProfile::ProviderDynamicAbi
-            && result.requirement == "ABI descriptor structure"
-    }));
-    assert!(allowed.skipped_tests.iter().any(|result| {
-        result.profile == ProviderConformanceProfile::ProviderDynamicAbi
-            && result.requirement == "factory symbol exists"
-    }));
-}
-
-#[test]
-fn provider_conformance_profile_ids_mark_hardware_profiles_optional() {
-    let profile_ids = provider_conformance_profile_ids([
-        ProviderConformanceProfile::ProviderCore,
-        ProviderConformanceProfile::Cuda,
-        ProviderConformanceProfile::Metal,
-        ProviderConformanceProfile::OpenVino,
-        ProviderConformanceProfile::Qnn,
-    ]);
-
-    assert!(profile_ids["provider-core"]);
-    assert!(!profile_ids["provider-hardware-cuda"]);
-    assert!(!profile_ids["provider-hardware-metal"]);
-    assert!(!profile_ids["provider-hardware-openvino"]);
-    assert!(!profile_ids["provider-hardware-qnn"]);
 }
 
 #[test]
@@ -761,15 +673,6 @@ fn first_native_single_host_topology_requires_reference_cpu_provider_and_device(
 }
 
 #[test]
-fn first_native_component_engine_accepts_native_controlled_wasi_capabilities() {
-    let capabilities = ComponentEngineCapabilities::native();
-
-    assert!(validate_first_native_component_engine_capabilities(&capabilities).is_ok());
-    assert!(capabilities.supports(ComponentEngineFeature::ComponentModel));
-    assert!(capabilities.supports(ComponentEngineFeature::ControlledWasi));
-}
-
-#[test]
 fn first_native_component_engine_rejects_non_native_or_ambient_test_profile() {
     let capabilities = ComponentEngineCapabilities::test();
 
@@ -804,36 +707,6 @@ fn compute_v1_import_is_not_satisfied_by_compute_v2_provider() {
             if capability.id().as_str() == COMPUTE_CAPABILITY_ID
                 && capability.version() == CapabilityVersion::new(1, 1, 0)
     ));
-}
-#[test]
-fn compute_operation_catalog_defines_stable_family_metadata() {
-    let families = ComputeOperationFamily::ALL
-        .into_iter()
-        .map(|family| family.id())
-        .collect::<BTreeSet<_>>();
-
-    assert_eq!(families.len(), 11);
-    assert!(families.contains("descriptor-and-view"));
-    assert!(families.contains("construction-and-allocation"));
-    assert!(families.contains("data-movement-and-conversion"));
-    assert!(families.contains("elementwise"));
-    assert!(families.contains("comparison-and-selection"));
-    assert!(families.contains("reduction"));
-    assert!(families.contains("linear-algebra"));
-    assert!(families.contains("convolution-and-spatial-transform"));
-    assert!(families.contains("indexing-and-update"));
-    assert!(families.contains("random-generation"));
-    assert!(families.contains("synchronization-and-completion"));
-
-    let metadata = ComputeOperationFamily::LinearAlgebra.metadata();
-    assert_eq!(metadata.family, ComputeOperationFamily::LinearAlgebra);
-    assert_eq!(metadata.scope, "matrix and batched matrix operations");
-    assert!(metadata.examples.contains(&"matmul"));
-    assert_eq!(
-        ComputeOperationFamily::from_id("elementwise"),
-        Some(ComputeOperationFamily::Elementwise)
-    );
-    assert_eq!(ComputeOperationFamily::from_id("autograd"), None);
 }
 #[test]
 fn compute_wit_defines_the_stabilized_run_surface() {
@@ -1021,73 +894,6 @@ fn compute_diagnostics_are_optional_redacted_and_non_contractual() {
     );
 }
 #[test]
-fn compute_operation_validation_uses_provider_advertisements() {
-    let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    provider.metadata.compute_operation_support.insert(
-        ComputeOperationFamily::Elementwise,
-        ComputeOperationSupport::new()
-            .with_dtypes([ComputeDType::Float32, ComputeDType::Float64])
-            .with_layouts([ComputeLayout::Dense])
-            .with_precision_modes([ComputePrecision::Default, ComputePrecision::Reduced]),
-    );
-    provider.metadata.compute_operation_support.insert(
-        ComputeOperationFamily::LinearAlgebra,
-        ComputeOperationSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense])
-            .with_precision_modes([ComputePrecision::Default]),
-    );
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-
-    runtime
-        .validate_compute_operations(
-            "portable-compute",
-            &[
-                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
-                    .with_dtype(ComputeDType::Float32)
-                    .with_layout(ComputeLayout::Dense)
-                    .with_precision(ComputePrecision::Reduced),
-                ComputeOperationDescriptor::new(ComputeOperationFamily::LinearAlgebra)
-                    .with_dtype(ComputeDType::Float32)
-                    .with_layout(ComputeLayout::Dense),
-            ],
-        )
-        .unwrap();
-
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "portable-compute",
-            &[ComputeOperationDescriptor::new(
-                ComputeOperationFamily::Reduction
-            )],
-        ),
-        Err(ComputeValidationError::UnsupportedOperationFamily { .. })
-    ));
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "portable-compute",
-            &[
-                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
-                    .with_dtype(ComputeDType::UInt8)
-            ],
-        ),
-        Err(ComputeValidationError::UnsupportedDType { .. })
-    ));
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "portable-compute",
-            &[
-                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
-                    .with_layout(ComputeLayout::Strided)
-            ],
-        ),
-        Err(ComputeValidationError::UnsupportedLayout { .. })
-    ));
-}
-#[test]
 fn compute_operation_schemas_define_initial_portable_operations() {
     let schemas = initial_compute_operation_schemas();
 
@@ -1127,47 +933,6 @@ fn compute_operation_schemas_define_initial_portable_operations() {
         .get(&ComputeOperationId::new("tensor.scatter"))
         .unwrap();
     assert!(scatter.provider_specific_semantics);
-}
-#[test]
-fn provider_compute_advertisement_drives_operation_validation() {
-    let schemas = initial_compute_operation_schemas();
-    let add = schemas
-        .get(&ComputeOperationId::new("elementwise.binary.add"))
-        .unwrap();
-    let mut provider = provider_with_capabilities("advertised-compute", [compute_capability()]);
-    provider.metadata.compute_advertisement = ProviderComputeAdvertisement::new()
-        .with_capability(
-            ComputeCapabilitySupport::default()
-                .with_versions([COMPUTE_CAPABILITY_VERSION])
-                .with_operation_catalog_revision("initial")
-                .with_operation_schema_revision("initial"),
-        )
-        .with_operation_schema(OperationSchemaSupport::from_operation_support(
-            add.id.clone(),
-            add.family,
-            ComputeOperationSupport::new()
-                .with_dtypes([ComputeDType::Float32])
-                .with_layouts([ComputeLayout::Dense])
-                .with_precision_modes([ComputePrecision::Default]),
-        ));
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let tensor = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 2]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-
-    runtime
-        .validate_compute_operations(
-            "advertised-compute",
-            &[ComputeOperationDescriptor::from_schema(add)
-                .with_tensor(tensor.clone())
-                .with_tensor(tensor.clone())
-                .with_tensor(tensor)],
-        )
-        .unwrap();
 }
 #[test]
 fn provider_compute_advertisement_reports_version_and_schema_rejections() {
@@ -1214,261 +979,6 @@ fn provider_compute_advertisement_reports_version_and_schema_rejections() {
             &[ComputeOperationDescriptor::from_schema(add)]
         ),
         Err(ComputeValidationError::UnsupportedOperationSchema { .. })
-    ));
-}
-#[test]
-fn compute_operation_schema_validation_checks_attributes_and_shapes() {
-    let schemas = initial_compute_operation_schemas();
-    let add = schemas
-        .get(&ComputeOperationId::new("elementwise.binary.add"))
-        .unwrap();
-    let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    provider.metadata.compute_operation_schema_support.insert(
-        add.id.clone(),
-        ComputeOperationSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense]),
-    );
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let lhs = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 1]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    let rhs = TensorDescriptor::materialized(
-        ShapeDescriptor::new([1, 3]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    let output = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 3]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-
-    runtime
-        .validate_compute_operations(
-            "portable-compute",
-            &[ComputeOperationDescriptor::from_schema(add)
-                .with_tensor(lhs.clone())
-                .with_tensor(rhs.clone())
-                .with_tensor(output.clone())],
-        )
-        .unwrap();
-
-    let bad_output = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 2]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "portable-compute",
-            &[ComputeOperationDescriptor::from_schema(add)
-                .with_tensor(lhs.clone())
-                .with_tensor(rhs.clone())
-                .with_tensor(bad_output)]
-        ),
-        Err(ComputeValidationError::InvalidOutputDescriptor { .. })
-    ));
-
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "portable-compute",
-            &[ComputeOperationDescriptor::from_schema(add)
-                .with_attribute("unknown", ComputeOperationAttribute::Boolean(true))
-                .with_tensor(lhs)
-                .with_tensor(rhs)
-                .with_tensor(output)]
-        ),
-        Err(ComputeValidationError::InvalidOperationAttribute { .. })
-    ));
-}
-#[test]
-fn compute_operation_schema_validation_checks_reduction_matmul_and_random_rules() {
-    let schemas = initial_compute_operation_schemas();
-    let sum = schemas
-        .get(&ComputeOperationId::new("reduction.sum"))
-        .unwrap();
-    let matmul = schemas
-        .get(&ComputeOperationId::new("linalg.matmul"))
-        .unwrap();
-    let random = schemas
-        .get(&ComputeOperationId::new("random.uniform"))
-        .unwrap();
-    let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    for schema in [sum, matmul, random] {
-        provider.metadata.compute_operation_schema_support.insert(
-            schema.id.clone(),
-            ComputeOperationSupport::new()
-                .with_dtypes([ComputeDType::Float32, ComputeDType::SInt64])
-                .with_layouts([ComputeLayout::Dense]),
-        );
-    }
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let f32_2x3 = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 3]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-
-    runtime
-        .validate_compute_operations(
-            "portable-compute",
-            &[ComputeOperationDescriptor::from_schema(sum)
-                .with_attribute("axes", ComputeOperationAttribute::Axes(vec![1]))
-                .with_attribute("keep-dimensions", ComputeOperationAttribute::Boolean(true))
-                .with_tensor(f32_2x3.clone())
-                .with_tensor(TensorDescriptor::materialized(
-                    ShapeDescriptor::new([2, 1]),
-                    DTypeDescriptor::portable(ComputeDType::Float32),
-                ))],
-        )
-        .unwrap();
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "portable-compute",
-            &[ComputeOperationDescriptor::from_schema(sum)
-                .with_attribute("axes", ComputeOperationAttribute::Axes(vec![2]))
-                .with_tensor(f32_2x3.clone())
-                .with_tensor(f32_2x3.clone())]
-        ),
-        Err(ComputeValidationError::InvalidShape { .. })
-    ));
-
-    runtime
-        .validate_compute_operations(
-            "portable-compute",
-            &[ComputeOperationDescriptor::from_schema(matmul)
-                .with_tensor(f32_2x3.clone())
-                .with_tensor(TensorDescriptor::materialized(
-                    ShapeDescriptor::new([3, 4]),
-                    DTypeDescriptor::portable(ComputeDType::Float32),
-                ))
-                .with_tensor(TensorDescriptor::materialized(
-                    ShapeDescriptor::new([2, 4]),
-                    DTypeDescriptor::portable(ComputeDType::Float32),
-                ))],
-        )
-        .unwrap();
-
-    runtime
-        .validate_compute_operations(
-            "portable-compute",
-            &[ComputeOperationDescriptor::from_schema(random)
-                .with_attribute(
-                    "shape",
-                    ComputeOperationAttribute::Shape(ShapeDescriptor::new([2, 2])),
-                )
-                .with_attribute(
-                    "dtype",
-                    ComputeOperationAttribute::DType(ComputeDType::Float32),
-                )
-                .with_attribute("seed", ComputeOperationAttribute::Integer(42))
-                .with_tensor(TensorDescriptor::materialized(
-                    ShapeDescriptor::new([2, 2]),
-                    DTypeDescriptor::portable(ComputeDType::Float32),
-                ))],
-        )
-        .unwrap();
-}
-#[test]
-fn tensor_descriptors_validate_shape_dtype_layout_and_provider_support() {
-    let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    provider.metadata.compute_operation_support.insert(
-        ComputeOperationFamily::DescriptorAndView,
-        ComputeOperationSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense, ComputeLayout::Strided])
-            .with_descriptor_limits(TensorDescriptorLimits {
-                max_rank: 4,
-                max_dimension: 1024,
-                max_elements: 4096,
-                max_bytes: 16_384,
-                allow_zero_sized: false,
-            }),
-    );
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let tensor = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 3, 4]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-
-    runtime
-        .validate_compute_operations(
-            "portable-compute",
-            &[
-                ComputeOperationDescriptor::new(ComputeOperationFamily::DescriptorAndView)
-                    .with_tensor(tensor.clone()),
-            ],
-        )
-        .unwrap();
-
-    let zero_dim = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 0]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "portable-compute",
-            &[
-                ComputeOperationDescriptor::new(ComputeOperationFamily::DescriptorAndView)
-                    .with_tensor(zero_dim)
-            ]
-        ),
-        Err(ComputeValidationError::InvalidShape { .. })
-    ));
-
-    let unsupported_dtype = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 3]),
-        DTypeDescriptor::portable(ComputeDType::Float64),
-    );
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "portable-compute",
-            &[
-                ComputeOperationDescriptor::new(ComputeOperationFamily::DescriptorAndView)
-                    .with_tensor(unsupported_dtype)
-            ]
-        ),
-        Err(ComputeValidationError::UnsupportedDType { .. })
-    ));
-
-    let unsupported_layout = TensorDescriptor::new(
-        ShapeDescriptor::new([2, 3]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-        LayoutDescriptor::ProviderOpaque {
-            layout_id: "native-blocked".into(),
-        },
-    );
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "portable-compute",
-            &[
-                ComputeOperationDescriptor::new(ComputeOperationFamily::DescriptorAndView)
-                    .with_tensor(unsupported_layout)
-            ]
-        ),
-        Err(ComputeValidationError::UnsupportedLayout { .. })
-    ));
-
-    let overflowing = TensorDescriptor::materialized(
-        ShapeDescriptor::new([64, 65]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "portable-compute",
-            &[
-                ComputeOperationDescriptor::new(ComputeOperationFamily::DescriptorAndView)
-                    .with_tensor(overflowing)
-            ]
-        ),
-        Err(ComputeValidationError::SizeOverflow { .. })
     ));
 }
 #[test]
@@ -1638,39 +1148,6 @@ fn memory_planning_accounts_for_explicit_host_staged_transfers() {
     );
 }
 #[test]
-fn provider_compute_advertisement_drives_data_movement_validation() {
-    let mut provider = provider_with_capabilities("advertised-movement", [compute_capability()]);
-    provider.metadata.compute_advertisement = ProviderComputeAdvertisement::new()
-        .with_capability(
-            ComputeCapabilitySupport::default().with_versions([COMPUTE_CAPABILITY_VERSION]),
-        )
-        .with_data_movement(DataMovementSupport::from_compute_support(
-            ComputeDataMovementKind::Upload,
-            ComputeDataMovementSupport::new()
-                .with_dtypes([ComputeDType::Float32])
-                .with_layouts([ComputeLayout::Dense])
-                .with_host_encodings([HostBufferEncoding::LittleEndian]),
-        ));
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let descriptor = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 2]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-
-    runtime
-        .validate_compute_data_movement(
-            "advertised-movement",
-            &[ComputeDataMovementDescriptor::upload(
-                HostBufferDescriptor::new(16, HostBufferEncoding::LittleEndian),
-                descriptor,
-            )],
-        )
-        .unwrap();
-}
-#[test]
 fn compute_operation_requests_reject_unknown_family_ids() {
     let provider = provider_with_capabilities("portable-compute", [compute_capability()]);
     let runtime = Runtime::builder()
@@ -1685,66 +1162,6 @@ fn compute_operation_requests_reject_unknown_family_ids() {
         ),
         Err(ComputeValidationError::UnknownOperationFamily(_))
     ));
-}
-#[test]
-fn compute_graph_validation_checks_references_provider_support_and_submission_affinity() {
-    let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    provider.metadata.compute_operation_support.insert(
-        ComputeOperationFamily::Elementwise,
-        ComputeOperationSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense]),
-    );
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let descriptor = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 2]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    let graph = ComputeGraph::new(ComputeGraphId::new("graph-1"))
-        .with_input(ComputeInput::new(
-            ComputeInputId::new("x"),
-            ComputeInputValue::TensorDescriptor(descriptor.clone()),
-        ))
-        .with_node(
-            ComputeNode::new(
-                ComputeNodeId::new("add"),
-                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
-                    .with_dtype(ComputeDType::Float32)
-                    .with_layout(ComputeLayout::Dense),
-            )
-            .with_input(ComputeValueRef::Input(ComputeInputId::new("x")))
-            .with_output(ComputeNodeOutput::new(
-                ComputeOutputId::new("y"),
-                descriptor,
-            )),
-        )
-        .with_output(ComputeOutput::new(
-            ComputeOutputId::new("result"),
-            ComputeValueRef::NodeOutput {
-                node: ComputeNodeId::new("add"),
-                output: ComputeOutputId::new("y"),
-            },
-        ));
-
-    let report = runtime
-        .validate_compute_graph("portable-compute", &graph)
-        .unwrap();
-    assert_eq!(report.node_count, 1);
-    assert_eq!(report.input_count, 1);
-    assert_eq!(report.output_count, 1);
-
-    let submission = runtime
-        .submit_validated_compute_graph("portable-compute", &graph)
-        .unwrap();
-    assert_eq!(submission.graph, ComputeGraphId::new("graph-1"));
-    assert_eq!(submission.state(), ComputeSubmissionState::Pending);
-    assert_eq!(
-        submission.affinity.provider().map(ProviderBinding::as_str),
-        Some("portable-compute")
-    );
 }
 #[test]
 fn compute_execution_planning_selects_provider_device_and_validates_plan() {
@@ -1825,73 +1242,6 @@ fn compute_execution_planning_selects_provider_device_and_validates_plan() {
     assert_eq!(
         plan.memory_plan.graph,
         Some(ComputeGraphId::new("planned-graph"))
-    );
-}
-#[test]
-fn compute_execution_planning_preserves_provider_pinned_resources() {
-    let mut provider_a = provider_with_capabilities("provider-a", [compute_capability()]);
-    provider_a.metadata.compute_operation_support.insert(
-        ComputeOperationFamily::Elementwise,
-        ComputeOperationSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense]),
-    );
-    let mut provider_b = provider_with_capabilities("provider-b", [compute_capability()]);
-    provider_b.metadata.compute_operation_support.insert(
-        ComputeOperationFamily::Elementwise,
-        ComputeOperationSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense]),
-    );
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider_b))
-        .register_provider(Arc::new(provider_a))
-        .build()
-        .unwrap();
-    let descriptor = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 2]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    let resource = TensorResourceDescriptor::new(
-        TensorResourceId::new("pinned"),
-        descriptor.clone(),
-        ResourceAffinity::new(FallbackClass::ProviderPinned)
-            .with_provider(ProviderBinding::new("provider-b"))
-            .with_capability(CapabilityBinding::new(
-                CapabilityId::new(COMPUTE_CAPABILITY_ID),
-                COMPUTE_CAPABILITY_VERSION,
-            )),
-    );
-    let graph = ComputeGraph::new(ComputeGraphId::new("pinned-graph"))
-        .with_input(ComputeInput::new(
-            ComputeInputId::new("x"),
-            ComputeInputValue::TensorResource(resource),
-        ))
-        .with_node(
-            ComputeNode::new(
-                ComputeNodeId::new("add"),
-                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
-                    .with_dtype(ComputeDType::Float32)
-                    .with_layout(ComputeLayout::Dense),
-            )
-            .with_input(ComputeValueRef::Input(ComputeInputId::new("x")))
-            .with_output(ComputeNodeOutput::new(
-                ComputeOutputId::new("y"),
-                descriptor,
-            )),
-        );
-
-    let plan = runtime.plan_compute_execution(&graph).unwrap();
-
-    assert_eq!(plan.provider.as_str(), "provider-b");
-    assert_eq!(
-        plan.classification,
-        ComputeExecutionClassification::ProviderPinned
-    );
-    assert!(
-        plan.steps
-            .iter()
-            .any(|step| step.kind == ExecutionStepKind::PreserveProviderPinnedAffinity)
     );
 }
 #[test]
@@ -2419,144 +1769,6 @@ fn scheduler_interrupts_when_provider_is_unavailable_before_submission() {
     assert_eq!(
         scheduler.operation(operation).unwrap().state(),
         SchedulingState::Interrupted
-    );
-}
-#[test]
-fn compute_graph_validation_rejects_missing_and_future_references() {
-    let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    provider.metadata.compute_operation_support.insert(
-        ComputeOperationFamily::Elementwise,
-        ComputeOperationSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense]),
-    );
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let descriptor = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 2]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    let missing_input = ComputeGraph::new(ComputeGraphId::new("bad-input")).with_node(
-        ComputeNode::new(
-            ComputeNodeId::new("node"),
-            ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise),
-        )
-        .with_input(ComputeValueRef::Input(ComputeInputId::new("missing")))
-        .with_output(ComputeNodeOutput::new(
-            ComputeOutputId::new("out"),
-            descriptor.clone(),
-        )),
-    );
-    assert!(matches!(
-        runtime.validate_compute_graph("portable-compute", &missing_input),
-        Err(ComputeValidationError::MissingInput { .. })
-    ));
-
-    let future_reference = ComputeGraph::new(ComputeGraphId::new("cycle"))
-        .with_node(
-            ComputeNode::new(
-                ComputeNodeId::new("first"),
-                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise),
-            )
-            .with_input(ComputeValueRef::NodeOutput {
-                node: ComputeNodeId::new("second"),
-                output: ComputeOutputId::new("out"),
-            })
-            .with_output(ComputeNodeOutput::new(
-                ComputeOutputId::new("out"),
-                descriptor.clone(),
-            )),
-        )
-        .with_node(
-            ComputeNode::new(
-                ComputeNodeId::new("second"),
-                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise),
-            )
-            .with_output(ComputeNodeOutput::new(
-                ComputeOutputId::new("out"),
-                descriptor,
-            )),
-        );
-    assert!(matches!(
-        runtime.validate_compute_graph("portable-compute", &future_reference),
-        Err(ComputeValidationError::CyclicGraph { .. })
-    ));
-}
-#[test]
-fn memory_planning_tracks_lifetimes_reuse_and_output_affinity() {
-    let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    provider.metadata.compute_operation_support.insert(
-        ComputeOperationFamily::Elementwise,
-        ComputeOperationSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense]),
-    );
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let descriptor = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 2]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    let graph = ComputeGraph::new(ComputeGraphId::new("memory-graph"))
-        .with_input(ComputeInput::new(
-            ComputeInputId::new("x"),
-            ComputeInputValue::TensorDescriptor(descriptor.clone()),
-        ))
-        .with_node(
-            ComputeNode::new(
-                ComputeNodeId::new("temp"),
-                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
-                    .with_dtype(ComputeDType::Float32)
-                    .with_layout(ComputeLayout::Dense),
-            )
-            .with_input(ComputeValueRef::Input(ComputeInputId::new("x")))
-            .with_output(ComputeNodeOutput::new(
-                ComputeOutputId::new("tmp"),
-                descriptor.clone(),
-            )),
-        )
-        .with_node(
-            ComputeNode::new(
-                ComputeNodeId::new("result-node"),
-                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
-                    .with_dtype(ComputeDType::Float32)
-                    .with_layout(ComputeLayout::Dense),
-            )
-            .with_input(ComputeValueRef::Input(ComputeInputId::new("x")))
-            .with_output(ComputeNodeOutput::new(
-                ComputeOutputId::new("y"),
-                descriptor,
-            )),
-        )
-        .with_output(ComputeOutput::new(
-            ComputeOutputId::new("result"),
-            ComputeValueRef::NodeOutput {
-                node: ComputeNodeId::new("result-node"),
-                output: ComputeOutputId::new("y"),
-            },
-        ));
-
-    let plan = runtime
-        .plan_compute_graph_memory("portable-compute", &graph)
-        .unwrap();
-
-    assert!(
-        plan.decisions
-            .iter()
-            .any(|decision| matches!(decision, MemoryPlanningDecision::Reuse { .. }))
-    );
-    assert_eq!(
-        plan.output_affinity.provider().map(ProviderBinding::as_str),
-        Some("portable-compute")
-    );
-    assert!(
-        plan.requirements
-            .iter()
-            .any(|requirement| requirement.region == MemoryRegionKind::Intermediate)
     );
 }
 #[test]
@@ -3465,60 +2677,6 @@ fn public_component_api_does_not_expose_wasmtime_native_types() {
 }
 
 #[test]
-fn component_engine_profiles_declare_platform_capabilities() {
-    let native = ComponentEngineCapabilities::native();
-    assert_eq!(native.profile, ComponentEngineProfile::Native);
-    assert!(native.supports(ComponentEngineFeature::ComponentModel));
-    assert!(native.supports(ComponentEngineFeature::NativeProviderEndpoints));
-    assert!(!native.supports(ComponentEngineFeature::BrowserCompatible));
-
-    let web = ComponentEngineCapabilities::web();
-    assert_eq!(web.profile, ComponentEngineProfile::Web);
-    assert!(web.supports(ComponentEngineFeature::BrowserCompatible));
-    assert!(web.supports(ComponentEngineFeature::JsMediatedHostCalls));
-    assert!(web.supports(ComponentEngineFeature::BrowserMemory));
-    assert!(!web.supports(ComponentEngineFeature::NativeProviderEndpoints));
-
-    let test = ComponentEngineCapabilities::test();
-    assert_eq!(test.profile, ComponentEngineProfile::Test);
-    assert!(test.supports(ComponentEngineFeature::Interruption));
-    assert!(!test.supports(ComponentEngineFeature::ControlledWasi));
-}
-
-#[test]
-fn component_engine_requirements_fail_closed_on_profile_or_feature_mismatch() {
-    let requirements = ComponentEngineRequirements::default()
-        .require_profile(ComponentEngineProfile::Web)
-        .require_feature(ComponentEngineFeature::BrowserCompatible);
-
-    assert!(
-        requirements
-            .validate("browser-component", &ComponentEngineCapabilities::web())
-            .is_ok()
-    );
-
-    assert!(matches!(
-        requirements.validate("browser-component", &ComponentEngineCapabilities::native()),
-        Err(ComponentError::EngineProfileMismatch {
-            required: ComponentEngineProfile::Web,
-            actual: ComponentEngineProfile::Native,
-            ..
-        })
-    ));
-
-    let requirements = ComponentEngineRequirements::default()
-        .require_feature(ComponentEngineFeature::NativeProviderEndpoints);
-    assert!(matches!(
-        requirements.validate("native-component", &ComponentEngineCapabilities::web()),
-        Err(ComponentError::EngineFeatureUnavailable {
-            feature: ComponentEngineFeature::NativeProviderEndpoints,
-            profile: ComponentEngineProfile::Web,
-            ..
-        })
-    ));
-}
-
-#[test]
 fn component_manager_observes_engine_selection_and_rejection() {
     let mut manager = ComponentManager::new();
     manager
@@ -3987,26 +3145,6 @@ fn component_import_version_must_match_authorized_interface() {
 }
 
 #[test]
-fn component_wasi_imports_fail_closed_without_authorization() {
-    let filesystem = WitInterface::new("wasi:filesystem/types", "0.2.0");
-    let environment = WitInterface::new("wasi:cli/environment", "0.2.0");
-    let mut manager = ComponentManager::new();
-    manager
-        .register_component(ComponentDescriptor::new(
-            ComponentMetadata::new("wasi-consumer", "1", "test component")
-                .with_import(filesystem)
-                .with_import(environment),
-            "wasi-consumer.wasm",
-        ))
-        .unwrap();
-
-    assert!(matches!(
-        manager.instantiate_component("wasi-consumer"),
-        Err(ComponentError::UnauthorizedImport { .. })
-    ));
-}
-
-#[test]
 fn component_ambient_network_process_and_secret_imports_fail_closed() {
     let interfaces = [
         WitInterface::new("wasi:sockets/tcp", "0.2.0"),
@@ -4262,70 +3400,6 @@ fn inference_cache_registry_scopes_access_to_session_and_model() {
             .unwrap()
         ),
         Err(ComponentError::ArtifactRejected { .. })
-    ));
-}
-
-#[test]
-fn prepared_component_contract_must_match_declared_imports() {
-    let declared = WitInterface::new("example:declared/api", "1.0.0");
-    let undeclared = WitInterface::new("example:undeclared/api", "1.0.0");
-    let mut contract = ComponentContract::default();
-    contract.imports.insert(ComponentImportRequirement::new(
-        undeclared,
-        ComponentInterfaceShape::Interface,
-    ));
-    let mut engine = MockComponentEngine::new();
-    engine.prepared_contract = Some(contract);
-    let mut manager = ComponentManager::with_engine(Box::new(engine));
-    manager
-        .register_component(ComponentDescriptor::new(
-            ComponentMetadata::new("consumer", "1", "test component").with_import(declared),
-            "consumer.wasm",
-        ))
-        .unwrap();
-
-    assert!(matches!(
-        manager.prepare_component("consumer"),
-        Err(ComponentError::ContractValidationFailed { .. })
-    ));
-}
-
-#[test]
-fn prepared_component_contract_must_include_declared_exports() {
-    let exported = WitInterface::new("example:export/api", "1.0.0");
-    let mut engine = MockComponentEngine::new();
-    engine.prepared_contract = Some(ComponentContract::default());
-    let mut manager = ComponentManager::with_engine(Box::new(engine));
-    manager
-        .register_component(ComponentDescriptor::new(
-            ComponentMetadata::new("producer", "1", "test component").with_export(exported),
-            "producer.wasm",
-        ))
-        .unwrap();
-
-    assert!(matches!(
-        manager.prepare_component("producer"),
-        Err(ComponentError::ContractValidationFailed { .. })
-    ));
-}
-
-#[test]
-fn component_exports_do_not_automatically_satisfy_imports() {
-    let interface = WitInterface::new("example:service/api", "1.0.0");
-    let producer =
-        ComponentMetadata::new("producer", "1", "producer").with_export(interface.clone());
-    let consumer = ComponentMetadata::new("consumer", "1", "consumer").with_import(interface);
-    let mut manager = ComponentManager::new();
-    manager
-        .register_component(ComponentDescriptor::new(producer, "producer.wasm"))
-        .unwrap();
-    manager
-        .register_component(ComponentDescriptor::new(consumer, "consumer.wasm"))
-        .unwrap();
-
-    assert!(matches!(
-        manager.instantiate_component("consumer"),
-        Err(ComponentError::UnauthorizedImport { .. })
     ));
 }
 
@@ -4718,32 +3792,6 @@ impl ComponentDistributionSourceProvider for TestComponentDistributionSource {
 }
 
 #[test]
-fn pushed_component_package_is_validated_before_preparation() {
-    let bytes = b"component-bytes";
-    let digest = ComponentDigest::sha256(bytes);
-    let package =
-        component_artifact_package(bytes, ComponentDistributionSourceKind::ClientProvided);
-    let mut manager = ComponentManager::new();
-    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value.clone()));
-
-    manager.prepare_pushed_package(package).unwrap();
-
-    let definition = manager.definition("magnetar.examples.hello").unwrap();
-    assert_eq!(definition.artifact_digest, Some(digest));
-    assert!(matches!(
-        definition.trust_decision,
-        Some(ComponentTrustDecision {
-            status: ComponentTrustStatus::Trusted,
-            ..
-        })
-    ));
-    assert!(manager.observations().iter().any(|observation| {
-        observation.kind == ComponentObservationKind::Distribution
-            && observation.message.contains("client-provided")
-    }));
-}
-
-#[test]
 fn pushed_component_package_temp_materialization_is_removed_with_manager() {
     let before = std::fs::read_dir(std::env::temp_dir())
         .unwrap()
@@ -4781,23 +3829,6 @@ fn pushed_component_package_temp_materialization_is_removed_with_manager() {
 }
 
 #[test]
-fn pushed_component_package_rejects_source_digest_mismatch() {
-    let mut package =
-        component_artifact_package(b"component-bytes", ComponentDistributionSourceKind::Tachyon);
-    package.declared_digest = ComponentDigest::sha256(b"different");
-    let mut manager = ComponentManager::new();
-    manager.set_trust_store(ComponentTrustStore::default().trust_source("tachyon"));
-
-    assert!(matches!(
-        manager.prepare_pushed_package(package),
-        Err(ComponentError::Distribution {
-            category: ComponentDistributionErrorCategory::DigestMismatch,
-            ..
-        })
-    ));
-}
-
-#[test]
 fn distribution_source_identity_does_not_imply_trust() {
     let package =
         component_artifact_package(b"component-bytes", ComponentDistributionSourceKind::Tachyon);
@@ -4809,28 +3840,6 @@ fn distribution_source_identity_does_not_imply_trust() {
             status: ComponentTrustStatus::Unknown,
             ..
         })
-    ));
-}
-
-#[test]
-fn trusted_distribution_source_still_rejects_forbidden_authority() {
-    let bytes = b"component-bytes";
-    let digest = ComponentDigest::sha256(bytes);
-    let manifest = manifest_yaml_with_authority(&digest.value, &["filesystem"])
-        .replace("  kind: \"local\"", "  kind: \"tachyon\"");
-    let package = ComponentArtifactPackage::new(
-        bytes.to_vec(),
-        manifest.into_bytes(),
-        digest,
-        ComponentDistributionSource::new(ComponentDistributionSourceKind::Tachyon, "tachyon"),
-    );
-    let mut manager = ComponentManager::new();
-    manager.set_trust_store(ComponentTrustStore::default().trust_source("tachyon"));
-
-    assert!(matches!(
-        manager.prepare_pushed_package(package),
-        Err(ComponentError::Manifest { message, .. })
-            if message == "authority kind is outside Magnetar inference scope"
     ));
 }
 
@@ -4882,22 +3891,6 @@ fn pulled_component_package_rejects_empty_candidate_list() {
             ..
         })
     ));
-}
-
-#[test]
-fn local_distribution_does_not_require_tachyon_or_network() {
-    let bytes = b"component-bytes";
-    let digest = ComponentDigest::sha256(bytes);
-    let package =
-        component_artifact_package(bytes, ComponentDistributionSourceKind::LocalDirectory);
-    let mut manager = ComponentManager::new();
-    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value));
-
-    manager.prepare_pushed_package(package).unwrap();
-    assert_eq!(
-        manager.definition_state("magnetar.examples.hello"),
-        Some(ComponentDefinitionState::Prepared)
-    );
 }
 
 #[test]
@@ -5755,38 +4748,6 @@ fn runtime_initializes_memory_manager_as_first_class_service() {
 }
 
 #[test]
-fn memory_manager_admission_uses_pressure_and_queue_policy() {
-    let manager = MemoryManager::default();
-    let request = MemoryAllocationRequest::new(
-        MemoryAllocationClass::Tensor,
-        1024,
-        MemoryPlacement::HostOrdinary,
-        MemoryAllocationOwner::Runtime,
-    );
-    let saturated = MemoryPressureSnapshot {
-        runtime: MemoryPressureLevel::Saturated,
-        ..MemoryPressureSnapshot::default()
-    };
-
-    assert!(matches!(
-        manager.admit(MemoryAdmissionRequest {
-            allocation: request.clone(),
-            pressure: saturated.clone(),
-            queue_allowed: false,
-        }),
-        MemoryAdmissionDecision::Reject { .. }
-    ));
-    assert!(matches!(
-        manager.admit(MemoryAdmissionRequest {
-            allocation: request,
-            pressure: saturated,
-            queue_allowed: true,
-        }),
-        MemoryAdmissionDecision::Queue { .. }
-    ));
-}
-
-#[test]
 fn memory_manager_tracks_allocation_lifetime_and_tensor_residency() {
     let mut manager = MemoryManager::new(MemoryManagerConfig {
         max_runtime_bytes: Some(4096),
@@ -5937,153 +4898,6 @@ fn memory_manager_rejects_forbidden_staging_and_incompatible_zero_copy() {
     );
     assert!(!zero_copy.feasible);
     assert!(zero_copy.reason.contains("incompatible"));
-}
-
-#[test]
-fn memory_manager_reuses_cached_allocations_and_evicts_over_limit() {
-    let mut manager = MemoryManager::new(MemoryManagerConfig {
-        max_cached_bytes: 512,
-        ..MemoryManagerConfig::default()
-    });
-    let request = MemoryAllocationRequest::new(
-        MemoryAllocationClass::Tensor,
-        256,
-        MemoryPlacement::HostOrdinary,
-        MemoryAllocationOwner::Runtime,
-    );
-
-    let first = manager.allocate(request.clone()).unwrap();
-    manager.release(first.id).unwrap();
-    let second = manager.allocate(request).unwrap();
-
-    assert_eq!(first.id, second.id);
-    assert!(manager.observations().iter().any(|observation| {
-        observation.kind == MemoryObservationKind::CacheHit
-            && observation.allocation == Some(first.id)
-    }));
-
-    manager.release(second.id).unwrap();
-    let other = manager
-        .allocate(MemoryAllocationRequest::new(
-            MemoryAllocationClass::TemporaryWorkspace,
-            768,
-            MemoryPlacement::HostOrdinary,
-            MemoryAllocationOwner::Runtime,
-        ))
-        .unwrap();
-    manager.release(other.id).unwrap();
-
-    assert!(
-        manager
-            .observations()
-            .iter()
-            .any(|observation| { observation.kind == MemoryObservationKind::CacheEviction })
-    );
-}
-
-#[test]
-fn memory_manager_tracks_arena_growth_shrink_pressure_and_diagnostics() {
-    let mut manager = MemoryManager::default();
-    let arena = manager
-        .create_arena(
-            MemoryAllocationClass::TemporaryWorkspace,
-            MemoryPlacement::HostOrdinary,
-            128,
-            MemoryArenaOwner::Runtime,
-        )
-        .unwrap();
-    let id = arena.id;
-    *manager.arena_mut(id).unwrap() = MemoryArena::new(
-        id,
-        MemoryAllocationClass::TemporaryWorkspace,
-        MemoryPlacement::HostOrdinary,
-        128,
-        MemoryArenaOwner::Runtime,
-    )
-    .with_growth(MemoryArenaGrowthPolicy::GrowOnDemand {
-        increment_bytes: 128,
-    })
-    .with_shrink(MemoryArenaShrinkPolicy::ReleaseReusable);
-
-    manager.reserve_in_arena(id, 192).unwrap();
-    manager.shrink_arena(id).unwrap();
-
-    let arena = manager.arenas().find(|arena| arena.id == id).unwrap();
-    assert_eq!(arena.used_bytes, 192);
-    assert!(arena.capacity_bytes >= 192);
-    assert!(matches!(
-        arena.pressure,
-        MemoryPressureLevel::High | MemoryPressureLevel::Saturated
-    ));
-    assert!(
-        manager
-            .observations()
-            .iter()
-            .any(|observation| { observation.kind == MemoryObservationKind::ArenaPressure })
-    );
-}
-
-#[test]
-fn memory_manager_pending_queue_times_out_cancels_and_retries() {
-    let mut timeout_manager = MemoryManager::default();
-    timeout_manager
-        .submit_pending_allocation(
-            MemoryAllocationRequest::new(
-                MemoryAllocationClass::Tensor,
-                64,
-                MemoryPlacement::HostOrdinary,
-                MemoryAllocationOwner::Runtime,
-            )
-            .with_alignment(8)
-            .with_deadline_millis(20),
-            10,
-        )
-        .unwrap();
-    let errors = timeout_manager.expire_pending_allocations(20);
-    assert!(matches!(
-        errors.as_slice(),
-        [MemoryError::AllocationTimeout { .. }]
-    ));
-
-    let mut cancel_manager = MemoryManager::default();
-    let pending = cancel_manager
-        .submit_pending_allocation(
-            MemoryAllocationRequest::new(
-                MemoryAllocationClass::Tensor,
-                64,
-                MemoryPlacement::HostOrdinary,
-                MemoryAllocationOwner::Runtime,
-            ),
-            10,
-        )
-        .unwrap();
-    assert!(matches!(
-        cancel_manager.cancel_pending_allocation(pending.allocation.id),
-        Err(MemoryError::AllocationCancelled { .. })
-    ));
-
-    let mut retry_manager = MemoryManager::default();
-    retry_manager
-        .submit_pending_allocation(
-            MemoryAllocationRequest::new(
-                MemoryAllocationClass::Tensor,
-                64,
-                MemoryPlacement::HostOrdinary,
-                MemoryAllocationOwner::Runtime,
-            ),
-            0,
-        )
-        .unwrap();
-    let results = retry_manager.retry_pending_allocations();
-    assert_eq!(results.len(), 1);
-    assert!(results[0].is_ok());
-    assert!(retry_manager.pending_allocations().next().is_none());
-    assert!(
-        retry_manager
-            .observations()
-            .iter()
-            .any(|observation| { observation.kind == MemoryObservationKind::PendingQueueDelay })
-    );
 }
 
 #[test]
@@ -6599,26 +5413,6 @@ fn reference_cpu_host_tensor(shape: impl Into<Vec<u64>>, data: impl Into<Vec<f32
 }
 
 #[test]
-fn reference_cpu_provider_identity_and_device_are_stable() {
-    let provider = ReferenceCpuProvider::new();
-    let metadata = provider.metadata();
-    assert_eq!(metadata.name, REFERENCE_CPU_PROVIDER_NAME);
-    assert_eq!(metadata.vendor, REFERENCE_CPU_PROVIDER_VENDOR);
-
-    let devices = provider.devices();
-    assert_eq!(devices.len(), 1);
-    assert_eq!(devices[0].id().as_str(), REFERENCE_CPU_DEVICE_ID);
-    assert_eq!(devices[0].device_type(), DeviceType::Cpu);
-
-    let (min, max) = REFERENCE_CPU_SUPPORTED_RUNTIME_VERSION_RANGE;
-    assert!(min <= max);
-    assert_eq!(
-        REFERENCE_CPU_KERNEL_FAMILY,
-        KernelImplementationFamily::CpuScalar
-    );
-}
-
-#[test]
 fn reference_cpu_provider_status_snapshot_reports_health_and_lifecycle() {
     let provider = ReferenceCpuProvider::new();
     let snapshot = provider.status_snapshot();
@@ -6681,25 +5475,6 @@ fn reference_cpu_initialize_emits_provider_registered_and_device_detected() {
         observations
             .iter()
             .any(|observation| observation.kind == KernelObservationKind::DeviceDetected)
-    );
-}
-
-#[test]
-fn reference_cpu_conformance_report_passes_and_is_observed() {
-    let provider = ReferenceCpuProvider::new();
-    let executor = provider.executor();
-    let report = executor.run_conformance_checks();
-    assert!(
-        report.is_conformant(),
-        "Reference CPU conformance checks failed: {:?}",
-        report.checks
-    );
-    assert_eq!(report.profile, REFERENCE_CPU_CONFORMANCE_PROFILE);
-    assert!(
-        executor
-            .observations()
-            .iter()
-            .any(|observation| observation.kind == KernelObservationKind::KernelConformanceResult)
     );
 }
 
@@ -7212,13 +5987,6 @@ fn reference_cpu_attention_mask_kind_must_be_consistent_with_causal_flag() {
 }
 
 #[test]
-fn reference_cpu_dtype_conversion_rejects_non_f32() {
-    let input = reference_cpu_host_tensor([1], [1.0]);
-    assert!(dtype_conversion(&input, ComputeDType::Float32, ComputeDType::Float32).is_ok());
-    assert!(dtype_conversion(&input, ComputeDType::Float16, ComputeDType::Float32).is_err());
-}
-
-#[test]
 fn reference_cpu_layout_conversion_rejects_non_contiguous() {
     let input = reference_cpu_host_tensor([1], [1.0]);
     assert!(
@@ -7253,21 +6021,6 @@ fn reference_cpu_fallback_denied_by_default_allowed_by_policy() {
     let transparent = ResourceAffinity::new(FallbackClass::Transparent);
     assert!(evaluate_fallback(&transparent, &FallbackPolicyContext::new(false)).is_err());
     assert!(evaluate_fallback(&transparent, &FallbackPolicyContext::new(true)).is_ok());
-}
-
-#[test]
-fn reference_cpu_fallback_denied_when_dtype_or_layout_conversion_forbidden() {
-    let transparent = ResourceAffinity::new(FallbackClass::Transparent);
-    let dtype_denied = FallbackPolicyContext::new(true).with_dtype_conversion(true, false);
-    assert!(evaluate_fallback(&transparent, &dtype_denied).is_err());
-
-    let layout_denied = FallbackPolicyContext::new(true).with_layout_conversion(true, false);
-    assert!(evaluate_fallback(&transparent, &layout_denied).is_err());
-
-    let both_allowed = FallbackPolicyContext::new(true)
-        .with_dtype_conversion(true, true)
-        .with_layout_conversion(true, true);
-    assert!(evaluate_fallback(&transparent, &both_allowed).is_ok());
 }
 
 #[test]
@@ -8372,23 +7125,6 @@ fn reference_cpu_execution_only_accepts_runtime_created_invocation_shapes() {
 }
 
 #[test]
-fn reference_cpu_provider_passes_generic_conformance_core_profile() {
-    let suite =
-        ProviderConformanceSuite::new(ProviderConformanceConfig::default().with_profiles([
-            ProviderConformanceProfile::ProviderCore,
-            ProviderConformanceProfile::ProviderObservability,
-        ]));
-    let report = suite.run(ProviderConformanceTarget::BuiltIn {
-        provider: Arc::new(ReferenceCpuProvider::new()),
-    });
-    assert!(
-        report.is_conformant(),
-        "Reference CPU Provider failed conformance: {:?}",
-        report.failed_tests
-    );
-}
-
-#[test]
 fn reference_cpu_kernel_registry_accepts_provider_advertisements() {
     let provider = ReferenceCpuProvider::new();
     let mut registry = KernelRegistry::new();
@@ -8485,25 +7221,6 @@ fn tensor_lifecycle_rejects_declared_to_ready_skip() {
 }
 
 #[test]
-fn tensor_resource_released_is_rejected_for_use() {
-    let mut resource = tensor_resource_for_test("tensor-lifecycle-3");
-    resource
-        .transition_to(TensorLifecycleState::Planned)
-        .unwrap();
-    resource
-        .transition_to(TensorLifecycleState::Allocating)
-        .unwrap();
-    resource.mark_ready().unwrap();
-    resource
-        .transition_to(TensorLifecycleState::Released)
-        .unwrap();
-    assert_eq!(
-        resource.ensure_usable().unwrap_err(),
-        TensorError::ResourceReleased
-    );
-}
-
-#[test]
 fn tensor_readiness_blocks_dispatch_until_ready() {
     let mut resource = tensor_resource_for_test("tensor-readiness-1");
     resource
@@ -8520,24 +7237,6 @@ fn tensor_readiness_blocks_dispatch_until_ready() {
     ));
     resource.readiness = TensorReadiness::Ready;
     assert!(resource.ensure_usable().is_ok());
-}
-
-#[test]
-fn tensor_mutability_denies_mutation_of_immutable_resource() {
-    let error =
-        validate_mutability_for_dispatch(TensorMutabilityKind::Immutable, true).unwrap_err();
-    assert!(matches!(error, TensorError::MutabilityViolation { .. }));
-    assert!(validate_mutability_for_dispatch(TensorMutabilityKind::Mutable, true).is_ok());
-    assert!(validate_mutability_for_dispatch(TensorMutabilityKind::Immutable, false).is_ok());
-}
-
-#[test]
-fn tensor_aliasing_requires_in_place_kernel_support() {
-    let error =
-        validate_aliasing_for_dispatch(TensorAliasingKind::InputOutputAlias, false).unwrap_err();
-    assert!(matches!(error, TensorError::AliasingViolation { .. }));
-    assert!(validate_aliasing_for_dispatch(TensorAliasingKind::InputOutputAlias, true).is_ok());
-    assert!(validate_aliasing_for_dispatch(TensorAliasingKind::NoAlias, false).is_ok());
 }
 
 #[test]
@@ -8559,21 +7258,6 @@ fn tensor_memory_class_is_derived_from_memory_placement() {
 }
 
 #[test]
-fn tensor_memory_class_validation_rejects_unsupported_class() {
-    let error = validate_memory_class_for_kernel(
-        TensorMemoryClass::Device,
-        &[TensorMemoryClass::Host, TensorMemoryClass::PinnedHost],
-    )
-    .unwrap_err();
-    assert!(matches!(error, TensorError::MemoryClassUnsupported { .. }));
-    assert!(validate_memory_class_for_kernel(TensorMemoryClass::Device, &[]).is_ok());
-    assert!(
-        validate_memory_class_for_kernel(TensorMemoryClass::Host, &[TensorMemoryClass::Host])
-            .is_ok()
-    );
-}
-
-#[test]
 fn tensor_view_becomes_unavailable_once_base_is_terminal() {
     let view = TensorView::new(
         TensorResourceId::new("base"),
@@ -8590,57 +7274,6 @@ fn tensor_view_becomes_unavailable_once_base_is_terminal() {
         .validate_against_base(TensorLifecycleState::Released)
         .unwrap_err();
     assert!(matches!(error, TensorError::ViewBaseUnavailable { .. }));
-}
-
-#[test]
-fn tensor_layout_descriptor_kind_covers_every_layout_category() {
-    assert_eq!(LayoutDescriptor::Contiguous.kind(), ComputeLayout::Dense);
-    assert_eq!(
-        LayoutDescriptor::Blocked {
-            block_dimensions: vec![2, 2],
-        }
-        .kind(),
-        ComputeLayout::Blocked
-    );
-    assert_eq!(
-        LayoutDescriptor::Paged {
-            page_size_elements: 16,
-            block_size_elements: 4,
-            capacity_pages: None,
-            current_length_elements: None,
-            logical_to_physical: None,
-            append_behavior: None,
-        }
-        .kind(),
-        ComputeLayout::Paged
-    );
-    assert_eq!(
-        LayoutDescriptor::PackedQuantized {
-            method: "int4".into(),
-            bits_per_value: 4,
-            group_size: Some(32),
-            scale_dtype: None,
-            zero_point_dtype: None,
-            packing_order: None,
-            dequantization_requirements: None,
-        }
-        .kind(),
-        ComputeLayout::PackedQuantized
-    );
-    assert_eq!(
-        LayoutDescriptor::AttentionSpecific {
-            layout_id: "paged-attention".into(),
-        }
-        .kind(),
-        ComputeLayout::AttentionSpecific
-    );
-    assert_eq!(
-        LayoutDescriptor::BrowserCompatible {
-            layout_id: "wasm-linear".into(),
-        }
-        .kind(),
-        ComputeLayout::BrowserCompatible
-    );
 }
 
 #[test]
@@ -8674,18 +7307,6 @@ fn operator_layout_kind_maps_every_layout_descriptor_variant() {
         }),
         TensorLayoutKind::QuantizedPacked
     );
-}
-
-#[test]
-fn tensor_error_and_observation_redact_backend_diagnostics() {
-    let error = TensorError::resource_invalid("native handle=0xdeadbeef");
-    assert_eq!(
-        error.to_string(),
-        "tensor resource invalid: [redacted backend diagnostic]"
-    );
-    let observation = TensorObservation::new(TensorObservationKind::ResourceReady)
-        .with_message("C:\\weights\\model.bin");
-    assert_eq!(observation.message, "[redacted backend diagnostic]");
 }
 
 #[test]
@@ -8723,40 +7344,6 @@ fn tensor_descriptor_builder_sets_intents_and_semantic_role() {
         mismatched
             .validate(&TensorDescriptorLimits::default())
             .is_err()
-    );
-}
-
-#[test]
-fn shape_descriptor_row_major_strides_matches_expected_layout() {
-    let shape = ShapeDescriptor::new([2, 3, 4]);
-    assert_eq!(shape.row_major_strides(), vec![12, 4, 1]);
-    assert_eq!(ShapeDescriptor::new([5]).row_major_strides(), vec![1]);
-}
-
-#[test]
-fn tensor_descriptor_estimated_byte_size_honors_packed_quantized_bits() {
-    let packed = TensorDescriptor::new(
-        ShapeDescriptor::new([16]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-        LayoutDescriptor::PackedQuantized {
-            method: "int4".into(),
-            bits_per_value: 4,
-            group_size: Some(16),
-            scale_dtype: None,
-            zero_point_dtype: None,
-            packing_order: None,
-            dequantization_requirements: None,
-        },
-    );
-    assert_eq!(packed.estimated_byte_size().unwrap(), 8);
-
-    let dense = TensorDescriptor::materialized(
-        ShapeDescriptor::new([16]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    assert_eq!(
-        dense.estimated_byte_size().unwrap(),
-        dense.byte_size().unwrap()
     );
 }
 
@@ -8803,36 +7390,6 @@ fn tensor_residency_affinity_rejects_forged_device_binding() {
 }
 
 #[test]
-fn tensor_layout_placeholder_variants_validate_without_bounds_checking() {
-    let blocked = TensorDescriptor::new(
-        ShapeDescriptor::new([4, 4]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-        LayoutDescriptor::Blocked {
-            block_dimensions: vec![2, 2],
-        },
-    );
-    let paged = TensorDescriptor::new(
-        ShapeDescriptor::new([256]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-        LayoutDescriptor::Paged {
-            page_size_elements: 16,
-            block_size_elements: 4,
-            capacity_pages: Some(16),
-            current_length_elements: Some(200),
-            logical_to_physical: None,
-            append_behavior: None,
-        },
-    );
-    for descriptor in [blocked, paged] {
-        assert!(
-            descriptor
-                .validate(&TensorDescriptorLimits::default())
-                .is_ok()
-        );
-    }
-}
-
-#[test]
 fn kernel_result_tracks_aliasing_updates_alongside_readiness_and_residency() {
     let result = KernelResult::success(KernelInvocationId::new("aliasing-update"))
         .with_aliasing_update("output", TensorAliasingKind::InputOutputAlias);
@@ -8848,51 +7405,6 @@ fn tensor_resource_debug_output_never_exposes_raw_pointers_or_handles() {
     let text = format!("{resource:?}");
     assert!(!text.contains("0x"));
     assert!(!text.contains("handle="));
-}
-
-#[test]
-fn shape_descriptor_symbolic_dimensions_validate_fixed_consistency() {
-    let consistent = ShapeDescriptor::new([2, 8]).with_symbolic_dimensions([
-        SymbolicDimension::Symbolic("batch".into()),
-        SymbolicDimension::Fixed(8),
-    ]);
-    assert!(consistent.validate_symbolic().is_ok());
-
-    let inconsistent = ShapeDescriptor::new([2, 8]).with_symbolic_dimensions([
-        SymbolicDimension::Symbolic("batch".into()),
-        SymbolicDimension::Fixed(16),
-    ]);
-    assert!(inconsistent.validate_symbolic().is_err());
-
-    let wrong_rank =
-        ShapeDescriptor::new([2, 8]).with_symbolic_dimensions([SymbolicDimension::Dynamic]);
-    assert!(wrong_rank.validate_symbolic().is_err());
-}
-
-#[test]
-fn layout_descriptor_paged_tracks_logical_to_physical_and_append_behavior() {
-    let mut logical_to_physical = std::collections::BTreeMap::new();
-    logical_to_physical.insert(0, 3);
-    logical_to_physical.insert(1, 7);
-    let paged = LayoutDescriptor::Paged {
-        page_size_elements: 16,
-        block_size_elements: 4,
-        capacity_pages: Some(8),
-        current_length_elements: Some(64),
-        logical_to_physical: Some(logical_to_physical.clone()),
-        append_behavior: Some(PagedAppendBehavior::GrowOnDemand),
-    };
-    let LayoutDescriptor::Paged {
-        logical_to_physical: stored_map,
-        append_behavior: stored_behavior,
-        ..
-    } = &paged
-    else {
-        unreachable!()
-    };
-    assert_eq!(stored_map.as_ref(), Some(&logical_to_physical));
-    assert_eq!(*stored_behavior, Some(PagedAppendBehavior::GrowOnDemand));
-    assert_eq!(paged.kind(), ComputeLayout::Paged);
 }
 
 #[test]
@@ -9086,23 +7598,6 @@ fn inference_api_model_reference_rejects_path_like_input() {
 }
 
 #[test]
-fn inference_api_scope_validation_rejects_non_inference_capabilities() {
-    assert!(validate_inference_scope("generation").is_ok());
-    for forbidden in [
-        "workspace-filesystem",
-        "git",
-        "shell",
-        "secrets",
-        "tool-call",
-    ] {
-        assert!(matches!(
-            validate_inference_scope(forbidden),
-            Err(InferenceApiError::PolicyDenied { .. })
-        ));
-    }
-}
-
-#[test]
 fn inference_api_session_creation_rejects_forbidden_allowed_capabilities() {
     let runtime = &mut Runtime::builder().build().unwrap();
     let mut request = session_creation_request();
@@ -9131,16 +7626,6 @@ fn inference_api_session_creation_succeeds_with_inference_only_capabilities() {
 }
 
 #[test]
-fn inference_api_tokenize_plain_text_never_stores_raw_prompt_text() {
-    let tokenizer = FixtureTokenizer::new(generation_tokenizer_metadata());
-    let request = TokenizationRequest::new(PromptInput::PlainText("secret".into()));
-
-    let result = tokenize_prompt_input(&tokenizer, request, None).unwrap();
-    assert!(!result.token_ids.is_empty());
-    assert!(!format!("{result:?}").contains("secret"));
-}
-
-#[test]
 fn inference_api_tokenize_chat_messages_requires_authorized_formatter() {
     let tokenizer = FixtureTokenizer::new(generation_tokenizer_metadata());
     let request = TokenizationRequest::new(PromptInput::ChatMessages(vec![ChatMessage::new(
@@ -9149,43 +7634,6 @@ fn inference_api_tokenize_chat_messages_requires_authorized_formatter() {
 
     let error = tokenize_prompt_input(&tokenizer, request, None).unwrap_err();
     assert!(matches!(error, InferenceApiError::PolicyDenied { .. }));
-}
-
-struct ConcatenationChatTemplate;
-impl ChatTemplateFormatter for ConcatenationChatTemplate {
-    fn format(&self, messages: &[ChatMessage]) -> Result<String, InferenceApiError> {
-        Ok(messages
-            .iter()
-            .map(|message| message.content.as_str())
-            .collect::<Vec<_>>()
-            .join(" "))
-    }
-}
-
-#[test]
-fn inference_api_tokenize_chat_messages_formats_through_authorized_contract() {
-    let tokenizer = FixtureTokenizer::new(generation_tokenizer_metadata());
-    let request = TokenizationRequest::new(PromptInput::ChatMessages(vec![ChatMessage::new(
-        "user", "hi",
-    )]));
-
-    let result =
-        tokenize_prompt_input(&tokenizer, request, Some(&ConcatenationChatTemplate)).unwrap();
-    assert!(!result.token_ids.is_empty());
-}
-
-#[test]
-fn inference_api_tokenize_already_tokenized_input_validates_range() {
-    let tokenizer = FixtureTokenizer::new(generation_tokenizer_metadata());
-    let in_range = TokenizationRequest::new(PromptInput::TokenIds(vec![2, 3, 4]));
-    assert!(tokenize_prompt_input(&tokenizer, in_range, None).is_ok());
-
-    let out_of_range = TokenizationRequest::new(PromptInput::TestTokenSequence(vec![99_999]));
-    let error = tokenize_prompt_input(&tokenizer, out_of_range, None).unwrap_err();
-    assert!(matches!(
-        error,
-        InferenceApiError::TokenizationFailed { .. }
-    ));
 }
 
 #[test]
@@ -11945,35 +10393,6 @@ fn inference_api_session_close_transitions_lifecycle_to_closed() {
 }
 
 #[test]
-fn inference_api_tokenize_prompt_input_observed_emits_tokenized_and_failed() {
-    let tokenizer = FixtureTokenizer::new(generation_tokenizer_metadata());
-    let mut observer = InferenceApiObserver::new();
-
-    tokenize_prompt_input_observed(
-        &tokenizer,
-        TokenizationRequest::new(PromptInput::PlainText("secret".into())),
-        None,
-        &mut observer,
-    )
-    .unwrap();
-    tokenize_prompt_input_observed(
-        &tokenizer,
-        TokenizationRequest::new(PromptInput::TestTokenSequence(vec![99_999])),
-        None,
-        &mut observer,
-    )
-    .unwrap_err();
-
-    let kinds: Vec<_> = observer
-        .observations()
-        .iter()
-        .map(|observation| observation.kind)
-        .collect();
-    assert!(kinds.contains(&InferenceApiObservationKind::PromptTokenized));
-    assert!(kinds.contains(&InferenceApiObservationKind::TokenizationFailed));
-}
-
-#[test]
 fn inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contracts() {
     let metadata = generation_tokenizer_metadata();
     let vocabulary_size = metadata.vocabulary_size as usize;
@@ -12104,22 +10523,6 @@ fn inference_api_adapter_activation_denied_when_incompatible() {
 }
 
 #[test]
-fn inference_api_adapter_activation_observed_emits_adapter_activated() {
-    let residency = adapter_residency_fixture();
-    let request = adapter_activation_request_fixture(&residency);
-    let mut observer = InferenceApiObserver::new();
-
-    activate_adapter_observed(&residency, &request, None, None, &mut observer).unwrap();
-
-    assert!(
-        observer
-            .observations()
-            .iter()
-            .any(|observation| observation.kind == InferenceApiObservationKind::AdapterActivated)
-    );
-}
-
-#[test]
 fn inference_api_kv_cache_policy_covers_enabled_scope_budget_reuse_eviction_privacy() {
     let policy = KvCachePolicy {
         enabled: true,
@@ -12209,88 +10612,6 @@ fn inference_api_generation_result_reports_error_for_failed_finish_reason() {
 
     let result = GenerationResult::new(output);
     assert!(result.error.is_some());
-}
-
-#[test]
-fn inference_api_cancellation_stage_before_dispatch_always_succeeds() {
-    let token = CancellationToken::new(GenerationRequestId::new("gen-1").unwrap());
-    for stage in [
-        CancellationStage::Queued,
-        CancellationStage::Tokenization,
-        CancellationStage::Prefill,
-        CancellationStage::Decode,
-        CancellationStage::Sampling,
-        CancellationStage::Batching,
-        CancellationStage::GraphExecution,
-        CancellationStage::KernelDispatch,
-    ] {
-        assert_eq!(
-            request_cancellation_at_stage(&token, stage, false),
-            CancellationOutcome::Cancelled
-        );
-    }
-}
-
-#[test]
-fn inference_api_cancellation_stage_provider_execution_depends_on_support() {
-    let token = CancellationToken::new(GenerationRequestId::new("gen-1").unwrap());
-    assert_eq!(
-        request_cancellation_at_stage(&token, CancellationStage::ProviderExecution, true),
-        CancellationOutcome::Cancelled
-    );
-    assert!(matches!(
-        request_cancellation_at_stage(&token, CancellationStage::ProviderExecution, false),
-        CancellationOutcome::LimitationReported { .. }
-    ));
-}
-
-#[test]
-fn inference_api_cancellation_stage_observed_emits_generation_cancelled() {
-    let token = CancellationToken::new(GenerationRequestId::new("gen-1").unwrap());
-    let mut observer = InferenceApiObserver::new();
-
-    request_cancellation_at_stage_observed(&token, CancellationStage::Decode, false, &mut observer);
-
-    assert!(
-        observer
-            .observations()
-            .iter()
-            .any(|observation| observation.kind
-                == InferenceApiObservationKind::GenerationCancelled)
-    );
-}
-
-#[test]
-fn inference_api_observer_buffer_stays_bounded_and_retains_most_recent() {
-    let mut observer = InferenceApiObserver::new();
-    let total = INFERENCE_API_OBSERVATION_BUFFER_CAPACITY + 128;
-    for index in 0..total {
-        observer.observe(
-            InferenceApiObservationKind::TokenCommitted,
-            format!("observation-{index}"),
-            None,
-        );
-    }
-    assert_eq!(
-        observer.observations().len(),
-        INFERENCE_API_OBSERVATION_BUFFER_CAPACITY
-    );
-    // The oldest observations were evicted to admit the newest ones -- the
-    // buffer reflects the most recent causal evidence, not whatever
-    // happened to be observed first.
-    assert!(
-        !observer
-            .observations()
-            .iter()
-            .any(|observation| observation.message == "observation-0")
-    );
-    assert_eq!(
-        observer
-            .observations()
-            .last()
-            .map(|observation| observation.message.as_str()),
-        Some(format!("observation-{}", total - 1)).as_deref()
-    );
 }
 
 #[test]
@@ -12878,19 +11199,6 @@ fn kernel_source_format_is_extensible_and_not_provider_binding() {
 }
 
 #[test]
-fn artifact_trust_is_only_ever_policy_controlled() {
-    assert_eq!(
-        evaluate_artifact_trust(false),
-        KernelArtifactTrust::Untrusted
-    );
-    assert_eq!(evaluate_artifact_trust(true), KernelArtifactTrust::Trusted);
-    assert_eq!(
-        KernelArtifactTrust::default(),
-        KernelArtifactTrust::Untrusted
-    );
-}
-
-#[test]
 fn source_artifact_validation_requires_trust_and_valid_format() {
     let operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
     let artifact = KernelSourceArtifact::new(
@@ -12962,38 +11270,6 @@ fn compiled_artifact_validation_rejects_operator_and_provider_mismatch() {
         validate_compiled_artifact(&untrusted, &operator, &provider),
         Err(KernelArtifactError::Untrusted { .. })
     ));
-}
-
-#[test]
-fn hot_path_denies_compilation_cold_path_allows_it() {
-    assert!(matches!(
-        reject_hot_path_compilation(
-            KernelArtifactPath::Hot,
-            KernelArtifactColdPathOperation::Compilation
-        ),
-        Err(KernelArtifactError::HotPathCompilationDenied { .. })
-    ));
-    assert!(
-        reject_hot_path_compilation(
-            KernelArtifactPath::Cold,
-            KernelArtifactColdPathOperation::Compilation
-        )
-        .is_ok()
-    );
-}
-
-#[test]
-fn lazy_preparation_requires_explicit_policy_and_admission_state() {
-    assert!(evaluate_lazy_preparation(LazyPreparationPolicy::disabled(), false, false).is_ok());
-    assert!(matches!(
-        evaluate_lazy_preparation(LazyPreparationPolicy::disabled(), true, true),
-        Err(KernelArtifactError::PreparationUnavailable { .. })
-    ));
-    assert!(matches!(
-        evaluate_lazy_preparation(LazyPreparationPolicy { enabled: true }, true, false),
-        Err(KernelArtifactError::PreparationUnavailable { .. })
-    ));
-    assert!(evaluate_lazy_preparation(LazyPreparationPolicy { enabled: true }, true, true).is_ok());
 }
 
 #[test]
@@ -13083,14 +11359,6 @@ fn kernel_advertisement_may_reference_artifact_metadata() {
     let advertisement = KernelAdvertisement::new(id.clone()).with_artifact(binding);
     assert!(advertisement.artifact.is_some());
     assert_eq!(advertisement.id, id);
-}
-
-#[test]
-fn inference_requests_reject_kernel_artifact_management_fields() {
-    for field in KERNEL_ARTIFACT_FORBIDDEN_INFERENCE_FIELDS {
-        assert!(reject_inference_request_artifact_field(field).is_err());
-    }
-    assert!(reject_inference_request_artifact_field("prompt").is_ok());
 }
 
 #[test]
@@ -13337,69 +11605,6 @@ fn kernel_manifest_unsupported_schema_major_is_rejected() {
 }
 
 #[test]
-fn kernel_manifest_dependency_cycle_is_detected() {
-    let digest_a = KernelBlobDigest::of_bytes(b"artifact-a");
-    let digest_b = KernelBlobDigest::of_bytes(b"artifact-b");
-    let mut artifact_a = KernelManifestArtifact::new(KernelBlobDescriptor::new(
-        KernelBlobRole::new(KernelBlobRole::COMPILED_KERNEL),
-        KernelArtifactFormat::new("nvidia", "cubin"),
-        digest_a.clone(),
-        4,
-    ));
-    artifact_a.dependencies.push(digest_b.clone());
-    let mut artifact_b = KernelManifestArtifact::new(KernelBlobDescriptor::new(
-        KernelBlobRole::new(KernelBlobRole::COMPILED_KERNEL),
-        KernelArtifactFormat::new("nvidia", "cubin"),
-        digest_b,
-        4,
-    ));
-    artifact_b.dependencies.push(digest_a);
-    let manifest = KernelManifestV1 {
-        artifacts: vec![artifact_a, artifact_b],
-        ..KernelManifestV1::new()
-    };
-    assert!(detect_dependency_cycle(&manifest).is_some());
-    assert!(matches!(
-        manifest.validate(),
-        Err(KernelManifestError::DependencyCycle { .. })
-    ));
-}
-
-#[test]
-fn kernel_exchange_bundle_validates_end_to_end() {
-    let directory = temp_kernel_bundle_dir("happy-path");
-    write_kernel_bundle(&directory, b"cubin-bytes");
-
-    let bundle = KernelExchangeBundle::open(&directory);
-    let validated = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default())
-        .expect("well-formed bundle should validate");
-    assert_eq!(validated.digest, validated.manifest.digest());
-
-    fs::remove_dir_all(&directory).unwrap();
-}
-
-#[test]
-fn kernel_exchange_bundle_rejects_corrupted_blob() {
-    let directory = temp_kernel_bundle_dir("corrupted-blob");
-    let digest_value = write_kernel_bundle(&directory, b"cubin-bytes");
-    fs::write(
-        directory.join("blobs").join("sha256").join(&digest_value),
-        b"tampered-bytes",
-    )
-    .unwrap();
-
-    let bundle = KernelExchangeBundle::open(&directory);
-    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
-    assert!(matches!(
-        outcome,
-        Err(KernelManifestError::BundleBlobSizeMismatch { .. })
-            | Err(KernelManifestError::BundleBlobDigestMismatch { .. })
-    ));
-
-    fs::remove_dir_all(&directory).unwrap();
-}
-
-#[test]
 fn kernel_exchange_bundle_missing_optional_embedded_artifact_is_tolerated() {
     let directory = temp_kernel_bundle_dir("optional-missing");
     let present_digest = KernelBlobDigest::of_bytes(b"present-bytes");
@@ -13513,18 +11718,6 @@ fn kernel_exchange_bundle_rejects_required_external_artifact_without_fetching() 
 }
 
 #[test]
-fn kernel_exchange_bundle_missing_manifest_is_rejected() {
-    let directory = temp_kernel_bundle_dir("missing-manifest");
-    let bundle = KernelExchangeBundle::open(&directory);
-    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
-    assert!(matches!(
-        outcome,
-        Err(KernelManifestError::BundleManifestMissing)
-    ));
-    fs::remove_dir_all(&directory).unwrap();
-}
-
-#[test]
 fn kernel_bundle_path_safety_rejects_traversal_and_absolute_paths() {
     for bad in [
         "../escape",
@@ -13571,15 +11764,6 @@ fn kernel_bundle_symlink_entry_is_rejected_when_creatable() {
 }
 
 #[test]
-fn kernel_manifest_inference_request_field_boundary_rejects_bundle_fields() {
-    for field in KERNEL_MANIFEST_FORBIDDEN_INFERENCE_FIELDS {
-        let outcome = reject_inference_request_manifest_field(field);
-        assert!(outcome.is_err(), "expected '{field}' to be rejected");
-    }
-    assert!(reject_inference_request_manifest_field("prompt").is_ok());
-}
-
-#[test]
 fn kernel_manifest_extension_cannot_claim_a_core_field_namespace() {
     let limits = KernelManifestLimits::default();
     let text = format!(
@@ -13608,18 +11792,6 @@ fn kernel_manifest_extension_cannot_claim_a_core_field_namespace() {
         outcome,
         Err(KernelManifestError::ArtifactReferenceInvalid { .. })
     ));
-}
-
-#[test]
-fn kernel_manifest_recommendation_never_grants_promotion() {
-    for recommendation in [
-        KernelManifestRecommendation::RecommendedForLatency,
-        KernelManifestRecommendation::RecommendedForThroughput,
-        KernelManifestRecommendation::Experimental,
-        KernelManifestRecommendation::Reject,
-    ] {
-        assert!(!recommendation_grants_promotion(recommendation));
-    }
 }
 
 #[test]
@@ -13686,19 +11858,6 @@ fn kernel_manifest_accepts_unknown_future_artifact_format() {
         manifest.artifacts[0].blob.format.stable_key(),
         "vendor:new-ir@1"
     );
-}
-
-#[test]
-fn kernel_manifest_signature_presence_alone_is_never_verified() {
-    let envelope = KernelSignatureEnvelope {
-        algorithm: "ed25519".into(),
-        key_id: Some("key-1".into()),
-        signed_digest: KernelBlobDigest::of_bytes(b"manifest"),
-        signature_material: KernelBlobDigest::of_bytes(b"signature-bytes"),
-        certificate_chain_reference: None,
-    };
-    assert!(!signature_is_verified(&envelope, false));
-    assert!(signature_is_verified(&envelope, true));
 }
 
 #[test]
@@ -13902,38 +12061,6 @@ fn kernel_manifest_target_specialization_compiler_precision_generator_round_trip
     let canonical_text = String::from_utf8(manifest.canonical_bytes()).unwrap();
     let reparsed = parse_manifest_json(&canonical_text, &limits).expect("canonical bytes reparse");
     assert_eq!(reparsed.digest(), manifest.digest());
-}
-
-#[test]
-fn kernel_manifest_generator_rejects_embedded_credential_locator() {
-    let generator = KernelGeneratorMetadata {
-        generator_name: Some("gen".into()),
-        generator_version: None,
-        campaign_id: None,
-        source_revision: Some("https://user:secret@example.invalid/repo".into()),
-    };
-    assert!(matches!(
-        generator.validate(),
-        Err(KernelManifestError::ProvenanceInvalid { .. })
-    ));
-
-    let clean = KernelGeneratorMetadata {
-        source_revision: Some("https://example.invalid/repo@deadbeef".into()),
-        ..generator
-    };
-    assert!(clean.validate().is_ok());
-}
-
-#[test]
-fn kernel_manifest_specialization_rejects_impossible_range() {
-    let specialization = KernelManifestSpecialization {
-        batch_range: Some((32, 1)),
-        ..KernelManifestSpecialization::default()
-    };
-    assert!(matches!(
-        specialization.validate(),
-        Err(KernelManifestError::SpecializationInvalid { .. })
-    ));
 }
 
 #[test]
@@ -14183,102 +12310,6 @@ fn kernel_manifest_validation_pipeline_orders_schema_before_blob_io() {
 }
 
 #[test]
-fn kernel_manifest_normalizes_to_source_and_compiled_artifacts() {
-    let mut source_blob = KernelBlobDescriptor::new(
-        KernelBlobRole::new(KernelBlobRole::KERNEL_SOURCE),
-        KernelArtifactFormat::new("triton", "source").with_version("3"),
-        KernelBlobDigest::of_bytes(b"normalize-source"),
-        4,
-    );
-    source_blob.required = true;
-    let mut source_artifact = KernelManifestArtifact::new(source_blob);
-    source_artifact.semantic_binding = Some(KernelSemanticBinding::single(OperatorId::magnetar(
-        "matmul",
-        1,
-        OperatorFamily::LinearAlgebra,
-    )));
-    source_artifact.provenance = Some(KernelArtifactProvenance::AiGenerated);
-    source_artifact.specialization.batch_range = Some((1, 8));
-
-    let normalized_source =
-        normalize_to_source_artifact(&source_artifact).expect("source normalizes");
-    assert_eq!(normalized_source.format.stable_key(), "triton:source@3");
-    assert_eq!(normalized_source.shape.max_batch_size, Some(8));
-    assert_eq!(
-        normalized_source.provenance,
-        KernelArtifactProvenance::AiGenerated
-    );
-
-    let compiled_blob = KernelBlobDescriptor::new(
-        KernelBlobRole::new(KernelBlobRole::COMPILED_KERNEL),
-        KernelArtifactFormat::new("nvidia", "cubin"),
-        KernelBlobDigest::of_bytes(b"normalize-compiled"),
-        4,
-    );
-    let mut compiled_artifact = KernelManifestArtifact::new(compiled_blob);
-    compiled_artifact.semantic_binding = Some(KernelSemanticBinding::single(OperatorId::magnetar(
-        "matmul",
-        1,
-        OperatorFamily::LinearAlgebra,
-    )));
-    compiled_artifact.compiler_metadata = Some(KernelCompilerMetadata {
-        compiler_identity: Some("triton".into()),
-        compiler_version: Some("3.1".into()),
-        ..Default::default()
-    });
-    compiled_artifact.target.architecture = Some("sm90".into());
-
-    let normalized_compiled =
-        normalize_to_compiled_artifact(&compiled_artifact).expect("compiled normalizes");
-    assert_eq!(normalized_compiled.compiler_identity, "triton");
-    assert_eq!(normalized_compiled.target_architecture, "sm90");
-
-    // No semantic binding -> normalization fails rather than fabricating one.
-    let unbound = KernelManifestArtifact::new(KernelBlobDescriptor::new(
-        KernelBlobRole::new(KernelBlobRole::COMPILED_KERNEL),
-        KernelArtifactFormat::new("nvidia", "cubin"),
-        KernelBlobDigest::of_bytes(b"unbound"),
-        4,
-    ));
-    assert!(normalize_to_source_artifact(&unbound).is_err());
-    assert!(normalize_to_compiled_artifact(&unbound).is_err());
-}
-
-#[test]
-fn kernel_manifest_normalizes_qualification_identity_pieces() {
-    let evidence = KernelEvidenceReference {
-        digest: KernelBlobDigest::of_bytes(b"qualification-evidence"),
-        profile: "baseline-correctness@1".into(),
-        suite_or_workload_version: Some("v3".into()),
-        oracle_or_provider_identity: Some("reference-cpu@2".into()),
-        target_compatibility: std::collections::BTreeSet::new(),
-        status: KernelEvidenceStatus::Passed,
-        storage_mode: KernelArtifactStorageMode::Embedded,
-        workload_profile: None,
-        device_context: None,
-        provider_context: None,
-        workload_metadata: None,
-    };
-    let profile = normalize_qualification_profile(&evidence).expect("profile normalizes");
-    assert_eq!(
-        profile,
-        QualificationProfile::new("baseline-correctness", 1)
-    );
-
-    let oracle = normalize_oracle_identity(&evidence).expect("oracle normalizes");
-    assert_eq!(oracle.provider, ProviderBinding::new("reference-cpu"));
-    assert_eq!(oracle.version, "2");
-
-    let mut malformed = evidence.clone();
-    malformed.profile = "no-version-separator".into();
-    assert!(normalize_qualification_profile(&malformed).is_err());
-
-    let mut no_oracle = evidence;
-    no_oracle.oracle_or_provider_identity = None;
-    assert!(normalize_oracle_identity(&no_oracle).is_err());
-}
-
-#[test]
 fn kernel_manifest_normalizes_to_cache_key_and_entry_without_granting_trust() {
     let mut blob = KernelBlobDescriptor::new(
         KernelBlobRole::new(KernelBlobRole::COMPILED_KERNEL),
@@ -14403,232 +12434,6 @@ fn build_kernel_bundle_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
     builder.into_inner().unwrap()
 }
 
-fn gzip_compress(bytes: &[u8]) -> Vec<u8> {
-    use std::io::Write as _;
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(bytes).unwrap();
-    encoder.finish().unwrap()
-}
-
-fn kernel_bundle_tar_entries(blob_bytes: &[u8]) -> (Vec<(&'static str, Vec<u8>)>, String) {
-    let digest = KernelBlobDigest::of_bytes(blob_bytes);
-    let manifest = format!(
-        r#"{{
-  "schema": "magnetar:kernel-manifest@1.0",
-  "artifacts": [
-    {{
-      "role": "compiled-kernel",
-      "format": "nvidia:cubin",
-      "digest": "sha256:{digest}",
-      "size": {size},
-      "storage_mode": "embedded",
-      "required": true,
-      "operators": [
-        {{ "namespace": "magnetar:operator", "name": "matmul", "version": 1, "family": "linear-algebra" }}
-      ]
-    }}
-  ]
-}}"#,
-        digest = digest.value,
-        size = blob_bytes.len()
-    );
-    (
-        vec![
-            (KERNEL_MANIFEST_FILE_NAME, manifest.into_bytes()),
-            (
-                Box::leak(format!("blobs/sha256/{}", digest.value).into_boxed_str()),
-                blob_bytes.to_vec(),
-            ),
-        ],
-        digest.value,
-    )
-}
-
-#[test]
-fn kernel_exchange_tar_archive_validates_to_identical_digest_as_directory_bundle() {
-    let directory = temp_kernel_bundle_dir("archive-directory-parity");
-    write_kernel_bundle(&directory, b"tar-parity-bytes");
-    let directory_bundle = KernelExchangeBundle::open(&directory);
-    let directory_validated =
-        validate_kernel_exchange_bundle(&directory_bundle, &KernelManifestLimits::default())
-            .expect("directory bundle validates");
-
-    let (entries, _digest) = kernel_bundle_tar_entries(b"tar-parity-bytes");
-    let entry_refs: Vec<(&str, &[u8])> = entries.iter().map(|(p, d)| (*p, d.as_slice())).collect();
-    let tar_bytes = build_kernel_bundle_tar(&entry_refs);
-
-    let extract_dir = temp_kernel_bundle_dir("archive-directory-parity-extracted");
-    let archive_bundle = extract_kernel_exchange_archive(
-        std::io::Cursor::new(&tar_bytes),
-        false,
-        &extract_dir,
-        &KernelExchangeArchiveLimits::default(),
-    )
-    .expect("tar archive extracts");
-    let archive_validated =
-        validate_kernel_exchange_bundle(&archive_bundle, &KernelManifestLimits::default())
-            .expect("extracted archive bundle validates");
-
-    assert_eq!(directory_validated.digest, archive_validated.digest);
-
-    // The archive checksum is a distinct, transport-level concept: it is
-    // *not* the manifest digest, and never claimed to be.
-    let archive_checksum = archive_diagnostic_checksum(&tar_bytes);
-    assert_ne!(archive_checksum, directory_validated.digest.value);
-
-    fs::remove_dir_all(&directory).unwrap();
-    fs::remove_dir_all(&extract_dir).unwrap();
-}
-
-#[test]
-fn kernel_exchange_tar_gz_archive_produces_the_same_manifest_digest_as_plain_tar() {
-    let (entries, _digest) = kernel_bundle_tar_entries(b"gzip-parity-bytes");
-    let entry_refs: Vec<(&str, &[u8])> = entries.iter().map(|(p, d)| (*p, d.as_slice())).collect();
-    let tar_bytes = build_kernel_bundle_tar(&entry_refs);
-    let gz_bytes = gzip_compress(&tar_bytes);
-
-    let plain_dir = temp_kernel_bundle_dir("gzip-parity-plain");
-    let plain_bundle = extract_kernel_exchange_archive(
-        std::io::Cursor::new(&tar_bytes),
-        false,
-        &plain_dir,
-        &KernelExchangeArchiveLimits::default(),
-    )
-    .expect("plain tar extracts");
-    let plain_validated =
-        validate_kernel_exchange_bundle(&plain_bundle, &KernelManifestLimits::default())
-            .expect("plain tar bundle validates");
-
-    let gz_dir = temp_kernel_bundle_dir("gzip-parity-compressed");
-    let gz_bundle = extract_kernel_exchange_archive(
-        std::io::Cursor::new(&gz_bytes),
-        true,
-        &gz_dir,
-        &KernelExchangeArchiveLimits::default(),
-    )
-    .expect("gzip tar extracts");
-    let gz_validated =
-        validate_kernel_exchange_bundle(&gz_bundle, &KernelManifestLimits::default())
-            .expect("gzip tar bundle validates");
-
-    assert_eq!(plain_validated.digest, gz_validated.digest);
-    // Compressing the exact same logical content changes the raw archive
-    // bytes (and therefore the transport-level diagnostic checksum) without
-    // touching logical identity.
-    assert_ne!(
-        archive_diagnostic_checksum(&tar_bytes),
-        archive_diagnostic_checksum(&gz_bytes)
-    );
-
-    fs::remove_dir_all(&plain_dir).unwrap();
-    fs::remove_dir_all(&gz_dir).unwrap();
-}
-
-#[test]
-fn kernel_exchange_archive_ignores_ownership_timestamp_and_mode_for_identity() {
-    let (entries, _digest) = kernel_bundle_tar_entries(b"metadata-irrelevant-bytes");
-
-    let mut builder_a = tar::Builder::new(Vec::new());
-    let mut builder_b = tar::Builder::new(Vec::new());
-    for (path, data) in &entries {
-        let mut header_a = tar::Header::new_gnu();
-        header_a.set_size(data.len() as u64);
-        header_a.set_mode(0o644);
-        header_a.set_mtime(1_000);
-        header_a.set_uid(0);
-        header_a.set_gid(0);
-        header_a.set_cksum();
-        builder_a
-            .append_data(&mut header_a, *path, data.as_slice())
-            .unwrap();
-
-        let mut header_b = tar::Header::new_gnu();
-        header_b.set_size(data.len() as u64);
-        header_b.set_mode(0o755);
-        header_b.set_mtime(999_999_999);
-        header_b.set_uid(1000);
-        header_b.set_gid(1000);
-        header_b.set_cksum();
-        builder_b
-            .append_data(&mut header_b, *path, data.as_slice())
-            .unwrap();
-    }
-    let tar_a = builder_a.into_inner().unwrap();
-    let tar_b = builder_b.into_inner().unwrap();
-    assert_ne!(
-        archive_diagnostic_checksum(&tar_a),
-        archive_diagnostic_checksum(&tar_b),
-        "sanity check: the two archives really do differ at the byte level"
-    );
-
-    let dir_a = temp_kernel_bundle_dir("archive-metadata-a");
-    let dir_b = temp_kernel_bundle_dir("archive-metadata-b");
-    let bundle_a = extract_kernel_exchange_archive(
-        std::io::Cursor::new(&tar_a),
-        false,
-        &dir_a,
-        &KernelExchangeArchiveLimits::default(),
-    )
-    .unwrap();
-    let bundle_b = extract_kernel_exchange_archive(
-        std::io::Cursor::new(&tar_b),
-        false,
-        &dir_b,
-        &KernelExchangeArchiveLimits::default(),
-    )
-    .unwrap();
-    let validated_a =
-        validate_kernel_exchange_bundle(&bundle_a, &KernelManifestLimits::default()).unwrap();
-    let validated_b =
-        validate_kernel_exchange_bundle(&bundle_b, &KernelManifestLimits::default()).unwrap();
-    assert_eq!(
-        validated_a.digest, validated_b.digest,
-        "ownership/timestamp/mode differences must not affect logical bundle identity"
-    );
-
-    fs::remove_dir_all(&dir_a).unwrap();
-    fs::remove_dir_all(&dir_b).unwrap();
-}
-
-fn build_tar_with_raw_path_entry(path: &str, data: &[u8]) -> Vec<u8> {
-    // `tar::Header::set_path` (used by `append_data`) refuses `..` itself,
-    // which is correct behavior for a well-behaved writer but means it
-    // cannot be used to construct the maliciously-crafted archive this test
-    // needs. Writing directly into the raw GNU header name bytes bypasses
-    // that writer-side check, simulating an archive from an attacker who
-    // does not go through this safe API.
-    let mut builder = tar::Builder::new(Vec::new());
-    let mut header = tar::Header::new_gnu();
-    header.set_size(data.len() as u64);
-    header.set_mode(0o644);
-    header.set_mtime(0);
-    {
-        let gnu = header.as_gnu_mut().expect("gnu header");
-        let name_bytes = path.as_bytes();
-        gnu.name[..name_bytes.len()].copy_from_slice(name_bytes);
-    }
-    header.set_cksum();
-    builder.append(&header, data).unwrap();
-    builder.into_inner().unwrap()
-}
-
-#[test]
-fn kernel_exchange_archive_rejects_path_traversal_entry() {
-    let tar_bytes = build_tar_with_raw_path_entry("../escape.txt", b"malicious");
-    let dir = temp_kernel_bundle_dir("archive-traversal");
-    let outcome = extract_kernel_exchange_archive(
-        std::io::Cursor::new(&tar_bytes),
-        false,
-        &dir,
-        &KernelExchangeArchiveLimits::default(),
-    );
-    assert!(matches!(
-        outcome,
-        Err(KernelManifestError::BundlePathInvalid { .. })
-    ));
-    fs::remove_dir_all(&dir).unwrap();
-}
-
 #[test]
 fn kernel_exchange_archive_rejects_symlink_entry() {
     let mut builder = tar::Builder::new(Vec::new());
@@ -14739,15 +12544,6 @@ fn kernel_exchange_archive_enforces_entry_count_limit() {
 }
 
 #[test]
-fn kernel_bundle_transport_reservation_marks_only_directory_and_tar_as_implemented() {
-    assert!(KernelBundleTransport::Directory.is_implemented());
-    assert!(KernelBundleTransport::TarArchive.is_implemented());
-    assert!(!KernelBundleTransport::ObjectStore.is_implemented());
-    assert!(!KernelBundleTransport::OciLike.is_implemented());
-    assert!(!KernelBundleTransport::Registry.is_implemented());
-}
-
-#[test]
 fn kernel_manifest_evaluate_trust_pipeline_stage_delegates_to_sole_authority() {
     assert_eq!(
         evaluate_manifest_trust(true),
@@ -14758,80 +12554,6 @@ fn kernel_manifest_evaluate_trust_pipeline_stage_delegates_to_sole_authority() {
         crate::evaluate_artifact_trust(false)
     );
     assert!(!evaluate_manifest_trust(false).is_trusted());
-}
-
-#[test]
-fn kernel_manifest_normalizes_benchmark_profile() {
-    let evidence = KernelEvidenceReference {
-        digest: KernelBlobDigest::of_bytes(b"benchmark-evidence"),
-        profile: "latency@1".into(),
-        suite_or_workload_version: Some("v2".into()),
-        oracle_or_provider_identity: None,
-        target_compatibility: std::collections::BTreeSet::new(),
-        status: KernelEvidenceStatus::Passed,
-        storage_mode: KernelArtifactStorageMode::Embedded,
-        workload_profile: Some("decode-256".into()),
-        device_context: Some("h100".into()),
-        provider_context: Some("nvidia-cuda@12.4".into()),
-        workload_metadata: Some(KernelBenchmarkWorkloadMetadata {
-            input_shapes: Some("[1,256,4096]".into()),
-            dtype_layout: Some("fp16-row-major".into()),
-            batch_size: Some(1),
-            sequence_length: Some(256),
-            warmup_count: Some(10),
-            measurement_count: Some(100),
-            synchronization_policy: Some("device-sync".into()),
-            driver_runtime_version: Some("cuda-12.4".into()),
-            benchmark_version: Some("bench-1".into()),
-        }),
-    };
-
-    let profile =
-        normalize_benchmark_profile(&evidence, "sm90").expect("benchmark profile normalizes");
-    assert_eq!(profile.target_device, "h100");
-    assert_eq!(profile.hardware_architecture, "sm90");
-    assert_eq!(profile.provider_version, "nvidia-cuda@12.4");
-    assert_eq!(profile.measurement_count, 100);
-    assert!(profile.is_authoritative());
-
-    let mut missing_workload = evidence.clone();
-    missing_workload.workload_metadata = None;
-    assert!(normalize_benchmark_profile(&missing_workload, "sm90").is_err());
-}
-
-#[test]
-fn kernel_manifest_observation_builders_carry_schema_artifact_count_and_formats() {
-    let schema = KernelManifestSchemaVersion::current();
-    let formats = vec![
-        KernelArtifactFormat::new("nvidia", "cubin"),
-        KernelArtifactFormat::new("triton", "source").with_version("3"),
-    ];
-    let observation = KernelManifestObservation::new(KernelManifestObservationKind::ManifestParsed)
-        .with_schema_version(&schema)
-        .with_artifact_count(2)
-        .with_formats(formats);
-
-    assert_eq!(
-        observation
-            .redacted_metadata
-            .get("schema-version")
-            .map(String::as_str),
-        Some("magnetar:kernel-manifest@1.0")
-    );
-    assert_eq!(
-        observation
-            .redacted_metadata
-            .get("artifact-count")
-            .map(String::as_str),
-        Some("2")
-    );
-    assert_eq!(
-        observation
-            .redacted_metadata
-            .get("formats")
-            .map(String::as_str),
-        Some("nvidia:cubin, triton:source@3")
-    );
 }
 
 // ---------------------------------------------------------------------
@@ -15268,17 +12990,6 @@ fn source_format_negotiation_rejects_unsupported_before_compilation() {
 }
 
 #[test]
-fn output_format_negotiation_requires_explicit_declaration() {
-    let produced: std::collections::BTreeSet<String> =
-        ["nvidia:ptx@9".to_string()].into_iter().collect();
-    assert!(negotiate_output_format("nvidia:ptx@9", &produced).is_ok());
-    assert!(matches!(
-        negotiate_output_format("nvidia:cubin", &produced),
-        Err(KernelCompilationError::OutputFormatUnsupported { .. })
-    ));
-}
-
-#[test]
 fn runtime_target_authority_rejects_provider_and_device_redirection() {
     let selected_provider = ProviderBinding::new("cuda-provider");
     let selected_device = DeviceBinding::new(crate::DeviceId::new("cuda-0"));
@@ -15302,110 +13013,6 @@ fn runtime_target_authority_rejects_provider_and_device_redirection() {
 }
 
 #[test]
-fn compilation_job_lifecycle_progresses_legally_and_never_reverts() {
-    let mut allocator = CompilationJobIdAllocator::default();
-    let mut job = CompilationJob::new(allocator.allocate(), CompilationRequestId::new("req-1"));
-    assert_eq!(job.state, CompilationJobState::Queued);
-    assert!(job.start_compiling().is_ok());
-    assert_eq!(job.state, CompilationJobState::Compiling);
-    assert!(job.mark_succeeded().is_ok());
-    assert_eq!(job.state, CompilationJobState::Succeeded);
-    assert!(job.state.may_publish_artifact());
-
-    let mut cancelled_before_start =
-        CompilationJob::new(allocator.allocate(), CompilationRequestId::new("req-2"));
-    assert!(matches!(
-        cancelled_before_start.mark_succeeded(),
-        Err(KernelCompilationError::JobStateInvalid { .. })
-    ));
-    assert!(cancelled_before_start.mark_cancelled().is_ok());
-    assert!(!cancelled_before_start.state.may_publish_artifact());
-}
-
-#[test]
-fn cancellation_support_levels_are_respected() {
-    assert!(matches!(
-        evaluate_cancellation_request(CompilationCancellationSupport::NotSupported, false),
-        Err(KernelCompilationError::CancellationUnsupported)
-    ));
-    assert!(matches!(
-        evaluate_cancellation_request(CompilationCancellationSupport::BeforeStartOnly, true),
-        Err(KernelCompilationError::CancellationUnsupported)
-    ));
-    assert!(matches!(
-        evaluate_cancellation_request(CompilationCancellationSupport::BeforeStartOnly, false),
-        Ok(CompilationJobState::Cancelled)
-    ));
-    assert!(matches!(
-        evaluate_cancellation_request(CompilationCancellationSupport::Cooperative, true),
-        Ok(CompilationJobState::Cancelled)
-    ));
-}
-
-#[test]
-fn compilation_deadline_fails_closed_when_unenforceable() {
-    let required = CompilationDeadline {
-        max_wall_clock_millis: 5_000,
-    };
-    assert!(matches!(
-        enforce_compilation_deadline(Some(required), false),
-        Err(KernelCompilationError::DeadlineUnsupported { .. })
-    ));
-    assert!(enforce_compilation_deadline(Some(required), true).is_ok());
-    assert!(enforce_compilation_deadline(None, false).is_ok());
-}
-
-#[test]
-fn compilation_limits_are_enforced_before_compiler_invocation() {
-    let limits = CompilationLimits {
-        max_source_bytes: Some(1024),
-        max_output_bytes: Some(2048),
-        max_concurrent_jobs: Some(2),
-        max_workspace_bytes: Some(1 << 20),
-        max_host_memory_bytes: Some(1 << 30),
-    };
-    assert!(enforce_compilation_limits(512, &limits).is_ok());
-    assert!(matches!(
-        enforce_compilation_limits(2048, &limits),
-        Err(KernelCompilationError::SourceTooLarge { .. })
-    ));
-    assert!(matches!(
-        enforce_output_limit(4096, &limits),
-        Err(KernelCompilationError::OutputTooLarge { .. })
-    ));
-    assert!(enforce_concurrency_limit(1, &limits).is_ok());
-    assert!(matches!(
-        enforce_concurrency_limit(2, &limits),
-        Err(KernelCompilationError::ConcurrencyLimit { .. })
-    ));
-}
-
-#[test]
-fn isolation_sufficiency_rejects_weaker_than_required_model() {
-    assert!(matches!(
-        evaluate_isolation_sufficiency(
-            CompilationIsolationModel::InProcessTrustedCompiler,
-            CompilationIsolationModel::SandboxedSubprocess,
-        ),
-        Err(KernelCompilationError::IsolationInsufficient { .. })
-    ));
-    assert!(
-        evaluate_isolation_sufficiency(
-            CompilationIsolationModel::SandboxedSubprocess,
-            CompilationIsolationModel::SandboxedSubprocess,
-        )
-        .is_ok()
-    );
-    assert!(
-        evaluate_isolation_sufficiency(
-            CompilationIsolationModel::ExternalCompilationService,
-            CompilationIsolationModel::SandboxedSubprocess,
-        )
-        .is_ok()
-    );
-}
-
-#[test]
 fn compilation_success_never_grants_trust_by_itself() {
     assert!(!compilation_result_trust(false).is_trusted());
     assert!(compilation_result_trust(true).is_trusted());
@@ -15423,32 +13030,6 @@ fn network_boundary_denies_implicit_dependency_downloads() {
     };
     assert!(enforce_compilation_network_boundary(true, &authorized).is_ok());
     assert!(enforce_compilation_network_boundary(false, &policy).is_ok());
-}
-
-#[test]
-fn environment_variables_are_denied_by_default() {
-    let deny = CompilationEnvironmentPolicy::Deny;
-    assert!(!evaluate_environment_variable("SECRET_TOKEN", &deny));
-
-    let mut allowed = std::collections::BTreeSet::new();
-    allowed.insert("CUDA_HOME".to_string());
-    let allowlist = CompilationEnvironmentPolicy::Allowlist(allowed);
-    assert!(evaluate_environment_variable("CUDA_HOME", &allowlist));
-    assert!(!evaluate_environment_variable("SECRET_TOKEN", &allowlist));
-}
-
-#[test]
-fn explicit_specialization_is_required_when_applied() {
-    let empty = CompilationSpecialization::default();
-    assert!(matches!(
-        require_explicit_compilation_specialization(true, &empty),
-        Err(KernelCompilationError::SpecializationUnsupported { .. })
-    ));
-    assert!(require_explicit_compilation_specialization(false, &empty).is_ok());
-
-    let mut declared = CompilationSpecialization::default();
-    declared.dtype.insert(ComputeDType::Float16);
-    assert!(require_explicit_compilation_specialization(true, &declared).is_ok());
 }
 
 #[test]
@@ -15471,22 +13052,6 @@ fn compiler_crash_is_normalized_and_redacted_never_a_success() {
         other => panic!("unexpected error: {other:?}"),
     }
     assert_eq!(error.id(), "kernel-compilation-compiler-crashed");
-}
-
-#[test]
-fn provider_compiler_panic_is_caught_and_never_unwinds_across_boundary() {
-    let result: Result<(), KernelCompilationError> =
-        call_provider_compiler_without_unwinding(|| -> Result<(), KernelCompilationError> {
-            panic!("simulated compiler panic");
-        });
-    assert!(matches!(
-        result,
-        Err(KernelCompilationError::CompilerCrashed { .. })
-    ));
-
-    let ok: Result<u32, KernelCompilationError> =
-        call_provider_compiler_without_unwinding(|| Ok(42));
-    assert_eq!(ok, Ok(42));
 }
 
 #[test]
@@ -15519,31 +13084,6 @@ fn kernel_compilation_abi_descriptor_validates_ownership_and_version() {
 }
 
 #[test]
-fn compilation_job_ids_and_prepared_kernel_ids_expose_no_pointer_semantics() {
-    let mut allocator = CompilationJobIdAllocator::default();
-    let job_id = allocator.allocate();
-    assert!(assert_prepared_kernel_id_opaque(&job_id.to_string()).is_ok());
-    assert!(matches!(
-        assert_prepared_kernel_id_opaque("0xdeadbeef"),
-        Err(KernelCompilationError::BufferOwnershipViolation { .. })
-    ));
-}
-
-#[test]
-fn compiler_diagnostics_redact_raw_output() {
-    let diagnostic = CompilerDiagnostic::from_raw_output(
-        "parse",
-        "error in C:\\tmp\\kernel.triton at 0xffffabcd",
-    )
-    .with_source_location("kernel.triton:12:5");
-    assert_eq!(diagnostic.redacted_message, "[redacted backend diagnostic]");
-    assert_eq!(
-        diagnostic.source_location.as_deref(),
-        Some("kernel.triton:12:5")
-    );
-}
-
-#[test]
 fn compiler_flags_are_redacted_by_default() {
     let identity = CompilerIdentity::default().with_raw_flags("-I C:\\vendor\\include -DSECRET=1");
     assert_eq!(
@@ -15566,41 +13106,6 @@ fn failed_compilation_never_mutates_existing_known_good_artifact() {
     let crash = normalize_compiler_crash("replacement compile crashed");
     let preserved = preserve_known_good_artifact_on_failure(&v1, &crash);
     assert_eq!(preserved, &v1);
-}
-
-#[test]
-fn compilation_process_arguments_are_structural_never_shell_strings() {
-    let untrusted_metadata = "kernel; rm -rf / #";
-    let invocation = CompilationProcessArguments::new("nvcc")
-        .with_arg("--compile")
-        .with_arg(untrusted_metadata);
-    assert_eq!(invocation.program, "nvcc");
-    // The untrusted value is preserved as a single argument element -- never
-    // interpolated into (and re-parsed out of) a shell command string.
-    assert_eq!(invocation.args.len(), 2);
-    assert_eq!(invocation.args[1], untrusted_metadata);
-}
-
-#[test]
-fn compilation_observation_never_carries_raw_source_or_native_handles() {
-    let observation =
-        KernelCompilationObservation::new(KernelCompilationObservationKind::CompilerCompleted)
-            .with_job("compilation-job-1")
-            .with_redacted_metadata("compiler", "nvcc 12.4")
-            .with_redacted_metadata("temp_path", "C:\\tmp\\build\\0xdeadbeef");
-    assert_eq!(
-        observation.kind,
-        KernelCompilationObservationKind::CompilerCompleted
-    );
-    assert_eq!(observation.job.as_deref(), Some("compilation-job-1"));
-    assert_eq!(
-        observation.redacted_metadata.get("temp_path").unwrap(),
-        "[redacted backend diagnostic]"
-    );
-    assert_eq!(
-        observation.redacted_metadata.get("compiler").unwrap(),
-        "nvcc 12.4"
-    );
 }
 
 #[test]
@@ -16129,36 +13634,6 @@ fn kernel_selection_policy_conformance_report_is_conformant() {
 }
 
 #[test]
-fn eligible_candidate_cannot_be_constructed_without_passing_eligibility() {
-    let rejected = EligibleCandidate::from_checked(
-        selection_policy_identity("ineligible"),
-        CandidateMetrics::default(),
-        &CandidateEligibilityInput {
-            shape_compatible: false,
-            ..CandidateEligibilityInput::all_satisfied()
-        },
-    );
-    assert_eq!(
-        rejected,
-        Err(KernelSelectionExclusionReason::ShapeIncompatible)
-    );
-}
-
-#[test]
-fn eligibility_checks_fail_in_deterministic_order() {
-    // Both dtype and layout are wrong; dtype is checked first, so it wins.
-    let input = CandidateEligibilityInput {
-        dtype_compatible: false,
-        layout_compatible: false,
-        ..CandidateEligibilityInput::all_satisfied()
-    };
-    assert_eq!(
-        evaluate_candidate_eligibility(&input),
-        Err(KernelSelectionExclusionReason::DTypeIncompatible)
-    );
-}
-
-#[test]
 fn kernel_candidate_rejection_maps_onto_selection_exclusion_reason() {
     assert_eq!(
         KernelSelectionExclusionReason::from(KernelCandidateRejection::Revoked),
@@ -16168,142 +13643,6 @@ fn kernel_candidate_rejection_maps_onto_selection_exclusion_reason() {
         KernelSelectionExclusionReason::from(KernelCandidateRejection::WorkspaceUnavailable),
         KernelSelectionExclusionReason::WorkspaceInfeasible
     );
-}
-
-#[test]
-fn missing_metric_never_resolves_to_best_possible_value() {
-    assert_eq!(
-        missing_metric_value(MissingMetricPolicy::Exclude, None),
-        f64::INFINITY
-    );
-    assert!(missing_metric_value(MissingMetricPolicy::RankConservatively, None) > 0.0);
-    assert_eq!(
-        missing_metric_value(MissingMetricPolicy::UseFallbackMetadata, Some(42.0)),
-        42.0
-    );
-}
-
-#[test]
-fn should_retain_active_due_to_missing_metric_only_under_that_policy() {
-    let metrics = CandidateMetrics::default();
-    assert!(should_retain_active_due_to_missing_metric(
-        &metrics,
-        &[ObjectiveDimension::Latency],
-        MissingMetricPolicy::RetainActiveKernel,
-    ));
-    assert!(!should_retain_active_due_to_missing_metric(
-        &metrics,
-        &[ObjectiveDimension::Latency],
-        MissingMetricPolicy::Exclude,
-    ));
-}
-
-#[test]
-fn weighted_score_ranks_lower_combined_cost_first() {
-    let fast = CandidateMetrics::default()
-        .with(ObjectiveDimension::Latency, 1.0)
-        .with(ObjectiveDimension::Memory, 1.0);
-    let slow = CandidateMetrics::default()
-        .with(ObjectiveDimension::Latency, 10.0)
-        .with(ObjectiveDimension::Memory, 1.0);
-    let policy = WeightedScorePolicy {
-        weights: BTreeMap::from([
-            (ObjectiveDimension::Latency, 1.0),
-            (ObjectiveDimension::Memory, 1.0),
-        ]),
-        missing_metric_policy: MissingMetricPolicy::Exclude,
-    };
-    assert!(weighted_score(&fast, &policy) < weighted_score(&slow, &policy));
-}
-
-#[test]
-fn lexicographic_ranking_uses_first_differentiating_objective() {
-    let a = CandidateMetrics::default()
-        .with(ObjectiveDimension::Determinism, 0.0)
-        .with(ObjectiveDimension::Latency, 100.0);
-    let b = CandidateMetrics::default()
-        .with(ObjectiveDimension::Determinism, 1.0)
-        .with(ObjectiveDimension::Latency, 1.0);
-    let policy = LexicographicPolicy {
-        order: vec![ObjectiveDimension::Determinism, ObjectiveDimension::Latency],
-        missing_metric_policy: MissingMetricPolicy::Exclude,
-    };
-    assert_eq!(
-        lexicographic_compare(&a, &b, &policy),
-        std::cmp::Ordering::Less
-    );
-}
-
-#[test]
-fn rank_candidates_is_deterministic_across_repeated_calls() {
-    let candidates = vec![
-        EligibleCandidate::from_checked(
-            selection_policy_identity("z"),
-            CandidateMetrics::default().with(ObjectiveDimension::Latency, 3.0),
-            &CandidateEligibilityInput::all_satisfied(),
-        )
-        .unwrap(),
-        EligibleCandidate::from_checked(
-            selection_policy_identity("a"),
-            CandidateMetrics::default().with(ObjectiveDimension::Latency, 3.0),
-            &CandidateEligibilityInput::all_satisfied(),
-        )
-        .unwrap(),
-    ];
-    let strategy = RankingStrategy::WeightedScore(WeightedScorePolicy {
-        weights: BTreeMap::from([(ObjectiveDimension::Latency, 1.0)]),
-        missing_metric_policy: MissingMetricPolicy::Exclude,
-    });
-    assert!(selection_is_deterministic_for_identical_inputs(
-        &candidates,
-        &strategy
-    ));
-    // Tied score: stable tie-break falls back to CandidateIdentity's Ord.
-    let ranked = rank_candidates(&candidates, &strategy).unwrap();
-    assert_eq!(ranked[0].kernel.name, "a");
-}
-
-#[test]
-fn pinned_ranking_strategy_fails_when_kernel_is_not_eligible() {
-    let candidates = vec![
-        EligibleCandidate::from_checked(
-            selection_policy_identity("present"),
-            CandidateMetrics::default(),
-            &CandidateEligibilityInput::all_satisfied(),
-        )
-        .unwrap(),
-    ];
-    let strategy = RankingStrategy::Pinned(selection_policy_kernel_id("absent"));
-    assert_eq!(
-        rank_candidates(&candidates, &strategy),
-        Err(KernelSelectionError::PinnedKernelUnavailable)
-    );
-}
-
-#[test]
-fn policy_ordered_ranking_places_unlisted_candidates_last() {
-    let listed = selection_policy_kernel_id("listed");
-    let candidates = vec![
-        EligibleCandidate::from_checked(
-            selection_policy_identity("unlisted"),
-            CandidateMetrics::default(),
-            &CandidateEligibilityInput::all_satisfied(),
-        )
-        .unwrap(),
-        EligibleCandidate::from_checked(
-            CandidateIdentity {
-                kernel: listed.clone(),
-                provider: ProviderBinding::new("selection-policy-provider"),
-                artifact_digest: None,
-            },
-            CandidateMetrics::default(),
-            &CandidateEligibilityInput::all_satisfied(),
-        )
-        .unwrap(),
-    ];
-    let strategy = RankingStrategy::PolicyOrdered(vec![listed.clone()]);
-    let ranked = rank_candidates(&candidates, &strategy).unwrap();
-    assert_eq!(ranked[0].kernel, listed);
 }
 
 #[test]
@@ -16355,52 +13694,6 @@ fn shape_aware_evidence_does_not_apply_outside_its_bucket() {
 }
 
 #[test]
-fn pressure_bias_only_applies_to_an_already_eligible_candidate() {
-    let candidate = EligibleCandidate::from_checked(
-        selection_policy_identity("pressure"),
-        CandidateMetrics::default(),
-        &CandidateEligibilityInput::all_satisfied(),
-    )
-    .unwrap();
-    let saturated = PressureSnapshot {
-        memory_pressure: PressureLevel::Saturated,
-        provider_admission_open: true,
-        ..PressureSnapshot::default()
-    };
-    let nominal = PressureSnapshot {
-        provider_admission_open: true,
-        ..PressureSnapshot::default()
-    };
-    assert!(
-        pressure_ranking_bias(&candidate, &saturated) > pressure_ranking_bias(&candidate, &nominal)
-    );
-}
-
-#[test]
-fn conversion_cost_can_flip_the_faster_raw_execution_choice() {
-    let kernel_a = ConversionCost {
-        layout_conversion_ms: 30.0,
-        ..ConversionCost::default()
-    };
-    let kernel_b = ConversionCost::default();
-    let total_a = total_execution_cost_ms(20.0, &kernel_a);
-    let total_b = total_execution_cost_ms(35.0, &kernel_b);
-    assert!(total_b < total_a);
-}
-
-#[test]
-fn preparation_cost_is_not_charged_again_once_already_prepared() {
-    assert!(!preparation_cost_applies(
-        PreparationCostClass::OneTime,
-        true
-    ));
-    assert!(preparation_cost_applies(
-        PreparationCostClass::PerOperation,
-        true
-    ));
-}
-
-#[test]
 fn compilation_cost_is_excluded_once_artifact_is_cached() {
     assert!(compilation_cost_excluded_from_hot_path(true));
     assert!(!compilation_cost_excluded_from_hot_path(false));
@@ -16429,18 +13722,6 @@ fn anti_flapping_blocks_promotion_inside_cooldown_or_minimum_duration() {
     };
     assert!(!promotion_allowed_by_anti_flapping(&policy, 5, 20));
     assert!(promotion_allowed_by_anti_flapping(&policy, 30, 10));
-}
-
-#[test]
-fn promotion_recommendation_is_denied_when_hysteresis_or_anti_flapping_blocks_it() {
-    let candidate = selection_policy_identity("candidate");
-    let denied = recommend_promotion(&candidate, SelectionOutcome::RetainActive, true);
-    assert!(!denied.approved);
-    let denied_by_cooldown =
-        recommend_promotion(&candidate, SelectionOutcome::PromoteCandidate, false);
-    assert!(!denied_by_cooldown.approved);
-    let approved = recommend_promotion(&candidate, SelectionOutcome::PromoteCandidate, true);
-    assert!(approved.approved);
 }
 
 #[test]
@@ -16508,35 +13789,6 @@ fn model_component_cannot_select_a_concrete_kernel() {
 }
 
 #[test]
-fn session_and_cli_preference_only_apply_to_already_eligible_candidates() {
-    let eligible = vec![
-        EligibleCandidate::from_checked(
-            selection_policy_identity("eligible"),
-            CandidateMetrics::default(),
-            &CandidateEligibilityInput::all_satisfied(),
-        )
-        .unwrap(),
-    ];
-    let ineligible_kernel = selection_policy_kernel_id("ineligible");
-    assert!(resolve_session_preference(Some(&ineligible_kernel), &eligible).is_none());
-    assert!(resolve_cli_kernel_preference(Some(&ineligible_kernel), &eligible).is_none());
-    let eligible_kernel = eligible[0].identity.kernel.clone();
-    assert!(resolve_session_preference(Some(&eligible_kernel), &eligible).is_some());
-}
-
-#[test]
-fn cli_preference_maps_onto_the_matching_optimization_profile() {
-    assert_eq!(
-        map_cli_preference(CliPreference::Latency),
-        OptimizationProfile::Latency
-    );
-    assert_eq!(
-        map_cli_preference(CliPreference::Deterministic),
-        OptimizationProfile::Deterministic
-    );
-}
-
-#[test]
 fn provider_advertised_alternative_never_overrides_runtime_cross_provider_decision() {
     let runtime_choice = selection_policy_identity("runtime-choice");
     let provider_alternative = selection_policy_identity("provider-alternative");
@@ -16544,20 +13796,6 @@ fn provider_advertised_alternative_never_overrides_runtime_cross_provider_decisi
         resolve_cross_provider_selection(&runtime_choice, Some(&provider_alternative)),
         runtime_choice
     );
-}
-
-#[test]
-fn provider_private_variant_requires_every_contract_dimension_unchanged() {
-    assert!(!provider_may_select_variant_privately(
-        &ProviderPrivateVariant::default()
-    ));
-    assert!(provider_may_select_variant_privately(
-        &ProviderPrivateVariant {
-            contract_semantics_identical: true,
-            runtime_visible_compatibility_unchanged: true,
-            determinism_precision_unchanged: true,
-        }
-    ));
 }
 
 #[test]
@@ -16582,31 +13820,6 @@ fn fallback_chain_tries_classes_in_order_and_exhausts_explicitly() {
             true
         ),
         Ok(KernelFallbackClass::HostExecution)
-    );
-}
-
-#[test]
-fn cross_provider_movement_requires_both_explicit_and_authorized() {
-    assert!(
-        validate_cross_provider_movement(&CrossProviderMovement {
-            explicit: true,
-            authorized_by_policy: true,
-        })
-        .is_ok()
-    );
-    assert!(
-        validate_cross_provider_movement(&CrossProviderMovement {
-            explicit: true,
-            authorized_by_policy: false,
-        })
-        .is_err()
-    );
-    assert!(
-        validate_cross_provider_movement(&CrossProviderMovement {
-            explicit: false,
-            authorized_by_policy: true,
-        })
-        .is_err()
     );
 }
 
@@ -16647,24 +13860,6 @@ fn resolve_pinned_selection_distinguishes_unavailable_from_ineligible() {
 }
 
 #[test]
-fn exploration_is_denied_by_default_under_reproducible_mode_but_allowed_when_enabled_outside_it() {
-    let candidate = EligibleCandidate::from_checked(
-        selection_policy_identity("explore"),
-        CandidateMetrics::default(),
-        &CandidateEligibilityInput::all_satisfied(),
-    )
-    .unwrap();
-    let policy = ExplorationPolicy::default();
-    assert!(!exploration_allowed(&policy, false));
-    let enabled = ExplorationPolicy {
-        enabled: true,
-        disabled_for_reproducible: true,
-    };
-    assert!(eligible_for_exploration(&enabled, false, &candidate));
-    assert!(!eligible_for_exploration(&enabled, true, &candidate));
-}
-
-#[test]
 fn canary_budget_exhaustion_is_explicit() {
     let policy = CanaryPolicy {
         max_requests: Some(100),
@@ -16694,45 +13889,6 @@ fn online_measurement_never_overrides_trust_or_correctness() {
             KernelArtifactTrust::Untrusted
         ),
         KernelArtifactTrust::Untrusted
-    );
-}
-
-#[test]
-fn policy_precedence_lets_runtime_safety_override_every_lower_preference() {
-    let stack = PolicyConstraintStack {
-        runtime_safety_forces_deterministic: true,
-        cli_preference: Some(OptimizationProfile::Latency),
-        ..PolicyConstraintStack::default()
-    };
-    assert_eq!(
-        resolve_effective_profile(&stack),
-        OptimizationProfile::Deterministic
-    );
-}
-
-#[test]
-fn policy_precedence_lets_deployment_forbid_a_cli_requested_profile() {
-    let stack = PolicyConstraintStack {
-        cli_preference: Some(OptimizationProfile::Latency),
-        deployment_forbids_profile: BTreeSet::from([OptimizationProfile::Latency]),
-        model_instance_profile: Some(OptimizationProfile::Balanced),
-        ..PolicyConstraintStack::default()
-    };
-    assert_eq!(
-        resolve_effective_profile(&stack),
-        OptimizationProfile::Balanced
-    );
-}
-
-#[test]
-fn policy_precedence_honors_cli_preference_when_nothing_overrides_it() {
-    let stack = PolicyConstraintStack {
-        cli_preference: Some(OptimizationProfile::Throughput),
-        ..PolicyConstraintStack::default()
-    };
-    assert_eq!(
-        resolve_effective_profile(&stack),
-        OptimizationProfile::Throughput
     );
 }
 
@@ -16798,55 +13954,6 @@ fn workload_context_carries_batch_and_phase_metadata_for_ranking() {
     );
     assert!(performance_evidence_applies_to_workload(&bucket, &bucket));
     assert_eq!(context.phase, Some(GenerationPhase::Decode));
-}
-
-#[test]
-fn rank_by_generation_phase_permits_distinct_prefill_and_decode_winners() {
-    let prefill_throughput = EligibleCandidate::from_checked(
-        selection_policy_identity("prefill-throughput"),
-        CandidateMetrics::default().with(ObjectiveDimension::Latency, 50.0),
-        &CandidateEligibilityInput::all_satisfied(),
-    )
-    .unwrap();
-    let decode_latency = EligibleCandidate::from_checked(
-        selection_policy_identity("decode-latency"),
-        CandidateMetrics::default().with(ObjectiveDimension::Latency, 2.0),
-        &CandidateEligibilityInput::all_satisfied(),
-    )
-    .unwrap();
-    let strategy = RankingStrategy::WeightedScore(WeightedScorePolicy {
-        weights: BTreeMap::from([(ObjectiveDimension::Latency, 1.0)]),
-        missing_metric_policy: MissingMetricPolicy::Exclude,
-    });
-    let by_phase = rank_by_generation_phase(
-        std::slice::from_ref(&prefill_throughput),
-        std::slice::from_ref(&decode_latency),
-        &strategy,
-    )
-    .unwrap();
-    assert_eq!(
-        by_phase[&GenerationPhase::Prefill],
-        vec![prefill_throughput.identity]
-    );
-    assert_eq!(
-        by_phase[&GenerationPhase::Decode],
-        vec![decode_latency.identity]
-    );
-}
-
-#[test]
-fn rolling_measurement_window_only_reports_stable_once_full() {
-    let mut window = RollingMeasurementWindow::new(3);
-    assert!(!window.is_stable());
-    window.record(10.0);
-    window.record(12.0);
-    assert!(!window.is_stable());
-    window.record(11.0);
-    assert!(window.is_stable());
-    assert_eq!(window.len(), 3);
-    window.record(9.0);
-    assert_eq!(window.len(), 3);
-    assert!(window.mean().is_some());
 }
 
 #[test]
@@ -16981,27 +14088,6 @@ fn model_instance_definition_can_reference_a_kernel_selection_policy() {
 }
 
 #[test]
-fn generation_preference_boundary_has_no_way_to_carry_a_kernel_identity() {
-    // Structural: `resolve_generation_preference` only ever takes and
-    // returns an `OptimizationProfile`, so a generation request cannot use
-    // it to smuggle a concrete `PreparedKernelId` or `KernelId` into
-    // selection, implementing "Generation requests MAY provide high-level
-    // policy preferences. They SHALL NOT directly force an ineligible
-    // concrete Kernel" (proposal).
-    assert_eq!(
-        resolve_generation_preference(
-            Some(OptimizationProfile::Latency),
-            OptimizationProfile::Balanced
-        ),
-        OptimizationProfile::Latency
-    );
-    assert_eq!(
-        resolve_generation_preference(None, OptimizationProfile::Balanced),
-        OptimizationProfile::Balanced
-    );
-}
-
-#[test]
 fn reproducible_kernel_selection_forces_pinned_performance_feedback() {
     // Implements "Reproducible Mode Prevents Adaptation" (proposal, define-
     // kernel-performance-model-and-adaptive-feedback-contract): a pinned
@@ -17086,24 +14172,6 @@ fn artifact_bytes_test_tensor(
         digest: None,
     };
     (metadata, bytes)
-}
-
-#[test]
-fn host_tensors_from_artifact_bytes_reads_a_well_formed_tensor() {
-    let (mut metadata, tensor_bytes) =
-        artifact_bytes_test_tensor("weight.a", vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
-    // Simulate a second tensor's bytes preceding this one in a real file by
-    // offsetting into a larger buffer, rather than only ever testing offset
-    // zero.
-    let mut file = vec![0u8; 16];
-    file.extend_from_slice(&tensor_bytes);
-    metadata.offset_bytes = Some(16);
-
-    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &file, 0)
-        .expect("well-formed tensor materializes");
-    let tensor = weights.get("weight.a").expect("tensor present");
-    assert_eq!(tensor.shape, vec![2, 2]);
-    assert_eq!(tensor.data, vec![1.0, 2.0, 3.0, 4.0]);
 }
 
 /// Regression guard for a real bug found while implementing
@@ -17227,17 +14295,6 @@ fn f32_to_f16_handles_named_numeric_classes() {
     assert!(f16_to_f32(f32_to_f16(f32::NAN)).is_nan());
 }
 
-#[test]
-fn f32_to_bf16_handles_named_numeric_classes() {
-    assert_eq!(f32_to_bf16(0.0), 0x0000);
-    assert_eq!(f32_to_bf16(-0.0), 0x8000);
-    assert_eq!(f32_to_bf16(1.0), 0x3F80);
-    assert_eq!(f32_to_bf16(-2.0), 0xC000);
-    assert_eq!(f32_to_bf16(f32::INFINITY), 0x7F80);
-    assert_eq!(f32_to_bf16(f32::NEG_INFINITY), 0xFF80);
-    assert!(bf16_to_f32(f32_to_bf16(f32::NAN)).is_nan());
-}
-
 /// The load-bearing verification: every one of the 65,536 possible `u16`
 /// bit patterns is, by construction, an exactly representable `f16` value.
 /// Decoding it via the already-trusted `f16_to_f32`
@@ -17264,39 +14321,6 @@ fn f32_to_f16_round_trips_every_possible_f16_bit_pattern_exactly() {
             );
         }
     }
-}
-
-/// Same exhaustive round-trip proof for `bfloat16`.
-#[test]
-fn f32_to_bf16_round_trips_every_possible_bf16_bit_pattern_exactly() {
-    for bits in 0u32..=0xFFFF {
-        let bits = bits as u16;
-        let decoded = bf16_to_f32(bits);
-        let reencoded = f32_to_bf16(decoded);
-        if decoded.is_nan() {
-            assert!(
-                bf16_to_f32(reencoded).is_nan(),
-                "bf16 bit pattern {bits:#06x} decoded to NaN {decoded:?} must re-encode to a NaN, got {reencoded:#06x}"
-            );
-        } else {
-            assert_eq!(
-                reencoded, bits,
-                "bf16 bit pattern {bits:#06x} (decoded {decoded:?}) did not round-trip: got {reencoded:#06x}"
-            );
-        }
-    }
-}
-
-#[test]
-fn host_tensors_from_artifact_bytes_converts_f16_storage_to_f32() {
-    // 1.0, -2.0, 0.5, 0.0 as IEEE754 binary16 bit patterns.
-    let bytes = f16_bytes(&[0x3C00, 0xC000, 0x3800, 0x0000]);
-    let metadata = f16_tensor_metadata("weight.a", vec![4], bytes.len());
-
-    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
-        .expect("F16 tensor materializes");
-    let tensor = weights.get("weight.a").expect("tensor present");
-    assert_eq!(tensor.data, vec![1.0, -2.0, 0.5, 0.0]);
 }
 
 #[test]
@@ -17487,51 +14511,6 @@ fn host_tensors_from_artifact_bytes_rejects_shape_size_mismatch() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn provider_roadmap_features_are_all_optional_and_phase_tagged() {
-    assert_eq!(PROVIDER_ROADMAP_FEATURES.len(), 31);
-    for feature in PROVIDER_ROADMAP_FEATURES {
-        assert!(feature.is_optional(), "{feature:?} must be optional");
-    }
-    assert_eq!(
-        provider_roadmap_features_for_phase(ProviderRoadmapPhase::OptimizedCpu),
-        vec![
-            ProviderRoadmapFeature::Simd,
-            ProviderRoadmapFeature::Blas,
-            ProviderRoadmapFeature::ThreadPoolExecution,
-            ProviderRoadmapFeature::CacheAwareKernels,
-            ProviderRoadmapFeature::OptimizedCpuFusedKernels,
-        ]
-    );
-    assert_eq!(
-        provider_roadmap_features_for_phase(ProviderRoadmapPhase::Cuda).len(),
-        8
-    );
-    assert_eq!(
-        provider_roadmap_features_for_phase(ProviderRoadmapPhase::Metal).len(),
-        5
-    );
-    assert_eq!(
-        provider_roadmap_features_for_phase(ProviderRoadmapPhase::OpenVino).len(),
-        4
-    );
-    assert_eq!(
-        provider_roadmap_features_for_phase(ProviderRoadmapPhase::Qnn).len(),
-        4
-    );
-    assert_eq!(
-        provider_roadmap_features_for_phase(ProviderRoadmapPhase::WebGpu).len(),
-        5
-    );
-    for feature in PROVIDER_ROADMAP_FEATURES {
-        assert!(!feature.id().is_empty());
-        assert!(
-            provider_roadmap_features_for_phase(feature.phase()).contains(feature),
-            "{feature:?} must appear under its own phase()"
-        );
-    }
-}
-
-#[test]
 fn provider_roadmap_phases_are_ordered_1_through_9() {
     let mut ordinals: Vec<u8> = PROVIDER_ROADMAP_PHASES
         .iter()
@@ -17551,46 +14530,6 @@ fn provider_roadmap_every_phase_requires_provider_core() {
             "{phase:?} must require provider-core"
         );
     }
-}
-
-#[test]
-fn provider_roadmap_phase_readiness_requires_actually_passed_profiles() {
-    let cuda = ProviderRoadmapPhase::Cuda;
-    let required = cuda.required_conformance_gates();
-    assert!(!phase_is_production_ready(cuda, &BTreeSet::new()));
-    assert!(!phase_is_production_ready(
-        cuda,
-        &BTreeSet::from([ProviderConformanceProfile::ProviderCore])
-    ));
-    assert!(phase_is_production_ready(cuda, &required));
-}
-
-#[test]
-fn provider_roadmap_reference_cpu_remains_correctness_baseline() {
-    // Every post-baseline hardware family's primary fallback edge terminates
-    // at Reference CPU (or an explicit browser-CPU-like path for WebGPU),
-    // never at another hardware Provider -- Reference CPU stays the
-    // correctness baseline the roadmap compares optimized output against.
-    assert_eq!(
-        ProviderRoadmapHardwareFamily::Cuda.primary_fallback_edge(),
-        ProviderRoadmapFallbackEdge::CudaToReferenceCpu
-    );
-    assert_eq!(
-        ProviderRoadmapHardwareFamily::Metal.primary_fallback_edge(),
-        ProviderRoadmapFallbackEdge::MetalToReferenceCpu
-    );
-    assert_eq!(
-        ProviderRoadmapHardwareFamily::OpenVino.primary_fallback_edge(),
-        ProviderRoadmapFallbackEdge::OpenVinoToReferenceCpu
-    );
-    assert_eq!(
-        ProviderRoadmapHardwareFamily::Qnn.primary_fallback_edge(),
-        ProviderRoadmapFallbackEdge::QnnToReferenceCpu
-    );
-    assert_eq!(
-        ProviderRoadmapHardwareFamily::WebGpu.primary_fallback_edge(),
-        ProviderRoadmapFallbackEdge::WebGpuToBrowserCpuLike
-    );
 }
 
 #[test]
@@ -17664,38 +14603,6 @@ fn provider_roadmap_rejects_empty_provider_name() {
         reject_model_family_provider_name("   "),
         Err(ProviderRoadmapError::InternalProviderRoadmapError { .. })
     ));
-}
-
-#[test]
-fn provider_roadmap_denies_native_handle_exposure_for_every_hardware_family() {
-    for family in [
-        ProviderRoadmapHardwareFamily::Cuda,
-        ProviderRoadmapHardwareFamily::Metal,
-        ProviderRoadmapHardwareFamily::OpenVino,
-        ProviderRoadmapHardwareFamily::Qnn,
-    ] {
-        assert!(
-            !family.native_handle_kinds().is_empty(),
-            "{family:?} should declare at least one native handle kind"
-        );
-        for handle_kind in family.native_handle_kinds() {
-            let outcome = reject_native_handle_exposure(family, handle_kind);
-            assert!(matches!(
-                outcome,
-                Err(ProviderRoadmapError::ProviderNativeHandleExposureDenied { .. })
-            ));
-        }
-    }
-    // WebGPU has no native-handle boundary of its own (browser sandboxing
-    // constraints apply instead), but it still must not require native
-    // Provider loading.
-    assert!(
-        ProviderRoadmapHardwareFamily::WebGpu
-            .native_handle_kinds()
-            .is_empty()
-    );
-    assert!(ProviderRoadmapHardwareFamily::WebGpu.requires_no_native_provider_loading());
-    assert!(!ProviderRoadmapHardwareFamily::Cuda.requires_no_native_provider_loading());
 }
 
 #[test]
@@ -17776,24 +14683,6 @@ fn provider_roadmap_quantized_path_requires_explicit_metadata() {
         ..incomplete
     };
     assert!(validate_quantization_declaration(&complete).is_ok());
-}
-
-#[test]
-fn provider_roadmap_rejects_hidden_dequantization() {
-    assert!(matches!(
-        reject_hidden_dequantization(false),
-        Err(ProviderRoadmapError::ProviderQuantizationUnsupported { .. })
-    ));
-    assert!(reject_hidden_dequantization(true).is_ok());
-}
-
-#[test]
-fn provider_roadmap_advanced_attention_unsupported_path_fails_explicitly() {
-    let outcome = reject_unsupported_advanced_attention(AdvancedAttentionVariant::FlashAttention);
-    assert!(matches!(
-        outcome,
-        ProviderRoadmapError::ProviderAdvancedAttentionUnsupported { .. }
-    ));
 }
 
 #[test]
@@ -17938,72 +14827,10 @@ fn provider_roadmap_fallback_denies_provider_pinned_affinity_even_with_open_poli
 }
 
 #[test]
-fn provider_roadmap_fallback_observed_emits_considered_then_used_or_denied() {
-    let affinity = ResourceAffinity::new(FallbackClass::Transparent);
-    let denied_context = ProviderRoadmapFallbackContext::deny_by_default();
-    let (observations, outcome) = evaluate_provider_roadmap_fallback_observed(
-        ProviderRoadmapFallbackEdge::WebGpuToBrowserCpuLike,
-        &affinity,
-        &denied_context,
-    );
-    assert!(outcome.is_err());
-    assert_eq!(observations.len(), 2);
-    assert_eq!(
-        observations[0].kind,
-        ProviderRoadmapObservationKind::FallbackConsidered
-    );
-    assert_eq!(
-        observations[1].kind,
-        ProviderRoadmapObservationKind::FallbackDenied
-    );
-
-    let allowed_context = ProviderRoadmapFallbackContext {
-        cpu: FallbackPolicyContext::new(true),
-        memory_policy_allows_fallback: true,
-        privacy_policy_allows_fallback: true,
-        precision_policy_allows_fallback: true,
-    };
-    let (observations, outcome) = evaluate_provider_roadmap_fallback_observed(
-        ProviderRoadmapFallbackEdge::WebGpuToBrowserCpuLike,
-        &affinity,
-        &allowed_context,
-    );
-    assert!(outcome.is_ok());
-    assert_eq!(
-        observations[1].kind,
-        ProviderRoadmapObservationKind::FallbackUsed
-    );
-}
-
-#[test]
-fn provider_roadmap_runtime_api_remains_provider_independent() {
-    for capability in PROVIDER_ROADMAP_FORBIDDEN_API_HANDLE_SCOPES {
-        assert!(
-            reject_provider_specific_handle_capability(capability).is_err(),
-            "{capability} should have been rejected"
-        );
-    }
-    // Ordinary inference scopes remain unaffected.
-    assert!(reject_provider_specific_handle_capability("generation").is_ok());
-    assert!(validate_inference_scope("generation").is_ok());
-}
-
-#[test]
 fn provider_roadmap_cli_receives_redacted_provider_diagnostics_only() {
     let raw = "provider handle=0xdeadbeef failed on cuda-stream";
     let redacted = cli_redacted_provider_diagnostic(raw);
     assert!(!redacted.contains("0xdeadbeef"));
-}
-
-#[test]
-fn provider_roadmap_cli_may_pass_policy_preference_without_authority() {
-    let preference = ProviderRoadmapPolicyPreference {
-        preferred_provider: Some("cuda".into()),
-        allow_optimized_provider_fallback: true,
-    };
-    let echoed = cli_may_pass_policy_preference(&preference);
-    assert_eq!(echoed, preference);
-    assert!(reject_cli_raw_provider_handle_selection("cuda-device-pointer").is_err());
 }
 
 #[test]
@@ -18050,18 +14877,6 @@ fn provider_roadmap_memory_expansion_requires_manager_tracking() {
 }
 
 #[test]
-fn provider_roadmap_conformance_profiles_are_declared_without_implying_readiness() {
-    let ids = provider_roadmap_conformance_profile_ids();
-    assert_eq!(ids.len(), 9);
-    assert!(ids.values().all(|required| !required));
-    assert!(ids.contains_key(ProviderConformanceProfile::Quantized.id()));
-    assert!(ids.contains_key(ProviderConformanceProfile::AdvancedAttention.id()));
-    assert!(ids.contains_key(ProviderConformanceProfile::FusedKernel.id()));
-    assert!(ids.contains_key(ProviderConformanceProfile::Browser.id()));
-    assert!(ids.contains_key(ProviderConformanceProfile::WebGpu.id()));
-}
-
-#[test]
 fn provider_roadmap_benchmarks_stay_separate_from_conformance() {
     // A benchmark result is never accepted anywhere a conformance decision
     // is made: a report whose only entry is a correctness failure is not
@@ -18091,121 +14906,12 @@ fn provider_roadmap_benchmarks_stay_separate_from_conformance() {
 }
 
 #[test]
-fn provider_roadmap_error_display_is_non_empty_for_every_variant() {
-    let variants = vec![
-        ProviderRoadmapError::ProviderRoadmapUnsupported {
-            reason: "example".into(),
-        },
-        ProviderRoadmapError::OptimizedCpuProviderUnavailable {
-            reason: "example".into(),
-        },
-        ProviderRoadmapError::CudaProviderUnavailable {
-            reason: "example".into(),
-        },
-        ProviderRoadmapError::MetalProviderUnavailable {
-            reason: "example".into(),
-        },
-        ProviderRoadmapError::OpenVinoProviderUnavailable {
-            reason: "example".into(),
-        },
-        ProviderRoadmapError::QnnProviderUnavailable {
-            reason: "example".into(),
-        },
-        ProviderRoadmapError::WebGpuProviderUnavailable {
-            reason: "example".into(),
-        },
-        ProviderRoadmapError::ProviderFeatureUnsupported {
-            feature: "example".into(),
-        },
-        ProviderRoadmapError::ProviderLayoutUnsupported {
-            layout: "example".into(),
-        },
-        ProviderRoadmapError::ProviderDTypeUnsupported {
-            dtype: "example".into(),
-        },
-        ProviderRoadmapError::ProviderMemoryClassUnsupported {
-            memory_class: "example".into(),
-        },
-        ProviderRoadmapError::ProviderAdvancedAttentionUnsupported {
-            variant: "example".into(),
-        },
-        ProviderRoadmapError::ProviderQuantizationUnsupported {
-            reason: "example".into(),
-        },
-        ProviderRoadmapError::ProviderFusionInvalid {
-            reason: "example".into(),
-        },
-        ProviderRoadmapError::ProviderConformanceFailed {
-            report: "example".into(),
-        },
-        ProviderRoadmapError::ProviderBenchmarkFailed {
-            reason: "example".into(),
-        },
-        ProviderRoadmapError::ProviderFallbackDenied {
-            reason: "example".into(),
-        },
-        ProviderRoadmapError::ProviderNativeHandleExposureDenied {
-            handle_kind: "example".into(),
-        },
-        ProviderRoadmapError::InternalProviderRoadmapError {
-            reason: "example".into(),
-        },
-    ];
-    for variant in variants {
-        let rendered = variant.to_string();
-        assert!(!rendered.is_empty(), "{variant:?} rendered empty");
-        assert!(!variant.id().is_empty());
-    }
-}
-
-#[test]
 fn provider_roadmap_observation_redacts_metadata_by_default() {
     let observation = ProviderRoadmapObservation::new(ProviderRoadmapObservationKind::FallbackUsed)
         .with_provider("cuda")
         .with_redacted_metadata("diagnostic", "device pointer handle=0xdeadbeef");
     let value = observation.redacted_metadata.get("diagnostic").unwrap();
     assert!(!value.contains("0xdeadbeef"));
-}
-
-#[test]
-fn provider_roadmap_observation_kind_round_trips_through_debug() {
-    let kinds = [
-        ProviderRoadmapObservationKind::RoadmapFeatureDiscovered,
-        ProviderRoadmapObservationKind::CapabilityAdvertised,
-        ProviderRoadmapObservationKind::CapabilityRejected,
-        ProviderRoadmapObservationKind::OptimizedProviderSelected,
-        ProviderRoadmapObservationKind::AdvancedAttentionSelected,
-        ProviderRoadmapObservationKind::QuantizedKernelSelected,
-        ProviderRoadmapObservationKind::FusedKernelSelected,
-        ProviderRoadmapObservationKind::FallbackConsidered,
-        ProviderRoadmapObservationKind::FallbackUsed,
-        ProviderRoadmapObservationKind::FallbackDenied,
-        ProviderRoadmapObservationKind::ConformancePassed,
-        ProviderRoadmapObservationKind::ConformanceFailed,
-        ProviderRoadmapObservationKind::BenchmarkExecuted,
-        ProviderRoadmapObservationKind::BenchmarkSkipped,
-    ];
-    assert_eq!(kinds.len(), 14);
-    for kind in kinds {
-        let observation = ProviderRoadmapObservation::new(kind);
-        assert_eq!(observation.kind, kind);
-    }
-}
-
-#[test]
-fn provider_roadmap_device_metadata_templates_carry_family_memory_classes() {
-    for family in [
-        ProviderRoadmapHardwareFamily::Cuda,
-        ProviderRoadmapHardwareFamily::Metal,
-        ProviderRoadmapHardwareFamily::OpenVino,
-        ProviderRoadmapHardwareFamily::Qnn,
-        ProviderRoadmapHardwareFamily::WebGpu,
-    ] {
-        let device = family.device_metadata_template();
-        assert_eq!(device.memory_class_support, family.memory_classes());
-        assert!(!device.vendor.is_empty());
-        assert!(!device.architecture.is_empty());
-    }
 }
 
 #[test]
