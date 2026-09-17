@@ -76,7 +76,7 @@
 //!   the proposal's "Format Conformance" section.
 //! - [`ModelFormatRoadmapConformanceReport`] / [`run_model_format_roadmap_conformance`]:
 //!   a small conformance report, in the shape of
-//!   [`crate::ProviderRoadmapConformanceReport`], asserting the roadmap
+//!   [`crate::provider_roadmap::ProviderRoadmapConformanceReport`], asserting the roadmap
 //!   guarantees above hold.
 
 use crate::{
@@ -1289,7 +1289,7 @@ impl ModelFormatRoadmapObservation {
 // ---------------------------------------------------------------------
 
 /// A single model format roadmap conformance check result, mirroring
-/// [`crate::ProviderRoadmapConformanceResult`].
+/// [`crate::provider_roadmap::ProviderRoadmapConformanceResult`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelFormatRoadmapConformanceResult {
     pub requirement: String,
