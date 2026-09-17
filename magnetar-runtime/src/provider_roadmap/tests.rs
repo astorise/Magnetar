@@ -10,6 +10,7 @@ use crate::inference_api::validate_inference_scope;
 use crate::reference_cpu::FallbackPolicyContext;
 use std::collections::BTreeSet;
 
+use crate::operator::TensorLayoutKind;
 #[test]
 fn provider_roadmap_features_are_all_optional_and_phase_tagged() {
     assert_eq!(PROVIDER_ROADMAP_FEATURES.len(), 31);
@@ -365,4 +366,54 @@ fn provider_roadmap_rejects_empty_provider_name() {
         reject_model_family_provider_name("   "),
         Err(ProviderRoadmapError::InternalProviderRoadmapError { .. })
     ));
+}
+
+#[test]
+fn provider_roadmap_phases_are_ordered_1_through_9() {
+    let mut ordinals: Vec<u8> = PROVIDER_ROADMAP_PHASES
+        .iter()
+        .map(|phase| phase.ordinal())
+        .collect();
+    ordinals.sort_unstable();
+    assert_eq!(ordinals, (1..=9).collect::<Vec<_>>());
+}
+
+#[test]
+fn provider_roadmap_layout_expansion_requires_explicit_conversion() {
+    for layout in POST_BASELINE_LAYOUTS {
+        assert!(!layout.component_visible() || *layout != TensorLayoutKind::ProviderOpaque);
+    }
+    assert!(
+        require_explicit_layout_conversion(
+            TensorLayoutKind::Paged,
+            TensorLayoutKind::Paged,
+            false,
+        )
+        .is_ok()
+    );
+    assert!(
+        require_explicit_layout_conversion(
+            TensorLayoutKind::Paged,
+            TensorLayoutKind::Blocked,
+            false,
+        )
+        .is_err()
+    );
+    assert!(
+        require_explicit_layout_conversion(
+            TensorLayoutKind::Paged,
+            TensorLayoutKind::Blocked,
+            true,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn provider_roadmap_observation_redacts_metadata_by_default() {
+    let observation = ProviderRoadmapObservation::new(ProviderRoadmapObservationKind::FallbackUsed)
+        .with_provider("cuda")
+        .with_redacted_metadata("diagnostic", "device pointer handle=0xdeadbeef");
+    let value = observation.redacted_metadata.get("diagnostic").unwrap();
+    assert!(!value.contains("0xdeadbeef"));
 }

@@ -10,9 +10,13 @@ use crate::operator::{OperatorFamily, OperatorId};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use crate::kernel_artifact::KernelArtifactTrust;
 use crate::kernel_benchmark::{BenchmarkFreshness, BenchmarkStalenessReason};
 use crate::kernel_registry::KernelCandidateRejection;
 use crate::model_instance::KernelSelectionPolicy;
+use crate::model_instance::{
+    ModelInstanceWarmupPlan, ModelInstanceWarmupPolicy, PinnedKernelSelection,
+};
 fn selection_policy_identity(name: &str) -> CandidateIdentity {
     CandidateIdentity {
         kernel: selection_policy_kernel_id(name),
@@ -530,4 +534,90 @@ fn kernel_selection_error_ids_are_stable_and_match_the_proposal_vocabulary() {
         KernelSelectionError::InternalError { reason: "x".into() }.id(),
         "internal-kernel-selection-error"
     );
+}
+
+#[test]
+fn shape_aware_evidence_does_not_apply_outside_its_bucket() {
+    assert!(performance_evidence_applies_to_workload("b1s128", "b1s128"));
+    assert!(!performance_evidence_applies_to_workload(
+        "b1s128", "b64s8192"
+    ));
+}
+
+#[test]
+fn compilation_cost_is_excluded_once_artifact_is_cached() {
+    assert!(compilation_cost_excluded_from_hot_path(true));
+    assert!(!compilation_cost_excluded_from_hot_path(false));
+}
+
+#[test]
+fn exploration_failure_never_affects_an_unrelated_candidate() {
+    let failing = selection_policy_identity("failing");
+    let unrelated = selection_policy_identity("unrelated");
+    assert!(!exploration_failure_affects_unrelated_candidate(
+        ExplorationFailureAction::TriggerRollback,
+        &failing,
+        &unrelated,
+    ));
+}
+
+#[test]
+fn online_measurement_never_overrides_trust_or_correctness() {
+    assert_eq!(
+        online_measurement_cannot_override_correctness_or_trust(
+            true,
+            KernelArtifactTrust::Untrusted
+        ),
+        KernelArtifactTrust::Untrusted
+    );
+}
+
+#[test]
+fn selection_explanation_never_contains_native_handles() {
+    let mut explanation = SelectionExplanation::default();
+    explanation.exclusions.insert(
+        "some-kernel".into(),
+        KernelSelectionExclusionReason::PolicyDenied,
+    );
+    assert!(!explanation.contains_native_handles());
+}
+
+#[test]
+fn kernel_selection_observation_redacts_metadata_and_carries_kernel_identity() {
+    let kernel = selection_policy_kernel_id("observed");
+    let observation =
+        KernelSelectionObservation::new(KernelSelectionObservationKind::KernelSelected)
+            .with_kernel(&kernel)
+            .with_redacted_metadata("path", "C:\\secret\\path");
+    assert_eq!(observation.kernel, Some(kernel.stable_key()));
+    assert_eq!(
+        observation
+            .redacted_metadata
+            .get("path")
+            .map(String::as_str),
+        Some("[redacted backend diagnostic]")
+    );
+}
+
+#[test]
+fn static_selection_required_during_warmup_needs_pinned_mode_and_kernel_step() {
+    let kernel = selection_policy_kernel_id("pinned");
+    let pinned_mode = KernelSelectionPolicy::Pinned(PinnedKernelSelection::new(kernel, "digest"));
+    let dynamic_mode = KernelSelectionPolicy::Dynamic;
+    let full_plan = ModelInstanceWarmupPlan::for_policy(ModelInstanceWarmupPolicy::Full);
+    let metadata_only_plan =
+        ModelInstanceWarmupPlan::for_policy(ModelInstanceWarmupPolicy::ValidateMetadataOnly);
+
+    assert!(static_selection_required_during_warmup(
+        &pinned_mode,
+        &full_plan
+    ));
+    assert!(!static_selection_required_during_warmup(
+        &dynamic_mode,
+        &full_plan
+    ));
+    assert!(!static_selection_required_during_warmup(
+        &pinned_mode,
+        &metadata_only_plan
+    ));
 }

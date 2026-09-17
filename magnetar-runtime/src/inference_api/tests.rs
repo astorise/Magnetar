@@ -28,6 +28,7 @@ use crate::observability::{CorrelationId, TraceId};
 use crate::reference_cpu::ReferenceCpuProvider;
 use crate::runtime::Runtime;
 use crate::sampling::SamplingPolicy;
+use crate::tokenizer::TokenizerCompatibility;
 use crate::tokenizer::{TokenId, TokenStopPattern};
 use std::sync::Arc;
 fn adapter_activation_request_fixture(residency: &AdapterResidency) -> AdapterActivationRequest {
@@ -541,4 +542,37 @@ fn inference_api_run_generation_loop_rejects_incomplete_executor_evidence_before
     assert!(!kinds.contains(&InferenceApiObservationKind::TokenGenerated));
     assert!(!kinds.contains(&InferenceApiObservationKind::GenerationCompleted));
     assert!(!kinds.contains(&InferenceApiObservationKind::StreamClosed));
+}
+
+#[test]
+fn inference_api_adapter_activation_succeeds_for_ready_residency() {
+    let residency = adapter_residency_fixture();
+    let request = adapter_activation_request_fixture(&residency);
+
+    activate_adapter(&residency, &request, None, None).unwrap();
+}
+
+#[test]
+fn inference_api_tachyon_and_cli_boundary_capabilities_are_inference_only() {
+    for forbidden in ["git", "shell", "agent-orchestration", "secrets"] {
+        assert!(validate_inference_scope(forbidden).is_err());
+    }
+    assert!(validate_inference_scope("generation").is_ok());
+}
+
+#[test]
+fn inference_api_validate_tokenizer_compatibility_accepts_matching_digest() {
+    let metadata = generation_tokenizer_metadata();
+    let tokenizer = FixtureTokenizer::new(metadata.clone());
+    let compatibility = TokenizerCompatibility {
+        expected_digest: Some(metadata.digest.clone()),
+        expected_vocabulary_size: Some(metadata.vocabulary_size),
+        expected_family: Some(metadata.family.clone()),
+        expected_model_max_length: None,
+        expected_added_tokens: None,
+        expected_special_tokens: Vec::new(),
+        expected_normalization: None,
+    };
+
+    validate_tokenizer_compatibility(&tokenizer, &compatibility).unwrap();
 }

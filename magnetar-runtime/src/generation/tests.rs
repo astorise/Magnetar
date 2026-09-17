@@ -14,6 +14,12 @@ use crate::tokenizer::{
     TokenizerFamily, TokenizerId, TokenizerMetadata, TokenizerRevision,
 };
 
+use crate::memory::{MemoryAdmissionDecision, MemoryManager, MemoryManagerConfig};
+use crate::model::ModelArtifactKind;
+use crate::tokenizer::{
+    FixtureTokenizer, RuntimeTokenizer, StreamingDecodeState, TokenId, TokenizerArtifactReference,
+    TokenizerArtifactSet,
+};
 fn generation_request() -> GenerationRequest {
     let metadata = generation_tokenizer_metadata();
     GenerationRequest {
@@ -166,4 +172,132 @@ fn generation_provider_errors_map_to_finish_reasons() {
         finish_reason_from_provider_error(ProviderExecutionErrorCode::ExecutionFailed),
         FinishReason::ProviderError
     );
+}
+
+fn generation_runtime_tokenizer() -> RuntimeTokenizer<FixtureTokenizer> {
+    let metadata = generation_tokenizer_metadata();
+    let digest = metadata.digest.clone();
+    RuntimeTokenizer::new(
+        FixtureTokenizer::new(metadata),
+        TokenizerArtifactSet {
+            tokenizer: TokenizerArtifactReference::new(
+                TokenizerArtifactId::new("fixture-tokenizer").unwrap(),
+                ModelArtifactKind::Tokenizer,
+                digest,
+            )
+            .unwrap(),
+            tokenizer_config: None,
+            vocabulary: None,
+            special_tokens: None,
+        },
+    )
+}
+
+#[test]
+fn generation_can_ignore_eos_by_explicit_policy() {
+    let mut request = generation_request();
+    request.stop_conditions.eos.mode = EosMode::Ignore;
+
+    assert_eq!(stop_reason_for(&request, &[299]), None);
+}
+
+#[test]
+fn generation_decode_step_preserves_token_index_and_state_boundary() {
+    let request = generation_request();
+    let step = decode_step(&request, &[20, 21], 22).unwrap();
+
+    assert_eq!(step.token_id, 22);
+    assert_eq!(step.token_index, 2);
+    assert!(step.state_update.is_some());
+}
+
+#[test]
+fn generation_prefill_validates_tokens_and_records_prompt_count() {
+    let request = generation_request();
+    let state = prefill(&request).unwrap();
+
+    assert_eq!(state.prompt_token_count, 3);
+    assert!(state.kv_cache_placeholder.is_some());
+    assert!(state.observations.iter().any(|event| {
+        event.kind == GenerationEventKind::PrefillStarted && event.request_id == request.request_id
+    }));
+}
+
+#[test]
+fn generation_token_stream_events_preserve_order_and_identity() {
+    let request = generation_request();
+    let events = token_stream_events(&request, &[10, 11, 12], None).unwrap();
+
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].token_id, Some(10));
+    assert_eq!(events[1].token_index, Some(1));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.request_id == request.request_id)
+    );
+}
+
+#[test]
+fn generation_streaming_text_uses_tokenizer_decode() {
+    let tokenizer = generation_runtime_tokenizer();
+    let output = streaming_text_chunk(
+        &tokenizer,
+        StreamingDecodeState::default(),
+        vec![b'h' as TokenId + 1, b'i' as TokenId + 1],
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(output.text, "hi");
+    assert!(output.pending_partial_state.is_none());
+}
+
+#[test]
+fn generation_prepares_text_stop_sequences_through_tokenizer() {
+    let tokenizer = generation_runtime_tokenizer();
+    let patterns = prepare_stop_sequences(&tokenizer, &["xy".into()]).unwrap();
+
+    assert_eq!(patterns[0].text, "xy");
+    assert_eq!(
+        patterns[0].token_ids,
+        vec![b'x' as TokenId + 1, b'y' as TokenId + 1]
+    );
+}
+
+#[test]
+fn generation_usage_and_output_account_for_tokens_without_decoded_text() {
+    let request = generation_request();
+    let output = GenerationOutput::new(&request, vec![10, 11], FinishReason::StopToken);
+
+    output.validate().unwrap();
+    assert_eq!(output.generated_token_count, 2);
+    assert_eq!(output.usage.prompt_tokens, 3);
+    assert_eq!(output.usage.total_tokens, 5);
+}
+
+#[test]
+fn generation_cancellation_maps_to_stable_finish_reason() {
+    let mut request = generation_request();
+    request.cancellation.requested = true;
+
+    assert_eq!(
+        stop_reason_for(&request, &[]),
+        Some(FinishReason::Cancelled)
+    );
+}
+
+#[test]
+fn generation_memory_admission_uses_memory_manager_policy() {
+    let mut request = generation_request();
+    request.memory.logits_buffer_bytes = 1024;
+    let manager = MemoryManager::new(MemoryManagerConfig {
+        max_runtime_bytes: Some(64),
+        ..MemoryManagerConfig::default()
+    });
+
+    assert!(matches!(
+        memory_admission(&request, &manager).unwrap(),
+        MemoryAdmissionDecision::Reject { .. }
+    ));
 }

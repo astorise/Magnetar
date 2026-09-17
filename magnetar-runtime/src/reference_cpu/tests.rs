@@ -13,6 +13,7 @@ use super::*;
 
 use crate::affinity::ProviderPressureLevel;
 use crate::kernel_registry::validate_kernel_advertisement;
+use crate::operator::TensorLayoutKind;
 use crate::tensor::ReferenceCpuErrorCode;
 use std::collections::BTreeSet;
 struct Rng(u64);
@@ -782,4 +783,191 @@ fn reference_cpu_quantize_and_dequantize_placeholders_reject_explicitly() {
     for error in [dequantize_placeholder(), quantize_placeholder()] {
         assert_eq!(error.code, ReferenceCpuErrorCode::DTypeUnsupported);
     }
+}
+
+#[test]
+fn reference_cpu_matmul_known_output() {
+    let a = reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]);
+    let b = reference_cpu_host_tensor([2, 2], [5.0, 6.0, 7.0, 8.0]);
+    let result = matmul(&a, &b, false, false).unwrap();
+    assert_eq!(result.shape, vec![2, 2]);
+    assert_eq!(result.data, vec![19.0, 22.0, 43.0, 50.0]);
+}
+
+#[test]
+fn reference_cpu_matmul_rejects_inner_dimension_mismatch() {
+    let a = reference_cpu_host_tensor([2, 3], vec![0.0; 6]);
+    let b = reference_cpu_host_tensor([2, 2], vec![0.0; 4]);
+    assert!(matmul(&a, &b, false, false).is_err());
+}
+
+#[test]
+fn reference_cpu_embedding_known_output_and_out_of_range() {
+    let table = reference_cpu_host_tensor([3, 2], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let ids = reference_cpu_host_tensor([2], [0.0, 2.0]);
+    let result = embedding_lookup(&table, &ids).unwrap();
+    assert_eq!(result.shape, vec![2, 2]);
+    assert_eq!(result.data, vec![1.0, 2.0, 5.0, 6.0]);
+
+    let out_of_range = reference_cpu_host_tensor([1], [3.0]);
+    assert!(embedding_lookup(&table, &out_of_range).is_err());
+}
+
+#[test]
+fn reference_cpu_rmsnorm_known_output() {
+    let input = reference_cpu_host_tensor([1, 4], [1.0, 2.0, 3.0, 4.0]);
+    let weight = reference_cpu_host_tensor([4], [1.0, 1.0, 1.0, 1.0]);
+    let result = rmsnorm(&input, &weight, 1e-6).unwrap();
+    let mean_square = (1.0_f32 + 4.0 + 9.0 + 16.0) / 4.0;
+    let scale = 1.0 / (mean_square + 1e-6).sqrt();
+    for (actual, expected) in result.data.iter().zip([1.0, 2.0, 3.0, 4.0]) {
+        assert!((actual - expected * scale).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn reference_cpu_rmsnorm_full_shape_weights_apply_per_row() {
+    let input = reference_cpu_host_tensor([2, 2], [3.0, 4.0, 3.0, 4.0]);
+    let weight = reference_cpu_host_tensor([2, 2], [1.0, 1.0, 2.0, 3.0]);
+    let result = rmsnorm(&input, &weight, 1e-6).unwrap();
+    let scale = 1.0 / (((9.0_f32 + 16.0) / 2.0) + 1e-6).sqrt();
+
+    assert!((result.data[0] - 3.0 * scale).abs() < 1e-5);
+    assert!((result.data[1] - 4.0 * scale).abs() < 1e-5);
+    assert!((result.data[2] - 3.0 * scale * 2.0).abs() < 1e-5);
+    assert!((result.data[3] - 4.0 * scale * 3.0).abs() < 1e-5);
+}
+
+#[test]
+fn reference_cpu_rmsnorm_flattens_leading_dimensions() {
+    let input = reference_cpu_host_tensor([1, 2, 2], [3.0, 4.0, 5.0, 12.0]);
+    let weight = reference_cpu_host_tensor([1, 2, 2], [1.0, 2.0, 3.0, 4.0]);
+    let result = rmsnorm(&input, &weight, 1e-6).unwrap();
+    let row0_scale = 1.0 / (((9.0_f32 + 16.0) / 2.0) + 1e-6).sqrt();
+    let row1_scale = 1.0 / (((25.0_f32 + 144.0) / 2.0) + 1e-6).sqrt();
+
+    assert_eq!(result.shape, vec![1, 2, 2]);
+    assert!((result.data[0] - 3.0 * row0_scale).abs() < 1e-5);
+    assert!((result.data[1] - 4.0 * row0_scale * 2.0).abs() < 1e-5);
+    assert!((result.data[2] - 5.0 * row1_scale * 3.0).abs() < 1e-5);
+    assert!((result.data[3] - 12.0 * row1_scale * 4.0).abs() < 1e-5);
+}
+
+#[test]
+fn reference_cpu_rmsnorm_rejects_dtype_shape_mismatch() {
+    let input = reference_cpu_host_tensor([1, 4], vec![1.0; 4]);
+    let weight = reference_cpu_host_tensor([3], vec![1.0; 3]);
+    assert!(rmsnorm(&input, &weight, 1e-6).is_err());
+}
+
+#[test]
+fn reference_cpu_rope_identity_at_position_zero() {
+    let input = reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]);
+    let result = rope(&input, 10000.0, 1.0, 2, 0, 1).unwrap();
+    assert!((result.data[0] - 1.0).abs() < 1e-5);
+    assert!((result.data[1] - 2.0).abs() < 1e-5);
+}
+
+#[test]
+fn reference_cpu_softmax_known_output() {
+    let input = reference_cpu_host_tensor([1, 3], [1.0, 1.0, 1.0]);
+    let result = softmax_rows(&input).unwrap();
+    for value in result.data {
+        assert!((value - (1.0 / 3.0)).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn reference_cpu_softmax_allows_partially_masked_row() {
+    let input = reference_cpu_host_tensor([1, 3], [f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY]);
+    let result = softmax_rows(&input).unwrap();
+    assert!(result.data.iter().all(|value| value.is_finite()));
+    assert!((result.data[1] - 1.0).abs() < 1e-5);
+}
+
+#[test]
+fn reference_cpu_silu_known_output() {
+    let input = reference_cpu_host_tensor([1], [0.0]);
+    let result = silu(&input);
+    assert!((result.data[0] - 0.0).abs() < 1e-6);
+}
+
+#[test]
+fn reference_cpu_elementwise_known_outputs() {
+    let a = reference_cpu_host_tensor([2], [1.0, 2.0]);
+    let b = reference_cpu_host_tensor([2], [3.0, 4.0]);
+    assert_eq!(add(&a, &b).unwrap().data, vec![4.0, 6.0]);
+    assert_eq!(mul(&a, &b).unwrap().data, vec![3.0, 8.0]);
+    assert_eq!(residual_add(&a, &b).unwrap().data, vec![4.0, 6.0]);
+
+    let mismatched = reference_cpu_host_tensor([3], vec![0.0; 3]);
+    assert!(add(&a, &mismatched).is_err());
+}
+
+#[test]
+fn reference_cpu_attention_causal_masks_future_tokens() {
+    let q = reference_cpu_host_tensor([2, 2], [1.0, 0.0, 0.0, 1.0]);
+    let k = q.clone();
+    let v = reference_cpu_host_tensor([2, 2], [10.0, 10.0, 20.0, 20.0]);
+    let result = attention(&q, &k, &v, 1, 2, None, None, true).unwrap();
+    // Position 0 can only attend to itself, so its output must equal v[0].
+    assert!((result.data[0] - 10.0).abs() < 1e-4);
+    assert!((result.data[1] - 10.0).abs() < 1e-4);
+}
+
+#[test]
+fn reference_cpu_attention_grouped_query_shares_kv_heads() {
+    // 2 query heads sharing 1 kv head (head_dimension = 2).
+    let q = reference_cpu_host_tensor([1, 4], [1.0, 0.0, 0.0, 1.0]);
+    let k = reference_cpu_host_tensor([1, 2], [5.0, 6.0]);
+    let v = reference_cpu_host_tensor([1, 2], [7.0, 8.0]);
+    let result = attention(&q, &k, &v, 2, 2, Some(1), None, false).unwrap();
+    // Single key position: every query head's output must equal v.
+    assert_eq!(result.data, vec![7.0, 8.0, 7.0, 8.0]);
+}
+
+#[test]
+fn reference_cpu_attention_rejects_incompatible_head_grouping() {
+    let q = reference_cpu_host_tensor([1, 4], [1.0, 0.0, 0.0, 1.0]);
+    let k = reference_cpu_host_tensor([1, 4], [5.0, 6.0, 7.0, 8.0]);
+    let v = k.clone();
+    // head_count 2 is not a multiple of kv_head_count 3.
+    assert!(attention(&q, &k, &v, 2, 2, Some(3), None, false).is_err());
+}
+
+#[test]
+fn reference_cpu_attention_window_size_restricts_context() {
+    let q = reference_cpu_host_tensor([3, 1], [0.0, 0.0, 0.0]);
+    let k = q.clone();
+    let v = reference_cpu_host_tensor([3, 1], [1.0, 2.0, 3.0]);
+    // window_size = 1: each position can only see itself.
+    let result = attention(&q, &k, &v, 1, 1, None, Some(1), true).unwrap();
+    assert_eq!(result.data, vec![1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn reference_cpu_layout_conversion_rejects_non_contiguous() {
+    let input = reference_cpu_host_tensor([1], [1.0]);
+    assert!(
+        layout_conversion(
+            &input,
+            TensorLayoutKind::Contiguous,
+            TensorLayoutKind::Contiguous
+        )
+        .is_ok()
+    );
+    assert!(
+        layout_conversion(
+            &input,
+            TensorLayoutKind::Contiguous,
+            TensorLayoutKind::Strided
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn reference_cpu_quantization_is_explicitly_unsupported() {
+    let error = dequantize_placeholder();
+    assert_eq!(error.id(), "reference-cpu-dtype-unsupported");
 }

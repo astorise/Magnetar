@@ -138,3 +138,27 @@ fn tensor_memory_class_is_derived_from_memory_placement() {
     let staged = MemoryPlacement::StagedTemporary(Box::new(MemoryPlacement::HostOrdinary));
     assert_eq!(TensorMemoryClass::from(&staged), TensorMemoryClass::Host);
 }
+
+#[test]
+fn reference_cpu_host_tensor_rejects_overflowing_shape() {
+    // The product of these dimensions wraps to 0 under unchecked u64
+    // multiplication, which would let an empty buffer pass the length check.
+    let error = HostTensor::new([1_u64 << 32, 1_u64 << 32], Vec::<f32>::new())
+        .expect_err("overflowing shape must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
+}
+
+#[test]
+fn reference_cpu_host_tensor_rejects_shape_beyond_address_space() {
+    let error = HostTensor::new([u64::MAX], Vec::<f32>::new())
+        .expect_err("shape beyond the address space must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
+}
+
+#[test]
+fn tensor_resource_debug_output_never_exposes_raw_pointers_or_handles() {
+    let resource = tensor_resource_for_test("tensor-debug-safety");
+    let text = format!("{resource:?}");
+    assert!(!text.contains("0x"));
+    assert!(!text.contains("handle="));
+}

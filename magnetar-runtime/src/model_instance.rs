@@ -2047,3 +2047,6 @@ fn validate_instance_identity(value: &str) -> Result<(), ModelInstanceError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

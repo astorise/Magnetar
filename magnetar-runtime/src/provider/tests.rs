@@ -238,3 +238,23 @@ fn provider_abi_handles_lifecycle_and_errors_are_internal_runtime_contracts() {
     assert_eq!(compute_error.code, ComputeErrorCode::ProviderUnavailable);
     assert_eq!(compute_error.phase, ComputeErrorPhase::Resolution);
 }
+
+#[test]
+fn load_valid_provider() {
+    let p = Arc::new(TestProvider::new("valid"));
+    let mut m = ProviderLoader::new();
+    m.register_provider(p.clone()).unwrap();
+    assert!(m.provider("valid").is_some());
+    assert!(p.initialized.load(Ordering::SeqCst));
+}
+
+#[test]
+fn provider_shutdown_releases_registered_provider() {
+    let p = TestProvider::new("provider");
+    let p = Arc::new(p);
+    let mut m = ProviderLoader::new();
+    m.register_provider(p.clone()).unwrap();
+    assert!(m.provider("provider").is_some());
+    m.shutdown().unwrap();
+    assert!(p.shut_down.load(Ordering::SeqCst));
+}

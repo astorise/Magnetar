@@ -21,6 +21,13 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use crate::component::MAGNETAR_RUNTIME_VERSION;
+use crate::compute::{
+    COMPUTE_CAPABILITY_VERSION, ComputeCapabilitySupport, ComputeDType, ComputeDataMovementKind,
+    ComputeDataMovementSupport, ComputeLayout, ComputeOperationFamily, ComputeOperationSupport,
+    ComputePrecision, DataMovementSupport, HostBufferEncoding, OperationFamilySupport,
+    ProviderComputeAdvertisement, compute_capability,
+};
 struct TestProvider {
     metadata: ProviderMetadata,
     initialized: AtomicBool,
@@ -190,4 +197,90 @@ fn reference_cpu_provider_passes_generic_conformance_core_profile() {
         "Reference CPU Provider failed conformance: {:?}",
         report.failed_tests
     );
+}
+
+#[test]
+fn provider_conformance_suite_reports_core_compute_and_data_movement_success() {
+    let mut provider = TestProvider::new("magnetar.test.conformant");
+    provider.metadata.capabilities.insert(compute_capability());
+    let operation_support = ComputeOperationSupport::new()
+        .with_dtypes([ComputeDType::Float32])
+        .with_layouts([ComputeLayout::Dense])
+        .with_precision_modes([ComputePrecision::Default]);
+    provider.metadata.compute_advertisement = ProviderComputeAdvertisement::new()
+        .with_capability(
+            ComputeCapabilitySupport::default().with_versions([COMPUTE_CAPABILITY_VERSION]),
+        )
+        .with_operation_family(OperationFamilySupport::from_operation_support(
+            ComputeOperationFamily::Elementwise,
+            operation_support,
+        ))
+        .with_data_movement(DataMovementSupport::from_compute_support(
+            ComputeDataMovementKind::Upload,
+            ComputeDataMovementSupport::new()
+                .with_dtypes([ComputeDType::Float32])
+                .with_layouts([ComputeLayout::Dense])
+                .with_host_encodings([HostBufferEncoding::RawBytes]),
+        ));
+
+    let suite =
+        ProviderConformanceSuite::new(ProviderConformanceConfig::default().with_profiles([
+            ProviderConformanceProfile::ProviderCore,
+            ProviderConformanceProfile::ProviderCompute,
+            ProviderConformanceProfile::ProviderDataMovement,
+            ProviderConformanceProfile::ProviderObservability,
+        ]));
+    let report = suite.run(ProviderConformanceTarget::mock(Arc::new(provider)));
+
+    assert!(report.is_conformant(), "{report:#?}");
+    assert_eq!(report.suite_version, PROVIDER_CONFORMANCE_SUITE_VERSION);
+    assert_eq!(report.runtime_version, MAGNETAR_RUNTIME_VERSION);
+    assert!(report.passed_tests.iter().any(|result| {
+        result.profile == ProviderConformanceProfile::ProviderCompute
+            && result.requirement.contains("elementwise")
+    }));
+    assert!(report.passed_tests.iter().any(|result| {
+        result.profile == ProviderConformanceProfile::ProviderDataMovement
+            && result.requirement.contains("upload")
+    }));
+
+    let json = provider_conformance_report_json(&report).unwrap();
+    assert!(json.contains("\"provider_identity\": \"magnetar.test.conformant\""));
+    assert!(json.contains("\"suite_version\""));
+}
+
+#[test]
+fn first_native_model_execution_profile_validation_rejects_incomplete_profiles() {
+    let mut profile = first_native_model_execution_profile();
+    profile.version.clear();
+    assert!(matches!(
+        profile.validate(),
+        Err(FirstNativeModelExecutionProfileError::MissingVersion)
+    ));
+
+    let mut profile = first_native_model_execution_profile();
+    profile
+        .mandatory_capabilities
+        .remove(&FirstNativeProfileCapability::KernelRegistry);
+    assert!(matches!(
+        profile.validate(),
+        Err(
+            FirstNativeModelExecutionProfileError::MissingMandatoryCapability(
+                FirstNativeProfileCapability::KernelRegistry
+            )
+        )
+    ));
+
+    let mut profile = first_native_model_execution_profile();
+    profile
+        .deferred_capabilities
+        .remove(&FirstNativeDeferredCapability::TensorParallel);
+    assert!(matches!(
+        profile.validate(),
+        Err(
+            FirstNativeModelExecutionProfileError::MissingDeferredCapability(
+                FirstNativeDeferredCapability::TensorParallel
+            )
+        )
+    ));
 }

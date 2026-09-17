@@ -175,3 +175,45 @@ fn model_format_roadmap_sentencepiece_unsupported_feature_fails_explicitly() {
         Err(ModelFormatRoadmapError::SentencePieceUnsupported { .. })
     ));
 }
+
+#[test]
+fn model_format_roadmap_phases_are_ordered_1_through_12() {
+    let mut ordinals: Vec<u8> = MODEL_FORMAT_ROADMAP_PHASES
+        .iter()
+        .map(|phase| phase.ordinal())
+        .collect();
+    ordinals.sort_unstable();
+    assert_eq!(ordinals, (1..=12).collect::<Vec<_>>());
+    for phase in MODEL_FORMAT_ROADMAP_PHASES {
+        assert!(!phase.id().is_empty());
+        assert!(phase.normalizes_into_existing_contract());
+    }
+}
+
+#[test]
+fn model_format_roadmap_rejects_format_shaped_provider_names() {
+    for name in [
+        "GGUFProvider",
+        "SafetensorsProvider",
+        "QwenSafetensorsProvider",
+        "sentencepiece-provider",
+        "tokenizer-json-provider",
+    ] {
+        assert!(
+            reject_model_format_provider_name(name).is_err(),
+            "{name} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn model_format_roadmap_format_parsers_cannot_supply_execution_graphs() {
+    assert!(reject_format_execution_graph(true).is_err());
+    assert!(reject_format_execution_graph(false).is_ok());
+}
+
+#[test]
+fn model_format_roadmap_tokenizer_config_requires_explicit_runtime_validation() {
+    assert!(reject_silent_tokenizer_config_override(false).is_err());
+    assert!(reject_silent_tokenizer_config_override(true).is_ok());
+}

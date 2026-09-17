@@ -880,3 +880,33 @@ fn kernel_manifest_evaluate_trust_pipeline_stage_delegates_to_sole_authority() {
     );
     assert!(!evaluate_manifest_trust(false).is_trusted());
 }
+
+#[test]
+fn kernel_bundle_path_safety_rejects_traversal_and_absolute_paths() {
+    for bad in [
+        "../escape",
+        "/etc/passwd",
+        "C:/Windows/system32",
+        "a/../../b",
+        "\\\\server\\share",
+    ] {
+        assert!(
+            validate_bundle_relative_path(bad).is_err(),
+            "expected '{bad}' to be rejected"
+        );
+    }
+    assert!(validate_bundle_relative_path("blobs/sha256/deadbeef").is_ok());
+}
+
+#[test]
+fn kernel_manifest_embedded_byte_accounting_saturates_instead_of_overflowing() {
+    // The bundle validation pipeline accumulates declared blob sizes with
+    // `u64::saturating_add`, implementing "Reject overflow" (tasks, "Integer
+    // Safety"): summing sizes near `u64::MAX` must never wrap around or
+    // panic, even though no real bundle could actually contain that many
+    // bytes on disk.
+    let total = [u64::MAX, u64::MAX, 1_u64]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add);
+    assert_eq!(total, u64::MAX);
+}

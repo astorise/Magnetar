@@ -256,3 +256,30 @@ fn preparation_only_provider_is_a_valid_distinct_support_level() {
     assert!(descriptor.validate().is_ok());
     assert!(descriptor.accepted_source_formats.is_empty());
 }
+
+#[test]
+fn compilation_success_never_grants_trust_by_itself() {
+    assert!(!compilation_result_trust(false).is_trusted());
+    assert!(compilation_result_trust(true).is_trusted());
+}
+
+#[test]
+fn compiler_crash_is_normalized_and_redacted_never_a_success() {
+    let error = normalize_compiler_crash("segfault at C:\\temp\\compiler\\work\\0xdeadbeef");
+    match &error {
+        KernelCompilationError::CompilerCrashed { detail } => {
+            assert_eq!(detail, "[redacted backend diagnostic]");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(error.id(), "kernel-compilation-compiler-crashed");
+}
+
+#[test]
+fn compiler_flags_are_redacted_by_default() {
+    let identity = CompilerIdentity::default().with_raw_flags("-I C:\\vendor\\include -DSECRET=1");
+    assert_eq!(
+        identity.flags_fingerprint.as_deref(),
+        Some("[redacted backend diagnostic]")
+    );
+}

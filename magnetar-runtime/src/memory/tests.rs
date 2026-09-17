@@ -5,6 +5,9 @@
 
 use super::*;
 
+use crate::affinity::{DeviceBinding, FallbackClass, ProviderBinding, ResourceAffinity};
+use crate::compute::{HostStagingPolicy, TensorResourceId};
+use crate::device::DeviceId;
 #[test]
 fn memory_manager_admission_uses_pressure_and_queue_policy() {
     let manager = MemoryManager::default();
@@ -181,5 +184,75 @@ fn memory_manager_pending_queue_times_out_cancels_and_retries() {
             .observations()
             .iter()
             .any(|observation| { observation.kind == MemoryObservationKind::PendingQueueDelay })
+    );
+}
+
+#[test]
+fn memory_manager_observes_zero_copy_staging_pinned_and_browser_policy() {
+    let mut manager = MemoryManager::new(MemoryManagerConfig {
+        max_pinned_host_bytes: 16,
+        allow_browser_linear_memory: false,
+        ..MemoryManagerConfig::default()
+    });
+    let affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
+        .with_provider(ProviderBinding::new("compute"));
+    let source = TensorResidency::new(
+        TensorResourceId::new("tensor:0"),
+        MemoryPlacement::HostOrdinary,
+        affinity,
+    );
+
+    let accepted =
+        manager.observed_zero_copy_feasibility(&source, &MemoryPlacement::HostOrdinary, None);
+    assert!(accepted.feasible);
+    let rejected = manager.observed_zero_copy_feasibility(
+        &source,
+        &MemoryPlacement::Device(DeviceBinding::new(DeviceId::new("gpu:0"))),
+        None,
+    );
+    assert!(!rejected.feasible);
+
+    assert!(
+        manager
+            .observed_staging_feasibility(HostStagingPolicy::Permit, 8)
+            .feasible
+    );
+    assert!(
+        !manager
+            .observed_staging_feasibility(HostStagingPolicy::Forbid, 8)
+            .feasible
+    );
+    assert!(matches!(
+        manager.allocate(MemoryAllocationRequest::new(
+            MemoryAllocationClass::BrowserLinearMemory,
+            8,
+            MemoryPlacement::BrowserLinearMemory,
+            MemoryAllocationOwner::Runtime,
+        )),
+        Err(MemoryError::UnsupportedPlacement(_))
+    ));
+    assert!(
+        manager
+            .observations()
+            .iter()
+            .any(|observation| { observation.kind == MemoryObservationKind::ZeroCopyAccepted })
+    );
+    assert!(
+        manager
+            .observations()
+            .iter()
+            .any(|observation| { observation.kind == MemoryObservationKind::ZeroCopyRejected })
+    );
+    assert!(
+        manager
+            .observations()
+            .iter()
+            .any(|observation| { observation.kind == MemoryObservationKind::StagingInserted })
+    );
+    assert!(
+        manager
+            .observations()
+            .iter()
+            .any(|observation| { observation.kind == MemoryObservationKind::StagingDenied })
     );
 }
