@@ -1,9 +1,10 @@
-[workspace]
-
 [package]
 name = "magnetar-integration-production-loading"
 version = "0.1.0"
 edition = "2024"
+# #64: member of ../../submodule-workspace -- see that manifest's own
+# comment.
+workspace = "../../submodule-workspace"
 license = "MIT"
 # Never published: this crate exists only to run the real production
 # Qwen loading pipeline end to end against a real external ingestor

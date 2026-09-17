@@ -1,9 +1,10 @@
-[workspace]
-
 [package]
 name = "magnetar-integration-multi-device-cpu-cuda"
 version = "0.1.0"
 edition = "2024"
+# #64: member of ../../submodule-workspace -- see that manifest's own
+# comment.
+workspace = "../../submodule-workspace"
 license = "MIT"
 # Never published: this crate exists only to prove a single Runtime can
 # register two real, heterogeneous Providers (Reference CPU +  CUDA)

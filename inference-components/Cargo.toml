@@ -1,9 +1,9 @@
-[workspace]
-
 [package]
 name = "magnetar-inference-component"
 version = "0.1.0"
 edition = "2024"
+# #64: member of ../submodule-workspace -- see that manifest's own comment.
+workspace = "../submodule-workspace"
 license = "MIT"
 publish = false
 

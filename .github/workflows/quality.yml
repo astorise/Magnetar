@@ -443,12 +443,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # `integration-tests/cuda-first-native` was previously in no
-          # workflow at all (not merely GPU-gated -- #58): this GPU-less
-          # runner exercises its graceful `!provider.is_available()`
-          # early-return path, the same shape `multi-device-cpu-cuda`
-          # already covers here; the real CUDA-hardware run happens on
-          # `gpu-runner-smoke.yml`.
           for manifest in \
             components/qwen/Cargo.toml \
             components/llama/Cargo.toml \
@@ -462,57 +456,50 @@ jobs:
             providers/npu/Cargo.toml \
             providers/tpu/Cargo.toml \
             loaders/huggingface/Cargo.toml \
-            loaders/gguf/Cargo.toml \
-            integration-tests/production-loading/Cargo.toml \
-            integration-tests/multi-device-cpu-cuda/Cargo.toml \
-            integration-tests/cuda-first-native/Cargo.toml \
-            inference-components/Cargo.toml
+            loaders/gguf/Cargo.toml
           do
             echo "::group::$manifest"
             cargo test --locked --manifest-path "$manifest"
             echo "::endgroup::"
           done
-      # `magnetar-cli` moved out of the repository root's `[workspace]`
-      # (`implement-production-qwen-model-loading` task 10.4): it depends
-      # on `loaders/huggingface`, so a plain root-level `cargo check`/
-      # `clippy`/`test`/`fmt --all` (which run with submodules absent) can
-      # no longer cover it. This is the one job that checks it out
-      # recursively, so it is the one job that builds, tests, formats, and
-      # lints `magnetar-cli` now -- not merely `cargo test` like the other
-      # submodule crates above, since `magnetar-cli` is first-party code
-      # this repository owns directly, not an externalized module.
-      - name: Format-check magnetar-cli
+      # `magnetar-cli`, `inference-components`, and the three
+      # `integration-tests/*` crates are first-party code this repository
+      # owns directly (not externalized modules), but each depends on a
+      # submodule absent from a plain root-level build (`loaders/
+      # huggingface`, `loaders/gguf`, `providers/cpu`, `providers/cuda`) --
+      # `implement-production-qwen-model-loading` task 10.4 moved
+      # `magnetar-cli` out of the repository root's `[workspace]` for
+      # exactly this reason, and the other four followed the same pattern
+      # independently over time (#64: five separate `[workspace]` tables,
+      # five separate `Cargo.lock`s, three of the five never even covered
+      # by a `cargo fmt`/`clippy` step -- `integration-tests/cuda-first-
+      # native` was in no workflow at all before #58,
+      # `inference-components` was built and tested nowhere before this
+      # job first added it). All five now share one `[workspace]` in
+      # `submodule-workspace/Cargo.toml` (each declares
+      # `package.workspace = "../submodule-workspace"` or
+      # `"../../submodule-workspace"` instead of its own `[workspace]`
+      # table), so this is the one job that checks them out recursively
+      # and the one place that now builds, tests, formats, and lints all
+      # five together, in the same `--workspace` shape the root-level jobs
+      # above use for `magnetar-runtime`.
+      - name: Format-check the submodule workspace
         shell: bash
-        run: cargo fmt --manifest-path magnetar-cli/Cargo.toml --all -- --check
-      - name: Check and test magnetar-cli
+        run: cargo fmt --manifest-path submodule-workspace/Cargo.toml --all -- --check
+      - name: Check and test the submodule workspace
         shell: bash
         run: |
           set -euo pipefail
-          cargo check --locked --manifest-path magnetar-cli/Cargo.toml --all-targets --all-features
-          cargo test --locked --manifest-path magnetar-cli/Cargo.toml --all-targets
-      - name: Clippy magnetar-cli
+          cargo check --locked --manifest-path submodule-workspace/Cargo.toml --workspace --all-targets --all-features
+          cargo test --locked --manifest-path submodule-workspace/Cargo.toml --workspace --all-targets --all-features
+      - name: Clippy the submodule workspace
         shell: bash
-        run: cargo clippy --locked --manifest-path magnetar-cli/Cargo.toml --all-targets --all-features -- -D warnings
-      - name: Build magnetar-cli documentation
+        run: cargo clippy --locked --manifest-path submodule-workspace/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+      - name: Build submodule workspace documentation
         shell: bash
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --manifest-path magnetar-cli/Cargo.toml --no-deps
-      # `inference-components` (the Tachyon-facing `LoadedInferenceComponent`
-      # boundary the Tachyon integration audit itself reviewed) has the same
-      # shape as `magnetar-cli` above: its own `[workspace]`, moved out of
-      # the repository root because it depends on `loaders/gguf`/`loaders/
-      # huggingface`/`providers/cpu` submodules absent from a plain
-      # root-level build. Before this step it was built and tested nowhere
-      # in CI at all -- found while closing the audit's own outstanding
-      # gap (no integration test drove `LoadedInferenceComponent::load`
-      # itself), added here rather than silently left uncovered.
-      - name: Format-check inference-components
-        shell: bash
-        run: cargo fmt --manifest-path inference-components/Cargo.toml --all -- --check
-      - name: Clippy inference-components
-        shell: bash
-        run: cargo clippy --locked --manifest-path inference-components/Cargo.toml --all-targets -- -D warnings
+        run: cargo doc --locked --manifest-path submodule-workspace/Cargo.toml --workspace --no-deps
       # `implement-production-qwen-model-loading` task 12.8: production
       # loading/generation SHALL NOT call `fixture_model_manifest`, a
       # fixture tensor inventory builder, or require the literal
@@ -596,7 +583,7 @@ jobs:
       # rest.
       - name: Install cargo-deny
         uses: taiki-e/install-action@5724fe4561a201b0d36bddf13177e3557b43787b # cargo-deny
-      - name: Check magnetar-cli's own dependency graph (advisories, bans, licenses, sources)
+      - name: Check the submodule workspace's dependency graph (advisories, bans, licenses, sources)
         # `--allow wildcard --allow unlicensed`: `magnetar-format-safetensors`
         # and `magnetar-loader-huggingface` (external submodules this
         # repository does not own) declare neither `license` nor
@@ -605,28 +592,17 @@ jobs:
         # (`allow-wildcard-paths` only exempts a crate cargo-deny can see
         # is unpublishable). Not fixable from this repository; scoped to
         # exactly these two lint classes so a real license/bans/advisories/
-        # sources regression elsewhere in this 200-crate graph still fails
-        # the build.
-        run: cargo deny --manifest-path magnetar-cli/Cargo.toml check --allow wildcard --allow unlicensed
-      - name: Check inference-components' own dependency graph (advisories, bans, licenses, sources)
-        # Same exception, for the same reason -- this crate also reaches
-        # `magnetar-format-safetensors`, plus `magnetar-format-gguf`/
-        # `magnetar-loader-gguf`/`magnetar-provider-cpu`, all missing the
-        # same metadata.
-        run: cargo deny --manifest-path inference-components/Cargo.toml check --allow wildcard --allow unlicensed
+        # sources regression elsewhere in this graph still fails the
+        # build. `--manifest-path submodule-workspace/Cargo.toml` checks
+        # all five of `magnetar-cli`/`inference-components`/the three
+        # `integration-tests/*` crates in one resolved graph (#64) --
+        # cargo-deny's own default scope for a workspace manifest is every
+        # member, so this replaces what used to be five separate steps.
+        run: cargo deny --manifest-path submodule-workspace/Cargo.toml check --allow wildcard --allow unlicensed
       - name: Check loaders/huggingface's own dependency graph (advisories, bans, licenses, sources)
         run: cargo deny --manifest-path loaders/huggingface/Cargo.toml check --allow wildcard --allow unlicensed
       - name: Check loaders/gguf's own dependency graph (advisories, bans, licenses, sources)
         run: cargo deny --manifest-path loaders/gguf/Cargo.toml check --allow wildcard --allow unlicensed
-      # These three integration-test crates reach none of the
-      # still-unlicensed external submodules above, so no exception is
-      # needed -- a real regression here fails outright.
-      - name: Check integration-tests/production-loading's own dependency graph (advisories, bans, licenses, sources)
-        run: cargo deny --manifest-path integration-tests/production-loading/Cargo.toml check
-      - name: Check integration-tests/multi-device-cpu-cuda's own dependency graph (advisories, bans, licenses, sources)
-        run: cargo deny --manifest-path integration-tests/multi-device-cpu-cuda/Cargo.toml check
-      - name: Check integration-tests/cuda-first-native's own dependency graph (advisories, bans, licenses, sources)
-        run: cargo deny --manifest-path integration-tests/cuda-first-native/Cargo.toml check
 
   coverage:
     name: quality / coverage
