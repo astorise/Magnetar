@@ -1,6 +1,19 @@
 //! Post-baseline model format roadmap contract (see
 //! `openspec/changes/define-post-baseline-model-format-roadmap`).
 //!
+//! Kept inside `magnetar-runtime` rather than moved to the
+//! `magnetar-roadmap-contracts` crate with the other six roadmap/
+//! release-process modules (#62): despite the "roadmap, not
+//! implementation" framing below, `loaders/huggingface` -- a real,
+//! external submodule, the production Hugging Face ingestion path --
+//! already depends on [`HfConfigMetadata`], [`HfRopeMetadata`],
+//! [`GenerationConfigMetadata`], [`PaddingSide`], [`TokenizerConfigMetadata`],
+//! [`TruncationSide`], and [`detect_duplicate_tensor_names`] as real,
+//! load-bearing production API, not an illustrative contract. Moving this
+//! module would have broken that submodule's build; this module also
+//! depends on [`crate::provider_roadmap`], which stays for the same
+//! reason (nothing else forced it to stay on its own).
+//!
 //! The first Magnetar baseline uses fixture model artifacts only -- small,
 //! deterministic, local, CPU-only, and conformance-friendly. This module does
 //! not implement byte-level safetensors/GGUF/SentencePiece parsers, does not
@@ -74,12 +87,13 @@ use crate::{
     ModelLicenseMetadata, ModelManifest, ModelName, ModelProvenance, ModelQuantization,
     ModelRevision, ModelShard, ModelShardId, ModelTensorMetadata, ModelTrustDecision,
     ModelTrustStore, SpecialToken, TokenIdRange, TokenizerArtifactId, TokenizerFamily, TokenizerId,
-    TokenizerMetadata, TokenizerRevision,
+    TokenizerMetadata, TokenizerRevision, compute::redact_backend_diagnostic,
 };
 use crate::{
-    compute::redact_backend_diagnostic,
-    provider_roadmap::{reject_hidden_dequantization, validate_quantization_declaration},
+    provider_roadmap::reject_hidden_dequantization,
+    provider_roadmap::validate_quantization_declaration,
 };
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -1518,7 +1532,7 @@ pub fn run_model_format_roadmap_conformance() -> ModelFormatRoadmapConformanceRe
         record(
             &mut results,
             "an unrecognized digest is not trusted merely because the format parsed",
-            decision.status == crate::ModelTrustStatus::Unknown,
+            decision.status() == crate::ModelTrustStatus::Unknown,
             format!("unexpected trust decision: {decision:?}"),
         );
     }

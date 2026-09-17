@@ -20,3 +20,8 @@ publish = false
 [dependencies]
 magnetar-runtime = { path = "../magnetar-runtime", version = "0.1.0" }
 magnetar-loader-huggingface = { path = "../loaders/huggingface" }
+# `magnetar release-version`/`magnetar version` (commands.rs) build a
+# ReleaseBinaryVersionReport -- release_packaging's own #62 move out of
+# magnetar-runtime revealed this as the one real, non-doc-comment
+# dependency magnetar-cli had on a roadmap/release-process module.
+magnetar-roadmap-contracts = { path = "../roadmap-contracts" }

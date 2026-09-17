@@ -3197,7 +3197,11 @@ impl ComputeDiagnostic {
     }
 }
 
-pub(crate) fn redact_backend_diagnostic(message: &str) -> String {
+/// Public (not `pub(crate)`): unlike [`crate::model::ModelTrustDecision`]'s
+/// fields, this carries no authority -- it's a stateless text redaction the
+/// `magnetar-roadmap-contracts` crate's own release/security diagnostic
+/// contracts (#62) need to reproduce identically outside this crate.
+pub fn redact_backend_diagnostic(message: &str) -> String {
     let contains_native_handle = message.contains("0x") || message.contains("handle=");
     let contains_path = message.contains('\\') || message.contains('/');
     if contains_native_handle || contains_path {

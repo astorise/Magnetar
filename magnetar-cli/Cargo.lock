@@ -810,6 +810,7 @@ name = "magnetar-cli"
 version = "0.1.0"
 dependencies = [
  "magnetar-loader-huggingface",
+ "magnetar-roadmap-contracts",
  "magnetar-runtime",
 ]
 
@@ -832,6 +833,13 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokenizers",
+]
+
+[[package]]
+name = "magnetar-roadmap-contracts"
+version = "0.1.0"
+dependencies = [
+ "magnetar-runtime",
 ]
 
 [[package]]

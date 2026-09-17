@@ -22,13 +22,15 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use magnetar_loader_huggingface::HuggingFaceIngestor;
+use magnetar_roadmap_contracts::release_packaging::{
+    ReleaseVersion, build_release_binary_version_report,
+};
 use magnetar_runtime::{
     CliBoundaryError, InferenceApiError, ModelArtifactSource, ModelInstanceId,
     ModelInstanceUnloadPolicy, ModelLoadingApiRequest, ModelLoadingCoordinator,
     ModelLoadingRequest, ModelLoadingRequestId, ModelRef, ModelRegistry, ModelResolutionRequest,
-    ProductionModelArtifactIngestor, ProductionModelSource, ReferenceCpuProvider, ReleaseVersion,
-    Runtime, build_release_binary_version_report, load_model, load_production_qwen_instance,
-    unload_model_instance,
+    ProductionModelArtifactIngestor, ProductionModelSource, ReferenceCpuProvider, Runtime,
+    load_model, load_production_qwen_instance, unload_model_instance,
 };
 
 use crate::observability::{CliObservationKind, CliObserver};
@@ -933,7 +935,7 @@ fn cmd_devices() -> Result<(), CliBoundaryError> {
 
 /// `magnetar version` / `magnetar --version` / `magnetar -V`. Builds and
 /// prints the release binary version report defined by
-/// `magnetar_runtime::release_packaging::build_release_binary_version_report`
+/// `magnetar_roadmap_contracts::release_packaging::build_release_binary_version_report`
 /// (see `openspec/changes/define-release-packaging-and-versioning-policy`).
 /// `magnetar-cli`'s own crate version (`env!("CARGO_PKG_VERSION")`) is the
 /// binary version; the build profile is derived from `debug_assertions`

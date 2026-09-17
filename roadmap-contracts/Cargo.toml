@@ -1,0 +1,19 @@
+[package]
+name = "magnetar-roadmap-contracts"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+# Never published, and never a magnetar-runtime consumer's dependency: this
+# crate holds executable roadmap/release-process contracts (#62) that used
+# to be `pub mod` + `pub use ...::*` inside magnetar-runtime itself, which
+# made ~432 items of undone-work description and this repository's own
+# release process part of every embedder's compiled dependency and public
+# API surface. Moving them here keeps "the roadmap is executable Rust, not
+# prose" (their own doc comments' framing) without shipping to consumers;
+# their conformance tests still run in CI exactly as before, just from this
+# crate's own `cargo test` instead of magnetar-runtime's.
+publish = false
+description = "Executable roadmap and release-process contracts for the Magnetar project (not part of magnetar-runtime's public API)."
+
+[dependencies]
+magnetar-runtime = { path = "../magnetar-runtime", version = "0.1.0" }

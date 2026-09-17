@@ -233,13 +233,16 @@ jobs:
   # their own doc comments); `first_native_implementation_cut.rs` and
   # `e2e_conformance.rs` are explicitly scoped to the first-native
   # (currently Qwen) cut and to test/conformance fixtures respectively, not
-  # generic Core; `model_format_roadmap.rs`, `model_source_cache_roadmap.rs`,
-  # `provider_roadmap.rs`, `release_cutover.rs`, `release_packaging.rs`, and
-  # `release_security.rs` are roadmap/release-process files whose explicit
+  # generic Core. The roadmap/release-process files this guard used to name
+  # here (`model_format_roadmap.rs`, `model_source_cache_roadmap.rs`,
+  # `provider_roadmap.rs`, `release_cutover.rs`, `release_packaging.rs`,
+  # `release_security.rs`) no longer live in `magnetar-runtime/src/` at all
+  # -- they moved to the `roadmap-contracts/` crate (#62), whose explicit
   # purpose is to name specific model families (planned format/provider
-  # support, the current release's own Qwen-baseline scope) -- naming a
+  # support, the current release's own Qwen-baseline scope); naming a
   # family there is the point, not a leak, so this guard does not apply to
-  # them. `tests.rs` and other `#[cfg(test)]`-only modules are exempt for
+  # them, and now can't even see them. `tests.rs` and other
+  # `#[cfg(test)]`-only modules are exempt for
   # the same reason as the "explicitly isolated tests/oracles" carve-out in
   # the tracking issue: a fixture identifier string is not live Core logic.
   model-family-isolation:
@@ -640,8 +643,19 @@ jobs:
       - name: Prepare coverage output
         run: mkdir -p target/llvm-cov
       - name: Generate coverage
+        # `--exclude-from-report magnetar-roadmap-contracts`: that crate
+        # still builds and its own tests still run here (part of
+        # `--workspace`), but its ~17,500 lines of executable roadmap/
+        # release-process contracts (#62) are near-100%-covered by
+        # construction (they're conformance tests for their own module) and
+        # would otherwise reinflate this ratchet the same way #54 found
+        # them doing when they lived inside magnetar-runtime itself --
+        # `roadmap_contracts` (crate name, not package name) since
+        # `--exclude-from-report`/`--exclude` match the library/binary
+        # name cargo-llvm-cov resolves per-crate, not the `[package] name`.
         run: >
           cargo llvm-cov --locked --workspace --all-targets --all-features
+          --exclude-from-report magnetar-roadmap-contracts
           --ignore-filename-regex '(^|/)(target|tests?)/'
           --json --summary-only --output-path target/llvm-cov/coverage.json
       - name: Generate LCOV artifact

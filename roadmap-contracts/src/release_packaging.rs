@@ -65,12 +65,12 @@
 //! - [`ReleasePackagingError`]: structured error categories.
 //! - [`ReleasePackagingConformanceReport`] / [`run_release_packaging_conformance`]:
 //!   a conformance report, in the shape of
-//!   [`crate::CliBoundaryConformanceReport`], asserting the guarantees above
+//!   [`magnetar_runtime::CliBoundaryConformanceReport`], asserting the guarantees above
 //!   hold.
 
 use std::{collections::BTreeMap, error::Error, fmt};
 
-use crate::{
+use magnetar_runtime::{
     E2E_SUITE_VERSION, FIRST_OPERATOR_SCOPE_VERSION, MAGNETAR_RUNTIME_VERSION,
     PROVIDER_CONFORMANCE_SUITE_VERSION, QWEN_BASELINE_CONTRACT_VERSION, WitInterface,
     compute::redact_backend_diagnostic,
@@ -1412,7 +1412,7 @@ impl Error for ReleasePackagingError {}
 // ---------------------------------------------------------------------
 
 /// A single release packaging conformance check result, mirroring
-/// [`crate::CliBoundaryConformanceResult`].
+/// [`magnetar_runtime::CliBoundaryConformanceResult`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleasePackagingConformanceResult {
     pub requirement: String,

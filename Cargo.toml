@@ -16,5 +16,8 @@
 # `[workspace]` table anyway, which meant `cargo fmt`/`clippy -D warnings`/
 # `test` at the repository root never covered the one tool that gates every
 # other change's coverage (#60). Folded in here instead.
-members = ["magnetar-runtime", "tools/coverage-ratchet"]
+#
+# `roadmap-contracts` also has none of that: it depends on magnetar-runtime
+# only (#62), so it belongs here for the same reason.
+members = ["magnetar-runtime", "tools/coverage-ratchet", "roadmap-contracts"]
 resolver = "2"
