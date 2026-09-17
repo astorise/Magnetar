@@ -7,7 +7,6 @@ use super::*;
 use crate::conformance::validate_first_native_component_engine_capabilities;
 
 use crate::session::InferenceSessionId;
-use std::collections::BTreeSet;
 use std::fs;
 fn component_artifact_package(
     bytes: &[u8],
@@ -998,20 +997,23 @@ fn component_observations_are_non_authoritative_and_redacted() {
 
 #[test]
 fn pushed_component_package_temp_materialization_is_removed_with_manager() {
-    let before = std::fs::read_dir(std::env::temp_dir())
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("magnetar-distributed-component-"))
-        })
-        .collect::<BTreeSet<_>>();
     let bytes = b"component-bytes-cleanup";
     let digest = ComponentDigest::sha256(bytes);
     let package =
         component_artifact_package(bytes, ComponentDistributionSourceKind::ClientProvided);
+    // `prepare_pushed_package`'s temp directory name is
+    // "magnetar-distributed-component-{digest}-{counter}": the digest
+    // portion is this test's own (from its own literal `bytes`), so
+    // matching on that full prefix -- rather than the bare
+    // "magnetar-distributed-component-" prefix every such directory
+    // shares -- can no longer pick up a directory some other,
+    // concurrently-running test created under `cargo test`'s default
+    // thread-parallel execution (a prior version of this test raced on
+    // exactly that and flaked in CI).
+    let expected_prefix = format!(
+        "magnetar-distributed-component-{}-",
+        digest.value.replace(':', "-")
+    );
     let materialized = {
         let mut manager = ComponentManager::new();
         manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value.clone()));
@@ -1021,11 +1023,9 @@ fn pushed_component_package_temp_materialization_is_removed_with_manager() {
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .find(|path| {
-                !before.contains(path)
-                    && path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("magnetar-distributed-component-"))
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&expected_prefix))
             })
             .expect("distributed component package materialized")
     };
