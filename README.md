@@ -539,9 +539,107 @@ existing `multi_device_placement` data-model types were tied to a real
 execution's own data for the first time, though full production
 `ModelInstance`-level placement across more than one real GPU remains
 unimplemented -- `ModelInstancePlacement` still structurally binds one
-Provider/Device per instance, and this repository has only one real GPU
-to verify a multi-GPU case against even once implemented. Mistral/Gemma
-Model Components remain future work.
+Provider/Device per instance.
+
+`add-real-second-gpu-cuda-provider` corrected that "only one real GPU"
+premise for CI specifically: the user identified that `arc-gpu-magnetar`'s
+CI node genuinely has two real GPUs, and the reason they were not both
+visible turned out to be a real, isolated infrastructure gap -- its
+per-job Kubernetes pod resource request (`nvidia.com/gpu`, in the separate
+`talos` cluster-config repository, outside this repository's own git
+history) asked for only 1, while sibling job hooks on the same cluster
+already asked for 2. Raised and applied directly to the live cluster,
+re-verified via a real `gpu-runner-smoke.yml` dispatch showing both GPUs
+in `nvidia-smi`'s own output. `providers/cuda` gained
+`CudaProvider::for_device(ordinal, provider_name)`, binding to a specific
+real GPU ordinal under a distinct Provider name -- required because
+`Runtime`'s `ProviderLoader` rejects a second `register_provider` call
+under an already-registered name outright, so two `CudaProvider`s bound
+to two different real GPUs could not coexist in one Runtime before this;
+`new()` remains exactly `for_device(0, CUDA_PROVIDER_NAME)`, verified
+unchanged. `integration-tests/multi-device-cpu-cuda` gained a real
+two-GPU test genuinely executing a chained computation across two
+physically distinct real GPUs (verified on `arc-gpu-magnetar`, gracefully
+skipping on this repository's own single-GPU development workstation and
+most other hosts).
+
+`add-real-peer-to-peer-gpu-movement` closed the peer-access gap the same
+way: `providers/cuda` gained a real `peer` module wrapping the real
+`cuDeviceCanAccessPeer`/`cuCtxEnablePeerAccess` driver entry points
+directly (`cudarc` itself has no safe wrapper for either), and
+`CudaExecutor::copy_tensor_from_peer_admitted`, a real cross-GPU
+device-to-device copy (`cuMemcpyPeerAsync`) that never touches host
+memory -- structurally distinct from every other cross-Device movement in
+this repository, which all explicitly stage through the host. Verified
+genuinely executing (not skipped) on the real two-GPU CI node: the real
+peer-capability query returned true, real peer access was enabled, and
+the real cross-GPU copy produced a byte-identical result.
+
+`add-real-per-device-memory-feasibility-ranking` drove
+`magnetar-runtime`'s existing `PlacementCandidate`/`select_lowest_cost_
+eligible` eligibility-and-ranking logic (real since before this session,
+but only ever exercised by its own synthetic unit-test fixtures) with a
+real GPU's real, full memory capacity for the first time, verified
+genuinely on the CI node's real hardware -- also proving eligibility is
+checked before cost ranking, using real candidate data.
+
+`add-real-device-loss-degraded-replan-state-machine` closed the fourth
+and last of these follow-up items: a real, two-real-GPU-derived
+`MultiDevicePlacementPlan` is transitioned to `Invalidated` and the real,
+unmodified state machine is confirmed to refuse reverting it back to
+`Ready` in place, verified genuinely on the CI node. Honestly, explicitly
+**not** a hardware-failure-injection test -- this repository's tooling has
+no safe way to force a real GPU to disappear on shared CI infrastructure,
+so the "loss" event itself is a real, caller-driven transition, not a
+hardware-detected one; what is real is the Plan's own Device-derived data
+and the state-machine code itself.
+
+`add-real-multi-device-model-instance-placement` then closed the one
+item every prior sub-chantier above had deliberately deferred: real
+production `ModelInstance`-level placement across more than one real
+GPU. `ModelInstancePlacement` itself remains structurally single-Device
+per instance, untouched -- the "safe" design chosen over invasively
+generalizing `ctx.provider` at 30+ dispatch call sites is two separate,
+ordinary `ModelInstance`s, each bound to its own real Provider/Device
+and materializing only its own real decoder-layer range's weights, with
+the boundary hidden-state tensor moved between them via an explicit
+Host round trip (later replaced -- see below -- by a real zero-Host-
+round-trip peer-to-peer copy). `model-component-graph.wit` gained `1.3.0`'s
+`build-prefill-graph-segment`/`build-decode-graph-segment` (purely
+additive) so the real Qwen Component can build a graph for one layer
+range instead of always the whole stack. Verified in three real,
+increasingly deep steps, each building on the last: bit-for-bit
+identical to the full graph on Reference CPU against a synthetic
+fixture; on two real, physically distinct GPUs for a real prefill;
+and, finally, on two real GPUs running a real multi-step greedy
+generation loop against the real, public Qwen2.5-0.5B-Instruct
+checkpoint (`tests_real_checkpoint_smoke.rs`'s own checkpoint),
+producing exactly the same generated token ids as the real full,
+unsegmented graph dispatched on one real GPU alone. Along the way, real
+hardware testing caught and fixed two real bugs: a Component-side tied-
+embeddings alias failure for a segment reaching the lm-head without
+owning the embedding lookup, and a `magnetar-runtime` per-layer KV-state
+bug (a `Vec`'s position silently stopped meaning "real layer number"
+the moment a graph could touch an arbitrary layer range, not just
+`0..N`) -- both fixed before any real-hardware dispatch was attempted
+against them. The explicit Host round trip for the boundary tensor has
+since been replaced with the already-proven zero-Host-round-trip
+`CudaExecutor::copy_tensor_from_peer_admitted` primitive: a new
+`QwenSegmentBoundaryInput::Resident` path lets a segment's
+`input.hidden_states_in` edge be satisfied by a real Device-resident
+peer copy instead of a Host-staged write, with the pre-existing
+Host-staged path (`QwenSegmentBoundaryInput::Host`) kept unchanged
+for every other caller. Verified on two real, physically distinct
+GPUs -- genuine peer-to-peer, no skip -- producing logits identical
+to the unsegmented full-graph reference.
+
+Memory-feasibility ranking against a *genuinely heterogeneous* real
+budget (the two real GPUs available are identical, so the infeasibility
+case uses one deliberately, honestly constrained artificial budget
+instead) and real hardware-failure-injection for Device loss (no safe
+mechanism exists) remain unverified -- both are permanent limitations of
+this repository's current hardware/tooling, not open chantiers. Mistral/
+Gemma Model Components remain future work.
 
 **Tachyon integration audit** (`docs/audits/audit-magnetar-integration-
 tachyon-2026-09-13.md`, a separate review from the scope-charter

@@ -19,9 +19,18 @@
 //! as this repository's precedent for exercising the generic dispatch
 //! contract without the Qwen-specific machinery built on top of it.
 //!
-//! What this test proves, for real, on this repository's own hardware
-//! (Reference CPU + a real NVIDIA GPU -- no second GPU exists anywhere in
-//! this repository's tooling):
+//! Two `#[test]` functions live here: one CPU+CUDA (verified on this
+//! development workstation's single real GPU, and gracefully on any
+//! GPU-less CI runner), and one real two-CUDA-GPU proof
+//! (`add-real-second-gpu-cuda-provider`) -- verified on `arc-gpu-magnetar`'s
+//! CI node, which genuinely has two real GPUs, once its per-job Kubernetes
+//! pod resource request (`nvidia.com/gpu`) was raised from 1 to 2, a real,
+//! separate infrastructure fix this change's own verification found
+//! necessary. This development workstation itself has only one real GPU,
+//! so the two-GPU test gracefully skips here -- see its own doc comment.
+//!
+//! What the CPU+CUDA test proves, for real, on this repository's own
+//! hardware:
 //!
 //! - A single `Runtime` can hold two real Providers' Kernels in one shared
 //!   Kernel Registry at once (nothing in `Runtime::register_provider`
@@ -67,33 +76,114 @@
 //!   drove or gated that execution, which nothing in this codebase
 //!   currently consults `MultiDevicePlacementPlan` to do.
 //!
-//! What this deliberately does **not** attempt (real future work, not
-//! silently assumed): peer-to-peer GPU-to-GPU movement or per-Device memory
-//! feasibility ranking against a real multi-GPU budget (no second GPU
-//! exists here to exercise either against), Device-loss/degraded-replan
-//! behavior, placement-generation republishing under live in-flight
-//! traffic, having `MultiDevicePlacementPlan` actually gate or drive
-//! dispatch (nothing in this codebase consults it today -- it remains a
-//! real, structurally-validated record, not yet an enforced contract), or
-//! wiring any of this into `ModelInstance`/production Qwen graph execution.
+//! A third test, `two_real_cuda_gpus_move_a_tensor_via_real_peer_to_peer_
+//! copy_not_host_staging`, proves real CUDA peer-to-peer GPU-to-GPU memory
+//! access (`add-real-peer-to-peer-gpu-movement`): `providers/cuda`'s new
+//! `peer` module wraps the real `cuDeviceCanAccessPeer`/
+//! `cuCtxEnablePeerAccess` driver entry points (`cudarc` itself exposes no
+//! safe wrapper for either), and `CudaExecutor::copy_tensor_from_peer_
+//! admitted` moves a tensor directly between two real GPUs' own device
+//! memory via a real cross-context `cuMemcpyPeerAsync`, never touching
+//! host memory -- structurally distinct from the two tests above, which
+//! both move data via an explicit host round trip.
+//!
+//! A fourth test,
+//! `per_device_memory_feasibility_ranking_rejects_an_infeasible_real_gpu_
+//! and_accepts_a_feasible_one`
+//! (`add-real-per-device-memory-feasibility-ranking`), drives
+//! `magnetar-runtime`'s existing `PlacementCandidate`/`select_lowest_cost_
+//! eligible` -- unit-tested against synthetic fixtures since before this
+//! session began, never driven by a real Device's own real capacity
+//! numbers until now -- using one real GPU's real, full memory capacity
+//! and one deliberately, honestly constrained artificial budget (this
+//! repository's own two real GPUs are identical, so no genuinely
+//! heterogeneous real budget exists to test infeasibility against), also
+//! proving eligibility is checked before cost ranking.
+//!
+//! A fifth test,
+//! `a_real_two_gpu_plan_correctly_invalidates_and_refuses_to_revert`
+//! (`add-real-device-loss-degraded-replan-state-machine`), drives a real,
+//! two-real-GPU-derived `MultiDevicePlacementPlan` through its real
+//! `Ready` -> `Invalidated` state transition and confirms the real state
+//! machine refuses to silently revert it -- honestly, explicitly *not* a
+//! real hardware-failure-injection test (this repository's tooling has no
+//! safe way to force an actual GPU to disappear mid-test); the "loss"
+//! event is caller-driven, only the Plan's own source data and the state
+//! machine itself are real. See that test's own doc comment.
+//!
+//! A sixth test,
+//! `two_real_cuda_gpus_run_one_real_qwen_forward_pass_split_across_two_
+//! segment_model_instances` (`add-real-multi-device-model-instance-
+//! placement`), is the one that *does* wire this into real Qwen
+//! `ModelInstance`/graph execution, the gap every test above left open: a
+//! real Qwen forward pass split into two segment `ModelInstance`s (real
+//! GPU 0 for decoder layers `[0, mid)`, real GPU 1 for `[mid,
+//! num_hidden_layers)`), the boundary hidden state moved between them via
+//! an explicit Host round trip, producing the same real logits (within
+//! numeric tolerance) as running the identical prompt through the one,
+//! full, unsegmented graph on a single real GPU. See that test's own doc
+//! comment for how this differs from `ModelInstancePlacement` itself
+//! (still structurally single-Device -- two separate Model Instances, not
+//! one Instance spanning two Devices).
+//!
+//! A seventh test,
+//! `two_real_cuda_gpus_run_one_real_qwen_forward_pass_with_real_peer_to_
+//! peer_boundary_movement` (`add-real-peer-to-peer-segment-boundary-
+//! movement`), closes the gap the sixth test's own doc comment used to
+//! name as future work: the same two-segment split, but the boundary
+//! hidden state moves via the already-proven zero-Host-round-trip
+//! `CudaExecutor::copy_tensor_from_peer_admitted` Device-to-Device copy
+//! instead of a Host round trip, using the new
+//! `QwenSegmentBoundaryInput::Resident` variant. Verified on the real
+//! two-GPU CI node with no skip, producing the same real logits (within
+//! tolerance) as the sixth test's Host-staged path and as the full,
+//! unsegmented graph.
+//!
+//! What no test here attempts (real future work, not silently assumed):
+//! per-Device memory feasibility ranking against a *genuinely*
+//! heterogeneous real multi-GPU budget (this repository's own two real
+//! GPUs are identical), real hardware-failure-injection for Device loss
+//! (no safe mechanism exists), placement-generation republishing under
+//! live in-flight traffic, having `MultiDevicePlacementPlan` actually
+//! gate or drive dispatch (nothing in this codebase consults it today --
+//! it remains a real, structurally-validated record, not yet an enforced
+//! contract), or a real production checkpoint (Qwen2.5-0.5B or similar)
+//! actually split and generating real text this way end to end (the
+//! separate `tests_real_checkpoint_multi_gpu_segment.rs` does the latter,
+//! still via the Host-staged path).
 
 use std::sync::Arc;
 
 use magnetar_runtime::provider::Provider;
+use magnetar_runtime::qwen_model_component::{
+    qwen_architecture_implementation, qwen_architecture_metadata, qwen_component_descriptor,
+    qwen_component_identity, qwen_validate_model_artifact,
+};
 use magnetar_runtime::{
     ComputeDType, DTypeDescriptor, DeviceBinding, DeviceSet, DeviceSetId, DeviceSetMember,
-    ExecutionNodeId, FallbackClass, HostStagingPolicy, HostTensor, KernelDispatchPlan,
+    E2eFixture, ExecutionNodeId, FallbackClass, HostStagingPolicy, HostTensor, KernelDispatchPlan,
     KernelDispatchPlanId, KernelDispatcher, KernelInvocationId, KernelMemoryClass, KernelResource,
-    KernelResultStatus, KernelSelectionRequest, LayoutDescriptor, MemoryAllocationOwner,
-    MemoryDomain, MemoryPlacement, MultiDevicePlacementFingerprint, MultiDevicePlacementGeneration,
-    MultiDevicePlacementPlan, MultiDevicePlacementPlanId, MultiDevicePlacementState,
-    OperatorFamily, OperatorId, PipelineStage, PlacementBinding, ProviderBinding,
-    ProviderExecutionApi, ResourceAffinity, Runtime, ShapeDescriptor, StageMovementEdge,
-    TensorDescriptor, TensorResourceDescriptor, TensorResourceId, initial_operator_catalog,
+    KernelResultStatus, KernelSelectionRequest, KvCacheId, LayoutDescriptor, MemoryAllocationClass,
+    MemoryAllocationOwner, MemoryDomain, MemoryPlacement, ModelArchitectureImplementationKind,
+    ModelComponentId, ModelComponentImplementationKind, ModelComponentVersion,
+    MultiDevicePlacementError, MultiDevicePlacementErrorCode, MultiDevicePlacementFingerprint,
+    MultiDevicePlacementGeneration, MultiDevicePlacementPlan, MultiDevicePlacementPlanId,
+    MultiDevicePlacementState, OperatorFamily, OperatorId, PipelineStage, PlacementBinding,
+    PlacementCandidate, PlacementScope, ProviderBinding, ProviderExecutionApi,
+    ProviderPressureLevel, QwenConfig, QwenRopeConfig, QwenSegmentBoundaryInput, ResourceAffinity,
+    Runtime, ShapeDescriptor, StageMovementEdge, TensorDescriptor, TensorEdgeId,
+    TensorResourceDescriptor, TensorResourceId, build_first_native_graphs_from_real_qwen_component,
+    build_first_native_prefill_graph_segment_for_config, e2e_fixture_manifest_from_weights,
+    e2e_fixture_tokenizer, e2e_fixture_weights, initial_operator_catalog,
+    load_first_native_segment_with_provider_and_weights, register_qwen_component_artifact,
+    run_first_native_graph_segment_dispatch,
+    run_first_native_graph_segment_with_provider_and_weights,
+    run_first_native_graph_with_provider_and_weights, select_lowest_cost_eligible,
 };
 
 use magnetar_provider_cpu::ReferenceCpuProvider;
 use magnetar_provider_cuda::CudaProvider;
+use magnetar_provider_cuda::peer;
 use sha2::{Digest, Sha256};
 
 fn descriptor_1d(len: u64) -> TensorDescriptor {
@@ -131,6 +221,40 @@ struct Stage {
     /// Kernel with `KernelMemoryClassUnsupported`, found running this test
     /// for the first time.
     kernel_memory_class: KernelMemoryClass,
+}
+
+/// Builds a [`Stage`] from a real, already-registered Provider's own
+/// discovered Device -- never hand-constructed. Returns the real `Device`
+/// handle too (callers need it for `DeviceSetMember::new`).
+fn stage_from_provider(
+    provider: &dyn Provider,
+    output_placement: MemoryPlacement,
+    kernel_memory_class: KernelMemoryClass,
+) -> (Stage, Arc<dyn magnetar_runtime::Device>) {
+    let device = provider
+        .devices()
+        .into_iter()
+        .next()
+        .expect("this helper is only used for Providers that report exactly one Device");
+    let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
+    let device_binding = DeviceBinding::new(device.id().clone());
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent)
+        .with_provider(provider_binding.clone())
+        .with_device(device_binding.clone());
+    let executor = provider
+        .execution_api()
+        .expect("this helper is only used for Providers already confirmed available");
+    (
+        Stage {
+            executor,
+            affinity,
+            provider_binding,
+            device_binding,
+            output_placement,
+            kernel_memory_class,
+        },
+        device,
+    )
 }
 
 /// Dispatches a real `add` Kernel invocation for `stage`, through the exact
@@ -536,4 +660,1171 @@ fn cpu_and_cuda_providers_execute_one_chained_add_across_two_real_devices_in_one
     // content -- the same `sha256:`-prefixed digest format every other
     // fingerprint in this module uses.
     assert!(plan.fingerprint().as_str().starts_with("sha256:"));
+}
+
+/// The real, two-real-GPU counterpart to the CPU+CUDA test above --
+/// `add-real-second-gpu-cuda-provider` made this possible by teaching
+/// `CudaProvider` to bind a specific real GPU ordinal under its own
+/// distinct Provider name (`Runtime`'s `ProviderLoader` otherwise rejects a
+/// second `register_provider` call under an already-registered name
+/// outright, so two `CudaProvider::new()` instances could never coexist in
+/// one Runtime before this).
+///
+/// Gracefully skips on any host with fewer than two real, compatible CUDA
+/// devices (this repository's own development workstation included -- one
+/// real GPU only) -- genuinely exercises two real, physically distinct
+/// GPUs only on a host that actually has them
+/// (`arc-gpu-magnetar`'s CI node, after its `nvidia.com/gpu` job-pod
+/// resource request was raised from 1 to 2, a real, separate infrastructure
+/// fix this change's own verification found necessary and applied).
+///
+/// What this proves beyond the CPU+CUDA test: two *homogeneous* Provider
+/// instances (same crate, same Kernel implementation, same driver) can
+/// coexist in one Kernel Registry without their advertisements colliding,
+/// and the shared registry still discriminates correctly between them by
+/// Device, not just by Provider identity/dtype -- a real, distinct
+/// verification `KernelDispatchPlan::from_selection`'s per-invocation
+/// `device: Option<DeviceBinding>` this file's own `dispatch_add` already
+/// asserts is respected.
+///
+/// What this deliberately still does not attempt: real peer-to-peer
+/// GPU-to-GPU memory access (movement between the two GPUs below is a real,
+/// explicit host round trip through `read_tensor`/`write_tensor_admitted`,
+/// exactly like the CPU+CUDA test's CPU->CUDA crossing -- CUDA peer access
+/// APIs are not implemented anywhere in this repository), and per-Device
+/// memory feasibility ranking against each GPU's own real capacity (both
+/// GPUs here happen to be identical RTX 3060s with identical budgets on
+/// the one host that can run this for real; a genuinely heterogeneous
+/// two-GPU case remains unverified).
+#[test]
+fn two_real_cuda_gpus_execute_one_chained_add_across_two_real_devices_in_one_runtime() {
+    let gpu0_probe = CudaProvider::new();
+    if !gpu0_probe.is_available() {
+        eprintln!("skipping: no compatible CUDA device found on this host at all");
+        return;
+    }
+    let gpu1_probe = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    if !gpu1_probe.is_available() {
+        eprintln!(
+            "skipping: this host has only one real CUDA device -- a genuine second real \
+             GPU is required to prove anything this test is specifically for"
+        );
+        return;
+    }
+
+    let gpu0_provider: Arc<CudaProvider> = Arc::new(gpu0_probe);
+    let gpu1_provider: Arc<CudaProvider> = Arc::new(gpu1_probe);
+
+    let (gpu0_stage, gpu0_device) = stage_from_provider(
+        gpu0_provider.as_ref(),
+        MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+            gpu0_provider.metadata().name.clone(),
+        )),
+        KernelMemoryClass::Device,
+    );
+    let (gpu1_stage, gpu1_device) = stage_from_provider(
+        gpu1_provider.as_ref(),
+        MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+            gpu1_provider.metadata().name.clone(),
+        )),
+        KernelMemoryClass::Device,
+    );
+    assert_ne!(
+        gpu0_stage.device_binding, gpu1_stage.device_binding,
+        "ordinal 0 and ordinal 1 must be two genuinely distinct real Devices"
+    );
+    assert_ne!(
+        gpu0_stage.provider_binding, gpu1_stage.provider_binding,
+        "the two CudaProvider instances must register under two distinct names"
+    );
+
+    // The real proof this test exists for: two CudaProvider instances,
+    // each bound to a different real GPU ordinal under its own distinct
+    // name, registering into the same Runtime together without the
+    // ProviderAlreadyRegistered collision a shared name would cause.
+    let mut runtime = Runtime::builder()
+        .register_provider(gpu0_provider.clone())
+        .register_provider(gpu1_provider.clone())
+        .build()
+        .expect("two CudaProviders under two distinct names must both register successfully");
+
+    let a = HostTensor::new([3], [1.0, 2.0, 3.0]).unwrap();
+    let b = HostTensor::new([3], [10.0, 20.0, 30.0]).unwrap();
+    let c = HostTensor::new([3], [100.0, 200.0, 300.0]).unwrap();
+    let expected = [111.0f32, 222.0, 333.0];
+
+    let a_id = TensorResourceId::new("multi-gpu-a");
+    let b_id = TensorResourceId::new("multi-gpu-b");
+    let c_id = TensorResourceId::new("multi-gpu-c");
+    let stage1_output_id = TensorResourceId::new("multi-gpu-stage1-output");
+    let stage2_output_id = TensorResourceId::new("multi-gpu-stage2-output");
+
+    gpu0_stage
+        .executor
+        .write_tensor_value_admitted(
+            runtime.memory_mut(),
+            a_id.clone(),
+            magnetar_runtime::TensorValue::Host(a),
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("admitting operand 'a' on real GPU 0 must succeed");
+    gpu0_stage
+        .executor
+        .write_tensor_value_admitted(
+            runtime.memory_mut(),
+            b_id.clone(),
+            magnetar_runtime::TensorValue::Host(b),
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("admitting operand 'b' on real GPU 0 must succeed");
+
+    // Stage 1: `a + b` on real GPU 0. Proves the shared Kernel Registry
+    // selects GPU 0's own candidate, not GPU 1's, even though both
+    // Providers advertise an identical `add` Kernel shape.
+    let stage1_result = dispatch_add(
+        &mut runtime,
+        &gpu0_stage,
+        "stage1-gpu0-add",
+        a_id.clone(),
+        b_id.clone(),
+        3,
+        stage1_output_id.clone(),
+    );
+    assert_eq!(
+        stage1_result.data,
+        vec![11.0, 22.0, 33.0],
+        "stage 1 (real GPU 0 add) produced an incorrect result"
+    );
+
+    // Explicit cross-Device movement, GPU 0 -> GPU 1: a real host round
+    // trip, not peer access (unimplemented anywhere in this repository --
+    // see this test's own doc comment).
+    gpu1_stage
+        .executor
+        .write_tensor_value_admitted(
+            runtime.memory_mut(),
+            stage1_output_id.clone(),
+            magnetar_runtime::TensorValue::Host(stage1_result),
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("admitting stage 1's result on real GPU 1 must succeed");
+    gpu1_stage
+        .executor
+        .write_tensor_value_admitted(
+            runtime.memory_mut(),
+            c_id.clone(),
+            magnetar_runtime::TensorValue::Host(c),
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("admitting operand 'c' on real GPU 1 must succeed");
+
+    // Stage 2: `(a + b) + c` on real GPU 1 -- a genuinely different
+    // physical device from stage 1's.
+    let stage2_result = dispatch_add(
+        &mut runtime,
+        &gpu1_stage,
+        "stage2-gpu1-add",
+        stage1_output_id.clone(),
+        c_id.clone(),
+        3,
+        stage2_output_id.clone(),
+    );
+    assert_eq!(
+        stage2_result.data, expected,
+        "stage 2 (real GPU 1 add) produced an incorrect result -- the final, \
+         real, GPU-computed value must equal the hand-computed a + b + c"
+    );
+
+    // Same real `multi_device_placement` wiring as the CPU+CUDA test,
+    // built from these two real, physically distinct GPUs' own metadata.
+    let device_set = DeviceSet::new(
+        DeviceSetId::new("multi-gpu-cuda-proof").unwrap(),
+        [
+            DeviceSetMember::new(gpu0_device.metadata().clone(), gpu0_device.availability()),
+            DeviceSetMember::new(gpu1_device.metadata().clone(), gpu1_device.availability()),
+        ],
+    )
+    .expect("two real, distinct GPU Devices form a valid DeviceSet");
+
+    let mut plan = MultiDevicePlacementPlan::new(
+        MultiDevicePlacementPlanId::new("gpu0-then-gpu1-add-chain").unwrap(),
+        MultiDevicePlacementGeneration::new(1),
+        real_fingerprint("stage1:gpu0:add|stage2:gpu1:add"),
+        1,
+        device_set,
+        "multi-gpu-cuda-proof-v1",
+    )
+    .expect("real, non-zero-generation Plan construction must succeed");
+    assert_eq!(plan.state, MultiDevicePlacementState::Building);
+
+    let gpu0_binding = PlacementBinding::new(
+        gpu0_stage.provider_binding.clone(),
+        gpu0_stage.device_binding.clone(),
+        MemoryDomain::DeviceLocal(gpu0_stage.device_binding.clone()),
+    )
+    .expect("GPU 0 binding with a matching device-local memory domain must succeed");
+    let gpu1_binding = PlacementBinding::new(
+        gpu1_stage.provider_binding.clone(),
+        gpu1_stage.device_binding.clone(),
+        MemoryDomain::DeviceLocal(gpu1_stage.device_binding.clone()),
+    )
+    .expect("GPU 1 binding with a matching device-local memory domain must succeed");
+
+    plan.stages.push(
+        PipelineStage::new(
+            "stage1-gpu0-add",
+            [ExecutionNodeId::new("stage1-gpu0-add")],
+            gpu0_binding.clone(),
+            0,
+        )
+        .unwrap()
+        .with_input(a_id)
+        .with_input(b_id)
+        .with_output(stage1_output_id.clone()),
+    );
+    plan.stages.push(
+        PipelineStage::new(
+            "stage2-gpu1-add",
+            [ExecutionNodeId::new("stage2-gpu1-add")],
+            gpu1_binding.clone(),
+            1,
+        )
+        .unwrap()
+        .with_input(stage1_output_id.clone())
+        .with_input(c_id)
+        .with_output(stage2_output_id),
+    );
+    plan.movement_edges.push(
+        StageMovementEdge::new(
+            "stage1-gpu0-add",
+            "stage2-gpu1-add",
+            stage1_output_id,
+            gpu0_binding,
+            gpu1_binding,
+            HostStagingPolicy::Permit,
+        )
+        .expect("a movement edge between two genuinely different Devices must succeed"),
+    );
+    plan.mark_ready()
+        .expect("a Plan with real stages must reach Ready");
+    assert_eq!(plan.state, MultiDevicePlacementState::Ready);
+    assert_eq!(plan.stages.len(), 2);
+    assert_eq!(plan.movement_edges.len(), 1);
+    assert!(plan.fingerprint().as_str().starts_with("sha256:"));
+}
+
+/// Real CUDA peer-to-peer GPU-to-GPU memory access
+/// (`add-real-peer-to-peer-gpu-movement`): a tensor admitted on real GPU 0
+/// is moved directly into real GPU 1's own device memory via a real
+/// cross-context `cuMemcpyPeerAsync` (`CudaExecutor::copy_tensor_from_
+/// peer_admitted`), never touching host memory -- structurally distinct
+/// from every other cross-Device movement in this file, which all
+/// explicitly round-trip through the host via `write_tensor_value_
+/// admitted`/`read_tensor`.
+///
+/// Real, explicit peer-capability check first
+/// (`multi-device-placement`'s own "Peer Capability Is Explicit": "Runtime
+/// SHALL not infer peer access from Device similarity"): this test calls
+/// the real `cuDeviceCanAccessPeer` driver entry point and gracefully
+/// skips, rather than assuming, if these two real GPUs report no usable
+/// peer path. On this repository's own real two-GPU CI node (`arc-gpu-
+/// magnetar`, two identical RTX 3060s on the same host), that query has
+/// been confirmed to return true.
+///
+/// Gracefully skips, like the two tests above, on any host with fewer
+/// than two real, compatible CUDA devices.
+#[test]
+fn two_real_cuda_gpus_move_a_tensor_via_real_peer_to_peer_copy_not_host_staging() {
+    let gpu0_probe = CudaProvider::new();
+    if !gpu0_probe.is_available() {
+        eprintln!("skipping: no compatible CUDA device found on this host at all");
+        return;
+    }
+    let gpu1_probe = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    if !gpu1_probe.is_available() {
+        eprintln!(
+            "skipping: this host has only one real CUDA device -- a genuine second real \
+             GPU is required to prove anything this test is specifically for"
+        );
+        return;
+    }
+
+    let gpu0_context = gpu0_probe
+        .context()
+        .expect("an available CudaProvider always exposes its real CudaContext");
+    let gpu1_context = gpu1_probe
+        .context()
+        .expect("an available CudaProvider always exposes its real CudaContext");
+
+    // Real, explicit query -- never assumed from Device similarity, even
+    // though both real GPUs here happen to be the identical model.
+    let can_access = peer::device_can_access_peer(&gpu0_context, &gpu1_context)
+        .expect("a real cuDeviceCanAccessPeer query must not itself fail on two available Devices");
+    if !can_access {
+        eprintln!(
+            "skipping: this host's two real GPUs report no usable peer access path \
+             (multi-device-placement's own \"Peer Capability Is Explicit\" -- never assumed \
+             from two Devices sharing a vendor or architecture)"
+        );
+        return;
+    }
+    peer::enable_peer_access(&gpu0_context, &gpu1_context).expect(
+        "enabling real peer access between two Devices that just reported they can access \
+         each other must succeed",
+    );
+
+    let gpu0_executor = gpu0_probe
+        .executor()
+        .expect("an available CudaProvider always exposes its concrete CudaExecutor");
+    let gpu1_executor = gpu1_probe
+        .executor()
+        .expect("an available CudaProvider always exposes its concrete CudaExecutor");
+
+    let gpu0_provider: Arc<CudaProvider> = Arc::new(gpu0_probe);
+    let gpu1_provider: Arc<CudaProvider> = Arc::new(gpu1_probe);
+    let mut runtime = Runtime::builder()
+        .register_provider(gpu0_provider.clone())
+        .register_provider(gpu1_provider.clone())
+        .build()
+        .expect("two CudaProviders under two distinct names must both register successfully");
+
+    let source_id = TensorResourceId::new("peer-copy-source");
+    let dest_id = TensorResourceId::new("peer-copy-dest");
+    let tensor = HostTensor::new([4], [1.5f32, -2.0, 3.25, 0.0]).unwrap();
+    let expected = tensor.data.clone();
+
+    gpu0_executor
+        .write_tensor_admitted(
+            runtime.memory_mut(),
+            source_id.clone(),
+            tensor,
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("admitting the source tensor on real GPU 0 must succeed");
+
+    // The real proof this test exists for: a direct GPU 0 -> GPU 1
+    // device-to-device copy via the real CUDA peer path, never touching
+    // host memory.
+    gpu1_executor
+        .copy_tensor_from_peer_admitted(
+            runtime.memory_mut(),
+            &gpu0_executor,
+            &source_id,
+            dest_id.clone(),
+            magnetar_runtime::MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Runtime,
+        )
+        .expect("a real peer-to-peer device-to-device copy between two real GPUs must succeed");
+
+    let result = gpu1_executor
+        .read_tensor(&dest_id)
+        .expect("the peer-copied tensor must be readable back from real GPU 1");
+    assert_eq!(
+        result.data, expected,
+        "the tensor that crossed via a real peer-to-peer copy must be bit-identical \
+         to what was admitted on the source GPU"
+    );
+
+    // Ties this real peer movement to `multi_device_placement`'s own
+    // explicit-movement contract with `HostStagingPolicy::Forbid` --
+    // unlike the two tests above (both `Permit`, since they genuinely do
+    // stage through the host), this movement genuinely never touched host
+    // memory, so `Forbid` is the real, honest value here.
+    let gpu0_device_binding = DeviceBinding::new(
+        gpu0_provider
+            .devices()
+            .into_iter()
+            .next()
+            .expect("an available CudaProvider reports exactly one Device")
+            .id()
+            .clone(),
+    );
+    let gpu1_device_binding = DeviceBinding::new(
+        gpu1_provider
+            .devices()
+            .into_iter()
+            .next()
+            .expect("an available CudaProvider reports exactly one Device")
+            .id()
+            .clone(),
+    );
+    let gpu0_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu0_provider.metadata().name.clone()),
+        gpu0_device_binding.clone(),
+        MemoryDomain::DeviceLocal(gpu0_device_binding.clone()),
+    )
+    .expect("GPU 0 binding with a matching device-local memory domain must succeed");
+    let gpu1_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu1_provider.metadata().name.clone()),
+        gpu1_device_binding.clone(),
+        MemoryDomain::DeviceLocal(gpu1_device_binding.clone()),
+    )
+    .expect("GPU 1 binding with a matching device-local memory domain must succeed");
+    let movement_edge = StageMovementEdge::new(
+        "peer-source",
+        "peer-dest",
+        source_id,
+        gpu0_binding,
+        gpu1_binding,
+        HostStagingPolicy::Forbid,
+    )
+    .expect("a movement edge between two genuinely different Devices must succeed");
+    assert_eq!(movement_edge.host_staging_policy, HostStagingPolicy::Forbid);
+}
+
+/// Real per-Device memory feasibility ranking
+/// (`add-real-per-device-memory-feasibility-ranking`, `multi-device-
+/// placement`'s own "Per Device Memory Feasibility" requirement: "Every
+/// Device binding SHALL satisfy its own Memory Manager capacity policy"),
+/// using two real GPUs' own real, discovered memory capacity via
+/// `magnetar-runtime`'s existing, previously execution-unwired
+/// `PlacementCandidate`/`select_lowest_cost_eligible` -- unit-tested
+/// against synthetic fixtures since before this session began, never
+/// driven by a real Device's own real capacity numbers until now.
+///
+/// This repository's own real hardware has exactly two identical GPUs
+/// (same real memory capacity), so there is no genuinely heterogeneous
+/// real budget to test infeasibility against -- one candidate's
+/// `available_memory_bytes` is deliberately, honestly constrained to a
+/// small artificial value for this reason, the same "constrain a real
+/// budget to force a deterministic outcome" convention this repository's
+/// own `check_weight_materialization_failure_never_reaches_ready` test
+/// already established. The *other* candidate uses its real GPU's real,
+/// full, unmodified capacity -- a real value, not synthetic. The
+/// constrained candidate is also given a deliberately *lower* cost
+/// (zero latency/transfer/pressure penalty) than the real, feasible one,
+/// so this test also proves eligibility is checked before cost ranking,
+/// not the other way around: a cheaper-looking but infeasible candidate
+/// must still lose.
+///
+/// Gracefully skips, like the other tests in this file, on any host with
+/// fewer than two real CUDA devices.
+#[test]
+fn per_device_memory_feasibility_ranking_rejects_an_infeasible_real_gpu_and_accepts_a_feasible_one()
+{
+    let gpu0_probe = CudaProvider::new();
+    if !gpu0_probe.is_available() {
+        eprintln!("skipping: no compatible CUDA device found on this host at all");
+        return;
+    }
+    let gpu1_probe = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    if !gpu1_probe.is_available() {
+        eprintln!(
+            "skipping: this host has only one real CUDA device -- a genuine second real \
+             GPU is required to prove anything this test is specifically for"
+        );
+        return;
+    }
+
+    let gpu0_device = gpu0_probe
+        .devices()
+        .into_iter()
+        .next()
+        .expect("an available CudaProvider reports exactly one Device");
+    let gpu1_device = gpu1_probe
+        .devices()
+        .into_iter()
+        .next()
+        .expect("an available CudaProvider reports exactly one Device");
+
+    let gpu0_capacity = gpu0_device.metadata().memory_capacity;
+    assert!(
+        gpu0_capacity > 0,
+        "a real CUDA device always reports non-zero total memory"
+    );
+
+    // A real, realistic requirement -- 64 MiB -- comfortably smaller than
+    // any real GPU's own total memory, but far larger than the artificial
+    // budget the "infeasible" candidate below is deliberately given.
+    let required_bytes: u64 = 64 * 1024 * 1024;
+
+    let gpu0_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu0_probe.metadata().name.clone()),
+        DeviceBinding::new(gpu0_device.id().clone()),
+        MemoryDomain::DeviceLocal(DeviceBinding::new(gpu0_device.id().clone())),
+    )
+    .expect("GPU 0 binding with a matching device-local memory domain must succeed");
+    let gpu1_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu1_probe.metadata().name.clone()),
+        DeviceBinding::new(gpu1_device.id().clone()),
+        MemoryDomain::DeviceLocal(DeviceBinding::new(gpu1_device.id().clone())),
+    )
+    .expect("GPU 1 binding with a matching device-local memory domain must succeed");
+
+    let feasible_candidate = PlacementCandidate {
+        scope: PlacementScope::operator_group("feasible-real-gpu0")
+            .expect("a real operator group name must be valid"),
+        binding: gpu0_binding.clone(),
+        required_kernel: None,
+        required_memory_bytes: required_bytes,
+        available_memory_bytes: gpu0_capacity,
+        required_memory_class: KernelMemoryClass::Device,
+        provider_capable: true,
+        device_capable: true,
+        kernel_available: true,
+        resource_affinity_valid: true,
+        transfer_permitted: true,
+        host_staging_permitted: true,
+        latency_micros: 500,
+        throughput_units: 0,
+        transfer_cost_micros: 200,
+        pressure: ProviderPressureLevel::Low,
+        stability_penalty_micros: 0,
+    };
+    let infeasible_candidate = PlacementCandidate {
+        scope: PlacementScope::operator_group("infeasible-constrained-gpu1")
+            .expect("a real operator group name must be valid"),
+        binding: gpu1_binding.clone(),
+        required_kernel: None,
+        required_memory_bytes: required_bytes,
+        // Deliberately, honestly constrained: this real GPU's own real
+        // capacity is actually far larger (identical to GPU 0's), but no
+        // genuinely heterogeneous real budget exists on this repository's
+        // hardware to test infeasibility against -- see this test's own
+        // doc comment.
+        available_memory_bytes: 1024,
+        required_memory_class: KernelMemoryClass::Device,
+        provider_capable: true,
+        device_capable: true,
+        kernel_available: true,
+        resource_affinity_valid: true,
+        transfer_permitted: true,
+        host_staging_permitted: true,
+        // Deliberately cheaper-looking than the feasible candidate, to
+        // prove eligibility is checked before cost ranking.
+        latency_micros: 0,
+        throughput_units: 0,
+        transfer_cost_micros: 0,
+        pressure: ProviderPressureLevel::Low,
+        stability_penalty_micros: 0,
+    };
+
+    let (selected, report) =
+        select_lowest_cost_eligible([feasible_candidate, infeasible_candidate.clone()])
+            .expect("the real, sufficiently large real GPU 0 candidate must be feasible");
+
+    assert_eq!(
+        selected.binding.device, gpu0_binding.device,
+        "the real, sufficiently large real GPU must be selected, despite the artificially \
+         constrained candidate's lower cost"
+    );
+    assert_eq!(report.evaluated, 2);
+    assert_eq!(report.rejected.len(), 1);
+    assert_eq!(report.rejected[0].device, gpu1_binding.device);
+    assert_eq!(
+        report.rejected[0].reason,
+        MultiDevicePlacementErrorCode::MemoryInfeasible,
+        "the artificially constrained candidate must be rejected specifically for memory \
+         infeasibility, not any other reason"
+    );
+}
+
+/// Real Device-loss / degraded-placement state-machine exercise
+/// (`add-real-device-loss-degraded-replan-state-machine`,
+/// `multi-device-placement`'s own "Device Loss Invalidates Dependent
+/// Placement" and "Degraded Placement Requires Valid Plan" requirements).
+///
+/// # Honesty about what this does and does not prove
+///
+/// This repository's tooling has no real, safe way to force an actual
+/// physical GPU to disappear from a live CI runner mid-test -- unlike
+/// every other test in this file, the "loss" event here is a real,
+/// explicit, caller-driven state transition, not a hardware-detected
+/// failure. What genuinely is real: the `MultiDevicePlacementPlan` this
+/// test invalidates is built from two real GPUs' own real Device
+/// metadata (not synthetic fixtures), and the state machine itself
+/// (`MultiDevicePlacementState::can_transition_to`) is Magnetar's real,
+/// unmodified production code -- the same code path this file's other
+/// tests' own `Ready` plans already reach, now also driven past `Ready`
+/// for the first time in this repository's history with a real,
+/// hardware-derived Plan (`multi_device_placement.rs`'s own 24
+/// pre-existing unit tests already cover this same state machine, but
+/// only against synthetic Device data).
+///
+/// Gracefully skips, like the other tests in this file, on any host with
+/// fewer than two real CUDA devices.
+#[test]
+fn a_real_two_gpu_plan_correctly_invalidates_and_refuses_to_revert() {
+    let gpu0_probe = CudaProvider::new();
+    if !gpu0_probe.is_available() {
+        eprintln!("skipping: no compatible CUDA device found on this host at all");
+        return;
+    }
+    let gpu1_probe = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    if !gpu1_probe.is_available() {
+        eprintln!(
+            "skipping: this host has only one real CUDA device -- a genuine second real \
+             GPU is required to prove anything this test is specifically for"
+        );
+        return;
+    }
+
+    let gpu0_device = gpu0_probe
+        .devices()
+        .into_iter()
+        .next()
+        .expect("an available CudaProvider reports exactly one Device");
+    let gpu1_device = gpu1_probe
+        .devices()
+        .into_iter()
+        .next()
+        .expect("an available CudaProvider reports exactly one Device");
+
+    let device_set = DeviceSet::new(
+        DeviceSetId::new("device-loss-proof").unwrap(),
+        [
+            DeviceSetMember::new(gpu0_device.metadata().clone(), gpu0_device.availability()),
+            DeviceSetMember::new(gpu1_device.metadata().clone(), gpu1_device.availability()),
+        ],
+    )
+    .expect("two real, distinct GPU Devices form a valid DeviceSet");
+
+    let mut plan = MultiDevicePlacementPlan::new(
+        MultiDevicePlacementPlanId::new("device-loss-plan").unwrap(),
+        MultiDevicePlacementGeneration::new(1),
+        real_fingerprint("device-loss-proof"),
+        1,
+        device_set,
+        "device-loss-proof-v1",
+    )
+    .expect("real, non-zero-generation Plan construction must succeed");
+
+    let gpu0_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu0_probe.metadata().name.clone()),
+        DeviceBinding::new(gpu0_device.id().clone()),
+        MemoryDomain::DeviceLocal(DeviceBinding::new(gpu0_device.id().clone())),
+    )
+    .expect("GPU 0 binding with a matching device-local memory domain must succeed");
+    let gpu1_binding = PlacementBinding::new(
+        ProviderBinding::new(gpu1_probe.metadata().name.clone()),
+        DeviceBinding::new(gpu1_device.id().clone()),
+        MemoryDomain::DeviceLocal(DeviceBinding::new(gpu1_device.id().clone())),
+    )
+    .expect("GPU 1 binding with a matching device-local memory domain must succeed");
+
+    plan.add_binding(
+        PlacementScope::operator_group("gpu0-stage")
+            .expect("a real operator group name must be valid"),
+        gpu0_binding,
+    )
+    .expect("GPU 0's binding must reference a Device inside this Plan's own DeviceSet");
+    plan.add_binding(
+        PlacementScope::operator_group("gpu1-stage")
+            .expect("a real operator group name must be valid"),
+        gpu1_binding,
+    )
+    .expect("GPU 1's binding must reference a Device inside this Plan's own DeviceSet");
+
+    plan.mark_ready()
+        .expect("a Plan with two real bindings must reach Ready");
+    assert_eq!(plan.state, MultiDevicePlacementState::Ready);
+    assert!(plan.state.accepts_new_work());
+
+    // The real, caller-driven "Device lost" signal this test's own doc
+    // comment is honest about: no real hardware failure occurs here.
+    plan.transition_to(MultiDevicePlacementState::Invalidated)
+        .expect("Ready -> Invalidated is a real, valid transition");
+    assert_eq!(plan.state, MultiDevicePlacementState::Invalidated);
+    assert!(
+        !plan.state.accepts_new_work(),
+        "an Invalidated Plan must never accept new work -- \"Degraded Placement Requires \
+         Valid Plan\""
+    );
+
+    // The real state machine must refuse to silently revert an
+    // Invalidated Plan back to Ready -- a caller needing to resume must
+    // build an entirely new Plan generation instead, matching "Placement
+    // Change Uses New Plan Generation".
+    let revert_attempt = plan.transition_to(MultiDevicePlacementState::Ready);
+    assert!(
+        matches!(
+            revert_attempt,
+            Err(MultiDevicePlacementError::InvalidStateTransition {
+                from: MultiDevicePlacementState::Invalidated,
+                to: MultiDevicePlacementState::Ready,
+            })
+        ),
+        "an Invalidated Plan must not be revertible to Ready in place: got {revert_attempt:?}"
+    );
+    assert_eq!(
+        plan.state,
+        MultiDevicePlacementState::Invalidated,
+        "a rejected transition must leave the Plan's real state unchanged"
+    );
+}
+
+/// Reads the checked-in, real Qwen Component artifact this repository
+/// ships (`magnetar-runtime`'s own fixture) from disk and registers it for
+/// production first-native generation to use -- the same real, non-test-
+/// shortcut call path `magnetar-cli` and `integration-tests/cuda-first-
+/// native` both use.
+fn register_real_qwen_component() {
+    let component_bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../magnetar-runtime/fixtures/components/qwen-real.component.wasm"
+    ))
+    .expect("checked-in real Qwen Component .wasm is readable");
+    let manifest_bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../magnetar-runtime/fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
+    ))
+    .expect("checked-in real Qwen Component manifest is readable");
+    register_qwen_component_artifact(component_bytes, manifest_bytes);
+}
+
+/// A small, real 2-decoder-layer Qwen fixture -- the one canonical E2E
+/// fixture this repository ships has only one decoder layer (too small to
+/// split into two non-trivial segments), so this is built the same way
+/// `genuinely_gqa_shaped_rope_dispatches_on_cuda_device_resident_with_
+/// distinct_head_counts` (`integration-tests/cuda-first-native`) builds
+/// its own non-canonical fixture: entirely from `magnetar-runtime`'s own
+/// public fixture-building primitives.
+fn two_layer_fixture() -> E2eFixture {
+    let architecture = qwen_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
+    let identity = qwen_component_identity(
+        ModelComponentId::new("multi-gpu-segment-fixture").expect("static id is valid"),
+        ModelComponentVersion::new(1, 0, 0),
+        ModelComponentImplementationKind::WebAssemblyComponent,
+    );
+    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    config
+        .validate(&identity)
+        .expect("2-layer config validates");
+    let architecture_implementation = qwen_architecture_implementation(
+        &identity,
+        ModelArchitectureImplementationKind::ComponentBased,
+    );
+    let weights = e2e_fixture_weights(&config).expect("2-layer fixture weights build");
+    let manifest = e2e_fixture_manifest_from_weights(
+        &config,
+        &architecture_implementation.architecture,
+        &weights,
+    )
+    .expect("2-layer fixture manifest builds");
+    let tokenizer = e2e_fixture_tokenizer().expect("fixture tokenizer builds");
+    let descriptor = qwen_component_descriptor(identity.clone(), &config)
+        .expect("2-layer component descriptor builds");
+    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+        .expect("2-layer manifest matches its own descriptor");
+    E2eFixture {
+        config,
+        identity,
+        architecture_implementation,
+        manifest,
+        tokenizer,
+        weights,
+    }
+}
+
+/// `add-real-multi-device-model-instance-placement`'s own real, two-real-
+/// GPU proof: a real Qwen forward pass, split into two segment
+/// `ModelInstance`s -- layers `[0, mid)` loaded and executed on real GPU
+/// 0, layers `[mid, num_hidden_layers)` loaded and executed on real GPU
+/// 1, the boundary hidden state moved between them via an explicit Host
+/// round trip (`run_first_native_graph_segment_with_provider_and_weights`'s
+/// own doc comment on why this, not yet real CUDA peer-to-peer, bridges
+/// the two segments) -- produces the same real logits, within numeric
+/// tolerance, as running the identical prompt through the one, full,
+/// unsegmented graph on a single real GPU. Phase B.1
+/// (`magnetar-runtime`'s own in-crate `check_two_segment_split_produces_
+/// identical_output_to_full_graph`) already proved this split is bit-for-
+/// bit exact on Reference CPU; this is the same real proof extended to
+/// two genuinely distinct real Devices instead of one Provider running
+/// twice -- the "real Multi-Device `ModelInstance` placement" the
+/// project's own scope charter named as its last unimplemented item, and
+/// this repository's `tests_multi_device_cpu_cuda.rs` module doc
+/// previously listed under "What no test here attempts".
+///
+/// Skips cleanly on any host without two real CUDA devices, matching
+/// every other real-hardware-gated test in this crate.
+#[test]
+fn two_real_cuda_gpus_run_one_real_qwen_forward_pass_split_across_two_segment_model_instances() {
+    let gpu0_probe = CudaProvider::new();
+    if !gpu0_probe.is_available() {
+        eprintln!("skipping: no compatible CUDA device found on this host at all");
+        return;
+    }
+    let gpu1_probe = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    if !gpu1_probe.is_available() {
+        eprintln!(
+            "skipping: this host has only one real CUDA device -- a genuine second real \
+             GPU is required to prove anything this test is specifically for"
+        );
+        return;
+    }
+
+    register_real_qwen_component();
+    let fixture = two_layer_fixture();
+    let num_hidden_layers = fixture.config.architecture.layer_count as u32;
+    let mid = num_hidden_layers / 2;
+    assert!(
+        mid > 0 && mid < num_hidden_layers,
+        "this fixture must have at least 2 decoder layers to split into two non-trivial segments"
+    );
+    let token_ids = [3_u32, 5, 7];
+
+    // Ground truth: the real, full, unsegmented graph dispatched on real
+    // GPU 0 alone.
+    let (full_graphs, _definition, _instance) =
+        build_first_native_graphs_from_real_qwen_component(&fixture, token_ids.len() as u64)
+            .expect("the real Qwen Component produces a real full prefill graph");
+    let full_cache_id =
+        KvCacheId::new("multi-gpu-segment-full-graph-cache").expect("cache id is valid");
+    let full_outcome = run_first_native_graph_with_provider_and_weights(
+        Arc::new(CudaProvider::new()),
+        &fixture,
+        &fixture.weights,
+        &full_graphs.prefill,
+        &full_cache_id,
+        &token_ids,
+    )
+    .expect("the real full-graph dispatch against real GPU 0 succeeds");
+    assert_eq!(full_outcome.dispatch.status, KernelResultStatus::Succeeded);
+    let full_logits = full_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .expect("full graph produced a logits-named output")
+        .data
+        .clone();
+
+    // Segment 1: layers [0, mid), real GPU 0, real prefill-segment graph
+    // through the real Qwen Component's build-prefill-graph-segment
+    // export.
+    let (segment_one_graph, _definition, _instance) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            token_ids.len() as u64,
+            0,
+            mid,
+        )
+        .expect("the real Qwen Component produces a real segment-one prefill graph");
+    let segment_one_cache_id =
+        KvCacheId::new("multi-gpu-segment-one-cache").expect("cache id is valid");
+    let segment_one_outcome = run_first_native_graph_segment_with_provider_and_weights(
+        Arc::new(CudaProvider::new()),
+        &fixture,
+        &fixture.weights,
+        &segment_one_graph,
+        &segment_one_cache_id,
+        &token_ids,
+        0,
+        mid,
+        None,
+    )
+    .expect("segment one's real dispatch against real GPU 0 succeeds");
+    assert_eq!(
+        segment_one_outcome.dispatch.status,
+        KernelResultStatus::Succeeded
+    );
+    let boundary_hidden = segment_one_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .expect("segment one produced a logits-named (raw hidden-state) output")
+        .clone();
+    assert_ne!(
+        boundary_hidden.data, full_logits,
+        "segment one's raw hidden-state output must genuinely differ from the full graph's \
+         final logits -- otherwise this test is not exercising a real mid-stack boundary"
+    );
+
+    // Explicit cross-Device movement, real GPU 0 -> real GPU 1: a real
+    // Host round trip (see this test's own doc comment on why not yet
+    // real CUDA peer-to-peer).
+    //
+    // Segment 2: layers [mid, num_hidden_layers), real GPU 1, consuming
+    // segment one's own real boundary output as `hidden_states_in`.
+    let (segment_two_graph, _definition, _instance) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            token_ids.len() as u64,
+            mid,
+            num_hidden_layers,
+        )
+        .expect("the real Qwen Component produces a real segment-two prefill graph");
+    let segment_two_cache_id =
+        KvCacheId::new("multi-gpu-segment-two-cache").expect("cache id is valid");
+    let segment_two_outcome = run_first_native_graph_segment_with_provider_and_weights(
+        Arc::new(gpu1_probe),
+        &fixture,
+        &fixture.weights,
+        &segment_two_graph,
+        &segment_two_cache_id,
+        &token_ids,
+        mid,
+        num_hidden_layers,
+        Some(boundary_hidden),
+    )
+    .expect("segment two's real dispatch against real GPU 1 succeeds");
+    assert_eq!(
+        segment_two_outcome.dispatch.status,
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(
+        segment_two_outcome.resolved_provider.as_str(),
+        "magnetar:provider/cuda:1",
+        "segment two must actually resolve to real GPU 1, not silently fall back elsewhere"
+    );
+    let segment_two_logits = segment_two_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .expect("segment two produced a logits-named output")
+        .data
+        .clone();
+
+    assert_eq!(
+        segment_two_logits.len(),
+        full_logits.len(),
+        "the two-segment split across real GPU 0 + real GPU 1 must produce the same number \
+         of logits as the full graph on real GPU 0 alone"
+    );
+    const TOLERANCE: f32 = 1e-2;
+    for (index, (segmented, full)) in segment_two_logits.iter().zip(&full_logits).enumerate() {
+        assert!(
+            (segmented - full).abs() <= TOLERANCE,
+            "logit {index}: two-real-GPU segmented={segmented} full-graph-on-one-real-GPU={full} \
+             exceeds tolerance {TOLERANCE}"
+        );
+    }
+}
+
+/// `add-real-multi-device-model-instance-placement`'s own follow-up,
+/// closing the one thing the sixth test above left as future work: this
+/// is the SAME real two-real-GPU Qwen segment split, but the boundary
+/// hidden-state tensor crosses from real GPU 0 to real GPU 1 via a real,
+/// zero-Host-round-trip `cuMemcpyPeerAsync` (`CudaExecutor::copy_tensor_
+/// from_peer_admitted`, already proven possible in isolation by
+/// `two_real_cuda_gpus_move_a_tensor_via_real_peer_to_peer_copy_not_host_
+/// staging` above) instead of an explicit Host round trip --
+/// `run_first_native_graph_segment_dispatch`'s new `QwenSegmentBoundaryInput
+/// ::Resident` variant (`add-real-multi-device-model-instance-placement`).
+///
+/// Segment one still dispatches through the convenience wrapper (which
+/// always ALSO materializes its own outputs to Host as a side effect --
+/// harmless and unused here, not the real movement path this test cares
+/// about); segment two is loaded and dispatched through the lower-level,
+/// reusable primitives directly so this test can hand it an already-
+/// Device-resident boundary input instead of a `HostTensor`. The real
+/// peer-copied boundary tensor's own real numeric values are never
+/// downloaded to the Host or inspected directly here -- this test's own
+/// correctness assertion (segmented output matches the full graph on one
+/// real GPU, within the same tolerance the sixth test above uses) is
+/// exactly the proof that the real values that crossed via peer copy are
+/// the right ones.
+///
+/// Skips cleanly (returns without assertions) on any host without two
+/// real, peer-capable CUDA devices.
+#[test]
+fn two_real_cuda_gpus_run_one_real_qwen_forward_pass_with_real_peer_to_peer_boundary_movement() {
+    let gpu0_probe = CudaProvider::new();
+    if !gpu0_probe.is_available() {
+        eprintln!("skipping: no compatible CUDA device found on this host at all");
+        return;
+    }
+    let gpu1_probe = CudaProvider::for_device(1, "magnetar:provider/cuda:1");
+    if !gpu1_probe.is_available() {
+        eprintln!(
+            "skipping: this host has only one real CUDA device -- a genuine second real \
+             GPU is required to prove anything this test is specifically for"
+        );
+        return;
+    }
+
+    let gpu0_context = gpu0_probe
+        .context()
+        .expect("an available CudaProvider always exposes its real CudaContext");
+    let gpu1_context = gpu1_probe
+        .context()
+        .expect("an available CudaProvider always exposes its real CudaContext");
+    let can_access = peer::device_can_access_peer(&gpu0_context, &gpu1_context)
+        .expect("a real cuDeviceCanAccessPeer query must not itself fail on two available Devices");
+    if !can_access {
+        eprintln!(
+            "skipping: this host's two real GPUs report no usable peer access path \
+             (multi-device-placement's own \"Peer Capability Is Explicit\" -- never assumed \
+             from two Devices sharing a vendor or architecture)"
+        );
+        return;
+    }
+    peer::enable_peer_access(&gpu0_context, &gpu1_context).expect(
+        "enabling real peer access between two Devices that just reported they can access \
+         each other must succeed",
+    );
+
+    register_real_qwen_component();
+    let fixture = two_layer_fixture();
+    let num_hidden_layers = fixture.config.architecture.layer_count as u32;
+    let mid = num_hidden_layers / 2;
+    assert!(
+        mid > 0 && mid < num_hidden_layers,
+        "this fixture must have at least 2 decoder layers to split into two non-trivial segments"
+    );
+    let token_ids = [3_u32, 5, 7];
+
+    // Ground truth: the real, full, unsegmented graph on real GPU 0 alone.
+    let (full_graphs, _definition, _instance) =
+        build_first_native_graphs_from_real_qwen_component(&fixture, token_ids.len() as u64)
+            .expect("the real Qwen Component produces a real full prefill graph");
+    let full_cache_id =
+        KvCacheId::new("multi-gpu-peer-boundary-full-graph-cache").expect("cache id is valid");
+    let full_outcome = run_first_native_graph_with_provider_and_weights(
+        Arc::new(CudaProvider::new()),
+        &fixture,
+        &fixture.weights,
+        &full_graphs.prefill,
+        &full_cache_id,
+        &token_ids,
+    )
+    .expect("the real full-graph dispatch against real GPU 0 succeeds");
+    let full_logits = full_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .expect("full graph produced a logits-named output")
+        .data
+        .clone();
+
+    // Segment one: real GPU 0, layers [0, mid) -- the convenience wrapper
+    // (loads once, dispatches once); its own Host materialization of
+    // "logits" is a harmless, unused side effect, not this test's real
+    // movement path. Kept as a real, concrete `Arc<CudaProvider>` (not
+    // yet erased to `Arc<dyn Provider>`) so `.executor()` below reaches
+    // the exact same real `CudaExecutor`/storage this dispatch just wrote
+    // to, mirroring `two_real_cuda_gpus_move_a_tensor_via_real_peer_to_
+    // peer_copy_not_host_staging`'s own pattern above.
+    let gpu0_provider: Arc<CudaProvider> = Arc::new(gpu0_probe);
+    let gpu0_executor = gpu0_provider
+        .executor()
+        .expect("an available CudaProvider always exposes its concrete CudaExecutor");
+
+    let (segment_one_graph, _definition, _instance) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            token_ids.len() as u64,
+            0,
+            mid,
+        )
+        .expect("the real Qwen Component produces a real segment-one prefill graph");
+    let segment_one_cache_id =
+        KvCacheId::new("multi-gpu-peer-boundary-segment-one-cache").expect("cache id is valid");
+    let segment_one_outcome = run_first_native_graph_segment_with_provider_and_weights(
+        gpu0_provider.clone(),
+        &fixture,
+        &fixture.weights,
+        &segment_one_graph,
+        &segment_one_cache_id,
+        &token_ids,
+        0,
+        mid,
+        None,
+    )
+    .expect("segment one's real dispatch against real GPU 0 succeeds");
+    let boundary_shape = segment_one_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .expect("segment one produced a logits-named (raw hidden-state) output")
+        .shape
+        .clone();
+
+    // Segment two: real GPU 1, layers [mid, num_hidden_layers), loaded via
+    // the lower-level primitives so it can be dispatched with an already-
+    // Device-resident boundary input instead of a `HostTensor`.
+    let gpu1_provider: Arc<CudaProvider> = Arc::new(gpu1_probe);
+    let gpu1_executor = gpu1_provider
+        .executor()
+        .expect("an available CudaProvider always exposes its concrete CudaExecutor");
+    let (segment_two_graph, _definition, _instance) =
+        build_first_native_prefill_graph_segment_for_config(
+            &fixture.config,
+            &fixture.identity,
+            token_ids.len() as u64,
+            mid,
+            num_hidden_layers,
+        )
+        .expect("the real Qwen Component produces a real segment-two prefill graph");
+    let (mut segment_two_runtime, segment_two_instance, segment_two_binding) =
+        load_first_native_segment_with_provider_and_weights(
+            gpu1_provider,
+            &fixture,
+            &fixture.weights,
+            mid,
+            num_hidden_layers,
+        )
+        .expect("real GPU 1's own segment loads and materializes its real weights");
+
+    // The real proof this test exists for: a direct GPU 0 -> GPU 1
+    // device-to-device copy of the real segment-one boundary output via
+    // the real CUDA peer path, never touching host memory -- `boundary_
+    // resource_id` matches segment one's own dispatch (`execute_qwen_
+    // graph`'s node-output convention, `edge.{edge-id}`), `hidden_states_
+    // in_resource_id` matches what segment two's own graph-input handling
+    // expects for `input.hidden_states_in` (a graph input's resource id is
+    // its own edge id, unprefixed).
+    let boundary_resource_id = TensorResourceId::new("edge.logits");
+    let hidden_states_in_resource_id = TensorResourceId::new("input.hidden_states_in");
+    gpu1_executor
+        .copy_tensor_from_peer_admitted(
+            segment_two_runtime.memory_mut(),
+            &gpu0_executor,
+            &boundary_resource_id,
+            hidden_states_in_resource_id.clone(),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session("multi-gpu-peer-boundary-segment-two-cache".into()),
+        )
+        .expect(
+            "a real peer-to-peer device-to-device copy of the real segment boundary tensor \
+             between two real GPUs must succeed",
+        );
+
+    let segment_two_cache_id =
+        KvCacheId::new("multi-gpu-peer-boundary-segment-two-cache").expect("cache id is valid");
+    let segment_two_outcome = run_first_native_graph_segment_dispatch(
+        segment_two_runtime,
+        &fixture,
+        segment_two_instance,
+        &segment_two_binding,
+        &segment_two_graph,
+        &segment_two_cache_id,
+        &token_ids,
+        mid,
+        Some(QwenSegmentBoundaryInput::Resident {
+            resource_id: hidden_states_in_resource_id,
+            shape: boundary_shape,
+        }),
+        None,
+        Some(0),
+    )
+    .expect("segment two's real dispatch against real GPU 1, fed by a real peer copy, succeeds");
+    assert_eq!(
+        segment_two_outcome.resolved_provider.as_str(),
+        "magnetar:provider/cuda:1",
+        "segment two must actually resolve to real GPU 1, not silently fall back elsewhere"
+    );
+    let segment_two_logits = segment_two_outcome
+        .bindings
+        .get(&TensorEdgeId::new("logits"))
+        .expect("segment two produced a logits output")
+        .data
+        .clone();
+
+    assert_eq!(
+        segment_two_logits.len(),
+        full_logits.len(),
+        "the two-real-GPU peer-copy-bridged split must produce the same number of logits as \
+         the full graph on real GPU 0 alone"
+    );
+    const TOLERANCE: f32 = 1e-2;
+    for (index, (segmented, full)) in segment_two_logits.iter().zip(&full_logits).enumerate() {
+        assert!(
+            (segmented - full).abs() <= TOLERANCE,
+            "logit {index}: real-peer-copy-bridged segmented={segmented} \
+             full-graph-on-one-real-GPU={full} exceeds tolerance {TOLERANCE}"
+        );
+    }
 }

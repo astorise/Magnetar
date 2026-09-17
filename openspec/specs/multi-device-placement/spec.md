@@ -1,7 +1,7 @@
 # multi-device-placement Specification
 
 ## Purpose
-Defines Magnetar's local multi-Device placement contract: Runtime-owned placement decisions, explicit placement plans, eligibility-before-ranking, explicit cross-Device movement, and heterogeneous-Device support -- plus, as of `add-multi-device-cpu-cuda-execution-proof`, the real, hardware-verified facts this repository has actually confirmed about it: concurrent multi-Provider Runtime registration, the Kernel Registry's real Provider-ranking (not Provider-filtering) candidate selection, and a `MultiDevicePlacementPlan` buildable as an explicit record from a real execution's own data. Full production `ModelInstance`-level placement across more than one real GPU remains unimplemented and unverified -- this repository's own tooling has exactly one real GPU.
+Defines Magnetar's local multi-Device placement contract: Runtime-owned placement decisions, explicit placement plans, eligibility-before-ranking, explicit cross-Device movement, and heterogeneous-Device support -- plus the real, hardware-verified facts this repository has actually confirmed about it: concurrent multi-Provider Runtime registration, the Kernel Registry's real Provider-ranking (not Provider-filtering) candidate selection, a `MultiDevicePlacementPlan` buildable as an explicit record from a real execution's own data (`add-multi-device-cpu-cuda-execution-proof`, CPU+CUDA), and a real chained computation genuinely executing across two physically distinct real GPUs in one Runtime (`add-real-second-gpu-cuda-provider`, verified on `arc-gpu-magnetar`'s CI node). `add-real-peer-to-peer-gpu-movement` closed the peer-access gap: a real, explicit `cuDeviceCanAccessPeer` query and `cuCtxEnablePeerAccess` enable step, and a real cross-GPU device-to-device copy that never touches host memory, verified genuinely executing on two real, physically distinct, peer-capable GPUs. `add-real-per-device-memory-feasibility-ranking` drove the existing `PlacementCandidate`/`select_lowest_cost_eligible` eligibility-and-ranking logic with a real Device's real memory capacity for the first time, verified genuinely on the CI node's real GPU. `add-real-device-loss-degraded-replan-state-machine` exercised the existing `MultiDevicePlacementState` invalidation state machine against a real, two-real-GPU-derived Plan for the first time -- honestly not a hardware-failure-injection test (no safe mechanism exists to force a real GPU to disappear on shared CI infrastructure), but a real Plan and the real, unmodified state-machine code, verified genuinely on the CI node. `add-real-multi-device-model-instance-placement` closed the last of these gaps: production `ModelInstance`-level placement across two real GPUs, achieved via two separate, ordinary `ModelInstance`s (each bound to its own real Provider/Device and materializing only its own real decoder-layer range's weights) and an explicit boundary-tensor hand-off between them -- `ModelInstancePlacement` itself still structurally binds one Provider/Device per instance, deliberately untouched by that design. Verified in three real, increasingly deep steps: bit-for-bit on Reference CPU against a synthetic fixture, on two real physically distinct GPUs for prefill, and on two real GPUs running real multi-step greedy decode against the real, public Qwen2.5-0.5B-Instruct checkpoint, matching the real full, unsegmented graph on one real GPU exactly. `add-real-peer-to-peer-segment-boundary-movement` then closed that remaining follow-up: the segment boundary hidden-state tensor can now move via a real, zero-Host-round-trip `CudaExecutor::copy_tensor_from_peer_admitted` Device-to-Device copy, in addition to the pre-existing Host-staged path, verified genuinely executing (no skip) on two real, physically distinct, peer-capable GPUs, matching the real full, unsegmented graph within tolerance. Memory-feasibility ranking against a genuinely heterogeneous real budget and real hardware-failure-injection for Device loss remain the two permanent, honestly-documented limitations (only identical GPUs are available, and no safe way exists to force a real Device failure).
 ## Requirements
 ### Requirement: Runtime Owns Multi Device Placement
 
@@ -210,4 +210,86 @@ A `MultiDevicePlacementPlan` SHALL be permitted to exist purely as a descriptive
 - **GIVEN** a real cross-Device execution driven directly through `KernelSelectionRequest`/`KernelDispatchPlan`/`KernelDispatcher`
 - **WHEN** a `MultiDevicePlacementPlan` is built afterward to describe what happened
 - **THEN** the execution's own success or failure did not depend on that Plan's existence, content, or state
+
+### Requirement: A Real Chained Computation Can Execute Across Two Physically Distinct Real GPUs
+
+Given two available, distinctly-named CUDA Provider instances bound to two different real GPU ordinals registered into one Runtime, a caller SHALL be able to dispatch a multi-stage computation across both real Devices, with each stage's output explicitly, physically movable to the other Device via an explicit host round trip.
+
+#### Scenario: Two-stage computation across two real GPUs
+
+- **GIVEN** two real, physically distinct GPUs, each with its own registered CUDA Provider instance
+- **WHEN** stage one executes on the first real GPU, its result is read back to the host, and admitted fresh into the second real GPU's memory domain for stage two
+- **THEN** stage two's real, GPU-computed result matches the expected value for the full chained computation
+
+#### Scenario: Homogeneous real Devices are still tracked as distinct
+
+- **GIVEN** two real GPUs of the identical model and identical memory capacity
+- **WHEN** a `DeviceSet` is built from both Devices' own real metadata
+- **THEN** the two Devices are recognized as distinct members, not deduplicated by shared architecture/vendor/capacity
+
+### Requirement: Real Peer Access, Once Confirmed Available, Can Genuinely Move a Resource Without Host Staging
+
+When two real Devices report genuine peer-access capability, a caller SHALL be able to move a Tensor Resource between them without host staging, and this movement SHALL be representable with `HostStagingPolicy::Forbid` truthfully -- distinct from a host-staged crossing, which SHALL be represented with `HostStagingPolicy::Permit`.
+
+#### Scenario: A real peer movement is represented as Forbid
+
+- **GIVEN** a real cross-Device movement that used direct peer-to-peer device memory access, never touching host memory
+- **WHEN** a `StageMovementEdge` is built to describe it
+- **THEN** its `host_staging_policy` is `Forbid`, honestly reflecting that no host staging occurred
+
+#### Scenario: Peer capability absent falls back to explicit host staging
+
+- **GIVEN** two real Devices whose peer-capability query returns false
+- **WHEN** a caller needs to move a resource between them
+- **THEN** the caller uses an explicit host-staged crossing instead, represented with `HostStagingPolicy::Permit`, never a silent assumption of peer access
+
+### Requirement: Per-Device Memory Feasibility Ranking Is Verified Against Real Device Capacity
+
+The existing `PlacementCandidate`/`select_lowest_cost_eligible` eligibility-and-ranking logic SHALL be exercised with at least one real Device's own real, discovered memory capacity, not only synthetic fixture values, and SHALL correctly reject a candidate whose required bytes exceed its available budget regardless of that candidate's own ranking cost.
+
+#### Scenario: A real feasible candidate is selected over a cheaper infeasible one
+
+- **GIVEN** two placement candidates for the same required byte size -- one backed by a real Device's real, sufficient memory capacity, one backed by an insufficient budget -- where the insufficient candidate has a lower ranking cost
+- **WHEN** the candidates are evaluated
+- **THEN** the real, sufficient candidate is selected
+- **AND** the insufficient candidate is rejected specifically for memory infeasibility, not any other reason
+
+### Requirement: Device-Loss Invalidation Is Verified Against a Real, Device-Derived Plan
+
+The existing `MultiDevicePlacementPlan` state machine's `Ready` -> `Invalidated` transition, and its refusal to revert an `Invalidated` Plan back to `Ready`, SHALL be exercised against a Plan built from at least one real Device's own real metadata, not only synthetic fixtures. This requirement does not itself require real hardware-failure detection -- the invalidating transition MAY be caller-driven.
+
+#### Scenario: A real, Device-derived Plan is invalidated and cannot silently revert
+
+- **GIVEN** a `Ready` `MultiDevicePlacementPlan` built from real Device metadata
+- **WHEN** it is transitioned to `Invalidated`
+- **THEN** it no longer accepts new work
+- **AND** a subsequent attempt to transition it back to `Ready` is rejected, leaving its state unchanged
+
+### Requirement: Production Model Instance Placement Across Two Real Devices Is Achieved Via Two Separate Instances And Explicit Movement
+
+A production Qwen `ModelInstance`'s real decoder stack SHALL be placeable across two real, distinct Devices by loading two separate, ordinary `ModelInstance`s -- each bound to its own real Provider/Device and each materializing only its own real decoder-layer range's weights -- and moving the boundary hidden-state tensor between them explicitly, either via an explicit Host round trip or via a real, zero-Host-round-trip Device-to-Device peer copy. This requirement does not itself restructure `ModelInstancePlacement`, which remains structurally single-Device per instance.
+
+#### Scenario: A real forward pass splits bit-for-bit identically across two segment Model Instances
+
+- **GIVEN** a real Qwen forward pass and a chosen decoder-layer split point `mid`
+- **WHEN** the same prompt is run once through the one, full, unsegmented graph, and separately through two segment `ModelInstance`s (layers `[0, mid)` then `[mid, num_hidden_layers)`), the boundary hidden state handed explicitly from the first into the second
+- **THEN** the segmented result matches the full-graph result bit-for-bit
+
+#### Scenario: The same split executes correctly across two real, physically distinct GPUs
+
+- **GIVEN** two real GPUs, one segment Model Instance loaded and executed on each
+- **WHEN** the boundary hidden-state tensor is moved between them via an explicit Host round trip
+- **THEN** the two-real-GPU segmented result matches the real full graph dispatched on one real GPU alone, within numeric tolerance
+
+#### Scenario: The same split executes correctly across two real GPUs via a real peer-to-peer copy, without Host staging
+
+- **GIVEN** two real, peer-capable, physically distinct GPUs, one segment Model Instance loaded on each
+- **WHEN** the boundary hidden-state tensor is moved between them via a real `CudaExecutor::copy_tensor_from_peer_admitted` Device-to-Device copy, never touching host memory
+- **THEN** the two-real-GPU segmented result matches the real full graph dispatched on one real GPU alone, within numeric tolerance
+
+#### Scenario: A real, multi-step decode generation splits correctly across two real GPUs against a real, public checkpoint
+
+- **GIVEN** the real, public Qwen2.5-0.5B-Instruct checkpoint, split by real decoder-layer range across two real GPUs, each segment Model Instance loaded once and streaming only its own weights from the real checkpoint file
+- **WHEN** a real multi-step greedy generation runs (one real prefill step, then several real decode steps), each segment's own per-layer KV state threaded forward from its own prior step
+- **THEN** the generated token ids exactly match the real full, unsegmented graph's own generation on one real GPU alone, for the identical prompt
 

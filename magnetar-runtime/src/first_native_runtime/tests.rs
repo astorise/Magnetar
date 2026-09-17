@@ -2510,7 +2510,7 @@ fn kv_update_transaction_resolves_the_states_bound_provider() {
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer").unwrap(),
         ),
-        layer_kv: Vec::new(),
+        layer_kv: QwenLayerKvMap::new(),
         provider: Some(mock_provider.clone()),
     };
 
@@ -2535,7 +2535,7 @@ fn kv_update_transaction_falls_back_to_reference_cpu_when_unbound() {
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer").unwrap(),
         ),
-        layer_kv: Vec::new(),
+        layer_kv: QwenLayerKvMap::new(),
         provider: None,
     };
 
@@ -3048,6 +3048,26 @@ fn e2e_repeated_load_unload_does_not_accumulate_weight_storage() {
     let fixture = e2e_fixture().expect("fixture builds");
     check_repeated_load_unload_does_not_accumulate_weight_storage(&fixture)
         .expect("repeated load/unload cycles do not accumulate Provider-owned weight storage");
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn e2e_two_segment_split_produces_identical_output_to_full_graph() {
+    check_two_segment_split_produces_identical_output_to_full_graph().expect(
+        "splitting a real forward pass into two segment Model Instances, bridged \
+                  through a real hidden-state hand-off, must bit-for-bit match running the \
+                  same prompt through the one full graph",
+    );
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn e2e_two_segment_split_decode_step_matches_full_graph_decode() {
+    check_two_segment_split_decode_step_matches_full_graph_decode().expect(
+        "a real decode step split across two segment Model Instances, each dispatched twice \
+         (prefill then decode) with its own KV state threaded forward, must bit-for-bit match \
+         the full, unsegmented graph's own decode step",
+    );
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]

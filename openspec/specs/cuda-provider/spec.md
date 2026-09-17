@@ -1,7 +1,7 @@
 # cuda-provider Specification
 
 ## Purpose
-Defines the CUDA Provider's baseline contract: identity, graceful unavailability without compatible hardware, device discovery, Kernel advertisements and their correctness against Reference CPU, explicit data movement and Memory Manager integration (including caller-owned output pre-admission and Device-resident chaining between Kernels), synchronous execution, error categories, and conformance scope -- including native multi-head RoPE rotation.
+Defines the CUDA Provider's baseline contract: identity, graceful unavailability without compatible hardware, device discovery, Kernel advertisements and their correctness against Reference CPU, explicit data movement and Memory Manager integration (including caller-owned output pre-admission and Device-resident chaining between Kernels), synchronous execution, error categories, and conformance scope -- including native multi-head RoPE rotation, binding to a specific real GPU ordinal under a distinct Provider name so more than one instance can coexist in one Runtime (`add-real-second-gpu-cuda-provider`), and real peer-to-peer device-to-device movement between two such instances, gated by an explicit, never-assumed peer-capability query (`add-real-peer-to-peer-gpu-movement`).
 ## Requirements
 ### Requirement: CUDA RoPE Kernel Supports Native Multi-Head Rotation
 
@@ -397,4 +397,70 @@ CUDA Provider SHALL offer real, on-device `F16`/`bfloat16` storage and elementwi
 - **GIVEN** a `KernelSelectionRequest` for the `add` (or `mul`) Operator whose input/output resources declare `Float16` (or `BrainFloat16`) as their `ComputeDType`
 - **WHEN** the Kernel Registry selects a candidate and the resulting invocation is dispatched through `ProviderExecutionApi::submit_kernel`/`complete_kernel`
 - **THEN** the native half-precision Kernel is selected in preference to the `f32`-only one, and the dispatched result matches the same reference conversion model the direct-call scenarios above already establish
+
+### Requirement: CUDA Provider Can Bind to a Specific Real Device Ordinal Under a Distinct Name
+
+The CUDA Provider SHALL support construction bound to a caller-specified real device ordinal, registering under a caller-specified Provider name distinct from the default. The default constructor SHALL be behaviorally identical to binding ordinal 0 under the default name.
+
+#### Scenario: Default construction is unchanged
+
+- **GIVEN** the CUDA Provider's default constructor and its ordinal-0/default-name constructor
+- **WHEN** both are constructed on the same host
+- **THEN** they report identical availability, health, and Device identity
+
+#### Scenario: A second real GPU ordinal is requested under its own name
+
+- **GIVEN** a host with two or more real, compatible CUDA devices
+- **WHEN** the CUDA Provider is constructed bound to ordinal 1 under a distinct Provider name
+- **THEN** it reports `ProviderHealth::Available`
+- **AND** its one reported Device has an identity distinct from ordinal 0's
+
+#### Scenario: An out-of-range ordinal is requested
+
+- **GIVEN** a host with fewer real CUDA devices than the requested ordinal plus one
+- **WHEN** the CUDA Provider is constructed bound to that ordinal
+- **THEN** construction succeeds
+- **AND** it reports `ProviderHealth::Unavailable`, never a construction error or panic
+
+### Requirement: Two Distinctly-Named CUDA Providers Register Into One Runtime Together
+
+Two CUDA Provider instances bound to two different real device ordinals, each registered under its own distinct Provider name, SHALL both register successfully into the same Runtime.
+
+#### Scenario: Two real GPUs registered together
+
+- **GIVEN** two CUDA Provider instances bound to two different real device ordinals under two distinct names
+- **WHEN** both are registered into the same Runtime
+- **THEN** Runtime construction succeeds
+- **AND** both Providers' Devices and Kernels are present in that Runtime
+
+### Requirement: CUDA Provider Exposes a Real, Explicit Peer-Capability Query
+
+The CUDA Provider SHALL expose a real, explicit query for whether one real GPU Device can directly access another real GPU Device's memory. This query SHALL NOT infer or assume the result from Device similarity (shared vendor, architecture, or memory capacity).
+
+#### Scenario: Two real GPUs are queried for peer capability
+
+- **GIVEN** two real, available CUDA Devices
+- **WHEN** the peer-capability query is called for that pair
+- **THEN** it returns the real, driver-reported capability, not an assumption derived from the two Devices' own metadata
+
+### Requirement: CUDA Provider Supports Enabling Real Peer Access
+
+The CUDA Provider SHALL support enabling one real GPU Device's context to directly access another real GPU Device's memory, and SHALL NOT perform this without a caller having first obtained a positive result from the peer-capability query for that same pair.
+
+#### Scenario: Peer access is enabled after a positive capability query
+
+- **GIVEN** a peer-capability query that returned true for a real Device pair
+- **WHEN** peer access is enabled for that pair
+- **THEN** the operation succeeds, including when called more than once for the same pair
+
+### Requirement: CUDA Provider Supports a Real Cross-Device Copy That Never Touches Host Memory
+
+The CUDA Provider SHALL support copying a Tensor Resource's current device allocation directly from one real GPU Device's own storage into another's, via a real device-to-device transfer, without host materialization at any point in the call path.
+
+#### Scenario: A tensor is moved between two real GPUs
+
+- **GIVEN** a tensor resource resident on one real GPU Device, and peer access already enabled between it and a second real GPU Device
+- **WHEN** the cross-Device copy is invoked with the second Device's own executor as the destination
+- **THEN** the tensor's bytes are readable back from the second Device
+- **AND** they are bit-identical to the source
 
