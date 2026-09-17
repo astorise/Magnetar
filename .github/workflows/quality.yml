@@ -656,6 +656,37 @@ jobs:
       - name: Check loaders/gguf's own dependency graph (advisories, bans, licenses, sources)
         run: cargo deny --manifest-path loaders/gguf/Cargo.toml check --allow wildcard --allow unlicensed
 
+  # #54's own separate request: a re-baseline should record *why* in a
+  # structured field, not only as prose appended to `notes` (which had grown
+  # to a single ~4 KB ever-growing string). tools/check_coverage_baseline_history.py
+  # enforces that going forward: if a PR changes quality/coverage-baseline.json's
+  # recorded line_coverage_percent/function_coverage_percent, its
+  # rebaseline_history array must have gained a new entry whose own
+  # `recorded` figures match and which carries a non-empty `reason`. Only
+  # runs on pull_request (needs the PR's base commit to diff against); a
+  # direct push to main skips it.
+  coverage-baseline-history:
+    name: quality / coverage baseline history
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Require a structured rebaseline_history entry when the recorded percentages change
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "$BASE_SHA"
+          if git diff --quiet "$BASE_SHA" -- quality/coverage-baseline.json; then
+            echo "quality/coverage-baseline.json unchanged in this PR"
+            exit 0
+          fi
+          git show "$BASE_SHA:quality/coverage-baseline.json" > /tmp/base-coverage-baseline.json
+          python3 tools/check_coverage_baseline_history.py \
+            quality/coverage-baseline.json /tmp/base-coverage-baseline.json
+
   coverage:
     name: quality / coverage
     runs-on: ubuntu-latest
