@@ -609,3 +609,274 @@ fn kernel_manifest_observation_builders_carry_schema_artifact_count_and_formats(
         Some("nvidia:cubin, triton:source@3")
     );
 }
+
+#[test]
+fn kernel_exchange_bundle_missing_required_embedded_artifact_is_rejected() {
+    let directory = temp_kernel_bundle_dir("required-missing");
+    let missing_digest = KernelBlobDigest::of_bytes(b"never-written");
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{missing}",
+      "size": 13,
+      "storage_mode": "embedded",
+      "required": true
+    }}
+  ]
+}}"#,
+        missing = missing_digest.value
+    );
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::BundleRequiredArtifactMissing { .. })
+    ));
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_exchange_bundle_rejects_required_external_artifact_without_fetching() {
+    let directory = temp_kernel_bundle_dir("required-external");
+    let digest = KernelBlobDigest::of_bytes(b"external-bytes");
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 13,
+      "storage_mode": "external",
+      "required": true,
+      "location_hint": "https://example.invalid/artifact.cubin"
+    }}
+  ]
+}}"#,
+        digest = digest.value
+    );
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::ExchangeExternalReferenceDenied { .. })
+    ));
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_bundle_symlink_entry_is_rejected_when_creatable() {
+    let directory = temp_kernel_bundle_dir("symlink");
+    write_kernel_bundle(&directory, b"symlink-fixture");
+    let target = directory.join(KERNEL_MANIFEST_FILE_NAME);
+    let link = directory.join("blobs").join("escape-link");
+
+    #[cfg(unix)]
+    let created = std::os::unix::fs::symlink(&target, &link).is_ok();
+    #[cfg(windows)]
+    let created = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+    #[cfg(not(any(unix, windows)))]
+    let created = false;
+
+    if created {
+        let outcome = scan_bundle_for_unsafe_entries(&directory);
+        assert!(matches!(
+            outcome,
+            Err(KernelManifestError::BundleSymlinkDenied { .. })
+        ));
+    }
+    // When the platform/permissions do not allow creating a symlink (e.g.
+    // Windows without Developer Mode or admin rights), this test is a no-op
+    // rather than a false failure -- the rejection code path itself is
+    // exercised whenever a symlink can actually be created.
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_manifest_qualification_evidence_array_round_trips_through_json() {
+    let limits = KernelManifestLimits::default();
+    let digest = KernelBlobDigest::of_bytes(b"evidence-bytes").value;
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{artifact_digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }}
+  ],
+  "qualification_evidence": [
+    {{
+      "digest": "sha256:{digest}",
+      "profile": "correctness",
+      "suite_or_workload_version": "v1",
+      "oracle_or_provider_identity": "reference-cpu@1",
+      "status": "passed"
+    }}
+  ]
+}}"#,
+        artifact_digest = KernelBlobDigest::of_bytes(b"artifact-bytes").value,
+        digest = digest
+    );
+    let manifest =
+        parse_manifest_json(&text, &limits).expect("manifest with qualification evidence parses");
+    assert_eq!(manifest.qualification_evidence.len(), 1);
+    let evidence = &manifest.qualification_evidence[0];
+    assert_eq!(evidence.profile, "correctness");
+    assert_eq!(evidence.status, KernelEvidenceStatus::Passed);
+    assert!(oracle_identity_is_known(evidence));
+    assert!(evaluate_qualification_evidence_currency(evidence, "v1"));
+    assert!(!evaluate_qualification_evidence_currency(evidence, "v2"));
+}
+
+#[test]
+fn kernel_manifest_evaluate_target_compatibility() {
+    let target = KernelTargetConstraints {
+        architecture: Some("sm90".into()),
+        provider_compatibility: ["nvidia-cuda".to_string()].into_iter().collect(),
+        device_features: ["tensor-core".to_string()].into_iter().collect(),
+        ..KernelTargetConstraints::default()
+    };
+
+    let matching_context = KernelRuntimeCompatibilityContext {
+        provider_id: Some("nvidia-cuda".into()),
+        architecture: Some("sm90".into()),
+        available_device_features: ["tensor-core".to_string()].into_iter().collect(),
+    };
+    assert!(evaluate_target_compatibility(&target, &matching_context).is_ok());
+
+    let wrong_architecture = KernelRuntimeCompatibilityContext {
+        architecture: Some("sm80".into()),
+        ..matching_context.clone()
+    };
+    assert!(matches!(
+        evaluate_target_compatibility(&target, &wrong_architecture),
+        Err(KernelManifestError::ExchangeCompatibilityFailed { .. })
+    ));
+
+    let missing_feature = KernelRuntimeCompatibilityContext {
+        available_device_features: std::collections::BTreeSet::new(),
+        ..matching_context
+    };
+    assert!(matches!(
+        evaluate_target_compatibility(&target, &missing_feature),
+        Err(KernelManifestError::ExchangeCompatibilityFailed { .. })
+    ));
+
+    // An artifact with no declared target constraints is always compatible.
+    assert!(
+        evaluate_target_compatibility(
+            &KernelTargetConstraints::default(),
+            &KernelRuntimeCompatibilityContext::default()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn kernel_exchange_bundle_total_size_limit_is_enforced() {
+    let directory = temp_kernel_bundle_dir("total-size-limit");
+    let bytes_a = b"aaaa";
+    let bytes_b = b"bbbb";
+    let digest_a = KernelBlobDigest::of_bytes(bytes_a);
+    let digest_b = KernelBlobDigest::of_bytes(bytes_b);
+    fs::write(
+        directory.join("blobs").join("sha256").join(&digest_a.value),
+        bytes_a,
+    )
+    .unwrap();
+    fs::write(
+        directory.join("blobs").join("sha256").join(&digest_b.value),
+        bytes_b,
+    )
+    .unwrap();
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{ "role": "compiled-kernel", "format": "nvidia:cubin", "digest": "sha256:{a}", "size": 4, "storage_mode": "embedded" }},
+    {{ "role": "auxiliary", "format": "nvidia:cubin", "digest": "sha256:{b}", "size": 4, "storage_mode": "embedded" }}
+  ]
+}}"#,
+        a = digest_a.value,
+        b = digest_b.value
+    );
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let limits = KernelManifestLimits {
+        max_total_embedded_bytes: 6,
+        ..KernelManifestLimits::default()
+    };
+    let outcome = validate_kernel_exchange_bundle(&bundle, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::BundleTotalSizeExceeded { .. })
+    ));
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_exchange_archive_enforces_per_entry_decompressed_size_limit() {
+    let oversized = vec![0u8; 1024];
+    let tar_bytes = build_kernel_bundle_tar(&[("blobs/sha256/oversized", &oversized)]);
+    let dir = temp_kernel_bundle_dir("archive-entry-limit");
+    let limits = KernelExchangeArchiveLimits {
+        max_entry_decompressed_bytes: 100,
+        ..KernelExchangeArchiveLimits::default()
+    };
+    let outcome =
+        extract_kernel_exchange_archive(std::io::Cursor::new(&tar_bytes), false, &dir, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::LimitExceeded { .. })
+    ));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn kernel_exchange_archive_enforces_entry_count_limit() {
+    let entries: Vec<(&str, &[u8])> = vec![("a", b"1"), ("b", b"2"), ("c", b"3")];
+    let tar_bytes = build_kernel_bundle_tar(&entries);
+    let dir = temp_kernel_bundle_dir("archive-entry-count-limit");
+    let limits = KernelExchangeArchiveLimits {
+        max_entries: 2,
+        ..KernelExchangeArchiveLimits::default()
+    };
+    let outcome =
+        extract_kernel_exchange_archive(std::io::Cursor::new(&tar_bytes), false, &dir, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::LimitExceeded { .. })
+    ));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn kernel_manifest_evaluate_trust_pipeline_stage_delegates_to_sole_authority() {
+    assert_eq!(
+        evaluate_manifest_trust(true),
+        crate::evaluate_artifact_trust(true)
+    );
+    assert_eq!(
+        evaluate_manifest_trust(false),
+        crate::evaluate_artifact_trust(false)
+    );
+    assert!(!evaluate_manifest_trust(false).is_trusted());
+}

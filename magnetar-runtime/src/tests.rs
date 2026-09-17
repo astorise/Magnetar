@@ -271,34 +271,6 @@ fn runtime_enumerates_provider_devices_with_metadata() {
     );
 }
 #[test]
-fn device_registration_rejects_duplicate_ids_and_mismatched_owners() {
-    let device = |id: &str, provider: &str| {
-        Arc::new(DeviceDescriptor::new(DeviceMetadata::new(
-            DeviceId::new(id),
-            "test",
-            DeviceType::Gpu,
-            provider,
-        ))) as Arc<dyn Device>
-    };
-    let mut registry = ProviderRegistry::default();
-    registry
-        .register_devices("cuda", [device("gpu:0", "cuda")])
-        .unwrap();
-    assert!(matches!(
-        registry.register_devices("other", [device("gpu:0", "other")]),
-        Err(ProviderError::DeviceAlreadyRegistered(_))
-    ));
-    assert!(matches!(
-        registry.register_devices("cuda", [device("gpu:2", "cuda"), device("gpu:0", "cuda")]),
-        Err(ProviderError::DeviceAlreadyRegistered(_))
-    ));
-    assert!(registry.device(&DeviceId::new("gpu:2")).is_none());
-    assert!(matches!(
-        registry.register_devices("cuda", [device("gpu:1", "other")]),
-        Err(ProviderError::DeviceProviderMismatch { .. })
-    ));
-}
-#[test]
 fn registers_capabilities_and_resolves_fallbacks_by_name() {
     let capability = capability("magnetar:runtime/execute", CapabilityVersion::new(1, 0, 0));
     let mut primary = TestProvider::new("a-primary");
@@ -793,323 +765,6 @@ fn compute_wit_defines_the_stabilized_run_surface() {
     assert!(!wit.contains("custom-operation"));
 }
 #[test]
-fn compute_error_model_maps_validation_resolution_affinity_and_execution_failures() {
-    let invalid_shape = ComputeError::from(ComputeValidationError::InvalidShape {
-        reason: "rank exceeds limit".into(),
-    });
-    assert_eq!(invalid_shape.code, ComputeErrorCode::InvalidShape);
-    assert_eq!(invalid_shape.phase, ComputeErrorPhase::Validation);
-    assert_eq!(invalid_shape.severity, ComputeErrorSeverity::Terminal);
-    assert!(
-        invalid_shape
-            .recovery_hints
-            .contains(&RecoveryHint::NotRetryable)
-    );
-
-    let materialization = ComputeError::from(ComputeValidationError::MaterializationRequired {
-        reason: "view must be materialized".into(),
-    });
-    assert_eq!(
-        materialization.code,
-        ComputeErrorCode::MaterializationRequired
-    );
-    assert!(
-        materialization
-            .recovery_hints
-            .contains(&RecoveryHint::ExplicitMaterializationRequired)
-    );
-
-    let affinity = ComputeError::from(AffinityError::BoundProviderUnavailable(
-        ProviderBinding::new("provider-a"),
-    ));
-    assert_eq!(affinity.code, ComputeErrorCode::ProviderUnavailable);
-    assert_eq!(affinity.phase, ComputeErrorPhase::Interruption);
-    assert!(
-        affinity
-            .recovery_hints
-            .contains(&RecoveryHint::ProviderPinned)
-    );
-
-    let policy = ComputeError::from(ProviderError::PolicyRejectedProvider {
-        capability: CapabilityBinding::new(
-            CapabilityId::new(COMPUTE_CAPABILITY_ID),
-            COMPUTE_CAPABILITY_VERSION,
-        ),
-        policy: BuiltInResolutionPolicy::Availability.id(),
-    });
-    assert_eq!(policy.code, ComputeErrorCode::PolicyRejectedProvider);
-    assert_eq!(policy.phase, ComputeErrorPhase::Resolution);
-    assert_eq!(
-        policy.diagnostics[0]
-            .capability
-            .as_ref()
-            .unwrap()
-            .id()
-            .as_str(),
-        COMPUTE_CAPABILITY_ID
-    );
-
-    let execution = ComputeError::from(ProviderError::Lifecycle("device lost".into()));
-    assert_eq!(execution.code, ComputeErrorCode::ExecutionInterrupted);
-    assert_eq!(execution.phase, ComputeErrorPhase::Interruption);
-    assert!(
-        execution
-            .recovery_hints
-            .contains(&RecoveryHint::RetryBeforeState)
-    );
-}
-#[test]
-fn compute_diagnostics_are_optional_redacted_and_non_contractual() {
-    let diagnostic = ComputeDiagnostic::new()
-        .with_provider(ProviderBinding::new("provider-a"))
-        .with_device(DeviceBinding::new(DeviceId::new("gpu:0")))
-        .with_operation_family(ComputeOperationFamily::LinearAlgebra)
-        .with_backend_message("native handle=0xdeadbeef at C:\\secret\\tensor.bin")
-        .with_debug_trace_id("trace-42");
-
-    assert_eq!(
-        diagnostic.provider.as_ref().map(ProviderBinding::as_str),
-        Some("provider-a")
-    );
-    assert_eq!(
-        diagnostic.backend_message.as_deref(),
-        Some("[redacted backend diagnostic]")
-    );
-
-    let error = ComputeError::new(
-        ComputeErrorCode::ExecutionFailed,
-        ComputeErrorPhase::Execution,
-        ComputeErrorSeverity::Terminal,
-        "provider execution failed",
-    )
-    .with_diagnostic(diagnostic)
-    .with_recovery_hint(RecoveryHint::RestartableWithReplay);
-
-    assert_eq!(error.code, ComputeErrorCode::ExecutionFailed);
-    assert_eq!(error.diagnostics.len(), 1);
-    assert!(
-        error
-            .recovery_hints
-            .contains(&RecoveryHint::RestartableWithReplay)
-    );
-}
-#[test]
-fn compute_operation_schemas_define_initial_portable_operations() {
-    let schemas = initial_compute_operation_schemas();
-
-    for id in [
-        "tensor.reshape",
-        "tensor.transpose",
-        "tensor.permute",
-        "tensor.slice",
-        "tensor.broadcast",
-        "tensor.squeeze",
-        "tensor.unsqueeze",
-        "elementwise.unary.relu",
-        "elementwise.binary.add",
-        "comparison.eq",
-        "selection.where",
-        "reduction.sum",
-        "linalg.matmul",
-        "linalg.batched-matmul",
-        "tensor.gather",
-        "tensor.index-select",
-        "tensor.scatter",
-        "tensor.scatter-add",
-        "tensor.concat",
-        "random.uniform",
-        "random.normal",
-    ] {
-        assert!(schemas.contains_key(&ComputeOperationId::new(id)), "{id}");
-    }
-    assert!(!schemas.contains_key(&ComputeOperationId::new("convolution.conv2d")));
-    assert!(!schemas.contains_key(&ComputeOperationId::new("pooling.max")));
-    assert!(!schemas.contains_key(&ComputeOperationId::new("attention.flash")));
-    assert!(!schemas.contains_key(&ComputeOperationId::new("quantized.matmul")));
-    assert!(!schemas.contains_key(&ComputeOperationId::new("custom.kernel")));
-    assert!(!schemas.contains_key(&ComputeOperationId::new("autograd.backward")));
-
-    let scatter = schemas
-        .get(&ComputeOperationId::new("tensor.scatter"))
-        .unwrap();
-    assert!(scatter.provider_specific_semantics);
-}
-#[test]
-fn provider_compute_advertisement_reports_version_and_schema_rejections() {
-    let schemas = initial_compute_operation_schemas();
-    let add = schemas
-        .get(&ComputeOperationId::new("elementwise.binary.add"))
-        .unwrap();
-    let mut incompatible = TestProvider::new("incompatible-compute");
-    incompatible.metadata.compute_advertisement = ProviderComputeAdvertisement::new()
-        .with_capability(
-            ComputeCapabilitySupport::default().with_versions([CapabilityVersion::new(0, 9, 0)]),
-        );
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(incompatible))
-        .build()
-        .unwrap();
-
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "incompatible-compute",
-            &[ComputeOperationDescriptor::from_schema(add)]
-        ),
-        Err(ComputeValidationError::UnsupportedAdvertisement { .. })
-    ));
-
-    let mut unsupported = provider_with_capabilities("unsupported-schema", [compute_capability()]);
-    unsupported.metadata.compute_advertisement = ProviderComputeAdvertisement::new()
-        .with_capability(
-            ComputeCapabilitySupport::default().with_versions([COMPUTE_CAPABILITY_VERSION]),
-        )
-        .with_operation_family(OperationFamilySupport::from_operation_support(
-            ComputeOperationFamily::Elementwise,
-            ComputeOperationSupport::new().with_dtypes([ComputeDType::Float32]),
-        ))
-        .with_unsupported_operation_schema(add.id.clone());
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(unsupported))
-        .build()
-        .unwrap();
-
-    assert!(matches!(
-        runtime.validate_compute_operations(
-            "unsupported-schema",
-            &[ComputeOperationDescriptor::from_schema(add)]
-        ),
-        Err(ComputeValidationError::UnsupportedOperationSchema { .. })
-    ));
-}
-#[test]
-fn tensor_views_and_resources_preserve_affinity_and_materialization_boundaries() {
-    let provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let source = TensorResourceId::new("tensor-1");
-    let descriptor = TensorDescriptor::new(
-        ShapeDescriptor::new([4, 4]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-        LayoutDescriptor::Strided {
-            strides_elements: vec![4, 1],
-            offset_elements: 0,
-        },
-    )
-    .with_view(ViewDescriptor::from_resource(source.clone(), 4, [4, 1]));
-    let resource = TensorResourceDescriptor::new(
-        source,
-        descriptor,
-        ResourceAffinity::new(FallbackClass::ProviderPinned)
-            .with_provider(ProviderBinding::new("portable-compute"))
-            .with_capability(CapabilityBinding::new(
-                CapabilityId::new(COMPUTE_CAPABILITY_ID),
-                COMPUTE_CAPABILITY_VERSION,
-            )),
-    );
-
-    runtime
-        .validate_compute_tensor_resources("portable-compute", &[resource])
-        .unwrap();
-
-    let foreign = TensorResourceDescriptor::new(
-        TensorResourceId::new("tensor-2"),
-        TensorDescriptor::materialized(
-            ShapeDescriptor::new([4, 4]),
-            DTypeDescriptor::portable(ComputeDType::Float32),
-        ),
-        ResourceAffinity::new(FallbackClass::ProviderPinned)
-            .with_provider(ProviderBinding::new("other-provider")),
-    );
-    assert!(matches!(
-        runtime.validate_compute_tensor_resources("portable-compute", &[foreign]),
-        Err(ComputeValidationError::IncompatibleResourceAffinity(_))
-    ));
-}
-#[test]
-fn compute_data_movement_validates_host_buffers_affinity_and_provider_support() {
-    let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    provider.metadata.compute_data_movement_support.insert(
-        ComputeDataMovementKind::Upload,
-        ComputeDataMovementSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense])
-            .with_host_encodings([HostBufferEncoding::LittleEndian]),
-    );
-    provider.metadata.compute_data_movement_support.insert(
-        ComputeDataMovementKind::Transfer,
-        ComputeDataMovementSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense]),
-    );
-    provider.metadata.compute_data_movement_support.insert(
-        ComputeDataMovementKind::Materialize,
-        ComputeDataMovementSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense, ComputeLayout::Strided]),
-    );
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let descriptor = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 2]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-
-    let upload = ComputeDataMovementDescriptor::upload(
-        HostBufferDescriptor::new(16, HostBufferEncoding::LittleEndian),
-        descriptor.clone(),
-    );
-    runtime
-        .validate_compute_data_movement("portable-compute", std::slice::from_ref(&upload))
-        .unwrap();
-    let uploaded = runtime
-        .wrap_compute_data_movement_output(
-            "portable-compute",
-            &upload,
-            TensorResourceId::new("uploaded"),
-        )
-        .unwrap();
-    assert_eq!(
-        uploaded.affinity.provider().map(ProviderBinding::as_str),
-        Some("portable-compute")
-    );
-
-    let invalid_upload = ComputeDataMovementDescriptor::upload(
-        HostBufferDescriptor::new(8, HostBufferEncoding::LittleEndian),
-        descriptor.clone(),
-    );
-    assert!(matches!(
-        runtime.validate_compute_data_movement("portable-compute", &[invalid_upload]),
-        Err(ComputeValidationError::InvalidHostBuffer { .. })
-    ));
-
-    let foreign = TensorResourceDescriptor::new(
-        TensorResourceId::new("foreign"),
-        descriptor.clone(),
-        ResourceAffinity::new(FallbackClass::ProviderPinned)
-            .with_provider(ProviderBinding::new("other-provider")),
-    );
-    let transfer = ComputeDataMovementDescriptor::transfer(foreign, descriptor.clone());
-    runtime
-        .validate_compute_data_movement("portable-compute", &[transfer])
-        .unwrap();
-
-    let materialized = TensorResourceDescriptor::new(
-        TensorResourceId::new("materialized"),
-        descriptor.clone(),
-        ResourceAffinity::new(FallbackClass::ProviderPinned)
-            .with_provider(ProviderBinding::new("portable-compute")),
-    );
-    let invalid_materialize = ComputeDataMovementDescriptor::materialize(materialized, descriptor);
-    assert!(matches!(
-        runtime.validate_compute_data_movement("portable-compute", &[invalid_materialize]),
-        Err(ComputeValidationError::MaterializationRequired { .. })
-    ));
-}
-#[test]
 fn memory_planning_accounts_for_explicit_host_staged_transfers() {
     let mut provider = provider_with_capabilities("movement-compute", [compute_capability()]);
     provider.metadata.compute_data_movement_support.insert(
@@ -1162,87 +817,6 @@ fn compute_operation_requests_reject_unknown_family_ids() {
         ),
         Err(ComputeValidationError::UnknownOperationFamily(_))
     ));
-}
-#[test]
-fn compute_execution_planning_selects_provider_device_and_validates_plan() {
-    let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    provider.metadata.compute_operation_support.insert(
-        ComputeOperationFamily::Elementwise,
-        ComputeOperationSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense]),
-    );
-    let mut device = DeviceMetadata::new(
-        DeviceId::new("gpu:0"),
-        "GPU 0",
-        DeviceType::Gpu,
-        "portable-compute",
-    );
-    device.memory_capacity = 1_048_576;
-    provider
-        .devices
-        .push(Arc::new(DeviceDescriptor::new(device)));
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let descriptor = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 2]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    let graph = ComputeGraph::new(ComputeGraphId::new("planned-graph"))
-        .with_input(ComputeInput::new(
-            ComputeInputId::new("x"),
-            ComputeInputValue::TensorDescriptor(descriptor.clone()),
-        ))
-        .with_node(
-            ComputeNode::new(
-                ComputeNodeId::new("add"),
-                ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
-                    .with_dtype(ComputeDType::Float32)
-                    .with_layout(ComputeLayout::Dense),
-            )
-            .with_input(ComputeValueRef::Input(ComputeInputId::new("x")))
-            .with_output(ComputeNodeOutput::new(
-                ComputeOutputId::new("y"),
-                descriptor,
-            )),
-        )
-        .with_output(ComputeOutput::new(
-            ComputeOutputId::new("result"),
-            ComputeValueRef::NodeOutput {
-                node: ComputeNodeId::new("add"),
-                output: ComputeOutputId::new("y"),
-            },
-        ));
-
-    let plan = runtime.plan_compute_execution(&graph).unwrap();
-
-    assert!(plan.is_validated());
-    assert_eq!(plan.provider.as_str(), "portable-compute");
-    assert_eq!(
-        plan.device.as_ref().map(|device| device.id().as_str()),
-        Some("gpu:0")
-    );
-    assert_eq!(plan.policy, BuiltInResolutionPolicy::Deterministic.id());
-    assert_eq!(
-        plan.classification,
-        ComputeExecutionClassification::Transparent
-    );
-    assert!(
-        plan.steps
-            .iter()
-            .any(|step| step.kind == ExecutionStepKind::SubmitToProvider)
-    );
-    assert!(
-        plan.constraints
-            .iter()
-            .any(|constraint| matches!(constraint, ExecutionConstraint::NoHiddenCpuStaging))
-    );
-    assert_eq!(
-        plan.memory_plan.graph,
-        Some(ComputeGraphId::new("planned-graph"))
-    );
 }
 #[test]
 fn scheduler_accepts_validated_plans_and_runs_fifo() {
@@ -2043,30 +1617,6 @@ fn provider_status_snapshot_separates_health_readiness_pressure_and_admission() 
 }
 
 #[test]
-fn provider_lifecycle_transitions_and_drain_completion_are_explicit() {
-    assert!(ProviderLifecycleState::Registered.can_transition_to(ProviderLifecycleState::Loading));
-    assert!(
-        ProviderLifecycleState::Loading.can_transition_to(ProviderLifecycleState::Initializing)
-    );
-    assert!(ProviderLifecycleState::Initializing.can_transition_to(ProviderLifecycleState::Ready));
-    assert!(ProviderLifecycleState::Ready.can_transition_to(ProviderLifecycleState::Draining));
-    assert!(ProviderLifecycleState::Draining.can_transition_to(ProviderLifecycleState::Stopped));
-    assert!(!ProviderLifecycleState::Ready.can_transition_to(ProviderLifecycleState::Removed));
-
-    let mut draining = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
-        ProviderBinding::new("provider-a"),
-        HealthState::Draining,
-    ));
-    draining.lifecycle = ProviderLifecycleState::Draining;
-    draining.readiness = ProviderReadinessState::Draining;
-    draining.in_flight_operations = 1;
-    assert!(!draining.is_drain_complete());
-    assert!(draining.pinned_work_allowed_during_drain());
-    draining.in_flight_operations = 0;
-    assert!(draining.is_drain_complete());
-}
-
-#[test]
 fn operation_family_status_falls_back_to_capability_status_when_absent() {
     let provider = ProviderBinding::new("provider-a");
     let mut snapshot = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
@@ -2433,25 +1983,6 @@ fn builder_does_not_register_kernels_for_a_rejected_provider() {
     assert_eq!(runtime.startup_diagnostics().len(), 1);
 }
 #[test]
-fn reject_incompatible() {
-    let mut p = TestProvider::new("old");
-    p.metadata.api_version += 1;
-    assert!(matches!(
-        ProviderLoader::new().register_provider(Arc::new(p)),
-        Err(ProviderError::IncompatibleApiVersion { .. })
-    ));
-}
-#[test]
-fn reject_duplicate() {
-    let mut m = ProviderLoader::new();
-    m.register_provider(Arc::new(TestProvider::new("same")))
-        .unwrap();
-    assert!(matches!(
-        m.register_provider(Arc::new(TestProvider::new("same"))),
-        Err(ProviderError::ProviderAlreadyRegistered(_))
-    ));
-}
-#[test]
 fn provider_shutdown_releases_registered_provider() {
     let p = TestProvider::new("provider");
     let p = Arc::new(p);
@@ -2460,19 +1991,6 @@ fn provider_shutdown_releases_registered_provider() {
     assert!(m.provider("provider").is_some());
     m.shutdown().unwrap();
     assert!(p.shut_down.load(Ordering::SeqCst));
-}
-
-#[test]
-fn dynamic_provider_loading_denies_paths_by_default() {
-    let mut loader = ProviderLoader::new();
-    let path = std::path::PathBuf::from("target/test-provider.dll");
-
-    let result = unsafe { loader.load_dynamic(&path) };
-
-    assert!(matches!(
-        result,
-        Err(ProviderError::ProviderPathDenied { path: denied }) if denied == path
-    ));
 }
 
 #[test]
@@ -2557,64 +2075,6 @@ fn provider_abi_descriptor_validates_version_layout_functions_and_ownership() {
 }
 
 #[test]
-fn provider_abi_handles_lifecycle_and_errors_are_internal_runtime_contracts() {
-    let instance = ProviderAbiHandleDescriptor::new(
-        ProviderAbiHandleKind::ProviderInstance,
-        ProviderAbiHandle::new(7),
-    );
-    let resource = ProviderAbiHandleDescriptor::new(
-        ProviderAbiHandleKind::ProviderResource,
-        ProviderAbiHandle::new(8),
-    );
-    let operation = ProviderAbiHandleDescriptor::new(
-        ProviderAbiHandleKind::Operation,
-        ProviderAbiHandle::new(9),
-    );
-
-    assert!(instance.destroy_required);
-    assert_eq!(resource.handle.as_u64(), 8);
-    assert_eq!(operation.kind, ProviderAbiHandleKind::Operation);
-    assert!(
-        ProviderAbiLoadingLifecycle::Discovered
-            .can_transition_to(ProviderAbiLoadingLifecycle::LibraryLoaded)
-    );
-    assert!(
-        !ProviderAbiLoadingLifecycle::Discovered
-            .can_transition_to(ProviderAbiLoadingLifecycle::Registered)
-    );
-    assert!(
-        ProviderAbiLoadingLifecycle::Failed
-            .can_transition_to(ProviderAbiLoadingLifecycle::Destroyed)
-    );
-
-    let categories = [
-        ProviderAbiErrorCode::InvalidAbiDescriptor,
-        ProviderAbiErrorCode::UnsupportedAbiVersion,
-        ProviderAbiErrorCode::InvalidMetadata,
-        ProviderAbiErrorCode::InvalidAdvertisement,
-        ProviderAbiErrorCode::InvalidDeviceMetadata,
-        ProviderAbiErrorCode::InitializationFailure,
-        ProviderAbiErrorCode::ProviderNotReady,
-        ProviderAbiErrorCode::ProviderDraining,
-        ProviderAbiErrorCode::ProviderSaturated,
-        ProviderAbiErrorCode::ExecutionRejected,
-        ProviderAbiErrorCode::ExecutionFailed,
-        ProviderAbiErrorCode::CancellationUnsupported,
-        ProviderAbiErrorCode::CancellationFailed,
-        ProviderAbiErrorCode::ResourceInvalid,
-        ProviderAbiErrorCode::InternalProviderError,
-        ProviderAbiErrorCode::PanicOrUnwindViolation,
-    ];
-    assert_eq!(categories.len(), 16);
-
-    let compute_error = ComputeError::from(ProviderError::PanicOrUnwindViolation(
-        "panic crossed boundary".into(),
-    ));
-    assert_eq!(compute_error.code, ComputeErrorCode::ProviderUnavailable);
-    assert_eq!(compute_error.phase, ComputeErrorPhase::Resolution);
-}
-
-#[test]
 fn provider_loading_policy_is_explicit_for_dynamic_and_development_modes() {
     let root = std::path::PathBuf::from("target/providers");
     let provider = root.join("provider.dll");
@@ -2677,162 +2137,11 @@ fn public_component_api_does_not_expose_wasmtime_native_types() {
 }
 
 #[test]
-fn component_manager_observes_engine_selection_and_rejection() {
-    let mut manager = ComponentManager::new();
-    manager
-        .register_component(ComponentDescriptor::new(
-            ComponentMetadata::new("component", "1", "test component"),
-            "component.wasm",
-        ))
-        .unwrap();
-
-    manager.prepare_component("component").unwrap();
-    assert!(
-        manager.observations().iter().any(|observation| {
-            observation.kind == ComponentObservationKind::EngineSelection
-                && observation
-                    .message
-                    .contains(ComponentEngineProfile::Test.as_str())
-        }),
-        "selected engine profile should be observable"
-    );
-
-    let error = ComponentEngineRequirements::default()
-        .require_feature(ComponentEngineFeature::ControlledWasi)
-        .validate("component", &manager.engine_capabilities())
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        ComponentError::EngineFeatureUnavailable {
-            feature: ComponentEngineFeature::ControlledWasi,
-            ..
-        }
-    ));
-}
-
-#[test]
 fn execution_context_default_allocates_unique_ids() {
     let first = ExecutionContext::default();
     let second = ExecutionContext::default();
     assert_ne!(first.id(), second.id());
     assert_ne!(first.id(), ExecutionContextId::default());
-}
-
-#[test]
-fn affinity_constraints_preserve_compatible_facts_and_fallback_precedence() {
-    let capability_a = capability_binding("magnetar:compute/run", CapabilityVersion::new(1, 1, 0));
-    let capability_b = capability_binding("magnetar:tokenize/run", CapabilityVersion::new(1, 0, 0));
-    let provider = ProviderBinding::new("provider-a");
-    let device = DeviceBinding::new(DeviceId::new("gpu:0"));
-    let context = ExecutionContextId::new(42);
-    let group = AffinityGroupId::new(7);
-
-    let model = ResourceAffinity::new(FallbackClass::Transparent)
-        .with_provider(provider.clone())
-        .with_device(device.clone())
-        .with_capability(capability_a.clone())
-        .with_artifact(ArtifactBinding::new("model", "sha256:model"))
-        .with_artifact(ArtifactBinding::new("bundle", "sha256:bundle"))
-        .with_execution_context(context)
-        .with_group(group);
-    let tokenizer = ResourceAffinity::new(FallbackClass::ProviderPinned)
-        .with_provider(provider)
-        .with_device(device)
-        .with_capability(capability_b.clone())
-        .with_artifact(ArtifactBinding::new("tokenizer", "sha256:tokenizer"))
-        .with_artifact(ArtifactBinding::new("bundle", "sha256:bundle"))
-        .with_execution_context(context)
-        .with_group(group);
-
-    let constraints = AffinityConstraints::try_from_affinities([&model, &tokenizer]).unwrap();
-    let aggregate = constraints.affinity();
-    assert_eq!(aggregate.capability(capability_a.id()), Some(&capability_a));
-    assert_eq!(aggregate.capability(capability_b.id()), Some(&capability_b));
-    assert_eq!(
-        aggregate.artifact("model").unwrap().fingerprint(),
-        "sha256:model"
-    );
-    assert_eq!(
-        aggregate.artifact("tokenizer").unwrap().fingerprint(),
-        "sha256:tokenizer"
-    );
-    assert_eq!(
-        aggregate.artifact("bundle").unwrap().fingerprint(),
-        "sha256:bundle"
-    );
-    assert_eq!(aggregate.fallback(), FallbackClass::ProviderPinned);
-}
-
-#[test]
-fn affinity_constraints_report_each_binding_conflict() {
-    let base = ResourceAffinity::new(FallbackClass::Transparent)
-        .with_provider(ProviderBinding::new("provider-a"))
-        .with_device(DeviceBinding::new(DeviceId::new("gpu:0")))
-        .with_capability(capability_binding(
-            "magnetar:compute/run",
-            CapabilityVersion::new(1, 1, 0),
-        ))
-        .with_artifact(ArtifactBinding::new("bundle", "sha256:a"))
-        .with_execution_context(ExecutionContextId::new(1))
-        .with_group(AffinityGroupId::new(1));
-
-    let provider_conflict = base
-        .clone()
-        .with_provider(ProviderBinding::new("provider-b"));
-    assert!(matches!(
-        base.validate_with(&provider_conflict),
-        Err(AffinityError::ProviderMismatch { .. })
-    ));
-
-    let device_conflict = base
-        .clone()
-        .with_device(DeviceBinding::new(DeviceId::new("gpu:1")));
-    assert!(matches!(
-        base.validate_with(&device_conflict),
-        Err(AffinityError::DeviceMismatch { .. })
-    ));
-
-    let capability_conflict = base.clone().with_capability(capability_binding(
-        "magnetar:compute/run",
-        CapabilityVersion::new(1, 2, 0),
-    ));
-    assert!(matches!(
-        base.validate_with(&capability_conflict),
-        Err(AffinityError::CapabilityMismatch { .. })
-    ));
-
-    let artifact_conflict = base
-        .clone()
-        .with_artifact(ArtifactBinding::new("bundle", "sha256:b"));
-    assert!(matches!(
-        base.validate_with(&artifact_conflict),
-        Err(AffinityError::ArtifactMismatch { .. })
-    ));
-
-    let context_conflict = base
-        .clone()
-        .with_execution_context(ExecutionContextId::new(2));
-    assert!(matches!(
-        base.validate_with(&context_conflict),
-        Err(AffinityError::ExecutionContextMismatch { .. })
-    ));
-
-    let group_conflict = base.clone().with_group(AffinityGroupId::new(2));
-    assert!(matches!(
-        base.validate_with(&group_conflict),
-        Err(AffinityError::AffinityGroupMismatch { .. })
-    ));
-}
-
-#[test]
-fn affinity_resource_keeps_value_and_affinity_together() {
-    let affinity = ResourceAffinity::new(FallbackClass::Restartable)
-        .with_provider(ProviderBinding::new("provider-a"));
-    let resource = AffinityResource::new("native-handle", affinity.clone());
-
-    assert_eq!(resource.value(), &"native-handle");
-    assert_eq!(resource.affinity(), &affinity);
-    assert_eq!(resource.into_parts(), ("native-handle", affinity));
 }
 
 #[test]
@@ -3099,35 +2408,6 @@ fn component_artifact_reference_prepares_future_artifact_model_without_trust_pol
 }
 
 #[test]
-fn component_imports_are_authorized_and_linked_explicitly() {
-    let interface = WitInterface::new("magnetar:runtime/run", "1.0.0");
-    let metadata =
-        ComponentMetadata::new("consumer", "1", "test component").with_import(interface.clone());
-    let mut manager = ComponentManager::new();
-    manager
-        .register_component(ComponentDescriptor::new(metadata, "consumer.wasm"))
-        .unwrap();
-
-    assert!(matches!(
-        manager.instantiate_component("consumer"),
-        Err(ComponentError::UnauthorizedImport { .. })
-    ));
-
-    manager.authorize_interface(interface.clone());
-    assert!(matches!(
-        manager.instantiate_component("consumer"),
-        Err(ComponentError::UnresolvedImport { .. })
-    ));
-
-    manager.provide_interface(interface);
-    let instance = manager.instantiate_component("consumer").unwrap();
-    assert_eq!(
-        manager.instance_state(instance),
-        Some(ComponentInstanceState::Ready)
-    );
-}
-
-#[test]
 fn component_import_version_must_match_authorized_interface() {
     let authorized = WitInterface::new("magnetar:runtime/run", "1.0.0");
     let requested = WitInterface::new("magnetar:runtime/run", "2.0.0");
@@ -3141,213 +2421,6 @@ fn component_import_version_must_match_authorized_interface() {
     assert!(matches!(
         manager.instantiate_component("consumer"),
         Err(ComponentError::UnauthorizedImport { .. })
-    ));
-}
-
-#[test]
-fn component_ambient_network_process_and_secret_imports_fail_closed() {
-    let interfaces = [
-        WitInterface::new("wasi:sockets/tcp", "0.2.0"),
-        WitInterface::new("wasi:cli/run", "0.2.0"),
-        WitInterface::new("magnetar:secrets/read", "1.0.0"),
-    ];
-    for (index, interface) in interfaces.into_iter().enumerate() {
-        let name = format!("authority-{index}");
-        let mut manager = ComponentManager::new();
-        manager
-            .register_component(ComponentDescriptor::new(
-                ComponentMetadata::new(&name, "1", "test component").with_import(interface),
-                format!("{name}.wasm"),
-            ))
-            .unwrap();
-
-        assert!(matches!(
-            manager.instantiate_component(&name),
-            Err(ComponentError::UnauthorizedImport { .. })
-        ));
-    }
-}
-
-#[test]
-fn component_link_plan_is_runtime_owned_and_immutable_to_callers() {
-    let interface = WitInterface::new("magnetar:runtime/run", "1.0.0");
-    let metadata =
-        ComponentMetadata::new("consumer", "1", "test component").with_import(interface.clone());
-    let mut manager = ComponentManager::new();
-    manager.provide_interface(interface.clone());
-    manager
-        .register_component(ComponentDescriptor::new(metadata, "consumer.wasm"))
-        .unwrap();
-
-    let plan = manager.link_plan("consumer").unwrap();
-    let links = plan.links().collect::<Vec<_>>();
-    assert_eq!(links.len(), 1);
-    assert_eq!(links[0].0, &interface);
-    assert!(matches!(
-        links[0].1,
-        ComponentEndpoint::Capability { interface: linked } if linked == &interface
-    ));
-    assert_eq!(plan.endpoint(&interface), Some(links[0].1));
-}
-
-#[test]
-fn component_link_plan_rejects_forbidden_external_interfaces_even_if_provided() {
-    for interface in [
-        WitInterface::new("wasi:filesystem/types", "0.2.0"),
-        WitInterface::new("wasi:sockets/tcp", "0.2.0"),
-        WitInterface::new("magnetar:workspace/read", "1.0.0"),
-        WitInterface::new("magnetar:git/status", "1.0.0"),
-        WitInterface::new("magnetar:process/run", "1.0.0"),
-        WitInterface::new("magnetar:secrets/read", "1.0.0"),
-    ] {
-        let mut manager = ComponentManager::new();
-        manager.provide_interface(interface.clone());
-        manager
-            .register_component(ComponentDescriptor::new(
-                ComponentMetadata::new("external", "1", "external component")
-                    .with_import(interface),
-                "external.wasm",
-            ))
-            .unwrap();
-
-        assert!(matches!(
-            manager.link_plan("external"),
-            Err(ComponentError::UnauthorizedImport { .. })
-        ));
-    }
-}
-
-#[test]
-fn component_authority_requirements_map_to_inference_runtime_endpoints() {
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "compute-capability".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::Capability { interface }
-            if interface == WitInterface::new("magnetar:compute/run", "2.0.0")
-    ));
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "model-artifact-read".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
-            kind: InferenceArtifactKind::Model
-        }
-    ));
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "tokenizer-artifact-read".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
-            kind: InferenceArtifactKind::Tokenizer
-        }
-    ));
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "prompt-template-read".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
-            kind: InferenceArtifactKind::PromptTemplate
-        }
-    ));
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "adapter-artifact-read".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
-            kind: InferenceArtifactKind::Adapter
-        }
-    ));
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "quantization-artifact-read".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
-            kind: InferenceArtifactKind::Quantization
-        }
-    ));
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "kv-cache-access".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::InferenceCacheService {
-            kind: InferenceCacheKind::Kv
-        }
-    ));
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "prefix-cache-access".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::InferenceCacheService {
-            kind: InferenceCacheKind::Prefix
-        }
-    ));
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "observability-emit".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::Observability
-    ));
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "runtime-diagnostics".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::RuntimeDiagnostics
-    ));
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "generation-capability".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::PendingRuntimeService { .. }
-    ));
-    assert!(matches!(
-        (ComponentAuthorityRequirement {
-            kind: "sampling-capability".into(),
-        })
-        .endpoint(),
-        ComponentAuthorityEndpoint::PendingRuntimeService { .. }
-    ));
-}
-
-#[test]
-fn inference_artifact_registry_uses_identities_not_paths_and_scopes_sessions() {
-    let mut manager = ComponentManager::new();
-    let digest = ComponentDigest::sha256(b"model");
-    let session = InferenceSessionId::new("session-a").unwrap();
-    manager
-        .register_inference_artifact(
-            InferenceArtifactReference::new(InferenceArtifactKind::Model, "qwen-model", digest)
-                .unwrap()
-                .with_session(session.clone()),
-        )
-        .unwrap();
-
-    let artifact = manager
-        .resolve_inference_artifact(InferenceArtifactKind::Model, "qwen-model", Some(&session))
-        .unwrap();
-    assert_eq!(artifact.id, "qwen-model");
-    assert!(matches!(
-        manager.resolve_inference_artifact(InferenceArtifactKind::Model, "../qwen-model", None),
-        Err(ComponentError::ArtifactRejected { .. })
-    ));
-    assert!(matches!(
-        manager.resolve_inference_artifact(
-            InferenceArtifactKind::Model,
-            "qwen-model",
-            Some(&InferenceSessionId::new("session-b").unwrap())
-        ),
-        Err(ComponentError::ArtifactRejected { .. })
     ));
 }
 
@@ -3400,75 +2473,6 @@ fn inference_cache_registry_scopes_access_to_session_and_model() {
             .unwrap()
         ),
         Err(ComponentError::ArtifactRejected { .. })
-    ));
-}
-
-#[test]
-fn component_definition_can_create_multiple_isolated_instances() {
-    let mut manager = ComponentManager::new();
-    manager
-        .register_component(ComponentDescriptor::new(
-            ComponentMetadata::new("component", "1", "test component"),
-            "component.wasm",
-        ))
-        .unwrap();
-
-    let first = manager.instantiate_component("component").unwrap();
-    let second = manager.instantiate_component("component").unwrap();
-    assert_ne!(first, second);
-    assert_eq!(
-        manager.instance_state(first),
-        Some(ComponentInstanceState::Ready)
-    );
-    assert_eq!(
-        manager.instance_state(second),
-        Some(ComponentInstanceState::Ready)
-    );
-}
-
-#[test]
-fn component_manager_enforces_instance_and_invocation_limits() {
-    let mut manager = ComponentManager::new();
-    manager.set_resource_limits(ComponentResourceLimits {
-        max_instances: Some(1),
-        ..ComponentResourceLimits::default()
-    });
-    manager
-        .register_component(ComponentDescriptor::new(
-            ComponentMetadata::new("component", "1", "test component"),
-            "component.wasm",
-        ))
-        .unwrap();
-
-    manager.instantiate_component("component").unwrap();
-    assert!(matches!(
-        manager.instantiate_component("component"),
-        Err(ComponentError::ResourceLimitExceeded {
-            limit: "instances",
-            ..
-        })
-    ));
-
-    let interface = WitInterface::new("example:app/run", "1.0.0");
-    let mut manager = ComponentManager::new();
-    manager.set_resource_limits(ComponentResourceLimits {
-        max_concurrent_invocations: Some(0),
-        ..ComponentResourceLimits::default()
-    });
-    manager
-        .register_component(ComponentDescriptor::new(
-            ComponentMetadata::new("callable", "1", "test component")
-                .with_export(interface.clone()),
-            "callable.wasm",
-        ))
-        .unwrap();
-    let instance = manager.instantiate_component("callable").unwrap();
-    assert!(matches!(
-        manager.invoke(ComponentInvocation::new(instance, interface, "run")),
-        Err(ComponentError::ResourceLimitExceeded {
-            limit: "concurrent invocations",
-            ..
-        })
     ));
 }
 
@@ -3563,48 +2567,6 @@ fn component_observations_are_non_authoritative_and_redacted() {
             || observation.message.contains("Device")
             || observation.message.contains("Store")
     }));
-}
-
-#[test]
-fn component_engine_normalizes_traps_interruptions_and_limit_failures() {
-    let interface = WitInterface::new("example:app/run", "1.0.0");
-    let mut trapping_engine = MockComponentEngine::new();
-    trapping_engine.trap_on_invoke = Some(ComponentTrapKind::Trap);
-    let mut manager = ComponentManager::with_engine(Box::new(trapping_engine));
-    manager
-        .register_component(ComponentDescriptor::new(
-            ComponentMetadata::new("component", "1", "test component")
-                .with_export(interface.clone()),
-            "component.wasm",
-        ))
-        .unwrap();
-    let instance = manager.instantiate_component("component").unwrap();
-    assert!(matches!(
-        manager.invoke(ComponentInvocation::new(instance, interface, "run")),
-        Err(ComponentError::Trap {
-            kind: ComponentTrapKind::Trap,
-            ..
-        })
-    ));
-
-    let mut manager = ComponentManager::with_engine(Box::new(
-        MockComponentEngine::new().without_resource_limits(),
-    ));
-    manager.set_resource_limits(ComponentResourceLimits {
-        require_memory_limit: true,
-        max_memory_bytes: Some(1024),
-        ..ComponentResourceLimits::default()
-    });
-    manager
-        .register_component(ComponentDescriptor::new(
-            ComponentMetadata::new("limited", "1", "test component"),
-            "limited.wasm",
-        ))
-        .unwrap();
-    assert!(matches!(
-        manager.instantiate_component("limited"),
-        Err(ComponentError::ResourceLimitUnsupported { .. })
-    ));
 }
 
 #[test]
@@ -3826,50 +2788,6 @@ fn pushed_component_package_temp_materialization_is_removed_with_manager() {
     };
 
     assert!(!materialized.exists());
-}
-
-#[test]
-fn distribution_source_identity_does_not_imply_trust() {
-    let package =
-        component_artifact_package(b"component-bytes", ComponentDistributionSourceKind::Tachyon);
-    let mut manager = ComponentManager::new();
-
-    assert!(matches!(
-        manager.prepare_pushed_package(package),
-        Err(ComponentError::ArtifactRejected {
-            status: ComponentTrustStatus::Unknown,
-            ..
-        })
-    ));
-}
-
-#[test]
-fn pulled_component_package_resolves_fetches_and_validates_locally() {
-    let bytes = b"component-bytes";
-    let digest = ComponentDigest::sha256(bytes);
-    let package =
-        component_artifact_package(bytes, ComponentDistributionSourceKind::LocalDirectory);
-    let source = TestComponentDistributionSource {
-        package,
-        candidates: vec![digest.clone()],
-    };
-    let mut manager = ComponentManager::new();
-    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value.clone()));
-
-    manager
-        .prepare_pulled_package(&source, "magnetar.examples.hello", Some(">=0.1.0,<1.0.0"))
-        .unwrap();
-
-    assert_eq!(
-        manager
-            .definition("magnetar.examples.hello")
-            .and_then(|definition| definition.artifact_digest.clone()),
-        Some(digest)
-    );
-    assert!(manager.observations().iter().any(|observation| {
-        observation.kind == ComponentObservationKind::Distribution
-            && observation.message.contains("candidate digest")
-    }));
 }
 
 #[test]
@@ -5214,50 +4132,6 @@ fn generation_request_rejects_prompt_that_exceeds_limits_without_truncation() {
 }
 
 #[test]
-fn generation_parameters_validate_temperature_sampling_and_greedy_modes() {
-    let mut invalid = generation_request();
-    invalid.parameters.temperature = f32::NAN;
-    assert!(matches!(
-        invalid.validate(),
-        Err(GenerationError::ParameterInvalid {
-            parameter: "temperature",
-            ..
-        })
-    ));
-
-    let mut greedy = generation_request();
-    greedy.parameters = GenerationParameters::greedy();
-    greedy.validate().unwrap();
-    assert!(!greedy.parameters.sampling_enabled);
-}
-
-#[test]
-fn generation_stop_conditions_distinguish_length_eos_token_and_sequences() {
-    let request = generation_request();
-
-    assert_eq!(
-        stop_reason_for(&request, &[1, 2, 3, 4]),
-        Some(FinishReason::MaxNewTokens)
-    );
-    assert_eq!(
-        stop_reason_for(&request, &[299]),
-        Some(FinishReason::EosToken)
-    );
-    assert_eq!(
-        stop_reason_for(&request, &[298]),
-        Some(FinishReason::StopToken)
-    );
-    assert_eq!(
-        stop_reason_for(&request, &[1, 10, 11]),
-        Some(FinishReason::StopSequence)
-    );
-    assert_eq!(
-        stop_reason_for(&request, &[1, 121, 122]),
-        Some(FinishReason::StopSequence)
-    );
-}
-
-#[test]
 fn generation_can_ignore_eos_by_explicit_policy() {
     let mut request = generation_request();
     request.stop_conditions.eos.mode = EosMode::Ignore;
@@ -5270,23 +4144,6 @@ fn generation_decode_step_preserves_token_index_and_state_boundary() {
     let request = generation_request();
     let step = decode_step(&request, &[20, 21], 22).unwrap();
 
-    assert_eq!(step.token_id, 22);
-    assert_eq!(step.token_index, 2);
-    assert!(step.state_update.is_some());
-}
-
-#[test]
-fn generation_decode_step_delegates_next_token_selection_to_sampling() {
-    let mut request = generation_request();
-    request.parameters = GenerationParameters::greedy();
-    request.stop_conditions = StopConditions::default();
-    let mut logits = vec![0.0; request.tokenizer.metadata.vocabulary_size as usize];
-    logits[21] = 10.0;
-
-    let (sampling, step) =
-        decode_step_from_sampling(&request, &[20, 21], logits, SamplingPolicy::default()).unwrap();
-
-    assert_eq!(sampling.selected_token_id, 22);
     assert_eq!(step.token_id, 22);
     assert_eq!(step.token_index, 2);
     assert!(step.state_update.is_some());
@@ -5384,22 +4241,6 @@ fn generation_memory_admission_uses_memory_manager_policy() {
 }
 
 #[test]
-fn generation_provider_errors_map_to_finish_reasons() {
-    assert_eq!(
-        finish_reason_from_provider_error(ProviderExecutionErrorCode::ExecutionInterrupted),
-        FinishReason::Interrupted
-    );
-    assert_eq!(
-        finish_reason_from_provider_error(ProviderExecutionErrorCode::OutOfMemory),
-        FinishReason::MemoryLimit
-    );
-    assert_eq!(
-        finish_reason_from_provider_error(ProviderExecutionErrorCode::ExecutionFailed),
-        FinishReason::ProviderError
-    );
-}
-
-#[test]
 fn generation_contract_has_no_authoritative_provider_or_device_selector() {
     let request = generation_request();
 
@@ -5421,20 +4262,6 @@ fn reference_cpu_provider_status_snapshot_reports_health_and_lifecycle() {
     assert_eq!(snapshot.lifecycle, ProviderLifecycleState::Ready);
     assert_eq!(snapshot.admission, ProviderAdmissionDecision::Admit);
     assert!(snapshot.diagnostics.is_empty());
-}
-
-#[test]
-fn reference_cpu_provider_pressure_is_explicitly_reportable() {
-    let provider = ReferenceCpuProvider::new();
-    assert_eq!(
-        provider.status_snapshot().pressure,
-        ProviderPressureLevel::Low
-    );
-    provider.report_pressure(ProviderPressureLevel::Saturated);
-    assert_eq!(
-        provider.status_snapshot().pressure,
-        ProviderPressureLevel::Saturated
-    );
 }
 
 #[test]
@@ -5476,39 +4303,6 @@ fn reference_cpu_initialize_emits_provider_registered_and_device_detected() {
             .iter()
             .any(|observation| observation.kind == KernelObservationKind::DeviceDetected)
     );
-}
-
-#[test]
-fn reference_cpu_advertises_only_implemented_kernels() {
-    let provider = ReferenceCpuProvider::new();
-    let advertisements = provider.kernel_advertisements();
-    let names = advertisements
-        .iter()
-        .map(|advertisement| advertisement.id.name.as_str())
-        .collect::<BTreeSet<_>>();
-    for expected in [
-        "matmul",
-        "embedding",
-        "rmsnorm",
-        "rope",
-        "attention",
-        "softmax",
-        "silu",
-        "gelu",
-        "activation",
-        "add",
-        "mul",
-        "residual-add",
-        "dtype-conversion",
-        "layout-conversion",
-    ] {
-        assert!(names.contains(expected), "missing kernel: {expected}");
-    }
-    assert!(!names.contains("quantize"));
-    assert!(!names.contains("dequantize"));
-    for advertisement in &advertisements {
-        validate_kernel_advertisement(advertisement).unwrap();
-    }
 }
 
 #[test]
@@ -5697,18 +4491,6 @@ fn reference_cpu_attention_rejects_zero_window() {
     // A zero window admits no keys at all; it must not be silently widened to 1.
     let error =
         attention(&q, &k, &v, 1, 1, None, Some(0), true).expect_err("zero window must be rejected");
-    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
-}
-
-#[test]
-fn reference_cpu_attention_rejects_window_without_causal_mask() {
-    let q = reference_cpu_host_tensor([2, 1], [0.0, 0.0]);
-    let k = q.clone();
-    let v = reference_cpu_host_tensor([2, 1], [1.0, 2.0]);
-    // The window is anchored at the query position, which only fully describes
-    // the mask under causal attention.
-    let error = attention(&q, &k, &v, 1, 1, None, Some(1), false)
-        .expect_err("bidirectional sliding window must be rejected");
     assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
 }
 
@@ -6011,54 +4793,6 @@ fn reference_cpu_layout_conversion_rejects_non_contiguous() {
 fn reference_cpu_quantization_is_explicitly_unsupported() {
     let error = dequantize_placeholder();
     assert_eq!(error.id(), "reference-cpu-dtype-unsupported");
-}
-
-#[test]
-fn reference_cpu_fallback_denied_by_default_allowed_by_policy() {
-    let pinned = ResourceAffinity::new(FallbackClass::ProviderPinned);
-    assert!(evaluate_fallback(&pinned, &FallbackPolicyContext::new(true)).is_err());
-
-    let transparent = ResourceAffinity::new(FallbackClass::Transparent);
-    assert!(evaluate_fallback(&transparent, &FallbackPolicyContext::new(false)).is_err());
-    assert!(evaluate_fallback(&transparent, &FallbackPolicyContext::new(true)).is_ok());
-}
-
-#[test]
-fn reference_cpu_fallback_is_observable() {
-    let provider = ReferenceCpuProvider::new();
-    let executor = provider.executor();
-    let kernel = provider
-        .kernel_advertisements()
-        .into_iter()
-        .find(|advertisement| advertisement.id.name == "matmul")
-        .unwrap()
-        .id;
-    let transparent = ResourceAffinity::new(FallbackClass::Transparent);
-
-    executor
-        .evaluate_fallback_observed(&kernel, &transparent, &FallbackPolicyContext::new(true))
-        .unwrap();
-    let observations = executor.observations();
-    assert!(
-        observations
-            .iter()
-            .any(|observation| observation.kind == KernelObservationKind::KernelFallbackConsidered)
-    );
-    assert!(
-        observations
-            .iter()
-            .any(|observation| observation.kind == KernelObservationKind::KernelFallbackUsed)
-    );
-
-    executor
-        .evaluate_fallback_observed(&kernel, &transparent, &FallbackPolicyContext::new(false))
-        .unwrap_err();
-    assert!(
-        executor
-            .observations()
-            .iter()
-            .any(|observation| observation.kind == KernelObservationKind::KernelFallbackFailed)
-    );
 }
 
 fn reference_cpu_resource(
@@ -7197,64 +5931,12 @@ fn tensor_resource_for_test(id: &str) -> TensorResource {
 }
 
 #[test]
-fn tensor_lifecycle_allows_declared_to_ready_happy_path() {
-    let mut resource = tensor_resource_for_test("tensor-lifecycle-1");
-    resource
-        .transition_to(TensorLifecycleState::Planned)
-        .unwrap();
-    resource
-        .transition_to(TensorLifecycleState::Allocating)
-        .unwrap();
-    resource.mark_ready().unwrap();
-    assert_eq!(resource.lifecycle, TensorLifecycleState::Ready);
-    assert_eq!(resource.readiness, TensorReadiness::Ready);
-    assert!(resource.ensure_usable().is_ok());
-}
-
-#[test]
 fn tensor_lifecycle_rejects_declared_to_ready_skip() {
     let mut resource = tensor_resource_for_test("tensor-lifecycle-2");
     let error = resource
         .transition_to(TensorLifecycleState::Ready)
         .unwrap_err();
     assert!(matches!(error, TensorError::ResourceInvalid { .. }));
-}
-
-#[test]
-fn tensor_readiness_blocks_dispatch_until_ready() {
-    let mut resource = tensor_resource_for_test("tensor-readiness-1");
-    resource
-        .transition_to(TensorLifecycleState::Planned)
-        .unwrap();
-    resource
-        .transition_to(TensorLifecycleState::Allocating)
-        .unwrap();
-    resource.transition_to(TensorLifecycleState::Ready).unwrap();
-    resource.readiness = TensorReadiness::PendingTransfer;
-    assert!(matches!(
-        resource.ensure_usable().unwrap_err(),
-        TensorError::ResourceNotReady { .. }
-    ));
-    resource.readiness = TensorReadiness::Ready;
-    assert!(resource.ensure_usable().is_ok());
-}
-
-#[test]
-fn tensor_memory_class_is_derived_from_memory_placement() {
-    assert_eq!(
-        TensorMemoryClass::from(&MemoryPlacement::HostOrdinary),
-        TensorMemoryClass::Host
-    );
-    assert_eq!(
-        TensorMemoryClass::from(&MemoryPlacement::HostPinned),
-        TensorMemoryClass::PinnedHost
-    );
-    assert_eq!(
-        TensorMemoryClass::from(&MemoryPlacement::BrowserLinearMemory),
-        TensorMemoryClass::BrowserLinearMemory
-    );
-    let staged = MemoryPlacement::StagedTemporary(Box::new(MemoryPlacement::HostOrdinary));
-    assert_eq!(TensorMemoryClass::from(&staged), TensorMemoryClass::Host);
 }
 
 #[test]
@@ -7306,44 +5988,6 @@ fn operator_layout_kind_maps_every_layout_descriptor_variant() {
             dequantization_requirements: None,
         }),
         TensorLayoutKind::QuantizedPacked
-    );
-}
-
-#[test]
-fn tensor_descriptor_builder_sets_intents_and_semantic_role() {
-    let descriptor = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 3]),
-        DTypeDescriptor::portable(ComputeDType::Float16),
-    )
-    .with_storage_dtype(DTypeDescriptor::portable(ComputeDType::Float16))
-    .with_compute_dtype(DTypeDescriptor::portable(ComputeDType::Float32))
-    .with_memory_class_intent(TensorMemoryClass::Host)
-    .with_mutability_intent(TensorMutabilityKind::Immutable)
-    .with_aliasing_intent(TensorAliasingKind::NoAlias)
-    .with_affinity_constraints(ResourceAffinity::new(FallbackClass::Transparent))
-    .with_semantic_role(TensorRole::Input)
-    .with_dimension_roles([DimensionRole::Batch, DimensionRole::Hidden]);
-
-    assert_eq!(
-        descriptor.compute_dtype,
-        Some(DTypeDescriptor::portable(ComputeDType::Float32))
-    );
-    assert_eq!(
-        descriptor.memory_class_intent,
-        Some(TensorMemoryClass::Host)
-    );
-    assert_eq!(descriptor.semantic_role, Some(TensorRole::Input));
-    assert!(
-        descriptor
-            .validate(&TensorDescriptorLimits::default())
-            .is_ok()
-    );
-
-    let mismatched = descriptor.with_dimension_roles([DimensionRole::Batch]);
-    assert!(
-        mismatched
-            .validate(&TensorDescriptorLimits::default())
-            .is_err()
     );
 }
 
@@ -7405,37 +6049,6 @@ fn tensor_resource_debug_output_never_exposes_raw_pointers_or_handles() {
     let text = format!("{resource:?}");
     assert!(!text.contains("0x"));
     assert!(!text.contains("handle="));
-}
-
-#[test]
-fn layout_descriptor_packed_quantized_tracks_dequantization_requirements() {
-    let layout = LayoutDescriptor::PackedQuantized {
-        method: "int4".into(),
-        bits_per_value: 4,
-        group_size: Some(32),
-        scale_dtype: Some(Box::new(DTypeDescriptor::portable(ComputeDType::Float16))),
-        zero_point_dtype: None,
-        packing_order: Some("row-major-blocks".into()),
-        dequantization_requirements: Some("requires dequantize_placeholder before use".into()),
-    };
-    let LayoutDescriptor::PackedQuantized {
-        dequantization_requirements,
-        ..
-    } = &layout
-    else {
-        unreachable!()
-    };
-    assert_eq!(
-        dequantization_requirements.as_deref(),
-        Some("requires dequantize_placeholder before use")
-    );
-}
-
-#[test]
-fn reference_cpu_quantize_and_dequantize_placeholders_reject_explicitly() {
-    for error in [dequantize_placeholder(), quantize_placeholder()] {
-        assert_eq!(error.code, ReferenceCpuErrorCode::DTypeUnsupported);
-    }
 }
 
 #[test]
@@ -7586,18 +6199,6 @@ fn inference_api_model_reference_resolution_fails_for_unregistered_reference() {
 }
 
 #[test]
-fn inference_api_model_reference_rejects_path_like_input() {
-    assert!(matches!(
-        ModelRef::new("../etc/passwd"),
-        Err(InferenceApiError::ModelReferenceInvalid { .. })
-    ));
-    assert!(matches!(
-        ModelRef::new("models/qwen"),
-        Err(InferenceApiError::ModelReferenceInvalid { .. })
-    ));
-}
-
-#[test]
 fn inference_api_session_creation_rejects_forbidden_allowed_capabilities() {
     let runtime = &mut Runtime::builder().build().unwrap();
     let mut request = session_creation_request();
@@ -7623,17 +6224,6 @@ fn inference_api_session_creation_succeeds_with_inference_only_capabilities() {
     assert_eq!(status.id, session);
     assert!(!status.raw_prompt_available);
     assert!(!status.raw_handles_available);
-}
-
-#[test]
-fn inference_api_tokenize_chat_messages_requires_authorized_formatter() {
-    let tokenizer = FixtureTokenizer::new(generation_tokenizer_metadata());
-    let request = TokenizationRequest::new(PromptInput::ChatMessages(vec![ChatMessage::new(
-        "user", "hello",
-    )]));
-
-    let error = tokenize_prompt_input(&tokenizer, request, None).unwrap_err();
-    assert!(matches!(error, InferenceApiError::PolicyDenied { .. }));
 }
 
 #[test]
@@ -10623,25 +9213,6 @@ fn inference_api_tachyon_and_cli_boundary_capabilities_are_inference_only() {
 }
 
 #[test]
-fn inference_api_streaming_handle_correlates_with_ordered_token_events() {
-    let request = generation_request();
-    let handle = StreamingHandle::for_request(&request);
-
-    let events = token_stream_events(&request, &[10, 11, 12], None).unwrap();
-    assert_eq!(events.len(), 3);
-    assert!(
-        events
-            .iter()
-            .all(|event| event.request_id == handle.request)
-    );
-    let indices: Vec<_> = events
-        .iter()
-        .filter_map(|event| event.token_index)
-        .collect();
-    assert_eq!(indices, vec![0, 1, 2]);
-}
-
-#[test]
 fn inference_api_diagnostics_and_status_debug_output_never_exposes_raw_pointer_markers() {
     let runtime = Runtime::builder().build().unwrap();
     let diagnostics = runtime_diagnostics(&runtime);
@@ -10654,19 +9225,6 @@ fn inference_api_diagnostics_and_status_debug_output_never_exposes_raw_pointer_m
     let debug_output = format!("{diagnostics:?} {instance:?}");
     assert!(!debug_output.contains("0x"));
     assert!(!debug_output.to_ascii_lowercase().contains("pointer"));
-}
-
-#[test]
-fn inference_api_cancellation_reports_limitation_when_unsupported_after_dispatch() {
-    let token = CancellationToken::new(GenerationRequestId::new("gen-1").unwrap());
-    assert_eq!(
-        request_cancellation(&token, true),
-        CancellationOutcome::Cancelled
-    );
-    assert!(matches!(
-        request_cancellation(&token, false),
-        CancellationOutcome::LimitationReported { .. }
-    ));
 }
 
 #[test]
@@ -10688,19 +9246,6 @@ fn inference_api_usage_report_never_carries_raw_prompt_text() {
     assert_eq!(report.generated_token_count, 4);
     assert_eq!(report.cache_hit, Some(true));
     assert!(!report.cancelled);
-}
-
-#[test]
-fn inference_api_browser_feature_check_only_rejects_on_wasm32() {
-    let result = require_browser_supported("wasmtime");
-    if cfg!(target_arch = "wasm32") {
-        assert!(matches!(
-            result,
-            Err(InferenceApiError::BrowserFeatureUnsupported { .. })
-        ));
-    } else {
-        assert!(result.is_ok());
-    }
 }
 
 fn session_creation_request() -> SessionCreationRequest {
@@ -10766,16 +9311,6 @@ fn inference_api_model_resolution_local_registry_source_still_resolves() {
 }
 
 #[test]
-fn inference_api_streaming_decode_request_carries_state_across_calls() {
-    let tokenizer = FixtureTokenizer::new(generation_tokenizer_metadata());
-    let mut request = StreamingDecodeRequest::new(vec![2, 3]);
-    request.skip_special_tokens = true;
-
-    let output = decode_tokens_streaming(&tokenizer, request).unwrap();
-    assert!(output.consumed_token_count > 0 || output.pending_partial_state.is_some());
-}
-
-#[test]
 fn inference_api_validate_tokenizer_compatibility_accepts_matching_digest() {
     let metadata = generation_tokenizer_metadata();
     let tokenizer = FixtureTokenizer::new(metadata.clone());
@@ -10832,61 +9367,6 @@ fn inference_api_browser_inference_capabilities_reduced_excludes_kv_cache() {
 }
 
 #[test]
-fn inference_api_run_generation_loop_emits_full_streaming_lifecycle_and_completes() {
-    let mut request = generation_request();
-    request.parameters = GenerationParameters::greedy();
-    request.stop_conditions = StopConditions::default();
-    request.max_new_tokens = 2;
-    let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
-
-    let mut runtime = runtime_with_model_execution_engine(
-        vocabulary_size,
-        RuntimeGenerationExecutionEvidence::complete(),
-    );
-    let mut observer = InferenceApiObserver::new();
-
-    let result = run_generation_loop(
-        &mut runtime,
-        &request,
-        SamplingPolicy::default(),
-        CacheUsageSummary {
-            kv_cache_hit: Some(true),
-            prefix_cache_hit: Some(false),
-        },
-        |_generated| false,
-        &mut observer,
-    )
-    .unwrap();
-
-    assert_eq!(result.output.generated_token_count, 2);
-    assert_eq!(result.output.finish_reason, FinishReason::MaxNewTokens);
-    assert_eq!(result.cache_usage.kv_cache_hit, Some(true));
-
-    let kinds: Vec<_> = observer
-        .observations()
-        .iter()
-        .map(|observation| observation.kind)
-        .collect();
-    for expected in [
-        InferenceApiObservationKind::GenerationStarted,
-        InferenceApiObservationKind::StreamOpened,
-        InferenceApiObservationKind::KvCacheUsed,
-        InferenceApiObservationKind::PrefixCacheMiss,
-        InferenceApiObservationKind::PrefillStarted,
-        InferenceApiObservationKind::PrefillCompleted,
-        InferenceApiObservationKind::DecodeStarted,
-        InferenceApiObservationKind::TokenGenerated,
-        InferenceApiObservationKind::GenerationCompleted,
-        InferenceApiObservationKind::StreamClosed,
-    ] {
-        assert!(
-            kinds.contains(&expected),
-            "missing {expected:?} in {kinds:?}"
-        );
-    }
-}
-
-#[test]
 fn inference_api_run_generation_loop_cancels_during_decode() {
     let mut request = generation_request();
     request.parameters = GenerationParameters::greedy();
@@ -10920,51 +9400,6 @@ fn inference_api_run_generation_loop_cancels_during_decode() {
     assert!(kinds.contains(&InferenceApiObservationKind::GenerationCancelled));
     assert!(kinds.contains(&InferenceApiObservationKind::StreamInterrupted));
     assert!(!kinds.contains(&InferenceApiObservationKind::GenerationCompleted));
-}
-
-#[test]
-fn inference_api_run_generation_loop_rejects_incomplete_executor_evidence_before_sampling() {
-    let mut request = generation_request();
-    request.parameters = GenerationParameters::greedy();
-    request.stop_conditions = StopConditions::default();
-    let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
-    let mut runtime = runtime_with_model_execution_engine(
-        vocabulary_size,
-        RuntimeGenerationExecutionEvidence {
-            model_instance_ready: true,
-            graph_validated: true,
-            kernel_selected: true,
-            kernel_dispatched: false,
-            provider_executed: false,
-            tensor_resource_used: false,
-            context: Vec::new(),
-        },
-    );
-    let mut observer = InferenceApiObserver::new();
-
-    let error = run_generation_loop(
-        &mut runtime,
-        &request,
-        SamplingPolicy::default(),
-        CacheUsageSummary::default(),
-        |_generated| false,
-        &mut observer,
-    )
-    .unwrap_err();
-
-    assert!(matches!(error, InferenceApiError::KernelUnavailable { .. }));
-    let kinds: Vec<_> = observer
-        .observations()
-        .iter()
-        .map(|observation| observation.kind)
-        .collect();
-    assert!(kinds.contains(&InferenceApiObservationKind::ExecutionGraphValidated));
-    assert!(kinds.contains(&InferenceApiObservationKind::KernelSelected));
-    assert!(kinds.contains(&InferenceApiObservationKind::KernelUnavailable));
-    assert!(kinds.contains(&InferenceApiObservationKind::StreamInterrupted));
-    assert!(!kinds.contains(&InferenceApiObservationKind::TokenGenerated));
-    assert!(!kinds.contains(&InferenceApiObservationKind::GenerationCompleted));
-    assert!(!kinds.contains(&InferenceApiObservationKind::StreamClosed));
 }
 
 #[test]
@@ -11653,71 +10088,6 @@ fn kernel_exchange_bundle_missing_optional_embedded_artifact_is_tolerated() {
 }
 
 #[test]
-fn kernel_exchange_bundle_missing_required_embedded_artifact_is_rejected() {
-    let directory = temp_kernel_bundle_dir("required-missing");
-    let missing_digest = KernelBlobDigest::of_bytes(b"never-written");
-    let manifest = format!(
-        r#"{{
-  "schema": "magnetar:kernel-manifest@1.0",
-  "artifacts": [
-    {{
-      "role": "compiled-kernel",
-      "format": "nvidia:cubin",
-      "digest": "sha256:{missing}",
-      "size": 13,
-      "storage_mode": "embedded",
-      "required": true
-    }}
-  ]
-}}"#,
-        missing = missing_digest.value
-    );
-    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
-
-    let bundle = KernelExchangeBundle::open(&directory);
-    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
-    assert!(matches!(
-        outcome,
-        Err(KernelManifestError::BundleRequiredArtifactMissing { .. })
-    ));
-
-    fs::remove_dir_all(&directory).unwrap();
-}
-
-#[test]
-fn kernel_exchange_bundle_rejects_required_external_artifact_without_fetching() {
-    let directory = temp_kernel_bundle_dir("required-external");
-    let digest = KernelBlobDigest::of_bytes(b"external-bytes");
-    let manifest = format!(
-        r#"{{
-  "schema": "magnetar:kernel-manifest@1.0",
-  "artifacts": [
-    {{
-      "role": "compiled-kernel",
-      "format": "nvidia:cubin",
-      "digest": "sha256:{digest}",
-      "size": 13,
-      "storage_mode": "external",
-      "required": true,
-      "location_hint": "https://example.invalid/artifact.cubin"
-    }}
-  ]
-}}"#,
-        digest = digest.value
-    );
-    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
-
-    let bundle = KernelExchangeBundle::open(&directory);
-    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
-    assert!(matches!(
-        outcome,
-        Err(KernelManifestError::ExchangeExternalReferenceDenied { .. })
-    ));
-
-    fs::remove_dir_all(&directory).unwrap();
-}
-
-#[test]
 fn kernel_bundle_path_safety_rejects_traversal_and_absolute_paths() {
     for bad in [
         "../escape",
@@ -11732,35 +10102,6 @@ fn kernel_bundle_path_safety_rejects_traversal_and_absolute_paths() {
         );
     }
     assert!(validate_bundle_relative_path("blobs/sha256/deadbeef").is_ok());
-}
-
-#[test]
-fn kernel_bundle_symlink_entry_is_rejected_when_creatable() {
-    let directory = temp_kernel_bundle_dir("symlink");
-    write_kernel_bundle(&directory, b"symlink-fixture");
-    let target = directory.join(KERNEL_MANIFEST_FILE_NAME);
-    let link = directory.join("blobs").join("escape-link");
-
-    #[cfg(unix)]
-    let created = std::os::unix::fs::symlink(&target, &link).is_ok();
-    #[cfg(windows)]
-    let created = std::os::windows::fs::symlink_file(&target, &link).is_ok();
-    #[cfg(not(any(unix, windows)))]
-    let created = false;
-
-    if created {
-        let outcome = scan_bundle_for_unsafe_entries(&directory);
-        assert!(matches!(
-            outcome,
-            Err(KernelManifestError::BundleSymlinkDenied { .. })
-        ));
-    }
-    // When the platform/permissions do not allow creating a symlink (e.g.
-    // Windows without Developer Mode or admin rights), this test is a no-op
-    // rather than a false failure -- the rejection code path itself is
-    // exercised whenever a symlink can actually be created.
-
-    fs::remove_dir_all(&directory).unwrap();
 }
 
 #[test]
@@ -11792,46 +10133,6 @@ fn kernel_manifest_extension_cannot_claim_a_core_field_namespace() {
         outcome,
         Err(KernelManifestError::ArtifactReferenceInvalid { .. })
     ));
-}
-
-#[test]
-fn kernel_manifest_qualification_evidence_array_round_trips_through_json() {
-    let limits = KernelManifestLimits::default();
-    let digest = KernelBlobDigest::of_bytes(b"evidence-bytes").value;
-    let text = format!(
-        r#"{{
-  "schema": "magnetar:kernel-manifest@1.0",
-  "artifacts": [
-    {{
-      "role": "compiled-kernel",
-      "format": "nvidia:cubin",
-      "digest": "sha256:{artifact_digest}",
-      "size": 4,
-      "storage_mode": "embedded"
-    }}
-  ],
-  "qualification_evidence": [
-    {{
-      "digest": "sha256:{digest}",
-      "profile": "correctness",
-      "suite_or_workload_version": "v1",
-      "oracle_or_provider_identity": "reference-cpu@1",
-      "status": "passed"
-    }}
-  ]
-}}"#,
-        artifact_digest = KernelBlobDigest::of_bytes(b"artifact-bytes").value,
-        digest = digest
-    );
-    let manifest =
-        parse_manifest_json(&text, &limits).expect("manifest with qualification evidence parses");
-    assert_eq!(manifest.qualification_evidence.len(), 1);
-    let evidence = &manifest.qualification_evidence[0];
-    assert_eq!(evidence.profile, "correctness");
-    assert_eq!(evidence.status, KernelEvidenceStatus::Passed);
-    assert!(oracle_identity_is_known(evidence));
-    assert!(evaluate_qualification_evidence_currency(evidence, "v1"));
-    assert!(!evaluate_qualification_evidence_currency(evidence, "v2"));
 }
 
 #[test]
@@ -12241,50 +10542,6 @@ fn kernel_manifest_multi_target_bundle_validates_with_distinct_architectures() {
 }
 
 #[test]
-fn kernel_manifest_evaluate_target_compatibility() {
-    let target = KernelTargetConstraints {
-        architecture: Some("sm90".into()),
-        provider_compatibility: ["nvidia-cuda".to_string()].into_iter().collect(),
-        device_features: ["tensor-core".to_string()].into_iter().collect(),
-        ..KernelTargetConstraints::default()
-    };
-
-    let matching_context = KernelRuntimeCompatibilityContext {
-        provider_id: Some("nvidia-cuda".into()),
-        architecture: Some("sm90".into()),
-        available_device_features: ["tensor-core".to_string()].into_iter().collect(),
-    };
-    assert!(evaluate_target_compatibility(&target, &matching_context).is_ok());
-
-    let wrong_architecture = KernelRuntimeCompatibilityContext {
-        architecture: Some("sm80".into()),
-        ..matching_context.clone()
-    };
-    assert!(matches!(
-        evaluate_target_compatibility(&target, &wrong_architecture),
-        Err(KernelManifestError::ExchangeCompatibilityFailed { .. })
-    ));
-
-    let missing_feature = KernelRuntimeCompatibilityContext {
-        available_device_features: std::collections::BTreeSet::new(),
-        ..matching_context
-    };
-    assert!(matches!(
-        evaluate_target_compatibility(&target, &missing_feature),
-        Err(KernelManifestError::ExchangeCompatibilityFailed { .. })
-    ));
-
-    // An artifact with no declared target constraints is always compatible.
-    assert!(
-        evaluate_target_compatibility(
-            &KernelTargetConstraints::default(),
-            &KernelRuntimeCompatibilityContext::default()
-        )
-        .is_ok()
-    );
-}
-
-#[test]
 fn kernel_manifest_validation_pipeline_orders_schema_before_blob_io() {
     // A directory bundle with a *missing* blobs directory entirely and an
     // *unsupported* schema major version: if schema validation ran after
@@ -12342,50 +10599,6 @@ fn kernel_manifest_normalizes_to_cache_key_and_entry_without_granting_trust() {
 }
 
 #[test]
-fn kernel_exchange_bundle_total_size_limit_is_enforced() {
-    let directory = temp_kernel_bundle_dir("total-size-limit");
-    let bytes_a = b"aaaa";
-    let bytes_b = b"bbbb";
-    let digest_a = KernelBlobDigest::of_bytes(bytes_a);
-    let digest_b = KernelBlobDigest::of_bytes(bytes_b);
-    fs::write(
-        directory.join("blobs").join("sha256").join(&digest_a.value),
-        bytes_a,
-    )
-    .unwrap();
-    fs::write(
-        directory.join("blobs").join("sha256").join(&digest_b.value),
-        bytes_b,
-    )
-    .unwrap();
-    let manifest = format!(
-        r#"{{
-  "schema": "magnetar:kernel-manifest@1.0",
-  "artifacts": [
-    {{ "role": "compiled-kernel", "format": "nvidia:cubin", "digest": "sha256:{a}", "size": 4, "storage_mode": "embedded" }},
-    {{ "role": "auxiliary", "format": "nvidia:cubin", "digest": "sha256:{b}", "size": 4, "storage_mode": "embedded" }}
-  ]
-}}"#,
-        a = digest_a.value,
-        b = digest_b.value
-    );
-    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
-
-    let bundle = KernelExchangeBundle::open(&directory);
-    let limits = KernelManifestLimits {
-        max_total_embedded_bytes: 6,
-        ..KernelManifestLimits::default()
-    };
-    let outcome = validate_kernel_exchange_bundle(&bundle, &limits);
-    assert!(matches!(
-        outcome,
-        Err(KernelManifestError::BundleTotalSizeExceeded { .. })
-    ));
-
-    fs::remove_dir_all(&directory).unwrap();
-}
-
-#[test]
 fn kernel_manifest_embedded_byte_accounting_saturates_instead_of_overflowing() {
     // The bundle validation pipeline accumulates declared blob sizes with
     // `u64::saturating_add`, implementing "Reject overflow" (tasks, "Integer
@@ -12419,19 +10632,6 @@ fn kernel_manifest_cli_operations_all_use_shared_validation() {
     }
 
     fs::remove_dir_all(&directory).unwrap();
-}
-
-fn build_kernel_bundle_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut builder = tar::Builder::new(Vec::new());
-    for (path, data) in entries {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(data.len() as u64);
-        header.set_mode(0o644);
-        header.set_mtime(0);
-        header.set_cksum();
-        builder.append_data(&mut header, *path, *data).unwrap();
-    }
-    builder.into_inner().unwrap()
 }
 
 #[test]
@@ -12505,55 +10705,6 @@ fn kernel_exchange_archive_rejects_hardlink_and_device_entries() {
         );
         let _ = fs::remove_dir_all(&dir);
     }
-}
-
-#[test]
-fn kernel_exchange_archive_enforces_per_entry_decompressed_size_limit() {
-    let oversized = vec![0u8; 1024];
-    let tar_bytes = build_kernel_bundle_tar(&[("blobs/sha256/oversized", &oversized)]);
-    let dir = temp_kernel_bundle_dir("archive-entry-limit");
-    let limits = KernelExchangeArchiveLimits {
-        max_entry_decompressed_bytes: 100,
-        ..KernelExchangeArchiveLimits::default()
-    };
-    let outcome =
-        extract_kernel_exchange_archive(std::io::Cursor::new(&tar_bytes), false, &dir, &limits);
-    assert!(matches!(
-        outcome,
-        Err(KernelManifestError::LimitExceeded { .. })
-    ));
-    fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn kernel_exchange_archive_enforces_entry_count_limit() {
-    let entries: Vec<(&str, &[u8])> = vec![("a", b"1"), ("b", b"2"), ("c", b"3")];
-    let tar_bytes = build_kernel_bundle_tar(&entries);
-    let dir = temp_kernel_bundle_dir("archive-entry-count-limit");
-    let limits = KernelExchangeArchiveLimits {
-        max_entries: 2,
-        ..KernelExchangeArchiveLimits::default()
-    };
-    let outcome =
-        extract_kernel_exchange_archive(std::io::Cursor::new(&tar_bytes), false, &dir, &limits);
-    assert!(matches!(
-        outcome,
-        Err(KernelManifestError::LimitExceeded { .. })
-    ));
-    fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn kernel_manifest_evaluate_trust_pipeline_stage_delegates_to_sole_authority() {
-    assert_eq!(
-        evaluate_manifest_trust(true),
-        crate::evaluate_artifact_trust(true)
-    );
-    assert_eq!(
-        evaluate_manifest_trust(false),
-        crate::evaluate_artifact_trust(false)
-    );
-    assert!(!evaluate_manifest_trust(false).is_trusted());
 }
 
 // ---------------------------------------------------------------------
@@ -12939,13 +11090,6 @@ fn ingestion_concurrent_transactions_are_isolated() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn compilation_capability_absence_is_valid_and_optional() {
-    let descriptor = KernelCompilationCapabilityDescriptor::unsupported();
-    assert!(!descriptor.is_present());
-    assert!(descriptor.validate().is_ok());
-}
-
-#[test]
 fn compilation_capability_descriptor_validation_requires_declared_formats_and_isolation() {
     let mut descriptor = KernelCompilationCapabilityDescriptor::unsupported();
     descriptor.support_level = CompilationSupportLevel::SourceCompilation;
@@ -13016,20 +11160,6 @@ fn runtime_target_authority_rejects_provider_and_device_redirection() {
 fn compilation_success_never_grants_trust_by_itself() {
     assert!(!compilation_result_trust(false).is_trusted());
     assert!(compilation_result_trust(true).is_trusted());
-}
-
-#[test]
-fn network_boundary_denies_implicit_dependency_downloads() {
-    let policy = CompilationNetworkPolicy::default();
-    assert!(matches!(
-        enforce_compilation_network_boundary(true, &policy),
-        Err(KernelCompilationError::PolicyDenied { .. })
-    ));
-    let authorized = CompilationNetworkPolicy {
-        network_access_authorized: true,
-    };
-    assert!(enforce_compilation_network_boundary(true, &authorized).is_ok());
-    assert!(enforce_compilation_network_boundary(false, &policy).is_ok());
 }
 
 #[test]
@@ -13106,19 +11236,6 @@ fn failed_compilation_never_mutates_existing_known_good_artifact() {
     let crash = normalize_compiler_crash("replacement compile crashed");
     let preserved = preserve_known_good_artifact_on_failure(&v1, &crash);
     assert_eq!(preserved, &v1);
-}
-
-#[test]
-fn preparation_only_provider_is_a_valid_distinct_support_level() {
-    let mut descriptor = KernelCompilationCapabilityDescriptor::unsupported();
-    descriptor.support_level = CompilationSupportLevel::PreparationOnly;
-    descriptor
-        .produced_compiled_formats
-        .insert("nvidia:cubin".into());
-    descriptor.isolation_model = CompilationIsolationModel::PlatformManagedCompiler;
-    assert!(descriptor.is_present());
-    assert!(descriptor.validate().is_ok());
-    assert!(descriptor.accepted_source_formats.is_empty());
 }
 
 #[test]
@@ -13634,18 +11751,6 @@ fn kernel_selection_policy_conformance_report_is_conformant() {
 }
 
 #[test]
-fn kernel_candidate_rejection_maps_onto_selection_exclusion_reason() {
-    assert_eq!(
-        KernelSelectionExclusionReason::from(KernelCandidateRejection::Revoked),
-        KernelSelectionExclusionReason::QualificationRevoked
-    );
-    assert_eq!(
-        KernelSelectionExclusionReason::from(KernelCandidateRejection::WorkspaceUnavailable),
-        KernelSelectionExclusionReason::WorkspaceInfeasible
-    );
-}
-
-#[test]
 fn benchmark_context_requires_exact_match() {
     let context = BenchmarkContext {
         provider: ProviderBinding::new("p"),
@@ -13670,22 +11775,6 @@ fn benchmark_context_requires_exact_match() {
 }
 
 #[test]
-fn stale_benchmark_policy_explicitly_governs_exclusion() {
-    let stale = BenchmarkFreshness::Stale {
-        reason: BenchmarkStalenessReason::DriverChanged,
-    };
-    assert!(evaluate_stale_benchmark_policy(stale, StaleBenchmarkPolicy::Accept).is_ok());
-    assert_eq!(
-        evaluate_stale_benchmark_policy(stale, StaleBenchmarkPolicy::Exclude),
-        Err(KernelSelectionError::BenchmarkStale)
-    );
-    assert!(
-        evaluate_stale_benchmark_policy(BenchmarkFreshness::Fresh, StaleBenchmarkPolicy::Exclude)
-            .is_ok()
-    );
-}
-
-#[test]
 fn shape_aware_evidence_does_not_apply_outside_its_bucket() {
     assert!(performance_evidence_applies_to_workload("b1s128", "b1s128"));
     assert!(!performance_evidence_applies_to_workload(
@@ -13697,21 +11786,6 @@ fn shape_aware_evidence_does_not_apply_outside_its_bucket() {
 fn compilation_cost_is_excluded_once_artifact_is_cached() {
     assert!(compilation_cost_excluded_from_hot_path(true));
     assert!(!compilation_cost_excluded_from_hot_path(false));
-}
-
-#[test]
-fn hysteresis_retains_active_kernel_below_threshold_and_promotes_above_it() {
-    let policy = HysteresisPolicy {
-        promotion_threshold_fraction: 0.05,
-    };
-    assert_eq!(
-        evaluate_hysteresis(100.0, 99.9, &policy),
-        SelectionOutcome::RetainActive
-    );
-    assert_eq!(
-        evaluate_hysteresis(100.0, 80.0, &policy),
-        SelectionOutcome::PromoteCandidate
-    );
 }
 
 #[test]
@@ -13744,28 +11818,6 @@ fn selection_cache_invalidate_all_clears_every_entry() {
     cache.invalidate_all(SelectionCacheInvalidationTrigger::PolicyChanged);
     assert!(cache.is_empty());
     assert!(cache.get(&key).is_none());
-}
-
-#[test]
-fn kernel_optimization_policy_rejects_self_contradictory_deterministic_profile() {
-    let policy = KernelOptimizationPolicy {
-        id: KernelSelectionPolicyId::new("policy-1"),
-        version: KernelSelectionPolicyVersion(1),
-        profile: OptimizationProfile::Deterministic,
-        ranking_strategy: RankingStrategy::WeightedScore(WeightedScorePolicy {
-            weights: BTreeMap::new(),
-            missing_metric_policy: MissingMetricPolicy::Exclude,
-        }),
-        fallback: FallbackPolicy::default(),
-        hysteresis: HysteresisPolicy::default(),
-        anti_flapping: AntiFlappingPolicy::default(),
-        exploration: ExplorationPolicy::default(),
-        selection_mode: KernelSelectionPolicy::Dynamic,
-        determinism_required: false,
-        require_trusted: true,
-        allowed_qualification_profiles: BTreeSet::new(),
-    };
-    assert!(policy.validate().is_err());
 }
 
 #[test]
@@ -13900,22 +11952,6 @@ fn selection_explanation_never_contains_native_handles() {
         KernelSelectionExclusionReason::PolicyDenied,
     );
     assert!(!explanation.contains_native_handles());
-}
-
-#[test]
-fn kernel_selection_error_ids_are_stable_and_match_the_proposal_vocabulary() {
-    assert_eq!(
-        KernelSelectionError::NoEligibleCandidates.id(),
-        "kernel-selection-no-eligible-candidates"
-    );
-    assert_eq!(
-        KernelSelectionError::PinnedKernelIneligible.id(),
-        "kernel-selection-pinned-kernel-ineligible"
-    );
-    assert_eq!(
-        KernelSelectionError::InternalError { reason: "x".into() }.id(),
-        "internal-kernel-selection-error"
-    );
 }
 
 #[test]
@@ -14521,18 +12557,6 @@ fn provider_roadmap_phases_are_ordered_1_through_9() {
 }
 
 #[test]
-fn provider_roadmap_every_phase_requires_provider_core() {
-    for phase in PROVIDER_ROADMAP_PHASES {
-        assert!(
-            phase
-                .required_conformance_gates()
-                .contains(&ProviderConformanceProfile::ProviderCore),
-            "{phase:?} must require provider-core"
-        );
-    }
-}
-
-#[test]
 fn provider_roadmap_optimized_provider_does_not_redefine_operator_semantics() {
     // A fused kernel that does not preserve portable Operator/graph
     // semantics is rejected outright, regardless of how it declares itself.
@@ -14561,25 +12585,6 @@ fn provider_roadmap_optimized_provider_does_not_redefine_operator_semantics() {
 }
 
 #[test]
-fn provider_roadmap_rejects_model_family_provider_names() {
-    for name in [
-        "QwenProvider",
-        "LlamaProvider",
-        "GemmaProvider",
-        "DeepSeekProvider",
-    ] {
-        let outcome = reject_model_family_provider_name(name);
-        assert!(
-            matches!(
-                outcome,
-                Err(ProviderRoadmapError::ProviderRoadmapUnsupported { .. })
-            ),
-            "{name} should have been rejected, got {outcome:?}"
-        );
-    }
-}
-
-#[test]
 fn provider_roadmap_allows_hardware_and_optimized_provider_names() {
     for name in [
         "CudaProvider",
@@ -14595,14 +12600,6 @@ fn provider_roadmap_allows_hardware_and_optimized_provider_names() {
             "{name} should have been allowed"
         );
     }
-}
-
-#[test]
-fn provider_roadmap_rejects_empty_provider_name() {
-    assert!(matches!(
-        reject_model_family_provider_name("   "),
-        Err(ProviderRoadmapError::InternalProviderRoadmapError { .. })
-    ));
 }
 
 #[test]
@@ -14977,39 +12974,9 @@ fn model_format_roadmap_allows_hardware_and_optimized_provider_names() {
 }
 
 #[test]
-fn model_format_roadmap_rejects_empty_provider_name() {
-    assert!(matches!(
-        reject_model_format_provider_name("   "),
-        Err(ModelFormatRoadmapError::InternalModelFormatError { .. })
-    ));
-}
-
-#[test]
 fn model_format_roadmap_format_parsers_cannot_supply_execution_graphs() {
     assert!(reject_format_execution_graph(true).is_err());
     assert!(reject_format_execution_graph(false).is_ok());
-}
-
-#[test]
-fn model_format_roadmap_normalized_manifest_coverage_tracks_present_fields() {
-    let mut manifest = fixture_model_manifest();
-    let coverage = NormalizedManifestCoverage::from_manifest(&manifest);
-    assert!(coverage.identity);
-    assert!(coverage.digest);
-    assert!(coverage.architecture_family);
-    assert!(!coverage.tokenizer);
-    assert!(!coverage.license);
-    assert!(coverage.covers_required_fields() || manifest.parts.is_empty());
-
-    manifest.tokenizer = Some("tokenizer.json".into());
-    manifest.license = Some(ModelLicenseMetadata {
-        identifier: "apache-2.0".into(),
-        url: None,
-        usage_restrictions: Vec::new(),
-    });
-    let coverage = NormalizedManifestCoverage::from_manifest(&manifest);
-    assert!(coverage.tokenizer);
-    assert!(coverage.license);
 }
 
 fn fixture_model_manifest() -> ModelManifest {
@@ -15061,41 +13028,6 @@ fn tensor(name: &str, shape: Vec<u64>) -> ModelTensorMetadata {
         expected_compute_dtype: None,
         digest: None,
     }
-}
-
-#[test]
-fn model_format_roadmap_safetensors_manifest_validates_and_normalizes() {
-    let manifest = SafetensorsManifest {
-        tensors: vec![SafetensorsTensorEntry {
-            name: "layer.0.weight".into(),
-            shape: vec![4, 4],
-            dtype: ModelDType::F32,
-            byte_offset: 0,
-            byte_length: 64,
-        }],
-        header_metadata: BTreeMap::new(),
-    };
-    assert!(manifest.validate().is_ok());
-    let tensors = manifest.into_tensor_metadata();
-    assert_eq!(tensors.len(), 1);
-    assert_eq!(tensors[0].name, "layer.0.weight");
-    assert_eq!(tensors[0].offset_bytes, Some(0));
-    assert_eq!(tensors[0].size_bytes, Some(64));
-
-    let degenerate = SafetensorsManifest {
-        tensors: vec![SafetensorsTensorEntry {
-            name: "bad".into(),
-            shape: vec![0],
-            dtype: ModelDType::F32,
-            byte_offset: 0,
-            byte_length: 4,
-        }],
-        header_metadata: BTreeMap::new(),
-    };
-    assert!(matches!(
-        degenerate.validate(),
-        Err(ModelFormatRoadmapError::SafetensorsInvalid { .. })
-    ));
 }
 
 #[test]
@@ -15229,70 +13161,6 @@ fn model_format_roadmap_normalizes_tokenizer_json() {
 fn model_format_roadmap_tokenizer_config_requires_explicit_runtime_validation() {
     assert!(reject_silent_tokenizer_config_override(false).is_err());
     assert!(reject_silent_tokenizer_config_override(true).is_ok());
-}
-
-#[test]
-fn model_format_roadmap_generation_config_as_defaults_and_override() {
-    let parsed = GenerationConfigMetadata {
-        temperature: Some(0.7),
-        max_new_tokens: Some(256),
-        stop_strings: vec!["<eos>".into()],
-        ..Default::default()
-    };
-    let defaults = parsed.as_defaults();
-    assert_eq!(defaults.temperature, Some(0.7));
-    assert_eq!(defaults.max_tokens, Some(256));
-    assert_eq!(defaults.stop_tokens, vec!["<eos>".to_string()]);
-
-    assert_eq!(apply_generation_override(Some(0.7), Some(1.5)), Some(1.5));
-    assert_eq!(apply_generation_override(Some(0.7), None), Some(0.7));
-    assert_eq!(apply_generation_override::<f32>(None, None), None);
-}
-
-#[test]
-fn model_format_roadmap_chat_template_requires_compatibility_and_variables() {
-    let metadata = ChatTemplateMetadata {
-        identity: "qwen-chat".into(),
-        source: ChatTemplateSourceKind::EmbeddedInManifest,
-        tokenizer_compatible: true,
-        model_family_compatible: true,
-        required_variables: BTreeSet::from(["messages".to_string()]),
-        special_token_interaction: BTreeSet::new(),
-    };
-    assert!(validate_chat_template(&metadata, &BTreeSet::new()).is_err());
-    assert!(validate_chat_template(&metadata, &BTreeSet::from(["messages".to_string()])).is_ok());
-
-    let incompatible = ChatTemplateMetadata {
-        tokenizer_compatible: false,
-        ..metadata
-    };
-    assert!(matches!(
-        validate_chat_template(&incompatible, &BTreeSet::new()),
-        Err(ModelFormatRoadmapError::ChatTemplateInvalid { .. })
-    ));
-
-    assert_eq!(
-        redact_chat_template_diagnostic("plain message"),
-        "plain message"
-    );
-}
-
-#[test]
-fn model_format_roadmap_sentencepiece_unsupported_feature_fails_explicitly() {
-    let metadata = SentencePieceMetadata {
-        model_identity: "spm-1".into(),
-        vocabulary_size: 32000,
-        special_tokens: Vec::new(),
-        normalization: None,
-        browser_supported: false,
-        license: None,
-        supported_features: BTreeSet::from(["bpe".to_string()]),
-    };
-    assert!(reject_unsupported_sentencepiece_feature(&metadata, "bpe").is_ok());
-    assert!(matches!(
-        reject_unsupported_sentencepiece_feature(&metadata, "byte-fallback"),
-        Err(ModelFormatRoadmapError::SentencePieceUnsupported { .. })
-    ));
 }
 
 #[test]

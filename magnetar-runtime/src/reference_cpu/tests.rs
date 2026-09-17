@@ -11,6 +11,10 @@
 
 use super::*;
 
+use crate::affinity::ProviderPressureLevel;
+use crate::kernel_registry::validate_kernel_advertisement;
+use crate::tensor::ReferenceCpuErrorCode;
+use std::collections::BTreeSet;
 struct Rng(u64);
 
 impl Rng {
@@ -664,4 +668,118 @@ fn reference_cpu_fallback_denied_when_dtype_or_layout_conversion_forbidden() {
         .with_dtype_conversion(true, true)
         .with_layout_conversion(true, true);
     assert!(evaluate_fallback(&transparent, &both_allowed).is_ok());
+}
+
+#[test]
+fn reference_cpu_provider_pressure_is_explicitly_reportable() {
+    let provider = ReferenceCpuProvider::new();
+    assert_eq!(
+        provider.status_snapshot().pressure,
+        ProviderPressureLevel::Low
+    );
+    provider.report_pressure(ProviderPressureLevel::Saturated);
+    assert_eq!(
+        provider.status_snapshot().pressure,
+        ProviderPressureLevel::Saturated
+    );
+}
+
+#[test]
+fn reference_cpu_advertises_only_implemented_kernels() {
+    let provider = ReferenceCpuProvider::new();
+    let advertisements = provider.kernel_advertisements();
+    let names = advertisements
+        .iter()
+        .map(|advertisement| advertisement.id.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for expected in [
+        "matmul",
+        "embedding",
+        "rmsnorm",
+        "rope",
+        "attention",
+        "softmax",
+        "silu",
+        "gelu",
+        "activation",
+        "add",
+        "mul",
+        "residual-add",
+        "dtype-conversion",
+        "layout-conversion",
+    ] {
+        assert!(names.contains(expected), "missing kernel: {expected}");
+    }
+    assert!(!names.contains("quantize"));
+    assert!(!names.contains("dequantize"));
+    for advertisement in &advertisements {
+        validate_kernel_advertisement(advertisement).unwrap();
+    }
+}
+
+#[test]
+fn reference_cpu_attention_rejects_window_without_causal_mask() {
+    let q = reference_cpu_host_tensor([2, 1], [0.0, 0.0]);
+    let k = q.clone();
+    let v = reference_cpu_host_tensor([2, 1], [1.0, 2.0]);
+    // The window is anchored at the query position, which only fully describes
+    // the mask under causal attention.
+    let error = attention(&q, &k, &v, 1, 1, None, Some(1), false)
+        .expect_err("bidirectional sliding window must be rejected");
+    assert_eq!(error.code, ReferenceCpuErrorCode::ShapeUnsupported);
+}
+
+#[test]
+fn reference_cpu_fallback_denied_by_default_allowed_by_policy() {
+    let pinned = ResourceAffinity::new(FallbackClass::ProviderPinned);
+    assert!(evaluate_fallback(&pinned, &FallbackPolicyContext::new(true)).is_err());
+
+    let transparent = ResourceAffinity::new(FallbackClass::Transparent);
+    assert!(evaluate_fallback(&transparent, &FallbackPolicyContext::new(false)).is_err());
+    assert!(evaluate_fallback(&transparent, &FallbackPolicyContext::new(true)).is_ok());
+}
+
+#[test]
+fn reference_cpu_fallback_is_observable() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let kernel = provider
+        .kernel_advertisements()
+        .into_iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap()
+        .id;
+    let transparent = ResourceAffinity::new(FallbackClass::Transparent);
+
+    executor
+        .evaluate_fallback_observed(&kernel, &transparent, &FallbackPolicyContext::new(true))
+        .unwrap();
+    let observations = executor.observations();
+    assert!(
+        observations
+            .iter()
+            .any(|observation| observation.kind == KernelObservationKind::KernelFallbackConsidered)
+    );
+    assert!(
+        observations
+            .iter()
+            .any(|observation| observation.kind == KernelObservationKind::KernelFallbackUsed)
+    );
+
+    executor
+        .evaluate_fallback_observed(&kernel, &transparent, &FallbackPolicyContext::new(false))
+        .unwrap_err();
+    assert!(
+        executor
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == KernelObservationKind::KernelFallbackFailed)
+    );
+}
+
+#[test]
+fn reference_cpu_quantize_and_dequantize_placeholders_reject_explicitly() {
+    for error in [dequantize_placeholder(), quantize_placeholder()] {
+        assert_eq!(error.code, ReferenceCpuErrorCode::DTypeUnsupported);
+    }
 }

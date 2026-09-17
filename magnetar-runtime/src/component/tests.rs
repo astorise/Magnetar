@@ -6,6 +6,7 @@
 use super::*;
 use crate::conformance::validate_first_native_component_engine_capabilities;
 
+use crate::session::InferenceSessionId;
 fn component_artifact_package(
     bytes: &[u8],
     source_kind: ComponentDistributionSourceKind,
@@ -300,4 +301,460 @@ fn local_distribution_does_not_require_tachyon_or_network() {
         manager.definition_state("magnetar.examples.hello"),
         Some(ComponentDefinitionState::Prepared)
     );
+}
+
+#[derive(Clone)]
+struct TestComponentDistributionSource {
+    package: ComponentArtifactPackage,
+    candidates: Vec<ComponentDigest>,
+}
+
+impl ComponentDistributionSourceProvider for TestComponentDistributionSource {
+    fn resolve(
+        &self,
+        component: &str,
+        _version_requirement: Option<&str>,
+    ) -> Result<Vec<ComponentDigest>, ComponentError> {
+        if component == "magnetar.examples.hello" {
+            Ok(self.candidates.clone())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn fetch(&self, digest: &ComponentDigest) -> Result<ComponentArtifactPackage, ComponentError> {
+        if self.package.declared_digest == *digest {
+            Ok(self.package.clone())
+        } else {
+            Err(ComponentError::Distribution {
+                category: ComponentDistributionErrorCategory::ArtifactNotFound,
+                message: "digest not found".into(),
+            })
+        }
+    }
+}
+
+#[test]
+fn component_manager_observes_engine_selection_and_rejection() {
+    let mut manager = ComponentManager::new();
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component"),
+            "component.wasm",
+        ))
+        .unwrap();
+
+    manager.prepare_component("component").unwrap();
+    assert!(
+        manager.observations().iter().any(|observation| {
+            observation.kind == ComponentObservationKind::EngineSelection
+                && observation
+                    .message
+                    .contains(ComponentEngineProfile::Test.as_str())
+        }),
+        "selected engine profile should be observable"
+    );
+
+    let error = ComponentEngineRequirements::default()
+        .require_feature(ComponentEngineFeature::ControlledWasi)
+        .validate("component", &manager.engine_capabilities())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ComponentError::EngineFeatureUnavailable {
+            feature: ComponentEngineFeature::ControlledWasi,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn component_imports_are_authorized_and_linked_explicitly() {
+    let interface = WitInterface::new("magnetar:runtime/run", "1.0.0");
+    let metadata =
+        ComponentMetadata::new("consumer", "1", "test component").with_import(interface.clone());
+    let mut manager = ComponentManager::new();
+    manager
+        .register_component(ComponentDescriptor::new(metadata, "consumer.wasm"))
+        .unwrap();
+
+    assert!(matches!(
+        manager.instantiate_component("consumer"),
+        Err(ComponentError::UnauthorizedImport { .. })
+    ));
+
+    manager.authorize_interface(interface.clone());
+    assert!(matches!(
+        manager.instantiate_component("consumer"),
+        Err(ComponentError::UnresolvedImport { .. })
+    ));
+
+    manager.provide_interface(interface);
+    let instance = manager.instantiate_component("consumer").unwrap();
+    assert_eq!(
+        manager.instance_state(instance),
+        Some(ComponentInstanceState::Ready)
+    );
+}
+
+#[test]
+fn component_ambient_network_process_and_secret_imports_fail_closed() {
+    let interfaces = [
+        WitInterface::new("wasi:sockets/tcp", "0.2.0"),
+        WitInterface::new("wasi:cli/run", "0.2.0"),
+        WitInterface::new("magnetar:secrets/read", "1.0.0"),
+    ];
+    for (index, interface) in interfaces.into_iter().enumerate() {
+        let name = format!("authority-{index}");
+        let mut manager = ComponentManager::new();
+        manager
+            .register_component(ComponentDescriptor::new(
+                ComponentMetadata::new(&name, "1", "test component").with_import(interface),
+                format!("{name}.wasm"),
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            manager.instantiate_component(&name),
+            Err(ComponentError::UnauthorizedImport { .. })
+        ));
+    }
+}
+
+#[test]
+fn component_link_plan_is_runtime_owned_and_immutable_to_callers() {
+    let interface = WitInterface::new("magnetar:runtime/run", "1.0.0");
+    let metadata =
+        ComponentMetadata::new("consumer", "1", "test component").with_import(interface.clone());
+    let mut manager = ComponentManager::new();
+    manager.provide_interface(interface.clone());
+    manager
+        .register_component(ComponentDescriptor::new(metadata, "consumer.wasm"))
+        .unwrap();
+
+    let plan = manager.link_plan("consumer").unwrap();
+    let links = plan.links().collect::<Vec<_>>();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].0, &interface);
+    assert!(matches!(
+        links[0].1,
+        ComponentEndpoint::Capability { interface: linked } if linked == &interface
+    ));
+    assert_eq!(plan.endpoint(&interface), Some(links[0].1));
+}
+
+#[test]
+fn component_link_plan_rejects_forbidden_external_interfaces_even_if_provided() {
+    for interface in [
+        WitInterface::new("wasi:filesystem/types", "0.2.0"),
+        WitInterface::new("wasi:sockets/tcp", "0.2.0"),
+        WitInterface::new("magnetar:workspace/read", "1.0.0"),
+        WitInterface::new("magnetar:git/status", "1.0.0"),
+        WitInterface::new("magnetar:process/run", "1.0.0"),
+        WitInterface::new("magnetar:secrets/read", "1.0.0"),
+    ] {
+        let mut manager = ComponentManager::new();
+        manager.provide_interface(interface.clone());
+        manager
+            .register_component(ComponentDescriptor::new(
+                ComponentMetadata::new("external", "1", "external component")
+                    .with_import(interface),
+                "external.wasm",
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            manager.link_plan("external"),
+            Err(ComponentError::UnauthorizedImport { .. })
+        ));
+    }
+}
+
+#[test]
+fn component_authority_requirements_map_to_inference_runtime_endpoints() {
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "compute-capability".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::Capability { interface }
+            if interface == WitInterface::new("magnetar:compute/run", "2.0.0")
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "model-artifact-read".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Model
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "tokenizer-artifact-read".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Tokenizer
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "prompt-template-read".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::PromptTemplate
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "adapter-artifact-read".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Adapter
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "quantization-artifact-read".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceArtifactRegistry {
+            kind: InferenceArtifactKind::Quantization
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "kv-cache-access".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceCacheService {
+            kind: InferenceCacheKind::Kv
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "prefix-cache-access".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::InferenceCacheService {
+            kind: InferenceCacheKind::Prefix
+        }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "observability-emit".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::Observability
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "runtime-diagnostics".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::RuntimeDiagnostics
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "generation-capability".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::PendingRuntimeService { .. }
+    ));
+    assert!(matches!(
+        (ComponentAuthorityRequirement {
+            kind: "sampling-capability".into(),
+        })
+        .endpoint(),
+        ComponentAuthorityEndpoint::PendingRuntimeService { .. }
+    ));
+}
+
+#[test]
+fn inference_artifact_registry_uses_identities_not_paths_and_scopes_sessions() {
+    let mut manager = ComponentManager::new();
+    let digest = ComponentDigest::sha256(b"model");
+    let session = InferenceSessionId::new("session-a").unwrap();
+    manager
+        .register_inference_artifact(
+            InferenceArtifactReference::new(InferenceArtifactKind::Model, "qwen-model", digest)
+                .unwrap()
+                .with_session(session.clone()),
+        )
+        .unwrap();
+
+    let artifact = manager
+        .resolve_inference_artifact(InferenceArtifactKind::Model, "qwen-model", Some(&session))
+        .unwrap();
+    assert_eq!(artifact.id, "qwen-model");
+    assert!(matches!(
+        manager.resolve_inference_artifact(InferenceArtifactKind::Model, "../qwen-model", None),
+        Err(ComponentError::ArtifactRejected { .. })
+    ));
+    assert!(matches!(
+        manager.resolve_inference_artifact(
+            InferenceArtifactKind::Model,
+            "qwen-model",
+            Some(&InferenceSessionId::new("session-b").unwrap())
+        ),
+        Err(ComponentError::ArtifactRejected { .. })
+    ));
+}
+
+#[test]
+fn component_definition_can_create_multiple_isolated_instances() {
+    let mut manager = ComponentManager::new();
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component"),
+            "component.wasm",
+        ))
+        .unwrap();
+
+    let first = manager.instantiate_component("component").unwrap();
+    let second = manager.instantiate_component("component").unwrap();
+    assert_ne!(first, second);
+    assert_eq!(
+        manager.instance_state(first),
+        Some(ComponentInstanceState::Ready)
+    );
+    assert_eq!(
+        manager.instance_state(second),
+        Some(ComponentInstanceState::Ready)
+    );
+}
+
+#[test]
+fn component_manager_enforces_instance_and_invocation_limits() {
+    let mut manager = ComponentManager::new();
+    manager.set_resource_limits(ComponentResourceLimits {
+        max_instances: Some(1),
+        ..ComponentResourceLimits::default()
+    });
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component"),
+            "component.wasm",
+        ))
+        .unwrap();
+
+    manager.instantiate_component("component").unwrap();
+    assert!(matches!(
+        manager.instantiate_component("component"),
+        Err(ComponentError::ResourceLimitExceeded {
+            limit: "instances",
+            ..
+        })
+    ));
+
+    let interface = WitInterface::new("example:app/run", "1.0.0");
+    let mut manager = ComponentManager::new();
+    manager.set_resource_limits(ComponentResourceLimits {
+        max_concurrent_invocations: Some(0),
+        ..ComponentResourceLimits::default()
+    });
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("callable", "1", "test component")
+                .with_export(interface.clone()),
+            "callable.wasm",
+        ))
+        .unwrap();
+    let instance = manager.instantiate_component("callable").unwrap();
+    assert!(matches!(
+        manager.invoke(ComponentInvocation::new(instance, interface, "run")),
+        Err(ComponentError::ResourceLimitExceeded {
+            limit: "concurrent invocations",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn component_engine_normalizes_traps_interruptions_and_limit_failures() {
+    let interface = WitInterface::new("example:app/run", "1.0.0");
+    let mut trapping_engine = MockComponentEngine::new();
+    trapping_engine.trap_on_invoke = Some(ComponentTrapKind::Trap);
+    let mut manager = ComponentManager::with_engine(Box::new(trapping_engine));
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("component", "1", "test component")
+                .with_export(interface.clone()),
+            "component.wasm",
+        ))
+        .unwrap();
+    let instance = manager.instantiate_component("component").unwrap();
+    assert!(matches!(
+        manager.invoke(ComponentInvocation::new(instance, interface, "run")),
+        Err(ComponentError::Trap {
+            kind: ComponentTrapKind::Trap,
+            ..
+        })
+    ));
+
+    let mut manager = ComponentManager::with_engine(Box::new(
+        MockComponentEngine::new().without_resource_limits(),
+    ));
+    manager.set_resource_limits(ComponentResourceLimits {
+        require_memory_limit: true,
+        max_memory_bytes: Some(1024),
+        ..ComponentResourceLimits::default()
+    });
+    manager
+        .register_component(ComponentDescriptor::new(
+            ComponentMetadata::new("limited", "1", "test component"),
+            "limited.wasm",
+        ))
+        .unwrap();
+    assert!(matches!(
+        manager.instantiate_component("limited"),
+        Err(ComponentError::ResourceLimitUnsupported { .. })
+    ));
+}
+
+#[test]
+fn distribution_source_identity_does_not_imply_trust() {
+    let package =
+        component_artifact_package(b"component-bytes", ComponentDistributionSourceKind::Tachyon);
+    let mut manager = ComponentManager::new();
+
+    assert!(matches!(
+        manager.prepare_pushed_package(package),
+        Err(ComponentError::ArtifactRejected {
+            status: ComponentTrustStatus::Unknown,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn pulled_component_package_resolves_fetches_and_validates_locally() {
+    let bytes = b"component-bytes";
+    let digest = ComponentDigest::sha256(bytes);
+    let package =
+        component_artifact_package(bytes, ComponentDistributionSourceKind::LocalDirectory);
+    let source = TestComponentDistributionSource {
+        package,
+        candidates: vec![digest.clone()],
+    };
+    let mut manager = ComponentManager::new();
+    manager.set_trust_store(ComponentTrustStore::default().trust_digest(digest.value.clone()));
+
+    manager
+        .prepare_pulled_package(&source, "magnetar.examples.hello", Some(">=0.1.0,<1.0.0"))
+        .unwrap();
+
+    assert_eq!(
+        manager
+            .definition("magnetar.examples.hello")
+            .and_then(|definition| definition.artifact_digest.clone()),
+        Some(digest)
+    );
+    assert!(manager.observations().iter().any(|observation| {
+        observation.kind == ComponentObservationKind::Distribution
+            && observation.message.contains("candidate digest")
+    }));
 }

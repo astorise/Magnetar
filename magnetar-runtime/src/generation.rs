@@ -1049,3 +1049,6 @@ fn validate_identity(value: &str, label: &str) -> Result<(), GenerationError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

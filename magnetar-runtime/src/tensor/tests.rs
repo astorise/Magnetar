@@ -86,3 +86,55 @@ fn tensor_error_and_observation_redact_backend_diagnostics() {
         .with_message("C:\\weights\\model.bin");
     assert_eq!(observation.message, "[redacted backend diagnostic]");
 }
+
+#[test]
+fn tensor_lifecycle_allows_declared_to_ready_happy_path() {
+    let mut resource = tensor_resource_for_test("tensor-lifecycle-1");
+    resource
+        .transition_to(TensorLifecycleState::Planned)
+        .unwrap();
+    resource
+        .transition_to(TensorLifecycleState::Allocating)
+        .unwrap();
+    resource.mark_ready().unwrap();
+    assert_eq!(resource.lifecycle, TensorLifecycleState::Ready);
+    assert_eq!(resource.readiness, TensorReadiness::Ready);
+    assert!(resource.ensure_usable().is_ok());
+}
+
+#[test]
+fn tensor_readiness_blocks_dispatch_until_ready() {
+    let mut resource = tensor_resource_for_test("tensor-readiness-1");
+    resource
+        .transition_to(TensorLifecycleState::Planned)
+        .unwrap();
+    resource
+        .transition_to(TensorLifecycleState::Allocating)
+        .unwrap();
+    resource.transition_to(TensorLifecycleState::Ready).unwrap();
+    resource.readiness = TensorReadiness::PendingTransfer;
+    assert!(matches!(
+        resource.ensure_usable().unwrap_err(),
+        TensorError::ResourceNotReady { .. }
+    ));
+    resource.readiness = TensorReadiness::Ready;
+    assert!(resource.ensure_usable().is_ok());
+}
+
+#[test]
+fn tensor_memory_class_is_derived_from_memory_placement() {
+    assert_eq!(
+        TensorMemoryClass::from(&MemoryPlacement::HostOrdinary),
+        TensorMemoryClass::Host
+    );
+    assert_eq!(
+        TensorMemoryClass::from(&MemoryPlacement::HostPinned),
+        TensorMemoryClass::PinnedHost
+    );
+    assert_eq!(
+        TensorMemoryClass::from(&MemoryPlacement::BrowserLinearMemory),
+        TensorMemoryClass::BrowserLinearMemory
+    );
+    let staged = MemoryPlacement::StagedTemporary(Box::new(MemoryPlacement::HostOrdinary));
+    assert_eq!(TensorMemoryClass::from(&staged), TensorMemoryClass::Host);
+}

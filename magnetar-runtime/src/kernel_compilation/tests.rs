@@ -222,3 +222,37 @@ fn compilation_observation_never_carries_raw_source_or_native_handles() {
         "nvcc 12.4"
     );
 }
+
+#[test]
+fn compilation_capability_absence_is_valid_and_optional() {
+    let descriptor = KernelCompilationCapabilityDescriptor::unsupported();
+    assert!(!descriptor.is_present());
+    assert!(descriptor.validate().is_ok());
+}
+
+#[test]
+fn network_boundary_denies_implicit_dependency_downloads() {
+    let policy = CompilationNetworkPolicy::default();
+    assert!(matches!(
+        enforce_compilation_network_boundary(true, &policy),
+        Err(KernelCompilationError::PolicyDenied { .. })
+    ));
+    let authorized = CompilationNetworkPolicy {
+        network_access_authorized: true,
+    };
+    assert!(enforce_compilation_network_boundary(true, &authorized).is_ok());
+    assert!(enforce_compilation_network_boundary(false, &policy).is_ok());
+}
+
+#[test]
+fn preparation_only_provider_is_a_valid_distinct_support_level() {
+    let mut descriptor = KernelCompilationCapabilityDescriptor::unsupported();
+    descriptor.support_level = CompilationSupportLevel::PreparationOnly;
+    descriptor
+        .produced_compiled_formats
+        .insert("nvidia:cubin".into());
+    descriptor.isolation_model = CompilationIsolationModel::PlatformManagedCompiler;
+    assert!(descriptor.is_present());
+    assert!(descriptor.validate().is_ok());
+    assert!(descriptor.accepted_source_formats.is_empty());
+}

@@ -10,6 +10,9 @@ use crate::operator::{OperatorFamily, OperatorId};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use crate::kernel_benchmark::{BenchmarkFreshness, BenchmarkStalenessReason};
+use crate::kernel_registry::KernelCandidateRejection;
+use crate::model_instance::KernelSelectionPolicy;
 fn selection_policy_identity(name: &str) -> CandidateIdentity {
     CandidateIdentity {
         kernel: selection_policy_kernel_id(name),
@@ -445,5 +448,86 @@ fn generation_preference_boundary_has_no_way_to_carry_a_kernel_identity() {
     assert_eq!(
         resolve_generation_preference(None, OptimizationProfile::Balanced),
         OptimizationProfile::Balanced
+    );
+}
+
+#[test]
+fn kernel_candidate_rejection_maps_onto_selection_exclusion_reason() {
+    assert_eq!(
+        KernelSelectionExclusionReason::from(KernelCandidateRejection::Revoked),
+        KernelSelectionExclusionReason::QualificationRevoked
+    );
+    assert_eq!(
+        KernelSelectionExclusionReason::from(KernelCandidateRejection::WorkspaceUnavailable),
+        KernelSelectionExclusionReason::WorkspaceInfeasible
+    );
+}
+
+#[test]
+fn stale_benchmark_policy_explicitly_governs_exclusion() {
+    let stale = BenchmarkFreshness::Stale {
+        reason: BenchmarkStalenessReason::DriverChanged,
+    };
+    assert!(evaluate_stale_benchmark_policy(stale, StaleBenchmarkPolicy::Accept).is_ok());
+    assert_eq!(
+        evaluate_stale_benchmark_policy(stale, StaleBenchmarkPolicy::Exclude),
+        Err(KernelSelectionError::BenchmarkStale)
+    );
+    assert!(
+        evaluate_stale_benchmark_policy(BenchmarkFreshness::Fresh, StaleBenchmarkPolicy::Exclude)
+            .is_ok()
+    );
+}
+
+#[test]
+fn hysteresis_retains_active_kernel_below_threshold_and_promotes_above_it() {
+    let policy = HysteresisPolicy {
+        promotion_threshold_fraction: 0.05,
+    };
+    assert_eq!(
+        evaluate_hysteresis(100.0, 99.9, &policy),
+        SelectionOutcome::RetainActive
+    );
+    assert_eq!(
+        evaluate_hysteresis(100.0, 80.0, &policy),
+        SelectionOutcome::PromoteCandidate
+    );
+}
+
+#[test]
+fn kernel_optimization_policy_rejects_self_contradictory_deterministic_profile() {
+    let policy = KernelOptimizationPolicy {
+        id: KernelSelectionPolicyId::new("policy-1"),
+        version: KernelSelectionPolicyVersion(1),
+        profile: OptimizationProfile::Deterministic,
+        ranking_strategy: RankingStrategy::WeightedScore(WeightedScorePolicy {
+            weights: BTreeMap::new(),
+            missing_metric_policy: MissingMetricPolicy::Exclude,
+        }),
+        fallback: FallbackPolicy::default(),
+        hysteresis: HysteresisPolicy::default(),
+        anti_flapping: AntiFlappingPolicy::default(),
+        exploration: ExplorationPolicy::default(),
+        selection_mode: KernelSelectionPolicy::Dynamic,
+        determinism_required: false,
+        require_trusted: true,
+        allowed_qualification_profiles: BTreeSet::new(),
+    };
+    assert!(policy.validate().is_err());
+}
+
+#[test]
+fn kernel_selection_error_ids_are_stable_and_match_the_proposal_vocabulary() {
+    assert_eq!(
+        KernelSelectionError::NoEligibleCandidates.id(),
+        "kernel-selection-no-eligible-candidates"
+    );
+    assert_eq!(
+        KernelSelectionError::PinnedKernelIneligible.id(),
+        "kernel-selection-pinned-kernel-ineligible"
+    );
+    assert_eq!(
+        KernelSelectionError::InternalError { reason: "x".into() }.id(),
+        "internal-kernel-selection-error"
     );
 }

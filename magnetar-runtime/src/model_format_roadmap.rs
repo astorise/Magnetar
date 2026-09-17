@@ -1579,3 +1579,6 @@ fn minimal_trust_probe_manifest() -> ModelManifest {
         architecture_config: None,
     }
 }
+
+#[cfg(test)]
+mod tests;

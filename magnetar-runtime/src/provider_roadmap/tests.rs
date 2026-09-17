@@ -327,3 +327,42 @@ fn provider_roadmap_device_metadata_templates_carry_family_memory_classes() {
         assert!(!device.architecture.is_empty());
     }
 }
+
+#[test]
+fn provider_roadmap_every_phase_requires_provider_core() {
+    for phase in PROVIDER_ROADMAP_PHASES {
+        assert!(
+            phase
+                .required_conformance_gates()
+                .contains(&ProviderConformanceProfile::ProviderCore),
+            "{phase:?} must require provider-core"
+        );
+    }
+}
+
+#[test]
+fn provider_roadmap_rejects_model_family_provider_names() {
+    for name in [
+        "QwenProvider",
+        "LlamaProvider",
+        "GemmaProvider",
+        "DeepSeekProvider",
+    ] {
+        let outcome = reject_model_family_provider_name(name);
+        assert!(
+            matches!(
+                outcome,
+                Err(ProviderRoadmapError::ProviderRoadmapUnsupported { .. })
+            ),
+            "{name} should have been rejected, got {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn provider_roadmap_rejects_empty_provider_name() {
+    assert!(matches!(
+        reject_model_family_provider_name("   "),
+        Err(ProviderRoadmapError::InternalProviderRoadmapError { .. })
+    ));
+}
