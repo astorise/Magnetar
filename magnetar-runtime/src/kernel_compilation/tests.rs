@@ -7,6 +7,7 @@ use super::*;
 use crate::compute::ComputeDType;
 
 use crate::affinity::{DeviceBinding, ProviderBinding};
+use crate::kernel_artifact::CompiledKernelArtifactId;
 use crate::kernel_artifact::{KernelArtifactPath, KernelSourceFormat};
 #[test]
 fn output_format_negotiation_requires_explicit_declaration() {
@@ -366,4 +367,14 @@ fn kernel_compilation_conformance_report_is_conformant() {
         );
     }
     assert!(report.is_conformant());
+}
+
+#[test]
+fn output_integrity_rejects_digest_mismatch() {
+    let id = CompiledKernelArtifactId::from_digest("expected-digest");
+    assert!(verify_output_integrity("expected-digest", &id).is_ok());
+    assert!(matches!(
+        verify_output_integrity("different-digest", &id),
+        Err(KernelCompilationError::OutputIntegrityFailed { .. })
+    ));
 }

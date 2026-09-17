@@ -12,6 +12,9 @@ use std::collections::BTreeSet;
 
 use crate::compute::ComputeDType;
 use crate::kernel::{
+    KernelDequantizationBehavior, KernelQuantizationMetadata, KernelQuantizationMethod,
+};
+use crate::kernel::{
     KernelDeterminism, KernelFallbackClass, KernelFusionMetadata, KernelKvCacheMetadata,
     KernelMemoryClass, KernelPrecisionMetadata,
 };
@@ -662,4 +665,36 @@ fn provider_roadmap_conformance_report_is_conformant() {
         );
     }
     assert!(report.is_conformant());
+}
+
+#[test]
+fn provider_roadmap_quantized_path_requires_explicit_metadata() {
+    let incomplete = KernelQuantizationMetadata {
+        method: KernelQuantizationMethod::Int8,
+        storage_dtype: ComputeDType::SInt8,
+        compute_dtype: ComputeDType::Float32,
+        accumulation_dtype: ComputeDType::Float32,
+        scale_dtype: ComputeDType::Float32,
+        zero_point_dtype: None,
+        group_size: None,
+        packing_layout: TensorLayoutKind::QuantizedPacked,
+        dequantization: KernelDequantizationBehavior::ExplicitBeforeOperator,
+        supported_operators: BTreeSet::new(),
+        conformance_tolerance_profile: String::new(),
+    };
+    assert!(matches!(
+        validate_quantization_declaration(&incomplete),
+        Err(ProviderRoadmapError::ProviderQuantizationUnsupported { .. })
+    ));
+
+    let complete = KernelQuantizationMetadata {
+        supported_operators: BTreeSet::from([OperatorId::magnetar(
+            "matmul",
+            1,
+            OperatorFamily::LinearAlgebra,
+        )]),
+        conformance_tolerance_profile: "quantized-int8-default".into(),
+        ..incomplete
+    };
+    assert!(validate_quantization_declaration(&complete).is_ok());
 }

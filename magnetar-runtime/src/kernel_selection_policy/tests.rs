@@ -775,3 +775,23 @@ fn workload_context_carries_batch_and_phase_metadata_for_ranking() {
     assert!(performance_evidence_applies_to_workload(&bucket, &bucket));
     assert_eq!(context.phase, Some(GenerationPhase::Decode));
 }
+
+#[test]
+fn model_component_cannot_select_a_concrete_kernel() {
+    assert!(
+        validate_model_component_request(&ModelComponentKernelRequest::ConcreteKernelOverride(
+            selection_policy_kernel_id("x")
+        ))
+        .is_err()
+    );
+    assert!(
+        validate_model_component_request(
+            &ModelComponentKernelRequest::PortableOperatorRequirement(OperatorId::magnetar(
+                "matmul",
+                1,
+                OperatorFamily::LinearAlgebra
+            ))
+        )
+        .is_ok()
+    );
+}

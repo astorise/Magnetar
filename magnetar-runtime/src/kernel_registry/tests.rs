@@ -5,8 +5,12 @@
 
 use super::*;
 use crate::affinity::{DeviceBinding, ProviderBinding};
+use crate::affinity::{
+    FallbackClass, HealthState, ProviderHealthReport, ProviderStatusSnapshot, ResourceAffinity,
+};
 use crate::capability::CapabilityVersion;
 use crate::device::DeviceId;
+use crate::kernel::KernelObservationKind;
 use crate::kernel::{KernelId, KernelImplementationFamily, KernelOperatorVersionRange};
 use crate::kernel_artifact::{
     CompiledKernelArtifactId, PreparedKernel, PreparedKernelGeneration, PreparedKernelIdAllocator,
@@ -14,6 +18,7 @@ use crate::kernel_artifact::{
 use crate::kernel_performance_model::KernelPerformanceMetricSummary;
 use crate::operator::{OperatorFamily, OperatorId};
 use crate::provider::Provider;
+use crate::reference_cpu::REFERENCE_CPU_PROVIDER_NAME;
 use crate::reference_cpu::ReferenceCpuProvider;
 use std::collections::BTreeMap;
 #[test]
@@ -164,5 +169,95 @@ fn registry_performance_evidence_is_keyed_by_generation_and_never_fabricated() {
     assert!(
         lookup_performance_evidence(&evidence, &artifact, generation_n_plus_1).is_none(),
         "a new generation must not silently inherit the prior generation's evidence"
+    );
+}
+
+#[test]
+fn reference_cpu_kernel_registry_selects_registered_candidate() {
+    let provider = ReferenceCpuProvider::new();
+    let mut registry = KernelRegistry::new();
+    for advertisement in provider.kernel_advertisements() {
+        registry
+            .register_provider_advertisement(advertisement)
+            .unwrap();
+    }
+    registry.set_provider_status(ProviderStatusSnapshot::from_health_report(
+        ProviderHealthReport::new(
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            HealthState::Available,
+        ),
+    ));
+    let matmul_operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
+    let request = KernelSelectionRequest::new(
+        "select-matmul",
+        matmul_operator,
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    let selection = registry.select(&request).unwrap();
+    let selected = selection
+        .selected
+        .expect("a compatible Reference CPU candidate should be selected");
+    assert_eq!(selected.provider.as_str(), REFERENCE_CPU_PROVIDER_NAME);
+    assert!(
+        selection
+            .observations
+            .iter()
+            .any(|observation| observation.kind == KernelObservationKind::KernelSelected)
+    );
+}
+
+#[test]
+fn continuous_batching_preserves_in_flight_generation_and_admits_new_work_on_new_generation() {
+    let kernel = KernelId::new(
+        ProviderBinding::new("conformance-provider"),
+        "conformance-kernel",
+        crate::CapabilityVersion::new(1, 0, 0),
+        OperatorId::magnetar("matmul", 1, crate::OperatorFamily::LinearAlgebra),
+        KernelOperatorVersionRange::exact(1),
+        crate::KernelImplementationFamily::TestFixture,
+    );
+    let device = DeviceBinding::new(crate::DeviceId::new("conformance-device"));
+    let mut allocator = PreparedKernelIdAllocator::default();
+    let mut registry = KernelRegistry::new();
+
+    let mut generation_one = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-batch-v1"),
+        ProviderBinding::new("conformance-provider"),
+        device.clone(),
+        PreparedKernelGeneration::new(1),
+    );
+    generation_one.mark_ready().unwrap();
+    let generation_one_id = generation_one.id;
+    registry.register_prepared_kernel(generation_one);
+    registry
+        .promote_generation(&kernel, generation_one_id)
+        .unwrap();
+
+    let slot_binding = registry.bind_batch_slot(&kernel, 7).unwrap();
+    assert_eq!(slot_binding.generation, generation_one_id);
+
+    let mut generation_two = PreparedKernel::new(
+        allocator.allocate(),
+        kernel.clone(),
+        CompiledKernelArtifactId::from_digest("digest-batch-v2"),
+        ProviderBinding::new("conformance-provider"),
+        device,
+        PreparedKernelGeneration::new(2),
+    );
+    generation_two.mark_ready().unwrap();
+    let generation_two_id = generation_two.id;
+    registry.register_prepared_kernel(generation_two);
+    registry
+        .promote_generation(&kernel, generation_two_id)
+        .unwrap();
+
+    // The existing slot binding is unaffected by promotion...
+    assert_eq!(slot_binding.generation, generation_one_id);
+    // ...but new batch admissions resolve to the newly promoted generation.
+    assert_eq!(
+        registry.admit_new_batch_work(&kernel),
+        Some(generation_two_id)
     );
 }

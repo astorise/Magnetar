@@ -18,6 +18,7 @@ use crate::compute::{
     COMPUTE_CAPABILITY_ID, COMPUTE_CAPABILITY_VERSION, ComputeGraphId, DTypeDescriptor,
     ShapeDescriptor, TensorDescriptor, TensorResourceDescriptor, TensorResourceId,
 };
+use crate::kernel::KernelCancellationSupport;
 use crate::kernel::{
     KernelAdvertisement, KernelError, KernelInvocation, KernelInvocationId, KernelMemoryClass,
     KernelResource, KernelResultStatus,
@@ -30,6 +31,7 @@ use crate::operator::{OperatorAttributeValue, TensorRole, initial_operator_catal
 use crate::planning::{
     ComputeExecutionClassification, ComputeExecutionPlan, ExecutionPlanId, MemoryPlan,
 };
+use crate::provider::Provider;
 use crate::provider::ProviderExecutionApi;
 use crate::resolution::ResolutionPolicyId;
 use crate::scheduler::{
@@ -1393,4 +1395,305 @@ fn reference_cpu_generic_provider_execution_api_completes_exactly_once() {
     // status nor a second complete succeeds against the same handle.
     assert!(ProviderExecutionApi::status(executor.as_ref(), &handle).is_err());
     assert!(ProviderExecutionApi::complete(executor.as_ref(), &handle).is_err());
+}
+
+#[test]
+fn reference_cpu_generic_activation_kernel_dispatches_on_kind() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = reference_cpu_kernel_by_name(&advertisements, "activation");
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (input_id, input_resource) = reference_cpu_resource("activation-in", [1]);
+    let (_out_id, out_resource) = reference_cpu_resource("activation-out", [1]);
+    executor.write_tensor(input_id, reference_cpu_host_tensor([1], [0.0]));
+
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "kind".to_string(),
+        OperatorAttributeValue::String("silu".into()),
+    );
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-activation"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(input_resource)
+    .with_output(out_resource.clone())
+    .with_attributes(attributes);
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    let output = executor.read_tensor(&out_resource.resource.id).unwrap();
+    assert!((output.data[0] - 0.0).abs() < 1e-6);
+}
+
+#[test]
+fn reference_cpu_generic_activation_kernel_rejects_unknown_kind() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = reference_cpu_kernel_by_name(&advertisements, "activation");
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (input_id, input_resource) = reference_cpu_resource("activation-bad-in", [1]);
+    let (_out_id, out_resource) = reference_cpu_resource("activation-bad-out", [1]);
+    executor.write_tensor(input_id, reference_cpu_host_tensor([1], [0.0]));
+
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "kind".to_string(),
+        OperatorAttributeValue::String("relu".into()),
+    );
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-activation-bad"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(input_resource)
+    .with_output(out_resource)
+    .with_attributes(attributes);
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Failed);
+}
+
+#[test]
+fn reference_cpu_rope_rejects_unimplemented_position_mode() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = reference_cpu_kernel_by_name(&advertisements, "rope");
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (input_id, input_resource) = reference_cpu_resource("rope-mode-in", [1, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("rope-mode-out", [1, 2]);
+    executor.write_tensor(input_id, reference_cpu_host_tensor([1, 2], [1.0, 2.0]));
+
+    let mut attributes = BTreeMap::new();
+    attributes.insert("base".to_string(), OperatorAttributeValue::Float(10000.0));
+    attributes.insert("dimension".to_string(), OperatorAttributeValue::Integer(2));
+    attributes.insert(
+        "position_mode".to_string(),
+        OperatorAttributeValue::String("absolute".into()),
+    );
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-rope-mode"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(input_resource)
+    .with_output(out_resource)
+    .with_attributes(attributes);
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Failed);
+}
+
+#[test]
+fn reference_cpu_attention_mask_kind_must_be_consistent_with_causal_flag() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = reference_cpu_kernel_by_name(&advertisements, "attention");
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+    let workspace = executor.allocate_workspace(&mut memory, 4096).unwrap();
+
+    let (q_id, q_resource) = reference_cpu_resource("attn-mismatch-q", [1, 2]);
+    let (k_id, k_resource) = reference_cpu_resource("attn-mismatch-k", [1, 2]);
+    let (v_id, v_resource) = reference_cpu_resource("attn-mismatch-v", [1, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("attn-mismatch-out", [1, 2]);
+    executor.write_tensor(q_id, reference_cpu_host_tensor([1, 2], [1.0, 0.0]));
+    executor.write_tensor(k_id, reference_cpu_host_tensor([1, 2], [1.0, 0.0]));
+    executor.write_tensor(v_id, reference_cpu_host_tensor([1, 2], [5.0, 6.0]));
+
+    // causal=false but attention_mask_kind says "causal": inconsistent.
+    let invocation = reference_cpu_attention_invocation(
+        advertisement,
+        false,
+        Some("causal"),
+        q_resource,
+        k_resource,
+        v_resource,
+        out_resource,
+    )
+    .with_workspace(workspace);
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Failed);
+}
+
+#[test]
+fn reference_cpu_executes_matmul_invocation_end_to_end() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (a_id, a_resource) = reference_cpu_resource("a", [2, 2]);
+    let (b_id, b_resource) = reference_cpu_resource("b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("out", [2, 2]);
+    executor.write_tensor(
+        a_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+    );
+    executor.write_tensor(
+        b_id,
+        reference_cpu_host_tensor([2, 2], [5.0, 6.0, 7.0, 8.0]),
+    );
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-1"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource.clone());
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    let output = executor.read_tensor(&out_resource.resource.id).unwrap();
+    assert_eq!(output.data, vec![19.0, 22.0, 43.0, 50.0]);
+}
+
+#[test]
+fn reference_cpu_honors_already_elapsed_deadline_as_timeout() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    assert_eq!(
+        advertisement.cancellation,
+        KernelCancellationSupport::TimeoutOnly
+    );
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (a_id, a_resource) = reference_cpu_resource("deadline-a", [2, 2]);
+    let (b_id, b_resource) = reference_cpu_resource("deadline-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("deadline-out", [2, 2]);
+    executor.write_tensor(a_id, reference_cpu_host_tensor([2, 2], vec![0.0; 4]));
+    executor.write_tensor(b_id, reference_cpu_host_tensor([2, 2], vec![0.0; 4]));
+
+    let mut invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-deadline"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource);
+    invocation.deadline_millis = Some(0);
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Failed);
+    assert_eq!(result.error, Some(KernelError::KernelTimeout));
+    assert!(
+        executor
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == KernelObservationKind::KernelTimeout)
+    );
+}
+
+#[test]
+fn reference_cpu_execution_only_accepts_runtime_created_invocation_shapes() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    // Only one input bound where the Operator requires two: Runtime-level
+    // validation must reject it rather than the Provider guessing.
+    let (a_id, a_resource) = reference_cpu_resource("a", [2, 2]);
+    let (out_id, out_resource) = reference_cpu_resource("out", [2, 2]);
+    executor.write_tensor(
+        a_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+    );
+    let _ = out_id;
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-2"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_output(out_resource);
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Failed);
+    assert!(result.error.is_some());
+}
+
+#[test]
+fn reference_cpu_no_raw_handles_exposed_in_invocation_or_result() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (a_id, a_resource) = reference_cpu_resource("a", [2, 2]);
+    let (b_id, b_resource) = reference_cpu_resource("b", [2, 2]);
+    let (_, out_resource) = reference_cpu_resource("out", [2, 2]);
+    executor.write_tensor(
+        a_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+    );
+    executor.write_tensor(
+        b_id,
+        reference_cpu_host_tensor([2, 2], [5.0, 6.0, 7.0, 8.0]),
+    );
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-3"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource);
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    let text = format!("{invocation:?} {result:?}");
+    assert!(!text.contains("0x"));
+    assert!(!text.contains("raw handle"));
 }

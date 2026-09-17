@@ -9,6 +9,7 @@ use crate::affinity::{
     DeviceAvailability, ProviderHealth, ProviderHealthReport, ProviderStatusSnapshot,
 };
 use crate::affinity::{DeviceBinding, FallbackClass, ProviderBinding, ResourceAffinity};
+use crate::compute::{ComputeDType, DTypeDescriptor, ShapeDescriptor, TensorDescriptor};
 use crate::compute::{HostStagingPolicy, TensorResourceId};
 use crate::device::DeviceId;
 use crate::device::{DeviceMetadata, DeviceType};
@@ -410,4 +411,36 @@ fn tensor_residency_tracks_eviction_size_estimate_and_host_visibility() {
     );
     assert!(!device.is_host_visible());
     assert_eq!(device.memory_class(), TensorMemoryClass::Device);
+}
+
+#[test]
+fn memory_manager_admits_tensor_computed_from_descriptor_size() {
+    let manager = MemoryManager::default();
+    let descriptor = TensorDescriptor::materialized(
+        ShapeDescriptor::new([4, 4]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let decision = manager.admit_tensor(
+        &descriptor,
+        MemoryPlacement::HostOrdinary,
+        MemoryAllocationOwner::Runtime,
+        MemoryPressureSnapshot::default(),
+    );
+    assert!(matches!(decision, MemoryAdmissionDecision::Admit { .. }));
+}
+
+#[test]
+fn memory_manager_rejects_tensor_admission_when_size_is_unknown() {
+    let manager = MemoryManager::default();
+    let descriptor = TensorDescriptor::materialized(
+        ShapeDescriptor::new([u64::MAX, 2]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let decision = manager.admit_tensor(
+        &descriptor,
+        MemoryPlacement::HostOrdinary,
+        MemoryAllocationOwner::Runtime,
+        MemoryPressureSnapshot::default(),
+    );
+    assert!(matches!(decision, MemoryAdmissionDecision::Reject { .. }));
 }

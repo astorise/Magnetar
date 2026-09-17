@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use crate::reference_cpu::reference_cpu_kernel_advertisements;
 struct TestProvider {
     metadata: ProviderMetadata,
     initialized: AtomicBool,
@@ -450,4 +451,20 @@ fn runtime_initializes_memory_manager_as_first_class_service() {
     assert!(runtime.is_initialized());
     assert_eq!(runtime.memory().config(), &MemoryManagerConfig::default());
     assert_eq!(runtime.memory().allocations().count(), 0);
+}
+
+#[test]
+fn builder_does_not_register_kernels_for_a_rejected_provider() {
+    let mut failed = TestProvider::new("failed");
+    failed.fail_initialization = true;
+    failed.kernel_advertisements = reference_cpu_kernel_advertisements();
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(failed))
+        .build()
+        .unwrap();
+
+    // The Provider never came up, so its kernels must not be left in the
+    // registry as candidates that can never resolve.
+    assert!(runtime.providers().provider("failed").is_none());
+    assert_eq!(runtime.startup_diagnostics().len(), 1);
 }

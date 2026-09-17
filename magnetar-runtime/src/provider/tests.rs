@@ -408,3 +408,30 @@ fn provider_abi_descriptor_validates_version_layout_functions_and_ownership() {
         Err(ProviderError::InvalidAbiDescriptor(_))
     ));
 }
+
+#[test]
+fn capability_dependencies_must_resolve_compatibly() {
+    let mut registry = ProviderRegistry::default();
+    let dependent = Capability::new(
+        CapabilityId::new("magnetar:app/run"),
+        CapabilityVersion::new(1, 0, 0),
+        CapabilityDescriptor::new("dependent")
+            .with_contract(WitInterface::new("magnetar:app/run", "1.0.0"))
+            .with_dependency(
+                CapabilityId::new("magnetar:compute/run"),
+                CapabilityVersion::new(1, 1, 0),
+            ),
+    );
+    registry.register_capability(dependent).unwrap();
+    assert!(matches!(
+        registry.validate_dependencies(),
+        Err(ProviderError::MissingCapabilityDependency { .. })
+    ));
+    registry
+        .register_capability(capability(
+            "magnetar:compute/run",
+            CapabilityVersion::new(1, 2, 0),
+        ))
+        .unwrap();
+    registry.validate_dependencies().unwrap();
+}

@@ -17,7 +17,9 @@ use crate::tokenizer::{
     TokenizerFamily, TokenizerId, TokenizerMetadata, TokenizerRevision,
 };
 
+use crate::affinity::{FallbackClass, ProviderBinding, ResourceAffinity};
 use crate::batching::BatchingPolicy;
+use crate::compute::TensorResourceId;
 use crate::generation::GenerationOutput;
 use crate::generation::{
     CancellationMetadata, EosMode, EosOutputPolicy, EosPolicy, FinishReason,
@@ -25,17 +27,32 @@ use crate::generation::{
     GenerationTokenizerReference, StopConditions, StreamingMode, token_stream_events,
 };
 use crate::kernel_execution_plan::PreparedExecutionPlan;
+use crate::materialize_model_instance_weights;
 use crate::memory::MemoryPlacement;
+use crate::memory::MemoryPressureLevel;
+use crate::model::ModelArchitecture;
 use crate::model::{ModelArtifactId, ModelArtifactKind, ModelName, ModelRevision};
 use crate::model_instance::ModelInstanceId;
+use crate::model_instance::{
+    ModelInstanceAdapterState, ModelInstanceDefinition, ModelInstanceLifecycleState,
+    ModelInstancePlacement, ModelInstancePolicy, ModelInstanceReadinessChecks,
+    ModelInstanceResourceBindings, ModelInstanceSuspensionReason, ModelInstanceUsage,
+    ModelInstanceWarmupPlan, ModelInstanceWarmupPolicy,
+};
 use crate::model_loading::ModelLoadingPhase;
+use crate::model_loading::{
+    ModelArchitectureImplementation, ModelArchitectureImplementationKind, ModelResidencyId,
+};
 use crate::observability::{CorrelationId, TraceId};
+use crate::reference_cpu::REFERENCE_CPU_PROVIDER_NAME;
 use crate::reference_cpu::ReferenceCpuProvider;
 use crate::runtime::Runtime;
 use crate::sampling::SamplingPolicy;
 use crate::session::{SessionCreationRequest, SessionMemoryBudget, SessionPolicy};
+use crate::tensor::HostTensor;
 use crate::tokenizer::TokenizerCompatibility;
 use crate::tokenizer::{TokenId, TokenStopPattern};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 fn adapter_activation_request_fixture(residency: &AdapterResidency) -> AdapterActivationRequest {
@@ -859,4 +876,147 @@ fn inference_api_browser_inference_capabilities_reduced_excludes_kv_cache() {
     assert!(capabilities.generation);
     assert!(capabilities.streaming);
     assert!(!capabilities.kv_cache);
+}
+
+/// Materializes one real, Runtime-issued-evidence-backed weight for
+/// `instance` through `materialize_model_instance_weights` -- the one
+/// legitimate way any caller (production or an external embedder) can turn
+/// weight bytes into bound, Ready-eligible resources
+/// (`bind-model-loading-evidence-to-validated-artifact`). This alone
+/// reaches `Ready`: the underlying transaction commits bindings, mints
+/// materialization evidence, and marks the instance Ready in one step, the
+/// same as the real production path -- a separate follow-up
+/// `warm_model_instance` call is not just redundant but would fail (no
+/// `Ready -> Ready` lifecycle transition exists). Requires a
+/// `ReferenceCpuProvider` already registered on `runtime` and `instance`'s
+/// placement pinned to it.
+fn reach_ready_with_real_weight(runtime: &mut Runtime, instance: &ModelInstanceId) {
+    let weights = BTreeMap::from([("weight".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(runtime, instance, "test", &weights).unwrap();
+}
+
+fn model_instance_definition() -> ModelInstanceDefinition {
+    ModelInstanceDefinition {
+        artifact: ModelArtifactId::new(
+            ModelArtifactKind::ModelWeights,
+            ModelName::new("qwen").unwrap(),
+            ModelRevision::new("1").unwrap(),
+            ModelDigest::sha256(b"weights"),
+        ),
+        architecture: ModelArchitectureImplementation {
+            architecture: ModelArchitecture::new("qwen", "qwen2"),
+            kind: ModelArchitectureImplementationKind::TestFixture,
+            required_capabilities: Vec::new(),
+        },
+        residencies: BTreeSet::from([ModelResidencyId::new(1)]),
+        tokenizer: None,
+        placement: ModelInstancePlacement::new(ResourceAffinity::new(FallbackClass::Transparent)),
+        policy: ModelInstancePolicy::default(),
+        adapter_state: ModelInstanceAdapterState::default(),
+        associated_sessions: BTreeSet::new(),
+        usage: ModelInstanceUsage::default(),
+        compute_dtype: None,
+        mutation_version: 0,
+        tenant: None,
+        owner: None,
+        resource_bindings: ModelInstanceResourceBindings::default(),
+        kernel_selection_policy: None,
+        required_weight_names: BTreeSet::new(),
+        required_weight_digests: BTreeMap::new(),
+        required_weight_shapes: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn inference_api_model_instance_suspend_resume_drain_through_api_boundary() {
+    let mut runtime = Runtime::builder()
+        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+    // `create()` no longer reaches Ready on its own (transactional-weight-
+    // materialization); this test's own concern is suspend/resume/drain
+    // *from* Ready, so reach Ready explicitly first -- with real,
+    // Provider-backed evidence: `resume_model_instance` now re-derives
+    // readiness (Correctif: Runtime-owned ModelInstance readiness
+    // authority, round 3), so an instance that was never really
+    // materialized correctly cannot resume back to Ready any more, and
+    // this test's own concern (the suspend/resume/drain state machine,
+    // not weight materialization) needs a genuinely resumable instance
+    // to exercise that machinery at all.
+    reach_ready_with_real_weight(&mut runtime, &instance);
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(!status.raw_provider_handle_available);
+    assert!(!status.raw_device_handle_available);
+    assert!(!status.raw_weights_available);
+
+    suspend_model_instance(
+        &mut runtime,
+        &instance,
+        ModelInstanceSuspensionReason::AdministrativePolicy,
+    )
+    .unwrap();
+    resume_model_instance(&mut runtime, &instance).unwrap();
+    drain_model_instance(&mut runtime, &instance).unwrap();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Draining);
+}
+
+#[test]
+fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_ready() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let instance = runtime
+        .model_instances_mut()
+        .create(model_instance_definition())
+        .unwrap();
+    // `create()` no longer reaches Ready on its own (transactional-weight-
+    // materialization); this test's own concern is warmup's conflict
+    // detection against an *already Ready* instance, so reach Ready
+    // explicitly first. Bind a weight resource before doing so: since
+    // `warm_model_instance` now derives `weights_materialized` from
+    // `resource_bindings.weights` non-emptiness (`runtime-owned-model-
+    // instance-readiness-authority`), an instance with none would make the
+    // later `warm_model_instance` call fail on that check instead of the
+    // already-Ready conflict this test actually means to exercise -- both
+    // happen to map to the same broad `ModelInstanceUnavailable` variant,
+    // which would silently let this test pass for the wrong reason.
+    runtime
+        .model_instances_mut()
+        .instance_mut(&instance)
+        .unwrap()
+        .definition
+        .resource_bindings
+        .weights
+        .insert("weight".into(), TensorResourceId::new("test.weight"));
+    runtime.model_instances_mut().mark_ready(&instance).unwrap();
+    let plan = ModelInstanceWarmupPlan {
+        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
+        steps: Vec::new(),
+    };
+    let checks = ModelInstanceReadinessChecks {
+        residency_available: true,
+        provider_ready: true,
+        device_ready: true,
+        adapter_ready: true,
+        memory_pressure: MemoryPressureLevel::Low,
+        runtime_policy_allows: true,
+        browser_supported: true,
+        kernel_preparation_ready: true,
+        autotuning_ready: true,
+        weights_materialized: true,
+    };
+
+    let error = warm_model_instance(&mut runtime, &instance, &plan, &checks).unwrap_err();
+    assert!(matches!(
+        error,
+        InferenceApiError::ModelInstanceUnavailable { .. }
+    ));
 }
