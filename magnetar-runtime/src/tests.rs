@@ -867,34 +867,6 @@ fn runtime_observability_correlates_plan_scheduler_and_metrics() {
 }
 
 #[test]
-fn runtime_diagnostics_redact_native_details_and_exporters_are_components() {
-    let diagnostic = RuntimeDiagnostic::new(
-        RuntimeDiagnosticCode::ExecutionFailed,
-        "backend handle=0xdeadbeef at C:\\native\\queue",
-    )
-    .with_trace(TraceId::new("trace:failure"))
-    .with_provider(ProviderBinding::new("provider-a"));
-    assert_eq!(diagnostic.message, "[redacted backend diagnostic]");
-
-    let component = ComponentMetadata::new("otel-exporter", "1", "exports observations");
-    let mut exporter =
-        ObservabilityExporterDescriptor::new(component, ObservabilitySink::OpenTelemetry);
-    exporter
-        .accepted_events
-        .insert(RuntimeEventKind::ExecutionCompleted);
-
-    assert_eq!(
-        exporter.input_contract,
-        WitInterface::new("magnetar:runtime/observability", "1.0.0")
-    );
-    assert!(
-        exporter
-            .accepted_events
-            .contains(&RuntimeEventKind::ExecutionCompleted)
-    );
-}
-
-#[test]
 fn provider_execution_api_submits_validated_scheduled_work() {
     let api = Arc::new(TestProviderExecutionApi::new());
     let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
@@ -1083,19 +1055,6 @@ fn provider_execution_rejects_mismatched_provider_request_and_maps_cancellation(
     assert_eq!(
         runtime.cancel_provider_execution(&handle).unwrap(),
         ProviderCancellationOutcome::Accepted
-    );
-}
-#[test]
-fn provider_execution_diagnostics_redact_native_details() {
-    let diagnostic = ProviderExecutionDiagnostic::new(
-        ProviderBinding::new("provider"),
-        ProviderExecutionPhase::Submit,
-    )
-    .with_detail("backend handle=0xdeadbeef");
-
-    assert_eq!(
-        diagnostic.detail.as_deref(),
-        Some("[redacted backend diagnostic]")
     );
 }
 #[test]
@@ -11495,28 +11454,6 @@ fn host_tensors_from_artifact_bytes_verifies_f16_digest_against_original_bytes()
 }
 
 #[test]
-fn host_tensors_from_artifact_bytes_rejects_f16_digest_mismatch() {
-    let bytes = f16_bytes(&[0x3C00]);
-    let mut metadata = f16_tensor_metadata("weight.a", vec![1], bytes.len());
-    metadata.digest = Some(ModelDigest::sha256(b"not the real storage bytes"));
-
-    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
-        .expect_err("a digest mismatch against the original F16 bytes must be rejected");
-    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
-}
-
-#[test]
-fn host_tensors_from_artifact_bytes_rejects_out_of_bounds_range() {
-    let (metadata, _bytes) = artifact_bytes_test_tensor("weight.a", vec![4], &[1.0, 2.0, 3.0, 4.0]);
-    // Declare a range that does not actually fit in a much smaller buffer.
-    let short_file = vec![0u8; 4];
-
-    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &short_file, 0)
-        .expect_err("out-of-bounds range must be rejected");
-    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
-}
-
-#[test]
 fn host_tensors_from_artifact_bytes_rejects_shape_size_mismatch() {
     let (mut metadata, bytes) =
         artifact_bytes_test_tensor("weight.a", vec![4], &[1.0, 2.0, 3.0, 4.0]);
@@ -11928,21 +11865,6 @@ fn tensor(name: &str, shape: Vec<u64>) -> ModelTensorMetadata {
         expected_compute_dtype: None,
         digest: None,
     }
-}
-
-#[test]
-fn model_format_roadmap_memory_mapping_policy_rejects_raw_pointer_exposure() {
-    let policy = MemoryMappingPolicy {
-        mapping_allowed: true,
-        streaming_read_allowed: true,
-        exposes_raw_pointer: true,
-    };
-    assert!(policy.validate().is_err());
-    let safe = MemoryMappingPolicy {
-        exposes_raw_pointer: false,
-        ..policy
-    };
-    assert!(safe.validate().is_ok());
 }
 
 #[test]

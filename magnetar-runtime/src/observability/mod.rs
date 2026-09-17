@@ -354,3 +354,6 @@ pub enum ObservabilitySink {
 pub fn runtime_observability_wit() -> WitInterface {
     WitInterface::new("magnetar:runtime/observability", "1.0.0")
 }
+
+#[cfg(test)]
+mod tests;

@@ -4,7 +4,7 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
-use crate::model::{ModelDType, ModelTensorMetadata};
+use crate::model::{ModelDType, ModelDigest, ModelTensorMetadata};
 
 fn f16_bytes(values: &[u16]) -> Vec<u8> {
     values
@@ -112,4 +112,26 @@ fn host_tensors_from_artifact_bytes_converts_f16_storage_to_f32() {
         .expect("F16 tensor materializes");
     let tensor = weights.get("weight.a").expect("tensor present");
     assert_eq!(tensor.data, vec![1.0, -2.0, 0.5, 0.0]);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_rejects_f16_digest_mismatch() {
+    let bytes = f16_bytes(&[0x3C00]);
+    let mut metadata = f16_tensor_metadata("weight.a", vec![1], bytes.len());
+    metadata.digest = Some(ModelDigest::sha256(b"not the real storage bytes"));
+
+    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect_err("a digest mismatch against the original F16 bytes must be rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_rejects_out_of_bounds_range() {
+    let (metadata, _bytes) = artifact_bytes_test_tensor("weight.a", vec![4], &[1.0, 2.0, 3.0, 4.0]);
+    // Declare a range that does not actually fit in a much smaller buffer.
+    let short_file = vec![0u8; 4];
+
+    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &short_file, 0)
+        .expect_err("out-of-bounds range must be rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
 }

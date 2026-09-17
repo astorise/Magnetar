@@ -217,3 +217,18 @@ fn model_format_roadmap_tokenizer_config_requires_explicit_runtime_validation() 
     assert!(reject_silent_tokenizer_config_override(false).is_err());
     assert!(reject_silent_tokenizer_config_override(true).is_ok());
 }
+
+#[test]
+fn model_format_roadmap_memory_mapping_policy_rejects_raw_pointer_exposure() {
+    let policy = MemoryMappingPolicy {
+        mapping_allowed: true,
+        streaming_read_allowed: true,
+        exposes_raw_pointer: true,
+    };
+    assert!(policy.validate().is_err());
+    let safe = MemoryMappingPolicy {
+        exposes_raw_pointer: false,
+        ..policy
+    };
+    assert!(safe.validate().is_ok());
+}
