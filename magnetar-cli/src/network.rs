@@ -217,6 +217,30 @@ fn decode_chunked_body(body: &[u8], max_bytes: usize) -> Result<Vec<u8>, CliBoun
 /// authority -- only the returned `String` may later be folded into a
 /// prompt by the caller (§10/§15 "Assemble network retrieval context in
 /// CLI").
+/// Tries each of `addresses` in turn, returning the first successful
+/// connection. A hostname can resolve to several addresses (dual-stack
+/// IPv4/IPv6 being the common case); a plain `TcpStream::connect((host,
+/// port))` tries each resolved address in turn until one connects, and this
+/// preserves that fallback while still bounding each individual attempt by
+/// `timeout` (a single `SocketAddr` has no such portable timeout via
+/// `TcpStream::connect` alone, hence `connect_timeout` per address rather
+/// than delegating to `TcpStream::connect`'s own multi-address handling).
+/// Returns the last per-address error when every attempt fails; `addresses`
+/// must be non-empty.
+fn connect_to_first_reachable(
+    addresses: &[std::net::SocketAddr],
+    timeout: Duration,
+) -> std::io::Result<TcpStream> {
+    let mut last_error = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(address, timeout) {
+            Ok(connected) => return Ok(connected),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("addresses is non-empty, so at least one attempt was made"))
+}
+
 pub fn fetch_url_context(url: &str, policy: NetworkPolicy) -> Result<String, CliBoundaryError> {
     if !matches!(policy, NetworkPolicy::AllowExplicit) {
         return Err(CliBoundaryError::CliNetworkDenied {
@@ -227,19 +251,21 @@ pub fn fetch_url_context(url: &str, policy: NetworkPolicy) -> Result<String, Cli
     // DNS resolution itself (`to_socket_addrs`) is not bounded by
     // `IO_TIMEOUT` -- the standard library gives no portable way to time
     // out a hostname lookup without a dependency -- but the connection
-    // attempt against the resolved address now is, which the previous
+    // attempt against each resolved address now is, which the previous
     // plain `TcpStream::connect` (no timeout at all, relying only on the
     // OS default) was not.
-    let address = (host.as_str(), port)
+    let addresses = (host.as_str(), port)
         .to_socket_addrs()
         .map_err(|error| CliBoundaryError::CliNetworkDenied {
             reason: format!("failed to resolve '{host}:{port}': {error}"),
         })?
-        .next()
-        .ok_or_else(|| CliBoundaryError::CliNetworkDenied {
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(CliBoundaryError::CliNetworkDenied {
             reason: format!("'{host}:{port}' resolved to no address"),
-        })?;
-    let mut stream = TcpStream::connect_timeout(&address, IO_TIMEOUT).map_err(|error| {
+        });
+    }
+    let mut stream = connect_to_first_reachable(&addresses, IO_TIMEOUT).map_err(|error| {
         CliBoundaryError::CliNetworkDenied {
             reason: format!("failed to connect to '{host}:{port}': {error}"),
         }
@@ -317,6 +343,46 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         addr
+    }
+
+    /// A Codex review finding on this PR: taking only the first resolved
+    /// address regressed the fallback-across-addresses behavior a plain
+    /// `TcpStream::connect((host, port))` used to provide (relevant to
+    /// dual-stack hosts where, say, IPv6 resolves first but only IPv4 is
+    /// reachable). Crafts an address list whose first entry is guaranteed
+    /// unreachable (a listener bound then immediately dropped, so the OS
+    /// refuses the connection) and confirms the second, live address is
+    /// still tried and succeeds.
+    #[test]
+    fn connect_to_first_reachable_falls_back_past_an_unreachable_address() {
+        let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let unreachable_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = connect_to_first_reachable(
+            &[unreachable_addr, live_addr],
+            std::time::Duration::from_secs(2),
+        )
+        .expect("should fall back to the second, reachable address");
+        assert_eq!(stream.peer_addr().unwrap(), live_addr);
+    }
+
+    #[test]
+    fn connect_to_first_reachable_reports_the_last_error_when_all_addresses_fail() {
+        let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let unreachable_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+
+        let error =
+            connect_to_first_reachable(&[unreachable_addr], std::time::Duration::from_secs(2))
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
     }
 
     /// §10/§29 "Test network stays in CLI": with explicit policy, a real
