@@ -95,3 +95,17 @@ fn cli_boundary_error_preserves_wrapped_runtime_error_category() {
     let wrapped = CliBoundaryError::from(source.clone());
     assert_eq!(wrapped.runtime_category(), Some(&source));
 }
+
+#[test]
+fn cli_boundary_conformance_report_is_conformant() {
+    let report = run_cli_boundary_conformance();
+    assert!(report.is_conformant());
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+}

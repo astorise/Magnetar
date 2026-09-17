@@ -10,6 +10,7 @@ use crate::kernel_qualification::QualificationProfile;
 use crate::operator::{OperatorFamily, OperatorId};
 use std::fs;
 
+use crate::kernel::KernelOperatorVersionRange;
 fn gzip_compress(bytes: &[u8]) -> Vec<u8> {
     use std::io::Write as _;
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -909,4 +910,713 @@ fn kernel_manifest_embedded_byte_accounting_saturates_instead_of_overflowing() {
         .into_iter()
         .fold(0_u64, u64::saturating_add);
     assert_eq!(total, u64::MAX);
+}
+
+#[test]
+fn kernel_artifact_manifest_conformance_report_is_conformant() {
+    let report = run_kernel_artifact_manifest_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn kernel_manifest_json_duplicate_key_is_rejected() {
+    let limits = KernelManifestLimits::default();
+    let text = r#"{"schema":"magnetar:kernel-manifest@1.0","artifacts":[],"artifacts":[]}"#;
+    let outcome = parse_manifest_json(text, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::DuplicateKey { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_json_excessive_nesting_is_rejected() {
+    let limits = KernelManifestLimits {
+        max_nesting_depth: 4,
+        ..KernelManifestLimits::default()
+    };
+    let mut text = String::new();
+    for _ in 0..10 {
+        text.push('[');
+    }
+    for _ in 0..10 {
+        text.push(']');
+    }
+    let outcome = parse_manifest_json(&text, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::LimitExceeded { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_oversized_input_is_rejected() {
+    let limits = KernelManifestLimits {
+        max_manifest_bytes: 8,
+        ..KernelManifestLimits::default()
+    };
+    let outcome = parse_manifest_json(
+        r#"{"schema":"magnetar:kernel-manifest@1.0","artifacts":[]}"#,
+        &limits,
+    );
+    assert!(matches!(outcome, Err(KernelManifestError::TooLarge { .. })));
+}
+
+#[test]
+fn kernel_manifest_unsupported_schema_major_is_rejected() {
+    let limits = KernelManifestLimits::default();
+    let outcome = parse_manifest_json(
+        r#"{"schema":"magnetar:kernel-manifest@2.0","artifacts":[]}"#,
+        &limits,
+    );
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::SchemaUnsupported { .. })
+    ));
+}
+
+#[test]
+fn kernel_exchange_bundle_missing_optional_embedded_artifact_is_tolerated() {
+    let directory = temp_kernel_bundle_dir("optional-missing");
+    let present_digest = KernelBlobDigest::of_bytes(b"present-bytes");
+    fs::write(
+        directory
+            .join("blobs")
+            .join("sha256")
+            .join(&present_digest.value),
+        b"present-bytes",
+    )
+    .unwrap();
+    let missing_digest = KernelBlobDigest::of_bytes(b"missing-bytes");
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{present}",
+      "size": 13,
+      "storage_mode": "embedded",
+      "required": true
+    }},
+    {{
+      "role": "benchmark-evidence",
+      "format": "magnetar:benchmark-report@1",
+      "digest": "sha256:{missing}",
+      "size": 99,
+      "storage_mode": "embedded",
+      "required": false
+    }}
+  ]
+}}"#,
+        present = present_digest.value,
+        missing = missing_digest.value
+    );
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let validated = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default())
+        .expect("missing optional embedded artifact should not invalidate the bundle");
+    assert_eq!(validated.manifest.artifacts.len(), 2);
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_manifest_extension_cannot_claim_a_core_field_namespace() {
+    let limits = KernelManifestLimits::default();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"core-field-fixture").value
+    );
+    let mut manifest = parse_manifest_json(&text, &limits).expect("sample manifest parses");
+    manifest.extensions.push(KernelManifestExtension {
+        namespace: "trust:override".into(),
+        required: false,
+        data: serde_json::Value::Null,
+    });
+    let outcome = manifest.validate();
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::ArtifactReferenceInvalid { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_accepts_unknown_future_artifact_format() {
+    let limits = KernelManifestLimits::default();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "vendor:new-ir@1",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"future-format-bytes").value
+    );
+    let manifest = parse_manifest_json(&text, &limits)
+        .expect("unknown future format still parses structurally");
+    assert_eq!(
+        manifest.artifacts[0].blob.format.stable_key(),
+        "vendor:new-ir@1"
+    );
+}
+
+#[test]
+fn kernel_manifest_operator_version_range_compatibility() {
+    let limits = KernelManifestLimits::default();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded",
+      "operators": [
+        {{ "namespace": "magnetar:operator", "name": "matmul", "version": 1, "family": "linear-algebra" }}
+      ],
+      "operator_version_range": {{ "min": 1, "max": 3 }}
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"version-range-fixture").value
+    );
+    let manifest = parse_manifest_json(&text, &limits).expect("manifest with version range parses");
+    let binding = manifest.artifacts[0].semantic_binding.as_ref().unwrap();
+    assert!(binding.is_version_compatible(1));
+    assert!(binding.is_version_compatible(3));
+    assert!(!binding.is_version_compatible(4));
+
+    let invalid_range = KernelSemanticBinding {
+        operators: vec![OperatorId::magnetar(
+            "matmul",
+            1,
+            OperatorFamily::LinearAlgebra,
+        )],
+        primary_version_requirements: Some(KernelOperatorVersionRange { min: 5, max: 1 }),
+    };
+    assert!(matches!(
+        invalid_range.validate(),
+        Err(KernelManifestError::SemanticBindingInvalid { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_fused_semantic_binding_preserves_operator_order() {
+    let limits = KernelManifestLimits::default();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded",
+      "operators": [
+        {{ "namespace": "magnetar:operator", "name": "rmsnorm", "version": 1, "family": "normalization" }},
+        {{ "namespace": "magnetar:operator", "name": "matmul", "version": 1, "family": "linear-algebra" }}
+      ]
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"fused-fixture").value
+    );
+    let manifest = parse_manifest_json(&text, &limits).expect("fused binding manifest parses");
+    let binding = manifest.artifacts[0].semantic_binding.as_ref().unwrap();
+    assert!(binding.is_fused());
+    assert_eq!(
+        binding.fingerprint(),
+        "magnetar:operator/rmsnorm@1 -> magnetar:operator/matmul@1"
+    );
+
+    // Order matters: swapping the two operators is a different fusion.
+    let reversed_text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded",
+      "operators": [
+        {{ "namespace": "magnetar:operator", "name": "matmul", "version": 1, "family": "linear-algebra" }},
+        {{ "namespace": "magnetar:operator", "name": "rmsnorm", "version": 1, "family": "normalization" }}
+      ]
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"fused-fixture-reversed").value
+    );
+    let reversed = parse_manifest_json(&reversed_text, &limits)
+        .expect("reversed fused binding manifest parses");
+    let reversed_binding = reversed.artifacts[0].semantic_binding.as_ref().unwrap();
+    assert_ne!(binding.fingerprint(), reversed_binding.fingerprint());
+
+    // Normalizing a fused source artifact preserves the remaining operators
+    // as the fused group, and only the primary Operator becomes the
+    // compiled artifact's single `operator_semantics`.
+    let normalized_source =
+        normalize_to_source_artifact(&manifest.artifacts[0]).expect("fused source normalizes");
+    assert_eq!(normalized_source.fused_operator_group.len(), 1);
+    assert_eq!(normalized_source.fused_operator_group[0].name(), "matmul");
+}
+
+#[test]
+fn kernel_manifest_target_specialization_compiler_precision_generator_round_trip() {
+    let limits = KernelManifestLimits::default();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded",
+      "operators": [
+        {{ "namespace": "magnetar:operator", "name": "matmul", "version": 1, "family": "linear-algebra" }}
+      ],
+      "target": {{
+        "device_type": "gpu",
+        "hardware_vendor": "nvidia",
+        "architecture": "sm90",
+        "device_features": ["tensor-core"],
+        "provider_compatibility": ["nvidia-cuda"],
+        "runtime_driver_compatibility": ["cuda-12"],
+        "memory_classes": ["hbm"]
+      }},
+      "specialization": {{
+        "exact_dimensions": {{"0": 128}},
+        "batch_range": [1, 32],
+        "sequence_range": [1, 4096],
+        "head_count": 32,
+        "head_dimension": 128,
+        "tile_sizes": [64, 64],
+        "alignment": 16,
+        "dtype": "float16",
+        "layout": "row-major",
+        "quantization_profile": "int8-groupwise",
+        "execution_phase": "decode",
+        "device_features": ["tensor-core"]
+      }},
+      "compiler_metadata": {{
+        "compiler_identity": "triton",
+        "compiler_version": "3.1",
+        "backend_identity_version": "ptxas-12.4",
+        "flags_fingerprint": "abc123",
+        "build_fingerprint": "build-456",
+        "target_architecture": "sm90"
+      }},
+      "precision": {{
+        "accumulation_dtype": "float32",
+        "approximate_math": true,
+        "deterministic": false,
+        "tolerance_profile": "operator-default",
+        "quantization_error_profile": "int8-standard"
+      }},
+      "generator": {{
+        "generator_name": "kernel-forge",
+        "generator_version": "2.0",
+        "campaign_id": "campaign-42",
+        "source_revision": "https://example.invalid/repo@deadbeef"
+      }}
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"rich-descriptor-fixture").value
+    );
+    let manifest = parse_manifest_json(&text, &limits).expect("rich descriptor manifest parses");
+    let artifact = &manifest.artifacts[0];
+
+    assert_eq!(artifact.target.device_type.as_deref(), Some("gpu"));
+    assert_eq!(artifact.target.architecture.as_deref(), Some("sm90"));
+    assert!(artifact.target.device_features.contains("tensor-core"));
+
+    assert_eq!(artifact.specialization.batch_range, Some((1, 32)));
+    assert_eq!(artifact.specialization.head_count, Some(32));
+    assert_eq!(artifact.specialization.dtype.as_deref(), Some("float16"));
+    assert_eq!(
+        artifact.specialization.execution_phase,
+        Some(KernelExecutionPhase::Decode)
+    );
+
+    let compiler = artifact.compiler_metadata.as_ref().unwrap();
+    assert_eq!(compiler.compiler_identity.as_deref(), Some("triton"));
+    assert_eq!(compiler.target_architecture.as_deref(), Some("sm90"));
+
+    assert!(artifact.precision.approximate_math);
+    assert_eq!(artifact.precision.deterministic, Some(false));
+
+    let generator = artifact.generator.as_ref().unwrap();
+    assert_eq!(generator.generator_name.as_deref(), Some("kernel-forge"));
+    assert_eq!(generator.campaign_id.as_deref(), Some("campaign-42"));
+
+    // Canonical identity round-trips through re-parsing the canonical bytes.
+    let canonical_text = String::from_utf8(manifest.canonical_bytes()).unwrap();
+    let reparsed = parse_manifest_json(&canonical_text, &limits).expect("canonical bytes reparse");
+    assert_eq!(reparsed.digest(), manifest.digest());
+}
+
+#[test]
+fn kernel_manifest_target_entry_count_limit_is_enforced() {
+    let limits = KernelManifestLimits {
+        max_target_entries: 2,
+        ..KernelManifestLimits::default()
+    };
+    let features: Vec<String> = (0..5).map(|i| format!("\"feature-{i}\"")).collect();
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded",
+      "target": {{ "device_features": [{features}] }}
+    }}
+  ]
+}}"#,
+        digest = KernelBlobDigest::of_bytes(b"target-limit-fixture").value,
+        features = features.join(", ")
+    );
+    let outcome = parse_manifest_json(&text, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::LimitExceeded { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_conflicting_digest_metadata_is_rejected() {
+    let limits = KernelManifestLimits::default();
+    let digest = KernelBlobDigest::of_bytes(b"shared-content").value;
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }},
+    {{
+      "role": "auxiliary",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 999,
+      "storage_mode": "embedded"
+    }}
+  ]
+}}"#,
+    );
+    let outcome = parse_manifest_json(&text, &limits);
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::ArtifactReferenceInvalid { .. })
+    ));
+}
+
+#[test]
+fn kernel_manifest_same_digest_same_size_across_artifacts_is_allowed() {
+    let limits = KernelManifestLimits::default();
+    let digest = KernelBlobDigest::of_bytes(b"deduplicated-content").value;
+    let text = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }},
+    {{
+      "role": "auxiliary",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{digest}",
+      "size": 4,
+      "storage_mode": "embedded"
+    }}
+  ]
+}}"#,
+    );
+    assert!(parse_manifest_json(&text, &limits).is_ok());
+}
+
+#[test]
+fn kernel_manifest_multi_target_bundle_validates_with_distinct_architectures() {
+    let directory = temp_kernel_bundle_dir("multi-target");
+    let sm80_bytes = b"sm80-cubin";
+    let sm90_bytes = b"sm90-cubin";
+    let sm80_digest = KernelBlobDigest::of_bytes(sm80_bytes);
+    let sm90_digest = KernelBlobDigest::of_bytes(sm90_bytes);
+    fs::write(
+        directory
+            .join("blobs")
+            .join("sha256")
+            .join(&sm80_digest.value),
+        sm80_bytes,
+    )
+    .unwrap();
+    fs::write(
+        directory
+            .join("blobs")
+            .join("sha256")
+            .join(&sm90_digest.value),
+        sm90_bytes,
+    )
+    .unwrap();
+    let manifest = format!(
+        r#"{{
+  "schema": "magnetar:kernel-manifest@1.0",
+  "artifacts": [
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{sm80}",
+      "size": {sm80_len},
+      "storage_mode": "embedded",
+      "target": {{ "architecture": "sm80", "provider_compatibility": ["nvidia-cuda"] }}
+    }},
+    {{
+      "role": "compiled-kernel",
+      "format": "nvidia:cubin",
+      "digest": "sha256:{sm90}",
+      "size": {sm90_len},
+      "storage_mode": "embedded",
+      "target": {{ "architecture": "sm90", "provider_compatibility": ["nvidia-cuda"] }}
+    }}
+  ],
+  "qualification_evidence": [
+    {{ "digest": "sha256:{sm80}", "profile": "correctness@1", "status": "passed" }}
+  ],
+  "benchmark_evidence": [
+    {{ "digest": "sha256:{sm90}", "profile": "latency@1", "workload_profile": "decode-256", "status": "passed" }}
+  ]
+}}"#,
+        sm80 = sm80_digest.value,
+        sm80_len = sm80_bytes.len(),
+        sm90 = sm90_digest.value,
+        sm90_len = sm90_bytes.len(),
+    );
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let validated = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default())
+        .expect("multi-target bundle should validate");
+    assert_eq!(validated.manifest.artifacts.len(), 2);
+    assert_eq!(validated.manifest.qualification_evidence.len(), 1);
+    assert_eq!(validated.manifest.benchmark_evidence.len(), 1);
+    assert_eq!(
+        validated.manifest.benchmark_evidence[0]
+            .workload_profile
+            .as_deref(),
+        Some("decode-256")
+    );
+
+    let architectures: std::collections::BTreeSet<_> = validated
+        .manifest
+        .artifacts
+        .iter()
+        .filter_map(|artifact| artifact.target.architecture.clone())
+        .collect();
+    assert_eq!(
+        architectures.len(),
+        2,
+        "expected two distinct compiled architectures"
+    );
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_manifest_validation_pipeline_orders_schema_before_blob_io() {
+    // A directory bundle with a *missing* blobs directory entirely and an
+    // *unsupported* schema major version: if schema validation ran after
+    // blob I/O, this would surface as a filesystem/blob error instead.
+    let directory = temp_kernel_bundle_dir("ordering");
+    let manifest = r#"{
+  "schema": "magnetar:kernel-manifest@99.0",
+  "artifacts": [
+    { "role": "compiled-kernel", "format": "nvidia:cubin", "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "size": 4 }
+  ]
+}"#;
+    fs::write(directory.join(KERNEL_MANIFEST_FILE_NAME), manifest).unwrap();
+    fs::remove_dir_all(directory.join("blobs")).unwrap();
+
+    let bundle = KernelExchangeBundle::open(&directory);
+    let outcome = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default());
+    assert!(
+        matches!(outcome, Err(KernelManifestError::SchemaUnsupported { .. })),
+        "expected schema validation to fail before any blob I/O is attempted, got {outcome:?}"
+    );
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_manifest_normalizes_to_cache_key_and_entry_without_granting_trust() {
+    let mut blob = KernelBlobDescriptor::new(
+        KernelBlobRole::new(KernelBlobRole::COMPILED_KERNEL),
+        KernelArtifactFormat::new("nvidia", "cubin"),
+        KernelBlobDigest::of_bytes(b"cache-bridge-fixture"),
+        4,
+    );
+    blob.required = true;
+    let mut artifact = KernelManifestArtifact::new(blob);
+    artifact.target.architecture = Some("sm90".into());
+    artifact.compiler_metadata = Some(KernelCompilerMetadata {
+        compiler_identity: Some("triton".into()),
+        compiler_version: Some("3.1".into()),
+        ..Default::default()
+    });
+
+    let key = normalize_to_cache_key(&artifact);
+    assert_eq!(key.target_architecture, "sm90");
+    assert_eq!(key.compiler_identity, "triton");
+
+    let entry = normalize_to_cache_entry(&artifact);
+    assert!(
+        !entry.trust.is_trusted(),
+        "a freshly normalized cache entry must start untrusted"
+    );
+    assert!(
+        entry.qualification.is_none(),
+        "a freshly normalized cache entry must start unqualified"
+    );
+}
+
+#[test]
+fn kernel_manifest_cli_operations_all_use_shared_validation() {
+    let directory = temp_kernel_bundle_dir("cli-shared-validation");
+    write_kernel_bundle(&directory, b"cli-fixture-bytes");
+    let bundle = KernelExchangeBundle::open(&directory);
+    let limits = KernelManifestLimits::default();
+
+    for operation in [
+        KernelManifestCliOperation::Inspect,
+        KernelManifestCliOperation::Validate,
+        KernelManifestCliOperation::Import,
+        KernelManifestCliOperation::Export,
+    ] {
+        let result = run_kernel_manifest_cli_operation(operation, &bundle, &limits);
+        assert!(
+            result.is_ok(),
+            "operation {operation:?} should reuse shared validation and succeed"
+        );
+    }
+
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn kernel_exchange_archive_rejects_symlink_entry() {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_size(0);
+    header.set_cksum();
+    builder
+        .append_link(&mut header, "blobs/escape-link", "/etc/passwd")
+        .unwrap();
+    let tar_bytes = builder.into_inner().unwrap();
+
+    let dir = temp_kernel_bundle_dir("archive-symlink");
+    let outcome = extract_kernel_exchange_archive(
+        std::io::Cursor::new(&tar_bytes),
+        false,
+        &dir,
+        &KernelExchangeArchiveLimits::default(),
+    );
+    assert!(matches!(
+        outcome,
+        Err(KernelManifestError::BundleSymlinkDenied { .. })
+    ));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn kernel_exchange_archive_rejects_hardlink_and_device_entries() {
+    for entry_type in [
+        tar::EntryType::Link,
+        tar::EntryType::Char,
+        tar::EntryType::Fifo,
+    ] {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        if entry_type == tar::EntryType::Char {
+            header.set_device_major(1).unwrap();
+            header.set_device_minor(3).unwrap();
+        }
+        if entry_type == tar::EntryType::Link {
+            // `append_link` sets the path/link-name and writes the header's
+            // checksum itself, so no manual `set_cksum` call here.
+            builder
+                .append_link(&mut header, "blobs/hardlink", "blobs/sha256/target")
+                .unwrap();
+        } else {
+            // The raw `append` method does not recompute the checksum, so
+            // the path must be set *before* `set_cksum` here.
+            header.set_path("special-entry").unwrap();
+            header.set_cksum();
+            builder.append(&header, std::io::empty()).unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let dir = temp_kernel_bundle_dir(&format!("archive-special-{entry_type:?}"));
+        let outcome = extract_kernel_exchange_archive(
+            std::io::Cursor::new(&tar_bytes),
+            false,
+            &dir,
+            &KernelExchangeArchiveLimits::default(),
+        );
+        assert!(
+            matches!(outcome, Err(KernelManifestError::BundlePathInvalid { .. })),
+            "expected {entry_type:?} to be rejected, got {outcome:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

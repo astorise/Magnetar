@@ -17,6 +17,8 @@ use crate::tokenizer::{
     TokenizerFamily, TokenizerId, TokenizerMetadata, TokenizerRevision,
 };
 
+use crate::batching::BatchingPolicy;
+use crate::generation::GenerationOutput;
 use crate::generation::{
     CancellationMetadata, EosMode, EosOutputPolicy, EosPolicy, FinishReason,
     GenerationMemoryEstimate, GenerationParameters, GenerationPriority, GenerationRequest,
@@ -24,12 +26,17 @@ use crate::generation::{
 };
 use crate::kernel_execution_plan::PreparedExecutionPlan;
 use crate::memory::MemoryPlacement;
+use crate::model::{ModelArtifactId, ModelArtifactKind, ModelName, ModelRevision};
+use crate::model_instance::ModelInstanceId;
+use crate::model_loading::ModelLoadingPhase;
 use crate::observability::{CorrelationId, TraceId};
 use crate::reference_cpu::ReferenceCpuProvider;
 use crate::runtime::Runtime;
 use crate::sampling::SamplingPolicy;
+use crate::session::{SessionCreationRequest, SessionMemoryBudget, SessionPolicy};
 use crate::tokenizer::TokenizerCompatibility;
 use crate::tokenizer::{TokenId, TokenStopPattern};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 fn adapter_activation_request_fixture(residency: &AdapterResidency) -> AdapterActivationRequest {
     AdapterActivationRequest {
@@ -575,4 +582,281 @@ fn inference_api_validate_tokenizer_compatibility_accepts_matching_digest() {
     };
 
     validate_tokenizer_compatibility(&tokenizer, &compatibility).unwrap();
+}
+
+fn session_creation_request() -> SessionCreationRequest {
+    let metadata = generation_tokenizer_metadata();
+    SessionCreationRequest {
+        model: GenerationModelReference::LoadedModelContext("model-context".into()),
+        tokenizer: GenerationTokenizerReference {
+            tokenizer_id: metadata.id.clone(),
+            metadata,
+        },
+        generation_defaults: GenerationParameters::default(),
+        policy: SessionPolicy::default(),
+        memory: SessionMemoryBudget::default(),
+        allowed_capabilities: BTreeSet::new(),
+        correlation_id: Some(CorrelationId::new("corr-1")),
+        created_at_millis: 0,
+    }
+}
+
+#[test]
+fn inference_api_build_generation_request_from_tokenized_input() {
+    let metadata = generation_tokenizer_metadata();
+    let tokenizer = GenerationTokenizerReference {
+        tokenizer_id: metadata.id.clone(),
+        metadata,
+    };
+    let tokenized = TokenizationResult {
+        token_ids: vec![2, 3, 4],
+        token_count: 3,
+        offsets: None,
+        diagnostics: Vec::new(),
+        correlation_id: Some(CorrelationId::new("corr-1")),
+    };
+
+    let request = build_generation_request(
+        GenerationRequestId::new("gen-api-1").unwrap(),
+        None,
+        GenerationModelReference::LoadedModelContext("model-context".into()),
+        tokenizer,
+        tokenized,
+        4,
+        GenerationParameters::default(),
+        StopConditions::default(),
+        StreamingMode::TokenIds,
+    );
+
+    assert_eq!(request.prompt_token_count, 3);
+    request.validate().unwrap();
+}
+
+#[test]
+fn inference_api_model_resolution_observed_emits_model_resolved_and_failed() {
+    let reference = ModelRef::new("qwen-test").unwrap();
+    let artifact = ModelArtifactId::new(
+        ModelArtifactKind::ModelWeights,
+        ModelName::new("qwen").unwrap(),
+        ModelRevision::new("1").unwrap(),
+        ModelDigest::sha256(b"weights"),
+    );
+    let mut registry = ModelRegistry::new();
+    registry.register(reference.clone(), artifact);
+    let mut observer = InferenceApiObserver::new();
+
+    registry
+        .resolve_observed(&ModelResolutionRequest::new(reference), &mut observer)
+        .unwrap();
+    registry
+        .resolve_observed(
+            &ModelResolutionRequest::new(ModelRef::new("unknown").unwrap()),
+            &mut observer,
+        )
+        .unwrap_err();
+
+    let kinds: Vec<_> = observer
+        .observations()
+        .iter()
+        .map(|observation| observation.kind)
+        .collect();
+    assert!(kinds.contains(&InferenceApiObservationKind::ModelResolved));
+    assert!(kinds.contains(&InferenceApiObservationKind::ModelResolutionFailed));
+}
+
+#[test]
+fn inference_api_session_lifecycle_observed_emits_created_and_closed() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let mut request = session_creation_request();
+    request.allowed_capabilities.insert("generation".into());
+    let mut observer = InferenceApiObserver::new();
+
+    let session = create_inference_session_observed(&mut runtime, request, &mut observer).unwrap();
+    close_inference_session_observed(&mut runtime, &session, &mut observer).unwrap();
+
+    let kinds: Vec<_> = observer
+        .observations()
+        .iter()
+        .map(|observation| observation.kind)
+        .collect();
+    assert!(kinds.contains(&InferenceApiObservationKind::SessionCreated));
+    assert!(kinds.contains(&InferenceApiObservationKind::SessionClosed));
+}
+
+#[test]
+fn inference_api_one_shot_pipeline_uses_session_tokenizer_and_generation_contracts() {
+    let metadata = generation_tokenizer_metadata();
+    let vocabulary_size = metadata.vocabulary_size as usize;
+    let mut runtime = runtime_with_model_execution_engine(
+        vocabulary_size,
+        RuntimeGenerationExecutionEvidence::complete(),
+    );
+    let mut request = session_creation_request();
+    request.allowed_capabilities.insert("generation".into());
+    let session = create_one_shot_session(&mut runtime, request).unwrap();
+
+    let tokenizer = FixtureTokenizer::new(generation_tokenizer_metadata());
+    let tokenized = tokenize_prompt_input(
+        &tokenizer,
+        TokenizationRequest::new(PromptInput::PlainText("hi".into())),
+        None,
+    )
+    .unwrap();
+
+    let generation_request = build_generation_request(
+        GenerationRequestId::new("one-shot-1").unwrap(),
+        Some(session.clone()),
+        GenerationModelReference::LoadedModelContext("model-context".into()),
+        GenerationTokenizerReference {
+            tokenizer_id: metadata.id.clone(),
+            metadata,
+        },
+        tokenized,
+        2,
+        GenerationParameters::greedy(),
+        StopConditions::default(),
+        StreamingMode::TokenIds,
+    );
+    let prepared = prepare_generation(&runtime, generation_request).unwrap();
+
+    let policy = BatchingPolicy {
+        allow_queueing: false,
+        ..BatchingPolicy::default()
+    };
+    let batch = runtime.create_continuous_batch(policy);
+    let (state, _) = submit_generation(&mut runtime, &batch, &prepared).unwrap();
+    assert_eq!(state, AdmissionState::Accepted);
+
+    // One-shot inference SHALL not bypass Model Instance, Tokenizer,
+    // Generation, Sampling, Memory Manager, or Provider/Kernel contracts:
+    // this drives the same Generation Contract loop (prefill, per-token
+    // Sampling Contract decode, Provider/Kernel readiness gating) that any
+    // session-bound generation would use.
+    let mut observer = InferenceApiObserver::new();
+    let result = run_generation_loop(
+        &mut runtime,
+        &prepared,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated| false,
+        &mut observer,
+    )
+    .unwrap();
+    assert_eq!(result.output.finish_reason, FinishReason::MaxNewTokens);
+    assert!(
+        observer
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == InferenceApiObservationKind::TokenGenerated)
+    );
+
+    close_inference_session(&mut runtime, &session).unwrap();
+}
+
+#[test]
+fn inference_api_adapter_activation_rejects_forbidden_operation_scope() {
+    let residency = adapter_residency_fixture();
+    let mut request = adapter_activation_request_fixture(&residency);
+    request.scope = AdapterActivationScope::Operation("shell".into());
+
+    let error = activate_adapter(&residency, &request, None, None).unwrap_err();
+    assert!(matches!(error, InferenceApiError::PolicyDenied { .. }));
+}
+
+#[test]
+fn inference_api_adapter_activation_denied_when_incompatible() {
+    let residency = adapter_residency_fixture();
+    let mut request = adapter_activation_request_fixture(&residency);
+    request.residency = AdapterResidencyId::new("other-residency").unwrap();
+
+    let error = activate_adapter(&residency, &request, None, None).unwrap_err();
+    assert!(matches!(
+        error,
+        InferenceApiError::AdapterActivationFailed { .. }
+    ));
+}
+
+#[test]
+fn inference_api_runtime_diagnostics_with_inputs_includes_caller_supplied_status() {
+    let runtime = Runtime::builder().build().unwrap();
+    let inputs = RuntimeDiagnosticsInputs {
+        model_resolution_status: Some(ModelResolutionStatus::Resolved),
+        model_loading_status: Some(ModelLoadingPhase::PublishModelContext),
+        operator_missing_count: 2,
+        tokenizer_compatible: Some(true),
+        queued_admission_count: 3,
+    };
+
+    let diagnostics = runtime_diagnostics_with(&runtime, inputs);
+    assert_eq!(
+        diagnostics.model_resolution_status,
+        Some(ModelResolutionStatus::Resolved)
+    );
+    assert_eq!(
+        diagnostics.model_loading_status,
+        Some(ModelLoadingPhase::PublishModelContext)
+    );
+    assert_eq!(diagnostics.operator_missing_count, 2);
+    assert_eq!(diagnostics.tokenizer_compatible, Some(true));
+    assert_eq!(diagnostics.queued_admission_count, 3);
+    assert!(diagnostics.redacted);
+}
+
+#[test]
+fn inference_api_generation_result_wraps_output_with_decoded_text_and_cache_usage() {
+    let request = generation_request();
+    let output = GenerationOutput::new(&request, vec![10, 11, 12], FinishReason::EosToken);
+
+    let result = GenerationResult::new(output)
+        .with_decoded_text("hello".into())
+        .with_model_instance(ModelInstanceId::new("instance-1").unwrap())
+        .with_cache_usage(CacheUsageSummary {
+            kv_cache_hit: Some(true),
+            prefix_cache_hit: Some(false),
+        });
+
+    assert_eq!(result.decoded_text.as_deref(), Some("hello"));
+    assert!(result.model_instance.is_some());
+    assert_eq!(result.cache_usage.kv_cache_hit, Some(true));
+    assert!(result.error.is_none());
+    assert!(result.redacted);
+}
+
+#[test]
+fn inference_api_runtime_diagnostics_are_redacted_and_reflect_empty_runtime() {
+    let runtime = Runtime::builder().build().unwrap();
+    let diagnostics = runtime_diagnostics(&runtime);
+    assert!(diagnostics.redacted);
+    assert_eq!(diagnostics.model_instance_count, 0);
+    assert_eq!(diagnostics.active_session_count, 0);
+}
+
+#[test]
+fn inference_api_validate_tokenizer_compatibility_rejects_digest_mismatch() {
+    let metadata = generation_tokenizer_metadata();
+    let tokenizer = FixtureTokenizer::new(metadata);
+    let compatibility = TokenizerCompatibility {
+        expected_digest: Some(ModelDigest::sha256(b"a different tokenizer")),
+        expected_vocabulary_size: None,
+        expected_family: None,
+        expected_model_max_length: None,
+        expected_added_tokens: None,
+        expected_special_tokens: Vec::new(),
+        expected_normalization: None,
+    };
+
+    let error = validate_tokenizer_compatibility(&tokenizer, &compatibility).unwrap_err();
+    assert!(matches!(
+        error,
+        InferenceApiError::TokenizerIncompatible { .. }
+    ));
+}
+
+#[test]
+fn inference_api_browser_inference_capabilities_reduced_excludes_kv_cache() {
+    let capabilities = BrowserInferenceCapabilities::reduced();
+    assert!(capabilities.tokenization);
+    assert!(capabilities.generation);
+    assert!(capabilities.streaming);
+    assert!(!capabilities.kv_cache);
 }

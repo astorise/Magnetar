@@ -10,6 +10,8 @@ use crate::operator::{OperatorFamily, OperatorId};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use crate::compute::{ComputeDType, HostStagingPolicy};
+use crate::kernel::{KernelExecutionMode, KernelFallbackClass};
 use crate::kernel_artifact::KernelArtifactTrust;
 use crate::kernel_benchmark::{BenchmarkFreshness, BenchmarkStalenessReason};
 use crate::kernel_registry::KernelCandidateRejection;
@@ -17,6 +19,7 @@ use crate::model_instance::KernelSelectionPolicy;
 use crate::model_instance::{
     ModelInstanceWarmupPlan, ModelInstanceWarmupPolicy, PinnedKernelSelection,
 };
+use crate::operator::TensorLayoutKind;
 fn selection_policy_identity(name: &str) -> CandidateIdentity {
     CandidateIdentity {
         kernel: selection_policy_kernel_id(name),
@@ -620,4 +623,155 @@ fn static_selection_required_during_warmup_needs_pinned_mode_and_kernel_step() {
         &pinned_mode,
         &metadata_only_plan
     ));
+}
+
+#[test]
+fn kernel_selection_policy_conformance_report_is_conformant() {
+    let report = run_kernel_selection_policy_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn benchmark_context_requires_exact_match() {
+    let context = BenchmarkContext {
+        provider: ProviderBinding::new("p"),
+        device_architecture: "sm90".into(),
+        driver_runtime_compatibility: "cuda-12".into(),
+        operator_version: 1,
+        artifact_digest: None,
+        dtype: ComputeDType::Float32,
+        layout: TensorLayoutKind::Contiguous,
+        shape_bucket: "b1s128".into(),
+        batch_bucket: "b1".into(),
+        sequence_bucket: "s128".into(),
+        execution_mode: KernelExecutionMode::Synchronous,
+        benchmark_profile_version: 1,
+    };
+    let different_shape = BenchmarkContext {
+        shape_bucket: "b64s8192".into(),
+        ..context.clone()
+    };
+    assert!(benchmark_context_compatible(&context, &context));
+    assert!(!benchmark_context_compatible(&different_shape, &context));
+}
+
+#[test]
+fn anti_flapping_blocks_promotion_inside_cooldown_or_minimum_duration() {
+    let policy = AntiFlappingPolicy {
+        cooldown_seconds: 30,
+        minimum_active_duration_seconds: 10,
+    };
+    assert!(!promotion_allowed_by_anti_flapping(&policy, 5, 20));
+    assert!(promotion_allowed_by_anti_flapping(&policy, 30, 10));
+}
+
+#[test]
+fn provider_advertised_alternative_never_overrides_runtime_cross_provider_decision() {
+    let runtime_choice = selection_policy_identity("runtime-choice");
+    let provider_alternative = selection_policy_identity("provider-alternative");
+    assert_eq!(
+        resolve_cross_provider_selection(&runtime_choice, Some(&provider_alternative)),
+        runtime_choice
+    );
+}
+
+#[test]
+fn fallback_chain_tries_classes_in_order_and_exhausts_explicitly() {
+    let policy = FallbackPolicy {
+        ordered_classes: vec![KernelFallbackClass::HostExecution],
+        allow_reference_cpu: false,
+    };
+    assert_eq!(
+        evaluate_kernel_selection_fallback_chain(&policy, true, HostStagingPolicy::Permit, true),
+        Err(KernelSelectionError::FallbackExhausted)
+    );
+    let permissive = FallbackPolicy {
+        ordered_classes: vec![KernelFallbackClass::HostExecution],
+        allow_reference_cpu: true,
+    };
+    assert_eq!(
+        evaluate_kernel_selection_fallback_chain(
+            &permissive,
+            true,
+            HostStagingPolicy::Permit,
+            true
+        ),
+        Ok(KernelFallbackClass::HostExecution)
+    );
+}
+
+#[test]
+fn resolve_pinned_selection_distinguishes_unavailable_from_ineligible() {
+    let kernel = selection_policy_kernel_id("pinned");
+    let pin = PinnedKernelSelection::new(kernel.clone(), "digest-1");
+    let unavailable = resolve_pinned_selection(&pin, &[], &[]);
+    assert_eq!(
+        unavailable,
+        Err(KernelSelectionError::PinnedKernelUnavailable)
+    );
+
+    let discovered = vec![CandidateIdentity {
+        kernel: kernel.clone(),
+        provider: ProviderBinding::new("selection-policy-provider"),
+        artifact_digest: None,
+    }];
+    let ineligible = resolve_pinned_selection(&pin, &discovered, &[]);
+    assert_eq!(
+        ineligible,
+        Err(KernelSelectionError::PinnedKernelIneligible)
+    );
+
+    let eligible = vec![
+        EligibleCandidate::from_checked(
+            CandidateIdentity {
+                kernel: kernel.clone(),
+                provider: ProviderBinding::new("selection-policy-provider"),
+                artifact_digest: None,
+            },
+            CandidateMetrics::default(),
+            &CandidateEligibilityInput::all_satisfied(),
+        )
+        .unwrap(),
+    ];
+    assert!(resolve_pinned_selection(&pin, &discovered, &eligible).is_ok());
+}
+
+#[test]
+fn canary_budget_exhaustion_is_explicit() {
+    let policy = CanaryPolicy {
+        max_requests: Some(100),
+        max_duration_seconds: None,
+        max_percentage: None,
+    };
+    assert!(!canary_budget_exhausted(&policy, 99, 0));
+    assert!(canary_budget_exhausted(&policy, 100, 0));
+}
+
+#[test]
+fn workload_context_carries_batch_and_phase_metadata_for_ranking() {
+    let context = WorkloadContext {
+        active_sequences: 32,
+        batch_width: 32,
+        total_active_tokens: 4096,
+        raggedness: Some(0.2),
+        phase: Some(GenerationPhase::Decode),
+        kv_cache_mode: Some("paged".into()),
+    };
+    // Batch-aware ranking evidence is only meaningful when a candidate's
+    // metrics are indexed under the matching workload bucket -- confirm the
+    // context can drive that bucket key deterministically.
+    let bucket = format!(
+        "batch{}-seq{}",
+        context.batch_width, context.total_active_tokens
+    );
+    assert!(performance_evidence_applies_to_workload(&bucket, &bucket));
+    assert_eq!(context.phase, Some(GenerationPhase::Decode));
 }

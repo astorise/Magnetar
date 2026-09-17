@@ -40,3 +40,17 @@ fn oracle_required_when_reference_cpu_does_not_support_operator() {
     assert!(require_oracle(true, None).is_ok());
     assert!(require_oracle(false, Some(&reference_cpu_oracle("1"))).is_ok());
 }
+
+#[test]
+fn kernel_qualification_conformance_report_is_conformant() {
+    let report = run_kernel_qualification_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}

@@ -2615,3 +2615,6 @@ pub(crate) fn device_execution_error_for_health(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

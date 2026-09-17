@@ -7,6 +7,7 @@ use super::*;
 use crate::affinity::{DeviceBinding, ProviderBinding};
 use crate::capability::CapabilityVersion;
 use crate::device::DeviceId;
+use crate::kernel::KernelAdvertisement;
 use crate::kernel::{KernelId, KernelImplementationFamily, KernelOperatorVersionRange};
 use crate::operator::{OperatorFamily, OperatorId};
 #[test]
@@ -118,4 +119,102 @@ fn prepared_kernel_lifecycle_blocks_destruction_while_referenced() {
     prepared.release_reference();
     prepared.retire().unwrap();
     assert!(prepared.destroy().is_ok());
+}
+
+#[test]
+fn source_artifact_validation_requires_trust_and_valid_format() {
+    let operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
+    let artifact = KernelSourceArtifact::new(
+        KernelSourceArtifactId::from_digest("digest-1"),
+        KernelSourceFormat::new("triton", "source").with_version("3"),
+        operator,
+        KernelArtifactProvenance::AiGenerated,
+    );
+
+    let untrusted = validate_source_artifact(&artifact);
+    assert!(matches!(
+        untrusted,
+        Err(KernelArtifactError::Untrusted { .. })
+    ));
+
+    let trusted = artifact.with_trust(evaluate_artifact_trust(true));
+    assert!(validate_source_artifact(&trusted).is_ok());
+
+    let empty_digest = KernelSourceArtifact::new(
+        KernelSourceArtifactId::from_digest(""),
+        KernelSourceFormat::new("triton", "source"),
+        OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra),
+        KernelArtifactProvenance::HumanAuthored,
+    )
+    .with_trust(evaluate_artifact_trust(true));
+    assert!(matches!(
+        validate_source_artifact(&empty_digest),
+        Err(KernelArtifactError::ArtifactInvalid { .. })
+    ));
+}
+
+#[test]
+fn compiled_artifact_validation_rejects_operator_and_provider_mismatch() {
+    let operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
+    let other_operator = OperatorId::magnetar("softmax", 1, OperatorFamily::Activation);
+    let provider = ProviderBinding::new("cuda-provider");
+    let other_provider = ProviderBinding::new("metal-provider");
+
+    let artifact = CompiledKernelArtifact::new(
+        CompiledKernelArtifactId::from_digest("compiled-digest"),
+        "cubin",
+        "nvcc",
+        "12.4",
+        "sm_90",
+        operator.clone(),
+    )
+    .with_trust(evaluate_artifact_trust(true))
+    .with_provider_compatibility([provider.clone()]);
+
+    assert!(validate_compiled_artifact(&artifact, &operator, &provider).is_ok());
+    assert!(matches!(
+        validate_compiled_artifact(&artifact, &other_operator, &provider),
+        Err(KernelArtifactError::OperatorIncompatible { .. })
+    ));
+    assert!(matches!(
+        validate_compiled_artifact(&artifact, &operator, &other_provider),
+        Err(KernelArtifactError::ProviderIncompatible { .. })
+    ));
+
+    let untrusted = CompiledKernelArtifact::new(
+        CompiledKernelArtifactId::from_digest("compiled-digest-2"),
+        "cubin",
+        "nvcc",
+        "12.4",
+        "sm_90",
+        operator.clone(),
+    );
+    assert!(matches!(
+        validate_compiled_artifact(&untrusted, &operator, &provider),
+        Err(KernelArtifactError::Untrusted { .. })
+    ));
+}
+
+#[test]
+fn kernel_advertisement_may_reference_artifact_metadata() {
+    let id = conformance_kernel_id("matmul-advertised");
+    let binding = KernelArtifactBinding::new(CompiledKernelArtifactId::from_digest("digest"))
+        .with_source_artifact(KernelSourceArtifactId::from_digest("source-digest"));
+    let advertisement = KernelAdvertisement::new(id.clone()).with_artifact(binding);
+    assert!(advertisement.artifact.is_some());
+    assert_eq!(advertisement.id, id);
+}
+
+#[test]
+fn kernel_artifact_conformance_report_is_conformant() {
+    let report = run_kernel_artifact_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
 }

@@ -10,7 +10,13 @@ use crate::inference_api::validate_inference_scope;
 use crate::reference_cpu::FallbackPolicyContext;
 use std::collections::BTreeSet;
 
+use crate::compute::ComputeDType;
+use crate::kernel::{
+    KernelDeterminism, KernelFallbackClass, KernelFusionMetadata, KernelKvCacheMetadata,
+    KernelMemoryClass, KernelPrecisionMetadata,
+};
 use crate::operator::TensorLayoutKind;
+use crate::operator::{OperatorFamily, OperatorId};
 #[test]
 fn provider_roadmap_features_are_all_optional_and_phase_tagged() {
     assert_eq!(PROVIDER_ROADMAP_FEATURES.len(), 31);
@@ -416,4 +422,244 @@ fn provider_roadmap_observation_redacts_metadata_by_default() {
         .with_redacted_metadata("diagnostic", "device pointer handle=0xdeadbeef");
     let value = observation.redacted_metadata.get("diagnostic").unwrap();
     assert!(!value.contains("0xdeadbeef"));
+}
+
+#[test]
+fn provider_roadmap_allows_hardware_and_optimized_provider_names() {
+    for name in [
+        "CudaProvider",
+        "MetalProvider",
+        "OpenVinoProvider",
+        "QnnProvider",
+        "WebGpuProvider",
+        "OptimizedCpuProvider",
+        "ReferenceCpuProvider",
+    ] {
+        assert!(
+            reject_model_family_provider_name(name).is_ok(),
+            "{name} should have been allowed"
+        );
+    }
+}
+
+#[test]
+fn provider_roadmap_fused_kernel_requires_semantic_declaration() {
+    let missing = validate_fused_kernel_declaration(FusedKernelDeclaration {
+        fusion: None,
+        precision: &KernelPrecisionMetadata::default(),
+        fallback_hints: &BTreeSet::new(),
+    });
+    assert!(matches!(
+        missing,
+        Err(ProviderRoadmapError::ProviderFusionInvalid { .. })
+    ));
+
+    let empty_group = KernelFusionMetadata {
+        operator_group: Vec::new(),
+        preserves_graph_semantics: true,
+    };
+    let precision = KernelPrecisionMetadata {
+        tolerance_profile: Some("operator-default".into()),
+        ..KernelPrecisionMetadata::default()
+    };
+    let fallback_hints = BTreeSet::from([KernelFallbackClass::AlternateKernel]);
+    assert!(
+        validate_fused_kernel_declaration(FusedKernelDeclaration {
+            fusion: Some(&empty_group),
+            precision: &precision,
+            fallback_hints: &fallback_hints,
+        })
+        .is_err()
+    );
+
+    let complete = KernelFusionMetadata {
+        operator_group: vec![OperatorId::magnetar(
+            "matmul",
+            1,
+            OperatorFamily::LinearAlgebra,
+        )],
+        preserves_graph_semantics: true,
+    };
+    assert!(
+        validate_fused_kernel_declaration(FusedKernelDeclaration {
+            fusion: Some(&complete),
+            precision: &precision,
+            fallback_hints: &fallback_hints,
+        })
+        .is_ok()
+    );
+}
+
+#[test]
+fn provider_roadmap_advanced_attention_declaration_requires_kv_cache_for_paged() {
+    let operator = OperatorId::magnetar("attention", 1, OperatorFamily::Attention);
+    let layouts = BTreeSet::from([TensorLayoutKind::AttentionSpecific]);
+    let memory_classes = BTreeSet::from([KernelMemoryClass::Device]);
+    let dtypes = BTreeSet::from([ComputeDType::Float32]);
+    let precision = KernelPrecisionMetadata {
+        tolerance_profile: Some("attention-default".into()),
+        ..KernelPrecisionMetadata::default()
+    };
+    let determinism = KernelDeterminism::default();
+    let fallback_hints = BTreeSet::from([KernelFallbackClass::AlternateKernel]);
+
+    let missing_kv_cache = validate_advanced_attention_declaration(AdvancedAttentionDeclaration {
+        variant: AdvancedAttentionVariant::PagedAttention,
+        operator: &operator,
+        layouts: &layouts,
+        memory_classes: &memory_classes,
+        dtypes: &dtypes,
+        kv_cache: None,
+        precision: &precision,
+        determinism: &determinism,
+        fallback_hints: &fallback_hints,
+    });
+    assert!(matches!(
+        missing_kv_cache,
+        Err(ProviderRoadmapError::ProviderAdvancedAttentionUnsupported { .. })
+    ));
+
+    let kv_cache = KernelKvCacheMetadata {
+        layouts: BTreeSet::from(["paged".to_string()]),
+        paged_cache: true,
+        append: true,
+        read: true,
+        dtypes: BTreeSet::from([ComputeDType::Float32]),
+        memory_classes: BTreeSet::from([KernelMemoryClass::Device]),
+        affinity: None,
+    };
+    let complete = validate_advanced_attention_declaration(AdvancedAttentionDeclaration {
+        variant: AdvancedAttentionVariant::PagedAttention,
+        operator: &operator,
+        layouts: &layouts,
+        memory_classes: &memory_classes,
+        dtypes: &dtypes,
+        kv_cache: Some(&kv_cache),
+        precision: &precision,
+        determinism: &determinism,
+        fallback_hints: &fallback_hints,
+    });
+    assert!(complete.is_ok());
+
+    // Flash attention doesn't inherently require KV cache metadata.
+    let flash_without_kv_cache =
+        validate_advanced_attention_declaration(AdvancedAttentionDeclaration {
+            variant: AdvancedAttentionVariant::FlashAttention,
+            operator: &operator,
+            layouts: &layouts,
+            memory_classes: &memory_classes,
+            dtypes: &dtypes,
+            kv_cache: None,
+            precision: &precision,
+            determinism: &determinism,
+            fallback_hints: &fallback_hints,
+        });
+    assert!(flash_without_kv_cache.is_ok());
+}
+
+#[test]
+fn provider_roadmap_fallback_denied_by_default() {
+    let context = ProviderRoadmapFallbackContext::deny_by_default();
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent);
+    let outcome = evaluate_provider_roadmap_fallback(
+        ProviderRoadmapFallbackEdge::CudaToReferenceCpu,
+        &affinity,
+        &context,
+    );
+    assert!(matches!(
+        outcome,
+        Err(ProviderRoadmapError::ProviderFallbackDenied { .. })
+    ));
+}
+
+#[test]
+fn provider_roadmap_fallback_requires_every_gate_open() {
+    let affinity = ResourceAffinity::new(FallbackClass::Transparent);
+    let mut context = ProviderRoadmapFallbackContext {
+        cpu: FallbackPolicyContext::new(true),
+        memory_policy_allows_fallback: true,
+        privacy_policy_allows_fallback: true,
+        precision_policy_allows_fallback: false,
+    };
+    assert!(
+        evaluate_provider_roadmap_fallback(
+            ProviderRoadmapFallbackEdge::MetalToReferenceCpu,
+            &affinity,
+            &context,
+        )
+        .is_err(),
+        "precision gate closed must still deny fallback"
+    );
+    context.precision_policy_allows_fallback = true;
+    assert!(
+        evaluate_provider_roadmap_fallback(
+            ProviderRoadmapFallbackEdge::MetalToReferenceCpu,
+            &affinity,
+            &context,
+        )
+        .is_ok(),
+        "all gates open must allow fallback"
+    );
+    context.memory_policy_allows_fallback = false;
+    assert!(
+        evaluate_provider_roadmap_fallback(
+            ProviderRoadmapFallbackEdge::MetalToReferenceCpu,
+            &affinity,
+            &context,
+        )
+        .is_err(),
+        "memory gate closed must still deny fallback"
+    );
+}
+
+#[test]
+fn provider_roadmap_fallback_denies_provider_pinned_affinity_even_with_open_policy() {
+    let affinity = ResourceAffinity::new(FallbackClass::ProviderPinned);
+    let context = ProviderRoadmapFallbackContext {
+        cpu: FallbackPolicyContext::new(true),
+        memory_policy_allows_fallback: true,
+        privacy_policy_allows_fallback: true,
+        precision_policy_allows_fallback: true,
+    };
+    assert!(
+        evaluate_provider_roadmap_fallback(
+            ProviderRoadmapFallbackEdge::CudaToOptimizedCpu,
+            &affinity,
+            &context,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn provider_roadmap_cli_receives_redacted_provider_diagnostics_only() {
+    let raw = "provider handle=0xdeadbeef failed on cuda-stream";
+    let redacted = cli_redacted_provider_diagnostic(raw);
+    assert!(!redacted.contains("0xdeadbeef"));
+}
+
+#[test]
+fn provider_roadmap_memory_expansion_requires_manager_tracking() {
+    assert_eq!(POST_BASELINE_MEMORY_CLASSES.len(), 7);
+    for memory_class in POST_BASELINE_MEMORY_CLASSES {
+        assert!(require_memory_manager_tracking(*memory_class, true).is_ok());
+        assert!(matches!(
+            require_memory_manager_tracking(*memory_class, false),
+            Err(ProviderRoadmapError::ProviderMemoryClassUnsupported { .. })
+        ));
+    }
+}
+
+#[test]
+fn provider_roadmap_conformance_report_is_conformant() {
+    let report = run_provider_roadmap_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
 }

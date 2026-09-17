@@ -6,6 +6,8 @@
 use super::*;
 use crate::compute::ComputeDType;
 
+use crate::affinity::{DeviceBinding, ProviderBinding};
+use crate::kernel_artifact::{KernelArtifactPath, KernelSourceFormat};
 #[test]
 fn output_format_negotiation_requires_explicit_declaration() {
     let produced: std::collections::BTreeSet<String> =
@@ -282,4 +284,86 @@ fn compiler_flags_are_redacted_by_default() {
         identity.flags_fingerprint.as_deref(),
         Some("[redacted backend diagnostic]")
     );
+}
+
+#[test]
+fn source_format_negotiation_rejects_unsupported_before_compilation() {
+    let accepted: std::collections::BTreeSet<KernelSourceFormat> =
+        [KernelSourceFormat::new("triton", "source").with_version("3")]
+            .into_iter()
+            .collect();
+    let wgsl = KernelSourceFormat::new("webgpu", "wgsl");
+    assert!(matches!(
+        negotiate_source_format(&wgsl, &accepted),
+        Err(KernelCompilationError::SourceFormatUnsupported { .. })
+    ));
+    let triton = KernelSourceFormat::new("triton", "source").with_version("3");
+    assert!(negotiate_source_format(&triton, &accepted).is_ok());
+}
+
+#[test]
+fn runtime_target_authority_rejects_provider_and_device_redirection() {
+    let selected_provider = ProviderBinding::new("cuda-provider");
+    let selected_device = DeviceBinding::new(crate::DeviceId::new("cuda-0"));
+    let target =
+        CompilationTarget::new(selected_provider.clone(), selected_device.clone(), "sm_90");
+    assert!(
+        enforce_runtime_target_authority(&target, &selected_provider, &selected_device).is_ok()
+    );
+
+    let other_provider = ProviderBinding::new("metal-provider");
+    assert!(matches!(
+        enforce_runtime_target_authority(&target, &other_provider, &selected_device),
+        Err(KernelCompilationError::TargetUnsupported { .. })
+    ));
+
+    let other_device = DeviceBinding::new(crate::DeviceId::new("cuda-1"));
+    assert!(matches!(
+        enforce_runtime_target_authority(&target, &selected_provider, &other_device),
+        Err(KernelCompilationError::TargetUnsupported { .. })
+    ));
+}
+
+#[test]
+fn hot_path_denies_kernel_compilation_cold_path_allows_it() {
+    assert!(matches!(
+        reject_hot_path_kernel_compilation(KernelArtifactPath::Hot),
+        Err(KernelCompilationError::HotPathDenied)
+    ));
+    assert!(reject_hot_path_kernel_compilation(KernelArtifactPath::Cold).is_ok());
+}
+
+#[test]
+fn platform_managed_compilation_mode_preserves_cold_hot_boundary() {
+    let mut descriptor = KernelCompilationCapabilityDescriptor::unsupported();
+    descriptor.support_level = CompilationSupportLevel::SourceCompilation;
+    descriptor.modes.insert(CompilationMode::ProviderManaged);
+    descriptor.isolation_model = CompilationIsolationModel::PlatformManagedCompiler;
+    descriptor
+        .accepted_source_formats
+        .insert(KernelSourceFormat::new("apple", "msl"));
+    descriptor
+        .produced_compiled_formats
+        .insert("apple:metallib".into());
+    assert!(descriptor.validate().is_ok());
+    // Even a platform that logically combines compile+prepare internally
+    // still denies compilation on the decode hot path.
+    assert!(matches!(
+        reject_hot_path_kernel_compilation(KernelArtifactPath::Hot),
+        Err(KernelCompilationError::HotPathDenied)
+    ));
+}
+
+#[test]
+fn kernel_compilation_conformance_report_is_conformant() {
+    let report = run_kernel_compilation_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
 }

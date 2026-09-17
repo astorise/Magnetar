@@ -11,6 +11,19 @@ use crate::model::{
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use crate::compute::ComputeDType;
+use crate::kernel::{
+    KernelDequantizationBehavior, KernelQuantizationMetadata, KernelQuantizationMethod,
+};
+use crate::model::{
+    ModelArtifactSource, ModelQuantization, ModelQuantizationFormat, ModelTrustStatus,
+    ModelTrustStore,
+};
+use crate::operator::{OperatorFamily, OperatorId, TensorLayoutKind};
+use crate::tokenizer::{
+    SpecialToken, SpecialTokenKind, TokenizerArtifactId, TokenizerFamily, TokenizerId,
+    TokenizerRevision,
+};
 fn fixture_model_manifest() -> ModelManifest {
     let digest = ModelDigest::parse(format!("sha256:{}", "2".repeat(64))).unwrap();
     let id = ModelArtifactId::new(
@@ -231,4 +244,214 @@ fn model_format_roadmap_memory_mapping_policy_rejects_raw_pointer_exposure() {
         ..policy
     };
     assert!(safe.validate().is_ok());
+}
+
+#[test]
+fn model_format_roadmap_allows_hardware_and_optimized_provider_names() {
+    for name in [
+        "ReferenceCpuProvider",
+        "CudaProvider",
+        "OptimizedCpuProvider",
+    ] {
+        assert!(
+            reject_model_format_provider_name(name).is_ok(),
+            "{name} must be allowed"
+        );
+    }
+}
+
+#[test]
+fn model_format_roadmap_torch_dtype_never_forces_compute_dtype() {
+    assert_eq!(
+        torch_dtype_does_not_force_compute_dtype(Some("bfloat16"), ModelDType::F32),
+        ModelDType::F32
+    );
+    assert_eq!(
+        torch_dtype_does_not_force_compute_dtype(None, ModelDType::Bf16),
+        ModelDType::Bf16
+    );
+}
+
+#[test]
+fn model_format_roadmap_normalizes_tokenizer_json() {
+    let parsed = TokenizerJsonMetadata {
+        vocabulary_size: 32000,
+        added_tokens: Vec::new(),
+        special_tokens: vec![SpecialToken::new(SpecialTokenKind::Bos, "<s>", 1)],
+        normalizer: Some("nfc".into()),
+        pre_tokenizer: Some("byte-level".into()),
+        decoder: Some("byte-level".into()),
+        supports_offsets: true,
+    };
+    let metadata = normalize_tokenizer_json(
+        TokenizerId::new("tok-1").unwrap(),
+        TokenizerArtifactId::new("tokenizer.json").unwrap(),
+        ModelDigest::parse(format!("sha256:{}", "6".repeat(64))).unwrap(),
+        TokenizerFamily::new("qwen").unwrap(),
+        TokenizerRevision::new("v1").unwrap(),
+        &parsed,
+    )
+    .unwrap();
+    assert_eq!(metadata.vocabulary_size, 32000);
+    assert!(metadata.supports_offsets);
+    assert_eq!(metadata.special_tokens.len(), 1);
+
+    let empty = TokenizerJsonMetadata {
+        vocabulary_size: 0,
+        ..parsed
+    };
+    assert!(matches!(
+        normalize_tokenizer_json(
+            TokenizerId::new("tok-2").unwrap(),
+            TokenizerArtifactId::new("tokenizer.json").unwrap(),
+            ModelDigest::parse(format!("sha256:{}", "7".repeat(64))).unwrap(),
+            TokenizerFamily::new("qwen").unwrap(),
+            TokenizerRevision::new("v1").unwrap(),
+            &empty,
+        ),
+        Err(ModelFormatRoadmapError::TokenizerJsonInvalid { .. })
+    ));
+}
+
+#[test]
+fn model_format_roadmap_gguf_metadata_validates_and_normalizes_quantized_tensors() {
+    let quantization = ModelQuantization {
+        format: ModelQuantizationFormat::GgufQ4K,
+        group_size: Some(32),
+        block_size: None,
+        scale_dtype: Some(ModelDType::F16),
+        zero_point_dtype: None,
+        per_channel: false,
+        workspace_bytes: None,
+        required_capabilities: Vec::new(),
+    };
+    let gguf = GgufMetadata {
+        architecture: "qwen2".into(),
+        alignment: 32,
+        tensors: vec![GgufTensorEntry {
+            name: "layer.0.weight".into(),
+            shape: vec![4, 4],
+            dtype: ModelDType::Q4K,
+            quantization: Some(quantization),
+        }],
+        tokenizer_embedded: None,
+        key_values: BTreeMap::new(),
+    };
+    assert!(gguf.validate().is_ok());
+    let tensors = gguf.into_tensor_metadata();
+    assert_eq!(tensors.len(), 1);
+    assert!(tensors[0].quantization.is_some());
+    assert_eq!(tensors[0].layout.as_deref(), Some("quantized-packed"));
+
+    let empty = GgufMetadata {
+        tensors: Vec::new(),
+        ..gguf
+    };
+    assert!(matches!(
+        empty.validate(),
+        Err(ModelFormatRoadmapError::GgufInvalid { .. })
+    ));
+
+    assert!(reject_model_format_provider_name("GGUFProvider").is_err());
+}
+
+#[test]
+fn model_format_roadmap_quantization_declaration_requires_scale_dtype_and_rejects_hidden_dequant() {
+    let missing_scale = ModelFormatQuantizationDeclaration {
+        model_quantization: ModelQuantization {
+            format: ModelQuantizationFormat::Gptq,
+            group_size: Some(64),
+            block_size: None,
+            scale_dtype: None,
+            zero_point_dtype: None,
+            per_channel: false,
+            workspace_bytes: None,
+            required_capabilities: Vec::new(),
+        },
+        kernel_compatibility: None,
+    };
+    assert!(matches!(
+        validate_model_format_quantization(&missing_scale, true),
+        Err(ModelFormatRoadmapError::QuantizationMetadataInvalid { .. })
+    ));
+
+    let with_kernel = ModelFormatQuantizationDeclaration {
+        model_quantization: ModelQuantization {
+            scale_dtype: Some(ModelDType::F16),
+            ..missing_scale.model_quantization.clone()
+        },
+        kernel_compatibility: Some(KernelQuantizationMetadata {
+            method: KernelQuantizationMethod::Int8,
+            storage_dtype: ComputeDType::SInt8,
+            compute_dtype: ComputeDType::Float32,
+            accumulation_dtype: ComputeDType::Float32,
+            scale_dtype: ComputeDType::Float32,
+            zero_point_dtype: None,
+            group_size: None,
+            packing_layout: TensorLayoutKind::QuantizedPacked,
+            dequantization: KernelDequantizationBehavior::ExplicitBeforeOperator,
+            supported_operators: BTreeSet::from([OperatorId::magnetar(
+                "matmul",
+                1,
+                OperatorFamily::LinearAlgebra,
+            )]),
+            conformance_tolerance_profile: "operator-default".into(),
+        }),
+    };
+    assert!(validate_model_format_quantization(&with_kernel, true).is_ok());
+    assert!(matches!(
+        validate_model_format_quantization(&with_kernel, false),
+        Err(ModelFormatRoadmapError::QuantizationMetadataInvalid { .. })
+    ));
+}
+
+#[test]
+fn model_format_roadmap_source_and_local_file_and_network_boundaries() {
+    for source in [
+        ModelArtifactSource::LocalPath("/models/qwen".into()),
+        ModelArtifactSource::LocalCache("cache-1".into()),
+        ModelArtifactSource::ClientProvided("client-1".into()),
+        ModelArtifactSource::Registry("registry-1".into()),
+        ModelArtifactSource::HuggingFace("qwen/qwen2".into()),
+        ModelArtifactSource::Oci("oci://image".into()),
+        ModelArtifactSource::Tachyon("tachyon-1".into()),
+    ] {
+        assert!(reject_arbitrary_model_download(&source).is_ok());
+    }
+
+    let local = ModelArtifactSource::LocalPath("/models/qwen".into());
+    assert!(matches!(
+        validate_local_file_boundary(&local, false),
+        Err(ModelFormatRoadmapError::ModelFormatLocalFileDenied { .. })
+    ));
+    assert!(validate_local_file_boundary(&local, true).is_ok());
+
+    assert!(reject_raw_network_model_reference("https://example.com/model.gguf").is_err());
+    assert!(reject_raw_network_model_reference("qwen/qwen2").is_ok());
+}
+
+#[test]
+fn model_format_roadmap_format_alone_does_not_grant_trust() {
+    let store = ModelTrustStore::default();
+    let manifest = fixture_model_manifest();
+    let decision = model_format_grants_no_trust(&store, &manifest);
+    assert_eq!(decision.status(), ModelTrustStatus::Unknown);
+
+    let trusted_store = ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone());
+    let trusted_decision = model_format_grants_no_trust(&trusted_store, &manifest);
+    assert_eq!(trusted_decision.status(), ModelTrustStatus::Trusted);
+}
+
+#[test]
+fn model_format_roadmap_conformance_report_is_conformant() {
+    let report = run_model_format_roadmap_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
 }

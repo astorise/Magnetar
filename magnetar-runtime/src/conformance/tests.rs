@@ -28,6 +28,7 @@ use crate::compute::{
     ComputePrecision, DataMovementSupport, HostBufferEncoding, OperationFamilySupport,
     ProviderComputeAdvertisement, compute_capability,
 };
+use crate::runtime::Runtime;
 struct TestProvider {
     metadata: ProviderMetadata,
     initialized: AtomicBool,
@@ -282,5 +283,101 @@ fn first_native_model_execution_profile_validation_rejects_incomplete_profiles()
                 FirstNativeDeferredCapability::TensorParallel
             )
         )
+    ));
+}
+
+#[test]
+fn first_native_model_execution_profile_declares_versioned_mandatory_capabilities() {
+    let profile = first_native_model_execution_profile();
+
+    assert_eq!(
+        profile.version,
+        FIRST_NATIVE_MODEL_EXECUTION_PROFILE_VERSION
+    );
+    assert!(profile.validate().is_ok());
+
+    let mandatory = profile.mandatory_ids();
+    for expected in [
+        "local-runtime",
+        "platform-component-engine",
+        "wasmtime-component-engine",
+        "model-wasm-component",
+        "model-artifact",
+        "tokenizer",
+        "operator-catalog",
+        "execution-graph",
+        "prepared-execution-plan",
+        "kernel-registry",
+        "reference-cpu-provider",
+        "logical-cpu-device",
+        "f32-execution",
+        "tensor-resource",
+        "runtime-memory-manager",
+        "kv-cache",
+        "incremental-decode",
+        "greedy-sampling",
+        "streaming-output",
+        "observability-redaction",
+    ] {
+        assert!(
+            mandatory.contains(expected),
+            "missing mandatory capability {expected}"
+        );
+    }
+}
+
+#[test]
+fn first_native_model_execution_profile_defers_advanced_capabilities() {
+    let profile = first_native_model_execution_profile();
+    let deferred = profile.deferred_ids();
+
+    for expected in [
+        "multi-device-placement",
+        "tensor-parallel",
+        "collectives",
+        "generated-kernels",
+        "provider-runtime-compilation",
+        "kernel-artifact-ingestion",
+        "hot-swap",
+        "runtime-autotuning",
+        "adaptive-performance-feedback",
+        "performance-model-replacement",
+        "accelerated-providers",
+        "reduced-precision",
+        "quantization",
+        "cross-provider-zero-copy",
+        "advanced-memory-pools",
+        "paged-kv-cache",
+        "prefix-cache-optimization",
+        "production-continuous-batching",
+        "advanced-async-execution-streams",
+    ] {
+        assert!(
+            deferred.contains(expected),
+            "missing deferred capability {expected}"
+        );
+        assert!(
+            !profile.mandatory_ids().contains(expected),
+            "deferred capability {expected} must not be mandatory"
+        );
+    }
+}
+
+#[test]
+fn first_native_single_host_topology_accepts_one_reference_cpu_runtime() {
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .build()
+        .unwrap();
+
+    assert!(validate_first_native_single_host_topology(&runtime).is_ok());
+}
+
+#[test]
+fn first_native_single_host_topology_requires_reference_cpu_provider_and_device() {
+    let runtime = Runtime::builder().build().unwrap();
+    assert!(matches!(
+        validate_first_native_single_host_topology(&runtime),
+        Err(FirstNativeModelExecutionProfileError::ReferenceCpuProviderMissing)
     ));
 }

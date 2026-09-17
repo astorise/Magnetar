@@ -6,6 +6,10 @@
 use super::*;
 use crate::model::{ModelDType, ModelDigest, ModelTensorMetadata};
 
+use crate::memory::MemoryManager;
+use crate::model::{
+    ModelArchitecture, ModelManifest, ModelQuantizationFormat, ModelTrustDecision, ModelTrustStore,
+};
 fn f16_bytes(values: &[u16]) -> Vec<u8> {
     values
         .iter()
@@ -133,5 +137,197 @@ fn host_tensors_from_artifact_bytes_rejects_out_of_bounds_range() {
 
     let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &short_file, 0)
         .expect_err("out-of-bounds range must be rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
+}
+
+fn sealed_loading_valid_manifest() -> ModelManifest {
+    ModelManifest::from_yaml_str(&format!(
+        r#"
+schema: magnetar-model-artifact
+schema_version: 1
+kind: model-bundle
+digest: {}
+model:
+  name: qwen.example
+  revision: r1
+architecture:
+  family: qwen
+  identifier: qwen2
+storage_dtype: int8
+compute_dtype: bf16
+supported_compute_dtypes: [bf16, fp16]
+artifacts:
+  weights:
+    kind: model-weights
+    digest: {}
+    size_bytes: 128
+  config:
+    kind: model-config
+    digest: {}
+    size_bytes: 16
+quantization:
+  format: q4_k
+  workspace_bytes: 64
+shards:
+  - id: shard0
+    digest: {}
+    size_bytes: 128
+    order: 0
+tensors:
+  - name: transformer.wte.weight
+    shape: [4, 8]
+    storage_dtype: int8
+    shard: shard0
+"#,
+        sealed_loading_digest(),
+        sealed_loading_digest(),
+        sealed_loading_digest(),
+        sealed_loading_digest()
+    ))
+    .unwrap()
+}
+
+fn sealed_loading_trusted(manifest: &ModelManifest) -> ModelTrustDecision {
+    ModelTrustStore::default()
+        .trust_digest(manifest.id.digest.value.clone())
+        .evaluate(manifest)
+}
+
+fn sealed_loading_coordinator() -> ModelLoadingCoordinator {
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: ModelArchitecture::new("qwen", "qwen2"),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    coordinator
+}
+
+fn sealed_loading_digest() -> String {
+    "sha256:0000000000000000000000000000000000000000000000000000000000000001".into()
+}
+
+#[test]
+fn sealed_loading_rejects_untrusted_artifact_before_memory_allocation() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::default();
+    let request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let untrusted = ModelTrustStore::default()
+        .reject_digest(manifest.id.digest.value.clone())
+        .evaluate(&manifest);
+
+    let error = coordinator
+        .load(request, &manifest, &untrusted, &mut memory)
+        .unwrap_err();
+
+    assert_eq!(error.code, ModelLoadingErrorCode::ModelArtifactUntrusted);
+    assert_eq!(memory.allocations().count(), 0);
+}
+
+#[test]
+fn sealed_loading_creates_runtime_owned_ready_context_without_raw_handles() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::default();
+    let mut request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
+    request.sharding_policy = ModelShardingPolicy::Sequential;
+
+    let context = coordinator
+        .load(
+            request,
+            &manifest,
+            &sealed_loading_trusted(&manifest),
+            &mut memory,
+        )
+        .unwrap();
+
+    assert_eq!(context.state(), ModelLoadingState::Ready);
+    assert!(context.can_start_inference());
+    assert!(!context.plan().has_raw_native_handles());
+    assert_eq!(
+        context.plan().quantization_handling(),
+        &ModelQuantizationHandling::DequantizeAtLoad(ModelQuantizationFormat::GgufQ4K)
+    );
+    assert_eq!(
+        context.plan().memory_placements(),
+        &[ModelResidencyLocation::Host]
+    );
+    assert_eq!(memory.allocations().count(), 1);
+    assert!(
+        coordinator
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == ModelLoadingObservationKind::ModelReady)
+    );
+}
+
+#[test]
+fn sealed_loading_memory_budget_failure_does_not_allocate() {
+    let manifest = sealed_loading_valid_manifest();
+    let mut coordinator = sealed_loading_coordinator();
+    let mut memory = MemoryManager::default();
+    let mut request =
+        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
+    request.memory_budget_bytes = Some(1);
+
+    let error = coordinator
+        .load(
+            request,
+            &manifest,
+            &sealed_loading_trusted(&manifest),
+            &mut memory,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code, ModelLoadingErrorCode::MemoryFeasibilityFailed);
+    assert_eq!(memory.allocations().count(), 0);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_rejects_unsupported_dtype() {
+    let (mut metadata, bytes) = artifact_bytes_test_tensor("weight.a", vec![1], &[1.0]);
+    // I8 (not F32/F16/BF16/Q8_0/Q4_K/Q5_K) stays genuinely unsupported --
+    // Q8_0/Q4_K/Q5_K moved to their own dedicated dequantization tests
+    // once `support-gguf-quantized-tensor-dequantization` added real support for
+    // them (they no longer belong in this "still rejected" test).
+    metadata.storage_dtype = ModelDType::I8;
+
+    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect_err("an unsupported dtype must be rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::StorageDTypeUnsupported);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_converts_bf16_storage_to_f32() {
+    // 1.0 and -2.0 as bfloat16 bit patterns (f32's top 16 bits).
+    let bytes: Vec<u8> = [0x3F80u16, 0xC000u16]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let metadata = ModelTensorMetadata {
+        storage_dtype: ModelDType::Bf16,
+        ..f16_tensor_metadata("weight.a", vec![2], bytes.len())
+    };
+
+    let weights = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect("BF16 tensor materializes");
+    let tensor = weights.get("weight.a").expect("tensor present");
+    assert_eq!(tensor.data, vec![1.0, -2.0]);
+}
+
+#[test]
+fn host_tensors_from_artifact_bytes_rejects_shape_size_mismatch() {
+    let (mut metadata, bytes) =
+        artifact_bytes_test_tensor("weight.a", vec![4], &[1.0, 2.0, 3.0, 4.0]);
+    // Shape says 4 elements (16 bytes), but size_bytes disagrees.
+    metadata.size_bytes = Some(8);
+
+    let error = host_tensors_from_artifact_bytes(std::slice::from_ref(&metadata), &bytes, 0)
+        .expect_err("shape/size mismatch must be rejected");
     assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
 }

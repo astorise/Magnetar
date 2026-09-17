@@ -74,3 +74,17 @@ fn ingestion_error_ids_are_stable_and_displayable() {
         assert!(!error.to_string().is_empty());
     }
 }
+
+#[test]
+fn kernel_artifact_ingestion_conformance_report_is_conformant() {
+    let report = run_kernel_artifact_ingestion_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}

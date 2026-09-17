@@ -3,6 +3,10 @@
 //! Kept in its own file so coverage tooling classifies it as test
 //! source rather than Runtime implementation source.
 
+use crate::affinity::ProviderBinding;
+use crate::compute::ComputeDType;
+use crate::operator::{OperatorFamily, OperatorId, TensorLayoutKind};
+use std::collections::BTreeSet;
 fn conformance_axis() -> KernelSpecializationAxis {
     KernelSpecializationAxis::new(
         KernelSpecializationAxisId::new("triton", "num-warps"),
@@ -783,4 +787,54 @@ fn offline_deployment_requires_no_live_tuning_when_precomputed() {
         pinned_selection: Some(CompiledKernelArtifactId::from_digest("pinned")),
     };
     assert!(with_pinned.requires_no_live_tuning());
+}
+
+#[test]
+fn kernel_autotuning_conformance_report_is_conformant() {
+    let report = run_kernel_autotuning_conformance();
+    assert!(!report.results.is_empty());
+    for result in &report.results {
+        assert!(
+            result.passed,
+            "{} failed: {:?}",
+            result.requirement, result.diagnostic
+        );
+    }
+    assert!(report.is_conformant());
+}
+
+#[test]
+fn kernel_autotuning_policy_enforces_single_active_policy() {
+    assert!(!KernelAutotuningPolicy::Disabled.permits_live_tuning());
+    assert!(KernelAutotuningPolicy::Optional.permits_live_tuning());
+    assert!(KernelAutotuningPolicy::Required.permits_live_tuning());
+    assert!(
+        !KernelAutotuningPolicy::Pinned {
+            record_fingerprint: "r".into(),
+        }
+        .permits_live_tuning()
+    );
+    assert!(require_autotuning_enabled(&KernelAutotuningPolicy::Disabled).is_err());
+    assert!(require_autotuning_enabled(&KernelAutotuningPolicy::Optional).is_ok());
+}
+
+#[test]
+fn kernel_autotuning_workload_bucket_requires_exact_match() {
+    let bucket = KernelAutotuningWorkloadBucket {
+        operator: OperatorId::magnetar("attention", 1, OperatorFamily::Attention),
+        shape_bucket: "batch=1/seq=4096".into(),
+        batch_bucket: Some("1".into()),
+        sequence_bucket: Some("4096".into()),
+        phase: KernelAutotuningExecutionPhase::Prefill,
+        dtype: ComputeDType::Float16,
+        layout: TensorLayoutKind::Contiguous,
+        quantization: None,
+        provider: ProviderBinding::new("cuda"),
+        device_architecture: "sm90".into(),
+        device_features: BTreeSet::new(),
+    };
+    let mut decode_bucket = bucket.clone();
+    decode_bucket.phase = KernelAutotuningExecutionPhase::Decode;
+    assert!(bucket.is_compatible_with(&bucket.clone()));
+    assert!(!bucket.is_compatible_with(&decode_bucket));
 }
