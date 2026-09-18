@@ -21,4 +21,4 @@ publish = false
 magnetar-runtime = { path = "../../magnetar-runtime" }
 magnetar-provider-cpu = { path = "../../providers/cpu" }
 magnetar-provider-cuda = { path = "../../providers/cuda" }
-sha2 = "0.10"
+sha2 = "0.11"
