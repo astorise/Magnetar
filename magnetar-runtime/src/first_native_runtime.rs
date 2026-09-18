@@ -7693,21 +7693,29 @@ static REGISTERED_COMPONENT_RUNTIMES: std::sync::OnceLock<
 /// runtime back up by, so a caller never needs to invent or track its own
 /// separate identifier for "the Component I just registered."
 ///
-/// Idempotent per digest, like [`register_qwen_component_artifact`]: a
-/// second registration of bytes that hash to a digest already present in the
-/// registry is a harmless no-op (the existing compiled runtime is kept,
-/// never recompiled), so a caller can register unconditionally on every
-/// load rather than tracking its own "have I already registered this one"
-/// state. Distinct Components (distinct digests) coexist in the registry
+/// Idempotent per digest for *compilation*, like
+/// [`register_qwen_component_artifact`]: a second registration of bytes that
+/// hash to a digest already present in the registry never recompiles the
+/// Component, so a caller can register unconditionally on every load rather
+/// than tracking its own "have I already registered this one" state.
+/// Distinct Components (distinct digests) coexist in the registry
 /// simultaneously -- unlike the Qwen singleton, this is not a "last one
 /// wins" slot.
 ///
+/// Never idempotent for *authorization*, though (#71): reusing an already-
+/// compiled runtime is a cache concern, not a trust one, so `trust` -- this
+/// specific call's own [`ComponentTrustStore`] -- is evaluated against
+/// `manifest_bytes` on every call, cache hit included. A digest some earlier
+/// caller's trust store authorized is not thereby authorized for a later
+/// caller whose own trust store does not.
+///
 /// Fails closed, exactly like every other Component loading path in this
-/// crate: untrusted bytes (`trust` does not trust this digest), a
-/// manifest whose own embedded digest does not match the real bytes, or a
-/// manifest outside inference scope are all rejected by
-/// [`ComponentManager::prepare_pushed_package`] before anything is cached,
-/// not silently accepted.
+/// crate: untrusted bytes (`trust` does not trust this digest) or a
+/// manifest whose own embedded digest does not match the real bytes are
+/// rejected before anything is returned, whether this call ends up
+/// compiling the Component fresh (via
+/// [`ComponentManager::prepare_pushed_package`]) or reusing an
+/// already-registered one.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub fn register_inference_component_artifact(
     component_bytes: Vec<u8>,
@@ -7716,11 +7724,39 @@ pub fn register_inference_component_artifact(
 ) -> Result<ComponentDigest, E2eConformanceError> {
     let digest = ComponentDigest::sha256(&component_bytes);
     let registry = REGISTERED_COMPONENT_RUNTIMES.get_or_init(|| Mutex::new(BTreeMap::new()));
-    {
+    let already_registered = {
         let existing = registry.lock().unwrap();
-        if existing.contains_key(&digest.value) {
-            return Ok(digest);
+        existing.contains_key(&digest.value)
+    };
+    if already_registered {
+        // #71: the compiled runtime is reused (that is the whole point of
+        // the cache), but *this* caller's own `trust` must still authorize
+        // `digest` on every call -- a digest another, earlier caller
+        // authorized is not thereby authorized for everyone. Re-parses
+        // `manifest_bytes` (always supplied fresh by the caller, cache hit
+        // or not) and re-runs the same digest-consistency check and trust
+        // decision `validate_component_artifact` applies on a fresh
+        // registration, so a cache hit can never skip the authorization a
+        // cache miss would have enforced.
+        let manifest = ComponentManifest::from_yaml_bytes(
+            &manifest_bytes,
+            std::path::Path::new("<registered-component-manifest>"),
+        )
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+        if manifest.digest != digest {
+            return Err(E2eConformanceError::ModelComponentFailed {
+                reason: "manifest-declared digest does not match received bytes".into(),
+            });
         }
+        let trust_decision = trust.evaluate(&manifest, &digest);
+        if trust_decision.status != ComponentTrustStatus::Trusted {
+            return Err(E2eConformanceError::ModelComponentFailed {
+                reason: trust_decision.reason,
+            });
+        }
+        return Ok(digest);
     }
     let capability = Arc::new(GraphBuilderCapability::new());
     let model_config_capability = Arc::new(ModelConfigCapability::new());

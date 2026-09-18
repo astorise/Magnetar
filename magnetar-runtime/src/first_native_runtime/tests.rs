@@ -3171,23 +3171,36 @@ fn e2e_qwen_component_digest_mismatch_fails_before_planning() {
 /// several `#[test]` functions. `REGISTERED_COMPONENT_RUNTIMES` is one
 /// process-wide registry shared by every test in this binary, keyed by real
 /// content digest; every one of these assertions registers (or attempts to
-/// register) the *same* fixture bytes, so the same digest. Splitting them
-/// into separate `#[test]` functions is genuinely racy under Rust's default
-/// parallel test execution: whichever test's *trusted* registration runs
-/// first populates the shared cache entry, after which a *later*,
-/// deliberately-untrusted registration attempt for that same digest would
-/// hit the idempotent-return fast path before ever re-evaluating trust,
-/// making the "untrusted artifacts are rejected" assertion pass or fail
-/// based on test scheduling instead of behavior -- caught by a real CI
-/// failure (this exact race), not found by inspection.
+/// register) the *same* fixture bytes, so the same digest.
+///
+/// Splitting the untrusted-rejection assertions into their own `#[test]`
+/// functions used to be genuinely racy under Rust's default parallel test
+/// execution: whichever test's *trusted* registration ran first populated
+/// the shared cache entry, after which a *later*, deliberately-untrusted
+/// registration attempt for that same digest hit the idempotent-return fast
+/// path before ever re-evaluating trust, making the "untrusted artifacts
+/// are rejected" assertion pass or fail based on test scheduling instead of
+/// behavior -- caught by a real CI failure (this exact race), not found by
+/// inspection. That fast path turned out not to be only a test-scheduling
+/// hazard: it was the identical bug in production code (Tachyon
+/// integration audit MAG-03, tracked as #71) -- `register_inference_component_artifact`'s
+/// cache hit returned `Ok(digest)` without ever consulting *this* caller's
+/// own `trust`, so any caller could receive an artifact only some other,
+/// earlier caller had actually authorized. Fixed by re-evaluating trust
+/// against the cache hit on every call, which also means the scheduling
+/// race described above can no longer happen -- the mid-test
+/// untrusted-after-cached assertion below now passes deterministically
+/// regardless of the order these tests run in. Assertions stay
+/// consolidated here anyway, both for locality (everything about this one
+/// digest's lifecycle in one place) and because splitting them still
+/// wouldn't be free of shared-state ordering to reason about.
 ///
 /// This same reasoning is why the Tachyon integration audit MAG-07 proof
 /// (two distinct, independently-registered Components served at once) lives
 /// at the end of this function instead of its own `#[test]`: a second test
 /// that trusts and registers `QWEN_REAL_COMPONENT_BYTES` under its own
-/// fresh `ComponentTrustStore` races this function's own untrusted-rejection
-/// assertion above by the identical mechanism (confirmed by a real,
-/// reproduced local failure before consolidating).
+/// fresh `ComponentTrustStore` would still share this function's own
+/// digest-keyed cache entry.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
 fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matches_the_singleton_path()
@@ -3231,6 +3244,32 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     )
     .expect("re-registering the same bytes is a harmless no-op, not an error");
     assert_eq!(digest, second);
+
+    // Tachyon integration audit MAG-03 / #71: this digest is now cached
+    // (registered and trusted above), so this call exercises exactly the
+    // cache-hit path -- and must still be rejected for a caller whose own
+    // trust store does not name it, the same as the untrusted call at the
+    // top of this test did before anything was cached. Before the MAG-03
+    // fix, the cache-hit fast path returned `Ok(digest)` unconditionally
+    // without ever consulting `trust`, so a caller who authorized nothing
+    // would silently receive an artifact only some *other*, earlier caller
+    // had actually authorized -- an authorization bypass, not merely the
+    // test-scheduling hazard this function's own doc comment above
+    // describes. Reject-then-cache-then-reject-again in one sequential
+    // test (like every other assertion here) rather than splitting the
+    // second rejection into its own `#[test]`, for the identical
+    // shared-registry reason.
+    let untrusted_after_cached = register_inference_component_artifact(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &ComponentTrustStore::default(),
+    );
+    assert!(
+        untrusted_after_cached.is_err(),
+        "a caller-trusted digest must not become implicitly trusted for a \
+         later caller whose own trust store authorizes nothing, just \
+         because the compiled runtime is already cached: {untrusted_after_cached:?}"
+    );
 
     // The load-bearing correctness proof for this generic registry: a
     // Component registered above (a caller-supplied digest/trust, no
