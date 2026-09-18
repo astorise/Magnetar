@@ -876,7 +876,7 @@ mod tests {
 /// through `LoadedInferenceComponent::load` itself). Builds a real,
 /// completely-specified Hugging Face-shaped bundle on disk (every tensor the
 /// real Qwen Component's graph resolves, at the exact shapes
-/// `magnetar_runtime::qwen_expected_tensor_shape` expects) and runs a real
+/// `magnetar_runtime::first_native_expected_tensor_shape` expects) and runs a real
 /// generation through `invoke_payload`, the same call shape a real embedder
 /// (e.g. Tachyon) uses.
 #[cfg(test)]
@@ -992,7 +992,7 @@ mod load_end_to_end_tests {
     }
 
     /// Every tensor name/shape here matches `magnetar_runtime::
-    /// qwen_expected_tensor_shape`'s HF-stored (pre-transpose) convention
+    /// first_native_expected_tensor_shape`'s HF-stored (pre-transpose) convention
     /// exactly for `tiny_config_json`'s dimensions: hidden_size=8,
     /// intermediate_size=16, num_hidden_layers=1, num_attention_heads=
     /// num_key_value_heads=2 (head_dim=4, so q/k/v_dim=8), vocab_size=4,
@@ -1121,7 +1121,7 @@ mod load_end_to_end_tests {
     }
 
     /// Every tensor name/shape here matches `magnetar_runtime::
-    /// qwen_expected_tensor_shape`'s HF-stored (pre-transpose) convention
+    /// first_native_expected_tensor_shape`'s HF-stored (pre-transpose) convention
     /// exactly for `llama_config_json`'s dimensions: hidden_size=12,
     /// intermediate_size=24, num_hidden_layers=2, num_attention_heads=3,
     /// num_key_value_heads=1 (head_dim=4, so q_dim=12, kv_dim=4), vocab_size=6,

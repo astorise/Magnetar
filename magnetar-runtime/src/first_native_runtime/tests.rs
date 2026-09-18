@@ -1177,7 +1177,7 @@ fn run_first_native_graph_with_provider_matches_reference_cpu_e2e_dispatch() {
 }
 
 /// `audit-complet-cuda-hot-path-2026-09-08` P1-1: proves a fully custom,
-/// genuinely grouped-query-shaped `QwenConfig`
+/// genuinely grouped-query-shaped `FirstNativeModelConfig`
 /// (`attention_head_count=4, kv_head_count=2`, which the one canonical E2E
 /// fixture this crate ships is not) can run through the real first-native
 /// pipeline end to end -- own manifest, own synthetic weights, own
@@ -1193,13 +1193,13 @@ fn run_first_native_graph_with_provider_matches_reference_cpu_e2e_dispatch() {
 /// configuration, not just the one fixture it was written against.
 #[test]
 fn run_first_native_graph_with_provider_and_weights_handles_a_genuinely_gqa_shaped_config() {
-    let architecture = qwen_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
-    let identity = qwen_component_identity(
+    let architecture = first_native_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
+    let identity = first_native_component_identity(
         ModelComponentId::new("gqa-integration-fixture").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
     );
-    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
     config.validate(&identity).expect("GQA config validates");
     let architecture_implementation = qwen_architecture_implementation(
         &identity,
@@ -1213,9 +1213,9 @@ fn run_first_native_graph_with_provider_and_weights_handles_a_genuinely_gqa_shap
     )
     .expect("GQA fixture manifest builds");
     let tokenizer = e2e_fixture_tokenizer().expect("fixture tokenizer builds");
-    let descriptor = qwen_component_descriptor(identity.clone(), &config)
+    let descriptor = first_native_component_descriptor(identity.clone(), &config)
         .expect("GQA component descriptor builds");
-    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+    validate_first_native_model_artifact(&descriptor, &config, &manifest)
         .expect("GQA manifest matches its own descriptor");
     let fixture = E2eFixture {
         config,
@@ -1284,13 +1284,13 @@ fn run_first_native_graph_with_provider_and_weights_handles_a_genuinely_gqa_shap
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
 fn real_qwen_component_produces_a_config_correct_graph_for_a_genuinely_gqa_shaped_config() {
-    let architecture = qwen_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
-    let identity = qwen_component_identity(
+    let architecture = first_native_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
+    let identity = first_native_component_identity(
         ModelComponentId::new("gqa-real-component-fixture").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
     );
-    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
     config.validate(&identity).expect("GQA config validates");
     let architecture_implementation = qwen_architecture_implementation(
         &identity,
@@ -1304,9 +1304,9 @@ fn real_qwen_component_produces_a_config_correct_graph_for_a_genuinely_gqa_shape
     )
     .expect("GQA fixture manifest builds");
     let tokenizer = e2e_fixture_tokenizer().expect("fixture tokenizer builds");
-    let descriptor = qwen_component_descriptor(identity.clone(), &config)
+    let descriptor = first_native_component_descriptor(identity.clone(), &config)
         .expect("GQA component descriptor builds");
-    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+    validate_first_native_model_artifact(&descriptor, &config, &manifest)
         .expect("GQA manifest matches its own descriptor");
     let fixture = E2eFixture {
         config,
@@ -3286,7 +3286,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
 
     let (via_named, _definition, _instance) = build_first_native_graphs_from_named_component(
         &digest,
-        &architecture_config_from_qwen_config(&fixture.config),
+        &architecture_config_from_first_native_model_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3336,7 +3336,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     let (synthetic_graphs, _definition, _instance) =
         build_first_native_graphs_from_named_component(
             &synthetic_digest,
-            &architecture_config_from_qwen_config(&fixture.config),
+            &architecture_config_from_first_native_model_config(&fixture.config),
             &fixture.identity,
             prompt_token_count,
         )
@@ -3358,7 +3358,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     // digest again still succeeds and still matches the singleton path.
     let (qwen_graphs_again, _definition, _instance) = build_first_native_graphs_from_named_component(
         &digest,
-        &architecture_config_from_qwen_config(&fixture.config),
+        &architecture_config_from_first_native_model_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3406,7 +3406,7 @@ fn build_first_native_graphs_from_named_component_serves_a_real_second_architect
     .expect("the real Llama Component must register");
     assert_eq!(registered, llama_digest);
 
-    // e2e_fixture()'s own config has `attention_bias: false` (`QwenConfig::
+    // e2e_fixture()'s own config has `attention_bias: false` (`FirstNativeModelConfig::
     // new`'s default) -- the same value a real, bias-free Llama checkpoint
     // would carry, and (not coincidentally) what the pre-existing Qwen
     // singleton path itself already builds graphs against elsewhere in
@@ -3420,7 +3420,7 @@ fn build_first_native_graphs_from_named_component_serves_a_real_second_architect
 
     let (llama_graphs, _definition, _instance) = build_first_native_graphs_from_named_component(
         &llama_digest,
-        &architecture_config_from_qwen_config(&fixture.config),
+        &architecture_config_from_first_native_model_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3458,7 +3458,7 @@ fn build_first_native_graphs_from_named_component_serves_a_real_second_architect
     let (llama_biased_graphs, _definition, _instance) =
         build_first_native_graphs_from_named_component(
             &llama_digest,
-            &architecture_config_from_qwen_config(&biased_config),
+            &architecture_config_from_first_native_model_config(&biased_config),
             &fixture.identity,
             prompt_token_count,
         )
@@ -3485,7 +3485,7 @@ fn build_first_native_graphs_from_named_component_fails_closed_for_an_unregister
     let fixture = e2e_fixture().expect("fixture builds");
     let result = build_first_native_graphs_from_named_component(
         &never_registered,
-        &architecture_config_from_qwen_config(&fixture.config),
+        &architecture_config_from_first_native_model_config(&fixture.config),
         &fixture.identity,
         2,
     );
@@ -4411,7 +4411,7 @@ impl crate::production_model_ingestion::ProductionArtifactPayloadSource
     }
 }
 
-/// Task groups 10-11 end to end: a `QwenConfig` deliberately different
+/// Task groups 10-11 end to end: a `FirstNativeModelConfig` deliberately different
 /// from the canonical E2E fixture (hidden_size=8, attention_head_count=4,
 /// kv_head_count=2 -- genuinely GQA-shaped, unlike the fixture's 2/2) is
 /// wrapped as a production-shaped `ModelManifest` (no fixture manifest
@@ -4430,14 +4430,14 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
     // 256, plus BOS/EOS), so the vocabulary must cover that range
     // regardless of this test's otherwise-deliberately-non-canonical
     // dimensions.
-    let architecture = qwen_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 1_000_000);
-    let config = QwenConfig {
+    let architecture = first_native_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 1_000_000);
+    let config = FirstNativeModelConfig {
         architecture,
-        rope: QwenRopeConfig {
+        rope: FirstNativeRopeConfig {
             base: 10_000.0,
             scale: None,
             dimension: 2,
-            position_mode: QwenRopePositionMode::Sequential,
+            position_mode: FirstNativeRopePositionMode::Sequential,
             dynamic_scaling_supported: false,
         },
         rmsnorm_epsilon: 1e-6,
@@ -4516,7 +4516,7 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
         provenance: None,
         signatures: Vec::new(),
         source: None,
-        architecture_config: Some(architecture_config_from_qwen_config(&config)),
+        architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
     };
 
     let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
@@ -4726,7 +4726,7 @@ fn production_loaded_model_load_with_component_matches_the_singleton_path() {
         provenance: None,
         signatures: Vec::new(),
         source: None,
-        architecture_config: Some(architecture_config_from_qwen_config(&config)),
+        architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
     };
 
     let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
@@ -4806,7 +4806,7 @@ fn apply_rope_per_head(
     tensor: &HostTensor,
     head_count: u64,
     head_dimension: u64,
-    rope_config: &QwenRopeConfig,
+    rope_config: &FirstNativeRopeConfig,
 ) -> Result<HostTensor, E2eConformanceError> {
     let (rows, cols) = tensor.rows_cols()?;
     let mut out = vec![0.0_f32; tensor.data.len()];
@@ -6391,7 +6391,7 @@ fn validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
 /// build, and tests not themselves exercising component/graph mismatch
 /// detection).
 fn qwen_component_graph_semantics_for_prompt(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,
 ) -> Result<QwenComponentGraphSemantics, E2eConformanceError> {
@@ -6991,7 +6991,7 @@ fn check_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage(
 /// `qwen_prefill_graph` rather than `first_native_component_graphs_for_prompt`
 /// so this proof holds regardless of whether a strict Component engine is
 /// available: the "split" node exists only in this Rust-synthesized
-/// recipe (`qwen_expected_tensor_names`'s doc comment), not in the
+/// recipe (`first_native_expected_tensor_names`'s doc comment), not in the
 /// checked-in real Qwen Component's own graph.
 fn check_two_output_split_dispatch_produces_independently_resolvable_resources(
     fixture: &E2eFixture,
@@ -7423,7 +7423,7 @@ fn forward_segment_logits_with_weights(
     // down to this segment's own subset -- mirrors `load_fixture_instance_
     // with_weights`'s own ordering for the exact same reason (tied
     // embeddings' `lm_head` is never a separately declared manifest tensor;
-    // see `qwen_expected_tensor_names`).
+    // see `first_native_expected_tensor_names`).
     let mut segment_weights = weights.clone();
     qwen_weights_with_derived_lm_head(fixture, &mut segment_weights)?;
     segment_weights.retain(|name, _| {
@@ -7518,14 +7518,14 @@ fn forward_segment_logits_with_weights(
 /// A small, real 2-decoder-layer Qwen fixture, independent of the canonical
 /// 1-layer `E2E_FIXTURE_*` constants (too small to split into two non-
 /// trivial segments) -- built from `e2e_fixture_manifest_from_weights`
-/// (self-consistent digests for an arbitrary `QwenConfig`, not tied to the
+/// (self-consistent digests for an arbitrary `FirstNativeModelConfig`, not tied to the
 /// checked-in canonical Safetensors fixture), exactly like `e2e_fixture()`
 /// itself, just with `layer_count: 2`.
 fn two_layer_segment_test_fixture() -> Result<E2eFixture, E2eConformanceError> {
-    let architecture = qwen_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
-    let mut config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    let architecture = first_native_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
+    let mut config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
     config.tied_embeddings = true;
-    let identity = qwen_component_identity(
+    let identity = first_native_component_identity(
         ModelComponentId::new("segment-split-fixture").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
@@ -7543,8 +7543,8 @@ fn two_layer_segment_test_fixture() -> Result<E2eFixture, E2eConformanceError> {
     )?;
     let tokenizer = e2e_fixture_tokenizer()?;
 
-    let descriptor = qwen_component_descriptor(identity.clone(), &config)?;
-    qwen_validate_model_artifact(&descriptor, &config, &manifest)?;
+    let descriptor = first_native_component_descriptor(identity.clone(), &config)?;
+    validate_first_native_model_artifact(&descriptor, &config, &manifest)?;
 
     Ok(E2eFixture {
         config,

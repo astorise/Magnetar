@@ -660,7 +660,7 @@ pub fn e2e_conformance_report_json(
 /// canonical logical tensor names Model Loading expects.
 #[derive(Clone)]
 pub struct E2eFixture {
-    pub config: QwenConfig,
+    pub config: FirstNativeModelConfig,
     pub identity: ModelComponentIdentity,
     pub architecture_implementation: ModelArchitectureImplementation,
     pub manifest: ModelManifest,
@@ -668,8 +668,8 @@ pub struct E2eFixture {
     pub weights: BTreeMap<String, HostTensor>,
 }
 
-pub fn e2e_fixture_config() -> QwenConfig {
-    let architecture = qwen_architecture_metadata(
+pub fn e2e_fixture_config() -> FirstNativeModelConfig {
+    let architecture = first_native_architecture_metadata(
         E2E_FIXTURE_HIDDEN,
         E2E_FIXTURE_LAYERS,
         E2E_FIXTURE_HEADS,
@@ -679,13 +679,16 @@ pub fn e2e_fixture_config() -> QwenConfig {
         E2E_FIXTURE_VOCAB,
         E2E_FIXTURE_CONTEXT,
     );
-    let mut config = QwenConfig::new(architecture, QwenRopeConfig::standard(E2E_FIXTURE_HEAD_DIM));
+    let mut config = FirstNativeModelConfig::new(
+        architecture,
+        FirstNativeRopeConfig::standard(E2E_FIXTURE_HEAD_DIM),
+    );
     config.tied_embeddings = true;
     config
 }
 
 pub fn e2e_fixture_identity() -> ModelComponentIdentity {
-    qwen_component_identity(
+    first_native_component_identity(
         ModelComponentId::new("e2e-qwen-fixture").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
@@ -725,7 +728,7 @@ pub fn e2e_fixture_tokenizer() -> Result<FixtureTokenizer, E2eConformanceError> 
 }
 
 pub fn e2e_fixture_manifest(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     architecture: &ModelArchitecture,
 ) -> Result<ModelManifest, E2eConformanceError> {
     const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000003";
@@ -803,7 +806,7 @@ tensors:
 /// [`e2e_fixture_manifest`], generalized to compute every tensor's content
 /// digest from a caller-supplied `weights` map instead of the checked-in
 /// `E2E_FIXTURE_SAFETENSORS_BYTES` -- so a caller building a fixture for a
-/// `QwenConfig` other than the one canonical E2E fixture (for example a
+/// `FirstNativeModelConfig` other than the one canonical E2E fixture (for example a
 /// genuinely grouped-query-shaped configuration) gets a manifest whose
 /// declared digests actually match the weights it will go on to
 /// materialize, instead of either failing the digest mismatch check in
@@ -811,7 +814,7 @@ tensors:
 /// validating the wrong content. Structurally identical to
 /// `e2e_fixture_manifest` otherwise.
 pub fn e2e_fixture_manifest_from_weights(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     architecture: &ModelArchitecture,
     weights: &BTreeMap<String, HostTensor>,
 ) -> Result<ModelManifest, E2eConformanceError> {
@@ -948,12 +951,13 @@ pub fn e2e_fixture_weight_digest(weights: &BTreeMap<String, HostTensor>) -> Stri
 }
 
 pub fn e2e_fixture_weights(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
 ) -> Result<BTreeMap<String, HostTensor>, E2eConformanceError> {
     let mut weights = BTreeMap::new();
-    for name in qwen_expected_tensor_names(config.architecture.layer_count, config.tied_embeddings)
+    for name in
+        first_native_expected_tensor_names(config.architecture.layer_count, config.tied_embeddings)
     {
-        let shape = qwen_expected_tensor_shape(&name, config).ok_or_else(|| {
+        let shape = first_native_expected_tensor_shape(&name, config).ok_or_else(|| {
             E2eConformanceError::FixtureInvalid {
                 reason: format!("no expected shape for fixture tensor '{name}'"),
             }
@@ -1054,7 +1058,7 @@ pub fn e2e_fixture_safetensors_digest() -> String {
 /// calling a format parser: `magnetar-runtime` cannot depend on
 /// `formats/safetensors` even at test time (`externalize-runtime-extension-modules`),
 /// but this fixture's tensor names/shapes/generation order are already
-/// fully known here (`qwen_expected_tensor_names`/`qwen_expected_tensor_shape`),
+/// fully known here (`first_native_expected_tensor_names`/`first_native_expected_tensor_shape`),
 /// and the file was written by iterating that exact same sorted order (a
 /// `BTreeSet`/`BTreeMap`'s iteration order, deterministic regardless of
 /// insertion order) with each tensor's byte length equal to its element
@@ -1064,13 +1068,14 @@ pub fn e2e_fixture_safetensors_digest() -> String {
 /// is parseable by the real, independent parser (see that crate's
 /// `e2e_fixture_weights_round_trip_through_real_safetensors_bytes` test).
 pub fn e2e_fixture_weight_inventory(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
 ) -> Result<Vec<ModelTensorMetadata>, E2eConformanceError> {
     let mut tensors = Vec::new();
     let mut offset = 0_u64;
-    for name in qwen_expected_tensor_names(config.architecture.layer_count, config.tied_embeddings)
+    for name in
+        first_native_expected_tensor_names(config.architecture.layer_count, config.tied_embeddings)
     {
-        let shape = qwen_expected_tensor_shape(&name, config).ok_or_else(|| {
+        let shape = first_native_expected_tensor_shape(&name, config).ok_or_else(|| {
             E2eConformanceError::FixtureInvalid {
                 reason: format!("no expected shape for fixture tensor '{name}'"),
             }
@@ -1104,7 +1109,7 @@ pub fn e2e_fixture_weight_inventory(
 /// "Tensor Content Digest Binding" requirement for the one real artifact
 /// source this crate has today.
 pub fn e2e_fixture_weight_inventory_with_digests(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
 ) -> Result<Vec<ModelTensorMetadata>, E2eConformanceError> {
     let inventory = e2e_fixture_weight_inventory(config)?;
     let real_weights = e2e_fixture_weights_from_real_artifact(config)?;
@@ -1125,7 +1130,7 @@ pub fn e2e_fixture_weight_inventory_with_digests(
 /// counterpart to [`e2e_fixture_weights`]'s in-memory construction, proven
 /// equal to it by `tests::e2e_fixture_real_artifact_weights_match_in_memory_weights`.
 pub fn e2e_fixture_weights_from_real_artifact(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
 ) -> Result<BTreeMap<String, HostTensor>, E2eConformanceError> {
     let inventory = e2e_fixture_weight_inventory(config)?;
     // The Safetensors envelope's own 8-byte little-endian header-length
@@ -1165,8 +1170,8 @@ pub fn e2e_fixture() -> Result<E2eFixture, E2eConformanceError> {
     let tokenizer = e2e_fixture_tokenizer()?;
     let weights = e2e_fixture_weights(&config)?;
 
-    let descriptor = qwen_component_descriptor(identity.clone(), &config)?;
-    qwen_validate_model_artifact(&descriptor, &config, &manifest)?;
+    let descriptor = first_native_component_descriptor(identity.clone(), &config)?;
+    validate_first_native_model_artifact(&descriptor, &config, &manifest)?;
 
     Ok(E2eFixture {
         config,
@@ -2869,7 +2874,7 @@ fn dispatch_qwen_rope(
     operation_id: &str,
     input: NodeValue,
     head_count: u64,
-    rope_config: &QwenRopeConfig,
+    rope_config: &FirstNativeRopeConfig,
     position_offset: u64,
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
@@ -2996,7 +3001,7 @@ fn parse_kv_cache_id(cache_id: &str) -> Result<(usize, KvRole), InferenceApiErro
 }
 
 /// Maps an execution-graph weight edge id to the canonical Model Loading
-/// tensor name `fixture.weights` is keyed by (see `qwen_expected_tensor_names`).
+/// tensor name `fixture.weights` is keyed by (see `first_native_expected_tensor_names`).
 /// A weight edge id is always `weight.{logical_name}` (see
 /// `GraphBuilderCapability::weight_edge`), and the Model Component -- not
 /// the Runtime -- is the one that chooses `logical_name`; the Qwen
@@ -3301,7 +3306,7 @@ fn dispatch_first_native_graph_node(
             let position_offset = absolute_position_override
                 .map(Ok)
                 .unwrap_or_else(|| node_attribute_u64(node, "position_offset"))?;
-            let rope_config = QwenRopeConfig {
+            let rope_config = FirstNativeRopeConfig {
                 base,
                 scale: fixture.config.rope.scale,
                 dimension: head_dimension,
@@ -4220,7 +4225,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             let component_graphs = match &self.component_digest {
                 Some(digest) => build_first_native_graphs_from_named_component(
                     digest,
-                    &architecture_config_from_qwen_config(&self.fixture.config),
+                    &architecture_config_from_first_native_model_config(&self.fixture.config),
                     &self.fixture.identity,
                     prompt_token_count,
                 )
@@ -4983,7 +4988,7 @@ fn load_fixture_instance_for_provider(
 /// materialize caller-supplied `weights` directly through
 /// `materialize_model_instance_weights` instead of the fixture's own
 /// digest-checked `bind_qwen_fixture_weights` -- so a caller can run this
-/// pipeline against a `fixture`/`QwenConfig` of their own choosing (for
+/// pipeline against a `fixture`/`FirstNativeModelConfig` of their own choosing (for
 /// example a genuinely grouped-query-shaped configuration,
 /// `attention_head_count != kv_head_count`, which the one canonical E2E
 /// fixture this crate ships is not) instead of only the one canonical E2E
@@ -5168,7 +5173,7 @@ pub fn run_first_native_graph_with_provider(
 /// caller-supplied `weights` (through
 /// `load_fixture_instance_with_weights_for_provider`) instead of the one
 /// canonical E2E fixture's own digest-checked weights -- lets a caller run
-/// the real first-native pipeline against a `fixture`/`QwenConfig`/`graph`
+/// the real first-native pipeline against a `fixture`/`FirstNativeModelConfig`/`graph`
 /// of their own choosing end to end, for example a genuinely grouped-
 /// query-shaped configuration this crate's own fixture is not.
 pub fn run_first_native_graph_with_provider_and_weights(
@@ -6313,7 +6318,7 @@ fn resolve_qwen_component_from_lookup(
 ///
 /// Takes the generic, WIT-facing [`ModelArchitectureConfig`] (#73 / Tachyon
 /// integration audit MAG-02), not a Qwen-specific type: despite the name
-/// this crate's [`QwenConfig`] carried, the shape this function computes
+/// this crate's [`FirstNativeModelConfig`] carried, the shape this function computes
 /// (pre-norm decoder blocks, GQA-capable q/k/v/o projections, a gated MLP,
 /// tied or untied embeddings) is the same generic decoder-only transformer
 /// layout a real, independently-compiled Llama Component's weights need
@@ -6379,17 +6384,17 @@ fn weight_shapes_for_architecture_config(
     shapes
 }
 
-/// Bridges the Rust-side [`QwenConfig`] (this crate's own test-oracle
+/// Bridges the Rust-side [`FirstNativeModelConfig`] (this crate's own test-oracle
 /// architecture representation) into the generic, WIT-facing
 /// [`ModelArchitectureConfig`] the `model-config` Capability hands to a
 /// configurable Component (`implement-production-qwen-model-loading`
-/// Decision 6). `QwenConfig` carries no token id metadata today, so
+/// Decision 6). `FirstNativeModelConfig` carries no token id metadata today, so
 /// `bos_token_id`/`eos_token_id` are `None` here -- real production
 /// ingestion (task group 3) populates those from `config.json`.
 ///
 /// Deliberately *not* `cfg`-gated to `wasmtime-component-engine`/non-`wasm32`
 /// like most of this module's Component-engine machinery: both
-/// `QwenConfig` and `ModelArchitectureConfig` are plain, portable structs
+/// `FirstNativeModelConfig` and `ModelArchitectureConfig` are plain, portable structs
 /// with no Wasmtime dependency, and `E2eRuntimeModelExecutionEngine::
 /// execute_generation_step` (itself never `cfg`-gated, since it must build
 /// for every target/feature combination this crate supports) calls this
@@ -6398,7 +6403,9 @@ fn weight_shapes_for_architecture_config(
 /// (Tachyon integration audit MAG-03: gating this function specifically to
 /// the non-`wasm32` Component-engine build broke `cargo check --target
 /// wasm32-unknown-unknown` for exactly this call site).
-fn architecture_config_from_qwen_config(config: &QwenConfig) -> ModelArchitectureConfig {
+fn architecture_config_from_first_native_model_config(
+    config: &FirstNativeModelConfig,
+) -> ModelArchitectureConfig {
     let a = &config.architecture;
     ModelArchitectureConfig {
         hidden_size: a.hidden_size,
@@ -6418,8 +6425,8 @@ fn architecture_config_from_qwen_config(config: &QwenConfig) -> ModelArchitectur
     }
 }
 
-/// The inverse of [`architecture_config_from_qwen_config`]: builds a
-/// [`QwenConfig`] from a Runtime-authorized [`ModelArchitectureConfig`]
+/// The inverse of [`architecture_config_from_first_native_model_config`]: builds a
+/// [`FirstNativeModelConfig`] from a Runtime-authorized [`ModelArchitectureConfig`]
 /// (production ingestion's normalized output) plus `context_length`
 /// (`config.json`'s `max_position_embeddings`, not yet a field of
 /// `ModelArchitectureConfig` itself -- threaded separately here rather
@@ -6428,11 +6435,11 @@ fn architecture_config_from_qwen_config(config: &QwenConfig) -> ModelArchitectur
 /// permissive (`false`)/absent: production loading validates tokenizer
 /// compatibility separately (task group 9), not through this constructor.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-fn qwen_config_from_architecture_config(
+fn first_native_model_config_from_architecture_config(
     config: &ModelArchitectureConfig,
     context_length: u64,
-) -> QwenConfig {
-    let architecture = qwen_architecture_metadata(
+) -> FirstNativeModelConfig {
+    let architecture = first_native_architecture_metadata(
         config.hidden_size,
         config.num_hidden_layers as u64,
         config.num_attention_heads as u64,
@@ -6442,13 +6449,13 @@ fn qwen_config_from_architecture_config(
         config.vocab_size,
         context_length,
     );
-    QwenConfig {
+    FirstNativeModelConfig {
         architecture,
-        rope: QwenRopeConfig {
+        rope: FirstNativeRopeConfig {
             base: config.rope_theta,
             scale: config.rope_scaling_factor.map(f64::from),
             dimension: config.head_dim,
-            position_mode: QwenRopePositionMode::Sequential,
+            position_mode: FirstNativeRopePositionMode::Sequential,
             dynamic_scaling_supported: false,
         },
         rmsnorm_epsilon: config.rms_norm_eps,
@@ -6471,7 +6478,7 @@ fn qwen_config_from_architecture_config(
 /// uses this same one.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn production_model_component_identity() -> ModelComponentIdentity {
-    qwen_component_identity(
+    first_native_component_identity(
         ModelComponentId::new("production-model").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
@@ -6509,7 +6516,8 @@ pub fn production_model_fixture(
     // silent: a caller inspecting this fixture's config sees exactly
     // this value, and it never came from an unrecorded assumption.
     let context_length = 1_000_000u64;
-    let config = qwen_config_from_architecture_config(&architecture_config, context_length);
+    let config =
+        first_native_model_config_from_architecture_config(&architecture_config, context_length);
     let identity = production_model_component_identity();
     config
         .validate(&identity)
@@ -6519,9 +6527,9 @@ pub fn production_model_fixture(
         kind: ModelArchitectureImplementationKind::ComponentBased,
         required_capabilities: Vec::new(),
     };
-    let descriptor =
-        qwen_component_descriptor(identity.clone(), &config).map_err(E2eConformanceError::from)?;
-    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+    let descriptor = first_native_component_descriptor(identity.clone(), &config)
+        .map_err(E2eConformanceError::from)?;
+    validate_first_native_model_artifact(&descriptor, &config, &manifest)
         .map_err(E2eConformanceError::from)?;
     Ok(E2eFixture {
         config,
@@ -7076,7 +7084,7 @@ fn finish_production_generation(
 /// own `LoadedModel` lifecycle and create per-request sessions on top of the
 /// same ready [`ModelInstanceId`].
 ///
-/// Despite [`E2eFixture::config`]'s own [`QwenConfig`] type name, this state
+/// Despite [`E2eFixture::config`]'s own [`FirstNativeModelConfig`] type name, this state
 /// machine carries no real Qwen-family-only gating: `component_digest`, when
 /// set, makes an arbitrary caller-registered Component (any architecture the
 /// registered Component's own graph producer implements, not just Qwen) the
@@ -7340,7 +7348,7 @@ impl ProductionLoadedModel {
         let component_graphs = match &self.component_digest {
             Some(digest) => build_first_native_graphs_from_named_component(
                 digest,
-                &architecture_config_from_qwen_config(&self.fixture.config),
+                &architecture_config_from_first_native_model_config(&self.fixture.config),
                 &self.fixture.identity,
                 prompt_token_count,
             )
@@ -7878,12 +7886,12 @@ fn named_component_runtime(
 /// instead of the single hardcoded Qwen singleton.
 ///
 /// Takes the generic, WIT-facing [`ModelArchitectureConfig`] directly (#73 /
-/// Tachyon integration audit MAG-02), not [`QwenConfig`] -- a caller whose
+/// Tachyon integration audit MAG-02), not [`FirstNativeModelConfig`] -- a caller whose
 /// own config is Qwen-shaped converts once via
-/// `architecture_config_from_qwen_config` before calling, exactly like
+/// `architecture_config_from_first_native_model_config` before calling, exactly like
 /// `build_first_native_graphs_for_config` (the Qwen-singleton path) now
 /// does internally; a caller for any other architecture never needs a
-/// `QwenConfig` to exist at all. See
+/// `FirstNativeModelConfig` to exist at all. See
 /// `build_first_native_graphs_from_named_component_serves_a_real_second_
 /// architecture_family` for the proof that an independently-compiled,
 /// non-Qwen Component (real Llama) drives this exact entry point correctly.
@@ -7985,11 +7993,11 @@ pub fn build_first_native_graphs_from_real_qwen_component(
 /// fields that function ever read. Additive -- the public, `E2eFixture`-
 /// shaped entry point above is now a one-line wrapper with unchanged
 /// behavior, so every existing caller is unaffected; this decoupled form
-/// is what production loading (driven by a real ingested `QwenConfig`/
+/// is what production loading (driven by a real ingested `FirstNativeModelConfig`/
 /// `ModelComponentIdentity`, not a fixture) calls directly.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn build_first_native_graphs_for_config(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,
 ) -> Result<
@@ -8001,7 +8009,7 @@ fn build_first_native_graphs_for_config(
     E2eConformanceError,
 > {
     let runtime = qwen_real_component_runtime()?;
-    let architecture_config = architecture_config_from_qwen_config(config);
+    let architecture_config = architecture_config_from_first_native_model_config(config);
     build_first_native_graphs_with_runtime(
         &runtime.manager,
         &runtime.capability,
@@ -8147,7 +8155,7 @@ fn build_first_native_prefill_graph_segment_with_runtime(
     capability: &GraphBuilderCapability,
     model_config_capability: &ModelConfigCapability,
     definition: ComponentDefinitionId,
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,
     start_layer: u32,
@@ -8172,7 +8180,7 @@ fn build_first_native_prefill_graph_segment_with_runtime(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
-        let architecture_config = architecture_config_from_qwen_config(config);
+        let architecture_config = architecture_config_from_first_native_model_config(config);
         let weight_shapes = weight_shapes_for_architecture_config(&architecture_config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = SessionContext {
@@ -8221,7 +8229,7 @@ fn build_first_native_prefill_graph_segment_with_runtime(
 /// `build_first_native_graphs_for_config`.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub fn build_first_native_prefill_graph_segment_for_config(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,
     start_layer: u32,
@@ -8257,7 +8265,7 @@ fn build_first_native_decode_graph_segment_with_runtime(
     capability: &GraphBuilderCapability,
     model_config_capability: &ModelConfigCapability,
     definition: ComponentDefinitionId,
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
     cached_token_count: u64,
     start_layer: u32,
@@ -8282,7 +8290,7 @@ fn build_first_native_decode_graph_segment_with_runtime(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
-        let architecture_config = architecture_config_from_qwen_config(config);
+        let architecture_config = architecture_config_from_first_native_model_config(config);
         let weight_shapes = weight_shapes_for_architecture_config(&architecture_config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = SessionContext {
@@ -8331,7 +8339,7 @@ fn build_first_native_decode_graph_segment_with_runtime(
 /// [`build_first_native_prefill_graph_segment_for_config`].
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub fn build_first_native_decode_graph_segment_for_config(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
     cached_token_count: u64,
     start_layer: u32,
@@ -9958,7 +9966,7 @@ fn check_memory_admission_failure() -> Result<(), E2eConformanceError> {
 fn check_incompatible_tokenizer(fixture: &E2eFixture) -> Result<(), E2eConformanceError> {
     let mut incompatible = fixture.tokenizer.metadata().clone();
     incompatible.special_tokens.clear();
-    match qwen_validate_tokenizer_compatibility(&fixture.config, &incompatible) {
+    match validate_first_native_tokenizer_compatibility(&fixture.config, &incompatible) {
         Err(_) => Ok(()),
         Ok(()) => Err(E2eConformanceError::Internal {
             reason: "expected incompatible tokenizer (missing EOS) to be rejected".into(),
@@ -10000,7 +10008,7 @@ fn check_invalid_tensor_shape(fixture: &E2eFixture) -> Result<(), E2eConformance
         expected_compute_dtype: None,
         digest: None,
     };
-    match qwen_validate_tensor_shapes(&fixture.config, std::slice::from_ref(&bad_tensor)) {
+    match validate_first_native_tensor_shapes(&fixture.config, std::slice::from_ref(&bad_tensor)) {
         Err(_) => Ok(()),
         Ok(()) => Err(E2eConformanceError::Internal {
             reason: "expected invalid tensor shape to be rejected".into(),

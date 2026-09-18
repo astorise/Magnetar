@@ -79,25 +79,27 @@ def main() -> int:
 
     errors: list[str] = []
 
-    # #82's own tracked, individually justified exceptions -- each already
-    # investigated and confirmed to be either (a) the deliberate QwenConfig
-    # bridge every ModelArchitectureConfig-driven caller still needs until
-    # E2eFixture itself stops being QwenConfig-typed, or (b) the intentional,
-    # documented hardcoded-Qwen-singleton fallback for a None component_digest.
+    # #82: production_model_fixture used to call qwen_config_from_architecture_config/
+    # qwen_component_descriptor/qwen_validate_model_artifact (in qwen_model_component.rs);
+    # investigation confirmed none of the three gated on anything genuinely
+    # Qwen-family-specific, so they were renamed to first_native_model_config_
+    # from_architecture_config/first_native_component_descriptor/validate_
+    # first_native_model_artifact -- production_model_fixture's own body needs
+    # no allowlist entries anymore.
     errors += check(
         "production_model_fixture",
         extract_body(runtime_src, "fn production_model_fixture(", 0, "production_model_fixture"),
-        allowed={
-            "qwen_config_from_architecture_config",
-            "qwen_component_descriptor",
-            "qwen_validate_model_artifact",
-        },
+        allowed=set(),
     )
+    # impl ProductionLoadedModel's one remaining exception:
+    # build_first_native_graphs_from_real_qwen_component is the intentional,
+    # documented hardcoded-Qwen-singleton fallback for a None component_digest
+    # (a real design choice, not a naming leftover -- see that function's own
+    # doc comment).
     errors += check(
         "impl ProductionLoadedModel",
         extract_body(runtime_src, "impl ProductionLoadedModel {", 0, "impl ProductionLoadedModel"),
         allowed={
-            "architecture_config_from_qwen_config",
             "build_first_native_graphs_from_real_qwen_component",
         },
     )
