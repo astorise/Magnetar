@@ -1213,11 +1213,11 @@ struct E2eRuntimeModelExecutionEngine {
     fixture: E2eFixture,
     kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
     pending_kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
-    /// See [`ProductionQwenLoadedModel::component_digest`]'s doc comment --
+    /// See [`ProductionLoadedModel::component_digest`]'s doc comment --
     /// must stay in lockstep with the same instance's `prepare_generation`
     /// digest so a published plan's fingerprint matches what dispatch here
     /// actually builds. `None` (every construction site but
-    /// `ProductionQwenLoadedModel::load`) preserves the pre-existing
+    /// `ProductionLoadedModel::load`) preserves the pre-existing
     /// hardcoded-singleton behavior exactly.
     component_digest: Option<ComponentDigest>,
     /// Test-only deterministic-token override, read by
@@ -4215,7 +4215,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // so calling it again here reproduces the identical graph the
             // plan was prepared against. Must match `prepare_generation`'s
             // own choice of digest exactly -- see
-            // `ProductionQwenLoadedModel::component_digest`'s doc comment.
+            // `ProductionLoadedModel::component_digest`'s doc comment.
             let prompt_token_count = request.input_token_ids.len() as u64;
             let component_graphs = match &self.component_digest {
                 Some(digest) => build_first_native_graphs_from_named_component(
@@ -6467,7 +6467,7 @@ fn production_qwen_component_identity() -> ModelComponentIdentity {
 }
 
 /// Builds a real [`E2eFixture`] from production ingestion output (task
-/// group 10): the same Qwen graph-execution/KV-cache/
+/// group 10): the same graph-execution/KV-cache/
 /// `RuntimeModelExecutionEngine` machinery every existing first-native
 /// caller already uses, driven by real Hugging Face bundle data instead
 /// of the canonical tiny fixture. `weights` is deliberately empty --
@@ -6479,7 +6479,7 @@ fn production_qwen_component_identity() -> ModelComponentIdentity {
 /// resolves weights by Provider resource id per node -- see
 /// `execute_qwen_graph`'s own doc comment).
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-pub fn production_qwen_fixture(
+pub fn production_model_fixture(
     manifest: ModelManifest,
     tokenizer_metadata: TokenizerMetadata,
     tokenizer: std::sync::Arc<dyn crate::tokenizer::Tokenizer + Send + Sync>,
@@ -6678,7 +6678,7 @@ pub fn load_production_qwen_instance_segment_for_provider(
 /// own one-shot shape (fresh `Runtime`/session per call) but for real
 /// ingested data instead of the `qwen-test` fixture.
 ///
-/// `fixture` is [`production_qwen_fixture`]'s output; `payload_source` is
+/// `fixture` is [`production_model_fixture`]'s output; `payload_source` is
 /// the same one the caller's ingestor produced; `trust_store` is the
 /// caller's own trust policy (Decision 2: this function grants no trust
 /// of its own -- an untrusted manifest fails inside `load_model` before
@@ -7059,12 +7059,25 @@ fn finish_production_generation(
     })
 }
 
-/// Production Qwen model state loaded once into a Magnetar [`Runtime`].
+/// Production model state loaded once into a Magnetar [`Runtime`].
 /// Embedders with an external model registry keep this object behind their
 /// own `LoadedModel` lifecycle and create per-request sessions on top of the
 /// same ready [`ModelInstanceId`].
+///
+/// Despite [`E2eFixture::config`]'s own [`QwenConfig`] type name, this state
+/// machine carries no real Qwen-family-only gating: `component_digest`, when
+/// set, makes an arbitrary caller-registered Component (any architecture the
+/// registered Component's own graph producer implements, not just Qwen) the
+/// real graph-production authority for both `prepare_generation` and
+/// `E2eRuntimeModelExecutionEngine::execute_generation_step` (Tachyon
+/// integration audit MAG-01/MAG-02, #72/#73) -- see
+/// `loaded_inference_component_load_runs_a_real_second_architecture_end_to_end`
+/// in `inference-components` for the proof that a real, independently-
+/// compiled non-Qwen Component drives this exact type correctly end to end,
+/// through `LoadedInferenceComponent::load` rather than only this crate's
+/// own lower-level entry points.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-pub struct ProductionQwenLoadedModel {
+pub struct ProductionLoadedModel {
     fixture: E2eFixture,
     runtime: Runtime,
     instance: ModelInstanceId,
@@ -7085,7 +7098,7 @@ pub struct ProductionQwenLoadedModel {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-impl ProductionQwenLoadedModel {
+impl ProductionLoadedModel {
     pub fn load(
         fixture: E2eFixture,
         payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
@@ -7892,7 +7905,7 @@ pub fn build_first_native_graphs_from_named_component(
 /// (`wasm32`, or `wasmtime-component-engine` disabled) -- fails closed,
 /// structurally, exactly like [`first_native_component_graphs_for_prompt`]'s
 /// own non-test fallback for the same reason. `E2eRuntimeModelExecutionEngine::
-/// execute_generation_step` and `ProductionQwenLoadedModel::prepare_generation`
+/// execute_generation_step` and `ProductionLoadedModel::prepare_generation`
 /// both reach this whenever `component_digest` is `Some` on such a build,
 /// so a `None`-digest instance (the pre-existing singleton path, unaffected
 /// by this fallback) remains the only thing that can ever run here.

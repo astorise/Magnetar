@@ -49,7 +49,7 @@ use magnetar_runtime::{
     E2eFixture, PromptInput, TokenId, TokenizationRequest,
     build_first_native_decode_graph_segment_for_config,
     build_first_native_prefill_graph_segment_for_config,
-    load_production_qwen_instance_segment_for_provider, production_qwen_fixture,
+    load_production_qwen_instance_segment_for_provider, production_model_fixture,
     run_first_native_graph_segment_dispatch, run_production_qwen_generation_for_provider,
     tokenize_prompt_input,
 };
@@ -136,7 +136,7 @@ fn real_public_checkpoint_multi_gpu_segment_decode_matches_full_graph_on_one_gpu
         max_tokens: Some(MAX_TOKENS as u32),
         ..Default::default()
     });
-    let reference_fixture = production_qwen_fixture(
+    let reference_fixture = production_model_fixture(
         reference_manifest,
         tokenizer_metadata.clone(),
         Arc::clone(&real_tokenizer),
@@ -166,7 +166,7 @@ fn real_public_checkpoint_multi_gpu_segment_decode_matches_full_graph_on_one_gpu
 
     // The two-real-GPU segmented pipeline, against the same real ingested
     // checkpoint/tokenizer/prompt.
-    let segment_fixture: E2eFixture = production_qwen_fixture(
+    let segment_fixture: E2eFixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         Arc::clone(&real_tokenizer),

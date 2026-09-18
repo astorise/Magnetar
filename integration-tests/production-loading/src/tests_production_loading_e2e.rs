@@ -6,7 +6,7 @@ use magnetar_runtime::production_model_ingestion::{
 };
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
-    ModelArtifactSource, load_production_qwen_instance, production_qwen_fixture,
+    ModelArtifactSource, load_production_qwen_instance, production_model_fixture,
 };
 use std::{fs, sync::Arc};
 
@@ -57,7 +57,7 @@ fn tachyon_shaped_real_production_ingestion_loads_through_the_real_qwen_componen
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
 
-    let fixture = production_qwen_fixture(
+    let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         real_tokenizer,
@@ -236,7 +236,7 @@ fn multi_step_decode_request_against_an_unsupporting_provider_fails_fast() {
     // `ModelTrustStore::default()` -- if the new check did not run before
     // any real execution work, this would fail with a *different* error
     // (component-unavailable or trust-rejected) instead of `Unsupported`.
-    let fixture = production_qwen_fixture(
+    let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         real_tokenizer,
@@ -297,7 +297,7 @@ fn tiny_production_fixture_and_ingestion(
 
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
-    let fixture = production_qwen_fixture(
+    let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         real_tokenizer,
@@ -535,7 +535,7 @@ fn production_generation_request_unsupported_gate_applies_to_the_overridden_toke
     let tokenizer_metadata = real_tokenizer.metadata().clone();
     let real_tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(real_tokenizer);
 
-    let fixture = production_qwen_fixture(
+    let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         real_tokenizer,
@@ -847,7 +847,7 @@ fn production_generation_request_streaming_unsupported_gate_never_invokes_the_ca
     let tokenizer_metadata = real_tokenizer.metadata().clone();
     let real_tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(real_tokenizer);
 
-    let fixture = production_qwen_fixture(
+    let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         real_tokenizer,

@@ -39,7 +39,8 @@ use magnetar_runtime::production_model_ingestion::{
 };
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
-    ChatMessage, ModelArtifactSource, ModelGenerationDefaults, PromptInput, production_qwen_fixture,
+    ChatMessage, ModelArtifactSource, ModelGenerationDefaults, PromptInput,
+    production_model_fixture,
 };
 use std::{fs, path::PathBuf, sync::Arc};
 
@@ -158,7 +159,7 @@ fn real_public_checkpoint_loads_and_generates_on_reference_cpu() {
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
 
-    let fixture = production_qwen_fixture(
+    let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         real_tokenizer,
@@ -244,7 +245,7 @@ fn real_public_checkpoint_renders_chat_messages_through_its_own_real_template() 
 
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
-    let fixture = production_qwen_fixture(
+    let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         real_tokenizer,
@@ -329,7 +330,7 @@ fn real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda() {
 
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
-    let cpu_fixture = production_qwen_fixture(
+    let cpu_fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata.clone(),
         Arc::clone(&real_tokenizer),
@@ -343,7 +344,7 @@ fn real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda() {
     )
     .expect("Reference CPU generation runs end to end on the real checkpoint");
 
-    let cuda_fixture = production_qwen_fixture(
+    let cuda_fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         real_tokenizer,
