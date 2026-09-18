@@ -6385,7 +6385,18 @@ fn weight_shapes_for_architecture_config(
 /// Decision 6). `QwenConfig` carries no token id metadata today, so
 /// `bos_token_id`/`eos_token_id` are `None` here -- real production
 /// ingestion (task group 3) populates those from `config.json`.
-#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+///
+/// Deliberately *not* `cfg`-gated to `wasmtime-component-engine`/non-`wasm32`
+/// like most of this module's Component-engine machinery: both
+/// `QwenConfig` and `ModelArchitectureConfig` are plain, portable structs
+/// with no Wasmtime dependency, and `E2eRuntimeModelExecutionEngine::
+/// execute_generation_step` (itself never `cfg`-gated, since it must build
+/// for every target/feature combination this crate supports) calls this
+/// unconditionally before delegating to whichever `cfg`-selected variant of
+/// `build_first_native_graphs_from_named_component` is actually compiled
+/// (Tachyon integration audit MAG-03: gating this function specifically to
+/// the non-`wasm32` Component-engine build broke `cargo check --target
+/// wasm32-unknown-unknown` for exactly this call site).
 fn architecture_config_from_qwen_config(config: &QwenConfig) -> ModelArchitectureConfig {
     let a = &config.architecture;
     ModelArchitectureConfig {
@@ -7868,8 +7879,8 @@ fn named_component_runtime(
 /// Takes the generic, WIT-facing [`ModelArchitectureConfig`] directly (#73 /
 /// Tachyon integration audit MAG-02), not [`QwenConfig`] -- a caller whose
 /// own config is Qwen-shaped converts once via
-/// [`architecture_config_from_qwen_config`] before calling, exactly like
-/// [`build_first_native_graphs_for_config`] (the Qwen-singleton path) now
+/// `architecture_config_from_qwen_config` before calling, exactly like
+/// `build_first_native_graphs_for_config` (the Qwen-singleton path) now
 /// does internally; a caller for any other architecture never needs a
 /// `QwenConfig` to exist at all. See
 /// `build_first_native_graphs_from_named_component_serves_a_real_second_
