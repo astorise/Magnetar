@@ -4220,7 +4220,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             let component_graphs = match &self.component_digest {
                 Some(digest) => build_first_native_graphs_from_named_component(
                     digest,
-                    &self.fixture.config,
+                    &architecture_config_from_qwen_config(&self.fixture.config),
                     &self.fixture.identity,
                     prompt_token_count,
                 )
@@ -6309,35 +6309,48 @@ fn resolve_qwen_component_from_lookup(
 /// -- weight *shape* is architecture metadata, resolving the real bytes
 /// behind a weight edge happens later, at execution time
 /// (`resolve_qwen_weight_edge`), unaffected by this function.
+///
+/// Takes the generic, WIT-facing [`ModelArchitectureConfig`] (#73 / Tachyon
+/// integration audit MAG-02), not a Qwen-specific type: despite the name
+/// this crate's [`QwenConfig`] carried, the shape this function computes
+/// (pre-norm decoder blocks, GQA-capable q/k/v/o projections, a gated MLP,
+/// tied or untied embeddings) is the same generic decoder-only transformer
+/// layout a real, independently-compiled Llama Component's weights need
+/// too -- see `build_first_native_graphs_from_named_component_serves_a_
+/// real_second_architecture_family`, which proves the Llama and Qwen
+/// binaries produce identical graphs for the identical `architecture-
+/// config`. Nothing here reads a Qwen-only field; every value comes
+/// straight off [`ModelArchitectureConfig`].
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-fn qwen_weight_shapes_for_config(config: &QwenConfig) -> BTreeMap<String, Vec<u64>> {
-    let a = &config.architecture;
-    let q_dim = a.attention_head_count * a.head_dimension;
-    let kv_dim = a.kv_head_count * a.head_dimension;
+fn weight_shapes_for_architecture_config(
+    config: &ModelArchitectureConfig,
+) -> BTreeMap<String, Vec<u64>> {
+    let q_dim = config.num_attention_heads as u64 * config.head_dim;
+    let kv_dim = config.num_key_value_heads as u64 * config.head_dim;
     let mut shapes = BTreeMap::new();
     shapes.insert(
         "token_embedding".to_string(),
-        vec![a.vocabulary_size, a.hidden_size],
+        vec![config.vocab_size, config.hidden_size],
     );
-    shapes.insert("final_norm".to_string(), vec![a.hidden_size]);
+    shapes.insert("final_norm".to_string(), vec![config.hidden_size]);
     shapes.insert(
         "lm_head".to_string(),
-        vec![a.hidden_size, a.vocabulary_size],
+        vec![config.hidden_size, config.vocab_size],
     );
-    for layer in 0..a.layer_count {
+    for layer in 0..config.num_hidden_layers {
         let prefix = format!("layers.{layer}");
-        shapes.insert(format!("{prefix}.input_norm"), vec![a.hidden_size]);
+        shapes.insert(format!("{prefix}.input_norm"), vec![config.hidden_size]);
         shapes.insert(
             format!("{prefix}.self_attn.q_proj"),
-            vec![a.hidden_size, q_dim],
+            vec![config.hidden_size, q_dim],
         );
         shapes.insert(
             format!("{prefix}.self_attn.k_proj"),
-            vec![a.hidden_size, kv_dim],
+            vec![config.hidden_size, kv_dim],
         );
         shapes.insert(
             format!("{prefix}.self_attn.v_proj"),
-            vec![a.hidden_size, kv_dim],
+            vec![config.hidden_size, kv_dim],
         );
         if config.attention_bias {
             shapes.insert(format!("{prefix}.self_attn.q_bias"), vec![q_dim]);
@@ -6346,20 +6359,20 @@ fn qwen_weight_shapes_for_config(config: &QwenConfig) -> BTreeMap<String, Vec<u6
         }
         shapes.insert(
             format!("{prefix}.self_attn.o_proj"),
-            vec![q_dim, a.hidden_size],
+            vec![q_dim, config.hidden_size],
         );
-        shapes.insert(format!("{prefix}.post_attn_norm"), vec![a.hidden_size]);
+        shapes.insert(format!("{prefix}.post_attn_norm"), vec![config.hidden_size]);
         shapes.insert(
             format!("{prefix}.mlp.gate_proj"),
-            vec![a.hidden_size, a.intermediate_size],
+            vec![config.hidden_size, config.intermediate_size],
         );
         shapes.insert(
             format!("{prefix}.mlp.up_proj"),
-            vec![a.hidden_size, a.intermediate_size],
+            vec![config.hidden_size, config.intermediate_size],
         );
         shapes.insert(
             format!("{prefix}.mlp.down_proj"),
-            vec![a.intermediate_size, a.hidden_size],
+            vec![config.intermediate_size, config.hidden_size],
         );
     }
     shapes
@@ -7302,7 +7315,7 @@ impl ProductionQwenLoadedModel {
         let component_graphs = match &self.component_digest {
             Some(digest) => build_first_native_graphs_from_named_component(
                 digest,
-                &self.fixture.config,
+                &architecture_config_from_qwen_config(&self.fixture.config),
                 &self.fixture.identity,
                 prompt_token_count,
             )
@@ -7838,10 +7851,21 @@ fn named_component_runtime(
 /// counterpart: builds prefill/decode graphs from whichever Component
 /// [`register_inference_component_artifact`] registered under `digest`,
 /// instead of the single hardcoded Qwen singleton.
+///
+/// Takes the generic, WIT-facing [`ModelArchitectureConfig`] directly (#73 /
+/// Tachyon integration audit MAG-02), not [`QwenConfig`] -- a caller whose
+/// own config is Qwen-shaped converts once via
+/// [`architecture_config_from_qwen_config`] before calling, exactly like
+/// [`build_first_native_graphs_for_config`] (the Qwen-singleton path) now
+/// does internally; a caller for any other architecture never needs a
+/// `QwenConfig` to exist at all. See
+/// `build_first_native_graphs_from_named_component_serves_a_real_second_
+/// architecture_family` for the proof that an independently-compiled,
+/// non-Qwen Component (real Llama) drives this exact entry point correctly.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub fn build_first_native_graphs_from_named_component(
     digest: &ComponentDigest,
-    config: &QwenConfig,
+    config: &ModelArchitectureConfig,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,
 ) -> Result<
@@ -7875,7 +7899,7 @@ pub fn build_first_native_graphs_from_named_component(
 #[cfg(not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")))]
 pub fn build_first_native_graphs_from_named_component(
     _digest: &ComponentDigest,
-    _config: &QwenConfig,
+    _config: &ModelArchitectureConfig,
     _identity: &ModelComponentIdentity,
     _prompt_token_count: u64,
 ) -> Result<
@@ -7952,12 +7976,13 @@ fn build_first_native_graphs_for_config(
     E2eConformanceError,
 > {
     let runtime = qwen_real_component_runtime()?;
+    let architecture_config = architecture_config_from_qwen_config(config);
     build_first_native_graphs_with_runtime(
         &runtime.manager,
         &runtime.capability,
         &runtime.model_config_capability,
         runtime.definition,
-        config,
+        &architecture_config,
         identity,
         prompt_token_count,
     )
@@ -7982,7 +8007,7 @@ fn build_first_native_graphs_with_runtime(
     capability: &GraphBuilderCapability,
     model_config_capability: &ModelConfigCapability,
     definition: ComponentDefinitionId,
-    config: &QwenConfig,
+    config: &ModelArchitectureConfig,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,
 ) -> Result<
@@ -8012,7 +8037,7 @@ fn build_first_native_graphs_with_runtime(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
-        let weight_shapes = qwen_weight_shapes_for_config(config);
+        let weight_shapes = weight_shapes_for_architecture_config(config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = |weight_shapes: BTreeMap<String, Vec<u64>>| SessionContext {
             component_id: identity.id.as_str().to_string(),
@@ -8022,8 +8047,7 @@ fn build_first_native_graphs_with_runtime(
             output_edge_name: "logits".to_string(),
         };
 
-        let architecture_config = architecture_config_from_qwen_config(config);
-        model_config_capability.bind_config(&engine_key, architecture_config.clone());
+        model_config_capability.bind_config(&engine_key, config.clone());
 
         capability.prepare_session(&engine_key, session_context(weight_shapes.clone()));
         let prefill_result = manager
@@ -8042,7 +8066,7 @@ fn build_first_native_graphs_with_runtime(
                 reason: "build-prefill-graph handle did not resolve to a finished graph".into(),
             })?;
 
-        model_config_capability.bind_config(&engine_key, architecture_config);
+        model_config_capability.bind_config(&engine_key, config.clone());
         capability.prepare_session(&engine_key, session_context(weight_shapes));
         let decode_result = manager
             .invoke(
@@ -8123,7 +8147,8 @@ fn build_first_native_prefill_graph_segment_with_runtime(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
-        let weight_shapes = qwen_weight_shapes_for_config(config);
+        let architecture_config = architecture_config_from_qwen_config(config);
+        let weight_shapes = weight_shapes_for_architecture_config(&architecture_config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = SessionContext {
             component_id: identity.id.as_str().to_string(),
@@ -8133,8 +8158,7 @@ fn build_first_native_prefill_graph_segment_with_runtime(
             output_edge_name: "logits".to_string(),
         };
 
-        model_config_capability
-            .bind_config(&engine_key, architecture_config_from_qwen_config(config));
+        model_config_capability.bind_config(&engine_key, architecture_config);
         capability.prepare_session(&engine_key, session_context);
         let segment_result = manager
             .invoke(
@@ -8233,7 +8257,8 @@ fn build_first_native_decode_graph_segment_with_runtime(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
-        let weight_shapes = qwen_weight_shapes_for_config(config);
+        let architecture_config = architecture_config_from_qwen_config(config);
+        let weight_shapes = weight_shapes_for_architecture_config(&architecture_config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = SessionContext {
             component_id: identity.id.as_str().to_string(),
@@ -8243,8 +8268,7 @@ fn build_first_native_decode_graph_segment_with_runtime(
             output_edge_name: "logits".to_string(),
         };
 
-        model_config_capability
-            .bind_config(&engine_key, architecture_config_from_qwen_config(config));
+        model_config_capability.bind_config(&engine_key, architecture_config);
         capability.prepare_session(&engine_key, session_context);
         let segment_result = manager
             .invoke(

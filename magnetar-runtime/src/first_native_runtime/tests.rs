@@ -3286,7 +3286,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
 
     let (via_named, _definition, _instance) = build_first_native_graphs_from_named_component(
         &digest,
-        &fixture.config,
+        &architecture_config_from_qwen_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3336,7 +3336,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     let (synthetic_graphs, _definition, _instance) =
         build_first_native_graphs_from_named_component(
             &synthetic_digest,
-            &fixture.config,
+            &architecture_config_from_qwen_config(&fixture.config),
             &fixture.identity,
             prompt_token_count,
         )
@@ -3358,7 +3358,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     // digest again still succeeds and still matches the singleton path.
     let (qwen_graphs_again, _definition, _instance) = build_first_native_graphs_from_named_component(
         &digest,
-        &fixture.config,
+        &architecture_config_from_qwen_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3420,7 +3420,7 @@ fn build_first_native_graphs_from_named_component_serves_a_real_second_architect
 
     let (llama_graphs, _definition, _instance) = build_first_native_graphs_from_named_component(
         &llama_digest,
-        &fixture.config,
+        &architecture_config_from_qwen_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3458,7 +3458,7 @@ fn build_first_native_graphs_from_named_component_serves_a_real_second_architect
     let (llama_biased_graphs, _definition, _instance) =
         build_first_native_graphs_from_named_component(
             &llama_digest,
-            &biased_config,
+            &architecture_config_from_qwen_config(&biased_config),
             &fixture.identity,
             prompt_token_count,
         )
@@ -3485,7 +3485,7 @@ fn build_first_native_graphs_from_named_component_fails_closed_for_an_unregister
     let fixture = e2e_fixture().expect("fixture builds");
     let result = build_first_native_graphs_from_named_component(
         &never_registered,
-        &fixture.config,
+        &architecture_config_from_qwen_config(&fixture.config),
         &fixture.identity,
         2,
     );
