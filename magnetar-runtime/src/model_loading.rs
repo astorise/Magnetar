@@ -1713,3 +1713,6 @@ pub fn allocation_released(allocation: &MemoryAllocation) -> bool {
             | MemoryAllocationState::Cancelled
     )
 }
+
+#[cfg(test)]
+mod tests;

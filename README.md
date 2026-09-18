@@ -1,5 +1,8 @@
 # Magnetar
 
+[![Quality](https://github.com/astorise/Magnetar/actions/workflows/quality.yml/badge.svg)](https://github.com/astorise/Magnetar/actions/workflows/quality.yml)
+[![GPU Runner Smoke Test](https://github.com/astorise/Magnetar/actions/workflows/gpu-runner-smoke.yml/badge.svg)](https://github.com/astorise/Magnetar/actions/workflows/gpu-runner-smoke.yml)
+
 Magnetar is a Rust runtime for portable local AI execution.
 
 The current implementation is a v0.1 local-runtime baseline with real
@@ -590,6 +593,45 @@ no safe way to force a real GPU to disappear on shared CI infrastructure,
 so the "loss" event itself is a real, caller-driven transition, not a
 hardware-detected one; what is real is the Plan's own Device-derived data
 and the state-machine code itself.
+
+`add-real-multi-device-model-instance-placement` then closed the one
+item every prior sub-chantier above had deliberately deferred: real
+production `ModelInstance`-level placement across more than one real
+GPU. `ModelInstancePlacement` itself remains structurally single-Device
+per instance, untouched -- the "safe" design chosen over invasively
+generalizing `ctx.provider` at 30+ dispatch call sites is two separate,
+ordinary `ModelInstance`s, each bound to its own real Provider/Device
+and materializing only its own real decoder-layer range's weights, with
+the boundary hidden-state tensor moved between them via an explicit
+Host round trip (later replaced -- see below -- by a real zero-Host-
+round-trip peer-to-peer copy). `model-component-graph.wit` gained `1.3.0`'s
+`build-prefill-graph-segment`/`build-decode-graph-segment` (purely
+additive) so the real Qwen Component can build a graph for one layer
+range instead of always the whole stack. Verified in three real,
+increasingly deep steps, each building on the last: bit-for-bit
+identical to the full graph on Reference CPU against a synthetic
+fixture; on two real, physically distinct GPUs for a real prefill;
+and, finally, on two real GPUs running a real multi-step greedy
+generation loop against the real, public Qwen2.5-0.5B-Instruct
+checkpoint (`tests_real_checkpoint_smoke.rs`'s own checkpoint),
+producing exactly the same generated token ids as the real full,
+unsegmented graph dispatched on one real GPU alone. Along the way, real
+hardware testing caught and fixed two real bugs: a Component-side tied-
+embeddings alias failure for a segment reaching the lm-head without
+owning the embedding lookup, and a `magnetar-runtime` per-layer KV-state
+bug (a `Vec`'s position silently stopped meaning "real layer number"
+the moment a graph could touch an arbitrary layer range, not just
+`0..N`) -- both fixed before any real-hardware dispatch was attempted
+against them. The explicit Host round trip for the boundary tensor has
+since been replaced with the already-proven zero-Host-round-trip
+`CudaExecutor::copy_tensor_from_peer_admitted` primitive: a new
+`QwenSegmentBoundaryInput::Resident` path lets a segment's
+`input.hidden_states_in` edge be satisfied by a real Device-resident
+peer copy instead of a Host-staged write, with the pre-existing
+Host-staged path (`QwenSegmentBoundaryInput::Host`) kept unchanged
+for every other caller. Verified on two real, physically distinct
+GPUs -- genuine peer-to-peer, no skip -- producing logits identical
+to the unsegmented full-graph reference.
 
 Memory-feasibility ranking against a *genuinely heterogeneous* real
 budget (the two real GPUs available are identical, so the infeasibility

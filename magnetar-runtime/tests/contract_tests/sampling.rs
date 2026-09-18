@@ -74,6 +74,22 @@ fn sampling_greedy_selects_highest_valid_token_without_decoding() {
     );
 }
 
+/// #51: a score tie must resolve the same way greedy selection, the top-k
+/// cut, the top-p cut, and `token_rank` all already agree on internally --
+/// lowest token id wins -- so the reported rank of the selected token is
+/// always 1, never a rank contradicting the selection it describes.
+#[test]
+fn sampling_greedy_breaks_a_score_tie_toward_the_lower_token_id() {
+    let mut request = request(vec![0.0, 0.0, 0.0, 0.0, 7.0, 1.0, 7.0, 0.0]);
+    request.policy.allow_probability_metadata = true;
+
+    let result = select_next_token(&request).unwrap();
+
+    assert_eq!(result.selected_token_id, 4);
+    assert_eq!(result.selection_mode, SamplingSelectionMode::Greedy);
+    assert_eq!(result.token_rank, Some(1));
+}
+
 #[test]
 fn sampling_validates_temperature_and_reserved_modes() {
     let mut invalid_temperature = request(vec![0.0; 8]);
@@ -103,9 +119,13 @@ fn sampling_applies_top_k_top_p_and_penalties_in_stable_order() {
     top_k.parameters.top_k = Some(2);
     assert_eq!(select_next_token(&top_k).unwrap().selected_token_id, 4);
 
+    // repetition_penalty is multiplicative (1.0 is the no-op value), so a
+    // real penalty here needs a value above 1.0: it divides token 4's score
+    // (4.0 -> 2.0), which top_k's cut (run after the penalty, per the
+    // processor_order assertion below) then sees instead of the raw 4.0.
     let mut penalty = request(vec![0.0, 0.1, 0.2, 0.3, 4.0, 3.9, 2.0, 1.0]);
     penalty.token_history = vec![4, 4];
-    penalty.parameters.repetition_penalty = Some(1.0);
+    penalty.parameters.repetition_penalty = Some(2.0);
     penalty.parameters.top_k = Some(2);
     assert_eq!(select_next_token(&penalty).unwrap().selected_token_id, 5);
 
@@ -118,6 +138,62 @@ fn sampling_applies_top_k_top_p_and_penalties_in_stable_order() {
                 .iter()
                 .position(|kind| *kind == LogitsProcessorKind::TopK)
     );
+}
+
+/// #52: `repetition_penalty` is multiplicative (Hugging Face /
+/// `RepetitionPenaltyLogitsProcessor` convention), so `1.0` -- the
+/// conventional "no penalty" value every caller porting a generation
+/// config from another stack will pass -- must leave selection exactly as
+/// if no penalty were configured at all.
+#[test]
+fn sampling_repetition_penalty_of_one_is_a_no_op() {
+    let mut without_penalty = request(vec![0.0, 1.0, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    without_penalty.token_history = vec![1];
+    let baseline = select_next_token(&without_penalty)
+        .unwrap()
+        .selected_token_id;
+
+    let mut with_penalty = request(vec![0.0, 1.0, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    with_penalty.token_history = vec![1];
+    with_penalty.parameters.repetition_penalty = Some(1.0);
+    let penalized = select_next_token(&with_penalty).unwrap().selected_token_id;
+
+    assert_eq!(baseline, penalized);
+}
+
+/// A real (non-1.0) `repetition_penalty` still changes selection --
+/// distinguishing this from a test that would pass merely because the
+/// parameter is never read.
+#[test]
+fn sampling_repetition_penalty_above_one_discourages_a_repeated_token() {
+    let mut request = request(vec![0.0, 1.0, 0.0, 0.0, 0.9, 0.0, 0.0, 0.0]);
+    request.token_history = vec![1];
+    request.parameters.repetition_penalty = Some(2.0);
+
+    // token 1 (score 1.0, repeated) is penalized to 0.5, so token 4 (score
+    // 0.9) becomes the greedy selection instead.
+    assert_eq!(select_next_token(&request).unwrap().selected_token_id, 4);
+}
+
+/// `repetition_penalty` (multiplicative) and `presence_penalty` (additive)
+/// must remain distinct operations, not collapse into the same subtraction
+/// (#52): for a large repeated-token score, dividing it down (repetition)
+/// and subtracting a flat amount from it (presence) disagree on which
+/// token ends up selected, even for the identical penalty value.
+#[test]
+fn sampling_repetition_penalty_and_presence_penalty_are_not_the_same_operation() {
+    let mut repetition = request(vec![0.0, 100.0, 0.0, 0.0, 60.0, 0.0, 0.0, 0.0]);
+    repetition.token_history = vec![1];
+    repetition.parameters.repetition_penalty = Some(2.0);
+    // 100.0 / 2.0 = 50.0, now below token 4's 60.0: the repeated token loses.
+    assert_eq!(select_next_token(&repetition).unwrap().selected_token_id, 4);
+
+    let mut presence = request(vec![0.0, 100.0, 0.0, 0.0, 60.0, 0.0, 0.0, 0.0]);
+    presence.token_history = vec![1];
+    presence.parameters.presence_penalty = Some(2.0);
+    // 100.0 - 2.0 = 98.0, still well above token 4's 60.0: the same
+    // penalty value, applied additively, does not flip the outcome.
+    assert_eq!(select_next_token(&presence).unwrap().selected_token_id, 1);
 }
 
 #[test]

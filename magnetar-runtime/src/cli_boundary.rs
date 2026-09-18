@@ -258,3 +258,6 @@ pub fn run_cli_boundary_conformance() -> CliBoundaryConformanceReport {
 
     CliBoundaryConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;

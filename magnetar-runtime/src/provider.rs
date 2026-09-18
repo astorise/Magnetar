@@ -1873,3 +1873,6 @@ impl From<ProviderError> for ComputeError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

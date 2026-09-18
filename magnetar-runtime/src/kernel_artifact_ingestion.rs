@@ -3080,3 +3080,6 @@ pub fn run_kernel_artifact_ingestion_conformance() -> KernelIngestionConformance
 
     KernelIngestionConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;

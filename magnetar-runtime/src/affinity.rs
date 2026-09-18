@@ -1303,3 +1303,6 @@ impl<'a> AffinityResolution<'a> {
         self.affinity
     }
 }
+
+#[cfg(test)]
+mod tests;

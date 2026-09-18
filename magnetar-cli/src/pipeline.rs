@@ -346,6 +346,43 @@ mod tests {
         tokenize_prompt_input, unload_model_instance,
     };
 
+    /// #65: this crate's own bundled `qwen-real.component.wasm` (loaded
+    /// above via `include_bytes!` -- see [`QWEN_COMPONENT_BYTES`]'s doc
+    /// comment for why this crate deliberately embeds its own copy rather
+    /// than reaching into `magnetar-runtime`'s test-fixture directory) is
+    /// checked in a second time, byte-identical today, at
+    /// `magnetar-runtime/fixtures/components/qwen-real.component.wasm`
+    /// (that copy backs `magnetar-runtime`'s own `#[cfg(test)]` oracle plus
+    /// `inference-components`'/the integration-test crates' fixtures).
+    /// Nothing previously compared the two: a regeneration that updated one
+    /// copy and missed the other would still likely surface eventually
+    /// (Runtime's own `QWEN_REAL_COMPONENT_DIGEST` pin rejects a
+    /// mismatched artifact at generation time -- see
+    /// `first_native_runtime.rs`), but only once a generation test
+    /// happened to exercise the stale copy, with a `DigestMismatch` error
+    /// that does not by itself say "these two checked-in files drifted
+    /// apart". This test makes that specific failure mode immediate and
+    /// explicit.
+    #[test]
+    fn bundled_qwen_component_matches_the_magnetar_runtime_fixture_copy() {
+        const RUNTIME_FIXTURE_COMPONENT_BYTES: &[u8] =
+            include_bytes!("../../magnetar-runtime/fixtures/components/qwen-real.component.wasm");
+        const RUNTIME_FIXTURE_MANIFEST_BYTES: &[u8] = include_bytes!(
+            "../../magnetar-runtime/fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"
+        );
+        assert_eq!(
+            QWEN_COMPONENT_BYTES, RUNTIME_FIXTURE_COMPONENT_BYTES,
+            "magnetar-cli's bundled qwen-real.component.wasm no longer matches \
+             magnetar-runtime's fixture copy of the same artifact -- regenerate both together"
+        );
+        assert_eq!(
+            QWEN_COMPONENT_MANIFEST_BYTES, RUNTIME_FIXTURE_MANIFEST_BYTES,
+            "magnetar-cli's bundled qwen-real.component.wasm.magnetar-component.yaml no longer \
+             matches magnetar-runtime's fixture copy of the same manifest -- regenerate both \
+             together"
+        );
+    }
+
     #[test]
     fn one_shot_pipeline_uses_native_fixture_generation() {
         let model_ref = ModelRef::new("qwen-test").unwrap();

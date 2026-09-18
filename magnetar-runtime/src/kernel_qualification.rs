@@ -1730,3 +1730,6 @@ pub fn run_kernel_qualification_conformance() -> KernelQualificationConformanceR
 
     KernelQualificationConformanceReport { results }
 }
+
+#[cfg(test)]
+mod tests;

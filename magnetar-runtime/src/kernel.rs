@@ -1261,3 +1261,6 @@ impl fmt::Display for KernelError {
 }
 
 impl Error for KernelError {}
+
+#[cfg(test)]
+mod tests;

@@ -15,9 +15,19 @@
 use magnetar_runtime::CliBoundaryError;
 
 /// CLI-owned process execution policy (§13/§21 "Keep tool policy in CLI").
-/// Deny by default: a process only runs when both this policy allows it and
-/// the caller explicitly requests it (see `commands::cmd_run`'s `--tool`
-/// flag and `config::CliConfig::tool_policy`).
+/// A process only ever runs when both this policy allows it and the caller
+/// explicitly requests it (see `commands::cmd_run`'s `--tool` flag and
+/// `config::CliConfig::tool_policy`) -- a flag alone is never sufficient.
+///
+/// This type's own [`Default`] is [`Self::Deny`], but that is not what
+/// ships: [`crate::config::CliConfig::default`] sets `tool_policy` to
+/// [`Self::AllowExplicit`], so `--tool` works out of the box today (see
+/// that type's doc comment for why, and #55 for the discrepancy between
+/// this comment's previous "deny by default" framing and the actually
+/// shipped, permissive default). `Self::Deny` is real and reachable --
+/// once a persistent configuration mechanism exists, setting it there
+/// disables `--tool` regardless of the flag -- it is simply not selected
+/// by anything today.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ProcessPolicy {
     #[default]

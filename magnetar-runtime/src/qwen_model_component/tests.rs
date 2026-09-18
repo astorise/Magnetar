@@ -11,6 +11,663 @@ use crate::{
     ModelQuantizationPolicy, ModelRevision, ModelTrustDecision, ModelTrustStatus, ResourceAffinity,
     TokenizerId,
 };
+use crate::{
+    ExecutionGraphId, ExecutionGraphProducer, GraphKvCacheBehavior, GraphKvCacheMetadata,
+    GraphModelCompatibility, GraphProductionResult, LayoutDescriptor, ShapeDescriptor,
+    TensorAliasing, default_graph_catalog, validate_first_scope_graph,
+};
+
+fn f32_edge(id: impl Into<String>, dims: Vec<u64>) -> TensorEdge {
+    let id = TensorEdgeId::new(id);
+    TensorEdge::new(
+        id,
+        TensorDescriptor::new(
+            ShapeDescriptor::new(dims),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+            LayoutDescriptor::Contiguous,
+        ),
+    )
+}
+fn token_id_edge(id: impl Into<String>, dims: Vec<u64>) -> TensorEdge {
+    let id = TensorEdgeId::new(id);
+    TensorEdge::new(
+        id,
+        TensorDescriptor::new(
+            ShapeDescriptor::new(dims),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+            LayoutDescriptor::Contiguous,
+        ),
+    )
+}
+/// Build the `weight.lm_head` edge. When the baseline uses tied embeddings,
+/// this logical tensor is declared with [`TensorAliasing::MayAlias`] pointing
+/// at `weight.token_embedding`, recording that it shares storage rather than
+/// silently duplicating it; when untied it is an independent tensor.
+fn qwen_lm_head_weight_edge(config: &QwenConfig) -> TensorEdge {
+    let a = &config.architecture;
+    let mut edge = f32_edge("weight.lm_head", vec![a.hidden_size, a.vocabulary_size]);
+    if config.tied_embeddings {
+        edge.aliasing = TensorAliasing::MayAlias(TensorEdgeId::new("weight.token_embedding"));
+    }
+    edge
+}
+/// Build a Qwen prefill or decode Execution Graph: embedding, `layer_count`
+/// repeated pre-norm decoder layers (RMSNorm, QKV matmul, RoPE, attention,
+/// output projection, residual-add, RMSNorm, gated MLP, residual-add), a
+/// final RMSNorm, and an `lm_head` logits projection. Every node uses a
+/// required-now Operator.
+///
+/// Test-oracle only (Correctif 9 / `reach-architecture-freeze-1` task 12.6):
+/// production first-native generation never calls this -- the real Qwen
+/// WASM Component is the sole production source of graph semantics. This
+/// Rust implementation survives only to be compared against the real
+/// Component's output in tests, proving the two agree numerically, and as
+/// a conformance fixture for this module's own tests.
+pub fn qwen_build_graph(
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+    phase: ExecutionGraphPhase,
+    sequence_length: u64,
+    kv_cache_enabled: bool,
+    position_offset: u64,
+) -> Result<ExecutionGraph, QwenComponentError> {
+    if sequence_length == 0 {
+        return Err(QwenComponentError::GraphProductionFailed {
+            reason: "sequence length must be positive".into(),
+        });
+    }
+    let a = &config.architecture;
+    let q_dim = a.attention_head_count * a.head_dimension;
+    let kv_dim = a.kv_head_count * a.head_dimension;
+
+    let mut graph = ExecutionGraph::new(
+        ExecutionGraphId::new(format!(
+            "qwen-{phase:?}-{}-{}",
+            identity.id, identity.version.0
+        )),
+        phase,
+    )
+    .with_producer(ExecutionGraphProducer::ModelComponent {
+        component_id: identity.id.as_str().into(),
+    });
+    graph.model = GraphModelCompatibility {
+        model_instance_id: None,
+        architecture: Some(QWEN_ARCHITECTURE_FAMILY.into()),
+        tokenizer_dependency: None,
+    };
+    graph.fingerprint = Some(qwen_component_compatibility_key(identity));
+
+    graph = graph
+        .with_edge(token_id_edge("input.token_ids", vec![sequence_length]))
+        .with_edge(f32_edge(
+            "weight.token_embedding",
+            vec![a.vocabulary_size, a.hidden_size],
+        ))
+        .with_edge(f32_edge("hidden.0", vec![sequence_length, a.hidden_size]))
+        .with_node(
+            op_node("embedding", "embedding", OperatorFamily::Tensor)
+                .with_input(TensorEdgeId::new("input.token_ids"))
+                .with_input(TensorEdgeId::new("weight.token_embedding"))
+                .with_output(TensorEdgeId::new("hidden.0")),
+        );
+
+    let mut hidden_edge = "hidden.0".to_string();
+    let kv_behavior = match phase {
+        ExecutionGraphPhase::Decode => GraphKvCacheBehavior::Append,
+        _ => GraphKvCacheBehavior::Output,
+    };
+
+    for layer in 0..a.layer_count {
+        let prefix = format!("layer{layer}");
+        let residual_in = hidden_edge.clone();
+
+        let normed = format!("{prefix}.normed");
+        graph = graph
+            .with_edge(f32_edge(
+                format!("weight.layers.{layer}.input_norm"),
+                vec![a.hidden_size],
+            ))
+            .with_edge(f32_edge(
+                normed.clone(),
+                vec![sequence_length, a.hidden_size],
+            ))
+            .with_node(
+                op_node(
+                    format!("{prefix}.input_norm"),
+                    "rmsnorm",
+                    OperatorFamily::Normalization,
+                )
+                .with_input(TensorEdgeId::new(residual_in.clone()))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.input_norm"
+                )))
+                .with_output(TensorEdgeId::new(normed.clone()))
+                .with_attribute(
+                    "epsilon",
+                    OperatorAttributeValue::Float(config.rmsnorm_epsilon as f64),
+                ),
+            );
+
+        let q = format!("{prefix}.q");
+        let k = format!("{prefix}.k");
+        let v = format!("{prefix}.v");
+        graph = graph
+            .with_edge(f32_edge(
+                format!("weight.layers.{layer}.self_attn.q_proj"),
+                vec![a.hidden_size, q_dim],
+            ))
+            .with_edge(f32_edge(q.clone(), vec![sequence_length, q_dim]))
+            .with_node(
+                op_node(
+                    format!("{prefix}.q_proj"),
+                    "matmul",
+                    OperatorFamily::LinearAlgebra,
+                )
+                .with_input(TensorEdgeId::new(normed.clone()))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.self_attn.q_proj"
+                )))
+                .with_output(TensorEdgeId::new(q.clone())),
+            )
+            .with_edge(f32_edge(
+                format!("weight.layers.{layer}.self_attn.k_proj"),
+                vec![a.hidden_size, kv_dim],
+            ))
+            .with_edge(f32_edge(k.clone(), vec![sequence_length, kv_dim]))
+            .with_node(
+                op_node(
+                    format!("{prefix}.k_proj"),
+                    "matmul",
+                    OperatorFamily::LinearAlgebra,
+                )
+                .with_input(TensorEdgeId::new(normed.clone()))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.self_attn.k_proj"
+                )))
+                .with_output(TensorEdgeId::new(k.clone())),
+            )
+            .with_edge(f32_edge(
+                format!("weight.layers.{layer}.self_attn.v_proj"),
+                vec![a.hidden_size, kv_dim],
+            ))
+            .with_edge(f32_edge(v.clone(), vec![sequence_length, kv_dim]))
+            .with_node(
+                op_node(
+                    format!("{prefix}.v_proj"),
+                    "matmul",
+                    OperatorFamily::LinearAlgebra,
+                )
+                .with_input(TensorEdgeId::new(normed.clone()))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.self_attn.v_proj"
+                )))
+                .with_output(TensorEdgeId::new(v.clone())),
+            );
+
+        let q_rope = format!("{prefix}.q_rope");
+        let k_rope = format!("{prefix}.k_rope");
+        graph = graph
+            .with_edge(f32_edge(q_rope.clone(), vec![sequence_length, q_dim]))
+            .with_node(
+                op_node(
+                    format!("{prefix}.rope_q"),
+                    "rope",
+                    OperatorFamily::PositionEncoding,
+                )
+                .with_input(TensorEdgeId::new(q.clone()))
+                .with_output(TensorEdgeId::new(q_rope.clone()))
+                .with_attribute("base", OperatorAttributeValue::Float(config.rope.base))
+                .with_attribute(
+                    "dimension",
+                    OperatorAttributeValue::Integer(config.rope.dimension as i64),
+                )
+                .with_attribute(
+                    "position_mode",
+                    OperatorAttributeValue::String(config.rope.position_mode.as_str().into()),
+                )
+                .with_attribute(
+                    "position_offset",
+                    OperatorAttributeValue::Integer(position_offset as i64),
+                )
+                // `make-first-native-cuda-hot-path-device-resident`:
+                // explicit graph data, not inferred by Runtime from this
+                // node's id -- Q always rotates `attention_head_count`
+                // independent head blocks.
+                .with_attribute(
+                    "head_count",
+                    OperatorAttributeValue::Integer(a.attention_head_count as i64),
+                ),
+            )
+            .with_edge(f32_edge(k_rope.clone(), vec![sequence_length, kv_dim]))
+            .with_node(
+                op_node(
+                    format!("{prefix}.rope_k"),
+                    "rope",
+                    OperatorFamily::PositionEncoding,
+                )
+                .with_input(TensorEdgeId::new(k.clone()))
+                .with_output(TensorEdgeId::new(k_rope.clone()))
+                .with_attribute("base", OperatorAttributeValue::Float(config.rope.base))
+                .with_attribute(
+                    "dimension",
+                    OperatorAttributeValue::Integer(config.rope.dimension as i64),
+                )
+                .with_attribute(
+                    "position_mode",
+                    OperatorAttributeValue::String(config.rope.position_mode.as_str().into()),
+                )
+                .with_attribute(
+                    "position_offset",
+                    OperatorAttributeValue::Integer(position_offset as i64),
+                )
+                // K rotates `kv_head_count` independent head blocks --
+                // may differ from Q's under grouped-query/multi-query
+                // attention (`kv_head_count < attention_head_count`).
+                .with_attribute(
+                    "head_count",
+                    OperatorAttributeValue::Integer(a.kv_head_count as i64),
+                ),
+            );
+
+        if kv_cache_enabled {
+            let cache_metadata = |cache_role: &str| GraphKvCacheMetadata {
+                cache_id: format!("qwen.{prefix}.{cache_role}"),
+                behavior: kv_behavior.clone(),
+                paged: false,
+                compatibility_key: qwen_component_compatibility_key(identity),
+            };
+            if let Some(edge) = graph.edges.get_mut(&TensorEdgeId::new(k_rope.clone())) {
+                edge.kv_cache = Some(cache_metadata("k"));
+            }
+            if let Some(edge) = graph.edges.get_mut(&TensorEdgeId::new(v.clone())) {
+                edge.kv_cache = Some(cache_metadata("v"));
+            }
+        }
+
+        let attn_out = format!("{prefix}.attn_out");
+        graph = graph
+            .with_edge(f32_edge(attn_out.clone(), vec![sequence_length, q_dim]))
+            .with_node(
+                op_node(
+                    format!("{prefix}.attention"),
+                    "attention",
+                    OperatorFamily::Attention,
+                )
+                .with_input(TensorEdgeId::new(q_rope.clone()))
+                .with_input(TensorEdgeId::new(k_rope.clone()))
+                .with_input(TensorEdgeId::new(v.clone()))
+                .with_output(TensorEdgeId::new(attn_out.clone()))
+                .with_attribute("causal", OperatorAttributeValue::Boolean(true))
+                .with_attribute(
+                    "head_count",
+                    OperatorAttributeValue::Integer(a.attention_head_count as i64),
+                )
+                .with_attribute(
+                    "kv_head_count",
+                    OperatorAttributeValue::Integer(a.kv_head_count as i64),
+                )
+                .with_attribute(
+                    "head_dimension",
+                    OperatorAttributeValue::Integer(a.head_dimension as i64),
+                )
+                .with_attribute(
+                    "attention_mask_kind",
+                    OperatorAttributeValue::String("causal".into()),
+                ),
+            );
+
+        let attn_proj = format!("{prefix}.attn_proj");
+        graph = graph
+            .with_edge(f32_edge(
+                format!("weight.layers.{layer}.self_attn.o_proj"),
+                vec![q_dim, a.hidden_size],
+            ))
+            .with_edge(f32_edge(
+                attn_proj.clone(),
+                vec![sequence_length, a.hidden_size],
+            ))
+            .with_node(
+                op_node(
+                    format!("{prefix}.o_proj"),
+                    "matmul",
+                    OperatorFamily::LinearAlgebra,
+                )
+                .with_input(TensorEdgeId::new(attn_out.clone()))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.self_attn.o_proj"
+                )))
+                .with_output(TensorEdgeId::new(attn_proj.clone())),
+            );
+
+        let post_attn = format!("{prefix}.post_attn");
+        graph = graph
+            .with_edge(f32_edge(
+                post_attn.clone(),
+                vec![sequence_length, a.hidden_size],
+            ))
+            .with_node(
+                op_node(
+                    format!("{prefix}.residual1"),
+                    "residual-add",
+                    OperatorFamily::Tensor,
+                )
+                .with_input(TensorEdgeId::new(residual_in.clone()))
+                .with_input(TensorEdgeId::new(attn_proj.clone()))
+                .with_output(TensorEdgeId::new(post_attn.clone())),
+            );
+
+        let mlp_normed = format!("{prefix}.mlp_normed");
+        graph = graph
+            .with_edge(f32_edge(
+                format!("weight.layers.{layer}.post_attn_norm"),
+                vec![a.hidden_size],
+            ))
+            .with_edge(f32_edge(
+                mlp_normed.clone(),
+                vec![sequence_length, a.hidden_size],
+            ))
+            .with_node(
+                op_node(
+                    format!("{prefix}.post_attn_norm"),
+                    "rmsnorm",
+                    OperatorFamily::Normalization,
+                )
+                .with_input(TensorEdgeId::new(post_attn.clone()))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.post_attn_norm"
+                )))
+                .with_output(TensorEdgeId::new(mlp_normed.clone()))
+                .with_attribute(
+                    "epsilon",
+                    OperatorAttributeValue::Float(config.rmsnorm_epsilon as f64),
+                ),
+            );
+
+        let gate_up = format!("{prefix}.gate_up");
+        let gate = format!("{prefix}.gate");
+        let up = format!("{prefix}.up");
+        let activated = format!("{prefix}.activated");
+        let mlp_hidden = format!("{prefix}.mlp_hidden");
+        let mlp_out = format!("{prefix}.mlp_out");
+        graph = graph
+            .with_edge(f32_edge(
+                format!("weight.layers.{layer}.mlp.gate_up_proj"),
+                vec![a.hidden_size, 2 * a.intermediate_size],
+            ))
+            .with_edge(f32_edge(
+                gate_up.clone(),
+                vec![sequence_length, 2 * a.intermediate_size],
+            ))
+            .with_node(
+                op_node(
+                    format!("{prefix}.gate_up_proj"),
+                    "matmul",
+                    OperatorFamily::LinearAlgebra,
+                )
+                .with_input(TensorEdgeId::new(mlp_normed.clone()))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.mlp.gate_up_proj"
+                )))
+                .with_output(TensorEdgeId::new(gate_up.clone())),
+            )
+            // Fused gate/up projection, halved by a genuinely two-output
+            // "split" node (`define-provider-prepared-kernel-execution-
+            // contract` task group 3) rather than two separate matmuls --
+            // a real-world LLM-serving optimization (one larger matmul
+            // instead of two smaller ones), and this recipe's only node
+            // with more than one output edge.
+            .with_edge(f32_edge(
+                gate.clone(),
+                vec![sequence_length, a.intermediate_size],
+            ))
+            .with_edge(f32_edge(
+                up.clone(),
+                vec![sequence_length, a.intermediate_size],
+            ))
+            .with_node(
+                op_node(format!("{prefix}.split"), "split", OperatorFamily::Tensor)
+                    .with_input(TensorEdgeId::new(gate_up.clone()))
+                    .with_output(TensorEdgeId::new(gate.clone()))
+                    .with_output(TensorEdgeId::new(up.clone())),
+            )
+            .with_edge(f32_edge(
+                activated.clone(),
+                vec![sequence_length, a.intermediate_size],
+            ))
+            .with_node(
+                op_node(format!("{prefix}.silu"), "silu", OperatorFamily::Activation)
+                    .with_input(TensorEdgeId::new(gate.clone()))
+                    .with_output(TensorEdgeId::new(activated.clone())),
+            )
+            .with_edge(f32_edge(
+                mlp_hidden.clone(),
+                vec![sequence_length, a.intermediate_size],
+            ))
+            .with_node(
+                op_node(format!("{prefix}.mul"), "mul", OperatorFamily::Tensor)
+                    .with_input(TensorEdgeId::new(activated.clone()))
+                    .with_input(TensorEdgeId::new(up.clone()))
+                    .with_output(TensorEdgeId::new(mlp_hidden.clone())),
+            )
+            .with_edge(f32_edge(
+                format!("weight.layers.{layer}.mlp.down_proj"),
+                vec![a.intermediate_size, a.hidden_size],
+            ))
+            .with_edge(f32_edge(
+                mlp_out.clone(),
+                vec![sequence_length, a.hidden_size],
+            ))
+            .with_node(
+                op_node(
+                    format!("{prefix}.down_proj"),
+                    "matmul",
+                    OperatorFamily::LinearAlgebra,
+                )
+                .with_input(TensorEdgeId::new(mlp_hidden.clone()))
+                .with_input(TensorEdgeId::new(format!(
+                    "weight.layers.{layer}.mlp.down_proj"
+                )))
+                .with_output(TensorEdgeId::new(mlp_out.clone())),
+            );
+
+        let layer_out = format!("{prefix}.out");
+        graph = graph
+            .with_edge(f32_edge(
+                layer_out.clone(),
+                vec![sequence_length, a.hidden_size],
+            ))
+            .with_node(
+                op_node(
+                    format!("{prefix}.residual2"),
+                    "residual-add",
+                    OperatorFamily::Tensor,
+                )
+                .with_input(TensorEdgeId::new(post_attn.clone()))
+                .with_input(TensorEdgeId::new(mlp_out.clone()))
+                .with_output(TensorEdgeId::new(layer_out.clone())),
+            );
+
+        hidden_edge = layer_out;
+    }
+
+    graph = graph
+        .with_edge(f32_edge("weight.final_norm", vec![a.hidden_size]))
+        .with_edge(f32_edge(
+            "hidden.final",
+            vec![sequence_length, a.hidden_size],
+        ))
+        .with_node(
+            op_node("final_norm", "rmsnorm", OperatorFamily::Normalization)
+                .with_input(TensorEdgeId::new(hidden_edge.clone()))
+                .with_input(TensorEdgeId::new("weight.final_norm"))
+                .with_output(TensorEdgeId::new("hidden.final"))
+                .with_attribute(
+                    "epsilon",
+                    OperatorAttributeValue::Float(config.rmsnorm_epsilon as f64),
+                ),
+        )
+        .with_edge(qwen_lm_head_weight_edge(config))
+        .with_edge(f32_edge("logits", vec![sequence_length, a.vocabulary_size]))
+        .with_node(
+            op_node("lm_head", "matmul", OperatorFamily::LinearAlgebra)
+                .with_input(TensorEdgeId::new("hidden.final"))
+                .with_input(TensorEdgeId::new("weight.lm_head"))
+                .with_output(TensorEdgeId::new("logits")),
+        );
+
+    Ok(graph)
+}
+/// Produce a validated Qwen prefill Execution Graph for `prompt_length`
+/// tokens.
+///
+/// Test-oracle only -- see [`qwen_build_graph`]'s doc comment.
+pub fn qwen_prefill_graph(
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+    prompt_length: u64,
+    kv_cache_enabled: bool,
+) -> Result<GraphProductionResult, QwenComponentError> {
+    let graph = qwen_build_graph(
+        config,
+        identity,
+        ExecutionGraphPhase::Prefill,
+        prompt_length,
+        kv_cache_enabled,
+        // A prefill starts the sequence, so its first row is position zero.
+        0,
+    )?;
+    validate_first_scope_graph(&graph)?;
+    GraphProductionResult::validated(graph, &identity.id, &default_graph_catalog())
+        .map_err(QwenComponentError::from)
+}
+
+/// Produce a validated Qwen decode Execution Graph for a single new token,
+/// consuming prior KV cache.
+///
+/// `cached_token_count` is how many tokens the KV cache already holds, which
+/// is the absolute position of the token being generated. It is required
+/// rather than defaulted: a decode graph built as if the new token were at
+/// position zero produces wrong rotations for every token after the first, and
+/// does so silently.
+///
+/// Test-oracle only -- see [`qwen_build_graph`]'s doc comment.
+pub fn qwen_decode_graph(
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+    cached_token_count: u64,
+) -> Result<GraphProductionResult, QwenComponentError> {
+    let graph = qwen_build_graph(
+        config,
+        identity,
+        ExecutionGraphPhase::Decode,
+        1,
+        true,
+        cached_token_count,
+    )?;
+    validate_first_scope_graph(&graph)?;
+    GraphProductionResult::validated(graph, &identity.id, &default_graph_catalog())
+        .map_err(QwenComponentError::from)
+}
+// ---------------------------------------------------------------------------
+// Conformance report
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QwenConformanceCheck {
+    pub name: &'static str,
+    pub passed: bool,
+    pub detail: Option<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QwenConformanceReport {
+    pub checks: Vec<QwenConformanceCheck>,
+}
+impl QwenConformanceReport {
+    pub fn is_conformant(&self) -> bool {
+        self.checks.iter().all(|check| check.passed)
+    }
+}
+/// Run the Qwen baseline's runnable conformance fixtures against `config`
+/// and `identity`, producing a report. See [`qwen_conformance_fixture_names`]
+/// for the full named fixture set this baseline SHALL cover; some fixtures
+/// (e.g. authority denial) are covered by dedicated unit tests rather than
+/// this data-driven report.
+pub fn qwen_conformance_report(
+    config: &QwenConfig,
+    identity: &ModelComponentIdentity,
+) -> QwenConformanceReport {
+    let mut checks = Vec::new();
+
+    let valid = config.validate(identity);
+    checks.push(QwenConformanceCheck {
+        name: "valid-minimal-config",
+        passed: valid.is_ok(),
+        detail: valid.err().map(|error| error.to_string()),
+    });
+
+    let mut invalid_family_architecture = config.architecture.clone();
+    invalid_family_architecture.family = "not-qwen".into();
+    let invalid_family_result =
+        QwenConfig::new(invalid_family_architecture, config.rope.clone()).validate(identity);
+    checks.push(QwenConformanceCheck {
+        name: "invalid-architecture-family",
+        passed: matches!(
+            invalid_family_result,
+            Err(QwenComponentError::ArchitectureUnsupported)
+        ),
+        detail: invalid_family_result.err().map(|error| error.to_string()),
+    });
+
+    let scope_result =
+        validate_model_component_first_scope_requirements(&qwen_operator_requirements())
+            .map_err(QwenComponentError::from);
+    checks.push(QwenConformanceCheck {
+        name: "required-operator-scope-validation",
+        passed: scope_result.is_ok(),
+        detail: scope_result.err().map(|error| error.to_string()),
+    });
+
+    let prefill_result = qwen_prefill_graph(config, identity, 4, true);
+    checks.push(QwenConformanceCheck {
+        name: "prefill-graph-production",
+        passed: prefill_result.is_ok(),
+        detail: prefill_result.err().map(|error| error.to_string()),
+    });
+
+    // Decode the 5th token, i.e. against the 4 tokens the prefill above cached,
+    // so the check exercises a non-zero position rather than the degenerate
+    // first-token case.
+    let decode_result = qwen_decode_graph(config, identity, 4);
+    checks.push(QwenConformanceCheck {
+        name: "decode-graph-production",
+        passed: decode_result.is_ok(),
+        detail: decode_result.err().map(|error| error.to_string()),
+    });
+
+    checks.push(QwenConformanceCheck {
+        name: "unsupported-quantization-rejection",
+        passed: qwen_quantization_compatibility()
+            .supported_methods
+            .is_empty(),
+        detail: None,
+    });
+
+    checks.push(QwenConformanceCheck {
+        name: "authority-denial",
+        passed: crate::validate_model_component_authority(["network"]).is_err()
+            && !qwen_authority().is_empty(),
+        detail: None,
+    });
+
+    checks.push(QwenConformanceCheck {
+        name: "target-module-exposure",
+        passed: qwen_target_modules().len() == QWEN_TARGET_MODULE_ROLES.len(),
+        detail: None,
+    });
+
+    QwenConformanceReport { checks }
+}
+
 use std::collections::BTreeMap;
 
 fn small_architecture() -> ModelComponentArchitectureMetadata {

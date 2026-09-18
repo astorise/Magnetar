@@ -6,6 +6,7 @@
 use super::*;
 use crate::{ShapeDescriptor, TensorDescriptor};
 
+use crate::compute::LayoutDescriptor;
 #[test]
 fn operator_catalog_contains_required_families_and_initial_operators() {
     let families = OperatorFamily::ALL
@@ -193,4 +194,37 @@ fn concat_shape_rule_accepts_additive_rows_and_rejects_column_mismatch() {
         ),
         Err(OperatorError::ShapeMismatch { .. })
     ));
+}
+
+#[test]
+fn operator_layout_kind_maps_every_layout_descriptor_variant() {
+    assert_eq!(
+        layout_kind(&LayoutDescriptor::Blocked {
+            block_dimensions: vec![4],
+        }),
+        TensorLayoutKind::Blocked
+    );
+    assert_eq!(
+        layout_kind(&LayoutDescriptor::Paged {
+            page_size_elements: 16,
+            block_size_elements: 4,
+            capacity_pages: None,
+            current_length_elements: None,
+            logical_to_physical: None,
+            append_behavior: None,
+        }),
+        TensorLayoutKind::Paged
+    );
+    assert_eq!(
+        layout_kind(&LayoutDescriptor::PackedQuantized {
+            method: "int4".into(),
+            bits_per_value: 4,
+            group_size: None,
+            scale_dtype: None,
+            zero_point_dtype: None,
+            packing_order: None,
+            dequantization_requirements: None,
+        }),
+        TensorLayoutKind::QuantizedPacked
+    );
 }

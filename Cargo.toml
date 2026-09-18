@@ -10,5 +10,14 @@
 # its own `[workspace]` table for exactly this reason (the same pattern
 # `integration-tests/cuda-first-native` already uses) and is built via its
 # own `--manifest-path`, not `--workspace` here.
-members = ["magnetar-runtime"]
+#
+# `tools/coverage-ratchet` has none of that: no submodule dependency, so
+# the reason above does not apply to it -- it previously declared its own
+# `[workspace]` table anyway, which meant `cargo fmt`/`clippy -D warnings`/
+# `test` at the repository root never covered the one tool that gates every
+# other change's coverage (#60). Folded in here instead.
+#
+# `roadmap-contracts` also has none of that: it depends on magnetar-runtime
+# only (#62), so it belongs here for the same reason.
+members = ["magnetar-runtime", "tools/coverage-ratchet", "roadmap-contracts"]
 resolver = "2"

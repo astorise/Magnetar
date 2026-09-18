@@ -3022,3 +3022,6 @@ impl From<BatchingError> for InferenceApiError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

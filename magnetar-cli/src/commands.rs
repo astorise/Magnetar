@@ -22,30 +22,48 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use magnetar_loader_huggingface::HuggingFaceIngestor;
+use magnetar_roadmap_contracts::release_packaging::{
+    ReleaseVersion, build_release_binary_version_report,
+};
 use magnetar_runtime::{
     CliBoundaryError, InferenceApiError, ModelArtifactSource, ModelInstanceId,
     ModelInstanceUnloadPolicy, ModelLoadingApiRequest, ModelLoadingCoordinator,
     ModelLoadingRequest, ModelLoadingRequestId, ModelRef, ModelRegistry, ModelResolutionRequest,
-    ProductionModelArtifactIngestor, ProductionModelSource, ReferenceCpuProvider, ReleaseVersion,
-    Runtime, build_release_binary_version_report, load_model, load_production_qwen_instance,
-    unload_model_instance,
+    ProductionModelArtifactIngestor, ProductionModelSource, ReferenceCpuProvider, Runtime,
+    load_model, load_production_qwen_instance, unload_model_instance,
 };
 
 use crate::observability::{CliObservationKind, CliObserver};
 use crate::{agent, aliases, config, network, pipeline, render, secrets, serve, tools};
 
-pub fn dispatch(args: &[String]) -> Result<(), CliBoundaryError> {
-    // `-v`/`--verbose` is a global flag: recognized anywhere in `args`,
-    // stripped before subcommand parsing, and controls only whether a
-    // one-line CLI observability summary (counts only, see
-    // `observability.rs`'s redaction guarantee) is printed at the end.
-    // Default output is unchanged when it is absent.
-    let verbose = args.iter().any(|arg| arg == "--verbose" || arg == "-v");
-    let filtered: Vec<String> = args
+/// Splits a global `-v`/`--verbose` flag out of `args`, returning whether it
+/// was present and the remaining arguments with it removed. Recognizes the
+/// flag anywhere *before* a bare `--`, but never after: `run` and `agent`
+/// both treat `--` as ending their own flag parsing so a prompt/goal word
+/// that genuinely starts with `--verbose` can still be passed through (see
+/// `parse_run_flags`, `cmd_agent`) -- scanning past that same `--` would let
+/// this global flag shadow that convention by consuming a literal
+/// `--verbose` meant as positional text.
+fn split_global_verbose_flag(args: &[String]) -> (bool, Vec<String>) {
+    let split_at = args.iter().position(|arg| arg == "--");
+    let (scanned, passthrough) = match split_at {
+        Some(idx) => args.split_at(idx),
+        None => (args, [].as_slice()),
+    };
+    let verbose = scanned.iter().any(|arg| arg == "--verbose" || arg == "-v");
+    let filtered = scanned
         .iter()
         .filter(|arg| arg.as_str() != "--verbose" && arg.as_str() != "-v")
         .cloned()
+        .chain(passthrough.iter().cloned())
         .collect();
+    (verbose, filtered)
+}
+
+pub fn dispatch(args: &[String]) -> Result<(), CliBoundaryError> {
+    // Default output is unchanged when `--verbose`/`-v` is absent; see
+    // `split_global_verbose_flag`'s doc comment for the flag's exact scope.
+    let (verbose, filtered) = split_global_verbose_flag(args);
 
     let mut observer = CliObserver::new();
     observer.observe(
@@ -111,7 +129,7 @@ pub fn dispatch(args: &[String]) -> Result<(), CliBoundaryError> {
 /// change proposal's "Workspace And File Access" / "Git Access" / "Network
 /// Access" / "Tool Execution" / "Secret Access" sections ("MAY access ...
 /// where explicitly requested").
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct RunFlags {
     file: Option<String>,
     git_diff: bool,
@@ -121,25 +139,64 @@ struct RunFlags {
     env_secret: Option<String>,
 }
 
+/// Reads the value following a value-taking flag, or a structured
+/// [`CliBoundaryError::CliCommandInvalid`] when the flag is the last
+/// argument (#56: previously `iter.next()` was assigned straight into the
+/// `Option` field, so a flag given with no value was silently dropped --
+/// `magnetar run qwen-test --file` ran with no file context and printed
+/// nothing to say the flag had been ignored). Mirrors the
+/// `ok_or_else(...)` pattern `cmd_agent`'s own `--steps` handling already
+/// uses.
+fn require_flag_value(
+    flag: &str,
+    iter: &mut impl Iterator<Item = String>,
+) -> Result<String, CliBoundaryError> {
+    iter.next()
+        .ok_or_else(|| CliBoundaryError::CliCommandInvalid {
+            reason: format!("{flag} requires a value"),
+        })
+}
+
 /// Splits `args` into recognized [`RunFlags`] and the remaining positional
 /// arguments (model reference + prompt words), preserving relative order.
 /// Pure CLI-side argument parsing; never touches Runtime.
-fn parse_run_flags(args: &[String]) -> (RunFlags, Vec<String>) {
+///
+/// A recognized flag with no following value, or an unrecognized
+/// `--`-prefixed argument, is rejected with [`CliBoundaryError::CliCommandInvalid`]
+/// rather than silently folded into the positional/prompt words (#56) --
+/// `--` ends flag parsing, so a prompt that genuinely needs to start with a
+/// word like `--verbose` can still be passed after it.
+fn parse_run_flags(args: &[String]) -> Result<(RunFlags, Vec<String>), CliBoundaryError> {
     let mut flags = RunFlags::default();
     let mut rest = Vec::new();
     let mut iter = args.iter().cloned();
+    let mut end_of_flags = false;
     while let Some(arg) = iter.next() {
+        if end_of_flags {
+            rest.push(arg);
+            continue;
+        }
         match arg.as_str() {
-            "--file" => flags.file = iter.next(),
+            "--" => end_of_flags = true,
+            "--file" => flags.file = Some(require_flag_value("--file", &mut iter)?),
             "--git-diff" => flags.git_diff = true,
             "--workspace" => flags.workspace = true,
-            "--url" => flags.url = iter.next(),
-            "--tool" => flags.tool = iter.next(),
-            "--env-secret" => flags.env_secret = iter.next(),
+            "--url" => flags.url = Some(require_flag_value("--url", &mut iter)?),
+            "--tool" => flags.tool = Some(require_flag_value("--tool", &mut iter)?),
+            "--env-secret" => {
+                flags.env_secret = Some(require_flag_value("--env-secret", &mut iter)?)
+            }
+            other if other.starts_with("--") => {
+                return Err(CliBoundaryError::CliCommandInvalid {
+                    reason: format!(
+                        "unrecognized flag '{other}'; pass -- before a prompt word that starts with --"
+                    ),
+                });
+            }
             _ => rest.push(arg),
         }
     }
-    (flags, rest)
+    Ok((flags, rest))
 }
 
 /// Collects a shallow CLI-owned "workspace context" snapshot: the current
@@ -225,13 +282,20 @@ const RUN_USAGE: &str = "usage: magnetar run <model-ref> [--file <path>] [--git-
 /// assemble prompt context here in the CLI, then hand off to the Runtime
 /// Inference API for everything inference-scoped.
 fn cmd_run(args: &[String], observer: &mut CliObserver) -> Result<(), CliBoundaryError> {
-    let (flags, rest) = parse_run_flags(args);
+    let (flags, rest) = parse_run_flags(args)?;
     let config = config::CliConfig::default();
 
     // Model reference resolution: positional arg 0 if present, else CLI
-    // config's default alias (§21 "Keep default model alias in CLI" --
-    // inert today since `CliConfig::default()` always has `None` here, see
-    // `config.rs`'s doc comment and tests).
+    // config's default alias (§21 "Keep default model alias in CLI").
+    // Structurally unreachable for `run` specifically, independent of
+    // `CliConfig::default()` always having `None` here (see `config.rs`'s
+    // doc comment): `run` takes both a model ref *and* mandatory prompt
+    // text from the same positional slot pool, so falling back to a
+    // configured default alias only happens when `rest` is empty -- and an
+    // empty `rest` has no prompt words left either, which the check right
+    // below always rejects. `cmd_chat` has no such conflict (its one
+    // positional slot is the model ref and nothing else) and is this
+    // mechanism's one real, reachable caller (#56).
     let (model_ref_arg, prompt_words) = match rest.split_first() {
         Some((first, remainder)) => (first.clone(), remainder.to_vec()),
         None => match config::resolve_model_ref_arg(&rest, &config) {
@@ -366,7 +430,18 @@ fn cmd_run(args: &[String], observer: &mut CliObserver) -> Result<(), CliBoundar
 /// `pipeline::ChatSession::turn` (and from there into the Runtime
 /// Inference API).
 fn cmd_chat(args: &[String], observer: &mut CliObserver) -> Result<(), CliBoundaryError> {
-    let Some(model_ref_arg) = args.first() else {
+    // §21 "Keep default model alias in CLI": unlike `cmd_run` (whose
+    // positional model-ref slot is ambiguous with the start of its
+    // mandatory prompt text, so its own default-alias fallback is
+    // structurally unreachable -- see that call site's comment), `chat`
+    // takes no prompt argument at all, so its single positional slot can
+    // unambiguously fall back to `config.default_model_alias` when absent.
+    // This is the one real caller `config.rs`'s own module doc comment
+    // names -- previously it named this function but nothing here actually
+    // called `resolve_model_ref_arg` (#56).
+    let config = config::CliConfig::default();
+    let positional_args: Vec<String> = args.first().into_iter().cloned().collect();
+    let Some(model_ref_arg) = config::resolve_model_ref_arg(&positional_args, &config) else {
         return Err(CliBoundaryError::CliCommandInvalid {
             reason: "usage: magnetar chat <model-ref>".into(),
         });
@@ -497,22 +572,33 @@ fn cmd_agent(args: &[String], observer: &mut CliObserver) -> Result<(), CliBound
     let mut write: Option<String> = None;
     let mut rest = Vec::new();
     let mut iter = args.iter().cloned();
+    let mut end_of_flags = false;
     while let Some(arg) = iter.next() {
+        if end_of_flags {
+            rest.push(arg);
+            continue;
+        }
         match arg.as_str() {
+            "--" => end_of_flags = true,
             "--steps" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| CliBoundaryError::CliCommandInvalid {
-                        reason: AGENT_USAGE.into(),
-                    })?;
+                let value = require_flag_value("--steps", &mut iter)?;
                 steps = value
                     .parse()
                     .map_err(|_| CliBoundaryError::CliCommandInvalid {
                         reason: format!("invalid --steps value '{value}'"),
                     })?;
             }
-            "--tool" => tool = iter.next(),
-            "--write" => write = iter.next(),
+            // #56: previously `iter.next()` assigned directly, silently
+            // dropping the flag when it was the last argument.
+            "--tool" => tool = Some(require_flag_value("--tool", &mut iter)?),
+            "--write" => write = Some(require_flag_value("--write", &mut iter)?),
+            other if other.starts_with("--") => {
+                return Err(CliBoundaryError::CliCommandInvalid {
+                    reason: format!(
+                        "unrecognized flag '{other}'; pass -- before a goal word that starts with --"
+                    ),
+                });
+            }
             _ => rest.push(arg),
         }
     }
@@ -535,8 +621,18 @@ fn cmd_agent(args: &[String], observer: &mut CliObserver) -> Result<(), CliBound
         CliObservationKind::RuntimeRequestSubmitted,
         "agent: starting agent loop",
     );
-    let options = agent::AgentOptions { steps, tool, write };
-    agent::run_agent_loop(&model_ref, &goal, &options)?;
+    // §13/§21: `tool_policy`/`write_policy` come from CLI config, exactly as
+    // `cmd_run` threads `config.tool_policy` into its own `--tool` handling
+    // -- a flag alone is not sufficient for either capability (#53).
+    let config = config::CliConfig::default();
+    let options = agent::AgentOptions {
+        steps,
+        tool,
+        write,
+        tool_policy: config.tool_policy,
+        write_policy: config.write_policy,
+    };
+    agent::run_agent_loop(&model_ref, &goal, &options, observer)?;
     Ok(())
 }
 
@@ -855,7 +951,7 @@ fn cmd_devices() -> Result<(), CliBoundaryError> {
 
 /// `magnetar version` / `magnetar --version` / `magnetar -V`. Builds and
 /// prints the release binary version report defined by
-/// `magnetar_runtime::release_packaging::build_release_binary_version_report`
+/// `magnetar_roadmap_contracts::release_packaging::build_release_binary_version_report`
 /// (see `openspec/changes/define-release-packaging-and-versioning-policy`).
 /// `magnetar-cli`'s own crate version (`env!("CARGO_PKG_VERSION")`) is the
 /// binary version; the build profile is derived from `debug_assertions`
@@ -956,7 +1052,7 @@ mod tests {
             "prompt".to_string(),
             "words".to_string(),
         ];
-        let (flags, rest) = parse_run_flags(&args);
+        let (flags, rest) = parse_run_flags(&args).unwrap();
         assert_eq!(flags.file.as_deref(), Some("notes.txt"));
         assert!(flags.git_diff);
         assert_eq!(flags.env_secret.as_deref(), Some("MY_SECRET"));
@@ -973,11 +1069,90 @@ mod tests {
     #[test]
     fn parse_run_flags_with_no_flags_returns_all_args_as_positional() {
         let args = vec!["model-ref".to_string(), "hello".to_string()];
-        let (flags, rest) = parse_run_flags(&args);
+        let (flags, rest) = parse_run_flags(&args).unwrap();
         assert!(flags.file.is_none());
         assert!(!flags.git_diff);
         assert!(flags.env_secret.is_none());
         assert_eq!(rest, args);
+    }
+
+    #[test]
+    fn split_global_verbose_flag_recognizes_verbose_before_any_dashdash() {
+        let args = vec![
+            "run".to_string(),
+            "--verbose".to_string(),
+            "model-ref".to_string(),
+        ];
+        let (verbose, filtered) = split_global_verbose_flag(&args);
+        assert!(verbose);
+        assert_eq!(filtered, vec!["run".to_string(), "model-ref".to_string()]);
+    }
+
+    /// A Codex review finding on this PR: `dispatch`'s global `--verbose`
+    /// scan previously ran over the whole argument list, so
+    /// `magnetar run qwen-test -- --verbose flag` both incorrectly enabled
+    /// global verbose output and dropped the literal `--verbose` token that
+    /// `parse_run_flags`'s own `--` convention is supposed to preserve as
+    /// prompt text. The scan must stop at the first bare `--`.
+    #[test]
+    fn split_global_verbose_flag_does_not_consume_verbose_after_dashdash() {
+        let args = vec![
+            "run".to_string(),
+            "model-ref".to_string(),
+            "--".to_string(),
+            "--verbose".to_string(),
+            "flag".to_string(),
+        ];
+        let (verbose, filtered) = split_global_verbose_flag(&args);
+        assert!(!verbose);
+        assert_eq!(filtered, args);
+    }
+
+    /// #56: a value-taking flag given as the last argument is rejected,
+    /// never silently dropped -- previously `magnetar run qwen-test --file`
+    /// ran with no file context and no indication the flag had been
+    /// ignored.
+    #[test]
+    fn parse_run_flags_rejects_a_value_flag_with_no_following_value() {
+        let args = vec!["model-ref".to_string(), "--file".to_string()];
+        let error = parse_run_flags(&args).unwrap_err();
+        assert!(matches!(error, CliBoundaryError::CliCommandInvalid { .. }));
+    }
+
+    /// #56: an unrecognized `--`-prefixed argument is rejected rather than
+    /// silently folded into the positional/prompt words.
+    #[test]
+    fn parse_run_flags_rejects_an_unrecognized_flag() {
+        let args = vec![
+            "model-ref".to_string(),
+            "--fil".to_string(),
+            "explain".to_string(),
+        ];
+        let error = parse_run_flags(&args).unwrap_err();
+        assert!(matches!(error, CliBoundaryError::CliCommandInvalid { .. }));
+    }
+
+    /// #56: `--` ends flag parsing, so a prompt word that happens to start
+    /// with `--` is preserved as prompt text instead of being consumed as
+    /// an (unrecognized, and therefore rejected) flag.
+    #[test]
+    fn parse_run_flags_treats_everything_after_a_bare_dashdash_as_positional() {
+        let args = vec![
+            "model-ref".to_string(),
+            "--".to_string(),
+            "--verbose".to_string(),
+            "flag".to_string(),
+        ];
+        let (flags, rest) = parse_run_flags(&args).unwrap();
+        assert!(flags.file.is_none());
+        assert_eq!(
+            rest,
+            vec![
+                "model-ref".to_string(),
+                "--verbose".to_string(),
+                "flag".to_string()
+            ]
+        );
     }
 
     /// §8/§29 "Test CLI file read stays in CLI": a missing/unreadable path
@@ -1201,5 +1376,53 @@ mod tests {
             "hi".to_string(),
         ])
         .unwrap();
+    }
+
+    /// #56: `cmd_agent`'s own hand-rolled flag parser had the identical
+    /// silently-dropped-value bug `parse_run_flags` had for `run` -- fixed
+    /// the same way, via `require_flag_value`.
+    #[test]
+    fn cmd_agent_rejects_a_tool_flag_with_no_following_value() {
+        let mut observer = CliObserver::new();
+        let error = cmd_agent(
+            &[
+                "qwen-test".to_string(),
+                "reach".to_string(),
+                "the".to_string(),
+                "goal".to_string(),
+                "--tool".to_string(),
+            ],
+            &mut observer,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CliBoundaryError::CliCommandInvalid { .. }));
+    }
+
+    #[test]
+    fn cmd_agent_rejects_an_unrecognized_flag() {
+        let mut observer = CliObserver::new();
+        let error = cmd_agent(
+            &[
+                "qwen-test".to_string(),
+                "--goal".to_string(),
+                "reach it".to_string(),
+            ],
+            &mut observer,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CliBoundaryError::CliCommandInvalid { .. }));
+    }
+
+    /// #56: `cmd_chat` now actually calls `config::resolve_model_ref_arg`
+    /// (previously `config.rs`'s own module doc comment named it as a
+    /// caller, but nothing here did) -- with no configured default alias
+    /// and no positional model ref, the outcome is unchanged: a structured
+    /// usage error, not a panic or a silently accepted empty model
+    /// reference.
+    #[test]
+    fn cmd_chat_without_a_model_ref_or_configured_default_is_command_invalid() {
+        let mut observer = CliObserver::new();
+        let error = cmd_chat(&[], &mut observer).unwrap_err();
+        assert!(matches!(error, CliBoundaryError::CliCommandInvalid { .. }));
     }
 }

@@ -1,9 +1,11 @@
-[workspace]
-
 [package]
 name = "magnetar-integration-cuda-first-native"
 version = "0.1.0"
 edition = "2024"
+# #64: member of ../../submodule-workspace -- see that manifest's own
+# comment.
+workspace = "../../submodule-workspace"
+license = "MIT"
 # Never published: this crate exists only to run the real first-native
 # pipeline (magnetar-runtime) against a real CUDA Provider
 # (magnetar-provider-cuda) end to end -- something neither crate can prove

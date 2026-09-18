@@ -20,7 +20,7 @@ use magnetar_runtime::production_model_ingestion::{
     ProductionModelArtifactIngestor, ProductionModelSource,
 };
 use magnetar_runtime::tokenizer::Tokenizer;
-use magnetar_runtime::{ModelArtifactSource, PromptInput, production_qwen_fixture};
+use magnetar_runtime::{ModelArtifactSource, PromptInput, production_model_fixture};
 use std::{fs, sync::Arc};
 
 fn le_u32(value: u32) -> Vec<u8> {
@@ -254,8 +254,9 @@ fn ingests_and_generates_from_a_real_gguf_file() {
 
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
-    let fixture = production_qwen_fixture(ingested.manifest.clone(), tokenizer_metadata, tokenizer)
-        .expect("production fixture builds from real ingested GGUF data");
+    let fixture =
+        production_model_fixture(ingested.manifest.clone(), tokenizer_metadata, tokenizer)
+            .expect("production fixture builds from real ingested GGUF data");
 
     let outcome = magnetar_runtime::run_production_qwen_generation(
         fixture,
@@ -310,7 +311,7 @@ fn gguf_and_huggingface_ingestion_of_identical_weights_produce_identical_generat
     let hf_tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(hf_tokenizer);
     let hf_trust_store =
         ModelTrustStore::default().trust_digest(hf_ingested.manifest.id.digest.value.clone());
-    let hf_fixture = production_qwen_fixture(
+    let hf_fixture = production_model_fixture(
         hf_ingested.manifest.clone(),
         hf_tokenizer_metadata,
         hf_tokenizer,
@@ -347,7 +348,7 @@ fn gguf_and_huggingface_ingestion_of_identical_weights_produce_identical_generat
     let gguf_tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(gguf_tokenizer);
     let gguf_trust_store =
         ModelTrustStore::default().trust_digest(gguf_ingested.manifest.id.digest.value.clone());
-    let gguf_fixture = production_qwen_fixture(
+    let gguf_fixture = production_model_fixture(
         gguf_ingested.manifest.clone(),
         gguf_tokenizer_metadata,
         gguf_tokenizer,

@@ -178,7 +178,7 @@ pub struct InferenceComponentOutput {
 /// a second call arriving while one is already in flight *blocks* until
 /// the first finishes -- it is never rejected, dropped, or run
 /// concurrently against the same `Runtime`/`ModelInstance`. This is a
-/// deliberate choice, not an oversight: `ProductionQwenLoadedModel` owns
+/// deliberate choice, not an oversight: `ProductionLoadedModel` owns
 /// one `Runtime` and one KV-cache-bearing `ModelInstance`, and
 /// `magnetar-runtime`'s generation loop is not designed for two
 /// generations to interleave their KV state within a single instance.
@@ -197,7 +197,7 @@ pub struct LoadedInferenceComponent {
     root: PathBuf,
     chat_formatter: Option<Arc<HuggingFaceChatTemplateFormatter>>,
     provider: ComponentProviderAdvertisement,
-    loaded_model: Mutex<magnetar_runtime::ProductionQwenLoadedModel>,
+    loaded_model: Mutex<magnetar_runtime::ProductionLoadedModel>,
 }
 
 pub fn local_bundle_manifest_digest(root: impl Into<PathBuf>) -> Result<String> {
@@ -367,7 +367,7 @@ impl LoadedInferenceComponent {
                 trust_decision.reason()
             );
         }
-        let fixture = magnetar_runtime::production_qwen_fixture(
+        let fixture = magnetar_runtime::production_model_fixture(
             ingested.manifest.clone(),
             tokenizer_metadata,
             real_tokenizer,
@@ -384,9 +384,9 @@ impl LoadedInferenceComponent {
         // execution (Tachyon integration audit MAG-02) -- verified to
         // produce identical generation to the singleton path for identical
         // Component bytes
-        // (`production_qwen_loaded_model_load_with_component_matches_the_
+        // (`production_loaded_model_load_with_component_matches_the_
         // singleton_path`).
-        let loaded_model = magnetar_runtime::ProductionQwenLoadedModel::load_with_component(
+        let loaded_model = magnetar_runtime::ProductionLoadedModel::load_with_component(
             fixture,
             ingested.payload_source.as_ref(),
             trust_policy.into_model_trust_store(),
@@ -869,7 +869,7 @@ mod tests {
 /// This crate's own end-to-end integration test for `LoadedInferenceComponent::
 /// load` (the noted gap left after the Tachyon integration audit closure: the
 /// equivalent `magnetar-runtime` path is exercised by
-/// `production_qwen_loaded_model_load_with_component_matches_the_singleton_path`,
+/// `production_loaded_model_load_with_component_matches_the_singleton_path`,
 /// but that test lives inside `magnetar-runtime` and never drives this
 /// crate's own orchestration -- format detection, tokenizer construction,
 /// Component registration, trust evaluation, `load_with_component` wiring --
@@ -1096,6 +1096,79 @@ mod load_end_to_end_tests {
             .expect(
                 "generation must run end to end through the real load()-produced instance, \
                  the same call shape a real embedder uses",
+            );
+        assert_eq!(
+            output.usage.prompt_tokens, 2,
+            "\"hello world\" tokenizes to exactly 2 real tokens under this bundle's own tokenizer"
+        );
+        assert_eq!(output.usage.generated_tokens, 1);
+    }
+
+    fn llama_component_bytes() -> &'static [u8] {
+        include_bytes!("../../magnetar-runtime/fixtures/components/llama-real.component.wasm")
+    }
+
+    fn llama_component_manifest_bytes() -> &'static [u8] {
+        include_bytes!(
+            "../../magnetar-runtime/fixtures/components/llama-real.component.wasm.magnetar-component.yaml"
+        )
+    }
+
+    /// Tachyon integration audit MAG-01/MAG-06 (#72): the noted gap left
+    /// even after `magnetar-runtime`'s own
+    /// `build_first_native_graphs_from_named_component_serves_a_real_second_
+    /// architecture_family` proved a real, independently-compiled non-Qwen
+    /// Component (Llama) produces byte-identical graphs to Qwen for the same
+    /// config -- that test never drove this crate's own `LoadedInferenceComponent::
+    /// load`, so the audit's demand to "tester une seconde architecture
+    /// complète via LoadedInferenceComponent::load" stayed unproven. Loads
+    /// the exact same tiny Hugging Face-shaped bundle the Qwen end-to-end
+    /// test above uses (same tensors, same config, same tokenizer --
+    /// `attention_bias: false`, matching the fixture config the
+    /// Llama/Qwen-equivalence test itself assumes) but through the real
+    /// checked-in Llama Component artifact instead of Qwen's, registered and
+    /// trusted under its own real digest exactly like Qwen's is above.
+    /// `LoadedInferenceComponent` itself never names Qwen anywhere in this
+    /// call: which Component drives graph production is entirely a function
+    /// of which artifact/digest the caller supplies.
+    #[test]
+    fn loaded_inference_component_load_runs_a_real_second_architecture_end_to_end() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_qwen_bundle(dir.path());
+
+        let model_digest =
+            local_bundle_manifest_digest(dir.path()).expect("the bundle inspects cleanly");
+        // The real Llama Component artifact digest, computed from the real
+        // checked-in Llama Component bytes -- an independently-compiled
+        // binary, structurally distinct from the Qwen Component above
+        // (Tachyon integration audit MAG-03: Component trust is independent
+        // of Model Artifact trust, and both are named explicitly here).
+        let component_digest = magnetar_runtime::ComponentDigest::sha256(llama_component_bytes());
+
+        let trust_policy = ArtifactTrustPolicy::default()
+            .trust_digest(&model_digest)
+            .trust_component_digest(&component_digest.value);
+
+        let component = LoadedInferenceComponent::load(
+            "test-llama",
+            InferenceComponentArtifact::from_bytes(
+                llama_component_bytes().to_vec(),
+                llama_component_manifest_bytes().to_vec(),
+            ),
+            InferenceComponentSource::authorized_local_bundle("test-fixture", dir.path()),
+            trust_policy,
+            InferenceComponentPlacement::ReferenceCpu,
+        )
+        .expect(
+            "a real, independently-compiled non-Qwen Component (Llama) must load end to end \
+             through this crate's own orchestration exactly like the Qwen Component does",
+        );
+
+        let output = component
+            .invoke_payload(br#"{"prompt":"hello world","max_new_tokens":1}"#)
+            .expect(
+                "generation must run end to end through the real Llama-Component-driven \
+                 instance, the same call shape a real embedder uses",
             );
         assert_eq!(
             output.usage.prompt_tokens, 2,

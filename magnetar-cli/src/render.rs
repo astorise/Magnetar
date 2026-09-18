@@ -14,10 +14,8 @@
 //! function that returns a `String` instead of printing directly, so
 //! redaction can be asserted in tests without capturing real stdout.
 
-use magnetar_runtime::{
-    CliBoundaryError, DeviceMetadata, InferenceApiObserver, ProviderMetadata,
-    ReleaseBinaryVersionReport,
-};
+use magnetar_roadmap_contracts::release_packaging::ReleaseBinaryVersionReport;
+use magnetar_runtime::{CliBoundaryError, DeviceMetadata, InferenceApiObserver, ProviderMetadata};
 
 /// Prints a [`CliBoundaryError`] to stderr via its `Display` impl only --
 /// never `{:?}`. `Display` is the structured, human-readable rendering that
@@ -190,7 +188,7 @@ CLI/Runtime authority boundary this binary implements."#
 }
 
 /// `magnetar version`. Prints the release binary version report defined by
-/// `magnetar_runtime::release_packaging` (see
+/// `magnetar_roadmap_contracts::release_packaging` (see
 /// `openspec/changes/define-release-packaging-and-versioning-policy`):
 /// binary version, Runtime crate version, OpenSpec baseline version, WIT
 /// contract versions, enabled feature flags, build profile, commit hash

@@ -12,6 +12,15 @@ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-targets
 ```
 
+The commands above cover the root `[workspace]` only (`magnetar-runtime`,
+`roadmap-contracts`, `tools/coverage-ratchet`). If your change touches
+`magnetar-cli`, `inference-components`, or `integration-tests/*`, also run
+the same commands against `submodule-workspace/Cargo.toml` -- these crates
+depend on a submodule not present in every checkout, so a plain
+root-level `--workspace` never builds them (#64). See
+[docs/quality.md](docs/quality.md)'s "Submodule Workspace" section for the
+exact commands.
+
 The Rust toolchain is pinned in `rust-toolchain.toml`; rustup installs it
 automatically when you run cargo in this directory. Do not install a different
 version to match CI -- CI uses the same pinned toolchain.
