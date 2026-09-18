@@ -386,7 +386,14 @@ impl ComponentTrustStore {
         self
     }
 
-    fn evaluate(
+    /// Evaluates `manifest`/`digest` against this trust store's policy,
+    /// independent of any particular loading path -- the same decision
+    /// [`validate_component_artifact`] applies during a fresh
+    /// `prepare_component`, exposed so a caller that already holds a
+    /// registered Component (and therefore never runs that validation
+    /// again) can still re-check *this* caller's own trust before reusing
+    /// it (see #71: a cache hit must never skip this).
+    pub fn evaluate(
         &self,
         manifest: &ComponentManifest,
         digest: &ComponentDigest,
@@ -829,8 +836,25 @@ impl ComponentManifest {
             message: source.to_string(),
             source: Some(source),
         })?;
+        Self::from_yaml_bytes(content.as_bytes(), path)
+    }
+
+    /// [`Self::load_yaml`]'s parsing half, taking already-read bytes instead
+    /// of a filesystem path -- lets a caller that already has the manifest
+    /// bytes in hand (e.g. to evaluate trust against a digest that is
+    /// already registered, without re-reading it from disk) parse and
+    /// validate them the same way a fresh `load_yaml` would. `path` is used
+    /// only to shape error messages the same as `load_yaml`'s own, exactly
+    /// like [`ComponentManifestYaml::validate`] already does with it;
+    /// nothing here touches the filesystem.
+    pub fn from_yaml_bytes(bytes: &[u8], path: &Path) -> Result<Self, ComponentError> {
+        let content = std::str::from_utf8(bytes).map_err(|source| ComponentError::Manifest {
+            path: path.into(),
+            message: source.to_string(),
+            source: None,
+        })?;
         let raw: ComponentManifestYaml =
-            serde_norway::from_str(&content).map_err(|source| ComponentError::Manifest {
+            serde_norway::from_str(content).map_err(|source| ComponentError::Manifest {
                 path: path.into(),
                 message: source.to_string(),
                 source: None,

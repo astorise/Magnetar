@@ -1213,11 +1213,11 @@ struct E2eRuntimeModelExecutionEngine {
     fixture: E2eFixture,
     kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
     pending_kv_states: Arc<Mutex<BTreeMap<String, FirstNativeExecutionKvState>>>,
-    /// See [`ProductionQwenLoadedModel::component_digest`]'s doc comment --
+    /// See [`ProductionLoadedModel::component_digest`]'s doc comment --
     /// must stay in lockstep with the same instance's `prepare_generation`
     /// digest so a published plan's fingerprint matches what dispatch here
     /// actually builds. `None` (every construction site but
-    /// `ProductionQwenLoadedModel::load`) preserves the pre-existing
+    /// `ProductionLoadedModel::load`) preserves the pre-existing
     /// hardcoded-singleton behavior exactly.
     component_digest: Option<ComponentDigest>,
     /// Test-only deterministic-token override, read by
@@ -4215,12 +4215,12 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // so calling it again here reproduces the identical graph the
             // plan was prepared against. Must match `prepare_generation`'s
             // own choice of digest exactly -- see
-            // `ProductionQwenLoadedModel::component_digest`'s doc comment.
+            // `ProductionLoadedModel::component_digest`'s doc comment.
             let prompt_token_count = request.input_token_ids.len() as u64;
             let component_graphs = match &self.component_digest {
                 Some(digest) => build_first_native_graphs_from_named_component(
                     digest,
-                    &self.fixture.config,
+                    &architecture_config_from_qwen_config(&self.fixture.config),
                     &self.fixture.identity,
                     prompt_token_count,
                 )
@@ -6309,35 +6309,48 @@ fn resolve_qwen_component_from_lookup(
 /// -- weight *shape* is architecture metadata, resolving the real bytes
 /// behind a weight edge happens later, at execution time
 /// (`resolve_qwen_weight_edge`), unaffected by this function.
+///
+/// Takes the generic, WIT-facing [`ModelArchitectureConfig`] (#73 / Tachyon
+/// integration audit MAG-02), not a Qwen-specific type: despite the name
+/// this crate's [`QwenConfig`] carried, the shape this function computes
+/// (pre-norm decoder blocks, GQA-capable q/k/v/o projections, a gated MLP,
+/// tied or untied embeddings) is the same generic decoder-only transformer
+/// layout a real, independently-compiled Llama Component's weights need
+/// too -- see `build_first_native_graphs_from_named_component_serves_a_
+/// real_second_architecture_family`, which proves the Llama and Qwen
+/// binaries produce identical graphs for the identical `architecture-
+/// config`. Nothing here reads a Qwen-only field; every value comes
+/// straight off [`ModelArchitectureConfig`].
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-fn qwen_weight_shapes_for_config(config: &QwenConfig) -> BTreeMap<String, Vec<u64>> {
-    let a = &config.architecture;
-    let q_dim = a.attention_head_count * a.head_dimension;
-    let kv_dim = a.kv_head_count * a.head_dimension;
+fn weight_shapes_for_architecture_config(
+    config: &ModelArchitectureConfig,
+) -> BTreeMap<String, Vec<u64>> {
+    let q_dim = config.num_attention_heads as u64 * config.head_dim;
+    let kv_dim = config.num_key_value_heads as u64 * config.head_dim;
     let mut shapes = BTreeMap::new();
     shapes.insert(
         "token_embedding".to_string(),
-        vec![a.vocabulary_size, a.hidden_size],
+        vec![config.vocab_size, config.hidden_size],
     );
-    shapes.insert("final_norm".to_string(), vec![a.hidden_size]);
+    shapes.insert("final_norm".to_string(), vec![config.hidden_size]);
     shapes.insert(
         "lm_head".to_string(),
-        vec![a.hidden_size, a.vocabulary_size],
+        vec![config.hidden_size, config.vocab_size],
     );
-    for layer in 0..a.layer_count {
+    for layer in 0..config.num_hidden_layers {
         let prefix = format!("layers.{layer}");
-        shapes.insert(format!("{prefix}.input_norm"), vec![a.hidden_size]);
+        shapes.insert(format!("{prefix}.input_norm"), vec![config.hidden_size]);
         shapes.insert(
             format!("{prefix}.self_attn.q_proj"),
-            vec![a.hidden_size, q_dim],
+            vec![config.hidden_size, q_dim],
         );
         shapes.insert(
             format!("{prefix}.self_attn.k_proj"),
-            vec![a.hidden_size, kv_dim],
+            vec![config.hidden_size, kv_dim],
         );
         shapes.insert(
             format!("{prefix}.self_attn.v_proj"),
-            vec![a.hidden_size, kv_dim],
+            vec![config.hidden_size, kv_dim],
         );
         if config.attention_bias {
             shapes.insert(format!("{prefix}.self_attn.q_bias"), vec![q_dim]);
@@ -6346,20 +6359,20 @@ fn qwen_weight_shapes_for_config(config: &QwenConfig) -> BTreeMap<String, Vec<u6
         }
         shapes.insert(
             format!("{prefix}.self_attn.o_proj"),
-            vec![q_dim, a.hidden_size],
+            vec![q_dim, config.hidden_size],
         );
-        shapes.insert(format!("{prefix}.post_attn_norm"), vec![a.hidden_size]);
+        shapes.insert(format!("{prefix}.post_attn_norm"), vec![config.hidden_size]);
         shapes.insert(
             format!("{prefix}.mlp.gate_proj"),
-            vec![a.hidden_size, a.intermediate_size],
+            vec![config.hidden_size, config.intermediate_size],
         );
         shapes.insert(
             format!("{prefix}.mlp.up_proj"),
-            vec![a.hidden_size, a.intermediate_size],
+            vec![config.hidden_size, config.intermediate_size],
         );
         shapes.insert(
             format!("{prefix}.mlp.down_proj"),
-            vec![a.intermediate_size, a.hidden_size],
+            vec![config.intermediate_size, config.hidden_size],
         );
     }
     shapes
@@ -6454,7 +6467,7 @@ fn production_qwen_component_identity() -> ModelComponentIdentity {
 }
 
 /// Builds a real [`E2eFixture`] from production ingestion output (task
-/// group 10): the same Qwen graph-execution/KV-cache/
+/// group 10): the same graph-execution/KV-cache/
 /// `RuntimeModelExecutionEngine` machinery every existing first-native
 /// caller already uses, driven by real Hugging Face bundle data instead
 /// of the canonical tiny fixture. `weights` is deliberately empty --
@@ -6466,7 +6479,7 @@ fn production_qwen_component_identity() -> ModelComponentIdentity {
 /// resolves weights by Provider resource id per node -- see
 /// `execute_qwen_graph`'s own doc comment).
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-pub fn production_qwen_fixture(
+pub fn production_model_fixture(
     manifest: ModelManifest,
     tokenizer_metadata: TokenizerMetadata,
     tokenizer: std::sync::Arc<dyn crate::tokenizer::Tokenizer + Send + Sync>,
@@ -6665,7 +6678,7 @@ pub fn load_production_qwen_instance_segment_for_provider(
 /// own one-shot shape (fresh `Runtime`/session per call) but for real
 /// ingested data instead of the `qwen-test` fixture.
 ///
-/// `fixture` is [`production_qwen_fixture`]'s output; `payload_source` is
+/// `fixture` is [`production_model_fixture`]'s output; `payload_source` is
 /// the same one the caller's ingestor produced; `trust_store` is the
 /// caller's own trust policy (Decision 2: this function grants no trust
 /// of its own -- an untrusted manifest fails inside `load_model` before
@@ -7046,12 +7059,25 @@ fn finish_production_generation(
     })
 }
 
-/// Production Qwen model state loaded once into a Magnetar [`Runtime`].
+/// Production model state loaded once into a Magnetar [`Runtime`].
 /// Embedders with an external model registry keep this object behind their
 /// own `LoadedModel` lifecycle and create per-request sessions on top of the
 /// same ready [`ModelInstanceId`].
+///
+/// Despite [`E2eFixture::config`]'s own [`QwenConfig`] type name, this state
+/// machine carries no real Qwen-family-only gating: `component_digest`, when
+/// set, makes an arbitrary caller-registered Component (any architecture the
+/// registered Component's own graph producer implements, not just Qwen) the
+/// real graph-production authority for both `prepare_generation` and
+/// `E2eRuntimeModelExecutionEngine::execute_generation_step` (Tachyon
+/// integration audit MAG-01/MAG-02, #72/#73) -- see
+/// `loaded_inference_component_load_runs_a_real_second_architecture_end_to_end`
+/// in `inference-components` for the proof that a real, independently-
+/// compiled non-Qwen Component drives this exact type correctly end to end,
+/// through `LoadedInferenceComponent::load` rather than only this crate's
+/// own lower-level entry points.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-pub struct ProductionQwenLoadedModel {
+pub struct ProductionLoadedModel {
     fixture: E2eFixture,
     runtime: Runtime,
     instance: ModelInstanceId,
@@ -7072,7 +7098,7 @@ pub struct ProductionQwenLoadedModel {
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-impl ProductionQwenLoadedModel {
+impl ProductionLoadedModel {
     pub fn load(
         fixture: E2eFixture,
         payload_source: &dyn crate::production_model_ingestion::ProductionArtifactPayloadSource,
@@ -7302,7 +7328,7 @@ impl ProductionQwenLoadedModel {
         let component_graphs = match &self.component_digest {
             Some(digest) => build_first_native_graphs_from_named_component(
                 digest,
-                &self.fixture.config,
+                &architecture_config_from_qwen_config(&self.fixture.config),
                 &self.fixture.identity,
                 prompt_token_count,
             )
@@ -7693,21 +7719,29 @@ static REGISTERED_COMPONENT_RUNTIMES: std::sync::OnceLock<
 /// runtime back up by, so a caller never needs to invent or track its own
 /// separate identifier for "the Component I just registered."
 ///
-/// Idempotent per digest, like [`register_qwen_component_artifact`]: a
-/// second registration of bytes that hash to a digest already present in the
-/// registry is a harmless no-op (the existing compiled runtime is kept,
-/// never recompiled), so a caller can register unconditionally on every
-/// load rather than tracking its own "have I already registered this one"
-/// state. Distinct Components (distinct digests) coexist in the registry
+/// Idempotent per digest for *compilation*, like
+/// [`register_qwen_component_artifact`]: a second registration of bytes that
+/// hash to a digest already present in the registry never recompiles the
+/// Component, so a caller can register unconditionally on every load rather
+/// than tracking its own "have I already registered this one" state.
+/// Distinct Components (distinct digests) coexist in the registry
 /// simultaneously -- unlike the Qwen singleton, this is not a "last one
 /// wins" slot.
 ///
+/// Never idempotent for *authorization*, though (#71): reusing an already-
+/// compiled runtime is a cache concern, not a trust one, so `trust` -- this
+/// specific call's own [`ComponentTrustStore`] -- is evaluated against
+/// `manifest_bytes` on every call, cache hit included. A digest some earlier
+/// caller's trust store authorized is not thereby authorized for a later
+/// caller whose own trust store does not.
+///
 /// Fails closed, exactly like every other Component loading path in this
-/// crate: untrusted bytes (`trust` does not trust this digest), a
-/// manifest whose own embedded digest does not match the real bytes, or a
-/// manifest outside inference scope are all rejected by
-/// [`ComponentManager::prepare_pushed_package`] before anything is cached,
-/// not silently accepted.
+/// crate: untrusted bytes (`trust` does not trust this digest) or a
+/// manifest whose own embedded digest does not match the real bytes are
+/// rejected before anything is returned, whether this call ends up
+/// compiling the Component fresh (via
+/// [`ComponentManager::prepare_pushed_package`]) or reusing an
+/// already-registered one.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub fn register_inference_component_artifact(
     component_bytes: Vec<u8>,
@@ -7716,11 +7750,39 @@ pub fn register_inference_component_artifact(
 ) -> Result<ComponentDigest, E2eConformanceError> {
     let digest = ComponentDigest::sha256(&component_bytes);
     let registry = REGISTERED_COMPONENT_RUNTIMES.get_or_init(|| Mutex::new(BTreeMap::new()));
-    {
+    let already_registered = {
         let existing = registry.lock().unwrap();
-        if existing.contains_key(&digest.value) {
-            return Ok(digest);
+        existing.contains_key(&digest.value)
+    };
+    if already_registered {
+        // #71: the compiled runtime is reused (that is the whole point of
+        // the cache), but *this* caller's own `trust` must still authorize
+        // `digest` on every call -- a digest another, earlier caller
+        // authorized is not thereby authorized for everyone. Re-parses
+        // `manifest_bytes` (always supplied fresh by the caller, cache hit
+        // or not) and re-runs the same digest-consistency check and trust
+        // decision `validate_component_artifact` applies on a fresh
+        // registration, so a cache hit can never skip the authorization a
+        // cache miss would have enforced.
+        let manifest = ComponentManifest::from_yaml_bytes(
+            &manifest_bytes,
+            std::path::Path::new("<registered-component-manifest>"),
+        )
+        .map_err(|error| E2eConformanceError::ModelComponentFailed {
+            reason: error.to_string(),
+        })?;
+        if manifest.digest != digest {
+            return Err(E2eConformanceError::ModelComponentFailed {
+                reason: "manifest-declared digest does not match received bytes".into(),
+            });
         }
+        let trust_decision = trust.evaluate(&manifest, &digest);
+        if trust_decision.status != ComponentTrustStatus::Trusted {
+            return Err(E2eConformanceError::ModelComponentFailed {
+                reason: trust_decision.reason,
+            });
+        }
+        return Ok(digest);
     }
     let capability = Arc::new(GraphBuilderCapability::new());
     let model_config_capability = Arc::new(ModelConfigCapability::new());
@@ -7802,10 +7864,21 @@ fn named_component_runtime(
 /// counterpart: builds prefill/decode graphs from whichever Component
 /// [`register_inference_component_artifact`] registered under `digest`,
 /// instead of the single hardcoded Qwen singleton.
+///
+/// Takes the generic, WIT-facing [`ModelArchitectureConfig`] directly (#73 /
+/// Tachyon integration audit MAG-02), not [`QwenConfig`] -- a caller whose
+/// own config is Qwen-shaped converts once via
+/// [`architecture_config_from_qwen_config`] before calling, exactly like
+/// [`build_first_native_graphs_for_config`] (the Qwen-singleton path) now
+/// does internally; a caller for any other architecture never needs a
+/// `QwenConfig` to exist at all. See
+/// `build_first_native_graphs_from_named_component_serves_a_real_second_
+/// architecture_family` for the proof that an independently-compiled,
+/// non-Qwen Component (real Llama) drives this exact entry point correctly.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 pub fn build_first_native_graphs_from_named_component(
     digest: &ComponentDigest,
-    config: &QwenConfig,
+    config: &ModelArchitectureConfig,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,
 ) -> Result<
@@ -7832,14 +7905,14 @@ pub fn build_first_native_graphs_from_named_component(
 /// (`wasm32`, or `wasmtime-component-engine` disabled) -- fails closed,
 /// structurally, exactly like [`first_native_component_graphs_for_prompt`]'s
 /// own non-test fallback for the same reason. `E2eRuntimeModelExecutionEngine::
-/// execute_generation_step` and `ProductionQwenLoadedModel::prepare_generation`
+/// execute_generation_step` and `ProductionLoadedModel::prepare_generation`
 /// both reach this whenever `component_digest` is `Some` on such a build,
 /// so a `None`-digest instance (the pre-existing singleton path, unaffected
 /// by this fallback) remains the only thing that can ever run here.
 #[cfg(not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")))]
 pub fn build_first_native_graphs_from_named_component(
     _digest: &ComponentDigest,
-    _config: &QwenConfig,
+    _config: &ModelArchitectureConfig,
     _identity: &ModelComponentIdentity,
     _prompt_token_count: u64,
 ) -> Result<
@@ -7916,12 +7989,13 @@ fn build_first_native_graphs_for_config(
     E2eConformanceError,
 > {
     let runtime = qwen_real_component_runtime()?;
+    let architecture_config = architecture_config_from_qwen_config(config);
     build_first_native_graphs_with_runtime(
         &runtime.manager,
         &runtime.capability,
         &runtime.model_config_capability,
         runtime.definition,
-        config,
+        &architecture_config,
         identity,
         prompt_token_count,
     )
@@ -7946,7 +8020,7 @@ fn build_first_native_graphs_with_runtime(
     capability: &GraphBuilderCapability,
     model_config_capability: &ModelConfigCapability,
     definition: ComponentDefinitionId,
-    config: &QwenConfig,
+    config: &ModelArchitectureConfig,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,
 ) -> Result<
@@ -7976,7 +8050,7 @@ fn build_first_native_graphs_with_runtime(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
-        let weight_shapes = qwen_weight_shapes_for_config(config);
+        let weight_shapes = weight_shapes_for_architecture_config(config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = |weight_shapes: BTreeMap<String, Vec<u64>>| SessionContext {
             component_id: identity.id.as_str().to_string(),
@@ -7986,8 +8060,7 @@ fn build_first_native_graphs_with_runtime(
             output_edge_name: "logits".to_string(),
         };
 
-        let architecture_config = architecture_config_from_qwen_config(config);
-        model_config_capability.bind_config(&engine_key, architecture_config.clone());
+        model_config_capability.bind_config(&engine_key, config.clone());
 
         capability.prepare_session(&engine_key, session_context(weight_shapes.clone()));
         let prefill_result = manager
@@ -8006,7 +8079,7 @@ fn build_first_native_graphs_with_runtime(
                 reason: "build-prefill-graph handle did not resolve to a finished graph".into(),
             })?;
 
-        model_config_capability.bind_config(&engine_key, architecture_config);
+        model_config_capability.bind_config(&engine_key, config.clone());
         capability.prepare_session(&engine_key, session_context(weight_shapes));
         let decode_result = manager
             .invoke(
@@ -8087,7 +8160,8 @@ fn build_first_native_prefill_graph_segment_with_runtime(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
-        let weight_shapes = qwen_weight_shapes_for_config(config);
+        let architecture_config = architecture_config_from_qwen_config(config);
+        let weight_shapes = weight_shapes_for_architecture_config(&architecture_config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = SessionContext {
             component_id: identity.id.as_str().to_string(),
@@ -8097,8 +8171,7 @@ fn build_first_native_prefill_graph_segment_with_runtime(
             output_edge_name: "logits".to_string(),
         };
 
-        model_config_capability
-            .bind_config(&engine_key, architecture_config_from_qwen_config(config));
+        model_config_capability.bind_config(&engine_key, architecture_config);
         capability.prepare_session(&engine_key, session_context);
         let segment_result = manager
             .invoke(
@@ -8197,7 +8270,8 @@ fn build_first_native_decode_graph_segment_with_runtime(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
-        let weight_shapes = qwen_weight_shapes_for_config(config);
+        let architecture_config = architecture_config_from_qwen_config(config);
+        let weight_shapes = weight_shapes_for_architecture_config(&architecture_config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = SessionContext {
             component_id: identity.id.as_str().to_string(),
@@ -8207,8 +8281,7 @@ fn build_first_native_decode_graph_segment_with_runtime(
             output_edge_name: "logits".to_string(),
         };
 
-        model_config_capability
-            .bind_config(&engine_key, architecture_config_from_qwen_config(config));
+        model_config_capability.bind_config(&engine_key, architecture_config);
         capability.prepare_session(&engine_key, session_context);
         let segment_result = manager
             .invoke(

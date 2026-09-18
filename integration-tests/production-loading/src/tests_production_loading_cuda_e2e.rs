@@ -16,7 +16,7 @@ use magnetar_runtime::production_model_ingestion::{
     ProductionModelArtifactIngestor, ProductionModelSource,
 };
 use magnetar_runtime::tokenizer::Tokenizer;
-use magnetar_runtime::{ModelArtifactSource, production_qwen_fixture};
+use magnetar_runtime::{ModelArtifactSource, production_model_fixture};
 use std::sync::Arc;
 
 #[test]
@@ -69,7 +69,7 @@ fn real_production_ingestion_generates_on_real_cuda_hardware() {
 
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
-    let fixture = production_qwen_fixture(
+    let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         real_tokenizer,
@@ -181,7 +181,7 @@ fn production_generation_request_forwards_parameters_and_stop_conditions_on_real
     // crashing or hanging.
     let (tokenizer_metadata, real_tokenizer) = load_tokenizer();
     let non_greedy_fixture =
-        production_qwen_fixture(manifest.clone(), tokenizer_metadata, real_tokenizer)
+        production_model_fixture(manifest.clone(), tokenizer_metadata, real_tokenizer)
             .expect("production fixture builds from real ingested data");
     let non_greedy_outcome =
         magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
@@ -221,7 +221,7 @@ fn production_generation_request_forwards_parameters_and_stop_conditions_on_real
     // instead of being replaced by StopConditions::default().
     let (tokenizer_metadata, real_tokenizer) = load_tokenizer();
     let baseline_fixture =
-        production_qwen_fixture(manifest.clone(), tokenizer_metadata, real_tokenizer)
+        production_model_fixture(manifest.clone(), tokenizer_metadata, real_tokenizer)
             .expect("production fixture builds from real ingested data");
     let baseline = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
         baseline_fixture,
@@ -246,7 +246,7 @@ fn production_generation_request_forwards_parameters_and_stop_conditions_on_real
         .expect("baseline CUDA generation produced at least one token");
 
     let (tokenizer_metadata, real_tokenizer) = load_tokenizer();
-    let stopped_fixture = production_qwen_fixture(manifest, tokenizer_metadata, real_tokenizer)
+    let stopped_fixture = production_model_fixture(manifest, tokenizer_metadata, real_tokenizer)
         .expect("production fixture builds from real ingested data");
     let stopped = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
         stopped_fixture,
@@ -330,7 +330,7 @@ fn production_generation_request_streaming_matches_non_streaming_on_real_cuda_ha
 
     let (tokenizer_metadata, real_tokenizer) = load_tokenizer();
     let non_streaming_fixture =
-        production_qwen_fixture(manifest.clone(), tokenizer_metadata, real_tokenizer)
+        production_model_fixture(manifest.clone(), tokenizer_metadata, real_tokenizer)
             .expect("production fixture builds from real ingested data");
     let non_streaming = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
         non_streaming_fixture,
@@ -343,7 +343,7 @@ fn production_generation_request_streaming_matches_non_streaming_on_real_cuda_ha
     .expect("non-streaming production generation on real CUDA hardware succeeds");
 
     let (tokenizer_metadata, real_tokenizer) = load_tokenizer();
-    let streaming_fixture = production_qwen_fixture(manifest, tokenizer_metadata, real_tokenizer)
+    let streaming_fixture = production_model_fixture(manifest, tokenizer_metadata, real_tokenizer)
         .expect("production fixture builds from real ingested data");
     let mut events = Vec::new();
     let streamed = magnetar_runtime::run_production_qwen_generation_for_provider_streaming(

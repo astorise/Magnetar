@@ -34,7 +34,7 @@ use magnetar_runtime::production_model_ingestion::{
     ProductionModelArtifactIngestor, ProductionModelSource,
 };
 use magnetar_runtime::tokenizer::Tokenizer;
-use magnetar_runtime::{ModelArtifactSource, production_qwen_fixture};
+use magnetar_runtime::{ModelArtifactSource, production_model_fixture};
 use std::{fs, path::PathBuf, sync::Arc};
 
 /// `Qwen/Qwen2.5-0.5B-Instruct-GGUF`'s exact pinned commit on Hugging
@@ -144,7 +144,7 @@ fn real_public_gguf_checkpoint_loads_and_generates_on_reference_cpu() {
 
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
-    let fixture = production_qwen_fixture(
+    let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         real_tokenizer,
@@ -271,7 +271,7 @@ fn real_public_q8_0_gguf_checkpoint_loads_and_generates_on_reference_cpu() {
 
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
-    let fixture = production_qwen_fixture(
+    let fixture = production_model_fixture(
         ingested.manifest.clone(),
         tokenizer_metadata,
         real_tokenizer,

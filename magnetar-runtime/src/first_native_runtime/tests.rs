@@ -3171,23 +3171,36 @@ fn e2e_qwen_component_digest_mismatch_fails_before_planning() {
 /// several `#[test]` functions. `REGISTERED_COMPONENT_RUNTIMES` is one
 /// process-wide registry shared by every test in this binary, keyed by real
 /// content digest; every one of these assertions registers (or attempts to
-/// register) the *same* fixture bytes, so the same digest. Splitting them
-/// into separate `#[test]` functions is genuinely racy under Rust's default
-/// parallel test execution: whichever test's *trusted* registration runs
-/// first populates the shared cache entry, after which a *later*,
-/// deliberately-untrusted registration attempt for that same digest would
-/// hit the idempotent-return fast path before ever re-evaluating trust,
-/// making the "untrusted artifacts are rejected" assertion pass or fail
-/// based on test scheduling instead of behavior -- caught by a real CI
-/// failure (this exact race), not found by inspection.
+/// register) the *same* fixture bytes, so the same digest.
+///
+/// Splitting the untrusted-rejection assertions into their own `#[test]`
+/// functions used to be genuinely racy under Rust's default parallel test
+/// execution: whichever test's *trusted* registration ran first populated
+/// the shared cache entry, after which a *later*, deliberately-untrusted
+/// registration attempt for that same digest hit the idempotent-return fast
+/// path before ever re-evaluating trust, making the "untrusted artifacts
+/// are rejected" assertion pass or fail based on test scheduling instead of
+/// behavior -- caught by a real CI failure (this exact race), not found by
+/// inspection. That fast path turned out not to be only a test-scheduling
+/// hazard: it was the identical bug in production code (Tachyon
+/// integration audit MAG-03, tracked as #71) -- `register_inference_component_artifact`'s
+/// cache hit returned `Ok(digest)` without ever consulting *this* caller's
+/// own `trust`, so any caller could receive an artifact only some other,
+/// earlier caller had actually authorized. Fixed by re-evaluating trust
+/// against the cache hit on every call, which also means the scheduling
+/// race described above can no longer happen -- the mid-test
+/// untrusted-after-cached assertion below now passes deterministically
+/// regardless of the order these tests run in. Assertions stay
+/// consolidated here anyway, both for locality (everything about this one
+/// digest's lifecycle in one place) and because splitting them still
+/// wouldn't be free of shared-state ordering to reason about.
 ///
 /// This same reasoning is why the Tachyon integration audit MAG-07 proof
 /// (two distinct, independently-registered Components served at once) lives
 /// at the end of this function instead of its own `#[test]`: a second test
 /// that trusts and registers `QWEN_REAL_COMPONENT_BYTES` under its own
-/// fresh `ComponentTrustStore` races this function's own untrusted-rejection
-/// assertion above by the identical mechanism (confirmed by a real,
-/// reproduced local failure before consolidating).
+/// fresh `ComponentTrustStore` would still share this function's own
+/// digest-keyed cache entry.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
 fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matches_the_singleton_path()
@@ -3232,6 +3245,32 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     .expect("re-registering the same bytes is a harmless no-op, not an error");
     assert_eq!(digest, second);
 
+    // Tachyon integration audit MAG-03 / #71: this digest is now cached
+    // (registered and trusted above), so this call exercises exactly the
+    // cache-hit path -- and must still be rejected for a caller whose own
+    // trust store does not name it, the same as the untrusted call at the
+    // top of this test did before anything was cached. Before the MAG-03
+    // fix, the cache-hit fast path returned `Ok(digest)` unconditionally
+    // without ever consulting `trust`, so a caller who authorized nothing
+    // would silently receive an artifact only some *other*, earlier caller
+    // had actually authorized -- an authorization bypass, not merely the
+    // test-scheduling hazard this function's own doc comment above
+    // describes. Reject-then-cache-then-reject-again in one sequential
+    // test (like every other assertion here) rather than splitting the
+    // second rejection into its own `#[test]`, for the identical
+    // shared-registry reason.
+    let untrusted_after_cached = register_inference_component_artifact(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &ComponentTrustStore::default(),
+    );
+    assert!(
+        untrusted_after_cached.is_err(),
+        "a caller-trusted digest must not become implicitly trusted for a \
+         later caller whose own trust store authorizes nothing, just \
+         because the compiled runtime is already cached: {untrusted_after_cached:?}"
+    );
+
     // The load-bearing correctness proof for this generic registry: a
     // Component registered above (a caller-supplied digest/trust, no
     // hardcoded Qwen constant anywhere in the call) produces *exactly* the
@@ -3247,7 +3286,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
 
     let (via_named, _definition, _instance) = build_first_native_graphs_from_named_component(
         &digest,
-        &fixture.config,
+        &architecture_config_from_qwen_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3297,7 +3336,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     let (synthetic_graphs, _definition, _instance) =
         build_first_native_graphs_from_named_component(
             &synthetic_digest,
-            &fixture.config,
+            &architecture_config_from_qwen_config(&fixture.config),
             &fixture.identity,
             prompt_token_count,
         )
@@ -3319,7 +3358,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     // digest again still succeeds and still matches the singleton path.
     let (qwen_graphs_again, _definition, _instance) = build_first_native_graphs_from_named_component(
         &digest,
-        &fixture.config,
+        &architecture_config_from_qwen_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3381,7 +3420,7 @@ fn build_first_native_graphs_from_named_component_serves_a_real_second_architect
 
     let (llama_graphs, _definition, _instance) = build_first_native_graphs_from_named_component(
         &llama_digest,
-        &fixture.config,
+        &architecture_config_from_qwen_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3419,7 +3458,7 @@ fn build_first_native_graphs_from_named_component_serves_a_real_second_architect
     let (llama_biased_graphs, _definition, _instance) =
         build_first_native_graphs_from_named_component(
             &llama_digest,
-            &biased_config,
+            &architecture_config_from_qwen_config(&biased_config),
             &fixture.identity,
             prompt_token_count,
         )
@@ -3446,7 +3485,7 @@ fn build_first_native_graphs_from_named_component_fails_closed_for_an_unregister
     let fixture = e2e_fixture().expect("fixture builds");
     let result = build_first_native_graphs_from_named_component(
         &never_registered,
-        &fixture.config,
+        &architecture_config_from_qwen_config(&fixture.config),
         &fixture.identity,
         2,
     );
@@ -4378,7 +4417,7 @@ impl crate::production_model_ingestion::ProductionArtifactPayloadSource
 /// wrapped as a production-shaped `ModelManifest` (no fixture manifest
 /// constructor, real `architecture_config`, a real payload source keyed
 /// only by canonical tensor name/bytes) and driven through
-/// `load_production_qwen_instance` -> `production_qwen_fixture` ->
+/// `load_production_qwen_instance` -> `production_model_fixture` ->
 /// the same real Qwen Component graph production, generic Runtime
 /// Inference API, and generation loop every other first-native caller
 /// uses -- with no `qwen-test` identity or fixture manifest anywhere in
@@ -4483,8 +4522,14 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
     let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
     let delegate_tokenizer: std::sync::Arc<dyn crate::tokenizer::Tokenizer + Send + Sync> =
         std::sync::Arc::new(e2e_fixture_tokenizer().unwrap());
-    let fixture = production_qwen_fixture(manifest.clone(), tokenizer_metadata, delegate_tokenizer)
-        .expect("production fixture builds against a genuinely different config than the canonical fixture");
+    let fixture = production_model_fixture(
+        manifest.clone(),
+        tokenizer_metadata,
+        delegate_tokenizer,
+    )
+    .expect(
+        "production fixture builds against a genuinely different config than the canonical fixture",
+    );
     assert_eq!(fixture.config.architecture.attention_head_count, 4);
     assert_eq!(fixture.config.architecture.kv_head_count, 2);
 
@@ -4578,12 +4623,12 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
     .expect("model instance unloads cleanly, no leaked resources");
 }
 
-/// The load-bearing correctness proof for `ProductionQwenLoadedModel::
+/// The load-bearing correctness proof for `ProductionLoadedModel::
 /// load_with_component` (`wire-generic-inference-component-runtime`'s
 /// follow-up phase, closing the Tachyon integration audit's MAG-02): a
 /// model loaded against an *explicitly registered* Component digest
 /// generates *exactly* the same tokens as the same model loaded through
-/// [`ProductionQwenLoadedModel::load`]'s pre-existing hardcoded-singleton
+/// [`ProductionLoadedModel::load`]'s pre-existing hardcoded-singleton
 /// path, for the identical underlying Component bytes. This proves the
 /// registered Component genuinely drives generation end to end (plan
 /// production in `prepare_generation` and dispatch-time graph production in
@@ -4593,11 +4638,11 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
 /// idempotent_and_matches_the_singleton_path`).
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
-fn production_qwen_loaded_model_load_with_component_matches_the_singleton_path() {
+fn production_loaded_model_load_with_component_matches_the_singleton_path() {
     // `e2e_fixture()`'s own manifest is shaped for the in-memory,
     // fixture-only `E2eRuntimeModelExecutionEngine` path (no declared
     // per-tensor byte offset/size) -- `load_production_qwen_instance_for_
-    // provider` (the real production-loading path `ProductionQwenLoadedModel::
+    // provider` (the real production-loading path `ProductionLoadedModel::
     // load` drives) requires those, so this test builds its own
     // production-shaped manifest around the same canonical config, exactly
     // like `production_loading_generates_end_to_end_with_a_non_canonical_
@@ -4687,7 +4732,7 @@ fn production_qwen_loaded_model_load_with_component_matches_the_singleton_path()
     let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
     let delegate_tokenizer: std::sync::Arc<dyn crate::tokenizer::Tokenizer + Send + Sync> =
         std::sync::Arc::new(e2e_fixture_tokenizer().unwrap());
-    let fixture = production_qwen_fixture(manifest, tokenizer_metadata, delegate_tokenizer)
+    let fixture = production_model_fixture(manifest, tokenizer_metadata, delegate_tokenizer)
         .expect("production fixture builds against the canonical config");
 
     let component_trust = ComponentTrustStore::default()
@@ -4709,7 +4754,7 @@ fn production_qwen_loaded_model_load_with_component_matches_the_singleton_path()
         max_generation_millis: None,
     };
 
-    let mut via_singleton = ProductionQwenLoadedModel::load(
+    let mut via_singleton = ProductionLoadedModel::load(
         fixture.clone(),
         &payload_source,
         model_trust(),
@@ -4720,7 +4765,7 @@ fn production_qwen_loaded_model_load_with_component_matches_the_singleton_path()
         .generate(request(), None)
         .expect("singleton-path generation succeeds");
 
-    let mut via_named = ProductionQwenLoadedModel::load_with_component(
+    let mut via_named = ProductionLoadedModel::load_with_component(
         fixture.clone(),
         &payload_source,
         model_trust(),
