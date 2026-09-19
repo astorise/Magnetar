@@ -6,7 +6,7 @@
 //! functions). Both tests here drive
 //! `magnetar_runtime::run_first_native_graph_with_provider[_and_weights]`
 //! -- real Model Loading, real weight materialization, a real Prepared
-//! Execution Plan bound to CUDA, and the actual `execute_qwen_graph`
+//! Execution Plan bound to CUDA, and the actual `execute_first_native_graph`
 //! dispatch entrypoint every production first-native call goes through --
 //! against a real, registered `CudaProvider`.
 //!
@@ -34,7 +34,7 @@
 //!   `magnetar-runtime`'s genuinely-always-public graph primitives
 //!   (`ExecutionGraph`/`ExecutionNode`/`TensorEdge`, the same building
 //!   blocks `qwen_build_graph` itself is written from) -- real dispatch
-//!   through the real `execute_qwen_graph`/`resolve_qwen_weight_edge`/
+//!   through the real `execute_first_native_graph`/`resolve_first_native_weight_edge`/
 //!   `resident_resource_affinity` functions the P0 findings lived in,
 //!   without touching the Component-vs-Rust-graph production boundary at
 //!   all.
@@ -47,18 +47,19 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use magnetar_runtime::qwen_model_component::{
-    QWEN_ARCHITECTURE_FAMILY, qwen_architecture_implementation, qwen_architecture_metadata,
-    qwen_component_descriptor, qwen_component_identity, qwen_validate_model_artifact,
+    QWEN_ARCHITECTURE_FAMILY, first_native_architecture_metadata,
+    first_native_component_descriptor, first_native_component_identity,
+    qwen_architecture_implementation, validate_first_native_model_artifact,
 };
 use magnetar_runtime::{
     ComputeDType, DTypeDescriptor, E2eFixture, ExecutionGraph, ExecutionGraphPhase,
-    ExecutionGraphProducer, ExecutionNode, ExecutionNodeId, HostTensor, KernelResultStatus,
-    KvCacheId, LayoutDescriptor, MemoryAllocationState, MemoryPlacement,
-    ModelArchitectureImplementationKind, ModelComponentId, ModelComponentImplementationKind,
-    ModelComponentVersion, OperatorAttributeValue, OperatorFamily, OperatorId, QwenConfig,
-    QwenRopeConfig, Runtime, ShapeDescriptor, TensorDescriptor, TensorEdge, TensorEdgeId,
-    TensorResourceId, build_first_native_graphs_from_real_qwen_component, e2e_fixture,
-    e2e_fixture_manifest_from_weights, e2e_fixture_tokenizer, e2e_fixture_weights,
+    ExecutionGraphProducer, ExecutionNode, ExecutionNodeId, FirstNativeModelConfig,
+    FirstNativeRopeConfig, HostTensor, KernelResultStatus, KvCacheId, LayoutDescriptor,
+    MemoryAllocationState, MemoryPlacement, ModelArchitectureImplementationKind, ModelComponentId,
+    ModelComponentImplementationKind, ModelComponentVersion, OperatorAttributeValue,
+    OperatorFamily, OperatorId, Runtime, ShapeDescriptor, TensorDescriptor, TensorEdge,
+    TensorEdgeId, TensorResourceId, build_first_native_graphs_from_real_qwen_component,
+    e2e_fixture, e2e_fixture_manifest_from_weights, e2e_fixture_tokenizer, e2e_fixture_weights,
     register_qwen_component_artifact, run_first_native_graph_with_provider,
     run_first_native_graph_with_provider_and_weights,
 };
@@ -162,7 +163,7 @@ fn real_qwen_model_instance_dispatches_on_cuda_device_resident_and_matches_refer
 
     // Real dispatch against a real, registered CudaProvider: real Model
     // Loading, real weight materialization, a real Prepared Execution Plan
-    // bound to CUDA, the actual execute_qwen_graph entrypoint.
+    // bound to CUDA, the actual execute_first_native_graph entrypoint.
     let cuda_cache_id = KvCacheId::new("cuda-first-native-e2e-cache").expect("cache id is valid");
     let cuda_outcome = run_first_native_graph_with_provider(
         Arc::new(CudaProvider::new()),
@@ -244,11 +245,11 @@ fn f32_edge(id: impl Into<String>, dims: Vec<u64>) -> TensorEdge {
 /// around them. Not a realistic Q/K projection shape (both rope nodes
 /// consume the raw embedding output directly, skipping the matmul
 /// projections a real layer would have), but that is irrelevant to what
-/// this graph exists to prove: that `execute_qwen_graph`'s real "rope"
-/// dispatch arm, `resolve_qwen_weight_edge`, and `resident_resource_
+/// this graph exists to prove: that `execute_first_native_graph`'s real "rope"
+/// dispatch arm, `resolve_first_native_weight_edge`, and `resident_resource_
 /// affinity` handle two genuinely different `head_count` values correctly
 /// end to end on real CUDA hardware.
-fn build_minimal_gqa_rope_graph(config: &QwenConfig) -> ExecutionGraph {
+fn build_minimal_gqa_rope_graph(config: &FirstNativeModelConfig) -> ExecutionGraph {
     let a = &config.architecture;
 
     let mut graph = ExecutionGraph::new(
@@ -264,7 +265,7 @@ fn build_minimal_gqa_rope_graph(config: &QwenConfig) -> ExecutionGraph {
         tokenizer_dependency: None,
     };
 
-    // `execute_qwen_graph_nodes` unconditionally expects exactly
+    // `execute_first_native_graph_nodes` unconditionally expects exactly
     // `layer_count` K *and* V commits (one real Qwen layer's worth), even
     // for a minimal, non-Qwen-shaped graph like this one -- it is not a
     // fully generic graph executor, it has Qwen's own per-layer KV-cache
@@ -369,13 +370,13 @@ fn genuinely_gqa_shaped_rope_dispatches_on_cuda_device_resident_with_distinct_he
     // pattern proven in-crate against Reference CPU by
     // `run_first_native_graph_with_provider_and_weights_handles_a_genuinely_gqa_shaped_config`
     // before being ported here.
-    let architecture = qwen_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
-    let identity = qwen_component_identity(
+    let architecture = first_native_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
+    let identity = first_native_component_identity(
         ModelComponentId::new("cuda-gqa-integration-fixture").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
     );
-    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
     config.validate(&identity).expect("GQA config validates");
     let architecture_implementation = qwen_architecture_implementation(
         &identity,
@@ -389,9 +390,9 @@ fn genuinely_gqa_shaped_rope_dispatches_on_cuda_device_resident_with_distinct_he
     )
     .expect("GQA fixture manifest builds");
     let tokenizer = e2e_fixture_tokenizer().expect("fixture tokenizer builds");
-    let descriptor = qwen_component_descriptor(identity.clone(), &config)
+    let descriptor = first_native_component_descriptor(identity.clone(), &config)
         .expect("GQA component descriptor builds");
-    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+    validate_first_native_model_artifact(&descriptor, &config, &manifest)
         .expect("GQA manifest matches its own descriptor");
     let fixture = E2eFixture {
         config,

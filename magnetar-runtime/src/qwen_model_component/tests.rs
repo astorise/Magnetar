@@ -43,7 +43,7 @@ fn token_id_edge(id: impl Into<String>, dims: Vec<u64>) -> TensorEdge {
 /// this logical tensor is declared with [`TensorAliasing::MayAlias`] pointing
 /// at `weight.token_embedding`, recording that it shares storage rather than
 /// silently duplicating it; when untied it is an independent tensor.
-fn qwen_lm_head_weight_edge(config: &QwenConfig) -> TensorEdge {
+fn qwen_lm_head_weight_edge(config: &FirstNativeModelConfig) -> TensorEdge {
     let a = &config.architecture;
     let mut edge = f32_edge("weight.lm_head", vec![a.hidden_size, a.vocabulary_size]);
     if config.tied_embeddings {
@@ -64,7 +64,7 @@ fn qwen_lm_head_weight_edge(config: &QwenConfig) -> TensorEdge {
 /// Component's output in tests, proving the two agree numerically, and as
 /// a conformance fixture for this module's own tests.
 pub fn qwen_build_graph(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
     phase: ExecutionGraphPhase,
     sequence_length: u64,
@@ -522,7 +522,7 @@ pub fn qwen_build_graph(
 ///
 /// Test-oracle only -- see [`qwen_build_graph`]'s doc comment.
 pub fn qwen_prefill_graph(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
     prompt_length: u64,
     kv_cache_enabled: bool,
@@ -552,7 +552,7 @@ pub fn qwen_prefill_graph(
 ///
 /// Test-oracle only -- see [`qwen_build_graph`]'s doc comment.
 pub fn qwen_decode_graph(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
     cached_token_count: u64,
 ) -> Result<GraphProductionResult, QwenComponentError> {
@@ -593,7 +593,7 @@ impl QwenConformanceReport {
 /// (e.g. authority denial) are covered by dedicated unit tests rather than
 /// this data-driven report.
 pub fn qwen_conformance_report(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
 ) -> QwenConformanceReport {
     let mut checks = Vec::new();
@@ -608,7 +608,8 @@ pub fn qwen_conformance_report(
     let mut invalid_family_architecture = config.architecture.clone();
     invalid_family_architecture.family = "not-qwen".into();
     let invalid_family_result =
-        QwenConfig::new(invalid_family_architecture, config.rope.clone()).validate(identity);
+        FirstNativeModelConfig::new(invalid_family_architecture, config.rope.clone())
+            .validate(identity);
     checks.push(QwenConformanceCheck {
         name: "invalid-architecture-family",
         passed: matches!(
@@ -619,7 +620,7 @@ pub fn qwen_conformance_report(
     });
 
     let scope_result =
-        validate_model_component_first_scope_requirements(&qwen_operator_requirements())
+        validate_model_component_first_scope_requirements(&first_native_operator_requirements())
             .map_err(QwenComponentError::from);
     checks.push(QwenConformanceCheck {
         name: "required-operator-scope-validation",
@@ -646,7 +647,7 @@ pub fn qwen_conformance_report(
 
     checks.push(QwenConformanceCheck {
         name: "unsupported-quantization-rejection",
-        passed: qwen_quantization_compatibility()
+        passed: first_native_quantization_compatibility()
             .supported_methods
             .is_empty(),
         detail: None,
@@ -655,13 +656,13 @@ pub fn qwen_conformance_report(
     checks.push(QwenConformanceCheck {
         name: "authority-denial",
         passed: crate::validate_model_component_authority(["network"]).is_err()
-            && !qwen_authority().is_empty(),
+            && !first_native_authority().is_empty(),
         detail: None,
     });
 
     checks.push(QwenConformanceCheck {
         name: "target-module-exposure",
-        passed: qwen_target_modules().len() == QWEN_TARGET_MODULE_ROLES.len(),
+        passed: first_native_target_modules().len() == QWEN_TARGET_MODULE_ROLES.len(),
         detail: None,
     });
 
@@ -671,15 +672,15 @@ pub fn qwen_conformance_report(
 use std::collections::BTreeMap;
 
 fn small_architecture() -> ModelComponentArchitectureMetadata {
-    qwen_architecture_metadata(8, 2, 2, 2, 4, 16, 32, 64)
+    first_native_architecture_metadata(8, 2, 2, 2, 4, 16, 32, 64)
 }
 
-fn small_config() -> QwenConfig {
-    QwenConfig::new(small_architecture(), QwenRopeConfig::standard(4))
+fn small_config() -> FirstNativeModelConfig {
+    FirstNativeModelConfig::new(small_architecture(), FirstNativeRopeConfig::standard(4))
 }
 
 fn small_identity() -> ModelComponentIdentity {
-    qwen_component_identity(
+    first_native_component_identity(
         ModelComponentId::new("qwen-baseline").unwrap(),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::RuntimeNative,
@@ -688,7 +689,7 @@ fn small_identity() -> ModelComponentIdentity {
 
 #[test]
 fn valid_minimal_config_builds_descriptor() {
-    let descriptor = qwen_component_descriptor(small_identity(), &small_config()).unwrap();
+    let descriptor = first_native_component_descriptor(small_identity(), &small_config()).unwrap();
     assert_eq!(descriptor.architecture.family, QWEN_ARCHITECTURE_FAMILY);
     assert_eq!(
         descriptor.target_modules.len(),
@@ -700,7 +701,7 @@ fn valid_minimal_config_builds_descriptor() {
 fn invalid_architecture_family_is_rejected() {
     let mut architecture = small_architecture();
     architecture.family = "llama".into();
-    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(4));
+    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(4));
     assert_eq!(
         config.validate(&small_identity()),
         Err(QwenComponentError::ArchitectureUnsupported)
@@ -711,7 +712,7 @@ fn invalid_architecture_family_is_rejected() {
 fn invalid_hidden_head_configuration_is_rejected() {
     let mut architecture = small_architecture();
     architecture.hidden_size = 9; // not attention_head_count * head_dimension
-    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(4));
+    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(4));
     assert!(matches!(
         config.validate(&small_identity()),
         Err(QwenComponentError::ConfigInvalid {
@@ -737,7 +738,7 @@ fn missing_tensor_inventory_is_detected() {
         digest: None,
     }];
     assert!(matches!(
-        qwen_validate_tensor_inventory(&config, &tensors),
+        validate_first_native_tensor_inventory(&config, &tensors),
         Err(QwenComponentError::TensorInventoryMissing { .. })
     ));
 }
@@ -758,14 +759,14 @@ fn invalid_tensor_shape_is_detected() {
         digest: None,
     };
     assert!(matches!(
-        qwen_validate_tensor_shapes(&config, std::slice::from_ref(&tensor)),
+        validate_first_native_tensor_shapes(&config, std::slice::from_ref(&tensor)),
         Err(QwenComponentError::TensorShapeMismatch { .. })
     ));
 }
 
 #[test]
 fn target_modules_are_exposed() {
-    let modules = qwen_target_modules();
+    let modules = first_native_target_modules();
     assert!(
         modules
             .iter()
@@ -803,7 +804,8 @@ fn decode_graph_production_includes_kv_cache_append() {
 
 #[test]
 fn required_operator_scope_validation_passes_for_baseline_requirements() {
-    validate_model_component_first_scope_requirements(&qwen_operator_requirements()).unwrap();
+    validate_model_component_first_scope_requirements(&first_native_operator_requirements())
+        .unwrap();
 }
 
 #[test]
@@ -819,7 +821,7 @@ fn out_of_scope_operator_is_rejected_by_first_scope() {
 #[test]
 fn tokenizer_compatibility_declares_vocabulary_size() {
     let config = small_config();
-    let compatibility = qwen_tokenizer_compatibility(&config);
+    let compatibility = first_native_tokenizer_compatibility(&config);
     assert_eq!(
         compatibility.vocabulary_size,
         config.architecture.vocabulary_size
@@ -849,7 +851,7 @@ fn tokenizer_vocabulary_mismatch_is_rejected() {
         supports_browser: true,
     };
     assert_eq!(
-        qwen_validate_tokenizer_compatibility(&config, &tokenizer),
+        validate_first_native_tokenizer_compatibility(&config, &tokenizer),
         Err(QwenComponentError::TokenizerIncompatible)
     );
 }
@@ -862,7 +864,7 @@ fn generation_defaults_exceeding_context_length_are_rejected() {
         ..crate::ModelGenerationDefaults::default()
     };
     assert!(matches!(
-        qwen_validate_generation_defaults(&config, &defaults, None),
+        validate_first_native_generation_defaults(&config, &defaults, None),
         Err(QwenComponentError::GenerationMetadataInvalid { .. })
     ));
 }
@@ -870,7 +872,7 @@ fn generation_defaults_exceeding_context_length_are_rejected() {
 #[test]
 fn kv_cache_metadata_matches_architecture() {
     let config = small_config();
-    let metadata = qwen_kv_cache_metadata(&config);
+    let metadata = first_native_kv_cache_metadata(&config);
     assert_eq!(metadata.layer_count, config.architecture.layer_count);
     assert_eq!(metadata.head_dimension, config.architecture.head_dimension);
     assert!(!metadata.paged);
@@ -891,7 +893,7 @@ fn adapter_target_validation_exposes_expected_modules() {
 fn unsupported_quantization_is_rejected() {
     let config = small_config();
     let identity = small_identity();
-    let descriptor = qwen_component_descriptor(identity, &config).unwrap();
+    let descriptor = first_native_component_descriptor(identity, &config).unwrap();
     let mut manifest_architecture = ModelArchitecture::new(QWEN_ARCHITECTURE_FAMILY, "qwen-test");
     manifest_architecture.required_component_role = None;
     let manifest = ModelManifest {
@@ -935,14 +937,14 @@ fn unsupported_quantization_is_rejected() {
         architecture_config: None,
     };
     assert_eq!(
-        qwen_validate_model_artifact(&descriptor, &config, &manifest),
+        validate_first_native_model_artifact(&descriptor, &config, &manifest),
         Err(QwenComponentError::QuantizationUnsupported)
     );
 }
 
 #[test]
 fn authority_denies_forbidden_authorities() {
-    let authority = qwen_authority();
+    let authority = first_native_authority();
     assert!(authority.contains(&ModelComponentAuthority::ModelArtifactRead));
     assert!(crate::validate_model_component_authority(["network"]).is_err());
     assert!(crate::validate_model_component_authority(["filesystem"]).is_err());
@@ -966,7 +968,7 @@ fn no_provider_device_kernel_handle_exposure() {
 
 #[test]
 fn rope_dynamic_scaling_unsupported_is_rejected() {
-    let mut rope = QwenRopeConfig::standard(4);
+    let mut rope = FirstNativeRopeConfig::standard(4);
     rope.scale = Some(2.0);
     assert!(matches!(
         rope.validate(4),
@@ -1010,8 +1012,8 @@ fn tied_embedding_shape_must_match_vocabulary_and_hidden_size() {
     let mut config = small_config();
     config.tied_embeddings = true;
     let mut tensors = Vec::new();
-    for name in qwen_expected_tensor_names(config.architecture.layer_count, true) {
-        let shape = qwen_expected_tensor_shape(&name, &config).unwrap_or_default();
+    for name in first_native_expected_tensor_names(config.architecture.layer_count, true) {
+        let shape = first_native_expected_tensor_shape(&name, &config).unwrap_or_default();
         tensors.push(ModelTensorMetadata {
             name,
             shape,
@@ -1025,7 +1027,7 @@ fn tied_embedding_shape_must_match_vocabulary_and_hidden_size() {
             digest: None,
         });
     }
-    assert!(qwen_validate_tied_embedding_shape(&config, &tensors).is_ok());
+    assert!(validate_first_native_tied_embedding_shape(&config, &tensors).is_ok());
 
     for tensor in &mut tensors {
         if tensor.name == "token_embedding" {
@@ -1033,7 +1035,7 @@ fn tied_embedding_shape_must_match_vocabulary_and_hidden_size() {
         }
     }
     assert!(matches!(
-        qwen_validate_tied_embedding_shape(&config, &tensors),
+        validate_first_native_tied_embedding_shape(&config, &tensors),
         Err(QwenComponentError::TensorShapeMismatch { .. })
     ));
 }
@@ -1136,7 +1138,7 @@ fn tokenizer_missing_required_bos_is_rejected() {
         supports_browser: true,
     };
     assert_eq!(
-        qwen_validate_tokenizer_compatibility(&config, &tokenizer),
+        validate_first_native_tokenizer_compatibility(&config, &tokenizer),
         Err(QwenComponentError::TokenizerIncompatible)
     );
 }
@@ -1146,11 +1148,11 @@ fn chat_template_required_but_missing_is_rejected() {
     let mut config = small_config();
     config.chat_template_required = true;
     let identity = small_identity();
-    let descriptor = qwen_component_descriptor(identity, &config).unwrap();
+    let descriptor = first_native_component_descriptor(identity, &config).unwrap();
     let manifest_architecture = ModelArchitecture::new(QWEN_ARCHITECTURE_FAMILY, "qwen-test");
     let mut tensors = Vec::new();
-    for name in qwen_expected_tensor_names(config.architecture.layer_count, false) {
-        let shape = qwen_expected_tensor_shape(&name, &config).unwrap_or_default();
+    for name in first_native_expected_tensor_names(config.architecture.layer_count, false) {
+        let shape = first_native_expected_tensor_shape(&name, &config).unwrap_or_default();
         tensors.push(ModelTensorMetadata {
             name,
             shape,
@@ -1196,7 +1198,7 @@ fn chat_template_required_but_missing_is_rejected() {
         architecture_config: None,
     };
     assert!(matches!(
-        qwen_validate_model_artifact(&descriptor, &config, &manifest),
+        validate_first_native_model_artifact(&descriptor, &config, &manifest),
         Err(QwenComponentError::ComponentInvalid { .. })
     ));
 }
@@ -1211,7 +1213,7 @@ fn generation_defaults_non_authoritative_sampling_values_are_never_rejected() {
             top_k: Some(u32::MAX),
             ..crate::ModelGenerationDefaults::default()
         };
-        assert!(qwen_validate_generation_defaults(&config, &defaults, None).is_ok());
+        assert!(validate_first_native_generation_defaults(&config, &defaults, None).is_ok());
     }
 }
 
@@ -1333,7 +1335,7 @@ fn reference_cpu_rejects_incompatible_kv_head_count() {
 #[test]
 fn kv_cache_compatibility_embeds_component_version() {
     let identity_v1 = small_identity();
-    let identity_v2 = qwen_component_identity(
+    let identity_v2 = first_native_component_identity(
         ModelComponentId::new("qwen-baseline").unwrap(),
         ModelComponentVersion::new(2, 0, 0),
         ModelComponentImplementationKind::RuntimeNative,
@@ -1352,7 +1354,7 @@ fn kv_cache_compatibility_embeds_component_version() {
 #[test]
 fn prefix_cache_compatibility_rejects_cross_version_and_cross_adapter_reuse() {
     let identity_v1 = small_identity();
-    let identity_v2 = qwen_component_identity(
+    let identity_v2 = first_native_component_identity(
         ModelComponentId::new("qwen-baseline").unwrap(),
         ModelComponentVersion::new(2, 0, 0),
         ModelComponentImplementationKind::RuntimeNative,
@@ -1438,10 +1440,10 @@ fn conformance_report_is_conformant_for_valid_config() {
     assert!(names.contains("decode-graph-production"));
 }
 
-fn integration_config() -> QwenConfig {
-    QwenConfig::new(
-        qwen_architecture_metadata(4, 1, 2, 2, 2, 8, 16, 32),
-        QwenRopeConfig::standard(2),
+fn integration_config() -> FirstNativeModelConfig {
+    FirstNativeModelConfig::new(
+        first_native_architecture_metadata(4, 1, 2, 2, 2, 8, 16, 32),
+        FirstNativeRopeConfig::standard(2),
     )
 }
 
@@ -1449,8 +1451,8 @@ fn integration_manifest(architecture: ModelArchitecture) -> ModelManifest {
     let config = integration_config();
     let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
     let mut tensor_yaml = String::new();
-    for name in qwen_expected_tensor_names(config.architecture.layer_count, false) {
-        let shape = qwen_expected_tensor_shape(&name, &config).unwrap();
+    for name in first_native_expected_tensor_names(config.architecture.layer_count, false) {
+        let shape = first_native_expected_tensor_shape(&name, &config).unwrap();
         let shape_text = shape
             .iter()
             .map(u64::to_string)
@@ -1506,7 +1508,7 @@ tensors:
 #[test]
 fn qwen_component_integrates_with_model_loading_and_instance_and_graph_execution() {
     let config = integration_config();
-    let identity = qwen_component_identity(
+    let identity = first_native_component_identity(
         ModelComponentId::new("qwen-integration").unwrap(),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::RuntimeNative,
@@ -1517,9 +1519,12 @@ fn qwen_component_integrates_with_model_loading_and_instance_and_graph_execution
     );
     let manifest = integration_manifest(architecture_implementation.architecture.clone());
 
-    let descriptor = qwen_component_descriptor(identity.clone(), &config).unwrap();
-    qwen_validate_model_artifact(&descriptor, &config, &manifest).unwrap();
-    assert_eq!(qwen_target_modules().len(), QWEN_TARGET_MODULE_ROLES.len());
+    let descriptor = first_native_component_descriptor(identity.clone(), &config).unwrap();
+    validate_first_native_model_artifact(&descriptor, &config, &manifest).unwrap();
+    assert_eq!(
+        first_native_target_modules().len(),
+        QWEN_TARGET_MODULE_ROLES.len()
+    );
 
     let mut coordinator = ModelLoadingCoordinator::new();
     coordinator.register_architecture(architecture_implementation.clone());

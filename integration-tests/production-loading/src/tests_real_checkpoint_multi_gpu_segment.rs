@@ -6,7 +6,7 @@
 //!
 //! Two segment `ModelInstance`s, each loaded from the SAME real ingested
 //! checkpoint but materializing only its own layer range's real weights
-//! (`load_production_qwen_instance_segment_for_provider`, streamed
+//! (`load_production_model_instance_segment_for_provider`, streamed
 //! straight from the real Safetensors file -- the other segment's weights
 //! are never fetched): real GPU 0 holds decoder layers `[0, mid)`, real
 //! GPU 1 holds `[mid, num_hidden_layers)`. Each real generation step
@@ -49,7 +49,7 @@ use magnetar_runtime::{
     E2eFixture, PromptInput, TokenId, TokenizationRequest,
     build_first_native_decode_graph_segment_for_config,
     build_first_native_prefill_graph_segment_for_config,
-    load_production_qwen_instance_segment_for_provider, production_model_fixture,
+    load_production_model_instance_segment_for_provider, production_model_fixture,
     run_first_native_graph_segment_dispatch, run_production_qwen_generation_for_provider,
     tokenize_prompt_input,
 };
@@ -201,7 +201,7 @@ fn real_public_checkpoint_multi_gpu_segment_decode_matches_full_graph_on_one_gpu
         &magnetar_provider_cuda::CudaProvider::new(),
     )
     .expect("real GPU 0 prepared kernels register cleanly");
-    let mut gpu0_instance = load_production_qwen_instance_segment_for_provider(
+    let mut gpu0_instance = load_production_model_instance_segment_for_provider(
         &mut gpu0_runtime,
         &segment_fixture.manifest,
         ingested.payload_source.as_ref(),
@@ -221,7 +221,7 @@ fn real_public_checkpoint_multi_gpu_segment_decode_matches_full_graph_on_one_gpu
         &magnetar_provider_cuda::CudaProvider::for_device(1, "magnetar:provider/cuda:1"),
     )
     .expect("real GPU 1 prepared kernels register cleanly");
-    let mut gpu1_instance = load_production_qwen_instance_segment_for_provider(
+    let mut gpu1_instance = load_production_model_instance_segment_for_provider(
         &mut gpu1_runtime,
         &segment_fixture.manifest,
         ingested.payload_source.as_ref(),
@@ -239,8 +239,8 @@ fn real_public_checkpoint_multi_gpu_segment_decode_matches_full_graph_on_one_gpu
         .expect("cache id is valid");
 
     let mut generated_token_ids: Vec<TokenId> = Vec::with_capacity(MAX_TOKENS);
-    let mut gpu0_layer_kv = magnetar_runtime::QwenLayerKvMap::new();
-    let mut gpu1_layer_kv = magnetar_runtime::QwenLayerKvMap::new();
+    let mut gpu0_layer_kv = magnetar_runtime::LayerKvMap::new();
+    let mut gpu1_layer_kv = magnetar_runtime::LayerKvMap::new();
 
     for step in 0..MAX_TOKENS {
         let is_prefill = step == 0;

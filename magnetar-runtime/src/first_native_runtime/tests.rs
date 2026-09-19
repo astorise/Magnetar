@@ -217,7 +217,7 @@ fn e2e_fixture_tokenizer_produces_deterministic_tokens() {
 #[test]
 fn e2e_graph_nodes_transport_stays_tensor_value_typed() {
     check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls().expect(
-        "execute_qwen_graph_nodes's per-node transport has no direct HostTensor-typed calls",
+        "execute_first_native_graph_nodes's per-node transport has no direct HostTensor-typed calls",
     );
 }
 
@@ -1114,7 +1114,7 @@ impl Provider for TestFailableKernelProvider {
 /// Confirms: the dispatch actually succeeds through the fully generalized
 /// path (`build_runtime_with_model_execution_engine_and_provider` ->
 /// `load_fixture_instance_for_provider` -> `prepare_first_native_plan_
-/// for_graph` with an explicit Provider -> `execute_qwen_graph`), the
+/// for_graph` with an explicit Provider -> `execute_first_native_graph`), the
 /// resolved Provider is genuinely Reference CPU (not silently defaulted
 /// there by some untouched hardcoded path), and every weight/output
 /// resource's own recorded `ResourceAffinity`/`MemoryPlacement` agrees.
@@ -1177,7 +1177,7 @@ fn run_first_native_graph_with_provider_matches_reference_cpu_e2e_dispatch() {
 }
 
 /// `audit-complet-cuda-hot-path-2026-09-08` P1-1: proves a fully custom,
-/// genuinely grouped-query-shaped `QwenConfig`
+/// genuinely grouped-query-shaped `FirstNativeModelConfig`
 /// (`attention_head_count=4, kv_head_count=2`, which the one canonical E2E
 /// fixture this crate ships is not) can run through the real first-native
 /// pipeline end to end -- own manifest, own synthetic weights, own
@@ -1193,13 +1193,13 @@ fn run_first_native_graph_with_provider_matches_reference_cpu_e2e_dispatch() {
 /// configuration, not just the one fixture it was written against.
 #[test]
 fn run_first_native_graph_with_provider_and_weights_handles_a_genuinely_gqa_shaped_config() {
-    let architecture = qwen_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
-    let identity = qwen_component_identity(
+    let architecture = first_native_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
+    let identity = first_native_component_identity(
         ModelComponentId::new("gqa-integration-fixture").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
     );
-    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
     config.validate(&identity).expect("GQA config validates");
     let architecture_implementation = qwen_architecture_implementation(
         &identity,
@@ -1213,9 +1213,9 @@ fn run_first_native_graph_with_provider_and_weights_handles_a_genuinely_gqa_shap
     )
     .expect("GQA fixture manifest builds");
     let tokenizer = e2e_fixture_tokenizer().expect("fixture tokenizer builds");
-    let descriptor = qwen_component_descriptor(identity.clone(), &config)
+    let descriptor = first_native_component_descriptor(identity.clone(), &config)
         .expect("GQA component descriptor builds");
-    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+    validate_first_native_model_artifact(&descriptor, &config, &manifest)
         .expect("GQA manifest matches its own descriptor");
     let fixture = E2eFixture {
         config,
@@ -1284,13 +1284,13 @@ fn run_first_native_graph_with_provider_and_weights_handles_a_genuinely_gqa_shap
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
 fn real_qwen_component_produces_a_config_correct_graph_for_a_genuinely_gqa_shaped_config() {
-    let architecture = qwen_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
-    let identity = qwen_component_identity(
+    let architecture = first_native_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 32);
+    let identity = first_native_component_identity(
         ModelComponentId::new("gqa-real-component-fixture").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
     );
-    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
     config.validate(&identity).expect("GQA config validates");
     let architecture_implementation = qwen_architecture_implementation(
         &identity,
@@ -1304,9 +1304,9 @@ fn real_qwen_component_produces_a_config_correct_graph_for_a_genuinely_gqa_shape
     )
     .expect("GQA fixture manifest builds");
     let tokenizer = e2e_fixture_tokenizer().expect("fixture tokenizer builds");
-    let descriptor = qwen_component_descriptor(identity.clone(), &config)
+    let descriptor = first_native_component_descriptor(identity.clone(), &config)
         .expect("GQA component descriptor builds");
-    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+    validate_first_native_model_artifact(&descriptor, &config, &manifest)
         .expect("GQA manifest matches its own descriptor");
     let fixture = E2eFixture {
         config,
@@ -1417,7 +1417,7 @@ fn e2e_graph_dispatch_rolls_back_pre_admitted_output_on_submit_time_failure() {
     let ids = HostTensor::new([2], vec![1.0, 2.0]).expect("token id tensor builds");
     let cache_id = KvCacheId::new("test-submit-time-rollback-cache").expect("cache id is valid");
 
-    let result = execute_qwen_graph(
+    let result = execute_first_native_graph(
         &mut runtime,
         &fixture,
         &instance,
@@ -1513,7 +1513,7 @@ fn e2e_graph_dispatch_rolls_back_pre_admitted_output_on_kernel_completion_failur
         .filter(|allocation| allocation.state == MemoryAllocationState::Active)
         .count();
 
-    let result = execute_qwen_graph(
+    let result = execute_first_native_graph(
         &mut runtime,
         &fixture,
         &instance,
@@ -1542,7 +1542,7 @@ fn e2e_graph_dispatch_rolls_back_pre_admitted_output_on_kernel_completion_failur
          Runtime's Active allocation count exactly one higher than it was right after model \
          loading -- the one legitimate admission being the graph's own 'input.token_ids' \
          resource (admitted up front, before any node dispatches -- see \
-         `execute_qwen_graph_nodes`'s `initial_bindings` loop); `embedding`'s own \
+         `execute_first_native_graph_nodes`'s `initial_bindings` loop); `embedding`'s own \
          pre-admitted output must be rolled back, not left behind as a second, leaked \
          allocation"
     );
@@ -1588,7 +1588,7 @@ fn e2e_graph_dispatch_rolls_back_pre_admitted_output_on_kernel_completion_failur
         KvCacheId::new("test-kernel-completion-rollback-retry-cache").expect("cache id is valid");
     *executor.fail_operator.lock().unwrap() = None;
     executor.failing_handles.lock().unwrap().clear();
-    let retry_result = execute_qwen_graph(
+    let retry_result = execute_first_native_graph(
         &mut runtime,
         &fixture,
         &instance,
@@ -1623,7 +1623,7 @@ fn dispatch_reference_cpu_operator_multi_binds_every_output() {
     let mut runtime = build_runtime_trusting_fixture(&fixture);
     let provider: Arc<dyn ProviderExecutionApi> = Arc::new(ReferenceCpuExecutor::new());
     let mut node_events = Vec::new();
-    let mut dispatch_ctx = QwenDispatchContext {
+    let mut dispatch_ctx = FirstNativeDispatchContext {
         runtime: &mut runtime,
         provider,
         prepared_plan: None,
@@ -1812,7 +1812,7 @@ fn resident_input_passthrough_reuses_existing_resource_and_computes_correctly() 
     let mut runtime = build_runtime_trusting_fixture(&fixture);
     let provider: Arc<dyn ProviderExecutionApi> = Arc::new(OpaqueReportingExecutor::new());
     let mut node_events = Vec::new();
-    let mut dispatch_ctx = QwenDispatchContext {
+    let mut dispatch_ctx = FirstNativeDispatchContext {
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: None,
@@ -1911,7 +1911,7 @@ fn rmsnorm_accepts_a_resident_input_without_materializing_it_first() {
     ));
 
     let mut node_events = Vec::new();
-    let mut dispatch_ctx = QwenDispatchContext {
+    let mut dispatch_ctx = FirstNativeDispatchContext {
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: None,
@@ -1948,7 +1948,7 @@ fn rmsnorm_accepts_a_resident_input_without_materializing_it_first() {
 /// resource reported `Opaque` by the resolved Provider must resolve to
 /// `NodeValue::Resident` with the shape taken from the graph edge's own
 /// `TensorEdge.descriptor` -- not an error. Before this fix,
-/// `resolve_qwen_weight_edge` called `.into_host()` unconditionally, which
+/// `resolve_first_native_weight_edge` called `.into_host()` unconditionally, which
 /// fails with a structured error (`TensorValue::into_host` on `Opaque`) the
 /// moment a weight is genuinely Device-resident -- exactly the audit's
 /// P0-1 finding. Proven directly: without the fix, this call panics with
@@ -1969,7 +1969,7 @@ fn weight_edge_resolves_opaque_weight_to_resident_without_materializing() {
     let descriptor = f32_tensor_descriptor_from_shape(&[4, 4]);
 
     let resolved =
-        resolve_qwen_weight_edge(&provider, &weight_bindings, "weight.q_proj", &descriptor)
+        resolve_first_native_weight_edge(&provider, &weight_bindings, "weight.q_proj", &descriptor)
             .expect("an Opaque weight must resolve, not error");
 
     match resolved {
@@ -1984,7 +1984,7 @@ fn weight_edge_resolves_opaque_weight_to_resident_without_materializing() {
 /// `make-first-native-cuda-hot-path-device-resident` task 5.3: `lm_head`'s
 /// tied-embedding weight is transposed exactly once, at Model Load
 /// (`bind_qwen_fixture_weights` -> `qwen_weights_with_derived_lm_head`),
-/// not recomputed by `resolve_qwen_weight_edge` on every generation step.
+/// not recomputed by `resolve_first_native_weight_edge` on every generation step.
 /// Proven by running two separate graph dispatches (prefill, then decode)
 /// against the same `ModelInstance` and confirming: the `lm_head` resource
 /// binding is the same resource id both times, the Provider's stored data
@@ -2039,7 +2039,7 @@ fn lm_head_weight_is_transposed_once_at_model_load_not_per_generation_step() {
         prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
     )
     .unwrap();
-    let (_dispatch, _bindings, layer_kv, _provider) = execute_qwen_graph(
+    let (_dispatch, _bindings, layer_kv, _provider) = execute_first_native_graph(
         &mut runtime,
         &fixture,
         &instance,
@@ -2053,7 +2053,7 @@ fn lm_head_weight_is_transposed_once_at_model_load_not_per_generation_step() {
     )
     .unwrap();
     let admitted_ids = HostTensor::new([1], vec![3.0]).unwrap();
-    execute_qwen_graph(
+    execute_first_native_graph(
         &mut runtime,
         &fixture,
         &instance,
@@ -2488,7 +2488,7 @@ fn weight_materialization_uses_the_model_instances_bound_provider() {
 
 /// `generalize-first-native-provider-dispatch` P0 fix regression:
 /// `KvUpdateTransaction::begin` resolves the Provider carried on
-/// `FirstNativeExecutionKvState.provider` (what `execute_qwen_graph`
+/// `FirstNativeExecutionKvState.provider` (what `execute_first_native_graph`
 /// resolved and wrote this step's pending K/V resources under), not
 /// Reference CPU unconditionally. Tests `begin`'s resolution directly
 /// (rather than driving a full non-CPU generation step, which would need a
@@ -2510,7 +2510,7 @@ fn kv_update_transaction_resolves_the_states_bound_provider() {
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer").unwrap(),
         ),
-        layer_kv: QwenLayerKvMap::new(),
+        layer_kv: LayerKvMap::new(),
         provider: Some(mock_provider.clone()),
     };
 
@@ -2522,7 +2522,7 @@ fn kv_update_transaction_resolves_the_states_bound_provider() {
 }
 
 /// Same fix, the other branch: a state with no bound Provider (never
-/// touched by `execute_qwen_graph`, e.g. a freshly created prefill state)
+/// touched by `execute_first_native_graph`, e.g. a freshly created prefill state)
 /// still falls back to Reference CPU -- preserving today's only real
 /// behavior exactly.
 #[test]
@@ -2535,7 +2535,7 @@ fn kv_update_transaction_falls_back_to_reference_cpu_when_unbound() {
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer").unwrap(),
         ),
-        layer_kv: QwenLayerKvMap::new(),
+        layer_kv: LayerKvMap::new(),
         provider: None,
     };
 
@@ -2883,10 +2883,10 @@ mod resolve_qwen_component_from_env_var_tests {
     }
 }
 
-/// Static guard (Correctif 13 / task group 7): `execute_qwen_graph` used to
+/// Static guard (Correctif 13 / task group 7): `execute_first_native_graph` used to
 /// require `std::mem::take(runtime.memory_mut())` to get an independent
 /// `&mut MemoryManager` alongside a `&Runtime`; that gap is closed now that
-/// `QwenDispatchContext` holds a single `&mut Runtime` instead of separate
+/// `FirstNativeDispatchContext` holds a single `&mut Runtime` instead of separate
 /// `runtime`/`memory` fields (see its doc comment), so no first-native
 /// dispatch code should call `std::mem::take` on the Runtime memory service
 /// at all. This fails if the pattern reappears -- prefer cloning the
@@ -2901,7 +2901,7 @@ fn first_native_dispatch_never_takes_runtime_memory_manager() {
     assert_eq!(
         occurrences, 0,
         "expected zero std::mem::take(runtime.memory_mut()) calls in first_native_runtime.rs; \
-         found {occurrences}. Hold a single `&mut Runtime` (see `QwenDispatchContext`) and clone \
+         found {occurrences}. Hold a single `&mut Runtime` (see `FirstNativeDispatchContext`) and clone \
          out any value that must outlive a later `memory_mut()` call instead of taking the whole \
          MemoryManager."
     );
@@ -3286,7 +3286,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
 
     let (via_named, _definition, _instance) = build_first_native_graphs_from_named_component(
         &digest,
-        &architecture_config_from_qwen_config(&fixture.config),
+        &architecture_config_from_first_native_model_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3336,7 +3336,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     let (synthetic_graphs, _definition, _instance) =
         build_first_native_graphs_from_named_component(
             &synthetic_digest,
-            &architecture_config_from_qwen_config(&fixture.config),
+            &architecture_config_from_first_native_model_config(&fixture.config),
             &fixture.identity,
             prompt_token_count,
         )
@@ -3358,7 +3358,7 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
     // digest again still succeeds and still matches the singleton path.
     let (qwen_graphs_again, _definition, _instance) = build_first_native_graphs_from_named_component(
         &digest,
-        &architecture_config_from_qwen_config(&fixture.config),
+        &architecture_config_from_first_native_model_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3406,7 +3406,7 @@ fn build_first_native_graphs_from_named_component_serves_a_real_second_architect
     .expect("the real Llama Component must register");
     assert_eq!(registered, llama_digest);
 
-    // e2e_fixture()'s own config has `attention_bias: false` (`QwenConfig::
+    // e2e_fixture()'s own config has `attention_bias: false` (`FirstNativeModelConfig::
     // new`'s default) -- the same value a real, bias-free Llama checkpoint
     // would carry, and (not coincidentally) what the pre-existing Qwen
     // singleton path itself already builds graphs against elsewhere in
@@ -3420,7 +3420,7 @@ fn build_first_native_graphs_from_named_component_serves_a_real_second_architect
 
     let (llama_graphs, _definition, _instance) = build_first_native_graphs_from_named_component(
         &llama_digest,
-        &architecture_config_from_qwen_config(&fixture.config),
+        &architecture_config_from_first_native_model_config(&fixture.config),
         &fixture.identity,
         prompt_token_count,
     )
@@ -3458,7 +3458,7 @@ fn build_first_native_graphs_from_named_component_serves_a_real_second_architect
     let (llama_biased_graphs, _definition, _instance) =
         build_first_native_graphs_from_named_component(
             &llama_digest,
-            &architecture_config_from_qwen_config(&biased_config),
+            &architecture_config_from_first_native_model_config(&biased_config),
             &fixture.identity,
             prompt_token_count,
         )
@@ -3485,7 +3485,7 @@ fn build_first_native_graphs_from_named_component_fails_closed_for_an_unregister
     let fixture = e2e_fixture().expect("fixture builds");
     let result = build_first_native_graphs_from_named_component(
         &never_registered,
-        &architecture_config_from_qwen_config(&fixture.config),
+        &architecture_config_from_first_native_model_config(&fixture.config),
         &fixture.identity,
         2,
     );
@@ -4387,7 +4387,7 @@ fn e2e_chat_sessions_are_isolated_from_each_other() {
 /// In-memory [`ProductionArtifactPayloadSource`] test double: looks up
 /// bytes by tensor name only (offset/length are not cross-checked against
 /// a real file layout, since there is no file here) -- proves
-/// `load_production_qwen_instance` genuinely reads weight bytes through
+/// `load_production_model_instance` genuinely reads weight bytes through
 /// the payload-source contract, not a fixture-only shortcut.
 struct ProductionIntegrationPayloadSource {
     bytes_by_name: BTreeMap<String, Vec<u8>>,
@@ -4411,13 +4411,13 @@ impl crate::production_model_ingestion::ProductionArtifactPayloadSource
     }
 }
 
-/// Task groups 10-11 end to end: a `QwenConfig` deliberately different
+/// Task groups 10-11 end to end: a `FirstNativeModelConfig` deliberately different
 /// from the canonical E2E fixture (hidden_size=8, attention_head_count=4,
 /// kv_head_count=2 -- genuinely GQA-shaped, unlike the fixture's 2/2) is
 /// wrapped as a production-shaped `ModelManifest` (no fixture manifest
 /// constructor, real `architecture_config`, a real payload source keyed
 /// only by canonical tensor name/bytes) and driven through
-/// `load_production_qwen_instance` -> `production_model_fixture` ->
+/// `load_production_model_instance` -> `production_model_fixture` ->
 /// the same real Qwen Component graph production, generic Runtime
 /// Inference API, and generation loop every other first-native caller
 /// uses -- with no `qwen-test` identity or fixture manifest anywhere in
@@ -4430,14 +4430,14 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
     // 256, plus BOS/EOS), so the vocabulary must cover that range
     // regardless of this test's otherwise-deliberately-non-canonical
     // dimensions.
-    let architecture = qwen_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 1_000_000);
-    let config = QwenConfig {
+    let architecture = first_native_architecture_metadata(8, 1, 4, 2, 2, 16, 258, 1_000_000);
+    let config = FirstNativeModelConfig {
         architecture,
-        rope: QwenRopeConfig {
+        rope: FirstNativeRopeConfig {
             base: 10_000.0,
             scale: None,
             dimension: 2,
-            position_mode: QwenRopePositionMode::Sequential,
+            position_mode: FirstNativeRopePositionMode::Sequential,
             dynamic_scaling_supported: false,
         },
         rmsnorm_epsilon: 1e-6,
@@ -4516,7 +4516,7 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
         provenance: None,
         signatures: Vec::new(),
         source: None,
-        architecture_config: Some(architecture_config_from_qwen_config(&config)),
+        architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
     };
 
     let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
@@ -4534,7 +4534,7 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
     assert_eq!(fixture.config.architecture.kv_head_count, 2);
 
     let mut runtime = build_runtime_with_model_execution_engine(&fixture);
-    let instance = load_production_qwen_instance(&mut runtime, &manifest, &payload_source).expect(
+    let instance = load_production_model_instance(&mut runtime, &manifest, &payload_source).expect(
         "production loading succeeds through the generic Inference API, not a fixture loader",
     );
     require_ready_first_native_instance(&runtime, &instance)
@@ -4623,6 +4623,59 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
     .expect("model instance unloads cleanly, no leaked resources");
 }
 
+/// Steps 3-4 of the auditor's astorise/Magnetar#83 remediation plan,
+/// proven directly: `production_model_fixture` no longer hardcodes the
+/// reconstructed `FirstNativeModelConfig`'s architecture family to
+/// `QWEN_ARCHITECTURE_FAMILY` -- it threads through whatever family the
+/// real ingested `ModelManifest.architecture.family` actually carries
+/// (`first_native_model_config_from_architecture_config`'s new `family`
+/// parameter), and `production_model_component_identity`'s deliberately
+/// unrestricted `supported_architecture_families` (see its own doc
+/// comment) means a non-"qwen" family is not rejected by
+/// `ModelComponentDescriptor::validate_model_artifact` either.
+///
+/// This is the honestly-achievable half of the auditor's steps 6-7 (a
+/// real Component-vs-family compatibility test): today's
+/// `.magnetar-component.yaml` schema has no field for a *specific*
+/// Component to declare its own supported families, so a genuine "Llama
+/// Artifact + Qwen Component -> reject" test cannot yet be written --
+/// that remains an open follow-up tracked on astorise/Magnetar#83. What
+/// *can* be proven today, and is proven here, is that the generic path
+/// stops silently discarding/overwriting a real non-"qwen" family --
+/// exactly what steps 3-4 fix, and the regression this test guards
+/// against (before this fix, every family below would have been
+/// silently rewritten to `"qwen"`, and the loop's `assert_eq!` would
+/// have caught it).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn production_model_fixture_threads_the_real_ingested_architecture_family() {
+    let config = e2e_fixture_config();
+    let weights = e2e_fixture_weights(&config).expect("synthetic weights build");
+
+    for family in ["llama", "mistral", "gemma"] {
+        let architecture = ModelArchitecture::new(family, "architecture-family-test");
+        let mut manifest = e2e_fixture_manifest_from_weights(&config, &architecture, &weights)
+            .unwrap_or_else(|e| panic!("{family}: manifest builds: {e}"));
+        manifest.architecture_config =
+            Some(architecture_config_from_first_native_model_config(&config));
+
+        let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
+        let delegate_tokenizer: std::sync::Arc<dyn crate::tokenizer::Tokenizer + Send + Sync> =
+            std::sync::Arc::new(e2e_fixture_tokenizer().unwrap());
+
+        let fixture = production_model_fixture(manifest, tokenizer_metadata, delegate_tokenizer)
+            .unwrap_or_else(|e| {
+                panic!("family '{family}' must not be rejected by the generic production path: {e}")
+            });
+
+        assert_eq!(
+            fixture.config.architecture.family, family,
+            "the real ingested family must be threaded through unchanged, not \
+             silently rewritten to '{QWEN_ARCHITECTURE_FAMILY}'"
+        );
+    }
+}
+
 /// The load-bearing correctness proof for `ProductionLoadedModel::
 /// load_with_component` (`wire-generic-inference-component-runtime`'s
 /// follow-up phase, closing the Tachyon integration audit's MAG-02): a
@@ -4649,7 +4702,7 @@ fn production_loaded_model_load_with_component_matches_the_singleton_path() {
     // qwen_config` does for its own deliberately-different config.
     // `tied_embeddings: false` (unlike the canonical fixture's own `true`):
     // this test drives loading through the real production path
-    // (`load_production_qwen_instance_for_provider`), which expects a
+    // (`load_production_model_instance_for_provider`), which expects a
     // literal `lm_head` weight resource bound -- tied-embedding derivation
     // is an ingestion-layer concern (`loaders/huggingface`'s
     // `append_synthetic_lm_head_if_tied`) this hand-built manifest
@@ -4726,7 +4779,7 @@ fn production_loaded_model_load_with_component_matches_the_singleton_path() {
         provenance: None,
         signatures: Vec::new(),
         source: None,
-        architecture_config: Some(architecture_config_from_qwen_config(&config)),
+        architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
     };
 
     let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
@@ -4806,7 +4859,7 @@ fn apply_rope_per_head(
     tensor: &HostTensor,
     head_count: u64,
     head_dimension: u64,
-    rope_config: &QwenRopeConfig,
+    rope_config: &FirstNativeRopeConfig,
 ) -> Result<HostTensor, E2eConformanceError> {
     let (rows, cols) = tensor.rows_cols()?;
     let mut out = vec![0.0_f32; tensor.data.len()];
@@ -4995,12 +5048,12 @@ fn qwen_operator_kind_code(name: &str) -> Option<u32> {
 }
 
 /// Derives the expected Operator-kind-code sequence for `graph`, in the same
-/// dependency order `execute_qwen_graph` executes it in: the semantic
+/// dependency order `execute_first_native_graph` executes it in: the semantic
 /// content a Qwen Model Component is expected to reproduce when describing
 /// its own graph (see `qwen_operator_kind_code`).
 #[cfg(test)]
 fn qwen_graph_operator_codes(graph: &ExecutionGraph) -> Result<Vec<u32>, E2eConformanceError> {
-    let order = qwen_graph_execution_order(graph)?;
+    let order = first_native_graph_execution_order(graph)?;
     order
         .iter()
         .map(|node_id| {
@@ -5041,7 +5094,7 @@ fn qwen_operator_sequence_hash(codes: &[u32]) -> u32 {
 
 #[cfg(test)]
 /// Static guard (`define-provider-prepared-kernel-execution-contract` task
-/// 2.3): [`execute_qwen_graph_nodes`]'s per-node transport migrated fully off
+/// 2.3): [`execute_first_native_graph_nodes`]'s per-node transport migrated fully off
 /// the `HostTensor`-typed [`ProviderExecutionApi`] methods (that Change's
 /// task group 5) -- every read/write in its per-node loop goes through
 /// `read_tensor_value`/`write_tensor_value_admitted` instead, materializing
@@ -5058,16 +5111,17 @@ fn qwen_operator_sequence_hash(codes: &[u32]) -> u32 {
 fn check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls()
 -> Result<(), E2eConformanceError> {
     const SOURCE: &str = include_str!("../first_native_runtime.rs");
-    let start = SOURCE.find("fn execute_qwen_graph_nodes(").ok_or_else(|| {
-        E2eConformanceError::Internal {
-            reason: "execute_qwen_graph_nodes not found in first_native_runtime.rs source".into(),
-        }
-    })?;
+    let start = SOURCE
+        .find("fn execute_first_native_graph_nodes(")
+        .ok_or_else(|| E2eConformanceError::Internal {
+            reason: "execute_first_native_graph_nodes not found in first_native_runtime.rs source"
+                .into(),
+        })?;
     let body_start = SOURCE[start..]
         .find('{')
         .map(|offset| start + offset)
         .ok_or_else(|| E2eConformanceError::Internal {
-            reason: "execute_qwen_graph_nodes has no function body in source".into(),
+            reason: "execute_first_native_graph_nodes has no function body in source".into(),
         })?;
     let mut depth = 0i32;
     let mut body_end = body_start;
@@ -5086,7 +5140,8 @@ fn check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls()
     }
     if body_end == body_start {
         return Err(E2eConformanceError::Internal {
-            reason: "execute_qwen_graph_nodes's function body braces did not balance".into(),
+            reason: "execute_first_native_graph_nodes's function body braces did not balance"
+                .into(),
         });
     }
     let body = &SOURCE[body_start..body_end];
@@ -5101,7 +5156,7 @@ fn check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls()
     if host_tensor_typed_call_count != 0 {
         return Err(E2eConformanceError::Internal {
             reason: format!(
-                "execute_qwen_graph_nodes's per-node transport has \
+                "execute_first_native_graph_nodes's per-node transport has \
                  {host_tensor_typed_call_count} direct HostTensor-typed \
                  ProviderExecutionApi call(s); it must read/write through \
                  TensorValue (read_tensor_value/write_tensor_value_admitted) \
@@ -5133,7 +5188,7 @@ fn check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls()
 /// the identical node-id shape the Plan was actually built from, or Kernel
 /// selection fails closed with "no binding for node ...".
 fn dispatch_qwen_oracle_mlp_gate_up(
-    dispatch_ctx: &mut QwenDispatchContext<'_>,
+    dispatch_ctx: &mut FirstNativeDispatchContext<'_>,
     fixture: &E2eFixture,
     prefix: &str,
     layer_id: &str,
@@ -5167,7 +5222,7 @@ fn dispatch_qwen_oracle_mlp_gate_up(
     not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))
 ))]
 fn dispatch_qwen_oracle_mlp_gate_up(
-    dispatch_ctx: &mut QwenDispatchContext<'_>,
+    dispatch_ctx: &mut FirstNativeDispatchContext<'_>,
     fixture: &E2eFixture,
     prefix: &str,
     layer_id: &str,
@@ -5201,10 +5256,10 @@ fn dispatch_qwen_oracle_mlp_gate_up(
 
 #[cfg(test)]
 /// Test-only oracle: a hand-written, hard-coded prefill dispatch sequence
-/// kept only so tests can cross-check `execute_qwen_graph`'s output against
+/// kept only so tests can cross-check `execute_first_native_graph`'s output against
 /// an independently-written recipe. Production first-native execution
 /// cannot reach this function -- it computes logits exclusively through
-/// `execute_qwen_graph` (see `E2eRuntimeModelExecutionEngine::
+/// `execute_first_native_graph` (see `E2eRuntimeModelExecutionEngine::
 /// execute_generation_step`). `prepared_plan` is mandatory (not optional):
 /// the first-native hot path must always look up a published
 /// [`PlanNodeBinding`]/[`PreparedKernelId`] rather than ever falling back to
@@ -5237,7 +5292,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
     )?;
     let mut node_events = Vec::new();
-    let mut dispatch_ctx = QwenDispatchContext {
+    let mut dispatch_ctx = FirstNativeDispatchContext {
         runtime,
         provider: provider.clone(),
         prepared_plan: Some(prepared_plan),
@@ -5479,7 +5534,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
 }
 
 #[cfg(test)]
-/// Test-only oracle, kept only for cross-checking `execute_qwen_graph`; see
+/// Test-only oracle, kept only for cross-checking `execute_first_native_graph`; see
 /// [`execute_qwen_prefill_hidden_states_through_dispatch`]'s doc comment.
 fn execute_qwen_decode_hidden_states_through_dispatch(
     runtime: &mut Runtime,
@@ -5504,7 +5559,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         &ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
     )?;
     let mut node_events = Vec::new();
-    let mut dispatch_ctx = QwenDispatchContext {
+    let mut dispatch_ctx = FirstNativeDispatchContext {
         runtime,
         provider: provider.clone(),
         prepared_plan: Some(prepared_plan),
@@ -5765,7 +5820,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
 }
 
 #[cfg(test)]
-/// Test-only oracle, kept only for cross-checking `execute_qwen_graph`; see
+/// Test-only oracle, kept only for cross-checking `execute_first_native_graph`; see
 /// [`execute_qwen_prefill_hidden_states_through_dispatch`]'s doc comment.
 fn dispatch_qwen_logits_projection(
     runtime: &Runtime,
@@ -6389,7 +6444,7 @@ fn validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
 /// build, and tests not themselves exercising component/graph mismatch
 /// detection).
 fn qwen_component_graph_semantics_for_prompt(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,
 ) -> Result<QwenComponentGraphSemantics, E2eConformanceError> {
@@ -6715,7 +6770,7 @@ fn check_graph_dispatch_rejects_unregistered_provider(
     }
     let ids = HostTensor::new([2], vec![1.0, 2.0])?;
     let cache_id = KvCacheId::new("test-unregistered-executor-cache")?;
-    match execute_qwen_graph(
+    match execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -6763,7 +6818,7 @@ fn check_graph_dispatch_uses_registered_provider_instance(
         .len();
     let ids = HostTensor::new([2], vec![1.0, 2.0])?;
     let cache_id = KvCacheId::new("test-registered-executor-instance-cache")?;
-    execute_qwen_graph(
+    execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -6805,7 +6860,7 @@ fn check_graph_dispatch_accounts_outputs_through_runtime_memory_manager(
     let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
     let ids = HostTensor::new([2], vec![1.0, 2.0])?;
     let cache_id = KvCacheId::new("test-output-accounting-cache")?;
-    execute_qwen_graph(
+    execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -6869,7 +6924,7 @@ fn check_graph_dispatch_does_not_leak_kernel_output_allocations_across_repeated_
     let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
     let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
     let cache_id_1 = KvCacheId::new("test-leak-fix-cache-one")?;
-    execute_qwen_graph(
+    execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -6892,7 +6947,7 @@ fn check_graph_dispatch_does_not_leak_kernel_output_allocations_across_repeated_
     let mut plans = first_native_plans_for_prompt(&runtime, fixture, &instance, 2)?;
     let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
     let cache_id_2 = KvCacheId::new("test-leak-fix-cache-two")?;
-    execute_qwen_graph(
+    execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -6922,7 +6977,7 @@ fn check_graph_dispatch_does_not_leak_kernel_output_allocations_across_repeated_
 }
 
 #[cfg(test)]
-/// Correctif 5: `execute_qwen_graph_nodes`'s node-to-node transport is
+/// Correctif 5: `execute_first_native_graph_nodes`'s node-to-node transport is
 /// Resource-based, not a private `HostTensor` cache -- an *intermediate*
 /// graph edge's value (not just the final returned bindings) must be
 /// independently readable straight from the registered Provider's storage,
@@ -6945,7 +7000,7 @@ fn check_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage(
         })?;
     let ids = HostTensor::new([2], vec![1.0, 2.0])?;
     let cache_id = KvCacheId::new("test-intermediate-edge-resource-cache")?;
-    execute_qwen_graph(
+    execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -6989,7 +7044,7 @@ fn check_graph_dispatch_intermediate_edge_is_resolvable_from_provider_storage(
 /// `qwen_prefill_graph` rather than `first_native_component_graphs_for_prompt`
 /// so this proof holds regardless of whether a strict Component engine is
 /// available: the "split" node exists only in this Rust-synthesized
-/// recipe (`qwen_expected_tensor_names`'s doc comment), not in the
+/// recipe (`first_native_expected_tensor_names`'s doc comment), not in the
 /// checked-in real Qwen Component's own graph.
 fn check_two_output_split_dispatch_produces_independently_resolvable_resources(
     fixture: &E2eFixture,
@@ -7028,7 +7083,7 @@ fn check_two_output_split_dispatch_produces_independently_resolvable_resources(
     let mut plans = prepare_first_native_execution_plans(&runtime, &instance, graphs, 2)?;
     let ids = HostTensor::new([2], vec![1.0, 2.0])?;
     let cache_id = KvCacheId::new("test-two-output-split-cache")?;
-    execute_qwen_graph(
+    execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -7122,7 +7177,7 @@ fn check_graph_dispatch_releases_workspace_after_use(
     let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
     let ids = HostTensor::new([2], vec![1.0, 2.0])?;
     let cache_id = KvCacheId::new("test-workspace-release-cache")?;
-    execute_qwen_graph(
+    execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -7187,7 +7242,7 @@ fn check_graph_dispatch_records_memory_feasibility_failure_under_tight_budget(
     let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
     let ids = HostTensor::new([2], vec![1.0, 2.0])?;
     let cache_id = KvCacheId::new("test-tight-budget-cache")?;
-    let result = execute_qwen_graph(
+    let result = execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -7345,7 +7400,7 @@ fn check_materialize_model_instance_weights_accepts_matching_content(
 
 #[cfg(test)]
 /// Runs a real prefill through the production graph-execution path
-/// (`execute_qwen_graph`, the same one `execute_generation_step` uses) with
+/// (`execute_first_native_graph`, the same one `execute_generation_step` uses) with
 /// `weights` bound to a fresh `ModelInstance`, and returns the "logits"
 /// edge's values.
 fn forward_logits_with_weights(
@@ -7363,7 +7418,7 @@ fn forward_logits_with_weights(
         prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
     )?;
     let cache_id = KvCacheId::new("test-weight-sensitivity-cache")?;
-    let (_dispatch, mut bindings, _layer_kv, _provider) = execute_qwen_graph(
+    let (_dispatch, mut bindings, _layer_kv, _provider) = execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -7421,7 +7476,7 @@ fn forward_segment_logits_with_weights(
     // down to this segment's own subset -- mirrors `load_fixture_instance_
     // with_weights`'s own ordering for the exact same reason (tied
     // embeddings' `lm_head` is never a separately declared manifest tensor;
-    // see `qwen_expected_tensor_names`).
+    // see `first_native_expected_tensor_names`).
     let mut segment_weights = weights.clone();
     qwen_weights_with_derived_lm_head(fixture, &mut segment_weights)?;
     segment_weights.retain(|name, _| {
@@ -7489,7 +7544,7 @@ fn forward_segment_logits_with_weights(
         BTreeMap::from([(TensorEdgeId::new("input.hidden_states_in"), hidden)])
     };
     let cache_id = KvCacheId::new(format!("test-segment-cache-{start_layer}-{end_layer}"))?;
-    let (_dispatch, mut bindings, _layer_kv, _provider) = execute_qwen_graph(
+    let (_dispatch, mut bindings, _layer_kv, _provider) = execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -7516,14 +7571,14 @@ fn forward_segment_logits_with_weights(
 /// A small, real 2-decoder-layer Qwen fixture, independent of the canonical
 /// 1-layer `E2E_FIXTURE_*` constants (too small to split into two non-
 /// trivial segments) -- built from `e2e_fixture_manifest_from_weights`
-/// (self-consistent digests for an arbitrary `QwenConfig`, not tied to the
+/// (self-consistent digests for an arbitrary `FirstNativeModelConfig`, not tied to the
 /// checked-in canonical Safetensors fixture), exactly like `e2e_fixture()`
 /// itself, just with `layer_count: 2`.
 fn two_layer_segment_test_fixture() -> Result<E2eFixture, E2eConformanceError> {
-    let architecture = qwen_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
-    let mut config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    let architecture = first_native_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
+    let mut config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
     config.tied_embeddings = true;
-    let identity = qwen_component_identity(
+    let identity = first_native_component_identity(
         ModelComponentId::new("segment-split-fixture").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
@@ -7541,8 +7596,8 @@ fn two_layer_segment_test_fixture() -> Result<E2eFixture, E2eConformanceError> {
     )?;
     let tokenizer = e2e_fixture_tokenizer()?;
 
-    let descriptor = qwen_component_descriptor(identity.clone(), &config)?;
-    qwen_validate_model_artifact(&descriptor, &config, &manifest)?;
+    let descriptor = first_native_component_descriptor(identity.clone(), &config)?;
+    validate_first_native_model_artifact(&descriptor, &config, &manifest)?;
 
     Ok(E2eFixture {
         config,
@@ -7675,22 +7730,23 @@ fn check_two_segment_split_decode_step_matches_full_graph_decode() -> Result<(),
         [prompt_len],
         prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
     )?;
-    let (_prefill_dispatch, _prefill_bindings, full_layer_kv, _provider) = execute_qwen_graph(
-        &mut full_runtime,
-        &fixture,
-        &full_instance,
-        &full_cache,
-        &full_graphs.prefill,
-        &mut full_plans.prefill,
-        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), prompt_ids)]),
-        None,
-        Some(0),
-        &mut Vec::new(),
-    )
-    .map_err(E2eConformanceError::from)?;
+    let (_prefill_dispatch, _prefill_bindings, full_layer_kv, _provider) =
+        execute_first_native_graph(
+            &mut full_runtime,
+            &fixture,
+            &full_instance,
+            &full_cache,
+            &full_graphs.prefill,
+            &mut full_plans.prefill,
+            BTreeMap::from([(TensorEdgeId::new("input.token_ids"), prompt_ids)]),
+            None,
+            Some(0),
+            &mut Vec::new(),
+        )
+        .map_err(E2eConformanceError::from)?;
     let admitted_ids = HostTensor::new([1], vec![admitted as f32])?;
     let (_decode_dispatch, full_decode_bindings, _updated_layer_kv, _provider) =
-        execute_qwen_graph(
+        execute_first_native_graph(
             &mut full_runtime,
             &fixture,
             &full_instance,
@@ -7926,7 +7982,7 @@ fn check_graph_execution_fails_closed_on_missing_weight(
     let graphs = first_native_component_graphs_for_prompt(fixture, 2)?;
     let ids = HostTensor::new([2], vec![1.0, 2.0])?;
     let cache_id = KvCacheId::new("test-missing-weight-cache")?;
-    match execute_qwen_graph(
+    match execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -8182,7 +8238,7 @@ fn check_incremental_decode_matches_full_sequence_oracle(
         // 0-indexed `Vec` (it processes every layer unconditionally, never
         // a segment), so its Vec index already equals the real layer
         // number here -- `enumerate()` recovers that as an explicit key
-        // for `QwenLayerKvMap`.
+        // for `LayerKvMap`.
         layer_kv: layer_kv.into_iter().enumerate().collect(),
         provider: None,
     };
@@ -8244,7 +8300,7 @@ fn check_incremental_decode_matches_full_sequence_oracle(
 }
 
 #[cfg(test)]
-/// Proves the graph-driven executor (`execute_qwen_graph`, which production
+/// Proves the graph-driven executor (`execute_first_native_graph`, which production
 /// first-native execution now uses exclusively) produces logits matching the
 /// independent `e2e_forward` oracle, and that its recorded per-layer KV
 /// state carries one row per historical token. Complements
@@ -8266,7 +8322,7 @@ fn check_graph_executor_matches_full_sequence_oracle(
         [prompt.len() as u64],
         prompt.iter().map(|id| *id as f32).collect::<Vec<_>>(),
     )?;
-    let (_prefill_dispatch, _prefill_bindings, layer_kv, _provider) = execute_qwen_graph(
+    let (_prefill_dispatch, _prefill_bindings, layer_kv, _provider) = execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -8281,19 +8337,20 @@ fn check_graph_executor_matches_full_sequence_oracle(
     .map_err(E2eConformanceError::from)?;
 
     let admitted_ids = HostTensor::new([1], vec![admitted as f32])?;
-    let (_decode_dispatch, decode_bindings, updated_layer_kv, _provider) = execute_qwen_graph(
-        &mut runtime,
-        fixture,
-        &instance,
-        &cache_id,
-        &graphs.decode,
-        &mut plans.decode,
-        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), admitted_ids)]),
-        Some(&layer_kv),
-        Some(prompt.len() as u64),
-        &mut Vec::new(),
-    )
-    .map_err(E2eConformanceError::from)?;
+    let (_decode_dispatch, decode_bindings, updated_layer_kv, _provider) =
+        execute_first_native_graph(
+            &mut runtime,
+            fixture,
+            &instance,
+            &cache_id,
+            &graphs.decode,
+            &mut plans.decode,
+            BTreeMap::from([(TensorEdgeId::new("input.token_ids"), admitted_ids)]),
+            Some(&layer_kv),
+            Some(prompt.len() as u64),
+            &mut Vec::new(),
+        )
+        .map_err(E2eConformanceError::from)?;
 
     let logits = decode_bindings
         .get(&TensorEdgeId::new("logits"))
@@ -8465,7 +8522,7 @@ fn check_graph_executor_rejects_missing_plan_binding(
             .graph_nodes
             .contains(&ExecutionNodeId::new("embedding"))
     });
-    match execute_qwen_graph(
+    match execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -8501,7 +8558,7 @@ fn check_graph_executor_rejects_unsupported_operator(
             reason: "prefill graph is missing node 'embedding'".into(),
         })?;
     node.operator = OperatorId::magnetar("softmax", 1, OperatorFamily::Activation);
-    match execute_qwen_graph(
+    match execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -8559,7 +8616,7 @@ fn check_graph_executor_rejects_cyclic_graph(
             .with_input(TensorEdgeId::new("a"))
             .with_output(TensorEdgeId::new("b")),
         );
-    match execute_qwen_graph(
+    match execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -8599,7 +8656,7 @@ fn check_graph_executor_rejects_removed_producer_node(
     // underlying inconsistency than reaching the specific missing-producer
     // edge deeper into execution.
     graph.nodes.remove(&ExecutionNodeId::new("layer0.q_proj"));
-    match execute_qwen_graph(
+    match execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -8640,7 +8697,7 @@ fn check_graph_executor_logits_provenance_requires_declared_output_edge(
     // binding than reaching the end of a partial run and checking its
     // absence, since no dispatch happens at all.
     graph.nodes.remove(&ExecutionNodeId::new("lm_head"));
-    match execute_qwen_graph(
+    match execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -8700,7 +8757,7 @@ fn check_graph_dispatch_rejects_revoked_prepared_kernel(
         &embedding_kernel,
         "test: simulate revocation after Plan publication",
     );
-    match execute_qwen_graph(
+    match execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -8791,7 +8848,7 @@ fn check_graph_dispatch_ignores_kernel_registry_preference_change_after_plan_pub
     let architecture = &fixture.config.architecture;
     let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")?.clone();
     let mut node_events = Vec::new();
-    let mut dispatch_ctx = QwenDispatchContext {
+    let mut dispatch_ctx = FirstNativeDispatchContext {
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: Some(&mut plan),
@@ -8862,7 +8919,7 @@ fn check_graph_dispatch_rejects_stale_prepared_kernel_generation(
             reason: "prefill plan has no binding for node embedding".into(),
         })?;
     binding.prepared_kernel_generation = Some(PreparedKernelGeneration::new(u64::MAX));
-    match execute_qwen_graph(
+    match execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -8899,7 +8956,7 @@ fn check_graph_dispatch_rejects_provider_binding_mismatch(
     fixture: &E2eFixture,
 ) -> Result<(), E2eConformanceError> {
     let (mut runtime, instance, cache_id, graph, mut plan, ids) = graph_prefill_setup(fixture)?;
-    // Mutate the *last* binding, not the first: `execute_qwen_graph` resolves
+    // Mutate the *last* binding, not the first: `execute_first_native_graph` resolves
     // the Provider it actually dispatches through from `node_bindings.first()`
     // (every node in a first-native graph binds to the same Provider), so
     // corrupting that one would fail earlier and coarser, at graph-level
@@ -8911,7 +8968,7 @@ fn check_graph_dispatch_rejects_provider_binding_mismatch(
         }
     })?;
     binding.provider = ProviderBinding::new("magnetar:provider/does-not-exist");
-    match execute_qwen_graph(
+    match execute_first_native_graph(
         &mut runtime,
         fixture,
         &instance,
@@ -9019,7 +9076,7 @@ fn check_incremental_decode_rejects_missing_layer_kv(
             GenerationModelReference::LoadedModelContext("qwen-test".into()),
             TokenizerId::new("qwen-test-tokenizer")?,
         ),
-        layer_kv: QwenLayerKvMap::new(),
+        layer_kv: LayerKvMap::new(),
         provider: None,
     };
     match execute_qwen_decode_hidden_states_through_dispatch(
@@ -9295,7 +9352,7 @@ fn check_kv_pending_write_is_memory_admitted_for_its_concatenated_size(
                 && allocation.request.size_bytes == expected_bytes
         })
         .count();
-    // 4, not 2: `execute_qwen_graph_nodes` reassigns `output_tensor` to the
+    // 4, not 2: `execute_first_native_graph_nodes` reassigns `output_tensor` to the
     // concatenated value *before* the KV-node's `edge.*` write too (so a
     // later reader of that edge sees the same concatenated value the
     // pending write does -- see that write site's own doc comment), so

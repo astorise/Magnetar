@@ -6,7 +6,7 @@ use magnetar_runtime::production_model_ingestion::{
 };
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
-    ModelArtifactSource, load_production_qwen_instance, production_model_fixture,
+    ModelArtifactSource, load_production_model_instance, production_model_fixture,
 };
 use std::{fs, sync::Arc};
 
@@ -147,7 +147,7 @@ fn real_production_ingestion_rejects_when_untrusted() {
         .register_provider(Arc::new(magnetar_runtime::ReferenceCpuProvider::new()))
         .build()
         .unwrap();
-    let error = match load_production_qwen_instance(
+    let error = match load_production_model_instance(
         &mut runtime,
         &ingested.manifest,
         ingested.payload_source.as_ref(),
@@ -933,7 +933,7 @@ fn unloading_a_real_production_instance_leaves_no_memory_manager_allocation() {
 
     let baseline_active = active_allocation_count(&runtime);
 
-    let instance = load_production_qwen_instance(
+    let instance = load_production_model_instance(
         &mut runtime,
         &ingested.manifest,
         ingested.payload_source.as_ref(),

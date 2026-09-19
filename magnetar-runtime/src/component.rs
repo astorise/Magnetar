@@ -388,7 +388,7 @@ impl ComponentTrustStore {
 
     /// Evaluates `manifest`/`digest` against this trust store's policy,
     /// independent of any particular loading path -- the same decision
-    /// [`validate_component_artifact`] applies during a fresh
+    /// `validate_component_artifact` applies during a fresh
     /// `prepare_component`, exposed so a caller that already holds a
     /// registered Component (and therefore never runs that validation
     /// again) can still re-check *this* caller's own trust before reusing
@@ -845,7 +845,7 @@ impl ComponentManifest {
     /// already registered, without re-reading it from disk) parse and
     /// validate them the same way a fresh `load_yaml` would. `path` is used
     /// only to shape error messages the same as `load_yaml`'s own, exactly
-    /// like [`ComponentManifestYaml::validate`] already does with it;
+    /// like `ComponentManifestYaml::validate` already does with it;
     /// nothing here touches the filesystem.
     pub fn from_yaml_bytes(bytes: &[u8], path: &Path) -> Result<Self, ComponentError> {
         let content = std::str::from_utf8(bytes).map_err(|source| ComponentError::Manifest {
