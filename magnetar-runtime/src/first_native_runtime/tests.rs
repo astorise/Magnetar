@@ -4623,6 +4623,59 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
     .expect("model instance unloads cleanly, no leaked resources");
 }
 
+/// Steps 3-4 of the auditor's astorise/Magnetar#83 remediation plan,
+/// proven directly: `production_model_fixture` no longer hardcodes the
+/// reconstructed `FirstNativeModelConfig`'s architecture family to
+/// `QWEN_ARCHITECTURE_FAMILY` -- it threads through whatever family the
+/// real ingested `ModelManifest.architecture.family` actually carries
+/// (`first_native_model_config_from_architecture_config`'s new `family`
+/// parameter), and `production_model_component_identity`'s deliberately
+/// unrestricted `supported_architecture_families` (see its own doc
+/// comment) means a non-"qwen" family is not rejected by
+/// `ModelComponentDescriptor::validate_model_artifact` either.
+///
+/// This is the honestly-achievable half of the auditor's steps 6-7 (a
+/// real Component-vs-family compatibility test): today's
+/// `.magnetar-component.yaml` schema has no field for a *specific*
+/// Component to declare its own supported families, so a genuine "Llama
+/// Artifact + Qwen Component -> reject" test cannot yet be written --
+/// that remains an open follow-up tracked on astorise/Magnetar#83. What
+/// *can* be proven today, and is proven here, is that the generic path
+/// stops silently discarding/overwriting a real non-"qwen" family --
+/// exactly what steps 3-4 fix, and the regression this test guards
+/// against (before this fix, every family below would have been
+/// silently rewritten to `"qwen"`, and the loop's `assert_eq!` would
+/// have caught it).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn production_model_fixture_threads_the_real_ingested_architecture_family() {
+    let config = e2e_fixture_config();
+    let weights = e2e_fixture_weights(&config).expect("synthetic weights build");
+
+    for family in ["llama", "mistral", "gemma"] {
+        let architecture = ModelArchitecture::new(family, "architecture-family-test");
+        let mut manifest = e2e_fixture_manifest_from_weights(&config, &architecture, &weights)
+            .unwrap_or_else(|e| panic!("{family}: manifest builds: {e}"));
+        manifest.architecture_config =
+            Some(architecture_config_from_first_native_model_config(&config));
+
+        let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
+        let delegate_tokenizer: std::sync::Arc<dyn crate::tokenizer::Tokenizer + Send + Sync> =
+            std::sync::Arc::new(e2e_fixture_tokenizer().unwrap());
+
+        let fixture = production_model_fixture(manifest, tokenizer_metadata, delegate_tokenizer)
+            .unwrap_or_else(|e| {
+                panic!("family '{family}' must not be rejected by the generic production path: {e}")
+            });
+
+        assert_eq!(
+            fixture.config.architecture.family, family,
+            "the real ingested family must be threaded through unchanged, not \
+             silently rewritten to '{QWEN_ARCHITECTURE_FAMILY}'"
+        );
+    }
+}
+
 /// The load-bearing correctness proof for `ProductionLoadedModel::
 /// load_with_component` (`wire-generic-inference-component-runtime`'s
 /// follow-up phase, closing the Tachyon integration audit's MAG-02): a

@@ -395,9 +395,17 @@ impl FirstNativeModelConfig {
     }
 
     pub fn validate(&self, identity: &ModelComponentIdentity) -> Result<(), QwenComponentError> {
-        if self.architecture.family != QWEN_ARCHITECTURE_FAMILY {
-            return Err(QwenComponentError::ArchitectureUnsupported);
-        }
+        // astorise/Magnetar#83: this used to hardcode a family check against
+        // QWEN_ARCHITECTURE_FAMILY here, ignoring `identity` entirely --
+        // strictly more restrictive than (and redundant with)
+        // `self.architecture.validate(identity)` below, which already
+        // performs the correct, identity-driven check
+        // (`ModelComponentIdentity::supported_architecture_families`, empty
+        // meaning no restriction). The hardcoded check made every
+        // family-mismatch rejection tautological for callers whose
+        // `identity` already restricts to "qwen" (redundant, same outcome)
+        // and wrongly rejected every other real family for callers whose
+        // `identity` does not (the generic production path's own identity).
         self.architecture.validate(identity)?;
         if self.architecture.model_type != ModelComponentModelType::CausalLanguageModel {
             return Err(QwenComponentError::ConfigInvalid {

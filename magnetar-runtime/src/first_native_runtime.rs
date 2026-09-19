@@ -6430,7 +6430,13 @@ fn architecture_config_from_first_native_model_config(
 /// (production ingestion's normalized output) plus `context_length`
 /// (`config.json`'s `max_position_embeddings`, not yet a field of
 /// `ModelArchitectureConfig` itself -- threaded separately here rather
-/// than widening that WIT-facing type for one production-only value).
+/// than widening that WIT-facing type for one production-only value), and
+/// `family` -- the real ingested Model Artifact's own declared architecture
+/// family (astorise/Magnetar#83: `first_native_architecture_metadata`
+/// itself still defaults to `QWEN_ARCHITECTURE_FAMILY`, correct for its
+/// other, genuinely Qwen-singleton callers, but wrong here; this
+/// constructor overrides it with the real value instead of widening that
+/// shared helper's own signature for its one production-only caller).
 /// `require_bos`/`require_pad`/`chat_template_required` default to
 /// permissive (`false`)/absent: production loading validates tokenizer
 /// compatibility separately (task group 9), not through this constructor.
@@ -6438,8 +6444,9 @@ fn architecture_config_from_first_native_model_config(
 fn first_native_model_config_from_architecture_config(
     config: &ModelArchitectureConfig,
     context_length: u64,
+    family: impl Into<String>,
 ) -> FirstNativeModelConfig {
-    let architecture = first_native_architecture_metadata(
+    let mut architecture = first_native_architecture_metadata(
         config.hidden_size,
         config.num_hidden_layers as u64,
         config.num_attention_heads as u64,
@@ -6449,6 +6456,7 @@ fn first_native_model_config_from_architecture_config(
         config.vocab_size,
         context_length,
     );
+    architecture.family = family.into();
     FirstNativeModelConfig {
         architecture,
         rope: FirstNativeRopeConfig {
@@ -6476,13 +6484,28 @@ fn first_native_model_config_from_architecture_config(
 /// version: trust here is digest-based, not identity-based, so any
 /// consistent identity works, and every production-loaded Model Instance
 /// uses this same one.
+///
+/// Deliberately does *not* restrict `supported_architecture_families`
+/// (astorise/Magnetar#83), unlike [`first_native_component_identity`]'s own
+/// default: this identity backs the *generic* production path, which
+/// threads the real ingested Model Artifact's own family through
+/// (`production_model_fixture`) rather than assuming one. Restricting it to
+/// a single hardcoded family here would reject every real architecture
+/// whose family isn't literally that one string -- including real Qwen2
+/// checkpoints, which declare `"qwen2"`, not `"qwen"`. An empty set means
+/// no restriction at this layer (`ModelComponentIdentity::
+/// supports_architecture`'s own documented semantics) -- the real
+/// per-Component family compatibility check belongs where a specific
+/// Component's own declared support is known, not here.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 fn production_model_component_identity() -> ModelComponentIdentity {
-    first_native_component_identity(
+    ModelComponentIdentity::new(
         ModelComponentId::new("production-model").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
     )
+    .trusted()
+    .with_model_artifact_schema_version(MODEL_ARTIFACT_SCHEMA_VERSION)
 }
 
 /// Builds a real [`E2eFixture`] from production ingestion output (task
@@ -6516,8 +6539,11 @@ pub fn production_model_fixture(
     // silent: a caller inspecting this fixture's config sees exactly
     // this value, and it never came from an unrecorded assumption.
     let context_length = 1_000_000u64;
-    let config =
-        first_native_model_config_from_architecture_config(&architecture_config, context_length);
+    let config = first_native_model_config_from_architecture_config(
+        &architecture_config,
+        context_length,
+        manifest.architecture.family.clone(),
+    );
     let identity = production_model_component_identity();
     config
         .validate(&identity)
