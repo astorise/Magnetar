@@ -4521,6 +4521,7 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
         signatures: Vec::new(),
         source: None,
         architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
+        artifact_format: ArtifactFormat::HuggingFace,
     };
 
     let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
@@ -4791,6 +4792,7 @@ fn production_loaded_model_load_with_component_matches_the_singleton_path() {
         signatures: Vec::new(),
         source: None,
         architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
+        artifact_format: ArtifactFormat::HuggingFace,
     };
 
     let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
@@ -4937,6 +4939,7 @@ fn production_loaded_model_load_with_component_permits_a_component_with_no_decla
         signatures: Vec::new(),
         source: None,
         architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
+        artifact_format: ArtifactFormat::HuggingFace,
     };
 
     let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
@@ -4973,6 +4976,146 @@ fn production_loaded_model_load_with_component_permits_a_component_with_no_decla
     via_named
         .unload()
         .expect("model instance unloads cleanly, no leaked resources");
+}
+
+/// astorise/Magnetar#75's required negative proof, at the same
+/// `ProductionLoadedModel::load_with_component` layer
+/// `production_loaded_model_load_with_component_matches_the_singleton_path`
+/// exercises for the family gate: the real checked-in Qwen Component now
+/// declares `compatibility.artifact_formats: [huggingface]` in its own
+/// manifest (see `qwen-real.component.wasm.magnetar-component.yaml`).
+/// Pairing it with a hand-built Model Artifact manifest whose
+/// `architecture.family` is `"qwen2"` (so the *family* gate passes) but
+/// whose `artifact_format` is [`ArtifactFormat::Gguf`] must be rejected by
+/// the *format* gate alone -- proving `load_with_component`'s new
+/// `artifact_formats` check is real and independent of the pre-existing
+/// family check, before this fix no such rejection existed anywhere in
+/// this call chain and this exact pairing would have loaded successfully.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn production_loaded_model_load_with_component_rejects_a_format_mismatched_component() {
+    let mut config = e2e_fixture_config();
+    config.tied_embeddings = false;
+    let weights = e2e_fixture_weights(&config).expect("synthetic weights build");
+    let tensors = e2e_fixture_weight_inventory(&config).expect("tensor inventory builds");
+    let mut bytes_by_name = BTreeMap::new();
+    for tensor in &tensors {
+        let host_tensor = weights
+            .get(&tensor.name)
+            .expect("a weight exists for every inventory tensor");
+        let mut bytes = Vec::with_capacity(host_tensor.data.len() * 4);
+        for value in &host_tensor.data {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes_by_name.insert(tensor.name.clone(), bytes);
+    }
+    let payload_source = ProductionIntegrationPayloadSource { bytes_by_name };
+
+    let digest_seed = ModelDigest::parse(format!("sha256:{}", "1".repeat(64))).unwrap();
+    let id = ModelArtifactId::new(
+        ModelArtifactKind::ModelBundle,
+        ModelName::new("format-mismatch-test").unwrap(),
+        ModelRevision::new("r1").unwrap(),
+        digest_seed,
+    );
+    let mut parts = BTreeMap::new();
+    parts.insert(
+        "weights".to_string(),
+        ModelArtifactPart {
+            name: "weights".to_string(),
+            kind: ModelArtifactKind::ModelWeights,
+            digest: ModelDigest::parse(format!("sha256:{}", "2".repeat(64))).unwrap(),
+            size_bytes: None,
+            required: true,
+        },
+    );
+    parts.insert(
+        "config".to_string(),
+        ModelArtifactPart {
+            name: "config".to_string(),
+            kind: ModelArtifactKind::ModelConfig,
+            digest: ModelDigest::parse(format!("sha256:{}", "3".repeat(64))).unwrap(),
+            size_bytes: None,
+            required: true,
+        },
+    );
+    let manifest = ModelManifest {
+        schema_version: crate::MODEL_ARTIFACT_SCHEMA_VERSION,
+        id,
+        architecture: ModelArchitecture::new("qwen2", "format-mismatch-test"),
+        parts,
+        storage_dtype: Some(ModelDType::F32),
+        compute_dtype: None,
+        supported_compute_dtypes: BTreeSet::from([ModelDType::F32]),
+        tensors,
+        tokenizer: None,
+        tokenizer_config: None,
+        chat_template: None,
+        prompt_template: None,
+        generation: None,
+        quantization: None,
+        shards: Vec::new(),
+        runtime_features: BTreeSet::new(),
+        memory_features: BTreeSet::new(),
+        provider_capabilities: Vec::new(),
+        component: None,
+        license: None,
+        provenance: None,
+        signatures: Vec::new(),
+        source: None,
+        architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
+        // The real checked-in Qwen Component declares
+        // `compatibility.artifact_formats: [huggingface]` -- `Gguf` here is
+        // the one and only thing that must trigger the rejection below.
+        artifact_format: ArtifactFormat::Gguf,
+    };
+
+    let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
+    let delegate_tokenizer: std::sync::Arc<dyn crate::tokenizer::Tokenizer + Send + Sync> =
+        std::sync::Arc::new(e2e_fixture_tokenizer().unwrap());
+    let fixture = production_model_fixture(manifest, tokenizer_metadata, delegate_tokenizer)
+        .expect("production fixture builds against the canonical config");
+
+    let component_trust = ComponentTrustStore::default()
+        .trust_digest(&ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES).value);
+    let digest = register_inference_component_artifact(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &component_trust,
+    )
+    .expect("registration succeeds")
+    .digest;
+
+    let model_trust =
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone());
+
+    // `ProductionLoadedModel` does not implement `Debug`, so this checks
+    // the `Result` by hand rather than via `expect_err` (which requires
+    // `T: Debug` to format the Ok value in its panic message).
+    match ProductionLoadedModel::load_with_component(
+        fixture,
+        &payload_source,
+        model_trust,
+        Arc::new(ReferenceCpuProvider::new()),
+        Some(digest),
+    ) {
+        Ok(_) => panic!(
+            "a GGUF-declared Model Artifact paired with a real Qwen Component that declares \
+             `compatibility.artifact_formats: [huggingface]` must be rejected, even though the \
+             architecture family (`qwen2`) matches"
+        ),
+        Err(error) => {
+            assert!(
+                matches!(
+                    error,
+                    InferenceApiError::ModelComponentUnavailable { ref reason }
+                        if reason.contains("artifact format unsupported")
+                ),
+                "expected the rejection to be the artifact-format compatibility gate \
+                 (`ModelComponentError::ArtifactFormatUnsupported`), got: {error:#?}"
+            );
+        }
+    }
 }
 
 #[cfg(all(

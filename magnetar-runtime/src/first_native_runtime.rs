@@ -7198,6 +7198,20 @@ impl ProductionLoadedModel {
                     reason: ModelComponentError::ArchitectureUnsupported.to_string(),
                 });
             }
+            // astorise/Magnetar#75: the same gate one level down -- this
+            // specific registered Component's own declared
+            // `compatibility.artifact_formats` against the real ingested
+            // Model Artifact's own declared `artifact_format`. Empty
+            // declared set means permissive, exactly like
+            // `supported_architecture_families` above.
+            let declared_formats = &registered.supported_artifact_formats;
+            if !declared_formats.is_empty()
+                && !declared_formats.contains(fixture.manifest.artifact_format.as_str())
+            {
+                return Err(InferenceApiError::ModelComponentUnavailable {
+                    reason: ModelComponentError::ArtifactFormatUnsupported.to_string(),
+                });
+            }
         }
         let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
         let provider_supports_multi_step_decode = provider.supports_multi_step_decode();
@@ -7783,6 +7797,13 @@ struct RegisteredComponentRuntime {
     /// load_with_component`]) can look up what it declares without
     /// threading the manifest itself through every intermediate call.
     supported_architecture_families: BTreeSet<String>,
+    /// This Component's own declared [`ComponentManifest::
+    /// supported_artifact_formats`] (astorise/Magnetar#75), captured at
+    /// registration time for the same reason
+    /// `supported_architecture_families` is: [`ProductionLoadedModel::
+    /// load_with_component`] needs it to reject an incompatible Artifact
+    /// bundle format without re-parsing this Component's manifest.
+    supported_artifact_formats: BTreeSet<String>,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -7941,6 +7962,7 @@ pub fn register_inference_component_artifact(
             model_config_capability,
             definition,
             supported_architecture_families: manifest.supported_architecture_families.clone(),
+            supported_artifact_formats: manifest.supported_artifact_formats.clone(),
         })
     });
     Ok(RegisteredInferenceComponent { digest, manifest })

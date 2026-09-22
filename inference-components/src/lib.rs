@@ -3,9 +3,9 @@ use magnetar_loader_huggingface::{
     HuggingFaceChatTemplateFormatter, HuggingFaceIngestor, parse_tokenizer_config,
 };
 use magnetar_provider_cpu::ReferenceCpuProvider;
-use magnetar_runtime::model::{ModelTrustStatus, ModelTrustStore};
+use magnetar_runtime::model::{ArtifactFormat, ModelTrustStatus, ModelTrustStore};
 use magnetar_runtime::production_model_ingestion::{
-    ProductionModelArtifactIngestor, ProductionModelSource,
+    ProductionModelArtifactIngestor, ProductionModelSource, read_declared_artifact_format,
 };
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
@@ -216,11 +216,18 @@ pub fn local_bundle_manifest_digest(root: impl Into<PathBuf>) -> Result<String> 
         ModelArtifactSource::Tachyon("tachyon:test-fixture".to_owned()),
         root.clone(),
     );
-    let is_gguf = root.join(magnetar_loader_gguf::GGUF_FILE_NAME).is_file();
-    let ingested = if is_gguf {
-        magnetar_loader_gguf::GgufIngestor::new().ingest(&source)
-    } else {
-        HuggingFaceIngestor::new().ingest(&source)
+    // astorise/Magnetar#75: the declared-format sidecar, not filesystem
+    // structure, picks the ingestor. A bundle missing/malformed sidecar
+    // fails explicitly here instead of silently guessing a format.
+    let declared_format = read_declared_artifact_format(&source).with_context(|| {
+        format!(
+            "Magnetar could not read the declared Artifact format for bundle at `{}`",
+            root.display()
+        )
+    })?;
+    let ingested = match declared_format {
+        ArtifactFormat::Gguf => magnetar_loader_gguf::GgufIngestor::new().ingest(&source),
+        ArtifactFormat::HuggingFace => HuggingFaceIngestor::new().ingest(&source),
     }
     .with_context(|| {
         format!(
@@ -229,6 +236,51 @@ pub fn local_bundle_manifest_digest(root: impl Into<PathBuf>) -> Result<String> 
         )
     })?;
     Ok(ingested.manifest.id.digest.value)
+}
+
+/// Explicit, one-time legacy-migration path (astorise/Magnetar#75): derives
+/// an [`ArtifactFormat`] for an old-style bundle that predates the
+/// declared-format sidecar file, using the exact filesystem heuristic
+/// `LoadedInferenceComponent::load`/`local_bundle_manifest_digest`
+/// themselves used to rely on automatically, then writes the sidecar once
+/// so every subsequent load goes through the explicit declaration path.
+///
+/// This is never called by `LoadedInferenceComponent::load` or
+/// `local_bundle_manifest_digest` -- per the accepted decision on #75,
+/// filesystem-structure detection may remain only as an explicit
+/// import/migration mechanism for legacy Artifacts, never as a runtime
+/// fallback. A caller migrating a legacy bundle invokes this explicitly,
+/// once, as an upgrade step; it refuses to run again on a bundle that
+/// already carries a sidecar, so it cannot silently overwrite an operator's
+/// own explicit declaration.
+pub fn migrate_legacy_bundle_artifact_format(root: impl Into<PathBuf>) -> Result<ArtifactFormat> {
+    let root = root.into();
+    let sidecar_path =
+        root.join(magnetar_runtime::production_model_ingestion::ARTIFACT_FORMAT_SIDECAR_FILE_NAME);
+    if sidecar_path.is_file() {
+        bail!(
+            "Magnetar will not run legacy artifact-format migration on `{}`: a declared-format \
+             sidecar already exists at `{}`",
+            root.display(),
+            sidecar_path.display()
+        );
+    }
+    let format = if root.join(magnetar_loader_gguf::GGUF_FILE_NAME).is_file() {
+        ArtifactFormat::Gguf
+    } else {
+        ArtifactFormat::HuggingFace
+    };
+    std::fs::write(
+        &sidecar_path,
+        format!("artifact_format: {}\n", format.as_str()),
+    )
+    .with_context(|| {
+        format!(
+            "Magnetar failed to write declared-format sidecar at `{}`",
+            sidecar_path.display()
+        )
+    })?;
+    Ok(format)
 }
 
 pub fn cuda_provider_available() -> bool {
@@ -276,29 +328,35 @@ impl LoadedInferenceComponent {
         })?
         .digest;
 
-        // Format detection: a bundle is GGUF-shaped if it declares the
-        // single file `loaders/gguf`'s own ingestor looks for, Hugging-
-        // Face-shaped otherwise -- the only two real ingestors this crate
-        // has (Tachyon integration audit MAG-01: the generic adapter no
-        // longer hardcodes one format). Adding a third real ingestor to
-        // this codebase would extend this same match, not require
-        // touching every call site below -- both branches converge on the
-        // same `ProductionIngestionResult`/`Arc<dyn Tokenizer>`/`Option<
-        // String>` (raw chat template text) shapes.
-        let is_gguf = source
-            .root
-            .join(magnetar_loader_gguf::GGUF_FILE_NAME)
-            .is_file();
-
         let production_source = ProductionModelSource::authorized_local_bundle(
             ModelArtifactSource::Tachyon(source.provenance.clone()),
             source.root.clone(),
         );
+        // Format selection: the bundle's own declared-format sidecar file
+        // says which of this crate's two real ingestors applies -- Magnetar
+        // never infers it from filesystem structure (astorise/Magnetar#75,
+        // Tachyon integration audit MAG-01). A missing or malformed
+        // declaration fails explicitly instead of guessing. Adding a third
+        // real ingestor to this codebase would extend this same match, not
+        // require touching every call site below -- all branches converge
+        // on the same `ProductionIngestionResult`/`Arc<dyn Tokenizer>`/
+        // `Option<String>` (raw chat template text) shapes.
+        let declared_format =
+            read_declared_artifact_format(&production_source).with_context(|| {
+                format!(
+                    "Magnetar could not read the declared Artifact format for Component `{name}` \
+                 bundle at `{}`",
+                    source.root.display()
+                )
+            })?;
         let ingested: magnetar_runtime::production_model_ingestion::ProductionIngestionResult =
-            if is_gguf {
-                magnetar_loader_gguf::GgufIngestor::new().ingest(&production_source)
-            } else {
-                HuggingFaceIngestor::new().ingest(&production_source)
+            match declared_format {
+                ArtifactFormat::Gguf => {
+                    magnetar_loader_gguf::GgufIngestor::new().ingest(&production_source)
+                }
+                ArtifactFormat::HuggingFace => {
+                    HuggingFaceIngestor::new().ingest(&production_source)
+                }
             }
             .with_context(|| {
                 format!(
@@ -315,7 +373,7 @@ impl LoadedInferenceComponent {
         let (real_tokenizer, chat_template_text): (
             Arc<dyn Tokenizer + Send + Sync>,
             Option<String>,
-        ) = if is_gguf {
+        ) = if declared_format == ArtifactFormat::Gguf {
             let tokenizer = magnetar_loader_gguf::load_gguf_tokenizer(
                 &production_source,
                 format!("{name}-tokenizer"),
@@ -1184,6 +1242,7 @@ mod load_end_to_end_tests {
             ("lm_head.weight", vec![4, 8], filled(32, 1.20)),
         ];
         write_safetensors(&dir.join("model.safetensors"), &tensors);
+        write_declared_artifact_format_sidecar(dir, ArtifactFormat::HuggingFace);
     }
 
     /// #81: a genuinely independent second Model Artifact -- distinct
@@ -1323,6 +1382,23 @@ mod load_end_to_end_tests {
             .map(|(name, shape, values)| (name.as_str(), shape.clone(), values.clone()))
             .collect();
         write_safetensors(&dir.join("model.safetensors"), &borrowed);
+        write_declared_artifact_format_sidecar(dir, ArtifactFormat::HuggingFace);
+    }
+
+    /// astorise/Magnetar#75: writes the declared-format sidecar every real
+    /// test bundle needs since `LoadedInferenceComponent::load`/
+    /// `local_bundle_manifest_digest` no longer infer the format from
+    /// filesystem structure -- a bundle missing this file fails to load
+    /// explicitly (see `loaded_inference_component_load_rejects_a_bundle_
+    /// missing_the_declared_format_sidecar`).
+    fn write_declared_artifact_format_sidecar(dir: &Path, format: ArtifactFormat) {
+        std::fs::write(
+            dir.join(
+                magnetar_runtime::production_model_ingestion::ARTIFACT_FORMAT_SIDECAR_FILE_NAME,
+            ),
+            format!("artifact_format: {}\n", format.as_str()),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1616,5 +1692,78 @@ mod load_end_to_end_tests {
             "a Model Artifact trusted by nothing must not load, even with a trusted Component",
         );
         assert!(error.to_string().contains("Model Artifact trust rejected"));
+    }
+
+    /// astorise/Magnetar#75's required negative proof for the missing-
+    /// declaration case: a bundle that has every real Hugging Face file
+    /// (`config.json`, `tokenizer.json`, `model.safetensors`) but no
+    /// `magnetar-artifact-format.yaml` sidecar must be rejected explicitly,
+    /// never silently ingested by guessing from filesystem structure the
+    /// way `LoadedInferenceComponent::load` used to. Proves there is no
+    /// remaining fallback path inside `load` itself.
+    #[test]
+    fn loaded_inference_component_load_rejects_a_bundle_missing_the_declared_format_sidecar() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_qwen_bundle(dir.path());
+        std::fs::remove_file(
+            dir.path().join(
+                magnetar_runtime::production_model_ingestion::ARTIFACT_FORMAT_SIDECAR_FILE_NAME,
+            ),
+        )
+        .expect("the sidecar written by write_tiny_qwen_bundle exists and can be removed");
+
+        let error = local_bundle_manifest_digest(dir.path()).expect_err(
+            "a bundle with no declared-format sidecar must fail explicitly, not fall back to \
+             filesystem-structure guessing",
+        );
+        assert!(
+            error.chain().any(|cause| cause.to_string().contains(
+                magnetar_runtime::production_model_ingestion::ARTIFACT_FORMAT_SIDECAR_FILE_NAME
+            )),
+            "expected the rejection to name the missing sidecar file, got: {error:#}"
+        );
+    }
+
+    /// astorise/Magnetar#75's legacy-migration proof: an old-style bundle
+    /// with no declared-format sidecar is never auto-migrated by `load`
+    /// itself (proven above), but `migrate_legacy_bundle_artifact_format`
+    /// derives the same format the old filesystem heuristic always did and
+    /// writes the sidecar once, after which the bundle loads through the
+    /// normal explicit-declaration path -- and a second migration attempt
+    /// is refused rather than silently overwriting it.
+    #[test]
+    fn migrate_legacy_bundle_artifact_format_derives_and_writes_the_sidecar_once() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_qwen_bundle(dir.path());
+        let sidecar_path = dir
+            .path()
+            .join(magnetar_runtime::production_model_ingestion::ARTIFACT_FORMAT_SIDECAR_FILE_NAME);
+        std::fs::remove_file(&sidecar_path)
+            .expect("the sidecar written by write_tiny_qwen_bundle exists and can be removed");
+
+        let format = migrate_legacy_bundle_artifact_format(dir.path()).expect(
+            "migration must derive a format for a legacy Hugging Face-shaped bundle (no \
+             `model.gguf` file present)",
+        );
+        assert_eq!(format, ArtifactFormat::HuggingFace);
+        let sidecar_contents =
+            std::fs::read_to_string(&sidecar_path).expect("migration wrote the sidecar file");
+        assert_eq!(sidecar_contents, "artifact_format: huggingface\n");
+
+        // The now-migrated bundle loads cleanly through the normal
+        // explicit-declaration path, exactly like a bundle that was always
+        // written with the sidecar present.
+        local_bundle_manifest_digest(dir.path())
+            .expect("the migrated bundle now inspects cleanly through the declared format");
+
+        let second_attempt = migrate_legacy_bundle_artifact_format(dir.path()).expect_err(
+            "migration must refuse to run again once a declared-format sidecar already exists, \
+             rather than silently overwriting an operator's own explicit declaration",
+        );
+        assert!(
+            second_attempt
+                .to_string()
+                .contains("declared-format sidecar already exists"),
+        );
     }
 }
