@@ -712,31 +712,56 @@ impl Default for ModelComponentConformanceProfile {
 #[derive(Debug, Eq, PartialEq)]
 pub enum ModelComponentError {
     ModelComponentNotFound,
-    ModelComponentInvalid { reason: String },
+    ModelComponentInvalid {
+        reason: String,
+    },
     ModelComponentUntrusted,
     ModelComponentUnsupportedVersion,
     ArchitectureUnsupported,
-    ArchitectureMetadataInvalid { field: &'static str, reason: String },
-    ModelConfigInvalid { reason: String },
+    /// astorise/Magnetar#75: the registered Component's own declared
+    /// `compatibility.artifact_formats` does not include the Model
+    /// Artifact's declared [`crate::model::ArtifactFormat`]. Mirrors
+    /// [`Self::ArchitectureUnsupported`]'s own semantics one level down
+    /// (bundle shape rather than architecture family).
+    ArtifactFormatUnsupported,
+    ArchitectureMetadataInvalid {
+        field: &'static str,
+        reason: String,
+    },
+    ModelConfigInvalid {
+        reason: String,
+    },
     ModelArtifactIncompatible,
     TokenizerIncompatible,
     OperatorCatalogIncompatible,
     GraphContractIncompatible,
-    GraphProductionFailed { reason: String },
+    GraphProductionFailed {
+        reason: String,
+    },
     GraphValidationFailed(GraphError),
-    TargetModuleUnavailable { module: String },
+    TargetModuleUnavailable {
+        module: String,
+    },
     AdapterIncompatible,
-    KvCacheMetadataInvalid { reason: String },
+    KvCacheMetadataInvalid {
+        reason: String,
+    },
     QuantizationUnsupported,
-    CapabilityUnavailable { capability: String },
-    AuthorityDenied { authority: String },
+    CapabilityUnavailable {
+        capability: String,
+    },
+    AuthorityDenied {
+        authority: String,
+    },
     ProviderAccessDenied,
     DeviceAccessDenied,
     KernelAccessDenied,
     MemoryPointerAccessDenied,
     ProviderOwnedResourceAccessDenied,
     BrowserFeatureUnsupported,
-    InternalModelComponent { reason: String },
+    InternalModelComponent {
+        reason: String,
+    },
 }
 
 impl fmt::Display for ModelComponentError {
@@ -751,6 +776,7 @@ impl fmt::Display for ModelComponentError {
                 write!(f, "model component unsupported version")
             }
             Self::ArchitectureUnsupported => write!(f, "architecture unsupported"),
+            Self::ArtifactFormatUnsupported => write!(f, "artifact format unsupported"),
             Self::ArchitectureMetadataInvalid { field, reason } => {
                 write!(f, "architecture metadata invalid for {field}: {reason}")
             }

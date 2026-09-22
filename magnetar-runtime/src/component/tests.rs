@@ -1556,6 +1556,72 @@ fn component_manifest_rejects_an_explicitly_empty_architecture_families_list() {
     assert!(matches!(error, ComponentError::Manifest { .. }));
 }
 
+/// astorise/Magnetar#75's own schema-level half, mirroring
+/// `component_manifest_parses_declared_architecture_families` one field
+/// over: `compatibility.artifact_formats` populates
+/// `ComponentManifest::supported_artifact_formats`.
+#[test]
+fn component_manifest_parses_declared_artifact_formats() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let yaml = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION).replace(
+        "wit:\n",
+        "compatibility:\n  artifact_formats:\n    - huggingface\n    - gguf\nwit:\n",
+    );
+    let manifest = ComponentManifest::from_yaml_bytes(yaml.as_bytes(), Path::new("<test>"))
+        .expect("a manifest declaring artifact_formats parses");
+    assert_eq!(
+        manifest.supported_artifact_formats,
+        BTreeSet::from(["huggingface".to_string(), "gguf".to_string()])
+    );
+}
+
+/// Mirrors `component_manifest_with_no_compatibility_block_is_permissive`:
+/// no `compatibility` block declared must mean permissive on artifact
+/// format too, exactly like it always has for architecture family.
+#[test]
+fn component_manifest_with_no_compatibility_block_is_permissive_on_artifact_format() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let yaml = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION);
+    let manifest = ComponentManifest::from_yaml_bytes(yaml.as_bytes(), Path::new("<test>"))
+        .expect("a manifest with no compatibility block parses");
+    assert!(
+        manifest.supported_artifact_formats.is_empty(),
+        "no compatibility block declared must mean permissive, any-format compatibility"
+    );
+}
+
+/// Mirrors `component_manifest_rejects_an_explicitly_empty_architecture_families_list`:
+/// an explicitly empty `artifact_formats: []` is a declaration of
+/// *something*, not permissiveness, so it is rejected at parse time rather
+/// than silently treated the same as omitting the field.
+#[test]
+fn component_manifest_rejects_an_explicitly_empty_artifact_formats_list() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let yaml = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION)
+        .replace("wit:\n", "compatibility:\n  artifact_formats: []\nwit:\n");
+    let error = ComponentManifest::from_yaml_bytes(yaml.as_bytes(), Path::new("<test>"))
+        .expect_err("an explicitly empty artifact_formats list must be rejected");
+    assert!(matches!(error, ComponentError::Manifest { .. }));
+}
+
+/// An `artifact_formats` entry that is not a recognized
+/// [`crate::model::ArtifactFormat`] string is rejected at parse time
+/// (astorise/Magnetar#75) -- a typo here must never silently become a
+/// permissive-by-accident restriction nobody's Artifact can ever satisfy,
+/// nor pass through to become a value the runtime compatibility check
+/// mysteriously never matches.
+#[test]
+fn component_manifest_rejects_an_unrecognized_artifact_format() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let yaml = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION).replace(
+        "wit:\n",
+        "compatibility:\n  artifact_formats:\n    - onnx\nwit:\n",
+    );
+    let error = ComponentManifest::from_yaml_bytes(yaml.as_bytes(), Path::new("<test>"))
+        .expect_err("an unrecognized artifact_formats entry must be rejected");
+    assert!(matches!(error, ComponentError::Manifest { .. }));
+}
+
 #[test]
 fn component_artifact_rejects_runtime_max_version_incompatibility() {
     let directory = temp_component_artifact_dir("runtime-max");

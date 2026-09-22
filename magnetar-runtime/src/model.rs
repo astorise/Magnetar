@@ -498,6 +498,55 @@ pub enum ModelArtifactSource {
     Tachyon(String),
 }
 
+/// Which on-disk bundle shape a Model Artifact is packaged as -- a Hugging
+/// Face-style directory (`config.json`, `tokenizer.json`, separate weight
+/// files) versus a single self-contained GGUF container. Orthogonal to
+/// [`ModelArtifactSource`] (provenance -- where the bytes came from, not
+/// what shape they are): the same source kind can carry either format.
+///
+/// astorise/Magnetar#75: this used to be *detected* at load time by
+/// checking whether a well-known filename (`model.gguf`) exists next to
+/// the bundle -- a filesystem heuristic a caller had no way to override or
+/// make an ingestor's format selection explicit about. It is now a
+/// declared, static compatibility property: every [`ModelManifest`]
+/// carries its own `artifact_format`, and a production bundle declares it
+/// explicitly via a small sidecar file (see
+/// `crate::production_model_ingestion::read_declared_artifact_format`)
+/// rather than Magnetar inferring it. Extensible: a future third format
+/// adds a variant here, not a new filesystem check.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ArtifactFormat {
+    HuggingFace,
+    Gguf,
+}
+
+impl ArtifactFormat {
+    /// The stable, lowercase string form used in both the declared-format
+    /// sidecar file and a Component manifest's own
+    /// `compatibility.artifact_formats` list (astorise/Magnetar#75) --
+    /// the same string on both sides of the compatibility check.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::HuggingFace => "huggingface",
+            Self::Gguf => "gguf",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "huggingface" => Some(Self::HuggingFace),
+            "gguf" => Some(Self::Gguf),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ArtifactFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelComponentRequirement {
     pub role: String,
@@ -539,6 +588,16 @@ pub struct ModelManifest {
     /// before Component graph production. `None` for artifacts that carry
     /// no such configuration (every pre-existing fixture manifest).
     pub architecture_config: Option<ModelArchitectureConfig>,
+    /// The on-disk bundle shape this Artifact was ingested as
+    /// (astorise/Magnetar#75). Every concrete production ingestor stamps
+    /// its own known format here (a `GgufIngestor` always produces
+    /// [`ArtifactFormat::Gguf`], a `HuggingFaceIngestor` always
+    /// [`ArtifactFormat::HuggingFace`]) -- Magnetar never infers it from
+    /// filesystem structure. Compared against a registered Component's
+    /// `compatibility.artifact_formats` to select/validate the ingestor
+    /// path; see `crate::production_model_ingestion::read_declared_artifact_format`
+    /// for where a production bundle's declared format is read.
+    pub artifact_format: ArtifactFormat,
 }
 
 /// See [`ModelManifest::architecture_config`]. Deliberately narrow: only
@@ -1297,6 +1356,14 @@ struct RawModelManifest {
     license: Option<RawLicense>,
     #[serde(default)]
     provenance: Option<ModelProvenance>,
+    /// astorise/Magnetar#75: optional in the YAML text format so existing
+    /// fixture manifests don't all need editing -- defaults to
+    /// [`ArtifactFormat::HuggingFace`] when absent. A production bundle
+    /// never goes through this path; its format is always stamped by the
+    /// concrete ingestor that produced it (see
+    /// `crate::production_model_ingestion::read_declared_artifact_format`).
+    #[serde(default)]
+    artifact_format: Option<String>,
 }
 
 impl RawModelManifest {
@@ -1341,6 +1408,14 @@ impl TryFrom<RawModelManifest> for ModelManifest {
             .into_iter()
             .map(|value| parse_dtype(value, false))
             .collect::<Result<BTreeSet<_>, _>>()?;
+        let artifact_format = match raw.artifact_format {
+            Some(value) => {
+                ArtifactFormat::parse(&value).ok_or(ModelArtifactError::InvalidManifest {
+                    message: format!("unrecognized artifact_format '{value}'"),
+                })?
+            }
+            None => ArtifactFormat::HuggingFace,
+        };
         Ok(Self {
             schema_version: raw.schema_version,
             id,
@@ -1385,6 +1460,7 @@ impl TryFrom<RawModelManifest> for ModelManifest {
             signatures: Vec::new(),
             source: None,
             architecture_config: None,
+            artifact_format,
         })
     }
 }

@@ -5,11 +5,11 @@
 
 use super::*;
 use crate::{
-    AdapterSetId, FallbackClass, GenerationModelReference, MemoryManager, ModelArchitecture,
-    ModelArtifactId, ModelArtifactKind, ModelArtifactSource, ModelDigest, ModelInstanceDefinition,
-    ModelLoadingCoordinator, ModelLoadingRequest, ModelLoadingRequestId, ModelName,
-    ModelQuantizationPolicy, ModelRevision, ModelTrustDecision, ModelTrustStatus, ResourceAffinity,
-    TokenizerId,
+    AdapterSetId, ArtifactFormat, FallbackClass, GenerationModelReference, MemoryManager,
+    ModelArchitecture, ModelArtifactId, ModelArtifactKind, ModelArtifactSource, ModelDigest,
+    ModelInstanceDefinition, ModelLoadingCoordinator, ModelLoadingRequest, ModelLoadingRequestId,
+    ModelName, ModelQuantizationPolicy, ModelRevision, ModelTrustDecision, ModelTrustStatus,
+    ResourceAffinity, TokenizerId,
 };
 use crate::{
     ExecutionGraphId, ExecutionGraphProducer, GraphKvCacheBehavior, GraphKvCacheMetadata,
@@ -935,6 +935,7 @@ fn unsupported_quantization_is_rejected() {
         signatures: Vec::new(),
         source: Some(ModelArtifactSource::LocalCache("qwen-test".into())),
         architecture_config: None,
+        artifact_format: ArtifactFormat::HuggingFace,
     };
     assert_eq!(
         validate_first_native_model_artifact(&descriptor, &config, &manifest),
@@ -1196,6 +1197,7 @@ fn chat_template_required_but_missing_is_rejected() {
         signatures: Vec::new(),
         source: Some(ModelArtifactSource::LocalCache("qwen-test".into())),
         architecture_config: None,
+        artifact_format: ArtifactFormat::HuggingFace,
     };
     assert!(matches!(
         validate_first_native_model_artifact(&descriptor, &config, &manifest),

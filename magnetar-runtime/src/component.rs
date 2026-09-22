@@ -22,7 +22,14 @@ pub const COMPONENT_ARTIFACT_SCHEMA_VERSION: u64 = 1;
 /// to (at least) `0.1.1` -- `validate_runtime_compatibility` fails closed
 /// against an older Runtime that would otherwise silently ignore the
 /// field entirely (the YAML parser here has no `deny_unknown_fields`).
-pub const MAGNETAR_RUNTIME_VERSION: &str = "0.1.1";
+///
+/// astorise/Magnetar#75: bumped again to `0.1.2` for the same reason, one
+/// field over -- `compatibility.artifact_formats`. A Runtime older than
+/// `0.1.2` would silently ignore a declared `artifact_formats`
+/// restriction (still no `deny_unknown_fields`), which would let an
+/// incompatible Model Artifact bundle format load against a Component
+/// that explicitly declared it does not accept it.
+pub const MAGNETAR_RUNTIME_VERSION: &str = "0.1.2";
 
 static NEXT_COMPONENT_DEFINITION_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -477,6 +484,20 @@ pub struct ComponentManifest {
     /// parse time instead (see `ComponentManifestYaml::validate`) rather
     /// than silently becoming permissive by accident.
     pub supported_architecture_families: BTreeSet<String>,
+    /// Which Model Artifact bundle formats (astorise/Magnetar#75; see
+    /// [`crate::model::ArtifactFormat`]) this Component declares itself
+    /// compatible with -- the declarative source Magnetar checks a loaded
+    /// Artifact's own declared `artifact_format` against to select/validate
+    /// the ingestor path, replacing the old filesystem-structure heuristic.
+    /// Empty means permissive (no restriction), matching
+    /// `supported_architecture_families`'s own "empty means no
+    /// restriction" semantics: a manifest with no `compatibility` block
+    /// (or a present block with no `artifact_formats` list) accepts every
+    /// format. A manifest that explicitly declares an *empty*
+    /// `artifact_formats: []` list is rejected at parse time instead (see
+    /// `ComponentManifestYaml::validate`), for the same reason an
+    /// explicitly empty `architecture_families` is.
+    pub supported_artifact_formats: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -980,6 +1001,15 @@ struct ManifestCapabilitiesYaml {
 struct ManifestCompatibilityYaml {
     #[serde(default)]
     architecture_families: Option<Vec<String>>,
+    /// astorise/Magnetar#75. Named `artifact_formats` (plural, extensible)
+    /// rather than a singular `expected_artifact_format` per the accepted
+    /// decision on the issue: a Component may accept more than one bundle
+    /// format. Same three-state parse-time semantics as
+    /// `architecture_families` above (absent block, block with this field
+    /// absent, and an explicit non-empty list are all valid; an explicit
+    /// empty list is rejected -- see `validate`).
+    #[serde(default)]
+    artifact_formats: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1173,7 +1203,8 @@ impl ComponentManifestYaml {
         // accidentally open a Component to every architecture.
         let supported_architecture_families = match self
             .compatibility
-            .and_then(|compatibility| compatibility.architecture_families)
+            .as_ref()
+            .and_then(|compatibility| compatibility.architecture_families.clone())
         {
             None => BTreeSet::new(),
             Some(families) if families.is_empty() => {
@@ -1195,6 +1226,45 @@ impl ComponentManifestYaml {
                         ));
                     }
                     set.insert(family.to_string());
+                }
+                set
+            }
+        };
+
+        // astorise/Magnetar#75: same three-state semantics as
+        // `architecture_families` immediately above, for the Artifact
+        // bundle format(s) this Component accepts.
+        let supported_artifact_formats = match self
+            .compatibility
+            .and_then(|compatibility| compatibility.artifact_formats)
+        {
+            None => BTreeSet::new(),
+            Some(formats) if formats.is_empty() => {
+                return Err(manifest_validation_error(
+                    path,
+                    "compatibility.artifact_formats must not be an explicitly empty list \
+                     -- omit the field (or the whole compatibility block) entirely for \
+                     permissive, any-format compatibility",
+                ));
+            }
+            Some(formats) => {
+                let mut set = BTreeSet::new();
+                for format in formats {
+                    let format = format.trim();
+                    if format.is_empty() {
+                        return Err(manifest_validation_error(
+                            path,
+                            "compatibility.artifact_formats entries must not be empty",
+                        ));
+                    }
+                    if crate::model::ArtifactFormat::parse(format).is_none() {
+                        return Err(manifest_validation_error(
+                            path,
+                            "compatibility.artifact_formats entries must be a recognized \
+                             artifact format",
+                        ));
+                    }
+                    set.insert(format.to_string());
                 }
                 set
             }
@@ -1225,6 +1295,7 @@ impl ComponentManifestYaml {
             },
             signatures,
             supported_architecture_families,
+            supported_artifact_formats,
         })
     }
 }

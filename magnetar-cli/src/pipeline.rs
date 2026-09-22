@@ -6,7 +6,7 @@
 //! from Runtime model execution evidence rather than a CLI placeholder.
 
 use magnetar_runtime::{
-    ChatMessage, ChatTemplateFormatter, CliBoundaryError, FirstNativeChatSession,
+    ArtifactFormat, ChatMessage, ChatTemplateFormatter, CliBoundaryError, FirstNativeChatSession,
     FirstNativeRuntimeError, InferenceApiError, InferenceApiObserver, InferenceSessionId,
     MODEL_ARTIFACT_SCHEMA_VERSION, ModelArchitecture, ModelArtifactId, ModelArtifactKind,
     ModelDigest, ModelManifest, ModelName, ModelRef, ModelRevision,
@@ -148,6 +148,7 @@ pub fn fixture_model_manifest(label: &str) -> ModelManifest {
         signatures: Vec::new(),
         source: None,
         architecture_config: None,
+        artifact_format: ArtifactFormat::HuggingFace,
     }
 }
 

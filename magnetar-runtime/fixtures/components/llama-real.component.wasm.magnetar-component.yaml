@@ -12,10 +12,12 @@ component:
   role: "llama-model-component"
 runtime:
   magnetar:
-    min_version: "0.1.1"
+    min_version: "0.1.2"
 compatibility:
   architecture_families:
     - llama
+  artifact_formats:
+    - huggingface
 wit:
   imports:
     - package: "magnetar:model-component-graph"

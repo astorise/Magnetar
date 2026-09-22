@@ -210,6 +210,7 @@ fn component_manifest_role_must_be_model_component() {
         },
         signatures: Vec::new(),
         supported_architecture_families: BTreeSet::new(),
+        supported_artifact_formats: BTreeSet::new(),
     };
 
     assert!(matches!(

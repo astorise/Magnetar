@@ -216,6 +216,9 @@ impl From<ModelComponentError> for QwenComponentError {
                 Self::ComponentUnsupportedVersion
             }
             ModelComponentError::ArchitectureUnsupported => Self::ArchitectureUnsupported,
+            ModelComponentError::ArtifactFormatUnsupported => Self::ComponentInvalid {
+                reason: "artifact format unsupported".into(),
+            },
             ModelComponentError::ArchitectureMetadataInvalid { field, reason } => {
                 Self::ConfigInvalid { field, reason }
             }
