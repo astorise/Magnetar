@@ -12,7 +12,10 @@ component:
   role: "llama-model-component"
 runtime:
   magnetar:
-    min_version: "0.1.0"
+    min_version: "0.1.1"
+compatibility:
+  architecture_families:
+    - llama
 wit:
   imports:
     - package: "magnetar:model-component-graph"

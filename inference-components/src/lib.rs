@@ -263,7 +263,8 @@ impl LoadedInferenceComponent {
         )
         .map_err(|error| {
             anyhow!("Magnetar rejected inference Component artifact for `{name}`: {error}")
-        })?;
+        })?
+        .digest;
 
         // Format detection: a bundle is GGUF-shaped if it declares the
         // single file `loaders/gguf`'s own ingestor looks for, Hugging-
@@ -876,7 +877,7 @@ mod tests {
 /// through `LoadedInferenceComponent::load` itself). Builds a real,
 /// completely-specified Hugging Face-shaped bundle on disk (every tensor the
 /// real Qwen Component's graph resolves, at the exact shapes
-/// `magnetar_runtime::qwen_expected_tensor_shape` expects) and runs a real
+/// `magnetar_runtime::first_native_expected_tensor_shape` expects) and runs a real
 /// generation through `invoke_payload`, the same call shape a real embedder
 /// (e.g. Tachyon) uses.
 #[cfg(test)]
@@ -992,7 +993,7 @@ mod load_end_to_end_tests {
     }
 
     /// Every tensor name/shape here matches `magnetar_runtime::
-    /// qwen_expected_tensor_shape`'s HF-stored (pre-transpose) convention
+    /// first_native_expected_tensor_shape`'s HF-stored (pre-transpose) convention
     /// exactly for `tiny_config_json`'s dimensions: hidden_size=8,
     /// intermediate_size=16, num_hidden_layers=1, num_attention_heads=
     /// num_key_value_heads=2 (head_dim=4, so q/k/v_dim=8), vocab_size=4,
@@ -1052,6 +1053,145 @@ mod load_end_to_end_tests {
             ("lm_head.weight", vec![4, 8], filled(32, 1.20)),
         ];
         write_safetensors(&dir.join("model.safetensors"), &tensors);
+    }
+
+    /// #81: a genuinely independent second Model Artifact -- distinct
+    /// dimensions from `tiny_config_json`'s (not just a relabeled
+    /// `model_type`), its own tensor set, and its own tokenizer vocabulary --
+    /// for pairing with the real Llama Component instead of reusing
+    /// `write_tiny_qwen_bundle`'s exact tensors/config/tokenizer. Grouped-
+    /// query attention with a real head-count reduction this time
+    /// (`num_attention_heads: 3`, `num_key_value_heads: 1`, so `q_dim: 12`
+    /// but `kv_dim: 4` -- genuinely non-square projections, unlike the Qwen
+    /// fixture's `num_attention_heads == num_key_value_heads` shape, which
+    /// never exercises the GQA head-repetition path), and two decoder layers
+    /// instead of one.
+    fn llama_config_json() -> Vec<u8> {
+        serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 12,
+            "intermediate_size": 24,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 3,
+            "num_key_value_heads": 1,
+            "vocab_size": 6,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": false,
+            "torch_dtype": "float32",
+            "bos_token_id": 0,
+            "eos_token_id": 1
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// A real `tokenizer.json` (WordLevel over a 6-token vocabulary matching
+    /// `llama_config_json`'s `vocab_size`), genuinely distinct from
+    /// `tiny_tokenizer_json`'s vocabulary -- "the quick fox" round-trips to
+    /// exactly 3 real tokens under this tokenizer, unlike the Qwen fixture's
+    /// "hello world" (2 tokens).
+    fn llama_tokenizer_json() -> Vec<u8> {
+        serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                {
+                    "id": 0, "content": "<bos>", "special": true,
+                    "single_word": false, "lstrip": false, "rstrip": false, "normalized": false
+                },
+                {
+                    "id": 1, "content": "<eos>", "special": true,
+                    "single_word": false, "lstrip": false, "rstrip": false, "normalized": false
+                }
+            ],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<bos>": 0, "<eos>": 1, "the": 2, "quick": 3, "fox": 4, "jumps": 5},
+                "unk_token": "the"
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Every tensor name/shape here matches `magnetar_runtime::
+    /// first_native_expected_tensor_shape`'s HF-stored (pre-transpose) convention
+    /// exactly for `llama_config_json`'s dimensions: hidden_size=12,
+    /// intermediate_size=24, num_hidden_layers=2, num_attention_heads=3,
+    /// num_key_value_heads=1 (head_dim=4, so q_dim=12, kv_dim=4), vocab_size=6,
+    /// untied embeddings.
+    fn write_tiny_llama_bundle(dir: &Path) {
+        std::fs::write(dir.join("config.json"), llama_config_json()).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), llama_tokenizer_json()).unwrap();
+        let mut tensors: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+            (
+                "model.embed_tokens.weight".to_string(),
+                vec![6, 12],
+                filled(72, 2.10),
+            ),
+            ("model.norm.weight".to_string(), vec![12], filled(12, 2.20)),
+        ];
+        for layer in 0..2u32 {
+            let seed_offset = layer as f32 * 0.01;
+            tensors.push((
+                format!("model.layers.{layer}.input_layernorm.weight"),
+                vec![12],
+                filled(12, 2.30 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                vec![12, 12],
+                filled(144, 2.40 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                vec![4, 12],
+                filled(48, 2.50 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.v_proj.weight"),
+                vec![4, 12],
+                filled(48, 2.60 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                vec![12, 12],
+                filled(144, 2.70 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                vec![12],
+                filled(12, 2.80 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.mlp.gate_proj.weight"),
+                vec![24, 12],
+                filled(288, 2.90 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.mlp.up_proj.weight"),
+                vec![24, 12],
+                filled(288, 3.00 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.mlp.down_proj.weight"),
+                vec![12, 24],
+                filled(288, 3.10 + seed_offset),
+            ));
+        }
+        tensors.push(("lm_head.weight".to_string(), vec![6, 12], filled(72, 3.20)));
+        let borrowed: Vec<(&str, Vec<u64>, Vec<f32>)> = tensors
+            .iter()
+            .map(|(name, shape, values)| (name.as_str(), shape.clone(), values.clone()))
+            .collect();
+        write_safetensors(&dir.join("model.safetensors"), &borrowed);
     }
 
     #[test]
@@ -1114,27 +1254,31 @@ mod load_end_to_end_tests {
         )
     }
 
-    /// Tachyon integration audit MAG-01/MAG-06 (#72): the noted gap left
-    /// even after `magnetar-runtime`'s own
+    /// Tachyon integration audit MAG-01/MAG-06 (#72) and MAG-02 (#81): the
+    /// noted gap left even after `magnetar-runtime`'s own
     /// `build_first_native_graphs_from_named_component_serves_a_real_second_
     /// architecture_family` proved a real, independently-compiled non-Qwen
     /// Component (Llama) produces byte-identical graphs to Qwen for the same
     /// config -- that test never drove this crate's own `LoadedInferenceComponent::
     /// load`, so the audit's demand to "tester une seconde architecture
-    /// complète via LoadedInferenceComponent::load" stayed unproven. Loads
-    /// the exact same tiny Hugging Face-shaped bundle the Qwen end-to-end
-    /// test above uses (same tensors, same config, same tokenizer --
-    /// `attention_bias: false`, matching the fixture config the
-    /// Llama/Qwen-equivalence test itself assumes) but through the real
-    /// checked-in Llama Component artifact instead of Qwen's, registered and
-    /// trusted under its own real digest exactly like Qwen's is above.
-    /// `LoadedInferenceComponent` itself never names Qwen anywhere in this
-    /// call: which Component drives graph production is entirely a function
-    /// of which artifact/digest the caller supplies.
+    /// complète via LoadedInferenceComponent::load" stayed unproven. A first
+    /// version of this test (#72) closed the Component half of that gap but
+    /// still loaded `write_tiny_qwen_bundle`'s exact Qwen-shaped Model
+    /// Artifact -- proving the *Component* registry is multi-architecture,
+    /// not that a real independent second *model* stack works. This version
+    /// pairs the real checked-in Llama Component artifact with
+    /// `write_tiny_llama_bundle`'s own genuinely independent config
+    /// (different dimensions, a real GQA head-count reduction none of the
+    /// Qwen fixtures exercise), tensors, and tokenizer -- registered and
+    /// trusted under its own real digest exactly like the Qwen bundle is in
+    /// the test above. `LoadedInferenceComponent` itself never names Qwen
+    /// anywhere in this call: which Component drives graph production, and
+    /// which Model Artifact is ingested, are both entirely a function of
+    /// what the caller supplies.
     #[test]
     fn loaded_inference_component_load_runs_a_real_second_architecture_end_to_end() {
         let dir = tempfile::tempdir().expect("temp dir creates");
-        write_tiny_qwen_bundle(dir.path());
+        write_tiny_llama_bundle(dir.path());
 
         let model_digest =
             local_bundle_manifest_digest(dir.path()).expect("the bundle inspects cleanly");
@@ -1160,21 +1304,74 @@ mod load_end_to_end_tests {
             InferenceComponentPlacement::ReferenceCpu,
         )
         .expect(
-            "a real, independently-compiled non-Qwen Component (Llama) must load end to end \
-             through this crate's own orchestration exactly like the Qwen Component does",
+            "a real, independently-compiled non-Qwen Component (Llama) paired with its own \
+             genuinely independent Model Artifact must load end to end through this crate's \
+             own orchestration exactly like the Qwen Component/Artifact pair does",
         );
 
         let output = component
-            .invoke_payload(br#"{"prompt":"hello world","max_new_tokens":1}"#)
+            .invoke_payload(br#"{"prompt":"the quick fox","max_new_tokens":1}"#)
             .expect(
                 "generation must run end to end through the real Llama-Component-driven \
                  instance, the same call shape a real embedder uses",
             );
         assert_eq!(
-            output.usage.prompt_tokens, 2,
-            "\"hello world\" tokenizes to exactly 2 real tokens under this bundle's own tokenizer"
+            output.usage.prompt_tokens, 3,
+            "\"the quick fox\" tokenizes to exactly 3 real tokens under this bundle's own tokenizer"
         );
         assert_eq!(output.usage.generated_tokens, 1);
+    }
+
+    /// astorise/Magnetar#83 steps 6-7's required negative proof, through
+    /// the real `LoadedInferenceComponent::load` entry point end to end --
+    /// no hand-built `ModelComponentIdentity` anywhere in this test. Pairs
+    /// `write_tiny_llama_bundle`'s real Model Artifact (real ingestion
+    /// normalizes its `model_type: "llama"` into `architecture.family:
+    /// "llama"`, astorise/Magnetar#83 steps 1-5) with the real, checked-in
+    /// Qwen Component -- whose own manifest now declares `compatibility.
+    /// architecture_families: [qwen2]` -- both fully trusted (Model
+    /// Artifact trust and Component trust are independent, MAG-03, and
+    /// both are granted here so the *only* thing that can reject this load
+    /// is the family mismatch itself, not an unrelated trust gap). Proves
+    /// the Component-vs-family compatibility gate
+    /// `ProductionLoadedModel::load_with_component` now enforces is real:
+    /// before this fix, no such rejection existed anywhere in this call
+    /// chain, and this exact pairing would have loaded successfully.
+    #[test]
+    fn loaded_inference_component_load_rejects_a_family_mismatched_component() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_llama_bundle(dir.path());
+
+        let model_digest =
+            local_bundle_manifest_digest(dir.path()).expect("the bundle inspects cleanly");
+        let component_digest = magnetar_runtime::ComponentDigest::sha256(qwen_component_bytes());
+
+        let trust_policy = ArtifactTrustPolicy::default()
+            .trust_digest(&model_digest)
+            .trust_component_digest(&component_digest.value);
+
+        let error = LoadedInferenceComponent::load(
+            "test-mismatch",
+            InferenceComponentArtifact::from_bytes(
+                qwen_component_bytes().to_vec(),
+                qwen_component_manifest_bytes().to_vec(),
+            ),
+            InferenceComponentSource::authorized_local_bundle("test-fixture", dir.path()),
+            trust_policy,
+            InferenceComponentPlacement::ReferenceCpu,
+        )
+        .expect_err(
+            "a real Llama Model Artifact paired with a real Qwen Component that declares \
+             `compatibility.architecture_families: [qwen2]` must be rejected, even though both \
+             the Model Artifact and the Component are independently fully trusted",
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("architecture unsupported")),
+            "expected the rejection to be the architecture-family compatibility gate \
+             (`ModelComponentError::ArchitectureUnsupported`), got: {error:#}"
+        );
     }
 
     #[test]

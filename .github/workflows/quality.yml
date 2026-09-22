@@ -230,7 +230,13 @@ jobs:
   # Deliberately still excluded, by classification rather than oversight:
   # `first_native_runtime.rs` and `qwen_model_component.rs` are the two
   # files designated to legitimately carry Qwen-specific knowledge (see
-  # their own doc comments); `first_native_implementation_cut.rs` and
+  # their own doc comments) -- but `first_native_runtime.rs` also hosts the
+  # *generic* production facade (`ProductionLoadedModel`,
+  # `production_model_fixture`, `build_first_native_graphs_from_named_
+  # component`), which this file-level exclusion left with zero coverage
+  # (Tachyon integration audit MAG-05, #80). The second step below covers
+  # exactly that facade's own bodies instead of the whole file.
+  # `first_native_implementation_cut.rs` and
   # `e2e_conformance.rs` are explicitly scoped to the first-native
   # (currently Qwen) cut and to test/conformance fixtures respectively, not
   # generic Core. The roadmap/release-process files this guard used to name
@@ -287,6 +293,18 @@ jobs:
             fi
           done
           exit "$fail"
+      # Tachyon integration audit MAG-05 (#80): the guard above deliberately
+      # excludes first_native_runtime.rs and qwen_model_component.rs (they
+      # legitimately carry Qwen-specific knowledge), which also means it has
+      # zero visibility into the *generic* production facade that happens to
+      # live inside first_native_runtime.rs -- ProductionLoadedModel,
+      # production_model_fixture, build_first_native_graphs_from_named_component
+      # -- and inference-components' own LoadedInferenceComponent::load. This
+      # step scans exactly those specific bodies (not the whole file) against
+      # an explicit, individually justified allowlist tracked by #82 -- see
+      # tools/check_generic_facade_family_isolation.py's own doc comment.
+      - name: Reject model-family identifiers in the generic production facade
+        run: python3 tools/check_generic_facade_family_isolation.py .
 
   # #54/#63: the whole point of moving unit tests out of magnetar-runtime's
   # production files and into per-module `tests.rs` siblings was to stop

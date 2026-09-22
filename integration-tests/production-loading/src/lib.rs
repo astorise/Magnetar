@@ -12,7 +12,7 @@
 //! Face bundle (real `config.json`, real `tokenizer.json`, real
 //! Safetensors bytes) written to a temp directory, ingested through the
 //! real external `HuggingFaceIngestor`, loaded through
-//! `magnetar_runtime::load_production_qwen_instance`, and executed
+//! `magnetar_runtime::load_production_model_instance`, and executed
 //! through the real compiled Qwen Component and Reference CPU Provider --
 //! no fixture manifest, no `qwen-test` identity, anywhere in this path.
 //! `tests_production_loading_cuda_e2e.rs` proves the same real ingested

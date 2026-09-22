@@ -10,6 +10,21 @@
 //! Device, never executes a Kernel directly, and never receives a raw native
 //! handle. It only produces portable configuration metadata and Execution
 //! Graphs built from required-now Operators.
+//!
+//! Tachyon integration audit MAG-01 (#82): [`FirstNativeModelConfig`] and the
+//! validation/descriptor functions `first_native_runtime.rs`'s own generic
+//! production path (`production_model_fixture`) calls -- previously named
+//! `QwenConfig`, `qwen_component_descriptor`, `qwen_validate_model_artifact`,
+//! etc. -- were renamed off Qwen branding once investigation confirmed they
+//! encode this baseline's actual decoder-block shape (pre-norm, RoPE,
+//! grouped-query attention, SwiGLU MLP), not anything unique to real Qwen
+//! checkpoints specifically (a real, independently-compiled Llama Component
+//! exercises this exact same shape -- see `build_first_native_graphs_from_
+//! named_component_serves_a_real_second_architecture_family`). The rest of
+//! this module (adapter/LoRA compatibility, conformance fixture identity,
+//! observation tagging, browser-support/prefix-cache/KV-cache compatibility
+//! helpers) stays Qwen-named: none of it sits on the generic production
+//! path, and it remains this baseline's own legitimate territory.
 
 use crate::{
     ActivationKind, AdapterArchitectureCompatibility, AdapterLayerSelector, AdapterMethod,
@@ -284,11 +299,11 @@ impl From<GraphError> for QwenComponentError {
 
 /// Only RoPE position indexing mode supported by the first Qwen baseline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QwenRopePositionMode {
+pub enum FirstNativeRopePositionMode {
     Sequential,
 }
 
-impl QwenRopePositionMode {
+impl FirstNativeRopePositionMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Sequential => "sequential",
@@ -298,21 +313,21 @@ impl QwenRopePositionMode {
 
 /// Explicit Qwen RoPE metadata.
 #[derive(Clone, Debug, PartialEq)]
-pub struct QwenRopeConfig {
+pub struct FirstNativeRopeConfig {
     pub base: f64,
     pub scale: Option<f64>,
     pub dimension: u64,
-    pub position_mode: QwenRopePositionMode,
+    pub position_mode: FirstNativeRopePositionMode,
     pub dynamic_scaling_supported: bool,
 }
 
-impl QwenRopeConfig {
+impl FirstNativeRopeConfig {
     pub fn standard(head_dimension: u64) -> Self {
         Self {
             base: 10_000.0,
             scale: None,
             dimension: head_dimension,
-            position_mode: QwenRopePositionMode::Sequential,
+            position_mode: FirstNativeRopePositionMode::Sequential,
             dynamic_scaling_supported: false,
         }
     }
@@ -342,9 +357,9 @@ impl QwenRopeConfig {
 
 /// Qwen-like decoder-only architecture configuration.
 #[derive(Clone, Debug, PartialEq)]
-pub struct QwenConfig {
+pub struct FirstNativeModelConfig {
     pub architecture: ModelComponentArchitectureMetadata,
-    pub rope: QwenRopeConfig,
+    pub rope: FirstNativeRopeConfig,
     pub rmsnorm_epsilon: f32,
     pub tied_embeddings: bool,
     /// Whether `self_attn.{q,k,v}_proj` carry an additive bias term -- see
@@ -361,8 +376,11 @@ pub struct QwenConfig {
     pub chat_template_required: bool,
 }
 
-impl QwenConfig {
-    pub fn new(architecture: ModelComponentArchitectureMetadata, rope: QwenRopeConfig) -> Self {
+impl FirstNativeModelConfig {
+    pub fn new(
+        architecture: ModelComponentArchitectureMetadata,
+        rope: FirstNativeRopeConfig,
+    ) -> Self {
         Self {
             architecture,
             rope,
@@ -377,9 +395,17 @@ impl QwenConfig {
     }
 
     pub fn validate(&self, identity: &ModelComponentIdentity) -> Result<(), QwenComponentError> {
-        if self.architecture.family != QWEN_ARCHITECTURE_FAMILY {
-            return Err(QwenComponentError::ArchitectureUnsupported);
-        }
+        // astorise/Magnetar#83: this used to hardcode a family check against
+        // QWEN_ARCHITECTURE_FAMILY here, ignoring `identity` entirely --
+        // strictly more restrictive than (and redundant with)
+        // `self.architecture.validate(identity)` below, which already
+        // performs the correct, identity-driven check
+        // (`ModelComponentIdentity::supported_architecture_families`, empty
+        // meaning no restriction). The hardcoded check made every
+        // family-mismatch rejection tautological for callers whose
+        // `identity` already restricts to "qwen" (redundant, same outcome)
+        // and wrongly rejected every other real family for callers whose
+        // `identity` does not (the generic production path's own identity).
         self.architecture.validate(identity)?;
         if self.architecture.model_type != ModelComponentModelType::CausalLanguageModel {
             return Err(QwenComponentError::ConfigInvalid {
@@ -421,7 +447,7 @@ impl QwenConfig {
 /// normalization, activation, position encoding) and deriving the attention
 /// variant from the attention/KV head counts.
 #[allow(clippy::too_many_arguments)]
-pub fn qwen_architecture_metadata(
+pub fn first_native_architecture_metadata(
     hidden_size: u64,
     layer_count: u64,
     attention_head_count: u64,
@@ -457,7 +483,7 @@ pub fn qwen_architecture_metadata(
 }
 
 /// Build a trusted Qwen Model Component identity for the given id/version.
-pub fn qwen_component_identity(
+pub fn first_native_component_identity(
     id: ModelComponentId,
     version: ModelComponentVersion,
     implementation: ModelComponentImplementationKind,
@@ -469,7 +495,7 @@ pub fn qwen_component_identity(
 }
 
 /// Canonical Qwen target modules exposed for Adapter Loading.
-pub fn qwen_target_modules() -> Vec<TargetModuleMetadata> {
+pub fn first_native_target_modules() -> Vec<TargetModuleMetadata> {
     QWEN_TARGET_MODULE_ROLES
         .into_iter()
         .map(TargetModuleMetadata::canonical)
@@ -478,7 +504,7 @@ pub fn qwen_target_modules() -> Vec<TargetModuleMetadata> {
 
 /// Required-now Operator requirements for the Qwen baseline first executable
 /// path. See [`crate::first_operator_scope`].
-pub fn qwen_operator_requirements() -> Vec<OperatorRequirement> {
+pub fn first_native_operator_requirements() -> Vec<OperatorRequirement> {
     QWEN_REQUIRED_NOW_OPERATORS
         .into_iter()
         .map(|(name, family)| OperatorRequirement::new(OperatorId::magnetar(name, 1, family)))
@@ -488,7 +514,7 @@ pub fn qwen_operator_requirements() -> Vec<OperatorRequirement> {
 /// Authority the Qwen Model Component may hold. Deliberately excludes
 /// filesystem, network, process, shell, secrets, Git, workspace, Provider,
 /// Device, and Kernel authority.
-pub fn qwen_authority() -> BTreeSet<ModelComponentAuthority> {
+pub fn first_native_authority() -> BTreeSet<ModelComponentAuthority> {
     BTreeSet::from([
         ModelComponentAuthority::ModelArtifactRead,
         ModelComponentAuthority::TokenizerArtifactRead,
@@ -504,7 +530,9 @@ pub fn qwen_authority() -> BTreeSet<ModelComponentAuthority> {
     ])
 }
 
-pub fn qwen_kv_cache_metadata(config: &QwenConfig) -> ModelComponentKvCacheMetadata {
+pub fn first_native_kv_cache_metadata(
+    config: &FirstNativeModelConfig,
+) -> ModelComponentKvCacheMetadata {
     let a = &config.architecture;
     ModelComponentKvCacheMetadata {
         layer_count: a.layer_count,
@@ -519,7 +547,9 @@ pub fn qwen_kv_cache_metadata(config: &QwenConfig) -> ModelComponentKvCacheMetad
     }
 }
 
-pub fn qwen_tokenizer_compatibility(config: &QwenConfig) -> ModelComponentTokenizerCompatibility {
+pub fn first_native_tokenizer_compatibility(
+    config: &FirstNativeModelConfig,
+) -> ModelComponentTokenizerCompatibility {
     let mut special_tokens = BTreeSet::from(["eos".to_string()]);
     if config.require_bos {
         special_tokens.insert("bos".to_string());
@@ -543,8 +573,8 @@ pub fn qwen_tokenizer_compatibility(config: &QwenConfig) -> ModelComponentTokeni
 /// required), and BOS/pad token policy and added-token behavior where the
 /// baseline config declares them relevant. Tokenizer execution itself remains
 /// owned by the Tokenizer Contract.
-pub fn qwen_validate_tokenizer_compatibility(
-    config: &QwenConfig,
+pub fn validate_first_native_tokenizer_compatibility(
+    config: &FirstNativeModelConfig,
     tokenizer: &crate::TokenizerMetadata,
 ) -> Result<(), QwenComponentError> {
     let expected_vocabulary_size =
@@ -583,8 +613,8 @@ pub fn qwen_validate_tokenizer_compatibility(
 /// defaults (temperature/top-p/top-k) are intentionally never inspected here:
 /// they remain non-authoritative hints owned by the Generation/Sampling
 /// contracts.
-pub fn qwen_validate_generation_defaults(
-    config: &QwenConfig,
+pub fn validate_first_native_generation_defaults(
+    config: &FirstNativeModelConfig,
     defaults: &ModelGenerationDefaults,
     tokenizer: Option<&crate::TokenizerMetadata>,
 ) -> Result<(), QwenComponentError> {
@@ -604,7 +634,7 @@ pub fn qwen_validate_generation_defaults(
         });
     }
     if let Some(tokenizer) = tokenizer {
-        qwen_validate_tokenizer_compatibility(config, tokenizer)?;
+        validate_first_native_tokenizer_compatibility(config, tokenizer)?;
     }
     Ok(())
 }
@@ -612,7 +642,7 @@ pub fn qwen_validate_generation_defaults(
 /// The first Qwen baseline rejects quantized artifacts by declaring no
 /// supported quantization methods. A later baseline may add explicit
 /// dequantization support here.
-pub fn qwen_quantization_compatibility() -> ModelComponentQuantizationCompatibility {
+pub fn first_native_quantization_compatibility() -> ModelComponentQuantizationCompatibility {
     ModelComponentQuantizationCompatibility {
         supported_methods: BTreeSet::new(),
         tensor_grouping: None,
@@ -626,26 +656,26 @@ pub fn qwen_quantization_compatibility() -> ModelComponentQuantizationCompatibil
 
 /// Assemble and validate a Qwen [`ModelComponentDescriptor`], including
 /// first-scope operator requirement validation.
-pub fn qwen_component_descriptor(
+pub fn first_native_component_descriptor(
     identity: ModelComponentIdentity,
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
 ) -> Result<ModelComponentDescriptor, QwenComponentError> {
     config.validate(&identity)?;
     let descriptor = ModelComponentDescriptor {
         identity,
         architecture: config.architecture.clone(),
-        target_modules: qwen_target_modules(),
+        target_modules: first_native_target_modules(),
         graph_phases: BTreeSet::from([
             ExecutionGraphPhase::Warmup,
             ExecutionGraphPhase::Prefill,
             ExecutionGraphPhase::Decode,
         ]),
-        operator_requirements: qwen_operator_requirements(),
+        operator_requirements: first_native_operator_requirements(),
         capability_requirements: Vec::new(),
-        authority: qwen_authority(),
-        kv_cache: Some(qwen_kv_cache_metadata(config)),
-        tokenizer: Some(qwen_tokenizer_compatibility(config)),
-        quantization: Some(qwen_quantization_compatibility()),
+        authority: first_native_authority(),
+        kv_cache: Some(first_native_kv_cache_metadata(config)),
+        tokenizer: Some(first_native_tokenizer_compatibility(config)),
+        quantization: Some(first_native_quantization_compatibility()),
     };
     descriptor.validate()?;
     validate_model_component_first_scope_requirements(&descriptor.operator_requirements)?;
@@ -653,7 +683,10 @@ pub fn qwen_component_descriptor(
 }
 
 /// Expected logical tensor names for the Qwen baseline tensor inventory.
-pub fn qwen_expected_tensor_names(layer_count: u64, tied_embeddings: bool) -> BTreeSet<String> {
+pub fn first_native_expected_tensor_names(
+    layer_count: u64,
+    tied_embeddings: bool,
+) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     names.insert("token_embedding".to_string());
     for layer in 0..layer_count {
@@ -691,15 +724,15 @@ pub fn qwen_expected_tensor_names(layer_count: u64, tied_embeddings: bool) -> BT
 }
 
 /// Validate that every expected logical tensor is present in `tensors`.
-pub fn qwen_validate_tensor_inventory(
-    config: &QwenConfig,
+pub fn validate_first_native_tensor_inventory(
+    config: &FirstNativeModelConfig,
     tensors: &[ModelTensorMetadata],
 ) -> Result<(), QwenComponentError> {
     let present: BTreeSet<&str> = tensors.iter().map(|tensor| tensor.name.as_str()).collect();
     for expected in
-        qwen_expected_tensor_names(config.architecture.layer_count, config.tied_embeddings)
+        first_native_expected_tensor_names(config.architecture.layer_count, config.tied_embeddings)
     {
-        // `mlp.gate_up_proj` is `qwen_expected_tensor_names`'s fixture-
+        // `mlp.gate_up_proj` is `first_native_expected_tensor_names`'s fixture-
         // generation superset (its own doc comment: "additional to, not a
         // replacement for" standalone gate_proj/up_proj) -- the real
         // compiled Qwen Component's graph never references it, only this
@@ -721,7 +754,10 @@ pub fn qwen_validate_tensor_inventory(
 
 /// Expected shape for a Qwen logical tensor name, if the baseline declares
 /// one.
-pub fn qwen_expected_tensor_shape(name: &str, config: &QwenConfig) -> Option<Vec<u64>> {
+pub fn first_native_expected_tensor_shape(
+    name: &str,
+    config: &FirstNativeModelConfig,
+) -> Option<Vec<u64>> {
     let a = &config.architecture;
     let q_dim = a.attention_head_count * a.head_dimension;
     let kv_dim = a.kv_head_count * a.head_dimension;
@@ -739,7 +775,7 @@ pub fn qwen_expected_tensor_shape(name: &str, config: &QwenConfig) -> Option<Vec
         // Optional: real Qwen2/2.5 checkpoints declare these (an
         // architectural default, not config-driven -- see
         // `ModelArchitectureConfig::attention_bias`'s doc comment); never
-        // required by `qwen_expected_tensor_names`, so an untied/no-bias
+        // required by `first_native_expected_tensor_names`, so an untied/no-bias
         // configuration is unaffected. Checked here only when present.
         "self_attn.q_bias" => Some(vec![q_dim]),
         "self_attn.k_bias" | "self_attn.v_bias" => Some(vec![kv_dim]),
@@ -748,7 +784,7 @@ pub fn qwen_expected_tensor_shape(name: &str, config: &QwenConfig) -> Option<Vec
         // Fused gate/up projection (`define-provider-prepared-kernel-
         // execution-contract` task group 3): additional to (not a
         // replacement for) the standalone shapes above -- see
-        // `qwen_expected_tensor_names`'s doc comment for why both exist.
+        // `first_native_expected_tensor_names`'s doc comment for why both exist.
         // Twice as wide as either standalone projection, halved by the
         // "split" node the Rust test-oracle graph inserts below rather
         // than two separate matmuls -- a genuine real-world LLM-serving
@@ -761,12 +797,12 @@ pub fn qwen_expected_tensor_shape(name: &str, config: &QwenConfig) -> Option<Vec
 }
 
 /// Validate declared tensor shapes for every recognized Qwen logical tensor.
-pub fn qwen_validate_tensor_shapes(
-    config: &QwenConfig,
+pub fn validate_first_native_tensor_shapes(
+    config: &FirstNativeModelConfig,
     tensors: &[ModelTensorMetadata],
 ) -> Result<(), QwenComponentError> {
     for tensor in tensors {
-        if let Some(expected) = qwen_expected_tensor_shape(&tensor.name, config)
+        if let Some(expected) = first_native_expected_tensor_shape(&tensor.name, config)
             && tensor.shape != expected
         {
             return Err(QwenComponentError::TensorShapeMismatch {
@@ -780,9 +816,9 @@ pub fn qwen_validate_tensor_shapes(
 
 /// Validate the shared embedding tensor's shape when the baseline is
 /// configured for tied embeddings. Untied configurations have nothing to
-/// check here: `lm_head` shape is covered by [`qwen_validate_tensor_shapes`].
-pub fn qwen_validate_tied_embedding_shape(
-    config: &QwenConfig,
+/// check here: `lm_head` shape is covered by [`validate_first_native_tensor_shapes`].
+pub fn validate_first_native_tied_embedding_shape(
+    config: &FirstNativeModelConfig,
     tensors: &[ModelTensorMetadata],
 ) -> Result<(), QwenComponentError> {
     if !config.tied_embeddings {
@@ -816,15 +852,15 @@ pub fn qwen_validate_tied_embedding_shape(
 /// presence when the baseline requires it. Preserves Runtime artifact trust:
 /// this function never bypasses trust validation performed elsewhere by
 /// Model Loading.
-pub fn qwen_validate_model_artifact(
+pub fn validate_first_native_model_artifact(
     descriptor: &ModelComponentDescriptor,
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     manifest: &ModelManifest,
 ) -> Result<(), QwenComponentError> {
     descriptor.validate_model_artifact(manifest)?;
-    qwen_validate_tensor_inventory(config, &manifest.tensors)?;
-    qwen_validate_tensor_shapes(config, &manifest.tensors)?;
-    qwen_validate_tied_embedding_shape(config, &manifest.tensors)?;
+    validate_first_native_tensor_inventory(config, &manifest.tensors)?;
+    validate_first_native_tensor_shapes(config, &manifest.tensors)?;
+    validate_first_native_tied_embedding_shape(config, &manifest.tensors)?;
     if config.chat_template_required && manifest.chat_template.is_none() {
         return Err(QwenComponentError::ComponentInvalid {
             reason: "chat template metadata required but not present in Model Artifact".into(),
@@ -835,7 +871,7 @@ pub fn qwen_validate_model_artifact(
 
 /// Adapter (e.g. LoRA) architecture compatibility metadata for a Qwen model.
 pub fn qwen_adapter_architecture_compatibility(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     implementation: impl Into<String>,
 ) -> AdapterArchitectureCompatibility {
     let a = &config.architecture;
@@ -1014,7 +1050,7 @@ pub fn qwen_validate_adapter_activation_supported(
 
 /// Validate adapter target tensor shapes against Qwen architecture metadata.
 pub fn qwen_validate_adapter_target_shapes(
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     targets: &[AdapterTargetModule],
 ) -> Result<(), QwenComponentError> {
     let a = &config.architecture;
@@ -1150,7 +1186,7 @@ pub fn qwen_architecture_implementation(
 /// A deterministic fingerprint of Qwen architecture/config fields, distinct
 /// from Component identity/version, suitable for Prefix Cache and KV Cache
 /// compatibility metadata.
-pub fn qwen_config_fingerprint(config: &QwenConfig) -> String {
+pub fn qwen_config_fingerprint(config: &FirstNativeModelConfig) -> String {
     let a = &config.architecture;
     format!(
         "h{}-l{}-a{}-kv{}-d{}-i{}-v{}-c{}-rope{}",
@@ -1189,7 +1225,7 @@ pub fn qwen_kv_cache_compatibility(
 /// or cross-RoPE prefix reuse.
 pub fn qwen_prefix_cache_compatibility(
     identity: &ModelComponentIdentity,
-    config: &QwenConfig,
+    config: &FirstNativeModelConfig,
     model: crate::GenerationModelReference,
     tokenizer: crate::TokenizerId,
     tokenizer_revision: Option<String>,
@@ -1213,7 +1249,7 @@ pub fn qwen_prefix_cache_compatibility(
     compatibility
 }
 
-fn qwen_attention_implementation_tag(config: &QwenConfig) -> String {
+fn qwen_attention_implementation_tag(config: &FirstNativeModelConfig) -> String {
     match config.architecture.attention {
         crate::AttentionVariant::MultiHead => "multi-head".into(),
         crate::AttentionVariant::MultiQuery => "multi-query".into(),

@@ -30,7 +30,7 @@ use magnetar_runtime::{
     ModelInstanceUnloadPolicy, ModelLoadingApiRequest, ModelLoadingCoordinator,
     ModelLoadingRequest, ModelLoadingRequestId, ModelRef, ModelRegistry, ModelResolutionRequest,
     ProductionModelArtifactIngestor, ProductionModelSource, ReferenceCpuProvider, Runtime,
-    load_model, load_production_qwen_instance, unload_model_instance,
+    load_model, load_production_model_instance, unload_model_instance,
 };
 
 use crate::observability::{CliObservationKind, CliObserver};
@@ -832,7 +832,7 @@ fn cmd_model_load_local_file(args: &[String]) -> Result<(), CliBoundaryError> {
         .map_err(|error| CliBoundaryError::CliRuntimeUnavailable {
             reason: error.to_string(),
         })?;
-    let instance = load_production_qwen_instance(
+    let instance = load_production_model_instance(
         &mut runtime,
         &ingested.manifest,
         ingested.payload_source.as_ref(),
@@ -1298,7 +1298,7 @@ mod tests {
         // real single-tensor Safetensors bytes with a real 8-byte header-
         // length prefix (matching `loaders/huggingface`'s own test helper
         // shape) -- ingestion must succeed and genuinely reach
-        // `load_production_qwen_instance`, which fails on trust (this test
+        // `load_production_model_instance`, which fails on trust (this test
         // builds a `Runtime` with no configured trust policy, same as
         // `cmd_model_load_calls_real_load_model_and_fails_on_trust`), not
         // on parsing.

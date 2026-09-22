@@ -156,23 +156,25 @@ use std::sync::Arc;
 
 use magnetar_runtime::provider::Provider;
 use magnetar_runtime::qwen_model_component::{
-    qwen_architecture_implementation, qwen_architecture_metadata, qwen_component_descriptor,
-    qwen_component_identity, qwen_validate_model_artifact,
+    first_native_architecture_metadata, first_native_component_descriptor,
+    first_native_component_identity, qwen_architecture_implementation,
+    validate_first_native_model_artifact,
 };
 use magnetar_runtime::{
     ComputeDType, DTypeDescriptor, DeviceBinding, DeviceSet, DeviceSetId, DeviceSetMember,
-    E2eFixture, ExecutionNodeId, FallbackClass, HostStagingPolicy, HostTensor, KernelDispatchPlan,
-    KernelDispatchPlanId, KernelDispatcher, KernelInvocationId, KernelMemoryClass, KernelResource,
-    KernelResultStatus, KernelSelectionRequest, KvCacheId, LayoutDescriptor, MemoryAllocationClass,
+    E2eFixture, ExecutionNodeId, FallbackClass, FirstNativeModelConfig, FirstNativeRopeConfig,
+    HostStagingPolicy, HostTensor, KernelDispatchPlan, KernelDispatchPlanId, KernelDispatcher,
+    KernelInvocationId, KernelMemoryClass, KernelResource, KernelResultStatus,
+    KernelSelectionRequest, KvCacheId, LayoutDescriptor, MemoryAllocationClass,
     MemoryAllocationOwner, MemoryDomain, MemoryPlacement, ModelArchitectureImplementationKind,
     ModelComponentId, ModelComponentImplementationKind, ModelComponentVersion,
     MultiDevicePlacementError, MultiDevicePlacementErrorCode, MultiDevicePlacementFingerprint,
     MultiDevicePlacementGeneration, MultiDevicePlacementPlan, MultiDevicePlacementPlanId,
     MultiDevicePlacementState, OperatorFamily, OperatorId, PipelineStage, PlacementBinding,
     PlacementCandidate, PlacementScope, ProviderBinding, ProviderExecutionApi,
-    ProviderPressureLevel, QwenConfig, QwenRopeConfig, QwenSegmentBoundaryInput, ResourceAffinity,
-    Runtime, ShapeDescriptor, StageMovementEdge, TensorDescriptor, TensorEdgeId,
-    TensorResourceDescriptor, TensorResourceId, build_first_native_graphs_from_real_qwen_component,
+    ProviderPressureLevel, QwenSegmentBoundaryInput, ResourceAffinity, Runtime, ShapeDescriptor,
+    StageMovementEdge, TensorDescriptor, TensorEdgeId, TensorResourceDescriptor, TensorResourceId,
+    build_first_native_graphs_from_real_qwen_component,
     build_first_native_prefill_graph_segment_for_config, e2e_fixture_manifest_from_weights,
     e2e_fixture_tokenizer, e2e_fixture_weights, initial_operator_catalog,
     load_first_native_segment_with_provider_and_weights, register_qwen_component_artifact,
@@ -1385,13 +1387,13 @@ fn register_real_qwen_component() {
 /// its own non-canonical fixture: entirely from `magnetar-runtime`'s own
 /// public fixture-building primitives.
 fn two_layer_fixture() -> E2eFixture {
-    let architecture = qwen_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
-    let identity = qwen_component_identity(
+    let architecture = first_native_architecture_metadata(4, 2, 2, 2, 2, 8, 258, 32);
+    let identity = first_native_component_identity(
         ModelComponentId::new("multi-gpu-segment-fixture").expect("static id is valid"),
         ModelComponentVersion::new(1, 0, 0),
         ModelComponentImplementationKind::WebAssemblyComponent,
     );
-    let config = QwenConfig::new(architecture, QwenRopeConfig::standard(2));
+    let config = FirstNativeModelConfig::new(architecture, FirstNativeRopeConfig::standard(2));
     config
         .validate(&identity)
         .expect("2-layer config validates");
@@ -1407,9 +1409,9 @@ fn two_layer_fixture() -> E2eFixture {
     )
     .expect("2-layer fixture manifest builds");
     let tokenizer = e2e_fixture_tokenizer().expect("fixture tokenizer builds");
-    let descriptor = qwen_component_descriptor(identity.clone(), &config)
+    let descriptor = first_native_component_descriptor(identity.clone(), &config)
         .expect("2-layer component descriptor builds");
-    qwen_validate_model_artifact(&descriptor, &config, &manifest)
+    validate_first_native_model_artifact(&descriptor, &config, &manifest)
         .expect("2-layer manifest matches its own descriptor");
     E2eFixture {
         config,
