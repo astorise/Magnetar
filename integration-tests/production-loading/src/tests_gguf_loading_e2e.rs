@@ -3,7 +3,7 @@
 //! bundles: neither `magnetar-runtime` nor `loaders/gguf` can prove this
 //! on their own (the same `production-model-ingestion` externalization
 //! boundary applies). Proves the real external `GgufIngestor` reaches
-//! `magnetar_runtime::load_production_qwen_instance` and generation
+//! `magnetar_runtime::load_production_model_instance` and generation
 //! through the real compiled Qwen Component and Reference CPU Provider --
 //! the exact same production entry points `tests_production_loading_e2e.rs`
 //! uses for Hugging Face bundles, proving the production path is genuinely

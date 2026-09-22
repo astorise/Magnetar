@@ -3768,6 +3768,7 @@ fn minimal_model_manifest() -> ModelManifest {
         signatures: Vec::new(),
         source: None,
         architecture_config: None,
+        artifact_format: ArtifactFormat::HuggingFace,
     }
 }
 

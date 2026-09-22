@@ -14,7 +14,22 @@ use crate::InferenceSessionId;
 pub const COMPONENT_ARTIFACT_SCHEMA: &str = "magnetar-component-artifact";
 pub const COMPONENT_TRUST_SCHEMA: &str = "magnetar-component-trust";
 pub const COMPONENT_ARTIFACT_SCHEMA_VERSION: u64 = 1;
-pub const MAGNETAR_RUNTIME_VERSION: &str = "0.1.0";
+/// astorise/Magnetar#83 steps 6-7: bumped from `0.1.0` to `0.1.1` because
+/// this is the first Runtime version that understands a manifest's
+/// `compatibility.architecture_families` block (see
+/// `ComponentManifestYaml::validate`). A Component manifest that declares
+/// this new field must also raise its own `runtime.magnetar.min_version`
+/// to (at least) `0.1.1` -- `validate_runtime_compatibility` fails closed
+/// against an older Runtime that would otherwise silently ignore the
+/// field entirely (the YAML parser here has no `deny_unknown_fields`).
+///
+/// astorise/Magnetar#75: bumped again to `0.1.2` for the same reason, one
+/// field over -- `compatibility.artifact_formats`. A Runtime older than
+/// `0.1.2` would silently ignore a declared `artifact_formats`
+/// restriction (still no `deny_unknown_fields`), which would let an
+/// incompatible Model Artifact bundle format load against a Component
+/// that explicitly declared it does not accept it.
+pub const MAGNETAR_RUNTIME_VERSION: &str = "0.1.2";
 
 static NEXT_COMPONENT_DEFINITION_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -388,7 +403,7 @@ impl ComponentTrustStore {
 
     /// Evaluates `manifest`/`digest` against this trust store's policy,
     /// independent of any particular loading path -- the same decision
-    /// [`validate_component_artifact`] applies during a fresh
+    /// `validate_component_artifact` applies during a fresh
     /// `prepare_component`, exposed so a caller that already holds a
     /// registered Component (and therefore never runs that validation
     /// again) can still re-check *this* caller's own trust before reusing
@@ -452,6 +467,37 @@ pub struct ComponentManifest {
     pub publisher: Option<ComponentPublisher>,
     pub source: ComponentSource,
     pub signatures: Vec<ComponentSignature>,
+    /// Which Model Artifact architecture families this Component declares
+    /// itself compatible with (astorise/Magnetar#83, steps 6-7): the
+    /// declarative source the Model Component contract's own
+    /// `ModelComponentIdentity.supported_architecture_families` (see
+    /// `model_component.rs`) is populated from when this Component is
+    /// registered/loaded, instead of every caller having to invent that
+    /// value itself or leave it permissive by default. Empty means
+    /// permissive -- this Component declares no family restriction --
+    /// exactly [`crate::model_component::ModelComponentIdentity::
+    /// supports_architecture`]'s own "empty means no restriction"
+    /// semantics, so a manifest with no `compatibility` block (or a
+    /// present block with no `architecture_families` list) behaves
+    /// identically to a pre-#83 manifest. A manifest that explicitly
+    /// declares an *empty* `architecture_families: []` list is rejected at
+    /// parse time instead (see `ComponentManifestYaml::validate`) rather
+    /// than silently becoming permissive by accident.
+    pub supported_architecture_families: BTreeSet<String>,
+    /// Which Model Artifact bundle formats (astorise/Magnetar#75; see
+    /// [`crate::model::ArtifactFormat`]) this Component declares itself
+    /// compatible with -- the declarative source Magnetar checks a loaded
+    /// Artifact's own declared `artifact_format` against to select/validate
+    /// the ingestor path, replacing the old filesystem-structure heuristic.
+    /// Empty means permissive (no restriction), matching
+    /// `supported_architecture_families`'s own "empty means no
+    /// restriction" semantics: a manifest with no `compatibility` block
+    /// (or a present block with no `artifact_formats` list) accepts every
+    /// format. A manifest that explicitly declares an *empty*
+    /// `artifact_formats: []` list is rejected at parse time instead (see
+    /// `ComponentManifestYaml::validate`), for the same reason an
+    /// explicitly empty `architecture_families` is.
+    pub supported_artifact_formats: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -845,7 +891,7 @@ impl ComponentManifest {
     /// already registered, without re-reading it from disk) parse and
     /// validate them the same way a fresh `load_yaml` would. `path` is used
     /// only to shape error messages the same as `load_yaml`'s own, exactly
-    /// like [`ComponentManifestYaml::validate`] already does with it;
+    /// like `ComponentManifestYaml::validate` already does with it;
     /// nothing here touches the filesystem.
     pub fn from_yaml_bytes(bytes: &[u8], path: &Path) -> Result<Self, ComponentError> {
         let content = std::str::from_utf8(bytes).map_err(|source| ComponentError::Manifest {
@@ -879,6 +925,14 @@ struct ComponentManifestYaml {
     source: ComponentSourceYaml,
     #[serde(default)]
     signatures: Vec<ComponentSignatureYaml>,
+    /// astorise/Magnetar#83 steps 6-7: additive/optional root-level block
+    /// (schema_version stays 1 for this addition -- see
+    /// `ComponentManifest::supported_architecture_families`'s own doc
+    /// comment). Absent entirely on every manifest written before this
+    /// field existed, which is exactly why it must default rather than
+    /// be required.
+    #[serde(default)]
+    compatibility: Option<ManifestCompatibilityYaml>,
 }
 
 #[derive(Deserialize)]
@@ -934,6 +988,28 @@ struct ManifestWitInterfaceYaml {
 struct ManifestCapabilitiesYaml {
     #[serde(default)]
     requires: Vec<ManifestCapabilityYaml>,
+}
+
+/// astorise/Magnetar#83 steps 6-7. `architecture_families` is itself
+/// `#[serde(default)]` (not just the enclosing `compatibility` block) so
+/// `ComponentManifestYaml::validate` can distinguish all three states a
+/// manifest author can express: the `compatibility` block absent, the
+/// block present but `architecture_families` absent (both permissive,
+/// identical outcome), and the block present with `architecture_families`
+/// an explicit empty list (rejected -- see `validate`'s own handling).
+#[derive(Deserialize, Default)]
+struct ManifestCompatibilityYaml {
+    #[serde(default)]
+    architecture_families: Option<Vec<String>>,
+    /// astorise/Magnetar#75. Named `artifact_formats` (plural, extensible)
+    /// rather than a singular `expected_artifact_format` per the accepted
+    /// decision on the issue: a Component may accept more than one bundle
+    /// format. Same three-state parse-time semantics as
+    /// `architecture_families` above (absent block, block with this field
+    /// absent, and an explicit non-empty list are all valid; an explicit
+    /// empty list is rejected -- see `validate`).
+    #[serde(default)]
+    artifact_formats: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1116,6 +1192,84 @@ impl ComponentManifestYaml {
             })
             .collect();
 
+        // astorise/Magnetar#83 steps 6-7: `compatibility` absent, or
+        // present with `architecture_families` absent, both mean
+        // permissive (an empty set) -- backward compatible with every
+        // manifest written before this field existed. An explicitly empty
+        // list is rejected here rather than silently treated as
+        // permissive: an author who writes `architecture_families: []` is
+        // declaring *something*, and treating that the same as omitting
+        // the field entirely would let a typo'd or generated-empty list
+        // accidentally open a Component to every architecture.
+        let supported_architecture_families = match self
+            .compatibility
+            .as_ref()
+            .and_then(|compatibility| compatibility.architecture_families.clone())
+        {
+            None => BTreeSet::new(),
+            Some(families) if families.is_empty() => {
+                return Err(manifest_validation_error(
+                    path,
+                    "compatibility.architecture_families must not be an explicitly empty list \
+                     -- omit the field (or the whole compatibility block) entirely for \
+                     permissive, any-architecture compatibility",
+                ));
+            }
+            Some(families) => {
+                let mut set = BTreeSet::new();
+                for family in families {
+                    let family = family.trim();
+                    if family.is_empty() {
+                        return Err(manifest_validation_error(
+                            path,
+                            "compatibility.architecture_families entries must not be empty",
+                        ));
+                    }
+                    set.insert(family.to_string());
+                }
+                set
+            }
+        };
+
+        // astorise/Magnetar#75: same three-state semantics as
+        // `architecture_families` immediately above, for the Artifact
+        // bundle format(s) this Component accepts.
+        let supported_artifact_formats = match self
+            .compatibility
+            .and_then(|compatibility| compatibility.artifact_formats)
+        {
+            None => BTreeSet::new(),
+            Some(formats) if formats.is_empty() => {
+                return Err(manifest_validation_error(
+                    path,
+                    "compatibility.artifact_formats must not be an explicitly empty list \
+                     -- omit the field (or the whole compatibility block) entirely for \
+                     permissive, any-format compatibility",
+                ));
+            }
+            Some(formats) => {
+                let mut set = BTreeSet::new();
+                for format in formats {
+                    let format = format.trim();
+                    if format.is_empty() {
+                        return Err(manifest_validation_error(
+                            path,
+                            "compatibility.artifact_formats entries must not be empty",
+                        ));
+                    }
+                    if crate::model::ArtifactFormat::parse(format).is_none() {
+                        return Err(manifest_validation_error(
+                            path,
+                            "compatibility.artifact_formats entries must be a recognized \
+                             artifact format",
+                        ));
+                    }
+                    set.insert(format.to_string());
+                }
+                set
+            }
+        };
+
         Ok(ComponentManifest {
             component: ComponentMetadata {
                 name: self.component.name,
@@ -1140,6 +1294,8 @@ impl ComponentManifestYaml {
                 uri: self.source.uri,
             },
             signatures,
+            supported_architecture_families,
+            supported_artifact_formats,
         })
     }
 }

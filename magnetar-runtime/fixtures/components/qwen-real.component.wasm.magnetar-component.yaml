@@ -12,7 +12,12 @@ component:
   role: "qwen-model-component"
 runtime:
   magnetar:
-    min_version: "0.1.0"
+    min_version: "0.1.2"
+compatibility:
+  architecture_families:
+    - qwen2
+  artifact_formats:
+    - huggingface
 wit:
   imports:
     - package: "magnetar:model-component-graph"

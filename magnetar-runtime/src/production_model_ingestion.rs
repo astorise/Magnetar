@@ -26,11 +26,12 @@
 //! - [`ProductionIngestionError`]: the structured failure categories this
 //!   boundary exposes.
 
-use crate::{ModelArtifactSource, ModelDigest, ModelManifest};
+use crate::{ArtifactFormat, ModelArtifactSource, ModelDigest, ModelManifest};
+use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     error::Error,
-    fmt,
+    fmt, fs,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -169,6 +170,62 @@ impl ProductionModelSource {
         }
         Ok(canonical_candidate)
     }
+}
+
+// ---------------------------------------------------------------------
+// Declared Artifact format (astorise/Magnetar#75)
+// ---------------------------------------------------------------------
+
+/// Sidecar file name a production Model Artifact bundle root must carry to
+/// declare its own [`ArtifactFormat`] (astorise/Magnetar#75's accepted
+/// decision). Symmetric to a Model Component's own
+/// `.magnetar-component.yaml`: the bundle producer writes this file
+/// explicitly, Magnetar never infers its content from filesystem
+/// structure. Read via [`read_declared_artifact_format`].
+pub const ARTIFACT_FORMAT_SIDECAR_FILE_NAME: &str = "magnetar-artifact-format.yaml";
+
+#[derive(Deserialize)]
+struct DeclaredArtifactFormatYaml {
+    artifact_format: String,
+}
+
+/// Reads and parses `source`'s [`ARTIFACT_FORMAT_SIDECAR_FILE_NAME`]
+/// sidecar file, returning the [`ArtifactFormat`] it declares.
+///
+/// astorise/Magnetar#75: this is the sole way Magnetar learns which
+/// ingestor a production bundle needs -- the old
+/// `model.gguf`-file-presence filesystem heuristic is gone from this path
+/// entirely. A missing sidecar is
+/// [`ProductionIngestionError::RequiredPartMissing`] (via
+/// [`ProductionModelSource::resolve`]); an unreadable or
+/// unrecognized-format sidecar is
+/// [`ProductionIngestionError::MalformedMetadata`]. Neither case falls
+/// back to guessing: "toute ambiguïté doit échouer explicitement" is the
+/// accepted decision's own wording. A bundle producer that only has an
+/// old-style bundle without this sidecar must run the explicit legacy
+/// migration path to write one -- this function itself never does that.
+pub fn read_declared_artifact_format(
+    source: &ProductionModelSource,
+) -> Result<ArtifactFormat, ProductionIngestionError> {
+    let path = source.resolve(ARTIFACT_FORMAT_SIDECAR_FILE_NAME)?;
+    let content = fs::read_to_string(&path).map_err(|error| {
+        ProductionIngestionError::RequiredPartMissing {
+            part: format!("{ARTIFACT_FORMAT_SIDECAR_FILE_NAME} ({error})"),
+        }
+    })?;
+    let raw: DeclaredArtifactFormatYaml = serde_norway::from_str(&content).map_err(|error| {
+        ProductionIngestionError::MalformedMetadata {
+            reason: format!("{ARTIFACT_FORMAT_SIDECAR_FILE_NAME}: {error}"),
+        }
+    })?;
+    ArtifactFormat::parse(&raw.artifact_format).ok_or_else(|| {
+        ProductionIngestionError::MalformedMetadata {
+            reason: format!(
+                "{ARTIFACT_FORMAT_SIDECAR_FILE_NAME}: unrecognized artifact_format '{}'",
+                raw.artifact_format
+            ),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------

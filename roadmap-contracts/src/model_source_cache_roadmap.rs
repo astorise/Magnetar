@@ -1571,6 +1571,7 @@ pub(crate) fn probe_manifest() -> ModelManifest {
         signatures: Vec::new(),
         source: None,
         architecture_config: None,
+        artifact_format: magnetar_runtime::model::ArtifactFormat::HuggingFace,
     }
 }
 

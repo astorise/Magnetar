@@ -135,6 +135,7 @@ fn model_source_cache_roadmap_development_fixture_still_uses_real_trust_store() 
         signatures: Vec::new(),
         source: None,
         architecture_config: None,
+        artifact_format: ArtifactFormat::HuggingFace,
     };
     let decision = development_fixture_requires_explicit_trust_evaluation(&store, &manifest);
     assert_eq!(decision.status(), ModelTrustStatus::Unknown);
@@ -284,6 +285,7 @@ fn model_source_cache_roadmap_artifact_identity_coverage_tracks_present_fields()
         signatures: Vec::new(),
         source: Some(ModelArtifactSource::LocalCache("qwen".into())),
         architecture_config: None,
+        artifact_format: ArtifactFormat::HuggingFace,
     };
     let coverage = ArtifactIdentityCoverage::from_manifest(&manifest);
     assert!(coverage.content_digest);
@@ -397,6 +399,7 @@ fn model_source_cache_roadmap_cache_trust_re_evaluates_and_revocation_wins() {
         signatures: Vec::new(),
         source: None,
         architecture_config: None,
+        artifact_format: ArtifactFormat::HuggingFace,
     };
     let trusted = evaluate_cache_trust(&store, &manifest, false);
     assert_eq!(trusted.status(), ModelTrustStatus::Trusted);

@@ -104,7 +104,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install cargo-deny
-        uses: taiki-e/install-action@485a8581b10be1c8bf8f16c97f3b19760fc45b60 # cargo-deny
+        uses: taiki-e/install-action@38b89628c27e40135ce51bda20b40d8514bd341b # cargo-deny
       - name: Check advisories, bans, licenses and sources
         run: cargo deny --all-features check
 
@@ -186,7 +186,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install wasm-tools
-        uses: taiki-e/install-action@9ff70952f8517f3892a140cad25d82bbe46bdd4e # wasm-tools
+        uses: taiki-e/install-action@744b6bd0939a1c7f6cbb402324cf9bdade632006 # wasm-tools
       - name: Validate WIT packages
         shell: bash
         run: |
@@ -230,7 +230,13 @@ jobs:
   # Deliberately still excluded, by classification rather than oversight:
   # `first_native_runtime.rs` and `qwen_model_component.rs` are the two
   # files designated to legitimately carry Qwen-specific knowledge (see
-  # their own doc comments); `first_native_implementation_cut.rs` and
+  # their own doc comments) -- but `first_native_runtime.rs` also hosts the
+  # *generic* production facade (`ProductionLoadedModel`,
+  # `production_model_fixture`, `build_first_native_graphs_from_named_
+  # component`), which this file-level exclusion left with zero coverage
+  # (Tachyon integration audit MAG-05, #80). The second step below covers
+  # exactly that facade's own bodies instead of the whole file.
+  # `first_native_implementation_cut.rs` and
   # `e2e_conformance.rs` are explicitly scoped to the first-native
   # (currently Qwen) cut and to test/conformance fixtures respectively, not
   # generic Core. The roadmap/release-process files this guard used to name
@@ -287,6 +293,18 @@ jobs:
             fi
           done
           exit "$fail"
+      # Tachyon integration audit MAG-05 (#80): the guard above deliberately
+      # excludes first_native_runtime.rs and qwen_model_component.rs (they
+      # legitimately carry Qwen-specific knowledge), which also means it has
+      # zero visibility into the *generic* production facade that happens to
+      # live inside first_native_runtime.rs -- ProductionLoadedModel,
+      # production_model_fixture, build_first_native_graphs_from_named_component
+      # -- and inference-components' own LoadedInferenceComponent::load. This
+      # step scans exactly those specific bodies (not the whole file) against
+      # an explicit, individually justified allowlist tracked by #82 -- see
+      # tools/check_generic_facade_family_isolation.py's own doc comment.
+      - name: Reject model-family identifiers in the generic production facade
+        run: python3 tools/check_generic_facade_family_isolation.py .
 
   # #54/#63: the whole point of moving unit tests out of magnetar-runtime's
   # production files and into per-module `tests.rs` siblings was to stop
@@ -448,7 +466,7 @@ jobs:
       - name: Build and test the WGPU Provider
         run: cargo test --locked --manifest-path providers/wgpu/Cargo.toml
       - name: Install cargo-deny
-        uses: taiki-e/install-action@485a8581b10be1c8bf8f16c97f3b19760fc45b60 # cargo-deny
+        uses: taiki-e/install-action@38b89628c27e40135ce51bda20b40d8514bd341b # cargo-deny
       # The root `deny` job above never sees this submodule (it checks out
       # without submodules by design, `externalize-runtime-extension-
       # modules`'s "zero compile-time dependency on any externalized
@@ -634,7 +652,7 @@ jobs:
       # submodule recursively, so it is the natural place to close the
       # rest.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@485a8581b10be1c8bf8f16c97f3b19760fc45b60 # cargo-deny
+        uses: taiki-e/install-action@38b89628c27e40135ce51bda20b40d8514bd341b # cargo-deny
       - name: Check the submodule workspace's dependency graph (advisories, bans, licenses, sources)
         # `--allow wildcard --allow unlicensed`: `magnetar-format-safetensors`
         # and `magnetar-loader-huggingface` (external submodules this
@@ -696,7 +714,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@e47f98f5173eb0f3f3bb4aed1f57afcbbbf14d9a # cargo-llvm-cov
+        uses: taiki-e/install-action@ea0cd0420956692678d2145c3f991994d6ad6934 # cargo-llvm-cov
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Prepare coverage output

@@ -8,7 +8,7 @@
 //! `magnetar-provider-cuda`'s own tests (`tests_hardware_hot_path.rs`)
 //! deliberately reimplement the generic Kernel dispatch contract rather
 //! than reach `magnetar-runtime`'s private, Qwen-specific dispatch
-//! functions (`execute_qwen_graph`, `resolve_qwen_weight_edge`,
+//! functions (`execute_first_native_graph`, `resolve_first_native_weight_edge`,
 //! `resident_resource_affinity`, ...) at all -- those are exactly the
 //! functions this crate's own previous audit findings lived in.
 //!
