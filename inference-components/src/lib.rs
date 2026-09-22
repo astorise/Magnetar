@@ -9,7 +9,7 @@ use magnetar_runtime::production_model_ingestion::{
 };
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
-    ChatMessage, ComponentTrustStore, GenerationParameters, GenerationStreamEvent,
+    ChatMessage, ComponentTrustStore, GenerationParameters, GenerationStreamEvent, GenerationUsage,
     ModelArtifactSource, ProductionGenerationRequest, PromptInput, Provider, StopConditions,
     register_inference_component_artifact,
 };
@@ -166,6 +166,16 @@ pub struct InferenceComponentUsage {
 pub struct InferenceComponentOutput {
     pub text: String,
     pub usage: InferenceComponentUsage,
+}
+
+/// [`InferenceComponentOutput`]'s opaque counterpart
+/// (astorise/Magnetar#88): the same shape, with `text`/`usage` replaced by
+/// raw bytes and string-keyed tags -- see
+/// [`LoadedInferenceComponent::invoke_payload_opaque`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpaqueInferenceComponentOutput {
+    pub bytes: Vec<u8>,
+    pub tags: Vec<(String, String)>,
 }
 
 /// One resident, loaded inference Component instance.
@@ -487,11 +497,132 @@ impl LoadedInferenceComponent {
         })
     }
 
+    /// Opaque-bytes counterpart to [`Self::invoke_payload`]
+    /// (astorise/Magnetar#88, Tachyon integration audit TACH-02): returns
+    /// the generated text as raw UTF-8 bytes plus a string-keyed metadata
+    /// tag list, instead of [`InferenceComponentOutput`]'s typed `text`/
+    /// `usage` fields. An embedder whose own architecture must stay
+    /// model-agnostic -- never touching token/usage vocabulary directly --
+    /// can relay this straight through as opaque bytes and tags, instead of
+    /// writing its own typed-to-opaque translation layer against
+    /// `invoke_payload`'s output (exactly the boundary violation TACH-02
+    /// flagged in Tachyon's own adapter).
+    ///
+    /// Tags always carry `prompt_tokens`/`generated_tokens`/`finish_reason`
+    /// (the same fields [`InferenceComponentUsage`] and
+    /// [`GenerationStreamEvent::Finished`] already carry, just as opaque
+    /// string values instead of typed ones) -- a caller that wants
+    /// structured accounting still has `invoke_payload` for that; this
+    /// entry point is for one that does not.
+    ///
+    /// Blocks until any generation already in flight on this instance
+    /// finishes -- see [`LoadedInferenceComponent`]'s own "Concurrency
+    /// model" doc comment.
+    pub fn invoke_payload_opaque(&self, payload: &[u8]) -> Result<OpaqueInferenceComponentOutput> {
+        let request = InvocationPayload::parse(payload)?.into_generation_request()?;
+        let outcome = self
+            .loaded_model
+            .lock()
+            .map_err(|_| {
+                anyhow!(
+                    "resident Magnetar inference Component lock poisoned for `{}`",
+                    self.name
+                )
+            })?
+            .generate(request, self.chat_formatter())
+            .map_err(|error| {
+                anyhow!(
+                    "Magnetar inference Component invocation for `{}` failed: {error}",
+                    self.name
+                )
+            })?;
+        let tags = generation_usage_tags(&outcome.result.output.usage);
+        Ok(OpaqueInferenceComponentOutput {
+            bytes: outcome.text.into_bytes(),
+            tags,
+        })
+    }
+
+    /// Opaque-bytes counterpart to [`Self::invoke_payload_streaming`]
+    /// (astorise/Magnetar#88, Tachyon integration audit TACH-02): delivers
+    /// each produced token's decoded text delta to `on_frame` as a raw
+    /// UTF-8 byte frame, instead of [`GenerationStreamEvent`]'s typed
+    /// `Token`/`Finished` variants -- a caller relaying frames opaquely has
+    /// no typed event to fall back on, only bytes. A `Token` whose own
+    /// `text_delta` is `None` (no new visible text yet, e.g. a byte-level
+    /// tokenizer's not-yet-complete multi-byte sequence) delivers no frame
+    /// at all, rather than an empty one -- an opaque byte-frame consumer has
+    /// no way to distinguish "empty frame" from "no frame," so skipping
+    /// keeps every delivered frame meaningful. Returns the same final
+    /// metadata tags [`Self::invoke_payload_opaque`] does
+    /// (`prompt_tokens`/`generated_tokens`/`finish_reason`), once
+    /// generation finishes.
+    ///
+    /// Blocks until any generation already in flight on this instance
+    /// finishes -- see [`LoadedInferenceComponent`]'s own "Concurrency
+    /// model" doc comment.
+    pub fn invoke_payload_streaming_opaque(
+        &self,
+        payload: &[u8],
+        on_frame: &mut dyn FnMut(&[u8]) -> std::ops::ControlFlow<()>,
+    ) -> Result<Vec<(String, String)>> {
+        let request = InvocationPayload::parse(payload)?.into_generation_request()?;
+        let mut tags = Vec::new();
+        let mut on_event = |event: GenerationStreamEvent| -> std::ops::ControlFlow<()> {
+            match event {
+                GenerationStreamEvent::Token { text_delta, .. } => match text_delta {
+                    Some(text_delta) if !text_delta.is_empty() => on_frame(text_delta.as_bytes()),
+                    _ => std::ops::ControlFlow::Continue(()),
+                },
+                GenerationStreamEvent::Finished { usage, .. } => {
+                    tags = generation_usage_tags(&usage);
+                    std::ops::ControlFlow::Continue(())
+                }
+            }
+        };
+        self.loaded_model
+            .lock()
+            .map_err(|_| {
+                anyhow!(
+                    "resident Magnetar inference Component lock poisoned for `{}`",
+                    self.name
+                )
+            })?
+            .generate_streaming(request, self.chat_formatter(), &mut on_event)
+            .map_err(|error| {
+                anyhow!(
+                    "Magnetar inference Component streaming invocation for `{}` failed: {error}",
+                    self.name
+                )
+            })?;
+        Ok(tags)
+    }
+
     fn chat_formatter(&self) -> Option<&dyn magnetar_runtime::ChatTemplateFormatter> {
         self.chat_formatter
             .as_deref()
             .map(|formatter| formatter as &dyn magnetar_runtime::ChatTemplateFormatter)
     }
+}
+
+/// Shared by [`LoadedInferenceComponent::invoke_payload_opaque`] and
+/// [`LoadedInferenceComponent::invoke_payload_streaming_opaque`]: the same
+/// three fields, rendered as opaque string values rather than typed ones.
+/// `finish_reason` uses `FinishReason`'s own `Debug` representation (its
+/// exact variant name, e.g. `"EosToken"`) -- stable enough to be a useful
+/// opaque tag without this crate maintaining a separate string mapping.
+fn generation_usage_tags(usage: &GenerationUsage) -> Vec<(String, String)> {
+    vec![
+        ("prompt_tokens".to_string(), usage.prompt_tokens.to_string()),
+        (
+            "generated_tokens".to_string(),
+            usage.generated_tokens.to_string(),
+        ),
+        (
+            "finish_reason".to_string(),
+            format!("{:?}", usage.finish_reason),
+        ),
+    ]
 }
 
 fn capability_advertisement(
@@ -1242,6 +1373,91 @@ mod load_end_to_end_tests {
             "\"hello world\" tokenizes to exactly 2 real tokens under this bundle's own tokenizer"
         );
         assert_eq!(output.usage.generated_tokens, 1);
+    }
+
+    /// astorise/Magnetar#88 (Tachyon integration audit TACH-02): the opaque
+    /// entry points must be a different *shape* for the same underlying
+    /// call, not a parallel implementation that could silently diverge from
+    /// the typed one. Loads the same real Component/Artifact pair as the
+    /// test above and drives all three call shapes against it with the
+    /// identical payload -- the typed batch path (`invoke_payload`), the
+    /// opaque batch path (`invoke_payload_opaque`), and the opaque
+    /// streaming path (`invoke_payload_streaming_opaque`) -- asserting all
+    /// three agree on the generated text and on prompt/generated token
+    /// counts.
+    #[test]
+    fn loaded_inference_component_opaque_entry_points_match_the_typed_path() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_qwen_bundle(dir.path());
+
+        let model_digest =
+            local_bundle_manifest_digest(dir.path()).expect("the bundle inspects cleanly");
+        let component_digest = magnetar_runtime::ComponentDigest::sha256(qwen_component_bytes());
+        let trust_policy = ArtifactTrustPolicy::default()
+            .trust_digest(&model_digest)
+            .trust_component_digest(&component_digest.value);
+
+        let component = LoadedInferenceComponent::load(
+            "test-qwen-opaque",
+            InferenceComponentArtifact::from_bytes(
+                qwen_component_bytes().to_vec(),
+                qwen_component_manifest_bytes().to_vec(),
+            ),
+            InferenceComponentSource::authorized_local_bundle("test-fixture", dir.path()),
+            trust_policy,
+            InferenceComponentPlacement::ReferenceCpu,
+        )
+        .expect("a real, completely-specified Hugging Face-shaped bundle must load end to end");
+
+        let payload: &[u8] = br#"{"prompt":"hello world","max_new_tokens":1}"#;
+
+        let typed = component
+            .invoke_payload(payload)
+            .expect("typed invocation succeeds");
+
+        let opaque = component
+            .invoke_payload_opaque(payload)
+            .expect("opaque batch invocation succeeds");
+        let opaque_text =
+            String::from_utf8(opaque.bytes).expect("opaque batch output is valid UTF-8");
+        assert_eq!(
+            opaque_text, typed.text,
+            "the opaque batch path must produce the identical generated text to the typed path"
+        );
+        let opaque_tags: std::collections::BTreeMap<_, _> = opaque.tags.into_iter().collect();
+        assert_eq!(
+            opaque_tags.get("prompt_tokens").map(String::as_str),
+            Some(typed.usage.prompt_tokens.to_string()).as_deref()
+        );
+        assert_eq!(
+            opaque_tags.get("generated_tokens").map(String::as_str),
+            Some(typed.usage.generated_tokens.to_string()).as_deref()
+        );
+
+        let mut streamed_bytes = Vec::new();
+        let mut on_frame = |frame: &[u8]| -> std::ops::ControlFlow<()> {
+            streamed_bytes.extend_from_slice(frame);
+            std::ops::ControlFlow::Continue(())
+        };
+        let streaming_tags = component
+            .invoke_payload_streaming_opaque(payload, &mut on_frame)
+            .expect("opaque streaming invocation succeeds");
+        let streamed_text =
+            String::from_utf8(streamed_bytes).expect("streamed frames are valid UTF-8");
+        assert_eq!(
+            streamed_text, typed.text,
+            "the opaque streaming path's concatenated frames must produce the identical \
+             generated text to the typed path"
+        );
+        let streaming_tags: std::collections::BTreeMap<_, _> = streaming_tags.into_iter().collect();
+        assert_eq!(
+            streaming_tags.get("prompt_tokens").map(String::as_str),
+            Some(typed.usage.prompt_tokens.to_string()).as_deref()
+        );
+        assert_eq!(
+            streaming_tags.get("generated_tokens").map(String::as_str),
+            Some(typed.usage.generated_tokens.to_string()).as_deref()
+        );
     }
 
     fn llama_component_bytes() -> &'static [u8] {
