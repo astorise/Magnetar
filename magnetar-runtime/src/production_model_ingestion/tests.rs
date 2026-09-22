@@ -86,6 +86,7 @@ fn untrusted_probe_manifest() -> ModelManifest {
         signatures: Vec::new(),
         source: None,
         architecture_config: None,
+        artifact_format: ArtifactFormat::HuggingFace,
     }
 }
 
@@ -179,4 +180,93 @@ fn resolve_accepts_file_within_boundary() {
     );
     let resolved = source.resolve("Cargo.toml").unwrap();
     assert!(resolved.ends_with("Cargo.toml"));
+}
+
+/// A fresh, empty temporary bundle directory for `read_declared_artifact_format`
+/// tests, matching the established `temp_component_artifact_dir` pattern
+/// (`component/tests.rs`) rather than pulling in a `tempfile` dev-dependency
+/// this crate does not otherwise need.
+fn temp_bundle_dir(label: &str) -> PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-production-ingestion-{label}-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).unwrap();
+    directory
+}
+
+fn bundle_source(directory: PathBuf) -> ProductionModelSource {
+    ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(directory.clone()),
+        directory,
+    )
+}
+
+/// astorise/Magnetar#75: the sole success path -- a bundle carrying a
+/// well-formed `magnetar-artifact-format.yaml` sidecar declares its own
+/// [`ArtifactFormat`], read without any filesystem-structure inspection.
+#[test]
+fn read_declared_artifact_format_parses_a_well_formed_sidecar() {
+    let directory = temp_bundle_dir("well-formed");
+    fs::write(
+        directory.join(ARTIFACT_FORMAT_SIDECAR_FILE_NAME),
+        "artifact_format: gguf\n",
+    )
+    .unwrap();
+    let source = bundle_source(directory);
+    assert_eq!(
+        read_declared_artifact_format(&source).unwrap(),
+        ArtifactFormat::Gguf
+    );
+}
+
+/// A bundle with no sidecar file at all fails explicitly through
+/// [`ProductionModelSource::resolve`]'s own missing-file handling -- never
+/// a silent fallback to inspecting the bundle's other files.
+#[test]
+fn read_declared_artifact_format_rejects_a_missing_sidecar() {
+    let source = bundle_source(temp_bundle_dir("missing-sidecar"));
+    let error = read_declared_artifact_format(&source).unwrap_err();
+    assert!(matches!(
+        error,
+        ProductionIngestionError::RequiredPartMissing { .. }
+    ));
+}
+
+/// A sidecar that is not valid YAML at all (not merely an unrecognized
+/// value) is `MalformedMetadata`, not a panic or a silent default.
+#[test]
+fn read_declared_artifact_format_rejects_malformed_yaml() {
+    let directory = temp_bundle_dir("malformed-yaml");
+    fs::write(
+        directory.join(ARTIFACT_FORMAT_SIDECAR_FILE_NAME),
+        "artifact_format: [this is not a string\n",
+    )
+    .unwrap();
+    let source = bundle_source(directory);
+    let error = read_declared_artifact_format(&source).unwrap_err();
+    assert!(matches!(
+        error,
+        ProductionIngestionError::MalformedMetadata { .. }
+    ));
+}
+
+/// A syntactically valid sidecar declaring an unrecognized format string
+/// (a typo, or a not-yet-supported future format) fails explicitly rather
+/// than silently defaulting to a guessed format.
+#[test]
+fn read_declared_artifact_format_rejects_an_unrecognized_format() {
+    let directory = temp_bundle_dir("unrecognized-format");
+    fs::write(
+        directory.join(ARTIFACT_FORMAT_SIDECAR_FILE_NAME),
+        "artifact_format: onnx\n",
+    )
+    .unwrap();
+    let source = bundle_source(directory);
+    let error = read_declared_artifact_format(&source).unwrap_err();
+    assert!(matches!(
+        error,
+        ProductionIngestionError::MalformedMetadata { .. }
+    ));
 }

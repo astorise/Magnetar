@@ -81,13 +81,14 @@
 
 use crate::{
     AdapterArtifact, AdapterArtifactId, AdapterBaseModelCompatibility, AdapterMethod,
-    AdapterTargetModule, AdapterTargetModuleRole, AdapterTrustStatus, CapabilityBinding,
-    ComputeDType, KernelQuantizationMetadata, ModelArchitecture, ModelArtifactId,
-    ModelArtifactKind, ModelArtifactSource, ModelDType, ModelDigest, ModelGenerationDefaults,
-    ModelLicenseMetadata, ModelManifest, ModelName, ModelProvenance, ModelQuantization,
-    ModelRevision, ModelShard, ModelShardId, ModelTensorMetadata, ModelTrustDecision,
-    ModelTrustStore, SpecialToken, TokenIdRange, TokenizerArtifactId, TokenizerFamily, TokenizerId,
-    TokenizerMetadata, TokenizerRevision, compute::redact_backend_diagnostic,
+    AdapterTargetModule, AdapterTargetModuleRole, AdapterTrustStatus, ArtifactFormat,
+    CapabilityBinding, ComputeDType, KernelQuantizationMetadata, ModelArchitecture,
+    ModelArtifactId, ModelArtifactKind, ModelArtifactSource, ModelDType, ModelDigest,
+    ModelGenerationDefaults, ModelLicenseMetadata, ModelManifest, ModelName, ModelProvenance,
+    ModelQuantization, ModelRevision, ModelShard, ModelShardId, ModelTensorMetadata,
+    ModelTrustDecision, ModelTrustStore, SpecialToken, TokenIdRange, TokenizerArtifactId,
+    TokenizerFamily, TokenizerId, TokenizerMetadata, TokenizerRevision,
+    compute::redact_backend_diagnostic,
 };
 use crate::{
     provider_roadmap::reject_hidden_dequantization,
@@ -1577,6 +1578,7 @@ fn minimal_trust_probe_manifest() -> ModelManifest {
         signatures: Vec::new(),
         source: None,
         architecture_config: None,
+        artifact_format: ArtifactFormat::HuggingFace,
     }
 }
 

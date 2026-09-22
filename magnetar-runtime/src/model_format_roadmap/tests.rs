@@ -5,8 +5,9 @@
 
 use super::*;
 use crate::model::{
-    MODEL_ARTIFACT_SCHEMA_VERSION, ModelArchitecture, ModelArtifactId, ModelArtifactKind,
-    ModelDType, ModelDigest, ModelLicenseMetadata, ModelManifest, ModelName, ModelRevision,
+    ArtifactFormat, MODEL_ARTIFACT_SCHEMA_VERSION, ModelArchitecture, ModelArtifactId,
+    ModelArtifactKind, ModelDType, ModelDigest, ModelLicenseMetadata, ModelManifest, ModelName,
+    ModelRevision,
 };
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -57,6 +58,7 @@ fn fixture_model_manifest() -> ModelManifest {
         signatures: Vec::new(),
         source: None,
         architecture_config: None,
+        artifact_format: ArtifactFormat::HuggingFace,
     }
 }
 

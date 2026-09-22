@@ -3,13 +3,13 @@ use magnetar_loader_huggingface::{
     HuggingFaceChatTemplateFormatter, HuggingFaceIngestor, parse_tokenizer_config,
 };
 use magnetar_provider_cpu::ReferenceCpuProvider;
-use magnetar_runtime::model::{ModelTrustStatus, ModelTrustStore};
+use magnetar_runtime::model::{ArtifactFormat, ModelTrustStatus, ModelTrustStore};
 use magnetar_runtime::production_model_ingestion::{
-    ProductionModelArtifactIngestor, ProductionModelSource,
+    ProductionModelArtifactIngestor, ProductionModelSource, read_declared_artifact_format,
 };
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
-    ChatMessage, ComponentTrustStore, GenerationParameters, GenerationStreamEvent,
+    ChatMessage, ComponentTrustStore, GenerationParameters, GenerationStreamEvent, GenerationUsage,
     ModelArtifactSource, ProductionGenerationRequest, PromptInput, Provider, StopConditions,
     register_inference_component_artifact,
 };
@@ -168,6 +168,16 @@ pub struct InferenceComponentOutput {
     pub usage: InferenceComponentUsage,
 }
 
+/// [`InferenceComponentOutput`]'s opaque counterpart
+/// (astorise/Magnetar#88): the same shape, with `text`/`usage` replaced by
+/// raw bytes and string-keyed tags -- see
+/// [`LoadedInferenceComponent::invoke_payload_opaque`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpaqueInferenceComponentOutput {
+    pub bytes: Vec<u8>,
+    pub tags: Vec<(String, String)>,
+}
+
 /// One resident, loaded inference Component instance.
 ///
 /// # Concurrency model (Tachyon integration audit MAG-06)
@@ -206,11 +216,18 @@ pub fn local_bundle_manifest_digest(root: impl Into<PathBuf>) -> Result<String> 
         ModelArtifactSource::Tachyon("tachyon:test-fixture".to_owned()),
         root.clone(),
     );
-    let is_gguf = root.join(magnetar_loader_gguf::GGUF_FILE_NAME).is_file();
-    let ingested = if is_gguf {
-        magnetar_loader_gguf::GgufIngestor::new().ingest(&source)
-    } else {
-        HuggingFaceIngestor::new().ingest(&source)
+    // astorise/Magnetar#75: the declared-format sidecar, not filesystem
+    // structure, picks the ingestor. A bundle missing/malformed sidecar
+    // fails explicitly here instead of silently guessing a format.
+    let declared_format = read_declared_artifact_format(&source).with_context(|| {
+        format!(
+            "Magnetar could not read the declared Artifact format for bundle at `{}`",
+            root.display()
+        )
+    })?;
+    let ingested = match declared_format {
+        ArtifactFormat::Gguf => magnetar_loader_gguf::GgufIngestor::new().ingest(&source),
+        ArtifactFormat::HuggingFace => HuggingFaceIngestor::new().ingest(&source),
     }
     .with_context(|| {
         format!(
@@ -219,6 +236,51 @@ pub fn local_bundle_manifest_digest(root: impl Into<PathBuf>) -> Result<String> 
         )
     })?;
     Ok(ingested.manifest.id.digest.value)
+}
+
+/// Explicit, one-time legacy-migration path (astorise/Magnetar#75): derives
+/// an [`ArtifactFormat`] for an old-style bundle that predates the
+/// declared-format sidecar file, using the exact filesystem heuristic
+/// `LoadedInferenceComponent::load`/`local_bundle_manifest_digest`
+/// themselves used to rely on automatically, then writes the sidecar once
+/// so every subsequent load goes through the explicit declaration path.
+///
+/// This is never called by `LoadedInferenceComponent::load` or
+/// `local_bundle_manifest_digest` -- per the accepted decision on #75,
+/// filesystem-structure detection may remain only as an explicit
+/// import/migration mechanism for legacy Artifacts, never as a runtime
+/// fallback. A caller migrating a legacy bundle invokes this explicitly,
+/// once, as an upgrade step; it refuses to run again on a bundle that
+/// already carries a sidecar, so it cannot silently overwrite an operator's
+/// own explicit declaration.
+pub fn migrate_legacy_bundle_artifact_format(root: impl Into<PathBuf>) -> Result<ArtifactFormat> {
+    let root = root.into();
+    let sidecar_path =
+        root.join(magnetar_runtime::production_model_ingestion::ARTIFACT_FORMAT_SIDECAR_FILE_NAME);
+    if sidecar_path.is_file() {
+        bail!(
+            "Magnetar will not run legacy artifact-format migration on `{}`: a declared-format \
+             sidecar already exists at `{}`",
+            root.display(),
+            sidecar_path.display()
+        );
+    }
+    let format = if root.join(magnetar_loader_gguf::GGUF_FILE_NAME).is_file() {
+        ArtifactFormat::Gguf
+    } else {
+        ArtifactFormat::HuggingFace
+    };
+    std::fs::write(
+        &sidecar_path,
+        format!("artifact_format: {}\n", format.as_str()),
+    )
+    .with_context(|| {
+        format!(
+            "Magnetar failed to write declared-format sidecar at `{}`",
+            sidecar_path.display()
+        )
+    })?;
+    Ok(format)
 }
 
 pub fn cuda_provider_available() -> bool {
@@ -263,31 +325,38 @@ impl LoadedInferenceComponent {
         )
         .map_err(|error| {
             anyhow!("Magnetar rejected inference Component artifact for `{name}`: {error}")
-        })?;
-
-        // Format detection: a bundle is GGUF-shaped if it declares the
-        // single file `loaders/gguf`'s own ingestor looks for, Hugging-
-        // Face-shaped otherwise -- the only two real ingestors this crate
-        // has (Tachyon integration audit MAG-01: the generic adapter no
-        // longer hardcodes one format). Adding a third real ingestor to
-        // this codebase would extend this same match, not require
-        // touching every call site below -- both branches converge on the
-        // same `ProductionIngestionResult`/`Arc<dyn Tokenizer>`/`Option<
-        // String>` (raw chat template text) shapes.
-        let is_gguf = source
-            .root
-            .join(magnetar_loader_gguf::GGUF_FILE_NAME)
-            .is_file();
+        })?
+        .digest;
 
         let production_source = ProductionModelSource::authorized_local_bundle(
             ModelArtifactSource::Tachyon(source.provenance.clone()),
             source.root.clone(),
         );
+        // Format selection: the bundle's own declared-format sidecar file
+        // says which of this crate's two real ingestors applies -- Magnetar
+        // never infers it from filesystem structure (astorise/Magnetar#75,
+        // Tachyon integration audit MAG-01). A missing or malformed
+        // declaration fails explicitly instead of guessing. Adding a third
+        // real ingestor to this codebase would extend this same match, not
+        // require touching every call site below -- all branches converge
+        // on the same `ProductionIngestionResult`/`Arc<dyn Tokenizer>`/
+        // `Option<String>` (raw chat template text) shapes.
+        let declared_format =
+            read_declared_artifact_format(&production_source).with_context(|| {
+                format!(
+                    "Magnetar could not read the declared Artifact format for Component `{name}` \
+                 bundle at `{}`",
+                    source.root.display()
+                )
+            })?;
         let ingested: magnetar_runtime::production_model_ingestion::ProductionIngestionResult =
-            if is_gguf {
-                magnetar_loader_gguf::GgufIngestor::new().ingest(&production_source)
-            } else {
-                HuggingFaceIngestor::new().ingest(&production_source)
+            match declared_format {
+                ArtifactFormat::Gguf => {
+                    magnetar_loader_gguf::GgufIngestor::new().ingest(&production_source)
+                }
+                ArtifactFormat::HuggingFace => {
+                    HuggingFaceIngestor::new().ingest(&production_source)
+                }
             }
             .with_context(|| {
                 format!(
@@ -304,7 +373,7 @@ impl LoadedInferenceComponent {
         let (real_tokenizer, chat_template_text): (
             Arc<dyn Tokenizer + Send + Sync>,
             Option<String>,
-        ) = if is_gguf {
+        ) = if declared_format == ArtifactFormat::Gguf {
             let tokenizer = magnetar_loader_gguf::load_gguf_tokenizer(
                 &production_source,
                 format!("{name}-tokenizer"),
@@ -486,11 +555,132 @@ impl LoadedInferenceComponent {
         })
     }
 
+    /// Opaque-bytes counterpart to [`Self::invoke_payload`]
+    /// (astorise/Magnetar#88, Tachyon integration audit TACH-02): returns
+    /// the generated text as raw UTF-8 bytes plus a string-keyed metadata
+    /// tag list, instead of [`InferenceComponentOutput`]'s typed `text`/
+    /// `usage` fields. An embedder whose own architecture must stay
+    /// model-agnostic -- never touching token/usage vocabulary directly --
+    /// can relay this straight through as opaque bytes and tags, instead of
+    /// writing its own typed-to-opaque translation layer against
+    /// `invoke_payload`'s output (exactly the boundary violation TACH-02
+    /// flagged in Tachyon's own adapter).
+    ///
+    /// Tags always carry `prompt_tokens`/`generated_tokens`/`finish_reason`
+    /// (the same fields [`InferenceComponentUsage`] and
+    /// [`GenerationStreamEvent::Finished`] already carry, just as opaque
+    /// string values instead of typed ones) -- a caller that wants
+    /// structured accounting still has `invoke_payload` for that; this
+    /// entry point is for one that does not.
+    ///
+    /// Blocks until any generation already in flight on this instance
+    /// finishes -- see [`LoadedInferenceComponent`]'s own "Concurrency
+    /// model" doc comment.
+    pub fn invoke_payload_opaque(&self, payload: &[u8]) -> Result<OpaqueInferenceComponentOutput> {
+        let request = InvocationPayload::parse(payload)?.into_generation_request()?;
+        let outcome = self
+            .loaded_model
+            .lock()
+            .map_err(|_| {
+                anyhow!(
+                    "resident Magnetar inference Component lock poisoned for `{}`",
+                    self.name
+                )
+            })?
+            .generate(request, self.chat_formatter())
+            .map_err(|error| {
+                anyhow!(
+                    "Magnetar inference Component invocation for `{}` failed: {error}",
+                    self.name
+                )
+            })?;
+        let tags = generation_usage_tags(&outcome.result.output.usage);
+        Ok(OpaqueInferenceComponentOutput {
+            bytes: outcome.text.into_bytes(),
+            tags,
+        })
+    }
+
+    /// Opaque-bytes counterpart to [`Self::invoke_payload_streaming`]
+    /// (astorise/Magnetar#88, Tachyon integration audit TACH-02): delivers
+    /// each produced token's decoded text delta to `on_frame` as a raw
+    /// UTF-8 byte frame, instead of [`GenerationStreamEvent`]'s typed
+    /// `Token`/`Finished` variants -- a caller relaying frames opaquely has
+    /// no typed event to fall back on, only bytes. A `Token` whose own
+    /// `text_delta` is `None` (no new visible text yet, e.g. a byte-level
+    /// tokenizer's not-yet-complete multi-byte sequence) delivers no frame
+    /// at all, rather than an empty one -- an opaque byte-frame consumer has
+    /// no way to distinguish "empty frame" from "no frame," so skipping
+    /// keeps every delivered frame meaningful. Returns the same final
+    /// metadata tags [`Self::invoke_payload_opaque`] does
+    /// (`prompt_tokens`/`generated_tokens`/`finish_reason`), once
+    /// generation finishes.
+    ///
+    /// Blocks until any generation already in flight on this instance
+    /// finishes -- see [`LoadedInferenceComponent`]'s own "Concurrency
+    /// model" doc comment.
+    pub fn invoke_payload_streaming_opaque(
+        &self,
+        payload: &[u8],
+        on_frame: &mut dyn FnMut(&[u8]) -> std::ops::ControlFlow<()>,
+    ) -> Result<Vec<(String, String)>> {
+        let request = InvocationPayload::parse(payload)?.into_generation_request()?;
+        let mut tags = Vec::new();
+        let mut on_event = |event: GenerationStreamEvent| -> std::ops::ControlFlow<()> {
+            match event {
+                GenerationStreamEvent::Token { text_delta, .. } => match text_delta {
+                    Some(text_delta) if !text_delta.is_empty() => on_frame(text_delta.as_bytes()),
+                    _ => std::ops::ControlFlow::Continue(()),
+                },
+                GenerationStreamEvent::Finished { usage, .. } => {
+                    tags = generation_usage_tags(&usage);
+                    std::ops::ControlFlow::Continue(())
+                }
+            }
+        };
+        self.loaded_model
+            .lock()
+            .map_err(|_| {
+                anyhow!(
+                    "resident Magnetar inference Component lock poisoned for `{}`",
+                    self.name
+                )
+            })?
+            .generate_streaming(request, self.chat_formatter(), &mut on_event)
+            .map_err(|error| {
+                anyhow!(
+                    "Magnetar inference Component streaming invocation for `{}` failed: {error}",
+                    self.name
+                )
+            })?;
+        Ok(tags)
+    }
+
     fn chat_formatter(&self) -> Option<&dyn magnetar_runtime::ChatTemplateFormatter> {
         self.chat_formatter
             .as_deref()
             .map(|formatter| formatter as &dyn magnetar_runtime::ChatTemplateFormatter)
     }
+}
+
+/// Shared by [`LoadedInferenceComponent::invoke_payload_opaque`] and
+/// [`LoadedInferenceComponent::invoke_payload_streaming_opaque`]: the same
+/// three fields, rendered as opaque string values rather than typed ones.
+/// `finish_reason` uses `FinishReason`'s own `Debug` representation (its
+/// exact variant name, e.g. `"EosToken"`) -- stable enough to be a useful
+/// opaque tag without this crate maintaining a separate string mapping.
+fn generation_usage_tags(usage: &GenerationUsage) -> Vec<(String, String)> {
+    vec![
+        ("prompt_tokens".to_string(), usage.prompt_tokens.to_string()),
+        (
+            "generated_tokens".to_string(),
+            usage.generated_tokens.to_string(),
+        ),
+        (
+            "finish_reason".to_string(),
+            format!("{:?}", usage.finish_reason),
+        ),
+    ]
 }
 
 fn capability_advertisement(
@@ -876,7 +1066,7 @@ mod tests {
 /// through `LoadedInferenceComponent::load` itself). Builds a real,
 /// completely-specified Hugging Face-shaped bundle on disk (every tensor the
 /// real Qwen Component's graph resolves, at the exact shapes
-/// `magnetar_runtime::qwen_expected_tensor_shape` expects) and runs a real
+/// `magnetar_runtime::first_native_expected_tensor_shape` expects) and runs a real
 /// generation through `invoke_payload`, the same call shape a real embedder
 /// (e.g. Tachyon) uses.
 #[cfg(test)]
@@ -992,7 +1182,7 @@ mod load_end_to_end_tests {
     }
 
     /// Every tensor name/shape here matches `magnetar_runtime::
-    /// qwen_expected_tensor_shape`'s HF-stored (pre-transpose) convention
+    /// first_native_expected_tensor_shape`'s HF-stored (pre-transpose) convention
     /// exactly for `tiny_config_json`'s dimensions: hidden_size=8,
     /// intermediate_size=16, num_hidden_layers=1, num_attention_heads=
     /// num_key_value_heads=2 (head_dim=4, so q/k/v_dim=8), vocab_size=4,
@@ -1052,6 +1242,163 @@ mod load_end_to_end_tests {
             ("lm_head.weight", vec![4, 8], filled(32, 1.20)),
         ];
         write_safetensors(&dir.join("model.safetensors"), &tensors);
+        write_declared_artifact_format_sidecar(dir, ArtifactFormat::HuggingFace);
+    }
+
+    /// #81: a genuinely independent second Model Artifact -- distinct
+    /// dimensions from `tiny_config_json`'s (not just a relabeled
+    /// `model_type`), its own tensor set, and its own tokenizer vocabulary --
+    /// for pairing with the real Llama Component instead of reusing
+    /// `write_tiny_qwen_bundle`'s exact tensors/config/tokenizer. Grouped-
+    /// query attention with a real head-count reduction this time
+    /// (`num_attention_heads: 3`, `num_key_value_heads: 1`, so `q_dim: 12`
+    /// but `kv_dim: 4` -- genuinely non-square projections, unlike the Qwen
+    /// fixture's `num_attention_heads == num_key_value_heads` shape, which
+    /// never exercises the GQA head-repetition path), and two decoder layers
+    /// instead of one.
+    fn llama_config_json() -> Vec<u8> {
+        serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 12,
+            "intermediate_size": 24,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 3,
+            "num_key_value_heads": 1,
+            "vocab_size": 6,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": false,
+            "torch_dtype": "float32",
+            "bos_token_id": 0,
+            "eos_token_id": 1
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// A real `tokenizer.json` (WordLevel over a 6-token vocabulary matching
+    /// `llama_config_json`'s `vocab_size`), genuinely distinct from
+    /// `tiny_tokenizer_json`'s vocabulary -- "the quick fox" round-trips to
+    /// exactly 3 real tokens under this tokenizer, unlike the Qwen fixture's
+    /// "hello world" (2 tokens).
+    fn llama_tokenizer_json() -> Vec<u8> {
+        serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                {
+                    "id": 0, "content": "<bos>", "special": true,
+                    "single_word": false, "lstrip": false, "rstrip": false, "normalized": false
+                },
+                {
+                    "id": 1, "content": "<eos>", "special": true,
+                    "single_word": false, "lstrip": false, "rstrip": false, "normalized": false
+                }
+            ],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<bos>": 0, "<eos>": 1, "the": 2, "quick": 3, "fox": 4, "jumps": 5},
+                "unk_token": "the"
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Every tensor name/shape here matches `magnetar_runtime::
+    /// first_native_expected_tensor_shape`'s HF-stored (pre-transpose) convention
+    /// exactly for `llama_config_json`'s dimensions: hidden_size=12,
+    /// intermediate_size=24, num_hidden_layers=2, num_attention_heads=3,
+    /// num_key_value_heads=1 (head_dim=4, so q_dim=12, kv_dim=4), vocab_size=6,
+    /// untied embeddings.
+    fn write_tiny_llama_bundle(dir: &Path) {
+        std::fs::write(dir.join("config.json"), llama_config_json()).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), llama_tokenizer_json()).unwrap();
+        let mut tensors: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+            (
+                "model.embed_tokens.weight".to_string(),
+                vec![6, 12],
+                filled(72, 2.10),
+            ),
+            ("model.norm.weight".to_string(), vec![12], filled(12, 2.20)),
+        ];
+        for layer in 0..2u32 {
+            let seed_offset = layer as f32 * 0.01;
+            tensors.push((
+                format!("model.layers.{layer}.input_layernorm.weight"),
+                vec![12],
+                filled(12, 2.30 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                vec![12, 12],
+                filled(144, 2.40 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                vec![4, 12],
+                filled(48, 2.50 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.v_proj.weight"),
+                vec![4, 12],
+                filled(48, 2.60 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                vec![12, 12],
+                filled(144, 2.70 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                vec![12],
+                filled(12, 2.80 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.mlp.gate_proj.weight"),
+                vec![24, 12],
+                filled(288, 2.90 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.mlp.up_proj.weight"),
+                vec![24, 12],
+                filled(288, 3.00 + seed_offset),
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.mlp.down_proj.weight"),
+                vec![12, 24],
+                filled(288, 3.10 + seed_offset),
+            ));
+        }
+        tensors.push(("lm_head.weight".to_string(), vec![6, 12], filled(72, 3.20)));
+        let borrowed: Vec<(&str, Vec<u64>, Vec<f32>)> = tensors
+            .iter()
+            .map(|(name, shape, values)| (name.as_str(), shape.clone(), values.clone()))
+            .collect();
+        write_safetensors(&dir.join("model.safetensors"), &borrowed);
+        write_declared_artifact_format_sidecar(dir, ArtifactFormat::HuggingFace);
+    }
+
+    /// astorise/Magnetar#75: writes the declared-format sidecar every real
+    /// test bundle needs since `LoadedInferenceComponent::load`/
+    /// `local_bundle_manifest_digest` no longer infer the format from
+    /// filesystem structure -- a bundle missing this file fails to load
+    /// explicitly (see `loaded_inference_component_load_rejects_a_bundle_
+    /// missing_the_declared_format_sidecar`).
+    fn write_declared_artifact_format_sidecar(dir: &Path, format: ArtifactFormat) {
+        std::fs::write(
+            dir.join(
+                magnetar_runtime::production_model_ingestion::ARTIFACT_FORMAT_SIDECAR_FILE_NAME,
+            ),
+            format!("artifact_format: {}\n", format.as_str()),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1104,6 +1451,91 @@ mod load_end_to_end_tests {
         assert_eq!(output.usage.generated_tokens, 1);
     }
 
+    /// astorise/Magnetar#88 (Tachyon integration audit TACH-02): the opaque
+    /// entry points must be a different *shape* for the same underlying
+    /// call, not a parallel implementation that could silently diverge from
+    /// the typed one. Loads the same real Component/Artifact pair as the
+    /// test above and drives all three call shapes against it with the
+    /// identical payload -- the typed batch path (`invoke_payload`), the
+    /// opaque batch path (`invoke_payload_opaque`), and the opaque
+    /// streaming path (`invoke_payload_streaming_opaque`) -- asserting all
+    /// three agree on the generated text and on prompt/generated token
+    /// counts.
+    #[test]
+    fn loaded_inference_component_opaque_entry_points_match_the_typed_path() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_qwen_bundle(dir.path());
+
+        let model_digest =
+            local_bundle_manifest_digest(dir.path()).expect("the bundle inspects cleanly");
+        let component_digest = magnetar_runtime::ComponentDigest::sha256(qwen_component_bytes());
+        let trust_policy = ArtifactTrustPolicy::default()
+            .trust_digest(&model_digest)
+            .trust_component_digest(&component_digest.value);
+
+        let component = LoadedInferenceComponent::load(
+            "test-qwen-opaque",
+            InferenceComponentArtifact::from_bytes(
+                qwen_component_bytes().to_vec(),
+                qwen_component_manifest_bytes().to_vec(),
+            ),
+            InferenceComponentSource::authorized_local_bundle("test-fixture", dir.path()),
+            trust_policy,
+            InferenceComponentPlacement::ReferenceCpu,
+        )
+        .expect("a real, completely-specified Hugging Face-shaped bundle must load end to end");
+
+        let payload: &[u8] = br#"{"prompt":"hello world","max_new_tokens":1}"#;
+
+        let typed = component
+            .invoke_payload(payload)
+            .expect("typed invocation succeeds");
+
+        let opaque = component
+            .invoke_payload_opaque(payload)
+            .expect("opaque batch invocation succeeds");
+        let opaque_text =
+            String::from_utf8(opaque.bytes).expect("opaque batch output is valid UTF-8");
+        assert_eq!(
+            opaque_text, typed.text,
+            "the opaque batch path must produce the identical generated text to the typed path"
+        );
+        let opaque_tags: std::collections::BTreeMap<_, _> = opaque.tags.into_iter().collect();
+        assert_eq!(
+            opaque_tags.get("prompt_tokens").map(String::as_str),
+            Some(typed.usage.prompt_tokens.to_string()).as_deref()
+        );
+        assert_eq!(
+            opaque_tags.get("generated_tokens").map(String::as_str),
+            Some(typed.usage.generated_tokens.to_string()).as_deref()
+        );
+
+        let mut streamed_bytes = Vec::new();
+        let mut on_frame = |frame: &[u8]| -> std::ops::ControlFlow<()> {
+            streamed_bytes.extend_from_slice(frame);
+            std::ops::ControlFlow::Continue(())
+        };
+        let streaming_tags = component
+            .invoke_payload_streaming_opaque(payload, &mut on_frame)
+            .expect("opaque streaming invocation succeeds");
+        let streamed_text =
+            String::from_utf8(streamed_bytes).expect("streamed frames are valid UTF-8");
+        assert_eq!(
+            streamed_text, typed.text,
+            "the opaque streaming path's concatenated frames must produce the identical \
+             generated text to the typed path"
+        );
+        let streaming_tags: std::collections::BTreeMap<_, _> = streaming_tags.into_iter().collect();
+        assert_eq!(
+            streaming_tags.get("prompt_tokens").map(String::as_str),
+            Some(typed.usage.prompt_tokens.to_string()).as_deref()
+        );
+        assert_eq!(
+            streaming_tags.get("generated_tokens").map(String::as_str),
+            Some(typed.usage.generated_tokens.to_string()).as_deref()
+        );
+    }
+
     fn llama_component_bytes() -> &'static [u8] {
         include_bytes!("../../magnetar-runtime/fixtures/components/llama-real.component.wasm")
     }
@@ -1114,27 +1546,31 @@ mod load_end_to_end_tests {
         )
     }
 
-    /// Tachyon integration audit MAG-01/MAG-06 (#72): the noted gap left
-    /// even after `magnetar-runtime`'s own
+    /// Tachyon integration audit MAG-01/MAG-06 (#72) and MAG-02 (#81): the
+    /// noted gap left even after `magnetar-runtime`'s own
     /// `build_first_native_graphs_from_named_component_serves_a_real_second_
     /// architecture_family` proved a real, independently-compiled non-Qwen
     /// Component (Llama) produces byte-identical graphs to Qwen for the same
     /// config -- that test never drove this crate's own `LoadedInferenceComponent::
     /// load`, so the audit's demand to "tester une seconde architecture
-    /// complète via LoadedInferenceComponent::load" stayed unproven. Loads
-    /// the exact same tiny Hugging Face-shaped bundle the Qwen end-to-end
-    /// test above uses (same tensors, same config, same tokenizer --
-    /// `attention_bias: false`, matching the fixture config the
-    /// Llama/Qwen-equivalence test itself assumes) but through the real
-    /// checked-in Llama Component artifact instead of Qwen's, registered and
-    /// trusted under its own real digest exactly like Qwen's is above.
-    /// `LoadedInferenceComponent` itself never names Qwen anywhere in this
-    /// call: which Component drives graph production is entirely a function
-    /// of which artifact/digest the caller supplies.
+    /// complète via LoadedInferenceComponent::load" stayed unproven. A first
+    /// version of this test (#72) closed the Component half of that gap but
+    /// still loaded `write_tiny_qwen_bundle`'s exact Qwen-shaped Model
+    /// Artifact -- proving the *Component* registry is multi-architecture,
+    /// not that a real independent second *model* stack works. This version
+    /// pairs the real checked-in Llama Component artifact with
+    /// `write_tiny_llama_bundle`'s own genuinely independent config
+    /// (different dimensions, a real GQA head-count reduction none of the
+    /// Qwen fixtures exercise), tensors, and tokenizer -- registered and
+    /// trusted under its own real digest exactly like the Qwen bundle is in
+    /// the test above. `LoadedInferenceComponent` itself never names Qwen
+    /// anywhere in this call: which Component drives graph production, and
+    /// which Model Artifact is ingested, are both entirely a function of
+    /// what the caller supplies.
     #[test]
     fn loaded_inference_component_load_runs_a_real_second_architecture_end_to_end() {
         let dir = tempfile::tempdir().expect("temp dir creates");
-        write_tiny_qwen_bundle(dir.path());
+        write_tiny_llama_bundle(dir.path());
 
         let model_digest =
             local_bundle_manifest_digest(dir.path()).expect("the bundle inspects cleanly");
@@ -1160,21 +1596,74 @@ mod load_end_to_end_tests {
             InferenceComponentPlacement::ReferenceCpu,
         )
         .expect(
-            "a real, independently-compiled non-Qwen Component (Llama) must load end to end \
-             through this crate's own orchestration exactly like the Qwen Component does",
+            "a real, independently-compiled non-Qwen Component (Llama) paired with its own \
+             genuinely independent Model Artifact must load end to end through this crate's \
+             own orchestration exactly like the Qwen Component/Artifact pair does",
         );
 
         let output = component
-            .invoke_payload(br#"{"prompt":"hello world","max_new_tokens":1}"#)
+            .invoke_payload(br#"{"prompt":"the quick fox","max_new_tokens":1}"#)
             .expect(
                 "generation must run end to end through the real Llama-Component-driven \
                  instance, the same call shape a real embedder uses",
             );
         assert_eq!(
-            output.usage.prompt_tokens, 2,
-            "\"hello world\" tokenizes to exactly 2 real tokens under this bundle's own tokenizer"
+            output.usage.prompt_tokens, 3,
+            "\"the quick fox\" tokenizes to exactly 3 real tokens under this bundle's own tokenizer"
         );
         assert_eq!(output.usage.generated_tokens, 1);
+    }
+
+    /// astorise/Magnetar#83 steps 6-7's required negative proof, through
+    /// the real `LoadedInferenceComponent::load` entry point end to end --
+    /// no hand-built `ModelComponentIdentity` anywhere in this test. Pairs
+    /// `write_tiny_llama_bundle`'s real Model Artifact (real ingestion
+    /// normalizes its `model_type: "llama"` into `architecture.family:
+    /// "llama"`, astorise/Magnetar#83 steps 1-5) with the real, checked-in
+    /// Qwen Component -- whose own manifest now declares `compatibility.
+    /// architecture_families: [qwen2]` -- both fully trusted (Model
+    /// Artifact trust and Component trust are independent, MAG-03, and
+    /// both are granted here so the *only* thing that can reject this load
+    /// is the family mismatch itself, not an unrelated trust gap). Proves
+    /// the Component-vs-family compatibility gate
+    /// `ProductionLoadedModel::load_with_component` now enforces is real:
+    /// before this fix, no such rejection existed anywhere in this call
+    /// chain, and this exact pairing would have loaded successfully.
+    #[test]
+    fn loaded_inference_component_load_rejects_a_family_mismatched_component() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_llama_bundle(dir.path());
+
+        let model_digest =
+            local_bundle_manifest_digest(dir.path()).expect("the bundle inspects cleanly");
+        let component_digest = magnetar_runtime::ComponentDigest::sha256(qwen_component_bytes());
+
+        let trust_policy = ArtifactTrustPolicy::default()
+            .trust_digest(&model_digest)
+            .trust_component_digest(&component_digest.value);
+
+        let error = LoadedInferenceComponent::load(
+            "test-mismatch",
+            InferenceComponentArtifact::from_bytes(
+                qwen_component_bytes().to_vec(),
+                qwen_component_manifest_bytes().to_vec(),
+            ),
+            InferenceComponentSource::authorized_local_bundle("test-fixture", dir.path()),
+            trust_policy,
+            InferenceComponentPlacement::ReferenceCpu,
+        )
+        .expect_err(
+            "a real Llama Model Artifact paired with a real Qwen Component that declares \
+             `compatibility.architecture_families: [qwen2]` must be rejected, even though both \
+             the Model Artifact and the Component are independently fully trusted",
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("architecture unsupported")),
+            "expected the rejection to be the architecture-family compatibility gate \
+             (`ModelComponentError::ArchitectureUnsupported`), got: {error:#}"
+        );
     }
 
     #[test]
@@ -1203,5 +1692,78 @@ mod load_end_to_end_tests {
             "a Model Artifact trusted by nothing must not load, even with a trusted Component",
         );
         assert!(error.to_string().contains("Model Artifact trust rejected"));
+    }
+
+    /// astorise/Magnetar#75's required negative proof for the missing-
+    /// declaration case: a bundle that has every real Hugging Face file
+    /// (`config.json`, `tokenizer.json`, `model.safetensors`) but no
+    /// `magnetar-artifact-format.yaml` sidecar must be rejected explicitly,
+    /// never silently ingested by guessing from filesystem structure the
+    /// way `LoadedInferenceComponent::load` used to. Proves there is no
+    /// remaining fallback path inside `load` itself.
+    #[test]
+    fn loaded_inference_component_load_rejects_a_bundle_missing_the_declared_format_sidecar() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_qwen_bundle(dir.path());
+        std::fs::remove_file(
+            dir.path().join(
+                magnetar_runtime::production_model_ingestion::ARTIFACT_FORMAT_SIDECAR_FILE_NAME,
+            ),
+        )
+        .expect("the sidecar written by write_tiny_qwen_bundle exists and can be removed");
+
+        let error = local_bundle_manifest_digest(dir.path()).expect_err(
+            "a bundle with no declared-format sidecar must fail explicitly, not fall back to \
+             filesystem-structure guessing",
+        );
+        assert!(
+            error.chain().any(|cause| cause.to_string().contains(
+                magnetar_runtime::production_model_ingestion::ARTIFACT_FORMAT_SIDECAR_FILE_NAME
+            )),
+            "expected the rejection to name the missing sidecar file, got: {error:#}"
+        );
+    }
+
+    /// astorise/Magnetar#75's legacy-migration proof: an old-style bundle
+    /// with no declared-format sidecar is never auto-migrated by `load`
+    /// itself (proven above), but `migrate_legacy_bundle_artifact_format`
+    /// derives the same format the old filesystem heuristic always did and
+    /// writes the sidecar once, after which the bundle loads through the
+    /// normal explicit-declaration path -- and a second migration attempt
+    /// is refused rather than silently overwriting it.
+    #[test]
+    fn migrate_legacy_bundle_artifact_format_derives_and_writes_the_sidecar_once() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_qwen_bundle(dir.path());
+        let sidecar_path = dir
+            .path()
+            .join(magnetar_runtime::production_model_ingestion::ARTIFACT_FORMAT_SIDECAR_FILE_NAME);
+        std::fs::remove_file(&sidecar_path)
+            .expect("the sidecar written by write_tiny_qwen_bundle exists and can be removed");
+
+        let format = migrate_legacy_bundle_artifact_format(dir.path()).expect(
+            "migration must derive a format for a legacy Hugging Face-shaped bundle (no \
+             `model.gguf` file present)",
+        );
+        assert_eq!(format, ArtifactFormat::HuggingFace);
+        let sidecar_contents =
+            std::fs::read_to_string(&sidecar_path).expect("migration wrote the sidecar file");
+        assert_eq!(sidecar_contents, "artifact_format: huggingface\n");
+
+        // The now-migrated bundle loads cleanly through the normal
+        // explicit-declaration path, exactly like a bundle that was always
+        // written with the sidecar present.
+        local_bundle_manifest_digest(dir.path())
+            .expect("the migrated bundle now inspects cleanly through the declared format");
+
+        let second_attempt = migrate_legacy_bundle_artifact_format(dir.path()).expect_err(
+            "migration must refuse to run again once a declared-format sidecar already exists, \
+             rather than silently overwriting an operator's own explicit declaration",
+        );
+        assert!(
+            second_attempt
+                .to_string()
+                .contains("declared-format sidecar already exists"),
+        );
     }
 }
