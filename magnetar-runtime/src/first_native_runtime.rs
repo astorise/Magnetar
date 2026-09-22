@@ -7170,6 +7170,35 @@ impl ProductionLoadedModel {
         provider: Arc<dyn Provider>,
         component_digest: Option<ComponentDigest>,
     ) -> Result<Self, InferenceApiError> {
+        // astorise/Magnetar#83 steps 6-7: the real Component-vs-family
+        // compatibility gate. `None` (the pre-existing hardcoded-singleton
+        // path) is unaffected -- there is no caller-registered manifest to
+        // check against. `Some(digest)` looks up what that *specific*
+        // registered Component itself declared at registration time
+        // (`register_inference_component_artifact`, via `.magnetar-
+        // component.yaml`'s `compatibility.architecture_families`) and
+        // compares it against the real ingested Model Artifact's own
+        // `fixture.manifest.architecture.family` -- mirroring
+        // `ModelComponentIdentity::supports_architecture`'s exact
+        // semantics (empty set means permissive) without constructing a
+        // full identity for what is otherwise a one-shot boolean check.
+        // Checked before building the Runtime below: rejecting a mismatch
+        // here fails fast, instead of materializing weights and an
+        // instance for a Component that was never going to be allowed to
+        // execute them.
+        if let Some(digest) = &component_digest {
+            let registered = named_component_runtime(digest).map_err(|error| {
+                InferenceApiError::ModelComponentUnavailable {
+                    reason: error.to_string(),
+                }
+            })?;
+            let declared = &registered.supported_architecture_families;
+            if !declared.is_empty() && !declared.contains(&fixture.manifest.architecture.family) {
+                return Err(InferenceApiError::ModelComponentUnavailable {
+                    reason: ModelComponentError::ArchitectureUnsupported.to_string(),
+                });
+            }
+        }
         let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
         let provider_supports_multi_step_decode = provider.supports_multi_step_decode();
         let mut runtime = Runtime::builder()
@@ -7747,6 +7776,13 @@ struct RegisteredComponentRuntime {
     capability: Arc<GraphBuilderCapability>,
     model_config_capability: Arc<ModelConfigCapability>,
     definition: ComponentDefinitionId,
+    /// This Component's own declared [`ComponentManifest::
+    /// supported_architecture_families`] (astorise/Magnetar#83 steps 6-7),
+    /// captured at registration time so a later caller holding only this
+    /// Component's `ComponentDigest` (e.g. [`ProductionLoadedModel::
+    /// load_with_component`]) can look up what it declares without
+    /// threading the manifest itself through every intermediate call.
+    supported_architecture_families: BTreeSet<String>,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -7754,13 +7790,28 @@ static REGISTERED_COMPONENT_RUNTIMES: std::sync::OnceLock<
     Mutex<BTreeMap<String, Arc<RegisteredComponentRuntime>>>,
 > = std::sync::OnceLock::new();
 
+/// [`register_inference_component_artifact`]'s return value: the registered
+/// Component's real digest, plus the already-validated [`ComponentManifest`]
+/// parsed from `manifest_bytes` (astorise/Magnetar#83 steps 6-7). Carrying
+/// the manifest out here means a caller that needs to know what this
+/// specific Component declares -- most importantly
+/// [`ComponentManifest::supported_architecture_families`] -- never needs a
+/// second, independent YAML parse of bytes this function already parsed and
+/// validated once.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[derive(Debug)]
+pub struct RegisteredInferenceComponent {
+    pub digest: ComponentDigest,
+    pub manifest: ComponentManifest,
+}
+
 /// Registers an arbitrary Component artifact for generic first-native graph
 /// production, trusted against `trust` (the caller's own
 /// [`ComponentTrustStore`], never a hardcoded digest) rather than the single
 /// `QWEN_REAL_COMPONENT_DIGEST` constant [`register_qwen_component_artifact`]
-/// always uses. The returned [`ComponentDigest`] is computed from
-/// `component_bytes` themselves (`ComponentDigest::sha256`) -- never a
-/// caller-supplied claim -- and doubles as the handle
+/// always uses. The returned [`RegisteredInferenceComponent::digest`] is
+/// computed from `component_bytes` themselves (`ComponentDigest::sha256`) --
+/// never a caller-supplied claim -- and doubles as the handle
 /// [`build_first_native_graphs_from_named_component`] looks the registered
 /// runtime back up by, so a caller never needs to invent or track its own
 /// separate identifier for "the Component I just registered."
@@ -7793,8 +7844,26 @@ pub fn register_inference_component_artifact(
     component_bytes: Vec<u8>,
     manifest_bytes: Vec<u8>,
     trust: &ComponentTrustStore,
-) -> Result<ComponentDigest, E2eConformanceError> {
+) -> Result<RegisteredInferenceComponent, E2eConformanceError> {
     let digest = ComponentDigest::sha256(&component_bytes);
+    // astorise/Magnetar#83 steps 6-7: parsed once here, shared by both
+    // branches below, instead of only the cache-hit branch re-parsing it --
+    // this is the one and only place `manifest_bytes` is interpreted, so a
+    // caller (e.g. `inference-components`) never needs its own independent
+    // YAML parse of the same bytes to learn what this Component declares
+    // (`ComponentManifest::supported_architecture_families` included).
+    let manifest = ComponentManifest::from_yaml_bytes(
+        &manifest_bytes,
+        std::path::Path::new("<registered-component-manifest>"),
+    )
+    .map_err(|error| E2eConformanceError::ModelComponentFailed {
+        reason: error.to_string(),
+    })?;
+    if manifest.digest != digest {
+        return Err(E2eConformanceError::ModelComponentFailed {
+            reason: "manifest-declared digest does not match received bytes".into(),
+        });
+    }
     let registry = REGISTERED_COMPONENT_RUNTIMES.get_or_init(|| Mutex::new(BTreeMap::new()));
     let already_registered = {
         let existing = registry.lock().unwrap();
@@ -7804,31 +7873,17 @@ pub fn register_inference_component_artifact(
         // #71: the compiled runtime is reused (that is the whole point of
         // the cache), but *this* caller's own `trust` must still authorize
         // `digest` on every call -- a digest another, earlier caller
-        // authorized is not thereby authorized for everyone. Re-parses
-        // `manifest_bytes` (always supplied fresh by the caller, cache hit
-        // or not) and re-runs the same digest-consistency check and trust
-        // decision `validate_component_artifact` applies on a fresh
-        // registration, so a cache hit can never skip the authorization a
-        // cache miss would have enforced.
-        let manifest = ComponentManifest::from_yaml_bytes(
-            &manifest_bytes,
-            std::path::Path::new("<registered-component-manifest>"),
-        )
-        .map_err(|error| E2eConformanceError::ModelComponentFailed {
-            reason: error.to_string(),
-        })?;
-        if manifest.digest != digest {
-            return Err(E2eConformanceError::ModelComponentFailed {
-                reason: "manifest-declared digest does not match received bytes".into(),
-            });
-        }
+        // authorized is not thereby authorized for everyone. Re-runs the
+        // same trust decision `validate_component_artifact` applies on a
+        // fresh registration, so a cache hit can never skip the
+        // authorization a cache miss would have enforced.
         let trust_decision = trust.evaluate(&manifest, &digest);
         if trust_decision.status != ComponentTrustStatus::Trusted {
             return Err(E2eConformanceError::ModelComponentFailed {
                 reason: trust_decision.reason,
             });
         }
-        return Ok(digest);
+        return Ok(RegisteredInferenceComponent { digest, manifest });
     }
     let capability = Arc::new(GraphBuilderCapability::new());
     let model_config_capability = Arc::new(ModelConfigCapability::new());
@@ -7885,9 +7940,10 @@ pub fn register_inference_component_artifact(
             capability,
             model_config_capability,
             definition,
+            supported_architecture_families: manifest.supported_architecture_families.clone(),
         })
     });
-    Ok(digest)
+    Ok(RegisteredInferenceComponent { digest, manifest })
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]

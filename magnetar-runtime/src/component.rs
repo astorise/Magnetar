@@ -14,7 +14,15 @@ use crate::InferenceSessionId;
 pub const COMPONENT_ARTIFACT_SCHEMA: &str = "magnetar-component-artifact";
 pub const COMPONENT_TRUST_SCHEMA: &str = "magnetar-component-trust";
 pub const COMPONENT_ARTIFACT_SCHEMA_VERSION: u64 = 1;
-pub const MAGNETAR_RUNTIME_VERSION: &str = "0.1.0";
+/// astorise/Magnetar#83 steps 6-7: bumped from `0.1.0` to `0.1.1` because
+/// this is the first Runtime version that understands a manifest's
+/// `compatibility.architecture_families` block (see
+/// `ComponentManifestYaml::validate`). A Component manifest that declares
+/// this new field must also raise its own `runtime.magnetar.min_version`
+/// to (at least) `0.1.1` -- `validate_runtime_compatibility` fails closed
+/// against an older Runtime that would otherwise silently ignore the
+/// field entirely (the YAML parser here has no `deny_unknown_fields`).
+pub const MAGNETAR_RUNTIME_VERSION: &str = "0.1.1";
 
 static NEXT_COMPONENT_DEFINITION_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -452,6 +460,23 @@ pub struct ComponentManifest {
     pub publisher: Option<ComponentPublisher>,
     pub source: ComponentSource,
     pub signatures: Vec<ComponentSignature>,
+    /// Which Model Artifact architecture families this Component declares
+    /// itself compatible with (astorise/Magnetar#83, steps 6-7): the
+    /// declarative source the Model Component contract's own
+    /// `ModelComponentIdentity.supported_architecture_families` (see
+    /// `model_component.rs`) is populated from when this Component is
+    /// registered/loaded, instead of every caller having to invent that
+    /// value itself or leave it permissive by default. Empty means
+    /// permissive -- this Component declares no family restriction --
+    /// exactly [`crate::model_component::ModelComponentIdentity::
+    /// supports_architecture`]'s own "empty means no restriction"
+    /// semantics, so a manifest with no `compatibility` block (or a
+    /// present block with no `architecture_families` list) behaves
+    /// identically to a pre-#83 manifest. A manifest that explicitly
+    /// declares an *empty* `architecture_families: []` list is rejected at
+    /// parse time instead (see `ComponentManifestYaml::validate`) rather
+    /// than silently becoming permissive by accident.
+    pub supported_architecture_families: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -879,6 +904,14 @@ struct ComponentManifestYaml {
     source: ComponentSourceYaml,
     #[serde(default)]
     signatures: Vec<ComponentSignatureYaml>,
+    /// astorise/Magnetar#83 steps 6-7: additive/optional root-level block
+    /// (schema_version stays 1 for this addition -- see
+    /// `ComponentManifest::supported_architecture_families`'s own doc
+    /// comment). Absent entirely on every manifest written before this
+    /// field existed, which is exactly why it must default rather than
+    /// be required.
+    #[serde(default)]
+    compatibility: Option<ManifestCompatibilityYaml>,
 }
 
 #[derive(Deserialize)]
@@ -934,6 +967,19 @@ struct ManifestWitInterfaceYaml {
 struct ManifestCapabilitiesYaml {
     #[serde(default)]
     requires: Vec<ManifestCapabilityYaml>,
+}
+
+/// astorise/Magnetar#83 steps 6-7. `architecture_families` is itself
+/// `#[serde(default)]` (not just the enclosing `compatibility` block) so
+/// `ComponentManifestYaml::validate` can distinguish all three states a
+/// manifest author can express: the `compatibility` block absent, the
+/// block present but `architecture_families` absent (both permissive,
+/// identical outcome), and the block present with `architecture_families`
+/// an explicit empty list (rejected -- see `validate`'s own handling).
+#[derive(Deserialize, Default)]
+struct ManifestCompatibilityYaml {
+    #[serde(default)]
+    architecture_families: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1116,6 +1162,44 @@ impl ComponentManifestYaml {
             })
             .collect();
 
+        // astorise/Magnetar#83 steps 6-7: `compatibility` absent, or
+        // present with `architecture_families` absent, both mean
+        // permissive (an empty set) -- backward compatible with every
+        // manifest written before this field existed. An explicitly empty
+        // list is rejected here rather than silently treated as
+        // permissive: an author who writes `architecture_families: []` is
+        // declaring *something*, and treating that the same as omitting
+        // the field entirely would let a typo'd or generated-empty list
+        // accidentally open a Component to every architecture.
+        let supported_architecture_families = match self
+            .compatibility
+            .and_then(|compatibility| compatibility.architecture_families)
+        {
+            None => BTreeSet::new(),
+            Some(families) if families.is_empty() => {
+                return Err(manifest_validation_error(
+                    path,
+                    "compatibility.architecture_families must not be an explicitly empty list \
+                     -- omit the field (or the whole compatibility block) entirely for \
+                     permissive, any-architecture compatibility",
+                ));
+            }
+            Some(families) => {
+                let mut set = BTreeSet::new();
+                for family in families {
+                    let family = family.trim();
+                    if family.is_empty() {
+                        return Err(manifest_validation_error(
+                            path,
+                            "compatibility.architecture_families entries must not be empty",
+                        ));
+                    }
+                    set.insert(family.to_string());
+                }
+                set
+            }
+        };
+
         Ok(ComponentManifest {
             component: ComponentMetadata {
                 name: self.component.name,
@@ -1140,6 +1224,7 @@ impl ComponentManifestYaml {
                 uri: self.source.uri,
             },
             signatures,
+            supported_architecture_families,
         })
     }
 }

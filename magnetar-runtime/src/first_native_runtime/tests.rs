@@ -3229,7 +3229,8 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
         QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
         &trust,
     )
-    .expect("a caller-trusted, well-formed artifact must register");
+    .expect("a caller-trusted, well-formed artifact must register")
+    .digest;
     assert_eq!(
         digest, expected_digest,
         "the registry must key by the artifact's own real sha256, not a claim"
@@ -3242,7 +3243,8 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
         QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
         &trust,
     )
-    .expect("re-registering the same bytes is a harmless no-op, not an error");
+    .expect("re-registering the same bytes is a harmless no-op, not an error")
+    .digest;
     assert_eq!(digest, second);
 
     // Tachyon integration audit MAG-03 / #71: this digest is now cached
@@ -3330,7 +3332,8 @@ fn register_inference_component_artifact_enforces_trust_is_idempotent_and_matche
         SYNTHETIC_MINIMAL_COMPONENT_MANIFEST_BYTES.to_vec(),
         &synthetic_trust,
     )
-    .expect("the synthetic minimal Component must also register, alongside Qwen");
+    .expect("the synthetic minimal Component must also register, alongside Qwen")
+    .digest;
     assert_eq!(registered_synthetic_digest, synthetic_digest);
 
     let (synthetic_graphs, _definition, _instance) =
@@ -3403,7 +3406,8 @@ fn build_first_native_graphs_from_named_component_serves_a_real_second_architect
         LLAMA_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
         &trust,
     )
-    .expect("the real Llama Component must register");
+    .expect("the real Llama Component must register")
+    .digest;
     assert_eq!(registered, llama_digest);
 
     // e2e_fixture()'s own config has `attention_bias: false` (`FirstNativeModelConfig::
@@ -4758,7 +4762,14 @@ fn production_loaded_model_load_with_component_matches_the_singleton_path() {
     let manifest = ModelManifest {
         schema_version: crate::MODEL_ARTIFACT_SCHEMA_VERSION,
         id,
-        architecture: ModelArchitecture::new("qwen", "load-with-component-test"),
+        // astorise/Magnetar#83 steps 6-7: the real checked-in Qwen
+        // Component (registered below) now declares
+        // `compatibility.architecture_families: [qwen2]` in its own
+        // manifest, matching the real ingested `model_type` value
+        // `loaders/huggingface` actually produces -- "qwen" (the historical
+        // placeholder every family-compatibility check used to compare
+        // against itself) would now be genuinely rejected as a mismatch.
+        architecture: ModelArchitecture::new("qwen2", "load-with-component-test"),
         parts,
         storage_dtype: Some(ModelDType::F32),
         compute_dtype: None,
@@ -4795,7 +4806,8 @@ fn production_loaded_model_load_with_component_matches_the_singleton_path() {
         QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
         &component_trust,
     )
-    .expect("registration succeeds");
+    .expect("registration succeeds")
+    .digest;
 
     let model_trust =
         || ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone());
@@ -4837,6 +4849,130 @@ fn production_loaded_model_load_with_component_matches_the_singleton_path() {
          generation to the hardcoded singleton path, for the identical underlying Component \
          bytes"
     );
+}
+
+/// astorise/Magnetar#83 steps 6-7's required backward-compatibility proof:
+/// a Component manifest with no `compatibility` block at all (every
+/// manifest written before this field existed, e.g. `synthetic-minimal.
+/// component.wasm.magnetar-component.yaml`, deliberately left untouched by
+/// this change) must keep behaving exactly as permissively as before --
+/// loading must not start rejecting real callers just because they have
+/// not yet adopted the new declaration. `family: "gemma"` is deliberately
+/// nothing the synthetic Component could plausibly declare support for
+/// (it declares nothing at all): if the absent-block-means-permissive
+/// semantics were ever accidentally inverted, this load would start
+/// failing with `ArchitectureUnsupported` even though nothing about this
+/// specific Component's own manifest changed.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn production_loaded_model_load_with_component_permits_a_component_with_no_declared_compatibility()
+{
+    let mut config = e2e_fixture_config();
+    config.tied_embeddings = false;
+    let weights = e2e_fixture_weights(&config).expect("synthetic weights build");
+    let tensors = e2e_fixture_weight_inventory(&config).expect("tensor inventory builds");
+    let mut bytes_by_name = BTreeMap::new();
+    for tensor in &tensors {
+        let host_tensor = weights
+            .get(&tensor.name)
+            .expect("a weight exists for every inventory tensor");
+        let mut bytes = Vec::with_capacity(host_tensor.data.len() * 4);
+        for value in &host_tensor.data {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes_by_name.insert(tensor.name.clone(), bytes);
+    }
+    let payload_source = ProductionIntegrationPayloadSource { bytes_by_name };
+
+    let digest_seed = ModelDigest::parse(format!("sha256:{}", "d".repeat(64))).unwrap();
+    let id = ModelArtifactId::new(
+        ModelArtifactKind::ModelBundle,
+        ModelName::new("no-declared-compatibility-test").unwrap(),
+        ModelRevision::new("r1").unwrap(),
+        digest_seed,
+    );
+    let mut parts = BTreeMap::new();
+    parts.insert(
+        "weights".to_string(),
+        ModelArtifactPart {
+            name: "weights".to_string(),
+            kind: ModelArtifactKind::ModelWeights,
+            digest: ModelDigest::parse(format!("sha256:{}", "e".repeat(64))).unwrap(),
+            size_bytes: None,
+            required: true,
+        },
+    );
+    parts.insert(
+        "config".to_string(),
+        ModelArtifactPart {
+            name: "config".to_string(),
+            kind: ModelArtifactKind::ModelConfig,
+            digest: ModelDigest::parse(format!("sha256:{}", "f".repeat(64))).unwrap(),
+            size_bytes: None,
+            required: true,
+        },
+    );
+    let manifest = ModelManifest {
+        schema_version: crate::MODEL_ARTIFACT_SCHEMA_VERSION,
+        id,
+        architecture: ModelArchitecture::new("gemma", "no-declared-compatibility-test"),
+        parts,
+        storage_dtype: Some(ModelDType::F32),
+        compute_dtype: None,
+        supported_compute_dtypes: BTreeSet::from([ModelDType::F32]),
+        tensors,
+        tokenizer: None,
+        tokenizer_config: None,
+        chat_template: None,
+        prompt_template: None,
+        generation: None,
+        quantization: None,
+        shards: Vec::new(),
+        runtime_features: BTreeSet::new(),
+        memory_features: BTreeSet::new(),
+        provider_capabilities: Vec::new(),
+        component: None,
+        license: None,
+        provenance: None,
+        signatures: Vec::new(),
+        source: None,
+        architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
+    };
+
+    let tokenizer_metadata = e2e_fixture_tokenizer().unwrap().metadata().clone();
+    let delegate_tokenizer: std::sync::Arc<dyn crate::tokenizer::Tokenizer + Send + Sync> =
+        std::sync::Arc::new(e2e_fixture_tokenizer().unwrap());
+    let fixture =
+        production_model_fixture(manifest.clone(), tokenizer_metadata, delegate_tokenizer)
+            .expect("production fixture builds for a family the generic path never rejects");
+
+    let component_trust = ComponentTrustStore::default()
+        .trust_digest(&ComponentDigest::sha256(SYNTHETIC_MINIMAL_COMPONENT_BYTES).value);
+    let digest = register_inference_component_artifact(
+        SYNTHETIC_MINIMAL_COMPONENT_BYTES.to_vec(),
+        SYNTHETIC_MINIMAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &component_trust,
+    )
+    .expect("registration succeeds")
+    .digest;
+
+    let model_trust =
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone());
+
+    let via_named = ProductionLoadedModel::load_with_component(
+        fixture,
+        &payload_source,
+        model_trust,
+        Arc::new(ReferenceCpuProvider::new()),
+        Some(digest),
+    )
+    .expect(
+        "a Component with no declared `compatibility.architecture_families` must remain \
+         permissive, exactly like every manifest written before this field existed",
+    );
+    via_named
+        .unload()
+        .expect("model instance unloads cleanly, no leaked resources");
 }
 
 #[cfg(all(

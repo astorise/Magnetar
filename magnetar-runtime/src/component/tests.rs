@@ -1502,6 +1502,60 @@ fn component_manifest_may_declare_optional_wit_import_metadata() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// astorise/Magnetar#83 steps 6-7: the schema-level half of the
+/// Component-vs-family compatibility gate, tested directly at
+/// `ComponentManifest::from_yaml_bytes` (parsing/validation only, no
+/// `ComponentManager`/trust/registration machinery needed) rather than
+/// only through the higher-level integration proofs in
+/// `first_native_runtime/tests.rs` and `inference-components`.
+#[test]
+fn component_manifest_parses_declared_architecture_families() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let yaml = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION).replace(
+        "wit:\n",
+        "compatibility:\n  architecture_families:\n    - llama\n    - mistral\nwit:\n",
+    );
+    let manifest = ComponentManifest::from_yaml_bytes(yaml.as_bytes(), Path::new("<test>"))
+        .expect("a manifest declaring architecture_families parses");
+    assert_eq!(
+        manifest.supported_architecture_families,
+        BTreeSet::from(["llama".to_string(), "mistral".to_string()])
+    );
+}
+
+/// The other half of astorise/Magnetar#83's backward-compatibility
+/// requirement: every manifest written before this field existed has no
+/// `compatibility` block at all, and must keep parsing to the same
+/// permissive (empty) `supported_architecture_families` it always did.
+#[test]
+fn component_manifest_with_no_compatibility_block_is_permissive() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let yaml = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION);
+    let manifest = ComponentManifest::from_yaml_bytes(yaml.as_bytes(), Path::new("<test>"))
+        .expect("a manifest with no compatibility block parses");
+    assert!(
+        manifest.supported_architecture_families.is_empty(),
+        "no compatibility block declared must mean permissive, exactly like before this field \
+         existed"
+    );
+}
+
+/// An author writing `architecture_families: []` is declaring *something*
+/// -- treating it the same as omitting the field entirely (permissive)
+/// would let a typo'd or generated-empty list accidentally open a
+/// Component to every architecture, silently.
+#[test]
+fn component_manifest_rejects_an_explicitly_empty_architecture_families_list() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let yaml = manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION).replace(
+        "wit:\n",
+        "compatibility:\n  architecture_families: []\nwit:\n",
+    );
+    let error = ComponentManifest::from_yaml_bytes(yaml.as_bytes(), Path::new("<test>"))
+        .expect_err("an explicitly empty architecture_families list must be rejected");
+    assert!(matches!(error, ComponentError::Manifest { .. }));
+}
+
 #[test]
 fn component_artifact_rejects_runtime_max_version_incompatibility() {
     let directory = temp_component_artifact_dir("runtime-max");

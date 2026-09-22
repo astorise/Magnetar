@@ -263,7 +263,8 @@ impl LoadedInferenceComponent {
         )
         .map_err(|error| {
             anyhow!("Magnetar rejected inference Component artifact for `{name}`: {error}")
-        })?;
+        })?
+        .digest;
 
         // Format detection: a bundle is GGUF-shaped if it declares the
         // single file `loaders/gguf`'s own ingestor looks for, Hugging-
@@ -1319,6 +1320,58 @@ mod load_end_to_end_tests {
             "\"the quick fox\" tokenizes to exactly 3 real tokens under this bundle's own tokenizer"
         );
         assert_eq!(output.usage.generated_tokens, 1);
+    }
+
+    /// astorise/Magnetar#83 steps 6-7's required negative proof, through
+    /// the real `LoadedInferenceComponent::load` entry point end to end --
+    /// no hand-built `ModelComponentIdentity` anywhere in this test. Pairs
+    /// `write_tiny_llama_bundle`'s real Model Artifact (real ingestion
+    /// normalizes its `model_type: "llama"` into `architecture.family:
+    /// "llama"`, astorise/Magnetar#83 steps 1-5) with the real, checked-in
+    /// Qwen Component -- whose own manifest now declares `compatibility.
+    /// architecture_families: [qwen2]` -- both fully trusted (Model
+    /// Artifact trust and Component trust are independent, MAG-03, and
+    /// both are granted here so the *only* thing that can reject this load
+    /// is the family mismatch itself, not an unrelated trust gap). Proves
+    /// the Component-vs-family compatibility gate
+    /// `ProductionLoadedModel::load_with_component` now enforces is real:
+    /// before this fix, no such rejection existed anywhere in this call
+    /// chain, and this exact pairing would have loaded successfully.
+    #[test]
+    fn loaded_inference_component_load_rejects_a_family_mismatched_component() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        write_tiny_llama_bundle(dir.path());
+
+        let model_digest =
+            local_bundle_manifest_digest(dir.path()).expect("the bundle inspects cleanly");
+        let component_digest = magnetar_runtime::ComponentDigest::sha256(qwen_component_bytes());
+
+        let trust_policy = ArtifactTrustPolicy::default()
+            .trust_digest(&model_digest)
+            .trust_component_digest(&component_digest.value);
+
+        let error = LoadedInferenceComponent::load(
+            "test-mismatch",
+            InferenceComponentArtifact::from_bytes(
+                qwen_component_bytes().to_vec(),
+                qwen_component_manifest_bytes().to_vec(),
+            ),
+            InferenceComponentSource::authorized_local_bundle("test-fixture", dir.path()),
+            trust_policy,
+            InferenceComponentPlacement::ReferenceCpu,
+        )
+        .expect_err(
+            "a real Llama Model Artifact paired with a real Qwen Component that declares \
+             `compatibility.architecture_families: [qwen2]` must be rejected, even though both \
+             the Model Artifact and the Component are independently fully trusted",
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("architecture unsupported")),
+            "expected the rejection to be the architecture-family compatibility gate \
+             (`ModelComponentError::ArchitectureUnsupported`), got: {error:#}"
+        );
     }
 
     #[test]
