@@ -166,7 +166,7 @@ fn trusted_preflight_request_for_temp_component(
     QwenComponentPreflightRequest {
         component_package,
         trust_store: ComponentTrustStore::default().trust_digest(digest),
-        limits: qwen_component_runtime_limits(),
+        limits: inference_component_runtime_limits(),
     }
 }
 
@@ -3128,7 +3128,7 @@ fn e2e_qwen_component_missing_artifact_fails_before_planning() {
     let request = QwenComponentPreflightRequest {
         component_package,
         trust_store: ComponentTrustStore::default().trust_digest(&digest),
-        limits: qwen_component_runtime_limits(),
+        limits: inference_component_runtime_limits(),
     };
 
     let result = validate_and_instantiate_qwen_component_before_first_native_planning(request);
@@ -6593,7 +6593,7 @@ impl QwenComponentPreflightRequest {
         Self {
             component_package: qwen_graph_component_package(),
             trust_store: ComponentTrustStore::default().trust_digest(QWEN_GRAPH_COMPONENT_DIGEST),
-            limits: qwen_component_runtime_limits(),
+            limits: inference_component_runtime_limits(),
         }
     }
 }

@@ -6,9 +6,13 @@ Qwen-specific knowledge (the Qwen singleton path, the Qwen test-oracle graph).
 That exclusion means the guard has zero visibility into the *generic*
 production facade that happens to live inside first_native_runtime.rs too --
 ProductionLoadedModel, production_model_fixture,
-build_first_native_graphs_from_named_component -- and inference-components'
-own LoadedInferenceComponent::load, so it stayed green through MAG-01 (#82)
-the whole time.
+build_first_native_graphs_from_named_component,
+register_inference_component_artifact -- and inference-components' own
+LoadedInferenceComponent::load, so it stayed green through MAG-01 (#82) the
+whole time, and later missed register_inference_component_artifact calling
+a helper literally named qwen_component_runtime_limits despite gating on
+nothing Qwen-specific (audit round 3, MAG-01/MAG-02; the helper is now
+inference_component_runtime_limits and this guard covers that body too).
 
 This guard scans exactly those specific bodies (not the whole file) for
 model-family identifiers, source text only (comments stripped first, the same
@@ -125,15 +129,35 @@ def main() -> int:
         allowed=set(),
     )
 
+    # Audit round 3, MAG-01/MAG-02: register_inference_component_artifact
+    # is the generic, digest-keyed Component registry every caller (Qwen,
+    # Llama, or otherwise) registers through -- it used to call a helper
+    # named qwen_component_runtime_limits despite gating on nothing
+    # Qwen-specific, and this guard had no visibility into that body at
+    # all, so the misleading name could exist there without ever failing
+    # the check. The helper is now named inference_component_runtime_
+    # limits and this body is scanned like every other generic-facade
+    # entry point above.
+    errors += check(
+        "register_inference_component_artifact",
+        extract_body(
+            runtime_src,
+            "pub fn register_inference_component_artifact(",
+            0,
+            "register_inference_component_artifact",
+        ),
+        allowed=set(),
+    )
+
     if errors:
         for error in errors:
             print(error, file=sys.stderr)
         print(
             "\nThe generic production facade (ProductionLoadedModel, production_model_fixture, "
-            "build_first_native_graphs_from_named_component, LoadedInferenceComponent::load) "
-            "must not depend on a model-family-specific identifier unless it is an explicit, "
-            "individually justified exception in tools/check_generic_facade_family_isolation.py's "
-            "own allowlist -- see #82.",
+            "build_first_native_graphs_from_named_component, register_inference_component_artifact, "
+            "LoadedInferenceComponent::load) must not depend on a model-family-specific identifier "
+            "unless it is an explicit, individually justified exception in "
+            "tools/check_generic_facade_family_isolation.py's own allowlist -- see #82.",
             file=sys.stderr,
         )
         return 1

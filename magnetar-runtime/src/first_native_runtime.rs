@@ -7676,7 +7676,7 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
             }
         })?,
     ));
-    manager.set_resource_limits(qwen_component_runtime_limits());
+    manager.set_resource_limits(inference_component_runtime_limits());
     manager
         .set_trust_store(ComponentTrustStore::default().trust_digest(QWEN_REAL_COMPONENT_DIGEST));
     // `1.3.0`: the checked-in real Qwen Component now also exports
@@ -7915,7 +7915,7 @@ pub fn register_inference_component_artifact(
             }
         })?,
     ));
-    manager.set_resource_limits(qwen_component_runtime_limits());
+    manager.set_resource_limits(inference_component_runtime_limits());
     manager.set_trust_store(trust.clone());
     // This generic registry serves distinct, independently-compiled
     // Components concurrently (Llama and the synthetic-minimal test fixture
@@ -8535,22 +8535,36 @@ pub struct FirstNativeComponentGraphs {
     pub decode_node_count: usize,
 }
 
+/// Resource limits every `ComponentManager` this file constructs runs
+/// under -- the hardcoded-singleton `qwen_real_component_runtime` and the
+/// generic, digest-keyed registry `register_inference_component_artifact`
+/// populates alike (astorise/Magnetar audit round 3, MAG-01: this helper's
+/// former name, `qwen_component_runtime_limits`, wrongly implied the
+/// generic registry path depended on something Qwen-specific; nothing
+/// here does -- these are plain resource-budget constants, not a
+/// per-architecture policy). Not itself a Component-family-specific
+/// concept: a real Llama Component runs under these exact same values,
+/// with no branch anywhere selecting different limits per family. If a
+/// Component ever legitimately needs a different budget, that has to be
+/// expressed through a generic policy or the manifest, never a
+/// family-specific branch here.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-fn qwen_component_runtime_limits() -> ComponentResourceLimits {
+fn inference_component_runtime_limits() -> ComponentResourceLimits {
     ComponentResourceLimits {
         // 64 MiB: the checksum-only fixture Component fit in 1 MiB, and
         // the tiny 1-layer test fixture's real graph needed only ~19
-        // graph-builder calls -- but this same singleton runtime also
-        // builds graphs for real production checkpoints (task 12.4/12.5),
-        // whose per-layer call count (and this session's task-10.5/QKV-
-        // bias-support additions) scale with `num_hidden_layers`: a real
-        // 24-layer Qwen2.5-0.5B-Instruct config was observed to trip the
-        // previous 8 MiB/1,000,000-fuel/1000ms budget (`ResourcePolicy`
+        // graph-builder calls -- but every caller of this same shared
+        // budget also builds graphs for real production checkpoints (task
+        // 12.4/12.5), whose per-layer call count (and this session's
+        // task-10.5/QKV-bias-support additions) scale with
+        // `num_hidden_layers`: a real 24-layer Qwen2.5-0.5B-Instruct
+        // config was observed to trip the previous
+        // 8 MiB/1,000,000-fuel/1000ms budget (`ResourcePolicy`
         // interruption) building its ~500-call graph. Generous headroom
-        // here (not per-config, since this runtime is a shared, one-time-
-        // initialized singleton across every config it ever builds a
-        // graph for) still fails closed against a genuinely runaway
-        // Component -- it is bounded, not unlimited.
+        // here (not per-config, since each caller is itself a shared,
+        // one-time-initialized runtime across every config/Component it
+        // ever builds a graph for) still fails closed against a genuinely
+        // runaway Component -- it is bounded, not unlimited.
         max_memory_bytes: Some(1 << 26),
         execution_deadline_millis: Some(5_000),
         max_concurrent_invocations: Some(1),
