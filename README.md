@@ -705,9 +705,35 @@ wired into no CI job at all -- the crate the audit reviewed most closely
 had never been built or tested in CI. Fixed by adding it to
 `submodule-integration`, with the same format/clippy steps `magnetar-cli`
 already has, verified green on the real Linux runner. Outstanding, noted
-for the record: a GGUF-shaped equivalent of this end-to-end test (the
-`is_gguf` branch itself remains covered separately by `loaders/gguf`'s
-own tests and the `magnetar-runtime` singleton/named-component tests).
+for the record: a GGUF-shaped equivalent of this end-to-end test inside
+`inference-components` itself (format selection within that crate remains
+covered separately by `loaders/gguf`'s own tests and the `magnetar-runtime`
+singleton/named-component tests).
+
+**Tachyon integration audit, round 2**
+(`docs/audits/audit-magnetar-integration-tachyon-2026-09-22.md`, GO on the
+SHA Tachyon consumes, one P1 noted -- MAG-INT-01, convergence with `main`):
+found the previous round's closures held (no new architectural P0/P1 on the
+consumed SHA, Quality CI fully green), and flagged that the crate's own
+format selection (astorise/Magnetar#75, above) was still filesystem-
+structure-based (checking for `model.gguf`'s presence) rather than
+declared, and that a Model Component had no way to state which bundle
+format(s) it actually supports. `#90` closed this: a production bundle now
+declares its own on-disk format explicitly, via a
+`magnetar-artifact-format.yaml` sidecar at the bundle root (symmetric to a
+Component's own `.magnetar-component.yaml`); a Component manifest gains a
+`compatibility.artifact_formats` list (identical semantics to
+`architecture_families` above, including the version-bump and
+explicit-empty-list-is-rejected rules); and
+`ProductionLoadedModel::load_with_component` rejects a Component/Artifact
+format mismatch the same way it already rejects a family mismatch. The old
+filesystem heuristic survives only as an explicit,
+separately-invoked legacy-migration helper -- never an automatic runtime
+fallback. `#91` closed a coverage-ratchet regression `#90` introduced (the
+new sidecar-reading function was exercised only through
+`inference-components`, outside the root-workspace coverage ratchet's own
+scope). See `docs/artifact-format-declaration.md` for the integrator-facing
+recipe and minimal examples this audit round asked for.
 
 ## Terminology
 
