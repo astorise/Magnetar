@@ -709,6 +709,29 @@ for the record: a GGUF-shaped equivalent of this end-to-end test (the
 `is_gguf` branch itself remains covered separately by `loaders/gguf`'s
 own tests and the `magnetar-runtime` singleton/named-component tests).
 
+**Tachyon integration audit, round 3**
+(`docs/audits/audit-magnetar-integration-tachyon-2026-09-23.md`,
+functional GO on the SHA Tachyon consumes, minor architectural cleanup
+noted -- MAG-01/MAG-02): found every prior round's closures held (no new
+architectural P0/P1, Quality fully green on both the consumed SHA and
+`main`), and flagged that `register_inference_component_artifact` --
+the generic, digest-keyed Component registry every caller registers
+through, Qwen or otherwise -- still called a helper literally named
+`qwen_component_runtime_limits`, even though its values (memory/
+deadline/concurrency/fuel budget) depend on nothing Qwen-specific and a
+real Llama Component runs under the exact same limits with no
+per-family branch (MAG-01). It also found that
+`tools/check_generic_facade_family_isolation.py`'s guard, which already
+covers `ProductionLoadedModel`, `production_model_fixture`,
+`build_first_native_graphs_from_named_component`, and
+`LoadedInferenceComponent::load`, had no visibility into
+`register_inference_component_artifact`'s own body at all -- exactly
+why the misleadingly-named helper could sit there without ever failing
+the check (MAG-02). Both closed together: the helper is renamed to
+`inference_component_runtime_limits` (reused unchanged by both the
+hardcoded-singleton Qwen path and the generic registry), and the guard
+now scans `register_inference_component_artifact`'s body too.
+
 ## Terminology
 
 `Backend`, `Plugin`, and `Host` are not primary Magnetar architectural concepts.
