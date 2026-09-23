@@ -758,6 +758,18 @@ the check (MAG-02). Both closed together: the helper is renamed to
 hardcoded-singleton Qwen path and the generic registry), and the guard
 now scans `register_inference_component_artifact`'s body too.
 
+**Tachyon integration audit, closure**
+(`docs/audits/audit-magnetar-integration-tachyon-2026-09-23-closure.md`,
+GO on the Magnetar side): audited exactly the commit Tachyon vendors
+(`9db481d`, the merge of round 3's MAG-01/MAG-02 fix and the round 2
+convergence docs, `#95`/`#96`) and found every prior finding across all
+three audit rounds closed, no pin divergence between Magnetar `main` and
+Tachyon's vendored copy, and Quality fully green on the audited SHA. No
+new Magnetar-side finding. The integration's only remaining open items are
+on Tachyon's own side (Provider-detail exposure and internal
+`generate`/`prompt` vocabulary in its own surface) -- outside this
+repository's scope.
+
 ## Terminology
 
 `Backend`, `Plugin`, and `Host` are not primary Magnetar architectural concepts.
