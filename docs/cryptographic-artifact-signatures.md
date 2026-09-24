@@ -1,10 +1,15 @@
 # Cryptographic Artifact Signatures And Authenticated Publisher Identity
 
-Status: design only, not implemented. Tracks GitHub issue
-[#37](https://github.com/astorise/Magnetar/issues/37). Implementation, once
-these questions are settled, belongs in a separate OpenSpec Change -- this
-document exists to answer the design questions first, per the issue's own
-Non-Goals ("Implementation... should be tracked separately").
+Status: implemented, by
+[`implement-cryptographic-artifact-signatures`](../openspec/changes/implement-cryptographic-artifact-signatures/proposal.md).
+Tracks GitHub issue [#37](https://github.com/astorise/Magnetar/issues/37).
+This document remains the durable design reference -- the sections below
+describe the design as originally settled and are not rewritten here; the
+concrete realization is `magnetar-runtime/src/artifact_signature.rs`
+(`SignatureRecord`, `PublisherIdentity`, `key_id_for`, `verify_signature`),
+`ComponentTrustStore`/`ModelTrustStore`'s `trusted_publisher_keys` and
+`revoked_keys` fields, and each store's extended `evaluate` (see
+`SECURITY.md`'s "Implemented controls" section for the short version).
 
 ## Why this is still open
 

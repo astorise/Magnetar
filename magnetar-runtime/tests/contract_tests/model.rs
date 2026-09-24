@@ -209,6 +209,7 @@ fn model_shard_digest_mismatch_and_signature_metadata_are_explicit() {
         kind: "minisign".into(),
         key_id: Some("key-1".into()),
         digest: manifest.id.digest.clone(),
+        signature: None,
     };
     assert_eq!(signature.digest, manifest.id.digest);
 }

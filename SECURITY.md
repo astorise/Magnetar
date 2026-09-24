@@ -30,23 +30,39 @@ deadlines. Component resource limits, including memory limits, are part of the
 Runtime Component policy surface and are enforced when the Wasmtime engine is
 available.
 
-Component artifact trust is still policy-driven: digest pinning or an explicit
-local development policy may allow an artifact, while publisher/source metadata
-alone is not treated as cryptographic proof.
+Component artifact trust is policy-driven: digest pinning, a verified Ed25519
+signature from an operator-trusted publisher key, or an explicit local
+development policy may allow an artifact; publisher/source metadata alone is
+never treated as cryptographic proof.
+
+Component and Model Artifact signatures (`ComponentTrustStore`/
+`ModelTrustStore`'s `trusted_publisher_keys`/`revoked_keys`) are verified
+Ed25519 signatures (RFC 8032) over the artifact's existing SHA-256 content
+digest, composing with digest pinning as a second, independent trust path
+rather than replacing it -- every artifact trusted by digest pinning alone
+continues to be trusted identically whether or not it also carries a
+signature. A signature under an unrecognized key is treated the same as no
+signature (falls through to digest pinning); a signature under a *known*
+key that fails to verify is rejected outright, a stronger negative signal
+than absence; a revoked key's signature is rejected even when the key was
+previously trusted. The full design -- what gets signed, key
+identification, trust/revocation, and the fail-closed verification
+precedence -- is recorded in
+[`docs/cryptographic-artifact-signatures.md`](docs/cryptographic-artifact-signatures.md).
 
 ## Known gaps
 
 These are tracked publicly and do not need a private report:
 
-- Component and Model Artifact signatures carry no cryptographic material and
-  are not verified. Publisher/source metadata alone is treated as `Unknown`
-  and does not satisfy trust policy; acceptance still requires digest pinning
-  or explicit local development policy. The design for cryptographic artifact
-  signatures and authenticated publisher identity (what gets signed, Ed25519,
-  key identification and trust/revocation, and the resulting fail-closed
-  verification policy) is recorded in
-  [`docs/cryptographic-artifact-signatures.md`](docs/cryptographic-artifact-signatures.md);
-  implementation is separate, not-yet-scheduled follow-up work.
+- Trusted publisher keys and revocations are operator-configured local
+  policy only (the same distribution model digest pinning already has): no
+  key registry, discovery protocol, "well-known keys" list, or online
+  revocation checking (OCSP/CRL-style) exists. An operator wanting timely
+  revocation propagation is responsible for updating their local trust
+  store, the same way they already are for `revoked_digests` today.
+- Providers are trusted native code by architectural definition (see
+  Scope above) and are explicitly out of scope for signature verification;
+  a malicious Provider is outside this threat model regardless.
 - Non-Wasmtime or future Component engines must provide equivalent fuel,
   deadline/interruption, resource-limit, and no-ambient-authority guarantees
   before they can satisfy the same native security profile.

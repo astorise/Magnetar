@@ -5,6 +5,10 @@
 //! executable Component code, not a Provider, not Device metadata, and not a
 //! loaded Model Instance.
 
+use crate::artifact_signature::{
+    PublisherIdentity, SignatureRecord, SignatureVerification, VerifyingKeyBytes, key_id_for,
+    verify_signature,
+};
 use crate::{
     CapabilityBinding, CapabilityId, CapabilityVersion, ComponentArtifactReference, ComputeDType,
     DTypeDescriptor, MemoryAllocationClass, MemoryAllocationOwner, MemoryAllocationRequest,
@@ -483,8 +487,27 @@ pub struct ModelProvenance {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelSignature {
     pub kind: String,
+    /// The signing key's fingerprint (see [`key_id_for`]). `None`
+    /// alongside `signature: None` is the non-authoritative placeholder
+    /// shape.
     pub key_id: Option<String>,
     pub digest: ModelDigest,
+    /// The raw Ed25519 signature bytes, present only for a real,
+    /// verifiable signature.
+    pub signature: Option<[u8; 64]>,
+}
+
+impl ModelSignature {
+    /// Converts this entry into a [`SignatureRecord`] suitable for
+    /// [`verify_signature`], when it carries both a key id and signature
+    /// bytes.
+    fn as_signature_record(&self) -> Option<SignatureRecord> {
+        Some(SignatureRecord::new(
+            self.key_id.clone()?,
+            self.signature?,
+            self.digest.value.clone(),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -885,6 +908,12 @@ pub enum ModelTrustStatus {
 pub struct ModelTrustDecision {
     pub(crate) status: ModelTrustStatus,
     pub(crate) reason: String,
+    /// The publisher identity the trust store operator bound to the key
+    /// that produced a verifying signature on this artifact, present only
+    /// when `status` was reached through the signature verification path.
+    /// Never derived from the artifact's own self-declared provenance
+    /// metadata.
+    pub(crate) authenticated_publisher: Option<PublisherIdentity>,
 }
 
 impl ModelTrustDecision {
@@ -892,6 +921,19 @@ impl ModelTrustDecision {
         Self {
             status,
             reason: reason.into(),
+            authenticated_publisher: None,
+        }
+    }
+
+    pub(crate) fn with_authenticated_publisher(
+        status: ModelTrustStatus,
+        reason: impl Into<String>,
+        publisher: PublisherIdentity,
+    ) -> Self {
+        Self {
+            status,
+            reason: reason.into(),
+            authenticated_publisher: Some(publisher),
         }
     }
 
@@ -906,6 +948,13 @@ impl ModelTrustDecision {
     pub fn reason(&self) -> &str {
         &self.reason
     }
+
+    /// The authenticated publisher identity, when `status` was reached
+    /// through a verified signature. Read-only for the same reason
+    /// `status`/`reason` are.
+    pub fn authenticated_publisher(&self) -> Option<&PublisherIdentity> {
+        self.authenticated_publisher.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -915,6 +964,13 @@ pub struct ModelTrustStore {
     pub revoked_digests: BTreeSet<String>,
     pub trusted_sources: BTreeSet<String>,
     pub trusted_publishers: BTreeSet<String>,
+    /// Ed25519 keys the trust store operator trusts, keyed by
+    /// [`key_id_for`], each bound to the publisher identity that key
+    /// authenticates.
+    pub trusted_publisher_keys: BTreeMap<String, (VerifyingKeyBytes, PublisherIdentity)>,
+    /// Key ids whose signatures are rejected outright, checked before
+    /// cryptographic verification.
+    pub revoked_keys: BTreeSet<String>,
 }
 
 impl ModelTrustStore {
@@ -936,6 +992,21 @@ impl ModelTrustStore {
         self
     }
 
+    pub fn trust_publisher_key(
+        mut self,
+        public_key: VerifyingKeyBytes,
+        publisher: PublisherIdentity,
+    ) -> Self {
+        self.trusted_publisher_keys
+            .insert(key_id_for(&public_key), (public_key, publisher));
+        self
+    }
+
+    pub fn revoke_key(mut self, key_id: impl Into<String>) -> Self {
+        self.revoked_keys.insert(key_id.into().to_ascii_lowercase());
+        self
+    }
+
     pub fn evaluate(&self, manifest: &ModelManifest) -> ModelTrustDecision {
         let digest = &manifest.id.digest.value;
         if self.revoked_digests.contains(digest) {
@@ -946,6 +1017,55 @@ impl ModelTrustStore {
         }
         if self.trusted_digests.contains(digest) {
             return ModelTrustDecision::new(ModelTrustStatus::Trusted, "digest trusted by policy");
+        }
+        // See `ComponentTrustStore::evaluate`'s identical structure for the
+        // multi-signature rationale: any entry that verifies against a
+        // trusted key grants Trusted outright; a revoked or broken entry
+        // under a known key is remembered and only decides the outcome if
+        // no other entry verifies.
+        let mut signature_fallback: Option<ModelTrustDecision> = None;
+        for signature in &manifest.signatures {
+            let Some(record) = signature.as_signature_record() else {
+                continue;
+            };
+            if self.revoked_keys.contains(&record.key_id) {
+                signature_fallback.get_or_insert_with(|| {
+                    ModelTrustDecision::new(ModelTrustStatus::Revoked, "signature key revoked")
+                });
+                continue;
+            }
+            let Some((public_key, publisher)) = self.trusted_publisher_keys.get(&record.key_id)
+            else {
+                continue;
+            };
+            match verify_signature(&record, public_key, digest) {
+                SignatureVerification::Verified => {
+                    return ModelTrustDecision::with_authenticated_publisher(
+                        ModelTrustStatus::Trusted,
+                        "signature verified against trusted publisher key",
+                        publisher.clone(),
+                    );
+                }
+                SignatureVerification::DigestMismatch => {
+                    signature_fallback.get_or_insert_with(|| {
+                        ModelTrustDecision::new(
+                            ModelTrustStatus::Rejected,
+                            "signed digest does not match the artifact's actual digest",
+                        )
+                    });
+                }
+                SignatureVerification::Invalid => {
+                    signature_fallback.get_or_insert_with(|| {
+                        ModelTrustDecision::new(
+                            ModelTrustStatus::Rejected,
+                            "signature does not verify under a known trusted key",
+                        )
+                    });
+                }
+            }
+        }
+        if let Some(decision) = signature_fallback {
+            return decision;
         }
         if let Some(provenance) = &manifest.provenance
             && let Some(publisher) = &provenance.publisher
@@ -1356,6 +1476,8 @@ struct RawModelManifest {
     license: Option<RawLicense>,
     #[serde(default)]
     provenance: Option<ModelProvenance>,
+    #[serde(default)]
+    signatures: Vec<RawModelSignature>,
     /// astorise/Magnetar#75: optional in the YAML text format so existing
     /// fixture manifests don't all need editing -- defaults to
     /// [`ArtifactFormat::HuggingFace`] when absent. A production bundle
@@ -1370,6 +1492,40 @@ impl RawModelManifest {
     fn from_yaml_str(value: &str) -> Result<Self, ModelArtifactError> {
         serde_norway::from_str(value).map_err(|source| ModelArtifactError::InvalidManifest {
             message: source.to_string(),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct RawModelSignature {
+    kind: String,
+    #[serde(default)]
+    key_id: Option<String>,
+    digest: String,
+    /// Hex-encoded Ed25519 signature bytes (64 bytes -> 128 hex chars).
+    #[serde(default)]
+    signature: Option<String>,
+}
+
+impl TryFrom<RawModelSignature> for ModelSignature {
+    type Error = ModelArtifactError;
+
+    fn try_from(raw: RawModelSignature) -> Result<Self, Self::Error> {
+        let signature = raw
+            .signature
+            .as_deref()
+            .map(crate::artifact_signature::decode_hex::<64>)
+            .map(|decoded| {
+                decoded.ok_or_else(|| ModelArtifactError::InvalidManifest {
+                    message: "signature field is not valid hex".into(),
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            kind: raw.kind,
+            key_id: raw.key_id,
+            digest: ModelDigest::parse(raw.digest)?,
+            signature,
         })
     }
 }
@@ -1457,7 +1613,11 @@ impl TryFrom<RawModelManifest> for ModelManifest {
             component: None,
             license: raw.license.map(Into::into),
             provenance: raw.provenance,
-            signatures: Vec::new(),
+            signatures: raw
+                .signatures
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             source: None,
             architecture_config: None,
             artifact_format,
@@ -1782,3 +1942,6 @@ fn lower_hex(bytes: &[u8]) -> String {
     }
     output
 }
+
+#[cfg(test)]
+mod tests;

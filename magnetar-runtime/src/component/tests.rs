@@ -7,6 +7,7 @@ use super::*;
 use crate::conformance::validate_first_native_component_engine_capabilities;
 
 use crate::session::InferenceSessionId;
+use ed25519_dalek::Signer;
 use std::fs;
 fn component_artifact_package(
     bytes: &[u8],
@@ -2004,4 +2005,185 @@ fn component_artifact_validation_emits_structured_observations() {
             .any(|message| message.contains("trust decision"))
     );
     fs::remove_dir_all(directory).unwrap();
+}
+
+// MAG-02: Ed25519 Component Artifact signature verification
+// (docs/cryptographic-artifact-signatures.md). `ComponentTrustStore::evaluate`
+// is a pure function of `(manifest, digest)`, so these tests parse a manifest
+// directly via `from_yaml_bytes` and call `evaluate` directly, without the
+// filesystem/engine machinery `ComponentManager::prepare_component` needs.
+
+fn signature_test_keypair(seed: u8) -> (ed25519_dalek::SigningKey, VerifyingKeyBytes) {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let public_key = signing_key.verifying_key().to_bytes();
+    (signing_key, public_key)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn manifest_yaml_with_signature(
+    digest: &str,
+    signed_digest: &str,
+    key_id: &str,
+    signature_hex: &str,
+) -> String {
+    manifest_yaml(digest, MAGNETAR_RUNTIME_VERSION).replace(
+        "signatures: []",
+        &format!(
+            "signatures:\n  - kind: \"ed25519\"\n    key_id: \"{key_id}\"\n    digest: \"{signed_digest}\"\n    signature: \"{signature_hex}\"\n"
+        ),
+    )
+}
+
+fn parse_manifest(yaml: &str) -> ComponentManifest {
+    ComponentManifest::from_yaml_bytes(yaml.as_bytes(), Path::new("<test>"))
+        .expect("manifest parses")
+}
+
+#[test]
+fn component_signature_from_trusted_key_grants_trust_without_digest_pinning() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let (signing_key, public_key) = signature_test_keypair(1);
+    let key_id = key_id_for(&public_key);
+    let signature = signing_key.sign(digest.value.as_bytes()).to_bytes();
+    let manifest = parse_manifest(&manifest_yaml_with_signature(
+        &digest.value,
+        &digest.value,
+        &key_id,
+        &hex_encode(&signature),
+    ));
+
+    let trust_store = ComponentTrustStore::default()
+        .trust_publisher_key(public_key, PublisherIdentity::new("Acme Publishing"));
+    let decision = trust_store.evaluate(&manifest, &digest);
+
+    assert_eq!(decision.status, ComponentTrustStatus::Trusted);
+    assert_eq!(
+        decision.authenticated_publisher,
+        Some(PublisherIdentity::new("Acme Publishing"))
+    );
+}
+
+#[test]
+fn component_digest_pinning_continues_to_work_unchanged_without_a_signature() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let manifest = parse_manifest(&manifest_yaml(&digest.value, MAGNETAR_RUNTIME_VERSION));
+
+    let trust_store = ComponentTrustStore::default().trust_digest(digest.value.clone());
+    let decision = trust_store.evaluate(&manifest, &digest);
+
+    assert_eq!(decision.status, ComponentTrustStatus::Trusted);
+    assert_eq!(decision.reason, "digest trusted");
+    assert_eq!(decision.authenticated_publisher, None);
+}
+
+#[test]
+fn component_signature_from_an_untrusted_key_falls_through_to_unknown() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let (signing_key, public_key) = signature_test_keypair(2);
+    let key_id = key_id_for(&public_key);
+    let signature = signing_key.sign(digest.value.as_bytes()).to_bytes();
+    let manifest = parse_manifest(&manifest_yaml_with_signature(
+        &digest.value,
+        &digest.value,
+        &key_id,
+        &hex_encode(&signature),
+    ));
+
+    // The trust store trusts no digest and no publisher key at all -- the
+    // signature's key id resolves to nothing in `trusted_publisher_keys`.
+    let trust_store = ComponentTrustStore::default();
+    let decision = trust_store.evaluate(&manifest, &digest);
+
+    assert_eq!(decision.status, ComponentTrustStatus::Unknown);
+}
+
+#[test]
+fn component_signature_with_wrong_bytes_under_a_known_key_is_rejected() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let (signing_key, public_key) = signature_test_keypair(3);
+    let key_id = key_id_for(&public_key);
+    let mut signature = signing_key.sign(digest.value.as_bytes()).to_bytes();
+    signature[0] ^= 0xFF;
+    let manifest = parse_manifest(&manifest_yaml_with_signature(
+        &digest.value,
+        &digest.value,
+        &key_id,
+        &hex_encode(&signature),
+    ));
+
+    let trust_store = ComponentTrustStore::default()
+        .trust_publisher_key(public_key, PublisherIdentity::new("Acme Publishing"));
+    let decision = trust_store.evaluate(&manifest, &digest);
+
+    assert_eq!(decision.status, ComponentTrustStatus::Rejected);
+}
+
+#[test]
+fn component_signature_with_mismatched_signed_digest_under_a_known_key_is_rejected() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let (signing_key, public_key) = signature_test_keypair(4);
+    let key_id = key_id_for(&public_key);
+    let signature = signing_key.sign(digest.value.as_bytes()).to_bytes();
+    // `signatures[].digest` claims a different digest than the artifact's
+    // own actual computed digest -- rejected even though the signature
+    // bytes would verify against the claimed (wrong) digest.
+    let manifest = parse_manifest(&manifest_yaml_with_signature(
+        &digest.value,
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        &key_id,
+        &hex_encode(&signature),
+    ));
+
+    let trust_store = ComponentTrustStore::default()
+        .trust_publisher_key(public_key, PublisherIdentity::new("Acme Publishing"));
+    let decision = trust_store.evaluate(&manifest, &digest);
+
+    assert_eq!(decision.status, ComponentTrustStatus::Rejected);
+}
+
+#[test]
+fn component_revoked_signature_key_is_revoked_even_though_otherwise_valid() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let (signing_key, public_key) = signature_test_keypair(5);
+    let key_id = key_id_for(&public_key);
+    let signature = signing_key.sign(digest.value.as_bytes()).to_bytes();
+    let manifest = parse_manifest(&manifest_yaml_with_signature(
+        &digest.value,
+        &digest.value,
+        &key_id,
+        &hex_encode(&signature),
+    ));
+
+    let trust_store = ComponentTrustStore::default()
+        .trust_publisher_key(public_key, PublisherIdentity::new("Acme Publishing"))
+        .revoke_key(key_id);
+    let decision = trust_store.evaluate(&manifest, &digest);
+
+    assert_eq!(decision.status, ComponentTrustStatus::Revoked);
+}
+
+#[test]
+fn component_revoking_a_key_does_not_distrust_a_digest_pinned_artifact() {
+    let digest = ComponentDigest::sha256(b"component-bytes");
+    let (signing_key, public_key) = signature_test_keypair(6);
+    let key_id = key_id_for(&public_key);
+    let signature = signing_key.sign(digest.value.as_bytes()).to_bytes();
+    let manifest = parse_manifest(&manifest_yaml_with_signature(
+        &digest.value,
+        &digest.value,
+        &key_id,
+        &hex_encode(&signature),
+    ));
+
+    let trust_store = ComponentTrustStore::default()
+        .trust_digest(digest.value.clone())
+        .trust_publisher_key(public_key, PublisherIdentity::new("Acme Publishing"))
+        .revoke_key(key_id);
+    let decision = trust_store.evaluate(&manifest, &digest);
+
+    assert_eq!(decision.status, ComponentTrustStatus::Trusted);
+    assert_eq!(decision.reason, "digest trusted");
 }

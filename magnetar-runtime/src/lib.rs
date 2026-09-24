@@ -6,6 +6,7 @@
 
 pub mod adapter;
 pub mod affinity;
+pub mod artifact_signature;
 pub mod batching;
 pub mod capability;
 pub mod cli_boundary;
