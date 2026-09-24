@@ -216,3 +216,18 @@ artifact/compatibility/changelog manifests validate, the public API surface
 denies raw handle exposure, all required release gates must pass before
 stable publication, release candidate tags are never stable, and roadmap
 features are never presented as included baseline.
+
+## Publication Automation
+
+This document's own "Non-Goals" section originally deferred implementing
+release automation, a package registry, or supply-chain signing to a
+separate change. `openspec/changes/implement-release-publication-automation/`
+(MAG-06) is that change: it composes `release_may_publish_stable` and the
+other types documented above into a real, tag-triggered publication
+pipeline (`tools/release-publish`,
+`.github/workflows/release-publication.yml`,
+`.github/workflows/component-artifact-distribution.yml`). See
+[`docs/release-publication.md`](release-publication.md) for the pipeline
+shape, the credential seam, and the withdrawal procedure. Cryptographic
+signing remains its own follow-on chantier (MAG-02), not part of that
+change either.

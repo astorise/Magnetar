@@ -1,0 +1,120 @@
+name: Component Artifact Distribution
+
+# MAG-06 (openspec/changes/implement-release-publication-automation):
+# publishes a single Component Artifact or Kernel Exchange Bundle to
+# GHCR by OCI digest. Deliberately `workflow_dispatch`-only and
+# independent of release-publication.yml's tag-triggered cadence, per
+# design.md Decision 4 -- Component/Kernel artifacts may need to ship
+# more often than a full `magnetar-runtime` release cuts, and Runtime
+# crate publication must never gate on whether one happens to be ready.
+#
+# A single job, deliberately: every step through "Build OCI manifest and
+# local layout" and its artifact upload needs no credential and always
+# runs, so the exact digest this workflow would push is inspectable
+# (download the `oci-layout` workflow artifact) even on a run where the
+# credential check below fails it closed. Everything from "Check GHCR push
+# token is configured" onward is the one credentialed, real-network path,
+# gated per "Credential-Gated OCI Push Fails Closed": it asserts
+# `GHCR_PUSH_TOKEN` is present and non-empty and fails with an explicit
+# message before any network call if it is not.
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Artifact kind
+        required: true
+        type: choice
+        options: [component, kernel-bundle, conformance]
+      artifact_path:
+        description: Path (within the checkout) to the artifact bytes to publish
+        required: true
+        type: string
+      title:
+        description: Human-readable title recorded in the manifest's org.opencontainers.image.title annotation
+        required: true
+        type: string
+      tag:
+        description: Convenience tag to publish alongside the digest (never trust identity -- see component-artifact-distribution spec)
+        required: true
+        default: latest
+        type: string
+
+concurrency:
+  group: component-artifact-distribution-${{ github.event.inputs.artifact_path }}-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  GHCR_REPOSITORY: ghcr.io/${{ github.repository_owner }}/magnetar-${{ github.event.inputs.kind }}
+
+jobs:
+  publish:
+    name: component-artifact-distribution / publish
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build OCI manifest and local layout (no network)
+        run: |
+          set -euo pipefail
+          cargo run --locked --manifest-path tools/release-publish/Cargo.toml -- \
+            oci-manifest \
+            --kind "${{ github.event.inputs.kind }}" \
+            --input "${{ github.event.inputs.artifact_path }}" \
+            --title "${{ github.event.inputs.title }}" \
+            --tag "${{ github.event.inputs.tag }}" \
+            --out-dir oci-layout
+      - name: Upload OCI layout as a workflow artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: oci-layout
+          path: oci-layout
+      # "Credential-Gated OCI Push Fails Closed": asserts the secret is
+      # present and non-empty and fails with an explicit message before
+      # any network call if it is not.
+      - name: Check GHCR push token is configured
+        run: |
+          if [ -z "${{ secrets.GHCR_PUSH_TOKEN }}" ]; then
+            echo "::error::GHCR_PUSH_TOKEN is not configured as a repository secret. Configure it under Settings > Secrets and variables > Actions before running this workflow to push for real. The OCI manifest and local layout above were still built and uploaded as this run's 'oci-layout' artifact for inspection." >&2
+            exit 1
+          fi
+      # oras is installed directly from its published GitHub Releases
+      # binary, not a third-party GitHub Action pin -- this session could
+      # not independently verify one against this repo's GitHub access
+      # scope (see PR description). Review/update ORAS_VERSION when
+      # configuring this workflow for real use.
+      - name: Install oras
+        env:
+          ORAS_VERSION: "1.2.0"
+        run: |
+          set -euo pipefail
+          curl -fsSL -o oras.tar.gz \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          mkdir -p oras-install
+          tar -zxf oras.tar.gz -C oras-install
+          sudo mv oras-install/oras /usr/local/bin/oras
+          oras version
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GHCR_PUSH_TOKEN }}" | \
+            docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      # NOTE: verify this exact `oras cp --from-oci-layout` invocation
+      # against the installed oras version before the first real run --
+      # this session has no GHCR credentials and could not execute it.
+      - name: Push to GHCR by digest, tag as a convenience pointer only
+        id: push
+        run: |
+          set -euo pipefail
+          target="${GHCR_REPOSITORY}:${{ github.event.inputs.tag }}"
+          oras cp --from-oci-layout "oci-layout:${{ github.event.inputs.tag }}" "$target"
+          digest="$(oras resolve "$target")"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${GHCR_REPOSITORY} at digest $digest (tag '${{ github.event.inputs.tag }}' is a convenience pointer only, per component-artifact-distribution's 'OCI Digest Is The Only Trust Identity' requirement -- pin the digest, not the tag, in any consumer)."

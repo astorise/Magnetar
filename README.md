@@ -793,6 +793,36 @@ choice: each is a real repository-governance or multi-week release-
 engineering initiative, not a same-session code fix, and needs its own
 scoping before work starts.
 
+**MAG-06 follow-up (`openspec/changes/implement-release-publication-automation/`)**:
+proposed and then implemented in full, in two stages. First, the
+credential-free tooling -- a new `tools/release-publish` crate computing
+real `ArtifactChecksum`s, `SbomManifest`s from `cargo metadata`,
+`ReleaseProvenance` from this checkout's own git/rustc/content state, and
+local OCI Image Manifest/Layout construction for Component Artifacts and
+Kernel Exchange Bundles, all network- and credential-free. Second,
+`.github/workflows/release-publication.yml` and
+`.github/workflows/component-artifact-distribution.yml`, wiring that
+tooling into a real pipeline: a `dry-run-publish` job that stays green
+with zero secrets configured; `gate-evaluation`, which reads the tagged
+commit's own real check-run conclusions from the GitHub Checks API and
+evaluates `release_may_publish_stable`/`evaluate_release_security_blocking`
+for real; `github-release`, creating a real GitHub Release with checksums/
+SBOM/provenance; and two credential-gated real-publish paths (`cargo
+publish`, GHCR push via `oras`) that assert their secret is configured
+and fail closed with an explicit error otherwise, never running except on
+an explicit manual `workflow_dispatch`. `gate-evaluation` today correctly
+fails with `ReleaseGateMissing` for `CliBoundaryTests` -- no CI job runs
+`magnetar-cli`'s own tests yet, since it is deliberately outside the root
+workspace -- which is the required fail-closed behavior making a real,
+previously-invisible release-readiness gap visible, not a defect (see
+`docs/release-publication.md`). Remaining before a human can cut a real
+release: configure `CARGO_REGISTRY_TOKEN` and `GHCR_PUSH_TOKEN` as secrets
+on a `release` GitHub Environment, add a CI job for `magnetar-cli`'s own
+tests so `CliBoundaryTests` can pass, and trigger each workflow manually
+once to confirm it end to end. MAG-02 (cryptographic signatures) remains
+explicitly out of scope, deferred as its own follow-on chantier; digest
+pinning is this pipeline's trust mechanism until it lands.
+
 ## Terminology
 
 `Backend`, `Plugin`, and `Host` are not primary Magnetar architectural concepts.

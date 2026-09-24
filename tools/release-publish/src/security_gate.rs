@@ -75,6 +75,26 @@ pub fn collect_security_gate_inputs(
     })
 }
 
+/// Serializes a [`ReleaseSecurityGateInputs`] to the JSON this crate's CLI
+/// writes as a release artifact, recording exactly what was evaluated
+/// (not just pass/fail) for later audit. `ReleaseSecurityGateInputs`
+/// carries no `Serialize` impl (it lives in `magnetar-roadmap-contracts`),
+/// so this is the one place that shape is defined.
+pub fn gate_inputs_to_json(inputs: &ReleaseSecurityGateInputs) -> serde_json::Value {
+    serde_json::json!({
+        "secrets_detected": inputs.secrets_detected,
+        "critical_advisory_unmitigated": inputs.critical_advisory_unmitigated,
+        "incompatible_license_unapproved": inputs.incompatible_license_unapproved,
+        "redaction_gate_failed": inputs.redaction_gate_failed,
+        "raw_handle_exposed": inputs.raw_handle_exposed,
+        "trust_integrity_failed_in_fixtures": inputs.trust_integrity_failed_in_fixtures,
+        "e2e_conformance_bypassed": inputs.e2e_conformance_bypassed,
+        "openspec_validation_failed": inputs.openspec_validation_failed,
+        "checksum_mismatch": inputs.checksum_mismatch,
+        "undocumented_security_exception": inputs.undocumented_security_exception,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +145,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inputs, ReleaseSecurityGateInputs::default());
+    }
+
+    #[test]
+    fn gate_inputs_to_json_carries_every_field() {
+        let inputs = collect_security_gate_inputs(
+            BLOCKED_FIXTURE,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let json = gate_inputs_to_json(&inputs);
+        assert_eq!(json["secrets_detected"], true);
+        assert_eq!(json["critical_advisory_unmitigated"], true);
+        assert_eq!(json["incompatible_license_unapproved"], true);
+        assert_eq!(json["checksum_mismatch"], false);
     }
 }

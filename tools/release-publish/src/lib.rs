@@ -11,6 +11,7 @@
 pub mod checksum;
 pub mod oci;
 pub mod provenance;
+pub mod release_gate;
 pub mod sbom;
 pub mod security_gate;
 
