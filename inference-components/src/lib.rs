@@ -38,18 +38,29 @@ impl InferenceComponentPlacement {
     }
 }
 
+/// astorise/Magnetar audit round 5 (MAG-04): internal diagnostic-only
+/// mirror of the resolved Provider/Device identity a loaded Component runs
+/// under -- kept for this crate's own `Debug` output, never exported. An
+/// embedder (Tachyon included) is expected to classify placement only via
+/// the generic [`InferenceComponentPlacement`] it requested at load time,
+/// never by reflecting Magnetar's own Provider/Device identity back out;
+/// Tachyon's own boundary guard
+/// (`scripts/validate_ai_component_boundary.sh`) explicitly forbids its
+/// `core-host` from referencing this shape at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProviderDeviceClass {
+enum ProviderDeviceClass {
     ReferenceCpu,
     Cuda,
 }
 
+/// See [`ProviderDeviceClass`]'s own doc comment: internal-only, for
+/// `Debug` formatting.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ComponentProviderAdvertisement {
-    pub provider_name: String,
-    pub provider_version: String,
-    pub device_ids: Vec<String>,
-    pub device_class: ProviderDeviceClass,
+struct ComponentProviderAdvertisement {
+    provider_name: String,
+    provider_version: String,
+    device_ids: Vec<String>,
+    device_class: ProviderDeviceClass,
 }
 
 #[derive(Debug)]
@@ -473,10 +484,6 @@ impl LoadedInferenceComponent {
             provider,
             loaded_model: Mutex::new(loaded_model),
         })
-    }
-
-    pub fn provider(&self) -> &ComponentProviderAdvertisement {
-        &self.provider
     }
 
     pub fn resident_debug(&self) -> Result<(String, usize)> {

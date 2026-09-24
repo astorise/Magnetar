@@ -770,6 +770,29 @@ on Tachyon's own side (Provider-detail exposure and internal
 `generate`/`prompt` vocabulary in its own surface) -- outside this
 repository's scope.
 
+**Magnetar security/governance/production audit**
+(`docs/audits/audit-magnetar-2026-09-24-revision-publication.md`, GO on
+architecture and code quality, conditional GO on production/governance --
+a broader-scope audit with its own MAG-01 through MAG-06 IDs, distinct
+from the earlier architecture-focused rounds' identically-numbered
+findings above): found no new architectural P0/P1, and flagged this
+round's MAG-04 -- `inference-components` still publicly exported
+`ComponentProviderAdvertisement`/`ProviderDeviceClass`/
+`LoadedInferenceComponent::provider()`, a Provider/Device identity mirror
+Tachyon deliberately stopped consuming (its own
+`validate_ai_component_boundary.sh` guard forbids reintroducing it) and no
+other caller in this repository or Tachyon-Mesh ever referenced. Closed by
+making both types and the accessor crate-private -- the field itself stays
+for this crate's own `Debug` output, nothing behavioral changed. This
+round's MAG-01 (protect `main`), MAG-02 (implement the designed-but-
+unimplemented Ed25519 Component/Model Artifact signatures), and MAG-06
+(the newly decided official publication chain -- `magnetar-runtime` on
+crates.io, release artifacts/SBOM/provenance via GitHub Releases,
+Components/Kernel Exchange Bundles via OCI/GHCR) remain open by explicit
+choice: each is a real repository-governance or multi-week release-
+engineering initiative, not a same-session code fix, and needs its own
+scoping before work starts.
+
 ## Terminology
 
 `Backend`, `Plugin`, and `Host` are not primary Magnetar architectural concepts.
