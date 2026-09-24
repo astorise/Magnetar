@@ -91,6 +91,58 @@ pub fn verify_bundle_against_dir(
     Ok(())
 }
 
+/// Serializes a checksum bundle to the JSON array this crate's CLI writes
+/// as a release artifact (`[{"artifact": ..., "algorithm": "sha256",
+/// "digest": ...}, ...]`). `ArtifactChecksum` itself carries no `Serialize`
+/// impl (it lives in `magnetar-roadmap-contracts`, which this crate only
+/// consumes), so this is the one place that shape is defined.
+pub fn bundle_to_json(bundle: &[ArtifactChecksum]) -> serde_json::Value {
+    serde_json::Value::Array(
+        bundle
+            .iter()
+            .map(|checksum| {
+                serde_json::json!({
+                    "artifact": checksum.artifact,
+                    "algorithm": "sha256",
+                    "digest": checksum.digest,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Parses a checksum bundle back from [`bundle_to_json`]'s own shape.
+pub fn bundle_from_json(json: &str) -> Result<Vec<ArtifactChecksum>, ReleasePublishError> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let entries = value.as_array().ok_or_else(|| {
+        ReleasePublishError::Metadata("checksum bundle JSON must be an array".into())
+    })?;
+    entries
+        .iter()
+        .map(|entry| {
+            let artifact = entry["artifact"].as_str().ok_or_else(|| {
+                ReleasePublishError::Metadata("checksum entry missing 'artifact'".into())
+            })?;
+            let algorithm = entry["algorithm"].as_str().ok_or_else(|| {
+                ReleasePublishError::Metadata("checksum entry missing 'algorithm'".into())
+            })?;
+            if algorithm != "sha256" {
+                return Err(ReleasePublishError::Metadata(format!(
+                    "unsupported checksum algorithm '{algorithm}' for artifact '{artifact}'"
+                )));
+            }
+            let digest = entry["digest"].as_str().ok_or_else(|| {
+                ReleasePublishError::Metadata("checksum entry missing 'digest'".into())
+            })?;
+            Ok(ArtifactChecksum::new(
+                artifact,
+                ChecksumAlgorithm::Sha256,
+                digest,
+            )?)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +178,25 @@ mod tests {
                 magnetar_roadmap_contracts::ReleaseSecurityError::ChecksumMismatch { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn bundle_round_trips_through_json() {
+        let dir = TempDir::new("checksum-json-roundtrip");
+        fs::write(dir.join("a.txt"), b"hello").unwrap();
+        let bundle = checksum_bundle_for_dir(&dir).unwrap();
+
+        let json = bundle_to_json(&bundle).to_string();
+        let parsed = bundle_from_json(&json).unwrap();
+
+        assert_eq!(parsed, bundle);
+    }
+
+    #[test]
+    fn bundle_from_json_rejects_unsupported_algorithm() {
+        let json = r#"[{"artifact":"a","algorithm":"md5","digest":"deadbeef"}]"#;
+        let result = bundle_from_json(json);
+        assert!(matches!(result, Err(ReleasePublishError::Metadata(_))));
     }
 
     #[test]

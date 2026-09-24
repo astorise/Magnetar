@@ -305,3 +305,17 @@ dependency feature are rejected; an incomplete vulnerability handling policy
 and incomplete security notes are rejected; every release blocking
 criterion is evaluated; an undocumented security exception is rejected; and
 a release security observation is always redacted.
+
+## Publication Automation
+
+This document's own "Non-Goals" section originally deferred implementing
+full cryptographic signing, SLSA compliance, and remote registry
+authentication to a separate change.
+`openspec/changes/implement-release-publication-automation/` (MAG-06)
+fills part of that gap -- real digest-based artifact identity and a real
+`evaluate_release_security_blocking` evaluation wired into CI, via
+`tools/release-publish` and
+`.github/workflows/release-publication.yml` -- while explicitly leaving
+cryptographic signing itself (MAG-02) as its own follow-on chantier;
+digest pinning remains the interim trust mechanism in the meantime. See
+[`docs/release-publication.md`](release-publication.md) for details.

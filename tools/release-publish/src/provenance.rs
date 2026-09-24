@@ -117,6 +117,25 @@ pub fn collect_local_provenance(
     })
 }
 
+/// Serializes a [`ReleaseProvenance`] to the JSON this crate's CLI writes
+/// as a release artifact. `ReleaseProvenance` carries no `Serialize` impl
+/// (it lives in `magnetar-roadmap-contracts`), so this is the one place
+/// that shape is defined.
+pub fn provenance_to_json(provenance: &ReleaseProvenance) -> serde_json::Value {
+    serde_json::json!({
+        "source_commit": provenance.source_commit,
+        "release_tag": provenance.release_tag,
+        "ci_run_id": provenance.ci_run_id,
+        "build_target": provenance.build_target,
+        "build_profile": provenance.build_profile,
+        "rustc_version": provenance.rustc_version,
+        "lockfile_digest": provenance.lockfile_digest,
+        "openspec_baseline_digest": provenance.openspec_baseline_digest,
+        "wit_package_digest": provenance.wit_package_digest,
+        "conformance_report_digest": provenance.conformance_report_digest,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +200,24 @@ mod tests {
         assert!(provenance.rustc_version.is_some());
         assert!(provenance.lockfile_digest.is_some());
         assert_eq!(provenance.openspec_baseline_digest, None);
+    }
+
+    #[test]
+    fn provenance_to_json_carries_every_field() {
+        let provenance = collect_local_provenance(
+            &repo_root(),
+            None,
+            None,
+            Some("v0.1.0".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let json = provenance_to_json(&provenance);
+        assert_eq!(json["release_tag"], "v0.1.0");
+        assert!(json["source_commit"].is_string());
+        assert!(json["ci_run_id"].is_null());
     }
 }

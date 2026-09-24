@@ -71,6 +71,35 @@ pub fn generate_sbom_manifest(
     })
 }
 
+fn availability_to_str(availability: SbomAvailability) -> &'static str {
+    match availability {
+        SbomAvailability::Generated => "generated",
+        SbomAvailability::PlaceholderDocumented => "placeholder-documented",
+        SbomAvailability::Missing => "missing",
+    }
+}
+
+/// Serializes a [`SbomManifest`] to the JSON this crate's CLI writes as a
+/// release artifact. `SbomManifest` carries no `Serialize` impl (it lives
+/// in `magnetar-roadmap-contracts`), so this is the one place that shape
+/// is defined.
+pub fn manifest_to_json(manifest: &SbomManifest) -> serde_json::Value {
+    serde_json::json!({
+        "availability": availability_to_str(manifest.availability),
+        "limitation_note": manifest.limitation_note,
+        "build_target": manifest.build_target,
+        "feature_flags": manifest.feature_flags,
+        "entries": manifest.entries.iter().map(|entry| {
+            serde_json::json!({
+                "package_name": entry.package_name,
+                "package_version": entry.package_version,
+                "licenses": entry.licenses,
+                "source_repository": entry.source_repository,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +158,20 @@ mod tests {
         .unwrap();
         assert_eq!(manifest.availability, SbomAvailability::Generated);
         manifest.validate().expect("generated SBOM must validate");
+    }
+
+    #[test]
+    fn manifest_to_json_carries_availability_and_entries() {
+        let manifest = generate_sbom_manifest(
+            FIXTURE,
+            Some("x86_64-unknown-linux-gnu".to_string()),
+            vec![],
+        )
+        .unwrap();
+        let json = manifest_to_json(&manifest);
+        assert_eq!(json["availability"], "generated");
+        assert_eq!(json["entries"].as_array().unwrap().len(), 3);
+        assert_eq!(json["build_target"], "x86_64-unknown-linux-gnu");
     }
 
     #[test]

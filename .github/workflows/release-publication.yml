@@ -1,0 +1,235 @@
+name: Release Publication
+
+# MAG-06 (openspec/changes/implement-release-publication-automation):
+# publishes `magnetar-runtime` to crates.io and creates a GitHub Release
+# carrying checksums/SBOM/provenance, gated on
+# release_packaging::release_may_publish_stable and
+# release_security::evaluate_release_security_blocking both passing
+# against the tagged commit's own real CI results.
+#
+# `dry-run-publish` runs unconditionally, without any credential, on every
+# trigger below -- it is the one job this workflow SHOULD keep green with
+# no secrets configured. `real-publish` (the actual `cargo publish`) only
+# runs on a manual `workflow_dispatch`, per
+# "First Real Publication Is Manually Triggered", and fails closed with an
+# explicit message if `CARGO_REGISTRY_TOKEN` is not configured, per
+# "Credential-Gated Publish Steps Fail Closed".
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-publication-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dry-run-publish:
+    name: release-publication / dry-run publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: cargo publish --dry-run (no credential required)
+        run: cargo publish --locked --dry-run -p magnetar-runtime
+
+  gate-evaluation:
+    name: release-publication / gate evaluation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@6a0cb247e1ded000e6ae26346b5ab63b08c98e6a # cargo-deny
+      # release_packaging::release_may_publish_stable requires every gate
+      # in REQUIRED_RELEASE_GATES to be present and passed. We read the
+      # ones this repository's quality.yml already runs as named
+      # check-runs on the exact commit being released (never re-run them
+      # here -- "the tagged commit's actual CI run", not a fresh one),
+      # via the GitHub Checks API.
+      #
+      # Mapping (documented, not guessed at run time -- see
+      # docs/release-publication.md for the rationale behind each line):
+      #   Formatting                    <- "quality / rustfmt"
+      #   CargoCheck                    <- "quality / check (ubuntu-latest)"
+      #   Clippy                        <- "quality / clippy"
+      #   UnitTests                     <- "quality / test (ubuntu-latest)"
+      #   ContractTests                 <- "quality / test (ubuntu-latest)"
+      #   OpenSpecValidation            <- "quality / openspec"
+      #   WitValidation                 <- "quality / wit"
+      #   ReferenceCpuConformance       <- "quality / provider conformance"
+      #   OperatorFirstScopeConformance <- "quality / test (ubuntu-latest)"
+      #   RuntimeInferenceApiTests      <- "quality / test (ubuntu-latest)"
+      #   E2eLocalConformance           <- "quality / e2e conformance"
+      #   CoverageGate                  <- "quality / coverage"
+      #   RedactionChecks               <- "quality / test (ubuntu-latest)"
+      #   NoRawHandleExposureChecks     <- "quality / test (ubuntu-latest)"
+      #   CliBoundaryTests              <- (no CI job exists yet; left
+      #                                     unmapped on purpose, see below)
+      #
+      # `CliBoundaryTests` has no named check-run today: `magnetar-cli` is
+      # deliberately excluded from the root `[workspace]` (its own
+      # `Cargo.toml` comment explains why) and quality.yml has no job that
+      # runs its test suite. Until one exists, this gate is correctly
+      # reported as missing and blocks `release-gate` -- that is the
+      # required fail-closed behavior, not a bug in this workflow. Adding
+      # that CI job is separate follow-up work.
+      - name: Fetch check-run conclusions for this commit
+        id: check-runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/check-runs?per_page=100" \
+            --paginate --jq '.check_runs[] | {name, conclusion}' \
+            | jq -s '.' > check-runs.json
+          cat check-runs.json
+      - name: Build release-gate results from check-run conclusions
+        run: |
+          set -euo pipefail
+          jq -n --slurpfile runs check-runs.json '
+            def find_run(name): ($runs[0] // []) | map(select(.name == name)) | first;
+            def passed(name): (find_run(name).conclusion // "") == "success";
+            [
+              {gate: "Formatting", passed: passed("quality / rustfmt")},
+              {gate: "CargoCheck", passed: passed("quality / check (ubuntu-latest)")},
+              {gate: "Clippy", passed: passed("quality / clippy")},
+              {gate: "UnitTests", passed: passed("quality / test (ubuntu-latest)")},
+              {gate: "ContractTests", passed: passed("quality / test (ubuntu-latest)")},
+              {gate: "OpenSpecValidation", passed: passed("quality / openspec")},
+              {gate: "WitValidation", passed: passed("quality / wit")},
+              {gate: "ReferenceCpuConformance", passed: passed("quality / provider conformance")},
+              {gate: "OperatorFirstScopeConformance", passed: passed("quality / test (ubuntu-latest)")},
+              {gate: "RuntimeInferenceApiTests", passed: passed("quality / test (ubuntu-latest)")},
+              {gate: "E2eLocalConformance", passed: passed("quality / e2e conformance")},
+              {gate: "CoverageGate", passed: passed("quality / coverage")},
+              {gate: "RedactionChecks", passed: passed("quality / test (ubuntu-latest)")},
+              {gate: "NoRawHandleExposureChecks", passed: passed("quality / test (ubuntu-latest)")}
+            ]' > release-gate-results.json
+          cat release-gate-results.json
+      - name: Evaluate release_may_publish_stable
+        run: |
+          cargo run --locked --manifest-path tools/release-publish/Cargo.toml -- \
+            release-gate --results release-gate-results.json
+      # cargo-deny's `-f json` output goes to stderr, not stdout -- `|| true`
+      # keeps this step from failing on cargo-deny's own exit code so the
+      # release-publish security-gate step below gets to make the real
+      # pass/fail decision from the parsed inputs.
+      - name: Run cargo-deny (JSON, for security-gate parsing)
+        run: cargo deny --all-features -f json check 2> cargo-deny.jsonl || true
+      - name: Evaluate evaluate_release_security_blocking
+        run: |
+          cargo run --locked --manifest-path tools/release-publish/Cargo.toml -- \
+            security-gate --cargo-deny-json cargo-deny.jsonl --out security-gate-inputs.json
+      - name: Upload gate evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-gate-evidence
+          path: |
+            check-runs.json
+            release-gate-results.json
+            security-gate-inputs.json
+
+  github-release:
+    name: release-publication / GitHub Release
+    runs-on: ubuntu-latest
+    needs: [dry-run-publish, gate-evaluation]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Real multi-platform `magnetar` CLI binaries are a follow-up
+      # enhancement to this job (building them needs magnetar-cli's own
+      # submodule-pinned dependencies and a real build matrix, which is
+      # out of this change's credential-free-scaffolding scope). This job
+      # publishes what is honestly available today: a reproducible source
+      # archive plus real release proofs generated from it.
+      - name: Build release bundle directory
+        run: |
+          set -euo pipefail
+          mkdir -p release-bundle
+          git archive --format=tar.gz --prefix="magnetar-${{ github.ref_name }}/" \
+            -o "release-bundle/magnetar-${{ github.ref_name }}-source.tar.gz" HEAD
+      - name: Generate checksums
+        run: |
+          cargo run --locked --manifest-path tools/release-publish/Cargo.toml -- \
+            checksum-bundle release-bundle --out checksums.json
+      - name: Verify checksums against the bundle we are about to publish
+        run: |
+          cargo run --locked --manifest-path tools/release-publish/Cargo.toml -- \
+            verify-checksums checksums.json release-bundle
+      - name: Generate SBOM
+        run: |
+          cargo metadata --locked --format-version=1 --no-deps \
+            --manifest-path roadmap-contracts/Cargo.toml > cargo-metadata.json
+          cargo run --locked --manifest-path tools/release-publish/Cargo.toml -- \
+            sbom --cargo-metadata cargo-metadata.json --out sbom.json \
+            --build-target x86_64-unknown-linux-gnu
+      - name: Generate provenance
+        run: |
+          cargo run --locked --manifest-path tools/release-publish/Cargo.toml -- \
+            provenance --repo . --out provenance.json \
+            --release-tag "${{ github.ref_name }}" \
+            --ci-run-id "${{ github.run_id }}" \
+            --openspec-dir openspec/specs \
+            --wit-dir magnetar-runtime/wit
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            release-bundle/*.tar.gz checksums.json sbom.json provenance.json
+
+  real-publish:
+    name: release-publication / cargo publish (real)
+    runs-on: ubuntu-latest
+    needs: [dry-run-publish, gate-evaluation]
+    # "First Real Publication Is Manually Triggered": never runs
+    # automatically off a tag push, only an explicit workflow_dispatch,
+    # until a human has confirmed the pipeline end to end.
+    if: github.event_name == 'workflow_dispatch'
+    environment: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # "Credential-Gated Publish Steps Fail Closed": asserts the secret is
+      # present and non-empty and fails with an explicit message before
+      # any network call if it is not, rather than skipping silently.
+      - name: Check crates.io token is configured
+        run: |
+          if [ -z "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not configured as a repository secret. Configure it under Settings > Secrets and variables > Actions before running this workflow manually to publish for real." >&2
+            exit 1
+          fi
+      - name: cargo publish (real)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked -p magnetar-runtime
