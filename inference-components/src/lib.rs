@@ -50,6 +50,11 @@ impl InferenceComponentPlacement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProviderDeviceClass {
     ReferenceCpu,
+    // Only constructed by `capability_advertisement`'s `#[cfg(feature =
+    // "cuda")]` branch; a `cuda`-less build (this crate's `cuda` feature is
+    // default-off) never builds one, so `-D dead_code` flags it now that
+    // MAG-04 made this enum crate-private and no longer publicly reachable.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     Cuda,
 }
 
