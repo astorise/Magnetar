@@ -315,7 +315,16 @@ authentication to a separate change.
 fills part of that gap -- real digest-based artifact identity and a real
 `evaluate_release_security_blocking` evaluation wired into CI, via
 `tools/release-publish` and
-`.github/workflows/release-publication.yml` -- while explicitly leaving
-cryptographic signing itself (MAG-02) as its own follow-on chantier;
-digest pinning remains the interim trust mechanism in the meantime. See
+`.github/workflows/release-publication.yml`. See
 [`docs/release-publication.md`](release-publication.md) for details.
+
+`openspec/changes/implement-cryptographic-artifact-signatures/` (MAG-02)
+fills the cryptographic-signing part of that same gap for Component and
+Model Artifacts: Ed25519 signature verification is now available in
+`ComponentTrustStore`/`ModelTrustStore` as a second, independent trust path
+alongside digest pinning (see
+[`docs/cryptographic-artifact-signatures.md`](cryptographic-artifact-signatures.md)).
+This release pipeline itself does not sign anything it publishes by
+default -- digest pinning remains its own trust mechanism -- MAG-02 makes
+verification possible for artifacts whose publisher chooses to sign them,
+it does not obligate this pipeline to.

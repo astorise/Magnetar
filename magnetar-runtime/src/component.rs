@@ -10,6 +10,10 @@ use serde::Deserialize;
 use sha2::{Digest as ShaDigest, Sha256};
 
 use crate::InferenceSessionId;
+use crate::artifact_signature::{
+    PublisherIdentity, SignatureRecord, SignatureVerification, VerifyingKeyBytes, key_id_for,
+    verify_signature,
+};
 
 pub const COMPONENT_ARTIFACT_SCHEMA: &str = "magnetar-component-artifact";
 pub const COMPONENT_TRUST_SCHEMA: &str = "magnetar-component-trust";
@@ -323,6 +327,13 @@ pub enum ComponentTrustStatus {
 pub struct ComponentTrustDecision {
     pub status: ComponentTrustStatus,
     pub reason: String,
+    /// The publisher identity the trust store operator bound to the key
+    /// that produced a verifying signature on this artifact, present only
+    /// when `status` was reached through the signature verification path
+    /// (see `Requirement: Authenticated Publisher Identity Via Signature`).
+    /// Never derived from the artifact's own self-declared publisher
+    /// metadata.
+    pub authenticated_publisher: Option<PublisherIdentity>,
 }
 
 impl ComponentTrustDecision {
@@ -330,6 +341,19 @@ impl ComponentTrustDecision {
         Self {
             status,
             reason: reason.into(),
+            authenticated_publisher: None,
+        }
+    }
+
+    pub fn with_authenticated_publisher(
+        status: ComponentTrustStatus,
+        reason: impl Into<String>,
+        publisher: PublisherIdentity,
+    ) -> Self {
+        Self {
+            status,
+            reason: reason.into(),
+            authenticated_publisher: Some(publisher),
         }
     }
 }
@@ -343,6 +367,14 @@ pub struct ComponentTrustStore {
     pub trusted_publishers: BTreeSet<String>,
     pub trusted_sources: BTreeSet<String>,
     pub allow_unsigned_local_development: bool,
+    /// Ed25519 keys the trust store operator trusts, keyed by
+    /// [`key_id_for`], each bound to the publisher identity that key
+    /// authenticates.
+    pub trusted_publisher_keys: BTreeMap<String, (VerifyingKeyBytes, PublisherIdentity)>,
+    /// Key ids whose signatures are rejected outright, checked before
+    /// cryptographic verification (`Requirement: Signature Key
+    /// Revocation`).
+    pub revoked_keys: BTreeSet<String>,
 }
 
 impl ComponentTrustStore {
@@ -401,6 +433,21 @@ impl ComponentTrustStore {
         self
     }
 
+    pub fn trust_publisher_key(
+        mut self,
+        public_key: VerifyingKeyBytes,
+        publisher: PublisherIdentity,
+    ) -> Self {
+        self.trusted_publisher_keys
+            .insert(key_id_for(&public_key), (public_key, publisher));
+        self
+    }
+
+    pub fn revoke_key(mut self, key_id: impl Into<String>) -> Self {
+        self.revoked_keys.insert(key_id.into().to_ascii_lowercase());
+        self
+    }
+
     /// Evaluates `manifest`/`digest` against this trust store's policy,
     /// independent of any particular loading path -- the same decision
     /// `validate_component_artifact` applies during a fresh
@@ -427,6 +474,62 @@ impl ComponentTrustStore {
         }
         if self.trusted_digests.contains(&digest.value) {
             return ComponentTrustDecision::new(ComponentTrustStatus::Trusted, "digest trusted");
+        }
+        // A manifest may carry more than one `ComponentSignature` entry
+        // (e.g. co-signed by more than one publisher). Any single entry
+        // that verifies against a trusted key grants Trusted outright; a
+        // revoked or broken entry under a *known* key is remembered and
+        // only decides the outcome if no other entry verifies, so one
+        // bad/revoked signature never shadows a separately valid one from
+        // a different trusted key on the same artifact.
+        let mut signature_fallback: Option<ComponentTrustDecision> = None;
+        for signature in &manifest.signatures {
+            let Some(record) = signature.as_signature_record() else {
+                continue;
+            };
+            if self.revoked_keys.contains(&record.key_id) {
+                signature_fallback.get_or_insert_with(|| {
+                    ComponentTrustDecision::new(
+                        ComponentTrustStatus::Revoked,
+                        "signature key revoked",
+                    )
+                });
+                continue;
+            }
+            let Some((public_key, publisher)) = self.trusted_publisher_keys.get(&record.key_id)
+            else {
+                // Unknown key: not an error, falls through to digest
+                // pinning and other trust paths exactly as if unsigned.
+                continue;
+            };
+            match verify_signature(&record, public_key, &digest.value) {
+                SignatureVerification::Verified => {
+                    return ComponentTrustDecision::with_authenticated_publisher(
+                        ComponentTrustStatus::Trusted,
+                        "signature verified against trusted publisher key",
+                        publisher.clone(),
+                    );
+                }
+                SignatureVerification::DigestMismatch => {
+                    signature_fallback.get_or_insert_with(|| {
+                        ComponentTrustDecision::new(
+                            ComponentTrustStatus::Rejected,
+                            "signed digest does not match the artifact's actual digest",
+                        )
+                    });
+                }
+                SignatureVerification::Invalid => {
+                    signature_fallback.get_or_insert_with(|| {
+                        ComponentTrustDecision::new(
+                            ComponentTrustStatus::Rejected,
+                            "signature does not verify under a known trusted key",
+                        )
+                    });
+                }
+            }
+        }
+        if let Some(decision) = signature_fallback {
+            return decision;
         }
         let matched_unauthenticated_metadata = if let Some(publisher) = &manifest.publisher
             && self.trusted_publishers.contains(&publisher.id)
@@ -835,6 +938,29 @@ pub trait ComponentDistributionSourceProvider {
 pub struct ComponentSignature {
     pub algorithm: Option<String>,
     pub digest: Option<String>,
+    /// The signing key's fingerprint (see [`key_id_for`]). `None` means
+    /// this entry carries no cryptographic material and remains
+    /// non-authoritative metadata, per `Requirement: Signature Metadata Is
+    /// Optional and Non-Authoritative`.
+    pub key_id: Option<String>,
+    /// The raw Ed25519 signature bytes. `None` alongside `key_id: None` is
+    /// the pre-MAG-02 placeholder shape; a real, verifiable signature
+    /// carries both this and `key_id`.
+    pub signature: Option<[u8; 64]>,
+}
+
+impl ComponentSignature {
+    /// Converts this entry into a [`SignatureRecord`] suitable for
+    /// [`verify_signature`], when it carries both a key id and signature
+    /// bytes. Returns `None` for the non-authoritative placeholder shape
+    /// (missing `key_id`, `signature`, or `digest`).
+    fn as_signature_record(&self) -> Option<SignatureRecord> {
+        Some(SignatureRecord::new(
+            self.key_id.clone()?,
+            self.signature?,
+            self.digest.clone()?,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1055,6 +1181,9 @@ struct ComponentSourceYaml {
 struct ComponentSignatureYaml {
     algorithm: Option<String>,
     digest: Option<String>,
+    key_id: Option<String>,
+    /// Hex-encoded Ed25519 signature bytes (64 bytes -> 128 hex chars).
+    signature: Option<String>,
 }
 
 impl ComponentManifestYaml {
@@ -1186,11 +1315,23 @@ impl ComponentManifestYaml {
         let signatures = self
             .signatures
             .into_iter()
-            .map(|signature| ComponentSignature {
-                algorithm: signature.algorithm,
-                digest: signature.digest,
+            .map(|signature| {
+                let signature_bytes = match signature.signature.as_deref() {
+                    Some(hex) => Some(
+                        crate::artifact_signature::decode_hex::<64>(hex).ok_or_else(|| {
+                            manifest_validation_error(path, "signature field is not valid hex")
+                        })?,
+                    ),
+                    None => None,
+                };
+                Ok(ComponentSignature {
+                    algorithm: signature.algorithm,
+                    digest: signature.digest,
+                    key_id: signature.key_id,
+                    signature: signature_bytes,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ComponentError>>()?;
 
         // astorise/Magnetar#83 steps 6-7: `compatibility` absent, or
         // present with `architecture_families` absent, both mean
@@ -1317,12 +1458,28 @@ struct TrustStoreYaml {
     #[serde(default)]
     trusted_sources: BTreeSet<String>,
     development: Option<TrustStoreDevelopmentYaml>,
+    #[serde(default)]
+    trusted_publisher_keys: BTreeMap<String, TrustedPublisherKeyYaml>,
+    #[serde(default)]
+    revoked_keys: BTreeSet<String>,
 }
 
 #[derive(Deserialize)]
 struct TrustStoreDevelopmentYaml {
     #[serde(default)]
     allow_unsigned_local: bool,
+}
+
+#[derive(Deserialize)]
+struct TrustedPublisherKeyYaml {
+    /// Hex-encoded Ed25519 public key (32 bytes -> 64 hex chars).
+    public_key: String,
+    publisher: TrustedPublisherIdentityYaml,
+}
+
+#[derive(Deserialize)]
+struct TrustedPublisherIdentityYaml {
+    name: String,
 }
 
 impl TrustStoreYaml {
@@ -1350,6 +1507,24 @@ impl TrustStoreYaml {
                 ));
             }
         }
+        let mut trusted_publisher_keys = BTreeMap::new();
+        for (declared_key_id, entry) in self.trusted_publisher_keys {
+            let public_key: VerifyingKeyBytes =
+                crate::artifact_signature::decode_hex(&entry.public_key).ok_or_else(|| {
+                    trust_store_error(path, "trusted_publisher_keys public_key is not valid hex")
+                })?;
+            let actual_key_id = key_id_for(&public_key);
+            if declared_key_id.to_ascii_lowercase() != actual_key_id {
+                return Err(trust_store_error(
+                    path,
+                    "trusted_publisher_keys entry's key id does not match its public key",
+                ));
+            }
+            trusted_publisher_keys.insert(
+                actual_key_id,
+                (public_key, PublisherIdentity::new(entry.publisher.name)),
+            );
+        }
         Ok(ComponentTrustStore {
             trusted_digests: lower_set(self.trusted_digests),
             rejected_digests: lower_set(self.rejected_digests),
@@ -1360,6 +1535,8 @@ impl TrustStoreYaml {
             allow_unsigned_local_development: self
                 .development
                 .is_some_and(|development| development.allow_unsigned_local),
+            trusted_publisher_keys,
+            revoked_keys: lower_set(self.revoked_keys),
         })
     }
 }

@@ -73,7 +73,11 @@ code (BoringSSL-derived assembly) which complicates the wasm32 target and
 the crate's existing "no C dependencies for portable code paths" posture;
 `ed25519-dalek` is pure Rust, matching every other dependency
 `magnetar-runtime` already has in its base `[dependencies]` (`sha2`, `serde`,
-`serde_json`, `serde_norway`).
+`serde_json`, `serde_norway`). Enabled features are `fast`, `zeroize`
+(defaults) and `signature` (for the `Signer`/`Verifier` traits used by
+test-fixture signing); production verification code uses the inherent,
+stricter `VerifyingKey::verify_strict` rather than the `Verifier` trait's
+`verify`, so the `signature` feature is only load-bearing for tests.
 
 ### Where verification-only code lives vs. test-only signing code
 
