@@ -19,5 +19,14 @@
 #
 # `roadmap-contracts` also has none of that: it depends on magnetar-runtime
 # only (#62), so it belongs here for the same reason.
-members = ["magnetar-runtime", "tools/coverage-ratchet", "roadmap-contracts"]
+#
+# `tools/release-publish` (MAG-06, `implement-release-publication-automation`)
+# also has none of that: it depends on `roadmap-contracts` only, so it
+# belongs here for the same reason.
+members = [
+    "magnetar-runtime",
+    "tools/coverage-ratchet",
+    "roadmap-contracts",
+    "tools/release-publish",
+]
 resolver = "2"
