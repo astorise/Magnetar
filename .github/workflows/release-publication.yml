@@ -54,7 +54,7 @@ jobs:
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@caf6763a71f372082d0927c4ad43f42b97d889bf # cargo-deny
+        uses: taiki-e/install-action@6389de18ba1f566a1d477be1660e48710dfa416f # cargo-deny
       # release_packaging::release_may_publish_stable requires every gate
       # in REQUIRED_RELEASE_GATES to be present and passed. We read the
       # ones this repository's quality.yml already runs as named
