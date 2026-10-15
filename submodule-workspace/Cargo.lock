@@ -908,14 +908,14 @@ dependencies = [
 
 [[package]]
 name = "magnetar-format-gguf"
-version = "0.1.0"
+version = "1.0.0-RC0"
 dependencies = [
  "magnetar-runtime",
 ]
 
 [[package]]
 name = "magnetar-format-safetensors"
-version = "0.1.0"
+version = "1.0.0-RC0"
 dependencies = [
  "magnetar-runtime",
  "serde_json",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-loader-gguf"
-version = "0.1.0"
+version = "1.0.0-RC0"
 dependencies = [
  "magnetar-format-gguf",
  "magnetar-runtime",
@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-loader-huggingface"
-version = "0.1.0"
+version = "1.0.0-RC0"
 dependencies = [
  "magnetar-format-safetensors",
  "magnetar-runtime",
@@ -989,14 +989,14 @@ dependencies = [
 
 [[package]]
 name = "magnetar-provider-cpu"
-version = "0.1.0"
+version = "1.0.0-RC0"
 dependencies = [
  "magnetar-runtime",
 ]
 
 [[package]]
 name = "magnetar-provider-cuda"
-version = "0.1.0"
+version = "1.0.0-RC0"
 dependencies = [
  "cudarc",
  "magnetar-runtime",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-runtime"
-version = "0.1.0"
+version = "1.0.0-RC0"
 dependencies = [
  "ed25519-dalek",
  "flate2",
