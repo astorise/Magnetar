@@ -78,16 +78,11 @@ jobs:
       #   CoverageGate                  <- "quality / coverage"
       #   RedactionChecks               <- "quality / test (ubuntu-latest)"
       #   NoRawHandleExposureChecks     <- "quality / test (ubuntu-latest)"
-      #   CliBoundaryTests              <- (no CI job exists yet; left
-      #                                     unmapped on purpose, see below)
+      #   CliBoundaryTests              <- "quality / cli boundary"
       #
-      # `CliBoundaryTests` has no named check-run today: `magnetar-cli` is
-      # deliberately excluded from the root `[workspace]` (its own
-      # `Cargo.toml` comment explains why) and quality.yml has no job that
-      # runs its test suite. Until one exists, this gate is correctly
-      # reported as missing and blocks `release-gate` -- that is the
-      # required fail-closed behavior, not a bug in this workflow. Adding
-      # that CI job is separate follow-up work.
+      # `magnetar-cli` is deliberately excluded from the root `[workspace]`,
+      # so `quality / cli boundary` runs its test suite on its own and feeds
+      # this gate.
       - name: Fetch check-run conclusions for this commit
         id: check-runs
         env:
@@ -118,7 +113,8 @@ jobs:
               {gate: "E2eLocalConformance", passed: passed("quality / e2e conformance")},
               {gate: "CoverageGate", passed: passed("quality / coverage")},
               {gate: "RedactionChecks", passed: passed("quality / test (ubuntu-latest)")},
-              {gate: "NoRawHandleExposureChecks", passed: passed("quality / test (ubuntu-latest)")}
+              {gate: "NoRawHandleExposureChecks", passed: passed("quality / test (ubuntu-latest)")},
+              {gate: "CliBoundaryTests", passed: passed("quality / cli boundary")}
             ]' > release-gate-results.json
           cat release-gate-results.json
       - name: Evaluate release_may_publish_stable
