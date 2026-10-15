@@ -683,6 +683,24 @@ jobs:
   # `recorded` figures match and which carries a non-empty `reason`. Only
   # runs on pull_request (needs the PR's base commit to diff against); a
   # direct push to main skips it.
+  # Feeds the `CliBoundaryTests` release gate (release-publication.yml's
+  # gate-evaluation reads this check-run by name): `magnetar-cli` is outside
+  # the root `[workspace]`, so no other job runs its test suite on its own.
+  cli-boundary:
+    name: quality / cli boundary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Test magnetar-cli
+        run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-cli --all-targets --all-features
+
   coverage-baseline-history:
     name: quality / coverage baseline history
     if: github.event_name == 'pull_request'

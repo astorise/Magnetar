@@ -97,7 +97,7 @@ already-existing `quality.yml` check-runs (several roadmap-named gates --
 `RuntimeInferenceApiTests`, `RedactionChecks`, `NoRawHandleExposureChecks`
 -- map to `quality / test (ubuntu-latest)`, since the concerns they name
 are genuinely exercised there via `cargo test --workspace --all-targets`,
-just not as separately named check-runs yet). `CliBoundaryTests` has no
+just not as separately named check-runs yet). `CliBoundaryTests` (now fed by `quality / cli boundary`) has no
 mapping: `magnetar-cli` is deliberately excluded from the root
 `[workspace]` and no CI job runs its own test suite today. Until one
 exists, `gate-evaluation` -- and therefore `github-release` and
