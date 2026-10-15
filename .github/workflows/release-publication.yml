@@ -190,15 +190,30 @@ jobs:
             --ci-run-id "${{ github.run_id }}" \
             --openspec-dir openspec/specs \
             --wit-dir magnetar-runtime/wit
-      - name: Create GitHub Release
+      # Idempotent on purpose: this job also runs on a manual
+      # `workflow_dispatch` against an already-tagged commit (e.g. to run
+      # `real-publish`, which only fires on `workflow_dispatch`), so a
+      # release for this tag may already exist from the original tag-push
+      # run. `gh release create` fails outright in that case; re-running
+      # must instead refresh the release's assets with the bundle/proofs
+      # generated from *this* run so they stay keyed to the actually
+      # published bytes, never leaving the workflow red for a reason
+      # unrelated to publication succeeding.
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
-            release-bundle/*.tar.gz checksums.json sbom.json provenance.json
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" \
+              release-bundle/*.tar.gz checksums.json sbom.json provenance.json \
+              --clobber
+          else
+            gh release create "${{ github.ref_name }}" \
+              --title "${{ github.ref_name }}" \
+              --generate-notes \
+              release-bundle/*.tar.gz checksums.json sbom.json provenance.json
+          fi
 
   real-publish:
     name: release-publication / cargo publish (real)
