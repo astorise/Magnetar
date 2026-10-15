@@ -18,7 +18,7 @@ description = "First-party client/workspace/agent runtime around Magnetar infere
 publish = false
 
 [dependencies]
-magnetar-runtime = { path = "../magnetar-runtime", version = "0.1.0" }
+magnetar-runtime = { path = "../magnetar-runtime", version = "1.0.0-RC0" }
 magnetar-loader-huggingface = { path = "../loaders/huggingface" }
 # `magnetar release-version`/`magnetar version` (commands.rs) build a
 # ReleaseBinaryVersionReport -- release_packaging's own #62 move out of
