@@ -120,15 +120,25 @@ combined workflow. Rejected -- the audit's own channel table treats these as
 independently-cadenced concerns, and Runtime-crate publication SHALL NOT
 gate on whether a Component Artifact happens to be ready that day.
 
-**5. Secret seam: one named secret per registry, referenced but not defined here.**
-The workflows reference `${{ secrets.CARGO_REGISTRY_TOKEN }}` and
-`${{ secrets.GHCR_PUSH_TOKEN }}` (exact names finalized in tasks.md/implementation,
-not invented as real values here) and each publish job's first step asserts
-the secret is non-empty, failing with a clear message before attempting any
-network call. This keeps the distinction between "automation exists" and
-"automation is authorized to run for real" mechanical and auditable, rather
-than relying on someone remembering which steps are safe to merge before
-secrets exist.
+**5. Secret seam: crates.io needs one provisioned secret; GHCR needs none.**
+`real-publish` references `${{ secrets.CARGO_REGISTRY_TOKEN }}` and asserts
+it is non-empty, failing with a clear message before attempting any network
+call -- this keeps "automation exists" distinct from "automation is
+authorized to run for real" mechanical and auditable for the one target
+(crates.io) that genuinely needs a human-provisioned, externally-scoped
+credential. `component-artifact-distribution.yml`'s GHCR push does not: the
+job already requests `permissions: packages: write`, which is sufficient for
+the workflow's own `GITHUB_TOKEN` to push a package associated with this
+repository (the same mechanism `github-release` already relies on for
+creating releases) -- requiring a second, separately provisioned
+`GHCR_PUSH_TOKEN` secret on top of that permission would have been a
+redundant credential, not a safety property, since GitHub never fails to
+provide `GITHUB_TOKEN`. The "authorized to run for real" distinction for
+GHCR publication instead comes from the workflow staying
+`workflow_dispatch`-only (per Decision 4) and, optionally, from required
+reviewers on the `release` GitHub Environment the job runs under -- a
+human-configured gate the repo owner can add without this change needing to
+invent a second token.
 
 **6. OCI media types are versioned from day one.**
 `application/vnd.magnetar.component.v1+wasm`,
@@ -181,10 +191,10 @@ publish side hands consumers a real digest to pin instead of only a tag.
    present but unfilled; dry-run/local-registry jobs run in CI on every PR
    touching the publication tooling, so regressions are caught immediately
    even before any real secret exists.
-2. A human (repo owner) configures `CARGO_REGISTRY_TOKEN` and
-   `GHCR_PUSH_TOKEN` (or whatever this change's tasks.md finalizes as their
-   exact names) as repository secrets. This step is explicitly outside this
-   change's scope to perform.
+2. A human (repo owner) configures `CARGO_REGISTRY_TOKEN` as a repository
+   secret -- the only credential a human still needs to provision; GHCR
+   push authenticates with the workflow's own `GITHUB_TOKEN` (Decision 5).
+   This step is explicitly outside this change's scope to perform.
 3. First real publish is a deliberate, manual `workflow_dispatch` (not an
    automatic tag push) so its output can be inspected before any future tag
    push triggers publication unattended.

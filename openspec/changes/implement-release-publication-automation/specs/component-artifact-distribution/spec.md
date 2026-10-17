@@ -82,18 +82,31 @@ Then the same logical validation applies as a bundle delivered from GHCR,
 per the existing `kernel-distribution` "Kernel Distribution Is Transport
 Neutral" requirement.
 
-### Requirement: Credential-Gated OCI Push Fails Closed
+### Requirement: GHCR Push Uses The Workflow's Own Token
 
-The GHCR push step SHALL first assert that its required push credential secret is present and non-empty, and SHALL fail with an explicit "credential not configured" error before attempting any network call if it is not.
+The GHCR push step SHALL authenticate using the workflow run's own `GITHUB_TOKEN`, scoped via an explicit `permissions: packages: write` grant on the publishing job, and SHALL NOT require a separately provisioned push credential secret.
 
-#### Scenario: Missing GHCR push token
+#### Scenario: Push authenticates with the workflow's own token
 
-Given `GHCR_PUSH_TOKEN` is not configured in the running environment
+Given the `component-artifact-distribution` job has `permissions: packages: write`
 
-When the Component Artifact push step begins
+And no externally provisioned GHCR push credential is configured
 
-Then the step fails immediately with an explicit missing-credential error and
-performs no network request to GHCR.
+When the Component Artifact push step runs
+
+Then it authenticates to GHCR using the workflow run's own `GITHUB_TOKEN` and proceeds to push, without requiring any additional secret configuration.
+
+### Requirement: Real OCI Push Only Runs On Manual Dispatch
+
+The GHCR push step SHALL only ever run as part of an explicit `workflow_dispatch` trigger, never automatically off a tag push or any other event, so that a real publish is always a deliberate human action even though no credential gate stands in front of it.
+
+#### Scenario: Workflow is manually triggered
+
+Given a repository collaborator with permission to run workflows triggers `component-artifact-distribution.yml` via `workflow_dispatch`
+
+When the job runs
+
+Then the push step executes using the run's own `GITHUB_TOKEN`, and the `release` GitHub Environment's own protection rules (e.g. required reviewers), if configured by the repository owner, apply before the job starts.
 
 ### Requirement: Invalid OCI Publication Is Corrected By New Digest, Not Overwritten
 

@@ -83,10 +83,11 @@ one happens to be ready.
    (`release-publish oci-manifest`), no network. Always uploaded as a
    workflow artifact, so the exact bytes and digest that would be pushed
    are inspectable even when the next step fails closed.
-2. Assert `GHCR_PUSH_TOKEN` is configured (fail closed if not), then push
-   to `ghcr.io` by digest with `oras`, and print the resulting digest.
-   The convenience tag is repointed alongside it but is never itself
-   trust identity.
+2. Push to `ghcr.io` by digest with `oras`, authenticated with the
+   workflow run's own `GITHUB_TOKEN` (via `permissions: packages: write`
+   -- no separately provisioned secret needed), and print the resulting
+   digest. The convenience tag is repointed alongside it but is never
+   itself trust identity.
 
 ## The gate-mapping gap, on purpose
 
@@ -109,19 +110,25 @@ follow-up work.
 
 ## Credential seam
 
-Two repository secrets, read only from the `release` GitHub
-Environment (create it and, optionally, add required reviewers to it for
-extra hardening -- neither is done by this change):
+One repository secret, read only from the `release` GitHub Environment
+(create it and, optionally, add required reviewers to it for extra
+hardening -- neither is done by this change):
 
 - `CARGO_REGISTRY_TOKEN` -- crates.io publish token, used only in
-  `real-publish`.
-- `GHCR_PUSH_TOKEN` -- a token with `packages:write` scope, used only in
-  `component-artifact-distribution.yml`'s push step.
+  `real-publish`. Not configured by this change; the `real-publish` step
+  asserts it is present and fails with an explicit `::error::` message
+  before any network call if it is not -- deliberate, so a workflow
+  merged with the seam unfilled never looks silently "done."
 
-Neither is configured by this change. Every step that needs one asserts
-it is present and fails with an explicit `::error::` message before any
-network call if it is not -- this is deliberate: a workflow merged with
-the seam unfilled should never look silently "done."
+GHCR push needs no equivalent secret: `component-artifact-distribution.yml`
+authenticates with the workflow run's own `GITHUB_TOKEN`, scoped by the
+job's `permissions: packages: write` grant -- the same mechanism
+`github-release` already uses to create releases. A second,
+separately-provisioned push token would have been a redundant credential,
+not an additional safety property, since `GITHUB_TOKEN` is always present.
+The real-publish gate for GHCR instead comes from the workflow staying
+`workflow_dispatch`-only, plus whatever required-reviewer rule the repo
+owner optionally attaches to the `release` environment.
 
 `oras` (the OCI push tool) is installed from its published GitHub
 Releases binary directly, not a pinned third-party GitHub Action -- this
@@ -148,8 +155,9 @@ execute and verify it.
 Both real-publish paths are manual-`workflow_dispatch`-only until a
 human has:
 
-1. Configured `CARGO_REGISTRY_TOKEN` and `GHCR_PUSH_TOKEN` as secrets on
-   the `release` environment.
+1. Configured `CARGO_REGISTRY_TOKEN` as a secret on the `release`
+   environment (GHCR push needs no equivalent secret -- see "Credential
+   seam" above).
 2. Triggered each workflow manually via `workflow_dispatch` and confirmed
    the result before relying on the tag-triggered automatic paths
    (`dry-run-publish`, `gate-evaluation`, `github-release`).

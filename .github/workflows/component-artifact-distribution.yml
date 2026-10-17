@@ -11,12 +11,15 @@ name: Component Artifact Distribution
 # A single job, deliberately: every step through "Build OCI manifest and
 # local layout" and its artifact upload needs no credential and always
 # runs, so the exact digest this workflow would push is inspectable
-# (download the `oci-layout` workflow artifact) even on a run where the
-# credential check below fails it closed. Everything from "Check GHCR push
-# token is configured" onward is the one credentialed, real-network path,
-# gated per "Credential-Gated OCI Push Fails Closed": it asserts
-# `GHCR_PUSH_TOKEN` is present and non-empty and fails with an explicit
-# message before any network call if it is not.
+# (download the `oci-layout` workflow artifact) regardless of how the push
+# below goes. The push itself authenticates to GHCR with the workflow run's
+# own `GITHUB_TOKEN` (via the `permissions: packages: write` grant below),
+# per "GHCR Push Uses The Workflow's Own Token" -- no separately
+# provisioned push credential secret is required. The real-network step
+# still only ever runs on an explicit `workflow_dispatch` (never
+# automatically), and `environment: release` lets the repo owner attach
+# required reviewers to that environment for an extra manual checkpoint if
+# desired.
 on:
   workflow_dispatch:
     inputs:
@@ -77,15 +80,6 @@ jobs:
         with:
           name: oci-layout
           path: oci-layout
-      # "Credential-Gated OCI Push Fails Closed": asserts the secret is
-      # present and non-empty and fails with an explicit message before
-      # any network call if it is not.
-      - name: Check GHCR push token is configured
-        run: |
-          if [ -z "${{ secrets.GHCR_PUSH_TOKEN }}" ]; then
-            echo "::error::GHCR_PUSH_TOKEN is not configured as a repository secret. Configure it under Settings > Secrets and variables > Actions before running this workflow to push for real. The OCI manifest and local layout above were still built and uploaded as this run's 'oci-layout' artifact for inspection." >&2
-            exit 1
-          fi
       # oras is installed directly from its published GitHub Releases
       # binary, not a third-party GitHub Action pin -- this session could
       # not independently verify one against this repo's GitHub access
@@ -104,7 +98,7 @@ jobs:
           oras version
       - name: Log in to GHCR
         run: |
-          echo "${{ secrets.GHCR_PUSH_TOKEN }}" | \
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
             docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       # NOTE: verify this exact `oras cp --from-oci-layout` invocation
       # against the installed oras version before the first real run --

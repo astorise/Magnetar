@@ -83,10 +83,14 @@
 ## 4. `component-artifact-distribution` Pipeline — GHCR
 
 - [x] 4.1 Implement the GHCR push step using the manifests from section 3,
-      gated behind an explicit non-empty check of a named GHCR push token
-      secret; fail closed with a clear message when the secret is absent.
-      **Requires a human to configure the GHCR push token secret before this
-      step can run for real — not performed in this change.**
+      authenticated via the publishing job's own `GITHUB_TOKEN` under an
+      explicit `permissions: packages: write` grant. **No separately
+      provisioned push credential secret is required** -- revised from
+      this task's original "named GHCR push token secret" design after
+      confirming `GITHUB_TOKEN` is sufficient to push a package associated
+      with this repository (the same mechanism `github-release` already
+      relies on), matching how `cargo publish`'s crates.io token remains
+      the one credential that genuinely needs human provisioning.
 - [x] 4.2 Implement digest capture and recording into a release provenance
       record after a successful push (or, for the credential-free path, after
       a successful local OCI-layout construction), per the design's
@@ -137,7 +141,7 @@
       seam, and both withdrawal procedures, matching this change's design.md.
 - [x] 6.3 Update `README.md`'s "Magnetar and Tachyon" narrative log noting
       MAG-06 scaffolding is implemented and what remains for a human to
-      configure (crates.io token, GHCR push token, first manual publish).
+      configure (crates.io token, first manual publish of each pipeline).
 
 ## 7. Deferred To Follow-Up (tracked, not implemented here)
 
@@ -145,6 +149,6 @@
       chantier referencing this change's digest-pinning interim trust
       mechanism, without designing or implementing signing here.
 - [x] 7.2 Record the human follow-up actions required before real publication
-      can occur: configure `CARGO_REGISTRY_TOKEN` and the GHCR push token
-      secrets, then trigger the first manual `workflow_dispatch` run for
-      each pipeline.
+      can occur: configure `CARGO_REGISTRY_TOKEN` (the one secret GHCR
+      publication no longer needs, per 4.1), then trigger the first manual
+      `workflow_dispatch` run for each pipeline.
