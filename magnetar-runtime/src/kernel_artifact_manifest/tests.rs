@@ -1620,3 +1620,43 @@ fn kernel_exchange_archive_rejects_hardlink_and_device_entries() {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+/// Regression coverage for the first real, published Kernel Exchange
+/// Bundle fixture (`fixtures/kernels/cpu-reference-matmul.kernel-bundle.tar.gz`,
+/// built from compiling `fixtures/kernels/cpu_reference_matmul.c` with gcc
+/// into a genuine ELF shared object -- there is no production kernel
+/// compiler wired into this repo yet, so this is a real-but-reference
+/// kernel, mirroring how `fixtures/components/synthetic-minimal.component.wasm`
+/// is a real-but-test-only Component Artifact). Proves the committed
+/// archive extracts and validates against the actual production
+/// `extract_kernel_exchange_archive`/`validate_kernel_exchange_bundle`
+/// path, not just against a hand-built in-memory fixture.
+#[test]
+fn published_cpu_reference_matmul_kernel_bundle_fixture_validates() {
+    const BUNDLE_TAR_GZ: &[u8] =
+        include_bytes!("../../fixtures/kernels/cpu-reference-matmul.kernel-bundle.tar.gz");
+
+    let extract_dir = temp_kernel_bundle_dir("published-cpu-reference-matmul");
+    let bundle = extract_kernel_exchange_archive(
+        std::io::Cursor::new(BUNDLE_TAR_GZ),
+        true,
+        &extract_dir,
+        &KernelExchangeArchiveLimits::default(),
+    )
+    .expect("published kernel bundle archive extracts");
+
+    let validated = validate_kernel_exchange_bundle(&bundle, &KernelManifestLimits::default())
+        .expect("published kernel bundle validates");
+
+    assert_eq!(validated.manifest.artifacts.len(), 1);
+    assert_eq!(
+        validated.manifest.artifacts[0].blob.role.as_str(),
+        KernelBlobRole::COMPILED_KERNEL
+    );
+    assert_eq!(
+        validated.manifest.artifacts[0].blob.format.stable_key(),
+        "gcc:elf-shared-object"
+    );
+
+    fs::remove_dir_all(&extract_dir).unwrap();
+}
