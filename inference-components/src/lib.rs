@@ -3,6 +3,11 @@ use magnetar_loader_huggingface::{
     HuggingFaceChatTemplateFormatter, HuggingFaceIngestor, parse_tokenizer_config,
 };
 use magnetar_provider_cpu::ReferenceCpuProvider;
+// Re-exported below so an embedder (Tachyon included) can name a trusted
+// publisher key without depending on `magnetar_runtime` directly -- this
+// crate stays the one narrow seam, per the existing `ArtifactTrustPolicy`
+// boundary.
+pub use magnetar_runtime::artifact_signature::{PublisherIdentity, VerifyingKeyBytes, key_id_for};
 use magnetar_runtime::model::{ArtifactFormat, ModelTrustStatus, ModelTrustStore};
 use magnetar_runtime::production_model_ingestion::{
     ProductionModelArtifactIngestor, ProductionModelSource, read_declared_artifact_format,
@@ -156,6 +161,58 @@ impl ArtifactTrustPolicy {
     /// verified or pinned) before the artifact is ever registered.
     pub fn trust_component_digest(mut self, digest: &str) -> Self {
         self.component_trust_store = self.component_trust_store.trust_digest(digest);
+        self
+    }
+
+    /// Trusts a publisher's Ed25519 key for Model Artifact signatures --
+    /// never the Component binary. See
+    /// [`Self::trust_component_publisher_key`] for the separate,
+    /// Component-specific trust decision. The embedder supplies policy
+    /// data (which keys, bound to which publisher identity); the actual
+    /// signature cryptography is `ModelTrustStore::evaluate`'s, via
+    /// `artifact_signature::verify_signature` -- never duplicated here.
+    pub fn trust_publisher_key(
+        mut self,
+        public_key: VerifyingKeyBytes,
+        publisher: PublisherIdentity,
+    ) -> Self {
+        self.model_trust_store = self
+            .model_trust_store
+            .trust_publisher_key(public_key, publisher);
+        self
+    }
+
+    /// Trusts a publisher's Ed25519 key for Component (WASM) binary
+    /// signatures -- never the Model Artifact it happens to load. See
+    /// [`Self::trust_publisher_key`] for the separate, Model-specific
+    /// trust decision.
+    pub fn trust_component_publisher_key(
+        mut self,
+        public_key: VerifyingKeyBytes,
+        publisher: PublisherIdentity,
+    ) -> Self {
+        self.component_trust_store = self
+            .component_trust_store
+            .trust_publisher_key(public_key, publisher);
+        self
+    }
+
+    /// Revokes a signing key (by its [`key_id_for`] fingerprint) for Model
+    /// Artifact trust. Checked before cryptographic verification, so a
+    /// revoked key is rejected even if it is also, contradictorily, still
+    /// present in `trusted_publisher_keys` -- revocation always wins. See
+    /// [`Self::revoke_component_key`] for the separate, Component-specific
+    /// revocation.
+    pub fn revoke_key(mut self, key_id: impl Into<String>) -> Self {
+        self.model_trust_store = self.model_trust_store.revoke_key(key_id);
+        self
+    }
+
+    /// Revokes a signing key (by its [`key_id_for`] fingerprint) for
+    /// Component (WASM) binary trust. See [`Self::revoke_key`] for the
+    /// separate, Model-specific revocation.
+    pub fn revoke_component_key(mut self, key_id: impl Into<String>) -> Self {
+        self.component_trust_store = self.component_trust_store.revoke_key(key_id);
         self
     }
 
@@ -1777,5 +1834,176 @@ mod load_end_to_end_tests {
                 .to_string()
                 .contains("declared-format sidecar already exists"),
         );
+    }
+
+    /// TACH-11 (2026-09-24 Tachyon audit): `ArtifactTrustPolicy` used to
+    /// only ever carry `trusted_digests`/`trusted_component_digests` --
+    /// `trust_publisher_key`/`trust_component_publisher_key` (and their
+    /// `revoke_key`/`revoke_component_key` counterparts, added alongside)
+    /// are this crate's first public seam onto `ComponentTrustStore`'s
+    /// (and `ModelTrustStore`'s) Ed25519 signature trust, which
+    /// `magnetar_runtime` has carried since MAG-02 but which Tachyon had
+    /// no way to reach without reimplementing the cryptography itself.
+    /// These four tests drive a real signature through the exact same
+    /// `register_inference_component_artifact` → `ComponentTrustStore::
+    /// evaluate` → `artifact_signature::verify_signature` path a real
+    /// embedder's load exercises, proving the new builder methods are
+    /// wired all the way through rather than merely type-checking.
+    mod publisher_trust_tests {
+        use super::*;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        fn hex_encode(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+
+        /// A deterministic test keypair -- never a real publisher's key.
+        fn test_signing_key(seed_byte: u8) -> SigningKey {
+            SigningKey::from_bytes(&[seed_byte; 32])
+        }
+
+        /// Builds a manifest identical to the real, checked-in Qwen
+        /// Component's own fixture, except with `signatures: []` replaced
+        /// by one real, computed-over-the-real-digest signature entry --
+        /// so every other validation step (engine/WIT/runtime
+        /// compatibility, digest match) a fresh registration performs
+        /// still passes, and only the trust decision this test cares about
+        /// varies.
+        fn manifest_with_signature(
+            key_id: &str,
+            signature_hex: &str,
+            signed_digest: &str,
+        ) -> Vec<u8> {
+            let base = std::str::from_utf8(qwen_component_manifest_bytes())
+                .expect("fixture manifest is valid UTF-8");
+            base.replacen(
+                "signatures: []",
+                &format!(
+                    "signatures:\n  - algorithm: \"ed25519\"\n    digest: \"{signed_digest}\"\n    key_id: \"{key_id}\"\n    signature: \"{signature_hex}\"\n",
+                ),
+                1,
+            )
+            .into_bytes()
+        }
+
+        #[test]
+        fn component_publisher_key_authenticates_a_valid_signature() {
+            let digest = magnetar_runtime::ComponentDigest::sha256(qwen_component_bytes());
+            let signing_key = test_signing_key(1);
+            let verifying_key = signing_key.verifying_key().to_bytes();
+            let key_id = key_id_for(&verifying_key);
+            let signature = signing_key.sign(digest.value.as_bytes());
+
+            // Trusts the publisher's key alone -- no `trust_component_digest`
+            // pinning at all, so only a verifying signature can authorize
+            // this Component.
+            let trust_policy = ArtifactTrustPolicy::default().trust_component_publisher_key(
+                verifying_key,
+                PublisherIdentity::new("tach-11-test-publisher"),
+            );
+
+            let registered = register_inference_component_artifact(
+                qwen_component_bytes().to_vec(),
+                manifest_with_signature(&key_id, &hex_encode(&signature.to_bytes()), &digest.value),
+                trust_policy.component_trust_store(),
+            )
+            .expect(
+                "a signature verifying under a trusted publisher key must authorize the \
+                 Component even with no digest pinned at all",
+            );
+            assert_eq!(registered.digest, digest);
+        }
+
+        #[test]
+        fn component_signature_under_an_unknown_key_is_rejected() {
+            let digest = magnetar_runtime::ComponentDigest::sha256(qwen_component_bytes());
+            // Signs with a key the trust store never names at all.
+            let unknown_signer = test_signing_key(2);
+            let signature = unknown_signer.sign(digest.value.as_bytes());
+            let unknown_key_id = key_id_for(&unknown_signer.verifying_key().to_bytes());
+
+            // Trusts a *different* key -- the unknown signer's key never
+            // appears in this policy.
+            let trusted_signer = test_signing_key(3);
+            let trust_policy = ArtifactTrustPolicy::default().trust_component_publisher_key(
+                trusted_signer.verifying_key().to_bytes(),
+                PublisherIdentity::new("tach-11-test-publisher"),
+            );
+
+            let error = register_inference_component_artifact(
+                qwen_component_bytes().to_vec(),
+                manifest_with_signature(
+                    &unknown_key_id,
+                    &hex_encode(&signature.to_bytes()),
+                    &digest.value,
+                ),
+                trust_policy.component_trust_store(),
+            )
+            .expect_err(
+                "a signature under a key this policy never trusted must never authorize the \
+                 Component -- registry presence of the bytes is not trust",
+            );
+            assert!(error.to_string().contains("no trust policy matched"));
+        }
+
+        #[test]
+        fn component_signature_with_invalid_bytes_under_a_trusted_key_is_rejected() {
+            let digest = magnetar_runtime::ComponentDigest::sha256(qwen_component_bytes());
+            let signing_key = test_signing_key(4);
+            let verifying_key = signing_key.verifying_key().to_bytes();
+            let key_id = key_id_for(&verifying_key);
+            // Garbage signature bytes, under a key this policy does trust --
+            // cryptographic verification itself must still fail it.
+            let invalid_signature_hex = "11".repeat(64);
+
+            let trust_policy = ArtifactTrustPolicy::default().trust_component_publisher_key(
+                verifying_key,
+                PublisherIdentity::new("tach-11-test-publisher"),
+            );
+
+            let error = register_inference_component_artifact(
+                qwen_component_bytes().to_vec(),
+                manifest_with_signature(&key_id, &invalid_signature_hex, &digest.value),
+                trust_policy.component_trust_store(),
+            )
+            .expect_err(
+                "a syntactically well-formed but cryptographically invalid signature under a \
+                 trusted key must still be rejected",
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("signature does not verify under a known trusted key")
+            );
+        }
+
+        #[test]
+        fn component_signature_under_a_revoked_key_is_rejected_even_though_trusted() {
+            let digest = magnetar_runtime::ComponentDigest::sha256(qwen_component_bytes());
+            let signing_key = test_signing_key(5);
+            let verifying_key = signing_key.verifying_key().to_bytes();
+            let key_id = key_id_for(&verifying_key);
+            let signature = signing_key.sign(digest.value.as_bytes());
+
+            // Contradictory on purpose: the same key is both trusted *and*
+            // revoked. Revocation must win.
+            let trust_policy = ArtifactTrustPolicy::default()
+                .trust_component_publisher_key(
+                    verifying_key,
+                    PublisherIdentity::new("tach-11-test-publisher"),
+                )
+                .revoke_component_key(key_id.clone());
+
+            let error = register_inference_component_artifact(
+                qwen_component_bytes().to_vec(),
+                manifest_with_signature(&key_id, &hex_encode(&signature.to_bytes()), &digest.value),
+                trust_policy.component_trust_store(),
+            )
+            .expect_err(
+                "a key present in both trusted_publisher_keys and revoked_keys must never \
+                 authorize a signature -- revocation always wins",
+            );
+            assert!(error.to_string().contains("signature key revoked"));
+        }
     }
 }

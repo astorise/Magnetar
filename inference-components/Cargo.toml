@@ -22,3 +22,9 @@ serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: signs fixture manifests with a local test keypair to drive
+# `ArtifactTrustPolicy::trust_component_publisher_key`'s real Ed25519
+# verification path (TACH-11). Never used outside `#[cfg(test)]` --
+# production signature verification stays entirely inside
+# `magnetar-runtime`.
+ed25519-dalek = { version = "3.0.0", features = ["signature"] }
