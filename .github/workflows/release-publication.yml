@@ -39,7 +39,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: cargo publish --dry-run (no credential required)
         run: cargo publish --locked --dry-run -p magnetar-runtime
 
@@ -52,7 +52,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install cargo-deny
         uses: taiki-e/install-action@63300d694c674b6bd0e1ca77d202a2bc41c4b623 # cargo-deny
       # release_packaging::release_may_publish_stable requires every gate
@@ -154,7 +154,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # Real multi-platform `magnetar` CLI binaries are a follow-up
       # enhancement to this job (building them needs magnetar-cli's own
       # submodule-pinned dependencies and a real build matrix, which is
@@ -230,7 +230,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # "Credential-Gated Publish Steps Fail Closed": asserts the secret is
       # present and non-empty and fails with an explicit message before
       # any network call if it is not, rather than skipping silently.
