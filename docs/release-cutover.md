@@ -4,9 +4,15 @@ Magnetar now has architecture contracts, an implementation baseline plan,
 post-baseline roadmaps, a release packaging policy, a release security
 policy, and release conformance gates. The final step before stabilizing the
 first release is a concrete cutover checklist: the operational sequence
-required to move from release candidate to stable `v0.1`. This document, and
-the `magnetar-runtime::release_cutover` module it describes, define that
-checklist for `v0.1`.
+required to move from release candidate to a stable release. This document,
+and the `magnetar-runtime::release_cutover` module it describes, define that
+checklist -- named here, and in the module's own doc comment, after the
+original `openspec/changes/define-v0-1-release-cutover-checklist` proposal
+it implements (a historical name, not renamed after the fact). Its reusable
+constants and types are re-evidenced for `v1.0` (MAG-10) now that
+`1.0.0-RC0` is the real, published target -- see "Scope Confirmation",
+"Compatibility Matrix Completion", "Post-v0.1 Handoff", and "Final Release
+Statement" below for what changed and why.
 
 This document and module do **not** implement release automation, publish
 the release, define registry credentials, define a final hosting provider,
@@ -48,12 +54,15 @@ freeze is blocked or the freeze must be restarted.
 
 ## Scope Confirmation
 
-`validate_v0_1_scope_feature` composes
+`validate_v1_0_scope_feature` composes
 `release_packaging::reject_roadmap_feature_as_guarantee` rather than a
-second deferred-roadmap-feature list. `V0_1_INCLUDED_SCOPE` documents the
-`v0.1` included baseline; enforcement lives entirely in the composed
-function -- CUDA (or any other deferred roadmap feature) listed as included
-is rejected the same way `release_packaging` already rejects it.
+second deferred-roadmap-feature list. `V1_0_INCLUDED_SCOPE` documents the
+`v1.0` included baseline -- MAG-10 added `cuda-provider`, `webgpu-provider`,
+and `production-qwen-model-support`, all now real and hardware-validated
+(`README.md`'s "Current Status"); enforcement lives entirely in the
+composed function -- Metal, OpenVINO, QNN (or any other still-deferred
+roadmap feature) listed as included is rejected the same way
+`release_packaging` already rejects it.
 
 ## Version Confirmation
 
@@ -75,7 +84,7 @@ against the release tag.
 additionally denies a `TestOnly` or `ConformanceOnly` flag enabled by
 default in a release build, which the packaging-level check does not itself
 enforce. `validate_cutover_provider_feature_flags` composes
-`release_packaging::validate_provider_feature_flags_for_v0_1`.
+`release_packaging::validate_provider_feature_flags_for_v1_0`.
 
 ## Compatibility Matrix Completion
 
@@ -85,12 +94,13 @@ eight (adding Tokenizer Artifact metadata, Adapter Artifact metadata,
 supported targets, and feature flags), so this is deliberately a distinct
 type rather than reusing the narrower packaging-level one.
 `CutoverCompatibilityStatus` is the six-value approved status vocabulary
-(`stable-for-v0.1-baseline`, `preview`, `experimental`, `unstable`,
+(`stable-for-v1.0-baseline` -- MAG-10, renamed from
+`stable-for-v0.1-baseline` -- `preview`, `experimental`, `unstable`,
 `deferred`, `unsupported`). `CutoverCompatibilityMatrix::validate` requires
 every dimension to carry an explicit status -- a missing Provider ABI (or
 missing WIT packages) entry blocks release. `reject_status_misrepresentation`
-rejects presenting anything less stable than `StableForV01Baseline` as if it
-were `StableForV01Baseline`, implementing "experimental API presented
+rejects presenting anything less stable than `StableForV10Baseline` as if it
+were `StableForV10Baseline`, implementing "experimental API presented
 stable blocks release."
 
 ## Required Gate Execution
@@ -104,11 +114,15 @@ passed.
 ## Skip Review
 
 `GateSkip` records a single gate skip and the four conditions "Skip Review"
-requires for it to be allowed (outside `v0.1` scope, documented reason, does
+requires for it to be allowed (outside `v1.0` scope, documented reason, does
 not hide a baseline failure, included in the release report).
 `validate_gate_skips` rejects any skip that fails even one condition -- a
-Reference CPU Provider skip is disallowed because it is not outside `v0.1`
-scope, regardless of how well-documented the reason is.
+Reference CPU Provider skip is disallowed because it is not outside `v1.0`
+scope, regardless of how well-documented the reason is; a CUDA conformance
+skip is also no longer a believable "outside scope" example (CUDA is real
+and in `V1_0_INCLUDED_SCOPE` now, MAG-10) -- Metal is the current example,
+since `providers/metal` is still an honest, unconditionally-unavailable
+placeholder.
 
 ## Exception Review
 
@@ -162,7 +176,7 @@ changelog blocks release.
 ## Release Notes Completion
 
 `CutoverReleaseNotesChecklist` records the thirteen topics release notes
-SHALL answer or include (what `v0.1` is, what users can run, stable/
+SHALL answer or include (what `v1.0` is, what users can run, stable/
 preview/experimental/deferred/unsupported status explanations, artifact
 verification, security limitations, how to run conformance, and the
 compatibility matrix / security notes / known limitations themselves).
@@ -181,9 +195,9 @@ per-gate ordering check.
 ## Publication
 
 `validate_publication_scope_preserved` composes
-`validate_v0_1_scope_feature` (roadmap-feature inclusion) and
+`validate_v1_0_scope_feature` (roadmap-feature inclusion) and
 `reject_status_misrepresentation` (stability misrepresentation): "server API
-claimed included in `v0.1` publication, but server API gates were skipped
+claimed included in `v1.0` publication, but server API gates were skipped
 as deferred" is blocked the same way any other deferred-roadmap-feature
 inclusion claim is blocked.
 
@@ -205,20 +219,26 @@ update).
 
 ## Post-v0.1 Handoff
 
-`POST_V0_1_HANDOFF_CANDIDATES` lists the roadmap candidates named in
-"Post-v0.1 Handoff" (implementation hardening, optimized CPU Provider, model
-format support, source/cache implementation, server API implementation,
-production CLI UX, GPU Provider exploration, quantized inference, advanced
-attention). `PostV01HandoffItem` and
-`reject_post_v0_1_item_as_release_claim` enforce "post-v0.1 items SHALL
-remain separate from `v0.1` release claims."
+`POST_V1_0_HANDOFF_CANDIDATES` lists the roadmap candidates named in
+"Post-v0.1 Handoff" (quoted title unchanged from the original proposal;
+implementation hardening, optimized CPU Provider, model format support,
+source/cache implementation, server API implementation, production CLI
+UX, Metal/OpenVINO/QNN exploration, quantized inference, advanced
+attention). MAG-10: dropped CUDA and WebGPU from the exploration item --
+both are past exploration (real, hardware-validated Providers) -- leaving
+Metal/OpenVINO/QNN, which remain genuinely unimplemented. `PostV10HandoffItem`
+and `reject_post_v1_0_item_as_release_claim` enforce "post-v1.0 items SHALL
+remain separate from `v1.0` release claims."
 
 ## Final Release Statement
 
-`V0_1_FINAL_RELEASE_STATEMENT` is the exact statement text from the
-proposal. `validate_final_release_statement` rejects any statement text
-missing the CPU-local baseline, Runtime Inference API, Reference CPU
-Provider, or E2E local conformance phrases.
+`V1_0_FINAL_RELEASE_STATEMENT` is the statement text, re-evidenced for
+`v1.0` (MAG-10): the original `v0.1` text predated the real CUDA/WGPU
+Provider validation and the real production Qwen2/2.5 profile, so it now
+also names both. `validate_final_release_statement` rejects any statement
+text missing the CPU-local baseline, Runtime Inference API, Reference CPU
+Provider, or E2E local conformance phrases -- the new text still carries
+all four.
 
 ## Observability
 
@@ -248,8 +268,10 @@ tool execution blocks release" without a third capability list.
 `ReleaseCutoverGateInputs` records seventeen top-level blocking-criteria
 inputs, in the shape of `release_security::ReleaseSecurityGateInputs`.
 `evaluate_release_cutover` reports every triggered reason, not just the
-first, implementing the "Cutover Principle": "a stable `v0.1` release SHALL
-be cut only after required gates pass and release metadata is complete."
+first, implementing the "Cutover Principle": "a stable `v1.0` release SHALL
+be cut only after required gates pass and release metadata is complete"
+(MAG-10: renamed from "v0.1" -- the underlying principle, not the specific
+release number).
 
 ## Conformance
 
@@ -265,7 +287,7 @@ verification, incomplete artifact generation or verification, a checksum
 mismatch, an incomplete changelog or release notes, a tag created before
 gates pass (including before WIT validation), a publication scope violation
 (including a server API inclusion claim), a failed post-publication
-verification, incomplete rollback notes, a post-`v0.1` item presented as a
+verification, incomplete rollback notes, a post-`v1.0` item presented as a
 release claim, an invalid final release statement, a denied CLI/Runtime
 authority expansion, and a redacted, correlatable cutover observation are
 all rejected or accepted as documented above.

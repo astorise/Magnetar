@@ -1,15 +1,28 @@
 //! v0.1 release cutover checklist policy contract (see
-//! `openspec/changes/define-v0-1-release-cutover-checklist`).
+//! `openspec/changes/define-v0-1-release-cutover-checklist`; the proposal's
+//! own name and the `specs/v0-1-release-cutover/spec.md` citations
+//! throughout this module are historical and intentionally not renamed --
+//! they name the actual OpenSpec document this module implements, not the
+//! release this checklist currently targets. MAG-10: the module's own
+//! reusable constants/types ([`V1_0_INCLUDED_SCOPE`],
+//! [`V1_0_FINAL_RELEASE_STATEMENT`], [`POST_V1_0_HANDOFF_CANDIDATES`],
+//! [`CutoverCompatibilityStatus::StableForV10Baseline`]) are re-evidenced
+//! for `v1.0` now that `1.0.0-RC0` is the real, published target -- see
+//! each one's own doc comment for what changed and why).
 //!
 //! This module does not implement release automation, publish a release,
 //! define registry credentials, define a final hosting provider, define a
 //! legal approval process, guarantee production security, or include GPU
 //! Providers, a server API implementation, model hub downloads, or an
 //! agent/tool runtime -- the proposal's "Non-Goals" rule all of that out
-//! explicitly. Instead it defines, as executable Rust types and validation
-//! functions, the **operational sequence** required to move from release
-//! candidate to stable `v0.1`: `freeze -> gates -> reports -> artifacts ->
-//! tag -> publish -> verify`. It is deliberately an **orchestrator**: every
+//! explicitly (a historical scoping statement from the original proposal,
+//! not a claim that real GPU Provider work does not exist elsewhere in the
+//! repository today -- see `crate::release_packaging`'s own real
+//! `cuda-provider`/`webgpu-provider` flags). Instead it defines, as
+//! executable Rust types and validation functions, the **operational
+//! sequence** required to move from release candidate to a stable release:
+//! `freeze -> gates -> reports -> artifacts -> tag -> publish -> verify`.
+//! It is deliberately an **orchestrator**: every
 //! check below composes an existing policy module
 //! ([`crate::release_packaging`], [`crate::release_security`]) rather than
 //! re-implementing packaging, versioning, or security logic a sibling
@@ -21,7 +34,7 @@
 //!   "OpenSpec Freeze", composing [`crate::release_packaging::ReleaseFreezeState`]
 //!   and [`crate::release_packaging::reject_change_after_freeze`] instead of
 //!   a parallel freeze model.
-//! - [`validate_v0_1_scope_feature`]: "Scope Confirmation", composing
+//! - [`validate_v1_0_scope_feature`]: "Scope Confirmation", composing
 //!   [`crate::release_packaging::reject_roadmap_feature_as_guarantee`]
 //!   rather than a second deferred-roadmap-feature list.
 //! - [`WitPackageVersionRecord`] / [`validate_wit_versions_confirmed`] /
@@ -68,9 +81,9 @@
 //!   [`reject_status_misrepresentation`].
 //! - [`PostPublicationVerification`]: "Post-Publication Verification".
 //! - [`RollbackRetractionNotes`]: "Rollback And Retraction Notes".
-//! - [`PostV01HandoffItem`] / [`POST_V0_1_HANDOFF_CANDIDATES`] /
-//!   [`reject_post_v0_1_item_as_release_claim`]: "Post-v0.1 Handoff".
-//! - [`V0_1_FINAL_RELEASE_STATEMENT`] / [`validate_final_release_statement`]:
+//! - [`PostV10HandoffItem`] / [`POST_V1_0_HANDOFF_CANDIDATES`] /
+//!   [`reject_post_v1_0_item_as_release_claim`]: "Post-v0.1 Handoff".
+//! - [`V1_0_FINAL_RELEASE_STATEMENT`] / [`validate_final_release_statement`]:
 //!   "Final Release Statement".
 //! - [`ReleaseCutoverObservation`] / [`record_release_cutover_observation`]:
 //!   observability, composing [`magnetar_runtime::CorrelationId`] (for gate/target/
@@ -112,13 +125,21 @@ use magnetar_runtime::{CorrelationId, WitInterface};
 
 pub const RELEASE_CUTOVER_POLICY_VERSION: &str = "0.1.0";
 
-/// The `v0.1` included baseline named in "Scope Confirmation"
+/// The `v1.0` included baseline named in "Scope Confirmation"
 /// (`proposal.md`). Deliberately documentation-only: enforcement is
-/// [`validate_v0_1_scope_feature`], which composes
+/// [`validate_v1_0_scope_feature`], which composes
 /// [`reject_roadmap_feature_as_guarantee`] rather than a second list of
 /// excluded features -- `crate::release_packaging`'s deferred roadmap feature
 /// list already owns that.
-pub const V0_1_INCLUDED_SCOPE: &[&str] = &[
+///
+/// MAG-10: added `"cuda-provider"`, `"webgpu-provider"`, and
+/// `"production-qwen-model-support"` -- the original `v0.1` list predates
+/// all three becoming real and hardware-validated (`README.md`'s "Current
+/// Status"), and `crate::release_packaging::DEFERRED_ROADMAP_FEATURES` no
+/// longer names any of them either; this list would otherwise contradict
+/// that one. Every other entry is unchanged -- no evidence surfaced that
+/// the original CPU-local baseline scope should shrink.
+pub const V1_0_INCLUDED_SCOPE: &[&str] = &[
     "runtime-inference-api-baseline",
     "model-loading-baseline",
     "model-instance-baseline",
@@ -129,6 +150,9 @@ pub const V0_1_INCLUDED_SCOPE: &[&str] = &[
     "operator-first-scope",
     "kernel-registry-and-dispatch",
     "reference-cpu-provider",
+    "cuda-provider",
+    "webgpu-provider",
+    "production-qwen-model-support",
     "cli-boundary-harness",
     "e2e-local-inference-conformance",
     "release-reports",
@@ -267,7 +291,7 @@ pub fn reject_semantic_change_after_freeze(
 /// release" (`specs/v0-1-release-cutover/spec.md`): composes
 /// [`reject_roadmap_feature_as_guarantee`] rather than a second deferred-
 /// roadmap-feature list.
-pub fn validate_v0_1_scope_feature(
+pub fn validate_v1_0_scope_feature(
     feature: &str,
     presented_as_included: bool,
 ) -> Result<(), ReleaseCutoverError> {
@@ -482,11 +506,12 @@ pub const fn cutover_compatibility_dimension_id(
 }
 
 /// The six-value approved status vocabulary from "Compatibility Matrix
-/// Completion" (`proposal.md`): `stable-for-v0.1-baseline`, `preview`,
-/// `experimental`, `unstable`, `deferred`, `unsupported`.
+/// Completion" (`proposal.md`): `stable-for-v1.0-baseline` (MAG-10:
+/// renamed from `stable-for-v0.1-baseline`), `preview`, `experimental`,
+/// `unstable`, `deferred`, `unsupported`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CutoverCompatibilityStatus {
-    StableForV01Baseline,
+    StableForV10Baseline,
     Preview,
     Experimental,
     Unstable,
@@ -496,7 +521,7 @@ pub enum CutoverCompatibilityStatus {
 
 pub const fn cutover_compatibility_status_id(status: CutoverCompatibilityStatus) -> &'static str {
     match status {
-        CutoverCompatibilityStatus::StableForV01Baseline => "stable-for-v0.1-baseline",
+        CutoverCompatibilityStatus::StableForV10Baseline => "stable-for-v1.0-baseline",
         CutoverCompatibilityStatus::Preview => "preview",
         CutoverCompatibilityStatus::Experimental => "experimental",
         CutoverCompatibilityStatus::Unstable => "unstable",
@@ -539,8 +564,8 @@ impl CutoverCompatibilityMatrix {
 
 /// "Experimental API presented stable SHALL block release"
 /// (`specs/v0-1-release-cutover/spec.md`): rejects presenting anything less
-/// stable than [`CutoverCompatibilityStatus::StableForV01Baseline`] as if it
-/// were `StableForV01Baseline`.
+/// stable than [`CutoverCompatibilityStatus::StableForV10Baseline`] as if it
+/// were `StableForV10Baseline`.
 pub fn reject_status_misrepresentation(
     actual_status: CutoverCompatibilityStatus,
     presented_status: CutoverCompatibilityStatus,
@@ -548,11 +573,11 @@ pub fn reject_status_misrepresentation(
 ) -> Result<(), ReleaseCutoverError> {
     let actual_not_stable = !matches!(
         actual_status,
-        CutoverCompatibilityStatus::StableForV01Baseline
+        CutoverCompatibilityStatus::StableForV10Baseline
     );
     let presented_stable = matches!(
         presented_status,
-        CutoverCompatibilityStatus::StableForV01Baseline
+        CutoverCompatibilityStatus::StableForV10Baseline
     );
     if actual_not_stable && presented_stable {
         return Err(ReleaseCutoverError::StatusMisrepresented {
@@ -588,7 +613,7 @@ pub fn validate_required_gates_executed(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GateSkip {
     pub gate: String,
-    pub outside_v0_1_scope: bool,
+    pub outside_v1_0_scope: bool,
     pub reason: Option<String>,
     pub hides_baseline_failure: bool,
     pub included_in_release_report: bool,
@@ -600,7 +625,7 @@ impl GateSkip {
             .reason
             .as_deref()
             .is_some_and(|reason| !reason.trim().is_empty());
-        let allowed = self.outside_v0_1_scope
+        let allowed = self.outside_v1_0_scope
             && reason_documented
             && !self.hides_baseline_failure
             && self.included_in_release_report;
@@ -846,7 +871,7 @@ impl CutoverChangelogChecklist {
 /// thirteen topics release notes SHALL answer or include.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CutoverReleaseNotesChecklist {
-    pub explains_what_v0_1_is: bool,
+    pub explains_what_v1_0_is: bool,
     pub explains_what_users_can_run: bool,
     pub explains_stable_status: bool,
     pub explains_preview_status: bool,
@@ -864,7 +889,7 @@ pub struct CutoverReleaseNotesChecklist {
 impl CutoverReleaseNotesChecklist {
     pub fn validate(&self) -> Result<(), ReleaseCutoverError> {
         let checks: [(&str, bool); 13] = [
-            ("what-v0.1-is", self.explains_what_v0_1_is),
+            ("what-v1.0-is", self.explains_what_v1_0_is),
             ("what-users-can-run", self.explains_what_users_can_run),
             ("stable-status", self.explains_stable_status),
             ("preview-status", self.explains_preview_status),
@@ -927,7 +952,7 @@ pub fn validate_publication_scope_preserved(
     actual_status: CutoverCompatibilityStatus,
     presented_status: CutoverCompatibilityStatus,
 ) -> Result<(), ReleaseCutoverError> {
-    validate_v0_1_scope_feature(feature, presented_as_included).map_err(|error| {
+    validate_v1_0_scope_feature(feature, presented_as_included).map_err(|error| {
         ReleaseCutoverError::PublicationScopeViolation {
             reason: error.to_string(),
         }
@@ -1043,33 +1068,50 @@ impl RollbackRetractionNotes {
 // Post-v0.1 Handoff
 // ---------------------------------------------------------------------
 
-/// Post-`v0.1` roadmap handoff candidates named in "Post-v0.1 Handoff"
-/// (`proposal.md`).
-pub const POST_V0_1_HANDOFF_CANDIDATES: &[&str] = &[
+/// Post-`v1.0` roadmap handoff candidates named in "Post-v0.1 Handoff"
+/// (`proposal.md`; the quoted section title is unchanged from the
+/// original proposal document, see this module's own doc comment).
+///
+/// MAG-10: `"cuda-metal-openvino-qnn-webgpu-exploration"` became
+/// `"metal-openvino-qnn-exploration"` -- CUDA and WebGPU are past
+/// "exploration" (real, hardware-validated Providers, per
+/// `V1_0_INCLUDED_SCOPE`'s own doc comment); Metal/OpenVINO/QNN remain
+/// genuinely unimplemented. Every other entry is unchanged -- no evidence
+/// surfaced that `"quantized-inference"` or `"advanced-attention"` should
+/// be removed outright: real quantized-inference work has landed (GGUF's
+/// `Q8_0`/`Q4_K`/`Q5_K` dequantization has a full real-checkpoint
+/// generation proof) but a full generation proof specifically for GPTQ/
+/// AWQ/BitsAndBytes remains open per `RELEASE_NOTES.md`'s "Preview Or
+/// Contract-Only" section, and nothing in the evidence available to this
+/// change speaks to "advanced-attention" one way or the other.
+pub const POST_V1_0_HANDOFF_CANDIDATES: &[&str] = &[
     "implementation-hardening",
     "optimized-cpu-provider",
     "model-format-support",
     "source-cache-implementation",
     "server-api-implementation",
     "production-cli-ux",
-    "cuda-metal-openvino-qnn-webgpu-exploration",
+    "metal-openvino-qnn-exploration",
     "quantized-inference",
     "advanced-attention",
 ];
 
-/// A single post-`v0.1` handoff item.
+/// A single post-`v1.0` handoff item.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PostV01HandoffItem {
+pub struct PostV10HandoffItem {
     pub name: String,
-    pub presented_as_v0_1_release_claim: bool,
+    pub presented_as_v1_0_release_claim: bool,
 }
 
-/// "Post-v0.1 items SHALL remain separate from `v0.1` release claims."
-pub fn reject_post_v0_1_item_as_release_claim(
-    item: &PostV01HandoffItem,
+/// "Post-v1.0 items SHALL remain separate from `v1.0` release claims"
+/// (MAG-10: renamed from "Post-v0.1 items SHALL remain separate from
+/// `v0.1` release claims" -- the underlying principle, not the specific
+/// release number).
+pub fn reject_post_v1_0_item_as_release_claim(
+    item: &PostV10HandoffItem,
 ) -> Result<(), ReleaseCutoverError> {
-    if item.presented_as_v0_1_release_claim {
-        return Err(ReleaseCutoverError::PostV01ItemPresentedAsReleaseClaim {
+    if item.presented_as_v1_0_release_claim {
+        return Err(ReleaseCutoverError::PostV10ItemPresentedAsReleaseClaim {
             item: item.name.clone(),
         });
     }
@@ -1080,9 +1122,17 @@ pub fn reject_post_v0_1_item_as_release_claim(
 // Final Release Statement
 // ---------------------------------------------------------------------
 
-/// The exact final release statement from "Final Release Statement"
-/// (`proposal.md`).
-pub const V0_1_FINAL_RELEASE_STATEMENT: &str = "Magnetar v0.1 is a CPU-local inference runtime baseline. It validates the first end-to-end inference path through Runtime Inference API, Reference CPU Provider, and E2E local conformance. Post-baseline roadmap features are not included unless explicitly marked.";
+/// The final release statement from "Final Release Statement"
+/// (`proposal.md`), re-evidenced for `v1.0` (MAG-10): the original `v0.1`
+/// text predates the real, hardware-validated CUDA and WGPU Providers and
+/// the real production Qwen2/2.5 ingestion/generation profile
+/// (`README.md`'s "Current Status"), none of which it mentioned. Still
+/// passes [`validate_final_release_statement`]'s four required phrases
+/// and still names only what `V1_0_INCLUDED_SCOPE` actually includes --
+/// it does not claim Metal, OpenVINO, QNN, ROCm/NPU/TPU compute, a server
+/// API, or general production model support, all still genuinely
+/// deferred.
+pub const V1_0_FINAL_RELEASE_STATEMENT: &str = "Magnetar v1.0 is a CPU-local inference runtime baseline, now also validated through a real, hardware-verified external CUDA Provider, via the Runtime Inference API, Reference CPU Provider, and E2E local conformance. A real external WGPU Provider separately validates hardware-verified cross-platform GPU device discovery and one real compute Kernel, not yet wired into the Runtime Inference API dispatch path. It additionally validates real production Qwen2/2.5 model artifact ingestion and generation end to end on Reference CPU and real CUDA hardware. Post-baseline roadmap features are not included unless explicitly marked.";
 
 /// "It accurately describes included baseline and excludes roadmap
 /// features" (`specs/v0-1-release-cutover/spec.md`): rejects a statement
@@ -1216,7 +1266,7 @@ pub enum ReleaseCutoverError {
     PublicationScopeViolation { reason: String },
     PostPublicationVerificationFailed { check: String },
     RollbackNotesIncomplete { missing: String },
-    PostV01ItemPresentedAsReleaseClaim { item: String },
+    PostV10ItemPresentedAsReleaseClaim { item: String },
     FinalReleaseStatementInvalid { reason: String },
     RuntimeScopeViolation { reason: String },
     ReleaseCutoverBlocked { reasons: Vec<String> },
@@ -1257,8 +1307,8 @@ impl ReleaseCutoverError {
                 "post-publication-verification-failed"
             }
             Self::RollbackNotesIncomplete { .. } => "rollback-notes-incomplete",
-            Self::PostV01ItemPresentedAsReleaseClaim { .. } => {
-                "post-v0-1-item-presented-as-release-claim"
+            Self::PostV10ItemPresentedAsReleaseClaim { .. } => {
+                "post-v1-0-item-presented-as-release-claim"
             }
             Self::FinalReleaseStatementInvalid { .. } => "final-release-statement-invalid",
             Self::RuntimeScopeViolation { .. } => "runtime-scope-violation",
@@ -1312,7 +1362,7 @@ impl fmt::Display for ReleaseCutoverError {
             Self::PostPublicationVerificationFailed { check } => {
                 write!(f, "{}: {check}", self.id())
             }
-            Self::PostV01ItemPresentedAsReleaseClaim { item } => {
+            Self::PostV10ItemPresentedAsReleaseClaim { item } => {
                 write!(f, "{}: {item}", self.id())
             }
             Self::ReleaseCutoverBlocked { reasons } => {
@@ -1355,8 +1405,9 @@ pub struct ReleaseCutoverGateInputs {
 /// Evaluates every [`ReleaseCutoverGateInputs`] field and, if any are
 /// `true`, returns [`ReleaseCutoverError::ReleaseCutoverBlocked`] naming
 /// every triggered reason (not just the first) -- the "Cutover Principle"
-/// (`proposal.md`): "A stable v0.1 release SHALL be cut only after required
-/// gates pass and release metadata is complete."
+/// (`proposal.md`): "A stable v1.0 release SHALL be cut only after required
+/// gates pass and release metadata is complete" (MAG-10: renamed from
+/// "v0.1" -- the underlying principle, not the specific release number).
 pub fn evaluate_release_cutover(
     inputs: &ReleaseCutoverGateInputs,
 ) -> Result<(), ReleaseCutoverError> {
@@ -1469,7 +1520,7 @@ fn record(
 /// exception, a failed security verification, incomplete artifact
 /// generation or verification, an incomplete changelog or release notes, a
 /// tag created before gates pass, a publication scope violation, a failed
-/// post-publication verification, incomplete rollback notes, a post-`v0.1`
+/// post-publication verification, incomplete rollback notes, a post-`v1.0`
 /// item presented as a release claim, an invalid final release statement, a
 /// denied CLI/Runtime authority expansion, and a redacted, correlatable
 /// cutover observation are all rejected or accepted as documented above.
@@ -1537,14 +1588,14 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
         // longer in DEFERRED_ROADMAP_FEATURES, so presenting it as
         // included is now allowed (see release_packaging.rs's own
         // matching conformance check for the evidence).
-        let cuda_included = validate_v0_1_scope_feature("cuda", true);
+        let cuda_included = validate_v1_0_scope_feature("cuda", true);
         record(
             &mut results,
             "CUDA can now be presented as included for v1.0",
             cuda_included.is_ok(),
             format!("unexpected outcome: {cuda_included:?}"),
         );
-        let still_deferred_included = validate_v0_1_scope_feature("openvino", true);
+        let still_deferred_included = validate_v1_0_scope_feature("openvino", true);
         record(
             &mut results,
             "a genuinely still-deferred roadmap feature listed as included is blocked",
@@ -1554,7 +1605,7 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
             ),
             format!("unexpected outcome: {still_deferred_included:?}"),
         );
-        let baseline_included = validate_v0_1_scope_feature("reference-cpu-provider", true);
+        let baseline_included = validate_v1_0_scope_feature("reference-cpu-provider", true);
         record(
             &mut results,
             "the CPU-local baseline can be presented as included",
@@ -1658,7 +1709,7 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
         );
         let mut complete = CutoverCompatibilityMatrix::default();
         for dimension in CUTOVER_COMPATIBILITY_DIMENSIONS {
-            complete.set(*dimension, CutoverCompatibilityStatus::StableForV01Baseline);
+            complete.set(*dimension, CutoverCompatibilityStatus::StableForV10Baseline);
         }
         record(
             &mut results,
@@ -1671,7 +1722,7 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
     {
         let misrepresented = reject_status_misrepresentation(
             CutoverCompatibilityStatus::Experimental,
-            CutoverCompatibilityStatus::StableForV01Baseline,
+            CutoverCompatibilityStatus::StableForV10Baseline,
             "runtime-inference-api",
         );
         record(
@@ -1735,7 +1786,7 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
     {
         let disallowed = GateSkip {
             gate: "reference-cpu-conformance".into(),
-            outside_v0_1_scope: false,
+            outside_v1_0_scope: false,
             reason: Some("time constraints".into()),
             hides_baseline_failure: false,
             included_in_release_report: true,
@@ -1747,10 +1798,15 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
             matches!(outcome, Err(ReleaseCutoverError::DisallowedGateSkip { .. })),
             format!("unexpected outcome: {outcome:?}"),
         );
+        // MAG-10: this used to use "cuda-conformance" as the example --
+        // CUDA is real and in V1_0_INCLUDED_SCOPE now, so it is no longer
+        // a believable "outside v1.0 scope" example. Metal genuinely still
+        // is (an honest, unconditionally-unavailable placeholder; see
+        // README.md's "Current Status").
         let allowed = GateSkip {
-            gate: "cuda-conformance".into(),
-            outside_v0_1_scope: true,
-            reason: Some("CUDA is outside v0.1 scope".into()),
+            gate: "metal-conformance".into(),
+            outside_v1_0_scope: true,
+            reason: Some("Metal is outside v1.0 scope -- no macOS environment exists in this repository's tooling to implement or verify it".into()),
             hides_baseline_failure: false,
             included_in_release_report: true,
         };
@@ -1812,7 +1868,7 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
                 ..Default::default()
             },
             security_notes: SecurityReleaseNotes {
-                v0_1_threat_model: Some("CPU-local baseline".into()),
+                v1_0_threat_model: Some("CPU-local baseline".into()),
                 trusted_native_provider_model: Some("Providers are trusted native code".into()),
                 no_raw_handle_policy: Some("no raw handles in public APIs".into()),
                 default_redaction: Some("diagnostics redact by default".into()),
@@ -1896,7 +1952,7 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
 
     {
         let experimental_as_stable = CutoverReleaseNotesChecklist {
-            explains_what_v0_1_is: true,
+            explains_what_v1_0_is: true,
             ..Default::default()
         };
         record(
@@ -1910,7 +1966,7 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
         );
         let stability_outcome = reject_status_misrepresentation(
             CutoverCompatibilityStatus::Experimental,
-            CutoverCompatibilityStatus::StableForV01Baseline,
+            CutoverCompatibilityStatus::StableForV10Baseline,
             "cli-command-surface",
         );
         record(
@@ -1955,11 +2011,11 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
             "server-api-implementation",
             true,
             CutoverCompatibilityStatus::Deferred,
-            CutoverCompatibilityStatus::StableForV01Baseline,
+            CutoverCompatibilityStatus::StableForV10Baseline,
         );
         record(
             &mut results,
-            "server API claimed included in v0.1 publication is blocked",
+            "server API claimed included in v1.0 publication is blocked",
             matches!(
                 server_api_claimed,
                 Err(ReleaseCutoverError::PublicationScopeViolation { .. })
@@ -1969,8 +2025,8 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
         let accurate_publication = validate_publication_scope_preserved(
             "reference-cpu-provider",
             true,
-            CutoverCompatibilityStatus::StableForV01Baseline,
-            CutoverCompatibilityStatus::StableForV01Baseline,
+            CutoverCompatibilityStatus::StableForV10Baseline,
+            CutoverCompatibilityStatus::StableForV10Baseline,
         );
         record(
             &mut results,
@@ -2026,41 +2082,41 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
     }
 
     {
-        let next_work = PostV01HandoffItem {
+        let next_work = PostV10HandoffItem {
             name: "optimized-cpu-provider".into(),
-            presented_as_v0_1_release_claim: false,
+            presented_as_v1_0_release_claim: false,
         };
         record(
             &mut results,
-            "optimized CPU Provider listed as next work is clearly post-v0.1",
-            reject_post_v0_1_item_as_release_claim(&next_work).is_ok(),
+            "optimized CPU Provider listed as next work is clearly post-v1.0",
+            reject_post_v1_0_item_as_release_claim(&next_work).is_ok(),
             format!(
                 "unexpected outcome: {:?}",
-                reject_post_v0_1_item_as_release_claim(&next_work)
+                reject_post_v1_0_item_as_release_claim(&next_work)
             ),
         );
-        let misclaimed = PostV01HandoffItem {
+        let misclaimed = PostV10HandoffItem {
             name: "server-api-implementation".into(),
-            presented_as_v0_1_release_claim: true,
+            presented_as_v1_0_release_claim: true,
         };
-        let outcome = reject_post_v0_1_item_as_release_claim(&misclaimed);
+        let outcome = reject_post_v1_0_item_as_release_claim(&misclaimed);
         record(
             &mut results,
-            "a post-v0.1 item presented as a v0.1 release claim is rejected",
+            "a post-v1.0 item presented as a v1.0 release claim is rejected",
             outcome.is_err(),
             format!("unexpected outcome: {outcome:?}"),
         );
     }
 
     {
-        let outcome = validate_final_release_statement(V0_1_FINAL_RELEASE_STATEMENT);
+        let outcome = validate_final_release_statement(V1_0_FINAL_RELEASE_STATEMENT);
         record(
             &mut results,
             "the canonical final release statement is accepted",
             outcome.is_ok(),
             format!("unexpected outcome: {outcome:?}"),
         );
-        let invalid = validate_final_release_statement("Magnetar v0.1 ships GPU support.");
+        let invalid = validate_final_release_statement("Magnetar v1.0 ships GPU support.");
         record(
             &mut results,
             "a release statement missing required phrases is rejected",

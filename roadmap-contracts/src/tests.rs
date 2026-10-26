@@ -2253,7 +2253,7 @@ fn sbom_manifest_requires_generation_or_documented_limitation() {
 
     let documented = SbomManifest {
         availability: SbomAvailability::PlaceholderDocumented,
-        limitation_note: Some("SBOM generation is not implemented for v0.1".into()),
+        limitation_note: Some("SBOM generation is not available for this build target".into()),
         ..Default::default()
     };
     assert!(documented.validate().is_ok());
@@ -2752,7 +2752,7 @@ fn vulnerability_handling_policy_requires_every_field_defined() {
 fn security_release_notes_require_shall_strength_topics() {
     assert!(SecurityReleaseNotes::default().validate().is_err());
     let complete = SecurityReleaseNotes {
-        v0_1_threat_model: Some("CPU-local baseline".into()),
+        v1_0_threat_model: Some("CPU-local baseline".into()),
         trusted_native_provider_model: Some("Providers are trusted native code".into()),
         no_raw_handle_policy: Some("no raw handles in public APIs".into()),
         default_redaction: Some("diagnostics redact by default".into()),
@@ -2913,19 +2913,19 @@ fn semantic_change_after_freeze_is_blocked_or_freeze_is_restarted() {
 fn cuda_can_now_be_presented_as_included_for_v1_0() {
     // MAG-10: CUDA is real and hardware-validated and is no longer in
     // DEFERRED_ROADMAP_FEATURES.
-    let outcome = validate_v0_1_scope_feature("cuda", true);
+    let outcome = validate_v1_0_scope_feature("cuda", true);
     assert!(outcome.is_ok());
-    assert!(validate_v0_1_scope_feature("cuda", false).is_ok());
+    assert!(validate_v1_0_scope_feature("cuda", false).is_ok());
 }
 
 #[test]
 fn a_genuinely_still_deferred_feature_listed_as_included_is_blocked() {
-    let outcome = validate_v0_1_scope_feature("openvino", true);
+    let outcome = validate_v1_0_scope_feature("openvino", true);
     assert!(matches!(
         outcome,
         Err(ReleaseCutoverError::RoadmapFeaturePresentedAsIncluded { .. })
     ));
-    assert!(validate_v0_1_scope_feature("openvino", false).is_ok());
+    assert!(validate_v1_0_scope_feature("openvino", false).is_ok());
 }
 
 #[test]
@@ -2951,7 +2951,7 @@ fn missing_wit_package_blocks_the_cutover_compatibility_matrix() {
     let mut matrix = CutoverCompatibilityMatrix::default();
     for dimension in CUTOVER_COMPATIBILITY_DIMENSIONS {
         if *dimension != CutoverCompatibilityDimension::WitPackages {
-            matrix.set(*dimension, CutoverCompatibilityStatus::StableForV01Baseline);
+            matrix.set(*dimension, CutoverCompatibilityStatus::StableForV10Baseline);
         }
     }
     let outcome = matrix.validate();
@@ -3036,7 +3036,7 @@ fn provider_abi_missing_blocks_compatibility_matrix_completion() {
     let mut matrix = CutoverCompatibilityMatrix::default();
     for dimension in CUTOVER_COMPATIBILITY_DIMENSIONS {
         if *dimension != CutoverCompatibilityDimension::ProviderAbi {
-            matrix.set(*dimension, CutoverCompatibilityStatus::StableForV01Baseline);
+            matrix.set(*dimension, CutoverCompatibilityStatus::StableForV10Baseline);
         }
     }
     assert!(matches!(
@@ -3049,8 +3049,8 @@ fn provider_abi_missing_blocks_compatibility_matrix_completion() {
 fn cutover_compatibility_matrix_uses_approved_status_vocabulary() {
     assert_eq!(CUTOVER_COMPATIBILITY_DIMENSIONS.len(), 12);
     assert_eq!(
-        cutover_compatibility_status_id(CutoverCompatibilityStatus::StableForV01Baseline),
-        "stable-for-v0.1-baseline"
+        cutover_compatibility_status_id(CutoverCompatibilityStatus::StableForV10Baseline),
+        "stable-for-v1.0-baseline"
     );
     assert_eq!(
         cutover_compatibility_status_id(CutoverCompatibilityStatus::Unsupported),
@@ -3062,7 +3062,7 @@ fn cutover_compatibility_matrix_uses_approved_status_vocabulary() {
 fn experimental_api_presented_stable_is_blocked() {
     let outcome = reject_status_misrepresentation(
         CutoverCompatibilityStatus::Experimental,
-        CutoverCompatibilityStatus::StableForV01Baseline,
+        CutoverCompatibilityStatus::StableForV10Baseline,
         "cli-command-surface",
     );
     assert!(matches!(
@@ -3071,8 +3071,8 @@ fn experimental_api_presented_stable_is_blocked() {
     ));
     assert!(
         reject_status_misrepresentation(
-            CutoverCompatibilityStatus::StableForV01Baseline,
-            CutoverCompatibilityStatus::StableForV01Baseline,
+            CutoverCompatibilityStatus::StableForV10Baseline,
+            CutoverCompatibilityStatus::StableForV10Baseline,
             "cli-command-surface",
         )
         .is_ok()
@@ -3099,7 +3099,7 @@ fn e2e_gate_not_run_blocks_required_gate_execution() {
 fn reference_cpu_gate_skip_is_disallowed() {
     let skip = GateSkip {
         gate: "reference-cpu-conformance".into(),
-        outside_v0_1_scope: false,
+        outside_v1_0_scope: false,
         reason: Some("ran out of time".into()),
         hides_baseline_failure: false,
         included_in_release_report: true,
@@ -3114,7 +3114,7 @@ fn reference_cpu_gate_skip_is_disallowed() {
 fn allowed_skip_requires_every_condition() {
     let hides_failure = GateSkip {
         gate: "cuda-conformance".into(),
-        outside_v0_1_scope: true,
+        outside_v1_0_scope: true,
         reason: Some("out of scope".into()),
         hides_baseline_failure: true,
         included_in_release_report: true,
@@ -3174,7 +3174,7 @@ fn secret_scan_missing_blocks_security_verification() {
     let missing = CutoverSecurityVerification {
         gate_inputs: ReleaseSecurityGateInputs::default(),
         security_notes: SecurityReleaseNotes {
-            v0_1_threat_model: Some("CPU-local baseline".into()),
+            v1_0_threat_model: Some("CPU-local baseline".into()),
             trusted_native_provider_model: Some("Providers are trusted native code".into()),
             no_raw_handle_policy: Some("no raw handles in public APIs".into()),
             default_redaction: Some("diagnostics redact by default".into()),
@@ -3281,7 +3281,7 @@ fn known_limitation_missing_from_changelog_blocks_release() {
 #[test]
 fn release_notes_checklist_requires_every_topic() {
     let incomplete = CutoverReleaseNotesChecklist {
-        explains_what_v0_1_is: true,
+        explains_what_v1_0_is: true,
         ..Default::default()
     };
     assert!(matches!(
@@ -3290,7 +3290,7 @@ fn release_notes_checklist_requires_every_topic() {
     ));
 
     let complete = CutoverReleaseNotesChecklist {
-        explains_what_v0_1_is: true,
+        explains_what_v1_0_is: true,
         explains_what_users_can_run: true,
         explains_stable_status: true,
         explains_preview_status: true,
@@ -3352,7 +3352,7 @@ fn server_api_claimed_included_is_blocked() {
         "server-api-implementation",
         true,
         CutoverCompatibilityStatus::Deferred,
-        CutoverCompatibilityStatus::StableForV01Baseline,
+        CutoverCompatibilityStatus::StableForV10Baseline,
     );
     assert!(matches!(
         outcome,
@@ -3394,27 +3394,27 @@ fn rollback_and_retraction_notes_cover_invalid_release_discovery() {
 }
 
 #[test]
-fn post_v0_1_item_presented_as_release_claim_is_rejected() {
-    let next_work = PostV01HandoffItem {
+fn post_v1_0_item_presented_as_release_claim_is_rejected() {
+    let next_work = PostV10HandoffItem {
         name: "optimized-cpu-provider".into(),
-        presented_as_v0_1_release_claim: false,
+        presented_as_v1_0_release_claim: false,
     };
-    assert!(reject_post_v0_1_item_as_release_claim(&next_work).is_ok());
+    assert!(reject_post_v1_0_item_as_release_claim(&next_work).is_ok());
 
-    let misclaimed = PostV01HandoffItem {
+    let misclaimed = PostV10HandoffItem {
         name: "optimized-cpu-provider".into(),
-        presented_as_v0_1_release_claim: true,
+        presented_as_v1_0_release_claim: true,
     };
     assert!(matches!(
-        reject_post_v0_1_item_as_release_claim(&misclaimed),
-        Err(ReleaseCutoverError::PostV01ItemPresentedAsReleaseClaim { .. })
+        reject_post_v1_0_item_as_release_claim(&misclaimed),
+        Err(ReleaseCutoverError::PostV10ItemPresentedAsReleaseClaim { .. })
     ));
 }
 
 #[test]
 fn final_release_statement_describes_baseline_accurately() {
-    assert!(validate_final_release_statement(V0_1_FINAL_RELEASE_STATEMENT).is_ok());
-    assert!(validate_final_release_statement("Magnetar v0.1 ships full GPU support.").is_err());
+    assert!(validate_final_release_statement(V1_0_FINAL_RELEASE_STATEMENT).is_ok());
+    assert!(validate_final_release_statement("Magnetar v1.0 ships full GPU support.").is_err());
 }
 
 #[test]
