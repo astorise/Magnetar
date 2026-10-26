@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn round_trips_a_kernel_bundle_through_a_local_layout() {
-        let layer_bytes: &[u8] = b"fake tar+zstd bytes";
+        let layer_bytes: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03fake gzip payload";
         let built = build_artifact_manifest(
             ArtifactKind::KernelExchangeBundle,
             layer_bytes,

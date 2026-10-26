@@ -17,7 +17,17 @@ pub const COMPONENT_ARTIFACT_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.com
 /// correction could break.
 pub const COMPONENT_MANIFEST_MEDIA_TYPE_V1: &str =
     "application/vnd.magnetar.component-manifest.v1+yaml";
-pub const KERNEL_BUNDLE_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.kernel-bundle.v1+tar+zstd";
+/// `+tar+gzip`, not `+tar+zstd`: every Kernel Exchange Bundle this
+/// workspace can actually produce or ingest is gzip-compressed --
+/// `extract_kernel_exchange_archive` (`magnetar-runtime`) implements
+/// plain tar and tar.gz only, and zstd decompression is not wired into
+/// the ingestion path at all (MAG-09). A real Kernel Exchange Bundle
+/// (the `cpu_reference_matmul` fixture) was already published to GHCR
+/// under the old, inaccurate `+tar+zstd` label before this correction --
+/// see "Withdrawal / correction" in `docs/release-publication.md`: that
+/// digest stays resolvable as published, and a corrected republish uses
+/// this constant under its own new digest.
+pub const KERNEL_BUNDLE_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.kernel-bundle.v1+tar+gzip";
 pub const KERNEL_MANIFEST_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.kernel-manifest.v1+json";
 pub const CONFORMANCE_FIXTURE_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.conformance.v1+json";
 

@@ -189,6 +189,29 @@ have no such sidecar and reject `--manifest` if given one.
 is required (checked, fail-closed, before the no-network build step
 runs) whenever `kind` is `component`.
 
+## The Kernel Exchange Bundle media type now matches its real bytes (MAG-09)
+
+`KERNEL_BUNDLE_MEDIA_TYPE_V1` was originally defined as
+`application/vnd.magnetar.kernel-bundle.v1+tar+zstd`, but nothing in this
+workspace has ever produced or consumed zstd: `extract_kernel_exchange_
+archive` (`magnetar-runtime`) implements plain tar and tar.gz only, and
+no zstd decoder is wired into the ingestion path at all. The one real
+Kernel Exchange Bundle published so far (the `cpu_reference_matmul`
+fixture) is gzip-compressed, so the published package's declared media
+type never matched its actual bytes -- and nothing checked that it did.
+
+Both are now fixed: the constant is `...+tar+gzip`, and
+`build_artifact_manifest` rejects `ArtifactKind::KernelExchangeBundle`
+bytes that do not start with the gzip magic bytes (`0x1f 0x8b`) before
+building a manifest around them, so a declared format can no longer
+drift from the real content silently.
+
+The already-published `cpu_reference_matmul` digest predates this fix
+and stays resolvable exactly as published, per "Withdrawal /
+correction" below -- it is not retroactively rewritten. Republishing it
+(or any future Kernel Exchange Bundle) now produces a package whose
+declared and actual formats agree.
+
 ## Credential seam
 
 One repository secret, read only from the `release` GitHub Environment

@@ -36,8 +36,11 @@ Given a Component Artifact WASM binary is published to GHCR
 When its OCI manifest is constructed
 
 Then the layer's media type is exactly
-`application/vnd.magnetar.component.v1+wasm`, and the manifest media type is
-`application/vnd.magnetar.component-manifest.v1+json`.
+`application/vnd.magnetar.component.v1+wasm`, the Component's own
+`*.magnetar-component.yaml` manifest sidecar is embedded as a second layer
+under `application/vnd.magnetar.component-manifest.v1+yaml` (MAG-08: not
+`+json` -- the sidecar is YAML), and publication fails closed if that
+sidecar is not given.
 
 #### Scenario: Kernel Exchange Bundle pushed with correct media type
 
@@ -46,8 +49,10 @@ Given a Kernel Exchange Bundle is published to GHCR
 When its OCI manifest is constructed
 
 Then the layer's media type is exactly
-`application/vnd.magnetar.kernel-bundle.v1+tar+zstd`, and the manifest media
-type is `application/vnd.magnetar.kernel-manifest.v1+json`.
+`application/vnd.magnetar.kernel-bundle.v1+tar+gzip` (MAG-09: not
+`+tar+zstd` -- the bundle is gzip-compressed, and publication fails closed
+if the given bytes do not start with the gzip magic bytes), and the
+manifest media type is `application/vnd.magnetar.kernel-manifest.v1+json`.
 
 #### Scenario: Conformance fixture pushed with correct media type
 

@@ -26,6 +26,13 @@ pub fn digest_sha256(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256_hex(bytes))
 }
 
+/// Whether `bytes` starts with the gzip format's own two-byte magic
+/// number (RFC 1952 section 2.3.1), the simplest real check that content
+/// claiming to be gzip-compressed actually is (MAG-09).
+fn looks_like_gzip(bytes: &[u8]) -> bool {
+    bytes.first_chunk::<2>() == Some(&[0x1f, 0x8b])
+}
+
 /// One OCI content descriptor: a digest, size, media type, and optional
 /// annotations.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +108,17 @@ pub fn build_artifact_manifest(
         _ => {}
     }
 
+    // MAG-09: KERNEL_BUNDLE_MEDIA_TYPE_V1 declares `+tar+gzip`; verify the
+    // actual bytes before publishing a package whose declared format does
+    // not match its real content (exactly how a `+tar+zstd` label ended
+    // up on a gzip-compressed bundle in the first place -- nothing ever
+    // checked the two agreed).
+    if kind == ArtifactKind::KernelExchangeBundle && !looks_like_gzip(layer_bytes) {
+        return Err(ReleasePublishError::Metadata(
+            "Kernel Exchange Bundle bytes do not start with the gzip magic bytes (0x1f 0x8b) declared by KERNEL_BUNDLE_MEDIA_TYPE_V1 (+tar+gzip) -- MAG-09: refusing to publish a package whose declared format does not match its actual bytes".into(),
+        ));
+    }
+
     let layer_digest = digest_sha256(layer_bytes);
     let config_digest = digest_sha256(EMPTY_CONFIG_BYTES);
 
@@ -166,6 +184,12 @@ pub fn build_artifact_manifest(
 mod tests {
     use super::*;
 
+    /// A plausible gzip header (magic bytes, deflate method, no flags)
+    /// followed by arbitrary payload -- real enough to satisfy
+    /// [`looks_like_gzip`] without needing a real compressor in this
+    /// crate's own test dependencies.
+    const GZIP_MAGIC_FIXTURE: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03fake gzip payload";
+
     #[test]
     fn component_layer_uses_the_component_media_type() {
         let built = build_artifact_manifest(
@@ -185,15 +209,27 @@ mod tests {
     fn kernel_bundle_layer_uses_the_kernel_bundle_media_type() {
         let built = build_artifact_manifest(
             ArtifactKind::KernelExchangeBundle,
-            b"fake tar+zstd bytes",
+            GZIP_MAGIC_FIXTURE,
             "demo-kernel",
             None,
         )
         .unwrap();
         assert_eq!(
             built.manifest.layers[0].media_type,
-            "application/vnd.magnetar.kernel-bundle.v1+tar+zstd"
+            "application/vnd.magnetar.kernel-bundle.v1+tar+gzip"
         );
+    }
+
+    #[test]
+    fn kernel_bundle_bytes_that_do_not_look_like_gzip_are_rejected() {
+        // MAG-09: a declared +tar+gzip format must actually be gzip.
+        let result = build_artifact_manifest(
+            ArtifactKind::KernelExchangeBundle,
+            b"not actually gzip-compressed bytes",
+            "demo-kernel",
+            None,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
