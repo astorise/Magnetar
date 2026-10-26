@@ -73,14 +73,39 @@ Every command is credential-free and network-free:
    jobs), maps them to `ReleaseGate`s, and evaluates both
    `release_may_publish_stable` and
    `evaluate_release_security_blocking`.
-3. `github-release` (tag push only, needs 1+2 green) -- creates a
-   GitHub Release with a source archive, checksums, SBOM, and
-   provenance. Uses only the workflow's own `GITHUB_TOKEN`; no external
-   secret required.
-4. `real-publish` (manual `workflow_dispatch` only, needs 1+2 green) --
+3. `build-cli-binaries` (tag push only, needs 1+2 green; MAG-12) -- builds
+   a real `magnetar-cli` release binary on each of the three
+   `quality.yml`-proven OSes (`ubuntu-latest`/`windows-latest`/
+   `macos-latest`), from `submodule-workspace/Cargo.toml` (`magnetar-cli`
+   lives outside the root `[workspace]`, same as `quality.yml`'s "cli
+   boundary" job). Each binary is named by its real host target triple
+   (via `rustc -vV`, never a hardcoded guess) and uploaded as a workflow
+   artifact for `github-release` to pick up.
+4. `github-release` (tag push only, needs 1+2+3 green) -- creates a
+   GitHub Release with a source archive, the real CLI binaries from (3),
+   the release-gate/security-gate evidence `gate-evaluation` already
+   generated (MAG-12: previously only a workflow artifact, now attached
+   to the release itself so a consumer can see the actual
+   conformance/security verdicts a release was cut under), checksums
+   (covering every one of the above, not just the source archive), SBOM,
+   and provenance. Marks the release `--prerelease` when the tag looks
+   like a pre-release tag (`-alpha`/`-beta`/`-rc`, matching both
+   `ReleaseCandidateTag`'s own `-alpha`/`-beta`/`-rc.N` rendering and the
+   real `-RC<n>` form `v1.0.0-RC0` already used, case-insensitively;
+   MAG-12 -- a release candidate SHALL never be presented as stable, and
+   nothing previously enforced that on the actual GitHub Release object).
+   Uses only the workflow's own `GITHUB_TOKEN`; no external secret
+   required.
+5. `real-publish` (manual `workflow_dispatch` only, needs 1+2 green) --
    the real `cargo publish`. Asserts `CARGO_REGISTRY_TOKEN` is
    configured and fails closed with an explicit error if not, before any
    network call.
+
+**Permissions (MAG-12):** the workflow-level grant is `contents: read`;
+only the `github-release` job overrides it to `contents: write`, since
+it is the only job that actually creates or updates a GitHub Release.
+Every other job -- including `real-publish`, which only calls `cargo
+publish` -- needs no repository content write access at all.
 
 ### `component-artifact-distribution.yml` (manual dispatch only)
 
