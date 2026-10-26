@@ -1660,3 +1660,67 @@ fn published_cpu_reference_matmul_kernel_bundle_fixture_validates() {
 
     fs::remove_dir_all(&extract_dir).unwrap();
 }
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path);
+        } else {
+            fs::copy(entry.path(), dst_path).unwrap();
+        }
+    }
+}
+
+/// `implement-release-publication-automation` tasks.md 4.5 / the
+/// `kernel-distribution` spec's "Kernel Distribution Is Transport
+/// Neutral" requirement ("bundle delivered from filesystem" vs.
+/// "bundle delivered from object storage" SHALL get "same logical
+/// validation"): proves this directly against the one real Kernel
+/// Exchange Bundle this repository has actually published to GHCR
+/// (`component-artifact-distribution` run #5), not a synthetic
+/// fixture. `magnetar-runtime` has no GHCR-specific ingestion code
+/// path at all -- `extract_kernel_exchange_archive` only ever sees
+/// bytes and a boolean gzip flag, never a source/origin -- so the two
+/// sides below are: (1) extracting the real published tar.gz archive
+/// directly (what a GHCR pull-and-unpack step produces), and (2) a
+/// plain filesystem copy of that same extracted content opened with
+/// no archive step at all (what a "local CI artifact" or
+/// already-unpacked object-storage delivery produces). Both MUST
+/// validate to the identical digest; a future change that smuggled
+/// transport identity into validation would break this.
+#[test]
+fn published_kernel_bundle_validates_identically_from_an_archive_or_a_plain_directory() {
+    const BUNDLE_TAR_GZ: &[u8] =
+        include_bytes!("../../fixtures/kernels/cpu-reference-matmul.kernel-bundle.tar.gz");
+
+    let archive_extract_dir = temp_kernel_bundle_dir("transport-neutral-archive");
+    let archive_bundle = extract_kernel_exchange_archive(
+        std::io::Cursor::new(BUNDLE_TAR_GZ),
+        true,
+        &archive_extract_dir,
+        &KernelExchangeArchiveLimits::default(),
+    )
+    .expect("published kernel bundle archive extracts");
+    let archive_validated =
+        validate_kernel_exchange_bundle(&archive_bundle, &KernelManifestLimits::default())
+            .expect("archive-delivered bundle validates");
+
+    // An independent plain-filesystem copy of the same content -- never
+    // passed through extract_kernel_exchange_archive, standing in for a
+    // non-GHCR, already-unpacked local/object-storage delivery.
+    let local_copy_dir = temp_kernel_bundle_dir("transport-neutral-local-copy");
+    fs::remove_dir_all(&local_copy_dir).unwrap();
+    copy_dir_recursive(&archive_extract_dir, &local_copy_dir);
+    let local_bundle = KernelExchangeBundle::open(&local_copy_dir);
+    let local_validated =
+        validate_kernel_exchange_bundle(&local_bundle, &KernelManifestLimits::default())
+            .expect("plain-directory-delivered bundle validates");
+
+    assert_eq!(archive_validated.digest, local_validated.digest);
+
+    fs::remove_dir_all(&archive_extract_dir).unwrap();
+    fs::remove_dir_all(&local_copy_dir).unwrap();
+}
