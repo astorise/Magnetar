@@ -1770,7 +1770,7 @@ pub fn run_kernel_optimization_orchestration_conformance()
     )
     .with_redacted_metadata(
         "failure-context",
-        "api_key=sk-live-deadbeef native_handle=0xdeadbeef",
+        "api_key=sk-live-deadbeef native_handle=0xdeadbeef", // secret-scan:allow
     );
     let redacted_value = observation
         .redacted_metadata

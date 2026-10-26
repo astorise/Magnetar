@@ -97,11 +97,15 @@ fn walk_files(root: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), Rele
 }
 
 /// Checks whether `bytes[start..]` begins with at least `min_len`
-/// consecutive bytes satisfying `pred`.
+/// consecutive bytes satisfying `pred`. Requires at least `min_len` bytes
+/// to actually remain -- `Iterator::all` is vacuously `true` on a short or
+/// empty input, so without this check a token cut short by line end (e.g.
+/// a bare `"AKIA"` or `"ghp_"` with nothing after it) would wrongly count
+/// as a full-length match.
 fn has_run(bytes: &[u8], start: usize, min_len: usize, pred: impl Fn(u8) -> bool) -> bool {
     bytes
         .get(start..)
-        .is_some_and(|rest| rest.iter().take(min_len).all(|b| pred(*b)))
+        .is_some_and(|rest| rest.len() >= min_len && rest.iter().take(min_len).all(|b| pred(*b)))
 }
 
 fn is_upper_alnum(b: u8) -> bool {
@@ -112,10 +116,24 @@ fn is_token_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'+' || b == b'/' || b == b'='
 }
 
+/// Trailing-comment marker for a line that is known, deliberately
+/// secret-shaped and not a leak -- a pattern's own definition naming the
+/// shape it looks for (e.g. this module's PEM-header check), or a test
+/// fixture built to exercise detection. Scanning this crate's own source
+/// as release-shipped text would otherwise self-match both: a check for
+/// "does this line contain both PEM-header substrings" cannot itself
+/// avoid spelling out the two substrings it is looking for. Narrowly
+/// scoped to the exact marked line, never a whole file or block, so it
+/// cannot hide an unrelated real secret added later on a nearby line.
+const SUPPRESSION_MARKER: &str = "secret-scan:allow";
+
 /// Scans one line for every known secret-shaped pattern, returning the
 /// first pattern name matched (a line is flagged once, not once per
 /// pattern -- the finding's `path`/`line_number` is enough to go look).
 fn match_line(line: &str) -> Option<&'static str> {
+    if line.contains(SUPPRESSION_MARKER) {
+        return None;
+    }
     let bytes = line.as_bytes();
 
     // AWS access key id: literal "AKIA" followed by 16 more uppercase
@@ -151,7 +169,8 @@ fn match_line(line: &str) -> Option<&'static str> {
     }
 
     // PEM private key block header.
-    if line.contains("-----BEGIN") && line.contains("PRIVATE KEY") {
+    let is_pem_private_key_header = line.contains("-----BEGIN") && line.contains("PRIVATE KEY"); // secret-scan:allow
+    if is_pem_private_key_header {
         return Some("pem-private-key");
     }
 
@@ -286,7 +305,7 @@ mod tests {
     #[test]
     fn detects_aws_access_key_id() {
         let dir = TempDir::new("secret-scan-aws");
-        write(&dir, "notes.md", "export KEY=AKIAABCDEFGHIJKLMNOP\n");
+        write(&dir, "notes.md", "export KEY=AKIAABCDEFGHIJKLMNOP\n"); // secret-scan:allow
         let result = scan_paths_for_secrets(std::slice::from_ref(&dir.0)).unwrap();
         assert!(result.secrets_detected());
         assert_eq!(result.findings[0].pattern, "aws-access-key-id");
@@ -298,7 +317,7 @@ mod tests {
         write(
             &dir,
             "config.yml",
-            "token: ghp_1234567890abcdefghij1234567890abcdef\n",
+            "token: ghp_1234567890abcdefghij1234567890abcdef\n", // secret-scan:allow
         );
         let result = scan_paths_for_secrets(std::slice::from_ref(&dir.0)).unwrap();
         assert!(result.secrets_detected());
@@ -308,7 +327,7 @@ mod tests {
     #[test]
     fn detects_pem_private_key_header() {
         let dir = TempDir::new("secret-scan-pem");
-        write(&dir, "key.txt", "-----BEGIN RSA PRIVATE KEY-----\n");
+        write(&dir, "key.txt", "-----BEGIN RSA PRIVATE KEY-----\n"); // secret-scan:allow
         let result = scan_paths_for_secrets(std::slice::from_ref(&dir.0)).unwrap();
         assert!(result.secrets_detected());
         assert_eq!(result.findings[0].pattern, "pem-private-key");
@@ -345,10 +364,24 @@ mod tests {
     }
 
     #[test]
+    fn does_not_flag_a_token_prefix_cut_short_by_end_of_line() {
+        // Regression test: `has_run` used to accept a short or empty
+        // remaining slice as a vacuous match (`Iterator::all` on fewer
+        // than `min_len` items is trivially true), so ordinary text
+        // ending in a bare prefix like "AKIA" was wrongly flagged.
+        let dir = TempDir::new("secret-scan-short-suffix");
+        write(&dir, "notes.md", "the string ends in AKIA\n");
+        write(&dir, "other.md", "the identifier is ghp_abc\n");
+        write(&dir, "empty.md", "password = \n");
+        let result = scan_paths_for_secrets(std::slice::from_ref(&dir.0)).unwrap();
+        assert!(!result.secrets_detected(), "{:?}", result.findings);
+    }
+
+    #[test]
     fn skips_git_and_target_directories() {
         let dir = TempDir::new("secret-scan-skip-dirs");
-        write(&dir, ".git/config.rs", "AKIAABCDEFGHIJKLMNOP\n");
-        write(&dir, "target/debug/build.rs", "AKIAABCDEFGHIJKLMNOP\n");
+        write(&dir, ".git/config.rs", "AKIAABCDEFGHIJKLMNOP\n"); // secret-scan:allow
+        write(&dir, "target/debug/build.rs", "AKIAABCDEFGHIJKLMNOP\n"); // secret-scan:allow
         let result = scan_paths_for_secrets(std::slice::from_ref(&dir.0)).unwrap();
         assert!(!result.secrets_detected());
     }
@@ -356,7 +389,7 @@ mod tests {
     #[test]
     fn skips_non_text_extensions() {
         let dir = TempDir::new("secret-scan-skip-ext");
-        write(&dir, "fixture.wasm", "AKIAABCDEFGHIJKLMNOP\n");
+        write(&dir, "fixture.wasm", "AKIAABCDEFGHIJKLMNOP\n"); // secret-scan:allow
         let result = scan_paths_for_secrets(std::slice::from_ref(&dir.0)).unwrap();
         assert!(!result.secrets_detected());
     }

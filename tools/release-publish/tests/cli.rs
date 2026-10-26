@@ -268,7 +268,7 @@ fn secret_scan_reports_clean_when_no_secret_present() {
 #[test]
 fn secret_scan_detects_a_secret_and_writes_a_report() {
     let dir = temp_dir("secret-scan-found");
-    fs::write(dir.join("leaked.env.md"), "AKIAABCDEFGHIJKLMNOP\n").unwrap();
+    fs::write(dir.join("leaked.env.md"), "AKIAABCDEFGHIJKLMNOP\n").unwrap(); // secret-scan:allow
     let out = dir.join("secret-scan.json");
 
     let status = bin()
@@ -284,6 +284,35 @@ fn secret_scan_detects_a_secret_and_writes_a_report() {
     let json = fs::read_to_string(&out).unwrap();
     assert!(json.contains("\"secrets_detected\": true"));
     assert!(json.contains("aws-access-key-id"));
+}
+
+#[test]
+fn secret_scan_against_the_real_checkout_reports_no_secrets() {
+    // Regression test for a real false-positive-forever bug: scanning the
+    // actual checkout (as `gate-evaluation` does with `secret-scan .`)
+    // used to self-match this crate's own pattern-definition code and
+    // test fixtures, and a real redaction-conformance fixture elsewhere
+    // in the workspace, making `secrets_detected: true` permanent
+    // regardless of whether a real secret ever leaked. Scans the real
+    // repository root, not a synthetic fixture, so a future test or
+    // pattern string added anywhere in the workspace without a
+    // `secret-scan:allow` marker fails this test before it ever reaches
+    // CI's security gate.
+    let out = temp_dir("secret-scan-real-checkout").join("secret-scan.json");
+
+    let status = bin()
+        .arg("secret-scan")
+        .arg(repo_root())
+        .args(["--out"])
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let json = fs::read_to_string(&out).unwrap();
+    assert!(
+        json.contains("\"secrets_detected\": false"),
+        "unexpected secret-shaped content in the real checkout: {json}"
+    );
 }
 
 #[test]
