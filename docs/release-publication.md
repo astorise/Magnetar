@@ -41,11 +41,17 @@ Every command is credential-free and network-free:
 - `release-gate --results <file>` -- evaluates
   `release_packaging::release_may_publish_stable` against a
   `[{"gate": "...", "passed": bool}, ...]` results file.
-- `security-gate --cargo-deny-json <file> --out <file> [flags...]` --
-  evaluates `release_security::evaluate_release_security_blocking`,
-  deriving two of its ten inputs from real `cargo deny -f json check`
-  output and taking the rest as explicit flags from the caller's own CI
-  job outcomes.
+- `secret-scan <path>... --out <file>` -- scans real text files (source,
+  docs, release notes) for secret-shaped content (cloud/VCS/chat tokens,
+  PEM private key headers, generic `key = "..."` assignments) and writes
+  a `{"secrets_detected": bool, "findings": [...]}` report. Always
+  succeeds (it reports; `security-gate` is what blocks).
+- `security-gate --cargo-deny-json <file> --out <file> [--release-gate-results <file>] [--secret-scan-result <file>] [flags...]` --
+  evaluates `release_security::evaluate_release_security_blocking`
+  against ten inputs, eight of which now come from real evidence (MAG-07,
+  below); the remaining two (`checksum_mismatch`,
+  `undocumented_security_exception`) stay explicit flags with no
+  automated source yet.
 - `oci-manifest --kind ... --input <file> --title <name> --tag <tag> --out-dir <dir>`
   -- builds a real OCI Image Manifest and writes+verifies a local OCI
   Image Layout directory, with every digest computed from the actual
@@ -107,6 +113,44 @@ required fail-closed behavior, not a defect in this change: it makes a
 real, previously-invisible release-readiness gap visible and named,
 rather than silently skipping it. Adding that CI job is separate,
 follow-up work.
+
+## Security gate inputs, field by field (MAG-07)
+
+`evaluate_release_security_blocking` takes ten `ReleaseSecurityGateInputs`
+booleans. Before this fix, `gate-evaluation`'s `security-gate` invocation
+passed none of the eight non-`cargo-deny` flags, so they silently
+defaulted to `false` -- the gate recorded "no secret found", "no
+redaction failure", etc. for conditions it had never actually checked.
+Where each of the ten now comes from:
+
+| Field | Real source |
+|---|---|
+| `critical_advisory_unmitigated` | `cargo deny -f json check`'s `advisories.errors` |
+| `incompatible_license_unapproved` | `cargo deny -f json check`'s `licenses.errors` |
+| `secrets_detected` | `secret-scan`'s own result file (`--secret-scan-result`) |
+| `redaction_gate_failed` | `release-gate-results.json`'s `RedactionChecks` gate (`--release-gate-results`) |
+| `raw_handle_exposed` | `release-gate-results.json`'s `NoRawHandleExposureChecks` gate |
+| `e2e_conformance_bypassed` | `release-gate-results.json`'s `E2eLocalConformance` gate |
+| `openspec_validation_failed` | `release-gate-results.json`'s `OpenSpecValidation` gate |
+| `trust_integrity_failed_in_fixtures` | `release-gate-results.json`'s `ContractTests` gate -- there is no gate of this exact name, but the Component/Model trust fixture tests this field is about live in `magnetar-runtime`'s own test suite, which `ContractTests` already names |
+| `checksum_mismatch` | not derived here -- the bundle this would check doesn't exist yet at `gate-evaluation` time; `github-release`/`real-publish`'s own `verify-checksums` step fails the job hard on a real mismatch, a structural block rather than a recorded one |
+| `undocumented_security_exception` | not derived here -- no automated exception-registry detector exists; stays an explicit, human-set flag, honestly `false` today only because every known gap is in fact documented (`SECURITY.md`'s "Known gaps"), not because this crate checked |
+
+When `--release-gate-results <file>` is given, a gate the file does not
+report counts as **failed** -- missing is blocking, never silently
+`false` -- per `release_gate::gate_failed`. The explicit
+`--redaction-gate-failed`/`--raw-handle-exposed`/`--e2e-bypassed`/
+`--openspec-failed`/`--trust-integrity-failed`/`--secrets-detected`
+switches remain as a fallback for a caller with no results file at all,
+but `gate-evaluation` itself always passes both `--release-gate-results`
+and `--secret-scan-result` now, so in practice eight of the ten fields
+are real evidence on every run.
+
+`secret-scan`'s own scope at `gate-evaluation` time is the checked-out
+repository (source, docs, release notes) -- bundle-stage artifacts
+(conformance/E2E reports, build logs, the packaged release archive named
+in `release_security::SecretScanTarget`) don't exist yet at that point
+and are not covered by this scan.
 
 ## Credential seam
 

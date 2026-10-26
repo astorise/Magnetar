@@ -62,6 +62,17 @@ pub fn gate_results_from_json(json: &str) -> Result<Vec<ReleaseGateResult>, Rele
         .collect()
 }
 
+/// Whether `gate` is recorded in `results` as failed -- including not
+/// being recorded at all. Feeds MAG-07's security-gate derivation: "a
+/// field not measured must be Unknown/Missing and blocking, never false"
+/// means a gate this function can't find in `results` counts as failed,
+/// the same as one explicitly recorded `passed: false`.
+pub fn gate_failed(results: &[ReleaseGateResult], gate: ReleaseGate) -> bool {
+    !results
+        .iter()
+        .any(|result| result.gate == gate && result.passed)
+}
+
 /// Evaluates `results` against `release_may_publish_stable` and renders a
 /// human-readable reason on failure (that function's own error carries a
 /// `Debug`-formatted gate name and no further detail, which is enough to
@@ -123,6 +134,30 @@ mod tests {
         }];
         let error = evaluate_release_gates(&results).unwrap_err();
         assert!(error.contains("CliBoundaryTests") || error.contains("required release gate"));
+    }
+
+    #[test]
+    fn gate_failed_is_false_when_the_gate_passed() {
+        let results = vec![ReleaseGateResult {
+            gate: ReleaseGate::RedactionChecks,
+            passed: true,
+        }];
+        assert!(!gate_failed(&results, ReleaseGate::RedactionChecks));
+    }
+
+    #[test]
+    fn gate_failed_is_true_when_the_gate_explicitly_failed() {
+        let results = vec![ReleaseGateResult {
+            gate: ReleaseGate::RedactionChecks,
+            passed: false,
+        }];
+        assert!(gate_failed(&results, ReleaseGate::RedactionChecks));
+    }
+
+    #[test]
+    fn gate_failed_is_true_when_the_gate_is_not_reported_at_all() {
+        let results: Vec<ReleaseGateResult> = Vec::new();
+        assert!(gate_failed(&results, ReleaseGate::RedactionChecks));
     }
 
     #[test]

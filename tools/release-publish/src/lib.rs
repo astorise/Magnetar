@@ -13,6 +13,7 @@ pub mod oci;
 pub mod provenance;
 pub mod release_gate;
 pub mod sbom;
+pub mod secret_scan;
 pub mod security_gate;
 
 use std::{fmt, io};

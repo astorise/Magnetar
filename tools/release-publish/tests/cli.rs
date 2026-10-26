@@ -248,6 +248,132 @@ fn security_gate_fails_closed_on_a_blocked_cargo_deny_report() {
 }
 
 #[test]
+fn secret_scan_reports_clean_when_no_secret_present() {
+    let dir = temp_dir("secret-scan-clean");
+    fs::write(dir.join("README.md"), "# nothing to see here\n").unwrap();
+    let out = dir.join("secret-scan.json");
+
+    let status = bin()
+        .arg("secret-scan")
+        .arg(&dir)
+        .args(["--out"])
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let json = fs::read_to_string(&out).unwrap();
+    assert!(json.contains("\"secrets_detected\": false"));
+}
+
+#[test]
+fn secret_scan_detects_a_secret_and_writes_a_report() {
+    let dir = temp_dir("secret-scan-found");
+    fs::write(dir.join("leaked.env.md"), "AKIAABCDEFGHIJKLMNOP\n").unwrap();
+    let out = dir.join("secret-scan.json");
+
+    let status = bin()
+        .arg("secret-scan")
+        .arg(&dir)
+        .args(["--out"])
+        .arg(&out)
+        .status()
+        .unwrap();
+    // secret-scan itself always succeeds (it reports, it does not block --
+    // security-gate is what blocks); the finding is still recorded.
+    assert!(status.success());
+    let json = fs::read_to_string(&out).unwrap();
+    assert!(json.contains("\"secrets_detected\": true"));
+    assert!(json.contains("aws-access-key-id"));
+}
+
+#[test]
+fn security_gate_derives_redaction_failure_from_release_gate_results_without_the_explicit_switch() {
+    let dir = temp_dir("security-gate-derive-redaction");
+    let deny_json = dir.join("deny.jsonl");
+    fs::write(&deny_json, CLEAN_CARGO_DENY_FIXTURE).unwrap();
+    let release_gate_results = dir.join("release-gate-results.json");
+    fs::write(
+        &release_gate_results,
+        r#"[{"gate":"RedactionChecks","passed":false}]"#,
+    )
+    .unwrap();
+    let out = dir.join("security-gate.json");
+
+    let output = bin()
+        .arg("security-gate")
+        .args(["--cargo-deny-json"])
+        .arg(&deny_json)
+        .args(["--release-gate-results"])
+        .arg(&release_gate_results)
+        .args(["--out"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    // No --redaction-gate-failed switch was passed at all -- the block
+    // comes entirely from the derived value.
+    assert!(!output.status.success());
+    let json = fs::read_to_string(&out).unwrap();
+    assert!(json.contains("\"redaction_gate_failed\": true"));
+}
+
+#[test]
+fn security_gate_treats_a_gate_missing_from_release_gate_results_as_failed() {
+    let dir = temp_dir("security-gate-derive-missing");
+    let deny_json = dir.join("deny.jsonl");
+    fs::write(&deny_json, CLEAN_CARGO_DENY_FIXTURE).unwrap();
+    // RedactionChecks is simply absent, not explicitly failed.
+    let release_gate_results = dir.join("release-gate-results.json");
+    fs::write(
+        &release_gate_results,
+        r#"[{"gate":"OpenSpecValidation","passed":true}]"#,
+    )
+    .unwrap();
+    let out = dir.join("security-gate.json");
+
+    let output = bin()
+        .arg("security-gate")
+        .args(["--cargo-deny-json"])
+        .arg(&deny_json)
+        .args(["--release-gate-results"])
+        .arg(&release_gate_results)
+        .args(["--out"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let json = fs::read_to_string(&out).unwrap();
+    assert!(json.contains("\"redaction_gate_failed\": true"));
+}
+
+#[test]
+fn security_gate_consumes_a_real_secret_scan_result_without_the_explicit_switch() {
+    let dir = temp_dir("security-gate-secret-scan");
+    let deny_json = dir.join("deny.jsonl");
+    fs::write(&deny_json, CLEAN_CARGO_DENY_FIXTURE).unwrap();
+    let secret_scan_result = dir.join("secret-scan-result.json");
+    fs::write(
+        &secret_scan_result,
+        r#"{"secrets_detected": true, "findings": [{"path":"x","line_number":1,"pattern":"aws-access-key-id"}]}"#,
+    )
+    .unwrap();
+    let out = dir.join("security-gate.json");
+
+    let output = bin()
+        .arg("security-gate")
+        .args(["--cargo-deny-json"])
+        .arg(&deny_json)
+        .args(["--secret-scan-result"])
+        .arg(&secret_scan_result)
+        .args(["--out"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let json = fs::read_to_string(&out).unwrap();
+    assert!(json.contains("\"secrets_detected\": true"));
+}
+
+#[test]
 fn oci_manifest_builds_and_verifies_a_local_layout() {
     let dir = temp_dir("oci-manifest");
     let input = dir.join("component.wasm");

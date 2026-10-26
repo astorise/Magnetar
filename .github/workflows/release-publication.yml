@@ -127,10 +127,24 @@ jobs:
       # pass/fail decision from the parsed inputs.
       - name: Run cargo-deny (JSON, for security-gate parsing)
         run: cargo deny --all-features -f json check 2> cargo-deny.jsonl || true
+      # MAG-07: a real scan over the tagged commit's own checked-out
+      # source/docs, feeding `secrets_detected` below from an actual
+      # result instead of a switch nobody passed. Scoped to the checkout
+      # (source, docs, release notes) -- bundle-stage artifacts
+      # (conformance/E2E reports, build logs, the packaged release
+      # archive) don't exist yet at gate-evaluation time and are not this
+      # step's concern.
+      - name: Scan for secret-shaped content
+        run: |
+          cargo run --locked --manifest-path tools/release-publish/Cargo.toml -- \
+            secret-scan . --out secret-scan-result.json
       - name: Evaluate evaluate_release_security_blocking
         run: |
           cargo run --locked --manifest-path tools/release-publish/Cargo.toml -- \
-            security-gate --cargo-deny-json cargo-deny.jsonl --out security-gate-inputs.json
+            security-gate --cargo-deny-json cargo-deny.jsonl \
+            --release-gate-results release-gate-results.json \
+            --secret-scan-result secret-scan-result.json \
+            --out security-gate-inputs.json
       - name: Upload gate evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -139,6 +153,7 @@ jobs:
           path: |
             check-runs.json
             release-gate-results.json
+            secret-scan-result.json
             security-gate-inputs.json
 
   github-release:

@@ -11,7 +11,7 @@ use std::{env, fs, path::PathBuf, process};
 
 use release_publish::{
     checksum, oci::layout, oci::manifest::build_artifact_manifest, oci::media_types::ArtifactKind,
-    provenance, release_gate, sbom, security_gate,
+    provenance, release_gate, sbom, secret_scan, security_gate,
 };
 
 fn main() {
@@ -26,6 +26,7 @@ fn main() {
         "sbom" => cmd_sbom(args),
         "provenance" => cmd_provenance(args),
         "release-gate" => cmd_release_gate(args),
+        "secret-scan" => cmd_secret_scan(args),
         "security-gate" => cmd_security_gate(args),
         "oci-manifest" => cmd_oci_manifest(args),
         _ => usage_and_exit(),
@@ -47,10 +48,12 @@ fn usage_and_exit() -> ! {
          [--release-tag T] [--ci-run-id I] [--build-target T] [--build-profile P] \
          [--conformance-digest D]\n  \
          release-gate --results <file>\n  \
-         security-gate --cargo-deny-json <file> --out <file> [--secrets-detected] \
-         [--redaction-gate-failed] [--raw-handle-exposed] [--trust-integrity-failed] \
-         [--e2e-bypassed] [--openspec-failed] [--checksum-mismatch] \
-         [--undocumented-exception]\n  \
+         secret-scan <path>... --out <file>\n  \
+         security-gate --cargo-deny-json <file> --out <file> \
+         [--release-gate-results <file>] [--secret-scan-result <file>] \
+         [--secrets-detected] [--redaction-gate-failed] [--raw-handle-exposed] \
+         [--trust-integrity-failed] [--e2e-bypassed] [--openspec-failed] \
+         [--checksum-mismatch] [--undocumented-exception]\n  \
          oci-manifest --kind component|kernel-bundle|conformance --input <file> \
          --title <name> --tag <tag> --out-dir <dir>"
     );
@@ -167,18 +170,120 @@ fn cmd_release_gate(mut args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_secret_scan(mut args: Vec<String>) -> Result<(), String> {
+    let out = take_value(&mut args, "--out").ok_or("secret-scan requires --out <file>")?;
+    if args.is_empty() {
+        return Err("secret-scan requires at least one <path> argument".to_string());
+    }
+    let paths: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
+    let result = secret_scan::scan_paths_for_secrets(&paths).map_err(|e| e.to_string())?;
+    let json = secret_scan::result_to_json(&result);
+    fs::write(&out, serde_json::to_string_pretty(&json).unwrap()).map_err(|e| e.to_string())?;
+    println!(
+        "scanned {} path(s), {} finding(s) written to {out}",
+        paths.len(),
+        result.findings.len()
+    );
+    Ok(())
+}
+
+/// Resolves one of the five [`security_gate`] boolean inputs that
+/// `--release-gate-results` can derive from the tagged commit's own real
+/// check-run outcomes: when the file is given, the derived value wins over
+/// (and the explicit CLI switch for that field is ignored for) that field;
+/// a gate the results file does not report counts as failed, per
+/// `release_gate::gate_failed`'s own "missing is blocking" rule -- never
+/// silently `false`.
+fn derive_or_explicit(
+    release_gate_results: &Option<Vec<magnetar_roadmap_contracts::ReleaseGateResult>>,
+    gate: magnetar_roadmap_contracts::ReleaseGate,
+    explicit: bool,
+) -> bool {
+    match release_gate_results {
+        Some(results) => release_gate::gate_failed(results, gate),
+        None => explicit,
+    }
+}
+
 fn cmd_security_gate(mut args: Vec<String>) -> Result<(), String> {
     let deny_json_path = take_value(&mut args, "--cargo-deny-json")
         .ok_or("security-gate requires --cargo-deny-json <file>")?;
     let out = take_value(&mut args, "--out").ok_or("security-gate requires --out <file>")?;
-    let secrets_detected = take_switch(&mut args, "--secrets-detected");
-    let redaction_gate_failed = take_switch(&mut args, "--redaction-gate-failed");
-    let raw_handle_exposed = take_switch(&mut args, "--raw-handle-exposed");
-    let trust_integrity_failed = take_switch(&mut args, "--trust-integrity-failed");
-    let e2e_bypassed = take_switch(&mut args, "--e2e-bypassed");
-    let openspec_failed = take_switch(&mut args, "--openspec-failed");
+    let release_gate_results_path = take_value(&mut args, "--release-gate-results");
+    let secret_scan_result_path = take_value(&mut args, "--secret-scan-result");
+    let secrets_detected_switch = take_switch(&mut args, "--secrets-detected");
+    let redaction_gate_failed_switch = take_switch(&mut args, "--redaction-gate-failed");
+    let raw_handle_exposed_switch = take_switch(&mut args, "--raw-handle-exposed");
+    let trust_integrity_failed_switch = take_switch(&mut args, "--trust-integrity-failed");
+    let e2e_bypassed_switch = take_switch(&mut args, "--e2e-bypassed");
+    let openspec_failed_switch = take_switch(&mut args, "--openspec-failed");
+    // `checksum_mismatch` has no equivalent derivation here: the bundle
+    // this would check doesn't exist yet at gate-evaluation time (it's
+    // built afterward, by `github-release`/`real-publish`, whose own
+    // `verify-checksums` step already fails the job hard on a mismatch --
+    // a structural, not merely recorded, block). `undocumented_security_exception`
+    // has no automated detector either; it stays an explicit switch a
+    // human sets, honestly defaulting to `false` only because every known
+    // gap today is in fact documented (`SECURITY.md`'s "Known gaps"),
+    // not because this crate checked. Neither is a MAG-07 regression to
+    // "fix" the way the other eight fields were -- there is no real
+    // evidence source for either to wire up yet.
     let checksum_mismatch = take_switch(&mut args, "--checksum-mismatch");
     let undocumented_exception = take_switch(&mut args, "--undocumented-exception");
+
+    // MAG-07: `redaction_gate_failed`, `raw_handle_exposed`,
+    // `e2e_bypassed`, and `openspec_failed` each already have a named,
+    // real `ReleaseGate` evaluated from the tagged commit's own check-run
+    // conclusions (`release-gate-results.json`); `trust_integrity_failed`
+    // has no gate of that exact name, but the Component/Model trust
+    // fixture tests this field is about live in magnetar-runtime's own
+    // test suite, which `ContractTests` already names (see
+    // docs/release-publication.md). Deriving all five from that one file
+    // replaces five previously-always-`false`, never-passed switches with
+    // real evidence; the switches remain as an explicit-override escape
+    // hatch for a caller that does not have a results file at all.
+    let release_gate_results = release_gate_results_path
+        .map(|path| {
+            let json = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+            release_gate::gate_results_from_json(&json).map_err(|e| e.to_string())
+        })
+        .transpose()?;
+    let redaction_gate_failed = derive_or_explicit(
+        &release_gate_results,
+        magnetar_roadmap_contracts::ReleaseGate::RedactionChecks,
+        redaction_gate_failed_switch,
+    );
+    let raw_handle_exposed = derive_or_explicit(
+        &release_gate_results,
+        magnetar_roadmap_contracts::ReleaseGate::NoRawHandleExposureChecks,
+        raw_handle_exposed_switch,
+    );
+    let e2e_bypassed = derive_or_explicit(
+        &release_gate_results,
+        magnetar_roadmap_contracts::ReleaseGate::E2eLocalConformance,
+        e2e_bypassed_switch,
+    );
+    let openspec_failed = derive_or_explicit(
+        &release_gate_results,
+        magnetar_roadmap_contracts::ReleaseGate::OpenSpecValidation,
+        openspec_failed_switch,
+    );
+    let trust_integrity_failed = derive_or_explicit(
+        &release_gate_results,
+        magnetar_roadmap_contracts::ReleaseGate::ContractTests,
+        trust_integrity_failed_switch,
+    );
+
+    // MAG-07: `secrets_detected` now defaults to a real scan's own
+    // recorded outcome when one is given, instead of only ever being
+    // `true` if a caller remembered to pass `--secrets-detected` by hand.
+    let secrets_detected = match secret_scan_result_path {
+        Some(path) => {
+            let json = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+            secret_scan::secrets_detected_from_json(&json).map_err(|e| e.to_string())?
+        }
+        None => secrets_detected_switch,
+    };
 
     let deny_json = fs::read_to_string(&deny_json_path).map_err(|e| e.to_string())?;
     let inputs = security_gate::collect_security_gate_inputs(
