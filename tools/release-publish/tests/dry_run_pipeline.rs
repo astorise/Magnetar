@@ -118,13 +118,22 @@ fn full_credential_free_pipeline_composes_without_error() {
         .expect("clean inputs must not block");
 
     // 6. OCI manifest construction + local layout round-trip, no network.
+    let wasm_bytes: &[u8] = b"pretend wasm bytes";
+    let manifest_sidecar_bytes: &[u8] = b"component: {}\n";
     let built = build_artifact_manifest(
         ArtifactKind::ComponentArtifact,
-        b"pretend wasm bytes",
+        wasm_bytes,
         "demo",
+        Some(manifest_sidecar_bytes),
     )
     .unwrap();
-    layout::write_oci_layout(&dir.join("oci"), &built, b"pretend wasm bytes", "latest").unwrap();
+    layout::write_oci_layout(
+        &dir.join("oci"),
+        &built,
+        &[wasm_bytes, manifest_sidecar_bytes],
+        "latest",
+    )
+    .unwrap();
     layout::verify_oci_layout(&dir.join("oci")).unwrap();
 
     let _ = fs::remove_dir_all(&dir);
@@ -137,14 +146,33 @@ fn full_credential_free_pipeline_composes_without_error() {
 /// computation.
 #[test]
 fn tag_alone_never_changes_the_manifest_or_layer_digest() {
-    let bytes = b"identical component bytes";
-    let built_a = build_artifact_manifest(ArtifactKind::ComponentArtifact, bytes, "demo").unwrap();
-    let built_b = build_artifact_manifest(ArtifactKind::ComponentArtifact, bytes, "demo").unwrap();
+    let bytes: &[u8] = b"identical component bytes";
+    let manifest_bytes: &[u8] = b"component: {}\n";
+    let built_a = build_artifact_manifest(
+        ArtifactKind::ComponentArtifact,
+        bytes,
+        "demo",
+        Some(manifest_bytes),
+    )
+    .unwrap();
+    let built_b = build_artifact_manifest(
+        ArtifactKind::ComponentArtifact,
+        bytes,
+        "demo",
+        Some(manifest_bytes),
+    )
+    .unwrap();
 
     let dir_a = temp_dir("tag-a");
     let dir_b = temp_dir("tag-b");
-    layout::write_oci_layout(&dir_a, &built_a, bytes, "v1.0.0").unwrap();
-    layout::write_oci_layout(&dir_b, &built_b, bytes, "totally-different-tag").unwrap();
+    layout::write_oci_layout(&dir_a, &built_a, &[bytes, manifest_bytes], "v1.0.0").unwrap();
+    layout::write_oci_layout(
+        &dir_b,
+        &built_b,
+        &[bytes, manifest_bytes],
+        "totally-different-tag",
+    )
+    .unwrap();
 
     assert_eq!(built_a.manifest_digest, built_b.manifest_digest);
     assert_eq!(built_a.layer_digest, built_b.layer_digest);

@@ -52,10 +52,14 @@ Every command is credential-free and network-free:
   below); the remaining two (`checksum_mismatch`,
   `undocumented_security_exception`) stay explicit flags with no
   automated source yet.
-- `oci-manifest --kind ... --input <file> --title <name> --tag <tag> --out-dir <dir>`
+- `oci-manifest --kind ... --input <file> --title <name> --tag <tag> --out-dir <dir> [--manifest <file>]`
   -- builds a real OCI Image Manifest and writes+verifies a local OCI
   Image Layout directory, with every digest computed from the actual
-  bytes given.
+  bytes given. `--manifest <file>` embeds a second real layer holding
+  that file's bytes, under `COMPONENT_MANIFEST_MEDIA_TYPE_V1`
+  (`application/vnd.magnetar.component-manifest.v1+yaml`) -- required
+  when `--kind component` (MAG-08, below), rejected for every other
+  kind.
 
 ## Pipeline
 
@@ -151,6 +155,39 @@ repository (source, docs, release notes) -- bundle-stage artifacts
 (conformance/E2E reports, build logs, the packaged release archive named
 in `release_security::SecretScanTarget`) don't exist yet at that point
 and are not covered by this scan.
+
+## The Component OCI package is self-contained (MAG-08)
+
+Before this fix, `oci-manifest --kind component` published only the
+WASM bytes as a single OCI layer. The Component's own
+`*.magnetar-component.yaml` manifest -- the file
+`magnetar_runtime::component::manifest_path_for_definition` requires
+next to the WASM on disk, and the input every WIT/engine/capability/trust
+check in `component.rs` actually validates against -- was never part of
+the published package. A consumer pulling the Component by its OCI
+digest (Tachyon or otherwise) got a WASM binary with no manifest, no
+digest tying one to the other, and had to stage a manifest separately,
+out of band, from a channel this packaging gave no guarantee about.
+
+`oci-manifest --kind component` now requires `--manifest <file>` and
+embeds it as a second real OCI layer, under
+`COMPONENT_MANIFEST_MEDIA_TYPE_V1`
+(`application/vnd.magnetar.component-manifest.v1+yaml` -- `+yaml`, not
+`+json`: the real sidecar on disk is always YAML,
+`ComponentManifest::from_yaml_bytes` is what parses it, and this
+media type had never been used as a real layer's `mediaType` before
+now to name the shape it was publishing). A Component OCI package is
+now fully reconstructable from its manifest digest alone: both the WASM
+bytes and the manifest a consumer needs to actually load it are present,
+each individually digest-verified (`write_oci_layout` recomputes and
+checks every layer blob's digest against what the manifest declares
+before writing it, so a blob passed in the wrong order is rejected
+rather than silently mislabeled). `--kind kernel-bundle`/`conformance`
+have no such sidecar and reject `--manifest` if given one.
+
+`component-artifact-distribution.yml`'s `manifest_path` workflow input
+is required (checked, fail-closed, before the no-network build step
+runs) whenever `kind` is `component`.
 
 ## Credential seam
 

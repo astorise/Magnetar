@@ -407,6 +407,8 @@ fn oci_manifest_builds_and_verifies_a_local_layout() {
     let dir = temp_dir("oci-manifest");
     let input = dir.join("component.wasm");
     fs::write(&input, b"pretend wasm component bytes").unwrap();
+    let manifest = dir.join("component.wasm.magnetar-component.yaml");
+    fs::write(&manifest, b"component: {}\n").unwrap();
     let out_dir = dir.join("layout");
 
     let output = bin()
@@ -418,6 +420,8 @@ fn oci_manifest_builds_and_verifies_a_local_layout() {
         .args(["--tag", "v1"])
         .args(["--out-dir"])
         .arg(&out_dir)
+        .args(["--manifest"])
+        .arg(&manifest)
         .output()
         .unwrap();
     assert!(
@@ -428,8 +432,55 @@ fn oci_manifest_builds_and_verifies_a_local_layout() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("manifest digest: sha256:"));
     assert!(stdout.contains("layer digest: sha256:"));
+    assert!(stdout.contains("component manifest layer digest: sha256:"));
     assert!(out_dir.join("oci-layout").is_file());
     assert!(out_dir.join("index.json").is_file());
+}
+
+#[test]
+fn oci_manifest_rejects_a_component_with_no_manifest_sidecar() {
+    // MAG-08: a Component OCI package without its manifest sidecar
+    // cannot be reconstructed from OCI alone -- must fail closed.
+    let dir = temp_dir("oci-manifest-component-no-sidecar");
+    let input = dir.join("component.wasm");
+    fs::write(&input, b"pretend wasm component bytes").unwrap();
+
+    let output = bin()
+        .arg("oci-manifest")
+        .args(["--kind", "component"])
+        .args(["--input"])
+        .arg(&input)
+        .args(["--title", "demo"])
+        .args(["--tag", "v1"])
+        .args(["--out-dir"])
+        .arg(dir.join("layout"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
+#[test]
+fn oci_manifest_rejects_a_manifest_sidecar_for_a_non_component_kind() {
+    let dir = temp_dir("oci-manifest-kernel-with-sidecar");
+    let input = dir.join("bundle.tar.gz");
+    fs::write(&input, b"pretend tar+gzip bytes").unwrap();
+    let manifest = dir.join("bundle.magnetar-component.yaml");
+    fs::write(&manifest, b"component: {}\n").unwrap();
+
+    let output = bin()
+        .arg("oci-manifest")
+        .args(["--kind", "kernel-bundle"])
+        .args(["--input"])
+        .arg(&input)
+        .args(["--title", "demo-kernel"])
+        .args(["--tag", "v1"])
+        .args(["--out-dir"])
+        .arg(dir.join("layout"))
+        .args(["--manifest"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
 }
 
 #[test]

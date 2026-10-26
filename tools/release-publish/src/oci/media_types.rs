@@ -7,8 +7,16 @@
 //! parse.
 
 pub const COMPONENT_ARTIFACT_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.component.v1+wasm";
+/// `+yaml`, not `+json`: a Component's real manifest sidecar on disk is
+/// always `<artifact>.magnetar-component.yaml` (see
+/// `magnetar_runtime::component::manifest_path_for_definition`) and is
+/// parsed as YAML (`ComponentManifest::from_yaml_bytes`). This constant
+/// was never used as a real OCI layer `mediaType` before MAG-08 wired it
+/// up as one -- only ever as an annotation value naming the manifest
+/// shape -- so there is no real published artifact whose identity this
+/// correction could break.
 pub const COMPONENT_MANIFEST_MEDIA_TYPE_V1: &str =
-    "application/vnd.magnetar.component-manifest.v1+json";
+    "application/vnd.magnetar.component-manifest.v1+yaml";
 pub const KERNEL_BUNDLE_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.kernel-bundle.v1+tar+zstd";
 pub const KERNEL_MANIFEST_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.kernel-manifest.v1+json";
 pub const CONFORMANCE_FIXTURE_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.conformance.v1+json";

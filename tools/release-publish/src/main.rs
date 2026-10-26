@@ -55,7 +55,8 @@ fn usage_and_exit() -> ! {
          [--trust-integrity-failed] [--e2e-bypassed] [--openspec-failed] \
          [--checksum-mismatch] [--undocumented-exception]\n  \
          oci-manifest --kind component|kernel-bundle|conformance --input <file> \
-         --title <name> --tag <tag> --out-dir <dir>"
+         --title <name> --tag <tag> --out-dir <dir> \
+         [--manifest <file>] (required for --kind component, MAG-08)"
     );
     process::exit(2);
 }
@@ -325,15 +326,33 @@ fn cmd_oci_manifest(mut args: Vec<String>) -> Result<(), String> {
     let tag = take_value(&mut args, "--tag").ok_or("oci-manifest requires --tag <tag>")?;
     let out_dir =
         take_value(&mut args, "--out-dir").ok_or("oci-manifest requires --out-dir <dir>")?;
+    // MAG-08: every real Component has a `*.magnetar-component.yaml`
+    // sidecar on disk; embedding it as its own OCI layer is what makes
+    // the published package self-contained, so --kind component requires
+    // --manifest (checked by build_artifact_manifest itself, which
+    // rejects ComponentArtifact without one and rejects any other kind
+    // given one).
+    let manifest_path = take_value(&mut args, "--manifest");
 
     let layer_bytes = fs::read(&input).map_err(|e| e.to_string())?;
-    let built = build_artifact_manifest(kind, &layer_bytes, &title).map_err(|e| e.to_string())?;
-    layout::write_oci_layout(&PathBuf::from(&out_dir), &built, &layer_bytes, &tag)
+    let manifest_bytes = manifest_path
+        .map(|path| fs::read(&path).map_err(|e| e.to_string()))
+        .transpose()?;
+    let built = build_artifact_manifest(kind, &layer_bytes, &title, manifest_bytes.as_deref())
+        .map_err(|e| e.to_string())?;
+    let mut layer_blobs: Vec<&[u8]> = vec![&layer_bytes];
+    if let Some(manifest_bytes) = &manifest_bytes {
+        layer_blobs.push(manifest_bytes);
+    }
+    layout::write_oci_layout(&PathBuf::from(&out_dir), &built, &layer_blobs, &tag)
         .map_err(|e| e.to_string())?;
     layout::verify_oci_layout(&PathBuf::from(&out_dir)).map_err(|e| e.to_string())?;
 
     println!("manifest digest: {}", built.manifest_digest);
     println!("layer digest: {}", built.layer_digest);
+    if let Some(component_manifest_digest) = &built.component_manifest_digest {
+        println!("component manifest layer digest: {component_manifest_digest}");
+    }
     println!("OCI layout written and verified at {out_dir}");
     Ok(())
 }
