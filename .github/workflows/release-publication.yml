@@ -23,8 +23,12 @@ concurrency:
   group: release-publication-${{ github.ref }}
   cancel-in-progress: false
 
+# MAG-12: least privilege -- only `github-release` actually writes
+# repository content (creating/updating the GitHub Release). Every other
+# job only reads the checkout, check-run conclusions, or builds a binary
+# to upload as a workflow artifact; none needs write access at all.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -156,11 +160,62 @@ jobs:
             secret-scan-result.json
             security-gate-inputs.json
 
+  build-cli-binaries:
+    name: release-publication / build CLI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [dry-run-publish, gate-evaluation]
+    if: startsWith(github.ref, 'refs/tags/')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # magnetar-cli lives in submodule-workspace (#64), not the root
+      # [workspace] -- quality.yml's "cli boundary" job already proves it
+      # builds and tests from there on every PR; this just builds it in
+      # --release mode for real distribution instead of re-testing it.
+      - name: Build magnetar-cli (release)
+        run: cargo build --locked --release --manifest-path submodule-workspace/Cargo.toml -p magnetar-cli
+      # Named by its real host triple (via `rustc -vV`, not a hardcoded
+      # guess at what each runner label happens to mean today) so a
+      # consumer can tell exactly what each binary is without guessing,
+      # and so a future runner-image change (e.g. macos-latest's
+      # architecture) can't silently mislabel the artifact.
+      - name: Package binary under its real host target triple
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          ext=""
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ext=".exe"
+          fi
+          src="submodule-workspace/target/release/magnetar-cli${ext}"
+          dest="magnetar-cli-${triple}${ext}"
+          cp "$src" "$dest"
+          echo "artifact_name=$dest" >> "$GITHUB_OUTPUT"
+      - name: Upload CLI binary as a workflow artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: cli-binary-${{ matrix.os }}
+          path: ${{ steps.package.outputs.artifact_name }}
+
   github-release:
     name: release-publication / GitHub Release
     runs-on: ubuntu-latest
-    needs: [dry-run-publish, gate-evaluation]
+    needs: [dry-run-publish, gate-evaluation, build-cli-binaries]
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -170,18 +225,33 @@ jobs:
         run: rustup show
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      # Real multi-platform `magnetar` CLI binaries are a follow-up
-      # enhancement to this job (building them needs magnetar-cli's own
-      # submodule-pinned dependencies and a real build matrix, which is
-      # out of this change's credential-free-scaffolding scope). This job
-      # publishes what is honestly available today: a reproducible source
-      # archive plus real release proofs generated from it.
       - name: Build release bundle directory
         run: |
           set -euo pipefail
           mkdir -p release-bundle
           git archive --format=tar.gz --prefix="magnetar-${{ github.ref_name }}/" \
             -o "release-bundle/magnetar-${{ github.ref_name }}-source.tar.gz" HEAD
+      # MAG-12: real multi-platform magnetar-cli binaries, built by
+      # build-cli-binaries above, downloaded directly into the bundle so
+      # checksum-bundle (next step) covers them too -- one checksum
+      # manifest for everything actually published, not just the source
+      # archive.
+      - name: Download CLI binaries
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: cli-binary-*
+          path: release-bundle
+          merge-multiple: true
+      # MAG-12: the real release-gate/security-gate evidence gate-
+      # evaluation already generated against this exact tagged commit --
+      # attached to the release itself, not only a workflow artifact that
+      # expires, so a consumer can see the actual conformance/security
+      # verdicts a release was cut under.
+      - name: Download release gate evidence
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-gate-evidence
+          path: release-bundle
       - name: Generate checksums
         run: |
           cargo run --locked --manifest-path tools/release-publish/Cargo.toml -- \
@@ -205,6 +275,22 @@ jobs:
             --ci-run-id "${{ github.run_id }}" \
             --openspec-dir openspec/specs \
             --wit-dir magnetar-runtime/wit
+      # MAG-12: a release candidate SHALL never be presented as stable
+      # (ReleaseCandidateTag::is_stable() is false for every value) --
+      # mirrored here as a tag-shape check, since gh release create has
+      # no access to that Rust type. Matches both this policy's own
+      # `-alpha`/`-beta`/`-rc.N` convention and the real `-RC<n>` form
+      # the v1.0.0-RC0 tag actually used, case-insensitively.
+      - name: Determine prerelease status from the tag
+        id: prerelease
+        run: |
+          set -euo pipefail
+          tag_lower="$(tr '[:upper:]' '[:lower:]' <<< "${{ github.ref_name }}")"
+          if [[ "$tag_lower" =~ -(alpha|beta|rc)[.0-9]*$ ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
       # Idempotent on purpose: this job also runs on a manual
       # `workflow_dispatch` against an already-tagged commit (e.g. to run
       # `real-publish`, which only fires on `workflow_dispatch`), so a
@@ -217,17 +303,20 @@ jobs:
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ steps.prerelease.outputs.is_prerelease }}
         run: |
           set -euo pipefail
           if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
             gh release upload "${{ github.ref_name }}" \
-              release-bundle/*.tar.gz checksums.json sbom.json provenance.json \
+              release-bundle/* checksums.json sbom.json provenance.json \
               --clobber
+            gh release edit "${{ github.ref_name }}" --prerelease="$IS_PRERELEASE"
           else
             gh release create "${{ github.ref_name }}" \
               --title "${{ github.ref_name }}" \
               --generate-notes \
-              release-bundle/*.tar.gz checksums.json sbom.json provenance.json
+              --prerelease="$IS_PRERELEASE" \
+              release-bundle/* checksums.json sbom.json provenance.json
           fi
 
   real-publish:
