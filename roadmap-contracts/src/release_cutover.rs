@@ -1132,7 +1132,7 @@ pub fn reject_post_v1_0_item_as_release_claim(
 /// it does not claim Metal, OpenVINO, QNN, ROCm/NPU/TPU compute, a server
 /// API, or general production model support, all still genuinely
 /// deferred.
-pub const V1_0_FINAL_RELEASE_STATEMENT: &str = "Magnetar v1.0 is a CPU-local inference runtime baseline, now also validated through a real, hardware-verified external CUDA Provider and a real external WGPU Provider, via the Runtime Inference API, Reference CPU Provider, and E2E local conformance. It additionally validates real production Qwen2/2.5 model artifact ingestion and generation end to end on Reference CPU and real CUDA hardware. Post-baseline roadmap features are not included unless explicitly marked.";
+pub const V1_0_FINAL_RELEASE_STATEMENT: &str = "Magnetar v1.0 is a CPU-local inference runtime baseline, now also validated through a real, hardware-verified external CUDA Provider, via the Runtime Inference API, Reference CPU Provider, and E2E local conformance. A real external WGPU Provider separately validates hardware-verified cross-platform GPU device discovery and one real compute Kernel, not yet wired into the Runtime Inference API dispatch path. It additionally validates real production Qwen2/2.5 model artifact ingestion and generation end to end on Reference CPU and real CUDA hardware. Post-baseline roadmap features are not included unless explicitly marked.";
 
 /// "It accurately describes included baseline and excludes roadmap
 /// features" (`specs/v0-1-release-cutover/spec.md`): rejects a statement
