@@ -5,32 +5,48 @@ native Providers. Even the first `v0.1` baseline must avoid unsafe release
 practices: it must make clear what is trusted, what is untrusted, what is
 verified, what is only metadata, what is redacted, and what is explicitly
 unsupported. This document, and the `magnetar-runtime::release_security`
-module it describes, define that policy for `v0.1`.
+module it describes, define that policy, re-evidenced for `v1.0` (MAG-10)
+now that `1.0.0-RC0` is the real, published target -- see "Security Scope
+For v0.1" below for what changed and why.
 
 This document and module do **not** implement full cryptographic signing,
 SLSA compliance, production sandboxing, remote registry authentication,
 model hub security, server authentication, or a legal license-approval
 process (see
 `openspec/changes/define-release-security-and-supply-chain-hardening/proposal.md`'s
-"Non-Goals"). They also do not make native Providers untrusted sandboxed
-plugins, and do not guarantee all future Providers are secure. They define
-the release **security** policy as executable Rust types and validation
-functions, composing existing crate contracts (Model/Component trust,
-`cli_boundary`, `inference_api`, `provider_roadmap` handle scopes,
-`compute::redact_backend_diagnostic`, `release_packaging`) rather than
-duplicating them.
+"Non-Goals" -- a historical scoping statement from the original proposal,
+not a claim that cryptographic signing does not exist anywhere in the
+repository today: real Ed25519 verification now backs both
+`ComponentTrustStore` and `ModelTrustStore`, MAG-02, implemented in
+`magnetar_runtime::artifact_signature`). They also do not make native
+Providers untrusted sandboxed plugins, and do not guarantee all future
+Providers are secure. They define the release **security** policy as
+executable Rust types and validation functions, composing existing crate
+contracts (Model/Component trust, `cli_boundary`, `inference_api`,
+`provider_roadmap` handle scopes, `compute::redact_backend_diagnostic`,
+`release_packaging`) rather than duplicating them.
 
 ## Security Scope For v0.1
 
-`RELEASE_SECURITY_SCOPE_INCLUDED` lists the twelve areas the `v0.1` security
-scope covers (Rust source, workspace dependencies, release binaries and
-reports, the OpenSpec baseline, WIT packages, Reference CPU Provider, fixture
-Model/Tokenizer artifacts, the Runtime Inference API, the CLI boundary
-harness, and E2E local conformance).
+(Section title unchanged from the original proposal document; the scope
+itself is re-evidenced for `v1.0` below, MAG-10.)
+
+`RELEASE_SECURITY_SCOPE_INCLUDED` lists the `v1.0` security scope's
+fourteen areas (Rust source, workspace dependencies, release binaries and
+reports, the OpenSpec baseline, WIT packages, Reference CPU Provider,
+**CUDA Provider, WebGPU Provider** -- MAG-10: both added, their dependency
+graphs are already covered by the same `cargo-deny` audit the generic
+"workspace dependencies" entry already names -- fixture Model/Tokenizer
+artifacts, the Runtime Inference API, the CLI boundary harness, and E2E
+local conformance).
 `RELEASE_SECURITY_SCOPE_EXCLUDED_FROM_HARDENED_CLAIMS` lists the eleven areas
 that SHALL not be claimed hardened (CUDA, Metal, OpenVINO, QNN, WebGPU,
 server API, model hub downloads, remote registry authentication, production
-sandboxing, agent/tool runtime, large third-party model execution).
+sandboxing, agent/tool runtime, large third-party model execution) --
+**unchanged** by MAG-10: CUDA and WebGPU joining the included-scope list
+above is a weaker claim ("within the dependency/license/secret-scan
+review's scope") than "claimed hardened," and `README.md` never claims the
+latter for either.
 `reject_hardened_security_claim_for_excluded_feature` mechanically enforces
 this: it is deliberately separate from
 `release_packaging::classify_publishing_boundary`, which governs whether a
@@ -213,7 +229,7 @@ justification. `UnsafeCodePolicy::validate` enforces review and
 justification only when `deny_unreviewed` is set, implementing "Unsafe code
 MAY be denied in release gates unless explicitly allowed."
 `magnetar_runtime_unsafe_code_inventory` is the concrete, real audit result
-for this crate's `v0.1` required baseline: as of this change the only
+for this crate's `v1.0` required baseline: as of this change the only
 `unsafe` surface is `provider::ProviderLoader::load_dynamic`,
 `load_dynamic_with_policy`, and `discover_and_load`, each already carrying a
 `# Safety` doc comment and gated by `ProviderLoadingPolicy::allows` --
@@ -237,7 +253,7 @@ expectation); `validate()` requires all six to be defined.
 ## Security Notes
 
 `SecurityReleaseNotes` carries the full security notes a release SHALL
-include (`v0.1` threat model, trusted native Provider model, no-raw-handle
+include (`v1.0` threat model, trusted native Provider model, no-raw-handle
 policy, default redaction, source/cache and Model/Component Artifact trust
 boundaries, unsupported security features, known risks, reporting process
 placeholder). `validate()` enforces the SHALL-strength minimum: threat

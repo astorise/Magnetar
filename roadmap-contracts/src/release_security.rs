@@ -6,16 +6,26 @@
 //! security, server authentication, or a legal license-approval process --
 //! the proposal's "Non-Goals" rule all of that out explicitly, and it does
 //! not make native Providers untrusted sandboxed plugins or guarantee all
-//! future Providers are secure. Instead it defines, as executable Rust types
-//! and validation functions, the release **security** policy for `v0.1`,
-//! composing existing crate contracts (Model/Component/Adapter trust,
-//! `cli_boundary`, `inference_api`, `provider_roadmap` handle scopes,
-//! `compute::redact_backend_diagnostic`, `release_packaging`) rather than
-//! duplicating them:
+//! future Providers are secure (a historical scoping statement from the
+//! original proposal: it describes what this policy *module* does not
+//! define, not a claim that cryptographic signing does not exist anywhere
+//! in the repository today -- real Ed25519 verification now backs both
+//! `magnetar_runtime::component::ComponentTrustStore` and
+//! `magnetar_runtime::model::ModelTrustStore`, MAG-02, implemented in
+//! `magnetar_runtime::artifact_signature`). Instead it defines, as
+//! executable Rust types and validation functions, the release
+//! **security** policy for `v1.0` (MAG-10: re-evidenced from the original
+//! `v0.1`-scoped policy now that `1.0.0-RC0` is the real, published
+//! target), composing existing crate contracts (Model/Component/Adapter
+//! trust, `cli_boundary`, `inference_api`, `provider_roadmap` handle
+//! scopes, `compute::redact_backend_diagnostic`, `release_packaging`)
+//! rather than duplicating them:
 //!
 //! - [`RELEASE_SECURITY_SCOPE_INCLUDED`] / [`RELEASE_SECURITY_SCOPE_EXCLUDED_FROM_HARDENED_CLAIMS`]
-//!   / [`reject_hardened_security_claim_for_excluded_feature`]: the `v0.1`
-//!   CPU-local security scope and the "Security Scope For v0.1" boundary.
+//!   / [`reject_hardened_security_claim_for_excluded_feature`]: the `v1.0`
+//!   CPU-local security scope and the "Security Scope For v0.1" boundary
+//!   (the quoted title cites the original proposal document verbatim and
+//!   is not renamed).
 //! - [`DependencyAdvisorySeverity`] / [`DependencyAdvisory`] /
 //!   [`DependencyAuditReport`]: the "Dependency Audit" policy -- a critical,
 //!   unmitigated advisory in a required dependency blocks stable release.
@@ -121,8 +131,21 @@ pub const RELEASE_SECURITY_POLICY_VERSION: &str = "0.1.0";
 // Security Scope
 // ---------------------------------------------------------------------
 
-/// The `v0.1` CPU-local security scope, implementing "Security Scope For
-/// v0.1" -- "It SHALL include" (`proposal.md`).
+/// The `v1.0` CPU-local security scope, implementing "Security Scope For
+/// v0.1" -- "It SHALL include" (`proposal.md`; the quoted title is
+/// unchanged from the original proposal document).
+///
+/// MAG-10: added `"cuda-provider"` and `"webgpu-provider"` -- both are
+/// real submodules now, and their dependency graphs are already covered
+/// by the same `cargo-deny` dependency/license audit the generic
+/// `"workspace-dependencies"` entry already names (`quality.yml`'s
+/// `submodule-integration` job runs it across every submodule, these two
+/// included). This is a weaker claim than hardened: both remain in
+/// [`RELEASE_SECURITY_SCOPE_EXCLUDED_FROM_HARDENED_CLAIMS`] below, since
+/// "within the dependency/license/secret-scan review's scope" and
+/// "claimed production-hardened" are different axes -- `README.md` claims
+/// CUDA/WGPU are real and hardware-validated, never that either received
+/// a hardened security review.
 pub const RELEASE_SECURITY_SCOPE_INCLUDED: &[&str] = &[
     "rust-source",
     "workspace-dependencies",
@@ -131,6 +154,8 @@ pub const RELEASE_SECURITY_SCOPE_INCLUDED: &[&str] = &[
     "openspec-baseline",
     "wit-packages",
     "reference-cpu-provider",
+    "cuda-provider",
+    "webgpu-provider",
     "fixture-model-artifacts",
     "fixture-tokenizer-artifacts",
     "runtime-inference-api",
@@ -138,12 +163,21 @@ pub const RELEASE_SECURITY_SCOPE_INCLUDED: &[&str] = &[
     "e2e-local-conformance",
 ];
 
-/// Features `v0.1` security notes SHALL not claim hardened production
+/// Features `v1.0` security notes SHALL not claim hardened production
 /// security for, implementing "Security Scope For v0.1" -- "It SHALL not
-/// claim hardened production security for" (`proposal.md`). Deliberately
+/// claim hardened production security for" (`proposal.md`; the quoted
+/// title is unchanged from the original proposal document). Deliberately
 /// separate from [`crate::release_packaging`]'s deferred-roadmap-feature
 /// list: that list governs whether a feature may be presented as *included*
 /// baseline, this one governs whether a feature may be claimed *hardened*.
+///
+/// MAG-10: `"cuda"` and `"webgpu"` are deliberately still here even
+/// though both are now real and included (see
+/// [`RELEASE_SECURITY_SCOPE_INCLUDED`] above, and
+/// `crate::release_packaging::DEFERRED_ROADMAP_FEATURES`, which no longer
+/// names either) -- being real and functionally hardware-validated is not
+/// the same claim as being security-hardened, and nothing in `README.md`
+/// or `RELEASE_NOTES.md` claims the latter for either.
 pub const RELEASE_SECURITY_SCOPE_EXCLUDED_FROM_HARDENED_CLAIMS: &[&str] = &[
     "cuda",
     "metal",
@@ -313,8 +347,14 @@ pub enum SbomAvailability {
     Missing,
 }
 
-/// "If full SBOM generation is not implemented for `v0.1`, release notes
-/// SHALL state the limitation": [`SbomManifest::validate`] requires either a
+/// "If full SBOM generation is not implemented for `v1.0`, release notes
+/// SHALL state the limitation" (MAG-10: renamed from "v0.1" -- the
+/// underlying conditional rule, not a claim about current state; SBOM
+/// generation is in fact implemented for real now, see
+/// `tools/release-publish/src/sbom.rs`, so [`SbomAvailability::Generated`]
+/// is the expected case today and `PlaceholderDocumented` stays available
+/// for a build target that genuinely cannot produce one):
+/// [`SbomManifest::validate`] requires either a
 /// non-empty generated SBOM or a documented limitation note, never silent
 /// absence. `build_target` and `feature_flags` carry the two manifest-level
 /// fields from "SBOM SHOULD include" that apply to the whole release rather
@@ -1067,7 +1107,7 @@ impl UnsafeCodePolicy {
     }
 }
 
-/// The concrete `unsafe` inventory for the `v0.1` required baseline,
+/// The concrete `unsafe` inventory for the `v1.0` required baseline,
 /// implementing "Detect unsafe Rust usage" / "Review unsafe blocks where
 /// present" / "Document unsafe rationale" (`tasks.md`). As of this change,
 /// the only `unsafe` surface in `magnetar-runtime`'s required baseline is
@@ -1189,7 +1229,7 @@ impl VulnerabilityHandlingPolicy {
 /// sync field-by-field.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SecurityReleaseNotes {
-    pub v0_1_threat_model: Option<String>,
+    pub v1_0_threat_model: Option<String>,
     pub trusted_native_provider_model: Option<String>,
     pub no_raw_handle_policy: Option<String>,
     pub default_redaction: Option<String>,
@@ -1210,7 +1250,7 @@ impl SecurityReleaseNotes {
     /// judgment call.
     pub fn validate(&self) -> Result<(), ReleaseSecurityError> {
         let required = [
-            self.v0_1_threat_model.is_some(),
+            self.v1_0_threat_model.is_some(),
             self.trusted_native_provider_model.is_some(),
             self.no_raw_handle_policy.is_some(),
             self.default_redaction.is_some(),
@@ -1662,7 +1702,7 @@ pub fn run_release_security_conformance() -> ReleaseSecurityConformanceReport {
         let outcome = reject_hardened_security_claim_for_excluded_feature("cuda", true);
         record(
             &mut results,
-            "CUDA cannot be claimed as hardened in v0.1 security notes",
+            "CUDA cannot be claimed as hardened in v1.0 security notes",
             matches!(
                 outcome,
                 Err(ReleaseSecurityError::HardenedClaimForExcludedFeature { .. })
@@ -1759,7 +1799,7 @@ pub fn run_release_security_conformance() -> ReleaseSecurityConformanceReport {
         );
         let documented = SbomManifest {
             availability: SbomAvailability::PlaceholderDocumented,
-            limitation_note: Some("SBOM generation is not implemented for v0.1".into()),
+            limitation_note: Some("SBOM generation is not available for this build target".into()),
             ..Default::default()
         };
         record(
@@ -2407,7 +2447,7 @@ pub fn run_release_security_conformance() -> ReleaseSecurityConformanceReport {
             format!("unexpected outcome: {:?}", incomplete.validate()),
         );
         let complete = SecurityReleaseNotes {
-            v0_1_threat_model: Some("CPU-local baseline".into()),
+            v1_0_threat_model: Some("CPU-local baseline".into()),
             trusted_native_provider_model: Some("Providers are trusted native code".into()),
             no_raw_handle_policy: Some("no raw handles in public APIs".into()),
             default_redaction: Some("diagnostics redact by default".into()),
