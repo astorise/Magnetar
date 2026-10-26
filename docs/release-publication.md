@@ -238,10 +238,26 @@ owner optionally attaches to the `release` environment.
 Releases binary directly, not a pinned third-party GitHub Action -- this
 session's GitHub access was scoped to `astorise/Magnetar` only and could
 not verify a commit SHA for a third-party action it had not already used
-in this repository. Review the pinned `ORAS_VERSION` and the exact
-`oras cp --from-oci-layout` invocation against your installed version
-before the first real run; this session had no GHCR credentials to
-execute and verify it.
+in this repository. The downloaded binary is checksum-verified before
+use (MAG-11, below), and the exact `oras cp --from-oci-layout`
+invocation has since run successfully against real GHCR pushes
+(`component-artifact-distribution` runs #2-#5).
+
+### The installed `oras` binary is checksum-verified (MAG-11)
+
+Before this fix, `component-artifact-distribution.yml`'s "Install oras"
+step downloaded the `oras` release binary over a bare `curl` and ran it
+directly -- no checksum, no signature, nothing checking that what came
+back was what was asked for, in a job that holds `packages: write`.
+`ORAS_SHA256` now pins the expected SHA-256 of
+`oras_<ORAS_VERSION>_linux_amd64.tar.gz` (matched against the project's
+own published `oras_<ORAS_VERSION>_checksums.txt` at the time
+`ORAS_VERSION` was last set), and the step verifies the download against
+it with `sha256sum -c` before extracting or executing anything. Bump
+`ORAS_SHA256` alongside `ORAS_VERSION` whenever the pinned version
+changes -- re-derive it the same way: download the new version's
+tarball and its own published checksums file, and confirm they agree
+before pinning the new hash.
 
 ## Withdrawal / correction
 

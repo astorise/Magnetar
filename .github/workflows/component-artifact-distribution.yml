@@ -99,16 +99,25 @@ jobs:
           path: oci-layout
       # oras is installed directly from its published GitHub Releases
       # binary, not a third-party GitHub Action pin -- this session could
-      # not independently verify one against this repo's GitHub access
-      # scope (see PR description). Review/update ORAS_VERSION when
-      # configuring this workflow for real use.
+      # not independently verify a GitHub Action against this repo's
+      # access scope, but the binary itself is checksum-verified below
+      # (MAG-11: this job holds packages: write, so the oras binary it
+      # executes must be verified, not merely downloaded over a bare
+      # curl with nothing checking what came back). ORAS_SHA256 is the
+      # SHA-256 of oras_<ORAS_VERSION>_linux_amd64.tar.gz, matched against
+      # the project's own published oras_<ORAS_VERSION>_checksums.txt at
+      # https://github.com/oras-project/oras/releases/tag/v1.2.0 at the
+      # time ORAS_VERSION was last set. Review/update both together when
+      # bumping ORAS_VERSION.
       - name: Install oras
         env:
           ORAS_VERSION: "1.2.0"
+          ORAS_SHA256: "5b3f1cbb86d869eee68120b9b45b9be983f3738442f87ee5f06b00edd0bab336"
         run: |
           set -euo pipefail
           curl -fsSL -o oras.tar.gz \
             "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          echo "${ORAS_SHA256}  oras.tar.gz" | sha256sum -c -
           mkdir -p oras-install
           tar -zxf oras.tar.gz -C oras-install
           sudo mv oras-install/oras /usr/local/bin/oras
@@ -117,9 +126,9 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | \
             docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      # NOTE: verify this exact `oras cp --from-oci-layout` invocation
-      # against the installed oras version before the first real run --
-      # this session has no GHCR credentials and could not execute it.
+      # This exact `oras cp --from-oci-layout` invocation has run
+      # successfully against real GHCR pushes (component-artifact-
+      # distribution runs #2-#5); re-verify it if ORAS_VERSION changes.
       - name: Push to GHCR by digest, tag as a convenience pointer only
         id: push
         run: |
