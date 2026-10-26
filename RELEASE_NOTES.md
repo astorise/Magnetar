@@ -1,6 +1,11 @@
-# Magnetar v0.1.0 Release Notes
+# Magnetar v1.0.0-RC0 Release Notes
 
-Status: unreleased candidate evidence, not a stable publication.
+Status: `1.0.0-RC0` is a real, published release candidate (crates.io
+`cargo publish --dry-run` validated, a real tagged GitHub Release with
+checksums/SBOM/provenance). A release candidate is never a stable
+publication by construction (`ReleaseCandidateTag::is_stable()` is
+`false` for every value) -- stable `1.0.0` publication still requires a
+human-triggered `real-publish` run against this exact baseline.
 
 ## Included Baseline
 
@@ -97,15 +102,16 @@ Status: unreleased candidate evidence, not a stable publication.
 
 ## Unsupported Claims
 
-- v0.1 does not provide cryptographic artifact signing: Component and Model
-  Artifact signatures carry no cryptographic material and are not verified.
-  The design is recorded in
-  [docs/cryptographic-artifact-signatures.md](docs/cryptographic-artifact-signatures.md);
-  implementation is separate, not-yet-scheduled follow-up work.
-- v0.1 does not claim hardened production sandboxing for native Providers
+- Cryptographic artifact signing (MAG-02) is now implemented: real Ed25519
+  signature verification (`magnetar-runtime::artifact_signature`) backs
+  both `ComponentTrustStore` and `ModelTrustStore`, per
+  [docs/cryptographic-artifact-signatures.md](docs/cryptographic-artifact-signatures.md).
+  This note previously said v0.1 provided none; that claim predates this
+  work and is corrected here (MAG-10/MAG-13).
+- v1.0 does not claim hardened production sandboxing for native Providers
   (Providers are trusted native code by architectural definition; see
   [SECURITY.md](SECURITY.md)).
-- v0.1 does not claim general production large-model execution: the real,
+- v1.0 does not claim general production large-model execution: the real,
   hardware-verified profile is specifically Qwen2/2.5-family decoder models,
   as described above and in
   [docs/production-model-loading-integration.md](docs/production-model-loading-integration.md).
