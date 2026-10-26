@@ -32,7 +32,7 @@
 //! - [`validate_cutover_feature_flag`] / [`validate_cutover_provider_feature_flags`]:
 //!   "Feature Flag Confirmation", composing
 //!   [`crate::release_packaging::reject_experimental_flag_enabled_by_default`]
-//!   and [`crate::release_packaging::validate_provider_feature_flags_for_v0_1`].
+//!   and [`crate::release_packaging::validate_provider_feature_flags_for_v1_0`].
 //! - [`CutoverCompatibilityDimension`] / [`CutoverCompatibilityStatus`] /
 //!   [`CutoverCompatibilityMatrix`] / [`reject_status_misrepresentation`]:
 //!   "Compatibility Matrix Completion" -- the twelve-dimension, six-status
@@ -105,7 +105,7 @@ use crate::{
     SecurityReleaseNotes, evaluate_release_security_blocking, record_release_security_observation,
     reject_change_after_freeze, reject_experimental_flag_enabled_by_default,
     reject_roadmap_feature_as_guarantee, release_may_publish_stable,
-    validate_cli_authority_not_delegated_to_runtime, validate_provider_feature_flags_for_v0_1,
+    validate_cli_authority_not_delegated_to_runtime, validate_provider_feature_flags_for_v1_0,
     validate_runtime_inference_api_security, verify_checksum_matches_final_artifact,
 };
 use magnetar_runtime::{CorrelationId, WitInterface};
@@ -409,12 +409,12 @@ pub fn validate_cutover_feature_flag(flag: &ReleaseFeatureFlag) -> Result<(), Re
     Ok(())
 }
 
-/// Composes [`validate_provider_feature_flags_for_v0_1`]: only Reference CPU
+/// Composes [`validate_provider_feature_flags_for_v1_0`]: only Reference CPU
 /// Provider may be enabled by default.
 pub fn validate_cutover_provider_feature_flags(
     flags: &[ReleaseFeatureFlag],
 ) -> Result<(), ReleaseCutoverError> {
-    validate_provider_feature_flags_for_v0_1(flags).map_err(|error| {
+    validate_provider_feature_flags_for_v1_0(flags).map_err(|error| {
         ReleaseCutoverError::NonBaselineFeatureEnabledInRelease {
             flag: error.to_string(),
         }
@@ -1533,15 +1533,26 @@ pub fn run_release_cutover_conformance() -> ReleaseCutoverConformanceReport {
     }
 
     {
+        // MAG-10: CUDA is now real and hardware-validated, and is no
+        // longer in DEFERRED_ROADMAP_FEATURES, so presenting it as
+        // included is now allowed (see release_packaging.rs's own
+        // matching conformance check for the evidence).
         let cuda_included = validate_v0_1_scope_feature("cuda", true);
         record(
             &mut results,
-            "CUDA listed as included is blocked",
+            "CUDA can now be presented as included for v1.0",
+            cuda_included.is_ok(),
+            format!("unexpected outcome: {cuda_included:?}"),
+        );
+        let still_deferred_included = validate_v0_1_scope_feature("openvino", true);
+        record(
+            &mut results,
+            "a genuinely still-deferred roadmap feature listed as included is blocked",
             matches!(
-                cuda_included,
+                still_deferred_included,
                 Err(ReleaseCutoverError::RoadmapFeaturePresentedAsIncluded { .. })
             ),
-            format!("unexpected outcome: {cuda_included:?}"),
+            format!("unexpected outcome: {still_deferred_included:?}"),
         );
         let baseline_included = validate_v0_1_scope_feature("reference-cpu-provider", true);
         record(

@@ -5,7 +5,7 @@
 
 Magnetar is a Rust runtime for portable local AI execution.
 
-The current implementation is a v0.1 local-runtime baseline with real
+The current implementation is a v1.0 local-runtime baseline with real
 Provider-backed first-native execution. The repository contains the
 `magnetar-runtime` and `magnetar-cli` crates, executable contract and
 integration tests, and the OpenSpec history that defines the architecture as
@@ -166,7 +166,7 @@ Implemented only as a baseline, fixture, or incomplete production surface:
   `magnetar devices`, and `magnetar serve` as fully stabilized production
   service interfaces
 
-Deferred or unsupported for v0.1:
+Deferred or unsupported for v1.0:
 
 - OpenVINO and QNN Providers
 - Native Metal FFI (`providers/metal` is an honest, unconditionally-

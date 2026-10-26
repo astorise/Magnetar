@@ -6,7 +6,9 @@ stable, breaking WIT compatibility accidentally, mixing future roadmap
 features into the baseline release, or shipping artifacts that cannot be
 reproduced or validated. This document, and the
 `magnetar-runtime::release_packaging` module it describes, define that
-policy for `v0.1`.
+policy, re-evidenced for `v1.0` (MAG-10) now that `1.0.0-RC0` is the
+real, published release target -- see "Release Scope" and "Compatibility
+Policy" below for what changed from the original `v0.1` draft and why.
 
 This document and module do **not** implement release automation, a package
 registry, or supply-chain signing (see
@@ -17,18 +19,26 @@ command that reports it.
 
 ## Release Scope
 
-`v0.1` is scoped to the CPU-local baseline: Runtime Inference API, Model
-Loading, Model Instance, the tokenizer fixture path, the Qwen-like baseline
-fixture path, Generation + Sampling, Tensor + Memory, the first Operator
-scope, Kernel Registry + Dispatch, Reference CPU Provider, the CLI boundary
-harness, and E2E local conformance. It does not require CUDA, Metal,
-OpenVINO, QNN, WebGPU, production Qwen model support, large model execution,
-model hub downloads, a server API implementation, an agent/tool runtime, or
-production CLI UX. `classify_publishing_boundary` and
+`v1.0` is scoped to the CPU-local baseline plus the real, hardware-validated
+work that has since shipped: Runtime Inference API, Model Loading, Model
+Instance, the tokenizer fixture path, Generation + Sampling, Tensor +
+Memory, the first Operator scope, Kernel Registry + Dispatch, Reference CPU
+Provider, a real external CUDA Provider, a real external WGPU Provider
+(device discovery plus one real compute Kernel), real production Qwen model
+artifact ingestion and generation, the CLI boundary harness, and E2E local
+conformance. It does not require Metal, OpenVINO, QNN, ROCm/NPU/TPU compute
+Kernels (their Providers do real device discovery only), large model
+execution beyond the real Qwen2/2.5 profile, model hub downloads, a server
+API implementation, an agent/tool runtime, production CLI UX, or a concrete
+Component distribution protocol. `classify_publishing_boundary` and
 `reject_roadmap_feature_as_guarantee` make this mechanically enforceable:
-every name in `DEFERRED_ROADMAP_FEATURES` (`cuda`, `metal`, `openvino`,
-`qnn`, `webgpu`, `server-api-implementation`, ...) is rejected if presented
-as included baseline.
+every name in `DEFERRED_ROADMAP_FEATURES` (`metal`, `openvino`, `qnn`,
+`rocm-compute-kernels`, `npu-compute-kernels`, `tpu-compute-kernels`,
+`server-api-implementation`, ...) is rejected if presented as included
+baseline. CUDA, WGPU, and production Qwen support were removed from this
+list for `v1.0` (MAG-10): all three are now real and validated, and keeping
+them deferred would have this policy module block presenting work the
+project has already shipped (see `README.md`'s "Current Status").
 
 ## Versioning Policy
 
@@ -87,9 +97,14 @@ allowed.
 `ReleaseFeatureFlagClass` names the six classes (baseline, experimental,
 provider-specific, platform-specific, test-only, conformance-only).
 `reject_experimental_flag_enabled_by_default` denies an experimental flag
-enabled by default. `provider_feature_flags` lists the seven Provider flags
-from the proposal; `validate_provider_feature_flags_for_v0_1` requires that
-only `reference-cpu-provider` be enabled by default.
+enabled by default. `provider_feature_flags` lists ten Provider flags: the
+original seven from the proposal, plus `npu-provider`, `rocm-provider`, and
+`tpu-provider` (MAG-10, naming the real `providers/{npu,rocm,tpu}`
+submodules, which previously had no release feature flag at all).
+`validate_provider_feature_flags_for_v1_0` requires that only
+`reference-cpu-provider` be enabled by default -- still true even though
+`cuda-provider` is now real and hardware-validated, since CUDA hardware is
+not universal.
 `component_engine_feature_flags` lists the Wasmtime/web/test component
 engine flags (all disabled by default), and
 `reject_wasmtime_required_for_browser` denies a browser-like platform target
@@ -97,7 +112,7 @@ that requires `wasmtime-component-engine`.
 
 ## Platform Targets
 
-`release_platform_targets` returns the `v0.1` native CI targets plus a
+`release_platform_targets` returns the `v1.0` native CI targets plus a
 check-only `wasm32-unknown-unknown` browser target. `unsupported_targets`
 reports any candidate target not in the supported list, for release
 documentation to record.
@@ -132,9 +147,14 @@ compatibility status for (Rust public API, WIT contracts, Runtime Inference
 API, Model Artifact metadata, Provider ABI, OpenSpec baseline, CLI command
 surface, conformance report format). `ReleaseCompatibilityMatrix::validate`
 requires every dimension to have an explicit `CompatibilityStatus`.
-`v0_1_compatibility_matrix` gives the `v0.1` matrix implied by this change's
-own specs: every dimension is `StableForBaseline` except Provider ABI, which
-is `Unstable`.
+`v1_0_compatibility_matrix` gives the `v1.0` matrix (MAG-10: re-evidenced
+against `1.0.0-RC0`'s real, published state): every dimension is
+`StableForBaseline` except Provider ABI, which is `Unstable`, and CLI
+Command Surface, which is `Preview` -- `README.md`'s own "Implemented only
+as a baseline, fixture, or incomplete production surface" list says the
+CLI commands are not yet "fully stabilized production service interfaces,"
+so the matrix no longer claims a stability that surface's own documentation
+disclaims.
 
 ## Public API Safety
 
@@ -211,7 +231,7 @@ patch-scoped breaking changes rejected, undocumented crate dependencies
 rejected, WIT breaking changes require a major bump, the freeze policy
 denies semantic changes but allows documentation clarifications,
 experimental flags cannot be enabled by default, only Reference CPU Provider
-is required for `v0.1`, browser targets never require Wasmtime,
+is required for `v1.0`, browser targets never require Wasmtime,
 artifact/compatibility/changelog manifests validate, the public API surface
 denies raw handle exposure, all required release gates must pass before
 stable publication, release candidate tags are never stable, and roadmap

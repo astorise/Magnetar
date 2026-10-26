@@ -62,8 +62,13 @@
 
 - [x] 3.1 Define the five versioned OCI media type constants
       (`application/vnd.magnetar.component.v1+wasm`,
-      `application/vnd.magnetar.component-manifest.v1+json`,
-      `application/vnd.magnetar.kernel-bundle.v1+tar+zstd`,
+      `application/vnd.magnetar.component-manifest.v1+yaml` (MAG-08
+      correction from the originally-defined `+json`: the real sidecar is
+      YAML),
+      `application/vnd.magnetar.kernel-bundle.v1+tar+gzip` (MAG-09
+      correction from the originally-defined `+tar+zstd`: the bundle is
+      gzip-compressed, and zstd is not implemented anywhere in the
+      ingestion path),
       `application/vnd.magnetar.kernel-manifest.v1+json`,
       `application/vnd.magnetar.conformance.v1+json`) in the
       `tools/release-publish` crate (or a shared location it and consuming

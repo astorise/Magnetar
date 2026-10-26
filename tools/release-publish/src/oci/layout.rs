@@ -8,7 +8,11 @@
 
 use std::{fs, path::Path};
 
-use crate::{ReleasePublishError, checksum::sha256_hex, oci::manifest::BuiltArtifactManifest};
+use crate::{
+    ReleasePublishError,
+    checksum::sha256_hex,
+    oci::manifest::{BuiltArtifactManifest, digest_sha256},
+};
 
 fn blob_path(root: &Path, digest: &str) -> Result<std::path::PathBuf, ReleasePublishError> {
     let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
@@ -17,19 +21,29 @@ fn blob_path(root: &Path, digest: &str) -> Result<std::path::PathBuf, ReleasePub
     Ok(root.join("blobs").join("sha256").join(hex))
 }
 
-/// Writes `built.manifest`, an empty OCI config blob, and `layer_bytes`
-/// (the artifact's own bytes) as content-addressed blobs under `root`,
-/// plus `oci-layout` and `index.json`, per the OCI Image Layout Spec.
-/// `tag` is recorded only as the `org.opencontainers.image.ref.name`
-/// annotation on the index entry -- a convenience pointer, never trust
-/// identity, per `component-artifact-distribution`'s "OCI Digest Is The
-/// Only Trust Identity" requirement.
+/// Writes `built.manifest`, an empty OCI config blob, and `layer_blobs`
+/// (the artifact's own layer bytes, one per entry of `built.manifest.
+/// layers`, in the same order -- e.g. a Component's `[wasm bytes,
+/// component manifest sidecar bytes]`, MAG-08) as content-addressed blobs
+/// under `root`, plus `oci-layout` and `index.json`, per the OCI Image
+/// Layout Spec. `tag` is recorded only as the
+/// `org.opencontainers.image.ref.name` annotation on the index entry -- a
+/// convenience pointer, never trust identity, per
+/// `component-artifact-distribution`'s "OCI Digest Is The Only Trust
+/// Identity" requirement.
 pub fn write_oci_layout(
     root: &Path,
     built: &BuiltArtifactManifest,
-    layer_bytes: &[u8],
+    layer_blobs: &[&[u8]],
     tag: &str,
 ) -> Result<(), ReleasePublishError> {
+    if layer_blobs.len() != built.manifest.layers.len() {
+        return Err(ReleasePublishError::Metadata(format!(
+            "expected {} layer blob(s) matching built.manifest.layers, got {}",
+            built.manifest.layers.len(),
+            layer_blobs.len()
+        )));
+    }
     fs::create_dir_all(root.join("blobs").join("sha256"))?;
     fs::write(
         root.join("oci-layout"),
@@ -39,7 +53,16 @@ pub fn write_oci_layout(
         blob_path(root, &built.manifest_digest)?,
         &built.manifest_bytes,
     )?;
-    fs::write(blob_path(root, &built.layer_digest)?, layer_bytes)?;
+    for (layer, blob) in built.manifest.layers.iter().zip(layer_blobs) {
+        let actual_digest = digest_sha256(blob);
+        if actual_digest != layer.digest {
+            return Err(ReleasePublishError::Metadata(format!(
+                "layer blob for media type '{}' does not match its manifest digest (expected {}, got {actual_digest})",
+                layer.media_type, layer.digest
+            )));
+        }
+        fs::write(blob_path(root, &layer.digest)?, blob)?;
+    }
     fs::write(blob_path(root, &built.manifest.config.digest)?, b"{}")?;
 
     let index = serde_json::json!({
@@ -85,12 +108,18 @@ mod tests {
 
     #[test]
     fn round_trips_a_component_artifact_through_a_local_layout() {
-        let layer_bytes = b"fake wasm component bytes";
-        let built =
-            build_artifact_manifest(ArtifactKind::ComponentArtifact, layer_bytes, "demo").unwrap();
+        let layer_bytes: &[u8] = b"fake wasm component bytes";
+        let manifest_bytes: &[u8] = b"component: {}\n";
+        let built = build_artifact_manifest(
+            ArtifactKind::ComponentArtifact,
+            layer_bytes,
+            "demo",
+            Some(manifest_bytes),
+        )
+        .unwrap();
         let root = TempDir::new("oci-layout-roundtrip");
 
-        write_oci_layout(&root, &built, layer_bytes, "latest").unwrap();
+        write_oci_layout(&root, &built, &[layer_bytes, manifest_bytes], "latest").unwrap();
 
         assert!(root.join("oci-layout").is_file());
         assert!(root.join("index.json").is_file());
@@ -98,12 +127,35 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_a_kernel_bundle_through_a_local_layout() {
+        let layer_bytes: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03fake gzip payload";
+        let built = build_artifact_manifest(
+            ArtifactKind::KernelExchangeBundle,
+            layer_bytes,
+            "demo-kernel",
+            None,
+        )
+        .unwrap();
+        let root = TempDir::new("oci-layout-kernel-roundtrip");
+
+        write_oci_layout(&root, &built, &[layer_bytes], "latest").unwrap();
+
+        verify_oci_layout(&root).unwrap();
+    }
+
+    #[test]
     fn tampered_blob_is_detected_by_verification() {
-        let layer_bytes = b"fake wasm component bytes";
-        let built =
-            build_artifact_manifest(ArtifactKind::ComponentArtifact, layer_bytes, "demo").unwrap();
+        let layer_bytes: &[u8] = b"fake wasm component bytes";
+        let manifest_bytes: &[u8] = b"component: {}\n";
+        let built = build_artifact_manifest(
+            ArtifactKind::ComponentArtifact,
+            layer_bytes,
+            "demo",
+            Some(manifest_bytes),
+        )
+        .unwrap();
         let root = TempDir::new("oci-layout-tamper");
-        write_oci_layout(&root, &built, layer_bytes, "latest").unwrap();
+        write_oci_layout(&root, &built, &[layer_bytes, manifest_bytes], "latest").unwrap();
 
         let layer_blob = root
             .join("blobs")
@@ -112,6 +164,43 @@ mod tests {
         fs::write(&layer_blob, b"tampered bytes").unwrap();
 
         let result = verify_oci_layout(&root);
+        assert!(matches!(result, Err(ReleasePublishError::Metadata(_))));
+    }
+
+    #[test]
+    fn mismatched_layer_blob_count_is_rejected() {
+        let layer_bytes: &[u8] = b"fake wasm component bytes";
+        let manifest_bytes: &[u8] = b"component: {}\n";
+        let built = build_artifact_manifest(
+            ArtifactKind::ComponentArtifact,
+            layer_bytes,
+            "demo",
+            Some(manifest_bytes),
+        )
+        .unwrap();
+        let root = TempDir::new("oci-layout-blob-count-mismatch");
+
+        // Only one blob given for a two-layer manifest.
+        let result = write_oci_layout(&root, &built, &[layer_bytes], "latest");
+        assert!(matches!(result, Err(ReleasePublishError::Metadata(_))));
+    }
+
+    #[test]
+    fn a_blob_in_the_wrong_position_is_rejected_before_writing() {
+        let layer_bytes: &[u8] = b"fake wasm component bytes";
+        let manifest_bytes: &[u8] = b"component: {}\n";
+        let built = build_artifact_manifest(
+            ArtifactKind::ComponentArtifact,
+            layer_bytes,
+            "demo",
+            Some(manifest_bytes),
+        )
+        .unwrap();
+        let root = TempDir::new("oci-layout-blob-order-mismatch");
+
+        // Swapped order: this must be caught by the digest check, not
+        // silently written under the wrong layer's declared digest.
+        let result = write_oci_layout(&root, &built, &[manifest_bytes, layer_bytes], "latest");
         assert!(matches!(result, Err(ReleasePublishError::Metadata(_))));
     }
 }

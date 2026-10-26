@@ -142,8 +142,13 @@ invent a second token.
 
 **6. OCI media types are versioned from day one.**
 `application/vnd.magnetar.component.v1+wasm`,
-`application/vnd.magnetar.component-manifest.v1+json`,
-`application/vnd.magnetar.kernel-bundle.v1+tar+zstd`,
+`application/vnd.magnetar.component-manifest.v1+yaml` (MAG-08: `+yaml`,
+not `+json` -- the real `*.magnetar-component.yaml` sidecar is YAML),
+`application/vnd.magnetar.kernel-bundle.v1+tar+gzip` (MAG-09: `+tar+gzip`,
+not `+tar+zstd` -- `extract_kernel_exchange_archive` implements plain
+tar/tar.gz only; a `+tar+zstd` label on gzip-compressed bytes was a
+declared format that did not match the actual bytes, and zstd support
+does not exist anywhere in the ingestion path),
 `application/vnd.magnetar.kernel-manifest.v1+json`,
 `application/vnd.magnetar.conformance.v1+json`. The `v1` segment is
 deliberate: a breaking change to any manifest shape ships as `v2`, so a

@@ -1826,14 +1826,14 @@ fn experimental_feature_flag_cannot_be_enabled_by_default() {
 }
 
 #[test]
-fn only_reference_cpu_provider_is_required_for_v0_1() {
+fn only_reference_cpu_provider_is_required_for_v1_0() {
     let flags = provider_feature_flags();
-    assert_eq!(flags.len(), 7);
-    assert!(validate_provider_feature_flags_for_v0_1(&flags).is_ok());
+    assert_eq!(flags.len(), 10);
+    assert!(validate_provider_feature_flags_for_v1_0(&flags).is_ok());
 
     let mut bad_flags = flags.clone();
     bad_flags[1].enabled_by_default = true; // optimized-cpu-provider
-    assert!(validate_provider_feature_flags_for_v0_1(&bad_flags).is_err());
+    assert!(validate_provider_feature_flags_for_v1_0(&bad_flags).is_err());
 }
 
 #[test]
@@ -1932,8 +1932,8 @@ fn compatibility_matrix_requires_every_dimension_declared() {
 }
 
 #[test]
-fn v0_1_compatibility_matrix_marks_provider_abi_unstable() {
-    let matrix = v0_1_compatibility_matrix();
+fn v1_0_compatibility_matrix_marks_provider_abi_unstable() {
+    let matrix = v1_0_compatibility_matrix();
     assert!(matrix.validate().is_ok());
     assert_eq!(
         matrix.status.get(compatibility_dimension_id(
@@ -1946,6 +1946,21 @@ fn v0_1_compatibility_matrix_marks_provider_abi_unstable() {
             CompatibilityDimension::RustPublicApi
         )),
         Some(&CompatibilityStatus::StableForBaseline)
+    );
+}
+
+#[test]
+fn v1_0_compatibility_matrix_marks_cli_command_surface_preview() {
+    // MAG-10: README.md's own "Implemented only as a baseline, fixture,
+    // or incomplete production surface" list says the CLI commands are
+    // not yet "fully stabilized production service interfaces" -- the
+    // matrix must not claim StableForBaseline for this dimension.
+    let matrix = v1_0_compatibility_matrix();
+    assert_eq!(
+        matrix.status.get(compatibility_dimension_id(
+            CompatibilityDimension::CliCommandSurface
+        )),
+        Some(&CompatibilityStatus::Preview)
     );
 }
 
@@ -2079,13 +2094,20 @@ fn documentation_checklist_requires_known_limitations() {
 
 #[test]
 fn deferred_roadmap_features_are_never_included_baseline() {
+    // MAG-10: "cuda", "webgpu", and "production-qwen-model-support" were
+    // removed from DEFERRED_ROADMAP_FEATURES (all three are now real and
+    // validated -- see release_packaging.rs's own doc comment on that
+    // constant) and "rocm-compute-kernels"/"npu-compute-kernels"/
+    // "tpu-compute-kernels"/"component-distribution-protocol" were added.
     for feature in [
-        "cuda",
         "metal",
         "openvino",
         "qnn",
-        "webgpu",
+        "rocm-compute-kernels",
+        "npu-compute-kernels",
+        "tpu-compute-kernels",
         "server-api-implementation",
+        "component-distribution-protocol",
     ] {
         assert_eq!(
             classify_publishing_boundary(feature),
@@ -2888,13 +2910,22 @@ fn semantic_change_after_freeze_is_blocked_or_freeze_is_restarted() {
 }
 
 #[test]
-fn cuda_listed_as_included_is_blocked() {
+fn cuda_can_now_be_presented_as_included_for_v1_0() {
+    // MAG-10: CUDA is real and hardware-validated and is no longer in
+    // DEFERRED_ROADMAP_FEATURES.
     let outcome = validate_v0_1_scope_feature("cuda", true);
+    assert!(outcome.is_ok());
+    assert!(validate_v0_1_scope_feature("cuda", false).is_ok());
+}
+
+#[test]
+fn a_genuinely_still_deferred_feature_listed_as_included_is_blocked() {
+    let outcome = validate_v0_1_scope_feature("openvino", true);
     assert!(matches!(
         outcome,
         Err(ReleaseCutoverError::RoadmapFeaturePresentedAsIncluded { .. })
     ));
-    assert!(validate_v0_1_scope_feature("cuda", false).is_ok());
+    assert!(validate_v0_1_scope_feature("openvino", false).is_ok());
 }
 
 #[test]

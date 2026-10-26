@@ -4,7 +4,11 @@
 //! This module does not implement release automation, a package registry, or
 //! supply-chain signing -- the proposal's "Non-Goals" rule all of that out
 //! explicitly. Instead it defines, as executable Rust types and validation
-//! functions, the release packaging and versioning **policy** for `v0.1`:
+//! functions, the release packaging and versioning **policy** for `v1.0`
+//! (MAG-10: renamed and re-evidenced from the original `v0.1`-scoped
+//! policy now that `1.0.0-RC0` is the real, published release target --
+//! see `v1_0_compatibility_matrix` and `DEFERRED_ROADMAP_FEATURES` below
+//! for what changed and why):
 //!
 //! - [`ReleaseVersion`]: explicit semantic versioning
 //!   ([`evaluate_version_bump`] implements the pre-1.0 / 0.x-minor / patch
@@ -28,7 +32,10 @@
 //! - [`ReleaseFeatureFlagClass`] / [`ReleaseFeatureFlag`]: the six feature
 //!   flag classes, plus [`reject_experimental_flag_enabled_by_default`] and
 //!   the concrete [`provider_feature_flags`] / [`component_engine_feature_flags`]
-//!   catalogs (only `reference-cpu-provider` is required for `v0.1`).
+//!   catalogs (only `reference-cpu-provider` is required for `v1.0` --
+//!   every other real Provider submodule, including the now real and
+//!   hardware-validated `cuda-provider`, remains hardware-dependent and
+//!   so stays opt-in).
 //! - [`ReleasePlatformTarget`] / [`release_platform_targets`]: supported
 //!   native targets, the CI target set, and wasm32 check-only status.
 //! - [`ReleaseArtifactKind`] / [`ReleaseArtifactManifest`]: the release
@@ -463,9 +470,21 @@ pub fn reject_experimental_flag_enabled_by_default(
 }
 
 /// Provider-specific feature flags named in the proposal. Only
-/// `reference-cpu-provider` is required for `v0.1`; every other flag is
+/// `reference-cpu-provider` is required for `v1.0`; every other flag is
 /// absent, disabled, or explicitly experimental, implementing "Provider
 /// Feature Flags".
+///
+/// `npu-provider`, `rocm-provider`, and `tpu-provider` (MAG-10) name the
+/// real `providers/npu` (Intel Level Zero), `providers/rocm` (AMD HIP),
+/// and `providers/tpu` (Google Coral `libedgetpu`) submodules -- each a
+/// real device-discovery-only Provider with no compute Kernels yet and no
+/// matching hardware in this repository's own CI, so each stays disabled
+/// by default like every other non-baseline Provider. `openvino-provider`
+/// and `qnn-provider` remain distinct, not-yet-implemented roadmap
+/// hardware families (see `magnetar_runtime::provider_roadmap::
+/// ProviderRoadmapHardwareFamily`) -- OpenVINO and Qualcomm QNN are not
+/// the same hardware `providers/npu` targets (Intel NPU via Level Zero),
+/// so they are not satisfied by it.
 pub fn provider_feature_flags() -> Vec<ReleaseFeatureFlag> {
     let required_only = "reference-cpu-provider";
     [
@@ -476,6 +495,9 @@ pub fn provider_feature_flags() -> Vec<ReleaseFeatureFlag> {
         "openvino-provider",
         "qnn-provider",
         "webgpu-provider",
+        "npu-provider",
+        "rocm-provider",
+        "tpu-provider",
     ]
     .into_iter()
     .map(|name| ReleaseFeatureFlag {
@@ -486,9 +508,13 @@ pub fn provider_feature_flags() -> Vec<ReleaseFeatureFlag> {
     .collect()
 }
 
-/// "For `v0.1`, only Reference CPU Provider SHOULD be required. Other
+/// "For `v1.0`, only Reference CPU Provider SHOULD be required. Other
 /// Provider flags SHALL be absent, disabled, or explicitly experimental."
-pub fn validate_provider_feature_flags_for_v0_1(
+/// Still true after MAG-10's re-evidencing: `cuda-provider` is now real
+/// and hardware-validated (see `v1_0_compatibility_matrix`'s doc comment),
+/// but CUDA hardware is not universal, so it stays opt-in rather than
+/// becoming a second required-by-default flag.
+pub fn validate_provider_feature_flags_for_v1_0(
     flags: &[ReleaseFeatureFlag],
 ) -> Result<(), ReleasePackagingError> {
     for flag in flags {
@@ -551,7 +577,7 @@ pub struct ReleasePlatformTarget {
     pub is_browser_like: bool,
 }
 
-/// The `v0.1` platform target set: native CI targets plus a check-only
+/// The `v1.0` platform target set: native CI targets plus a check-only
 /// wasm32 browser target.
 pub fn release_platform_targets() -> Vec<ReleasePlatformTarget> {
     vec![
@@ -854,17 +880,31 @@ impl ReleaseCompatibilityMatrix {
     }
 }
 
-/// The `v0.1` compatibility matrix implied by this change's own specs: the
-/// Provider ABI is explicitly unstable
-/// (`specs/provider/spec.md`, "Provider ABI Compatibility Status") and
-/// everything else is stable-for-baseline.
-pub fn v0_1_compatibility_matrix() -> ReleaseCompatibilityMatrix {
+/// The `v1.0` compatibility matrix (MAG-10: re-evidenced against
+/// `1.0.0-RC0`'s real, published state, not the original `v0.1` draft):
+///
+/// - [`CompatibilityDimension::ProviderAbi`] is explicitly `Unstable`
+///   (`specs/provider/spec.md`, "Provider ABI Compatibility Status", and
+///   `README.md`'s own "Deferred or unsupported" list still names "a
+///   stable Provider ABI").
+/// - [`CompatibilityDimension::CliCommandSurface`] is `Preview`, not
+///   `StableForBaseline`: `README.md`'s own "Implemented only as a
+///   baseline, fixture, or incomplete production surface" list says
+///   plainly that `magnetar run`/`chat`/`model`/`providers`/`devices`/
+///   `serve` are not yet "fully stabilized production service
+///   interfaces" -- the matrix previously claimed a stability the CLI's
+///   own documentation disclaims.
+/// - Every other dimension remains `StableForBaseline`: no evidence
+///   surfaced (MAG-10's own investigation) that `RustPublicApi`,
+///   `WitContracts`, `RuntimeInferenceApi`, `ModelArtifactMetadata`,
+///   `OpenSpecBaseline`, or `ConformanceReportFormat` should change.
+pub fn v1_0_compatibility_matrix() -> ReleaseCompatibilityMatrix {
     let mut matrix = ReleaseCompatibilityMatrix::default();
     for dimension in COMPATIBILITY_DIMENSIONS {
-        let status = if matches!(dimension, CompatibilityDimension::ProviderAbi) {
-            CompatibilityStatus::Unstable
-        } else {
-            CompatibilityStatus::StableForBaseline
+        let status = match dimension {
+            CompatibilityDimension::ProviderAbi => CompatibilityStatus::Unstable,
+            CompatibilityDimension::CliCommandSurface => CompatibilityStatus::Preview,
+            _ => CompatibilityStatus::StableForBaseline,
         };
         matrix.set(*dimension, status);
     }
@@ -1206,18 +1246,41 @@ pub enum PublishingBoundaryCategory {
 
 /// Roadmap feature names this release explicitly defers, matching the
 /// proposal's "Release Scope" -- "The release SHALL NOT require" list.
+///
+/// Re-evidenced for `v1.0` (MAG-10) against `README.md`'s own "Deferred or
+/// unsupported" list and "Current Status" section:
+///
+/// - Removed `"cuda"`, `"webgpu"`, and `"production-qwen-model-support"`:
+///   all three are now real and validated (CUDA and WGPU: real,
+///   hardware-verified Provider execution; Qwen: real production artifact
+///   ingestion and generation, both verified end to end on real
+///   hardware). None of the three appears in `README.md`'s own deferred
+///   list any more; keeping them here would mean this policy module
+///   blocked presenting work the project has already shipped.
+/// - Added `"rocm-compute-kernels"`, `"npu-compute-kernels"`, and
+///   `"tpu-compute-kernels"`: `providers/{rocm,npu,tpu}` do real device
+///   discovery only -- no compute Kernels -- exactly matching
+///   `README.md`'s "ROCm/NPU/TPU compute Kernels" deferred entries,
+///   which this list did not previously name at all.
+/// - Added `"component-distribution-protocol"`: `README.md`'s deferred
+///   list names "a concrete Component distribution protocol"; this list
+///   did not.
+/// - `"metal"`, `"openvino"`, `"qnn"` remain unchanged: no submodule
+///   implements OpenVINO or Qualcomm QNN, and `providers/metal` stays an
+///   honest, unconditionally-unavailable placeholder.
 const DEFERRED_ROADMAP_FEATURES: &[&str] = &[
-    "cuda",
     "metal",
     "openvino",
     "qnn",
-    "webgpu",
-    "production-qwen-model-support",
+    "rocm-compute-kernels",
+    "npu-compute-kernels",
+    "tpu-compute-kernels",
     "large-model-execution",
     "model-hub-downloads",
     "server-api-implementation",
     "agent-tool-runtime",
     "production-cli-ux",
+    "component-distribution-protocol",
 ];
 
 /// Classifies `feature` into a [`PublishingBoundaryCategory`], implementing
@@ -1232,7 +1295,7 @@ pub fn classify_publishing_boundary(feature: &str) -> PublishingBoundaryCategory
     }
 }
 
-/// "Roadmap feature SHALL NOT be presented as included in `v0.1`": rejects
+/// "Roadmap feature SHALL NOT be presented as included in `v1.0`": rejects
 /// presenting a [`PublishingBoundaryCategory::DeferredRoadmap`] or
 /// [`PublishingBoundaryCategory::UnsupportedFeature`] feature as included
 /// baseline.
@@ -1451,7 +1514,7 @@ fn record(
 /// crate dependencies require documented compatibility; WIT breaking changes
 /// require a major bump; the freeze policy denies semantic changes but
 /// allows documentation clarifications; experimental flags cannot be
-/// enabled by default; only Reference CPU Provider is required for `v0.1`;
+/// enabled by default; only Reference CPU Provider is required for `v1.0`;
 /// browser targets never require Wasmtime; artifact/compatibility/changelog
 /// manifests validate; the public API surface denies raw handle exposure;
 /// all required release gates must pass before stable publication; release
@@ -1538,10 +1601,10 @@ pub fn run_release_packaging_conformance() -> ReleasePackagingConformanceReport 
 
     {
         let flags = provider_feature_flags();
-        let outcome = validate_provider_feature_flags_for_v0_1(&flags);
+        let outcome = validate_provider_feature_flags_for_v1_0(&flags);
         record(
             &mut results,
-            "only reference-cpu-provider is required for v0.1",
+            "only reference-cpu-provider is required for v1.0",
             outcome.is_ok(),
             format!("unexpected outcome: {outcome:?}"),
         );
@@ -1587,18 +1650,24 @@ pub fn run_release_packaging_conformance() -> ReleasePackagingConformanceReport 
     }
 
     {
-        let matrix = v0_1_compatibility_matrix();
+        let matrix = v1_0_compatibility_matrix();
         record(
             &mut results,
-            "the v0.1 compatibility matrix declares every dimension",
+            "the v1.0 compatibility matrix declares every dimension",
             matrix.validate().is_ok(),
             format!("unexpected outcome: {:?}", matrix.validate()),
         );
         record(
             &mut results,
-            "the v0.1 compatibility matrix marks Provider ABI unstable",
+            "the v1.0 compatibility matrix marks Provider ABI unstable",
             matrix.status.get("provider-abi") == Some(&CompatibilityStatus::Unstable),
             "provider-abi status was not Unstable",
+        );
+        record(
+            &mut results,
+            "the v1.0 compatibility matrix marks the CLI command surface as preview, not stable (MAG-10)",
+            matrix.status.get("cli-command-surface") == Some(&CompatibilityStatus::Preview),
+            "cli-command-surface status was not Preview",
         );
     }
 
@@ -1686,13 +1755,27 @@ pub fn run_release_packaging_conformance() -> ReleasePackagingConformanceReport 
     }
 
     {
-        let outcome = reject_roadmap_feature_as_guarantee("cuda", true);
+        // MAG-10: CUDA is now real and hardware-validated (README.md's
+        // "Current Status" section, v1_0_compatibility_matrix's doc
+        // comment) -- it is no longer in DEFERRED_ROADMAP_FEATURES, so
+        // presenting it as included is now allowed, unlike under the
+        // original v0.1 policy this test asserted.
+        let cuda_allowed = reject_roadmap_feature_as_guarantee("cuda", true);
         record(
             &mut results,
-            "CUDA cannot be presented as included in v0.1",
-            outcome.is_err(),
-            format!("unexpected outcome: {outcome:?}"),
+            "CUDA can now be presented as included for v1.0",
+            cuda_allowed.is_ok(),
+            format!("unexpected outcome: {cuda_allowed:?}"),
         );
+
+        let still_deferred = reject_roadmap_feature_as_guarantee("openvino", true);
+        record(
+            &mut results,
+            "a genuinely still-deferred roadmap feature cannot be presented as included",
+            still_deferred.is_err(),
+            format!("unexpected outcome: {still_deferred:?}"),
+        );
+
         let allowed = reject_roadmap_feature_as_guarantee("reference-cpu-provider", true);
         record(
             &mut results,

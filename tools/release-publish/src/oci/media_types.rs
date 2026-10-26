@@ -7,9 +7,27 @@
 //! parse.
 
 pub const COMPONENT_ARTIFACT_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.component.v1+wasm";
+/// `+yaml`, not `+json`: a Component's real manifest sidecar on disk is
+/// always `<artifact>.magnetar-component.yaml` (see
+/// `magnetar_runtime::component::manifest_path_for_definition`) and is
+/// parsed as YAML (`ComponentManifest::from_yaml_bytes`). This constant
+/// was never used as a real OCI layer `mediaType` before MAG-08 wired it
+/// up as one -- only ever as an annotation value naming the manifest
+/// shape -- so there is no real published artifact whose identity this
+/// correction could break.
 pub const COMPONENT_MANIFEST_MEDIA_TYPE_V1: &str =
-    "application/vnd.magnetar.component-manifest.v1+json";
-pub const KERNEL_BUNDLE_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.kernel-bundle.v1+tar+zstd";
+    "application/vnd.magnetar.component-manifest.v1+yaml";
+/// `+tar+gzip`, not `+tar+zstd`: every Kernel Exchange Bundle this
+/// workspace can actually produce or ingest is gzip-compressed --
+/// `extract_kernel_exchange_archive` (`magnetar-runtime`) implements
+/// plain tar and tar.gz only, and zstd decompression is not wired into
+/// the ingestion path at all (MAG-09). A real Kernel Exchange Bundle
+/// (the `cpu_reference_matmul` fixture) was already published to GHCR
+/// under the old, inaccurate `+tar+zstd` label before this correction --
+/// see "Withdrawal / correction" in `docs/release-publication.md`: that
+/// digest stays resolvable as published, and a corrected republish uses
+/// this constant under its own new digest.
+pub const KERNEL_BUNDLE_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.kernel-bundle.v1+tar+gzip";
 pub const KERNEL_MANIFEST_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.kernel-manifest.v1+json";
 pub const CONFORMANCE_FIXTURE_MEDIA_TYPE_V1: &str = "application/vnd.magnetar.conformance.v1+json";
 
