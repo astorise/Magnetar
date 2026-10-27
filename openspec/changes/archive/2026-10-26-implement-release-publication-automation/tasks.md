@@ -106,16 +106,21 @@
 - [x] 4.4 Add `.github/workflows/component-artifact-distribution.yml` wiring
       manifest construction → (manual-gated) GHCR push → digest recording,
       independent of the `release-publication.yml` workflow's schedule.
-- [ ] 4.5 Verify no existing `kernel-distribution` ingestion code path
+- [x] 4.5 Verify no existing `kernel-distribution` ingestion code path
       assumes a GHCR-only source; add a regression test (or extend an
       existing one) proving ingestion of an identical-digest artifact from a
       non-GHCR local source behaves identically, per the
-      "Kernel Distribution Is Transport Neutral" requirement. **Deferred:
-      confirmed by inspection that no `magnetar-runtime` source or test
-      references GHCR at all today (nothing to regress against), but
-      writing the regression test itself means exploring and touching
-      `magnetar-runtime`'s own ingestion test suite, a separate,
-      larger-scoped task from this round's CI-workflow work.**
+      "Kernel Distribution Is Transport Neutral" requirement. Confirmed by
+      inspection that `extract_kernel_exchange_archive` takes only bytes and
+      a gzip flag -- no source/origin parameter exists to regress.
+      `published_kernel_bundle_validates_identically_from_an_archive_or_a_plain_directory`
+      (`magnetar-runtime/src/kernel_artifact_manifest/tests.rs`) proves it
+      directly against the one real Kernel Exchange Bundle this repository
+      has actually published to GHCR: extracting that real tar.gz archive
+      (what a GHCR pull-and-unpack produces) and opening a plain-filesystem
+      copy of the same extracted content with no archive step at all (what
+      an already-unpacked local/object-storage delivery produces) validate
+      to the identical digest.
 - [x] 4.6 Document the OCI digest-based withdrawal/correction procedure
       (new digest + repointed tag, old digest stays resolvable but marked
       withdrawn) alongside the crates.io yank procedure from task 2.7.
