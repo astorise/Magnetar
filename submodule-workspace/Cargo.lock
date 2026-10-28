@@ -433,6 +433,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "daachorse"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5614204febbc33cc07a2806aa6440b904ac012b68eecc37f4493ea4a76455a3d"
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -909,14 +915,14 @@ dependencies = [
 
 [[package]]
 name = "magnetar-format-gguf"
-version = "1.0.0-RC0"
+version = "1.0.0-RC1"
 dependencies = [
  "magnetar-runtime",
 ]
 
 [[package]]
 name = "magnetar-format-safetensors"
-version = "1.0.0-RC0"
+version = "1.0.0-RC1"
 dependencies = [
  "magnetar-runtime",
  "serde_json",
@@ -969,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-loader-gguf"
-version = "1.0.0-RC0"
+version = "1.0.0-RC1"
 dependencies = [
  "magnetar-format-gguf",
  "magnetar-runtime",
@@ -978,27 +984,27 @@ dependencies = [
 
 [[package]]
 name = "magnetar-loader-huggingface"
-version = "1.0.0-RC0"
+version = "1.0.0-RC1"
 dependencies = [
  "magnetar-format-safetensors",
  "magnetar-runtime",
  "minijinja",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tokenizers",
 ]
 
 [[package]]
 name = "magnetar-provider-cpu"
-version = "1.0.0-RC0"
+version = "1.0.0-RC1"
 dependencies = [
  "magnetar-runtime",
 ]
 
 [[package]]
 name = "magnetar-provider-cuda"
-version = "1.0.0-RC0"
+version = "1.0.0-RC1"
 dependencies = [
  "cudarc",
  "magnetar-runtime",
@@ -1013,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-runtime"
-version = "1.0.0-RC0"
+version = "1.0.0-RC1"
 dependencies = [
  "ed25519-dalek",
  "flate2",
@@ -1041,18 +1047,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "memo-map"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5449c8c750f1a07ea702bbd212bd999fceece9b3d1508b17023b3e174583124b"
-
-[[package]]
 name = "minijinja"
-version = "2.24.0"
+version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
+checksum = "f384a3e3726ee69716c351e921b72138104afd1e5362561733c8a656fc8c6a9a"
 dependencies = [
- "memo-map",
  "serde",
 ]
 
@@ -1670,13 +1669,13 @@ dependencies = [
 
 [[package]]
 name = "tokenizers"
-version = "0.21.4"
+version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a620b996116a59e184c2fa2dfd8251ea34a36d0a514758c6f966386bd2e03476"
+checksum = "7afbf6e88718afcc138bad01d6ccc3051dbbc3b2ce9793d8b8a3aeb610969cfc"
 dependencies = [
  "ahash",
- "aho-corasick",
  "compact_str",
+ "daachorse",
  "dary_heap",
  "derive_builder",
  "esaxx-rs",

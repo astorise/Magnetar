@@ -16,4 +16,4 @@ publish = false
 description = "Executable roadmap and release-process contracts for the Magnetar project (not part of magnetar-runtime's public API)."
 
 [dependencies]
-magnetar-runtime = { path = "../magnetar-runtime", version = "1.0.0-RC0" }
+magnetar-runtime = { path = "../magnetar-runtime", version = "1.0.0-RC1" }
