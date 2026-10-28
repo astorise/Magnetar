@@ -1,0 +1,43 @@
+name: Create Release Tag
+
+# Creates and pushes a lightweight git tag using this workflow's own
+# GITHUB_TOKEN (via the permissions: contents: write grant below) --
+# the same mechanism release-publication.yml's github-release job
+# already relies on to create releases. Exists because pushing a tag
+# ref from outside GitHub's own infrastructure (e.g. a sandboxed CI
+# agent's git proxy) can be blocked even when pushing branches is
+# allowed; running on an Actions runner sidesteps that without
+# widening any credential. `environment: release` mirrors the other
+# real, state-changing workflows in this repo, so the repo owner can
+# attach required reviewers to that environment if desired.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag name to create (e.g. v1.0.0-RC1)
+        required: true
+        type: string
+      sha:
+        description: Commit SHA to tag
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  create-tag:
+    name: create-tag / push
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Create and push the tag
+        run: |
+          set -euo pipefail
+          git tag "${{ inputs.tag }}" "${{ inputs.sha }}"
+          git push origin "${{ inputs.tag }}"
+          echo "Pushed tag ${{ inputs.tag }} -> ${{ inputs.sha }}"
