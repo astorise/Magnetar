@@ -7295,6 +7295,32 @@ impl ProductionLoadedModel {
         chat_formatter: Option<&dyn ChatTemplateFormatter>,
         on_event: &mut dyn FnMut(GenerationStreamEvent) -> std::ops::ControlFlow<()>,
     ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+        self.generate_streaming_inner(request, chat_formatter, on_event, None)
+    }
+
+    /// [`Self::generate_streaming`], additionally handing each step's full
+    /// next-token logits (host-visible, vocabulary-sized, pre-sampling) to
+    /// `on_logits`, once per step and before that step's `Token` event
+    /// (`qualify-real-checkpoint-performance` A02). Observation only: the
+    /// logits, sampling and every event are exactly what
+    /// [`Self::generate_streaming`] produces for the same request.
+    pub fn generate_streaming_with_logits(
+        &mut self,
+        request: ProductionGenerationRequest,
+        chat_formatter: Option<&dyn ChatTemplateFormatter>,
+        on_event: &mut dyn FnMut(GenerationStreamEvent) -> std::ops::ControlFlow<()>,
+        on_logits: &mut dyn FnMut(&[f32]),
+    ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+        self.generate_streaming_inner(request, chat_formatter, on_event, Some(on_logits))
+    }
+
+    fn generate_streaming_inner(
+        &mut self,
+        request: ProductionGenerationRequest,
+        chat_formatter: Option<&dyn ChatTemplateFormatter>,
+        on_event: &mut dyn FnMut(GenerationStreamEvent) -> std::ops::ControlFlow<()>,
+        on_logits: Option<LogitsObserver<'_>>,
+    ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
         let mut prepared = self.prepare_generation(request, chat_formatter)?;
         let prepared_tokenizer = self.fixture.tokenizer.clone();
         let mut generated_so_far: Vec<TokenId> = Vec::new();
@@ -7329,19 +7355,35 @@ impl ProductionLoadedModel {
         let max_generation_duration = prepared
             .max_generation_millis
             .map(std::time::Duration::from_millis);
-        let generation_result = run_generation_loop_with_execution_plans_streaming(
-            &mut self.runtime,
-            &prepared.generation_request,
-            SamplingPolicy::default(),
-            CacheUsageSummary::default(),
-            |_generated_so_far| {
-                max_generation_duration
-                    .is_some_and(|deadline| deadline_started_at.elapsed() >= deadline)
-            },
-            &mut prepared.observer,
-            &mut execution_plans,
-            &mut on_token,
-        )?;
+        let should_cancel = |_generated_so_far: &[TokenId]| {
+            max_generation_duration
+                .is_some_and(|deadline| deadline_started_at.elapsed() >= deadline)
+        };
+        let generation_result = match on_logits {
+            Some(on_logits) => {
+                crate::inference_api::run_generation_loop_with_execution_plans_streaming_and_logits(
+                    &mut self.runtime,
+                    &prepared.generation_request,
+                    SamplingPolicy::default(),
+                    CacheUsageSummary::default(),
+                    should_cancel,
+                    &mut prepared.observer,
+                    &mut execution_plans,
+                    &mut on_token,
+                    on_logits,
+                )?
+            }
+            None => run_generation_loop_with_execution_plans_streaming(
+                &mut self.runtime,
+                &prepared.generation_request,
+                SamplingPolicy::default(),
+                CacheUsageSummary::default(),
+                should_cancel,
+                &mut prepared.observer,
+                &mut execution_plans,
+                &mut on_token,
+            )?,
+        };
         let _ = on_event(GenerationStreamEvent::Finished {
             finish_reason: generation_result.output.finish_reason,
             usage: generation_result.output.usage.clone(),

@@ -164,6 +164,21 @@ jobs:
         # checkpoint's greedy prefill token/text compared between
         # Reference CPU and this same real CUDA hardware.
         run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_checkpoint -- --include-ignored --test-threads=1
+      - name: Real-checkpoint CUDA logits against the Reference CPU corpus
+        # qualify-real-checkpoint-performance A02: CUDA's per-step logits
+        # and greedy tokens for the pinned checkpoint are compared with the
+        # checked-in Reference CPU corpus
+        # (integration-tests/production-loading/fixtures/qualification/)
+        # under the declared F32 profile, followed by streaming,
+        # cancellation and resume checks on the same CUDA instance. A
+        # failed comparison writes its full per-step differential evidence
+        # to the report directory uploaded below.
+        timeout-minutes: 60
+        env:
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports
+        run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_logits_match_the_reference_corpus -- --include-ignored --test-threads=1 --nocapture
       - name: Real-checkpoint qualification campaign on CUDA (cost per token)
         # qualify-real-checkpoint-performance A01/A04: one load, one cold
         # request, one warmup and five measured greedy requests of 128 new

@@ -31,10 +31,11 @@
 //!   manifest) and `MAGNETAR_QUALIFICATION_SUMMARY_PATH` (a Markdown summary
 //!   is appended there, e.g. `$GITHUB_STEP_SUMMARY`).
 //!
-//! What the report does not claim: A02 logit references (no logits are
-//! exposed at this public boundary yet), A07 budgeted memory campaigns, A08
-//! downstream quality and device-memory telemetry are recorded as pending
-//! gates / not measured, so the verdict stays unqualified until those land.
+//! What the report does not claim: A02 logit/lifecycle evidence (produced
+//! separately by `tests_real_checkpoint_numerics.rs`, not attached here), A07
+//! budgeted memory campaigns, A08 downstream quality and device-memory
+//! telemetry are recorded as pending gates / not measured, so the verdict
+//! stays unqualified until those land.
 
 use crate::test_support::{VOCAB_SIZE, register_real_qwen_component, write_tiny_production_bundle};
 use crate::tests_real_checkpoint_smoke::{
@@ -255,10 +256,17 @@ fn pending_gates() -> Vec<(String, String)> {
     [
         (
             "A02",
-            "checkpoint-bound logit references: generation exposes no logits at the public boundary yet",
+            "logit-reference comparison is a separate artifact \
+             (tests_real_checkpoint_numerics) not attached to this report",
         ),
-        ("A07", "budgeted memory-ladder / fixed-budget split campaigns not implemented yet"),
-        ("A08", "downstream quality datasets and thresholds not selected yet"),
+        (
+            "A07",
+            "budgeted memory-ladder / fixed-budget split campaigns not implemented yet",
+        ),
+        (
+            "A08",
+            "downstream quality datasets and thresholds not selected yet",
+        ),
     ]
     .into_iter()
     .map(|(gate, reason)| (gate.to_string(), reason.to_string()))

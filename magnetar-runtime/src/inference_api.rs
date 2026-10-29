@@ -1434,6 +1434,7 @@ pub fn run_generation_loop(
         observer,
         None,
         None,
+        None,
     )
 }
 
@@ -1460,6 +1461,7 @@ pub fn run_generation_loop_with_execution_plans(
         &mut should_cancel,
         observer,
         Some(execution_plans),
+        None,
         None,
     )
 }
@@ -1495,6 +1497,43 @@ pub fn run_generation_loop_with_execution_plans_streaming(
         observer,
         Some(execution_plans),
         Some(on_token),
+        None,
+    )
+}
+
+/// Observes one generation step's full, host-visible next-token logits
+/// (vocabulary-sized, pre-sampling).
+pub(crate) type LogitsObserver<'a> = &'a mut dyn FnMut(&[f32]);
+
+/// [`run_generation_loop_with_execution_plans_streaming`], additionally
+/// handing each step's full, host-visible next-token logits to `on_logits`
+/// immediately before sampling (`qualify-real-checkpoint-performance` A02:
+/// checkpoint-bound logit references and cross-Provider numerical
+/// comparison). `on_logits` observes only -- it cannot alter the logits or
+/// the sampled token -- and is invoked exactly once per step, in step
+/// order, before that step's token reaches `on_token`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_generation_loop_with_execution_plans_streaming_and_logits(
+    runtime: &mut Runtime,
+    request: &GenerationRequest,
+    sampling_policy: SamplingPolicy,
+    cache_usage: CacheUsageSummary,
+    mut should_cancel: impl FnMut(&[TokenId]) -> bool,
+    observer: &mut InferenceApiObserver,
+    execution_plans: &mut RuntimeGenerationExecutionPlans<'_>,
+    on_token: &mut dyn FnMut(TokenId) -> std::ops::ControlFlow<()>,
+    on_logits: &mut dyn FnMut(&[f32]),
+) -> Result<GenerationResult, InferenceApiError> {
+    run_generation_loop_inner(
+        runtime,
+        request,
+        sampling_policy,
+        cache_usage,
+        &mut should_cancel,
+        observer,
+        Some(execution_plans),
+        Some(on_token),
+        Some(on_logits),
     )
 }
 
@@ -1508,6 +1547,7 @@ fn run_generation_loop_inner(
     observer: &mut InferenceApiObserver,
     mut execution_plans: Option<&mut RuntimeGenerationExecutionPlans<'_>>,
     mut on_token: Option<&mut dyn FnMut(TokenId) -> std::ops::ControlFlow<()>>,
+    mut on_logits: Option<LogitsObserver<'_>>,
 ) -> Result<GenerationResult, InferenceApiError> {
     let correlation_id = request.correlation_id.clone();
     observer.observe(
@@ -1827,6 +1867,9 @@ fn run_generation_loop_inner(
         if let Err(error) = runtime_step.evidence.clone().validate() {
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
             return Err(error);
+        }
+        if let Some(on_logits) = on_logits.as_deref_mut() {
+            on_logits(&runtime_step.logits);
         }
         let (sampling, step) = decode_step_from_sampling_with_rng(
             request,
