@@ -151,3 +151,74 @@ When the release is withdrawn
 
 Then that version is yanked, remains visible as yanked in the crate's version
 history, and a corrected version is published under a new version number.
+
+---
+
+### Requirement: Release Tag Creation Validates Its Inputs
+
+The manual tag-creation workflow SHALL reject tags outside
+`vMAJOR.MINOR.PATCH[-PRERELEASE]`, unknown commits, and commits that are not
+ancestors of `origin/main` before creating or pushing a tag. It SHALL use the
+`release` environment and its workflow-scoped GitHub token.
+
+#### Scenario: Invalid tag or unrelated commit
+
+Given a malformed tag, an unknown commit, or a commit outside `origin/main` history
+
+When the tag-creation workflow validates the request
+
+Then it fails before creating or pushing the tag.
+
+#### Scenario: Tag created with the workflow token
+
+Given the tag-creation workflow pushes a validated tag using `GITHUB_TOKEN`
+
+When the operator proceeds to publication
+
+Then publication requires an explicit dispatch of the publication workflow
+against that tag rather than relying on a tag-push workflow trigger.
+
+---
+
+### Requirement: Candidate Releases Retain Prerelease Status
+
+GitHub Release creation and update SHALL mark alpha, beta, and RC tags as
+prereleases, including case-insensitive `-RC1` and `-rc.1` suffix forms.
+A stable tag such as `v1.0.0` SHALL not be marked as a prerelease.
+
+#### Scenario: Release candidate published or refreshed
+
+Given a tag ending in `-RC1` or `-rc.1`
+
+When the GitHub Release is created or updated
+
+Then the release retains prerelease status.
+
+---
+
+### Requirement: Published Release Includes Real Binaries And Gate Evidence
+
+The GitHub Release SHALL include CLI binaries built for Linux, Windows, and
+macOS from the selected tagged commit, alongside checksums, SBOM, provenance,
+and the collected release/security gate evidence. Re-running publication for
+an existing tag SHALL refresh assets and prerelease status using the current
+run's generated outputs. Read-only jobs SHALL retain read-only permissions;
+release-write permissions SHALL be scoped to the job that writes the release.
+
+#### Scenario: Existing release refreshed
+
+Given the selected tag already has a GitHub Release
+
+When publication runs again successfully
+
+Then its assets and release status are updated rather than failing solely
+because the release already exists.
+
+#### Scenario: Gate evidence accompanies binaries
+
+Given release-gate and security-gate evaluation completed for the tagged commit
+
+When the release bundle is published
+
+Then check-run conclusions, release-gate results, source secret-scan results,
+and security-gate inputs accompany the actual built binaries and release proofs.
