@@ -307,5 +307,11 @@ human has:
    the result before relying on the tag-triggered automatic paths
    (`dry-run-publish`, `gate-evaluation`, `github-release`).
 
-Cryptographic signing (MAG-02) is not implemented by this change; digest
-pinning is the trust mechanism until it lands.
+Cryptographic signing (MAG-02) was not implemented by this change at the
+time it was written; it has since landed as real Ed25519 signature
+verification (`magnetar-runtime::artifact_signature`), backing both
+`ComponentTrustStore` and `ModelTrustStore` -- see
+[docs/cryptographic-artifact-signatures.md](cryptographic-artifact-signatures.md).
+OCI digest pinning remains this document's own trust mechanism for the
+GHCR distribution channel it describes; the two are complementary, not
+substitutes for each other.
