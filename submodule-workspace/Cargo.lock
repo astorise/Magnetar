@@ -944,6 +944,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-inference-qualification"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "magnetar-integration-cuda-first-native"
 version = "0.1.0"
 dependencies = [
@@ -966,10 +975,12 @@ name = "magnetar-integration-production-loading"
 version = "0.1.0"
 dependencies = [
  "magnetar-format-gguf",
+ "magnetar-inference-qualification",
  "magnetar-loader-gguf",
  "magnetar-loader-huggingface",
  "magnetar-provider-cuda",
  "magnetar-runtime",
+ "serde_json",
  "tempfile",
 ]
 

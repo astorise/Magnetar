@@ -33,4 +33,6 @@ mod tests_production_loading_e2e;
 #[cfg(test)]
 mod tests_real_checkpoint_multi_gpu_segment;
 #[cfg(test)]
+mod tests_real_checkpoint_qualification;
+#[cfg(test)]
 mod tests_real_checkpoint_smoke;

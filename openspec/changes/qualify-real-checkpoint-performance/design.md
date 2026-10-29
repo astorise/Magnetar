@@ -12,6 +12,15 @@ Deliver the explicitly enumerated A01, A02, A03, A04, A07, A08 outcomes through 
 
 Extend the existing production-loading integration harness with immutable run manifests and raw samples. Keep fast fixture checks separate from manual/nightly real-checkpoint campaigns. Compare internal baseline improvements separately from external-engine comparisons.
 
+### Initial implemented profile
+
+The first increment covers A01 and A04 fully and A03 for discovery and explicit skips:
+
+- `tools/inference-qualification` (root workspace, serde/sha2 only) owns the report model: an immutable `RunManifest` whose SHA-256 names the report file, raw per-request `GenerationTrace`s (token arrival offsets at the public streaming boundary), derived TTFT/TPOT/ITL/throughput, procfs-based interval resource usage (peak RSS reset per interval when the kernel allows, `rchar`/`read_bytes`, CPU cores), nearest-rank p50/p95/p99 plus MAD dispersion, a noise-aware comparison that only promotes improvements clearing the combined noise band with at least five samples per side, and the A03 three-stage (discovery/compute/production) capability matrix.
+- `integration-tests/production-loading/src/tests_real_checkpoint_qualification.rs` drives `ProductionLoadedModel`: one load, one cold request, one warmup and five measured greedy requests on the same resident instance. The per-PR lane runs the tiny synthetic bundle and must be labeled `fixture_only`; the `#[ignore]`d manual/nightly lane runs pinned `Qwen/Qwen2.5-0.5B-Instruct@7ae557604adf67be50417f59c2c2f167def9a775` (digest recomputed before use) on Reference CPU and, when a Device exists, CUDA.
+- Profile: F32, batch 1, concurrency 1, plain-text prompt, 16 generated tokens by default. All 24 standard grid cells are recorded as skipped with their reason.
+- No WIT or runtime API change. Device memory is `not_measured` until a Provider exposes telemetry; A02, A07 and A08 are recorded as pending gates, so no report from this increment can qualify production performance.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
