@@ -21,8 +21,15 @@
 //!    MAGNETAR_QUALIFICATION_CODE_REVISION=$(git rev-parse HEAD) \
 //!    cargo test --release --manifest-path integration-tests/production-loading/Cargo.toml \
 //!      real_checkpoint_qualification_campaign -- --include-ignored --nocapture`
-//!   Optional: `MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS` (default 16) and
-//!   `MAGNETAR_QUALIFICATION_MEASURED_RUNS` (default 5).
+//!   Optional: `MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS` (default 16),
+//!   `MAGNETAR_QUALIFICATION_MEASURED_RUNS` (default 5),
+//!   `MAGNETAR_QUALIFICATION_PROVIDERS` (comma-separated subset of
+//!   `reference-cpu,cuda`, default both), `MAGNETAR_QUALIFICATION_REQUIRE_CUDA=1`
+//!   (fail instead of skipping when no CUDA Device exists -- set by the GPU
+//!   CI job, which must never report a skipped CUDA campaign as a pass),
+//!   `MAGNETAR_QUALIFICATION_DRIVER` (driver identity recorded in the
+//!   manifest) and `MAGNETAR_QUALIFICATION_SUMMARY_PATH` (a Markdown summary
+//!   is appended there, e.g. `$GITHUB_STEP_SUMMARY`).
 //!
 //! What the report does not claim: A02 logit references (no logits are
 //! exposed at this public boundary yet), A07 budgeted memory campaigns, A08
@@ -182,7 +189,7 @@ fn run_campaign(target: CampaignTarget<'_>, hardware: HardwareCapabilityMatrix) 
         provider: ProviderIdentity {
             name: provider_metadata.name,
             version: Some(provider_metadata.version),
-            driver: None,
+            driver: std::env::var("MAGNETAR_QUALIFICATION_DRIVER").ok(),
         },
         dtype: "f32".into(),
         prompt_tokens,
@@ -336,6 +343,42 @@ fn write_report_if_requested(report: &CampaignReport) {
             .expect("the campaign report is written to a fresh, immutable file");
         eprintln!("qualification report written to {}", path.display());
     }
+    if let Some(path) = std::env::var_os("MAGNETAR_QUALIFICATION_SUMMARY_PATH") {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("the qualification summary file opens for appending");
+        std::io::Write::write_all(
+            &mut file,
+            format!("{}\n", report.markdown_summary()).as_bytes(),
+        )
+        .expect("the qualification summary is written");
+    }
+}
+
+/// Which Providers the real campaign runs, from
+/// `MAGNETAR_QUALIFICATION_PROVIDERS` (default: all known).
+fn selected_providers() -> Vec<String> {
+    let selection = std::env::var("MAGNETAR_QUALIFICATION_PROVIDERS")
+        .unwrap_or_else(|_| "reference-cpu,cuda".into());
+    let providers: Vec<String> = selection
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    for name in &providers {
+        assert!(
+            matches!(name.as_str(), "reference-cpu" | "cuda"),
+            "MAGNETAR_QUALIFICATION_PROVIDERS names unknown Provider {name:?}"
+        );
+    }
+    assert!(
+        !providers.is_empty(),
+        "MAGNETAR_QUALIFICATION_PROVIDERS selects no Provider"
+    );
+    providers
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -483,6 +526,27 @@ fn hardware_matrix_never_turns_discovery_or_absence_into_a_capability_claim() {
 #[test]
 #[ignore = "downloads/holds a ~1GB real checkpoint; manual/nightly qualification profile only"]
 fn real_checkpoint_qualification_campaign() {
+    // Provider selection first: a GPU job that requires CUDA fails before
+    // spending minutes hashing and ingesting the checkpoint.
+    let selected = selected_providers();
+    let require_cuda = std::env::var("MAGNETAR_QUALIFICATION_REQUIRE_CUDA").as_deref() == Ok("1");
+    let mut providers: Vec<(&str, Arc<dyn Provider>)> = Vec::new();
+    if selected.iter().any(|name| name == "reference-cpu") {
+        providers.push(("reference-cpu", Arc::new(ReferenceCpuProvider::new())));
+    }
+    if selected.iter().any(|name| name == "cuda") {
+        let cuda = magnetar_provider_cuda::CudaProvider::new();
+        if cuda.is_available() {
+            providers.push(("cuda", Arc::new(cuda) as Arc<dyn Provider>));
+        } else {
+            assert!(
+                !require_cuda,
+                "MAGNETAR_QUALIFICATION_REQUIRE_CUDA=1 but no CUDA-capable Device is available"
+            );
+            eprintln!("CUDA campaign skipped: no CUDA-capable Device available");
+        }
+    }
+
     let dir = require_checkpoint_dir();
     let source = verified_checkpoint_source(&dir);
     register_real_qwen_component();
@@ -519,15 +583,6 @@ fn real_checkpoint_qualification_campaign() {
         // downloaded bytes (it panics otherwise).
         digest_verified: true,
     };
-
-    let mut providers: Vec<(&str, Arc<dyn Provider>)> =
-        vec![("reference-cpu", Arc::new(ReferenceCpuProvider::new()))];
-    let cuda = magnetar_provider_cuda::CudaProvider::new();
-    if cuda.is_available() {
-        providers.push(("cuda", Arc::new(cuda) as Arc<dyn Provider>));
-    } else {
-        eprintln!("CUDA campaign skipped: no CUDA-capable Device available");
-    }
 
     for (device, provider) in providers {
         let fixture = production_model_fixture(

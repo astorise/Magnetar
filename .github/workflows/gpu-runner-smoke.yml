@@ -164,3 +164,33 @@ jobs:
         # checkpoint's greedy prefill token/text compared between
         # Reference CPU and this same real CUDA hardware.
         run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_checkpoint -- --include-ignored --test-threads=1
+      - name: Real-checkpoint qualification campaign on CUDA (cost per token)
+        # qualify-real-checkpoint-performance A01/A04: one load, one cold
+        # request, one warmup and five measured greedy requests of 128 new
+        # tokens on the same resident CUDA instance, recording TTFT, TPOT,
+        # inter-token latency, throughput and resource usage into an
+        # immutable, manifest-digest-named JSON report. Reference CPU is
+        # deliberately not selected here (tens of seconds per token at this
+        # model size); `MAGNETAR_QUALIFICATION_REQUIRE_CUDA=1` makes a
+        # missing Device fail the job instead of skipping the campaign.
+        timeout-minutes: 90
+        env:
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
+          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports
+          MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
+        run: |
+          set -eux
+          export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
+          export MAGNETAR_QUALIFICATION_SUMMARY_PATH="$GITHUB_STEP_SUMMARY"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
+      - name: Upload qualification reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: qualification-reports-${{ github.run_id }}
+          path: ${{ runner.temp }}/qualification-reports
+          if-no-files-found: warn
+          retention-days: 90

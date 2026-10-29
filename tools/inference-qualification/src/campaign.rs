@@ -249,6 +249,81 @@ impl CampaignReport {
         file.write_all(&serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?)?;
         Ok(path)
     }
+
+    /// A short Markdown summary (e.g. for a CI job summary). The JSON
+    /// report stays the authoritative record; this only highlights the
+    /// warm medians/p95 and the verdict.
+    pub fn markdown_summary(&self) -> String {
+        let manifest = &self.manifest;
+        let summary_row = |label: &str, summary: &Option<SampleSummary>, unit: &str| {
+            summary.as_ref().map_or_else(
+                || format!("| {label} | not measured | | |\n"),
+                |s| {
+                    format!(
+                        "| {label} | {:.2} {unit} | {:.2} {unit} | {} |\n",
+                        s.median, s.p95, s.count
+                    )
+                },
+            )
+        };
+        let stats = &self.warm_statistics;
+        let mut out = format!(
+            "### Qualification campaign: {} on {}\n\n\
+             Checkpoint `{}`{}, {} prompt tokens, {} new tokens, batch {}, {} build. \
+             Report `{}`.\n\n",
+            manifest.checkpoint.name,
+            manifest.provider.name,
+            manifest.checkpoint.name,
+            manifest
+                .checkpoint
+                .revision
+                .as_deref()
+                .map(|revision| format!("@{revision}"))
+                .unwrap_or_default(),
+            manifest.prompt_tokens,
+            manifest.max_new_tokens,
+            manifest.batch_size,
+            manifest.build_profile,
+            self.manifest_digest,
+        );
+        if let Some(load) = &self.load {
+            out.push_str(&format!("Model load: {:.0} ms.\n\n", load.duration_ms));
+        }
+        out.push_str("| Warm metric | Median | p95 | Samples |\n|---|---|---|---|\n");
+        out.push_str(&summary_row("TTFT", &stats.time_to_first_token_ms, "ms"));
+        out.push_str(&summary_row("TPOT", &stats.time_per_output_token_ms, "ms"));
+        out.push_str(&summary_row(
+            "Inter-token latency",
+            &stats.inter_token_latency_ms,
+            "ms",
+        ));
+        out.push_str(&summary_row(
+            "End-to-end",
+            &stats.end_to_end_latency_ms,
+            "ms",
+        ));
+        out.push_str(&summary_row(
+            "Decode throughput",
+            &stats.decode_throughput_tokens_per_second,
+            "tok/s",
+        ));
+        out.push_str(&format!(
+            "\nQualifies production performance: **{}** ({} blocking exception(s)).\n",
+            if self.verdict.qualifies_production_performance {
+                "yes"
+            } else {
+                "no"
+            },
+            self.verdict.blocking_exceptions
+        ));
+        for exception in &self.exceptions {
+            out.push_str(&format!(
+                "- `{}`\n",
+                serde_json::to_string(exception).unwrap_or_default()
+            ));
+        }
+        out
+    }
 }
 
 /// Accumulates one campaign's samples in execution order.

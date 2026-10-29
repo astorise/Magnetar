@@ -259,3 +259,30 @@ fn standard_grid_covers_every_declared_combination() {
     assert!(grid.contains(&(1, 512, 128)));
     assert!(grid.contains(&(32, 16384, 512)));
 }
+
+#[test]
+fn markdown_summary_highlights_medians_and_the_verdict() {
+    let report = campaign(EvidenceClass::FixtureOnly, 5).finish(hardware(), run_cell(), vec![]);
+    let summary = report.markdown_summary();
+    assert!(summary.contains("example on reference-cpu"), "{summary}");
+    assert!(summary.contains("@abc"));
+    assert!(
+        summary.contains("| TTFT | 40.00 ms | 40.00 ms | 5 |"),
+        "{summary}"
+    );
+    assert!(summary.contains("| Decode throughput |"));
+    assert!(summary.contains("Qualifies production performance: **no**"));
+    assert!(summary.contains("fixture_only_evidence"));
+    assert!(summary.contains(&report.manifest_digest));
+
+    let empty = Campaign::new(manifest(EvidenceClass::RealCheckpoint, 0)).finish(
+        hardware(),
+        run_cell(),
+        vec![],
+    );
+    assert!(
+        empty
+            .markdown_summary()
+            .contains("| TTFT | not measured | | |")
+    );
+}
