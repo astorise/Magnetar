@@ -935,6 +935,15 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
                 "position_mode",
                 OperatorAttributeRule::optional(OperatorAttributeKind::String),
             )
+            // Which elements of a head block form each rotated pair
+            // (`fix-rope-rotation-pairing`): `interleaved` (2i, 2i+1, the
+            // default when absent) or `half_split` (i, i + dimension/2,
+            // Hugging Face `rotate_half`). Set by the Model Component;
+            // Providers reject any other value.
+            .with_rule(
+                "rotation_pairing",
+                OperatorAttributeRule::optional(OperatorAttributeKind::String),
+            )
             // Absolute position of the first row. Absent means the sequence
             // starts at zero, which is only true for a prefill; a decode step
             // against a populated cache carries the number of tokens already

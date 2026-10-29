@@ -393,6 +393,62 @@ pub fn rope(
     position_offset: u64,
     head_count: u64,
 ) -> Result<HostTensor, ReferenceCpuError> {
+    rope_with_pairing(
+        input,
+        base,
+        scale,
+        dimension,
+        position_offset,
+        head_count,
+        RopePairing::Interleaved,
+    )
+}
+
+/// Which elements of a RoPE head block form each rotated pair
+/// (`fix-rope-rotation-pairing`). Model-family semantics, declared by the
+/// Model Component through the `rope` Operator's `rotation_pairing`
+/// attribute -- never inferred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopePairing {
+    /// Pairs `(2i, 2i + 1)`: GPT-J / GGML "normal" mode. The default when
+    /// the attribute is absent.
+    Interleaved,
+    /// Pairs `(i, i + dimension / 2)`: GPT-NeoX, Hugging Face Llama/Qwen2
+    /// (`rotate_half`) and llama.cpp NeoX mode.
+    HalfSplit,
+}
+
+impl RopePairing {
+    /// Parses a `rotation_pairing` attribute value; `None` for an unknown
+    /// value, which callers reject rather than substitute.
+    pub fn from_attribute(value: &str) -> Option<Self> {
+        match value {
+            "interleaved" => Some(Self::Interleaved),
+            "half_split" => Some(Self::HalfSplit),
+            _ => None,
+        }
+    }
+
+    pub fn as_attribute(self) -> &'static str {
+        match self {
+            Self::Interleaved => "interleaved",
+            Self::HalfSplit => "half_split",
+        }
+    }
+}
+
+/// [`rope`] with an explicit [`RopePairing`]. Both pairings use the same
+/// angle `position * base^(-2i / dimension)` for pair `i`; they differ only
+/// in which two columns of the head block pair `i` rotates.
+pub fn rope_with_pairing(
+    input: &HostTensor,
+    base: f32,
+    scale: f32,
+    dimension: u64,
+    position_offset: u64,
+    head_count: u64,
+    pairing: RopePairing,
+) -> Result<HostTensor, ReferenceCpuError> {
     let (rows, cols) = input.rows_cols()?;
     if head_count == 0 || !cols.is_multiple_of(head_count) {
         return Err(ReferenceCpuError::new(
@@ -435,10 +491,14 @@ pub fn rope(
                 let frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
                 let angle = position * frequency;
                 let (sin, cos) = angle.sin_cos();
-                let even = input.data[col_base + 2 * pair];
-                let odd = input.data[col_base + 2 * pair + 1];
-                out[col_base + 2 * pair] = even * cos - odd * sin;
-                out[col_base + 2 * pair + 1] = even * sin + odd * cos;
+                let (first, second) = match pairing {
+                    RopePairing::Interleaved => (col_base + 2 * pair, col_base + 2 * pair + 1),
+                    RopePairing::HalfSplit => (col_base + pair, col_base + pair + half),
+                };
+                let a = input.data[first];
+                let b = input.data[second];
+                out[first] = a * cos - b * sin;
+                out[second] = a * sin + b * cos;
             }
         }
     }
@@ -2000,8 +2060,33 @@ impl ReferenceCpuExecutor {
                 // behavior before `head_count` existed.
                 let head_count =
                     Self::attribute_integer(&invocation.attributes, "head_count").unwrap_or(1);
-                rope(&input, base, scale, dimension, position_offset, head_count)
-                    .map_err(KernelError::from)?
+                // `fix-rope-rotation-pairing`: absent means interleaved,
+                // this Kernel's behavior before the attribute existed.
+                let pairing = match invocation.attributes.get("rotation_pairing") {
+                    None => RopePairing::Interleaved,
+                    Some(OperatorAttributeValue::String(value)) => {
+                        RopePairing::from_attribute(value).ok_or_else(|| {
+                            KernelError::KernelAttributeUnsupported {
+                                attribute: format!("rotation_pairing '{value}' is not implemented"),
+                            }
+                        })?
+                    }
+                    Some(_) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "rotation_pairing must be a string".into(),
+                        });
+                    }
+                };
+                rope_with_pairing(
+                    &input,
+                    base,
+                    scale,
+                    dimension,
+                    position_offset,
+                    head_count,
+                    pairing,
+                )
+                .map_err(KernelError::from)?
             }
             "attention" => {
                 if cfg!(target_arch = "wasm32") {

@@ -2869,16 +2869,22 @@ fn dispatch_qwen_rmsnorm(
 /// is `NodeValue`-eligible for Resident passthrough like every other
 /// operator here, since this is now a genuine single Kernel dispatch
 /// rather than a Rust-computed reassembly of several.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_qwen_rope(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,
     input: NodeValue,
     head_count: u64,
     rope_config: &FirstNativeRopeConfig,
+    pairing: RopePairing,
     position_offset: u64,
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
     let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "rotation_pairing".into(),
+        OperatorAttributeValue::String(pairing.as_attribute().into()),
+    );
     attributes.insert(
         "base".into(),
         OperatorAttributeValue::Float(rope_config.base),
@@ -3303,6 +3309,25 @@ fn dispatch_first_native_graph_node(
                 None => 1,
             };
             let base = node_attribute_f64(node, "base")?;
+            // `fix-rope-rotation-pairing`: the Model Component declares the
+            // pairing on the node; absent keeps the interleaved default.
+            // Forwarded to the Kernel as-is, never inferred.
+            let pairing = match node.attributes.get("rotation_pairing") {
+                None => RopePairing::Interleaved,
+                Some(OperatorAttributeValue::String(value)) => RopePairing::from_attribute(value)
+                    .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph node '{node_id}' attribute 'rotation_pairing' value '{value}' is not supported"
+                        ),
+                    })?,
+                Some(_) => {
+                    return Err(InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph node '{node_id}' attribute 'rotation_pairing' is not a string"
+                        ),
+                    });
+                }
+            };
             let position_offset = absolute_position_override
                 .map(Ok)
                 .unwrap_or_else(|| node_attribute_u64(node, "position_offset"))?;
@@ -3330,6 +3355,7 @@ fn dispatch_first_native_graph_node(
                 input,
                 head_count,
                 &rope_config,
+                pairing,
                 position_offset,
                 None,
             )
@@ -6164,7 +6190,7 @@ const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:cd10b875f12d70e025b27765a0abcc655d630b4150e1e29f944536f648d352a5";
+    "sha256:b99ca7fef19992c794561cd0bb4d58ee6442383e3e603a8edc8ae77891d9fe01";
 
 /// A Component artifact an embedder (e.g. `magnetar-cli`, the "deployment /
 /// CLI / Component source adapter" layer in this task's own design) has
@@ -9750,6 +9776,7 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             NodeValue::Host(one_row_hidden.clone()),
             architecture.attention_head_count,
             &fixture.config.rope,
+            RopePairing::HalfSplit,
             0,
             None,
         ),

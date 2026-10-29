@@ -1697,3 +1697,188 @@ fn reference_cpu_no_raw_handles_exposed_in_invocation_or_result() {
     assert!(!text.contains("0x"));
     assert!(!text.contains("raw handle"));
 }
+
+/// `fix-rope-rotation-pairing`: Hugging Face's `q * cos + rotate_half(q) *
+/// sin`, written independently of [`rope_with_pairing`], for one row and
+/// one head block. `rotate_half(x) = concat(-x[half..], x[..half])`.
+fn hugging_face_rotate_half_rope(
+    row: &[f32],
+    base: f32,
+    dimension: usize,
+    position: f32,
+) -> Vec<f32> {
+    let half = dimension / 2;
+    let mut out = row.to_vec();
+    for column in 0..dimension {
+        let pair = column % half;
+        let angle = position * base.powf(-2.0 * pair as f32 / dimension as f32);
+        let rotated = if column < half {
+            -row[column + half]
+        } else {
+            row[column - half]
+        };
+        out[column] = row[column] * angle.cos() + rotated * angle.sin();
+    }
+    out
+}
+
+#[test]
+fn rope_half_split_matches_hugging_face_rotate_half() {
+    let mut rng = Rng(0x7a1f);
+    let (rows, head_count, head_width) = (3_usize, 2_usize, 8_usize);
+    let cols = head_count * head_width;
+    let input = rng.tensor(rows as u64, cols as u64);
+    let offset = 4_u64;
+    let rotated = rope_with_pairing(
+        &input,
+        10000.0,
+        1.0,
+        head_width as u64,
+        offset,
+        head_count as u64,
+        RopePairing::HalfSplit,
+    )
+    .unwrap();
+    for row in 0..rows {
+        for head in 0..head_count {
+            let start = row * cols + head * head_width;
+            let expected = hugging_face_rotate_half_rope(
+                &input.data[start..start + head_width],
+                10000.0,
+                head_width,
+                (offset as usize + row) as f32,
+            );
+            for (actual, expected) in rotated.data[start..start + head_width]
+                .iter()
+                .zip(&expected)
+            {
+                assert!((actual - expected).abs() < 1e-5, "{actual} vs {expected}");
+            }
+        }
+    }
+}
+
+#[test]
+fn rope_half_split_and_interleaved_differ_but_agree_at_position_zero() {
+    let mut rng = Rng(0x7a20);
+    let input = rng.tensor(2, 8);
+    let interleaved =
+        rope_with_pairing(&input, 10000.0, 1.0, 8, 0, 1, RopePairing::Interleaved).unwrap();
+    let half_split =
+        rope_with_pairing(&input, 10000.0, 1.0, 8, 0, 1, RopePairing::HalfSplit).unwrap();
+    assert_eq!(
+        interleaved.data[..8],
+        input.data[..8],
+        "position 0 is the identity"
+    );
+    assert_eq!(
+        half_split.data[..8],
+        input.data[..8],
+        "position 0 is the identity"
+    );
+    assert_ne!(interleaved.data[8..], half_split.data[8..]);
+    assert_eq!(
+        rope(&input, 10000.0, 1.0, 8, 0, 1).unwrap(),
+        interleaved,
+        "`rope` keeps the interleaved default"
+    );
+}
+
+#[test]
+fn rope_half_split_partial_rotation_preserves_the_untouched_tail() {
+    let mut rng = Rng(0x7a21);
+    let input = rng.tensor(2, 12);
+    let rotated = rope_with_pairing(&input, 10000.0, 1.0, 4, 3, 2, RopePairing::HalfSplit).unwrap();
+    for row in 0..2 {
+        for head in 0..2 {
+            let start = row * 12 + head * 6;
+            assert_eq!(
+                rotated.data[start + 4..start + 6],
+                input.data[start + 4..start + 6]
+            );
+            let expected = hugging_face_rotate_half_rope(
+                &input.data[start..start + 4],
+                10000.0,
+                4,
+                (3 + row) as f32,
+            );
+            for (actual, expected) in rotated.data[start..start + 4].iter().zip(&expected) {
+                assert!((actual - expected).abs() < 1e-5);
+            }
+        }
+    }
+}
+
+#[test]
+fn rope_pairing_attribute_values_round_trip_and_reject_unknown() {
+    for pairing in [RopePairing::Interleaved, RopePairing::HalfSplit] {
+        assert_eq!(
+            RopePairing::from_attribute(pairing.as_attribute()),
+            Some(pairing)
+        );
+    }
+    assert_eq!(RopePairing::from_attribute("neox"), None);
+}
+
+fn reference_cpu_rope_invocation_result(
+    pairing: Option<OperatorAttributeValue>,
+) -> (KernelResultStatus, Option<HostTensor>) {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = reference_cpu_kernel_by_name(&advertisements, "rope");
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (input_id, input_resource) = reference_cpu_resource("rope-pairing-in", [2, 4]);
+    let (out_id, out_resource) = reference_cpu_resource("rope-pairing-out", [2, 4]);
+    executor.write_tensor(
+        input_id,
+        reference_cpu_host_tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+    );
+    let mut attributes = BTreeMap::new();
+    attributes.insert("base".to_string(), OperatorAttributeValue::Float(10000.0));
+    attributes.insert("dimension".to_string(), OperatorAttributeValue::Integer(4));
+    if let Some(pairing) = pairing {
+        attributes.insert("rotation_pairing".to_string(), pairing);
+    }
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-rope-pairing"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(input_resource)
+    .with_output(out_resource)
+    .with_attributes(attributes);
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    (result.status, executor.read_tensor(&out_id))
+}
+
+#[test]
+fn reference_cpu_rope_invocation_honors_and_validates_rotation_pairing() {
+    let input = reference_cpu_host_tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    let (status, output) = reference_cpu_rope_invocation_result(Some(
+        OperatorAttributeValue::String("half_split".into()),
+    ));
+    assert_eq!(status, KernelResultStatus::Succeeded);
+    assert_eq!(
+        output.unwrap(),
+        rope_with_pairing(&input, 10000.0, 1.0, 4, 0, 1, RopePairing::HalfSplit).unwrap()
+    );
+
+    let (status, output) = reference_cpu_rope_invocation_result(None);
+    assert_eq!(status, KernelResultStatus::Succeeded);
+    assert_eq!(
+        output.unwrap(),
+        rope(&input, 10000.0, 1.0, 4, 0, 1).unwrap()
+    );
+
+    let (status, _) =
+        reference_cpu_rope_invocation_result(Some(OperatorAttributeValue::String("neox".into())));
+    assert_eq!(status, KernelResultStatus::Failed);
+    let (status, _) =
+        reference_cpu_rope_invocation_result(Some(OperatorAttributeValue::Integer(1)));
+    assert_eq!(status, KernelResultStatus::Failed);
+}

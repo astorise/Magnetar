@@ -5688,6 +5688,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             q,
             architecture.attention_head_count,
             &fixture.config.rope,
+            RopePairing::HalfSplit,
             0,
             None,
         )?;
@@ -5698,6 +5699,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             k,
             architecture.kv_head_count,
             &fixture.config.rope,
+            RopePairing::HalfSplit,
             0,
             None,
         )?;
@@ -5959,6 +5961,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             q,
             architecture.attention_head_count,
             &fixture.config.rope,
+            RopePairing::HalfSplit,
             absolute_position,
             None,
         )?;
@@ -5969,6 +5972,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             k_new,
             architecture.kv_head_count,
             &fixture.config.rope,
+            RopePairing::HalfSplit,
             absolute_position,
             None,
         )?;
