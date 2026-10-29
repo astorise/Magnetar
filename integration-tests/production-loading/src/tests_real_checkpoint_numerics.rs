@@ -4,18 +4,22 @@
 //! qualified Provider.
 //!
 //! The reference corpus for the pinned real checkpoint is checked in at
-//! `fixtures/qualification/` and was produced on Reference CPU. Every
-//! Provider run (Reference CPU included) is compared against it, so the
-//! GPU CI job compares CUDA to Reference CPU without spending tens of
-//! minutes re-running Reference CPU. To regenerate it (only when the
-//! checkpoint, prompt or Reference CPU numerics deliberately change):
-//! `MAGNETAR_QWEN_REAL_CHECKPOINT_DIR=<dir> MAGNETAR_QUALIFICATION_WRITE_REFERENCE=1 \
-//!  MAGNETAR_QUALIFICATION_PROVIDERS=reference-cpu \
-//!  cargo test --release --manifest-path integration-tests/production-loading/Cargo.toml \
-//!    real_checkpoint_logits_match_the_reference_corpus -- --include-ignored --nocapture`
+//! `fixtures/qualification/`. It is produced independently of Magnetar by
+//! `tools/qualification/qwen2_reference_logits.py` (plain numpy, BF16
+//! weights upcast to F32, Hugging Face Qwen2 semantics), so it can catch a
+//! defect every Magnetar Provider shares -- comparing Providers only with
+//! each other cannot. Every Provider run, Reference CPU included, is
+//! compared against it, which also lets the GPU CI job check CUDA without
+//! re-running Reference CPU. To regenerate it (only when the checkpoint or
+//! prompt deliberately change):
+//! `python3 -I tools/qualification/qwen2_reference_logits.py <checkpoint dir> \
+//!    <revision> <weights sha256> 16 <corpus path> <prompt token ids...>`
 //!
-//! A failed comparison writes its full differential evidence (every step's
-//! differences) to `MAGNETAR_QUALIFICATION_REPORT_DIR` before failing.
+//! Lifecycle checks run for every selected Provider even when its
+//! numerical comparison fails; each comparison's full differential
+//! evidence (every step's differences) is written to
+//! `MAGNETAR_QUALIFICATION_REPORT_DIR`, and the test fails at the end
+//! naming every Provider that diverged.
 
 use crate::test_support::{VOCAB_SIZE, register_real_qwen_component, write_tiny_production_bundle};
 use crate::tests_real_checkpoint_smoke::{
@@ -50,7 +54,7 @@ const LIFECYCLE_SPLIT: usize = 3;
 
 fn reference_corpus_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/qualification/qwen2.5-0.5b-instruct-7ae5576-reference-cpu-f32.json")
+        .join("fixtures/qualification/qwen2.5-0.5b-instruct-7ae5576-independent-f32.json")
 }
 
 fn token_request(prompt_token_ids: &[u32], max_new_tokens: usize) -> ProductionGenerationRequest {
@@ -335,7 +339,7 @@ fn fixture_logit_references_and_lifecycle_checks() {
 }
 
 /// Tasks 3.1/3.2 on the pinned real checkpoint: each selected Provider's
-/// logits and tokens are compared with the checked-in Reference CPU corpus
+/// logits and tokens are compared with the checked-in independent corpus
 /// under the F32 profile, and the lifecycle checks run on that Provider.
 #[test]
 #[ignore = "downloads/holds a ~1GB real checkpoint; manual/nightly qualification profile only"]
@@ -343,8 +347,6 @@ fn real_checkpoint_logits_match_the_reference_corpus() {
     let selection = std::env::var("MAGNETAR_QUALIFICATION_PROVIDERS")
         .unwrap_or_else(|_| "reference-cpu,cuda".into());
     let require_cuda = std::env::var("MAGNETAR_QUALIFICATION_REQUIRE_CUDA").as_deref() == Ok("1");
-    let write_reference =
-        std::env::var("MAGNETAR_QUALIFICATION_WRITE_REFERENCE").as_deref() == Ok("1");
     let mut providers: Vec<(&str, Arc<dyn Provider>)> = Vec::new();
     for name in selection
         .split(',')
@@ -401,16 +403,21 @@ fn real_checkpoint_logits_match_the_reference_corpus() {
         digest_verified: true,
     };
     let profile = NumericalProfile::f32_cross_provider();
-    let corpus: Option<LogitReference> = fs::read(reference_corpus_path())
-        .ok()
-        .map(|bytes| serde_json::from_slice(&bytes).expect("the reference corpus parses"));
-    if let Some(corpus) = &corpus {
-        assert_eq!(
-            corpus.prompt_token_ids, prompt_token_ids,
-            "corpus prompt is pinned"
-        );
-    }
+    let corpus: LogitReference = serde_json::from_slice(
+        &fs::read(reference_corpus_path()).expect("the reference corpus is checked in"),
+    )
+    .expect("the reference corpus parses");
+    assert_eq!(
+        corpus.prompt_token_ids, prompt_token_ids,
+        "corpus prompt is pinned"
+    );
+    assert_eq!(
+        corpus.checkpoint.weights_digest.as_deref(),
+        Some(CHECKPOINT_WEIGHTS_SHA256),
+        "corpus is bound to the pinned checkpoint"
+    );
 
+    let mut diverged = Vec::new();
     for (provider_name, provider) in providers {
         let fixture = production_model_fixture(
             ingested.manifest.clone(),
@@ -433,28 +440,18 @@ fn real_checkpoint_logits_match_the_reference_corpus() {
             REFERENCE_NEW_TOKENS,
         );
 
-        if write_reference && provider_name == "reference-cpu" {
-            let path = reference_corpus_path();
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, serde_json::to_vec_pretty(&captured).unwrap()).unwrap();
-            eprintln!("reference corpus written to {}", path.display());
-        } else {
-            let corpus = corpus.as_ref().expect(
-                "no reference corpus is checked in; regenerate it with \
-                 MAGNETAR_QUALIFICATION_WRITE_REFERENCE=1 on Reference CPU",
-            );
-            let comparison = compare_logit_references(corpus, &captured, &profile);
-            record_comparison(&comparison, provider_name);
-            eprintln!(
-                "[{provider_name}] max |logit diff| vs Reference CPU corpus: {} over {} steps",
-                comparison.max_abs_difference,
-                comparison.steps.len()
-            );
-            assert!(
-                comparison.passed(),
-                "[{provider_name}] logits/tokens diverge from the Reference CPU corpus: {:?}",
-                comparison.failures
-            );
+        let comparison = compare_logit_references(&corpus, &captured, &profile);
+        record_comparison(&comparison, provider_name);
+        eprintln!(
+            "[{provider_name}] max |logit diff| vs independent corpus: {} over {} steps; \
+             tokens {:?} (reference {:?})",
+            comparison.max_abs_difference,
+            comparison.steps.len(),
+            captured.generated_token_ids,
+            corpus.generated_token_ids,
+        );
+        if !comparison.passed() {
+            diverged.push(format!("{provider_name}: {:?}", comparison.failures));
         }
 
         check_lifecycle(
@@ -467,4 +464,9 @@ fn real_checkpoint_logits_match_the_reference_corpus() {
         );
         model.unload().expect("the real checkpoint unloads");
     }
+    assert!(
+        diverged.is_empty(),
+        "logits/tokens diverge from the independent reference corpus:\n{}",
+        diverged.join("\n")
+    );
 }
