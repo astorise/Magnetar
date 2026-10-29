@@ -1,11 +1,12 @@
-# Magnetar v1.0.0-RC0 Release Notes
+# Magnetar v1.0.0 Release Notes
 
-Status: `1.0.0-RC0` is a real, published release candidate (crates.io
-`cargo publish --dry-run` validated, a real tagged GitHub Release with
-checksums/SBOM/provenance). A release candidate is never a stable
-publication by construction (`ReleaseCandidateTag::is_stable()` is
-`false` for every value) -- stable `1.0.0` publication still requires a
-human-triggered `real-publish` run against this exact baseline.
+Status: `1.0.0` is Magnetar's first stable publication -- a real `cargo
+publish` to crates.io, a real tagged GitHub Release carrying
+checksums/SBOM/provenance, and the full `release_packaging`/
+`release_security` gate suite evaluated against this exact baseline.
+It supersedes `1.0.0-RC0` and `1.0.0-RC1`, each a release candidate by
+construction (`ReleaseCandidateTag::is_stable()` is `false` for every
+value) and never itself the stable publication.
 
 ## Included Baseline
 
@@ -93,8 +94,12 @@ human-triggered `real-publish` run against this exact baseline.
 - ROCm, NPU, and TPU compute kernels (device discovery only -- no matching
   hardware in this repository's own tooling to implement or verify compute).
 - Production server/API transport and an OpenAI-compatible facade.
-- General model hub downloads, OCI distribution, and credential/retry
-  handling.
+- General Model Artifact hub downloads (model-hub discovery/fetch) and
+  their credential/retry handling; Magnetar still requires an
+  already-authorized local bundle for a Model Artifact specifically.
+  Component Artifact and Kernel Exchange Bundle OCI distribution is
+  real (GHCR, digest-addressed; see MAG-06 closure) and out of this
+  limitation's scope.
 - Agent and tool execution inside the Runtime (owned by `magnetar-cli`'s CLI
   boundary instead, per its own documented scope).
 - LoRA adapters and non-Qwen architecture families.
