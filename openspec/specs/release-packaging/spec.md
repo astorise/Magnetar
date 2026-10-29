@@ -2,6 +2,14 @@
 
 ## Purpose
 This specification defines v0.1 release packaging, versioning, baseline declaration, artifact manifests, checksums, changelog, and release notes.
+
+Explicit `v0.1` scope statements describe the historical CPU-local cutover;
+they do not exclude subsequently implemented Providers or distribution paths
+from the v1.0 baseline. Current publication behavior, including actual CLI
+binaries and release evidence, is defined in `release-publication`; OCI
+Component/Kernel Bundle distribution is defined in
+`component-artifact-distribution`. Model Artifact hub downloads remain a
+separate, deferred scope.
 ## Requirements
 ### Requirement: Release Packaging Policy
 

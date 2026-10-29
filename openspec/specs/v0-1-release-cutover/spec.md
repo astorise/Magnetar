@@ -2,6 +2,12 @@
 
 ## Purpose
 This specification defines the v0.1 release cutover checklist, freeze evidence, compatibility matrix, gates, limitations, and final release decision.
+
+This named capability retains the historical v0.1 cutover scope. For the
+implemented v1.0 publication workflow, validated tag creation, prerelease
+classification, and published evidence, see `release-publication` and
+`release-security`. Historical v0.1 limitations SHALL NOT be used as claims
+that later implemented v1.0 functionality is absent.
 ## Requirements
 ### Requirement: v0.1 Release Cutover Checklist
 

@@ -2,6 +2,11 @@
 
 ## Purpose
 This specification defines release security and supply-chain gates, audits, exceptions, provenance, checksum policy, and fail-closed release handling.
+
+The explicitly named `v0.1` requirements below retain their historical baseline
+scope. They do not describe the full implemented v1.0 profile: Component and
+Model Artifact Ed25519 verification is specified in `component` and `model`,
+and the current publication pipeline is specified in `release-publication`.
 ## Requirements
 ### Requirement: Release Security Hardening
 
@@ -595,4 +600,32 @@ Security documentation SHALL accurately describe implemented Component Runtime c
 #### Scenario: Remaining gaps precise
 - **WHEN** a security limitation remains open
 - **THEN** `SECURITY.md` documents the limitation precisely without listing already implemented controls as absent.
+
+### Requirement: Publication Security Evidence Has Explicit Scope
+
+The publication pipeline SHALL derive advisory and license failures from
+`cargo-deny` output, secret detection from the source scan, and redaction,
+native-handle, trust/integrity fixture, E2E, and OpenSpec failures from the
+selected commit's corresponding release-gate results. Source-scan evidence
+SHALL NOT be presented as a scan of subsequently built release artifacts.
+Checksum mismatch SHALL block bundle verification before upload.
+An undocumented-security-exception flag SHALL remain an explicit operator
+input rather than being represented as an automated exception audit.
+
+#### Scenario: Source scan scope is reported accurately
+
+Given the gate-stage secret scan ran before release binaries were built
+
+When release security evidence is described
+
+Then the scan is identified as source evidence, without claiming that it
+scanned the final binaries or release archive.
+
+#### Scenario: Fixture trust gate fails
+
+Given the selected commit's trust/integrity fixture gate failed
+
+When publication security inputs are collected
+
+Then the trust/integrity failure is derived from that gate and blocks publication.
 

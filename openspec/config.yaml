@@ -1,9 +1,19 @@
 schema: spec-driven
 
 context: |
-  Magnetar is a Rust-first local AI Runtime. The workspace currently contains
-  `magnetar-runtime`; additional crates and AI inference features are roadmap
-  items until their dedicated OpenSpec changes are implemented.
+  Magnetar is a Rust-first local AI Runtime with a v1.0.0 release baseline.
+  The root workspace contains `magnetar-runtime`, `roadmap-contracts`,
+  `tools/coverage-ratchet`, and `tools/release-publish`. A second workspace,
+  `submodule-workspace`, contains `magnetar-cli`, `inference-components`, and
+  production-loading, CUDA-first-native, and multi-device integration tests.
+  External Components, Providers, Formats, and Loaders are pinned submodules.
+  Reference CPU execution, Wasmtime Component execution, first-native Qwen
+  inference, production Qwen artifact loading, and Ed25519 Component/Model
+  Artifact verification are implemented. Hardware-specific support and
+  production loading remain bounded by their documented supported profiles.
+  Release automation includes real CLI builds, checksums, SBOM, provenance,
+  release/security gate evidence, and Component/Kernel Bundle OCI distribution.
+  A version declaration does not by itself prove remote publication succeeded.
 
   Canonical architecture:
 
@@ -71,15 +81,17 @@ context: |
   - The permitted dependency direction is Tachyon -> Magnetar, not Magnetar ->
     Tachyon.
 
-  Future AI Runtime scope:
-  - model loading and model residency
-  - tokenization and prompt formatting
-  - generation, streaming, continuous batching, KV cache, prefix cache,
-    adapters, LoRA, quantization, and multi-device execution
-  - agent execution and tool execution
-  - local CLI and service/API usage
-
-  These future responsibilities must be described as planned until implemented.
+  Scope and maturity:
+  - model loading/residency, tokenization, prompt formatting, generation,
+    streaming, sessions, and KV lifecycle have implemented paths; do not
+    describe them wholesale as future work or claim arbitrary-model support.
+  - production batching, prefix-cache reuse, adapters, quantization,
+    multi-device inference, model-hub downloads, and a production server/API
+    transport remain limited or deferred as documented.
+  - CLI client/agent functionality does not grant ambient filesystem, network,
+    process, or tool authority to Runtime inference or portable Components.
+  - distinguish implemented contracts and tested profiles from production
+    guarantees; use current specs, code, and tests over archived plans.
 
 rules:
   proposal:
