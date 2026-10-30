@@ -197,15 +197,14 @@ jobs:
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_decode_cost_profile -- --include-ignored --test-threads=1 --nocapture
       - name: Real-checkpoint qualification campaign on CUDA (cost per token)
         # qualify-real-checkpoint-performance A01/A04: one load, one cold
-        # request, one warmup and five measured greedy requests of 32 new
+        # request, one warmup and five measured greedy requests of 128 new
         # tokens on the same resident CUDA instance, recording TTFT, TPOT,
         # inter-token latency (and its growth per token), throughput and
         # resource usage into an immutable, manifest-digest-named JSON
-        # report. 32 rather than the design's 128-512 tokens until per-step
-        # decode cost stops growing with history (run 41008921749 did not
-        # finish 7 x 128 tokens in 90 minutes on an RTX 3060); every
-        # finished request is also appended to progress-cuda.jsonl so a
-        # timeout still leaves evidence. Reference CPU is deliberately not
+        # report. Back to 128 tokens once per-step cost became flat and
+        # ~135 ms on an RTX 3060 (run 41088755268); every finished request
+        # is also appended to progress-cuda.jsonl so a timeout still
+        # leaves evidence. Reference CPU is deliberately not
         # selected here (tens of seconds per token at this model size);
         # `MAGNETAR_QUALIFICATION_REQUIRE_CUDA=1` makes a missing Device
         # fail the job instead of skipping the campaign.
@@ -213,7 +212,7 @@ jobs:
         env:
           MAGNETAR_QUALIFICATION_PROVIDERS: cuda
           MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
-          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "32"
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports
           MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
