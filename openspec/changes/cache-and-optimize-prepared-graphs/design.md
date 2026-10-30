@@ -20,6 +20,8 @@ The first increment caches graphs, not plans:
 - The cache holds at most 8 prompt lengths, least recently used first out, and is dropped with the model. Engines constructed outside `ProductionLoadedModel` keep rebuilding graphs per step.
 - Plans are still prepared for every request (44 ms on Reference CPU once `attribute-redacted-inference-costs` removed their quadratic fingerprinting). Caching them needs the revalidation C02 requires (Kernel Registry generations, instance mutation version, capacity) and is not done yet, so tasks 2.1-2.3 stay open.
 
+CUDA evidence (RTX 3060, run 41100147352, five measured 128-token requests on one resident instance, compared with run 41088755268 before this increment and the plan-fingerprint fix): warm TTFT median 1244 ms -> 128 ms, TPOT median 135 ms -> 102 ms, 7.4 -> 9.8 tok/s, latency growth 0.0 ms/token. Request preparation is now 19 ms, all of it plan preparation; the per-step graph build is gone from the decode profile.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.

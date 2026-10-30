@@ -32,6 +32,8 @@ On CUDA (RTX 3060, driver 595.71.05, run 41088755268, same checkpoint, 32-token 
 
 Attribution was extended to request preparation (`StepKind::RequestPreparation`: session, tokenization, graph build, plan preparation, request validation). On Reference CPU with the real checkpoint, preparing a request took 1.67 s, 97% of it in plan preparation: `PreparedExecutionPlan::add_node_binding` recomputed the plan fingerprint over every binding added so far, so a ~460-binding plan fingerprinted its bindings ~460 times. `add_node_bindings` validates every binding first, adds them all and fingerprints once; the resulting plan is identical to adding them one by one. Plan preparation dropped from 1615 ms to 44 ms per request.
 
+After both fixes (run 41100147352) an 88 ms CUDA decode step splits into about 47 ms of node dispatches (matmul 16 ms), 27 ms unattributed (30%), 5 ms KV append, 5 ms output materialization, 3 ms sampling. The unattributed share is the generation loop's own work between leaves: publishing every per-node causal event and the step's evidence as formatted observations.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
