@@ -32,8 +32,8 @@ use crate::kv_cache::{
 };
 use crate::memory::{
     MemoryAdmissionDecision, MemoryAdmissionRequest, MemoryAllocationClass, MemoryAllocationId,
-    MemoryAllocationOwner, MemoryAllocationRequest, MemoryAllocationState, MemoryManager,
-    MemoryManagerConfig, MemoryPlacement,
+    MemoryAllocationOwner, MemoryAllocationRequest, MemoryManager, MemoryManagerConfig,
+    MemoryPlacement,
 };
 use crate::model::ModelTrustStore;
 use crate::model_instance::{
@@ -71,8 +71,8 @@ use crate::scheduler::{
 };
 use crate::session::{
     InferenceSession, InferenceSessionId, SessionAccessPolicy, SessionCreationRequest,
-    SessionError, SessionObservation, SessionObservationKind, SessionOperationAdmission,
-    SessionStatus, runtime_session_affinity,
+    SessionError, SessionLifecycleState, SessionObservation, SessionObservationKind,
+    SessionOperationAdmission, SessionStatus, runtime_session_affinity,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -544,6 +544,42 @@ impl Runtime {
         );
         Ok(())
     }
+    /// Forgets a closed or expired session: removes its record and the
+    /// records of its released KV caches that no prefix cache entry still
+    /// names as backing. A resident Model Instance serving many one-shot
+    /// requests calls this after each close so session and cache tables
+    /// stay proportional to live sessions rather than to every request
+    /// ever served (`bound-memory-manager-bookkeeping`). An open session is
+    /// left untouched and reported as still active.
+    pub fn forget_closed_inference_session(
+        &mut self,
+        session: &InferenceSessionId,
+    ) -> Result<(), SessionError> {
+        if !matches!(
+            self.inference_session(session)?.lifecycle,
+            SessionLifecycleState::Closed | SessionLifecycleState::Expired
+        ) {
+            return Err(SessionError::SessionActive);
+        }
+        let forgettable: Vec<KvCacheId> = self
+            .kv_caches
+            .caches()
+            .filter(|cache| cache.session.as_ref() == Some(session))
+            .filter(|cache| cache.lifecycle == KvCacheLifecycleState::Released)
+            .filter(|cache| {
+                !self
+                    .prefix_caches
+                    .entries()
+                    .any(|entry| entry.backing_kv_cache.cache == cache.id)
+            })
+            .map(|cache| cache.id.clone())
+            .collect();
+        for cache in &forgettable {
+            let _ = self.kv_caches.forget_released(cache);
+        }
+        self.sessions.remove(session);
+        Ok(())
+    }
     pub fn expire_inference_sessions(&mut self, now_millis: u64) -> Vec<InferenceSessionId> {
         let expired = self
             .sessions
@@ -905,11 +941,9 @@ impl Runtime {
     }
     fn release_kv_cache_memory(&mut self, cache: &KvCacheId) -> Result<(), KvCacheError> {
         if let Some(allocation) = self.kv_cache(cache)?.residency.memory_allocation {
-            if self
-                .memory
-                .allocations()
-                .any(|item| item.id == allocation && item.state == MemoryAllocationState::Released)
-            {
+            // Already released (possibly so long ago that it has left the
+            // MemoryManager's bounded retired history): nothing to do.
+            if !self.memory.is_live_allocation(allocation) {
                 return Ok(());
             }
             self.memory

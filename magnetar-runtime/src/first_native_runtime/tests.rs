@@ -4681,40 +4681,12 @@ fn production_model_fixture_threads_the_real_ingested_architecture_family() {
     }
 }
 
-/// The load-bearing correctness proof for `ProductionLoadedModel::
-/// load_with_component` (`wire-generic-inference-component-runtime`'s
-/// follow-up phase, closing the Tachyon integration audit's MAG-02): a
-/// model loaded against an *explicitly registered* Component digest
-/// generates *exactly* the same tokens as the same model loaded through
-/// [`ProductionLoadedModel::load`]'s pre-existing hardcoded-singleton
-/// path, for the identical underlying Component bytes. This proves the
-/// registered Component genuinely drives generation end to end (plan
-/// production in `prepare_generation` and dispatch-time graph production in
-/// `E2eRuntimeModelExecutionEngine::execute_generation_step` both honor the
-/// same digest), not merely that graph construction alone matches (already
-/// proven by `register_inference_component_artifact_enforces_trust_is_
-/// idempotent_and_matches_the_singleton_path`).
+/// The canonical first-native config as a production-shaped manifest
+/// (declared per-tensor offsets/sizes, untied `lm_head`) with an in-memory
+/// payload source, for tests that drive [`ProductionLoadedModel`] through
+/// the real production loading path.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-#[test]
-fn production_loaded_model_load_with_component_matches_the_singleton_path() {
-    // `e2e_fixture()`'s own manifest is shaped for the in-memory,
-    // fixture-only `E2eRuntimeModelExecutionEngine` path (no declared
-    // per-tensor byte offset/size) -- `load_production_qwen_instance_for_
-    // provider` (the real production-loading path `ProductionLoadedModel::
-    // load` drives) requires those, so this test builds its own
-    // production-shaped manifest around the same canonical config, exactly
-    // like `production_loading_generates_end_to_end_with_a_non_canonical_
-    // qwen_config` does for its own deliberately-different config.
-    // `tied_embeddings: false` (unlike the canonical fixture's own `true`):
-    // this test drives loading through the real production path
-    // (`load_production_model_instance_for_provider`), which expects a
-    // literal `lm_head` weight resource bound -- tied-embedding derivation
-    // is an ingestion-layer concern (`loaders/huggingface`'s
-    // `append_synthetic_lm_head_if_tied`) this hand-built manifest
-    // deliberately bypasses, exactly like `production_loading_generates_
-    // end_to_end_with_a_non_canonical_qwen_config`'s own config already
-    // does. Otherwise identical to the canonical fixture the real
-    // `qwen-real.component.wasm` Component already exercises elsewhere.
+fn production_shaped_canonical_fixture() -> (E2eFixture, ProductionIntegrationPayloadSource) {
     let mut config = e2e_fixture_config();
     config.tied_embeddings = false;
     let weights = e2e_fixture_weights(&config).expect("synthetic weights build");
@@ -4800,6 +4772,44 @@ fn production_loaded_model_load_with_component_matches_the_singleton_path() {
         std::sync::Arc::new(e2e_fixture_tokenizer().unwrap());
     let fixture = production_model_fixture(manifest, tokenizer_metadata, delegate_tokenizer)
         .expect("production fixture builds against the canonical config");
+    (fixture, payload_source)
+}
+
+/// The load-bearing correctness proof for `ProductionLoadedModel::
+/// load_with_component` (`wire-generic-inference-component-runtime`'s
+/// follow-up phase, closing the Tachyon integration audit's MAG-02): a
+/// model loaded against an *explicitly registered* Component digest
+/// generates *exactly* the same tokens as the same model loaded through
+/// [`ProductionLoadedModel::load`]'s pre-existing hardcoded-singleton
+/// path, for the identical underlying Component bytes. This proves the
+/// registered Component genuinely drives generation end to end (plan
+/// production in `prepare_generation` and dispatch-time graph production in
+/// `E2eRuntimeModelExecutionEngine::execute_generation_step` both honor the
+/// same digest), not merely that graph construction alone matches (already
+/// proven by `register_inference_component_artifact_enforces_trust_is_
+/// idempotent_and_matches_the_singleton_path`).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn production_loaded_model_load_with_component_matches_the_singleton_path() {
+    // `e2e_fixture()`'s own manifest is shaped for the in-memory,
+    // fixture-only `E2eRuntimeModelExecutionEngine` path (no declared
+    // per-tensor byte offset/size) -- `load_production_qwen_instance_for_
+    // provider` (the real production-loading path `ProductionLoadedModel::
+    // load` drives) requires those, so this test builds its own
+    // production-shaped manifest around the same canonical config, exactly
+    // like `production_loading_generates_end_to_end_with_a_non_canonical_
+    // qwen_config` does for its own deliberately-different config.
+    // `tied_embeddings: false` (unlike the canonical fixture's own `true`):
+    // this test drives loading through the real production path
+    // (`load_production_model_instance_for_provider`), which expects a
+    // literal `lm_head` weight resource bound -- tied-embedding derivation
+    // is an ingestion-layer concern (`loaders/huggingface`'s
+    // `append_synthetic_lm_head_if_tied`) this hand-built manifest
+    // deliberately bypasses, exactly like `production_loading_generates_
+    // end_to_end_with_a_non_canonical_qwen_config`'s own config already
+    // does. Otherwise identical to the canonical fixture the real
+    // `qwen-real.component.wasm` Component already exercises elsewhere.
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
 
     let component_trust = ComponentTrustStore::default()
         .trust_digest(&ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES).value);
@@ -10319,4 +10329,111 @@ fn check_chat_sessions_are_isolated_from_each_other() -> Result<(), E2eConforman
             reason: error.to_string(),
         })?;
     Ok(())
+}
+
+/// `bound-memory-manager-bookkeeping`: a resident [`ProductionLoadedModel`]
+/// serving many requests must keep every Runtime/Provider bookkeeping table
+/// proportional to live state, not to every request it ever served. Real
+/// CUDA campaigns slowed down by ~20 ms per previously generated token:
+/// `MemoryManager` kept every released allocation in the map its admission
+/// scans walk, edges both pre-admitted and explicitly written orphaned one
+/// allocation per step, superseded KV generations left Provider tracking
+/// entries behind, and each finished request left its final KV tensors,
+/// session and cache records in place. This records each table after every
+/// request: the two bounded logs must stay within their caps, everything
+/// else must not grow after the second request.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn resident_production_model_bookkeeping_stays_bounded_across_requests() {
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
+    let provider = Arc::new(ReferenceCpuProvider::new());
+    let mut model = ProductionLoadedModel::load(
+        fixture.clone(),
+        &payload_source,
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        provider.clone(),
+    )
+    .expect("production loading succeeds");
+    let request = || ProductionGenerationRequest {
+        prompt: PromptInput::PlainText("hi".into()),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(8),
+        max_generation_millis: None,
+    };
+    let bounded_logs = BTreeMap::from([
+        (
+            "memory.retired_allocations",
+            crate::memory::RETIRED_ALLOCATION_HISTORY_CAPACITY,
+        ),
+        (
+            "memory.observations",
+            2 * crate::memory::MEMORY_OBSERVATION_LOG_CAPACITY,
+        ),
+        (
+            "memory.residency_observations",
+            2 * crate::memory::MEMORY_OBSERVATION_LOG_CAPACITY,
+        ),
+    ]);
+    let mut history = Vec::new();
+    for _ in 0..6 {
+        model
+            .generate(request(), None)
+            .expect("generation succeeds");
+        let mut sizes: BTreeMap<String, usize> = model
+            .runtime
+            .memory()
+            .bookkeeping_sizes()
+            .into_iter()
+            .map(|(name, size)| (format!("memory.{name}"), size))
+            .collect();
+        sizes.insert("sessions".into(), model.runtime.sessions().count());
+        sizes.insert(
+            "kv_caches".into(),
+            model.runtime.kv_caches().caches().count(),
+        );
+        sizes.insert(
+            "provider.stored_tensors".into(),
+            provider.executor().stored_tensor_count(),
+        );
+        sizes.insert(
+            "provider.tracked_allocations".into(),
+            provider.executor().tracked_allocations().len(),
+        );
+        history.push(sizes);
+    }
+
+    let orphaned = {
+        let memory = model.runtime.memory();
+        let tracked: BTreeSet<_> = provider
+            .executor()
+            .tracked_allocations()
+            .into_values()
+            .collect();
+        let resident = memory.residency_allocations();
+        memory
+            .allocations()
+            .filter(|allocation| memory.is_live_allocation(allocation.id))
+            .filter(|allocation| {
+                !tracked.contains(&allocation.id) && !resident.contains(&allocation.id)
+            })
+            .count()
+    };
+    assert_eq!(
+        orphaned, 0,
+        "every live allocation is referenced by a residency record or its Provider"
+    );
+    let (second, last) = (&history[1], &history[history.len() - 1]);
+    for (name, size) in last {
+        match bounded_logs.get(name.as_str()) {
+            Some(cap) => assert!(size <= cap, "{name} = {size} exceeds its cap {cap}"),
+            None => assert!(
+                *size <= second[name],
+                "{name} grows with every served request: {} after request 1, {size} after \
+                 request {}",
+                second[name],
+                history.len() - 1
+            ),
+        }
+    }
 }

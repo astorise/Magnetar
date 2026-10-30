@@ -4406,6 +4406,48 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         }
         self.store_kv_state(request, state)
     }
+
+    fn release_request_state(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+    ) -> Result<(), InferenceApiError> {
+        self.discard_pending_kv_state(runtime, request)?;
+        let committed = self
+            .kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native KV state lock poisoned".into(),
+            })?
+            .remove(&Self::kv_state_key(request));
+        let Some(committed) = committed else {
+            return Ok(());
+        };
+        let provider_binding = committed
+            .provider
+            .clone()
+            .unwrap_or_else(|| ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+        let Ok(provider) = resolve_kernel_execution_provider(runtime, &provider_binding) else {
+            return Ok(());
+        };
+        // The committed bindings, plus each layer's `.pending` staging
+        // resource that every commit copies from and leaves behind
+        // (`execute_first_native_graph_nodes`'s KV pending writes).
+        for (layer, binding) in &committed.layer_kv {
+            let _ = provider.release_admitted_tensor(runtime.memory_mut(), &binding.k);
+            let _ = provider.release_admitted_tensor(runtime.memory_mut(), &binding.v);
+            for role in ["k", "v"] {
+                let _ = provider.release_admitted_tensor(
+                    runtime.memory_mut(),
+                    &TensorResourceId::new(format!(
+                        "kv.{}.layer{layer}.{role}.pending",
+                        committed.cache
+                    )),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One promoted layer's committed binding, and the binding it replaces (if
@@ -4497,8 +4539,12 @@ impl KvUpdateTransaction {
             // Best-effort, like the memory releases above: this is already
             // an unwind over a different failure, with nothing further to
             // roll back to if the Provider release itself fails.
-            let _ = self.executor.release_tensor(&already.binding.k);
-            let _ = self.executor.release_tensor(&already.binding.v);
+            let _ = self
+                .executor
+                .release_admitted_tensor(runtime.memory_mut(), &already.binding.k);
+            let _ = self
+                .executor
+                .release_admitted_tensor(runtime.memory_mut(), &already.binding.v);
         }
     }
 
@@ -4519,8 +4565,17 @@ impl KvUpdateTransaction {
                 // successfully, so a failure releasing the superseded one
                 // is a leak to surface separately, not a reason to fail
                 // this otherwise-successful commit.
-                let _ = self.executor.release_tensor(&previous.k);
-                let _ = self.executor.release_tensor(&previous.v);
+                // `release_admitted_tensor`, not `release_tensor`: the
+                // superseded generation was admitted (and is tracked) by
+                // the Provider, so dropping only its storage would leave a
+                // stale tracking entry per layer and role per decode step
+                // (`bound-memory-manager-bookkeeping`).
+                let _ = self
+                    .executor
+                    .release_admitted_tensor(runtime.memory_mut(), &previous.k);
+                let _ = self
+                    .executor
+                    .release_admitted_tensor(runtime.memory_mut(), &previous.v);
             }
             runtime
                 .kv_caches_mut()
@@ -7312,7 +7367,12 @@ impl ProductionLoadedModel {
             &mut prepared.observer,
             &mut execution_plans,
         )?;
-        self.finish_generation(prepared.session, generation_result, prepared.observer)
+        self.finish_generation(
+            prepared.session,
+            &prepared.generation_request,
+            generation_result,
+            prepared.observer,
+        )
     }
 
     pub fn generate_streaming(
@@ -7414,7 +7474,12 @@ impl ProductionLoadedModel {
             finish_reason: generation_result.output.finish_reason,
             usage: generation_result.output.usage.clone(),
         });
-        self.finish_generation(prepared.session, generation_result, prepared.observer)
+        self.finish_generation(
+            prepared.session,
+            &prepared.generation_request,
+            generation_result,
+            prepared.observer,
+        )
     }
 
     pub fn unload(mut self) -> Result<(), InferenceApiError> {
@@ -7533,9 +7598,17 @@ impl ProductionLoadedModel {
     fn finish_generation(
         &mut self,
         session: InferenceSessionId,
+        request: &GenerationRequest,
         generation_result: GenerationResult,
         observer: InferenceApiObserver,
     ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+        // A resident instance outlives every request it serves: release
+        // the engine's per-request KV state before the session closes, or
+        // each request's final KV tensors stay in Provider storage
+        // (`bound-memory-manager-bookkeeping`).
+        if let Some(engine) = self.runtime.model_execution_engine().cloned() {
+            engine.release_request_state(&mut self.runtime, request)?;
+        }
         let decoded_text = decode_tokens_streaming(
             &self.fixture.tokenizer,
             StreamingDecodeRequest::new(generation_result.output.generated_token_ids.clone()),
@@ -7553,6 +7626,9 @@ impl ProductionLoadedModel {
         });
         let generation_result = generation_result.with_decoded_text(decoded_text);
         close_inference_session(&mut self.runtime, &session)?;
+        self.runtime
+            .forget_closed_inference_session(&session)
+            .map_err(InferenceApiError::from)?;
         let text = generation_result.decoded_text.clone().ok_or_else(|| {
             InferenceApiError::GenerationFailed {
                 reason: "production generation produced no decoded text".into(),

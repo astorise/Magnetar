@@ -444,3 +444,104 @@ fn memory_manager_rejects_tensor_admission_when_size_is_unknown() {
     );
     assert!(matches!(decision, MemoryAdmissionDecision::Reject { .. }));
 }
+
+fn small_tensor_request() -> MemoryAllocationRequest {
+    MemoryAllocationRequest::new(
+        MemoryAllocationClass::Tensor,
+        64,
+        MemoryPlacement::HostOrdinary,
+        MemoryAllocationOwner::Runtime,
+    )
+}
+
+#[test]
+fn released_allocations_leave_the_live_table_but_stay_observable() {
+    let mut manager = MemoryManager::default();
+    let kept = manager.allocate(small_tensor_request()).unwrap();
+    let released = manager.allocate(small_tensor_request()).unwrap();
+    manager.release(released.id).unwrap();
+
+    assert!(manager.is_live_allocation(kept.id));
+    assert!(!manager.is_live_allocation(released.id));
+    let states: Vec<_> = manager
+        .allocations()
+        .map(|allocation| (allocation.id, allocation.state))
+        .collect();
+    assert_eq!(
+        states,
+        vec![
+            (kept.id, MemoryAllocationState::Active),
+            (released.id, MemoryAllocationState::Released),
+        ],
+        "live and retired allocations are merged back in id order"
+    );
+    assert_eq!(manager.bookkeeping_sizes()["live_allocations"], 1);
+    assert!(matches!(
+        manager.release(released.id),
+        Err(MemoryError::InvalidAllocationHandle(_))
+    ));
+    manager
+        .record_tensor_residency(
+            TensorResidency::new(
+                TensorResourceId::new("retired"),
+                MemoryPlacement::HostOrdinary,
+                ResourceAffinity::new(FallbackClass::Transparent),
+            )
+            .with_allocation(released.id),
+        )
+        .expect("a retired allocation is still a known handle");
+}
+
+#[test]
+fn retired_history_and_observation_logs_stay_bounded() {
+    let mut manager = MemoryManager::default();
+    let first = manager.allocate(small_tensor_request()).unwrap();
+    manager.release(first.id).unwrap();
+    for _ in 0..RETIRED_ALLOCATION_HISTORY_CAPACITY + 10 {
+        let allocation = manager.allocate(small_tensor_request()).unwrap();
+        manager.release(allocation.id).unwrap();
+    }
+    let sizes = manager.bookkeeping_sizes();
+    assert_eq!(sizes["live_allocations"], 0);
+    assert_eq!(
+        sizes["retired_allocations"],
+        RETIRED_ALLOCATION_HISTORY_CAPACITY
+    );
+    assert!(sizes["observations"] < 2 * MEMORY_OBSERVATION_LOG_CAPACITY);
+    assert!(
+        manager
+            .allocations()
+            .all(|allocation| allocation.id != first.id),
+        "the oldest retired allocation was forgotten"
+    );
+    assert!(matches!(
+        manager.release(first.id),
+        Err(MemoryError::InvalidAllocationHandle(_))
+    ));
+}
+
+#[test]
+fn reusable_allocations_stay_live_and_evictions_retire() {
+    let mut manager = MemoryManager::new(MemoryManagerConfig {
+        max_cached_bytes: 64,
+        ..MemoryManagerConfig::default()
+    });
+    let a = manager.allocate(small_tensor_request()).unwrap();
+    let b = manager.allocate(small_tensor_request()).unwrap();
+    manager.release(a.id).unwrap();
+    assert!(
+        manager.is_live_allocation(a.id),
+        "a reusable allocation stays live"
+    );
+    manager.release(b.id).unwrap();
+    let live = [a.id, b.id]
+        .iter()
+        .filter(|id| manager.is_live_allocation(**id))
+        .count();
+    assert_eq!(
+        live, 1,
+        "exceeding the cache limit retires one reusable allocation"
+    );
+    let reused = manager.allocate(small_tensor_request()).unwrap();
+    assert!(reused.id == a.id || reused.id == b.id);
+}

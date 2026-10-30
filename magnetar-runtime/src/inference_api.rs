@@ -1276,6 +1276,19 @@ pub(crate) trait RuntimeModelExecutionEngine: Send + Sync {
     ) -> Result<(), InferenceApiError> {
         Ok(())
     }
+
+    /// Releases everything this engine still holds for a finished
+    /// `request` (committed and pending KV tensors, their Provider-side
+    /// storage and tracking), so a resident Model Instance serving many
+    /// requests does not accumulate per-request state
+    /// (`bound-memory-manager-bookkeeping`). Idempotent.
+    fn release_request_state(
+        &self,
+        _runtime: &mut Runtime,
+        _request: &GenerationRequest,
+    ) -> Result<(), InferenceApiError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -1312,6 +1325,14 @@ impl SharedRuntimeModelExecutionEngine {
             accepted_token,
             step,
         )
+    }
+
+    pub(crate) fn release_request_state(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+    ) -> Result<(), InferenceApiError> {
+        self.0.release_request_state(runtime, request)
     }
 }
 
