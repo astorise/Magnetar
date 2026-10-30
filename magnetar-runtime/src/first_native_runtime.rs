@@ -3653,6 +3653,37 @@ fn execute_first_native_graph(
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
+    execute_first_native_graph_materializing(
+        runtime,
+        fixture,
+        model_instance,
+        kv_cache_id,
+        graph,
+        prepared_plan,
+        initial_bindings,
+        kv_history,
+        absolute_position_override,
+        node_events,
+        MaterializedEdges::All,
+    )
+}
+
+/// [`execute_first_native_graph`], downloading only the `materialized`
+/// edges once every node has run.
+#[allow(clippy::too_many_arguments)]
+fn execute_first_native_graph_materializing(
+    runtime: &mut Runtime,
+    fixture: &E2eFixture,
+    model_instance: &ModelInstanceId,
+    kv_cache_id: &KvCacheId,
+    graph: &ExecutionGraph,
+    prepared_plan: &mut PreparedExecutionPlan,
+    initial_bindings: BTreeMap<TensorEdgeId, HostTensor>,
+    kv_history: Option<&LayerKvMap>,
+    absolute_position_override: Option<u64>,
+    node_events: &mut Vec<PerNodeCausalEvent>,
+    materialized: MaterializedEdges<'_>,
+) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     execute_first_native_graph_with_resident_input(
         runtime,
         fixture,
@@ -3665,7 +3696,20 @@ fn execute_first_native_graph(
         kv_history,
         absolute_position_override,
         node_events,
+        materialized,
     )
+}
+
+/// Which graph edges a graph execution downloads to the host once every
+/// node has run. Every download waits for the Device, and a decode step's
+/// graph has hundreds of edges, the KV history among them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MaterializedEdges<'a> {
+    /// Every live edge (conformance and test entry points that inspect
+    /// intermediate values).
+    All,
+    /// Only these edges, when the graph produced them.
+    Only(&'a [&'a str]),
 }
 
 /// [`execute_first_native_graph`], generalized to additionally accept graph inputs
@@ -3693,6 +3737,7 @@ fn execute_first_native_graph_with_resident_input(
     kv_history: Option<&LayerKvMap>,
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
+    materialized: MaterializedEdges<'_>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     let prepare_clock = runtime.phase_ledger().clock();
     let order = first_native_graph_execution_order(graph)?;
@@ -3744,6 +3789,7 @@ fn execute_first_native_graph_with_resident_input(
         kv_history,
         absolute_position_override,
         node_events,
+        materialized,
     )?;
     Ok((dispatch, bindings, layer_kv, provider_binding))
 }
@@ -3763,6 +3809,7 @@ fn execute_first_native_graph_nodes(
     kv_history: Option<&LayerKvMap>,
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
+    materialized: MaterializedEdges<'_>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
     // This step's token count, for `PlanGuardContext::sequence_length`
     // (Correctif 4): the same value every dispatched node's Plan guards
@@ -4229,6 +4276,9 @@ fn execute_first_native_graph_nodes(
         reason: "first-native graph executed no nodes".into(),
     })?;
     let materialize_clock = dispatch_ctx.runtime.phase_ledger().clock();
+    if let MaterializedEdges::Only(edges) = materialized {
+        bindings.retain(|edge_id, _| edges.contains(&edge_id.as_str()));
+    }
     let materialized_bindings =
         materialize_first_native_graph_bindings(&*dispatch_ctx.provider, &bindings)?;
     dispatch_ctx
@@ -4446,7 +4496,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                             .collect::<Vec<_>>(),
                     )
                     .map_err(runtime_generation_failed)?;
-                    execute_first_native_graph(
+                    execute_first_native_graph_materializing(
                         runtime,
                         &self.fixture,
                         model_instance,
@@ -4457,6 +4507,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                         None,
                         Some(0),
                         &mut node_events,
+                        MaterializedEdges::Only(&["logits"]),
                     )?
                 } else {
                     let token = *generated_tokens.last().ok_or_else(|| {
@@ -4466,7 +4517,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                     })?;
                     let ids_tensor = HostTensor::new([1], vec![token as f32])
                         .map_err(runtime_generation_failed)?;
-                    execute_first_native_graph(
+                    execute_first_native_graph_materializing(
                         runtime,
                         &self.fixture,
                         model_instance,
@@ -4477,6 +4528,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                         Some(&kv_state.layer_kv),
                         Some(absolute_position as u64),
                         &mut node_events,
+                        MaterializedEdges::Only(&["logits"]),
                     )?
                 };
             // `execute_first_native_graph` topologically validates the graph (via
@@ -5693,6 +5745,7 @@ pub fn run_first_native_graph_segment_dispatch(
             kv_history,
             absolute_position_override,
             &mut node_events,
+            MaterializedEdges::All,
         )
         .map_err(E2eConformanceError::from)?;
     Ok(FirstNativeProviderRunOutcome {
