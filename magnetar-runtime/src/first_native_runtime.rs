@@ -3152,35 +3152,49 @@ fn resolve_first_native_weight_edge(
 fn first_native_graph_execution_order(
     graph: &ExecutionGraph,
 ) -> Result<Vec<ExecutionNodeId>, InferenceApiError> {
-    let mut producer_of: BTreeMap<&ExecutionNodeId, ()> = BTreeMap::new();
     let mut edge_producer: BTreeMap<&TensorEdgeId, &ExecutionNodeId> = BTreeMap::new();
     for (node_id, node) in &graph.nodes {
-        producer_of.insert(node_id, ());
         for output in &node.outputs {
             edge_producer.insert(output, node_id);
         }
     }
-    let mut remaining: BTreeSet<&ExecutionNodeId> = graph.nodes.keys().collect();
-    let mut order = Vec::with_capacity(remaining.len());
-    while !remaining.is_empty() {
-        let ready = remaining
-            .iter()
-            .find(|node_id| {
-                let node = &graph.nodes[**node_id];
-                node.inputs.iter().all(|edge_id| {
-                    edge_producer
-                        .get(edge_id)
-                        .is_none_or(|producer| !remaining.contains(producer))
-                })
-            })
-            .copied();
-        let Some(node_id) = ready else {
-            return Err(InferenceApiError::GraphPlanningFailed {
-                reason: "first-native graph contains a cycle or unresolved producer".into(),
-            });
-        };
-        remaining.remove(node_id);
+    // Kahn's algorithm, always taking the smallest ready node id: the same
+    // order as repeatedly picking the first remaining node whose producers
+    // have all run, in O(edges log nodes) instead of O(nodes^2).
+    let mut pending_inputs: BTreeMap<&ExecutionNodeId, usize> = BTreeMap::new();
+    let mut consumers: BTreeMap<&ExecutionNodeId, Vec<&ExecutionNodeId>> = BTreeMap::new();
+    for (node_id, node) in &graph.nodes {
+        let mut pending = 0;
+        for edge_id in &node.inputs {
+            if let Some(producer) = edge_producer.get(edge_id) {
+                pending += 1;
+                consumers.entry(*producer).or_default().push(node_id);
+            }
+        }
+        pending_inputs.insert(node_id, pending);
+    }
+    let mut ready: BTreeSet<&ExecutionNodeId> = pending_inputs
+        .iter()
+        .filter(|(_, pending)| **pending == 0)
+        .map(|(node_id, _)| *node_id)
+        .collect();
+    let mut order = Vec::with_capacity(graph.nodes.len());
+    while let Some(node_id) = ready.pop_first() {
         order.push(node_id.clone());
+        for consumer in consumers.get(node_id).into_iter().flatten() {
+            let pending = pending_inputs
+                .get_mut(consumer)
+                .expect("every consumer is a graph node");
+            *pending -= 1;
+            if *pending == 0 {
+                ready.insert(consumer);
+            }
+        }
+    }
+    if order.len() != graph.nodes.len() {
+        return Err(InferenceApiError::GraphPlanningFailed {
+            reason: "first-native graph contains a cycle or unresolved producer".into(),
+        });
     }
     Ok(order)
 }

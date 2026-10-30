@@ -10628,3 +10628,66 @@ fn resident_production_model_reuses_component_graphs_per_prompt_length() {
     );
     assert_eq!(model.graph_cache.prompt_lengths(), expected);
 }
+
+/// The previous O(nodes^2) execution order: repeatedly take the first
+/// remaining node (by id) whose producers have all run. Kept as the oracle
+/// `first_native_graph_execution_order` must match exactly.
+fn quadratic_execution_order(graph: &ExecutionGraph) -> Option<Vec<ExecutionNodeId>> {
+    let mut edge_producer: BTreeMap<&TensorEdgeId, &ExecutionNodeId> = BTreeMap::new();
+    for (node_id, node) in &graph.nodes {
+        for output in &node.outputs {
+            edge_producer.insert(output, node_id);
+        }
+    }
+    let mut remaining: BTreeSet<&ExecutionNodeId> = graph.nodes.keys().collect();
+    let mut order = Vec::new();
+    while !remaining.is_empty() {
+        let node_id = *remaining.iter().find(|node_id| {
+            graph.nodes[**node_id].inputs.iter().all(|edge_id| {
+                edge_producer
+                    .get(edge_id)
+                    .is_none_or(|producer| !remaining.contains(producer))
+            })
+        })?;
+        remaining.remove(node_id);
+        order.push(node_id.clone());
+    }
+    Some(order)
+}
+
+#[test]
+fn graph_execution_order_matches_the_previous_quadratic_order() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let graphs =
+        first_native_component_graphs_for_prompt(&fixture, 5).expect("component graphs build");
+    for graph in [&graphs.prefill, &graphs.decode] {
+        let order = first_native_graph_execution_order(graph).unwrap();
+        assert_eq!(order.len(), graph.nodes.len());
+        assert_eq!(Some(order), quadratic_execution_order(graph));
+    }
+
+    let mut cyclic = graphs.decode.clone();
+    let (first, second) = {
+        let mut ids = cyclic.nodes.keys().cloned();
+        (ids.next().unwrap(), ids.next().unwrap())
+    };
+    let second_output = cyclic.nodes[&second].outputs[0].clone();
+    let first_output = cyclic.nodes[&first].outputs[0].clone();
+    cyclic
+        .nodes
+        .get_mut(&first)
+        .unwrap()
+        .inputs
+        .push(second_output);
+    cyclic
+        .nodes
+        .get_mut(&second)
+        .unwrap()
+        .inputs
+        .push(first_output);
+    assert!(quadratic_execution_order(&cyclic).is_none());
+    assert!(matches!(
+        first_native_graph_execution_order(&cyclic),
+        Err(InferenceApiError::GraphPlanningFailed { .. })
+    ));
+}
