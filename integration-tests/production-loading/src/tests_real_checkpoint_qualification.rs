@@ -360,11 +360,25 @@ fn hardware_matrix(generated_on: Option<(&str, bool)>) -> HardwareCapabilityMatr
     HardwareCapabilityMatrix::new(host, entries)
 }
 
+/// A Provider name (e.g. `magnetar:provider/cuda`) as a single file-name
+/// component: anything but ASCII alphanumerics, `-` and `_` becomes `-`.
+fn file_label(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 /// Tokens between two in-request progress lines.
 const PROGRESS_TOKEN_INTERVAL: usize = 16;
 
 /// One line per finished request on stderr, and the same record appended
-/// to `<report dir>/progress-<provider>.jsonl`, so a campaign cut off by a
+/// to `<report dir>/progress-<provider label>.jsonl` (see [`file_label`]), so a campaign cut off by a
 /// timeout still leaves its completed requests behind. `step_ms` is the
 /// time the Runtime measured inside its own prefill/decode steps; the rest
 /// of the end-to-end latency is per-request work outside them.
@@ -410,7 +424,7 @@ fn report_progress(
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join(format!("progress-{provider}.jsonl")))
+            .open(dir.join(format!("progress-{}.jsonl", file_label(provider))))
             .expect("the progress file opens for appending");
         std::io::Write::write_all(&mut file, format!("{record}\n").as_bytes())
             .expect("the progress record is written");
@@ -569,6 +583,22 @@ fn fixture_only_campaign_is_measured_but_cannot_qualify_production_performance()
     )));
     let json = serde_json::to_value(&report).unwrap();
     assert_eq!(json["manifest"]["evidence_class"], "fixture_only");
+}
+
+#[test]
+fn provider_names_become_single_file_name_components() {
+    assert_eq!(
+        file_label("magnetar:provider/cuda"),
+        "magnetar-provider-cuda"
+    );
+    assert_eq!(file_label("reference-cpu"), "reference-cpu");
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path()
+            .join(format!("progress-{}.jsonl", file_label("a/b:c"))),
+        b"{}",
+    )
+    .unwrap();
 }
 
 /// Task 4.3: with no CUDA Device, every CUDA capability is an explicit
