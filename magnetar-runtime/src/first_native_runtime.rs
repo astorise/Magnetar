@@ -3249,8 +3249,8 @@ fn dispatch_first_native_graph_node(
     // Resolved once, before dispatch: this node's output edge's own final
     // resource identity, and the placement/owner it should be pre-admitted
     // under (`unify-provider-output-admission-and-residency`'s Decision 3).
-    // Every operator below except "rope" (which has no Kernel-level output
-    // identity of its own -- see that arm) targets this directly instead of
+    // Every operator below except a "rope" whose output carries KV-cache
+    // semantics (see that arm) targets this directly instead of
     // letting its own dispatch function synthesize a Kernel-internal id
     // that would later need a separate download-then-reupload to reach the
     // edge.
@@ -3411,17 +3411,25 @@ fn dispatch_first_native_graph_node(
                 position_mode: fixture.config.rope.position_mode,
                 dynamic_scaling_supported: fixture.config.rope.dynamic_scaling_supported,
             };
-            // Unlike every other arm, `output_target` is deliberately
-            // *not* passed here (matches this function's own top-of-body
-            // comment, predating this task group): RoPE's output edge
-            // (`rope_k`'s in particular) carries KV-cache Append semantics
-            // that `execute_first_native_graph_nodes` handles via its own
-            // unconditional `needs_explicit_edge_write` path for this
-            // node kind. Passing a pre-admitted `output_target` here too
-            // caused a genuine regression (double-admission racing the
-            // KV-cache pending-write path) caught by the full oracle
-            // comparison suite -- confirmed empirically, not just by
-            // re-reading the comment.
+            // `output_target` is not passed when RoPE's output edge carries
+            // KV-cache semantics (`rope_k`): `execute_first_native_graph_nodes`
+            // appends that output to the history itself, and pre-admitting
+            // it here too caused a genuine regression (double-admission
+            // racing the KV-cache pending-write path) caught by the full
+            // oracle comparison suite. Every other RoPE output (`rope_q`)
+            // is written straight into its edge like any other operator's,
+            // instead of being downloaded to the host and uploaded back
+            // after the dispatch (`attribute-redacted-inference-costs`: 24
+            // synchronizing round trips per CUDA decode step).
+            let output_has_kv_semantics = node.outputs.first().is_none_or(|edge_id| {
+                ctx.graph.as_ref().is_none_or(|graph| {
+                    graph
+                        .graph()
+                        .edges
+                        .get(edge_id)
+                        .is_none_or(|edge| edge.kv_cache.is_some())
+                })
+            });
             dispatch_qwen_rope(
                 ctx,
                 node_id,
@@ -3430,7 +3438,7 @@ fn dispatch_first_native_graph_node(
                 &rope_config,
                 pairing,
                 position_offset,
-                None,
+                (!output_has_kv_semantics).then_some(output_target),
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
