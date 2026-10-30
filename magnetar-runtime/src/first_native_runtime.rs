@@ -1791,11 +1791,7 @@ fn resolved_kernel_memory_class(
     let Some(prepared_plan) = prepared_plan else {
         return KernelMemoryClass::Host;
     };
-    let Some(binding) = prepared_plan
-        .node_bindings
-        .iter()
-        .find(|binding| binding.graph_nodes.contains(node))
-    else {
+    let Some(binding) = prepared_plan.node_binding(node) else {
         return KernelMemoryClass::Host;
     };
     if binding.provider.as_str() == REFERENCE_CPU_PROVIDER_NAME {
@@ -1823,11 +1819,7 @@ fn resolved_output_placement(
             REFERENCE_CPU_PROVIDER_NAME,
         ));
     };
-    let Some(binding) = prepared_plan
-        .node_bindings
-        .iter()
-        .find(|binding| binding.graph_nodes.contains(node))
-    else {
+    let Some(binding) = prepared_plan.node_binding(node) else {
         return MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
             REFERENCE_CPU_PROVIDER_NAME,
         ));
@@ -1862,11 +1854,7 @@ fn resolved_resource_affinity(
     let Some(prepared_plan) = prepared_plan else {
         return base.with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
     };
-    let Some(binding) = prepared_plan
-        .node_bindings
-        .iter()
-        .find(|binding| binding.graph_nodes.contains(node))
-    else {
+    let Some(binding) = prepared_plan.node_binding(node) else {
         return base.with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
     };
     let base = base.with_provider(binding.provider.clone());
@@ -4183,10 +4171,11 @@ fn execute_first_native_graph_nodes(
                         }
                     }
                 })?;
-                dispatch_ctx
-                    .runtime
-                    .phase_ledger_mut()
-                    .record(edge_clock, StepPhase::EdgeWrite);
+                dispatch_ctx.runtime.phase_ledger_mut().record_operator(
+                    edge_clock,
+                    StepPhase::EdgeWrite,
+                    node.operator.name(),
+                );
             }
             bindings.insert(output_edge_id.clone(), (output_resource_id, output_shape));
         }

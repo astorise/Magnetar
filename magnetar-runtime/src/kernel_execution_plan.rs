@@ -1484,9 +1484,61 @@ pub struct PreparedExecutionPlan {
     /// alone does not block new work, but staleness the rebuild policy marks
     /// mandatory does.
     stale_urgency: Option<PlanRebuildUrgency>,
+    /// Lazily built node -> binding position index for
+    /// [`Self::node_binding`]; not part of the plan's identity.
+    node_index: PlanNodeIndex,
+}
+
+/// Position of the first binding naming each graph node, as of the binding
+/// count it was built for. The binding methods reset it. A lookup falls
+/// back to a scan whenever the binding count changed, the node is not
+/// indexed or the indexed binding no longer names it, which covers bindings
+/// added, removed or replaced through the public `node_bindings` field.
+/// Reordering that field in place while two bindings name the same node is
+/// the one edit it does not detect; no Runtime path does that.
+#[derive(Clone, Default)]
+struct PlanNodeIndex(std::sync::OnceLock<(usize, BTreeMap<ExecutionNodeId, usize>)>);
+
+impl PartialEq for PlanNodeIndex {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PlanNodeIndex {}
+
+impl std::fmt::Debug for PlanNodeIndex {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PlanNodeIndex")
+    }
 }
 
 impl PreparedExecutionPlan {
+    /// The first binding naming `node`, as a scan of `node_bindings` would
+    /// find it, in O(log bindings) once the index is built.
+    pub fn node_binding(&self, node: &ExecutionNodeId) -> Option<&PlanNodeBinding> {
+        let (indexed_count, positions) = self.node_index.0.get_or_init(|| {
+            let mut positions = BTreeMap::new();
+            for (position, binding) in self.node_bindings.iter().enumerate() {
+                for graph_node in &binding.graph_nodes {
+                    positions.entry(graph_node.clone()).or_insert(position);
+                }
+            }
+            (self.node_bindings.len(), positions)
+        });
+        if *indexed_count == self.node_bindings.len()
+            && let Some(binding) = positions
+                .get(node)
+                .and_then(|position| self.node_bindings.get(*position))
+            && binding.graph_nodes.contains(node)
+        {
+            return Some(binding);
+        }
+        self.node_bindings
+            .iter()
+            .find(|binding| binding.graph_nodes.contains(node))
+    }
+
     pub fn new(
         id: PreparedExecutionPlanId,
         generation: PreparedExecutionPlanGeneration,
@@ -1518,6 +1570,7 @@ impl PreparedExecutionPlan {
             )],
             active_leases: 0,
             stale_urgency: None,
+            node_index: PlanNodeIndex::default(),
         })
     }
 
@@ -1597,6 +1650,7 @@ impl PreparedExecutionPlan {
         binding: PlanNodeBinding,
     ) -> Result<(), PreparedExecutionPlanError> {
         binding.validate()?;
+        self.node_index = PlanNodeIndex::default();
         self.node_bindings.push(binding);
         self.observe(PreparedExecutionPlanObservationKind::PlanNodeBound);
         self.fingerprint = plan_fingerprint(
@@ -1619,6 +1673,7 @@ impl PreparedExecutionPlan {
         for binding in &bindings {
             binding.validate()?;
         }
+        self.node_index = PlanNodeIndex::default();
         for binding in bindings {
             self.node_bindings.push(binding);
             self.observe(PreparedExecutionPlanObservationKind::PlanNodeBound);
@@ -1888,9 +1943,7 @@ impl PreparedExecutionPlanExecutor {
         }
         plan.execute_ready_path(context)?;
         let binding = plan
-            .node_bindings
-            .iter()
-            .find(|binding| binding.graph_nodes.contains(node))
+            .node_binding(node)
             .ok_or(PreparedExecutionPlanError::PlanNodeBindingMissing)?;
         binding.validate()?;
         let prepared_kernel_id = binding

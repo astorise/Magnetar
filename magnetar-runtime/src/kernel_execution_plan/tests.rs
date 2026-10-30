@@ -268,6 +268,44 @@ fn adding_node_bindings_at_once_matches_adding_them_one_by_one() {
 }
 
 #[test]
+fn indexed_node_binding_lookup_matches_a_scan_even_after_direct_edits() {
+    let scan = |plan: &PreparedExecutionPlan, node: &ExecutionNodeId| {
+        plan.node_bindings
+            .iter()
+            .find(|binding| binding.graph_nodes.contains(node))
+            .cloned()
+    };
+    let names = ["matmul", "rmsnorm", "attention", "silu"];
+    let mut plan = test_plan();
+    plan.add_node_bindings(names.iter().map(|name| prepared_binding(name, 1)).collect())
+        .unwrap();
+    let nodes: Vec<ExecutionNodeId> = names
+        .iter()
+        .map(|name| ExecutionNodeId::new(*name))
+        .chain([ExecutionNodeId::new("absent")])
+        .collect();
+    for node in &nodes {
+        assert_eq!(plan.node_binding(node).cloned(), scan(&plan, node));
+    }
+    // A later binding naming the same node never shadows the first one.
+    plan.add_node_binding(prepared_binding("matmul", 2))
+        .unwrap();
+    for node in &nodes {
+        assert_eq!(plan.node_binding(node).cloned(), scan(&plan, node));
+    }
+    // Direct edits to the public field are seen too.
+    plan.node_bindings.retain(|binding| {
+        !binding
+            .graph_nodes
+            .contains(&ExecutionNodeId::new("rmsnorm"))
+    });
+    plan.node_bindings.swap(0, 1);
+    for node in &nodes {
+        assert_eq!(plan.node_binding(node).cloned(), scan(&plan, node));
+    }
+}
+
+#[test]
 fn native_handle_boundary_rejects_and_redacts_pointer_shaped_data() {
     assert!(ProviderPreparedSegmentId::new("cuda-graph-1").is_ok());
     assert!(ProviderPreparedSegmentId::new("0xdeadbeef").is_err());
