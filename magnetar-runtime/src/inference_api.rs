@@ -39,6 +39,7 @@ use crate::model_instance::*;
 use crate::model_loading::*;
 use crate::observability::*;
 use crate::operator::*;
+use crate::phase_attribution::{StepKind, StepPhase};
 use crate::prefix_cache::*;
 use crate::runtime::*;
 use crate::sampling::*;
@@ -1764,6 +1765,11 @@ fn run_generation_loop_inner(
             }
         });
         let is_prefill_step = generated.is_empty();
+        runtime.phase_ledger_mut().begin_step(if is_prefill_step {
+            StepKind::Prefill
+        } else {
+            StepKind::Decode
+        });
         let step_started_at = std::time::Instant::now();
         let runtime_step =
             match executor.execute_generation_step(runtime, request, &generated, execution_plan) {
@@ -1890,8 +1896,13 @@ fn run_generation_loop_inner(
             return Err(error);
         }
         if let Some(on_logits) = on_logits.as_deref_mut() {
+            let clock = runtime.phase_ledger().clock();
             on_logits(&runtime_step.logits);
+            runtime
+                .phase_ledger_mut()
+                .record(clock, StepPhase::LogitsObserve);
         }
+        let sampling_clock = runtime.phase_ledger().clock();
         let (sampling, step) = decode_step_from_sampling_with_rng(
             request,
             &generated,
@@ -1904,6 +1915,10 @@ fn run_generation_loop_inner(
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
             error
         })?;
+        runtime
+            .phase_ledger_mut()
+            .record(sampling_clock, StepPhase::Sampling);
+        let commit_clock = runtime.phase_ledger().clock();
         if let Err(error) = executor.commit_generation_step(
             runtime,
             request,
@@ -1914,6 +1929,9 @@ fn run_generation_loop_inner(
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
             return Err(error);
         }
+        runtime
+            .phase_ledger_mut()
+            .record(commit_clock, StepPhase::Commit);
         if let Some(commit) = &runtime_step.kv_commit {
             let commit_context = match commit {
                 RuntimeKvCacheCommit::PrefillCompleted { cache, tokens } => vec![
@@ -1998,6 +2016,8 @@ fn run_generation_loop_inner(
             observation_message("token committed", &token_context),
             correlation_id.clone(),
         );
+        // The consumer's own time is not part of the step.
+        runtime.phase_ledger_mut().end_step();
         if let Some(on_token) = on_token.as_deref_mut()
             && on_token(step.token_id).is_break()
         {

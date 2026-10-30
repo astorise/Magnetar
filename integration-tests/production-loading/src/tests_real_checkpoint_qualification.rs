@@ -57,6 +57,7 @@ use magnetar_loader_huggingface::{
     HuggingFaceIngestor, HuggingFaceTokenizer, parse_tokenizer_config,
 };
 use magnetar_runtime::model::{ModelGenerationDefaults, ModelTrustStore};
+use magnetar_runtime::phase_attribution::{PhaseAttributionReport, StepKind};
 use magnetar_runtime::production_model_ingestion::{
     ProductionArtifactPayloadSource, ProductionModelArtifactIngestor, ProductionModelSource,
 };
@@ -839,6 +840,7 @@ fn real_checkpoint_decode_cost_profile() {
             .generate(request(2), None)
             .expect("warmup request generates");
 
+        model.enable_phase_attribution();
         let mut recorder = TraceRecorder::start();
         let outcome = model
             .generate_streaming(request(tokens), None, &mut |event| {
@@ -850,7 +852,9 @@ fn real_checkpoint_decode_cost_profile() {
             .expect("profile request generates");
         let usage = outcome.result.output.usage.clone();
         let metrics = recorder.finish(usage.prompt_tokens).metrics();
+        let attribution = model.take_phase_attribution();
         model.unload().expect("the real checkpoint unloads");
+        let decode_phases = decode_phase_rows(&attribution);
 
         let buckets: Vec<serde_json::Value> = metrics
             .inter_token_latencies_ms
@@ -892,6 +896,8 @@ fn real_checkpoint_decode_cost_profile() {
             "outside_runtime_steps_ms": metrics.end_to_end_latency_ms - step_ms as f64,
             "runtime_events_by_kind": events_by_kind,
             "runtime_events_truncated": truncated,
+            "decode_phase_attribution": decode_phases,
+            "phase_attribution": attribution,
         });
         eprintln!("[{device}] decode cost profile: {profile}");
         assert_eq!(
@@ -934,6 +940,20 @@ fn real_checkpoint_decode_cost_profile() {
                         .unwrap_or(f64::NAN)
                 ));
             }
+            summary.push_str(
+                "\nHost time per decode step, by phase (device time unavailable):\n\n\
+                 | Phase | Operator | Calls/step | ms/step | Share |\n|---|---|---|---|---|\n",
+            );
+            for row in &decode_phases {
+                summary.push_str(&format!(
+                    "| {} | {} | {:.1} | {:.2} | {:.1}% |\n",
+                    row["phase"].as_str().unwrap_or(""),
+                    row["operator"].as_str().unwrap_or(""),
+                    row["calls_per_step"].as_f64().unwrap_or(f64::NAN),
+                    row["ms_per_step"].as_f64().unwrap_or(f64::NAN),
+                    row["share"].as_f64().unwrap_or(f64::NAN) * 100.0,
+                ));
+            }
             let mut file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -942,4 +962,46 @@ fn real_checkpoint_decode_cost_profile() {
             std::io::Write::write_all(&mut file, format!("{summary}\n").as_bytes()).unwrap();
         }
     }
+}
+
+/// Mean host time per decode step for every phase, largest first, with
+/// the step time no phase covers as a final `unattributed` row.
+fn decode_phase_rows(report: &PhaseAttributionReport) -> Vec<serde_json::Value> {
+    let Some(summary) = report.summary(StepKind::Decode) else {
+        return Vec::new();
+    };
+    let steps = summary.steps.max(1) as f64;
+    let wall = summary.wall_micros.max(1) as f64;
+    let row = |phase: String, operator: Option<&str>, count: u64, micros: u64| {
+        serde_json::json!({
+            "phase": phase,
+            "operator": operator,
+            "calls_per_step": count as f64 / steps,
+            "ms_per_step": micros as f64 / steps / 1_000.0,
+            "share": micros as f64 / wall,
+        })
+    };
+    let mut phases: Vec<_> = summary.phases.iter().collect();
+    phases.sort_by_key(|(_, total)| std::cmp::Reverse(total.host_micros));
+    let mut rows: Vec<_> = phases
+        .into_iter()
+        .map(|(key, total)| {
+            row(
+                serde_json::to_value(key.phase)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                key.operator.as_deref(),
+                total.count,
+                total.host_micros,
+            )
+        })
+        .collect();
+    rows.push(row(
+        "unattributed".into(),
+        None,
+        0,
+        summary.unattributed_micros,
+    ));
+    rows
 }

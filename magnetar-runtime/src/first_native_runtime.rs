@@ -29,10 +29,11 @@ use crate::kernel_artifact::{
 };
 use crate::kernel_dispatch::*;
 use crate::kernel_execution_plan::{
-    PlanGuard, PlanGuardContext, PlanMemoryRequirements, PlanNodeBinding, PreparedExecutionPhase,
-    PreparedExecutionPlan, PreparedExecutionPlanError, PreparedExecutionPlanExecutor,
-    PreparedExecutionPlanGeneration, PreparedExecutionPlanId, PreparedExecutionPlanScope,
-    PreparedPlanNodeExecution, ResourceBindingPlan, semantic_graph_fingerprint,
+    FingerprintedGraph, PlanGuard, PlanGuardContext, PlanMemoryRequirements, PlanNodeBinding,
+    PreparedExecutionPhase, PreparedExecutionPlan, PreparedExecutionPlanError,
+    PreparedExecutionPlanExecutor, PreparedExecutionPlanGeneration, PreparedExecutionPlanId,
+    PreparedExecutionPlanScope, PreparedPlanNodeExecution, ResourceBindingPlan,
+    semantic_graph_fingerprint,
 };
 use crate::kernel_optimization_orchestration::run_kernel_optimization_orchestration_conformance;
 use crate::kernel_registry::*;
@@ -46,6 +47,7 @@ use crate::model_instance::*;
 use crate::model_loading::*;
 use crate::operator::*;
 use crate::operator_scope::*;
+use crate::phase_attribution::{PhaseAttributionReport, StepPhase};
 use crate::prefix_cache::*;
 use crate::provider::*;
 use crate::qwen_model_component;
@@ -1875,7 +1877,8 @@ struct FirstNativeDispatchContext<'a> {
     /// `None` only for callers that have no full graph (e.g. hand-written
     /// test oracles), which fall back to a synthetic-candidate path that
     /// production dispatch never takes.
-    graph: Option<&'a ExecutionGraph>,
+    /// Fingerprinted once per graph execution, not per node.
+    graph: Option<FingerprintedGraph<'a>>,
     /// This generation step's token count, used to populate
     /// `PlanGuardContext::sequence_length` when revalidating a published
     /// Plan's guards (Correctif 4). An absent value is treated by
@@ -2129,14 +2132,14 @@ fn dispatch_reference_cpu_operator_multi(
     // path (`prepared_candidate_for_operation`) survives only for callers
     // that have a `PreparedExecutionPlan` but no full `ExecutionGraph` to
     // revalidate it against -- hand-written test oracles, never production.
-    let selection = match (ctx.prepared_plan.as_deref_mut(), ctx.graph) {
+    let selection = match (ctx.prepared_plan.as_deref_mut(), ctx.graph.as_ref()) {
         (Some(prepared_plan), Some(graph)) => {
             let guard_context = first_native_plan_context(
                 prepared_plan.scope.phase,
                 ctx.sequence_length.unwrap_or(1),
             );
             let prepared = PreparedExecutionPlanExecutor::new()
-                .prepare_node_execution(
+                .prepare_fingerprinted_node_execution(
                     graph,
                     prepared_plan,
                     ctx.runtime.kernel_registry(),
@@ -3690,7 +3693,7 @@ fn execute_first_native_graph_nodes(
         runtime,
         provider: executor.clone(),
         prepared_plan: Some(prepared_plan),
-        graph: Some(graph),
+        graph: Some(FingerprintedGraph::new(graph)),
         sequence_length,
         last_provider_execution: None,
         node_events,
@@ -3717,6 +3720,7 @@ fn execute_first_native_graph_nodes(
     // Provider-side, so accounting stays bounded to this graph's edge count
     // no matter how many steps a session runs.
     let mut bindings: BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)> = BTreeMap::new();
+    let upload_clock = dispatch_ctx.runtime.phase_ledger().clock();
     for (edge_id, tensor) in initial_bindings {
         let resource_id = TensorResourceId::new(edge_id.as_str());
         let shape = tensor.shape.clone();
@@ -3747,6 +3751,10 @@ fn execute_first_native_graph_nodes(
             })?;
         bindings.insert(edge_id, (resource_id, shape));
     }
+    dispatch_ctx
+        .runtime
+        .phase_ledger_mut()
+        .record(upload_clock, StepPhase::InputUpload);
     // Graph inputs ALREADY resident in this executing Provider's own
     // storage (`add-real-multi-device-model-instance-placement`'s real
     // peer-to-peer segment boundary, `CudaExecutor::copy_tensor_from_
@@ -3788,6 +3796,7 @@ fn execute_first_native_graph_nodes(
                 | "rmsnorm"
                 | "rope"
         );
+        let inputs_clock = dispatch_ctx.runtime.phase_ledger().clock();
         let mut inputs = Vec::with_capacity(node.inputs.len());
         for edge_id in &node.inputs {
             let value = match bindings.get(edge_id) {
@@ -3836,6 +3845,11 @@ fn execute_first_native_graph_nodes(
             };
             inputs.push(value);
         }
+        dispatch_ctx
+            .runtime
+            .phase_ledger_mut()
+            .record(inputs_clock, StepPhase::NodeInputResolve);
+        let dispatch_clock = dispatch_ctx.runtime.phase_ledger().clock();
         let (dispatch_result, output_values) = dispatch_first_native_graph_node(
             &mut dispatch_ctx,
             fixture,
@@ -3844,6 +3858,11 @@ fn execute_first_native_graph_nodes(
             absolute_position_override,
             kv_cache_id,
         )?;
+        dispatch_ctx.runtime.phase_ledger_mut().record_operator(
+            dispatch_clock,
+            StepPhase::NodeDispatch,
+            node.operator.name(),
+        );
         if node.outputs.is_empty() {
             return Err(InferenceApiError::GraphPlanningFailed {
                 reason: format!("graph node '{node_id}' has no output edge"),
@@ -3927,6 +3946,7 @@ fn execute_first_native_graph_nodes(
                         resolved_output_placement(dispatch_ctx.prepared_plan.as_deref(), node_id),
                         MemoryAllocationOwner::Session(kv_cache_id.to_string()),
                     );
+                    let append_clock = dispatch_ctx.runtime.phase_ledger().clock();
                     let concatenated = dispatch_qwen_concat(
                         &mut dispatch_ctx,
                         &format!("{node_id}.kv-append"),
@@ -3935,6 +3955,10 @@ fn execute_first_native_graph_nodes(
                         output_tensor.clone(),
                         Some(concat_output_target),
                     )?;
+                    dispatch_ctx
+                        .runtime
+                        .phase_ledger_mut()
+                        .record(append_clock, StepPhase::KvAppend);
                     // The concat dispatch pre-admitted its output directly
                     // under `output_resource_id` (mirroring Decision 3's
                     // existing optimization for every other node kind), so
@@ -3966,6 +3990,7 @@ fn execute_first_native_graph_nodes(
                 let pending_resource = TensorResourceId::new(format!(
                     "kv.{kv_cache_id}.layer{layer}.{role_str}.pending"
                 ));
+                let pending_clock = dispatch_ctx.runtime.phase_ledger().clock();
                 let pending_write_result: Result<(), TensorValueAdmissionError> =
                     match &output_tensor {
                         NodeValue::Resident { id, .. } => dispatch_ctx
@@ -4015,6 +4040,10 @@ fn execute_first_native_graph_nodes(
                         }
                     }
                 })?;
+                dispatch_ctx
+                    .runtime
+                    .phase_ledger_mut()
+                    .record(pending_clock, StepPhase::KvPendingWrite);
                 dispatch_ctx.node_events.push(
                     PerNodeCausalEvent::new(
                         InferenceApiObservationKind::KvUpdatePrepared,
@@ -4040,6 +4069,7 @@ fn execute_first_native_graph_nodes(
             // the value is explicitly (re-)written exactly as before.
             let output_shape = output_tensor.shape().to_vec();
             if needs_explicit_edge_write {
+                let edge_clock = dispatch_ctx.runtime.phase_ledger().clock();
                 let output_tensor = output_tensor.into_host(&dispatch_ctx.provider)?;
                 dispatch_ctx
                 .provider
@@ -4066,6 +4096,10 @@ fn execute_first_native_graph_nodes(
                         }
                     }
                 })?;
+                dispatch_ctx
+                    .runtime
+                    .phase_ledger_mut()
+                    .record(edge_clock, StepPhase::EdgeWrite);
             }
             bindings.insert(output_edge_id.clone(), (output_resource_id, output_shape));
         }
@@ -4106,8 +4140,13 @@ fn execute_first_native_graph_nodes(
     let dispatch_result = last_dispatch.ok_or_else(|| InferenceApiError::GenerationFailed {
         reason: "first-native graph executed no nodes".into(),
     })?;
+    let materialize_clock = dispatch_ctx.runtime.phase_ledger().clock();
     let materialized_bindings =
         materialize_first_native_graph_bindings(&*dispatch_ctx.provider, &bindings)?;
+    dispatch_ctx
+        .runtime
+        .phase_ledger_mut()
+        .record(materialize_clock, StepPhase::OutputMaterialize);
     Ok((dispatch_result, materialized_bindings, updated_layer_kv))
 }
 
@@ -4168,6 +4207,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         let forced_token = self.forced_token;
 
         let vocab = self.fixture.config.architecture.vocabulary_size as usize;
+        let kv_clock = runtime.phase_ledger().clock();
         let mut kv_state = if generated_tokens.is_empty() {
             self.create_prefill_kv_state(runtime, request)?
         } else {
@@ -4190,6 +4230,9 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             })?
         };
         self.discard_pending_kv_state(runtime, request)?;
+        runtime
+            .phase_ledger_mut()
+            .record(kv_clock, StepPhase::KvStatePrepare);
         // Both flags below (task 8.1) are only ever assigned immediately
         // after the check they attest to actually ran and passed for *this*
         // step -- never assumed from an earlier, one-time check (Model
@@ -4248,6 +4291,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // own choice of digest exactly -- see
             // `ProductionLoadedModel::component_digest`'s doc comment.
             let prompt_token_count = request.input_token_ids.len() as u64;
+            let graph_build_clock = runtime.phase_ledger().clock();
             let component_graphs = match &self.component_digest {
                 Some(digest) => build_first_native_graphs_from_named_component(
                     digest,
@@ -4261,6 +4305,9 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             .map_err(|error| InferenceApiError::GraphPlanningFailed {
                 reason: error.to_string(),
             })?;
+            runtime
+                .phase_ledger_mut()
+                .record(graph_build_clock, StepPhase::GraphBuild);
             // Weight resources are bound to an active Model Instance (task
             // 6.3), so graph execution needs its id to look them up.
             let GenerationModelReference::ModelInstance(model_instance) = &request.model else {
@@ -4273,7 +4320,11 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // `prepare_first_native_execution_plans` performed before the
             // generation loop started, which cannot see an instance
             // unloaded or invalidated between steps.
+            let instance_clock = runtime.phase_ledger().clock();
             require_ready_first_native_instance(&*runtime, model_instance)?;
+            runtime
+                .phase_ledger_mut()
+                .record(instance_clock, StepPhase::InstanceCheck);
             model_instance_ready = true;
             // The graph, not a hand-written Rust sequence, is the
             // authoritative recipe for prefill/decode execution (see
@@ -4338,6 +4389,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // Provider the pending K/V resources were actually written
             // under.
             kv_state.provider = Some(resolved_provider);
+            let logits_clock = runtime.phase_ledger().clock();
             let logits_tensor = bindings
                 .remove(&TensorEdgeId::new("logits"))
                 .ok_or_else(|| InferenceApiError::GenerationFailed {
@@ -4345,10 +4397,11 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                 })?;
             let output_rows = logits_tensor.data.len() / vocab.max(1);
             let last_row_start = output_rows.saturating_sub(1) * vocab;
-            (
-                dispatch,
-                logits_tensor.data[last_row_start..last_row_start + vocab].to_vec(),
-            )
+            let logits = logits_tensor.data[last_row_start..last_row_start + vocab].to_vec();
+            runtime
+                .phase_ledger_mut()
+                .record(logits_clock, StepPhase::LogitsExtract);
+            (dispatch, logits)
         };
         let kv_commit = if generated_tokens.is_empty() {
             RuntimeKvCacheCommit::PrefillCompleted {
@@ -4361,7 +4414,11 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                 tokens: 1,
             }
         };
+        let store_clock = runtime.phase_ledger().clock();
         self.store_pending_kv_state(request, kv_state.clone())?;
+        runtime
+            .phase_ledger_mut()
+            .record(store_clock, StepPhase::KvStateStore);
         let mut evidence = RuntimeGenerationExecutionEvidence::from_dispatch_result(
             &dispatch_result,
             model_instance_ready,
@@ -7339,6 +7396,22 @@ impl ProductionLoadedModel {
 
     pub fn materialization_count(&self) -> usize {
         self.materialization_count
+    }
+
+    /// Starts attributing every later generation step's host time to its
+    /// phases (A06). Off by default.
+    pub fn enable_phase_attribution(&mut self) {
+        self.runtime.phase_ledger_mut().enable();
+    }
+
+    /// Stops attribution and forgets anything not yet taken.
+    pub fn disable_phase_attribution(&mut self) {
+        self.runtime.phase_ledger_mut().disable();
+    }
+
+    /// Drains the steps attributed since the last call.
+    pub fn take_phase_attribution(&mut self) -> PhaseAttributionReport {
+        self.runtime.phase_ledger_mut().take_report()
     }
 
     pub fn generate(

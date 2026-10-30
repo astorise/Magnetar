@@ -43,6 +43,7 @@ use crate::model_instance::{
 };
 use crate::model_loading::{LoadedModelContext, ModelArchitectureImplementation};
 use crate::observability::{CorrelationId, RuntimeDiagnostic, RuntimeDiagnosticCode, TraceId};
+use crate::phase_attribution::PhaseLedger;
 use crate::planning::{
     BufferLifetime, ComputeExecutionPhase, ComputeExecutionPlan, ComputePlanningError,
     ExecutionConstraint, ExecutionDiagnostic, ExecutionInput, ExecutionOutput, ExecutionStep,
@@ -270,6 +271,7 @@ impl RuntimeBuilder {
             startup_diagnostics,
             initialized: true,
             trust: self.trust,
+            phases: PhaseLedger::default(),
         }
     }
 }
@@ -292,6 +294,8 @@ pub struct Runtime {
     /// accessor returns an owned or mutable copy, so nothing downstream of
     /// construction can substitute a different trust policy for a load.
     trust: ModelTrustStore,
+    /// Per-step phase attribution (A06); disabled unless a caller enables it.
+    phases: PhaseLedger,
 }
 impl Runtime {
     pub fn builder() -> RuntimeBuilder {
@@ -319,6 +323,12 @@ impl Runtime {
     }
     pub fn memory_mut(&mut self) -> &mut MemoryManager {
         &mut self.memory
+    }
+    pub fn phase_ledger(&self) -> &PhaseLedger {
+        &self.phases
+    }
+    pub fn phase_ledger_mut(&mut self) -> &mut PhaseLedger {
+        &mut self.phases
     }
     pub fn batching(&self) -> &ContinuousBatchingManager {
         &self.batching

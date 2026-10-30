@@ -1835,10 +1835,31 @@ impl PreparedExecutionPlanExecutor {
         context: &PlanGuardContext,
         node: &ExecutionNodeId,
     ) -> Result<PreparedPlanNodeExecution, PreparedExecutionPlanError> {
-        if !graph.nodes.contains_key(node) {
+        self.prepare_fingerprinted_node_execution(
+            &FingerprintedGraph::new(graph),
+            plan,
+            registry,
+            context,
+            node,
+        )
+    }
+
+    /// [`Self::prepare_node_execution`] against a graph fingerprinted once
+    /// up front, so executing every node of a graph fingerprints it once
+    /// rather than once per node. The plan is still checked against that
+    /// fingerprint for every node.
+    pub fn prepare_fingerprinted_node_execution(
+        &self,
+        graph: &FingerprintedGraph<'_>,
+        plan: &mut PreparedExecutionPlan,
+        registry: &KernelRegistry,
+        context: &PlanGuardContext,
+        node: &ExecutionNodeId,
+    ) -> Result<PreparedPlanNodeExecution, PreparedExecutionPlanError> {
+        if !graph.graph().nodes.contains_key(node) {
             return Err(PreparedExecutionPlanError::PlanNodeBindingMissing);
         }
-        if semantic_graph_fingerprint(graph) != plan.graph_fingerprint {
+        if graph.fingerprint() != &plan.graph_fingerprint {
             return Err(PreparedExecutionPlanError::PlanValidationFailed);
         }
         plan.execute_ready_path(context)?;
@@ -2243,6 +2264,32 @@ impl PreparedExecutionPlanError {
 
     pub const fn id(&self) -> &'static str {
         self.code().id()
+    }
+}
+
+/// A borrowed graph together with its semantic fingerprint, computed once.
+/// The borrow keeps the graph immutable for as long as the fingerprint is
+/// relied on.
+#[derive(Clone, Debug)]
+pub struct FingerprintedGraph<'g> {
+    graph: &'g ExecutionGraph,
+    fingerprint: ExecutionGraphSemanticFingerprint,
+}
+
+impl<'g> FingerprintedGraph<'g> {
+    pub fn new(graph: &'g ExecutionGraph) -> Self {
+        Self {
+            graph,
+            fingerprint: semantic_graph_fingerprint(graph),
+        }
+    }
+
+    pub fn graph(&self) -> &'g ExecutionGraph {
+        self.graph
+    }
+
+    pub fn fingerprint(&self) -> &ExecutionGraphSemanticFingerprint {
+        &self.fingerprint
     }
 }
 

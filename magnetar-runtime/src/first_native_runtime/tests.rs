@@ -9145,7 +9145,7 @@ fn check_graph_dispatch_ignores_kernel_registry_preference_change_after_plan_pub
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: Some(&mut plan),
-        graph: Some(&graph),
+        graph: Some(FingerprintedGraph::new(&graph)),
         sequence_length: Some(seq_len),
         last_provider_execution: None,
         node_events: &mut node_events,
@@ -10436,4 +10436,102 @@ fn resident_production_model_bookkeeping_stays_bounded_across_requests() {
             ),
         }
     }
+}
+
+/// `attribute-redacted-inference-costs` A06 (tasks 2.2/2.3): a request that
+/// crosses graph build, input upload, dispatch, materialization, sampling
+/// and commit is attributed per step with leaves that never exceed the
+/// step's wall time, device time and overlap are reported unavailable
+/// rather than guessed, and nothing request-specific -- here a sentinel in
+/// the prompt -- reaches the exported report.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn production_generation_steps_are_attributed_by_phase_without_leaking_the_prompt() {
+    use crate::phase_attribution::{CounterAvailability, StepKind, StepPhase};
+
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
+    let mut model = ProductionLoadedModel::load(
+        fixture.clone(),
+        &payload_source,
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        Arc::new(ReferenceCpuProvider::new()),
+    )
+    .expect("production loading succeeds");
+    let sentinel = "zq-sentinel-4b1d";
+    let request = || ProductionGenerationRequest {
+        prompt: PromptInput::PlainText(sentinel.into()),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(4),
+        max_generation_millis: None,
+    };
+
+    model
+        .generate(request(), None)
+        .expect("generation succeeds");
+    assert!(
+        model.take_phase_attribution().steps.is_empty(),
+        "attribution is off by default"
+    );
+
+    model.enable_phase_attribution();
+    let outcome = model
+        .generate(request(), None)
+        .expect("generation succeeds");
+    let report = model.take_phase_attribution();
+    let generated = outcome.result.output.usage.generated_tokens as u64;
+    assert_eq!(report.device_time, CounterAvailability::Unavailable);
+    assert_eq!(report.host_device_overlap, CounterAvailability::Unavailable);
+    assert_eq!(report.host_time, CounterAvailability::Measured);
+    assert_eq!(report.summary(StepKind::Prefill).unwrap().steps, 1);
+    assert_eq!(
+        report.summary(StepKind::Decode).unwrap().steps,
+        generated - 1
+    );
+    for step in &report.steps {
+        assert!(step.attributed_micros() <= step.wall_micros, "{step:?}");
+        let phases: Vec<StepPhase> = step.phases.iter().map(|(key, _)| key.phase).collect();
+        for expected in [
+            StepPhase::GraphBuild,
+            StepPhase::InstanceCheck,
+            StepPhase::KvStatePrepare,
+            StepPhase::InputUpload,
+            StepPhase::NodeInputResolve,
+            StepPhase::NodeDispatch,
+            StepPhase::KvPendingWrite,
+            StepPhase::OutputMaterialize,
+            StepPhase::LogitsExtract,
+            StepPhase::KvStateStore,
+            StepPhase::Sampling,
+            StepPhase::Commit,
+        ] {
+            assert!(phases.contains(&expected), "{expected:?} missing: {step:?}");
+        }
+        assert!(
+            step.phases
+                .iter()
+                .filter(|(key, _)| key.phase == StepPhase::NodeDispatch)
+                .all(|(key, _)| key.operator.is_some())
+        );
+    }
+    let decode = &report.steps[1];
+    assert!(
+        decode
+            .phases
+            .iter()
+            .any(|(key, _)| key.phase == StepPhase::KvAppend),
+        "decode appends to the KV history: {decode:?}"
+    );
+
+    let exported = serde_json::to_string(&report).unwrap();
+    assert!(!exported.contains(sentinel));
+    assert!(!exported.contains("kv."));
+    assert!(!exported.contains("edge."));
+    assert!(!exported.contains("session"));
+
+    model.disable_phase_attribution();
+    model
+        .generate(request(), None)
+        .expect("generation succeeds");
+    assert!(model.take_phase_attribution().steps.is_empty());
 }

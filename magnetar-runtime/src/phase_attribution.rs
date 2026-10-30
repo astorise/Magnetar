@@ -1,0 +1,338 @@
+//! Redacted per-step phase attribution (A06).
+//!
+//! When enabled, the Runtime times the leaves of every generation step on
+//! the host monotonic clock and keeps one record per step. Leaves never
+//! overlap, so their sum never exceeds the step's wall time; whatever the
+//! Runtime did that no leaf covers is reported as `unattributed` instead of
+//! being folded into a neighbour. Device-side timing is reported as
+//! unavailable until a Provider exposes real device timestamps, so host
+//! time spent waiting on the Device is not mistaken for Device time.
+//!
+//! Records carry only a closed vocabulary of phase and operator labels and
+//! counters: no request, session, cache, resource or node identifier, no
+//! prompt text, token id, tensor value or path can reach a record.
+//! Attribution is disabled by default and costs one branch per leaf then.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+/// How many step records a ledger keeps before dropping the oldest.
+pub const PHASE_ATTRIBUTION_STEP_CAPACITY: usize = 4096;
+
+/// The step a record belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepKind {
+    Prefill,
+    Decode,
+}
+
+/// One non-overlapping leaf of a generation step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepPhase {
+    /// Building the step's execution graphs through the model Component.
+    GraphBuild,
+    /// Re-checking that the Model Instance can still generate.
+    InstanceCheck,
+    /// Resolving or creating the step's KV state and discarding stale
+    /// pending KV writes.
+    KvStatePrepare,
+    /// Writing host-supplied graph inputs into Provider storage.
+    InputUpload,
+    /// Reading node inputs back from Provider storage, including any
+    /// host download of a non-resident input.
+    NodeInputResolve,
+    /// One node's Kernel dispatch, labelled by operator.
+    NodeDispatch,
+    /// Appending the step's K/V row to the history (the concat dispatch).
+    KvAppend,
+    /// Copying or writing the step's K/V into its pending resource.
+    KvPendingWrite,
+    /// Writing a node output whose Kernel could not write it in place.
+    EdgeWrite,
+    /// Downloading the graph's live edges to the host at the end of the step.
+    OutputMaterialize,
+    /// Copying the last row of logits out of the materialized output.
+    LogitsExtract,
+    /// Recording the step's pending KV state for commit.
+    KvStateStore,
+    /// Handing the step's logits to a caller-supplied observer.
+    LogitsObserve,
+    /// Sampling the next token.
+    Sampling,
+    /// Promoting the step's pending KV state and committing the token.
+    Commit,
+}
+
+/// Where a duration was measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockDomain {
+    HostMonotonic,
+}
+
+/// Whether a counter was measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CounterAvailability {
+    Measured,
+    Unavailable,
+}
+
+/// The operator labels a record may carry. Any operator name outside this
+/// list is reported as `other`, so a Component cannot smuggle text into a
+/// record through an operator name.
+const OPERATOR_LABELS: &[&str] = &[
+    "add",
+    "attention",
+    "concat",
+    "embedding",
+    "matmul",
+    "mul",
+    "residual-add",
+    "rmsnorm",
+    "rope",
+    "silu",
+    "softmax",
+    "split",
+];
+
+/// Maps an operator name to its closed-vocabulary label.
+pub fn operator_label(name: &str) -> &'static str {
+    OPERATOR_LABELS
+        .iter()
+        .find(|label| **label == name)
+        .copied()
+        .unwrap_or("other")
+}
+
+/// Accumulated host time of one `(phase, operator)` leaf within a step.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PhaseTotal {
+    pub count: u64,
+    pub host_micros: u64,
+}
+
+impl PhaseTotal {
+    fn add(&mut self, other: &PhaseTotal) {
+        self.count += other.count;
+        self.host_micros += other.host_micros;
+    }
+}
+
+/// The key of one leaf: its phase and, for dispatches, its operator label.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PhaseKey {
+    pub phase: StepPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+}
+
+/// One generation step's attribution.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StepAttribution {
+    /// Position of this step in the ledger since it was enabled. Not a
+    /// request or token identifier.
+    pub ordinal: u64,
+    pub kind: StepKind,
+    pub wall_micros: u64,
+    /// Leaf totals, sorted by key.
+    pub phases: Vec<(PhaseKey, PhaseTotal)>,
+}
+
+impl StepAttribution {
+    /// Host time covered by leaves.
+    pub fn attributed_micros(&self) -> u64 {
+        self.phases.iter().map(|(_, total)| total.host_micros).sum()
+    }
+
+    /// Wall time no leaf covers.
+    pub fn unattributed_micros(&self) -> u64 {
+        self.wall_micros.saturating_sub(self.attributed_micros())
+    }
+}
+
+#[derive(Debug)]
+struct OpenStep {
+    kind: StepKind,
+    started_at: Instant,
+    phases: BTreeMap<PhaseKey, PhaseTotal>,
+}
+
+/// The Runtime-owned ledger. Disabled until [`PhaseLedger::enable`].
+#[derive(Debug, Default)]
+pub struct PhaseLedger {
+    enabled: bool,
+    open: Option<OpenStep>,
+    steps: VecDeque<StepAttribution>,
+    next_ordinal: u64,
+    dropped_steps: u64,
+}
+
+/// A started leaf timer; `None` while attribution is disabled.
+#[derive(Clone, Copy, Debug)]
+pub struct PhaseClock(Option<Instant>);
+
+impl PhaseLedger {
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
+    /// Stops recording and forgets every record and any open step.
+    pub fn disable(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Starts a leaf timer.
+    pub fn clock(&self) -> PhaseClock {
+        PhaseClock((self.enabled && self.open.is_some()).then(Instant::now))
+    }
+
+    /// Opens a step. A step left open by a failed predecessor is discarded.
+    pub fn begin_step(&mut self, kind: StepKind) {
+        if self.enabled {
+            self.open = Some(OpenStep {
+                kind,
+                started_at: Instant::now(),
+                phases: BTreeMap::new(),
+            });
+        }
+    }
+
+    /// Records the time since `clock` started under `phase`.
+    pub fn record(&mut self, clock: PhaseClock, phase: StepPhase) {
+        self.record_key(
+            clock,
+            PhaseKey {
+                phase,
+                operator: None,
+            },
+        );
+    }
+
+    /// Records the time since `clock` started under `phase`, labelled by
+    /// the operator's closed-vocabulary label.
+    pub fn record_operator(&mut self, clock: PhaseClock, phase: StepPhase, operator: &str) {
+        self.record_key(
+            clock,
+            PhaseKey {
+                phase,
+                operator: Some(operator_label(operator).to_string()),
+            },
+        );
+    }
+
+    fn record_key(&mut self, clock: PhaseClock, key: PhaseKey) {
+        let (Some(started_at), Some(open)) = (clock.0, self.open.as_mut()) else {
+            return;
+        };
+        let total = open.phases.entry(key).or_default();
+        total.count += 1;
+        total.host_micros += micros(started_at.elapsed());
+    }
+
+    /// Closes the open step, if any, and keeps its record.
+    pub fn end_step(&mut self) {
+        let Some(open) = self.open.take() else {
+            return;
+        };
+        if self.steps.len() == PHASE_ATTRIBUTION_STEP_CAPACITY {
+            self.steps.pop_front();
+            self.dropped_steps += 1;
+        }
+        self.steps.push_back(StepAttribution {
+            ordinal: self.next_ordinal,
+            kind: open.kind,
+            wall_micros: micros(open.started_at.elapsed()),
+            phases: open.phases.into_iter().collect(),
+        });
+        self.next_ordinal += 1;
+    }
+
+    /// Drains the closed steps into a report. Recording stays enabled.
+    pub fn take_report(&mut self) -> PhaseAttributionReport {
+        let steps: Vec<StepAttribution> = self.steps.drain(..).collect();
+        let dropped_steps = std::mem::take(&mut self.dropped_steps);
+        PhaseAttributionReport::from_steps(steps, dropped_steps)
+    }
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Totals for every step of one kind.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StepKindSummary {
+    pub kind: StepKind,
+    pub steps: u64,
+    pub wall_micros: u64,
+    pub unattributed_micros: u64,
+    pub phases: Vec<(PhaseKey, PhaseTotal)>,
+}
+
+/// What [`PhaseLedger::take_report`] returns.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PhaseAttributionReport {
+    pub clock_domain: ClockDomain,
+    /// Every duration here is host time. Host time of a leaf that waits on
+    /// the Device includes that wait.
+    pub host_time: CounterAvailability,
+    pub device_time: CounterAvailability,
+    pub host_device_overlap: CounterAvailability,
+    /// Steps dropped because the ledger was full.
+    pub dropped_steps: u64,
+    pub summaries: Vec<StepKindSummary>,
+    pub steps: Vec<StepAttribution>,
+}
+
+impl PhaseAttributionReport {
+    fn from_steps(steps: Vec<StepAttribution>, dropped_steps: u64) -> Self {
+        let mut by_kind: BTreeMap<StepKind, (u64, u64, u64, BTreeMap<PhaseKey, PhaseTotal>)> =
+            BTreeMap::new();
+        for step in &steps {
+            let (count, wall, unattributed, phases) = by_kind.entry(step.kind).or_default();
+            *count += 1;
+            *wall += step.wall_micros;
+            *unattributed += step.unattributed_micros();
+            for (key, total) in &step.phases {
+                phases.entry(key.clone()).or_default().add(total);
+            }
+        }
+        Self {
+            clock_domain: ClockDomain::HostMonotonic,
+            host_time: CounterAvailability::Measured,
+            device_time: CounterAvailability::Unavailable,
+            host_device_overlap: CounterAvailability::Unavailable,
+            dropped_steps,
+            summaries: by_kind
+                .into_iter()
+                .map(
+                    |(kind, (steps, wall_micros, unattributed_micros, phases))| StepKindSummary {
+                        kind,
+                        steps,
+                        wall_micros,
+                        unattributed_micros,
+                        phases: phases.into_iter().collect(),
+                    },
+                )
+                .collect(),
+            steps,
+        }
+    }
+
+    pub fn summary(&self, kind: StepKind) -> Option<&StepKindSummary> {
+        self.summaries.iter().find(|summary| summary.kind == kind)
+    }
+}
+
+#[cfg(test)]
+#[path = "phase_attribution_tests.rs"]
+mod tests;

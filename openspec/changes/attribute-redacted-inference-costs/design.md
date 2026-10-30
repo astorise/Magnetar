@@ -12,6 +12,20 @@ Deliver the explicitly enumerated A06, D01 outcomes through Runtime telemetry; P
 
 Correlate phases with opaque local identifiers and explicit clock domains. Separate overlapping host and Device durations. Export opt-in redacted access sequences for an offline cache simulator; an offline optimum is an oracle bound, never an online policy.
 
+### Initial implemented profile (A06)
+
+The first increment attributes generation-step host time; D01 is not started.
+
+- `magnetar-runtime::phase_attribution` owns a Runtime-held `PhaseLedger`, disabled by default (`ProductionLoadedModel::enable_phase_attribution` / `disable_phase_attribution` / `take_phase_attribution`). Disabled, each leaf costs one branch and records nothing.
+- The generation loop opens one record per prefill or decode step and closes it before the streaming consumer runs, so consumer time is never attributed to the Runtime. Leaves are timed on the host monotonic clock and never nest: graph build through the model Component, Model Instance check, KV state preparation, graph input upload, per-node input resolution, per-node Kernel dispatch by operator, KV append, pending KV write, explicit edge write, output materialization, logits extraction, pending KV store, logits observation, sampling and commit. Wall time no leaf covers is reported as `unattributed`, so the leaves plus `unattributed` equal the step's wall time exactly, with no double counting.
+- Device time and host/Device overlap are reported as `unavailable`: no Provider exposes Device timestamps yet, and host time of a leaf that waits on the Device includes that wait.
+- Records carry a closed vocabulary only: phase names, operator labels from a fixed list (any other operator name becomes `other`), counts, durations and a ledger-local ordinal. No request, session, cache, resource or node identifier, token, tensor value, prompt text or path can reach a record. The ledger keeps at most 4096 steps and counts the ones it drops.
+- The diagnostic `real_checkpoint_decode_cost_profile` enables the ledger after warmup and reports host time per decode step by phase, locally and in GPU CI.
+
+### First finding: per-node plan revalidation
+
+The first attribution of a real Qwen2.5-0.5B decode step on Reference CPU showed every node dispatch paying about 5 ms regardless of its work: a one-row `add` cost as much as a projection. `PreparedExecutionPlanExecutor::prepare_node_execution` recomputed the semantic fingerprint of the whole graph (every node, edge and attribute formatted into one string) for every node it validated, so each step fingerprinted its ~460-node graph ~460 times. The check is unchanged, but the fingerprint is now computed once per graph execution (`FingerprintedGraph`) and every node is still validated against the plan with it. On Reference CPU, a small operator's dispatch dropped from ~5.4 ms to ~0.2 ms and decode TPOT from 9.2 s to 6.6 s; most of what remains there is Reference CPU copying weights per node, which device-resident Providers do not do.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
