@@ -139,9 +139,16 @@ fn run_campaign(target: CampaignTarget<'_>, hardware: HardwareCapabilityMatrix) 
         target.protocol.measured_runs,
     ));
 
+    let provider_name = provider_metadata.name.clone();
+    let mut phase_ordinals: BTreeMap<String, usize> = BTreeMap::new();
     let runs: Vec<RawRun> = phases
         .into_iter()
         .map(|phase| {
+            let phase_label = format!("{phase:?}").to_lowercase();
+            let ordinal = *phase_ordinals
+                .entry(phase_label.clone())
+                .and_modify(|count| *count += 1)
+                .or_insert(0);
             let probe = IntervalProbe::begin();
             let mut recorder = TraceRecorder::start();
             let mut token_ids = Vec::new();
@@ -159,19 +166,28 @@ fn run_campaign(target: CampaignTarget<'_>, hardware: HardwareCapabilityMatrix) 
                         if let GenerationStreamEvent::Token { token_id, .. } = event {
                             recorder.token();
                             token_ids.push(token_id);
+                            if token_ids.len().is_multiple_of(PROGRESS_TOKEN_INTERVAL) {
+                                eprintln!(
+                                    "[{provider_name}] {phase_label} #{ordinal}: {} / {} tokens",
+                                    token_ids.len(),
+                                    target.max_new_tokens
+                                );
+                            }
                         }
                         ControlFlow::Continue(())
                     },
                 )
                 .expect("the campaign's request generates");
             let usage = &outcome.result.output.usage;
-            RawRun {
+            let run = RawRun {
                 phase,
                 trace: recorder.finish(usage.prompt_tokens),
                 resources: probe.end(),
                 token_ids,
                 finish_reason: format!("{:?}", outcome.result.output.finish_reason),
-            }
+            };
+            report_progress(&provider_name, &phase_label, ordinal, &run, usage);
+            run
         })
         .collect();
     model
@@ -342,6 +358,63 @@ fn hardware_matrix(generated_on: Option<(&str, bool)>) -> HardwareCapabilityMatr
         });
     }
     HardwareCapabilityMatrix::new(host, entries)
+}
+
+/// Tokens between two in-request progress lines.
+const PROGRESS_TOKEN_INTERVAL: usize = 16;
+
+/// One line per finished request on stderr, and the same record appended
+/// to `<report dir>/progress-<provider>.jsonl`, so a campaign cut off by a
+/// timeout still leaves its completed requests behind. `step_ms` is the
+/// time the Runtime measured inside its own prefill/decode steps; the rest
+/// of the end-to-end latency is per-request work outside them.
+fn report_progress(
+    provider: &str,
+    phase: &str,
+    ordinal: usize,
+    run: &RawRun,
+    usage: &magnetar_runtime::GenerationUsage,
+) {
+    let metrics = run.trace.metrics();
+    let step_ms = usage
+        .prefill_duration_millis
+        .unwrap_or(0)
+        .saturating_add(usage.decode_duration_millis.unwrap_or(0));
+    let record = serde_json::json!({
+        "provider": provider,
+        "phase": phase,
+        "ordinal": ordinal,
+        "prompt_tokens": metrics.prompt_tokens,
+        "generated_tokens": metrics.generated_tokens,
+        "time_to_first_token_ms": metrics.time_to_first_token_ms,
+        "time_per_output_token_ms": metrics.time_per_output_token_ms,
+        "inter_token_latency_slope_ms_per_token": metrics.inter_token_latency_slope_ms_per_token,
+        "end_to_end_latency_ms": metrics.end_to_end_latency_ms,
+        "runtime_step_ms": step_ms,
+        "outside_step_ms": metrics.end_to_end_latency_ms - step_ms as f64,
+        "finish_reason": run.finish_reason,
+    });
+    eprintln!(
+        "[{provider}] {phase} #{ordinal}: {} tokens, TTFT {:.1} ms, TPOT {:.1} ms, \
+         ITL growth {:.2} ms/token, end-to-end {:.0} ms (runtime steps {step_ms} ms)",
+        metrics.generated_tokens,
+        metrics.time_to_first_token_ms.unwrap_or(f64::NAN),
+        metrics.time_per_output_token_ms.unwrap_or(f64::NAN),
+        metrics
+            .inter_token_latency_slope_ms_per_token
+            .unwrap_or(f64::NAN),
+        metrics.end_to_end_latency_ms,
+    );
+    if let Some(dir) = std::env::var_os("MAGNETAR_QUALIFICATION_REPORT_DIR").map(PathBuf::from) {
+        fs::create_dir_all(&dir).expect("report directory is creatable");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("progress-{provider}.jsonl")))
+            .expect("the progress file opens for appending");
+        std::io::Write::write_all(&mut file, format!("{record}\n").as_bytes())
+            .expect("the progress record is written");
+    }
 }
 
 fn write_report_if_requested(report: &CampaignReport) {
@@ -527,18 +600,12 @@ fn hardware_matrix_never_turns_discovery_or_absence_into_a_capability_claim() {
     );
 }
 
-/// Tasks 2.1/2.2, 4.2 and 5.1/5.2 on real data: the pinned real
-/// Qwen2.5-0.5B-Instruct checkpoint, loaded once, one cold request, one
-/// warmup and (by default) five measured requests on Reference CPU -- and
-/// the same campaign on CUDA when a CUDA Device is available.
-#[test]
-#[ignore = "downloads/holds a ~1GB real checkpoint; manual/nightly qualification profile only"]
-fn real_checkpoint_qualification_campaign() {
-    // Provider selection first: a GPU job that requires CUDA fails before
-    // spending minutes hashing and ingesting the checkpoint.
+/// The selected Providers that can run here, honoring
+/// `MAGNETAR_QUALIFICATION_REQUIRE_CUDA=1`.
+fn selected_real_providers() -> Vec<(&'static str, Arc<dyn Provider>)> {
     let selected = selected_providers();
     let require_cuda = std::env::var("MAGNETAR_QUALIFICATION_REQUIRE_CUDA").as_deref() == Ok("1");
-    let mut providers: Vec<(&str, Arc<dyn Provider>)> = Vec::new();
+    let mut providers: Vec<(&'static str, Arc<dyn Provider>)> = Vec::new();
     if selected.iter().any(|name| name == "reference-cpu") {
         providers.push(("reference-cpu", Arc::new(ReferenceCpuProvider::new())));
     }
@@ -554,13 +621,22 @@ fn real_checkpoint_qualification_campaign() {
             eprintln!("CUDA campaign skipped: no CUDA-capable Device available");
         }
     }
+    providers
+}
 
+/// The pinned real checkpoint, digest-verified, ingested and trusted.
+struct RealCheckpoint {
+    ingested: magnetar_runtime::production_model_ingestion::ProductionIngestionResult,
+    tokenizer_metadata: magnetar_runtime::tokenizer::TokenizerMetadata,
+    tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+    trust_store: ModelTrustStore,
+    checkpoint: CheckpointIdentity,
+}
+
+fn load_real_checkpoint(max_new_tokens: usize) -> RealCheckpoint {
     let dir = require_checkpoint_dir();
     let source = verified_checkpoint_source(&dir);
     register_real_qwen_component();
-    let max_new_tokens = env_usize("MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS", 16);
-    let measured_runs = env_usize("MAGNETAR_QUALIFICATION_MEASURED_RUNS", 5);
-
     let mut ingested = HuggingFaceIngestor::new()
         .ingest(&source)
         .expect("real Qwen2.5-0.5B-Instruct bundle ingests");
@@ -580,17 +656,43 @@ fn real_checkpoint_qualification_campaign() {
     )
     .expect("real tokenizer.json loads");
     let tokenizer_metadata = tokenizer.metadata().clone();
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
-    let checkpoint = CheckpointIdentity {
-        name: "Qwen/Qwen2.5-0.5B-Instruct".into(),
-        revision: Some(CHECKPOINT_REVISION.into()),
-        weights_digest: Some(CHECKPOINT_WEIGHTS_SHA256.into()),
-        // `verified_checkpoint_source` recomputed this digest from the
-        // downloaded bytes (it panics otherwise).
-        digest_verified: true,
-    };
+    RealCheckpoint {
+        ingested,
+        tokenizer_metadata,
+        tokenizer: Arc::new(tokenizer),
+        trust_store,
+        checkpoint: CheckpointIdentity {
+            name: "Qwen/Qwen2.5-0.5B-Instruct".into(),
+            revision: Some(CHECKPOINT_REVISION.into()),
+            weights_digest: Some(CHECKPOINT_WEIGHTS_SHA256.into()),
+            // `verified_checkpoint_source` recomputed this digest from the
+            // downloaded bytes (it panics otherwise).
+            digest_verified: true,
+        },
+    }
+}
+
+/// Tasks 2.1/2.2, 4.2 and 5.1/5.2 on real data: the pinned real
+/// Qwen2.5-0.5B-Instruct checkpoint, loaded once, one cold request, one
+/// warmup and (by default) five measured requests on Reference CPU -- and
+/// the same campaign on CUDA when a CUDA Device is available.
+#[test]
+#[ignore = "downloads/holds a ~1GB real checkpoint; manual/nightly qualification profile only"]
+fn real_checkpoint_qualification_campaign() {
+    // Provider selection first: a GPU job that requires CUDA fails before
+    // spending minutes hashing and ingesting the checkpoint.
+    let providers = selected_real_providers();
+    let max_new_tokens = env_usize("MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS", 16);
+    let measured_runs = env_usize("MAGNETAR_QUALIFICATION_MEASURED_RUNS", 5);
+    let RealCheckpoint {
+        ingested,
+        tokenizer_metadata,
+        tokenizer,
+        trust_store,
+        checkpoint,
+    } = load_real_checkpoint(max_new_tokens);
 
     for (device, provider) in providers {
         let fixture = production_model_fixture(
@@ -654,5 +756,160 @@ fn real_checkpoint_qualification_campaign() {
             report.exceptions,
         );
         write_report_if_requested(&report);
+    }
+}
+
+/// Positions per bucket in the decode cost profile.
+const PROFILE_BUCKET_TOKENS: usize = 8;
+/// `magnetar_runtime`'s crate-private `INFERENCE_API_OBSERVATION_BUFFER_CAPACITY`:
+/// the observer keeps only this many most recent events, so per-kind event
+/// counts from a longer request are a lower bound, flagged as truncated.
+const RUNTIME_OBSERVATION_BUFFER_CAPACITY: usize = 4096;
+
+/// Diagnostic, not a qualification gate: where a decode step's cost comes
+/// from. One warmed-up greedy request of `MAGNETAR_QUALIFICATION_PROFILE_TOKENS`
+/// (default 64) tokens per selected Provider, reporting inter-token latency
+/// by position bucket and its least-squares growth per token, the share of
+/// time the Runtime spent inside its own prefill/decode steps, and how many
+/// Runtime events (Kernel dispatches, Provider executions...) each token
+/// costs. A growing latency means a step's work depends on history length;
+/// a large outside-step share means per-request work around the steps. The
+/// profile is written to `decode-cost-profile-<provider>.json` in
+/// `MAGNETAR_QUALIFICATION_REPORT_DIR` and summarized to
+/// `MAGNETAR_QUALIFICATION_SUMMARY_PATH`.
+#[test]
+#[ignore = "downloads/holds a ~1GB real checkpoint; manual/nightly diagnostic only"]
+fn real_checkpoint_decode_cost_profile() {
+    let providers = selected_real_providers();
+    let tokens = env_usize("MAGNETAR_QUALIFICATION_PROFILE_TOKENS", 64);
+    let real = load_real_checkpoint(tokens);
+    for (device, provider) in providers {
+        let fixture = production_model_fixture(
+            real.ingested.manifest.clone(),
+            real.tokenizer_metadata.clone(),
+            Arc::clone(&real.tokenizer),
+        )
+        .unwrap();
+        let mut model = ProductionLoadedModel::load(
+            fixture,
+            real.ingested.payload_source.as_ref(),
+            real.trust_store.clone(),
+            provider,
+        )
+        .expect("the real checkpoint loads");
+        let request = |max_new_tokens| ProductionGenerationRequest {
+            prompt: PromptInput::PlainText(REAL_PROMPT.into()),
+            parameters: GenerationParameters::greedy(),
+            stop_conditions: StopConditions::default(),
+            max_new_tokens: Some(max_new_tokens),
+            max_generation_millis: None,
+        };
+        // Warm the Component compilation and Kernel preparation caches.
+        model
+            .generate(request(2), None)
+            .expect("warmup request generates");
+
+        let mut recorder = TraceRecorder::start();
+        let outcome = model
+            .generate_streaming(request(tokens), None, &mut |event| {
+                if let GenerationStreamEvent::Token { .. } = event {
+                    recorder.token();
+                }
+                ControlFlow::Continue(())
+            })
+            .expect("profile request generates");
+        let usage = outcome.result.output.usage.clone();
+        let metrics = recorder.finish(usage.prompt_tokens).metrics();
+        model.unload().expect("the real checkpoint unloads");
+
+        let buckets: Vec<serde_json::Value> = metrics
+            .inter_token_latencies_ms
+            .chunks(PROFILE_BUCKET_TOKENS)
+            .enumerate()
+            .map(|(bucket, latencies)| {
+                let first_position = usage.prompt_tokens + 1 + bucket * PROFILE_BUCKET_TOKENS;
+                serde_json::json!({
+                    "first_position": first_position,
+                    "tokens": latencies.len(),
+                    "mean_inter_token_latency_ms":
+                        latencies.iter().sum::<f64>() / latencies.len() as f64,
+                })
+            })
+            .collect();
+        let observations = outcome.observer.observations();
+        let truncated = observations.len() >= RUNTIME_OBSERVATION_BUFFER_CAPACITY;
+        let mut events_by_kind: BTreeMap<String, usize> = BTreeMap::new();
+        for observation in observations {
+            *events_by_kind
+                .entry(format!("{:?}", observation.kind))
+                .or_insert(0) += 1;
+        }
+        let step_ms = usage
+            .prefill_duration_millis
+            .unwrap_or(0)
+            .saturating_add(usage.decode_duration_millis.unwrap_or(0));
+        let profile = serde_json::json!({
+            "provider": device,
+            "prompt_tokens": usage.prompt_tokens,
+            "generated_tokens": metrics.generated_tokens,
+            "time_to_first_token_ms": metrics.time_to_first_token_ms,
+            "time_per_output_token_ms": metrics.time_per_output_token_ms,
+            "inter_token_latency_slope_ms_per_token": metrics.inter_token_latency_slope_ms_per_token,
+            "inter_token_latency_buckets": buckets,
+            "end_to_end_latency_ms": metrics.end_to_end_latency_ms,
+            "runtime_prefill_ms": usage.prefill_duration_millis,
+            "runtime_decode_ms": usage.decode_duration_millis,
+            "outside_runtime_steps_ms": metrics.end_to_end_latency_ms - step_ms as f64,
+            "runtime_events_by_kind": events_by_kind,
+            "runtime_events_truncated": truncated,
+        });
+        eprintln!("[{device}] decode cost profile: {profile}");
+        assert_eq!(
+            metrics.generated_tokens, tokens,
+            "every requested token is generated"
+        );
+
+        if let Some(dir) = std::env::var_os("MAGNETAR_QUALIFICATION_REPORT_DIR").map(PathBuf::from)
+        {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(format!("decode-cost-profile-{device}.json")),
+                serde_json::to_vec_pretty(&profile).unwrap(),
+            )
+            .unwrap();
+        }
+        if let Some(path) = std::env::var_os("MAGNETAR_QUALIFICATION_SUMMARY_PATH") {
+            let mut summary = format!(
+                "### Decode cost profile: {device}\n\n{} prompt tokens, {} generated. \
+                 TTFT {:.1} ms, TPOT {:.1} ms, ITL growth {:.3} ms/token; \
+                 {:.0} of {:.0} ms inside Runtime steps.\n\n\
+                 | First position | Tokens | Mean ITL (ms) |\n|---|---|---|\n",
+                usage.prompt_tokens,
+                metrics.generated_tokens,
+                metrics.time_to_first_token_ms.unwrap_or(f64::NAN),
+                metrics.time_per_output_token_ms.unwrap_or(f64::NAN),
+                metrics
+                    .inter_token_latency_slope_ms_per_token
+                    .unwrap_or(f64::NAN),
+                step_ms as f64,
+                metrics.end_to_end_latency_ms,
+            );
+            for bucket in profile["inter_token_latency_buckets"].as_array().unwrap() {
+                summary.push_str(&format!(
+                    "| {} | {} | {:.1} |\n",
+                    bucket["first_position"],
+                    bucket["tokens"],
+                    bucket["mean_inter_token_latency_ms"]
+                        .as_f64()
+                        .unwrap_or(f64::NAN)
+                ));
+            }
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            std::io::Write::write_all(&mut file, format!("{summary}\n").as_bytes()).unwrap();
+        }
     }
 }

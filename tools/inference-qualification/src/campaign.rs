@@ -146,6 +146,7 @@ pub struct WarmStatistics {
     pub end_to_end_latency_ms: Option<SampleSummary>,
     pub request_throughput_tokens_per_second: Option<SampleSummary>,
     pub decode_throughput_tokens_per_second: Option<SampleSummary>,
+    pub inter_token_latency_slope_ms_per_token: Option<SampleSummary>,
 }
 
 /// One cell of the concurrency x context x generation profile grid.
@@ -307,6 +308,11 @@ impl CampaignReport {
             &stats.decode_throughput_tokens_per_second,
             "tok/s",
         ));
+        out.push_str(&summary_row(
+            "ITL growth per token",
+            &stats.inter_token_latency_slope_ms_per_token,
+            "ms",
+        ));
         out.push_str(&format!(
             "\nQualifies production performance: **{}** ({} blocking exception(s)).\n",
             if self.verdict.qualifies_production_performance {
@@ -407,6 +413,9 @@ impl Campaign {
                 m.request_throughput_tokens_per_second
             }),
             decode_throughput_tokens_per_second: collect(|m| m.decode_throughput_tokens_per_second),
+            inter_token_latency_slope_ms_per_token: collect(|m| {
+                m.inter_token_latency_slope_ms_per_token
+            }),
         };
 
         let mut exceptions = Vec::new();

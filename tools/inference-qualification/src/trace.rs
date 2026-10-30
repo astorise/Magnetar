@@ -76,6 +76,30 @@ pub struct GenerationMetrics {
     pub request_throughput_tokens_per_second: Option<f64>,
     /// Tokens after the first over the decode span.
     pub decode_throughput_tokens_per_second: Option<f64>,
+    /// Least-squares slope of inter-token latency against token position:
+    /// how much each further decode step costs than the one before.
+    /// Near zero when a step's cost does not depend on history length.
+    pub inter_token_latency_slope_ms_per_token: Option<f64>,
+}
+
+/// Least-squares slope of `values` against their index. `None` for fewer
+/// than two values.
+pub fn latency_slope(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    let n = values.len() as f64;
+    let mean_x = (n - 1.0) / 2.0;
+    let mean_y = values.iter().sum::<f64>() / n;
+    let (covariance, variance) =
+        values
+            .iter()
+            .enumerate()
+            .fold((0.0, 0.0), |(covariance, variance), (index, value)| {
+                let dx = index as f64 - mean_x;
+                (covariance + dx * (value - mean_y), variance + dx * dx)
+            });
+    Some(covariance / variance)
 }
 
 impl GenerationTrace {
@@ -98,6 +122,7 @@ impl GenerationTrace {
             time_to_first_token_ms: offsets.first().copied().map(to_ms),
             time_per_output_token_ms: decode_span_ms
                 .map(|span| span / (generated_tokens - 1) as f64),
+            inter_token_latency_slope_ms_per_token: latency_slope(&inter_token_latencies_ms),
             inter_token_latencies_ms,
             end_to_end_latency_ms,
             request_throughput_tokens_per_second: (generated_tokens > 0

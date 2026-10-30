@@ -55,3 +55,19 @@ fn recorder_offsets_are_monotonic_and_bounded_by_completion() {
     assert!(trace.token_offsets_micros[0] <= trace.token_offsets_micros[1]);
     assert!(trace.token_offsets_micros[1] <= trace.completed_micros);
 }
+
+#[test]
+fn latency_slope_measures_per_token_cost_growth() {
+    assert_eq!(latency_slope(&[]), None);
+    assert_eq!(latency_slope(&[5.0]), None);
+    assert_eq!(latency_slope(&[5.0, 5.0, 5.0]), Some(0.0));
+    assert!((latency_slope(&[10.0, 12.0, 14.0, 16.0]).unwrap() - 2.0).abs() < 1e-12);
+    let metrics = GenerationTrace {
+        prompt_tokens: 1,
+        token_offsets_micros: vec![0, 10_000, 30_000, 60_000],
+        completed_micros: 60_000,
+    }
+    .metrics();
+    assert_eq!(metrics.inter_token_latencies_ms, vec![10.0, 20.0, 30.0]);
+    assert!((metrics.inter_token_latency_slope_ms_per_token.unwrap() - 10.0).abs() < 1e-12);
+}
