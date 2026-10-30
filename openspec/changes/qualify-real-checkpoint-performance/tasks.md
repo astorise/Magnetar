@@ -13,7 +13,7 @@
 ## 3. A02 Numerical and lifecycle reference corpus
 
 - [x] 3.1 Implement A02: The harness SHALL maintain checkpoint-bound token/logit references, per-dtype tolerances, and streaming, resume and cancellation checks against Reference CPU and each qualified Provider. Implemented by `tools/inference-qualification::numerics`, `ProductionLoadedModel::generate_streaming_with_logits` and `integration-tests/production-loading/src/tests_real_checkpoint_numerics.rs`, against the checked-in Reference CPU corpus.
-- [ ] 3.2 Add the positive conformance case: when CPU and CUDA execute the same pinned checkpoint and token inputs, verify logits and tokens are compared under the declared numerical profile and lifecycle events are checked. Implemented; the CUDA comparison runs in `gpu-runner-smoke.yml` and is checked once that job passes on real hardware.
+- [x] 3.2 Add the positive conformance case: when CPU and CUDA execute the same pinned checkpoint and token inputs, verify logits and tokens are compared under the declared numerical profile and lifecycle events are checked. GPU run 41008921749 (RTX 3060): CUDA tokens identical to the independent corpus, max |logit difference| 6.6e-5; streaming, cancellation and resume checks pass.
 - [x] 3.3 Add the failure/isolation case: when logits exceed the declared tolerance despite identical decoded text, verify qualification fails and preserves the differential evidence.
 
 ## 4. A03 Hardware capability evidence
