@@ -1,8 +1,9 @@
 //! Redacted per-step phase attribution (A06).
 //!
 //! When enabled, the Runtime times the leaves of every generation step on
-//! the host monotonic clock and keeps one record per step. Leaves never
-//! overlap, so their sum never exceeds the step's wall time; whatever the
+//! the host monotonic clock and keeps one record per step. A leaf records
+//! only its exclusive time: a leaf timed inside another is subtracted from
+//! the outer one, so their sum never exceeds the step's wall time; whatever the
 //! Runtime did that no leaf covers is reported as `unattributed` instead of
 //! being folded into a neighbour. Device-side timing is reported as
 //! unavailable until a Provider exposes real device timestamps, so host
@@ -32,7 +33,7 @@ pub enum StepKind {
     Decode,
 }
 
-/// One non-overlapping leaf of a generation step.
+/// One leaf of a generation step, timed exclusively of any leaf nested in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepPhase {
@@ -56,9 +57,19 @@ pub enum StepPhase {
     /// Reading node inputs back from Provider storage, including any
     /// host download of a non-resident input.
     NodeInputResolve,
-    /// One node's Kernel dispatch, labelled by operator.
+    /// One node's dispatch, labelled by operator, exclusive of the
+    /// dispatch leaves nested in it.
     NodeDispatch,
-    /// Appending the step's K/V row to the history (the concat dispatch).
+    /// Inside a dispatch: resolving the node's plan binding, Kernel
+    /// advertisement and dispatch plan.
+    KernelResolve,
+    /// Inside a dispatch: looking up the Operator specification.
+    OperatorCatalog,
+    /// Inside a dispatch: submitting the Kernel to the Provider and waiting
+    /// for its completion, labelled by operator.
+    KernelExecute,
+    /// Appending the step's K/V row to the history (the concat dispatch),
+    /// exclusive of the dispatch it contains.
     KvAppend,
     /// Copying or writing the step's K/V into its pending resource.
     KvPendingWrite,
@@ -72,6 +83,11 @@ pub enum StepPhase {
     KvStateStore,
     /// Handing the step's logits to a caller-supplied observer.
     LogitsObserve,
+    /// Publishing the step's Runtime observations (per-node causal events,
+    /// KV commits, token events) and validating its execution evidence.
+    StepObservation,
+    /// Building the step's execution evidence.
+    EvidenceBuild,
     /// Sampling the next token.
     Sampling,
     /// Promoting the step's pending KV state and committing the token.
@@ -171,6 +187,9 @@ struct OpenStep {
     kind: StepKind,
     started_at: Instant,
     phases: BTreeMap<PhaseKey, PhaseTotal>,
+    /// Host time recorded so far in this step; lets a leaf that contains
+    /// other leaves record only its own, exclusive time.
+    attributed_micros: u64,
 }
 
 /// The Runtime-owned ledger. Disabled until [`PhaseLedger::enable`].
@@ -185,7 +204,7 @@ pub struct PhaseLedger {
 
 /// A started leaf timer; `None` while attribution is disabled.
 #[derive(Clone, Copy, Debug)]
-pub struct PhaseClock(Option<Instant>);
+pub struct PhaseClock(Option<(Instant, u64)>);
 
 impl PhaseLedger {
     pub fn enable(&mut self) {
@@ -203,7 +222,12 @@ impl PhaseLedger {
 
     /// Starts a leaf timer.
     pub fn clock(&self) -> PhaseClock {
-        PhaseClock((self.enabled && self.open.is_some()).then(Instant::now))
+        PhaseClock(
+            self.open
+                .as_ref()
+                .filter(|_| self.enabled)
+                .map(|open| (Instant::now(), open.attributed_micros)),
+        )
     }
 
     /// Opens a step. A step left open by a failed predecessor is discarded.
@@ -213,6 +237,7 @@ impl PhaseLedger {
                 kind,
                 started_at: Instant::now(),
                 phases: BTreeMap::new(),
+                attributed_micros: 0,
             });
         }
     }
@@ -241,12 +266,18 @@ impl PhaseLedger {
     }
 
     fn record_key(&mut self, clock: PhaseClock, key: PhaseKey) {
-        let (Some(started_at), Some(open)) = (clock.0, self.open.as_mut()) else {
+        let (Some((started_at, attributed_before)), Some(open)) = (clock.0, self.open.as_mut())
+        else {
             return;
         };
+        // Leaves recorded while this one was running are excluded, so a
+        // leaf may contain others without any time being counted twice.
+        let nested = open.attributed_micros.saturating_sub(attributed_before);
+        let exclusive = micros(started_at.elapsed()).saturating_sub(nested);
+        open.attributed_micros += exclusive;
         let total = open.phases.entry(key).or_default();
         total.count += 1;
-        total.host_micros += micros(started_at.elapsed());
+        total.host_micros += exclusive;
     }
 
     /// Closes the open step, if any, and keeps its record.

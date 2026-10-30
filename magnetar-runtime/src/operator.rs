@@ -686,6 +686,14 @@ pub fn validate_affinity_compatibility(
         })
 }
 
+/// [`initial_operator_catalog`], built once per process. The catalog is a
+/// constant, so hot paths look Operators up here instead of rebuilding it
+/// for every dispatch.
+pub fn shared_initial_operator_catalog() -> &'static OperatorCatalog {
+    static CATALOG: std::sync::OnceLock<OperatorCatalog> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(initial_operator_catalog)
+}
+
 pub fn initial_operator_catalog() -> OperatorCatalog {
     let floats = [
         ComputeDType::Float16,

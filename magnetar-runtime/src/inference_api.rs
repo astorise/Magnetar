@@ -1786,6 +1786,7 @@ fn run_generation_loop_inner(
             decode_step_ran = true;
             decode_millis_total = decode_millis_total.saturating_add(step_millis);
         }
+        let observation_clock = runtime.phase_ledger().clock();
         if runtime_step.evidence.model_instance_ready {
             observer.observe(
                 InferenceApiObservationKind::ModelInstanceReady,
@@ -1895,6 +1896,9 @@ fn run_generation_loop_inner(
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
             return Err(error);
         }
+        runtime
+            .phase_ledger_mut()
+            .record(observation_clock, StepPhase::StepObservation);
         if let Some(on_logits) = on_logits.as_deref_mut() {
             let clock = runtime.phase_ledger().clock();
             on_logits(&runtime_step.logits);
@@ -1932,6 +1936,7 @@ fn run_generation_loop_inner(
         runtime
             .phase_ledger_mut()
             .record(commit_clock, StepPhase::Commit);
+        let observation_clock = runtime.phase_ledger().clock();
         if let Some(commit) = &runtime_step.kv_commit {
             let commit_context = match commit {
                 RuntimeKvCacheCommit::PrefillCompleted { cache, tokens } => vec![
@@ -2016,6 +2021,9 @@ fn run_generation_loop_inner(
             observation_message("token committed", &token_context),
             correlation_id.clone(),
         );
+        runtime
+            .phase_ledger_mut()
+            .record(observation_clock, StepPhase::StepObservation);
         // The consumer's own time is not part of the step.
         runtime.phase_ledger_mut().end_step();
         if let Some(on_token) = on_token.as_deref_mut()

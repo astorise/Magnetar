@@ -2186,6 +2186,7 @@ fn dispatch_reference_cpu_operator_multi(
     // path (`prepared_candidate_for_operation`) survives only for callers
     // that have a `PreparedExecutionPlan` but no full `ExecutionGraph` to
     // revalidate it against -- hand-written test oracles, never production.
+    let resolve_clock = ctx.runtime.phase_ledger().clock();
     let selection = match (ctx.prepared_plan.as_deref_mut(), ctx.graph.as_ref()) {
         (Some(prepared_plan), Some(graph)) => {
             let guard_context = first_native_plan_context(
@@ -2289,12 +2290,20 @@ fn dispatch_reference_cpu_operator_multi(
         .map_err(|error| InferenceApiError::KernelUnavailable {
             reason: format!("{error:?}"),
         })?;
-    let operator_catalog = initial_operator_catalog();
+    ctx.runtime
+        .phase_ledger_mut()
+        .record(resolve_clock, StepPhase::KernelResolve);
+    let catalog_clock = ctx.runtime.phase_ledger().clock();
+    let operator_catalog = shared_initial_operator_catalog();
     let operator_spec = operator_catalog
         .get(&advertisement.implemented_operator)
         .map_err(|error| InferenceApiError::KernelUnavailable {
             reason: error.to_string(),
         })?;
+    ctx.runtime
+        .phase_ledger_mut()
+        .record(catalog_clock, StepPhase::OperatorCatalog);
+    let execute_clock = ctx.runtime.phase_ledger().clock();
     // Provider submission/completion identity (Correctif 2): `submit_kernel`
     // is what causally triggers the numerical Kernel work (Reference CPU is
     // synchronous, so it runs as part of this call); the returned handle is
@@ -2338,6 +2347,11 @@ fn dispatch_reference_cpu_operator_multi(
             ),
         }
     })?;
+    ctx.runtime.phase_ledger_mut().record_operator(
+        execute_clock,
+        StepPhase::KernelExecute,
+        advertisement.implemented_operator.name(),
+    );
     let dispatch_result = KernelDispatchResult::from_kernel_result(&plan, kernel_result);
     if dispatch_result.status != KernelResultStatus::Succeeded {
         return Err(InferenceApiError::ProviderUnavailable {
@@ -2707,7 +2721,7 @@ fn dispatch_qwen_concat(
         .provider
         .submit_kernel(
             &advertisement,
-            initial_operator_catalog()
+            shared_initial_operator_catalog()
                 .get(&advertisement.implemented_operator)
                 .map_err(|error| InferenceApiError::KernelUnavailable {
                     reason: error.to_string(),
@@ -4489,6 +4503,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         runtime
             .phase_ledger_mut()
             .record(store_clock, StepPhase::KvStateStore);
+        let evidence_clock = runtime.phase_ledger().clock();
         let mut evidence = RuntimeGenerationExecutionEvidence::from_dispatch_result(
             &dispatch_result,
             model_instance_ready,
@@ -4505,6 +4520,9 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         if let Some(session) = &request.session {
             evidence = evidence.with_context(format!("session={session}"));
         }
+        runtime
+            .phase_ledger_mut()
+            .record(evidence_clock, StepPhase::EvidenceBuild);
         Ok(RuntimeModelExecutionStep::new(logits, evidence)
             .with_kv_commit(kv_commit)
             .with_node_events(node_events))

@@ -97,3 +97,30 @@ fn disabling_forgets_records_and_an_open_step() {
     ledger.end_step();
     assert!(ledger.take_report().steps.is_empty());
 }
+
+#[test]
+fn a_nested_leaf_is_subtracted_from_the_leaf_containing_it() {
+    let mut ledger = PhaseLedger::default();
+    ledger.enable();
+    ledger.begin_step(StepKind::Decode);
+    let outer = ledger.clock();
+    spin(Duration::from_millis(3));
+    let inner = ledger.clock();
+    spin(Duration::from_millis(6));
+    ledger.record_operator(inner, StepPhase::KernelExecute, "matmul");
+    ledger.record_operator(outer, StepPhase::NodeDispatch, "matmul");
+    ledger.end_step();
+    let step = &ledger.take_report().steps[0];
+    let time = |phase| {
+        step.phases
+            .iter()
+            .find(|(key, _)| key.phase == phase)
+            .unwrap()
+            .1
+            .host_micros
+    };
+    assert!(time(StepPhase::KernelExecute) >= 6_000);
+    let dispatch = time(StepPhase::NodeDispatch);
+    assert!((3_000..6_000).contains(&dispatch), "{dispatch}");
+    assert!(step.attributed_micros() <= step.wall_micros);
+}
