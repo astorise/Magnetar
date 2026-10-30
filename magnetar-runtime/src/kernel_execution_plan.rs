@@ -1609,6 +1609,30 @@ impl PreparedExecutionPlan {
         Ok(())
     }
 
+    /// [`Self::add_node_binding`] for many bindings at once: every binding
+    /// is validated before any is added, and the plan fingerprint is
+    /// recomputed once instead of once per binding.
+    pub fn add_node_bindings(
+        &mut self,
+        bindings: Vec<PlanNodeBinding>,
+    ) -> Result<(), PreparedExecutionPlanError> {
+        for binding in &bindings {
+            binding.validate()?;
+        }
+        for binding in bindings {
+            self.node_bindings.push(binding);
+            self.observe(PreparedExecutionPlanObservationKind::PlanNodeBound);
+        }
+        self.fingerprint = plan_fingerprint(
+            &self.id,
+            self.generation,
+            &self.graph_fingerprint,
+            &self.scope,
+            &self.node_bindings,
+        )?;
+        Ok(())
+    }
+
     pub fn add_segment(
         &mut self,
         segment: PreparedExecutionSegment,

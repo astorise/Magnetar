@@ -6161,6 +6161,7 @@ fn build_runtime_with_model_execution_engine_and_forced_token(
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             component_digest: None,
             forced_token,
+            graph_cache: None,
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -9396,6 +9397,7 @@ fn new_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelExecutionEngi
         pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
         component_digest: None,
         forced_token: None,
+        graph_cache: None,
     }
 }
 
@@ -10488,8 +10490,28 @@ fn production_generation_steps_are_attributed_by_phase_without_leaking_the_promp
         report.summary(StepKind::Decode).unwrap().steps,
         generated - 1
     );
+    let preparation = report.summary(StepKind::RequestPreparation).unwrap();
+    assert_eq!(preparation.steps, 1);
+    let preparation_phases: Vec<StepPhase> = preparation
+        .phases
+        .iter()
+        .map(|(key, _)| key.phase)
+        .collect();
+    assert_eq!(
+        preparation_phases,
+        vec![
+            StepPhase::SessionCreate,
+            StepPhase::Tokenize,
+            StepPhase::PlanPrepare,
+            StepPhase::RequestValidate,
+            StepPhase::GraphBuild,
+        ]
+    );
     for step in &report.steps {
         assert!(step.attributed_micros() <= step.wall_micros, "{step:?}");
+        if step.kind == StepKind::RequestPreparation {
+            continue;
+        }
         let phases: Vec<StepPhase> = step.phases.iter().map(|(key, _)| key.phase).collect();
         for expected in [
             StepPhase::GraphBuild,
@@ -10514,7 +10536,11 @@ fn production_generation_steps_are_attributed_by_phase_without_leaking_the_promp
                 .all(|(key, _)| key.operator.is_some())
         );
     }
-    let decode = &report.steps[1];
+    let decode = report
+        .steps
+        .iter()
+        .find(|step| step.kind == StepKind::Decode)
+        .unwrap();
     assert!(
         decode
             .phases
@@ -10527,11 +10553,78 @@ fn production_generation_steps_are_attributed_by_phase_without_leaking_the_promp
     assert!(!exported.contains(sentinel));
     assert!(!exported.contains("kv."));
     assert!(!exported.contains("edge."));
-    assert!(!exported.contains("session"));
+    assert!(!exported.contains("session-"));
+    assert!(!exported.contains("request="));
 
     model.disable_phase_attribution();
     model
         .generate(request(), None)
         .expect("generation succeeds");
     assert!(model.take_phase_attribution().steps.is_empty());
+}
+
+/// `cache-and-optimize-prepared-graphs`: a loaded model builds its graphs
+/// once per prompt length, plans and every step of the request use those
+/// same graphs, and the cache keeps at most
+/// `COMPONENT_GRAPH_CACHE_CAPACITY` prompt lengths, most recent last.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn resident_production_model_reuses_component_graphs_per_prompt_length() {
+    use crate::phase_attribution::{StepKind, StepPhase};
+
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
+    let mut model = ProductionLoadedModel::load(
+        fixture.clone(),
+        &payload_source,
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        Arc::new(ReferenceCpuProvider::new()),
+    )
+    .expect("production loading succeeds");
+    let request = |prompt: String| ProductionGenerationRequest {
+        prompt: PromptInput::PlainText(prompt),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(3),
+        max_generation_millis: None,
+    };
+    let first = model.generate(request("hi".into()), None).unwrap();
+    let prompt_tokens = first.result.output.usage.prompt_tokens as u64;
+    assert_eq!(model.graph_cache.prompt_lengths(), vec![prompt_tokens]);
+
+    model.enable_phase_attribution();
+    let again = model.generate(request("hi".into()), None).unwrap();
+    assert_eq!(
+        again.result.output.generated_token_ids, first.result.output.generated_token_ids,
+        "cached graphs generate the same tokens"
+    );
+    assert_eq!(model.graph_cache.prompt_lengths(), vec![prompt_tokens]);
+    let report = model.take_phase_attribution();
+    for step in &report.steps {
+        let graph_builds = step
+            .phases
+            .iter()
+            .filter(|(key, _)| key.phase == StepPhase::GraphBuild)
+            .count();
+        assert_eq!(graph_builds, 1, "{step:?}");
+    }
+    assert_eq!(report.summary(StepKind::Decode).unwrap().steps, 2);
+
+    let mut lengths = vec![prompt_tokens];
+    for words in 2..=COMPONENT_GRAPH_CACHE_CAPACITY + 3 {
+        let prompt = "h".repeat(words);
+        let outcome = model.generate(request(prompt), None).unwrap();
+        let length = outcome.result.output.usage.prompt_tokens as u64;
+        lengths.retain(|known| *known != length);
+        lengths.push(length);
+    }
+    let expected: Vec<u64> = lengths
+        .iter()
+        .copied()
+        .skip(lengths.len().saturating_sub(COMPONENT_GRAPH_CACHE_CAPACITY))
+        .collect();
+    assert!(
+        lengths.len() > COMPONENT_GRAPH_CACHE_CAPACITY,
+        "{lengths:?}"
+    );
+    assert_eq!(model.graph_cache.prompt_lengths(), expected);
 }

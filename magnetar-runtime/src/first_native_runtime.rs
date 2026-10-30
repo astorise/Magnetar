@@ -47,7 +47,7 @@ use crate::model_instance::*;
 use crate::model_loading::*;
 use crate::operator::*;
 use crate::operator_scope::*;
-use crate::phase_attribution::{PhaseAttributionReport, StepPhase};
+use crate::phase_attribution::{PhaseAttributionReport, StepKind, StepPhase};
 use crate::prefix_cache::*;
 use crate::provider::*;
 use crate::qwen_model_component;
@@ -61,7 +61,7 @@ use crate::tokenizer::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     sync::{
         Arc, Mutex,
@@ -1238,6 +1238,60 @@ struct E2eRuntimeModelExecutionEngine {
     /// struct-embedded test-only field is dropping the `cfg` and keeping the
     /// field, and its value, identical in every build.
     forced_token: Option<TokenId>,
+    /// Graphs already built for this model, shared with the
+    /// `ProductionLoadedModel` that prepared their plans. `None` builds the
+    /// graphs again for every step.
+    graph_cache: Option<ComponentGraphCache>,
+}
+
+/// How many prompt lengths' graphs one loaded model keeps.
+pub(crate) const COMPONENT_GRAPH_CACHE_CAPACITY: usize = 8;
+
+/// The execution graphs one loaded model's Component built, by prompt
+/// length. A loaded model's Component, architecture and identity never
+/// change, so the prompt length is the only input left that the graphs
+/// depend on. Plans are prepared against these exact graphs and every step
+/// dispatches them, so a step can never execute a graph other than the one
+/// its plan was fingerprinted against. Bounded, least recently used first
+/// out.
+#[derive(Clone, Default)]
+pub(crate) struct ComponentGraphCache {
+    entries: Arc<Mutex<VecDeque<CachedComponentGraphs>>>,
+}
+
+/// One prompt length's graphs.
+type CachedComponentGraphs = (u64, Arc<FirstNativeComponentGraphs>);
+
+impl ComponentGraphCache {
+    pub(crate) fn get(&self, prompt_token_count: u64) -> Option<Arc<FirstNativeComponentGraphs>> {
+        let mut entries = self.entries.lock().unwrap();
+        let index = entries
+            .iter()
+            .position(|(count, _)| *count == prompt_token_count)?;
+        let entry = entries.remove(index)?;
+        let graphs = Arc::clone(&entry.1);
+        entries.push_back(entry);
+        Some(graphs)
+    }
+
+    pub(crate) fn insert(&self, prompt_token_count: u64, graphs: Arc<FirstNativeComponentGraphs>) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|(count, _)| *count != prompt_token_count);
+        if entries.len() == COMPONENT_GRAPH_CACHE_CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back((prompt_token_count, graphs));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prompt_lengths(&self) -> Vec<u64> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(count, _)| *count)
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4292,19 +4346,35 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // `ProductionLoadedModel::component_digest`'s doc comment.
             let prompt_token_count = request.input_token_ids.len() as u64;
             let graph_build_clock = runtime.phase_ledger().clock();
-            let component_graphs = match &self.component_digest {
-                Some(digest) => build_first_native_graphs_from_named_component(
-                    digest,
-                    &architecture_config_from_first_native_model_config(&self.fixture.config),
-                    &self.fixture.identity,
-                    prompt_token_count,
-                )
-                .map(|(graphs, _definition, _instance)| graphs),
-                None => first_native_component_graphs_for_prompt(&self.fixture, prompt_token_count),
-            }
-            .map_err(|error| InferenceApiError::GraphPlanningFailed {
-                reason: error.to_string(),
-            })?;
+            let cached_graphs = self
+                .graph_cache
+                .as_ref()
+                .and_then(|cache| cache.get(prompt_token_count));
+            let component_graphs = match cached_graphs {
+                Some(graphs) => graphs,
+                None => Arc::new(
+                    match &self.component_digest {
+                        Some(digest) => build_first_native_graphs_from_named_component(
+                            digest,
+                            &architecture_config_from_first_native_model_config(
+                                &self.fixture.config,
+                            ),
+                            &self.fixture.identity,
+                            prompt_token_count,
+                        )
+                        .map(|(graphs, _definition, _instance)| graphs),
+                        None => first_native_component_graphs_for_prompt(
+                            &self.fixture,
+                            prompt_token_count,
+                        ),
+                    }
+                    .map_err(|error| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: error.to_string(),
+                        }
+                    })?,
+                ),
+            };
             runtime
                 .phase_ledger_mut()
                 .record(graph_build_clock, StepPhase::GraphBuild);
@@ -4963,6 +5033,7 @@ fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             component_digest: None,
             forced_token: None,
+            graph_cache: None,
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -4997,6 +5068,7 @@ fn build_runtime_with_model_execution_engine_and_provider(
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             component_digest: None,
             forced_token: None,
+            graph_cache: None,
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -7100,6 +7172,7 @@ fn prepare_production_generation(
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             component_digest: None,
             forced_token: None,
+            graph_cache: None,
         }))
         .trust_store(trust_store)
         .build()
@@ -7279,6 +7352,8 @@ pub struct ProductionLoadedModel {
     /// Component. `None` preserves the pre-existing hardcoded-singleton
     /// behavior exactly, unchanged.
     component_digest: Option<ComponentDigest>,
+    /// Shared with this instance's execution engine.
+    graph_cache: ComponentGraphCache,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -7353,6 +7428,7 @@ impl ProductionLoadedModel {
         }
         let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
         let provider_supports_multi_step_decode = provider.supports_multi_step_decode();
+        let graph_cache = ComponentGraphCache::default();
         let mut runtime = Runtime::builder()
             .register_provider(provider.clone())
             .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
@@ -7361,6 +7437,7 @@ impl ProductionLoadedModel {
                 pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
                 component_digest: component_digest.clone(),
                 forced_token: None,
+                graph_cache: Some(graph_cache.clone()),
             }))
             .trust_store(trust_store)
             .build()
@@ -7387,6 +7464,7 @@ impl ProductionLoadedModel {
             provider_supports_multi_step_decode,
             materialization_count: 1,
             component_digest,
+            graph_cache,
         })
     }
 
@@ -7602,7 +7680,15 @@ impl ProductionLoadedModel {
             correlation_id: None,
             created_at_millis: 0,
         };
+        self.runtime
+            .phase_ledger_mut()
+            .begin_step(StepKind::RequestPreparation);
+        let clock = self.runtime.phase_ledger().clock();
         let session = create_inference_session(&mut self.runtime, session_request)?;
+        self.runtime
+            .phase_ledger_mut()
+            .record(clock, StepPhase::SessionCreate);
+        let clock = self.runtime.phase_ledger().clock();
         let tokenized = tokenize_prompt_input(
             &self.fixture.tokenizer,
             TokenizationRequest::new(prompt),
@@ -7618,29 +7704,51 @@ impl ProductionLoadedModel {
                     reason: error.to_string(),
                 },
             )?;
+        self.runtime
+            .phase_ledger_mut()
+            .record(clock, StepPhase::Tokenize);
         let observer = InferenceApiObserver::new();
         let prompt_token_count = tokenized.token_ids.len() as u64;
-        let component_graphs = match &self.component_digest {
-            Some(digest) => build_first_native_graphs_from_named_component(
-                digest,
-                &architecture_config_from_first_native_model_config(&self.fixture.config),
-                &self.fixture.identity,
-                prompt_token_count,
-            )
-            .map(|(graphs, _definition, _instance)| graphs),
-            None => build_first_native_graphs_from_real_qwen_component(
-                &self.fixture,
-                prompt_token_count,
-            )
-            .map(|(graphs, _definition, _instance)| graphs),
-        }
-        .map_err(|error| InferenceApiError::GraphPlanningFailed {
-            reason: error.to_string(),
-        })?;
+        let clock = self.runtime.phase_ledger().clock();
+        let component_graphs = match self.graph_cache.get(prompt_token_count) {
+            Some(graphs) => graphs,
+            None => {
+                let graphs = Arc::new(
+                    match &self.component_digest {
+                        Some(digest) => build_first_native_graphs_from_named_component(
+                            digest,
+                            &architecture_config_from_first_native_model_config(
+                                &self.fixture.config,
+                            ),
+                            &self.fixture.identity,
+                            prompt_token_count,
+                        )
+                        .map(|(graphs, _definition, _instance)| graphs),
+                        None => build_first_native_graphs_from_real_qwen_component(
+                            &self.fixture,
+                            prompt_token_count,
+                        )
+                        .map(|(graphs, _definition, _instance)| graphs),
+                    }
+                    .map_err(|error| {
+                        InferenceApiError::GraphPlanningFailed {
+                            reason: error.to_string(),
+                        }
+                    })?,
+                );
+                self.graph_cache
+                    .insert(prompt_token_count, Arc::clone(&graphs));
+                graphs
+            }
+        };
+        self.runtime
+            .phase_ledger_mut()
+            .record(clock, StepPhase::GraphBuild);
+        let clock = self.runtime.phase_ledger().clock();
         let prepared_plans = prepare_first_native_execution_plans_for_provider(
             &self.runtime,
             &self.instance,
-            component_graphs,
+            FirstNativeComponentGraphs::clone(&component_graphs),
             tokenized.token_ids.len() as u64,
             &self.provider_binding,
         )
@@ -7658,7 +7766,15 @@ impl ProductionLoadedModel {
             stop_conditions,
             StreamingMode::TokenIds,
         );
+        self.runtime
+            .phase_ledger_mut()
+            .record(clock, StepPhase::PlanPrepare);
+        let clock = self.runtime.phase_ledger().clock();
         let generation_request = prepare_generation(&self.runtime, generation_request)?;
+        self.runtime
+            .phase_ledger_mut()
+            .record(clock, StepPhase::RequestValidate);
+        self.runtime.phase_ledger_mut().end_step();
         Ok(PreparedResidentProductionGeneration {
             session,
             generation_request,
@@ -8745,6 +8861,7 @@ fn filter_manifest_for_layer_range(
 /// engine). Public so an external caller with its own real Provider (see
 /// `run_first_native_graph_with_provider`) can obtain the same real graph
 /// production drives, via [`build_first_native_graphs_from_real_qwen_component`].
+#[derive(Clone)]
 pub struct FirstNativeComponentGraphs {
     pub prefill: ExecutionGraph,
     pub prefill_node_count: usize,
@@ -8816,6 +8933,7 @@ fn prepare_first_native_plan_for_graph(
         .with_provider(provider.clone())
         .with_execution_context(runtime.context().id());
 
+    let mut bindings = Vec::with_capacity(graph.nodes.len());
     for (node_id, node) in &graph.nodes {
         let node_affinity = node
             .resource_affinity
@@ -8892,8 +9010,9 @@ fn prepare_first_native_plan_for_graph(
         if let Some(profile) = candidate.kernel.conformance_profile {
             binding = binding.with_qualification_profile(profile);
         }
-        plan.add_node_binding(binding)?;
+        bindings.push(binding);
     }
+    plan.add_node_bindings(bindings)?;
 
     plan.set_resource_plan(ResourceBindingPlan::default())?;
     plan.set_memory_requirements(PlanMemoryRequirements::default())?;

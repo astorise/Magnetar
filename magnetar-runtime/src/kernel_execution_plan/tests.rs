@@ -240,6 +240,34 @@ fn plan_fingerprint_changes_when_node_binding_changes() {
 }
 
 #[test]
+fn adding_node_bindings_at_once_matches_adding_them_one_by_one() {
+    let bindings: Vec<PlanNodeBinding> = ["matmul", "rmsnorm", "attention"]
+        .into_iter()
+        .map(|name| prepared_binding(name, 1))
+        .collect();
+    let mut one_by_one = test_plan();
+    for binding in bindings.clone() {
+        one_by_one.add_node_binding(binding).unwrap();
+    }
+    let mut at_once = test_plan();
+    at_once.add_node_bindings(bindings).unwrap();
+    assert_eq!(at_once, one_by_one);
+
+    let mut rejected = test_plan();
+    let before = rejected.clone();
+    let invalid = PlanNodeBinding {
+        graph_nodes: BTreeSet::new(),
+        ..prepared_binding("silu", 1)
+    };
+    assert!(
+        rejected
+            .add_node_bindings(vec![prepared_binding("add", 1), invalid])
+            .is_err()
+    );
+    assert_eq!(rejected, before, "an invalid binding adds none of them");
+}
+
+#[test]
 fn native_handle_boundary_rejects_and_redacts_pointer_shaped_data() {
     assert!(ProviderPreparedSegmentId::new("cuda-graph-1").is_ok());
     assert!(ProviderPreparedSegmentId::new("0xdeadbeef").is_err());

@@ -854,7 +854,8 @@ fn real_checkpoint_decode_cost_profile() {
         let metrics = recorder.finish(usage.prompt_tokens).metrics();
         let attribution = model.take_phase_attribution();
         model.unload().expect("the real checkpoint unloads");
-        let decode_phases = decode_phase_rows(&attribution);
+        let decode_phases = phase_rows(&attribution, StepKind::Decode);
+        let preparation_phases = phase_rows(&attribution, StepKind::RequestPreparation);
 
         let buckets: Vec<serde_json::Value> = metrics
             .inter_token_latencies_ms
@@ -897,6 +898,7 @@ fn real_checkpoint_decode_cost_profile() {
             "runtime_events_by_kind": events_by_kind,
             "runtime_events_truncated": truncated,
             "decode_phase_attribution": decode_phases,
+            "request_preparation_phase_attribution": preparation_phases,
             "phase_attribution": attribution,
         });
         eprintln!("[{device}] decode cost profile: {profile}");
@@ -940,19 +942,24 @@ fn real_checkpoint_decode_cost_profile() {
                         .unwrap_or(f64::NAN)
                 ));
             }
-            summary.push_str(
-                "\nHost time per decode step, by phase (device time unavailable):\n\n\
-                 | Phase | Operator | Calls/step | ms/step | Share |\n|---|---|---|---|---|\n",
-            );
-            for row in &decode_phases {
+            for (title, rows) in [
+                ("decode step", &decode_phases),
+                ("request preparation", &preparation_phases),
+            ] {
                 summary.push_str(&format!(
-                    "| {} | {} | {:.1} | {:.2} | {:.1}% |\n",
-                    row["phase"].as_str().unwrap_or(""),
-                    row["operator"].as_str().unwrap_or(""),
-                    row["calls_per_step"].as_f64().unwrap_or(f64::NAN),
-                    row["ms_per_step"].as_f64().unwrap_or(f64::NAN),
-                    row["share"].as_f64().unwrap_or(f64::NAN) * 100.0,
+                    "\nHost time per {title}, by phase (device time unavailable):\n\n\
+                     | Phase | Operator | Calls | ms | Share |\n|---|---|---|---|---|\n",
                 ));
+                for row in rows {
+                    summary.push_str(&format!(
+                        "| {} | {} | {:.1} | {:.2} | {:.1}% |\n",
+                        row["phase"].as_str().unwrap_or(""),
+                        row["operator"].as_str().unwrap_or(""),
+                        row["calls_per_step"].as_f64().unwrap_or(f64::NAN),
+                        row["ms_per_step"].as_f64().unwrap_or(f64::NAN),
+                        row["share"].as_f64().unwrap_or(f64::NAN) * 100.0,
+                    ));
+                }
             }
             let mut file = fs::OpenOptions::new()
                 .create(true)
@@ -964,10 +971,10 @@ fn real_checkpoint_decode_cost_profile() {
     }
 }
 
-/// Mean host time per decode step for every phase, largest first, with
+/// Mean host time per step of `kind` for every phase, largest first, with
 /// the step time no phase covers as a final `unattributed` row.
-fn decode_phase_rows(report: &PhaseAttributionReport) -> Vec<serde_json::Value> {
-    let Some(summary) = report.summary(StepKind::Decode) else {
+fn phase_rows(report: &PhaseAttributionReport, kind: StepKind) -> Vec<serde_json::Value> {
+    let Some(summary) = report.summary(kind) else {
         return Vec::new();
     };
     let steps = summary.steps.max(1) as f64;

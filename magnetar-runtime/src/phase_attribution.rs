@@ -25,6 +25,9 @@ pub const PHASE_ATTRIBUTION_STEP_CAPACITY: usize = 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepKind {
+    /// Everything a request does before its first Runtime step: session,
+    /// tokenization, graphs and plans.
+    RequestPreparation,
     Prefill,
     Decode,
 }
@@ -33,6 +36,14 @@ pub enum StepKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepPhase {
+    /// Opening the request's inference session.
+    SessionCreate,
+    /// Tokenizing the prompt and resolving stop sequences.
+    Tokenize,
+    /// Preparing (or revalidating cached) execution plans.
+    PlanPrepare,
+    /// Validating the generation request against the Runtime.
+    RequestValidate,
     /// Building the step's execution graphs through the model Component.
     GraphBuild,
     /// Re-checking that the Model Instance can still generate.

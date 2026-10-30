@@ -12,6 +12,14 @@ Deliver the explicitly enumerated C02, C03 outcomes through Runtime graph valida
 
 Cache immutable plan generations with a complete compatibility fingerprint and bounded storage. Run typed graph passes before publication; validate side effects and KV writes as well as numerical output. Recheck lifetimes and trust on reuse.
 
+### Initial implemented profile
+
+The first increment caches graphs, not plans:
+
+- A loaded model (`ProductionLoadedModel`) keeps the execution graphs its Component built, keyed by prompt length, in a `ComponentGraphCache` shared with its execution engine. The model's Component, architecture and identity are fixed for its lifetime, so the prompt length is the only remaining input the graphs depend on. Request preparation builds or reuses them, prepares the plans against them, and every step of the request dispatches those same graphs instead of asking the Component to rebuild them, so a step cannot execute a graph other than the one its plan was fingerprinted against; every node is still validated against the plan.
+- The cache holds at most 8 prompt lengths, least recently used first out, and is dropped with the model. Engines constructed outside `ProductionLoadedModel` keep rebuilding graphs per step.
+- Plans are still prepared for every request (44 ms on Reference CPU once `attribute-redacted-inference-costs` removed their quadratic fingerprinting). Caching them needs the revalidation C02 requires (Kernel Registry generations, instance mutation version, capacity) and is not done yet, so tasks 2.1-2.3 stay open.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
