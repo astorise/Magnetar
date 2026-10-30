@@ -3684,6 +3684,7 @@ fn execute_first_native_graph_with_resident_input(
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
+    let prepare_clock = runtime.phase_ledger().clock();
     let order = first_native_graph_execution_order(graph)?;
     // Every node in this graph binds to the same Provider; any binding names
     // it (task 5.2: resolve the executing Provider from Runtime provider
@@ -3708,6 +3709,9 @@ fn execute_first_native_graph_with_resident_input(
         .resource_bindings
         .weights
         .clone();
+    runtime
+        .phase_ledger_mut()
+        .record(prepare_clock, StepPhase::GraphPrepare);
     // Runtime's own MemoryManager is used directly (via `FirstNativeDispatchContext`
     // holding `&mut Runtime`, task group 7 / Correctif 13) rather than
     // temporarily taken out with `std::mem::take` and restored afterward --
@@ -3931,6 +3935,7 @@ fn execute_first_native_graph_nodes(
             StepPhase::NodeDispatch,
             node.operator.name(),
         );
+        let bind_clock = dispatch_ctx.runtime.phase_ledger().clock();
         if node.outputs.is_empty() {
             return Err(InferenceApiError::GraphPlanningFailed {
                 reason: format!("graph node '{node_id}' has no output edge"),
@@ -4171,6 +4176,10 @@ fn execute_first_native_graph_nodes(
             }
             bindings.insert(output_edge_id.clone(), (output_resource_id, output_shape));
         }
+        dispatch_ctx
+            .runtime
+            .phase_ledger_mut()
+            .record(bind_clock, StepPhase::NodeOutputBind);
         last_dispatch = Some(dispatch_result);
     }
 

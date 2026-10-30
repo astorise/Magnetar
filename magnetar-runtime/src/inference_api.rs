@@ -2655,10 +2655,24 @@ pub(crate) const INFERENCE_API_OBSERVATION_BUFFER_CAPACITY: usize = 4096;
 /// variants of the Runtime Inference API functions. Mirrors
 /// [`crate::tokenizer::TokenizerObserver`]'s pattern of a caller-owned,
 /// explicitly-threaded observer rather than a global sink.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+///
+/// Evicted observations are dropped in batches: the buffer grows to twice
+/// the capacity and then drops the oldest half at once, so recording one
+/// observation costs amortized O(1) instead of shifting the whole buffer.
+/// Only the most recent `INFERENCE_API_OBSERVATION_BUFFER_CAPACITY` are
+/// ever visible.
+#[derive(Clone, Debug, Default)]
 pub struct InferenceApiObserver {
     observations: Vec<InferenceApiObservation>,
 }
+
+impl PartialEq for InferenceApiObserver {
+    fn eq(&self, other: &Self) -> bool {
+        self.observations() == other.observations()
+    }
+}
+
+impl Eq for InferenceApiObserver {}
 
 impl InferenceApiObserver {
     pub fn new() -> Self {
@@ -2671,15 +2685,22 @@ impl InferenceApiObserver {
         message: impl Into<String>,
         correlation_id: Option<CorrelationId>,
     ) {
-        if self.observations.len() >= INFERENCE_API_OBSERVATION_BUFFER_CAPACITY {
-            self.observations.remove(0);
+        if self.observations.len() >= 2 * INFERENCE_API_OBSERVATION_BUFFER_CAPACITY {
+            self.observations
+                .drain(..INFERENCE_API_OBSERVATION_BUFFER_CAPACITY);
         }
         self.observations
             .push(InferenceApiObservation::new(kind, message, correlation_id));
     }
 
+    /// The most recent observations, oldest first, at most
+    /// `INFERENCE_API_OBSERVATION_BUFFER_CAPACITY` of them.
     pub fn observations(&self) -> &[InferenceApiObservation] {
-        &self.observations
+        let start = self
+            .observations
+            .len()
+            .saturating_sub(INFERENCE_API_OBSERVATION_BUFFER_CAPACITY);
+        &self.observations[start..]
     }
 }
 

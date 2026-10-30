@@ -52,6 +52,9 @@ pub enum StepPhase {
     /// Resolving or creating the step's KV state and discarding stale
     /// pending KV writes.
     KvStatePrepare,
+    /// Per graph execution: execution order, executing Provider and the
+    /// instance's weight bindings.
+    GraphPrepare,
     /// Writing host-supplied graph inputs into Provider storage.
     InputUpload,
     /// Reading node inputs back from Provider storage, including any
@@ -75,6 +78,9 @@ pub enum StepPhase {
     KvPendingWrite,
     /// Writing a node output whose Kernel could not write it in place.
     EdgeWrite,
+    /// Binding a node's outputs to their graph edges, exclusive of the KV
+    /// and edge-write leaves nested in it.
+    NodeOutputBind,
     /// Downloading the graph's live edges to the host at the end of the step.
     OutputMaterialize,
     /// Copying the last row of logits out of the materialized output.
