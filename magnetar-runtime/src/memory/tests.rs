@@ -89,6 +89,81 @@ fn memory_manager_reuses_cached_allocations_and_evicts_over_limit() {
 }
 
 #[test]
+fn running_allocation_totals_match_a_full_recount_through_reuse_and_eviction() {
+    let mut manager = MemoryManager::new(MemoryManagerConfig {
+        max_cached_bytes: 512,
+        max_runtime_bytes: Some(4096),
+        ..MemoryManagerConfig::default()
+    });
+    let request = |class, size, placement| {
+        MemoryAllocationRequest::new(class, size, placement, MemoryAllocationOwner::Runtime)
+    };
+    let mut live = Vec::new();
+    for (class, size, placement) in [
+        (
+            MemoryAllocationClass::Tensor,
+            256,
+            MemoryPlacement::HostOrdinary,
+        ),
+        (
+            MemoryAllocationClass::Tensor,
+            128,
+            MemoryPlacement::HostPinned,
+        ),
+        (
+            MemoryAllocationClass::TemporaryWorkspace,
+            64,
+            MemoryPlacement::HostOrdinary,
+        ),
+    ] {
+        live.push(
+            manager
+                .allocate(request(class, size, placement))
+                .unwrap()
+                .id,
+        );
+        manager.assert_allocation_totals_consistent();
+    }
+    manager.release(live[0]).unwrap();
+    manager.assert_allocation_totals_consistent();
+    let reused = manager
+        .allocate(request(
+            MemoryAllocationClass::Tensor,
+            200,
+            MemoryPlacement::HostOrdinary,
+        ))
+        .unwrap();
+    assert_eq!(reused.id, live[0], "the cached allocation is reused");
+    manager.assert_allocation_totals_consistent();
+    for id in [reused.id, live[1], live[2]] {
+        manager.release(id).unwrap();
+        manager.assert_allocation_totals_consistent();
+    }
+    let large = manager
+        .allocate(request(
+            MemoryAllocationClass::TemporaryWorkspace,
+            768,
+            MemoryPlacement::HostOrdinary,
+        ))
+        .unwrap();
+    manager.release(large.id).unwrap();
+    manager.assert_allocation_totals_consistent();
+
+    let mut uncached = MemoryManager::default();
+    let id = uncached
+        .allocate(request(
+            MemoryAllocationClass::Tensor,
+            32,
+            MemoryPlacement::HostOrdinary,
+        ))
+        .unwrap()
+        .id;
+    uncached.assert_allocation_totals_consistent();
+    uncached.release(id).unwrap();
+    uncached.assert_allocation_totals_consistent();
+}
+
+#[test]
 fn memory_manager_tracks_arena_growth_shrink_pressure_and_diagnostics() {
     let mut manager = MemoryManager::default();
     let arena = manager

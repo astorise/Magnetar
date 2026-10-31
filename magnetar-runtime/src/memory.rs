@@ -3686,6 +3686,66 @@ pub const RETIRED_ALLOCATION_HISTORY_CAPACITY: usize = 4096;
 /// How many recent entries each [`MemoryManager`] observation log keeps.
 pub const MEMORY_OBSERVATION_LOG_CAPACITY: usize = 4096;
 
+/// Bytes of live allocations by (state, class, pinned host placement), kept
+/// up to date wherever `MemoryManager::allocations` changes so admission
+/// does not rescan every live allocation for each new one. Derived from
+/// `allocations`, so it takes no part in equality.
+#[derive(Clone, Debug, Default)]
+struct AllocationTotals(Vec<(MemoryAllocationState, MemoryAllocationClass, bool, u64)>);
+
+impl PartialEq for AllocationTotals {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for AllocationTotals {}
+
+impl AllocationTotals {
+    fn key(allocation: &MemoryAllocation) -> (MemoryAllocationState, MemoryAllocationClass, bool) {
+        (
+            allocation.state,
+            allocation.request.class,
+            allocation.request.placement.requires_pinned_host(),
+        )
+    }
+
+    fn add(&mut self, allocation: &MemoryAllocation) {
+        let key = Self::key(allocation);
+        let size = allocation.request.size_bytes;
+        match self
+            .0
+            .iter_mut()
+            .find(|(state, class, pinned, _)| (*state, *class, *pinned) == key)
+        {
+            Some(entry) => entry.3 += size,
+            None => self.0.push((key.0, key.1, key.2, size)),
+        }
+    }
+
+    fn remove(&mut self, allocation: &MemoryAllocation) {
+        let key = Self::key(allocation);
+        if let Some(entry) = self
+            .0
+            .iter_mut()
+            .find(|(state, class, pinned, _)| (*state, *class, *pinned) == key)
+        {
+            entry.3 = entry.3.saturating_sub(allocation.request.size_bytes);
+        }
+    }
+
+    fn bytes(
+        &self,
+        include: impl Fn(MemoryAllocationState, MemoryAllocationClass, bool) -> bool,
+    ) -> u64 {
+        self.0
+            .iter()
+            .filter(|(state, class, pinned, _)| include(*state, *class, *pinned))
+            .map(|(_, _, _, bytes)| bytes)
+            .sum()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryManager {
     config: MemoryManagerConfig,
@@ -3696,6 +3756,7 @@ pub struct MemoryManager {
     /// Live allocations only (active, reusable): every admission scan
     /// walks this map, so it must not accumulate retired entries.
     allocations: BTreeMap<MemoryAllocationId, MemoryAllocation>,
+    totals: AllocationTotals,
     /// Bounded history of terminal allocations, see
     /// [`RETIRED_ALLOCATION_HISTORY_CAPACITY`].
     retired: BTreeMap<MemoryAllocationId, MemoryAllocation>,
@@ -3726,6 +3787,7 @@ impl MemoryManager {
             next_mapping_id: 1,
             next_view_id: 1,
             allocations: BTreeMap::new(),
+            totals: AllocationTotals::default(),
             retired: BTreeMap::new(),
             retired_order: VecDeque::new(),
             arenas: BTreeMap::new(),
@@ -3890,7 +3952,9 @@ impl MemoryManager {
                 .allocations
                 .get_mut(&reusable_id)
                 .expect("known allocation");
+            self.totals.remove(allocation);
             allocation.state = MemoryAllocationState::Active;
+            self.totals.add(allocation);
             let allocation = allocation.clone();
             self.observe(
                 MemoryObservationKind::CacheHit,
@@ -3918,6 +3982,7 @@ impl MemoryManager {
             state: MemoryAllocationState::Active,
             arena: None,
         };
+        self.totals.add(&allocation);
         self.allocations.insert(id, allocation.clone());
         self.observe(
             MemoryObservationKind::AllocationCompleted,
@@ -3936,8 +4001,11 @@ impl MemoryManager {
             return Err(MemoryError::InvalidAllocationHandle(id));
         }
         if self.config.max_cached_bytes > 0 {
+            self.totals.remove(allocation);
             allocation.state = MemoryAllocationState::Reusable;
+            self.totals.add(allocation);
         } else if let Some(released) = self.allocations.remove(&id) {
+            self.totals.remove(&released);
             self.retire(released, MemoryAllocationState::Released);
         }
         self.enforce_cache_limit();
@@ -4910,6 +4978,9 @@ impl MemoryManager {
         &self,
         request: &MemoryAllocationRequest,
     ) -> Option<MemoryAllocationId> {
+        if self.cached_bytes() == 0 {
+            return None;
+        }
         self.allocations
             .iter()
             .find(|(_, allocation)| {
@@ -4936,6 +5007,7 @@ impl MemoryManager {
                 break;
             };
             if let Some(evicted) = self.allocations.remove(&id) {
+                self.totals.remove(&evicted);
                 self.retire(evicted, MemoryAllocationState::Released);
             }
             self.observe(
@@ -4972,35 +5044,44 @@ impl MemoryManager {
     }
 
     fn pinned_bytes(&self) -> u64 {
-        self.allocations
-            .values()
-            .filter(|allocation| {
-                allocation.state == MemoryAllocationState::Active
-                    && allocation.request.placement.requires_pinned_host()
-            })
-            .map(|allocation| allocation.request.size_bytes)
-            .sum()
+        self.totals
+            .bytes(|state, _, pinned| state == MemoryAllocationState::Active && pinned)
     }
 
     fn bytes_for_state(&self, state: MemoryAllocationState) -> u64 {
-        self.allocations
-            .values()
-            .filter(|allocation| allocation.state == state)
-            .map(|allocation| allocation.request.size_bytes)
-            .sum()
+        self.totals.bytes(|entry_state, _, _| entry_state == state)
     }
 
     fn pressure_for_class(&self, class: MemoryAllocationClass) -> MemoryPressureLevel {
-        let used = self
-            .allocations
-            .values()
-            .filter(|allocation| {
-                allocation.state == MemoryAllocationState::Active
-                    && allocation.request.class == class
-            })
-            .map(|allocation| allocation.request.size_bytes)
-            .sum::<u64>();
+        let used = self.totals.bytes(|state, entry_class, _| {
+            state == MemoryAllocationState::Active && entry_class == class
+        });
         pressure_for_usage(used, self.config.max_runtime_bytes)
+    }
+
+    /// Recomputes every running total from `allocations`; tests compare it
+    /// with the incrementally maintained one.
+    #[cfg(test)]
+    pub(crate) fn assert_allocation_totals_consistent(&self) {
+        let mut recomputed = AllocationTotals::default();
+        for allocation in self.allocations.values() {
+            recomputed.add(allocation);
+        }
+        for state in [
+            MemoryAllocationState::Pending,
+            MemoryAllocationState::Active,
+            MemoryAllocationState::Released,
+            MemoryAllocationState::Reusable,
+            MemoryAllocationState::ReservedArena,
+            MemoryAllocationState::Failed,
+            MemoryAllocationState::Cancelled,
+        ] {
+            for pinned in [false, true] {
+                let expected = recomputed.bytes(|s, _, p| s == state && p == pinned);
+                let actual = self.totals.bytes(|s, _, p| s == state && p == pinned);
+                assert_eq!(actual, expected, "{state:?} pinned={pinned}");
+            }
+        }
     }
 
     fn observe(

@@ -10389,6 +10389,7 @@ fn resident_production_model_bookkeeping_stays_bounded_across_requests() {
             .into_iter()
             .map(|(name, size)| (format!("memory.{name}"), size))
             .collect();
+        model.runtime.memory().assert_allocation_totals_consistent();
         sizes.insert("sessions".into(), model.runtime.sessions().count());
         sizes.insert(
             "kv_caches".into(),
