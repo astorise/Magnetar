@@ -1568,8 +1568,8 @@ impl E2eRuntimeModelExecutionEngine {
             for layer in discarded.layer_kv.values() {
                 // Best-effort: this pending state is being discarded
                 // regardless of whether Provider-side release succeeds.
-                let _ = provider.release_admitted_tensor(runtime.memory_mut(), &layer.k);
-                let _ = provider.release_admitted_tensor(runtime.memory_mut(), &layer.v);
+                release_pending_kv_resource(runtime, &provider, &layer.k);
+                release_pending_kv_resource(runtime, &provider, &layer.v);
             }
         }
         Ok(())
@@ -4272,6 +4272,9 @@ fn execute_first_native_graph_nodes(
             // concatenation below produces genuinely new, host-computed data,
             // and "rope" nodes have no Kernel-level output identity to begin
             // with (always `NodeValue::Host`, never `Resident` under this id).
+            // The resource the edge resolves to for later nodes: its own
+            // identity, or the pending KV resource a KV append wrote.
+            let mut bound_resource_id = output_resource_id.clone();
             let mut needs_explicit_edge_write = !matches!(
                 &output_tensor,
                 NodeValue::Resident { id, .. } if *id == output_resource_id
@@ -4286,6 +4289,13 @@ fn execute_first_native_graph_nodes(
                         ),
                     });
                 }
+                let role_str = match role {
+                    KvRole::K => "k",
+                    KvRole::V => "v",
+                };
+                let pending_resource = TensorResourceId::new(format!(
+                    "kv.{kv_cache_id}.layer{layer}.{role_str}.pending"
+                ));
                 if kv_meta.behavior == GraphKvCacheBehavior::Append {
                     let history =
                         kv_history.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
@@ -4323,8 +4333,13 @@ fn execute_first_native_graph_nodes(
                         id: historical_resource.clone(),
                         shape: historical_shape,
                     };
+                    // The concatenated history is this step's pending KV
+                    // write: the concat writes it straight under the
+                    // pending identity, and the edge is bound to that
+                    // resource, instead of writing the edge and copying it
+                    // to the pending identity afterwards.
                     let concat_output_target: OutputTarget = (
-                        output_resource_id.clone(),
+                        pending_resource.clone(),
                         resolved_output_placement(dispatch_ctx.prepared_plan.as_deref(), node_id),
                         MemoryAllocationOwner::Session(kv_cache_id.to_string()),
                     );
@@ -4349,6 +4364,7 @@ fn execute_first_native_graph_nodes(
                     // needed below.
                     output_tensor = concatenated;
                     needs_explicit_edge_write = false;
+                    bound_resource_id = pending_resource.clone();
                 }
                 // Written under a *pending* resource id (task 7.4 prepare):
                 // this generation step's KV update becomes Runtime-owned only
@@ -4365,16 +4381,12 @@ fn execute_first_native_graph_nodes(
                 // decode`). Only a genuinely `Host`-typed value (e.g. "rope",
                 // which has no Kernel-level output identity to begin with)
                 // still needs an explicit host-typed admitted write here.
-                let role_str = match role {
-                    KvRole::K => "k",
-                    KvRole::V => "v",
-                };
-                let pending_resource = TensorResourceId::new(format!(
-                    "kv.{kv_cache_id}.layer{layer}.{role_str}.pending"
-                ));
                 let pending_clock = dispatch_ctx.runtime.phase_ledger().clock();
                 let pending_write_result: Result<(), TensorValueAdmissionError> =
                     match &output_tensor {
+                        // Already written under the pending identity (the
+                        // KV append above).
+                        NodeValue::Resident { id, .. } if *id == pending_resource => Ok(()),
                         NodeValue::Resident { id, .. } => dispatch_ctx
                             .provider
                             .copy_tensor_admitted(
@@ -4484,7 +4496,7 @@ fn execute_first_native_graph_nodes(
                     node.operator.name(),
                 );
             }
-            bindings.insert(output_edge_id.clone(), (output_resource_id, output_shape));
+            bindings.insert(output_edge_id.clone(), (bound_resource_id, output_shape));
         }
         dispatch_ctx
             .runtime
@@ -4910,8 +4922,9 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             let _ = provider.release_admitted_tensor(runtime.memory_mut(), &binding.k);
             let _ = provider.release_admitted_tensor(runtime.memory_mut(), &binding.v);
             for role in ["k", "v"] {
-                let _ = provider.release_admitted_tensor(
-                    runtime.memory_mut(),
+                release_pending_kv_resource(
+                    runtime,
+                    &provider,
                     &TensorResourceId::new(format!(
                         "kv.{}.layer{layer}.{role}.pending",
                         committed.cache
@@ -5123,6 +5136,26 @@ fn next_kv_commit_generation() -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Releases a step's pending KV resource: the Provider's storage and the
+/// allocation it tracks for it (a pending write admitted by the Provider,
+/// `copy_tensor_admitted`), and a Runtime pre-admission recorded for it (a
+/// KV append writes its pending resource through `admit_kernel_output`,
+/// which the Provider does not track).
+fn release_pending_kv_resource(
+    runtime: &mut Runtime,
+    provider: &Arc<dyn ProviderExecutionApi>,
+    id: &TensorResourceId,
+) {
+    let _ = provider.release_admitted_tensor(runtime.memory_mut(), id);
+    if let Some(allocation) = runtime
+        .memory_mut()
+        .remove_tensor_residency(id)
+        .and_then(|residency| residency.allocation)
+    {
+        let _ = runtime.memory_mut().release(allocation);
+    }
+}
+
 fn promote_pending_kv_layer_role(
     runtime: &mut Runtime,
     executor: &Arc<dyn ProviderExecutionApi>,
