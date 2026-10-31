@@ -13,7 +13,7 @@
 ## 3. C03 Validated graph optimization passes
 
 - [ ] 3.1 Implement C03: The graph pipeline SHALL type/layout-check propagation, constant folding, dead computation removal and qualified pattern fusion while preserving outputs, side effects, KV writes and portable Component authority.
-- [ ] 3.2 Add the positive conformance case: when an optimized graph passes semantic validation, verify it produces equivalent logits and lifecycle effects through the existing PreparedExecutionPlan path.
+- [x] 3.2 Add the positive conformance case: when an optimized graph passes semantic validation, verify it produces equivalent logits and lifecycle effects through the existing PreparedExecutionPlan path.
 - [ ] 3.3 Add the failure/isolation case: when a pass removes a required KV write or changes aliasing, verify validation rejects the candidate and publishes no partial optimized graph.
 
 ## 4. Qualification, rollout and documentation
