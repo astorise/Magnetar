@@ -4179,13 +4179,9 @@ impl MemoryManager {
         // record, keep it: replacing it would allocate, record and release
         // to end in the same state.
         if let Some(previous) = previous
-            && self
-                .allocations
-                .get(&previous)
-                .is_some_and(|allocation| {
-                    allocation.state == MemoryAllocationState::Active
-                        && allocation.request == request
-                })
+            && self.allocations.get(&previous).is_some_and(|allocation| {
+                allocation.state == MemoryAllocationState::Active && allocation.request == request
+            })
             && self.tensor_residency.get(&id)
                 == Some(
                     &TensorResidency::new(id.clone(), placement.clone(), affinity.clone())
