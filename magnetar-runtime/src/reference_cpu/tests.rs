@@ -1903,3 +1903,53 @@ fn kernel_observation_log_keeps_only_the_most_recent_observations() {
         Some(KernelObservationKind::KernelDispatchCompleted)
     );
 }
+
+/// `matmul-bias` (`graph_fusion::fuse_matmul_bias`) must be bit-identical to
+/// the `matmul` + row-broadcast `add` pair it replaces.
+#[test]
+fn reference_cpu_matmul_bias_is_bit_identical_to_matmul_then_add() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = reference_cpu_kernel_by_name(&advertisements, "matmul-bias");
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (m, k, n) = (3u64, 37u64, 21u64);
+    let values = |count: u64, seed: u64| -> Vec<f32> {
+        (0..count)
+            .map(|i| (((i * 7919 + seed * 104_729) % 2001) as f32 - 1000.0) * 1.3e-3)
+            .collect()
+    };
+    let a = reference_cpu_host_tensor([m, k], values(m * k, 1));
+    let b = reference_cpu_host_tensor([k, n], values(k * n, 2));
+    let bias = reference_cpu_host_tensor([n], values(n, 3));
+    let (a_id, a_resource) = reference_cpu_resource("matmul-bias-a", [m, k]);
+    let (b_id, b_resource) = reference_cpu_resource("matmul-bias-b", [k, n]);
+    let (bias_id, bias_resource) = reference_cpu_resource("matmul-bias-bias", [n]);
+    let (_out_id, out_resource) = reference_cpu_resource("matmul-bias-out", [m, n]);
+    executor.write_tensor(a_id, a.clone());
+    executor.write_tensor(b_id, b.clone());
+    executor.write_tensor(bias_id, bias.clone());
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-matmul-bias"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_input(bias_resource)
+    .with_output(out_resource.clone());
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    let fused = executor.read_tensor(&out_resource.resource.id).unwrap();
+    let unfused = add(&matmul(&a, &b, false, false).unwrap(), &bias).unwrap();
+    assert_eq!(fused.shape, unfused.shape);
+    assert_eq!(
+        fused.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        unfused.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+}

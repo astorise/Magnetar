@@ -26,6 +26,7 @@ pub mod first_native_implementation_cut;
 pub mod first_native_runtime;
 pub mod generation;
 pub mod graph_builder_capability;
+pub mod graph_fusion;
 pub mod inference_api;
 pub mod kernel;
 pub mod kernel_artifact;

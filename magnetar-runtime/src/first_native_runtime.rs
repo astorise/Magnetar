@@ -1257,10 +1257,30 @@ pub(crate) const COMPONENT_GRAPH_CACHE_CAPACITY: usize = 8;
 #[derive(Clone, Default)]
 pub(crate) struct ComponentGraphCache {
     entries: Arc<Mutex<VecDeque<CachedComponentGraphs>>>,
+    /// The Provider graphs are fused for (`graph_fusion`), or `None` to
+    /// keep every graph exactly as its Component built it.
+    fusion: Arc<Mutex<Option<ProviderBinding>>>,
 }
 
 /// One prompt length's graphs.
 type CachedComponentGraphs = (u64, Arc<FirstNativeComponentGraphs>);
+
+/// Whether `provider` has an active, prepared Kernel for `operator`.
+fn provider_advertises_operator(
+    runtime: &Runtime,
+    provider: &ProviderBinding,
+    operator: &str,
+) -> bool {
+    let registry = runtime.kernel_registry();
+    registry.entries().any(|entry| {
+        entry.active
+            && &entry.advertisement.id.provider == provider
+            && entry.advertisement.implemented_operator.name() == operator
+            && registry
+                .active_prepared_kernel(&entry.advertisement.id)
+                .is_some()
+    })
+}
 
 impl ComponentGraphCache {
     pub(crate) fn get(&self, prompt_token_count: u64) -> Option<Arc<FirstNativeComponentGraphs>> {
@@ -1281,6 +1301,43 @@ impl ComponentGraphCache {
             entries.pop_front();
         }
         entries.push_back((prompt_token_count, graphs));
+    }
+
+    /// Fuses graphs for `provider` from now on, or stops fusing with
+    /// `None`. Forgets every cached graph so plans and steps never mix
+    /// fused and unfused graphs.
+    pub(crate) fn set_fusion_provider(&self, provider: Option<ProviderBinding>) {
+        *self.fusion.lock().unwrap() = provider;
+        self.entries.lock().unwrap().clear();
+    }
+
+    /// Applies every fusion the fusion Provider currently advertises to
+    /// freshly built graphs; graphs are returned unchanged otherwise.
+    pub(crate) fn optimize(
+        &self,
+        runtime: &Runtime,
+        mut graphs: FirstNativeComponentGraphs,
+    ) -> FirstNativeComponentGraphs {
+        let Some(provider) = self.fusion.lock().unwrap().clone() else {
+            return graphs;
+        };
+        if !provider_advertises_operator(
+            runtime,
+            &provider,
+            crate::graph_fusion::MATMUL_BIAS_OPERATOR,
+        ) {
+            return graphs;
+        }
+        let is_weight = |edge: &TensorEdgeId| weight_tensor_name_from_edge(edge.as_str()).is_some();
+        let (prefill, prefill_fused) =
+            crate::graph_fusion::fuse_matmul_bias(&graphs.prefill, is_weight);
+        let (decode, decode_fused) =
+            crate::graph_fusion::fuse_matmul_bias(&graphs.decode, is_weight);
+        graphs.prefill = prefill;
+        graphs.prefill_node_count -= prefill_fused;
+        graphs.decode = decode;
+        graphs.decode_node_count -= decode_fused;
+        graphs
     }
 
     #[cfg(test)]
@@ -2549,6 +2606,38 @@ fn dispatch_reference_cpu_operator_pre_admitted(
     result
 }
 
+/// `graph_fusion::fuse_matmul_bias`'s fused node: `matmul(a, b) + bias`,
+/// `bias` a `[cols]` row broadcast to every output row.
+fn dispatch_qwen_matmul_bias(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    a: NodeValue,
+    b: NodeValue,
+    bias: NodeValue,
+    output_target: Option<OutputTarget>,
+) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
+    let (rows, _) = a.rows_cols()?;
+    let (_, cols) = b.rows_cols()?;
+    let descriptor = TensorDescriptor::new(
+        ShapeDescriptor::new([rows, cols]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+        LayoutDescriptor::Contiguous,
+    );
+    dispatch_reference_cpu_operator_pre_admitted(
+        ctx,
+        operation_id,
+        crate::graph_fusion::matmul_bias_operator(),
+        vec![
+            node_input_resource(operation_id, "a", a),
+            node_input_resource(operation_id, "b", b),
+            node_input_resource(operation_id, "bias", bias),
+        ],
+        descriptor,
+        output_target,
+        BTreeMap::new(),
+    )
+}
+
 fn dispatch_qwen_matmul(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,
@@ -3137,6 +3226,14 @@ fn resolve_first_native_weight_edge(
 /// `node.inputs`/`node.outputs` directly, rather than relying on
 /// `TensorEdge::producer`/`::consumers` (which Qwen's own graph builder does
 /// not populate).
+/// [`first_native_graph_execution_order`] for sibling modules' tests.
+#[cfg(test)]
+pub(crate) fn first_native_graph_execution_order_for_tests(
+    graph: &ExecutionGraph,
+) -> Result<Vec<ExecutionNodeId>, InferenceApiError> {
+    first_native_graph_execution_order(graph)
+}
+
 fn first_native_graph_execution_order(
     graph: &ExecutionGraph,
 ) -> Result<Vec<ExecutionNodeId>, InferenceApiError> {
@@ -3327,6 +3424,18 @@ fn dispatch_first_native_graph_node(
             let a = inputs.remove(0);
             let b = inputs.remove(0);
             dispatch_qwen_matmul(ctx, node_id, a, b, Some(output_target))
+                .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "matmul-bias" => {
+            if inputs.len() != 3 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 3 matmul-bias inputs"),
+                });
+            }
+            let a = inputs.remove(0);
+            let b = inputs.remove(0);
+            let bias = inputs.remove(0);
+            dispatch_qwen_matmul_bias(ctx, node_id, a, b, bias, Some(output_target))
                 .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "rope" => {
@@ -3916,6 +4025,7 @@ fn execute_first_native_graph_nodes(
         let passthrough_eligible = matches!(
             node.operator.name(),
             "matmul"
+                | "matmul-bias"
                 | "attention"
                 | "silu"
                 | "add"
@@ -4452,10 +4562,12 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                             prompt_token_count,
                         ),
                     }
-                    .map_err(|error| {
-                        InferenceApiError::GraphPlanningFailed {
-                            reason: error.to_string(),
-                        }
+                    .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                        reason: error.to_string(),
+                    })
+                    .map(|graphs| match &self.graph_cache {
+                        Some(cache) => cache.optimize(runtime, graphs),
+                        None => graphs,
                     })?,
                 ),
             };
@@ -7547,6 +7659,7 @@ impl ProductionLoadedModel {
             &provider_binding,
         )?;
         require_ready_first_native_instance(&runtime, &instance)?;
+        graph_cache.set_fusion_provider(Some(provider_binding.clone()));
         Ok(Self {
             fixture,
             runtime,
@@ -7565,6 +7678,13 @@ impl ProductionLoadedModel {
 
     pub fn materialization_count(&self) -> usize {
         self.materialization_count
+    }
+
+    /// Turns graph fusion (`graph_fusion`) on or off for later requests. On
+    /// by default; it only fuses what this instance's Provider advertises.
+    pub fn set_graph_fusion(&mut self, enabled: bool) {
+        self.graph_cache
+            .set_fusion_provider(enabled.then(|| self.provider_binding.clone()));
     }
 
     /// Starts attributing every later generation step's host time to its
@@ -7821,11 +7941,10 @@ impl ProductionLoadedModel {
                         )
                         .map(|(graphs, _definition, _instance)| graphs),
                     }
-                    .map_err(|error| {
-                        InferenceApiError::GraphPlanningFailed {
-                            reason: error.to_string(),
-                        }
-                    })?,
+                    .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                        reason: error.to_string(),
+                    })
+                    .map(|graphs| self.graph_cache.optimize(&self.runtime, graphs))?,
                 );
                 self.graph_cache
                     .insert(prompt_token_count, Arc::clone(&graphs));

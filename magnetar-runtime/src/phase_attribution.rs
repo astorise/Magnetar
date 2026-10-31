@@ -124,6 +124,7 @@ const OPERATOR_LABELS: &[&str] = &[
     "concat",
     "embedding",
     "matmul",
+    "matmul-bias",
     "mul",
     "residual-add",
     "rmsnorm",

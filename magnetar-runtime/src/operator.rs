@@ -731,6 +731,17 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::Any,
         ),
+        // `cache-and-optimize-prepared-graphs` C03: `matmul(a, b) + bias`
+        // with `bias` one row broadcast to every output row, produced only
+        // by `graph_fusion::fuse_matmul_bias` from an existing matmul/add
+        // pair, never by a Component.
+        (
+            "matmul-bias",
+            OperatorFamily::LinearAlgebra,
+            3,
+            1,
+            ShapeRule::Any,
+        ),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         (
             "rmsnorm",
@@ -888,7 +899,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
-        "matmul" | "batched-matmul" => OperatorAttributeSchema::default()
+        "matmul" | "batched-matmul" | "matmul-bias" => OperatorAttributeSchema::default()
             .with_rule(
                 "transpose_a",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
