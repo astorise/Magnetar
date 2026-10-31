@@ -2052,6 +2052,12 @@ struct FirstNativeDispatchContext<'a> {
     /// than a caller-fabricated id. `None` until the first successful
     /// dispatch.
     last_provider_execution: Option<ProviderExecutionResult>,
+    /// The last `concat` (KV-history append) selection and what it was
+    /// selected for. Every layer's K and V append in a step asks the
+    /// registry the same question (same operator, affinity, memory class,
+    /// tensor descriptors and affinities); the registry does not change
+    /// while a graph executes, so the answer is reused.
+    concat_selection: Option<(ConcatSelectionKey, KernelCandidate)>,
     /// Per-node causal-chain events (Correctif 17 / task group 17), pushed
     /// directly into the caller's own `Vec` (not accumulated locally and
     /// drained only on success) as each node's dispatch progresses through
@@ -2730,6 +2736,15 @@ fn dispatch_qwen_matmul(
 /// K/V, `b` is this step's newly computed K/V; mirrors
 /// `dispatch_qwen_matmul`'s own pattern of computing an output shape that
 /// differs from either input's own shape.
+/// Everything a `concat` selection depends on besides the registry: the
+/// request's affinity and memory class and each resource's descriptor and
+/// affinity (not its id).
+type ConcatSelectionKey = (
+    ResourceAffinity,
+    KernelMemoryClass,
+    Vec<(TensorDescriptor, ResourceAffinity)>,
+);
+
 /// Dispatches the "concat" Operator for KV-history concatenation
 /// (`implement-device-resident-multi-step-cuda-decode`): stacks `a`'s rows
 /// above `b`'s rows through a real Kernel Registry selection and real
@@ -2819,18 +2834,41 @@ fn dispatch_qwen_concat(
         selection_request =
             selection_request.with_input(KernelResource::new(resource, memory_class));
     }
-    let selection = ctx
-        .runtime
-        .kernel_registry()
-        .select(&selection_request)
-        .map_err(|error| InferenceApiError::KernelUnavailable {
-            reason: format!("{operation_id}: {error}"),
-        })?;
-    let candidate = selection
-        .selected
-        .ok_or_else(|| InferenceApiError::KernelUnavailable {
-            reason: format!("Kernel Registry selected no candidate for {operation_id}"),
-        })?;
+    let selection_key: ConcatSelectionKey = (
+        affinity.clone(),
+        memory_class,
+        selection_request
+            .outputs
+            .iter()
+            .chain(&selection_request.inputs)
+            .map(|resource| {
+                (
+                    resource.resource.descriptor.clone(),
+                    resource.resource.affinity.clone(),
+                )
+            })
+            .collect(),
+    );
+    let candidate = match &ctx.concat_selection {
+        Some((key, candidate)) if *key == selection_key => candidate.clone(),
+        _ => {
+            let selection = ctx
+                .runtime
+                .kernel_registry()
+                .select(&selection_request)
+                .map_err(|error| InferenceApiError::KernelUnavailable {
+                    reason: format!("{operation_id}: {error}"),
+                })?;
+            let candidate =
+                selection
+                    .selected
+                    .ok_or_else(|| InferenceApiError::KernelUnavailable {
+                        reason: format!("Kernel Registry selected no candidate for {operation_id}"),
+                    })?;
+            ctx.concat_selection = Some((selection_key, candidate.clone()));
+            candidate
+        }
+    };
     let advertisement = ctx
         .runtime
         .kernel_registry()
@@ -4035,6 +4073,7 @@ fn execute_first_native_graph_nodes(
         graph: Some(fingerprinted),
         sequence_length,
         last_provider_execution: None,
+        concat_selection: None,
         node_events,
     };
     let layer_count = fixture.config.architecture.layer_count as usize;
@@ -10276,6 +10315,7 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        concat_selection: None,
         node_events: &mut node_events,
     };
     let architecture = &fixture.config.architecture;

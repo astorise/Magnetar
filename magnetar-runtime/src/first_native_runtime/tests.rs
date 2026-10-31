@@ -1630,6 +1630,7 @@ fn dispatch_reference_cpu_operator_multi_binds_every_output() {
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        concat_selection: None,
         node_events: &mut node_events,
     };
     let input = HostTensor::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1819,6 +1820,7 @@ fn resident_input_passthrough_reuses_existing_resource_and_computes_correctly() 
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        concat_selection: None,
         node_events: &mut node_events,
     };
     let a = HostTensor::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1918,6 +1920,7 @@ fn rmsnorm_accepts_a_resident_input_without_materializing_it_first() {
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        concat_selection: None,
         node_events: &mut node_events,
     };
     let weight = HostTensor::new([4], vec![1.0, 1.0, 1.0, 1.0]).unwrap();
@@ -5588,6 +5591,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        concat_selection: None,
         node_events: &mut node_events,
     };
     let architecture = &fixture.config.architecture;
@@ -5857,6 +5861,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        concat_selection: None,
         node_events: &mut node_events,
     };
     let architecture = &fixture.config.architecture;
@@ -9149,6 +9154,7 @@ fn check_graph_dispatch_ignores_kernel_registry_preference_change_after_plan_pub
         graph: Some(FingerprintedGraph::new(&graph)),
         sequence_length: Some(seq_len),
         last_provider_execution: None,
+        concat_selection: None,
         node_events: &mut node_events,
     };
     let (dispatch_result, _hidden_states) = dispatch_reference_cpu_operator(
