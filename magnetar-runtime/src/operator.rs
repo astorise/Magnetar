@@ -742,6 +742,16 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::Any,
         ),
+        // C03: `residual + matmul(a, b)` and `silu(gate) * up`, likewise
+        // produced only by `graph_fusion`.
+        (
+            "matmul-residual",
+            OperatorFamily::LinearAlgebra,
+            3,
+            1,
+            ShapeRule::Any,
+        ),
+        ("silu-mul", OperatorFamily::Activation, 2, 1, ShapeRule::Any),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         (
             "rmsnorm",
@@ -899,19 +909,21 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
-        "matmul" | "batched-matmul" | "matmul-bias" => OperatorAttributeSchema::default()
-            .with_rule(
-                "transpose_a",
-                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
-            )
-            .with_rule(
-                "transpose_b",
-                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
-            )
-            .with_rule(
-                "accumulation_dtype",
-                OperatorAttributeRule::optional(OperatorAttributeKind::DType),
-            ),
+        "matmul" | "batched-matmul" | "matmul-bias" | "matmul-residual" => {
+            OperatorAttributeSchema::default()
+                .with_rule(
+                    "transpose_a",
+                    OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+                )
+                .with_rule(
+                    "transpose_b",
+                    OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+                )
+                .with_rule(
+                    "accumulation_dtype",
+                    OperatorAttributeRule::optional(OperatorAttributeKind::DType),
+                )
+        }
         "attention" | "paged-attention" => OperatorAttributeSchema::default()
             .with_rule(
                 "causal",

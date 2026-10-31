@@ -1321,22 +1321,33 @@ impl ComponentGraphCache {
         let Some(provider) = self.fusion.lock().unwrap().clone() else {
             return graphs;
         };
-        if !provider_advertises_operator(
-            runtime,
-            &provider,
-            crate::graph_fusion::MATMUL_BIAS_OPERATOR,
-        ) {
-            return graphs;
-        }
         let is_weight = |edge: &TensorEdgeId| weight_tensor_name_from_edge(edge.as_str()).is_some();
-        let (prefill, prefill_fused) =
-            crate::graph_fusion::fuse_matmul_bias(&graphs.prefill, is_weight);
-        let (decode, decode_fused) =
-            crate::graph_fusion::fuse_matmul_bias(&graphs.decode, is_weight);
-        graphs.prefill = prefill;
-        graphs.prefill_node_count -= prefill_fused;
-        graphs.decode = decode;
-        graphs.decode_node_count -= decode_fused;
+        type Pass<'a> = Box<dyn Fn(&ExecutionGraph) -> (ExecutionGraph, usize) + 'a>;
+        let passes: [(&str, Pass<'_>); 3] = [
+            (
+                crate::graph_fusion::MATMUL_BIAS_OPERATOR,
+                Box::new(|graph| crate::graph_fusion::fuse_matmul_bias(graph, is_weight)),
+            ),
+            (
+                crate::graph_fusion::MATMUL_RESIDUAL_OPERATOR,
+                Box::new(crate::graph_fusion::fuse_matmul_residual),
+            ),
+            (
+                crate::graph_fusion::SILU_MUL_OPERATOR,
+                Box::new(crate::graph_fusion::fuse_silu_mul),
+            ),
+        ];
+        for (operator, pass) in passes {
+            if !provider_advertises_operator(runtime, &provider, operator) {
+                continue;
+            }
+            let (prefill, prefill_fused) = pass(&graphs.prefill);
+            let (decode, decode_fused) = pass(&graphs.decode);
+            graphs.prefill = prefill;
+            graphs.prefill_node_count -= prefill_fused;
+            graphs.decode = decode;
+            graphs.decode_node_count -= decode_fused;
+        }
         graphs
     }
 
@@ -2606,14 +2617,15 @@ fn dispatch_reference_cpu_operator_pre_admitted(
     result
 }
 
-/// `graph_fusion::fuse_matmul_bias`'s fused node: `matmul(a, b) + bias`,
-/// `bias` a `[cols]` row broadcast to every output row.
-fn dispatch_qwen_matmul_bias(
+/// `graph_fusion`'s fused matmul nodes: `matmul(a, b)` plus `extra`
+/// (`matmul-bias`'s `[cols]` bias row, or `matmul-residual`'s residual).
+fn dispatch_qwen_matmul_fused(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,
+    operator: OperatorId,
     a: NodeValue,
     b: NodeValue,
-    bias: NodeValue,
+    extra: NodeValue,
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
     let (rows, _) = a.rows_cols()?;
@@ -2626,11 +2638,11 @@ fn dispatch_qwen_matmul_bias(
     dispatch_reference_cpu_operator_pre_admitted(
         ctx,
         operation_id,
-        crate::graph_fusion::matmul_bias_operator(),
+        operator,
         vec![
             node_input_resource(operation_id, "a", a),
             node_input_resource(operation_id, "b", b),
-            node_input_resource(operation_id, "bias", bias),
+            node_input_resource(operation_id, "extra", extra),
         ],
         descriptor,
         output_target,
@@ -3426,17 +3438,47 @@ fn dispatch_first_native_graph_node(
             dispatch_qwen_matmul(ctx, node_id, a, b, Some(output_target))
                 .map(|(dispatch, value)| (dispatch, vec![value]))
         }
-        "matmul-bias" => {
+        "matmul-bias" | "matmul-residual" => {
             if inputs.len() != 3 {
                 return Err(InferenceApiError::GraphPlanningFailed {
-                    reason: format!("graph node '{node_id}' expects 3 matmul-bias inputs"),
+                    reason: format!(
+                        "graph node '{node_id}' expects 3 {} inputs",
+                        node.operator.name()
+                    ),
                 });
             }
             let a = inputs.remove(0);
             let b = inputs.remove(0);
-            let bias = inputs.remove(0);
-            dispatch_qwen_matmul_bias(ctx, node_id, a, b, bias, Some(output_target))
-                .map(|(dispatch, value)| (dispatch, vec![value]))
+            let extra = inputs.remove(0);
+            dispatch_qwen_matmul_fused(
+                ctx,
+                node_id,
+                node.operator.clone(),
+                a,
+                b,
+                extra,
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "silu-mul" => {
+            if inputs.len() != 2 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 2 silu-mul inputs"),
+                });
+            }
+            let gate = inputs.remove(0);
+            let up = inputs.remove(0);
+            dispatch_qwen_binary_same_shape(
+                ctx,
+                node_id,
+                "silu-mul",
+                OperatorFamily::Activation,
+                gate,
+                up,
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "rope" => {
             if inputs.len() != 1 {
@@ -4026,6 +4068,8 @@ fn execute_first_native_graph_nodes(
             node.operator.name(),
             "matmul"
                 | "matmul-bias"
+                | "matmul-residual"
+                | "silu-mul"
                 | "attention"
                 | "silu"
                 | "add"

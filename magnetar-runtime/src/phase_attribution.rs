@@ -125,11 +125,13 @@ const OPERATOR_LABELS: &[&str] = &[
     "embedding",
     "matmul",
     "matmul-bias",
+    "matmul-residual",
     "mul",
     "residual-add",
     "rmsnorm",
     "rope",
     "silu",
+    "silu-mul",
     "softmax",
     "split",
 ];

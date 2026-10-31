@@ -109,3 +109,54 @@ fn a_graph_without_biases_or_with_a_shared_intermediate_is_left_unchanged() {
     assert!(fused.edges.contains_key(&intermediate));
     assert!(fused.nodes.contains_key(&add_id));
 }
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn residual_and_swiglu_pairs_of_the_real_qwen_graph_are_fused_after_the_biases() {
+    let mut fixture = e2e_fixture().expect("fixture builds");
+    fixture.config.attention_bias = true;
+    let layers = fixture.config.architecture.layer_count as usize;
+    let (graphs, _definition, _instance) =
+        crate::first_native_runtime::build_first_native_graphs_from_real_qwen_component(
+            &fixture, 3,
+        )
+        .expect("the real Qwen Component builds a bias-bearing graph");
+    for graph in [&graphs.prefill, &graphs.decode] {
+        let (biased, bias_count) = fuse_matmul_bias(graph, is_weight);
+        let (residual, residual_count) = fuse_matmul_residual(&biased);
+        let (fused, silu_count) = fuse_silu_mul(&residual);
+        assert_eq!(bias_count, 3 * layers);
+        assert_eq!(residual_count, 2 * layers, "o_proj and down_proj per layer");
+        assert_eq!(silu_count, layers, "one SwiGLU gate per layer");
+        assert_eq!(
+            fused.nodes.len(),
+            graph.nodes.len() - bias_count - residual_count - silu_count
+        );
+        let count = |name: &str| {
+            fused
+                .nodes
+                .values()
+                .filter(|node| node.operator.name() == name)
+                .count()
+        };
+        assert_eq!(count(MATMUL_RESIDUAL_OPERATOR), residual_count);
+        assert_eq!(count(SILU_MUL_OPERATOR), silu_count);
+        assert_eq!(count("residual-add"), 0);
+        assert_eq!(count("silu"), 0);
+        assert_eq!(count("mul"), 0);
+        for node in fused.nodes.values() {
+            if node.operator.name() == MATMUL_RESIDUAL_OPERATOR {
+                assert_eq!(node.inputs.len(), 3);
+                assert!(is_weight(&node.inputs[1]) && !is_weight(&node.inputs[2]));
+            }
+            if node.operator.name() == SILU_MUL_OPERATOR {
+                assert_eq!(node.inputs.len(), 2);
+            }
+        }
+        let order = first_native_graph_execution_order_for_tests(&fused)
+            .expect("the fused graph still has a valid execution order");
+        assert_eq!(order.len(), fused.nodes.len());
+        assert_eq!(fuse_matmul_residual(&fused).1, 0);
+        assert_eq!(fuse_silu_mul(&fused).1, 0);
+    }
+}

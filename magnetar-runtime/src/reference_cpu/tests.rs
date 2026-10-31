@@ -1963,3 +1963,67 @@ fn reference_cpu_matmul_bias_is_bit_identical_to_matmul_then_add() {
         "like matmul, matmul-bias only accumulates in f32"
     );
 }
+
+/// `matmul-residual` and `silu-mul` (`graph_fusion`) must be bit-identical
+/// to the `matmul` + `residual-add` and `silu` + `mul` pairs they replace.
+#[test]
+fn reference_cpu_matmul_residual_and_silu_mul_are_bit_identical_to_their_pairs() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let catalog = initial_operator_catalog();
+    let values = |count: u64, seed: u64| -> Vec<f32> {
+        (0..count)
+            .map(|i| (((i * 7919 + seed * 104_729) % 2001) as f32 - 1000.0) * 1.3e-3)
+            .collect()
+    };
+    let bits = |tensor: &HostTensor| tensor.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let run = |name: &str, inputs: Vec<(&str, HostTensor)>, out_shape: Vec<u64>| {
+        let advertisement = reference_cpu_kernel_by_name(&advertisements, name);
+        let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+        let mut invocation = KernelInvocation::new(
+            KernelInvocationId::new(format!("invocation-{name}")),
+            advertisement.implemented_operator.clone(),
+            advertisement.id.clone(),
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        );
+        for (id, tensor) in inputs {
+            let (resource_id, resource) =
+                reference_cpu_resource(&format!("{name}-{id}"), tensor.shape.clone());
+            executor.write_tensor(resource_id, tensor);
+            invocation = invocation.with_input(resource);
+        }
+        let (_out_id, out_resource) = reference_cpu_resource(&format!("{name}-out"), out_shape);
+        invocation = invocation.with_output(out_resource.clone());
+        let result = executor.execute_invocation(advertisement, operator, &invocation);
+        assert_eq!(result.status, KernelResultStatus::Succeeded, "{name}");
+        executor.read_tensor(&out_resource.resource.id).unwrap()
+    };
+
+    let (m, k, n) = (3u64, 37u64, 21u64);
+    let a = reference_cpu_host_tensor([m, k], values(m * k, 1));
+    let b = reference_cpu_host_tensor([k, n], values(k * n, 2));
+    let residual = reference_cpu_host_tensor([m, n], values(m * n, 3));
+    let fused = run(
+        "matmul-residual",
+        vec![
+            ("a", a.clone()),
+            ("b", b.clone()),
+            ("residual", residual.clone()),
+        ],
+        vec![m, n],
+    );
+    let unfused = residual_add(&residual, &matmul(&a, &b, false, false).unwrap()).unwrap();
+    assert_eq!(bits(&fused), bits(&unfused));
+
+    let gate = reference_cpu_host_tensor([m, n], values(m * n, 4));
+    let up = reference_cpu_host_tensor([m, n], values(m * n, 5));
+    let fused = run(
+        "silu-mul",
+        vec![("gate", gate.clone()), ("up", up.clone())],
+        vec![m, n],
+    );
+    let unfused = mul(&silu(&gate), &up).unwrap();
+    assert_eq!(bits(&fused), bits(&unfused));
+}
