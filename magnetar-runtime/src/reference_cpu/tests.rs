@@ -1882,3 +1882,24 @@ fn reference_cpu_rope_invocation_honors_and_validates_rotation_pairing() {
         reference_cpu_rope_invocation_result(Some(OperatorAttributeValue::Integer(1)));
     assert_eq!(status, KernelResultStatus::Failed);
 }
+
+#[test]
+fn kernel_observation_log_keeps_only_the_most_recent_observations() {
+    let executor = ReferenceCpuExecutor::new();
+    let total = 2 * KERNEL_OBSERVATION_LOG_CAPACITY + 7;
+    for index in 0..total {
+        let kind = if index + 1 == total {
+            KernelObservationKind::KernelDispatchCompleted
+        } else {
+            KernelObservationKind::KernelDispatchStarted
+        };
+        executor.observe(KernelObservation::new(kind));
+    }
+    let observations = executor.observations();
+    assert_eq!(observations.len(), KERNEL_OBSERVATION_LOG_CAPACITY);
+    assert!(executor.observations.lock().unwrap().len() <= 2 * KERNEL_OBSERVATION_LOG_CAPACITY);
+    assert_eq!(
+        observations.last().map(|observation| observation.kind),
+        Some(KernelObservationKind::KernelDispatchCompleted)
+    );
+}
