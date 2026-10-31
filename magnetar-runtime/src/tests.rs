@@ -1483,11 +1483,43 @@ fn admit_kernel_output_replaces_and_releases_the_previous_allocation_for_the_sam
                 && allocation.state == MemoryAllocationState::Active)
     );
 
-    // Re-admitting the same id (a later generation step dispatching the
-    // same graph node) must replace and release the previous allocation,
-    // not accumulate a second one.
+    // Re-admitting the same id with the same request (a later generation
+    // step dispatching the same graph node) keeps the still-active
+    // allocation: one allocation, not one per step.
     manager
-        .admit_kernel_output(id.clone(), &descriptor, placement, owner, affinity)
+        .admit_kernel_output(
+            id.clone(),
+            &descriptor,
+            placement.clone(),
+            owner.clone(),
+            affinity.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        manager.tensor_residency(&id).unwrap().allocation,
+        Some(first_allocation)
+    );
+    let active_for_owner = |manager: &MemoryManager| {
+        manager
+            .allocations()
+            .filter(|allocation| {
+                allocation.state == MemoryAllocationState::Active
+                    && allocation.request.owner == owner
+            })
+            .count()
+    };
+    assert_eq!(active_for_owner(&manager), 1);
+
+    // Re-admitting it with a different request (here a larger tensor) must
+    // replace and release the previous allocation, not accumulate a second
+    // one.
+    let larger = TensorDescriptor::new(
+        ShapeDescriptor::new([4, 4]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+        LayoutDescriptor::Contiguous,
+    );
+    manager
+        .admit_kernel_output(id.clone(), &larger, placement, owner.clone(), affinity)
         .unwrap();
     let second_allocation = manager.tensor_residency(&id).unwrap().allocation.unwrap();
     assert_ne!(first_allocation, second_allocation);
@@ -1498,6 +1530,7 @@ fn admit_kernel_output_replaces_and_releases_the_previous_allocation_for_the_sam
                 && allocation.state == MemoryAllocationState::Active),
         "the first allocation must no longer be Active after re-admission"
     );
+    assert_eq!(active_for_owner(&manager), 1);
 }
 
 #[test]

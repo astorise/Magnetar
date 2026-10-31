@@ -4169,11 +4169,36 @@ impl MemoryManager {
             owner,
         )
         .with_affinity(affinity.clone());
-        let allocation = self.allocate(request)?;
         let previous = self
             .tensor_residency
             .get(&id)
             .and_then(|residency| residency.allocation);
+        // A graph edge is admitted under the same id, size, placement, owner
+        // and affinity at every generation step. When its previous
+        // admission is still active and is exactly what this one would
+        // record, keep it: replacing it would allocate, record and release
+        // to end in the same state.
+        if let Some(previous) = previous
+            && self
+                .allocations
+                .get(&previous)
+                .is_some_and(|allocation| {
+                    allocation.state == MemoryAllocationState::Active
+                        && allocation.request == request
+                })
+            && self.tensor_residency.get(&id)
+                == Some(
+                    &TensorResidency::new(id.clone(), placement.clone(), affinity.clone())
+                        .with_allocation(previous),
+                )
+        {
+            return Ok(TensorResourceDescriptor::new(
+                id,
+                descriptor.clone(),
+                affinity,
+            ));
+        }
+        let allocation = self.allocate(request)?;
         self.record_tensor_residency(
             TensorResidency::new(id.clone(), placement, affinity.clone())
                 .with_allocation(allocation.id),
