@@ -518,16 +518,6 @@ pub fn select_next_token(request: &SamplingRequest) -> Result<SamplingResult, Sa
     apply_top_k(request.parameters.top_k, &mut candidates);
     apply_top_p(request.parameters.top_p, &mut candidates)?;
 
-    let eligible = candidates
-        .iter()
-        .filter(|candidate| candidate.eligible)
-        .collect::<Vec<_>>();
-    if eligible.is_empty() {
-        return Err(SamplingError::NoEligibleToken);
-    }
-
-    let probabilities = softmax(&eligible);
-    let mut stream_state = 0_u64;
     let selection_mode = if request.parameters.greedy
         || !request.parameters.sampling_enabled
         || request.parameters.temperature == 0.0
@@ -536,30 +526,36 @@ pub fn select_next_token(request: &SamplingRequest) -> Result<SamplingResult, Sa
     } else {
         SamplingSelectionMode::Stochastic
     };
-    let selected_index = match selection_mode {
-        // Uses `candidate_order` -- the same best-first, lowest-token-id-
-        // breaks-ties ordering every other candidate cut (top-k, top-p) and
-        // `rank_for` use -- rather than a bare score comparison. `max_by`
-        // over a plain score comparison would resolve a tie to the *last*
-        // (highest-token-id) maximum, which both contradicts the documented
-        // tie-break rule below and produces a `token_rank` other than 1 for
-        // the token this branch just selected as "the best" (#51).
-        SamplingSelectionMode::Greedy | SamplingSelectionMode::ProviderAssisted => probabilities
-            .iter()
-            .enumerate()
-            .min_by(|(_, left), (_, right)| {
-                candidate_order((left.score, left.token_id), (right.score, right.token_id))
-            })
-            .map(|(index, _)| index)
-            .expect("eligible set is non-empty"),
+    let probability_allowed = request.policy.allow_probability_metadata;
+    let mut stream_state = 0_u64;
+    let selected = match selection_mode {
+        // Greedy needs the best candidate, its rank and, only when the policy
+        // reports it, its probability: computed straight from the eligible
+        // candidates, with the same `max`, the same `exp` sum in the same
+        // order and the same `candidate_order` as [`softmax`] and
+        // [`rank_for`], so the result is bit-identical without building two
+        // vocabulary-sized vectors and taking every `exp` twice.
+        SamplingSelectionMode::Greedy | SamplingSelectionMode::ProviderAssisted => {
+            greedy_selection(&candidates, probability_allowed)?
+        }
         SamplingSelectionMode::Stochastic => {
+            let eligible = candidates
+                .iter()
+                .filter(|candidate| candidate.eligible)
+                .collect::<Vec<_>>();
+            if eligible.is_empty() {
+                return Err(SamplingError::NoEligibleToken);
+            }
+            let probabilities = softmax(&eligible);
             stream_state = resolve_stream_state(request, &probabilities);
-            sample_index(&probabilities, &mut stream_state)
+            let selected = probabilities[sample_index(&probabilities, &mut stream_state)];
+            SelectedCandidate {
+                token_id: selected.token_id,
+                probability: selected.probability,
+                rank: rank_for(selected.token_id, &probabilities),
+            }
         }
     };
-    let selected = &probabilities[selected_index];
-    let rank = rank_for(selected.token_id, &probabilities);
-    let probability_allowed = request.policy.allow_probability_metadata;
     let updated_rng_state = matches!(selection_mode, SamplingSelectionMode::Stochastic)
         .then(|| SamplingRngState::from_stream(stream_state));
 
@@ -567,7 +563,7 @@ pub fn select_next_token(request: &SamplingRequest) -> Result<SamplingResult, Sa
         request_id: request.request_id.clone(),
         selected_token_id: selected.token_id,
         selection_mode,
-        token_rank: Some(rank),
+        token_rank: Some(selected.rank),
         token_probability: probability_allowed.then_some(selected.probability),
         token_log_probability: probability_allowed.then_some(selected.probability.ln()),
         finish_hint: finish_hint_for(request, selected.token_id),
@@ -773,49 +769,68 @@ fn apply_token_constraints(
         .minimum_generated_tokens
         .is_some_and(|minimum| request.step_index < minimum);
 
-    for (index, candidate) in candidates.iter_mut().enumerate() {
-        if let Some(kind) = special.get(&candidate.token_id).copied() {
-            match kind {
-                SpecialTokenKind::Pad if request.policy.suppress_pad => candidate.eligible = false,
-                SpecialTokenKind::Unknown if request.policy.suppress_unknown => {
-                    candidate.eligible = false
-                }
-                SpecialTokenKind::Bos
-                    if request.policy.suppress_bos_after_beginning && request.step_index > 0 =>
-                {
-                    candidate.eligible = false
-                }
-                SpecialTokenKind::Additional
-                    if request.policy.suppress_additional_special_tokens =>
-                {
-                    candidate.eligible = false
-                }
-                SpecialTokenKind::Eos
-                    if minimum_active && !request.policy.allow_eos_before_min_length =>
-                {
-                    candidate.eligible = false
-                }
-                _ => {}
+    // Every rule only ever makes a candidate ineligible, so their order does
+    // not matter. Candidates are indexed by token id (`token_id_range.start`
+    // plus position, see `select_next_token`), so a rule naming token ids
+    // marks exactly those candidates instead of every candidate of the
+    // vocabulary looking itself up in every rule's set.
+    let start = tokenizer.token_id_range.start;
+    let positions_of = |token_id: TokenId, len: usize| -> std::ops::Range<usize> {
+        let Some(offset) = token_id.checked_sub(start) else {
+            return 0..0;
+        };
+        let first = offset as usize;
+        if first >= len {
+            return 0..0;
+        }
+        // Positions past `u32::MAX - start` all saturate to `u32::MAX`.
+        if token_id == TokenId::MAX {
+            first..len
+        } else {
+            first..first + 1
+        }
+    };
+    let len = candidates.len();
+    let mut exclude = |token_id: TokenId| {
+        for candidate in &mut candidates[positions_of(token_id, len)] {
+            candidate.eligible = false;
+        }
+    };
+    for (token_id, kind) in special {
+        let suppressed = match kind {
+            SpecialTokenKind::Pad => request.policy.suppress_pad,
+            SpecialTokenKind::Unknown => request.policy.suppress_unknown,
+            SpecialTokenKind::Bos => {
+                request.policy.suppress_bos_after_beginning && request.step_index > 0
+            }
+            SpecialTokenKind::Additional => request.policy.suppress_additional_special_tokens,
+            SpecialTokenKind::Eos => minimum_active && !request.policy.allow_eos_before_min_length,
+            _ => false,
+        };
+        if suppressed {
+            exclude(token_id);
+        }
+    }
+    if request.stop.mask_stop_tokens_before_minimum && minimum_active {
+        for &token_id in &request.stop.stop_token_ids {
+            exclude(token_id);
+        }
+    }
+    for token_id in banned {
+        exclude(token_id);
+    }
+    if let Some(mask) = &request.allowed_token_mask {
+        for (index, candidate) in candidates.iter_mut().enumerate() {
+            if !mask[index] {
+                candidate.eligible = false;
             }
         }
-        if request.stop.mask_stop_tokens_before_minimum
-            && minimum_active
-            && request.stop.stop_token_ids.contains(&candidate.token_id)
-        {
-            candidate.eligible = false;
-        }
-        if let Some(mask) = &request.allowed_token_mask
-            && !mask[index]
-        {
-            candidate.eligible = false;
-        }
-        if let Some(allowed) = &allowed
-            && !allowed.contains(&candidate.token_id)
-        {
-            candidate.eligible = false;
-        }
-        if banned.contains(&candidate.token_id) {
-            candidate.eligible = false;
+    }
+    if let Some(allowed) = &allowed {
+        for candidate in candidates.iter_mut() {
+            if !allowed.contains(&candidate.token_id) {
+                candidate.eligible = false;
+            }
         }
     }
     Ok(())
@@ -989,6 +1004,52 @@ fn apply_top_p(top_p: Option<f32>, candidates: &mut [Candidate]) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// The token a sampling step selected, its rank among the eligible
+/// candidates (1 being the best) and its probability.
+struct SelectedCandidate {
+    token_id: TokenId,
+    probability: f32,
+    rank: usize,
+}
+
+/// The best eligible candidate by [`candidate_order`]. Its probability is
+/// what [`softmax`] over the eligible candidates gives it, computed only when
+/// `with_probability` (otherwise reported as `NaN` and never read).
+fn greedy_selection(
+    candidates: &[Candidate],
+    with_probability: bool,
+) -> Result<SelectedCandidate, SamplingError> {
+    let eligible = || candidates.iter().filter(|candidate| candidate.eligible);
+    let best = eligible()
+        .min_by(|left, right| {
+            candidate_order((left.score, left.token_id), (right.score, right.token_id))
+        })
+        .ok_or(SamplingError::NoEligibleToken)?;
+    let best_key = (best.score, best.token_id);
+    let rank = eligible()
+        .filter(|candidate| {
+            candidate_order((candidate.score, candidate.token_id), best_key).is_lt()
+        })
+        .count()
+        + 1;
+    let probability = if with_probability {
+        let max = eligible()
+            .map(|candidate| candidate.score)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let denom = eligible()
+            .map(|candidate| (candidate.score - max).exp())
+            .sum::<f32>();
+        (best.score - max).exp() / denom
+    } else {
+        f32::NAN
+    };
+    Ok(SelectedCandidate {
+        token_id: best.token_id,
+        probability,
+        rank,
+    })
 }
 
 fn softmax(candidates: &[&Candidate]) -> Vec<ProbabilityCandidate> {

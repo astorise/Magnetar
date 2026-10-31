@@ -1771,7 +1771,7 @@ fn run_generation_loop_inner(
             StepKind::Decode
         });
         let step_started_at = std::time::Instant::now();
-        let runtime_step =
+        let mut runtime_step =
             match executor.execute_generation_step(runtime, request, &generated, execution_plan) {
                 Ok(runtime_step) => runtime_step,
                 Err(error) => {
@@ -1878,19 +1878,20 @@ fn run_generation_loop_inner(
         // Emitted even on a later failure (the `?`s above only run once
         // `execute_generation_step` already returned `Ok`, so every event
         // it did capture before any internal failure is still here).
+        // One `format!` per event (hundreds per step), giving exactly the
+        // text `observation_message` builds from the same context items.
         for event in &runtime_step.node_events {
-            let mut context = vec![
-                format!("request={}", request.request_id),
-                format!("node={}", event.node),
-            ];
-            if let Some(resource) = &event.resource {
-                context.push(format!("resource={resource}"));
-            }
-            observer.observe(
-                event.kind,
-                observation_message("per-node causal event", &context),
-                correlation_id.clone(),
-            );
+            let message = match &event.resource {
+                Some(resource) => format!(
+                    "per-node causal event; request={} node={} resource={resource}",
+                    request.request_id, event.node
+                ),
+                None => format!(
+                    "per-node causal event; request={} node={}",
+                    request.request_id, event.node
+                ),
+            };
+            observer.observe(event.kind, message, correlation_id.clone());
         }
         if let Err(error) = runtime_step.evidence.clone().validate() {
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
@@ -1910,7 +1911,9 @@ fn run_generation_loop_inner(
         let (sampling, step) = decode_step_from_sampling_with_rng(
             request,
             &generated,
-            runtime_step.logits.clone(),
+            // Moved, not copied: nothing reads a step's logits after
+            // sampling (`commit_generation_step` only commits its KV).
+            std::mem::take(&mut runtime_step.logits),
             sampling_policy.clone(),
             rng_state.take(),
         )

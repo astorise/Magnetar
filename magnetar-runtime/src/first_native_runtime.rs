@@ -29,11 +29,11 @@ use crate::kernel_artifact::{
 };
 use crate::kernel_dispatch::*;
 use crate::kernel_execution_plan::{
-    FingerprintedGraph, PlanGuard, PlanGuardContext, PlanMemoryRequirements, PlanNodeBinding,
-    PreparedExecutionPhase, PreparedExecutionPlan, PreparedExecutionPlanError,
-    PreparedExecutionPlanExecutor, PreparedExecutionPlanGeneration, PreparedExecutionPlanId,
-    PreparedExecutionPlanScope, PreparedPlanNodeExecution, ResourceBindingPlan,
-    semantic_graph_fingerprint,
+    ExecutionGraphSemanticFingerprint, FingerprintedGraph, PlanGuard, PlanGuardContext,
+    PlanMemoryRequirements, PlanNodeBinding, PreparedExecutionPhase, PreparedExecutionPlan,
+    PreparedExecutionPlanError, PreparedExecutionPlanExecutor, PreparedExecutionPlanGeneration,
+    PreparedExecutionPlanId, PreparedExecutionPlanScope, PreparedPlanNodeExecution,
+    ResourceBindingPlan, semantic_graph_fingerprint,
 };
 use crate::kernel_optimization_orchestration::run_kernel_optimization_orchestration_conformance;
 use crate::kernel_registry::*;
@@ -1263,7 +1263,58 @@ pub(crate) struct ComponentGraphCache {
 }
 
 /// One prompt length's graphs.
-type CachedComponentGraphs = (u64, Arc<FirstNativeComponentGraphs>);
+type CachedComponentGraphs = (u64, Arc<CachedGraphs>);
+
+/// What every step derives from a graph alone: its plan fingerprint and
+/// its execution order. A cached graph never changes, so each is computed
+/// at most once instead of on every step.
+#[derive(Default)]
+pub(crate) struct GraphExecutionMemo {
+    fingerprint: std::sync::OnceLock<ExecutionGraphSemanticFingerprint>,
+    order: std::sync::OnceLock<Vec<ExecutionNodeId>>,
+}
+
+impl GraphExecutionMemo {
+    fn fingerprint(&self, graph: &ExecutionGraph) -> &ExecutionGraphSemanticFingerprint {
+        self.fingerprint
+            .get_or_init(|| semantic_graph_fingerprint(graph))
+    }
+
+    fn order(&self, graph: &ExecutionGraph) -> Result<&[ExecutionNodeId], InferenceApiError> {
+        if let Some(order) = self.order.get() {
+            return Ok(order);
+        }
+        let order = first_native_graph_execution_order(graph)?;
+        Ok(self.order.get_or_init(|| order))
+    }
+}
+
+/// A loaded model's graphs for one prompt length, with each graph's
+/// [`GraphExecutionMemo`]. Only ever shared behind an `Arc`, so the graphs
+/// cannot change after a memo was filled.
+pub(crate) struct CachedGraphs {
+    graphs: FirstNativeComponentGraphs,
+    pub(crate) prefill_memo: GraphExecutionMemo,
+    pub(crate) decode_memo: GraphExecutionMemo,
+}
+
+impl CachedGraphs {
+    pub(crate) fn new(graphs: FirstNativeComponentGraphs) -> Self {
+        Self {
+            graphs,
+            prefill_memo: GraphExecutionMemo::default(),
+            decode_memo: GraphExecutionMemo::default(),
+        }
+    }
+}
+
+impl std::ops::Deref for CachedGraphs {
+    type Target = FirstNativeComponentGraphs;
+
+    fn deref(&self) -> &FirstNativeComponentGraphs {
+        &self.graphs
+    }
+}
 
 /// Whether `provider` has an active, prepared Kernel for `operator`.
 fn provider_advertises_operator(
@@ -1283,7 +1334,7 @@ fn provider_advertises_operator(
 }
 
 impl ComponentGraphCache {
-    pub(crate) fn get(&self, prompt_token_count: u64) -> Option<Arc<FirstNativeComponentGraphs>> {
+    pub(crate) fn get(&self, prompt_token_count: u64) -> Option<Arc<CachedGraphs>> {
         let mut entries = self.entries.lock().unwrap();
         let index = entries
             .iter()
@@ -1294,7 +1345,7 @@ impl ComponentGraphCache {
         Some(graphs)
     }
 
-    pub(crate) fn insert(&self, prompt_token_count: u64, graphs: Arc<FirstNativeComponentGraphs>) {
+    pub(crate) fn insert(&self, prompt_token_count: u64, graphs: Arc<CachedGraphs>) {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|(count, _)| *count != prompt_token_count);
         if entries.len() == COMPONENT_GRAPH_CACHE_CAPACITY {
@@ -2201,6 +2252,10 @@ fn dispatch_reference_cpu_operator_multi(
         operator,
         affinity.clone(),
     );
+    selection_request
+        .outputs
+        .reserve_exact(output_resources.len());
+    selection_request.inputs.reserve_exact(inputs.len());
     for output_resource in &output_resources {
         selection_request = selection_request
             .with_output(KernelResource::new(output_resource.clone(), memory_class));
@@ -2289,29 +2344,26 @@ fn dispatch_reference_cpu_operator_multi(
             })?)
         }
     };
-    // Cloned to an owned value (not kept as a borrow of `ctx.runtime`) so it
-    // can stay alive across this function's later `ctx.runtime.memory_mut()`
-    // calls without holding a live shared borrow of `ctx.runtime` at the
-    // same time (task group 7 / Correctif 13).
-    let advertisement = ctx
-        .runtime
-        .kernel_registry()
+    // Borrowed from the registry for the rest of this dispatch alongside the
+    // Memory Manager and the phase ledger (task group 7 / Correctif 13), so
+    // the advertisement is not copied for every node.
+    let (registry, memory, phases) = ctx.runtime.kernel_registry_memory_and_phases_mut();
+    let advertisement = registry
         .active_advertisement(selection.kernel())
         .ok_or_else(|| InferenceApiError::KernelUnavailable {
             reason: format!("selected advertisement for {operation_id} is no longer active"),
-        })?
-        .clone();
+        })?;
     ctx.node_events.push(PerNodeCausalEvent::new(
         InferenceApiObservationKind::PreparedKernelResolved,
         node.clone(),
     ));
     let mut plan = match &selection {
         HotPathKernelSelection::Prepared(prepared) => {
-            KernelDispatchPlan::from_prepared_node_execution(
+            KernelDispatchPlan::from_prepared_node_execution_owned(
                 KernelDispatchPlanId::new(format!("e2e-runtime-{operation_id}-dispatch")),
-                &selection_request,
+                selection_request,
                 prepared,
-                &advertisement,
+                advertisement,
                 KernelInvocationId::new(format!("e2e-runtime-{operation_id}-invocation")),
             )
         }
@@ -2319,7 +2371,7 @@ fn dispatch_reference_cpu_operator_multi(
             KernelDispatchPlanId::new(format!("e2e-runtime-{operation_id}-dispatch")),
             &selection_request,
             candidate,
-            &advertisement,
+            advertisement,
             KernelInvocationId::new(format!("e2e-runtime-{operation_id}-invocation")),
         ),
     }
@@ -2331,7 +2383,7 @@ fn dispatch_reference_cpu_operator_multi(
         let workspace = ctx
             .provider
             .allocate_workspace(
-                ctx.runtime.memory_mut(),
+                memory,
                 advertisement.workspace.size_bytes_upper_bound.unwrap_or(1),
             )
             .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
@@ -2340,26 +2392,22 @@ fn dispatch_reference_cpu_operator_multi(
         plan.invocation.workspace = Some(workspace);
         plan.workspace_reservation = Some(workspace);
     }
-    let mut dispatcher = KernelDispatcher::new();
+    let mut dispatcher = KernelDispatcher::for_single_dispatch();
     dispatcher
-        .revalidate(ctx.runtime.kernel_registry(), &mut plan)
+        .revalidate(registry, &mut plan)
         .map_err(|error| InferenceApiError::KernelUnavailable {
             reason: format!("{error:?}"),
         })?;
-    ctx.runtime
-        .phase_ledger_mut()
-        .record(resolve_clock, StepPhase::KernelResolve);
-    let catalog_clock = ctx.runtime.phase_ledger().clock();
+    phases.record(resolve_clock, StepPhase::KernelResolve);
+    let catalog_clock = phases.clock();
     let operator_catalog = shared_initial_operator_catalog();
     let operator_spec = operator_catalog
         .get(&advertisement.implemented_operator)
         .map_err(|error| InferenceApiError::KernelUnavailable {
             reason: error.to_string(),
         })?;
-    ctx.runtime
-        .phase_ledger_mut()
-        .record(catalog_clock, StepPhase::OperatorCatalog);
-    let execute_clock = ctx.runtime.phase_ledger().clock();
+    phases.record(catalog_clock, StepPhase::OperatorCatalog);
+    let execute_clock = phases.clock();
     // Provider submission/completion identity (Correctif 2): `submit_kernel`
     // is what causally triggers the numerical Kernel work (Reference CPU is
     // synchronous, so it runs as part of this call); the returned handle is
@@ -2369,12 +2417,7 @@ fn dispatch_reference_cpu_operator_multi(
     // trait object, not a concrete `ReferenceCpuExecutor`.
     let handle = ctx
         .provider
-        .submit_kernel(
-            &advertisement,
-            operator_spec,
-            &plan.invocation,
-            ctx.runtime.memory_mut(),
-        )
+        .submit_kernel(advertisement, operator_spec, &plan.invocation, memory)
         .map_err(|error| InferenceApiError::ProviderUnavailable {
             reason: format!(
                 "Reference CPU dispatch for {operation_id} could not be submitted: {error}"
@@ -2389,7 +2432,7 @@ fn dispatch_reference_cpu_operator_multi(
     // dispatch succeeded, rather than letting it accumulate as a leaked
     // allocation across every node this graph executes (task 5.4/5.5/5.6).
     if let Some(workspace) = plan.workspace_reservation {
-        let _ = ctx.runtime.memory_mut().release(workspace);
+        let _ = memory.release(workspace);
     }
     // `complete_kernel` observes the SAME work `handle` was returned for
     // above -- correlated by that handle, not fabricated -- and fails
@@ -2403,7 +2446,7 @@ fn dispatch_reference_cpu_operator_multi(
             ),
         }
     })?;
-    ctx.runtime.phase_ledger_mut().record_operator(
+    phases.record_operator(
         execute_clock,
         StepPhase::KernelExecute,
         advertisement.implemented_operator.name(),
@@ -3816,11 +3859,12 @@ fn execute_first_native_graph(
         absolute_position_override,
         node_events,
         MaterializedEdges::All,
+        None,
     )
 }
 
 /// [`execute_first_native_graph`], downloading only the `materialized`
-/// edges once every node has run.
+/// edges once every node has run. `memo`, when given, belongs to `graph`.
 #[allow(clippy::too_many_arguments)]
 fn execute_first_native_graph_materializing(
     runtime: &mut Runtime,
@@ -3834,6 +3878,7 @@ fn execute_first_native_graph_materializing(
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
+    memo: Option<&GraphExecutionMemo>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     execute_first_native_graph_with_resident_input(
         runtime,
@@ -3848,6 +3893,7 @@ fn execute_first_native_graph_materializing(
         absolute_position_override,
         node_events,
         materialized,
+        memo,
     )
 }
 
@@ -3889,9 +3935,21 @@ fn execute_first_native_graph_with_resident_input(
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
+    memo: Option<&GraphExecutionMemo>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     let prepare_clock = runtime.phase_ledger().clock();
-    let order = first_native_graph_execution_order(graph)?;
+    let computed_order;
+    let order = match memo {
+        Some(memo) => memo.order(graph)?,
+        None => {
+            computed_order = first_native_graph_execution_order(graph)?;
+            &computed_order[..]
+        }
+    };
+    let fingerprinted = match memo {
+        Some(memo) => FingerprintedGraph::with_known_fingerprint(graph, memo.fingerprint(graph)),
+        None => FingerprintedGraph::new(graph),
+    };
     // Every node in this graph binds to the same Provider; any binding names
     // it (task 5.2: resolve the executing Provider from Runtime provider
     // registration for each prepared binding).
@@ -3927,12 +3985,12 @@ fn execute_first_native_graph_with_resident_input(
     // (rather than continuing inline) purely for readability now, not to
     // manage a restore point.
     let (dispatch, bindings, layer_kv) = execute_first_native_graph_nodes(
-        &order,
+        order,
         runtime,
         fixture,
         &weight_bindings,
         kv_cache_id,
-        graph,
+        fingerprinted,
         prepared_plan,
         &executor,
         initial_bindings,
@@ -3952,7 +4010,7 @@ fn execute_first_native_graph_nodes(
     fixture: &E2eFixture,
     weight_bindings: &BTreeMap<String, TensorResourceId>,
     kv_cache_id: &KvCacheId,
-    graph: &ExecutionGraph,
+    fingerprinted: FingerprintedGraph<'_>,
     prepared_plan: &mut PreparedExecutionPlan,
     executor: &Arc<dyn ProviderExecutionApi>,
     initial_bindings: BTreeMap<TensorEdgeId, HostTensor>,
@@ -3962,6 +4020,7 @@ fn execute_first_native_graph_nodes(
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
+    let graph = fingerprinted.graph();
     // This step's token count, for `PlanGuardContext::sequence_length`
     // (Correctif 4): the same value every dispatched node's Plan guards
     // were built against (`PlanGuard::SequenceRange`), read from the graph
@@ -3973,7 +4032,7 @@ fn execute_first_native_graph_nodes(
         runtime,
         provider: executor.clone(),
         prepared_plan: Some(prepared_plan),
-        graph: Some(FingerprintedGraph::new(graph)),
+        graph: Some(fingerprinted),
         sequence_length,
         last_provider_execution: None,
         node_events,
@@ -4590,7 +4649,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                 .and_then(|cache| cache.get(prompt_token_count));
             let component_graphs = match cached_graphs {
                 Some(graphs) => graphs,
-                None => Arc::new(
+                None => Arc::new(CachedGraphs::new(
                     match &self.component_digest {
                         Some(digest) => build_first_native_graphs_from_named_component(
                             digest,
@@ -4613,7 +4672,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                         Some(cache) => cache.optimize(runtime, graphs),
                         None => graphs,
                     })?,
-                ),
+                )),
             };
             runtime
                 .phase_ledger_mut()
@@ -4664,6 +4723,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                         Some(0),
                         &mut node_events,
                         MaterializedEdges::Only(&["logits"]),
+                        Some(&component_graphs.prefill_memo),
                     )?
                 } else {
                     let token = *generated_tokens.last().ok_or_else(|| {
@@ -4685,6 +4745,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                         Some(absolute_position as u64),
                         &mut node_events,
                         MaterializedEdges::Only(&["logits"]),
+                        Some(&component_graphs.decode_memo),
                     )?
                 };
             // `execute_first_native_graph` topologically validates the graph (via
@@ -5902,6 +5963,7 @@ pub fn run_first_native_graph_segment_dispatch(
             absolute_position_override,
             &mut node_events,
             MaterializedEdges::All,
+            None,
         )
         .map_err(E2eConformanceError::from)?;
     Ok(FirstNativeProviderRunOutcome {
@@ -7968,7 +8030,7 @@ impl ProductionLoadedModel {
         let component_graphs = match self.graph_cache.get(prompt_token_count) {
             Some(graphs) => graphs,
             None => {
-                let graphs = Arc::new(
+                let graphs = Arc::new(CachedGraphs::new(
                     match &self.component_digest {
                         Some(digest) => build_first_native_graphs_from_named_component(
                             digest,
@@ -7989,7 +8051,7 @@ impl ProductionLoadedModel {
                         reason: error.to_string(),
                     })
                     .map(|graphs| self.graph_cache.optimize(&self.runtime, graphs))?,
-                );
+                ));
                 self.graph_cache
                     .insert(prompt_token_count, Arc::clone(&graphs));
                 graphs

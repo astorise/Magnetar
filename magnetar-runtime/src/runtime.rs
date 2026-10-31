@@ -357,6 +357,15 @@ impl Runtime {
     pub fn kernel_registry(&self) -> &KernelRegistry {
         &self.kernel_registry
     }
+    /// The Kernel Registry together with the Memory Manager and the phase
+    /// ledger, borrowed at once: a Kernel dispatch reads its advertisement
+    /// from the registry while it admits memory and records phases, without
+    /// copying the advertisement out first.
+    pub fn kernel_registry_memory_and_phases_mut(
+        &mut self,
+    ) -> (&KernelRegistry, &mut MemoryManager, &mut PhaseLedger) {
+        (&self.kernel_registry, &mut self.memory, &mut self.phases)
+    }
     pub fn kernel_registry_mut(&mut self) -> &mut KernelRegistry {
         &mut self.kernel_registry
     }

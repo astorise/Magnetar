@@ -2361,6 +2361,20 @@ impl<'g> FingerprintedGraph<'g> {
         }
     }
 
+    /// `graph` with the fingerprint an earlier [`Self::new`] computed for
+    /// this same, unchanged graph, so a graph executed every step is not
+    /// fingerprinted every step.
+    pub(crate) fn with_known_fingerprint(
+        graph: &'g ExecutionGraph,
+        fingerprint: &ExecutionGraphSemanticFingerprint,
+    ) -> Self {
+        debug_assert_eq!(fingerprint, &semantic_graph_fingerprint(graph));
+        Self {
+            graph,
+            fingerprint: fingerprint.clone(),
+        }
+    }
+
     pub fn graph(&self) -> &'g ExecutionGraph {
         self.graph
     }

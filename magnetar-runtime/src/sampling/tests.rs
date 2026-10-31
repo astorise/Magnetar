@@ -231,3 +231,56 @@ fn rank_is_one_for_a_token_outside_the_candidate_set() {
     let probabilities = softmax(&set.iter().collect::<Vec<_>>());
     assert_eq!(rank_for(999, &probabilities), 1);
 }
+
+#[test]
+fn greedy_selection_matches_softmax_and_rank_over_the_eligible_candidates() {
+    // Ties (resolved to the lower token id), ineligible candidates, a
+    // non-finite score and a pseudo-random spread of scores.
+    let mut candidates: Vec<Candidate> = (0..2048u32)
+        .map(|index| {
+            let mixed = index.wrapping_mul(2_654_435_761) % 1000;
+            Candidate {
+                token_id: index + 7,
+                score: mixed as f32 / 37.0 - 13.0,
+                eligible: index % 11 != 3,
+            }
+        })
+        .collect();
+    candidates[5].score = f32::NEG_INFINITY;
+    candidates[5].eligible = false;
+    let top = candidates
+        .iter()
+        .filter(|candidate| candidate.eligible)
+        .map(|candidate| candidate.score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    candidates[100].score = top;
+    candidates[900].score = top;
+    let eligible: Vec<&Candidate> = candidates.iter().filter(|c| c.eligible).collect();
+    let probabilities = softmax(&eligible);
+    let expected = probabilities
+        .iter()
+        .min_by(|left, right| {
+            candidate_order((left.score, left.token_id), (right.score, right.token_id))
+        })
+        .unwrap();
+    let selected = greedy_selection(&candidates, true).unwrap();
+    assert_eq!(selected.token_id, expected.token_id);
+    assert_eq!(
+        selected.probability.to_bits(),
+        expected.probability.to_bits()
+    );
+    assert_eq!(selected.rank, rank_for(expected.token_id, &probabilities));
+    let without = greedy_selection(&candidates, false).unwrap();
+    assert_eq!(
+        (without.token_id, without.rank),
+        (selected.token_id, selected.rank)
+    );
+
+    for candidate in &mut candidates {
+        candidate.eligible = false;
+    }
+    assert!(matches!(
+        greedy_selection(&candidates, true),
+        Err(SamplingError::NoEligibleToken)
+    ));
+}
