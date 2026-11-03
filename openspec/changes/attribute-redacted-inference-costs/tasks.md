@@ -6,9 +6,9 @@
 
 ## 2. A06 Redacted phase attribution
 
-- [ ] 2.1 Implement A06: Observability SHALL attribute kernel, plan, copy, I/O and cache costs through correlated phase records, use actual device timing when available and redact prompts, weight bytes, tensor values, secrets and sensitive paths.
-- [ ] 2.2 Add the positive conformance case: when a request crosses preparation, I/O, copies and compute, verify the report distinguishes device time, host time, overlap and unavailable counters without double counting.
-- [ ] 2.3 Add the failure/isolation case: when a prompt or tensor contains a recognizable sentinel, verify logs, traces and exported metrics omit that sentinel and retain only permitted metadata.
+- [x] 2.1 Implement A06: Observability SHALL attribute kernel, plan, copy, I/O and cache costs through correlated phase records, use actual device timing when available and redact prompts, weight bytes, tensor values, secrets and sensitive paths. (Initial profile: host time per generation-step leaf; Device time and overlap reported unavailable until a Provider exposes Device timestamps.)
+- [x] 2.2 Add the positive conformance case: when a request crosses preparation, I/O, copies and compute, verify the report distinguishes device time, host time, overlap and unavailable counters without double counting.
+- [x] 2.3 Add the failure/isolation case: when a prompt or tensor contains a recognizable sentinel, verify logs, traces and exported metrics omit that sentinel and retain only permitted metadata.
 
 ## 3. D01 Anonymized access traces and cache simulation
 

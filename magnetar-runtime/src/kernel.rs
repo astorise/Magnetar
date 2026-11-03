@@ -125,6 +125,30 @@ impl KernelId {
             self.provider, self.name, self.version, self.operator
         )
     }
+
+    /// Runs `lookup` on [`Self::stable_key`] written into a per-thread
+    /// buffer, so a registry lookup by key (several per dispatched node)
+    /// allocates nothing.
+    pub(crate) fn with_stable_key<R>(&self, lookup: impl FnOnce(&str) -> R) -> R {
+        use std::fmt::Write as _;
+        thread_local! {
+            static KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        }
+        KEY.with(|key| match key.try_borrow_mut() {
+            Ok(mut key) => {
+                key.clear();
+                write!(
+                    key,
+                    "{}:{}@{}:{}",
+                    self.provider, self.name, self.version, self.operator
+                )
+                .expect("writing to a String cannot fail");
+                lookup(&key)
+            }
+            // A lookup that itself looks a Kernel up.
+            Err(_) => lookup(&self.stable_key()),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

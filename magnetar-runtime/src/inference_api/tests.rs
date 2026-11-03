@@ -268,7 +268,7 @@ fn inference_api_cancellation_stage_observed_emits_generation_cancelled() {
 #[test]
 fn inference_api_observer_buffer_stays_bounded_and_retains_most_recent() {
     let mut observer = InferenceApiObserver::new();
-    let total = INFERENCE_API_OBSERVATION_BUFFER_CAPACITY + 128;
+    let total = 2 * INFERENCE_API_OBSERVATION_BUFFER_CAPACITY + 128;
     for index in 0..total {
         observer.observe(
             InferenceApiObservationKind::TokenCommitted,
@@ -295,6 +295,14 @@ fn inference_api_observer_buffer_stays_bounded_and_retains_most_recent() {
             .last()
             .map(|observation| observation.message.as_str()),
         Some(format!("observation-{}", total - 1)).as_deref()
+    );
+    assert_eq!(
+        observer.observations()[0].message,
+        format!(
+            "observation-{}",
+            total - INFERENCE_API_OBSERVATION_BUFFER_CAPACITY
+        ),
+        "exactly the most recent observations stay visible, in order"
     );
 }
 

@@ -1,0 +1,12 @@
+[package]
+name = "magnetar-inference-qualification"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Real-checkpoint inference performance qualification tooling for openspec/changes/qualify-real-checkpoint-performance (A01/A03/A04): run manifests, raw samples, campaign statistics and hardware capability evidence."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"

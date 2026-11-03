@@ -286,6 +286,84 @@ impl KernelDispatchPlan {
         })
     }
 
+    /// [`Self::from_prepared_node_execution`], taking the request by value:
+    /// its inputs and outputs are moved into the invocation, and the plan
+    /// keeps no second copy of them in `input_bindings`/`output_bindings`
+    /// (revalidation checks the invocation's own resources).
+    pub fn from_prepared_node_execution_owned(
+        id: KernelDispatchPlanId,
+        request: KernelSelectionRequest,
+        prepared: &PreparedPlanNodeExecution,
+        advertisement: &KernelAdvertisement,
+        invocation_id: KernelInvocationId,
+    ) -> Result<Self, KernelDispatchError> {
+        if prepared.kernel != advertisement.id {
+            return Err(KernelDispatchError::PlanInvalid(
+                "prepared execution's Kernel does not match advertisement".into(),
+            ));
+        }
+        let KernelSelectionRequest {
+            operator,
+            affinity,
+            inputs,
+            outputs,
+            execution_mode,
+            deadline_millis,
+            observability_correlation,
+            policy,
+            deterministic_required,
+            precision,
+            ..
+        } = request;
+        let mut invocation = KernelInvocation::new(
+            invocation_id,
+            operator,
+            prepared.kernel.clone(),
+            prepared.provider.clone(),
+            affinity,
+        );
+        invocation.inputs = inputs;
+        invocation.outputs = outputs;
+        invocation.device = prepared.device.clone();
+        invocation.execution_mode = execution_mode.unwrap_or_else(|| {
+            advertisement
+                .execution_modes
+                .iter()
+                .next()
+                .copied()
+                .unwrap_or(KernelExecutionMode::Synchronous)
+        });
+        invocation.deadline_millis = deadline_millis;
+        invocation.observability_correlation = observability_correlation.clone();
+        invocation.policy = policy;
+        invocation.deterministic_required = deterministic_required;
+        invocation.precision = precision;
+
+        Ok(Self {
+            id,
+            selected_kernel: prepared.kernel.clone(),
+            provider: prepared.provider.clone(),
+            device: prepared.device.clone(),
+            // Not duplicated: the invocation holds the resources, and
+            // revalidation checks them there.
+            input_bindings: Vec::new(),
+            output_bindings: Vec::new(),
+            workspace_reservation: invocation.workspace,
+            execution_mode: invocation.execution_mode,
+            cancellation: advertisement.cancellation,
+            deadline_millis,
+            fallback_chain: Vec::new(),
+            observability_correlation,
+            cleanup_behavior: BTreeMap::new(),
+            expected_result_metadata: BTreeMap::new(),
+            device_metadata: None,
+            lifecycle: KernelDispatchLifecycleState::Planned,
+            invocation,
+            movement_steps: Vec::new(),
+            conversion_steps: Vec::new(),
+        })
+    }
+
     pub fn without_raw_handles(&self) -> bool {
         let text = format!("{self:?}");
         !text.contains("0x") && !text.contains("function pointer") && !text.contains("raw handle")
@@ -406,11 +484,25 @@ impl KernelDispatchResult {
 #[derive(Clone, Debug, Default)]
 pub struct KernelDispatcher {
     observations: Vec<KernelObservation>,
+    /// Whether a successful revalidation is recorded as a
+    /// `KernelDispatchPlanRevalidated` observation.
+    skip_revalidation_observations: bool,
 }
 
 impl KernelDispatcher {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A dispatcher used for one revalidation and dropped right after
+    /// (once per dispatched graph node): it does not record the
+    /// `KernelDispatchPlanRevalidated` observation nobody can read, and
+    /// its key formatting. Failures are still observed.
+    pub fn for_single_dispatch() -> Self {
+        Self {
+            skip_revalidation_observations: true,
+            ..Self::default()
+        }
     }
 
     pub fn observations(&self) -> &[KernelObservation] {
@@ -435,10 +527,12 @@ impl KernelDispatcher {
         plan: &mut KernelDispatchPlan,
         context: &KernelDispatchRevalidationContext,
     ) -> Result<(), KernelDispatchError> {
-        self.observations.push(
-            KernelObservation::new(KernelObservationKind::KernelDispatchPlanRevalidated)
-                .with_kernel(&plan.selected_kernel),
-        );
+        if !self.skip_revalidation_observations {
+            self.observations.push(
+                KernelObservation::new(KernelObservationKind::KernelDispatchPlanRevalidated)
+                    .with_kernel(&plan.selected_kernel),
+            );
+        }
         let Some(advertisement) = registry.active_advertisement(&plan.selected_kernel) else {
             plan.lifecycle = KernelDispatchLifecycleState::Failed;
             return Err(KernelDispatchError::DispatchStale(
@@ -507,9 +601,15 @@ impl KernelDispatcher {
             );
             return Err(error);
         }
+        // The invocation's own resources, and the plan's binding copies of
+        // them where the plan keeps any (`from_prepared_node_execution_owned`
+        // does not).
         for resource in plan
-            .input_bindings
+            .invocation
+            .inputs
             .iter()
+            .chain(plan.invocation.outputs.iter())
+            .chain(plan.input_bindings.iter())
             .chain(plan.output_bindings.iter())
         {
             if let Err(error) = validate_affinity_compatibility(

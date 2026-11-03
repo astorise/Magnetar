@@ -163,6 +163,9 @@ use std::{
 
 /// Stable, package-qualified Reference CPU Provider identity.
 pub const REFERENCE_CPU_PROVIDER_NAME: &str = "magnetar:provider/reference-cpu";
+
+/// How many recent Kernel observations an executor keeps.
+pub const KERNEL_OBSERVATION_LOG_CAPACITY: usize = 4096;
 pub const REFERENCE_CPU_PROVIDER_VERSION: &str = "0.1.0";
 pub const REFERENCE_CPU_PROVIDER_VENDOR: &str = "magnetar";
 pub const REFERENCE_CPU_DEVICE_ID: &str = "reference-cpu:host:0";
@@ -393,6 +396,62 @@ pub fn rope(
     position_offset: u64,
     head_count: u64,
 ) -> Result<HostTensor, ReferenceCpuError> {
+    rope_with_pairing(
+        input,
+        base,
+        scale,
+        dimension,
+        position_offset,
+        head_count,
+        RopePairing::Interleaved,
+    )
+}
+
+/// Which elements of a RoPE head block form each rotated pair
+/// (`fix-rope-rotation-pairing`). Model-family semantics, declared by the
+/// Model Component through the `rope` Operator's `rotation_pairing`
+/// attribute -- never inferred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopePairing {
+    /// Pairs `(2i, 2i + 1)`: GPT-J / GGML "normal" mode. The default when
+    /// the attribute is absent.
+    Interleaved,
+    /// Pairs `(i, i + dimension / 2)`: GPT-NeoX, Hugging Face Llama/Qwen2
+    /// (`rotate_half`) and llama.cpp NeoX mode.
+    HalfSplit,
+}
+
+impl RopePairing {
+    /// Parses a `rotation_pairing` attribute value; `None` for an unknown
+    /// value, which callers reject rather than substitute.
+    pub fn from_attribute(value: &str) -> Option<Self> {
+        match value {
+            "interleaved" => Some(Self::Interleaved),
+            "half_split" => Some(Self::HalfSplit),
+            _ => None,
+        }
+    }
+
+    pub fn as_attribute(self) -> &'static str {
+        match self {
+            Self::Interleaved => "interleaved",
+            Self::HalfSplit => "half_split",
+        }
+    }
+}
+
+/// [`rope`] with an explicit [`RopePairing`]. Both pairings use the same
+/// angle `position * base^(-2i / dimension)` for pair `i`; they differ only
+/// in which two columns of the head block pair `i` rotates.
+pub fn rope_with_pairing(
+    input: &HostTensor,
+    base: f32,
+    scale: f32,
+    dimension: u64,
+    position_offset: u64,
+    head_count: u64,
+    pairing: RopePairing,
+) -> Result<HostTensor, ReferenceCpuError> {
     let (rows, cols) = input.rows_cols()?;
     if head_count == 0 || !cols.is_multiple_of(head_count) {
         return Err(ReferenceCpuError::new(
@@ -435,10 +494,14 @@ pub fn rope(
                 let frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
                 let angle = position * frequency;
                 let (sin, cos) = angle.sin_cos();
-                let even = input.data[col_base + 2 * pair];
-                let odd = input.data[col_base + 2 * pair + 1];
-                out[col_base + 2 * pair] = even * cos - odd * sin;
-                out[col_base + 2 * pair + 1] = even * sin + odd * cos;
+                let (first, second) = match pairing {
+                    RopePairing::Interleaved => (col_base + 2 * pair, col_base + 2 * pair + 1),
+                    RopePairing::HalfSplit => (col_base + pair, col_base + pair + half),
+                };
+                let a = input.data[first];
+                let b = input.data[second];
+                out[first] = a * cos - b * sin;
+                out[second] = a * sin + b * cos;
             }
         }
     }
@@ -473,6 +536,61 @@ pub fn softmax_rows(input: &HostTensor) -> Result<HostTensor, ReferenceCpuError>
         }
     }
     HostTensor::new(input.shape.clone(), out)
+}
+
+/// The `attention` Kernel feature a Provider advertises when it honours the
+/// `key_count` attribute (`append-kv-history-in-place`).
+pub const KEY_COUNT_FEATURE: &str = "key-count";
+
+/// The first `count` rows of a rank-2 tensor.
+pub fn leading_rows(tensor: &HostTensor, count: u64) -> Result<HostTensor, ReferenceCpuError> {
+    let (rows, cols) = tensor.rows_cols()?;
+    if count > rows {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("key_count {count} exceeds the {rows} rows of K/V"),
+        ));
+    }
+    HostTensor::new(
+        [count, cols],
+        tensor.data[..(count * cols) as usize].to_vec(),
+    )
+    .map_err(|error| {
+        ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, error.to_string())
+    })
+}
+
+/// `store` with `rows` written over its rows `row_offset..row_offset +
+/// rows` (`kv-write`, `append-kv-history-in-place`). Rows outside that range
+/// are unchanged.
+pub fn kv_write(
+    store: &HostTensor,
+    rows: &HostTensor,
+    row_offset: u64,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let (capacity, width) = store.rows_cols()?;
+    let (count, row_width) = rows.rows_cols()?;
+    if row_width != width {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("kv-write rows have width {row_width}, the store {width}"),
+        ));
+    }
+    if row_offset
+        .checked_add(count)
+        .is_none_or(|end| end > capacity)
+    {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("kv-write of {count} rows at {row_offset} exceeds the store's {capacity} rows"),
+        ));
+    }
+    let mut data = store.data.clone();
+    let start = (row_offset * width) as usize;
+    data[start..start + rows.data.len()].copy_from_slice(&rows.data);
+    HostTensor::new([capacity, width], data).map_err(|error| {
+        ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, error.to_string())
+    })
 }
 
 /// Simple causal (or unmasked) scaled dot-product attention over `head_count`
@@ -1074,10 +1192,15 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         memory_classes: BTreeSet::new(),
         affinity: None,
     });
+    // Honours the `key_count` attribute (`append-kv-history-in-place`).
+    attention.id.features.insert(KEY_COUNT_FEATURE.to_string());
     let embedding = baseline_advertisement("embedding", OperatorFamily::Tensor);
 
     vec![
         baseline_advertisement("matmul", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("matmul-bias", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("matmul-residual", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("silu-mul", OperatorFamily::Activation),
         embedding,
         baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
         baseline_advertisement("rope", OperatorFamily::PositionEncoding),
@@ -1089,6 +1212,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("add", OperatorFamily::Tensor),
         baseline_advertisement("mul", OperatorFamily::Tensor),
         baseline_advertisement("concat", OperatorFamily::Tensor),
+        baseline_advertisement("kv-write", OperatorFamily::Tensor),
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
         baseline_advertisement("layout-conversion", OperatorFamily::Layout),
@@ -1215,8 +1339,20 @@ impl ReferenceCpuExecutor {
         self.storage.lock().unwrap().get(id).cloned()
     }
 
+    #[cfg(test)]
     /// Drops a tensor from this executor's opaque storage. Returns `true`
     /// if `id` was present and removed, `false` if it was already absent.
+    /// The allocations this executor tracks for its admitted resources.
+    pub(crate) fn tracked_allocations(&self) -> BTreeMap<TensorResourceId, MemoryAllocationId> {
+        self.resource_allocations.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    /// How many tensors this executor's opaque storage currently holds.
+    pub(crate) fn stored_tensor_count(&self) -> usize {
+        self.storage.lock().unwrap().len()
+    }
+
     pub fn release_tensor(&self, id: &TensorResourceId) -> bool {
         self.storage.lock().unwrap().remove(id).is_some()
     }
@@ -1368,12 +1504,26 @@ impl ReferenceCpuExecutor {
         }
     }
 
+    /// The most recent Kernel observations, oldest first, at most
+    /// `KERNEL_OBSERVATION_LOG_CAPACITY` of them.
     pub fn observations(&self) -> Vec<KernelObservation> {
-        self.observations.lock().unwrap().clone()
+        let observations = self.observations.lock().unwrap();
+        let start = observations
+            .len()
+            .saturating_sub(KERNEL_OBSERVATION_LOG_CAPACITY);
+        observations[start..].to_vec()
     }
 
     fn observe(&self, observation: KernelObservation) {
-        self.observations.lock().unwrap().push(observation);
+        let mut observations = self.observations.lock().unwrap();
+        // Bounded like the Runtime's own observation logs: a resident model
+        // records two observations per dispatched Kernel for as long as it
+        // serves. Dropping the oldest half at twice the capacity keeps the
+        // cost per observation amortized O(1).
+        if observations.len() >= 2 * KERNEL_OBSERVATION_LOG_CAPACITY {
+            observations.drain(..KERNEL_OBSERVATION_LOG_CAPACITY);
+        }
+        observations.push(observation);
     }
 
     /// Runs a small, fixed set of known-input/known-output checks against
@@ -1650,12 +1800,34 @@ impl ReferenceCpuExecutor {
             std::collections::BTreeSet::new();
         for output in &invocation.outputs {
             let resource = &output.resource;
-            let self_admitted_before = self
+            // Pre-admitted whenever the residency record names an
+            // allocation other than the one this Provider tracks for the
+            // id: the caller admitted it, or re-admitted it after this
+            // Provider's own last write of the same id (an edge both
+            // pre-admitted per step and explicitly written). Self-admitting
+            // over it would overwrite the caller's residency record and
+            // orphan the caller's allocation once per step
+            // (`bound-memory-manager-bookkeeping`); instead the caller's
+            // record stays authoritative and this Provider's stale
+            // tracking entry for the id is dropped.
+            let tracked = self
                 .resource_allocations
                 .lock()
                 .unwrap()
-                .contains_key(&resource.id);
-            if !self_admitted_before && memory.tensor_residency(&resource.id).is_some() {
+                .get(&resource.id)
+                .copied();
+            let resident = memory
+                .tensor_residency(&resource.id)
+                .and_then(|residency| residency.allocation);
+            if memory.tensor_residency(&resource.id).is_some() && resident != tracked {
+                if let Some(stale) = self
+                    .resource_allocations
+                    .lock()
+                    .unwrap()
+                    .remove(&resource.id)
+                {
+                    let _ = memory.release(stale);
+                }
                 preadmitted.insert(resource.id.clone());
                 continue;
             }
@@ -1917,6 +2089,21 @@ impl ReferenceCpuExecutor {
         Ok(resource.resource.clone())
     }
 
+    /// `matmul` and `matmul-bias` accumulate in f32 only; any other
+    /// requested `accumulation_dtype` is rejected rather than ignored.
+    fn require_f32_accumulation(
+        attributes: &BTreeMap<String, OperatorAttributeValue>,
+    ) -> Result<(), KernelError> {
+        if let Some(OperatorAttributeValue::DType(dtype)) = attributes.get("accumulation_dtype")
+            && *dtype != ComputeDType::Float32
+        {
+            return Err(KernelError::KernelDTypeUnsupported {
+                dtype: format!("Reference CPU only accumulates in f32; requested {dtype:?}"),
+            });
+        }
+        Ok(())
+    }
+
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
         let mut result = KernelResult::success(invocation.id.clone());
@@ -1928,17 +2115,46 @@ impl ReferenceCpuExecutor {
                     Self::attribute_bool(&invocation.attributes, "transpose_a", false);
                 let transpose_b =
                     Self::attribute_bool(&invocation.attributes, "transpose_b", false);
-                if let Some(OperatorAttributeValue::DType(dtype)) =
-                    invocation.attributes.get("accumulation_dtype")
-                    && *dtype != ComputeDType::Float32
-                {
-                    return Err(KernelError::KernelDTypeUnsupported {
-                        dtype: format!(
-                            "Reference CPU only accumulates in f32; requested {dtype:?}"
-                        ),
-                    });
-                }
+                Self::require_f32_accumulation(&invocation.attributes)?;
                 matmul(&a, &b, transpose_a, transpose_b).map_err(KernelError::from)?
+            }
+            // `graph_fusion::fuse_matmul_bias`: exactly `matmul` followed
+            // by the row-broadcast `add` it replaces, so a fused graph is
+            // bit-identical to the unfused one.
+            "matmul-bias" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                let bias = self.input_tensor(invocation, 2)?;
+                let transpose_a =
+                    Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                let transpose_b =
+                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                Self::require_f32_accumulation(&invocation.attributes)?;
+                let product =
+                    matmul(&a, &b, transpose_a, transpose_b).map_err(KernelError::from)?;
+                add(&product, &bias).map_err(KernelError::from)?
+            }
+            // `graph_fusion::fuse_matmul_residual`: the matmul, then the
+            // `residual-add` it replaces (residual first, as Qwen2 builds it).
+            "matmul-residual" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                let residual = self.input_tensor(invocation, 2)?;
+                let transpose_a =
+                    Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                let transpose_b =
+                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                Self::require_f32_accumulation(&invocation.attributes)?;
+                let product =
+                    matmul(&a, &b, transpose_a, transpose_b).map_err(KernelError::from)?;
+                residual_add(&residual, &product).map_err(KernelError::from)?
+            }
+            // `graph_fusion::fuse_silu_mul`: `silu`, then the `mul` it
+            // replaces.
+            "silu-mul" => {
+                let gate = self.input_tensor(invocation, 0)?;
+                let up = self.input_tensor(invocation, 1)?;
+                mul(&silu(&gate), &up).map_err(KernelError::from)?
             }
             "embedding" => {
                 let table = self.input_tensor(invocation, 0)?;
@@ -2000,8 +2216,33 @@ impl ReferenceCpuExecutor {
                 // behavior before `head_count` existed.
                 let head_count =
                     Self::attribute_integer(&invocation.attributes, "head_count").unwrap_or(1);
-                rope(&input, base, scale, dimension, position_offset, head_count)
-                    .map_err(KernelError::from)?
+                // `fix-rope-rotation-pairing`: absent means interleaved,
+                // this Kernel's behavior before the attribute existed.
+                let pairing = match invocation.attributes.get("rotation_pairing") {
+                    None => RopePairing::Interleaved,
+                    Some(OperatorAttributeValue::String(value)) => {
+                        RopePairing::from_attribute(value).ok_or_else(|| {
+                            KernelError::KernelAttributeUnsupported {
+                                attribute: format!("rotation_pairing '{value}' is not implemented"),
+                            }
+                        })?
+                    }
+                    Some(_) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "rotation_pairing must be a string".into(),
+                        });
+                    }
+                };
+                rope_with_pairing(
+                    &input,
+                    base,
+                    scale,
+                    dimension,
+                    position_offset,
+                    head_count,
+                    pairing,
+                )
+                .map_err(KernelError::from)?
             }
             "attention" => {
                 if cfg!(target_arch = "wasm32") {
@@ -2060,6 +2301,16 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 }
+                // `append-kv-history-in-place`: only the first `key_count`
+                // rows of K and V are the key sequence; the rows beyond them
+                // are never read.
+                let (k, v) = match Self::attribute_integer(&invocation.attributes, "key_count") {
+                    None => (k, v),
+                    Some(key_count) => (
+                        leading_rows(&k, key_count).map_err(KernelError::from)?,
+                        leading_rows(&v, key_count).map_err(KernelError::from)?,
+                    ),
+                };
                 attention(
                     &q,
                     &k,
@@ -2112,6 +2363,15 @@ impl ReferenceCpuExecutor {
                 let a = self.input_tensor(invocation, 0)?;
                 let b = self.input_tensor(invocation, 1)?;
                 concat(&a, &b).map_err(KernelError::from)?
+            }
+            "kv-write" => {
+                let store = self.input_tensor(invocation, 0)?;
+                let rows = self.input_tensor(invocation, 1)?;
+                let row_offset = Self::attribute_integer(&invocation.attributes, "row_offset")
+                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                        attribute: "row_offset".into(),
+                    })?;
+                kv_write(&store, &rows, row_offset).map_err(KernelError::from)?
             }
             "residual-add" => {
                 let input = self.input_tensor(invocation, 0)?;

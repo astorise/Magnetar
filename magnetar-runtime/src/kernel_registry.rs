@@ -679,8 +679,8 @@ impl KernelRegistry {
     /// "Multiple Prepared Generations": Registry tracks at most one active
     /// generation per logical Kernel at a time.
     pub fn active_prepared_kernel(&self, kernel: &KernelId) -> Option<&PreparedKernel> {
-        self.active_generations
-            .get(&kernel.stable_key())
+        kernel
+            .with_stable_key(|key| self.active_generations.get(key))
             .and_then(|id| self.prepared_kernels.get(id))
     }
 
@@ -899,7 +899,7 @@ impl KernelRegistry {
     }
 
     pub fn is_kernel_revoked(&self, kernel: &KernelId) -> bool {
-        self.revoked_kernels.contains(&kernel.stable_key())
+        kernel.with_stable_key(|key| self.revoked_kernels.contains(key))
     }
 
     pub fn set_provider_status(&mut self, status: ProviderStatusSnapshot) {
@@ -952,14 +952,14 @@ impl KernelRegistry {
     }
 
     pub fn advertisement(&self, kernel: &KernelId) -> Option<&KernelAdvertisement> {
-        self.entries
-            .get(&kernel.stable_key())
+        kernel
+            .with_stable_key(|key| self.entries.get(key))
             .map(|entry| &entry.advertisement)
     }
 
     pub fn active_advertisement(&self, kernel: &KernelId) -> Option<&KernelAdvertisement> {
-        self.entries
-            .get(&kernel.stable_key())
+        kernel
+            .with_stable_key(|key| self.entries.get(key))
             .filter(|entry| entry.active)
             .map(|entry| &entry.advertisement)
     }

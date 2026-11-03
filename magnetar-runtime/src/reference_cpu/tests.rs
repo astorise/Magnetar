@@ -1697,3 +1697,390 @@ fn reference_cpu_no_raw_handles_exposed_in_invocation_or_result() {
     assert!(!text.contains("0x"));
     assert!(!text.contains("raw handle"));
 }
+
+/// `fix-rope-rotation-pairing`: Hugging Face's `q * cos + rotate_half(q) *
+/// sin`, written independently of [`rope_with_pairing`], for one row and
+/// one head block. `rotate_half(x) = concat(-x[half..], x[..half])`.
+fn hugging_face_rotate_half_rope(
+    row: &[f32],
+    base: f32,
+    dimension: usize,
+    position: f32,
+) -> Vec<f32> {
+    let half = dimension / 2;
+    let mut out = row.to_vec();
+    for column in 0..dimension {
+        let pair = column % half;
+        let angle = position * base.powf(-2.0 * pair as f32 / dimension as f32);
+        let rotated = if column < half {
+            -row[column + half]
+        } else {
+            row[column - half]
+        };
+        out[column] = row[column] * angle.cos() + rotated * angle.sin();
+    }
+    out
+}
+
+#[test]
+fn rope_half_split_matches_hugging_face_rotate_half() {
+    let mut rng = Rng(0x7a1f);
+    let (rows, head_count, head_width) = (3_usize, 2_usize, 8_usize);
+    let cols = head_count * head_width;
+    let input = rng.tensor(rows as u64, cols as u64);
+    let offset = 4_u64;
+    let rotated = rope_with_pairing(
+        &input,
+        10000.0,
+        1.0,
+        head_width as u64,
+        offset,
+        head_count as u64,
+        RopePairing::HalfSplit,
+    )
+    .unwrap();
+    for row in 0..rows {
+        for head in 0..head_count {
+            let start = row * cols + head * head_width;
+            let expected = hugging_face_rotate_half_rope(
+                &input.data[start..start + head_width],
+                10000.0,
+                head_width,
+                (offset as usize + row) as f32,
+            );
+            for (actual, expected) in rotated.data[start..start + head_width]
+                .iter()
+                .zip(&expected)
+            {
+                assert!((actual - expected).abs() < 1e-5, "{actual} vs {expected}");
+            }
+        }
+    }
+}
+
+#[test]
+fn rope_half_split_and_interleaved_differ_but_agree_at_position_zero() {
+    let mut rng = Rng(0x7a20);
+    let input = rng.tensor(2, 8);
+    let interleaved =
+        rope_with_pairing(&input, 10000.0, 1.0, 8, 0, 1, RopePairing::Interleaved).unwrap();
+    let half_split =
+        rope_with_pairing(&input, 10000.0, 1.0, 8, 0, 1, RopePairing::HalfSplit).unwrap();
+    assert_eq!(
+        interleaved.data[..8],
+        input.data[..8],
+        "position 0 is the identity"
+    );
+    assert_eq!(
+        half_split.data[..8],
+        input.data[..8],
+        "position 0 is the identity"
+    );
+    assert_ne!(interleaved.data[8..], half_split.data[8..]);
+    assert_eq!(
+        rope(&input, 10000.0, 1.0, 8, 0, 1).unwrap(),
+        interleaved,
+        "`rope` keeps the interleaved default"
+    );
+}
+
+#[test]
+fn rope_half_split_partial_rotation_preserves_the_untouched_tail() {
+    let mut rng = Rng(0x7a21);
+    let input = rng.tensor(2, 12);
+    let rotated = rope_with_pairing(&input, 10000.0, 1.0, 4, 3, 2, RopePairing::HalfSplit).unwrap();
+    for row in 0..2 {
+        for head in 0..2 {
+            let start = row * 12 + head * 6;
+            assert_eq!(
+                rotated.data[start + 4..start + 6],
+                input.data[start + 4..start + 6]
+            );
+            let expected = hugging_face_rotate_half_rope(
+                &input.data[start..start + 4],
+                10000.0,
+                4,
+                (3 + row) as f32,
+            );
+            for (actual, expected) in rotated.data[start..start + 4].iter().zip(&expected) {
+                assert!((actual - expected).abs() < 1e-5);
+            }
+        }
+    }
+}
+
+#[test]
+fn rope_pairing_attribute_values_round_trip_and_reject_unknown() {
+    for pairing in [RopePairing::Interleaved, RopePairing::HalfSplit] {
+        assert_eq!(
+            RopePairing::from_attribute(pairing.as_attribute()),
+            Some(pairing)
+        );
+    }
+    assert_eq!(RopePairing::from_attribute("neox"), None);
+}
+
+fn reference_cpu_rope_invocation_result(
+    pairing: Option<OperatorAttributeValue>,
+) -> (KernelResultStatus, Option<HostTensor>) {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = reference_cpu_kernel_by_name(&advertisements, "rope");
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (input_id, input_resource) = reference_cpu_resource("rope-pairing-in", [2, 4]);
+    let (out_id, out_resource) = reference_cpu_resource("rope-pairing-out", [2, 4]);
+    executor.write_tensor(
+        input_id,
+        reference_cpu_host_tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+    );
+    let mut attributes = BTreeMap::new();
+    attributes.insert("base".to_string(), OperatorAttributeValue::Float(10000.0));
+    attributes.insert("dimension".to_string(), OperatorAttributeValue::Integer(4));
+    if let Some(pairing) = pairing {
+        attributes.insert("rotation_pairing".to_string(), pairing);
+    }
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-rope-pairing"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(input_resource)
+    .with_output(out_resource)
+    .with_attributes(attributes);
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    (result.status, executor.read_tensor(&out_id))
+}
+
+#[test]
+fn reference_cpu_rope_invocation_honors_and_validates_rotation_pairing() {
+    let input = reference_cpu_host_tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    let (status, output) = reference_cpu_rope_invocation_result(Some(
+        OperatorAttributeValue::String("half_split".into()),
+    ));
+    assert_eq!(status, KernelResultStatus::Succeeded);
+    assert_eq!(
+        output.unwrap(),
+        rope_with_pairing(&input, 10000.0, 1.0, 4, 0, 1, RopePairing::HalfSplit).unwrap()
+    );
+
+    let (status, output) = reference_cpu_rope_invocation_result(None);
+    assert_eq!(status, KernelResultStatus::Succeeded);
+    assert_eq!(
+        output.unwrap(),
+        rope(&input, 10000.0, 1.0, 4, 0, 1).unwrap()
+    );
+
+    let (status, _) =
+        reference_cpu_rope_invocation_result(Some(OperatorAttributeValue::String("neox".into())));
+    assert_eq!(status, KernelResultStatus::Failed);
+    let (status, _) =
+        reference_cpu_rope_invocation_result(Some(OperatorAttributeValue::Integer(1)));
+    assert_eq!(status, KernelResultStatus::Failed);
+}
+
+#[test]
+fn kernel_observation_log_keeps_only_the_most_recent_observations() {
+    let executor = ReferenceCpuExecutor::new();
+    let total = 2 * KERNEL_OBSERVATION_LOG_CAPACITY + 7;
+    for index in 0..total {
+        let kind = if index + 1 == total {
+            KernelObservationKind::KernelDispatchCompleted
+        } else {
+            KernelObservationKind::KernelDispatchStarted
+        };
+        executor.observe(KernelObservation::new(kind));
+    }
+    let observations = executor.observations();
+    assert_eq!(observations.len(), KERNEL_OBSERVATION_LOG_CAPACITY);
+    assert!(executor.observations.lock().unwrap().len() <= 2 * KERNEL_OBSERVATION_LOG_CAPACITY);
+    assert_eq!(
+        observations.last().map(|observation| observation.kind),
+        Some(KernelObservationKind::KernelDispatchCompleted)
+    );
+}
+
+/// `matmul-bias` (`graph_fusion::fuse_matmul_bias`) must be bit-identical to
+/// the `matmul` + row-broadcast `add` pair it replaces.
+#[test]
+fn reference_cpu_matmul_bias_is_bit_identical_to_matmul_then_add() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = reference_cpu_kernel_by_name(&advertisements, "matmul-bias");
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (m, k, n) = (3u64, 37u64, 21u64);
+    let values = |count: u64, seed: u64| -> Vec<f32> {
+        (0..count)
+            .map(|i| (((i * 7919 + seed * 104_729) % 2001) as f32 - 1000.0) * 1.3e-3)
+            .collect()
+    };
+    let a = reference_cpu_host_tensor([m, k], values(m * k, 1));
+    let b = reference_cpu_host_tensor([k, n], values(k * n, 2));
+    let bias = reference_cpu_host_tensor([n], values(n, 3));
+    let (a_id, a_resource) = reference_cpu_resource("matmul-bias-a", [m, k]);
+    let (b_id, b_resource) = reference_cpu_resource("matmul-bias-b", [k, n]);
+    let (bias_id, bias_resource) = reference_cpu_resource("matmul-bias-bias", [n]);
+    let (_out_id, out_resource) = reference_cpu_resource("matmul-bias-out", [m, n]);
+    executor.write_tensor(a_id, a.clone());
+    executor.write_tensor(b_id, b.clone());
+    executor.write_tensor(bias_id, bias.clone());
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-matmul-bias"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_input(bias_resource)
+    .with_output(out_resource.clone());
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    let fused = executor.read_tensor(&out_resource.resource.id).unwrap();
+    let unfused = add(&matmul(&a, &b, false, false).unwrap(), &bias).unwrap();
+    assert_eq!(fused.shape, unfused.shape);
+    assert_eq!(
+        fused.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        unfused.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    let half_accumulation = invocation.clone().with_attributes(BTreeMap::from([(
+        "accumulation_dtype".to_string(),
+        OperatorAttributeValue::DType(ComputeDType::Float16),
+    )]));
+    let rejected = executor.execute_invocation(advertisement, operator, &half_accumulation);
+    assert_ne!(
+        rejected.status,
+        KernelResultStatus::Succeeded,
+        "like matmul, matmul-bias only accumulates in f32"
+    );
+}
+
+/// `matmul-residual` and `silu-mul` (`graph_fusion`) must be bit-identical
+/// to the `matmul` + `residual-add` and `silu` + `mul` pairs they replace.
+#[test]
+fn reference_cpu_matmul_residual_and_silu_mul_are_bit_identical_to_their_pairs() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let catalog = initial_operator_catalog();
+    let values = |count: u64, seed: u64| -> Vec<f32> {
+        (0..count)
+            .map(|i| (((i * 7919 + seed * 104_729) % 2001) as f32 - 1000.0) * 1.3e-3)
+            .collect()
+    };
+    let bits = |tensor: &HostTensor| tensor.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let run = |name: &str, inputs: Vec<(&str, HostTensor)>, out_shape: Vec<u64>| {
+        let advertisement = reference_cpu_kernel_by_name(&advertisements, name);
+        let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+        let mut invocation = KernelInvocation::new(
+            KernelInvocationId::new(format!("invocation-{name}")),
+            advertisement.implemented_operator.clone(),
+            advertisement.id.clone(),
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        );
+        for (id, tensor) in inputs {
+            let (resource_id, resource) =
+                reference_cpu_resource(&format!("{name}-{id}"), tensor.shape.clone());
+            executor.write_tensor(resource_id, tensor);
+            invocation = invocation.with_input(resource);
+        }
+        let (_out_id, out_resource) = reference_cpu_resource(&format!("{name}-out"), out_shape);
+        invocation = invocation.with_output(out_resource.clone());
+        let result = executor.execute_invocation(advertisement, operator, &invocation);
+        assert_eq!(result.status, KernelResultStatus::Succeeded, "{name}");
+        executor.read_tensor(&out_resource.resource.id).unwrap()
+    };
+
+    let (m, k, n) = (3u64, 37u64, 21u64);
+    let a = reference_cpu_host_tensor([m, k], values(m * k, 1));
+    let b = reference_cpu_host_tensor([k, n], values(k * n, 2));
+    let residual = reference_cpu_host_tensor([m, n], values(m * n, 3));
+    let fused = run(
+        "matmul-residual",
+        vec![
+            ("a", a.clone()),
+            ("b", b.clone()),
+            ("residual", residual.clone()),
+        ],
+        vec![m, n],
+    );
+    let unfused = residual_add(&residual, &matmul(&a, &b, false, false).unwrap()).unwrap();
+    assert_eq!(bits(&fused), bits(&unfused));
+
+    let gate = reference_cpu_host_tensor([m, n], values(m * n, 4));
+    let up = reference_cpu_host_tensor([m, n], values(m * n, 5));
+    let fused = run(
+        "silu-mul",
+        vec![("gate", gate.clone()), ("up", up.clone())],
+        vec![m, n],
+    );
+    let unfused = mul(&silu(&gate), &up).unwrap();
+    assert_eq!(bits(&fused), bits(&unfused));
+}
+
+/// `append-kv-history-in-place`: attention over the first `key_count` rows
+/// of a store whose tail is NaN equals attention over exactly those rows,
+/// and `kv-write` writes rows in place without touching the rest.
+#[test]
+fn key_count_attention_ignores_the_store_tail_and_kv_write_writes_in_place() {
+    let width = 4u64;
+    let values = |rows: u64, seed: u64| {
+        (0..rows * width)
+            .map(|i| (((i * 37 + seed * 11) % 17) as f32) / 17.0 - 0.5)
+            .collect::<Vec<_>>()
+    };
+    let q = HostTensor::new([2, width], values(2, 1)).unwrap();
+    let k = HostTensor::new([5, width], values(5, 2)).unwrap();
+    let v = HostTensor::new([5, width], values(5, 3)).unwrap();
+    let expected = attention(&q, &k, &v, 2, 2, Some(2), None, true).unwrap();
+
+    let mut store_k = vec![f32::NAN; (8 * width) as usize];
+    let mut store_v = vec![f32::NAN; (8 * width) as usize];
+    store_k[..k.data.len()].copy_from_slice(&k.data);
+    store_v[..v.data.len()].copy_from_slice(&v.data);
+    let store_k = HostTensor::new([8, width], store_k).unwrap();
+    let store_v = HostTensor::new([8, width], store_v).unwrap();
+    let bounded = attention(
+        &q,
+        &leading_rows(&store_k, 5).unwrap(),
+        &leading_rows(&store_v, 5).unwrap(),
+        2,
+        2,
+        Some(2),
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(bounded.data, expected.data);
+    assert!(leading_rows(&store_k, 9).is_err());
+
+    let store = HostTensor::new([4, 2], vec![0.0; 8]).unwrap();
+    let rows = HostTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let written = kv_write(&store, &rows, 1).unwrap();
+    assert_eq!(written.data, vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
+    assert!(kv_write(&store, &rows, 3).is_err(), "past the capacity");
+    assert!(
+        kv_write(&store, &HostTensor::new([1, 3], vec![0.0; 3]).unwrap(), 0).is_err(),
+        "width mismatch"
+    );
+    let attention_advertisement = reference_cpu_kernel_advertisements()
+        .into_iter()
+        .find(|advertisement| advertisement.implemented_operator.name() == "attention")
+        .unwrap();
+    assert!(
+        attention_advertisement
+            .id
+            .features
+            .contains(KEY_COUNT_FEATURE)
+    );
+}

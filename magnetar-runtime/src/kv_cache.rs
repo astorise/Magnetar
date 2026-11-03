@@ -806,6 +806,15 @@ impl KvCacheManager {
         Ok(())
     }
 
+    /// Drops the record of a released cache. A cache in any other
+    /// lifecycle state is kept and reported as a denied mutation.
+    pub fn forget_released(&mut self, id: &KvCacheId) -> Result<KvCache, KvCacheError> {
+        if self.cache_mut(id)?.lifecycle != KvCacheLifecycleState::Released {
+            return Err(KvCacheError::CacheMutationDenied);
+        }
+        self.caches.remove(id).ok_or(KvCacheError::CacheNotFound)
+    }
+
     pub fn release_session_caches(
         &mut self,
         session: &InferenceSessionId,

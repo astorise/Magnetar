@@ -23,10 +23,16 @@
 # `tools/release-publish` (MAG-06, `implement-release-publication-automation`)
 # also has none of that: it depends on `roadmap-contracts` only, so it
 # belongs here for the same reason.
+#
+# `tools/inference-qualification` (`qualify-real-checkpoint-performance`)
+# has no dependencies beyond serde/sha2, so it belongs here for the same
+# reason; the harness that feeds it real-checkpoint timings lives in the
+# submodule workspace (`integration-tests/production-loading`).
 members = [
     "magnetar-runtime",
     "tools/coverage-ratchet",
     "roadmap-contracts",
     "tools/release-publish",
+    "tools/inference-qualification",
 ]
 resolver = "2"

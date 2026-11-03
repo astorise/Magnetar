@@ -1630,6 +1630,8 @@ fn dispatch_reference_cpu_operator_multi_binds_every_output() {
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let input = HostTensor::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1819,6 +1821,8 @@ fn resident_input_passthrough_reuses_existing_resource_and_computes_correctly() 
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let a = HostTensor::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1918,6 +1922,8 @@ fn rmsnorm_accepts_a_resident_input_without_materializing_it_first() {
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let weight = HostTensor::new([4], vec![1.0, 1.0, 1.0, 1.0]).unwrap();
@@ -4681,40 +4687,12 @@ fn production_model_fixture_threads_the_real_ingested_architecture_family() {
     }
 }
 
-/// The load-bearing correctness proof for `ProductionLoadedModel::
-/// load_with_component` (`wire-generic-inference-component-runtime`'s
-/// follow-up phase, closing the Tachyon integration audit's MAG-02): a
-/// model loaded against an *explicitly registered* Component digest
-/// generates *exactly* the same tokens as the same model loaded through
-/// [`ProductionLoadedModel::load`]'s pre-existing hardcoded-singleton
-/// path, for the identical underlying Component bytes. This proves the
-/// registered Component genuinely drives generation end to end (plan
-/// production in `prepare_generation` and dispatch-time graph production in
-/// `E2eRuntimeModelExecutionEngine::execute_generation_step` both honor the
-/// same digest), not merely that graph construction alone matches (already
-/// proven by `register_inference_component_artifact_enforces_trust_is_
-/// idempotent_and_matches_the_singleton_path`).
+/// The canonical first-native config as a production-shaped manifest
+/// (declared per-tensor offsets/sizes, untied `lm_head`) with an in-memory
+/// payload source, for tests that drive [`ProductionLoadedModel`] through
+/// the real production loading path.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
-#[test]
-fn production_loaded_model_load_with_component_matches_the_singleton_path() {
-    // `e2e_fixture()`'s own manifest is shaped for the in-memory,
-    // fixture-only `E2eRuntimeModelExecutionEngine` path (no declared
-    // per-tensor byte offset/size) -- `load_production_qwen_instance_for_
-    // provider` (the real production-loading path `ProductionLoadedModel::
-    // load` drives) requires those, so this test builds its own
-    // production-shaped manifest around the same canonical config, exactly
-    // like `production_loading_generates_end_to_end_with_a_non_canonical_
-    // qwen_config` does for its own deliberately-different config.
-    // `tied_embeddings: false` (unlike the canonical fixture's own `true`):
-    // this test drives loading through the real production path
-    // (`load_production_model_instance_for_provider`), which expects a
-    // literal `lm_head` weight resource bound -- tied-embedding derivation
-    // is an ingestion-layer concern (`loaders/huggingface`'s
-    // `append_synthetic_lm_head_if_tied`) this hand-built manifest
-    // deliberately bypasses, exactly like `production_loading_generates_
-    // end_to_end_with_a_non_canonical_qwen_config`'s own config already
-    // does. Otherwise identical to the canonical fixture the real
-    // `qwen-real.component.wasm` Component already exercises elsewhere.
+fn production_shaped_canonical_fixture() -> (E2eFixture, ProductionIntegrationPayloadSource) {
     let mut config = e2e_fixture_config();
     config.tied_embeddings = false;
     let weights = e2e_fixture_weights(&config).expect("synthetic weights build");
@@ -4800,6 +4778,44 @@ fn production_loaded_model_load_with_component_matches_the_singleton_path() {
         std::sync::Arc::new(e2e_fixture_tokenizer().unwrap());
     let fixture = production_model_fixture(manifest, tokenizer_metadata, delegate_tokenizer)
         .expect("production fixture builds against the canonical config");
+    (fixture, payload_source)
+}
+
+/// The load-bearing correctness proof for `ProductionLoadedModel::
+/// load_with_component` (`wire-generic-inference-component-runtime`'s
+/// follow-up phase, closing the Tachyon integration audit's MAG-02): a
+/// model loaded against an *explicitly registered* Component digest
+/// generates *exactly* the same tokens as the same model loaded through
+/// [`ProductionLoadedModel::load`]'s pre-existing hardcoded-singleton
+/// path, for the identical underlying Component bytes. This proves the
+/// registered Component genuinely drives generation end to end (plan
+/// production in `prepare_generation` and dispatch-time graph production in
+/// `E2eRuntimeModelExecutionEngine::execute_generation_step` both honor the
+/// same digest), not merely that graph construction alone matches (already
+/// proven by `register_inference_component_artifact_enforces_trust_is_
+/// idempotent_and_matches_the_singleton_path`).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn production_loaded_model_load_with_component_matches_the_singleton_path() {
+    // `e2e_fixture()`'s own manifest is shaped for the in-memory,
+    // fixture-only `E2eRuntimeModelExecutionEngine` path (no declared
+    // per-tensor byte offset/size) -- `load_production_qwen_instance_for_
+    // provider` (the real production-loading path `ProductionLoadedModel::
+    // load` drives) requires those, so this test builds its own
+    // production-shaped manifest around the same canonical config, exactly
+    // like `production_loading_generates_end_to_end_with_a_non_canonical_
+    // qwen_config` does for its own deliberately-different config.
+    // `tied_embeddings: false` (unlike the canonical fixture's own `true`):
+    // this test drives loading through the real production path
+    // (`load_production_model_instance_for_provider`), which expects a
+    // literal `lm_head` weight resource bound -- tied-embedding derivation
+    // is an ingestion-layer concern (`loaders/huggingface`'s
+    // `append_synthetic_lm_head_if_tied`) this hand-built manifest
+    // deliberately bypasses, exactly like `production_loading_generates_
+    // end_to_end_with_a_non_canonical_qwen_config`'s own config already
+    // does. Otherwise identical to the canonical fixture the real
+    // `qwen-real.component.wasm` Component already exercises elsewhere.
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
 
     let component_trust = ComponentTrustStore::default()
         .trust_digest(&ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES).value);
@@ -5578,6 +5594,8 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let architecture = &fixture.config.architecture;
@@ -5688,6 +5706,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             q,
             architecture.attention_head_count,
             &fixture.config.rope,
+            RopePairing::HalfSplit,
             0,
             None,
         )?;
@@ -5698,6 +5717,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             k,
             architecture.kv_head_count,
             &fixture.config.rope,
+            RopePairing::HalfSplit,
             0,
             None,
         )?;
@@ -5719,6 +5739,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         layer_kv.push(FirstNativeLayerKvState {
             k: k_resource,
             v: v_resource,
+            rows: None,
         });
         let (_dispatch, attention_out) = dispatch_qwen_attention(
             &mut dispatch_ctx,
@@ -5727,6 +5748,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             NodeValue::Host(k),
             NodeValue::Host(v),
             architecture,
+            None,
             None,
         )?;
         let (_dispatch, attention_proj) = dispatch_qwen_matmul(
@@ -5845,6 +5867,8 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let architecture = &fixture.config.architecture;
@@ -5959,6 +5983,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             q,
             architecture.attention_head_count,
             &fixture.config.rope,
+            RopePairing::HalfSplit,
             absolute_position,
             None,
         )?;
@@ -5969,6 +5994,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             k_new,
             architecture.kv_head_count,
             &fixture.config.rope,
+            RopePairing::HalfSplit,
             absolute_position,
             None,
         )?;
@@ -6005,6 +6031,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         updated_layer_kv.push(FirstNativeLayerKvState {
             k: k_resource,
             v: v_resource,
+            rows: None,
         });
         let (_dispatch, attention_out) = dispatch_qwen_attention(
             &mut dispatch_ctx,
@@ -6013,6 +6040,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             NodeValue::Host(k),
             NodeValue::Host(v),
             architecture,
+            None,
             None,
         )?;
         let (_dispatch, attention_proj) = dispatch_qwen_matmul(
@@ -6147,6 +6175,8 @@ fn build_runtime_with_model_execution_engine_and_forced_token(
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             component_digest: None,
             forced_token,
+            graph_cache: None,
+            copy_based_kv: false,
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -9131,9 +9161,11 @@ fn check_graph_dispatch_ignores_kernel_registry_preference_change_after_plan_pub
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: Some(&mut plan),
-        graph: Some(&graph),
+        graph: Some(FingerprintedGraph::new(&graph)),
         sequence_length: Some(seq_len),
         last_provider_execution: None,
+        internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let (dispatch_result, _hidden_states) = dispatch_reference_cpu_operator(
@@ -9375,6 +9407,15 @@ fn check_incremental_decode_rejects_missing_layer_kv(
 }
 
 #[cfg(test)]
+/// [`new_kv_lifecycle_engine`] keeping KV history with the copy-based
+/// append, for tests of that path's pending resources.
+fn new_copy_based_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelExecutionEngine {
+    E2eRuntimeModelExecutionEngine {
+        copy_based_kv: true,
+        ..new_kv_lifecycle_engine(fixture)
+    }
+}
+
 fn new_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelExecutionEngine {
     E2eRuntimeModelExecutionEngine {
         fixture: fixture.clone(),
@@ -9382,6 +9423,8 @@ fn new_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelExecutionEngi
         pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
         component_digest: None,
         forced_token: None,
+        graph_cache: None,
+        copy_based_kv: false,
     }
 }
 
@@ -9594,7 +9637,7 @@ fn check_kv_pending_write_is_memory_admitted_for_its_concatenated_size(
 ) -> Result<(), E2eConformanceError> {
     let mut runtime = build_runtime_with_model_execution_engine(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
-    let engine = new_kv_lifecycle_engine(fixture);
+    let engine = new_copy_based_kv_lifecycle_engine(fixture);
     let request = kv_lifecycle_test_request(
         fixture,
         &runtime,
@@ -9723,7 +9766,7 @@ fn check_kv_partial_layer_failure_during_commit_rolls_back_cleanly(
 ) -> Result<(), E2eConformanceError> {
     let mut runtime = build_runtime_with_model_execution_engine(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
-    let engine = new_kv_lifecycle_engine(fixture);
+    let engine = new_copy_based_kv_lifecycle_engine(fixture);
     let request = kv_lifecycle_test_request(
         fixture,
         &runtime,
@@ -10315,4 +10358,438 @@ fn check_chat_sessions_are_isolated_from_each_other() -> Result<(), E2eConforman
             reason: error.to_string(),
         })?;
     Ok(())
+}
+
+/// `bound-memory-manager-bookkeeping`: a resident [`ProductionLoadedModel`]
+/// serving many requests must keep every Runtime/Provider bookkeeping table
+/// proportional to live state, not to every request it ever served. Real
+/// CUDA campaigns slowed down by ~20 ms per previously generated token:
+/// `MemoryManager` kept every released allocation in the map its admission
+/// scans walk, edges both pre-admitted and explicitly written orphaned one
+/// allocation per step, superseded KV generations left Provider tracking
+/// entries behind, and each finished request left its final KV tensors,
+/// session and cache records in place. This records each table after every
+/// request: the two bounded logs must stay within their caps, everything
+/// else must not grow after the second request.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn resident_production_model_bookkeeping_stays_bounded_across_requests() {
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
+    let provider = Arc::new(ReferenceCpuProvider::new());
+    let mut model = ProductionLoadedModel::load(
+        fixture.clone(),
+        &payload_source,
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        provider.clone(),
+    )
+    .expect("production loading succeeds");
+    let request = || ProductionGenerationRequest {
+        prompt: PromptInput::PlainText("hi".into()),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(8),
+        max_generation_millis: None,
+    };
+    let bounded_logs = BTreeMap::from([
+        (
+            "memory.retired_allocations",
+            crate::memory::RETIRED_ALLOCATION_HISTORY_CAPACITY,
+        ),
+        (
+            "memory.observations",
+            2 * crate::memory::MEMORY_OBSERVATION_LOG_CAPACITY,
+        ),
+        (
+            "memory.residency_observations",
+            2 * crate::memory::MEMORY_OBSERVATION_LOG_CAPACITY,
+        ),
+    ]);
+    let mut history = Vec::new();
+    for _ in 0..6 {
+        model
+            .generate(request(), None)
+            .expect("generation succeeds");
+        let mut sizes: BTreeMap<String, usize> = model
+            .runtime
+            .memory()
+            .bookkeeping_sizes()
+            .into_iter()
+            .map(|(name, size)| (format!("memory.{name}"), size))
+            .collect();
+        model.runtime.memory().assert_allocation_totals_consistent();
+        sizes.insert("sessions".into(), model.runtime.sessions().count());
+        sizes.insert(
+            "kv_caches".into(),
+            model.runtime.kv_caches().caches().count(),
+        );
+        sizes.insert(
+            "provider.stored_tensors".into(),
+            provider.executor().stored_tensor_count(),
+        );
+        sizes.insert(
+            "provider.tracked_allocations".into(),
+            provider.executor().tracked_allocations().len(),
+        );
+        history.push(sizes);
+    }
+
+    let orphaned = {
+        let memory = model.runtime.memory();
+        let tracked: BTreeSet<_> = provider
+            .executor()
+            .tracked_allocations()
+            .into_values()
+            .collect();
+        let resident = memory.residency_allocations();
+        memory
+            .allocations()
+            .filter(|allocation| memory.is_live_allocation(allocation.id))
+            .filter(|allocation| {
+                !tracked.contains(&allocation.id) && !resident.contains(&allocation.id)
+            })
+            .count()
+    };
+    assert_eq!(
+        orphaned, 0,
+        "every live allocation is referenced by a residency record or its Provider"
+    );
+    let (second, last) = (&history[1], &history[history.len() - 1]);
+    for (name, size) in last {
+        match bounded_logs.get(name.as_str()) {
+            Some(cap) => assert!(size <= cap, "{name} = {size} exceeds its cap {cap}"),
+            None => assert!(
+                *size <= second[name],
+                "{name} grows with every served request: {} after request 1, {size} after \
+                 request {}",
+                second[name],
+                history.len() - 1
+            ),
+        }
+    }
+}
+
+/// `attribute-redacted-inference-costs` A06 (tasks 2.2/2.3): a request that
+/// crosses graph build, input upload, dispatch, materialization, sampling
+/// and commit is attributed per step with leaves that never exceed the
+/// step's wall time, device time and overlap are reported unavailable
+/// rather than guessed, and nothing request-specific -- here a sentinel in
+/// the prompt -- reaches the exported report.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn production_generation_steps_are_attributed_by_phase_without_leaking_the_prompt() {
+    use crate::phase_attribution::{CounterAvailability, StepKind, StepPhase};
+
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
+    let mut model = ProductionLoadedModel::load(
+        fixture.clone(),
+        &payload_source,
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        Arc::new(ReferenceCpuProvider::new()),
+    )
+    .expect("production loading succeeds");
+    let sentinel = "zq-sentinel-4b1d";
+    let request = || ProductionGenerationRequest {
+        prompt: PromptInput::PlainText(sentinel.into()),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(4),
+        max_generation_millis: None,
+    };
+
+    model
+        .generate(request(), None)
+        .expect("generation succeeds");
+    assert!(
+        model.take_phase_attribution().steps.is_empty(),
+        "attribution is off by default"
+    );
+
+    model.enable_phase_attribution();
+    let outcome = model
+        .generate(request(), None)
+        .expect("generation succeeds");
+    let report = model.take_phase_attribution();
+    let generated = outcome.result.output.usage.generated_tokens as u64;
+    assert_eq!(report.device_time, CounterAvailability::Unavailable);
+    assert_eq!(report.host_device_overlap, CounterAvailability::Unavailable);
+    assert_eq!(report.host_time, CounterAvailability::Measured);
+    assert_eq!(report.summary(StepKind::Prefill).unwrap().steps, 1);
+    assert_eq!(
+        report.summary(StepKind::Decode).unwrap().steps,
+        generated - 1
+    );
+    let preparation = report.summary(StepKind::RequestPreparation).unwrap();
+    assert_eq!(preparation.steps, 1);
+    let preparation_phases: Vec<StepPhase> = preparation
+        .phases
+        .iter()
+        .map(|(key, _)| key.phase)
+        .collect();
+    assert_eq!(
+        preparation_phases,
+        vec![
+            StepPhase::SessionCreate,
+            StepPhase::Tokenize,
+            StepPhase::PlanPrepare,
+            StepPhase::RequestValidate,
+            StepPhase::GraphBuild,
+        ]
+    );
+    for step in &report.steps {
+        assert!(step.attributed_micros() <= step.wall_micros, "{step:?}");
+        if step.kind == StepKind::RequestPreparation {
+            continue;
+        }
+        let phases: Vec<StepPhase> = step.phases.iter().map(|(key, _)| key.phase).collect();
+        for expected in [
+            StepPhase::GraphBuild,
+            StepPhase::InstanceCheck,
+            StepPhase::KvStatePrepare,
+            StepPhase::InputUpload,
+            StepPhase::NodeInputResolve,
+            StepPhase::NodeDispatch,
+            StepPhase::OutputMaterialize,
+            StepPhase::LogitsExtract,
+            StepPhase::KvStateStore,
+            StepPhase::Sampling,
+            StepPhase::Commit,
+        ] {
+            assert!(phases.contains(&expected), "{expected:?} missing: {step:?}");
+        }
+        // A step's KV update: a pending write (copy-based history) or an
+        // in-place store write (`append-kv-history-in-place`).
+        assert!(
+            phases.contains(&StepPhase::KvPendingWrite) || phases.contains(&StepPhase::KvAppend),
+            "no KV update phase: {step:?}"
+        );
+        assert!(
+            step.phases
+                .iter()
+                .filter(|(key, _)| key.phase == StepPhase::NodeDispatch)
+                .all(|(key, _)| key.operator.is_some())
+        );
+    }
+    let decode = report
+        .steps
+        .iter()
+        .find(|step| step.kind == StepKind::Decode)
+        .unwrap();
+    assert!(
+        decode
+            .phases
+            .iter()
+            .any(|(key, _)| key.phase == StepPhase::KvAppend),
+        "decode appends to the KV history: {decode:?}"
+    );
+
+    let exported = serde_json::to_string(&report).unwrap();
+    assert!(!exported.contains(sentinel));
+    assert!(!exported.contains("kv."));
+    assert!(!exported.contains("edge."));
+    assert!(!exported.contains("session-"));
+    assert!(!exported.contains("request="));
+
+    model.disable_phase_attribution();
+    model
+        .generate(request(), None)
+        .expect("generation succeeds");
+    assert!(model.take_phase_attribution().steps.is_empty());
+}
+
+/// `cache-and-optimize-prepared-graphs`: a loaded model builds its graphs
+/// once per prompt length, plans and every step of the request use those
+/// same graphs, and the cache keeps at most
+/// `COMPONENT_GRAPH_CACHE_CAPACITY` prompt lengths, most recent last.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn resident_production_model_reuses_component_graphs_per_prompt_length() {
+    use crate::phase_attribution::{StepKind, StepPhase};
+
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
+    let mut model = ProductionLoadedModel::load(
+        fixture.clone(),
+        &payload_source,
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        Arc::new(ReferenceCpuProvider::new()),
+    )
+    .expect("production loading succeeds");
+    let request = |prompt: String| ProductionGenerationRequest {
+        prompt: PromptInput::PlainText(prompt),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(3),
+        max_generation_millis: None,
+    };
+    let first = model.generate(request("hi".into()), None).unwrap();
+    let prompt_tokens = first.result.output.usage.prompt_tokens as u64;
+    assert_eq!(model.graph_cache.prompt_lengths(), vec![prompt_tokens]);
+
+    model.enable_phase_attribution();
+    let again = model.generate(request("hi".into()), None).unwrap();
+    assert_eq!(
+        again.result.output.generated_token_ids, first.result.output.generated_token_ids,
+        "cached graphs generate the same tokens"
+    );
+    assert_eq!(model.graph_cache.prompt_lengths(), vec![prompt_tokens]);
+    let report = model.take_phase_attribution();
+    for step in &report.steps {
+        let graph_builds = step
+            .phases
+            .iter()
+            .filter(|(key, _)| key.phase == StepPhase::GraphBuild)
+            .count();
+        assert_eq!(graph_builds, 1, "{step:?}");
+    }
+    assert_eq!(report.summary(StepKind::Decode).unwrap().steps, 2);
+
+    let mut lengths = vec![prompt_tokens];
+    for words in 2..=COMPONENT_GRAPH_CACHE_CAPACITY + 3 {
+        let prompt = "h".repeat(words);
+        let outcome = model.generate(request(prompt), None).unwrap();
+        let length = outcome.result.output.usage.prompt_tokens as u64;
+        lengths.retain(|known| *known != length);
+        lengths.push(length);
+    }
+    let expected: Vec<u64> = lengths
+        .iter()
+        .copied()
+        .skip(lengths.len().saturating_sub(COMPONENT_GRAPH_CACHE_CAPACITY))
+        .collect();
+    assert!(
+        lengths.len() > COMPONENT_GRAPH_CACHE_CAPACITY,
+        "{lengths:?}"
+    );
+    assert_eq!(model.graph_cache.prompt_lengths(), expected);
+}
+
+/// The previous O(nodes^2) execution order: repeatedly take the first
+/// remaining node (by id) whose producers have all run. Kept as the oracle
+/// `first_native_graph_execution_order` must match exactly.
+fn quadratic_execution_order(graph: &ExecutionGraph) -> Option<Vec<ExecutionNodeId>> {
+    let mut edge_producer: BTreeMap<&TensorEdgeId, &ExecutionNodeId> = BTreeMap::new();
+    for (node_id, node) in &graph.nodes {
+        for output in &node.outputs {
+            edge_producer.insert(output, node_id);
+        }
+    }
+    let mut remaining: BTreeSet<&ExecutionNodeId> = graph.nodes.keys().collect();
+    let mut order = Vec::new();
+    while !remaining.is_empty() {
+        let node_id = *remaining.iter().find(|node_id| {
+            graph.nodes[**node_id].inputs.iter().all(|edge_id| {
+                edge_producer
+                    .get(edge_id)
+                    .is_none_or(|producer| !remaining.contains(producer))
+            })
+        })?;
+        remaining.remove(node_id);
+        order.push(node_id.clone());
+    }
+    Some(order)
+}
+
+#[test]
+fn graph_execution_order_matches_the_previous_quadratic_order() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let graphs =
+        first_native_component_graphs_for_prompt(&fixture, 5).expect("component graphs build");
+    for graph in [&graphs.prefill, &graphs.decode] {
+        let order = first_native_graph_execution_order(graph).unwrap();
+        assert_eq!(order.len(), graph.nodes.len());
+        assert_eq!(Some(order), quadratic_execution_order(graph));
+    }
+
+    let mut cyclic = graphs.decode.clone();
+    let (first, second) = {
+        let mut ids = cyclic.nodes.keys().cloned();
+        (ids.next().unwrap(), ids.next().unwrap())
+    };
+    let second_output = cyclic.nodes[&second].outputs[0].clone();
+    let first_output = cyclic.nodes[&first].outputs[0].clone();
+    cyclic
+        .nodes
+        .get_mut(&first)
+        .unwrap()
+        .inputs
+        .push(second_output);
+    cyclic
+        .nodes
+        .get_mut(&second)
+        .unwrap()
+        .inputs
+        .push(first_output);
+    assert!(quadratic_execution_order(&cyclic).is_none());
+    assert!(matches!(
+        first_native_graph_execution_order(&cyclic),
+        Err(InferenceApiError::GraphPlanningFailed { .. })
+    ));
+}
+
+/// `append-kv-history-in-place`: in-place KV history (Reference CPU
+/// advertises `kv-write` and `key-count` attention) produces the same logits
+/// bit for bit as the copy-based history, a decode step executed and
+/// discarded leaves the committed rows untouched (executing it again gives
+/// the same logits), and the committed layer binding is the layer's store.
+#[test]
+fn in_place_kv_history_matches_copy_based_history_and_survives_a_discarded_step() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let run = |engine: E2eRuntimeModelExecutionEngine| -> (Vec<Vec<u32>>, Runtime, String) {
+        let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+        let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let request =
+            kv_lifecycle_test_request(&fixture, &runtime, &instance, "kv-in-place", None, &[1, 2])
+                .unwrap();
+        let mut plans = first_native_plans_for_prompt(
+            &runtime,
+            &fixture,
+            &instance,
+            request.input_token_ids.len() as u64,
+        )
+        .unwrap();
+        let bits = |logits: &[f32]| logits.iter().map(|value| value.to_bits()).collect();
+        let mut steps = Vec::new();
+        let prefill = engine
+            .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+            .unwrap();
+        steps.push(bits(&prefill.logits));
+        engine
+            .commit_generation_step(&mut runtime, &request, &[], 1, &prefill)
+            .unwrap();
+        let cache = prefill_cache_id_from_step(&prefill).unwrap().to_string();
+        let mut generated = vec![1];
+        for token in [2, 1] {
+            let step = engine
+                .execute_generation_step(
+                    &mut runtime,
+                    &request,
+                    &generated,
+                    Some(&mut plans.decode),
+                )
+                .unwrap();
+            // Discarded (never committed), then executed again.
+            let again = engine
+                .execute_generation_step(
+                    &mut runtime,
+                    &request,
+                    &generated,
+                    Some(&mut plans.decode),
+                )
+                .unwrap();
+            assert_eq!(bits(&step.logits), bits(&again.logits));
+            steps.push(bits(&again.logits));
+            engine
+                .commit_generation_step(&mut runtime, &request, &generated, token, &again)
+                .unwrap();
+            generated.push(token);
+        }
+        (steps, runtime, cache)
+    };
+    let (in_place, runtime, cache) = run(new_kv_lifecycle_engine(&fixture));
+    let (copy_based, _, _) = run(new_copy_based_kv_lifecycle_engine(&fixture));
+    assert_eq!(in_place, copy_based);
+    let cache = runtime.kv_cache(&KvCacheId::new(cache).unwrap()).unwrap();
+    for binding in cache.layer_resources.values() {
+        assert!(binding.k.as_str().ends_with(".k.store"), "{}", binding.k);
+        assert!(binding.v.as_str().ends_with(".v.store"), "{}", binding.v);
+    }
 }

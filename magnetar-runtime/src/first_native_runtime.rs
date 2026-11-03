@@ -29,10 +29,11 @@ use crate::kernel_artifact::{
 };
 use crate::kernel_dispatch::*;
 use crate::kernel_execution_plan::{
-    PlanGuard, PlanGuardContext, PlanMemoryRequirements, PlanNodeBinding, PreparedExecutionPhase,
-    PreparedExecutionPlan, PreparedExecutionPlanError, PreparedExecutionPlanExecutor,
-    PreparedExecutionPlanGeneration, PreparedExecutionPlanId, PreparedExecutionPlanScope,
-    PreparedPlanNodeExecution, ResourceBindingPlan, semantic_graph_fingerprint,
+    ExecutionGraphSemanticFingerprint, FingerprintedGraph, PlanGuard, PlanGuardContext,
+    PlanMemoryRequirements, PlanNodeBinding, PreparedExecutionPhase, PreparedExecutionPlan,
+    PreparedExecutionPlanError, PreparedExecutionPlanExecutor, PreparedExecutionPlanGeneration,
+    PreparedExecutionPlanId, PreparedExecutionPlanScope, PreparedPlanNodeExecution,
+    ResourceBindingPlan, semantic_graph_fingerprint,
 };
 use crate::kernel_optimization_orchestration::run_kernel_optimization_orchestration_conformance;
 use crate::kernel_registry::*;
@@ -46,6 +47,9 @@ use crate::model_instance::*;
 use crate::model_loading::*;
 use crate::operator::*;
 use crate::operator_scope::*;
+use crate::phase_attribution::StepPhase;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+use crate::phase_attribution::{PhaseAttributionReport, StepKind};
 use crate::prefix_cache::*;
 use crate::provider::*;
 use crate::qwen_model_component;
@@ -59,7 +63,7 @@ use crate::tokenizer::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     sync::{
         Arc, Mutex,
@@ -1236,6 +1240,232 @@ struct E2eRuntimeModelExecutionEngine {
     /// struct-embedded test-only field is dropping the `cfg` and keeping the
     /// field, and its value, identical in every build.
     forced_token: Option<TokenId>,
+    /// Graphs already built for this model, shared with the
+    /// `ProductionLoadedModel` that prepared their plans. `None` builds the
+    /// graphs again for every step.
+    graph_cache: Option<ComponentGraphCache>,
+    /// Keep KV history with the copy-based append even where the Provider
+    /// supports in-place history (`append-kv-history-in-place`): for tests
+    /// of the copy-based path.
+    copy_based_kv: bool,
+}
+
+/// How many prompt lengths' graphs one loaded model keeps.
+pub(crate) const COMPONENT_GRAPH_CACHE_CAPACITY: usize = 8;
+
+/// The execution graphs one loaded model's Component built, by prompt
+/// length. A loaded model's Component, architecture and identity never
+/// change, so the prompt length is the only input left that the graphs
+/// depend on. Plans are prepared against these exact graphs and every step
+/// dispatches them, so a step can never execute a graph other than the one
+/// its plan was fingerprinted against. Bounded, least recently used first
+/// out.
+#[derive(Clone, Default)]
+pub(crate) struct ComponentGraphCache {
+    entries: Arc<Mutex<VecDeque<CachedComponentGraphs>>>,
+    /// The Provider graphs are fused for (`graph_fusion`), or `None` to
+    /// keep every graph exactly as its Component built it.
+    fusion: Arc<Mutex<Option<ProviderBinding>>>,
+}
+
+/// One prompt length's graphs.
+type CachedComponentGraphs = (u64, Arc<CachedGraphs>);
+
+/// Whether every node reading a KV-cache edge is an `attention` node: an
+/// in-place KV store holds more rows than the history, and only attention
+/// (through `key_count`) knows to read just the history
+/// (`append-kv-history-in-place`).
+fn kv_edges_feed_only_attention(graph: &ExecutionGraph) -> bool {
+    let kv_edges: BTreeSet<&TensorEdgeId> = graph
+        .edges
+        .iter()
+        .filter(|(_, edge)| edge.kv_cache.is_some())
+        .map(|(id, _)| id)
+        .collect();
+    graph.nodes.values().all(|node| {
+        node.operator.name() == "attention"
+            || !node.inputs.iter().any(|input| kv_edges.contains(input))
+    })
+}
+
+/// Whether `provider` can keep KV history in place: an active prepared
+/// `kv-write` Kernel, and every active `attention` Kernel of it honouring
+/// `key_count` (`append-kv-history-in-place`).
+fn in_place_kv_supported(runtime: &Runtime, provider: &ProviderBinding) -> bool {
+    let mut attention = false;
+    for entry in runtime.kernel_registry().entries() {
+        if !entry.active
+            || &entry.advertisement.id.provider != provider
+            || entry.advertisement.implemented_operator.name() != "attention"
+        {
+            continue;
+        }
+        if !entry
+            .advertisement
+            .id
+            .features
+            .contains(crate::reference_cpu::KEY_COUNT_FEATURE)
+        {
+            return false;
+        }
+        attention = true;
+    }
+    attention && provider_advertises_operator(runtime, provider, "kv-write")
+}
+
+/// What every step derives from a graph alone: its plan fingerprint and
+/// its execution order. A cached graph never changes, so each is computed
+/// at most once instead of on every step.
+#[derive(Default)]
+pub(crate) struct GraphExecutionMemo {
+    fingerprint: std::sync::OnceLock<ExecutionGraphSemanticFingerprint>,
+    order: std::sync::OnceLock<Vec<ExecutionNodeId>>,
+    kv_edges_feed_only_attention: std::sync::OnceLock<bool>,
+}
+
+impl GraphExecutionMemo {
+    fn fingerprint(&self, graph: &ExecutionGraph) -> &ExecutionGraphSemanticFingerprint {
+        self.fingerprint
+            .get_or_init(|| semantic_graph_fingerprint(graph))
+    }
+
+    fn kv_edges_feed_only_attention(&self, graph: &ExecutionGraph) -> bool {
+        *self
+            .kv_edges_feed_only_attention
+            .get_or_init(|| kv_edges_feed_only_attention(graph))
+    }
+
+    fn order(&self, graph: &ExecutionGraph) -> Result<&[ExecutionNodeId], InferenceApiError> {
+        if let Some(order) = self.order.get() {
+            return Ok(order);
+        }
+        let order = first_native_graph_execution_order(graph)?;
+        Ok(self.order.get_or_init(|| order))
+    }
+}
+
+/// A loaded model's graphs for one prompt length, with each graph's
+/// [`GraphExecutionMemo`]. Only ever shared behind an `Arc`, so the graphs
+/// cannot change after a memo was filled.
+pub(crate) struct CachedGraphs {
+    graphs: FirstNativeComponentGraphs,
+    pub(crate) prefill_memo: GraphExecutionMemo,
+    pub(crate) decode_memo: GraphExecutionMemo,
+}
+
+impl CachedGraphs {
+    pub(crate) fn new(graphs: FirstNativeComponentGraphs) -> Self {
+        Self {
+            graphs,
+            prefill_memo: GraphExecutionMemo::default(),
+            decode_memo: GraphExecutionMemo::default(),
+        }
+    }
+}
+
+impl std::ops::Deref for CachedGraphs {
+    type Target = FirstNativeComponentGraphs;
+
+    fn deref(&self) -> &FirstNativeComponentGraphs {
+        &self.graphs
+    }
+}
+
+/// Whether `provider` has an active, prepared Kernel for `operator`.
+fn provider_advertises_operator(
+    runtime: &Runtime,
+    provider: &ProviderBinding,
+    operator: &str,
+) -> bool {
+    let registry = runtime.kernel_registry();
+    registry.entries().any(|entry| {
+        entry.active
+            && &entry.advertisement.id.provider == provider
+            && entry.advertisement.implemented_operator.name() == operator
+            && registry
+                .active_prepared_kernel(&entry.advertisement.id)
+                .is_some()
+    })
+}
+
+impl ComponentGraphCache {
+    pub(crate) fn get(&self, prompt_token_count: u64) -> Option<Arc<CachedGraphs>> {
+        let mut entries = self.entries.lock().unwrap();
+        let index = entries
+            .iter()
+            .position(|(count, _)| *count == prompt_token_count)?;
+        let entry = entries.remove(index)?;
+        let graphs = Arc::clone(&entry.1);
+        entries.push_back(entry);
+        Some(graphs)
+    }
+
+    pub(crate) fn insert(&self, prompt_token_count: u64, graphs: Arc<CachedGraphs>) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|(count, _)| *count != prompt_token_count);
+        if entries.len() == COMPONENT_GRAPH_CACHE_CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back((prompt_token_count, graphs));
+    }
+
+    /// Fuses graphs for `provider` from now on, or stops fusing with
+    /// `None`. Forgets every cached graph so plans and steps never mix
+    /// fused and unfused graphs.
+    pub(crate) fn set_fusion_provider(&self, provider: Option<ProviderBinding>) {
+        *self.fusion.lock().unwrap() = provider;
+        self.entries.lock().unwrap().clear();
+    }
+
+    /// Applies every fusion the fusion Provider currently advertises to
+    /// freshly built graphs; graphs are returned unchanged otherwise.
+    pub(crate) fn optimize(
+        &self,
+        runtime: &Runtime,
+        mut graphs: FirstNativeComponentGraphs,
+    ) -> FirstNativeComponentGraphs {
+        let Some(provider) = self.fusion.lock().unwrap().clone() else {
+            return graphs;
+        };
+        let is_weight = |edge: &TensorEdgeId| weight_tensor_name_from_edge(edge.as_str()).is_some();
+        type Pass<'a> = Box<dyn Fn(&ExecutionGraph) -> (ExecutionGraph, usize) + 'a>;
+        let passes: [(&str, Pass<'_>); 3] = [
+            (
+                crate::graph_fusion::MATMUL_BIAS_OPERATOR,
+                Box::new(|graph| crate::graph_fusion::fuse_matmul_bias(graph, is_weight)),
+            ),
+            (
+                crate::graph_fusion::MATMUL_RESIDUAL_OPERATOR,
+                Box::new(crate::graph_fusion::fuse_matmul_residual),
+            ),
+            (
+                crate::graph_fusion::SILU_MUL_OPERATOR,
+                Box::new(crate::graph_fusion::fuse_silu_mul),
+            ),
+        ];
+        for (operator, pass) in passes {
+            if !provider_advertises_operator(runtime, &provider, operator) {
+                continue;
+            }
+            let (prefill, prefill_fused) = pass(&graphs.prefill);
+            let (decode, decode_fused) = pass(&graphs.decode);
+            graphs.prefill = prefill;
+            graphs.prefill_node_count -= prefill_fused;
+            graphs.decode = decode;
+            graphs.decode_node_count -= decode_fused;
+        }
+        graphs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prompt_lengths(&self) -> Vec<u64> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(count, _)| *count)
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1266,6 +1496,10 @@ struct FirstNativeExecutionKvState {
 pub struct FirstNativeLayerKvState {
     k: TensorResourceId,
     v: TensorResourceId,
+    /// In-place KV history (`append-kv-history-in-place`): `k` and `v` are
+    /// the layer's stores and this many leading rows are valid. `None` for
+    /// copy-based history, whose tensors are exactly the history.
+    rows: Option<u64>,
 }
 
 impl E2eRuntimeModelExecutionEngine {
@@ -1390,11 +1624,22 @@ impl E2eRuntimeModelExecutionEngine {
             // `write_tensor_admitted` (Correctif 1), so discarding it must
             // release that allocation too, not just drop the Provider
             // storage entry.
+            // In-place KV stores (`append-kv-history-in-place`) also hold
+            // the committed history: they are released with it, unless no
+            // step of this request ever committed (a failed prefill).
+            let has_committed_state = self
+                .kv_states
+                .lock()
+                .map(|states| states.contains_key(&Self::kv_state_key(request)))
+                .unwrap_or(true);
             for layer in discarded.layer_kv.values() {
+                if layer.rows.is_some() && has_committed_state {
+                    continue;
+                }
                 // Best-effort: this pending state is being discarded
                 // regardless of whether Provider-side release succeeds.
-                let _ = provider.release_admitted_tensor(runtime.memory_mut(), &layer.k);
-                let _ = provider.release_admitted_tensor(runtime.memory_mut(), &layer.v);
+                release_pending_kv_resource(runtime, &provider, &layer.k);
+                release_pending_kv_resource(runtime, &provider, &layer.v);
             }
         }
         Ok(())
@@ -1735,11 +1980,7 @@ fn resolved_kernel_memory_class(
     let Some(prepared_plan) = prepared_plan else {
         return KernelMemoryClass::Host;
     };
-    let Some(binding) = prepared_plan
-        .node_bindings
-        .iter()
-        .find(|binding| binding.graph_nodes.contains(node))
-    else {
+    let Some(binding) = prepared_plan.node_binding(node) else {
         return KernelMemoryClass::Host;
     };
     if binding.provider.as_str() == REFERENCE_CPU_PROVIDER_NAME {
@@ -1767,11 +2008,7 @@ fn resolved_output_placement(
             REFERENCE_CPU_PROVIDER_NAME,
         ));
     };
-    let Some(binding) = prepared_plan
-        .node_bindings
-        .iter()
-        .find(|binding| binding.graph_nodes.contains(node))
-    else {
+    let Some(binding) = prepared_plan.node_binding(node) else {
         return MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
             REFERENCE_CPU_PROVIDER_NAME,
         ));
@@ -1806,11 +2043,7 @@ fn resolved_resource_affinity(
     let Some(prepared_plan) = prepared_plan else {
         return base.with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
     };
-    let Some(binding) = prepared_plan
-        .node_bindings
-        .iter()
-        .find(|binding| binding.graph_nodes.contains(node))
-    else {
+    let Some(binding) = prepared_plan.node_binding(node) else {
         return base.with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
     };
     let base = base.with_provider(binding.provider.clone());
@@ -1875,7 +2108,8 @@ struct FirstNativeDispatchContext<'a> {
     /// `None` only for callers that have no full graph (e.g. hand-written
     /// test oracles), which fall back to a synthetic-candidate path that
     /// production dispatch never takes.
-    graph: Option<&'a ExecutionGraph>,
+    /// Fingerprinted once per graph execution, not per node.
+    graph: Option<FingerprintedGraph<'a>>,
     /// This generation step's token count, used to populate
     /// `PlanGuardContext::sequence_length` when revalidating a published
     /// Plan's guards (Correctif 4). An absent value is treated by
@@ -1888,6 +2122,16 @@ struct FirstNativeDispatchContext<'a> {
     /// than a caller-fabricated id. `None` until the first successful
     /// dispatch.
     last_provider_execution: Option<ProviderExecutionResult>,
+    /// The last selection made for an Operator the Runtime adds to the step
+    /// itself (the KV history append's `concat` or `kv-write`), and what it
+    /// was selected for. Every layer's K and V append in a step asks the
+    /// registry the same question (same operator, affinity, memory class,
+    /// tensor descriptors and affinities); the registry does not change
+    /// while a graph executes, so the answer is reused.
+    internal_selection: Option<(InternalSelectionKey, KernelCandidate)>,
+    /// KV edges bound to an in-place KV store, with the number of leading
+    /// rows attention reads from it (`append-kv-history-in-place`).
+    bounded_kv_edges: BTreeMap<TensorEdgeId, u64>,
     /// Per-node causal-chain events (Correctif 17 / task group 17), pushed
     /// directly into the caller's own `Vec` (not accumulated locally and
     /// drained only on success) as each node's dispatch progresses through
@@ -2088,6 +2332,10 @@ fn dispatch_reference_cpu_operator_multi(
         operator,
         affinity.clone(),
     );
+    selection_request
+        .outputs
+        .reserve_exact(output_resources.len());
+    selection_request.inputs.reserve_exact(inputs.len());
     for output_resource in &output_resources {
         selection_request = selection_request
             .with_output(KernelResource::new(output_resource.clone(), memory_class));
@@ -2129,14 +2377,15 @@ fn dispatch_reference_cpu_operator_multi(
     // path (`prepared_candidate_for_operation`) survives only for callers
     // that have a `PreparedExecutionPlan` but no full `ExecutionGraph` to
     // revalidate it against -- hand-written test oracles, never production.
-    let selection = match (ctx.prepared_plan.as_deref_mut(), ctx.graph) {
+    let resolve_clock = ctx.runtime.phase_ledger().clock();
+    let selection = match (ctx.prepared_plan.as_deref_mut(), ctx.graph.as_ref()) {
         (Some(prepared_plan), Some(graph)) => {
             let guard_context = first_native_plan_context(
                 prepared_plan.scope.phase,
                 ctx.sequence_length.unwrap_or(1),
             );
             let prepared = PreparedExecutionPlanExecutor::new()
-                .prepare_node_execution(
+                .prepare_fingerprinted_node_execution(
                     graph,
                     prepared_plan,
                     ctx.runtime.kernel_registry(),
@@ -2175,29 +2424,26 @@ fn dispatch_reference_cpu_operator_multi(
             })?)
         }
     };
-    // Cloned to an owned value (not kept as a borrow of `ctx.runtime`) so it
-    // can stay alive across this function's later `ctx.runtime.memory_mut()`
-    // calls without holding a live shared borrow of `ctx.runtime` at the
-    // same time (task group 7 / Correctif 13).
-    let advertisement = ctx
-        .runtime
-        .kernel_registry()
+    // Borrowed from the registry for the rest of this dispatch alongside the
+    // Memory Manager and the phase ledger (task group 7 / Correctif 13), so
+    // the advertisement is not copied for every node.
+    let (registry, memory, phases) = ctx.runtime.kernel_registry_memory_and_phases_mut();
+    let advertisement = registry
         .active_advertisement(selection.kernel())
         .ok_or_else(|| InferenceApiError::KernelUnavailable {
             reason: format!("selected advertisement for {operation_id} is no longer active"),
-        })?
-        .clone();
+        })?;
     ctx.node_events.push(PerNodeCausalEvent::new(
         InferenceApiObservationKind::PreparedKernelResolved,
         node.clone(),
     ));
     let mut plan = match &selection {
         HotPathKernelSelection::Prepared(prepared) => {
-            KernelDispatchPlan::from_prepared_node_execution(
+            KernelDispatchPlan::from_prepared_node_execution_owned(
                 KernelDispatchPlanId::new(format!("e2e-runtime-{operation_id}-dispatch")),
-                &selection_request,
+                selection_request,
                 prepared,
-                &advertisement,
+                advertisement,
                 KernelInvocationId::new(format!("e2e-runtime-{operation_id}-invocation")),
             )
         }
@@ -2205,7 +2451,7 @@ fn dispatch_reference_cpu_operator_multi(
             KernelDispatchPlanId::new(format!("e2e-runtime-{operation_id}-dispatch")),
             &selection_request,
             candidate,
-            &advertisement,
+            advertisement,
             KernelInvocationId::new(format!("e2e-runtime-{operation_id}-invocation")),
         ),
     }
@@ -2217,7 +2463,7 @@ fn dispatch_reference_cpu_operator_multi(
         let workspace = ctx
             .provider
             .allocate_workspace(
-                ctx.runtime.memory_mut(),
+                memory,
                 advertisement.workspace.size_bytes_upper_bound.unwrap_or(1),
             )
             .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
@@ -2226,18 +2472,22 @@ fn dispatch_reference_cpu_operator_multi(
         plan.invocation.workspace = Some(workspace);
         plan.workspace_reservation = Some(workspace);
     }
-    let mut dispatcher = KernelDispatcher::new();
+    let mut dispatcher = KernelDispatcher::for_single_dispatch();
     dispatcher
-        .revalidate(ctx.runtime.kernel_registry(), &mut plan)
+        .revalidate(registry, &mut plan)
         .map_err(|error| InferenceApiError::KernelUnavailable {
             reason: format!("{error:?}"),
         })?;
-    let operator_catalog = initial_operator_catalog();
+    phases.record(resolve_clock, StepPhase::KernelResolve);
+    let catalog_clock = phases.clock();
+    let operator_catalog = shared_initial_operator_catalog();
     let operator_spec = operator_catalog
         .get(&advertisement.implemented_operator)
         .map_err(|error| InferenceApiError::KernelUnavailable {
             reason: error.to_string(),
         })?;
+    phases.record(catalog_clock, StepPhase::OperatorCatalog);
+    let execute_clock = phases.clock();
     // Provider submission/completion identity (Correctif 2): `submit_kernel`
     // is what causally triggers the numerical Kernel work (Reference CPU is
     // synchronous, so it runs as part of this call); the returned handle is
@@ -2247,12 +2497,7 @@ fn dispatch_reference_cpu_operator_multi(
     // trait object, not a concrete `ReferenceCpuExecutor`.
     let handle = ctx
         .provider
-        .submit_kernel(
-            &advertisement,
-            operator_spec,
-            &plan.invocation,
-            ctx.runtime.memory_mut(),
-        )
+        .submit_kernel(advertisement, operator_spec, &plan.invocation, memory)
         .map_err(|error| InferenceApiError::ProviderUnavailable {
             reason: format!(
                 "Reference CPU dispatch for {operation_id} could not be submitted: {error}"
@@ -2267,7 +2512,7 @@ fn dispatch_reference_cpu_operator_multi(
     // dispatch succeeded, rather than letting it accumulate as a leaked
     // allocation across every node this graph executes (task 5.4/5.5/5.6).
     if let Some(workspace) = plan.workspace_reservation {
-        let _ = ctx.runtime.memory_mut().release(workspace);
+        let _ = memory.release(workspace);
     }
     // `complete_kernel` observes the SAME work `handle` was returned for
     // above -- correlated by that handle, not fabricated -- and fails
@@ -2281,6 +2526,11 @@ fn dispatch_reference_cpu_operator_multi(
             ),
         }
     })?;
+    phases.record_operator(
+        execute_clock,
+        StepPhase::KernelExecute,
+        advertisement.implemented_operator.name(),
+    );
     let dispatch_result = KernelDispatchResult::from_kernel_result(&plan, kernel_result);
     if dispatch_result.status != KernelResultStatus::Succeeded {
         return Err(InferenceApiError::ProviderUnavailable {
@@ -2490,6 +2740,39 @@ fn dispatch_reference_cpu_operator_pre_admitted(
     result
 }
 
+/// `graph_fusion`'s fused matmul nodes: `matmul(a, b)` plus `extra`
+/// (`matmul-bias`'s `[cols]` bias row, or `matmul-residual`'s residual).
+fn dispatch_qwen_matmul_fused(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    operator: OperatorId,
+    a: NodeValue,
+    b: NodeValue,
+    extra: NodeValue,
+    output_target: Option<OutputTarget>,
+) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
+    let (rows, _) = a.rows_cols()?;
+    let (_, cols) = b.rows_cols()?;
+    let descriptor = TensorDescriptor::new(
+        ShapeDescriptor::new([rows, cols]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+        LayoutDescriptor::Contiguous,
+    );
+    dispatch_reference_cpu_operator_pre_admitted(
+        ctx,
+        operation_id,
+        operator,
+        vec![
+            node_input_resource(operation_id, "a", a),
+            node_input_resource(operation_id, "b", b),
+            node_input_resource(operation_id, "extra", extra),
+        ],
+        descriptor,
+        output_target,
+        BTreeMap::new(),
+    )
+}
+
 fn dispatch_qwen_matmul(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,
@@ -2527,6 +2810,16 @@ fn dispatch_qwen_matmul(
 /// K/V, `b` is this step's newly computed K/V; mirrors
 /// `dispatch_qwen_matmul`'s own pattern of computing an output shape that
 /// differs from either input's own shape.
+/// Everything a `concat` selection depends on besides the registry: the
+/// request's affinity and memory class and each resource's descriptor and
+/// affinity (not its id).
+type InternalSelectionKey = (
+    OperatorId,
+    ResourceAffinity,
+    KernelMemoryClass,
+    Vec<(TensorDescriptor, ResourceAffinity)>,
+);
+
 /// Dispatches the "concat" Operator for KV-history concatenation
 /// (`implement-device-resident-multi-step-cuda-decode`): stacks `a`'s rows
 /// above `b`'s rows through a real Kernel Registry selection and real
@@ -2575,27 +2868,51 @@ fn dispatch_qwen_concat(
         });
     }
     let output_descriptor = f32_tensor_descriptor_from_shape(&[a_rows + b_rows, a_cols]);
+    let output = resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
+    dispatch_runtime_internal_operator(
+        ctx,
+        operation_id,
+        real_node,
+        dispatch_operator_id("concat", OperatorFamily::Tensor),
+        [("a", a), ("b", b)],
+        output,
+        BTreeMap::new(),
+    )
+}
+
+/// Dispatches an Operator the Runtime adds to a graph step itself (the KV
+/// history append's `concat` or `kv-write`), not a node of the graph: there
+/// is no Prepared Plan binding for it, so its Kernel comes from a live
+/// Kernel Registry selection (reused while the same request repeats within
+/// a graph execution), with `real_node`'s own resolved affinity so it
+/// targets the Provider that node is bound to. `output` is the resource the
+/// Kernel writes, already admitted by the caller when it needs to be.
+fn dispatch_runtime_internal_operator<const N: usize>(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    real_node: &ExecutionNodeId,
+    operator: OperatorId,
+    inputs: [(&str, NodeValue); N],
+    output: (TensorResourceId, TensorDescriptor),
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<NodeValue, InferenceApiError> {
+    let (output_id, output_descriptor) = output;
     let affinity = resolved_resource_affinity(
         ctx.prepared_plan.as_deref(),
         real_node,
         ctx.runtime.context().id(),
     );
     let memory_class = resolved_kernel_memory_class(ctx.prepared_plan.as_deref(), real_node);
-    let (output_id, output_descriptor) =
-        resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
     let output_resource =
         TensorResourceDescriptor::new(output_id.clone(), output_descriptor, affinity.clone());
     let mut selection_request = KernelSelectionRequest::new(
         format!("e2e-runtime-{operation_id}"),
-        dispatch_operator_id("concat", OperatorFamily::Tensor),
+        operator.clone(),
         affinity.clone(),
     )
     .with_output(KernelResource::new(output_resource.clone(), memory_class));
-    let inputs = [
-        node_input_resource(operation_id, "a", a),
-        node_input_resource(operation_id, "b", b),
-    ];
-    for input in inputs {
+    for (name, value) in inputs {
+        let input = node_input_resource(operation_id, name, value);
         let resource = match input {
             NodeInputResource::Fresh(id, descriptor, tensor) => {
                 let resource =
@@ -2616,47 +2933,72 @@ fn dispatch_qwen_concat(
         selection_request =
             selection_request.with_input(KernelResource::new(resource, memory_class));
     }
-    let selection = ctx
-        .runtime
-        .kernel_registry()
-        .select(&selection_request)
-        .map_err(|error| InferenceApiError::KernelUnavailable {
-            reason: format!("{operation_id}: {error}"),
-        })?;
-    let candidate = selection
-        .selected
-        .ok_or_else(|| InferenceApiError::KernelUnavailable {
-            reason: format!("Kernel Registry selected no candidate for {operation_id}"),
-        })?;
-    let advertisement = ctx
-        .runtime
-        .kernel_registry()
+    let selection_key: InternalSelectionKey = (
+        operator,
+        affinity.clone(),
+        memory_class,
+        selection_request
+            .outputs
+            .iter()
+            .chain(&selection_request.inputs)
+            .map(|resource| {
+                (
+                    resource.resource.descriptor.clone(),
+                    resource.resource.affinity.clone(),
+                )
+            })
+            .collect(),
+    );
+    let candidate = match &ctx.internal_selection {
+        Some((key, candidate)) if *key == selection_key => candidate.clone(),
+        _ => {
+            let selection = ctx
+                .runtime
+                .kernel_registry()
+                .select(&selection_request)
+                .map_err(|error| InferenceApiError::KernelUnavailable {
+                    reason: format!("{operation_id}: {error}"),
+                })?;
+            let candidate =
+                selection
+                    .selected
+                    .ok_or_else(|| InferenceApiError::KernelUnavailable {
+                        reason: format!("Kernel Registry selected no candidate for {operation_id}"),
+                    })?;
+            ctx.internal_selection = Some((selection_key, candidate.clone()));
+            candidate
+        }
+    };
+    // Borrowed alongside the Memory Manager instead of copied, as in
+    // `dispatch_reference_cpu_operator_multi`.
+    let (registry, memory, _phases) = ctx.runtime.kernel_registry_memory_and_phases_mut();
+    let advertisement = registry
         .active_advertisement(&candidate.kernel)
         .ok_or_else(|| InferenceApiError::KernelUnavailable {
             reason: format!("selected advertisement for {operation_id} is no longer active"),
-        })?
-        .clone();
+        })?;
     let mut plan = KernelDispatchPlan::from_selection(
         KernelDispatchPlanId::new(format!("e2e-runtime-{operation_id}-dispatch")),
         &selection_request,
         &candidate,
-        &advertisement,
+        advertisement,
         KernelInvocationId::new(format!("e2e-runtime-{operation_id}-invocation")),
     )
     .map_err(|error| InferenceApiError::KernelUnavailable {
         reason: format!("{error:?}"),
     })?;
+    plan.invocation.attributes = attributes;
     let handle = ctx
         .provider
         .submit_kernel(
-            &advertisement,
-            initial_operator_catalog()
+            advertisement,
+            shared_initial_operator_catalog()
                 .get(&advertisement.implemented_operator)
                 .map_err(|error| InferenceApiError::KernelUnavailable {
                     reason: error.to_string(),
                 })?,
             &plan.invocation,
-            ctx.runtime.memory_mut(),
+            memory,
         )
         .map_err(|error| InferenceApiError::ProviderUnavailable {
             reason: format!(
@@ -2664,7 +3006,7 @@ fn dispatch_qwen_concat(
             ),
         })?;
     if let Some(workspace) = plan.workspace_reservation.take() {
-        let _ = ctx.runtime.memory_mut().release(workspace);
+        let _ = memory.release(workspace);
     }
     let kernel_result = ctx.provider.complete_kernel(&handle).map_err(|error| {
         InferenceApiError::ProviderUnavailable {
@@ -2869,16 +3211,22 @@ fn dispatch_qwen_rmsnorm(
 /// is `NodeValue`-eligible for Resident passthrough like every other
 /// operator here, since this is now a genuine single Kernel dispatch
 /// rather than a Rust-computed reassembly of several.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_qwen_rope(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,
     input: NodeValue,
     head_count: u64,
     rope_config: &FirstNativeRopeConfig,
+    pairing: RopePairing,
     position_offset: u64,
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
     let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "rotation_pairing".into(),
+        OperatorAttributeValue::String(pairing.as_attribute().into()),
+    );
     attributes.insert(
         "base".into(),
         OperatorAttributeValue::Float(rope_config.base),
@@ -2915,6 +3263,7 @@ fn dispatch_qwen_rope(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_qwen_attention(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,
@@ -2923,9 +3272,18 @@ fn dispatch_qwen_attention(
     v: NodeValue,
     architecture: &ModelComponentArchitectureMetadata,
     output_target: Option<OutputTarget>,
+    key_count: Option<u64>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
     let mut attributes = BTreeMap::new();
     attributes.insert("causal".into(), OperatorAttributeValue::Boolean(true));
+    // K and V are in-place KV stores: only their first `key_count` rows are
+    // the key sequence (`append-kv-history-in-place`).
+    if let Some(key_count) = key_count {
+        attributes.insert(
+            "key_count".into(),
+            OperatorAttributeValue::Integer(key_count as i64),
+        );
+    }
     attributes.insert(
         "head_count".into(),
         OperatorAttributeValue::Integer(architecture.attention_head_count as i64),
@@ -3072,38 +3430,60 @@ fn resolve_first_native_weight_edge(
 /// `node.inputs`/`node.outputs` directly, rather than relying on
 /// `TensorEdge::producer`/`::consumers` (which Qwen's own graph builder does
 /// not populate).
+/// [`first_native_graph_execution_order`] for sibling modules' tests.
+#[cfg(test)]
+pub(crate) fn first_native_graph_execution_order_for_tests(
+    graph: &ExecutionGraph,
+) -> Result<Vec<ExecutionNodeId>, InferenceApiError> {
+    first_native_graph_execution_order(graph)
+}
+
 fn first_native_graph_execution_order(
     graph: &ExecutionGraph,
 ) -> Result<Vec<ExecutionNodeId>, InferenceApiError> {
-    let mut producer_of: BTreeMap<&ExecutionNodeId, ()> = BTreeMap::new();
     let mut edge_producer: BTreeMap<&TensorEdgeId, &ExecutionNodeId> = BTreeMap::new();
     for (node_id, node) in &graph.nodes {
-        producer_of.insert(node_id, ());
         for output in &node.outputs {
             edge_producer.insert(output, node_id);
         }
     }
-    let mut remaining: BTreeSet<&ExecutionNodeId> = graph.nodes.keys().collect();
-    let mut order = Vec::with_capacity(remaining.len());
-    while !remaining.is_empty() {
-        let ready = remaining
-            .iter()
-            .find(|node_id| {
-                let node = &graph.nodes[**node_id];
-                node.inputs.iter().all(|edge_id| {
-                    edge_producer
-                        .get(edge_id)
-                        .is_none_or(|producer| !remaining.contains(producer))
-                })
-            })
-            .copied();
-        let Some(node_id) = ready else {
-            return Err(InferenceApiError::GraphPlanningFailed {
-                reason: "first-native graph contains a cycle or unresolved producer".into(),
-            });
-        };
-        remaining.remove(node_id);
+    // Kahn's algorithm, always taking the smallest ready node id: the same
+    // order as repeatedly picking the first remaining node whose producers
+    // have all run, in O(edges log nodes) instead of O(nodes^2).
+    let mut pending_inputs: BTreeMap<&ExecutionNodeId, usize> = BTreeMap::new();
+    let mut consumers: BTreeMap<&ExecutionNodeId, Vec<&ExecutionNodeId>> = BTreeMap::new();
+    for (node_id, node) in &graph.nodes {
+        let mut pending = 0;
+        for edge_id in &node.inputs {
+            if let Some(producer) = edge_producer.get(edge_id) {
+                pending += 1;
+                consumers.entry(*producer).or_default().push(node_id);
+            }
+        }
+        pending_inputs.insert(node_id, pending);
+    }
+    let mut ready: BTreeSet<&ExecutionNodeId> = pending_inputs
+        .iter()
+        .filter(|(_, pending)| **pending == 0)
+        .map(|(node_id, _)| *node_id)
+        .collect();
+    let mut order = Vec::with_capacity(graph.nodes.len());
+    while let Some(node_id) = ready.pop_first() {
         order.push(node_id.clone());
+        for consumer in consumers.get(node_id).into_iter().flatten() {
+            let pending = pending_inputs
+                .get_mut(consumer)
+                .expect("every consumer is a graph node");
+            *pending -= 1;
+            if *pending == 0 {
+                ready.insert(consumer);
+            }
+        }
+    }
+    if order.len() != graph.nodes.len() {
+        return Err(InferenceApiError::GraphPlanningFailed {
+            reason: "first-native graph contains a cycle or unresolved producer".into(),
+        });
     }
     Ok(order)
 }
@@ -3170,8 +3550,8 @@ fn dispatch_first_native_graph_node(
     // Resolved once, before dispatch: this node's output edge's own final
     // resource identity, and the placement/owner it should be pre-admitted
     // under (`unify-provider-output-admission-and-residency`'s Decision 3).
-    // Every operator below except "rope" (which has no Kernel-level output
-    // identity of its own -- see that arm) targets this directly instead of
+    // Every operator below except a "rope" whose output carries KV-cache
+    // semantics (see that arm) targets this directly instead of
     // letting its own dispatch function synthesize a Kernel-internal id
     // that would later need a separate download-then-reupload to reach the
     // edge.
@@ -3250,6 +3630,48 @@ fn dispatch_first_native_graph_node(
             dispatch_qwen_matmul(ctx, node_id, a, b, Some(output_target))
                 .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        "matmul-bias" | "matmul-residual" => {
+            if inputs.len() != 3 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' expects 3 {} inputs",
+                        node.operator.name()
+                    ),
+                });
+            }
+            let a = inputs.remove(0);
+            let b = inputs.remove(0);
+            let extra = inputs.remove(0);
+            dispatch_qwen_matmul_fused(
+                ctx,
+                node_id,
+                node.operator.clone(),
+                a,
+                b,
+                extra,
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "silu-mul" => {
+            if inputs.len() != 2 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 2 silu-mul inputs"),
+                });
+            }
+            let gate = inputs.remove(0);
+            let up = inputs.remove(0);
+            dispatch_qwen_binary_same_shape(
+                ctx,
+                node_id,
+                "silu-mul",
+                OperatorFamily::Activation,
+                gate,
+                up,
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "rope" => {
             if inputs.len() != 1 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -3303,6 +3725,25 @@ fn dispatch_first_native_graph_node(
                 None => 1,
             };
             let base = node_attribute_f64(node, "base")?;
+            // `fix-rope-rotation-pairing`: the Model Component declares the
+            // pairing on the node; absent keeps the interleaved default.
+            // Forwarded to the Kernel as-is, never inferred.
+            let pairing = match node.attributes.get("rotation_pairing") {
+                None => RopePairing::Interleaved,
+                Some(OperatorAttributeValue::String(value)) => RopePairing::from_attribute(value)
+                    .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph node '{node_id}' attribute 'rotation_pairing' value '{value}' is not supported"
+                        ),
+                    })?,
+                Some(_) => {
+                    return Err(InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph node '{node_id}' attribute 'rotation_pairing' is not a string"
+                        ),
+                    });
+                }
+            };
             let position_offset = absolute_position_override
                 .map(Ok)
                 .unwrap_or_else(|| node_attribute_u64(node, "position_offset"))?;
@@ -3313,25 +3754,34 @@ fn dispatch_first_native_graph_node(
                 position_mode: fixture.config.rope.position_mode,
                 dynamic_scaling_supported: fixture.config.rope.dynamic_scaling_supported,
             };
-            // Unlike every other arm, `output_target` is deliberately
-            // *not* passed here (matches this function's own top-of-body
-            // comment, predating this task group): RoPE's output edge
-            // (`rope_k`'s in particular) carries KV-cache Append semantics
-            // that `execute_first_native_graph_nodes` handles via its own
-            // unconditional `needs_explicit_edge_write` path for this
-            // node kind. Passing a pre-admitted `output_target` here too
-            // caused a genuine regression (double-admission racing the
-            // KV-cache pending-write path) caught by the full oracle
-            // comparison suite -- confirmed empirically, not just by
-            // re-reading the comment.
+            // `output_target` is not passed when RoPE's output edge carries
+            // KV-cache semantics (`rope_k`): `execute_first_native_graph_nodes`
+            // appends that output to the history itself, and pre-admitting
+            // it here too caused a genuine regression (double-admission
+            // racing the KV-cache pending-write path) caught by the full
+            // oracle comparison suite. Every other RoPE output (`rope_q`)
+            // is written straight into its edge like any other operator's,
+            // instead of being downloaded to the host and uploaded back
+            // after the dispatch (`attribute-redacted-inference-costs`: 24
+            // synchronizing round trips per CUDA decode step).
+            let output_has_kv_semantics = node.outputs.first().is_none_or(|edge_id| {
+                ctx.graph.as_ref().is_none_or(|graph| {
+                    graph
+                        .graph()
+                        .edges
+                        .get(edge_id)
+                        .is_none_or(|edge| edge.kv_cache.is_some())
+                })
+            });
             dispatch_qwen_rope(
                 ctx,
                 node_id,
                 input,
                 head_count,
                 &rope_config,
+                pairing,
                 position_offset,
-                None,
+                (!output_has_kv_semantics).then_some(output_target),
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
@@ -3344,8 +3794,22 @@ fn dispatch_first_native_graph_node(
             let q = inputs.remove(0);
             let k = inputs.remove(0);
             let v = inputs.remove(0);
-            dispatch_qwen_attention(ctx, node_id, q, k, v, architecture, Some(output_target))
-                .map(|(dispatch, value)| (dispatch, vec![value]))
+            let key_count = node
+                .inputs
+                .get(1)
+                .and_then(|edge| ctx.bounded_kv_edges.get(edge))
+                .copied();
+            dispatch_qwen_attention(
+                ctx,
+                node_id,
+                q,
+                k,
+                v,
+                architecture,
+                Some(output_target),
+                key_count,
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "silu" => {
             if inputs.len() != 1 {
@@ -3546,6 +4010,41 @@ fn execute_first_native_graph(
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
+    execute_first_native_graph_materializing(
+        runtime,
+        fixture,
+        model_instance,
+        kv_cache_id,
+        graph,
+        prepared_plan,
+        initial_bindings,
+        kv_history,
+        absolute_position_override,
+        node_events,
+        MaterializedEdges::All,
+        None,
+        None,
+    )
+}
+
+/// [`execute_first_native_graph`], downloading only the `materialized`
+/// edges once every node has run. `memo`, when given, belongs to `graph`.
+#[allow(clippy::too_many_arguments)]
+fn execute_first_native_graph_materializing(
+    runtime: &mut Runtime,
+    fixture: &E2eFixture,
+    model_instance: &ModelInstanceId,
+    kv_cache_id: &KvCacheId,
+    graph: &ExecutionGraph,
+    prepared_plan: &mut PreparedExecutionPlan,
+    initial_bindings: BTreeMap<TensorEdgeId, HostTensor>,
+    kv_history: Option<&LayerKvMap>,
+    absolute_position_override: Option<u64>,
+    node_events: &mut Vec<PerNodeCausalEvent>,
+    materialized: MaterializedEdges<'_>,
+    memo: Option<&GraphExecutionMemo>,
+    kv_store_capacity: Option<u64>,
+) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     execute_first_native_graph_with_resident_input(
         runtime,
         fixture,
@@ -3558,7 +4057,22 @@ fn execute_first_native_graph(
         kv_history,
         absolute_position_override,
         node_events,
+        materialized,
+        memo,
+        kv_store_capacity,
     )
+}
+
+/// Which graph edges a graph execution downloads to the host once every
+/// node has run. Every download waits for the Device, and a decode step's
+/// graph has hundreds of edges, the KV history among them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MaterializedEdges<'a> {
+    /// Every live edge (conformance and test entry points that inspect
+    /// intermediate values).
+    All,
+    /// Only these edges, when the graph produced them.
+    Only(&'a [&'a str]),
 }
 
 /// [`execute_first_native_graph`], generalized to additionally accept graph inputs
@@ -3586,8 +4100,23 @@ fn execute_first_native_graph_with_resident_input(
     kv_history: Option<&LayerKvMap>,
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
+    materialized: MaterializedEdges<'_>,
+    memo: Option<&GraphExecutionMemo>,
+    kv_store_capacity: Option<u64>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
-    let order = first_native_graph_execution_order(graph)?;
+    let prepare_clock = runtime.phase_ledger().clock();
+    let computed_order;
+    let order = match memo {
+        Some(memo) => memo.order(graph)?,
+        None => {
+            computed_order = first_native_graph_execution_order(graph)?;
+            &computed_order[..]
+        }
+    };
+    let fingerprinted = match memo {
+        Some(memo) => FingerprintedGraph::with_known_fingerprint(graph, memo.fingerprint(graph)),
+        None => FingerprintedGraph::new(graph),
+    };
     // Every node in this graph binds to the same Provider; any binding names
     // it (task 5.2: resolve the executing Provider from Runtime provider
     // registration for each prepared binding).
@@ -3599,6 +4128,15 @@ fn execute_first_native_graph_with_resident_input(
             reason: "prepared execution plan has no node bindings".into(),
         })?;
     let executor = resolve_kernel_execution_provider(runtime, &provider_binding)?;
+    // In-place KV history (`append-kv-history-in-place`) only when the
+    // Provider supports it and attention is the only reader of KV edges.
+    let kv_store_capacity = kv_store_capacity.filter(|_| {
+        in_place_kv_supported(runtime, &provider_binding)
+            && match memo {
+                Some(memo) => memo.kv_edges_feed_only_attention(graph),
+                None => kv_edges_feed_only_attention(graph),
+            }
+    });
     // Cloning this instance's weight bindings (a small `String ->
     // TensorResourceId` map, not tensor bytes) sidesteps holding both this
     // immutable borrow and the mutable `memory_mut()` borrow below at once;
@@ -3611,6 +4149,9 @@ fn execute_first_native_graph_with_resident_input(
         .resource_bindings
         .weights
         .clone();
+    runtime
+        .phase_ledger_mut()
+        .record(prepare_clock, StepPhase::GraphPrepare);
     // Runtime's own MemoryManager is used directly (via `FirstNativeDispatchContext`
     // holding `&mut Runtime`, task group 7 / Correctif 13) rather than
     // temporarily taken out with `std::mem::take` and restored afterward --
@@ -3620,12 +4161,12 @@ fn execute_first_native_graph_with_resident_input(
     // (rather than continuing inline) purely for readability now, not to
     // manage a restore point.
     let (dispatch, bindings, layer_kv) = execute_first_native_graph_nodes(
-        &order,
+        order,
         runtime,
         fixture,
         &weight_bindings,
         kv_cache_id,
-        graph,
+        fingerprinted,
         prepared_plan,
         &executor,
         initial_bindings,
@@ -3633,6 +4174,8 @@ fn execute_first_native_graph_with_resident_input(
         kv_history,
         absolute_position_override,
         node_events,
+        materialized,
+        kv_store_capacity,
     )?;
     Ok((dispatch, bindings, layer_kv, provider_binding))
 }
@@ -3644,7 +4187,7 @@ fn execute_first_native_graph_nodes(
     fixture: &E2eFixture,
     weight_bindings: &BTreeMap<String, TensorResourceId>,
     kv_cache_id: &KvCacheId,
-    graph: &ExecutionGraph,
+    fingerprinted: FingerprintedGraph<'_>,
     prepared_plan: &mut PreparedExecutionPlan,
     executor: &Arc<dyn ProviderExecutionApi>,
     initial_bindings: BTreeMap<TensorEdgeId, HostTensor>,
@@ -3652,7 +4195,10 @@ fn execute_first_native_graph_nodes(
     kv_history: Option<&LayerKvMap>,
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
+    materialized: MaterializedEdges<'_>,
+    kv_store_capacity: Option<u64>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
+    let graph = fingerprinted.graph();
     // This step's token count, for `PlanGuardContext::sequence_length`
     // (Correctif 4): the same value every dispatched node's Plan guards
     // were built against (`PlanGuard::SequenceRange`), read from the graph
@@ -3664,9 +4210,11 @@ fn execute_first_native_graph_nodes(
         runtime,
         provider: executor.clone(),
         prepared_plan: Some(prepared_plan),
-        graph: Some(graph),
+        graph: Some(fingerprinted),
         sequence_length,
         last_provider_execution: None,
+        internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events,
     };
     let layer_count = fixture.config.architecture.layer_count as usize;
@@ -3691,6 +4239,7 @@ fn execute_first_native_graph_nodes(
     // Provider-side, so accounting stays bounded to this graph's edge count
     // no matter how many steps a session runs.
     let mut bindings: BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)> = BTreeMap::new();
+    let upload_clock = dispatch_ctx.runtime.phase_ledger().clock();
     for (edge_id, tensor) in initial_bindings {
         let resource_id = TensorResourceId::new(edge_id.as_str());
         let shape = tensor.shape.clone();
@@ -3721,6 +4270,10 @@ fn execute_first_native_graph_nodes(
             })?;
         bindings.insert(edge_id, (resource_id, shape));
     }
+    dispatch_ctx
+        .runtime
+        .phase_ledger_mut()
+        .record(upload_clock, StepPhase::InputUpload);
     // Graph inputs ALREADY resident in this executing Provider's own
     // storage (`add-real-multi-device-model-instance-placement`'s real
     // peer-to-peer segment boundary, `CudaExecutor::copy_tensor_from_
@@ -3731,6 +4284,9 @@ fn execute_first_native_graph_nodes(
     bindings.extend(resident_bindings);
     let mut layer_k: Vec<Option<TensorResourceId>> = vec![None; layer_count];
     let mut layer_v: Vec<Option<TensorResourceId>> = vec![None; layer_count];
+    // Valid rows of each layer's in-place KV stores this step, when the
+    // history is kept in place (`append-kv-history-in-place`).
+    let mut layer_rows: Vec<Option<u64>> = vec![None; layer_count];
     let mut last_dispatch: Option<KernelDispatchResult> = None;
 
     for node_id in order {
@@ -3753,6 +4309,9 @@ fn execute_first_native_graph_nodes(
         let passthrough_eligible = matches!(
             node.operator.name(),
             "matmul"
+                | "matmul-bias"
+                | "matmul-residual"
+                | "silu-mul"
                 | "attention"
                 | "silu"
                 | "add"
@@ -3762,6 +4321,7 @@ fn execute_first_native_graph_nodes(
                 | "rmsnorm"
                 | "rope"
         );
+        let inputs_clock = dispatch_ctx.runtime.phase_ledger().clock();
         let mut inputs = Vec::with_capacity(node.inputs.len());
         for edge_id in &node.inputs {
             let value = match bindings.get(edge_id) {
@@ -3810,6 +4370,11 @@ fn execute_first_native_graph_nodes(
             };
             inputs.push(value);
         }
+        dispatch_ctx
+            .runtime
+            .phase_ledger_mut()
+            .record(inputs_clock, StepPhase::NodeInputResolve);
+        let dispatch_clock = dispatch_ctx.runtime.phase_ledger().clock();
         let (dispatch_result, output_values) = dispatch_first_native_graph_node(
             &mut dispatch_ctx,
             fixture,
@@ -3818,6 +4383,12 @@ fn execute_first_native_graph_nodes(
             absolute_position_override,
             kv_cache_id,
         )?;
+        dispatch_ctx.runtime.phase_ledger_mut().record_operator(
+            dispatch_clock,
+            StepPhase::NodeDispatch,
+            node.operator.name(),
+        );
+        let bind_clock = dispatch_ctx.runtime.phase_ledger().clock();
         if node.outputs.is_empty() {
             return Err(InferenceApiError::GraphPlanningFailed {
                 reason: format!("graph node '{node_id}' has no output edge"),
@@ -3845,6 +4416,9 @@ fn execute_first_native_graph_nodes(
             // concatenation below produces genuinely new, host-computed data,
             // and "rope" nodes have no Kernel-level output identity to begin
             // with (always `NodeValue::Host`, never `Resident` under this id).
+            // The resource the edge resolves to for later nodes: its own
+            // identity, or the pending KV resource a KV append wrote.
+            let mut bound_resource_id = output_resource_id.clone();
             let mut needs_explicit_edge_write = !matches!(
                 &output_tensor,
                 NodeValue::Resident { id, .. } if *id == output_resource_id
@@ -3859,80 +4433,6 @@ fn execute_first_native_graph_nodes(
                         ),
                     });
                 }
-                if kv_meta.behavior == GraphKvCacheBehavior::Append {
-                    let history =
-                        kv_history.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
-                            reason: "decode graph execution requires historical KV state".into(),
-                        })?;
-                    let historical = history.get(&layer).ok_or_else(|| {
-                        InferenceApiError::KvCacheUnavailable {
-                            reason: format!(
-                                "decode requires historical KV state for layer {layer}"
-                            ),
-                        }
-                    })?;
-                    let historical_resource = match role {
-                        KvRole::K => &historical.k,
-                        KvRole::V => &historical.v,
-                    };
-                    // Historical KV data stays wherever the registered
-                    // Provider already holds it (task 7.2/7.3): a device-
-                    // resident Provider (CUDA) is never asked to produce
-                    // host-visible bytes for it -- `resident_shape` reads
-                    // only structural metadata, and the "concat" Operator
-                    // dispatch below runs through the exact same generic
-                    // Kernel Registry path every other graph node uses,
-                    // targeting this edge's own stable identity directly
-                    // (`implement-device-resident-multi-step-cuda-decode`,
-                    // replacing this block's former `read_tensor_value(..)
-                    // .into_host(..)` + Rust-computed `concat_rows`).
-                    let historical_shape = dispatch_ctx
-                        .provider
-                        .resident_shape(historical_resource)
-                        .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
-                            reason: format!("no materialized historical KV data for layer {layer}"),
-                        })?;
-                    let historical_value = NodeValue::Resident {
-                        id: historical_resource.clone(),
-                        shape: historical_shape,
-                    };
-                    let concat_output_target: OutputTarget = (
-                        output_resource_id.clone(),
-                        resolved_output_placement(dispatch_ctx.prepared_plan.as_deref(), node_id),
-                        MemoryAllocationOwner::Session(kv_cache_id.to_string()),
-                    );
-                    let concatenated = dispatch_qwen_concat(
-                        &mut dispatch_ctx,
-                        &format!("{node_id}.kv-append"),
-                        node_id,
-                        historical_value,
-                        output_tensor.clone(),
-                        Some(concat_output_target),
-                    )?;
-                    // The concat dispatch pre-admitted its output directly
-                    // under `output_resource_id` (mirroring Decision 3's
-                    // existing optimization for every other node kind), so
-                    // the edge is already correctly written -- no explicit
-                    // (re-)write, and critically no `into_host` round trip,
-                    // needed below.
-                    output_tensor = concatenated;
-                    needs_explicit_edge_write = false;
-                }
-                // Written under a *pending* resource id (task 7.4 prepare):
-                // this generation step's KV update becomes Runtime-owned only
-                // once `commit_generation_step` promotes it after sampling and
-                // token commit succeed; a failure or cancellation before then
-                // simply leaves this pending write unpromoted. When
-                // `output_tensor` is already `Resident` (decode's KV-append
-                // case always is, after the concat dispatch above; prefill's
-                // "Output" case is whenever the producing Kernel itself wrote
-                // directly into `output_resource_id`), this is a real
-                // Provider-side copy (`copy_tensor_admitted`) to the pending
-                // resource's own, separate, stable identity -- never a host
-                // round trip (`implement-device-resident-multi-step-cuda-
-                // decode`). Only a genuinely `Host`-typed value (e.g. "rope",
-                // which has no Kernel-level output identity to begin with)
-                // still needs an explicit host-typed admitted write here.
                 let role_str = match role {
                     KvRole::K => "k",
                     KvRole::V => "v",
@@ -3940,65 +4440,283 @@ fn execute_first_native_graph_nodes(
                 let pending_resource = TensorResourceId::new(format!(
                     "kv.{kv_cache_id}.layer{layer}.{role_str}.pending"
                 ));
-                let pending_write_result: Result<(), TensorValueAdmissionError> =
-                    match &output_tensor {
-                        NodeValue::Resident { id, .. } => dispatch_ctx
+                // In-place history (`append-kv-history-in-place`): a decode
+                // step continues the stores its history lives in; a prefill
+                // starts new stores when this execution keeps KV in place.
+                let in_place = match kv_history.and_then(|history| history.get(&layer)) {
+                    Some(FirstNativeLayerKvState {
+                        rows: Some(rows), ..
+                    }) => Some((
+                        kv_store_capacity.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                            reason: format!(
+                                "layer {layer} keeps its KV history in place, but this \
+                                     execution cannot continue it"
+                            ),
+                        })?,
+                        *rows,
+                    )),
+                    Some(_) => None,
+                    None => kv_store_capacity.map(|capacity| (capacity, 0)),
+                };
+                if let Some((capacity, row_offset)) = in_place {
+                    let store = TensorResourceId::new(format!(
+                        "kv.{kv_cache_id}.layer{layer}.{role_str}.store"
+                    ));
+                    let (rows, width) = output_tensor.rows_cols()?;
+                    let valid_rows = row_offset
+                        .checked_add(rows)
+                        .filter(|valid| *valid <= capacity)
+                        .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                            reason: format!(
+                                "layer {layer}: {rows} new KV rows at {row_offset} exceed the \
+                                 store's capacity of {capacity}"
+                            ),
+                        })?;
+                    let store_descriptor = f32_tensor_descriptor_from_shape(&[capacity, width]);
+                    let append_clock = dispatch_ctx.runtime.phase_ledger().clock();
+                    if row_offset == 0 {
+                        // A new store, admitted once for the whole request.
+                        let target: OutputTarget = (
+                            store.clone(),
+                            resolved_output_placement(
+                                dispatch_ctx.prepared_plan.as_deref(),
+                                node_id,
+                            ),
+                            MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                        );
+                        let (store_id, _) = resolve_output_target(
+                            &mut dispatch_ctx,
+                            &format!("{node_id}.kv-store"),
+                            store_descriptor.clone(),
+                            Some(target),
+                        )?;
+                        let zeros = HostTensor::new(
+                            [capacity, width],
+                            vec![0.0; (capacity * width) as usize],
+                        )
+                        .map_err(runtime_generation_failed)?;
+                        dispatch_ctx
                             .provider
-                            .copy_tensor_admitted(
-                                dispatch_ctx.runtime.memory_mut(),
-                                id,
-                                pending_resource.clone(),
-                                MemoryAllocationClass::Tensor,
-                                MemoryAllocationOwner::Session(kv_cache_id.to_string()),
-                            )
-                            .map(|_allocation_id| ()),
-                        NodeValue::Host(_) => {
-                            let pending_tensor =
-                                output_tensor.clone().into_host(&dispatch_ctx.provider)?;
-                            dispatch_ctx.provider.write_tensor_value_admitted(
-                                dispatch_ctx.runtime.memory_mut(),
-                                pending_resource.clone(),
-                                TensorValue::Host(pending_tensor),
-                                MemoryAllocationClass::Tensor,
-                                MemoryAllocationOwner::Session(kv_cache_id.to_string()),
-                            )
-                        }
+                            .write_tensor_value(store_id, TensorValue::Host(zeros))
+                            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                                reason: error.to_string(),
+                            })?;
+                    }
+                    let mut attributes = BTreeMap::new();
+                    attributes.insert(
+                        "row_offset".into(),
+                        OperatorAttributeValue::Integer(row_offset as i64),
+                    );
+                    dispatch_runtime_internal_operator(
+                        &mut dispatch_ctx,
+                        &format!("{node_id}.kv-write"),
+                        node_id,
+                        dispatch_operator_id("kv-write", OperatorFamily::Tensor),
+                        [
+                            (
+                                "store",
+                                NodeValue::Resident {
+                                    id: store.clone(),
+                                    shape: vec![capacity, width],
+                                },
+                            ),
+                            ("rows", output_tensor),
+                        ],
+                        (store.clone(), store_descriptor),
+                        attributes,
+                    )?;
+                    dispatch_ctx
+                        .runtime
+                        .phase_ledger_mut()
+                        .record(append_clock, StepPhase::KvAppend);
+                    output_tensor = NodeValue::Resident {
+                        id: store.clone(),
+                        shape: vec![capacity, width],
                     };
-                // Correctif 1: admitted (via `write_tensor_admitted`/
-                // `copy_tensor_admitted`), not a bare `write_tensor` -- this
-                // id is stable across every decode step for this layer/role,
-                // so admission replaces (and releases) whatever allocation
-                // the previous step's pending write held for it, the same
-                // reasoning as the graph-edge writes above.
-                // `discard_pending_kv_state` releases this through
-                // `release_admitted_tensor` when a step is cancelled or fails
-                // before commit.
-                pending_write_result.map_err(|error| match error {
-                    TensorValueAdmissionError::Memory(error) => {
-                        InferenceApiError::MemoryAdmissionFailed {
-                            reason: format!(
-                                "failed to account pending KV resource '{pending_resource}': {error}"
-                            ),
-                        }
+                    needs_explicit_edge_write = false;
+                    bound_resource_id = store.clone();
+                    dispatch_ctx
+                        .bounded_kv_edges
+                        .insert(output_edge_id.clone(), valid_rows);
+                    dispatch_ctx.node_events.push(
+                        PerNodeCausalEvent::new(
+                            InferenceApiObservationKind::KvUpdatePrepared,
+                            node_id.clone(),
+                        )
+                        .with_resource(store.clone()),
+                    );
+                    match role {
+                        KvRole::K => layer_k[layer] = Some(store),
+                        KvRole::V => layer_v[layer] = Some(store),
                     }
-                    TensorValueAdmissionError::Provider(error) => {
-                        InferenceApiError::ProviderTensorWriteFailed {
+                    if layer_rows[layer].is_some_and(|rows| rows != valid_rows) {
+                        return Err(InferenceApiError::KvCacheUnavailable {
                             reason: format!(
-                                "failed to write pending KV resource '{pending_resource}': {error}"
+                                "layer {layer}: K and V in-place stores disagree on their rows"
                             ),
-                        }
+                        });
                     }
-                })?;
-                dispatch_ctx.node_events.push(
-                    PerNodeCausalEvent::new(
-                        InferenceApiObservationKind::KvUpdatePrepared,
-                        node_id.clone(),
-                    )
-                    .with_resource(pending_resource.clone()),
-                );
-                match role {
-                    KvRole::K => layer_k[layer] = Some(pending_resource),
-                    KvRole::V => layer_v[layer] = Some(pending_resource),
+                    layer_rows[layer] = Some(valid_rows);
+                } else {
+                    if kv_meta.behavior == GraphKvCacheBehavior::Append {
+                        let history =
+                            kv_history.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                                reason: "decode graph execution requires historical KV state"
+                                    .into(),
+                            })?;
+                        let historical = history.get(&layer).ok_or_else(|| {
+                            InferenceApiError::KvCacheUnavailable {
+                                reason: format!(
+                                    "decode requires historical KV state for layer {layer}"
+                                ),
+                            }
+                        })?;
+                        let historical_resource = match role {
+                            KvRole::K => &historical.k,
+                            KvRole::V => &historical.v,
+                        };
+                        // Historical KV data stays wherever the registered
+                        // Provider already holds it (task 7.2/7.3): a device-
+                        // resident Provider (CUDA) is never asked to produce
+                        // host-visible bytes for it -- `resident_shape` reads
+                        // only structural metadata, and the "concat" Operator
+                        // dispatch below runs through the exact same generic
+                        // Kernel Registry path every other graph node uses,
+                        // targeting this edge's own stable identity directly
+                        // (`implement-device-resident-multi-step-cuda-decode`,
+                        // replacing this block's former `read_tensor_value(..)
+                        // .into_host(..)` + Rust-computed `concat_rows`).
+                        let historical_shape = dispatch_ctx
+                            .provider
+                            .resident_shape(historical_resource)
+                            .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                                reason: format!(
+                                    "no materialized historical KV data for layer {layer}"
+                                ),
+                            })?;
+                        let historical_value = NodeValue::Resident {
+                            id: historical_resource.clone(),
+                            shape: historical_shape,
+                        };
+                        // The concatenated history is this step's pending KV
+                        // write: the concat writes it straight under the
+                        // pending identity, and the edge is bound to that
+                        // resource, instead of writing the edge and copying it
+                        // to the pending identity afterwards.
+                        let concat_output_target: OutputTarget = (
+                            pending_resource.clone(),
+                            resolved_output_placement(
+                                dispatch_ctx.prepared_plan.as_deref(),
+                                node_id,
+                            ),
+                            MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                        );
+                        let append_clock = dispatch_ctx.runtime.phase_ledger().clock();
+                        let concatenated = dispatch_qwen_concat(
+                            &mut dispatch_ctx,
+                            &format!("{node_id}.kv-append"),
+                            node_id,
+                            historical_value,
+                            output_tensor.clone(),
+                            Some(concat_output_target),
+                        )?;
+                        dispatch_ctx
+                            .runtime
+                            .phase_ledger_mut()
+                            .record(append_clock, StepPhase::KvAppend);
+                        // The concat dispatch pre-admitted its output directly
+                        // under `output_resource_id` (mirroring Decision 3's
+                        // existing optimization for every other node kind), so
+                        // the edge is already correctly written -- no explicit
+                        // (re-)write, and critically no `into_host` round trip,
+                        // needed below.
+                        output_tensor = concatenated;
+                        needs_explicit_edge_write = false;
+                        bound_resource_id = pending_resource.clone();
+                    }
+                    // Written under a *pending* resource id (task 7.4 prepare):
+                    // this generation step's KV update becomes Runtime-owned only
+                    // once `commit_generation_step` promotes it after sampling and
+                    // token commit succeed; a failure or cancellation before then
+                    // simply leaves this pending write unpromoted. When
+                    // `output_tensor` is already `Resident` (decode's KV-append
+                    // case always is, after the concat dispatch above; prefill's
+                    // "Output" case is whenever the producing Kernel itself wrote
+                    // directly into `output_resource_id`), this is a real
+                    // Provider-side copy (`copy_tensor_admitted`) to the pending
+                    // resource's own, separate, stable identity -- never a host
+                    // round trip (`implement-device-resident-multi-step-cuda-
+                    // decode`). Only a genuinely `Host`-typed value (e.g. "rope",
+                    // which has no Kernel-level output identity to begin with)
+                    // still needs an explicit host-typed admitted write here.
+                    let pending_clock = dispatch_ctx.runtime.phase_ledger().clock();
+                    let pending_write_result: Result<(), TensorValueAdmissionError> =
+                        match &output_tensor {
+                            // Already written under the pending identity (the
+                            // KV append above).
+                            NodeValue::Resident { id, .. } if *id == pending_resource => Ok(()),
+                            NodeValue::Resident { id, .. } => dispatch_ctx
+                                .provider
+                                .copy_tensor_admitted(
+                                    dispatch_ctx.runtime.memory_mut(),
+                                    id,
+                                    pending_resource.clone(),
+                                    MemoryAllocationClass::Tensor,
+                                    MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                                )
+                                .map(|_allocation_id| ()),
+                            NodeValue::Host(_) => {
+                                let pending_tensor =
+                                    output_tensor.clone().into_host(&dispatch_ctx.provider)?;
+                                dispatch_ctx.provider.write_tensor_value_admitted(
+                                    dispatch_ctx.runtime.memory_mut(),
+                                    pending_resource.clone(),
+                                    TensorValue::Host(pending_tensor),
+                                    MemoryAllocationClass::Tensor,
+                                    MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                                )
+                            }
+                        };
+                    // Correctif 1: admitted (via `write_tensor_admitted`/
+                    // `copy_tensor_admitted`), not a bare `write_tensor` -- this
+                    // id is stable across every decode step for this layer/role,
+                    // so admission replaces (and releases) whatever allocation
+                    // the previous step's pending write held for it, the same
+                    // reasoning as the graph-edge writes above.
+                    // `discard_pending_kv_state` releases this through
+                    // `release_admitted_tensor` when a step is cancelled or fails
+                    // before commit.
+                    pending_write_result.map_err(|error| match error {
+                        TensorValueAdmissionError::Memory(error) => {
+                            InferenceApiError::MemoryAdmissionFailed {
+                                reason: format!(
+                                    "failed to account pending KV resource '{pending_resource}': {error}"
+                                ),
+                            }
+                        }
+                        TensorValueAdmissionError::Provider(error) => {
+                            InferenceApiError::ProviderTensorWriteFailed {
+                                reason: format!(
+                                    "failed to write pending KV resource '{pending_resource}': {error}"
+                                ),
+                            }
+                        }
+                    })?;
+                    dispatch_ctx
+                        .runtime
+                        .phase_ledger_mut()
+                        .record(pending_clock, StepPhase::KvPendingWrite);
+                    dispatch_ctx.node_events.push(
+                        PerNodeCausalEvent::new(
+                            InferenceApiObservationKind::KvUpdatePrepared,
+                            node_id.clone(),
+                        )
+                        .with_resource(pending_resource.clone()),
+                    );
+                    match role {
+                        KvRole::K => layer_k[layer] = Some(pending_resource),
+                        KvRole::V => layer_v[layer] = Some(pending_resource),
+                    }
                 }
             }
             // `output_resource_id` (computed above, before the KV block) is
@@ -4014,6 +4732,7 @@ fn execute_first_native_graph_nodes(
             // the value is explicitly (re-)written exactly as before.
             let output_shape = output_tensor.shape().to_vec();
             if needs_explicit_edge_write {
+                let edge_clock = dispatch_ctx.runtime.phase_ledger().clock();
                 let output_tensor = output_tensor.into_host(&dispatch_ctx.provider)?;
                 dispatch_ctx
                 .provider
@@ -4040,9 +4759,18 @@ fn execute_first_native_graph_nodes(
                         }
                     }
                 })?;
+                dispatch_ctx.runtime.phase_ledger_mut().record_operator(
+                    edge_clock,
+                    StepPhase::EdgeWrite,
+                    node.operator.name(),
+                );
             }
-            bindings.insert(output_edge_id.clone(), (output_resource_id, output_shape));
+            bindings.insert(output_edge_id.clone(), (bound_resource_id, output_shape));
         }
+        dispatch_ctx
+            .runtime
+            .phase_ledger_mut()
+            .record(bind_clock, StepPhase::NodeOutputBind);
         last_dispatch = Some(dispatch_result);
     }
 
@@ -4075,13 +4803,28 @@ fn execute_first_native_graph_nodes(
             .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                 reason: format!("first-native graph produced no V state for layer {layer}"),
             })?;
-        updated_layer_kv.insert(layer, FirstNativeLayerKvState { k, v });
+        updated_layer_kv.insert(
+            layer,
+            FirstNativeLayerKvState {
+                k,
+                v,
+                rows: layer_rows[layer],
+            },
+        );
     }
     let dispatch_result = last_dispatch.ok_or_else(|| InferenceApiError::GenerationFailed {
         reason: "first-native graph executed no nodes".into(),
     })?;
+    let materialize_clock = dispatch_ctx.runtime.phase_ledger().clock();
+    if let MaterializedEdges::Only(edges) = materialized {
+        bindings.retain(|edge_id, _| edges.contains(&edge_id.as_str()));
+    }
     let materialized_bindings =
         materialize_first_native_graph_bindings(&*dispatch_ctx.provider, &bindings)?;
+    dispatch_ctx
+        .runtime
+        .phase_ledger_mut()
+        .record(materialize_clock, StepPhase::OutputMaterialize);
     Ok((dispatch_result, materialized_bindings, updated_layer_kv))
 }
 
@@ -4142,6 +4885,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         let forced_token = self.forced_token;
 
         let vocab = self.fixture.config.architecture.vocabulary_size as usize;
+        let kv_clock = runtime.phase_ledger().clock();
         let mut kv_state = if generated_tokens.is_empty() {
             self.create_prefill_kv_state(runtime, request)?
         } else {
@@ -4164,6 +4908,9 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             })?
         };
         self.discard_pending_kv_state(runtime, request)?;
+        runtime
+            .phase_ledger_mut()
+            .record(kv_clock, StepPhase::KvStatePrepare);
         // Both flags below (task 8.1) are only ever assigned immediately
         // after the check they attest to actually ran and passed for *this*
         // step -- never assumed from an earlier, one-time check (Model
@@ -4222,19 +4969,41 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // own choice of digest exactly -- see
             // `ProductionLoadedModel::component_digest`'s doc comment.
             let prompt_token_count = request.input_token_ids.len() as u64;
-            let component_graphs = match &self.component_digest {
-                Some(digest) => build_first_native_graphs_from_named_component(
-                    digest,
-                    &architecture_config_from_first_native_model_config(&self.fixture.config),
-                    &self.fixture.identity,
-                    prompt_token_count,
-                )
-                .map(|(graphs, _definition, _instance)| graphs),
-                None => first_native_component_graphs_for_prompt(&self.fixture, prompt_token_count),
-            }
-            .map_err(|error| InferenceApiError::GraphPlanningFailed {
-                reason: error.to_string(),
-            })?;
+            let graph_build_clock = runtime.phase_ledger().clock();
+            let cached_graphs = self
+                .graph_cache
+                .as_ref()
+                .and_then(|cache| cache.get(prompt_token_count));
+            let component_graphs = match cached_graphs {
+                Some(graphs) => graphs,
+                None => Arc::new(CachedGraphs::new(
+                    match &self.component_digest {
+                        Some(digest) => build_first_native_graphs_from_named_component(
+                            digest,
+                            &architecture_config_from_first_native_model_config(
+                                &self.fixture.config,
+                            ),
+                            &self.fixture.identity,
+                            prompt_token_count,
+                        )
+                        .map(|(graphs, _definition, _instance)| graphs),
+                        None => first_native_component_graphs_for_prompt(
+                            &self.fixture,
+                            prompt_token_count,
+                        ),
+                    }
+                    .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                        reason: error.to_string(),
+                    })
+                    .map(|graphs| match &self.graph_cache {
+                        Some(cache) => cache.optimize(runtime, graphs),
+                        None => graphs,
+                    })?,
+                )),
+            };
+            runtime
+                .phase_ledger_mut()
+                .record(graph_build_clock, StepPhase::GraphBuild);
             // Weight resources are bound to an active Model Instance (task
             // 6.3), so graph execution needs its id to look them up.
             let GenerationModelReference::ModelInstance(model_instance) = &request.model else {
@@ -4247,13 +5016,24 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // `prepare_first_native_execution_plans` performed before the
             // generation loop started, which cannot see an instance
             // unloaded or invalidated between steps.
+            let instance_clock = runtime.phase_ledger().clock();
             require_ready_first_native_instance(&*runtime, model_instance)?;
+            runtime
+                .phase_ledger_mut()
+                .record(instance_clock, StepPhase::InstanceCheck);
             model_instance_ready = true;
             // The graph, not a hand-written Rust sequence, is the
             // authoritative recipe for prefill/decode execution (see
             // `execute_first_native_graph`'s doc comment). Its output edge
             // `"logits"` carries logits for every model-input row; only the
             // last row is a newly admitted token's distribution.
+            // Every row this request's KV history can reach: its prompt and
+            // every token it may generate (`append-kv-history-in-place`).
+            let kv_store_capacity = (!self.copy_based_kv).then(|| {
+                (request.input_token_ids.len() as u64)
+                    .saturating_add(request.max_new_tokens as u64)
+                    .max(1)
+            });
             let (dispatch, mut bindings, layer_kv, resolved_provider) =
                 if generated_tokens.is_empty() {
                     let ids_tensor = HostTensor::new(
@@ -4265,7 +5045,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                             .collect::<Vec<_>>(),
                     )
                     .map_err(runtime_generation_failed)?;
-                    execute_first_native_graph(
+                    execute_first_native_graph_materializing(
                         runtime,
                         &self.fixture,
                         model_instance,
@@ -4276,6 +5056,9 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                         None,
                         Some(0),
                         &mut node_events,
+                        MaterializedEdges::Only(&["logits"]),
+                        Some(&component_graphs.prefill_memo),
+                        kv_store_capacity,
                     )?
                 } else {
                     let token = *generated_tokens.last().ok_or_else(|| {
@@ -4285,7 +5068,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                     })?;
                     let ids_tensor = HostTensor::new([1], vec![token as f32])
                         .map_err(runtime_generation_failed)?;
-                    execute_first_native_graph(
+                    execute_first_native_graph_materializing(
                         runtime,
                         &self.fixture,
                         model_instance,
@@ -4296,6 +5079,9 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                         Some(&kv_state.layer_kv),
                         Some(absolute_position as u64),
                         &mut node_events,
+                        MaterializedEdges::Only(&["logits"]),
+                        Some(&component_graphs.decode_memo),
+                        kv_store_capacity,
                     )?
                 };
             // `execute_first_native_graph` topologically validates the graph (via
@@ -4312,6 +5098,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // Provider the pending K/V resources were actually written
             // under.
             kv_state.provider = Some(resolved_provider);
+            let logits_clock = runtime.phase_ledger().clock();
             let logits_tensor = bindings
                 .remove(&TensorEdgeId::new("logits"))
                 .ok_or_else(|| InferenceApiError::GenerationFailed {
@@ -4319,10 +5106,11 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                 })?;
             let output_rows = logits_tensor.data.len() / vocab.max(1);
             let last_row_start = output_rows.saturating_sub(1) * vocab;
-            (
-                dispatch,
-                logits_tensor.data[last_row_start..last_row_start + vocab].to_vec(),
-            )
+            let logits = logits_tensor.data[last_row_start..last_row_start + vocab].to_vec();
+            runtime
+                .phase_ledger_mut()
+                .record(logits_clock, StepPhase::LogitsExtract);
+            (dispatch, logits)
         };
         let kv_commit = if generated_tokens.is_empty() {
             RuntimeKvCacheCommit::PrefillCompleted {
@@ -4335,7 +5123,12 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                 tokens: 1,
             }
         };
+        let store_clock = runtime.phase_ledger().clock();
         self.store_pending_kv_state(request, kv_state.clone())?;
+        runtime
+            .phase_ledger_mut()
+            .record(store_clock, StepPhase::KvStateStore);
+        let evidence_clock = runtime.phase_ledger().clock();
         let mut evidence = RuntimeGenerationExecutionEvidence::from_dispatch_result(
             &dispatch_result,
             model_instance_ready,
@@ -4352,6 +5145,9 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         if let Some(session) = &request.session {
             evidence = evidence.with_context(format!("session={session}"));
         }
+        runtime
+            .phase_ledger_mut()
+            .record(evidence_clock, StepPhase::EvidenceBuild);
         Ok(RuntimeModelExecutionStep::new(logits, evidence)
             .with_kv_commit(kv_commit)
             .with_node_events(node_events))
@@ -4380,6 +5176,51 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         }
         self.store_kv_state(request, state)
     }
+
+    fn release_request_state(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+    ) -> Result<(), InferenceApiError> {
+        self.discard_pending_kv_state(runtime, request)?;
+        let committed = self
+            .kv_states
+            .lock()
+            .map_err(|_| InferenceApiError::KvCacheUnavailable {
+                reason: "first-native KV state lock poisoned".into(),
+            })?
+            .remove(&Self::kv_state_key(request));
+        let Some(committed) = committed else {
+            return Ok(());
+        };
+        let provider_binding = committed
+            .provider
+            .clone()
+            .unwrap_or_else(|| ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME));
+        let Ok(provider) = resolve_kernel_execution_provider(runtime, &provider_binding) else {
+            return Ok(());
+        };
+        // The committed bindings, plus each layer's `.pending` staging
+        // resource that every commit copies from and leaves behind
+        // (`execute_first_native_graph_nodes`'s KV pending writes).
+        for (layer, binding) in &committed.layer_kv {
+            // Copy-based generations are Provider-admitted; in-place stores
+            // are Runtime pre-admissions: release either.
+            release_pending_kv_resource(runtime, &provider, &binding.k);
+            release_pending_kv_resource(runtime, &provider, &binding.v);
+            for role in ["k", "v"] {
+                release_pending_kv_resource(
+                    runtime,
+                    &provider,
+                    &TensorResourceId::new(format!(
+                        "kv.{}.layer{layer}.{role}.pending",
+                        committed.cache
+                    )),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One promoted layer's committed binding, and the binding it replaces (if
@@ -4388,6 +5229,9 @@ struct PromotedKvLayer {
     layer: u32,
     binding: KvLayerResourceBinding,
     previous: Option<KvLayerResourceBinding>,
+    /// Valid rows of an in-place KV store (`append-kv-history-in-place`);
+    /// `None` for a copy-based generation.
+    rows: Option<u64>,
 }
 
 /// The KV commit lifecycle, named and typed explicitly (Correctif 11 / task
@@ -4446,6 +5290,33 @@ impl KvUpdateTransaction {
             .layer_resources
             .get(&(layer as u32))
             .cloned();
+        // In-place KV (`append-kv-history-in-place`): the step wrote its
+        // rows into the layer's stores beyond the committed rows, so
+        // committing only adopts the new row count; nothing is copied.
+        if let Some(rows) = pending.rows {
+            let allocation = |id: &TensorResourceId| {
+                runtime
+                    .memory()
+                    .tensor_residency(id)
+                    .and_then(|residency| residency.allocation)
+                    .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                        reason: format!("in-place KV store '{id}' has no admitted allocation"),
+                    })
+            };
+            let binding = KvLayerResourceBinding {
+                k: pending.k.clone(),
+                v: pending.v.clone(),
+                k_allocation: allocation(&pending.k)?,
+                v_allocation: allocation(&pending.v)?,
+            };
+            self.promoted.push(PromotedKvLayer {
+                layer: layer as u32,
+                binding,
+                previous,
+                rows: Some(rows),
+            });
+            return Ok(());
+        }
         let binding = promote_pending_kv_layer(
             runtime,
             &self.executor,
@@ -4458,6 +5329,7 @@ impl KvUpdateTransaction {
             layer: layer as u32,
             binding,
             previous,
+            rows: None,
         });
         Ok(())
     }
@@ -4465,14 +5337,20 @@ impl KvUpdateTransaction {
     /// Releases every resource admitted so far this attempt, leaving the
     /// cache's prior committed state completely untouched.
     fn abort(self, runtime: &mut Runtime) {
-        for already in &self.promoted {
+        // In-place stores are shared with the committed history and were
+        // not created by this transaction: nothing of theirs to release.
+        for already in self.promoted.iter().filter(|layer| layer.rows.is_none()) {
             let _ = runtime.memory_mut().release(already.binding.k_allocation);
             let _ = runtime.memory_mut().release(already.binding.v_allocation);
             // Best-effort, like the memory releases above: this is already
             // an unwind over a different failure, with nothing further to
             // roll back to if the Provider release itself fails.
-            let _ = self.executor.release_tensor(&already.binding.k);
-            let _ = self.executor.release_tensor(&already.binding.v);
+            let _ = self
+                .executor
+                .release_admitted_tensor(runtime.memory_mut(), &already.binding.k);
+            let _ = self
+                .executor
+                .release_admitted_tensor(runtime.memory_mut(), &already.binding.v);
         }
     }
 
@@ -4486,15 +5364,27 @@ impl KvUpdateTransaction {
     ) -> Result<LayerKvMap, InferenceApiError> {
         let mut committed = LayerKvMap::new();
         for promoted_layer in self.promoted {
-            if let Some(previous) = promoted_layer.previous {
+            if let Some(previous) = promoted_layer.previous
+                // The same in-place store, still in use.
+                && previous.k != promoted_layer.binding.k
+            {
                 let _ = runtime.memory_mut().release(previous.k_allocation);
                 let _ = runtime.memory_mut().release(previous.v_allocation);
                 // Best-effort: the new binding above already promoted
                 // successfully, so a failure releasing the superseded one
                 // is a leak to surface separately, not a reason to fail
                 // this otherwise-successful commit.
-                let _ = self.executor.release_tensor(&previous.k);
-                let _ = self.executor.release_tensor(&previous.v);
+                // `release_admitted_tensor`, not `release_tensor`: the
+                // superseded generation was admitted (and is tracked) by
+                // the Provider, so dropping only its storage would leave a
+                // stale tracking entry per layer and role per decode step
+                // (`bound-memory-manager-bookkeeping`).
+                let _ = self
+                    .executor
+                    .release_admitted_tensor(runtime.memory_mut(), &previous.k);
+                let _ = self
+                    .executor
+                    .release_admitted_tensor(runtime.memory_mut(), &previous.v);
             }
             runtime
                 .kv_caches_mut()
@@ -4506,6 +5396,7 @@ impl KvUpdateTransaction {
                 FirstNativeLayerKvState {
                     k: promoted_layer.binding.k,
                     v: promoted_layer.binding.v,
+                    rows: promoted_layer.rows,
                 },
             );
         }
@@ -4569,6 +5460,26 @@ fn next_kv_commit_generation() -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Releases a step's pending KV resource: the Provider's storage and the
+/// allocation it tracks for it (a pending write admitted by the Provider,
+/// `copy_tensor_admitted`), and a Runtime pre-admission recorded for it (a
+/// KV append writes its pending resource through `admit_kernel_output`,
+/// which the Provider does not track).
+fn release_pending_kv_resource(
+    runtime: &mut Runtime,
+    provider: &Arc<dyn ProviderExecutionApi>,
+    id: &TensorResourceId,
+) {
+    let _ = provider.release_admitted_tensor(runtime.memory_mut(), id);
+    if let Some(allocation) = runtime
+        .memory_mut()
+        .remove_tensor_residency(id)
+        .and_then(|residency| residency.allocation)
+    {
+        let _ = runtime.memory_mut().release(allocation);
+    }
+}
+
 fn promote_pending_kv_layer_role(
     runtime: &mut Runtime,
     executor: &Arc<dyn ProviderExecutionApi>,
@@ -4825,6 +5736,8 @@ fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             component_digest: None,
             forced_token: None,
+            graph_cache: None,
+            copy_based_kv: false,
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -4859,6 +5772,8 @@ fn build_runtime_with_model_execution_engine_and_provider(
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             component_digest: None,
             forced_token: None,
+            graph_cache: None,
+            copy_based_kv: false,
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -5445,6 +6360,9 @@ pub fn run_first_native_graph_segment_dispatch(
             kv_history,
             absolute_position_override,
             &mut node_events,
+            MaterializedEdges::All,
+            None,
+            None,
         )
         .map_err(E2eConformanceError::from)?;
     Ok(FirstNativeProviderRunOutcome {
@@ -6164,7 +7082,7 @@ const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:cd10b875f12d70e025b27765a0abcc655d630b4150e1e29f944536f648d352a5";
+    "sha256:b99ca7fef19992c794561cd0bb4d58ee6442383e3e603a8edc8ae77891d9fe01";
 
 /// A Component artifact an embedder (e.g. `magnetar-cli`, the "deployment /
 /// CLI / Component source adapter" layer in this task's own design) has
@@ -6962,6 +7880,8 @@ fn prepare_production_generation(
             pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
             component_digest: None,
             forced_token: None,
+            graph_cache: None,
+            copy_based_kv: false,
         }))
         .trust_store(trust_store)
         .build()
@@ -7141,6 +8061,8 @@ pub struct ProductionLoadedModel {
     /// Component. `None` preserves the pre-existing hardcoded-singleton
     /// behavior exactly, unchanged.
     component_digest: Option<ComponentDigest>,
+    /// Shared with this instance's execution engine.
+    graph_cache: ComponentGraphCache,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -7215,6 +8137,7 @@ impl ProductionLoadedModel {
         }
         let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
         let provider_supports_multi_step_decode = provider.supports_multi_step_decode();
+        let graph_cache = ComponentGraphCache::default();
         let mut runtime = Runtime::builder()
             .register_provider(provider.clone())
             .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
@@ -7223,6 +8146,8 @@ impl ProductionLoadedModel {
                 pending_kv_states: Arc::new(Mutex::new(BTreeMap::new())),
                 component_digest: component_digest.clone(),
                 forced_token: None,
+                graph_cache: Some(graph_cache.clone()),
+                copy_based_kv: false,
             }))
             .trust_store(trust_store)
             .build()
@@ -7241,6 +8166,7 @@ impl ProductionLoadedModel {
             &provider_binding,
         )?;
         require_ready_first_native_instance(&runtime, &instance)?;
+        graph_cache.set_fusion_provider(Some(provider_binding.clone()));
         Ok(Self {
             fixture,
             runtime,
@@ -7249,6 +8175,7 @@ impl ProductionLoadedModel {
             provider_supports_multi_step_decode,
             materialization_count: 1,
             component_digest,
+            graph_cache,
         })
     }
 
@@ -7258,6 +8185,29 @@ impl ProductionLoadedModel {
 
     pub fn materialization_count(&self) -> usize {
         self.materialization_count
+    }
+
+    /// Turns graph fusion (`graph_fusion`) on or off for later requests. On
+    /// by default; it only fuses what this instance's Provider advertises.
+    pub fn set_graph_fusion(&mut self, enabled: bool) {
+        self.graph_cache
+            .set_fusion_provider(enabled.then(|| self.provider_binding.clone()));
+    }
+
+    /// Starts attributing every later generation step's host time to its
+    /// phases (A06). Off by default.
+    pub fn enable_phase_attribution(&mut self) {
+        self.runtime.phase_ledger_mut().enable();
+    }
+
+    /// Stops attribution and forgets anything not yet taken.
+    pub fn disable_phase_attribution(&mut self) {
+        self.runtime.phase_ledger_mut().disable();
+    }
+
+    /// Drains the steps attributed since the last call.
+    pub fn take_phase_attribution(&mut self) -> PhaseAttributionReport {
+        self.runtime.phase_ledger_mut().take_report()
     }
 
     pub fn generate(
@@ -7286,7 +8236,12 @@ impl ProductionLoadedModel {
             &mut prepared.observer,
             &mut execution_plans,
         )?;
-        self.finish_generation(prepared.session, generation_result, prepared.observer)
+        self.finish_generation(
+            prepared.session,
+            &prepared.generation_request,
+            generation_result,
+            prepared.observer,
+        )
     }
 
     pub fn generate_streaming(
@@ -7294,6 +8249,32 @@ impl ProductionLoadedModel {
         request: ProductionGenerationRequest,
         chat_formatter: Option<&dyn ChatTemplateFormatter>,
         on_event: &mut dyn FnMut(GenerationStreamEvent) -> std::ops::ControlFlow<()>,
+    ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+        self.generate_streaming_inner(request, chat_formatter, on_event, None)
+    }
+
+    /// [`Self::generate_streaming`], additionally handing each step's full
+    /// next-token logits (host-visible, vocabulary-sized, pre-sampling) to
+    /// `on_logits`, once per step and before that step's `Token` event
+    /// (`qualify-real-checkpoint-performance` A02). Observation only: the
+    /// logits, sampling and every event are exactly what
+    /// [`Self::generate_streaming`] produces for the same request.
+    pub fn generate_streaming_with_logits(
+        &mut self,
+        request: ProductionGenerationRequest,
+        chat_formatter: Option<&dyn ChatTemplateFormatter>,
+        on_event: &mut dyn FnMut(GenerationStreamEvent) -> std::ops::ControlFlow<()>,
+        on_logits: &mut dyn FnMut(&[f32]),
+    ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+        self.generate_streaming_inner(request, chat_formatter, on_event, Some(on_logits))
+    }
+
+    fn generate_streaming_inner(
+        &mut self,
+        request: ProductionGenerationRequest,
+        chat_formatter: Option<&dyn ChatTemplateFormatter>,
+        on_event: &mut dyn FnMut(GenerationStreamEvent) -> std::ops::ControlFlow<()>,
+        on_logits: Option<LogitsObserver<'_>>,
     ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
         let mut prepared = self.prepare_generation(request, chat_formatter)?;
         let prepared_tokenizer = self.fixture.tokenizer.clone();
@@ -7329,24 +8310,45 @@ impl ProductionLoadedModel {
         let max_generation_duration = prepared
             .max_generation_millis
             .map(std::time::Duration::from_millis);
-        let generation_result = run_generation_loop_with_execution_plans_streaming(
-            &mut self.runtime,
-            &prepared.generation_request,
-            SamplingPolicy::default(),
-            CacheUsageSummary::default(),
-            |_generated_so_far| {
-                max_generation_duration
-                    .is_some_and(|deadline| deadline_started_at.elapsed() >= deadline)
-            },
-            &mut prepared.observer,
-            &mut execution_plans,
-            &mut on_token,
-        )?;
+        let should_cancel = |_generated_so_far: &[TokenId]| {
+            max_generation_duration
+                .is_some_and(|deadline| deadline_started_at.elapsed() >= deadline)
+        };
+        let generation_result = match on_logits {
+            Some(on_logits) => {
+                crate::inference_api::run_generation_loop_with_execution_plans_streaming_and_logits(
+                    &mut self.runtime,
+                    &prepared.generation_request,
+                    SamplingPolicy::default(),
+                    CacheUsageSummary::default(),
+                    should_cancel,
+                    &mut prepared.observer,
+                    &mut execution_plans,
+                    &mut on_token,
+                    on_logits,
+                )?
+            }
+            None => run_generation_loop_with_execution_plans_streaming(
+                &mut self.runtime,
+                &prepared.generation_request,
+                SamplingPolicy::default(),
+                CacheUsageSummary::default(),
+                should_cancel,
+                &mut prepared.observer,
+                &mut execution_plans,
+                &mut on_token,
+            )?,
+        };
         let _ = on_event(GenerationStreamEvent::Finished {
             finish_reason: generation_result.output.finish_reason,
             usage: generation_result.output.usage.clone(),
         });
-        self.finish_generation(prepared.session, generation_result, prepared.observer)
+        self.finish_generation(
+            prepared.session,
+            &prepared.generation_request,
+            generation_result,
+            prepared.observer,
+        )
     }
 
     pub fn unload(mut self) -> Result<(), InferenceApiError> {
@@ -7396,7 +8398,15 @@ impl ProductionLoadedModel {
             correlation_id: None,
             created_at_millis: 0,
         };
+        self.runtime
+            .phase_ledger_mut()
+            .begin_step(StepKind::RequestPreparation);
+        let clock = self.runtime.phase_ledger().clock();
         let session = create_inference_session(&mut self.runtime, session_request)?;
+        self.runtime
+            .phase_ledger_mut()
+            .record(clock, StepPhase::SessionCreate);
+        let clock = self.runtime.phase_ledger().clock();
         let tokenized = tokenize_prompt_input(
             &self.fixture.tokenizer,
             TokenizationRequest::new(prompt),
@@ -7412,29 +8422,50 @@ impl ProductionLoadedModel {
                     reason: error.to_string(),
                 },
             )?;
+        self.runtime
+            .phase_ledger_mut()
+            .record(clock, StepPhase::Tokenize);
         let observer = InferenceApiObserver::new();
         let prompt_token_count = tokenized.token_ids.len() as u64;
-        let component_graphs = match &self.component_digest {
-            Some(digest) => build_first_native_graphs_from_named_component(
-                digest,
-                &architecture_config_from_first_native_model_config(&self.fixture.config),
-                &self.fixture.identity,
-                prompt_token_count,
-            )
-            .map(|(graphs, _definition, _instance)| graphs),
-            None => build_first_native_graphs_from_real_qwen_component(
-                &self.fixture,
-                prompt_token_count,
-            )
-            .map(|(graphs, _definition, _instance)| graphs),
-        }
-        .map_err(|error| InferenceApiError::GraphPlanningFailed {
-            reason: error.to_string(),
-        })?;
+        let clock = self.runtime.phase_ledger().clock();
+        let component_graphs = match self.graph_cache.get(prompt_token_count) {
+            Some(graphs) => graphs,
+            None => {
+                let graphs = Arc::new(CachedGraphs::new(
+                    match &self.component_digest {
+                        Some(digest) => build_first_native_graphs_from_named_component(
+                            digest,
+                            &architecture_config_from_first_native_model_config(
+                                &self.fixture.config,
+                            ),
+                            &self.fixture.identity,
+                            prompt_token_count,
+                        )
+                        .map(|(graphs, _definition, _instance)| graphs),
+                        None => build_first_native_graphs_from_real_qwen_component(
+                            &self.fixture,
+                            prompt_token_count,
+                        )
+                        .map(|(graphs, _definition, _instance)| graphs),
+                    }
+                    .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                        reason: error.to_string(),
+                    })
+                    .map(|graphs| self.graph_cache.optimize(&self.runtime, graphs))?,
+                ));
+                self.graph_cache
+                    .insert(prompt_token_count, Arc::clone(&graphs));
+                graphs
+            }
+        };
+        self.runtime
+            .phase_ledger_mut()
+            .record(clock, StepPhase::GraphBuild);
+        let clock = self.runtime.phase_ledger().clock();
         let prepared_plans = prepare_first_native_execution_plans_for_provider(
             &self.runtime,
             &self.instance,
-            component_graphs,
+            FirstNativeComponentGraphs::clone(&component_graphs),
             tokenized.token_ids.len() as u64,
             &self.provider_binding,
         )
@@ -7452,7 +8483,15 @@ impl ProductionLoadedModel {
             stop_conditions,
             StreamingMode::TokenIds,
         );
+        self.runtime
+            .phase_ledger_mut()
+            .record(clock, StepPhase::PlanPrepare);
+        let clock = self.runtime.phase_ledger().clock();
         let generation_request = prepare_generation(&self.runtime, generation_request)?;
+        self.runtime
+            .phase_ledger_mut()
+            .record(clock, StepPhase::RequestValidate);
+        self.runtime.phase_ledger_mut().end_step();
         Ok(PreparedResidentProductionGeneration {
             session,
             generation_request,
@@ -7465,9 +8504,17 @@ impl ProductionLoadedModel {
     fn finish_generation(
         &mut self,
         session: InferenceSessionId,
+        request: &GenerationRequest,
         generation_result: GenerationResult,
         observer: InferenceApiObserver,
     ) -> Result<FirstNativeFixtureGeneration, InferenceApiError> {
+        // A resident instance outlives every request it serves: release
+        // the engine's per-request KV state before the session closes, or
+        // each request's final KV tensors stay in Provider storage
+        // (`bound-memory-manager-bookkeeping`).
+        if let Some(engine) = self.runtime.model_execution_engine().cloned() {
+            engine.release_request_state(&mut self.runtime, request)?;
+        }
         let decoded_text = decode_tokens_streaming(
             &self.fixture.tokenizer,
             StreamingDecodeRequest::new(generation_result.output.generated_token_ids.clone()),
@@ -7485,6 +8532,9 @@ impl ProductionLoadedModel {
         });
         let generation_result = generation_result.with_decoded_text(decoded_text);
         close_inference_session(&mut self.runtime, &session)?;
+        self.runtime
+            .forget_closed_inference_session(&session)
+            .map_err(InferenceApiError::from)?;
         let text = generation_result.decoded_text.clone().ok_or_else(|| {
             InferenceApiError::GenerationFailed {
                 reason: "production generation produced no decoded text".into(),
@@ -8528,6 +9578,7 @@ fn filter_manifest_for_layer_range(
 /// engine). Public so an external caller with its own real Provider (see
 /// `run_first_native_graph_with_provider`) can obtain the same real graph
 /// production drives, via [`build_first_native_graphs_from_real_qwen_component`].
+#[derive(Clone)]
 pub struct FirstNativeComponentGraphs {
     pub prefill: ExecutionGraph,
     pub prefill_node_count: usize,
@@ -8599,6 +9650,7 @@ fn prepare_first_native_plan_for_graph(
         .with_provider(provider.clone())
         .with_execution_context(runtime.context().id());
 
+    let mut bindings = Vec::with_capacity(graph.nodes.len());
     for (node_id, node) in &graph.nodes {
         let node_affinity = node
             .resource_affinity
@@ -8675,8 +9727,9 @@ fn prepare_first_native_plan_for_graph(
         if let Some(profile) = candidate.kernel.conformance_profile {
             binding = binding.with_qualification_profile(profile);
         }
-        plan.add_node_binding(binding)?;
+        bindings.push(binding);
     }
+    plan.add_node_bindings(bindings)?;
 
     plan.set_resource_plan(ResourceBindingPlan::default())?;
     plan.set_memory_requirements(PlanMemoryRequirements::default())?;
@@ -9624,6 +10677,8 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
+        internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let architecture = &fixture.config.architecture;
@@ -9708,6 +10763,7 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             NodeValue::Host(one_row_hidden.clone()),
             architecture.attention_head_count,
             &fixture.config.rope,
+            RopePairing::HalfSplit,
             0,
             None,
         ),
@@ -9722,6 +10778,7 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             NodeValue::Host(one_row_hidden.clone()),
             NodeValue::Host(one_row_hidden.clone()),
             architecture,
+            None,
             None,
         ),
     )?;

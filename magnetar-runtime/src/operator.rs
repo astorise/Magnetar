@@ -686,6 +686,14 @@ pub fn validate_affinity_compatibility(
         })
 }
 
+/// [`initial_operator_catalog`], built once per process. The catalog is a
+/// constant, so hot paths look Operators up here instead of rebuilding it
+/// for every dispatch.
+pub fn shared_initial_operator_catalog() -> &'static OperatorCatalog {
+    static CATALOG: std::sync::OnceLock<OperatorCatalog> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(initial_operator_catalog)
+}
+
 pub fn initial_operator_catalog() -> OperatorCatalog {
     let floats = [
         ComputeDType::Float16,
@@ -723,6 +731,27 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::Any,
         ),
+        // `cache-and-optimize-prepared-graphs` C03: `matmul(a, b) + bias`
+        // with `bias` one row broadcast to every output row, produced only
+        // by `graph_fusion::fuse_matmul_bias` from an existing matmul/add
+        // pair, never by a Component.
+        (
+            "matmul-bias",
+            OperatorFamily::LinearAlgebra,
+            3,
+            1,
+            ShapeRule::Any,
+        ),
+        // C03: `residual + matmul(a, b)` and `silu(gate) * up`, likewise
+        // produced only by `graph_fusion`.
+        (
+            "matmul-residual",
+            OperatorFamily::LinearAlgebra,
+            3,
+            1,
+            ShapeRule::Any,
+        ),
+        ("silu-mul", OperatorFamily::Activation, 2, 1, ShapeRule::Any),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         (
             "rmsnorm",
@@ -790,6 +819,9 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         ),
         ("mul", OperatorFamily::Tensor, 2, 1, ShapeRule::SameShape),
         ("concat", OperatorFamily::Tensor, 2, 1, ShapeRule::RowConcat),
+        // `append-kv-history-in-place`: writes `rows` into `store` at
+        // `row_offset`, in place; the output resource is the store itself.
+        ("kv-write", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         (
             "residual-add",
             OperatorFamily::Tensor,
@@ -858,6 +890,14 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
                 TensorLayoutKind::BrowserCompatible,
             ]);
         spec.attributes = default_attribute_schema(name);
+        if name == "kv-write" {
+            spec.memory = OperatorMemoryBehavior {
+                mutates_input: true,
+                aliases_output: true,
+                supports_in_place: true,
+                ..OperatorMemoryBehavior::pure()
+            };
+        }
         if matches!(family, OperatorFamily::Attention) {
             spec.memory = OperatorMemoryBehavior::pure()
                 .with_workspace()
@@ -880,19 +920,21 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
-        "matmul" | "batched-matmul" => OperatorAttributeSchema::default()
-            .with_rule(
-                "transpose_a",
-                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
-            )
-            .with_rule(
-                "transpose_b",
-                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
-            )
-            .with_rule(
-                "accumulation_dtype",
-                OperatorAttributeRule::optional(OperatorAttributeKind::DType),
-            ),
+        "matmul" | "batched-matmul" | "matmul-bias" | "matmul-residual" => {
+            OperatorAttributeSchema::default()
+                .with_rule(
+                    "transpose_a",
+                    OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+                )
+                .with_rule(
+                    "transpose_b",
+                    OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+                )
+                .with_rule(
+                    "accumulation_dtype",
+                    OperatorAttributeRule::optional(OperatorAttributeKind::DType),
+                )
+        }
         "attention" | "paged-attention" => OperatorAttributeSchema::default()
             .with_rule(
                 "causal",
@@ -917,7 +959,18 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "attention_mask_kind",
                 OperatorAttributeRule::optional(OperatorAttributeKind::String),
+            )
+            // `append-kv-history-in-place`: attend to the first `key_count`
+            // rows of K and V only (absent: every row). Set by the Runtime
+            // only for Kernels advertising the `key-count` feature.
+            .with_rule(
+                "key_count",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             ),
+        "kv-write" => OperatorAttributeSchema::default().with_rule(
+            "row_offset",
+            OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+        ),
         "rope" => OperatorAttributeSchema::default()
             .with_rule(
                 "base",
@@ -933,6 +986,15 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             )
             .with_rule(
                 "position_mode",
+                OperatorAttributeRule::optional(OperatorAttributeKind::String),
+            )
+            // Which elements of a head block form each rotated pair
+            // (`fix-rope-rotation-pairing`): `interleaved` (2i, 2i+1, the
+            // default when absent) or `half_split` (i, i + dimension/2,
+            // Hugging Face `rotate_half`). Set by the Model Component;
+            // Providers reject any other value.
+            .with_rule(
+                "rotation_pairing",
                 OperatorAttributeRule::optional(OperatorAttributeKind::String),
             )
             // Absolute position of the first row. Absent means the sequence

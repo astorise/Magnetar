@@ -4,10 +4,10 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:6ac536b0c011db10c128ce4dab43c5d2752d6ae2b574ba6cfc719b9455b4e6d5"
+    value: "sha256:a93b93d64518bb6dea1d2490d254ad9b73b7f042ac041204f4d9870e0e5159cc"
 component:
   name: "magnetar.llama.real"
-  version: "0.1.0"
+  version: "0.1.1"
   description: "The configurable, production Llama Model Component"
   role: "llama-model-component"
 runtime:

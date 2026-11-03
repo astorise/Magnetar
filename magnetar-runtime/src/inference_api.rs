@@ -39,6 +39,7 @@ use crate::model_instance::*;
 use crate::model_loading::*;
 use crate::observability::*;
 use crate::operator::*;
+use crate::phase_attribution::{StepKind, StepPhase};
 use crate::prefix_cache::*;
 use crate::runtime::*;
 use crate::sampling::*;
@@ -1276,6 +1277,19 @@ pub(crate) trait RuntimeModelExecutionEngine: Send + Sync {
     ) -> Result<(), InferenceApiError> {
         Ok(())
     }
+
+    /// Releases everything this engine still holds for a finished
+    /// `request` (committed and pending KV tensors, their Provider-side
+    /// storage and tracking), so a resident Model Instance serving many
+    /// requests does not accumulate per-request state
+    /// (`bound-memory-manager-bookkeeping`). Idempotent.
+    fn release_request_state(
+        &self,
+        _runtime: &mut Runtime,
+        _request: &GenerationRequest,
+    ) -> Result<(), InferenceApiError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -1312,6 +1326,14 @@ impl SharedRuntimeModelExecutionEngine {
             accepted_token,
             step,
         )
+    }
+
+    pub(crate) fn release_request_state(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+    ) -> Result<(), InferenceApiError> {
+        self.0.release_request_state(runtime, request)
     }
 }
 
@@ -1434,6 +1456,7 @@ pub fn run_generation_loop(
         observer,
         None,
         None,
+        None,
     )
 }
 
@@ -1460,6 +1483,7 @@ pub fn run_generation_loop_with_execution_plans(
         &mut should_cancel,
         observer,
         Some(execution_plans),
+        None,
         None,
     )
 }
@@ -1495,6 +1519,43 @@ pub fn run_generation_loop_with_execution_plans_streaming(
         observer,
         Some(execution_plans),
         Some(on_token),
+        None,
+    )
+}
+
+/// Observes one generation step's full, host-visible next-token logits
+/// (vocabulary-sized, pre-sampling).
+pub(crate) type LogitsObserver<'a> = &'a mut dyn FnMut(&[f32]);
+
+/// [`run_generation_loop_with_execution_plans_streaming`], additionally
+/// handing each step's full, host-visible next-token logits to `on_logits`
+/// immediately before sampling (`qualify-real-checkpoint-performance` A02:
+/// checkpoint-bound logit references and cross-Provider numerical
+/// comparison). `on_logits` observes only -- it cannot alter the logits or
+/// the sampled token -- and is invoked exactly once per step, in step
+/// order, before that step's token reaches `on_token`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_generation_loop_with_execution_plans_streaming_and_logits(
+    runtime: &mut Runtime,
+    request: &GenerationRequest,
+    sampling_policy: SamplingPolicy,
+    cache_usage: CacheUsageSummary,
+    mut should_cancel: impl FnMut(&[TokenId]) -> bool,
+    observer: &mut InferenceApiObserver,
+    execution_plans: &mut RuntimeGenerationExecutionPlans<'_>,
+    on_token: &mut dyn FnMut(TokenId) -> std::ops::ControlFlow<()>,
+    on_logits: &mut dyn FnMut(&[f32]),
+) -> Result<GenerationResult, InferenceApiError> {
+    run_generation_loop_inner(
+        runtime,
+        request,
+        sampling_policy,
+        cache_usage,
+        &mut should_cancel,
+        observer,
+        Some(execution_plans),
+        Some(on_token),
+        Some(on_logits),
     )
 }
 
@@ -1508,6 +1569,7 @@ fn run_generation_loop_inner(
     observer: &mut InferenceApiObserver,
     mut execution_plans: Option<&mut RuntimeGenerationExecutionPlans<'_>>,
     mut on_token: Option<&mut dyn FnMut(TokenId) -> std::ops::ControlFlow<()>>,
+    mut on_logits: Option<LogitsObserver<'_>>,
 ) -> Result<GenerationResult, InferenceApiError> {
     let correlation_id = request.correlation_id.clone();
     observer.observe(
@@ -1703,8 +1765,13 @@ fn run_generation_loop_inner(
             }
         });
         let is_prefill_step = generated.is_empty();
+        runtime.phase_ledger_mut().begin_step(if is_prefill_step {
+            StepKind::Prefill
+        } else {
+            StepKind::Decode
+        });
         let step_started_at = std::time::Instant::now();
-        let runtime_step =
+        let mut runtime_step =
             match executor.execute_generation_step(runtime, request, &generated, execution_plan) {
                 Ok(runtime_step) => runtime_step,
                 Err(error) => {
@@ -1719,6 +1786,7 @@ fn run_generation_loop_inner(
             decode_step_ran = true;
             decode_millis_total = decode_millis_total.saturating_add(step_millis);
         }
+        let observation_clock = runtime.phase_ledger().clock();
         if runtime_step.evidence.model_instance_ready {
             observer.observe(
                 InferenceApiObservationKind::ModelInstanceReady,
@@ -1810,28 +1878,42 @@ fn run_generation_loop_inner(
         // Emitted even on a later failure (the `?`s above only run once
         // `execute_generation_step` already returned `Ok`, so every event
         // it did capture before any internal failure is still here).
+        // One `format!` per event (hundreds per step), giving exactly the
+        // text `observation_message` builds from the same context items.
         for event in &runtime_step.node_events {
-            let mut context = vec![
-                format!("request={}", request.request_id),
-                format!("node={}", event.node),
-            ];
-            if let Some(resource) = &event.resource {
-                context.push(format!("resource={resource}"));
-            }
-            observer.observe(
-                event.kind,
-                observation_message("per-node causal event", &context),
-                correlation_id.clone(),
-            );
+            let message = match &event.resource {
+                Some(resource) => format!(
+                    "per-node causal event; request={} node={} resource={resource}",
+                    request.request_id, event.node
+                ),
+                None => format!(
+                    "per-node causal event; request={} node={}",
+                    request.request_id, event.node
+                ),
+            };
+            observer.observe(event.kind, message, correlation_id.clone());
         }
         if let Err(error) = runtime_step.evidence.clone().validate() {
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
             return Err(error);
         }
+        runtime
+            .phase_ledger_mut()
+            .record(observation_clock, StepPhase::StepObservation);
+        if let Some(on_logits) = on_logits.as_deref_mut() {
+            let clock = runtime.phase_ledger().clock();
+            on_logits(&runtime_step.logits);
+            runtime
+                .phase_ledger_mut()
+                .record(clock, StepPhase::LogitsObserve);
+        }
+        let sampling_clock = runtime.phase_ledger().clock();
         let (sampling, step) = decode_step_from_sampling_with_rng(
             request,
             &generated,
-            runtime_step.logits.clone(),
+            // Moved, not copied: nothing reads a step's logits after
+            // sampling (`commit_generation_step` only commits its KV).
+            std::mem::take(&mut runtime_step.logits),
             sampling_policy.clone(),
             rng_state.take(),
         )
@@ -1840,6 +1922,10 @@ fn run_generation_loop_inner(
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
             error
         })?;
+        runtime
+            .phase_ledger_mut()
+            .record(sampling_clock, StepPhase::Sampling);
+        let commit_clock = runtime.phase_ledger().clock();
         if let Err(error) = executor.commit_generation_step(
             runtime,
             request,
@@ -1850,6 +1936,10 @@ fn run_generation_loop_inner(
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
             return Err(error);
         }
+        runtime
+            .phase_ledger_mut()
+            .record(commit_clock, StepPhase::Commit);
+        let observation_clock = runtime.phase_ledger().clock();
         if let Some(commit) = &runtime_step.kv_commit {
             let commit_context = match commit {
                 RuntimeKvCacheCommit::PrefillCompleted { cache, tokens } => vec![
@@ -1934,6 +2024,11 @@ fn run_generation_loop_inner(
             observation_message("token committed", &token_context),
             correlation_id.clone(),
         );
+        runtime
+            .phase_ledger_mut()
+            .record(observation_clock, StepPhase::StepObservation);
+        // The consumer's own time is not part of the step.
+        runtime.phase_ledger_mut().end_step();
         if let Some(on_token) = on_token.as_deref_mut()
             && on_token(step.token_id).is_break()
         {
@@ -2563,10 +2658,24 @@ pub(crate) const INFERENCE_API_OBSERVATION_BUFFER_CAPACITY: usize = 4096;
 /// variants of the Runtime Inference API functions. Mirrors
 /// [`crate::tokenizer::TokenizerObserver`]'s pattern of a caller-owned,
 /// explicitly-threaded observer rather than a global sink.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+///
+/// Evicted observations are dropped in batches: the buffer grows to twice
+/// the capacity and then drops the oldest half at once, so recording one
+/// observation costs amortized O(1) instead of shifting the whole buffer.
+/// Only the most recent `INFERENCE_API_OBSERVATION_BUFFER_CAPACITY` are
+/// ever visible.
+#[derive(Clone, Debug, Default)]
 pub struct InferenceApiObserver {
     observations: Vec<InferenceApiObservation>,
 }
+
+impl PartialEq for InferenceApiObserver {
+    fn eq(&self, other: &Self) -> bool {
+        self.observations() == other.observations()
+    }
+}
+
+impl Eq for InferenceApiObserver {}
 
 impl InferenceApiObserver {
     pub fn new() -> Self {
@@ -2579,15 +2688,22 @@ impl InferenceApiObserver {
         message: impl Into<String>,
         correlation_id: Option<CorrelationId>,
     ) {
-        if self.observations.len() >= INFERENCE_API_OBSERVATION_BUFFER_CAPACITY {
-            self.observations.remove(0);
+        if self.observations.len() >= 2 * INFERENCE_API_OBSERVATION_BUFFER_CAPACITY {
+            self.observations
+                .drain(..INFERENCE_API_OBSERVATION_BUFFER_CAPACITY);
         }
         self.observations
             .push(InferenceApiObservation::new(kind, message, correlation_id));
     }
 
+    /// The most recent observations, oldest first, at most
+    /// `INFERENCE_API_OBSERVATION_BUFFER_CAPACITY` of them.
     pub fn observations(&self) -> &[InferenceApiObservation] {
-        &self.observations
+        let start = self
+            .observations
+            .len()
+            .saturating_sub(INFERENCE_API_OBSERVATION_BUFFER_CAPACITY);
+        &self.observations[start..]
     }
 }
 

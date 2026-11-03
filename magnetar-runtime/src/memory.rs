@@ -11,7 +11,7 @@ use crate::{
     TensorDescriptor, TensorResourceDescriptor, TensorResourceId,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt,
     ops::Range,
@@ -3675,6 +3675,77 @@ impl Default for MemoryManagerConfig {
     }
 }
 
+/// How many terminal (released, evicted, cancelled or failed) allocations
+/// a [`MemoryManager`] keeps for inspection through
+/// [`MemoryManager::allocations`], most recently retired first to go last.
+/// Older ones are forgotten, so bookkeeping stays proportional to live
+/// memory rather than to every allocation ever made
+/// (`bound-memory-manager-bookkeeping`).
+pub const RETIRED_ALLOCATION_HISTORY_CAPACITY: usize = 4096;
+
+/// How many recent entries each [`MemoryManager`] observation log keeps.
+pub const MEMORY_OBSERVATION_LOG_CAPACITY: usize = 4096;
+
+/// Bytes of live allocations by (state, class, pinned host placement), kept
+/// up to date wherever `MemoryManager::allocations` changes so admission
+/// does not rescan every live allocation for each new one. Derived from
+/// `allocations`, so it takes no part in equality.
+#[derive(Clone, Debug, Default)]
+struct AllocationTotals(Vec<(MemoryAllocationState, MemoryAllocationClass, bool, u64)>);
+
+impl PartialEq for AllocationTotals {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for AllocationTotals {}
+
+impl AllocationTotals {
+    fn key(allocation: &MemoryAllocation) -> (MemoryAllocationState, MemoryAllocationClass, bool) {
+        (
+            allocation.state,
+            allocation.request.class,
+            allocation.request.placement.requires_pinned_host(),
+        )
+    }
+
+    fn add(&mut self, allocation: &MemoryAllocation) {
+        let key = Self::key(allocation);
+        let size = allocation.request.size_bytes;
+        match self
+            .0
+            .iter_mut()
+            .find(|(state, class, pinned, _)| (*state, *class, *pinned) == key)
+        {
+            Some(entry) => entry.3 += size,
+            None => self.0.push((key.0, key.1, key.2, size)),
+        }
+    }
+
+    fn remove(&mut self, allocation: &MemoryAllocation) {
+        let key = Self::key(allocation);
+        if let Some(entry) = self
+            .0
+            .iter_mut()
+            .find(|(state, class, pinned, _)| (*state, *class, *pinned) == key)
+        {
+            entry.3 = entry.3.saturating_sub(allocation.request.size_bytes);
+        }
+    }
+
+    fn bytes(
+        &self,
+        include: impl Fn(MemoryAllocationState, MemoryAllocationClass, bool) -> bool,
+    ) -> u64 {
+        self.0
+            .iter()
+            .filter(|(state, class, pinned, _)| include(*state, *class, *pinned))
+            .map(|(_, _, _, bytes)| bytes)
+            .sum()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryManager {
     config: MemoryManagerConfig,
@@ -3682,7 +3753,14 @@ pub struct MemoryManager {
     next_arena_id: u64,
     next_mapping_id: u64,
     next_view_id: u64,
+    /// Live allocations only (active, reusable): every admission scan
+    /// walks this map, so it must not accumulate retired entries.
     allocations: BTreeMap<MemoryAllocationId, MemoryAllocation>,
+    totals: AllocationTotals,
+    /// Bounded history of terminal allocations, see
+    /// [`RETIRED_ALLOCATION_HISTORY_CAPACITY`].
+    retired: BTreeMap<MemoryAllocationId, MemoryAllocation>,
+    retired_order: VecDeque<MemoryAllocationId>,
     arenas: BTreeMap<MemoryArenaId, MemoryArena>,
     pending: BTreeMap<MemoryAllocationId, PendingMemoryAllocation>,
     tensor_residency: BTreeMap<TensorResourceId, TensorResidency>,
@@ -3709,6 +3787,9 @@ impl MemoryManager {
             next_mapping_id: 1,
             next_view_id: 1,
             allocations: BTreeMap::new(),
+            totals: AllocationTotals::default(),
+            retired: BTreeMap::new(),
+            retired_order: VecDeque::new(),
             arenas: BTreeMap::new(),
             pending: BTreeMap::new(),
             tensor_residency: BTreeMap::new(),
@@ -3725,8 +3806,71 @@ impl MemoryManager {
         &self.config
     }
 
+    /// Live allocations plus the most recent
+    /// [`RETIRED_ALLOCATION_HISTORY_CAPACITY`] terminal ones, in
+    /// allocation-id order.
     pub fn allocations(&self) -> impl Iterator<Item = &MemoryAllocation> {
-        self.allocations.values()
+        AllocationsById {
+            live: self.allocations.values().peekable(),
+            retired: self.retired.values().peekable(),
+        }
+    }
+
+    /// Whether `id` is a live (active or reusable) allocation. A released,
+    /// evicted, cancelled, failed or unknown id is not.
+    pub fn is_live_allocation(&self, id: MemoryAllocationId) -> bool {
+        self.allocations.contains_key(&id)
+    }
+
+    #[cfg(test)]
+    /// Entry counts of every internal bookkeeping table, for regression
+    /// tests asserting that bookkeeping stays proportional to live memory.
+    pub(crate) fn bookkeeping_sizes(&self) -> BTreeMap<&'static str, usize> {
+        BTreeMap::from([
+            ("live_allocations", self.allocations.len()),
+            ("retired_allocations", self.retired.len()),
+            ("arenas", self.arenas.len()),
+            ("pending", self.pending.len()),
+            ("tensor_residency", self.tensor_residency.len()),
+            ("resource_residency", self.resource_residency.len()),
+            ("resource_mappings", self.resource_mappings.len()),
+            ("resource_views", self.resource_views.len()),
+            ("residency_pins", self.residency_pins.len()),
+            ("residency_observations", self.residency_observations.len()),
+            ("observations", self.observations.len()),
+        ])
+    }
+
+    #[cfg(test)]
+    /// Allocations referenced by a tensor or resource residency record.
+    pub(crate) fn residency_allocations(&self) -> BTreeSet<MemoryAllocationId> {
+        self.tensor_residency
+            .values()
+            .filter_map(|residency| residency.allocation)
+            .chain(
+                self.resource_residency
+                    .values()
+                    .flat_map(|set| set.replicas.iter().filter_map(|replica| replica.allocation)),
+            )
+            .collect()
+    }
+
+    fn knows_allocation(&self, id: MemoryAllocationId) -> bool {
+        self.allocations.contains_key(&id) || self.retired.contains_key(&id)
+    }
+
+    /// Moves `allocation` into the bounded retired history in `state`.
+    fn retire(&mut self, mut allocation: MemoryAllocation, state: MemoryAllocationState) {
+        allocation.state = state;
+        let id = allocation.id;
+        if self.retired.insert(id, allocation).is_none() {
+            self.retired_order.push_back(id);
+        }
+        while self.retired_order.len() > RETIRED_ALLOCATION_HISTORY_CAPACITY {
+            if let Some(oldest) = self.retired_order.pop_front() {
+                self.retired.remove(&oldest);
+            }
+        }
     }
 
     pub fn arenas(&self) -> impl Iterator<Item = &MemoryArena> {
@@ -3808,7 +3952,9 @@ impl MemoryManager {
                 .allocations
                 .get_mut(&reusable_id)
                 .expect("known allocation");
+            self.totals.remove(allocation);
             allocation.state = MemoryAllocationState::Active;
+            self.totals.add(allocation);
             let allocation = allocation.clone();
             self.observe(
                 MemoryObservationKind::CacheHit,
@@ -3836,6 +3982,7 @@ impl MemoryManager {
             state: MemoryAllocationState::Active,
             arena: None,
         };
+        self.totals.add(&allocation);
         self.allocations.insert(id, allocation.clone());
         self.observe(
             MemoryObservationKind::AllocationCompleted,
@@ -3853,11 +4000,14 @@ impl MemoryManager {
         if allocation.state == MemoryAllocationState::Released {
             return Err(MemoryError::InvalidAllocationHandle(id));
         }
-        allocation.state = if self.config.max_cached_bytes > 0 {
-            MemoryAllocationState::Reusable
-        } else {
-            MemoryAllocationState::Released
-        };
+        if self.config.max_cached_bytes > 0 {
+            self.totals.remove(allocation);
+            allocation.state = MemoryAllocationState::Reusable;
+            self.totals.add(allocation);
+        } else if let Some(released) = self.allocations.remove(&id) {
+            self.totals.remove(&released);
+            self.retire(released, MemoryAllocationState::Released);
+        }
         self.enforce_cache_limit();
         self.observe(
             MemoryObservationKind::AllocationReleased,
@@ -3976,7 +4126,7 @@ impl MemoryManager {
         residency: TensorResidency,
     ) -> Result<(), MemoryError> {
         if let Some(allocation) = residency.allocation
-            && !self.allocations.contains_key(&allocation)
+            && !self.knows_allocation(allocation)
         {
             return Err(MemoryError::InvalidAllocationHandle(allocation));
         }
@@ -4019,11 +4169,32 @@ impl MemoryManager {
             owner,
         )
         .with_affinity(affinity.clone());
-        let allocation = self.allocate(request)?;
         let previous = self
             .tensor_residency
             .get(&id)
             .and_then(|residency| residency.allocation);
+        // A graph edge is admitted under the same id, size, placement, owner
+        // and affinity at every generation step. When its previous
+        // admission is still active and is exactly what this one would
+        // record, keep it: replacing it would allocate, record and release
+        // to end in the same state.
+        if let Some(previous) = previous
+            && self.allocations.get(&previous).is_some_and(|allocation| {
+                allocation.state == MemoryAllocationState::Active && allocation.request == request
+            })
+            && self.tensor_residency.get(&id)
+                == Some(
+                    &TensorResidency::new(id.clone(), placement.clone(), affinity.clone())
+                        .with_allocation(previous),
+                )
+        {
+            return Ok(TensorResourceDescriptor::new(
+                id,
+                descriptor.clone(),
+                affinity,
+            ));
+        }
+        let allocation = self.allocate(request)?;
         self.record_tensor_residency(
             TensorResidency::new(id.clone(), placement, affinity.clone())
                 .with_allocation(allocation.id),
@@ -4058,7 +4229,7 @@ impl MemoryManager {
         residency: ResourceResidency,
     ) -> Result<(), MemoryError> {
         if let Some(allocation) = residency.allocation
-            && !self.allocations.contains_key(&allocation)
+            && !self.knows_allocation(allocation)
         {
             return Err(MemoryError::InvalidAllocationHandle(allocation));
         }
@@ -4543,12 +4714,11 @@ impl MemoryManager {
     }
 
     pub fn cancel_pending_allocation(&mut self, id: MemoryAllocationId) -> Result<(), MemoryError> {
-        let mut pending = self
+        let pending = self
             .pending
             .remove(&id)
             .ok_or(MemoryError::InvalidAllocationHandle(id))?;
-        pending.allocation.state = MemoryAllocationState::Cancelled;
-        self.allocations.insert(id, pending.allocation);
+        self.retire(pending.allocation, MemoryAllocationState::Cancelled);
         Err(MemoryError::AllocationCancelled {
             reason: "pending allocation was cancelled".into(),
         })
@@ -4567,9 +4737,8 @@ impl MemoryManager {
             .collect::<Vec<_>>();
         let mut errors = Vec::new();
         for id in expired {
-            if let Some(mut pending) = self.pending.remove(&id) {
-                pending.allocation.state = MemoryAllocationState::Failed;
-                self.allocations.insert(id, pending.allocation);
+            if let Some(pending) = self.pending.remove(&id) {
+                self.retire(pending.allocation, MemoryAllocationState::Failed);
                 self.observe(
                     MemoryObservationKind::AllocationFailed,
                     Some(id),
@@ -4830,6 +4999,9 @@ impl MemoryManager {
         &self,
         request: &MemoryAllocationRequest,
     ) -> Option<MemoryAllocationId> {
+        if self.cached_bytes() == 0 {
+            return None;
+        }
         self.allocations
             .iter()
             .find(|(_, allocation)| {
@@ -4855,8 +5027,9 @@ impl MemoryManager {
             else {
                 break;
             };
-            if let Some(allocation) = self.allocations.get_mut(&id) {
-                allocation.state = MemoryAllocationState::Released;
+            if let Some(evicted) = self.allocations.remove(&id) {
+                self.totals.remove(&evicted);
+                self.retire(evicted, MemoryAllocationState::Released);
             }
             self.observe(
                 MemoryObservationKind::CacheEviction,
@@ -4892,35 +5065,44 @@ impl MemoryManager {
     }
 
     fn pinned_bytes(&self) -> u64 {
-        self.allocations
-            .values()
-            .filter(|allocation| {
-                allocation.state == MemoryAllocationState::Active
-                    && allocation.request.placement.requires_pinned_host()
-            })
-            .map(|allocation| allocation.request.size_bytes)
-            .sum()
+        self.totals
+            .bytes(|state, _, pinned| state == MemoryAllocationState::Active && pinned)
     }
 
     fn bytes_for_state(&self, state: MemoryAllocationState) -> u64 {
-        self.allocations
-            .values()
-            .filter(|allocation| allocation.state == state)
-            .map(|allocation| allocation.request.size_bytes)
-            .sum()
+        self.totals.bytes(|entry_state, _, _| entry_state == state)
     }
 
     fn pressure_for_class(&self, class: MemoryAllocationClass) -> MemoryPressureLevel {
-        let used = self
-            .allocations
-            .values()
-            .filter(|allocation| {
-                allocation.state == MemoryAllocationState::Active
-                    && allocation.request.class == class
-            })
-            .map(|allocation| allocation.request.size_bytes)
-            .sum::<u64>();
+        let used = self.totals.bytes(|state, entry_class, _| {
+            state == MemoryAllocationState::Active && entry_class == class
+        });
         pressure_for_usage(used, self.config.max_runtime_bytes)
+    }
+
+    /// Recomputes every running total from `allocations`; tests compare it
+    /// with the incrementally maintained one.
+    #[cfg(test)]
+    pub(crate) fn assert_allocation_totals_consistent(&self) {
+        let mut recomputed = AllocationTotals::default();
+        for allocation in self.allocations.values() {
+            recomputed.add(allocation);
+        }
+        for state in [
+            MemoryAllocationState::Pending,
+            MemoryAllocationState::Active,
+            MemoryAllocationState::Released,
+            MemoryAllocationState::Reusable,
+            MemoryAllocationState::ReservedArena,
+            MemoryAllocationState::Failed,
+            MemoryAllocationState::Cancelled,
+        ] {
+            for pinned in [false, true] {
+                let expected = recomputed.bytes(|s, _, p| s == state && p == pinned);
+                let actual = self.totals.bytes(|s, _, p| s == state && p == pinned);
+                assert_eq!(actual, expected, "{state:?} pinned={pinned}");
+            }
+        }
     }
 
     fn observe(
@@ -4929,6 +5111,7 @@ impl MemoryManager {
         allocation: Option<MemoryAllocationId>,
         message: impl Into<String>,
     ) {
+        trim_log(&mut self.observations);
         self.observations.push(MemoryObservation {
             kind,
             allocation,
@@ -4943,10 +5126,42 @@ impl MemoryManager {
         domain: Option<MemoryDomain>,
         message: impl AsRef<str>,
     ) {
+        trim_log(&mut self.residency_observations);
         self.residency_observations
             .push(ResidencyObservation::redacted(
                 kind, resource, domain, message,
             ));
+    }
+}
+
+/// Keeps an observation log bounded: once it holds twice
+/// [`MEMORY_OBSERVATION_LOG_CAPACITY`] entries, drops all but the most
+/// recent capacity at once, so trimming costs O(1) amortized per entry.
+fn trim_log<T>(log: &mut Vec<T>) {
+    if log.len() >= 2 * MEMORY_OBSERVATION_LOG_CAPACITY {
+        log.drain(..log.len() - MEMORY_OBSERVATION_LOG_CAPACITY);
+    }
+}
+
+/// Merges live and retired allocations back into one allocation-id order.
+struct AllocationsById<'a> {
+    live: std::iter::Peekable<
+        std::collections::btree_map::Values<'a, MemoryAllocationId, MemoryAllocation>,
+    >,
+    retired: std::iter::Peekable<
+        std::collections::btree_map::Values<'a, MemoryAllocationId, MemoryAllocation>,
+    >,
+}
+
+impl<'a> Iterator for AllocationsById<'a> {
+    type Item = &'a MemoryAllocation;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match (self.live.peek(), self.retired.peek()) {
+            (Some(live), Some(retired)) if retired.id < live.id => self.retired.next(),
+            (Some(_), _) => self.live.next(),
+            (None, _) => self.retired.next(),
+        }
     }
 }
 
