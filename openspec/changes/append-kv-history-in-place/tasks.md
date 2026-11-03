@@ -11,7 +11,7 @@
 
 ## 3. Providers
 
-- [ ] 3.1 `providers/cpu`: `kv-write` Kernel and `key_count` in attention, with the `key-count` feature.
+- [x] 3.1 `providers/cpu`: `kv-write` Kernel and `key_count` in attention, with the `key-count` feature.
 - [ ] 3.2 `providers/cuda`: in-place `kv-write`; both attention kernels honour `key_count`; device conformance with NaN-filled tails.
 
 ## 4. Qualification
