@@ -286,3 +286,39 @@ fn markdown_summary_highlights_medians_and_the_verdict() {
             .contains("| TTFT | not measured | | |")
     );
 }
+
+/// Runs that end before a metric exists do not count towards that metric's
+/// repetitions: four one-token runs and one two-token run give TPOT a
+/// single sample, which must not qualify (Codex review on
+/// astorise/Magnetar#140).
+#[test]
+fn a_metric_with_too_few_samples_blocks_qualification_even_with_enough_runs() {
+    let mut campaign = Campaign::new(manifest(EvidenceClass::RealCheckpoint, 5));
+    campaign.record_load(LoadSample {
+        duration_ms: 12.0,
+        resources: IntervalProbe::begin().end(),
+    });
+    for run in 0..5 {
+        let mut trace = trace(40_000);
+        if run > 0 {
+            trace.token_offsets_micros.truncate(1);
+        }
+        campaign.record(
+            RunPhase::Measured,
+            trace,
+            IntervalProbe::begin().end(),
+            vec![1],
+            "length",
+        );
+    }
+    let report = campaign.finish(hardware(), run_cell(), vec![]);
+    assert!(report.exceptions.iter().any(|exception| matches!(
+        exception,
+        CampaignException::InsufficientRepetitions {
+            measured: 1,
+            minimum: MINIMUM_WARM_REPETITIONS,
+            reason,
+        } if reason.starts_with("time_per_output_token_ms")
+    )));
+    assert!(!report.verdict.qualifies_production_performance);
+}

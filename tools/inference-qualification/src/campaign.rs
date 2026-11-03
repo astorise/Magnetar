@@ -454,6 +454,22 @@ impl Campaign {
                     metric: metric.into(),
                 }),
                 Some(summary) => {
+                    // A run that ends before a metric exists (no second
+                    // token, so no TPOT) is a measured run without a
+                    // sample: the minimum holds per metric, not per run.
+                    if summary.count < MINIMUM_WARM_REPETITIONS
+                        && measured.len() >= MINIMUM_WARM_REPETITIONS
+                    {
+                        exceptions.push(CampaignException::InsufficientRepetitions {
+                            measured: summary.count,
+                            minimum: MINIMUM_WARM_REPETITIONS,
+                            reason: format!(
+                                "{metric} has {} samples over {} measured runs",
+                                summary.count,
+                                measured.len()
+                            ),
+                        });
+                    }
                     if let Some(relative) = summary.relative_dispersion
                         && relative > MAXIMUM_RELATIVE_DISPERSION
                     {

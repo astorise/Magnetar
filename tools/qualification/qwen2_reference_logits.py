@@ -83,6 +83,17 @@ def main():
     ckpt, revision, weights_sha256 = sys.argv[1], sys.argv[2], sys.argv[3]
     n_new, out_path = int(sys.argv[4]), sys.argv[5]
     ids = [int(t) for t in sys.argv[6:]]
+    # The corpus is only attributable to the pinned checkpoint if these are
+    # its weights: hash them rather than trusting the command line.
+    expected = weights_sha256.removeprefix("sha256:").lower()
+    digest = hashlib.sha256()
+    with open(f"{ckpt}/model.safetensors", "rb") as weights:
+        for chunk in iter(lambda: weights.read(1 << 24), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected:
+        sys.exit(
+            f"model.safetensors has sha256 {digest.hexdigest()}, not the pinned {expected}"
+        )
     steps = []
     cfg = json.load(open(f"{ckpt}/config.json"))
     W = load_safetensors(f"{ckpt}/model.safetensors")
