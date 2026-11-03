@@ -34,6 +34,7 @@ use magnetar_loader_huggingface::{
     HuggingFaceIngestor, HuggingFaceTokenizer, parse_tokenizer_config,
 };
 use magnetar_runtime::model::ModelTrustStore;
+use magnetar_runtime::phase_attribution::StepPhase;
 use magnetar_runtime::production_model_ingestion::{
     ProductionModelArtifactIngestor, ProductionModelSource,
 };
@@ -452,6 +453,50 @@ fn real_checkpoint_logits_match_the_reference_corpus() {
         );
         if !comparison.passed() {
             diverged.push(format!("{provider_name}: {:?}", comparison.failures));
+        }
+
+        // Decode-step replay (`capture-and-replay-cuda-graphs`): replayed
+        // steps are bit-identical to per-node ones, and the CUDA Provider
+        // does replay them.
+        model.enable_phase_attribution();
+        let (replayed, _) = capture(
+            &mut model,
+            &checkpoint,
+            provider_name,
+            &prompt_token_ids,
+            REFERENCE_NEW_TOKENS,
+        );
+        let replays: u64 = model
+            .take_phase_attribution()
+            .steps
+            .iter()
+            .flat_map(|step| &step.phases)
+            .filter(|(key, _)| key.phase == StepPhase::StepReplay)
+            .map(|(_, total)| total.count)
+            .sum();
+        model.disable_phase_attribution();
+        model.set_step_replay(false);
+        let (per_node, _) = capture(
+            &mut model,
+            &checkpoint,
+            provider_name,
+            &prompt_token_ids,
+            REFERENCE_NEW_TOKENS,
+        );
+        model.set_step_replay(true);
+        let replay_comparison = compare_logit_references(&per_node, &replayed, &profile);
+        assert!(
+            replay_comparison
+                .steps
+                .iter()
+                .all(|step| step.bit_identical),
+            "[{provider_name}] replayed decode steps differ from per-node ones: {:?}",
+            replay_comparison.failures
+        );
+        eprintln!("[{provider_name}] {replays} of {REFERENCE_NEW_TOKENS} steps replayed");
+        if provider_name == "cuda" {
+            // Prefill and the first two decode steps run per node.
+            assert_eq!(replays, REFERENCE_NEW_TOKENS as u64 - 3);
         }
 
         check_lifecycle(

@@ -1248,6 +1248,8 @@ struct E2eRuntimeModelExecutionEngine {
     /// supports in-place history (`append-kv-history-in-place`): for tests
     /// of the copy-based path.
     copy_based_kv: bool,
+    /// Decode-step capture and replay (`capture-and-replay-cuda-graphs`).
+    step_replay: StepReplay,
 }
 
 /// How many prompt lengths' graphs one loaded model keeps.
@@ -1270,6 +1272,121 @@ pub(crate) struct ComponentGraphCache {
 
 /// One prompt length's graphs.
 type CachedComponentGraphs = (u64, Arc<CachedGraphs>);
+
+/// Integer attributes that advance by one from one decode step to the next
+/// (`capture-and-replay-cuda-graphs`): the RoPE position, the attention key
+/// count and the in-place KV write offset.
+const STEP_ADVANCING_ATTRIBUTES: [&str; 3] = ["position_offset", "key_count", "row_offset"];
+
+/// The decode step at which a request's step is captured: the first decode
+/// step allocates every decode-shaped output, so the second one allocates
+/// nothing and is the same as every later one.
+const STEP_CAPTURE_DECODE_INDEX: usize = 2;
+
+/// Decode-step capture and replay (`capture-and-replay-cuda-graphs`), shared
+/// by an engine and the `ProductionLoadedModel` that owns it.
+#[derive(Clone, Default)]
+pub(crate) struct StepReplay(Arc<StepReplayState>);
+
+struct StepReplayState {
+    enabled: std::sync::atomic::AtomicBool,
+    /// Each request's captured decode step, by KV state key.
+    recorded: Mutex<BTreeMap<String, RecordedDecodeStep>>,
+    /// Requests whose capture failed: they run every step per node.
+    declined: Mutex<BTreeSet<String>>,
+}
+
+impl Default for StepReplayState {
+    fn default() -> Self {
+        Self {
+            enabled: std::sync::atomic::AtomicBool::new(true),
+            recorded: Mutex::default(),
+            declined: Mutex::default(),
+        }
+    }
+}
+
+/// Releases every capture still held, however the requests that made them
+/// ended: a capture holds Provider resources (a CUDA graph executable).
+impl Drop for StepReplayState {
+    fn drop(&mut self) {
+        if let Ok(recorded) = self.recorded.get_mut() {
+            for step in recorded.values() {
+                step.executor.release_step_capture(&step.capture);
+            }
+        }
+    }
+}
+
+impl StepReplay {
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        self.0.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.0.enabled.load(Ordering::Relaxed)
+    }
+
+    fn recorded(&self, key: &str) -> Option<RecordedDecodeStep> {
+        self.0.recorded.lock().ok()?.get(key).cloned()
+    }
+
+    fn record(&self, key: String, step: RecordedDecodeStep) {
+        if let Ok(mut recorded) = self.0.recorded.lock()
+            && let Some(replaced) = recorded.insert(key, step)
+        {
+            replaced.executor.release_step_capture(&replaced.capture);
+        }
+    }
+
+    fn decline(&self, key: String) {
+        if let Ok(mut declined) = self.0.declined.lock() {
+            declined.insert(key);
+        }
+    }
+
+    fn is_declined(&self, key: &str) -> bool {
+        self.0
+            .declined
+            .lock()
+            .map(|declined| declined.contains(key))
+            .unwrap_or(true)
+    }
+
+    /// Forgets a request, releasing its capture.
+    fn release(&self, key: &str) {
+        if let Ok(mut declined) = self.0.declined.lock() {
+            declined.remove(key);
+        }
+        let step = self
+            .0
+            .recorded
+            .lock()
+            .ok()
+            .and_then(|mut recorded| recorded.remove(key));
+        if let Some(step) = step {
+            step.executor.release_step_capture(&step.capture);
+        }
+    }
+}
+
+/// What replaying a request's captured decode step needs.
+#[derive(Clone)]
+struct RecordedDecodeStep {
+    capture: StepCaptureId,
+    /// The Provider holding the capture.
+    executor: Arc<dyn ProviderExecutionApi>,
+    provider: ProviderBinding,
+    /// The absolute position of the captured step.
+    position: u64,
+    /// The input the captured step read its token from.
+    input: TensorResourceId,
+    /// The logits the captured step wrote, and their shape.
+    logits: (TensorResourceId, Vec<u64>),
+    /// The KV state the captured step left, its row counts at `position`.
+    layer_kv: LayerKvMap,
+    dispatch: KernelDispatchResult,
+}
 
 /// Whether every node reading a KV-cache edge is an `attention` node: an
 /// in-place KV store holds more rows than the history, and only attention
@@ -4203,9 +4320,12 @@ fn execute_first_native_graph_nodes(
     // (Correctif 4): the same value every dispatched node's Plan guards
     // were built against (`PlanGuard::SequenceRange`), read from the graph
     // input rather than recomputed per node.
+    let token_ids = TensorEdgeId::new("input.token_ids");
     let sequence_length = initial_bindings
-        .get(&TensorEdgeId::new("input.token_ids"))
-        .and_then(|tensor| tensor.shape.first().copied());
+        .get(&token_ids)
+        .map(|tensor| &tensor.shape)
+        .or_else(|| resident_bindings.get(&token_ids).map(|(_, shape)| shape))
+        .and_then(|shape| shape.first().copied());
     let mut dispatch_ctx = FirstNativeDispatchContext {
         runtime,
         provider: executor.clone(),
@@ -4409,7 +4529,7 @@ fn execute_first_native_graph_nodes(
                     reason: format!("first-native graph is missing edge '{output_edge_id}'"),
                 }
             })?;
-            let output_resource_id = TensorResourceId::new(format!("edge.{output_edge_id}"));
+            let output_resource_id = graph_edge_resource_id(output_edge_id.as_str());
             // Whether the Kernel already wrote directly into `output_resource_id`
             // (Decision 3's pre-admission, `dispatch_first_native_graph_node`) or this
             // loop must still explicitly (re-)write it: KV-history
@@ -4828,6 +4948,60 @@ fn execute_first_native_graph_nodes(
     Ok((dispatch_result, materialized_bindings, updated_layer_kv))
 }
 
+/// Replays a request's captured decode step at `absolute_position`
+/// (`capture-and-replay-cuda-graphs`). `None` when the capture can no longer
+/// be replayed: the step must run per node.
+fn replay_decode_step(
+    runtime: &mut Runtime,
+    recorded: &RecordedDecodeStep,
+    ids_tensor: HostTensor,
+    absolute_position: u64,
+) -> Result<Option<FirstNativeGraphExecutionOutput>, InferenceApiError> {
+    let Some(offset) = absolute_position.checked_sub(recorded.position) else {
+        return Ok(None);
+    };
+    let mut layer_kv = recorded.layer_kv.clone();
+    for layer in layer_kv.values_mut() {
+        let Some(rows) = layer.rows.and_then(|rows| rows.checked_add(offset)) else {
+            return Ok(None);
+        };
+        layer.rows = Some(rows);
+    }
+    let executor = recorded.executor.clone();
+    let replay_clock = runtime.phase_ledger().clock();
+    let replayed = executor.replay_step(
+        &recorded.capture,
+        offset,
+        vec![(recorded.input.clone(), ids_tensor)],
+    );
+    runtime
+        .phase_ledger_mut()
+        .record(replay_clock, StepPhase::StepReplay);
+    if replayed.is_err() {
+        return Ok(None);
+    }
+    let materialize_clock = runtime.phase_ledger().clock();
+    let bindings = materialize_first_native_graph_bindings(
+        &*executor,
+        &BTreeMap::from([(TensorEdgeId::new("logits"), recorded.logits.clone())]),
+    )?;
+    runtime
+        .phase_ledger_mut()
+        .record(materialize_clock, StepPhase::OutputMaterialize);
+    Ok(Some((
+        recorded.dispatch.clone(),
+        bindings,
+        layer_kv,
+        recorded.provider.clone(),
+    )))
+}
+
+/// The resource a node output edge is written under, unless it is a KV
+/// edge.
+fn graph_edge_resource_id(edge: &str) -> TensorResourceId {
+    TensorResourceId::new(format!("edge.{edge}"))
+}
+
 /// The one designated Device-to-Host materialization boundary for a first-
 /// native graph dispatch: every remaining live edge (including
 /// `"output.logits"`) crosses back into the caller-facing `HostTensor`
@@ -5066,21 +5240,17 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                             reason: "decode requires a newly admitted token".into(),
                         }
                     })?;
-                    let ids_tensor = HostTensor::new([1], vec![token as f32])
-                        .map_err(runtime_generation_failed)?;
-                    execute_first_native_graph_materializing(
+                    self.execute_decode_graph(
                         runtime,
-                        &self.fixture,
-                        model_instance,
-                        &kv_state.cache,
-                        &component_graphs.decode,
+                        request,
+                        &kv_state,
                         execution_plan,
-                        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)]),
-                        Some(&kv_state.layer_kv),
-                        Some(absolute_position as u64),
+                        &component_graphs,
+                        model_instance,
+                        token,
+                        absolute_position as u64,
+                        generated_tokens.len(),
                         &mut node_events,
-                        MaterializedEdges::Only(&["logits"]),
-                        Some(&component_graphs.decode_memo),
                         kv_store_capacity,
                     )?
                 };
@@ -5182,6 +5352,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         runtime: &mut Runtime,
         request: &GenerationRequest,
     ) -> Result<(), InferenceApiError> {
+        self.step_replay.release(&Self::kv_state_key(request));
         self.discard_pending_kv_state(runtime, request)?;
         let committed = self
             .kv_states
@@ -5552,6 +5723,215 @@ fn promote_pending_kv_layer_role(
 }
 
 impl E2eRuntimeModelExecutionEngine {
+    /// One decode step's graph execution: a replay of the request's
+    /// captured step when it has one, a captured per-node execution at
+    /// [`STEP_CAPTURE_DECODE_INDEX`], and a per-node execution otherwise or
+    /// whenever capture or replay cannot be used
+    /// (`capture-and-replay-cuda-graphs`).
+    #[allow(clippy::too_many_arguments)]
+    fn execute_decode_graph(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        kv_state: &FirstNativeExecutionKvState,
+        execution_plan: &mut PreparedExecutionPlan,
+        graphs: &CachedGraphs,
+        model_instance: &ModelInstanceId,
+        token: TokenId,
+        absolute_position: u64,
+        decode_index: usize,
+        node_events: &mut Vec<PerNodeCausalEvent>,
+        kv_store_capacity: Option<u64>,
+    ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
+        let ids_tensor =
+            HostTensor::new([1], vec![token as f32]).map_err(runtime_generation_failed)?;
+        let key = Self::kv_state_key(request);
+        // Only steps whose KV history is kept in place: their shapes and
+        // resources are the same from one step to the next.
+        let replayable = self.step_replay.is_enabled()
+            && kv_store_capacity.is_some()
+            && !kv_state.layer_kv.is_empty()
+            && kv_state.layer_kv.values().all(|layer| layer.rows.is_some());
+        if replayable {
+            if let Some(recorded) = self.step_replay.recorded(&key) {
+                if let Some(output) =
+                    replay_decode_step(runtime, &recorded, ids_tensor.clone(), absolute_position)?
+                {
+                    return Ok(output);
+                }
+                // Invalidated: this step runs per node, a later one may
+                // capture again.
+                self.step_replay.release(&key);
+            } else if decode_index >= STEP_CAPTURE_DECODE_INDEX
+                && !self.step_replay.is_declined(&key)
+            {
+                match self.capture_decode_step(
+                    runtime,
+                    kv_state,
+                    execution_plan,
+                    graphs,
+                    model_instance,
+                    ids_tensor.clone(),
+                    absolute_position,
+                    node_events,
+                    kv_store_capacity,
+                )? {
+                    Some((recorded, output)) => {
+                        self.step_replay.record(key, recorded);
+                        return Ok(output);
+                    }
+                    None => self.step_replay.decline(key),
+                }
+            }
+        }
+        execute_first_native_graph_materializing(
+            runtime,
+            &self.fixture,
+            model_instance,
+            &kv_state.cache,
+            &graphs.decode,
+            execution_plan,
+            BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)]),
+            Some(&kv_state.layer_kv),
+            Some(absolute_position),
+            node_events,
+            MaterializedEdges::Only(&["logits"]),
+            Some(&graphs.decode_memo),
+            kv_store_capacity,
+        )
+    }
+
+    /// Runs one decode step per node inside a step capture. `None` when the
+    /// Provider cannot capture it: nothing is recorded, and the caller runs
+    /// the step again per node (a step is idempotent: its KV rows land
+    /// beyond the committed rows and every output is replaced).
+    #[allow(clippy::too_many_arguments)]
+    fn capture_decode_step(
+        &self,
+        runtime: &mut Runtime,
+        kv_state: &FirstNativeExecutionKvState,
+        execution_plan: &mut PreparedExecutionPlan,
+        graphs: &CachedGraphs,
+        model_instance: &ModelInstanceId,
+        ids_tensor: HostTensor,
+        absolute_position: u64,
+        node_events: &mut Vec<PerNodeCausalEvent>,
+        kv_store_capacity: Option<u64>,
+    ) -> Result<Option<(RecordedDecodeStep, FirstNativeGraphExecutionOutput)>, InferenceApiError>
+    {
+        let Some(provider_binding) = execution_plan
+            .node_bindings
+            .first()
+            .map(|binding| binding.provider.clone())
+        else {
+            return Ok(None);
+        };
+        let executor = resolve_kernel_execution_provider(runtime, &provider_binding)?;
+        if !executor.supports_step_capture() {
+            return Ok(None);
+        }
+        // The input is written before the capture starts, as the per-node
+        // path writes it: a replay writes each step's token into it.
+        let input = TensorResourceId::new("input.token_ids");
+        let input_shape = ids_tensor.shape.clone();
+        let upload_clock = runtime.phase_ledger().clock();
+        executor
+            .write_tensor_value_admitted(
+                runtime.memory_mut(),
+                input.clone(),
+                TensorValue::Host(ids_tensor),
+                MemoryAllocationClass::Tensor,
+                MemoryAllocationOwner::Session(kv_state.cache.to_string()),
+            )
+            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                reason: format!("failed to write graph input resource '{input}': {error}"),
+            })?;
+        runtime
+            .phase_ledger_mut()
+            .record(upload_clock, StepPhase::InputUpload);
+        let capture_clock = runtime.phase_ledger().clock();
+        let request = StepCaptureRequest {
+            advancing_attributes: STEP_ADVANCING_ATTRIBUTES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        };
+        let begun = executor.begin_step_capture(&request);
+        runtime
+            .phase_ledger_mut()
+            .record(capture_clock, StepPhase::StepCapture);
+        if begun.is_err() {
+            return Ok(None);
+        }
+        let events_before = node_events.len();
+        // Nothing is downloaded while capturing.
+        let executed = execute_first_native_graph_with_resident_input(
+            runtime,
+            &self.fixture,
+            model_instance,
+            &kv_state.cache,
+            &graphs.decode,
+            execution_plan,
+            BTreeMap::new(),
+            BTreeMap::from([(
+                TensorEdgeId::new("input.token_ids"),
+                (input.clone(), input_shape),
+            )]),
+            Some(&kv_state.layer_kv),
+            Some(absolute_position),
+            node_events,
+            MaterializedEdges::Only(&[]),
+            Some(&graphs.decode_memo),
+            kv_store_capacity,
+        );
+        let end_clock = runtime.phase_ledger().clock();
+        let captured = match executed {
+            Ok(output) => executor
+                .end_step_capture()
+                .ok()
+                .map(|capture| (capture, output)),
+            Err(_) => {
+                executor.abort_step_capture();
+                None
+            }
+        };
+        runtime
+            .phase_ledger_mut()
+            .record(end_clock, StepPhase::StepCapture);
+        let Some((capture, (dispatch, _, layer_kv, provider))) = captured else {
+            node_events.truncate(events_before);
+            return Ok(None);
+        };
+        let logits = graph_edge_resource_id("logits");
+        let Some(logits_shape) = executor.resident_shape(&logits) else {
+            executor.release_step_capture(&capture);
+            node_events.truncate(events_before);
+            return Ok(None);
+        };
+        let materialize_clock = runtime.phase_ledger().clock();
+        let bindings = materialize_first_native_graph_bindings(
+            &*executor,
+            &BTreeMap::from([(
+                TensorEdgeId::new("logits"),
+                (logits.clone(), logits_shape.clone()),
+            )]),
+        )?;
+        runtime
+            .phase_ledger_mut()
+            .record(materialize_clock, StepPhase::OutputMaterialize);
+        let recorded = RecordedDecodeStep {
+            capture,
+            executor: executor.clone(),
+            provider: provider.clone(),
+            position: absolute_position,
+            input,
+            logits: (logits, logits_shape),
+            layer_kv: layer_kv.clone(),
+            dispatch: dispatch.clone(),
+        };
+        Ok(Some((recorded, (dispatch, bindings, layer_kv, provider))))
+    }
+
     /// Promotes each layer's *pending* K/V resource (written by
     /// `execute_first_native_graph_nodes` during this step) to the cache's
     /// *committed* resource, atomically across every layer, via
@@ -5738,6 +6118,7 @@ fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
             forced_token: None,
             graph_cache: None,
             copy_based_kv: false,
+            step_replay: StepReplay::default(),
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -5774,6 +6155,7 @@ fn build_runtime_with_model_execution_engine_and_provider(
             forced_token: None,
             graph_cache: None,
             copy_based_kv: false,
+            step_replay: StepReplay::default(),
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -7882,6 +8264,7 @@ fn prepare_production_generation(
             forced_token: None,
             graph_cache: None,
             copy_based_kv: false,
+            step_replay: StepReplay::default(),
         }))
         .trust_store(trust_store)
         .build()
@@ -8063,6 +8446,8 @@ pub struct ProductionLoadedModel {
     component_digest: Option<ComponentDigest>,
     /// Shared with this instance's execution engine.
     graph_cache: ComponentGraphCache,
+    /// Shared with this instance's execution engine.
+    step_replay: StepReplay,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -8138,6 +8523,7 @@ impl ProductionLoadedModel {
         let provider_binding = ProviderBinding::new(provider.metadata().name.clone());
         let provider_supports_multi_step_decode = provider.supports_multi_step_decode();
         let graph_cache = ComponentGraphCache::default();
+        let step_replay = StepReplay::default();
         let mut runtime = Runtime::builder()
             .register_provider(provider.clone())
             .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
@@ -8148,6 +8534,7 @@ impl ProductionLoadedModel {
                 forced_token: None,
                 graph_cache: Some(graph_cache.clone()),
                 copy_based_kv: false,
+                step_replay: step_replay.clone(),
             }))
             .trust_store(trust_store)
             .build()
@@ -8176,6 +8563,7 @@ impl ProductionLoadedModel {
             materialization_count: 1,
             component_digest,
             graph_cache,
+            step_replay,
         })
     }
 
@@ -8192,6 +8580,13 @@ impl ProductionLoadedModel {
     pub fn set_graph_fusion(&mut self, enabled: bool) {
         self.graph_cache
             .set_fusion_provider(enabled.then(|| self.provider_binding.clone()));
+    }
+
+    /// Turns decode-step capture and replay (`capture-and-replay-cuda-graphs`)
+    /// on or off for later steps. On by default; it only applies where this
+    /// instance's Provider supports step capture.
+    pub fn set_step_replay(&mut self, enabled: bool) {
+        self.step_replay.set_enabled(enabled);
     }
 
     /// Starts attributing every later generation step's host time to its

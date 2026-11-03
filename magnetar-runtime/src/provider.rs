@@ -916,7 +916,123 @@ pub trait ProviderExecutionApi: Send + Sync {
     fn observations(&self) -> Vec<KernelObservation> {
         Vec::new()
     }
+
+    /// Whether this Provider can capture a generation step and replay it
+    /// (`capture-and-replay-cuda-graphs`). The other step capture methods
+    /// are only called when this returns `true`.
+    fn supports_step_capture(&self) -> bool {
+        false
+    }
+
+    /// Starts recording every Kernel invocation and resource access until
+    /// [`Self::end_step_capture`] or [`Self::abort_step_capture`]. Every
+    /// integer attribute named in `request.advancing_attributes` that a
+    /// captured invocation carries must be replayable increased by the
+    /// replay offset; a Provider that cannot do so for an invocation fails
+    /// that invocation, and the capture with it.
+    fn begin_step_capture(
+        &self,
+        request: &StepCaptureRequest,
+    ) -> Result<(), ProviderExecutionError> {
+        let _ = request;
+        Err(step_capture_unsupported(ProviderExecutionPhase::Submit))
+    }
+
+    /// Ends the capture [`Self::begin_step_capture`] started. When this
+    /// returns, the captured step's results are available exactly as after
+    /// an uncaptured step: a Provider that only records during capture runs
+    /// the recorded work once here.
+    fn end_step_capture(&self) -> Result<StepCaptureId, ProviderExecutionError> {
+        Err(step_capture_unsupported(ProviderExecutionPhase::Complete))
+    }
+
+    /// Discards a capture in progress. The captured step's work may not
+    /// have run.
+    fn abort_step_capture(&self) {}
+
+    /// Writes each host input into the resource it was captured with, then
+    /// repeats the captured work with every advancing attribute increased
+    /// by `offset`. Fails with [`StepReplayError::Invalidated`], running
+    /// nothing, when a resource the capture touched no longer has the
+    /// storage it had at capture time, or when `offset` leaves a bound the
+    /// capture recorded.
+    fn replay_step(
+        &self,
+        id: &StepCaptureId,
+        offset: u64,
+        inputs: Vec<(TensorResourceId, crate::tensor::HostTensor)>,
+    ) -> Result<(), StepReplayError> {
+        let _ = (id, offset, inputs);
+        Err(StepReplayError::Failed(step_capture_unsupported(
+            ProviderExecutionPhase::Submit,
+        )))
+    }
+
+    /// Frees a capture. Unknown ids are ignored.
+    fn release_step_capture(&self, id: &StepCaptureId) {
+        let _ = id;
+    }
 }
+
+fn step_capture_unsupported(phase: ProviderExecutionPhase) -> ProviderExecutionError {
+    ProviderExecutionError::new(
+        ProviderExecutionErrorCode::UnsupportedOperation,
+        phase,
+        ProviderBinding::new("unknown"),
+        None,
+        "this Provider does not capture generation steps",
+    )
+}
+
+/// What a step capture records (`capture-and-replay-cuda-graphs`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StepCaptureRequest {
+    /// Integer attributes that advance by one per step, and by the replay
+    /// offset when a captured step is replayed.
+    pub advancing_attributes: Vec<String>,
+}
+
+/// An opaque, Provider-chosen identity for one captured step.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StepCaptureId(String);
+
+impl StepCaptureId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for StepCaptureId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Why [`ProviderExecutionApi::replay_step`] ran nothing or failed.
+#[derive(Clone, Debug)]
+pub enum StepReplayError {
+    /// The capture can no longer be replayed: a resource it touched has
+    /// other storage now, or the offset leaves one of its bounds. Nothing
+    /// ran; the step must run uncaptured.
+    Invalidated { reason: String },
+    /// The replay itself failed.
+    Failed(ProviderExecutionError),
+}
+
+impl fmt::Display for StepReplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalidated { reason } => write!(f, "step capture invalidated: {reason}"),
+            Self::Failed(error) => write!(f, "step replay failed: {error}"),
+        }
+    }
+}
+
+impl Error for StepReplayError {}
 
 /// Receives provider contributions.
 #[derive(Clone, Default)]

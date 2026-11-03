@@ -6177,6 +6177,7 @@ fn build_runtime_with_model_execution_engine_and_forced_token(
             forced_token,
             graph_cache: None,
             copy_based_kv: false,
+            step_replay: StepReplay::default(),
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -9412,6 +9413,7 @@ fn check_incremental_decode_rejects_missing_layer_kv(
 fn new_copy_based_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelExecutionEngine {
     E2eRuntimeModelExecutionEngine {
         copy_based_kv: true,
+        step_replay: StepReplay::default(),
         ..new_kv_lifecycle_engine(fixture)
     }
 }
@@ -9425,6 +9427,7 @@ fn new_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelExecutionEngi
         forced_token: None,
         graph_cache: None,
         copy_based_kv: false,
+        step_replay: StepReplay::default(),
     }
 }
 
@@ -10792,4 +10795,441 @@ fn in_place_kv_history_matches_copy_based_history_and_survives_a_discarded_step(
         assert!(binding.k.as_str().ends_with(".k.store"), "{}", binding.k);
         assert!(binding.v.as_str().ends_with(".v.store"), "{}", binding.v);
     }
+}
+
+// ---------------------------------------------------------------------
+// Decode-step capture and replay (`capture-and-replay-cuda-graphs`)
+// ---------------------------------------------------------------------
+
+/// A test Provider for step capture: Reference CPU's Kernels behind
+/// resident (`Opaque`) values, like a device Provider, recording every
+/// Kernel invocation of a capture and replaying them with the advancing
+/// attributes offset. Like the CUDA Provider, a capture fails when anything
+/// writes host data into its storage while capturing.
+struct ReplayingExecutor {
+    inner: ReferenceCpuExecutor,
+    state: Mutex<ReplayingState>,
+    /// Test hooks.
+    fail_capture: AtomicBool,
+    invalidate_next_replay: AtomicBool,
+}
+
+#[derive(Default)]
+struct ReplayingState {
+    recording: Option<RecordingCapture>,
+    captures: BTreeMap<StepCaptureId, RecordingCapture>,
+    next_capture: u64,
+    captured: u64,
+    replayed: u64,
+}
+
+#[derive(Clone, Default)]
+struct RecordingCapture {
+    advancing: Vec<String>,
+    invocations: Vec<(KernelAdvertisement, OperatorSpec, KernelInvocation)>,
+    poisoned: bool,
+}
+
+impl ReplayingExecutor {
+    fn new() -> Self {
+        Self {
+            inner: ReferenceCpuExecutor::new(),
+            state: Mutex::new(ReplayingState::default()),
+            fail_capture: AtomicBool::new(false),
+            invalidate_next_replay: AtomicBool::new(false),
+        }
+    }
+
+    fn poison_if_recording(&self) {
+        if let Some(recording) = self.state.lock().unwrap().recording.as_mut() {
+            recording.poisoned = true;
+        }
+    }
+
+    fn counts(&self) -> (u64, u64, usize) {
+        let state = self.state.lock().unwrap();
+        (state.captured, state.replayed, state.captures.len())
+    }
+
+    fn failure(reason: &str) -> ProviderExecutionError {
+        ProviderExecutionError::new(
+            ProviderExecutionErrorCode::ExecutionFailed,
+            ProviderExecutionPhase::Submit,
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            None,
+            reason,
+        )
+    }
+}
+
+impl ProviderExecutionApi for ReplayingExecutor {
+    fn submit(
+        &self,
+        request: ProviderExecutionRequest,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        self.inner.submit(request)
+    }
+    fn status(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionStatus, ProviderExecutionError> {
+        self.inner.status(handle)
+    }
+    fn cancel(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderCancellationOutcome, ProviderExecutionError> {
+        self.inner.cancel(handle)
+    }
+    fn complete(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        self.inner.complete(handle)
+    }
+    fn release(&self, handle: ProviderExecutionHandle) -> Result<(), ProviderExecutionError> {
+        self.inner.release(handle)
+    }
+    fn submit_kernel(
+        &self,
+        advertisement: &KernelAdvertisement,
+        operator: &OperatorSpec,
+        invocation: &KernelInvocation,
+        memory: &mut MemoryManager,
+    ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        if let Some(recording) = self.state.lock().unwrap().recording.as_mut() {
+            recording.invocations.push((
+                advertisement.clone(),
+                operator.clone(),
+                invocation.clone(),
+            ));
+        }
+        self.inner
+            .submit_kernel(advertisement, operator, invocation, memory)
+    }
+    fn complete_kernel(
+        &self,
+        handle: &ProviderExecutionHandle,
+    ) -> Result<KernelResult, ProviderExecutionError> {
+        self.inner.complete_kernel(handle)
+    }
+    fn write_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: HostTensor,
+    ) -> Result<(), ProviderExecutionError> {
+        self.poison_if_recording();
+        self.inner.write_tensor(id, tensor);
+        Ok(())
+    }
+    fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
+        self.inner.read_tensor(id)
+    }
+    fn release_tensor(&self, id: &TensorResourceId) -> Result<bool, ProviderExecutionError> {
+        Ok(self.inner.release_tensor(id))
+    }
+    fn release_admitted_tensor(
+        &self,
+        memory: &mut MemoryManager,
+        id: &TensorResourceId,
+    ) -> Result<bool, ProviderExecutionError> {
+        Ok(self.inner.release_admitted_tensor(memory, id))
+    }
+    fn write_tensor_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        resource_id: TensorResourceId,
+        tensor: HostTensor,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), MemoryError> {
+        self.poison_if_recording();
+        self.inner
+            .write_tensor_admitted(memory, resource_id, tensor, class, owner)
+    }
+    fn read_tensor_value(&self, id: &TensorResourceId) -> Option<TensorValue> {
+        self.inner.read_tensor(id).map(|_| TensorValue::Opaque)
+    }
+    fn resident_shape(&self, id: &TensorResourceId) -> Option<Vec<u64>> {
+        self.inner.resident_shape(id)
+    }
+    fn write_tensor_value(
+        &self,
+        id: TensorResourceId,
+        value: TensorValue,
+    ) -> Result<(), ProviderExecutionError> {
+        if matches!(value, TensorValue::Host(_)) {
+            self.poison_if_recording();
+        }
+        self.inner.write_tensor_value(id, value)
+    }
+    fn write_tensor_value_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        resource_id: TensorResourceId,
+        value: TensorValue,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), TensorValueAdmissionError> {
+        if matches!(value, TensorValue::Host(_)) {
+            self.poison_if_recording();
+        }
+        self.inner
+            .write_tensor_value_admitted(memory, resource_id, value, class, owner)
+    }
+    fn copy_tensor_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        from: &TensorResourceId,
+        to: TensorResourceId,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<MemoryAllocationId, TensorValueAdmissionError> {
+        self.poison_if_recording();
+        self.inner
+            .copy_tensor_admitted(memory, from, to, class, owner)
+    }
+    fn allocate_workspace(
+        &self,
+        memory: &mut MemoryManager,
+        size_bytes: u64,
+    ) -> Result<MemoryAllocationId, MemoryError> {
+        self.inner.allocate_workspace(memory, size_bytes)
+    }
+    fn observations(&self) -> Vec<KernelObservation> {
+        self.inner.observations()
+    }
+    fn supports_step_capture(&self) -> bool {
+        true
+    }
+    fn begin_step_capture(
+        &self,
+        request: &StepCaptureRequest,
+    ) -> Result<(), ProviderExecutionError> {
+        let mut state = self.state.lock().unwrap();
+        if state.recording.is_some() {
+            return Err(Self::failure("a capture is already in progress"));
+        }
+        state.recording = Some(RecordingCapture {
+            advancing: request.advancing_attributes.clone(),
+            ..RecordingCapture::default()
+        });
+        Ok(())
+    }
+    fn end_step_capture(&self) -> Result<StepCaptureId, ProviderExecutionError> {
+        let mut state = self.state.lock().unwrap();
+        let recording = state
+            .recording
+            .take()
+            .ok_or_else(|| Self::failure("no capture in progress"))?;
+        if recording.poisoned || self.fail_capture.load(Ordering::SeqCst) {
+            return Err(Self::failure("the capture wrote host data"));
+        }
+        let id = StepCaptureId::new(format!("replaying:{}", state.next_capture));
+        state.next_capture += 1;
+        state.captured += 1;
+        state.captures.insert(id.clone(), recording);
+        Ok(id)
+    }
+    fn abort_step_capture(&self) {
+        self.state.lock().unwrap().recording = None;
+    }
+    fn replay_step(
+        &self,
+        id: &StepCaptureId,
+        offset: u64,
+        inputs: Vec<(TensorResourceId, HostTensor)>,
+    ) -> Result<(), StepReplayError> {
+        if self.invalidate_next_replay.swap(false, Ordering::SeqCst) {
+            return Err(StepReplayError::Invalidated {
+                reason: "a captured resource changed".into(),
+            });
+        }
+        let capture = self
+            .state
+            .lock()
+            .unwrap()
+            .captures
+            .get(id)
+            .cloned()
+            .ok_or_else(|| StepReplayError::Invalidated {
+                reason: "unknown capture".into(),
+            })?;
+        for (id, tensor) in inputs {
+            self.inner.write_tensor(id, tensor);
+        }
+        for (advertisement, operator, invocation) in &capture.invocations {
+            let mut invocation = invocation.clone();
+            for name in &capture.advancing {
+                if let Some(OperatorAttributeValue::Integer(value)) =
+                    invocation.attributes.get_mut(name)
+                {
+                    *value += offset as i64;
+                }
+            }
+            let result = self
+                .inner
+                .execute_invocation(advertisement, operator, &invocation);
+            if result.status != KernelResultStatus::Succeeded {
+                return Err(StepReplayError::Failed(Self::failure(
+                    "a replayed invocation failed",
+                )));
+            }
+        }
+        self.state.lock().unwrap().replayed += 1;
+        Ok(())
+    }
+    fn release_step_capture(&self, id: &StepCaptureId) {
+        self.state.lock().unwrap().captures.remove(id);
+    }
+}
+
+/// Reference CPU's metadata, Devices and Kernels, executed by a
+/// [`ReplayingExecutor`].
+struct ReplayingProvider {
+    inner: ReferenceCpuProvider,
+    executor: Arc<ReplayingExecutor>,
+}
+
+impl Provider for ReplayingProvider {
+    fn metadata(&self) -> ProviderMetadata {
+        self.inner.metadata()
+    }
+    fn register(&self, registry: &mut ProviderRegistry) -> Result<(), ProviderError> {
+        self.inner.register(registry)
+    }
+    fn health(&self) -> ProviderHealth {
+        self.inner.health()
+    }
+    fn devices(&self) -> Vec<Arc<dyn Device>> {
+        self.inner.devices()
+    }
+    fn kernel_advertisements(&self) -> Vec<KernelAdvertisement> {
+        self.inner.kernel_advertisements()
+    }
+    fn execution_api(&self) -> Option<Arc<dyn ProviderExecutionApi>> {
+        Some(self.executor.clone())
+    }
+}
+
+/// Runs a prefill and `decode_steps` decode steps of one request on a
+/// [`ReplayingExecutor`] Runtime, returning each step's logits bits.
+/// `before_step(executor, decode_index)` runs before each decode step.
+fn run_replaying_decode(
+    replay: bool,
+    release_request: bool,
+    decode_steps: usize,
+    before_step: impl Fn(&ReplayingExecutor, usize),
+) -> (Vec<Vec<u32>>, Arc<ReplayingExecutor>, Runtime) {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let executor = Arc::new(ReplayingExecutor::new());
+    let provider = Arc::new(ReplayingProvider {
+        inner: ReferenceCpuProvider::new(),
+        executor: executor.clone(),
+    });
+    let mut runtime =
+        build_runtime_with_model_execution_engine_and_provider(&fixture, provider).unwrap();
+    let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let tokenized = tokenize_prompt_input(
+        &fixture.tokenizer,
+        TokenizationRequest::new(PromptInput::TokenIds(vec![1, 2])),
+        None,
+    )
+    .unwrap();
+    let request = prepare_generation(
+        &runtime,
+        build_generation_request(
+            GenerationRequestId::new("step-replay").unwrap(),
+            None,
+            GenerationModelReference::ModelInstance(instance.clone()),
+            generation_tokenizer_reference(&fixture),
+            tokenized,
+            decode_steps + 1,
+            GenerationParameters::greedy(),
+            StopConditions::default(),
+            StreamingMode::Disabled,
+        ),
+    )
+    .unwrap();
+    let engine = new_kv_lifecycle_engine(&fixture);
+    engine.step_replay.set_enabled(replay);
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        &fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )
+    .unwrap();
+    let bits = |logits: &[f32]| logits.iter().map(|value| value.to_bits()).collect();
+    let mut steps = Vec::new();
+    let prefill = engine
+        .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+        .unwrap();
+    steps.push(bits(&prefill.logits));
+    engine
+        .commit_generation_step(&mut runtime, &request, &[], 1, &prefill)
+        .unwrap();
+    let mut generated = vec![1];
+    for index in 1..=decode_steps {
+        before_step(&executor, index);
+        let step = engine
+            .execute_generation_step(&mut runtime, &request, &generated, Some(&mut plans.decode))
+            .unwrap();
+        steps.push(bits(&step.logits));
+        let token = (index % 3 + 1) as TokenId;
+        engine
+            .commit_generation_step(&mut runtime, &request, &generated, token, &step)
+            .unwrap();
+        generated.push(token);
+    }
+    if release_request {
+        engine
+            .release_request_state(&mut runtime, &request)
+            .unwrap();
+    }
+    (steps, executor, runtime)
+}
+
+#[test]
+fn replayed_decode_steps_match_per_node_steps_bit_for_bit() {
+    let (per_node, executor, _) = run_replaying_decode(false, true, 6, |_, _| {});
+    assert_eq!(executor.counts(), (0, 0, 0));
+    let (replayed, executor, _) = run_replaying_decode(true, true, 6, |_, _| {});
+    assert_eq!(per_node, replayed);
+    // Captured at the second decode step, replayed at the four after it,
+    // released with the request.
+    assert_eq!(executor.counts(), (1, 4, 0));
+}
+
+#[test]
+fn an_invalidated_replay_runs_per_node_and_captures_again() {
+    let (per_node, _, _) = run_replaying_decode(false, true, 6, |_, _| {});
+    let (replayed, executor, _) = run_replaying_decode(true, true, 6, |executor, index| {
+        if index == 4 {
+            executor
+                .invalidate_next_replay
+                .store(true, Ordering::SeqCst);
+        }
+    });
+    assert_eq!(per_node, replayed);
+    // Step 3 replays; step 4's replay is invalidated, so it runs per node
+    // and step 5 captures again; step 6 replays.
+    assert_eq!(executor.counts(), (2, 2, 0));
+}
+
+#[test]
+fn a_failed_capture_runs_the_step_per_node_and_stops_capturing() {
+    let (per_node, _, _) = run_replaying_decode(false, true, 5, |_, _| {});
+    let (replayed, executor, _) = run_replaying_decode(true, true, 5, |executor, _| {
+        executor.fail_capture.store(true, Ordering::SeqCst);
+    });
+    assert_eq!(per_node, replayed);
+    assert_eq!(executor.counts(), (0, 0, 0));
+}
+
+#[test]
+fn dropping_the_engine_releases_captures_its_requests_never_released() {
+    let (_, executor, _) = run_replaying_decode(true, false, 4, |_, _| {});
+    // Captured and replayed, then released when the engine dropped.
+    assert_eq!(executor.counts(), (1, 2, 0));
 }

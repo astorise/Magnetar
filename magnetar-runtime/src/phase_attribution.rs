@@ -81,6 +81,13 @@ pub enum StepPhase {
     /// Binding a node's outputs to their graph edges, exclusive of the KV
     /// and edge-write leaves nested in it.
     NodeOutputBind,
+    /// Starting or ending a decode-step capture
+    /// (`capture-and-replay-cuda-graphs`): when ending it runs the captured
+    /// work, that work's Device time is included.
+    StepCapture,
+    /// Replaying a captured decode step instead of dispatching its nodes,
+    /// up to the Provider's return.
+    StepReplay,
     /// Downloading the graph's live edges to the host at the end of the step.
     OutputMaterialize,
     /// Copying the last row of logits out of the materialized output.

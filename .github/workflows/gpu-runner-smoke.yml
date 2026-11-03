@@ -195,6 +195,20 @@ jobs:
           set -eux
           export MAGNETAR_QUALIFICATION_SUMMARY_PATH="$GITHUB_STEP_SUMMARY"
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_decode_cost_profile -- --include-ignored --test-threads=1 --nocapture
+      - name: Real-checkpoint CUDA decode cost profile, per node (diagnostic)
+        # capture-and-replay-cuda-graphs' disable control: the same profile
+        # with decode-step replay off, every step dispatched per node.
+        timeout-minutes: 30
+        env:
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_QUALIFICATION_PROFILE_TOKENS: "64"
+          MAGNETAR_QUALIFICATION_STEP_REPLAY: "0"
+          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports
+        run: |
+          set -eux
+          export MAGNETAR_QUALIFICATION_SUMMARY_PATH="$GITHUB_STEP_SUMMARY"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_decode_cost_profile -- --include-ignored --test-threads=1 --nocapture
       - name: Real-checkpoint qualification campaign on CUDA (cost per token)
         # qualify-real-checkpoint-performance A01/A04: one load, one cold
         # request, one warmup and five measured greedy requests of 128 new
