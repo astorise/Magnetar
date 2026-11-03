@@ -1285,70 +1285,87 @@ const STEP_CAPTURE_DECODE_INDEX: usize = 2;
 
 /// Decode-step capture and replay (`capture-and-replay-cuda-graphs`), shared
 /// by an engine and the `ProductionLoadedModel` that owns it.
-#[derive(Clone)]
-pub(crate) struct StepReplay {
-    enabled: Arc<std::sync::atomic::AtomicBool>,
+#[derive(Clone, Default)]
+pub(crate) struct StepReplay(Arc<StepReplayState>);
+
+struct StepReplayState {
+    enabled: std::sync::atomic::AtomicBool,
     /// Each request's captured decode step, by KV state key.
-    recorded: Arc<Mutex<BTreeMap<String, RecordedDecodeStep>>>,
+    recorded: Mutex<BTreeMap<String, RecordedDecodeStep>>,
     /// Requests whose capture failed: they run every step per node.
-    declined: Arc<Mutex<BTreeSet<String>>>,
+    declined: Mutex<BTreeSet<String>>,
 }
 
-impl Default for StepReplay {
+impl Default for StepReplayState {
     fn default() -> Self {
         Self {
-            enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            recorded: Arc::default(),
-            declined: Arc::default(),
+            enabled: std::sync::atomic::AtomicBool::new(true),
+            recorded: Mutex::default(),
+            declined: Mutex::default(),
+        }
+    }
+}
+
+/// Releases every capture still held, however the requests that made them
+/// ended: a capture holds Provider resources (a CUDA graph executable).
+impl Drop for StepReplayState {
+    fn drop(&mut self) {
+        if let Ok(recorded) = self.recorded.get_mut() {
+            for step in recorded.values() {
+                step.executor.release_step_capture(&step.capture);
+            }
         }
     }
 }
 
 impl StepReplay {
     pub(crate) fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
+        self.0.enabled.store(enabled, Ordering::Relaxed);
     }
 
     fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
+        self.0.enabled.load(Ordering::Relaxed)
     }
 
     fn recorded(&self, key: &str) -> Option<RecordedDecodeStep> {
-        self.recorded.lock().ok()?.get(key).cloned()
+        self.0.recorded.lock().ok()?.get(key).cloned()
     }
 
     fn record(&self, key: String, step: RecordedDecodeStep) {
-        if let Ok(mut recorded) = self.recorded.lock() {
-            recorded.insert(key, step);
+        if let Ok(mut recorded) = self.0.recorded.lock()
+            && let Some(replaced) = recorded.insert(key, step)
+        {
+            replaced.executor.release_step_capture(&replaced.capture);
         }
     }
 
-    fn take(&self, key: &str) -> Option<RecordedDecodeStep> {
-        self.recorded.lock().ok()?.remove(key)
-    }
-
     fn decline(&self, key: String) {
-        if let Ok(mut declined) = self.declined.lock() {
+        if let Ok(mut declined) = self.0.declined.lock() {
             declined.insert(key);
         }
     }
 
     fn is_declined(&self, key: &str) -> bool {
-        self.declined
+        self.0
+            .declined
             .lock()
             .map(|declined| declined.contains(key))
             .unwrap_or(true)
     }
 
-    /// Forgets a finished request, releasing its capture.
-    fn release(&self, runtime: &Runtime, key: &str) {
-        if let Ok(mut declined) = self.declined.lock() {
+    /// Forgets a request, releasing its capture.
+    fn release(&self, key: &str) {
+        if let Ok(mut declined) = self.0.declined.lock() {
             declined.remove(key);
         }
-        if let Some(step) = self.take(key)
-            && let Ok(provider) = resolve_kernel_execution_provider(runtime, &step.provider)
-        {
-            provider.release_step_capture(&step.capture);
+        let step = self
+            .0
+            .recorded
+            .lock()
+            .ok()
+            .and_then(|mut recorded| recorded.remove(key));
+        if let Some(step) = step {
+            step.executor.release_step_capture(&step.capture);
         }
     }
 }
@@ -1357,6 +1374,8 @@ impl StepReplay {
 #[derive(Clone)]
 struct RecordedDecodeStep {
     capture: StepCaptureId,
+    /// The Provider holding the capture.
+    executor: Arc<dyn ProviderExecutionApi>,
     provider: ProviderBinding,
     /// The absolute position of the captured step.
     position: u64,
@@ -4948,7 +4967,7 @@ fn replay_decode_step(
         };
         layer.rows = Some(rows);
     }
-    let executor = resolve_kernel_execution_provider(runtime, &recorded.provider)?;
+    let executor = recorded.executor.clone();
     let replay_clock = runtime.phase_ledger().clock();
     let replayed = executor.replay_step(
         &recorded.capture,
@@ -5333,8 +5352,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         runtime: &mut Runtime,
         request: &GenerationRequest,
     ) -> Result<(), InferenceApiError> {
-        self.step_replay
-            .release(runtime, &Self::kv_state_key(request));
+        self.step_replay.release(&Self::kv_state_key(request));
         self.discard_pending_kv_state(runtime, request)?;
         let committed = self
             .kv_states
@@ -5743,7 +5761,7 @@ impl E2eRuntimeModelExecutionEngine {
                 }
                 // Invalidated: this step runs per node, a later one may
                 // capture again.
-                self.step_replay.release(runtime, &key);
+                self.step_replay.release(&key);
             } else if decode_index >= STEP_CAPTURE_DECODE_INDEX
                 && !self.step_replay.is_declined(&key)
             {
@@ -5903,6 +5921,7 @@ impl E2eRuntimeModelExecutionEngine {
             .record(materialize_clock, StepPhase::OutputMaterialize);
         let recorded = RecordedDecodeStep {
             capture,
+            executor: executor.clone(),
             provider: provider.clone(),
             position: absolute_position,
             input,

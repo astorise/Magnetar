@@ -11117,6 +11117,7 @@ impl Provider for ReplayingProvider {
 /// `before_step(executor, decode_index)` runs before each decode step.
 fn run_replaying_decode(
     replay: bool,
+    release_request: bool,
     decode_steps: usize,
     before_step: impl Fn(&ReplayingExecutor, usize),
 ) -> (Vec<Vec<u32>>, Arc<ReplayingExecutor>, Runtime) {
@@ -11181,17 +11182,19 @@ fn run_replaying_decode(
             .unwrap();
         generated.push(token);
     }
-    engine
-        .release_request_state(&mut runtime, &request)
-        .unwrap();
+    if release_request {
+        engine
+            .release_request_state(&mut runtime, &request)
+            .unwrap();
+    }
     (steps, executor, runtime)
 }
 
 #[test]
 fn replayed_decode_steps_match_per_node_steps_bit_for_bit() {
-    let (per_node, executor, _) = run_replaying_decode(false, 6, |_, _| {});
+    let (per_node, executor, _) = run_replaying_decode(false, true, 6, |_, _| {});
     assert_eq!(executor.counts(), (0, 0, 0));
-    let (replayed, executor, _) = run_replaying_decode(true, 6, |_, _| {});
+    let (replayed, executor, _) = run_replaying_decode(true, true, 6, |_, _| {});
     assert_eq!(per_node, replayed);
     // Captured at the second decode step, replayed at the four after it,
     // released with the request.
@@ -11200,8 +11203,8 @@ fn replayed_decode_steps_match_per_node_steps_bit_for_bit() {
 
 #[test]
 fn an_invalidated_replay_runs_per_node_and_captures_again() {
-    let (per_node, _, _) = run_replaying_decode(false, 6, |_, _| {});
-    let (replayed, executor, _) = run_replaying_decode(true, 6, |executor, index| {
+    let (per_node, _, _) = run_replaying_decode(false, true, 6, |_, _| {});
+    let (replayed, executor, _) = run_replaying_decode(true, true, 6, |executor, index| {
         if index == 4 {
             executor
                 .invalidate_next_replay
@@ -11216,10 +11219,17 @@ fn an_invalidated_replay_runs_per_node_and_captures_again() {
 
 #[test]
 fn a_failed_capture_runs_the_step_per_node_and_stops_capturing() {
-    let (per_node, _, _) = run_replaying_decode(false, 5, |_, _| {});
-    let (replayed, executor, _) = run_replaying_decode(true, 5, |executor, _| {
+    let (per_node, _, _) = run_replaying_decode(false, true, 5, |_, _| {});
+    let (replayed, executor, _) = run_replaying_decode(true, true, 5, |executor, _| {
         executor.fail_capture.store(true, Ordering::SeqCst);
     });
     assert_eq!(per_node, replayed);
     assert_eq!(executor.counts(), (0, 0, 0));
+}
+
+#[test]
+fn dropping_the_engine_releases_captures_its_requests_never_released() {
+    let (_, executor, _) = run_replaying_decode(true, false, 4, |_, _| {});
+    // Captured and replayed, then released when the engine dropped.
+    assert_eq!(executor.counts(), (1, 2, 0));
 }
