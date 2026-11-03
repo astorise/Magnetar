@@ -1,8 +1,8 @@
 ## 1. Scope and compatibility
 
-- [ ] 1.1 Reconcile B01, B02 with the existing contracts linked in proposal.md and record the exact initial supported profile.
+- [x] 1.1 Reconcile B01, B02 with the existing contracts linked in proposal.md and record the exact initial supported profile. Recorded in design.md: lossless bfloat16 weight storage.
 - [ ] 1.2 Confirm upstream exit-gate dependencies, hardware access, checkpoint authorization, numeric/quality thresholds and memory/SLO budgets.
-- [ ] 1.3 Prefer current WIT; if new portable operators/state/results are needed, design a versioned additive extension, migration and unsupported behavior before implementation.
+- [x] 1.3 Prefer current WIT; if new portable operators/state/results are needed, design a versioned additive extension, migration and unsupported behavior before implementation. No WIT change: `ProviderExecutionApi::write_weight_tensor` only.
 
 ## 2. B01 End to end native half precision
 
