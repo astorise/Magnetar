@@ -897,12 +897,20 @@ fn fast_greedy_selection(
     let mut excluded = excluded_candidate_positions(request, scores.len())?;
     excluded.sort_by_key(|range| range.start);
     let start = tokenizer.token_id_range.start;
+    // Compare the scores `apply_temperature` would produce: its rounding
+    // can tie two scores, and a tie selects the lower token id.
+    let temperature = parameters.temperature;
     let mut best: Option<(f32, TokenId)> = None;
     let mut consider = |range: std::ops::Range<usize>| {
         for (index, &score) in scores[range.clone()].iter().enumerate() {
             if !score.is_finite() {
                 continue;
             }
+            let score = if temperature == 0.0 {
+                score
+            } else {
+                score / temperature
+            };
             let key = (score, start.saturating_add((range.start + index) as u32));
             if best.is_none_or(|current| candidate_order(key, current).is_lt()) {
                 best = Some(key);

@@ -324,6 +324,7 @@ fn fast_path_tokenizer(vocabulary: u32) -> TokenizerMetadata {
 #[test]
 fn fast_greedy_selection_matches_the_general_path() {
     let mut rng = Rng(0x5eed_fa57);
+    let mut selected = 0;
     for round in 0..200u32 {
         let vocabulary = 64 + (rng.next_u64() % 64) as u32;
         let mut scores: Vec<f32> = (0..vocabulary).map(|_| rng.score()).collect();
@@ -341,6 +342,10 @@ fn fast_greedy_selection_matches_the_general_path() {
             fast_path_tokenizer(vocabulary),
         );
         request.parameters.greedy = true;
+        request.parameters.sampling_enabled = false;
+        // Temperature rounding can tie scores; a tiny temperature overflows
+        // finite scores to infinity.
+        request.parameters.temperature = [1.0, 0.7, 0.0, 1.3, 1e-38][(round % 5) as usize];
         request.step_index = (rng.next_u64() % 3) as usize;
         request.policy.suppress_pad = rng.next_u64().is_multiple_of(2);
         request.policy.suppress_additional_special_tokens = rng.next_u64().is_multiple_of(2);
@@ -360,6 +365,7 @@ fn fast_greedy_selection_matches_the_general_path() {
         let general = select_next_token(&general);
         match (fast, general) {
             (Ok(fast), Ok(general)) => {
+                selected += 1;
                 assert_eq!(
                     fast.selected_token_id, general.selected_token_id,
                     "round {round}"
@@ -373,4 +379,25 @@ fn fast_greedy_selection_matches_the_general_path() {
             (fast, general) => panic!("round {round}: {fast:?} vs {general:?}"),
         }
     }
+    // Most rounds select a token rather than agree on an error.
+    assert!(selected > 150, "only {selected} rounds selected a token");
+}
+
+#[test]
+fn fast_greedy_selection_breaks_temperature_ties_like_the_general_path() {
+    // Tokens 4 and 5 divide by 0.7 to the same f32; the lower id wins.
+    let mut scores = vec![-1.0_f32; 16];
+    scores[4] = 1.400_000_1;
+    scores[5] = 1.400_000_2;
+    let mut request = SamplingRequest::host_scores(
+        SamplingRequestId::new("fast-tie").unwrap(),
+        scores,
+        fast_path_tokenizer(16),
+    );
+    request.parameters.greedy = true;
+    request.parameters.sampling_enabled = false;
+    request.parameters.temperature = 0.7;
+    assert_ne!(1.400_000_1_f32, 1.400_000_2_f32);
+    assert_eq!(1.400_000_1_f32 / 0.7, 1.400_000_2_f32 / 0.7);
+    assert_eq!(select_next_token(&request).unwrap().selected_token_id, 4);
 }
