@@ -9,6 +9,10 @@
 //! which tokens survive is a correctness bug, not a speedup.
 
 use super::*;
+use crate::{
+    ModelDigest, SpecialToken, TokenIdRange, TokenizerArtifactId, TokenizerFamily, TokenizerId,
+    TokenizerRevision,
+};
 
 /// Deterministic pseudorandom source, so a failure reproduces exactly.
 struct Rng(u64);
@@ -283,4 +287,90 @@ fn greedy_selection_matches_softmax_and_rank_over_the_eligible_candidates() {
         greedy_selection(&candidates, true),
         Err(SamplingError::NoEligibleToken)
     ));
+}
+
+fn fast_path_tokenizer(vocabulary: u32) -> TokenizerMetadata {
+    TokenizerMetadata {
+        id: TokenizerId::new("fast-path").unwrap(),
+        artifact: TokenizerArtifactId::new("fast-path-tokenizer").unwrap(),
+        digest: ModelDigest::sha256(b"tokenizer"),
+        family: TokenizerFamily::new("fast-path").unwrap(),
+        revision: TokenizerRevision::new("1.0.0").unwrap(),
+        vocabulary_size: vocabulary,
+        added_token_count: 0,
+        token_id_range: TokenIdRange::new(0, vocabulary),
+        model_max_length: None,
+        special_tokens: vec![
+            SpecialToken::new(SpecialTokenKind::Eos, "<eos>", vocabulary - 1),
+            SpecialToken::new(SpecialTokenKind::Pad, "<pad>", 3),
+        ],
+        additional_special_tokens: vec![SpecialToken::new(
+            SpecialTokenKind::Additional,
+            "<extra>",
+            vocabulary - 2,
+        )],
+        byte_fallback: false,
+        normalization: None,
+        pre_tokenizer: None,
+        supports_offsets: false,
+        supports_token_type_ids: false,
+        supports_browser: false,
+    }
+}
+
+/// The greedy fast path selects the same token, with the same rank, as the
+/// general candidate path, which an allowed list naming every token forces
+/// without changing which tokens are eligible.
+#[test]
+fn fast_greedy_selection_matches_the_general_path() {
+    let mut rng = Rng(0x5eed_fa57);
+    for round in 0..200u32 {
+        let vocabulary = 64 + (rng.next_u64() % 64) as u32;
+        let mut scores: Vec<f32> = (0..vocabulary).map(|_| rng.score()).collect();
+        for _ in 0..3 {
+            let index = (rng.next_u64() % u64::from(vocabulary)) as usize;
+            scores[index] = match rng.next_u64() % 3 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                _ => f32::NEG_INFINITY,
+            };
+        }
+        let mut request = SamplingRequest::host_scores(
+            SamplingRequestId::new(format!("fast-{round}")).unwrap(),
+            scores,
+            fast_path_tokenizer(vocabulary),
+        );
+        request.parameters.greedy = true;
+        request.step_index = (rng.next_u64() % 3) as usize;
+        request.policy.suppress_pad = rng.next_u64() % 2 == 0;
+        request.policy.suppress_additional_special_tokens = rng.next_u64() % 2 == 0;
+        request.stop.minimum_generated_tokens = Some(2);
+        request.stop.mask_stop_tokens_before_minimum = rng.next_u64() % 2 == 0;
+        request.stop.stop_token_ids = vec![(rng.next_u64() % u64::from(vocabulary)) as u32];
+        request.banned_token_ids = (0..(rng.next_u64() % 4))
+            .map(|_| (rng.next_u64() % u64::from(vocabulary)) as u32)
+            .collect();
+        if round % 5 == 0 {
+            // A banned run past the vocabulary's end.
+            request.banned_token_ids.push(TokenId::MAX);
+        }
+        let fast = select_next_token(&request);
+        let mut general = request.clone();
+        general.parameters.allowed_token_ids = Some((0..vocabulary).collect());
+        let general = select_next_token(&general);
+        match (fast, general) {
+            (Ok(fast), Ok(general)) => {
+                assert_eq!(
+                    fast.selected_token_id, general.selected_token_id,
+                    "round {round}"
+                );
+                assert_eq!(fast.token_rank, general.token_rank, "round {round}");
+                assert_eq!(fast.finish_hint, general.finish_hint, "round {round}");
+            }
+            (Err(fast), Err(general)) => {
+                assert_eq!(format!("{fast:?}"), format!("{general:?}"), "round {round}");
+            }
+            (fast, general) => panic!("round {round}: {fast:?} vs {general:?}"),
+        }
+    }
 }
