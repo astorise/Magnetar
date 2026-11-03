@@ -486,7 +486,10 @@ fn real_checkpoint_logits_match_the_reference_corpus() {
         model.set_step_replay(true);
         let replay_comparison = compare_logit_references(&per_node, &replayed, &profile);
         assert!(
-            replay_comparison.steps.iter().all(|step| step.bit_identical),
+            replay_comparison
+                .steps
+                .iter()
+                .all(|step| step.bit_identical),
             "[{provider_name}] replayed decode steps differ from per-node ones: {:?}",
             replay_comparison.failures
         );
