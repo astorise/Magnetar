@@ -2052,12 +2052,13 @@ struct FirstNativeDispatchContext<'a> {
     /// than a caller-fabricated id. `None` until the first successful
     /// dispatch.
     last_provider_execution: Option<ProviderExecutionResult>,
-    /// The last `concat` (KV-history append) selection and what it was
-    /// selected for. Every layer's K and V append in a step asks the
+    /// The last selection made for an Operator the Runtime adds to the step
+    /// itself (the KV history append's `concat` or `kv-write`), and what it
+    /// was selected for. Every layer's K and V append in a step asks the
     /// registry the same question (same operator, affinity, memory class,
     /// tensor descriptors and affinities); the registry does not change
     /// while a graph executes, so the answer is reused.
-    concat_selection: Option<(ConcatSelectionKey, KernelCandidate)>,
+    internal_selection: Option<(InternalSelectionKey, KernelCandidate)>,
     /// Per-node causal-chain events (Correctif 17 / task group 17), pushed
     /// directly into the caller's own `Vec` (not accumulated locally and
     /// drained only on success) as each node's dispatch progresses through
@@ -2739,7 +2740,8 @@ fn dispatch_qwen_matmul(
 /// Everything a `concat` selection depends on besides the registry: the
 /// request's affinity and memory class and each resource's descriptor and
 /// affinity (not its id).
-type ConcatSelectionKey = (
+type InternalSelectionKey = (
+    OperatorId,
     ResourceAffinity,
     KernelMemoryClass,
     Vec<(TensorDescriptor, ResourceAffinity)>,
@@ -2793,27 +2795,51 @@ fn dispatch_qwen_concat(
         });
     }
     let output_descriptor = f32_tensor_descriptor_from_shape(&[a_rows + b_rows, a_cols]);
+    let output = resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
+    dispatch_runtime_internal_operator(
+        ctx,
+        operation_id,
+        real_node,
+        dispatch_operator_id("concat", OperatorFamily::Tensor),
+        [("a", a), ("b", b)],
+        output,
+        BTreeMap::new(),
+    )
+}
+
+/// Dispatches an Operator the Runtime adds to a graph step itself (the KV
+/// history append's `concat` or `kv-write`), not a node of the graph: there
+/// is no Prepared Plan binding for it, so its Kernel comes from a live
+/// Kernel Registry selection (reused while the same request repeats within
+/// a graph execution), with `real_node`'s own resolved affinity so it
+/// targets the Provider that node is bound to. `output` is the resource the
+/// Kernel writes, already admitted by the caller when it needs to be.
+fn dispatch_runtime_internal_operator<const N: usize>(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    real_node: &ExecutionNodeId,
+    operator: OperatorId,
+    inputs: [(&str, NodeValue); N],
+    output: (TensorResourceId, TensorDescriptor),
+    attributes: BTreeMap<String, OperatorAttributeValue>,
+) -> Result<NodeValue, InferenceApiError> {
+    let (output_id, output_descriptor) = output;
     let affinity = resolved_resource_affinity(
         ctx.prepared_plan.as_deref(),
         real_node,
         ctx.runtime.context().id(),
     );
     let memory_class = resolved_kernel_memory_class(ctx.prepared_plan.as_deref(), real_node);
-    let (output_id, output_descriptor) =
-        resolve_output_target(ctx, operation_id, output_descriptor, output_target)?;
     let output_resource =
         TensorResourceDescriptor::new(output_id.clone(), output_descriptor, affinity.clone());
     let mut selection_request = KernelSelectionRequest::new(
         format!("e2e-runtime-{operation_id}"),
-        dispatch_operator_id("concat", OperatorFamily::Tensor),
+        operator.clone(),
         affinity.clone(),
     )
     .with_output(KernelResource::new(output_resource.clone(), memory_class));
-    let inputs = [
-        node_input_resource(operation_id, "a", a),
-        node_input_resource(operation_id, "b", b),
-    ];
-    for input in inputs {
+    for (name, value) in inputs {
+        let input = node_input_resource(operation_id, name, value);
         let resource = match input {
             NodeInputResource::Fresh(id, descriptor, tensor) => {
                 let resource =
@@ -2834,7 +2860,8 @@ fn dispatch_qwen_concat(
         selection_request =
             selection_request.with_input(KernelResource::new(resource, memory_class));
     }
-    let selection_key: ConcatSelectionKey = (
+    let selection_key: InternalSelectionKey = (
+        operator,
         affinity.clone(),
         memory_class,
         selection_request
@@ -2849,7 +2876,7 @@ fn dispatch_qwen_concat(
             })
             .collect(),
     );
-    let candidate = match &ctx.concat_selection {
+    let candidate = match &ctx.internal_selection {
         Some((key, candidate)) if *key == selection_key => candidate.clone(),
         _ => {
             let selection = ctx
@@ -2865,7 +2892,7 @@ fn dispatch_qwen_concat(
                     .ok_or_else(|| InferenceApiError::KernelUnavailable {
                         reason: format!("Kernel Registry selected no candidate for {operation_id}"),
                     })?;
-            ctx.concat_selection = Some((selection_key, candidate.clone()));
+            ctx.internal_selection = Some((selection_key, candidate.clone()));
             candidate
         }
     };
@@ -2887,6 +2914,7 @@ fn dispatch_qwen_concat(
     .map_err(|error| InferenceApiError::KernelUnavailable {
         reason: format!("{error:?}"),
     })?;
+    plan.invocation.attributes = attributes;
     let handle = ctx
         .provider
         .submit_kernel(
@@ -4073,7 +4101,7 @@ fn execute_first_native_graph_nodes(
         graph: Some(fingerprinted),
         sequence_length,
         last_provider_execution: None,
-        concat_selection: None,
+        internal_selection: None,
         node_events,
     };
     let layer_count = fixture.config.architecture.layer_count as usize;
@@ -10348,7 +10376,7 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
         graph: None,
         sequence_length: None,
         last_provider_execution: None,
-        concat_selection: None,
+        internal_selection: None,
         node_events: &mut node_events,
     };
     let architecture = &fixture.config.architecture;
