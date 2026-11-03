@@ -2869,19 +2869,19 @@ fn dispatch_qwen_concat(
             candidate
         }
     };
-    let advertisement = ctx
-        .runtime
-        .kernel_registry()
+    // Borrowed alongside the Memory Manager instead of copied, as in
+    // `dispatch_reference_cpu_operator_multi`.
+    let (registry, memory, _phases) = ctx.runtime.kernel_registry_memory_and_phases_mut();
+    let advertisement = registry
         .active_advertisement(&candidate.kernel)
         .ok_or_else(|| InferenceApiError::KernelUnavailable {
             reason: format!("selected advertisement for {operation_id} is no longer active"),
-        })?
-        .clone();
+        })?;
     let mut plan = KernelDispatchPlan::from_selection(
         KernelDispatchPlanId::new(format!("e2e-runtime-{operation_id}-dispatch")),
         &selection_request,
         &candidate,
-        &advertisement,
+        advertisement,
         KernelInvocationId::new(format!("e2e-runtime-{operation_id}-invocation")),
     )
     .map_err(|error| InferenceApiError::KernelUnavailable {
@@ -2890,14 +2890,14 @@ fn dispatch_qwen_concat(
     let handle = ctx
         .provider
         .submit_kernel(
-            &advertisement,
+            advertisement,
             shared_initial_operator_catalog()
                 .get(&advertisement.implemented_operator)
                 .map_err(|error| InferenceApiError::KernelUnavailable {
                     reason: error.to_string(),
                 })?,
             &plan.invocation,
-            ctx.runtime.memory_mut(),
+            memory,
         )
         .map_err(|error| InferenceApiError::ProviderUnavailable {
             reason: format!(
@@ -2905,7 +2905,7 @@ fn dispatch_qwen_concat(
             ),
         })?;
     if let Some(workspace) = plan.workspace_reservation.take() {
-        let _ = ctx.runtime.memory_mut().release(workspace);
+        let _ = memory.release(workspace);
     }
     let kernel_result = ctx.provider.complete_kernel(&handle).map_err(|error| {
         InferenceApiError::ProviderUnavailable {
