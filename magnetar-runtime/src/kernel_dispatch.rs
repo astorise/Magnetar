@@ -286,9 +286,10 @@ impl KernelDispatchPlan {
         })
     }
 
-    /// [`Self::from_prepared_node_execution`], taking the request by value
-    /// so its input and output bindings are moved into the plan rather than
-    /// copied (the invocation still gets its own copy).
+    /// [`Self::from_prepared_node_execution`], taking the request by value:
+    /// its inputs and outputs are moved into the invocation, and the plan
+    /// keeps no second copy of them in `input_bindings`/`output_bindings`
+    /// (revalidation checks the invocation's own resources).
     pub fn from_prepared_node_execution_owned(
         id: KernelDispatchPlanId,
         request: KernelSelectionRequest,
@@ -321,8 +322,8 @@ impl KernelDispatchPlan {
             prepared.provider.clone(),
             affinity,
         );
-        invocation.inputs = inputs.clone();
-        invocation.outputs = outputs.clone();
+        invocation.inputs = inputs;
+        invocation.outputs = outputs;
         invocation.device = prepared.device.clone();
         invocation.execution_mode = execution_mode.unwrap_or_else(|| {
             advertisement
@@ -343,8 +344,10 @@ impl KernelDispatchPlan {
             selected_kernel: prepared.kernel.clone(),
             provider: prepared.provider.clone(),
             device: prepared.device.clone(),
-            input_bindings: inputs,
-            output_bindings: outputs,
+            // Not duplicated: the invocation holds the resources, and
+            // revalidation checks them there.
+            input_bindings: Vec::new(),
+            output_bindings: Vec::new(),
             workspace_reservation: invocation.workspace,
             execution_mode: invocation.execution_mode,
             cancellation: advertisement.cancellation,
@@ -598,9 +601,15 @@ impl KernelDispatcher {
             );
             return Err(error);
         }
+        // The invocation's own resources, and the plan's binding copies of
+        // them where the plan keeps any (`from_prepared_node_execution_owned`
+        // does not).
         for resource in plan
-            .input_bindings
+            .invocation
+            .inputs
             .iter()
+            .chain(plan.invocation.outputs.iter())
+            .chain(plan.input_bindings.iter())
             .chain(plan.output_bindings.iter())
         {
             if let Err(error) = validate_affinity_compatibility(
