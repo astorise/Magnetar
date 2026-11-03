@@ -30,6 +30,10 @@ Use the shared real-checkpoint harness and baseline corpus rather than inventing
 
 Promotion requires appropriate real hardware and a real checkpoint, error/cancellation/memory-pressure/isolation tests, before/after evidence, a disable control and a qualified fallback or structured Unsupported result. Experimental features remain disabled by default until qualified. Run existing Rust, WIT, OpenSpec, license/SBOM/signature and artifact-reproducibility gates for affected code. Compare tail latency and total memory as well as throughput, under the same budget. Publish limitations and do not infer a blanket speedup from heterogeneous runs.
 
+### Host baseline
+
+Before any sampling moves to the Device, greedy selection without probability metadata, masks, penalties or top-k/top-p takes a one-pass host path (`fast_greedy_selection`), tested against the general path on random scores. On an RTX 3060 with Qwen2.5-0.5B (GPU CI run 41718804397) it cut host sampling from 0.48 to 0.20 ms per token, and campaign TPOT from 5.3 to 5.0 ms (199.0 tok/s), logits and tokens unchanged. What remains is the 151936-value logits download and one pass over it, which this change targets.
+
 ## Risks / Trade-offs
 
 - A faster sampler cannot reorder penalties or claim deterministic equality across profiles that only promise distributional equivalence.
