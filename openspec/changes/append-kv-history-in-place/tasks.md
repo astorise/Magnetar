@@ -1,7 +1,7 @@
 ## 1. Operators and Reference CPU
 
-- [ ] 1.1 Add `kv-write` to the initial operator catalog (in-place memory behavior, `row_offset` attribute, capacity check) and the optional `attention` `key_count` attribute.
-- [ ] 1.2 Reference CPU: `kv-write` Kernel; `attention` honours `key_count` and advertises `key-count`. Unit tests, including a NaN-filled tail.
+- [x] 1.1 Add `kv-write` to the initial operator catalog (in-place memory behavior, `row_offset` attribute, capacity check) and the optional `attention` `key_count` attribute.
+- [x] 1.2 Reference CPU: `kv-write` Kernel; `attention` honours `key_count` and advertises `key-count`. Unit tests, including a NaN-filled tail.
 
 ## 2. First-native engine
 

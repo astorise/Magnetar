@@ -538,6 +538,61 @@ pub fn softmax_rows(input: &HostTensor) -> Result<HostTensor, ReferenceCpuError>
     HostTensor::new(input.shape.clone(), out)
 }
 
+/// The `attention` Kernel feature a Provider advertises when it honours the
+/// `key_count` attribute (`append-kv-history-in-place`).
+pub const KEY_COUNT_FEATURE: &str = "key-count";
+
+/// The first `count` rows of a rank-2 tensor.
+pub fn leading_rows(tensor: &HostTensor, count: u64) -> Result<HostTensor, ReferenceCpuError> {
+    let (rows, cols) = tensor.rows_cols()?;
+    if count > rows {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("key_count {count} exceeds the {rows} rows of K/V"),
+        ));
+    }
+    HostTensor::new(
+        [count, cols],
+        tensor.data[..(count * cols) as usize].to_vec(),
+    )
+    .map_err(|error| {
+        ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, error.to_string())
+    })
+}
+
+/// `store` with `rows` written over its rows `row_offset..row_offset +
+/// rows` (`kv-write`, `append-kv-history-in-place`). Rows outside that range
+/// are unchanged.
+pub fn kv_write(
+    store: &HostTensor,
+    rows: &HostTensor,
+    row_offset: u64,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let (capacity, width) = store.rows_cols()?;
+    let (count, row_width) = rows.rows_cols()?;
+    if row_width != width {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("kv-write rows have width {row_width}, the store {width}"),
+        ));
+    }
+    if row_offset
+        .checked_add(count)
+        .is_none_or(|end| end > capacity)
+    {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("kv-write of {count} rows at {row_offset} exceeds the store's {capacity} rows"),
+        ));
+    }
+    let mut data = store.data.clone();
+    let start = (row_offset * width) as usize;
+    data[start..start + rows.data.len()].copy_from_slice(&rows.data);
+    HostTensor::new([capacity, width], data).map_err(|error| {
+        ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, error.to_string())
+    })
+}
+
 /// Simple causal (or unmasked) scaled dot-product attention over `head_count`
 /// query heads of `head_dimension` each. `q` has shape
 /// `[sequence_length, head_count * head_dimension]`; `k`/`v` have shape
@@ -1137,6 +1192,8 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         memory_classes: BTreeSet::new(),
         affinity: None,
     });
+    // Honours the `key_count` attribute (`append-kv-history-in-place`).
+    attention.id.features.insert(KEY_COUNT_FEATURE.to_string());
     let embedding = baseline_advertisement("embedding", OperatorFamily::Tensor);
 
     vec![
@@ -1155,6 +1212,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("add", OperatorFamily::Tensor),
         baseline_advertisement("mul", OperatorFamily::Tensor),
         baseline_advertisement("concat", OperatorFamily::Tensor),
+        baseline_advertisement("kv-write", OperatorFamily::Tensor),
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
         baseline_advertisement("layout-conversion", OperatorFamily::Layout),
@@ -2243,6 +2301,16 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 }
+                // `append-kv-history-in-place`: only the first `key_count`
+                // rows of K and V are the key sequence; the rows beyond them
+                // are never read.
+                let (k, v) = match Self::attribute_integer(&invocation.attributes, "key_count") {
+                    None => (k, v),
+                    Some(key_count) => (
+                        leading_rows(&k, key_count).map_err(KernelError::from)?,
+                        leading_rows(&v, key_count).map_err(KernelError::from)?,
+                    ),
+                };
                 attention(
                     &q,
                     &k,
@@ -2295,6 +2363,15 @@ impl ReferenceCpuExecutor {
                 let a = self.input_tensor(invocation, 0)?;
                 let b = self.input_tensor(invocation, 1)?;
                 concat(&a, &b).map_err(KernelError::from)?
+            }
+            "kv-write" => {
+                let store = self.input_tensor(invocation, 0)?;
+                let rows = self.input_tensor(invocation, 1)?;
+                let row_offset = Self::attribute_integer(&invocation.attributes, "row_offset")
+                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                        attribute: "row_offset".into(),
+                    })?;
+                kv_write(&store, &rows, row_offset).map_err(KernelError::from)?
             }
             "residual-add" => {
                 let input = self.input_tensor(invocation, 0)?;

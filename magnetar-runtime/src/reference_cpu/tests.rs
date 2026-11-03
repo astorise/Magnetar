@@ -2027,3 +2027,60 @@ fn reference_cpu_matmul_residual_and_silu_mul_are_bit_identical_to_their_pairs()
     let unfused = mul(&silu(&gate), &up).unwrap();
     assert_eq!(bits(&fused), bits(&unfused));
 }
+
+/// `append-kv-history-in-place`: attention over the first `key_count` rows
+/// of a store whose tail is NaN equals attention over exactly those rows,
+/// and `kv-write` writes rows in place without touching the rest.
+#[test]
+fn key_count_attention_ignores_the_store_tail_and_kv_write_writes_in_place() {
+    let width = 4u64;
+    let values = |rows: u64, seed: u64| {
+        (0..rows * width)
+            .map(|i| (((i * 37 + seed * 11) % 17) as f32) / 17.0 - 0.5)
+            .collect::<Vec<_>>()
+    };
+    let q = HostTensor::new([2, width], values(2, 1)).unwrap();
+    let k = HostTensor::new([5, width], values(5, 2)).unwrap();
+    let v = HostTensor::new([5, width], values(5, 3)).unwrap();
+    let expected = attention(&q, &k, &v, 2, 2, Some(2), None, true).unwrap();
+
+    let mut store_k = vec![f32::NAN; (8 * width) as usize];
+    let mut store_v = vec![f32::NAN; (8 * width) as usize];
+    store_k[..k.data.len()].copy_from_slice(&k.data);
+    store_v[..v.data.len()].copy_from_slice(&v.data);
+    let store_k = HostTensor::new([8, width], store_k).unwrap();
+    let store_v = HostTensor::new([8, width], store_v).unwrap();
+    let bounded = attention(
+        &q,
+        &leading_rows(&store_k, 5).unwrap(),
+        &leading_rows(&store_v, 5).unwrap(),
+        2,
+        2,
+        Some(2),
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(bounded.data, expected.data);
+    assert!(leading_rows(&store_k, 9).is_err());
+
+    let store = HostTensor::new([4, 2], vec![0.0; 8]).unwrap();
+    let rows = HostTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let written = kv_write(&store, &rows, 1).unwrap();
+    assert_eq!(written.data, vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
+    assert!(kv_write(&store, &rows, 3).is_err(), "past the capacity");
+    assert!(
+        kv_write(&store, &HostTensor::new([1, 3], vec![0.0; 3]).unwrap(), 0).is_err(),
+        "width mismatch"
+    );
+    let attention_advertisement = reference_cpu_kernel_advertisements()
+        .into_iter()
+        .find(|advertisement| advertisement.implemented_operator.name() == "attention")
+        .unwrap();
+    assert!(
+        attention_advertisement
+            .id
+            .features
+            .contains(KEY_COUNT_FEATURE)
+    );
+}

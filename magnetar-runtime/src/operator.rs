@@ -819,6 +819,9 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         ),
         ("mul", OperatorFamily::Tensor, 2, 1, ShapeRule::SameShape),
         ("concat", OperatorFamily::Tensor, 2, 1, ShapeRule::RowConcat),
+        // `append-kv-history-in-place`: writes `rows` into `store` at
+        // `row_offset`, in place; the output resource is the store itself.
+        ("kv-write", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         (
             "residual-add",
             OperatorFamily::Tensor,
@@ -887,6 +890,14 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
                 TensorLayoutKind::BrowserCompatible,
             ]);
         spec.attributes = default_attribute_schema(name);
+        if name == "kv-write" {
+            spec.memory = OperatorMemoryBehavior {
+                mutates_input: true,
+                aliases_output: true,
+                supports_in_place: true,
+                ..OperatorMemoryBehavior::pure()
+            };
+        }
         if matches!(family, OperatorFamily::Attention) {
             spec.memory = OperatorMemoryBehavior::pure()
                 .with_workspace()
@@ -948,7 +959,18 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "attention_mask_kind",
                 OperatorAttributeRule::optional(OperatorAttributeKind::String),
+            )
+            // `append-kv-history-in-place`: attend to the first `key_count`
+            // rows of K and V only (absent: every row). Set by the Runtime
+            // only for Kernels advertising the `key-count` feature.
+            .with_rule(
+                "key_count",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             ),
+        "kv-write" => OperatorAttributeSchema::default().with_rule(
+            "row_offset",
+            OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+        ),
         "rope" => OperatorAttributeSchema::default()
             .with_rule(
                 "base",
