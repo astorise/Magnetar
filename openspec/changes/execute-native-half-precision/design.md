@@ -8,6 +8,28 @@ Deliver the explicitly enumerated B01, B02 outcomes through Runtime typed resour
 
 ## Decisions
 
+### Initial profile: lossless bfloat16 weight storage (task 1.1)
+
+The first increment keeps every activation, intermediate, KV row and accumulation in f32, and changes only how weights are stored.
+
+- **Why it comes first.** After `capture-and-replay-cuda-graphs`, a Qwen2.5-0.5B decode step on an RTX 3060 is bound by the Device: the f32 weights it reads (1.98 GB) take about 5.5 ms of its 8.0 ms at the card's bandwidth.
+- **Why it is lossless.** The pinned checkpoint stores every weight as BF16. The f32 weights the Runtime materializes are exact upcasts of those values, so storing them as bfloat16 again loses nothing.
+
+**Contract.** `ProviderExecutionApi::write_weight_tensor` writes a Model Instance weight. A weight is never written again while its instance lives, so a Provider may keep it in any representation that reproduces every value exactly. The default writes it like any tensor. Graphs, descriptors, Operators, WIT and MemoryManager admission are unchanged: weights stay f32 tensors to every caller.
+
+**CUDA Provider.**
+- A weight is stored compact, as its bfloat16 bits, when:
+  - it is a matrix of at least 65 536 values;
+  - every one of its values has the low 16 bits of its f32 encoding at zero.
+- The matmul family reads a compact `b`, and the embedding lookup a compact table. Both convert each value back to the same f32 inside the Kernel, with the same accumulation order, so their results are bit-identical.
+- Any other Kernel argument expands the weight to f32, for good, on first use: correct, but without the saving.
+- Downloads, buffer copies, peer copies and step capture addresses handle compact buffers.
+
+**Limits.**
+- MemoryManager admission still counts 4 bytes per weight value, so it overstates the Device memory compact weights use.
+- An F16 checkpoint, or a BF16 checkpoint whose weights are transformed before materialization so that they stop being bfloat16 values, keeps f32 weights.
+- Native half activations and KV (the rest of B01) and Tensor Core matmul (B02) remain future work.
+
 ### Implementation boundary and data flow
 
 Propagate storage, compute and accumulation dtypes independently through tensor metadata, graph validation and Kernel Registry eligibility. Materialize native half storage; keep F32 reductions explicit. CUDA owns Tensor Core kernels and alignment handling, and Reference CPU remains the correctness oracle.
