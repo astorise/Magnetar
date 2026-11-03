@@ -47,7 +47,9 @@ use crate::model_instance::*;
 use crate::model_loading::*;
 use crate::operator::*;
 use crate::operator_scope::*;
-use crate::phase_attribution::{PhaseAttributionReport, StepKind, StepPhase};
+use crate::phase_attribution::StepPhase;
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+use crate::phase_attribution::{PhaseAttributionReport, StepKind};
 use crate::prefix_cache::*;
 use crate::provider::*;
 use crate::qwen_model_component;
