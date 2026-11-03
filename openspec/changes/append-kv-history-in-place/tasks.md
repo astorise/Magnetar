@@ -16,5 +16,5 @@
 
 ## 4. Qualification
 
-- [ ] 4.1 Real Qwen2.5-0.5B on Reference CPU and CUDA: logits unchanged against the independent corpus.
-- [ ] 4.2 GPU CI: record KV append, commit, decode step and TPOT before and after.
+- [x] 4.1 Real Qwen2.5-0.5B on Reference CPU and CUDA: logits unchanged against the independent corpus.
+- [x] 4.2 GPU CI: record KV append, commit, decode step and TPOT before and after.

@@ -49,3 +49,22 @@ A store is admitted once, at its full capacity: `capacity * width * 4` bytes per
 
 - **Unwritten rows.** A Provider bug that reads beyond `key_count` would read rows written by a failed step or never written. The conformance tests fill the store's tail with NaN and require the attention result to stay identical.
 - **Longer sessions.** Capacity is fixed per request. A future multi-turn cache that grows beyond its capacity must fall back to the concat path or reallocate. No current first-native path reuses a KV cache across requests.
+
+## Evidence
+
+Real Qwen2.5-0.5B, greedy, on an RTX 3060 (GPU CI):
+- **Baseline: run 41607144703** (copy-based history, after the per-node cuts).
+- **In place: run 41611795148** (Runtime 633f4b7, CUDA Provider 03485c0). The new device conformance passes: in-place `kv-write`, plus bounded attention over a NaN-filled store tail on both attention kernels.
+
+| | Copy-based (41607144703) | In place (41611795148) |
+|---|---|---|
+| Max logit diff vs. independent corpus | 1.3e-5 | 1.3e-5, same tokens |
+| KV append (48 per step) | 1.90 ms | 1.30 ms (`kv-write`) |
+| KV commit | 0.47 ms | 0.03 ms |
+| Decode step (profile) | 14.4 ms | 13.3 ms |
+| Inter-token latency slope | about 0.01 ms/token | none measurable (-0.02 ms/token, buckets 12.8-14.5 ms) |
+| Campaign TPOT median (5 x 128 tokens) | 14.7 ms | 13.4 ms |
+| Warm TTFT median | 48.4 ms | 44.0 ms |
+| Decode throughput | 68.0 tok/s | 74.7 tok/s |
+
+Reference CPU on the same checkpoint: logits unchanged (5.4e-5, same tokens), commit 0.47 -> 0.10 ms. Its `kv-write` writes a copy of the store, so its KV append does not improve; `providers/cpu` and CUDA write in place.
