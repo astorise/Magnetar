@@ -1242,6 +1242,10 @@ struct E2eRuntimeModelExecutionEngine {
     /// `ProductionLoadedModel` that prepared their plans. `None` builds the
     /// graphs again for every step.
     graph_cache: Option<ComponentGraphCache>,
+    /// Keep KV history with the copy-based append even where the Provider
+    /// supports in-place history (`append-kv-history-in-place`): for tests
+    /// of the copy-based path.
+    copy_based_kv: bool,
 }
 
 /// How many prompt lengths' graphs one loaded model keeps.
@@ -1265,6 +1269,48 @@ pub(crate) struct ComponentGraphCache {
 /// One prompt length's graphs.
 type CachedComponentGraphs = (u64, Arc<CachedGraphs>);
 
+/// Whether every node reading a KV-cache edge is an `attention` node: an
+/// in-place KV store holds more rows than the history, and only attention
+/// (through `key_count`) knows to read just the history
+/// (`append-kv-history-in-place`).
+fn kv_edges_feed_only_attention(graph: &ExecutionGraph) -> bool {
+    let kv_edges: BTreeSet<&TensorEdgeId> = graph
+        .edges
+        .iter()
+        .filter(|(_, edge)| edge.kv_cache.is_some())
+        .map(|(id, _)| id)
+        .collect();
+    graph.nodes.values().all(|node| {
+        node.operator.name() == "attention"
+            || !node.inputs.iter().any(|input| kv_edges.contains(input))
+    })
+}
+
+/// Whether `provider` can keep KV history in place: an active prepared
+/// `kv-write` Kernel, and every active `attention` Kernel of it honouring
+/// `key_count` (`append-kv-history-in-place`).
+fn in_place_kv_supported(runtime: &Runtime, provider: &ProviderBinding) -> bool {
+    let mut attention = false;
+    for entry in runtime.kernel_registry().entries() {
+        if !entry.active
+            || &entry.advertisement.id.provider != provider
+            || entry.advertisement.implemented_operator.name() != "attention"
+        {
+            continue;
+        }
+        if !entry
+            .advertisement
+            .id
+            .features
+            .contains(crate::reference_cpu::KEY_COUNT_FEATURE)
+        {
+            return false;
+        }
+        attention = true;
+    }
+    attention && provider_advertises_operator(runtime, provider, "kv-write")
+}
+
 /// What every step derives from a graph alone: its plan fingerprint and
 /// its execution order. A cached graph never changes, so each is computed
 /// at most once instead of on every step.
@@ -1272,12 +1318,19 @@ type CachedComponentGraphs = (u64, Arc<CachedGraphs>);
 pub(crate) struct GraphExecutionMemo {
     fingerprint: std::sync::OnceLock<ExecutionGraphSemanticFingerprint>,
     order: std::sync::OnceLock<Vec<ExecutionNodeId>>,
+    kv_edges_feed_only_attention: std::sync::OnceLock<bool>,
 }
 
 impl GraphExecutionMemo {
     fn fingerprint(&self, graph: &ExecutionGraph) -> &ExecutionGraphSemanticFingerprint {
         self.fingerprint
             .get_or_init(|| semantic_graph_fingerprint(graph))
+    }
+
+    fn kv_edges_feed_only_attention(&self, graph: &ExecutionGraph) -> bool {
+        *self
+            .kv_edges_feed_only_attention
+            .get_or_init(|| kv_edges_feed_only_attention(graph))
     }
 
     fn order(&self, graph: &ExecutionGraph) -> Result<&[ExecutionNodeId], InferenceApiError> {
@@ -1441,6 +1494,10 @@ struct FirstNativeExecutionKvState {
 pub struct FirstNativeLayerKvState {
     k: TensorResourceId,
     v: TensorResourceId,
+    /// In-place KV history (`append-kv-history-in-place`): `k` and `v` are
+    /// the layer's stores and this many leading rows are valid. `None` for
+    /// copy-based history, whose tensors are exactly the history.
+    rows: Option<u64>,
 }
 
 impl E2eRuntimeModelExecutionEngine {
@@ -1565,7 +1622,18 @@ impl E2eRuntimeModelExecutionEngine {
             // `write_tensor_admitted` (Correctif 1), so discarding it must
             // release that allocation too, not just drop the Provider
             // storage entry.
+            // In-place KV stores (`append-kv-history-in-place`) also hold
+            // the committed history: they are released with it, unless no
+            // step of this request ever committed (a failed prefill).
+            let has_committed_state = self
+                .kv_states
+                .lock()
+                .map(|states| states.contains_key(&Self::kv_state_key(request)))
+                .unwrap_or(true);
             for layer in discarded.layer_kv.values() {
+                if layer.rows.is_some() && has_committed_state {
+                    continue;
+                }
                 // Best-effort: this pending state is being discarded
                 // regardless of whether Provider-side release succeeds.
                 release_pending_kv_resource(runtime, &provider, &layer.k);
@@ -2059,6 +2127,9 @@ struct FirstNativeDispatchContext<'a> {
     /// tensor descriptors and affinities); the registry does not change
     /// while a graph executes, so the answer is reused.
     internal_selection: Option<(InternalSelectionKey, KernelCandidate)>,
+    /// KV edges bound to an in-place KV store, with the number of leading
+    /// rows attention reads from it (`append-kv-history-in-place`).
+    bounded_kv_edges: BTreeMap<TensorEdgeId, u64>,
     /// Per-node causal-chain events (Correctif 17 / task group 17), pushed
     /// directly into the caller's own `Vec` (not accumulated locally and
     /// drained only on success) as each node's dispatch progresses through
@@ -3190,6 +3261,7 @@ fn dispatch_qwen_rope(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_qwen_attention(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,
@@ -3198,9 +3270,18 @@ fn dispatch_qwen_attention(
     v: NodeValue,
     architecture: &ModelComponentArchitectureMetadata,
     output_target: Option<OutputTarget>,
+    key_count: Option<u64>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
     let mut attributes = BTreeMap::new();
     attributes.insert("causal".into(), OperatorAttributeValue::Boolean(true));
+    // K and V are in-place KV stores: only their first `key_count` rows are
+    // the key sequence (`append-kv-history-in-place`).
+    if let Some(key_count) = key_count {
+        attributes.insert(
+            "key_count".into(),
+            OperatorAttributeValue::Integer(key_count as i64),
+        );
+    }
     attributes.insert(
         "head_count".into(),
         OperatorAttributeValue::Integer(architecture.attention_head_count as i64),
@@ -3711,8 +3792,22 @@ fn dispatch_first_native_graph_node(
             let q = inputs.remove(0);
             let k = inputs.remove(0);
             let v = inputs.remove(0);
-            dispatch_qwen_attention(ctx, node_id, q, k, v, architecture, Some(output_target))
-                .map(|(dispatch, value)| (dispatch, vec![value]))
+            let key_count = node
+                .inputs
+                .get(1)
+                .and_then(|edge| ctx.bounded_kv_edges.get(edge))
+                .copied();
+            dispatch_qwen_attention(
+                ctx,
+                node_id,
+                q,
+                k,
+                v,
+                architecture,
+                Some(output_target),
+                key_count,
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "silu" => {
             if inputs.len() != 1 {
@@ -3926,6 +4021,7 @@ fn execute_first_native_graph(
         node_events,
         MaterializedEdges::All,
         None,
+        None,
     )
 }
 
@@ -3945,6 +4041,7 @@ fn execute_first_native_graph_materializing(
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
     memo: Option<&GraphExecutionMemo>,
+    kv_store_capacity: Option<u64>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     execute_first_native_graph_with_resident_input(
         runtime,
@@ -3960,6 +4057,7 @@ fn execute_first_native_graph_materializing(
         node_events,
         materialized,
         memo,
+        kv_store_capacity,
     )
 }
 
@@ -4002,6 +4100,7 @@ fn execute_first_native_graph_with_resident_input(
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
     memo: Option<&GraphExecutionMemo>,
+    kv_store_capacity: Option<u64>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     let prepare_clock = runtime.phase_ledger().clock();
     let computed_order;
@@ -4027,6 +4126,15 @@ fn execute_first_native_graph_with_resident_input(
             reason: "prepared execution plan has no node bindings".into(),
         })?;
     let executor = resolve_kernel_execution_provider(runtime, &provider_binding)?;
+    // In-place KV history (`append-kv-history-in-place`) only when the
+    // Provider supports it and attention is the only reader of KV edges.
+    let kv_store_capacity = kv_store_capacity.filter(|_| {
+        in_place_kv_supported(runtime, &provider_binding)
+            && match memo {
+                Some(memo) => memo.kv_edges_feed_only_attention(graph),
+                None => kv_edges_feed_only_attention(graph),
+            }
+    });
     // Cloning this instance's weight bindings (a small `String ->
     // TensorResourceId` map, not tensor bytes) sidesteps holding both this
     // immutable borrow and the mutable `memory_mut()` borrow below at once;
@@ -4065,6 +4173,7 @@ fn execute_first_native_graph_with_resident_input(
         absolute_position_override,
         node_events,
         materialized,
+        kv_store_capacity,
     )?;
     Ok((dispatch, bindings, layer_kv, provider_binding))
 }
@@ -4085,6 +4194,7 @@ fn execute_first_native_graph_nodes(
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
+    kv_store_capacity: Option<u64>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
     let graph = fingerprinted.graph();
     // This step's token count, for `PlanGuardContext::sequence_length`
@@ -4102,6 +4212,7 @@ fn execute_first_native_graph_nodes(
         sequence_length,
         last_provider_execution: None,
         internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events,
     };
     let layer_count = fixture.config.architecture.layer_count as usize;
@@ -4171,6 +4282,9 @@ fn execute_first_native_graph_nodes(
     bindings.extend(resident_bindings);
     let mut layer_k: Vec<Option<TensorResourceId>> = vec![None; layer_count];
     let mut layer_v: Vec<Option<TensorResourceId>> = vec![None; layer_count];
+    // Valid rows of each layer's in-place KV stores this step, when the
+    // history is kept in place (`append-kv-history-in-place`).
+    let mut layer_rows: Vec<Option<u64>> = vec![None; layer_count];
     let mut last_dispatch: Option<KernelDispatchResult> = None;
 
     for node_id in order {
@@ -4324,158 +4438,283 @@ fn execute_first_native_graph_nodes(
                 let pending_resource = TensorResourceId::new(format!(
                     "kv.{kv_cache_id}.layer{layer}.{role_str}.pending"
                 ));
-                if kv_meta.behavior == GraphKvCacheBehavior::Append {
-                    let history =
-                        kv_history.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
-                            reason: "decode graph execution requires historical KV state".into(),
-                        })?;
-                    let historical = history.get(&layer).ok_or_else(|| {
-                        InferenceApiError::KvCacheUnavailable {
+                // In-place history (`append-kv-history-in-place`): a decode
+                // step continues the stores its history lives in; a prefill
+                // starts new stores when this execution keeps KV in place.
+                let in_place = match kv_history.and_then(|history| history.get(&layer)) {
+                    Some(FirstNativeLayerKvState {
+                        rows: Some(rows), ..
+                    }) => Some((
+                        kv_store_capacity.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                             reason: format!(
-                                "decode requires historical KV state for layer {layer}"
+                                "layer {layer} keeps its KV history in place, but this \
+                                     execution cannot continue it"
                             ),
-                        }
-                    })?;
-                    let historical_resource = match role {
-                        KvRole::K => &historical.k,
-                        KvRole::V => &historical.v,
-                    };
-                    // Historical KV data stays wherever the registered
-                    // Provider already holds it (task 7.2/7.3): a device-
-                    // resident Provider (CUDA) is never asked to produce
-                    // host-visible bytes for it -- `resident_shape` reads
-                    // only structural metadata, and the "concat" Operator
-                    // dispatch below runs through the exact same generic
-                    // Kernel Registry path every other graph node uses,
-                    // targeting this edge's own stable identity directly
-                    // (`implement-device-resident-multi-step-cuda-decode`,
-                    // replacing this block's former `read_tensor_value(..)
-                    // .into_host(..)` + Rust-computed `concat_rows`).
-                    let historical_shape = dispatch_ctx
-                        .provider
-                        .resident_shape(historical_resource)
+                        })?,
+                        *rows,
+                    )),
+                    Some(_) => None,
+                    None => kv_store_capacity.map(|capacity| (capacity, 0)),
+                };
+                if let Some((capacity, row_offset)) = in_place {
+                    let store = TensorResourceId::new(format!(
+                        "kv.{kv_cache_id}.layer{layer}.{role_str}.store"
+                    ));
+                    let (rows, width) = output_tensor.rows_cols()?;
+                    let valid_rows = row_offset
+                        .checked_add(rows)
+                        .filter(|valid| *valid <= capacity)
                         .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
-                            reason: format!("no materialized historical KV data for layer {layer}"),
+                            reason: format!(
+                                "layer {layer}: {rows} new KV rows at {row_offset} exceed the \
+                                 store's capacity of {capacity}"
+                            ),
                         })?;
-                    let historical_value = NodeValue::Resident {
-                        id: historical_resource.clone(),
-                        shape: historical_shape,
-                    };
-                    // The concatenated history is this step's pending KV
-                    // write: the concat writes it straight under the
-                    // pending identity, and the edge is bound to that
-                    // resource, instead of writing the edge and copying it
-                    // to the pending identity afterwards.
-                    let concat_output_target: OutputTarget = (
-                        pending_resource.clone(),
-                        resolved_output_placement(dispatch_ctx.prepared_plan.as_deref(), node_id),
-                        MemoryAllocationOwner::Session(kv_cache_id.to_string()),
-                    );
+                    let store_descriptor = f32_tensor_descriptor_from_shape(&[capacity, width]);
                     let append_clock = dispatch_ctx.runtime.phase_ledger().clock();
-                    let concatenated = dispatch_qwen_concat(
+                    if row_offset == 0 {
+                        // A new store, admitted once for the whole request.
+                        let target: OutputTarget = (
+                            store.clone(),
+                            resolved_output_placement(
+                                dispatch_ctx.prepared_plan.as_deref(),
+                                node_id,
+                            ),
+                            MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                        );
+                        let (store_id, _) = resolve_output_target(
+                            &mut dispatch_ctx,
+                            &format!("{node_id}.kv-store"),
+                            store_descriptor.clone(),
+                            Some(target),
+                        )?;
+                        let zeros = HostTensor::new(
+                            [capacity, width],
+                            vec![0.0; (capacity * width) as usize],
+                        )
+                        .map_err(runtime_generation_failed)?;
+                        dispatch_ctx
+                            .provider
+                            .write_tensor_value(store_id, TensorValue::Host(zeros))
+                            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                                reason: error.to_string(),
+                            })?;
+                    }
+                    let mut attributes = BTreeMap::new();
+                    attributes.insert(
+                        "row_offset".into(),
+                        OperatorAttributeValue::Integer(row_offset as i64),
+                    );
+                    dispatch_runtime_internal_operator(
                         &mut dispatch_ctx,
-                        &format!("{node_id}.kv-append"),
+                        &format!("{node_id}.kv-write"),
                         node_id,
-                        historical_value,
-                        output_tensor.clone(),
-                        Some(concat_output_target),
+                        dispatch_operator_id("kv-write", OperatorFamily::Tensor),
+                        [
+                            (
+                                "store",
+                                NodeValue::Resident {
+                                    id: store.clone(),
+                                    shape: vec![capacity, width],
+                                },
+                            ),
+                            ("rows", output_tensor),
+                        ],
+                        (store.clone(), store_descriptor),
+                        attributes,
                     )?;
                     dispatch_ctx
                         .runtime
                         .phase_ledger_mut()
                         .record(append_clock, StepPhase::KvAppend);
-                    // The concat dispatch pre-admitted its output directly
-                    // under `output_resource_id` (mirroring Decision 3's
-                    // existing optimization for every other node kind), so
-                    // the edge is already correctly written -- no explicit
-                    // (re-)write, and critically no `into_host` round trip,
-                    // needed below.
-                    output_tensor = concatenated;
-                    needs_explicit_edge_write = false;
-                    bound_resource_id = pending_resource.clone();
-                }
-                // Written under a *pending* resource id (task 7.4 prepare):
-                // this generation step's KV update becomes Runtime-owned only
-                // once `commit_generation_step` promotes it after sampling and
-                // token commit succeed; a failure or cancellation before then
-                // simply leaves this pending write unpromoted. When
-                // `output_tensor` is already `Resident` (decode's KV-append
-                // case always is, after the concat dispatch above; prefill's
-                // "Output" case is whenever the producing Kernel itself wrote
-                // directly into `output_resource_id`), this is a real
-                // Provider-side copy (`copy_tensor_admitted`) to the pending
-                // resource's own, separate, stable identity -- never a host
-                // round trip (`implement-device-resident-multi-step-cuda-
-                // decode`). Only a genuinely `Host`-typed value (e.g. "rope",
-                // which has no Kernel-level output identity to begin with)
-                // still needs an explicit host-typed admitted write here.
-                let pending_clock = dispatch_ctx.runtime.phase_ledger().clock();
-                let pending_write_result: Result<(), TensorValueAdmissionError> =
-                    match &output_tensor {
-                        // Already written under the pending identity (the
-                        // KV append above).
-                        NodeValue::Resident { id, .. } if *id == pending_resource => Ok(()),
-                        NodeValue::Resident { id, .. } => dispatch_ctx
-                            .provider
-                            .copy_tensor_admitted(
-                                dispatch_ctx.runtime.memory_mut(),
-                                id,
-                                pending_resource.clone(),
-                                MemoryAllocationClass::Tensor,
-                                MemoryAllocationOwner::Session(kv_cache_id.to_string()),
-                            )
-                            .map(|_allocation_id| ()),
-                        NodeValue::Host(_) => {
-                            let pending_tensor =
-                                output_tensor.clone().into_host(&dispatch_ctx.provider)?;
-                            dispatch_ctx.provider.write_tensor_value_admitted(
-                                dispatch_ctx.runtime.memory_mut(),
-                                pending_resource.clone(),
-                                TensorValue::Host(pending_tensor),
-                                MemoryAllocationClass::Tensor,
-                                MemoryAllocationOwner::Session(kv_cache_id.to_string()),
-                            )
-                        }
+                    output_tensor = NodeValue::Resident {
+                        id: store.clone(),
+                        shape: vec![capacity, width],
                     };
-                // Correctif 1: admitted (via `write_tensor_admitted`/
-                // `copy_tensor_admitted`), not a bare `write_tensor` -- this
-                // id is stable across every decode step for this layer/role,
-                // so admission replaces (and releases) whatever allocation
-                // the previous step's pending write held for it, the same
-                // reasoning as the graph-edge writes above.
-                // `discard_pending_kv_state` releases this through
-                // `release_admitted_tensor` when a step is cancelled or fails
-                // before commit.
-                pending_write_result.map_err(|error| match error {
-                    TensorValueAdmissionError::Memory(error) => {
-                        InferenceApiError::MemoryAdmissionFailed {
-                            reason: format!(
-                                "failed to account pending KV resource '{pending_resource}': {error}"
-                            ),
-                        }
+                    needs_explicit_edge_write = false;
+                    bound_resource_id = store.clone();
+                    dispatch_ctx
+                        .bounded_kv_edges
+                        .insert(output_edge_id.clone(), valid_rows);
+                    dispatch_ctx.node_events.push(
+                        PerNodeCausalEvent::new(
+                            InferenceApiObservationKind::KvUpdatePrepared,
+                            node_id.clone(),
+                        )
+                        .with_resource(store.clone()),
+                    );
+                    match role {
+                        KvRole::K => layer_k[layer] = Some(store),
+                        KvRole::V => layer_v[layer] = Some(store),
                     }
-                    TensorValueAdmissionError::Provider(error) => {
-                        InferenceApiError::ProviderTensorWriteFailed {
+                    if layer_rows[layer].is_some_and(|rows| rows != valid_rows) {
+                        return Err(InferenceApiError::KvCacheUnavailable {
                             reason: format!(
-                                "failed to write pending KV resource '{pending_resource}': {error}"
+                                "layer {layer}: K and V in-place stores disagree on their rows"
                             ),
-                        }
+                        });
                     }
-                })?;
-                dispatch_ctx
-                    .runtime
-                    .phase_ledger_mut()
-                    .record(pending_clock, StepPhase::KvPendingWrite);
-                dispatch_ctx.node_events.push(
-                    PerNodeCausalEvent::new(
-                        InferenceApiObservationKind::KvUpdatePrepared,
-                        node_id.clone(),
-                    )
-                    .with_resource(pending_resource.clone()),
-                );
-                match role {
-                    KvRole::K => layer_k[layer] = Some(pending_resource),
-                    KvRole::V => layer_v[layer] = Some(pending_resource),
+                    layer_rows[layer] = Some(valid_rows);
+                } else {
+                    if kv_meta.behavior == GraphKvCacheBehavior::Append {
+                        let history =
+                            kv_history.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                                reason: "decode graph execution requires historical KV state"
+                                    .into(),
+                            })?;
+                        let historical = history.get(&layer).ok_or_else(|| {
+                            InferenceApiError::KvCacheUnavailable {
+                                reason: format!(
+                                    "decode requires historical KV state for layer {layer}"
+                                ),
+                            }
+                        })?;
+                        let historical_resource = match role {
+                            KvRole::K => &historical.k,
+                            KvRole::V => &historical.v,
+                        };
+                        // Historical KV data stays wherever the registered
+                        // Provider already holds it (task 7.2/7.3): a device-
+                        // resident Provider (CUDA) is never asked to produce
+                        // host-visible bytes for it -- `resident_shape` reads
+                        // only structural metadata, and the "concat" Operator
+                        // dispatch below runs through the exact same generic
+                        // Kernel Registry path every other graph node uses,
+                        // targeting this edge's own stable identity directly
+                        // (`implement-device-resident-multi-step-cuda-decode`,
+                        // replacing this block's former `read_tensor_value(..)
+                        // .into_host(..)` + Rust-computed `concat_rows`).
+                        let historical_shape = dispatch_ctx
+                            .provider
+                            .resident_shape(historical_resource)
+                            .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                                reason: format!(
+                                    "no materialized historical KV data for layer {layer}"
+                                ),
+                            })?;
+                        let historical_value = NodeValue::Resident {
+                            id: historical_resource.clone(),
+                            shape: historical_shape,
+                        };
+                        // The concatenated history is this step's pending KV
+                        // write: the concat writes it straight under the
+                        // pending identity, and the edge is bound to that
+                        // resource, instead of writing the edge and copying it
+                        // to the pending identity afterwards.
+                        let concat_output_target: OutputTarget = (
+                            pending_resource.clone(),
+                            resolved_output_placement(
+                                dispatch_ctx.prepared_plan.as_deref(),
+                                node_id,
+                            ),
+                            MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                        );
+                        let append_clock = dispatch_ctx.runtime.phase_ledger().clock();
+                        let concatenated = dispatch_qwen_concat(
+                            &mut dispatch_ctx,
+                            &format!("{node_id}.kv-append"),
+                            node_id,
+                            historical_value,
+                            output_tensor.clone(),
+                            Some(concat_output_target),
+                        )?;
+                        dispatch_ctx
+                            .runtime
+                            .phase_ledger_mut()
+                            .record(append_clock, StepPhase::KvAppend);
+                        // The concat dispatch pre-admitted its output directly
+                        // under `output_resource_id` (mirroring Decision 3's
+                        // existing optimization for every other node kind), so
+                        // the edge is already correctly written -- no explicit
+                        // (re-)write, and critically no `into_host` round trip,
+                        // needed below.
+                        output_tensor = concatenated;
+                        needs_explicit_edge_write = false;
+                        bound_resource_id = pending_resource.clone();
+                    }
+                    // Written under a *pending* resource id (task 7.4 prepare):
+                    // this generation step's KV update becomes Runtime-owned only
+                    // once `commit_generation_step` promotes it after sampling and
+                    // token commit succeed; a failure or cancellation before then
+                    // simply leaves this pending write unpromoted. When
+                    // `output_tensor` is already `Resident` (decode's KV-append
+                    // case always is, after the concat dispatch above; prefill's
+                    // "Output" case is whenever the producing Kernel itself wrote
+                    // directly into `output_resource_id`), this is a real
+                    // Provider-side copy (`copy_tensor_admitted`) to the pending
+                    // resource's own, separate, stable identity -- never a host
+                    // round trip (`implement-device-resident-multi-step-cuda-
+                    // decode`). Only a genuinely `Host`-typed value (e.g. "rope",
+                    // which has no Kernel-level output identity to begin with)
+                    // still needs an explicit host-typed admitted write here.
+                    let pending_clock = dispatch_ctx.runtime.phase_ledger().clock();
+                    let pending_write_result: Result<(), TensorValueAdmissionError> =
+                        match &output_tensor {
+                            // Already written under the pending identity (the
+                            // KV append above).
+                            NodeValue::Resident { id, .. } if *id == pending_resource => Ok(()),
+                            NodeValue::Resident { id, .. } => dispatch_ctx
+                                .provider
+                                .copy_tensor_admitted(
+                                    dispatch_ctx.runtime.memory_mut(),
+                                    id,
+                                    pending_resource.clone(),
+                                    MemoryAllocationClass::Tensor,
+                                    MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                                )
+                                .map(|_allocation_id| ()),
+                            NodeValue::Host(_) => {
+                                let pending_tensor =
+                                    output_tensor.clone().into_host(&dispatch_ctx.provider)?;
+                                dispatch_ctx.provider.write_tensor_value_admitted(
+                                    dispatch_ctx.runtime.memory_mut(),
+                                    pending_resource.clone(),
+                                    TensorValue::Host(pending_tensor),
+                                    MemoryAllocationClass::Tensor,
+                                    MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                                )
+                            }
+                        };
+                    // Correctif 1: admitted (via `write_tensor_admitted`/
+                    // `copy_tensor_admitted`), not a bare `write_tensor` -- this
+                    // id is stable across every decode step for this layer/role,
+                    // so admission replaces (and releases) whatever allocation
+                    // the previous step's pending write held for it, the same
+                    // reasoning as the graph-edge writes above.
+                    // `discard_pending_kv_state` releases this through
+                    // `release_admitted_tensor` when a step is cancelled or fails
+                    // before commit.
+                    pending_write_result.map_err(|error| match error {
+                        TensorValueAdmissionError::Memory(error) => {
+                            InferenceApiError::MemoryAdmissionFailed {
+                                reason: format!(
+                                    "failed to account pending KV resource '{pending_resource}': {error}"
+                                ),
+                            }
+                        }
+                        TensorValueAdmissionError::Provider(error) => {
+                            InferenceApiError::ProviderTensorWriteFailed {
+                                reason: format!(
+                                    "failed to write pending KV resource '{pending_resource}': {error}"
+                                ),
+                            }
+                        }
+                    })?;
+                    dispatch_ctx
+                        .runtime
+                        .phase_ledger_mut()
+                        .record(pending_clock, StepPhase::KvPendingWrite);
+                    dispatch_ctx.node_events.push(
+                        PerNodeCausalEvent::new(
+                            InferenceApiObservationKind::KvUpdatePrepared,
+                            node_id.clone(),
+                        )
+                        .with_resource(pending_resource.clone()),
+                    );
+                    match role {
+                        KvRole::K => layer_k[layer] = Some(pending_resource),
+                        KvRole::V => layer_v[layer] = Some(pending_resource),
+                    }
                 }
             }
             // `output_resource_id` (computed above, before the KV block) is
@@ -4562,7 +4801,14 @@ fn execute_first_native_graph_nodes(
             .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                 reason: format!("first-native graph produced no V state for layer {layer}"),
             })?;
-        updated_layer_kv.insert(layer, FirstNativeLayerKvState { k, v });
+        updated_layer_kv.insert(
+            layer,
+            FirstNativeLayerKvState {
+                k,
+                v,
+                rows: layer_rows[layer],
+            },
+        );
     }
     let dispatch_result = last_dispatch.ok_or_else(|| InferenceApiError::GenerationFailed {
         reason: "first-native graph executed no nodes".into(),
@@ -4779,6 +5025,13 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // `execute_first_native_graph`'s doc comment). Its output edge
             // `"logits"` carries logits for every model-input row; only the
             // last row is a newly admitted token's distribution.
+            // Every row this request's KV history can reach: its prompt and
+            // every token it may generate (`append-kv-history-in-place`).
+            let kv_store_capacity = (!self.copy_based_kv).then(|| {
+                (request.input_token_ids.len() as u64)
+                    .saturating_add(request.max_new_tokens as u64)
+                    .max(1)
+            });
             let (dispatch, mut bindings, layer_kv, resolved_provider) =
                 if generated_tokens.is_empty() {
                     let ids_tensor = HostTensor::new(
@@ -4803,6 +5056,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                         &mut node_events,
                         MaterializedEdges::Only(&["logits"]),
                         Some(&component_graphs.prefill_memo),
+                        kv_store_capacity,
                     )?
                 } else {
                     let token = *generated_tokens.last().ok_or_else(|| {
@@ -4825,6 +5079,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                         &mut node_events,
                         MaterializedEdges::Only(&["logits"]),
                         Some(&component_graphs.decode_memo),
+                        kv_store_capacity,
                     )?
                 };
             // `execute_first_native_graph` topologically validates the graph (via
@@ -4947,8 +5202,10 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         // resource that every commit copies from and leaves behind
         // (`execute_first_native_graph_nodes`'s KV pending writes).
         for (layer, binding) in &committed.layer_kv {
-            let _ = provider.release_admitted_tensor(runtime.memory_mut(), &binding.k);
-            let _ = provider.release_admitted_tensor(runtime.memory_mut(), &binding.v);
+            // Copy-based generations are Provider-admitted; in-place stores
+            // are Runtime pre-admissions: release either.
+            release_pending_kv_resource(runtime, &provider, &binding.k);
+            release_pending_kv_resource(runtime, &provider, &binding.v);
             for role in ["k", "v"] {
                 release_pending_kv_resource(
                     runtime,
@@ -4970,6 +5227,9 @@ struct PromotedKvLayer {
     layer: u32,
     binding: KvLayerResourceBinding,
     previous: Option<KvLayerResourceBinding>,
+    /// Valid rows of an in-place KV store (`append-kv-history-in-place`);
+    /// `None` for a copy-based generation.
+    rows: Option<u64>,
 }
 
 /// The KV commit lifecycle, named and typed explicitly (Correctif 11 / task
@@ -5028,6 +5288,33 @@ impl KvUpdateTransaction {
             .layer_resources
             .get(&(layer as u32))
             .cloned();
+        // In-place KV (`append-kv-history-in-place`): the step wrote its
+        // rows into the layer's stores beyond the committed rows, so
+        // committing only adopts the new row count; nothing is copied.
+        if let Some(rows) = pending.rows {
+            let allocation = |id: &TensorResourceId| {
+                runtime
+                    .memory()
+                    .tensor_residency(id)
+                    .and_then(|residency| residency.allocation)
+                    .ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                        reason: format!("in-place KV store '{id}' has no admitted allocation"),
+                    })
+            };
+            let binding = KvLayerResourceBinding {
+                k: pending.k.clone(),
+                v: pending.v.clone(),
+                k_allocation: allocation(&pending.k)?,
+                v_allocation: allocation(&pending.v)?,
+            };
+            self.promoted.push(PromotedKvLayer {
+                layer: layer as u32,
+                binding,
+                previous,
+                rows: Some(rows),
+            });
+            return Ok(());
+        }
         let binding = promote_pending_kv_layer(
             runtime,
             &self.executor,
@@ -5040,6 +5327,7 @@ impl KvUpdateTransaction {
             layer: layer as u32,
             binding,
             previous,
+            rows: None,
         });
         Ok(())
     }
@@ -5047,7 +5335,9 @@ impl KvUpdateTransaction {
     /// Releases every resource admitted so far this attempt, leaving the
     /// cache's prior committed state completely untouched.
     fn abort(self, runtime: &mut Runtime) {
-        for already in &self.promoted {
+        // In-place stores are shared with the committed history and were
+        // not created by this transaction: nothing of theirs to release.
+        for already in self.promoted.iter().filter(|layer| layer.rows.is_none()) {
             let _ = runtime.memory_mut().release(already.binding.k_allocation);
             let _ = runtime.memory_mut().release(already.binding.v_allocation);
             // Best-effort, like the memory releases above: this is already
@@ -5072,7 +5362,10 @@ impl KvUpdateTransaction {
     ) -> Result<LayerKvMap, InferenceApiError> {
         let mut committed = LayerKvMap::new();
         for promoted_layer in self.promoted {
-            if let Some(previous) = promoted_layer.previous {
+            if let Some(previous) = promoted_layer.previous
+                // The same in-place store, still in use.
+                && previous.k != promoted_layer.binding.k
+            {
                 let _ = runtime.memory_mut().release(previous.k_allocation);
                 let _ = runtime.memory_mut().release(previous.v_allocation);
                 // Best-effort: the new binding above already promoted
@@ -5101,6 +5394,7 @@ impl KvUpdateTransaction {
                 FirstNativeLayerKvState {
                     k: promoted_layer.binding.k,
                     v: promoted_layer.binding.v,
+                    rows: promoted_layer.rows,
                 },
             );
         }
@@ -5441,6 +5735,7 @@ fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) -> Runtime {
             component_digest: None,
             forced_token: None,
             graph_cache: None,
+            copy_based_kv: false,
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -5476,6 +5771,7 @@ fn build_runtime_with_model_execution_engine_and_provider(
             component_digest: None,
             forced_token: None,
             graph_cache: None,
+            copy_based_kv: false,
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -6063,6 +6359,7 @@ pub fn run_first_native_graph_segment_dispatch(
             absolute_position_override,
             &mut node_events,
             MaterializedEdges::All,
+            None,
             None,
         )
         .map_err(E2eConformanceError::from)?;
@@ -7582,6 +7879,7 @@ fn prepare_production_generation(
             component_digest: None,
             forced_token: None,
             graph_cache: None,
+            copy_based_kv: false,
         }))
         .trust_store(trust_store)
         .build()
@@ -7847,6 +8145,7 @@ impl ProductionLoadedModel {
                 component_digest: component_digest.clone(),
                 forced_token: None,
                 graph_cache: Some(graph_cache.clone()),
+                copy_based_kv: false,
             }))
             .trust_store(trust_store)
             .build()
@@ -10377,6 +10676,7 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
         sequence_length: None,
         last_provider_execution: None,
         internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let architecture = &fixture.config.architecture;
@@ -10476,6 +10776,7 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             NodeValue::Host(one_row_hidden.clone()),
             NodeValue::Host(one_row_hidden.clone()),
             architecture,
+            None,
             None,
         ),
     )?;

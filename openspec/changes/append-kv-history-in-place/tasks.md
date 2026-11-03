@@ -5,9 +5,9 @@
 
 ## 2. First-native engine
 
-- [ ] 2.1 Decide the in-place path once per request (Provider capabilities, whole-model step, capacity); keep the concat path otherwise.
-- [ ] 2.2 Prefill and decode write rows into per-layer stores; attention receives `key_count`; commit advances committed lengths without copies; discard and release free stores.
-- [ ] 2.3 Tests: in-place and concat paths produce bit-identical logits on the canonical fixture; failed or discarded steps leave committed rows untouched; resident-model bookkeeping stays bounded.
+- [x] 2.1 Decide the in-place path once per request (Provider capabilities, whole-model step, capacity); keep the concat path otherwise.
+- [x] 2.2 Prefill and decode write rows into per-layer stores; attention receives `key_count`; commit advances committed lengths without copies; discard and release free stores.
+- [x] 2.3 Tests: in-place and concat paths produce bit-identical logits on the canonical fixture; failed or discarded steps leave committed rows untouched; resident-model bookkeeping stays bounded.
 
 ## 3. Providers
 

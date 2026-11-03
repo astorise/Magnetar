@@ -1631,6 +1631,7 @@ fn dispatch_reference_cpu_operator_multi_binds_every_output() {
         sequence_length: None,
         last_provider_execution: None,
         internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let input = HostTensor::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1821,6 +1822,7 @@ fn resident_input_passthrough_reuses_existing_resource_and_computes_correctly() 
         sequence_length: None,
         last_provider_execution: None,
         internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let a = HostTensor::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1921,6 +1923,7 @@ fn rmsnorm_accepts_a_resident_input_without_materializing_it_first() {
         sequence_length: None,
         last_provider_execution: None,
         internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let weight = HostTensor::new([4], vec![1.0, 1.0, 1.0, 1.0]).unwrap();
@@ -5592,6 +5595,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         sequence_length: None,
         last_provider_execution: None,
         internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let architecture = &fixture.config.architecture;
@@ -5735,6 +5739,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
         layer_kv.push(FirstNativeLayerKvState {
             k: k_resource,
             v: v_resource,
+            rows: None,
         });
         let (_dispatch, attention_out) = dispatch_qwen_attention(
             &mut dispatch_ctx,
@@ -5743,6 +5748,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             NodeValue::Host(k),
             NodeValue::Host(v),
             architecture,
+            None,
             None,
         )?;
         let (_dispatch, attention_proj) = dispatch_qwen_matmul(
@@ -5862,6 +5868,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         sequence_length: None,
         last_provider_execution: None,
         internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let architecture = &fixture.config.architecture;
@@ -6024,6 +6031,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
         updated_layer_kv.push(FirstNativeLayerKvState {
             k: k_resource,
             v: v_resource,
+            rows: None,
         });
         let (_dispatch, attention_out) = dispatch_qwen_attention(
             &mut dispatch_ctx,
@@ -6032,6 +6040,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             NodeValue::Host(k),
             NodeValue::Host(v),
             architecture,
+            None,
             None,
         )?;
         let (_dispatch, attention_proj) = dispatch_qwen_matmul(
@@ -6167,6 +6176,7 @@ fn build_runtime_with_model_execution_engine_and_forced_token(
             component_digest: None,
             forced_token,
             graph_cache: None,
+            copy_based_kv: false,
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -9155,6 +9165,7 @@ fn check_graph_dispatch_ignores_kernel_registry_preference_change_after_plan_pub
         sequence_length: Some(seq_len),
         last_provider_execution: None,
         internal_selection: None,
+        bounded_kv_edges: BTreeMap::new(),
         node_events: &mut node_events,
     };
     let (dispatch_result, _hidden_states) = dispatch_reference_cpu_operator(
@@ -9396,6 +9407,15 @@ fn check_incremental_decode_rejects_missing_layer_kv(
 }
 
 #[cfg(test)]
+/// [`new_kv_lifecycle_engine`] keeping KV history with the copy-based
+/// append, for tests of that path's pending resources.
+fn new_copy_based_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelExecutionEngine {
+    E2eRuntimeModelExecutionEngine {
+        copy_based_kv: true,
+        ..new_kv_lifecycle_engine(fixture)
+    }
+}
+
 fn new_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelExecutionEngine {
     E2eRuntimeModelExecutionEngine {
         fixture: fixture.clone(),
@@ -9404,6 +9424,7 @@ fn new_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelExecutionEngi
         component_digest: None,
         forced_token: None,
         graph_cache: None,
+        copy_based_kv: false,
     }
 }
 
@@ -9616,7 +9637,7 @@ fn check_kv_pending_write_is_memory_admitted_for_its_concatenated_size(
 ) -> Result<(), E2eConformanceError> {
     let mut runtime = build_runtime_with_model_execution_engine(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
-    let engine = new_kv_lifecycle_engine(fixture);
+    let engine = new_copy_based_kv_lifecycle_engine(fixture);
     let request = kv_lifecycle_test_request(
         fixture,
         &runtime,
@@ -9745,7 +9766,7 @@ fn check_kv_partial_layer_failure_during_commit_rolls_back_cleanly(
 ) -> Result<(), E2eConformanceError> {
     let mut runtime = build_runtime_with_model_execution_engine(fixture);
     let (instance, _memory) = load_fixture_instance(fixture, &mut runtime)?;
-    let engine = new_kv_lifecycle_engine(fixture);
+    let engine = new_copy_based_kv_lifecycle_engine(fixture);
     let request = kv_lifecycle_test_request(
         fixture,
         &runtime,
@@ -10527,7 +10548,6 @@ fn production_generation_steps_are_attributed_by_phase_without_leaking_the_promp
             StepPhase::InputUpload,
             StepPhase::NodeInputResolve,
             StepPhase::NodeDispatch,
-            StepPhase::KvPendingWrite,
             StepPhase::OutputMaterialize,
             StepPhase::LogitsExtract,
             StepPhase::KvStateStore,
@@ -10536,6 +10556,12 @@ fn production_generation_steps_are_attributed_by_phase_without_leaking_the_promp
         ] {
             assert!(phases.contains(&expected), "{expected:?} missing: {step:?}");
         }
+        // A step's KV update: a pending write (copy-based history) or an
+        // in-place store write (`append-kv-history-in-place`).
+        assert!(
+            phases.contains(&StepPhase::KvPendingWrite) || phases.contains(&StepPhase::KvAppend),
+            "no KV update phase: {step:?}"
+        );
         assert!(
             step.phases
                 .iter()
@@ -10697,4 +10723,73 @@ fn graph_execution_order_matches_the_previous_quadratic_order() {
         first_native_graph_execution_order(&cyclic),
         Err(InferenceApiError::GraphPlanningFailed { .. })
     ));
+}
+
+/// `append-kv-history-in-place`: in-place KV history (Reference CPU
+/// advertises `kv-write` and `key-count` attention) produces the same logits
+/// bit for bit as the copy-based history, a decode step executed and
+/// discarded leaves the committed rows untouched (executing it again gives
+/// the same logits), and the committed layer binding is the layer's store.
+#[test]
+fn in_place_kv_history_matches_copy_based_history_and_survives_a_discarded_step() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let run = |engine: E2eRuntimeModelExecutionEngine| -> (Vec<Vec<u32>>, Runtime, String) {
+        let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+        let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let request =
+            kv_lifecycle_test_request(&fixture, &runtime, &instance, "kv-in-place", None, &[1, 2])
+                .unwrap();
+        let mut plans = first_native_plans_for_prompt(
+            &runtime,
+            &fixture,
+            &instance,
+            request.input_token_ids.len() as u64,
+        )
+        .unwrap();
+        let bits = |logits: &[f32]| logits.iter().map(|value| value.to_bits()).collect();
+        let mut steps = Vec::new();
+        let prefill = engine
+            .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+            .unwrap();
+        steps.push(bits(&prefill.logits));
+        engine
+            .commit_generation_step(&mut runtime, &request, &[], 1, &prefill)
+            .unwrap();
+        let cache = prefill_cache_id_from_step(&prefill).unwrap().to_string();
+        let mut generated = vec![1];
+        for token in [2, 1] {
+            let step = engine
+                .execute_generation_step(
+                    &mut runtime,
+                    &request,
+                    &generated,
+                    Some(&mut plans.decode),
+                )
+                .unwrap();
+            // Discarded (never committed), then executed again.
+            let again = engine
+                .execute_generation_step(
+                    &mut runtime,
+                    &request,
+                    &generated,
+                    Some(&mut plans.decode),
+                )
+                .unwrap();
+            assert_eq!(bits(&step.logits), bits(&again.logits));
+            steps.push(bits(&again.logits));
+            engine
+                .commit_generation_step(&mut runtime, &request, &generated, token, &again)
+                .unwrap();
+            generated.push(token);
+        }
+        (steps, runtime, cache)
+    };
+    let (in_place, runtime, cache) = run(new_kv_lifecycle_engine(&fixture));
+    let (copy_based, _, _) = run(new_copy_based_kv_lifecycle_engine(&fixture));
+    assert_eq!(in_place, copy_based);
+    let cache = runtime.kv_cache(&KvCacheId::new(cache).unwrap()).unwrap();
+    for binding in cache.layer_resources.values() {
+        assert!(binding.k.as_str().ends_with(".k.store"), "{}", binding.k);
+        assert!(binding.v.as_str().ends_with(".v.store"), "{}", binding.v);
+    }
 }
