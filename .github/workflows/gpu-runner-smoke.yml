@@ -85,6 +85,11 @@ jobs:
         # is a run where that must never happen (`docs/audits/cuda-provider-full-audit-2026-09-05.md`'s
         # P1 "explicit provider-hardware-cuda == Passed signal" finding).
         run: cargo test --locked --manifest-path providers/cuda/Cargo.toml -- --include-ignored
+      - name: CUDA decode matmul bandwidth (diagnostic)
+        # The Device time of each decode-step projection shape per matmul
+        # Kernel; diagnostic only.
+        timeout-minutes: 10
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml decode_matmul_bandwidth -- --ignored --nocapture
       - name: Build and test the real first-native Qwen Component against a real CudaProvider
         # #58: `integration-tests/cuda-first-native` runs the real
         # first-native pipeline (magnetar-runtime, driven by the checked-in
