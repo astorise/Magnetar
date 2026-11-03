@@ -813,6 +813,10 @@ const RUNTIME_OBSERVATION_BUFFER_CAPACITY: usize = 4096;
 fn real_checkpoint_decode_cost_profile() {
     let providers = selected_real_providers();
     let tokens = env_usize("MAGNETAR_QUALIFICATION_PROFILE_TOKENS", 64);
+    // `0` profiles with decode-step replay off: the
+    // `capture-and-replay-cuda-graphs` disable control.
+    let step_replay = std::env::var("MAGNETAR_QUALIFICATION_STEP_REPLAY").as_deref() != Ok("0");
+    let label = if step_replay { "" } else { "-per-node" };
     let real = load_real_checkpoint(tokens);
     for (device, provider) in providers {
         let fixture = production_model_fixture(
@@ -828,6 +832,7 @@ fn real_checkpoint_decode_cost_profile() {
             provider,
         )
         .expect("the real checkpoint loads");
+        model.set_step_replay(step_replay);
         let request = |max_new_tokens| ProductionGenerationRequest {
             prompt: PromptInput::PlainText(REAL_PROMPT.into()),
             parameters: GenerationParameters::greedy(),
@@ -885,6 +890,7 @@ fn real_checkpoint_decode_cost_profile() {
             .saturating_add(usage.decode_duration_millis.unwrap_or(0));
         let profile = serde_json::json!({
             "provider": device,
+            "step_replay": step_replay,
             "prompt_tokens": usage.prompt_tokens,
             "generated_tokens": metrics.generated_tokens,
             "time_to_first_token_ms": metrics.time_to_first_token_ms,
@@ -911,14 +917,14 @@ fn real_checkpoint_decode_cost_profile() {
         {
             fs::create_dir_all(&dir).unwrap();
             fs::write(
-                dir.join(format!("decode-cost-profile-{device}.json")),
+                dir.join(format!("decode-cost-profile-{device}{label}.json")),
                 serde_json::to_vec_pretty(&profile).unwrap(),
             )
             .unwrap();
         }
         if let Some(path) = std::env::var_os("MAGNETAR_QUALIFICATION_SUMMARY_PATH") {
             let mut summary = format!(
-                "### Decode cost profile: {device}\n\n{} prompt tokens, {} generated. \
+                "### Decode cost profile: {device}{label}\n\n{} prompt tokens, {} generated. \
                  TTFT {:.1} ms, TPOT {:.1} ms, ITL growth {:.3} ms/token; \
                  {:.0} of {:.0} ms inside Runtime steps.\n\n\
                  | First position | Tokens | Mean ITL (ms) |\n|---|---|---|\n",
