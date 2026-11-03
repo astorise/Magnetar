@@ -7215,7 +7215,7 @@ impl WeightMaterializationTransaction {
             })?;
         if let Err(error) = self
             .executor
-            .write_tensor(resource_id.clone(), tensor.clone())
+            .write_weight_tensor(resource_id.clone(), tensor.clone())
         {
             // Admission above already succeeded: release it before
             // propagating, so a write failure leaves no trace in the

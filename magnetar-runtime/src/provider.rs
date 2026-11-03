@@ -674,6 +674,19 @@ pub trait ProviderExecutionApi: Send + Sync {
         Ok(())
     }
 
+    /// Writes a Model Instance weight: like [`Self::write_tensor`], but the
+    /// resource is never written again while the instance lives, so the
+    /// Provider may keep it in any representation that reproduces every
+    /// value exactly (`execute-native-half-precision`: a CUDA Provider
+    /// stores a weight whose values are all bfloat16 values as bfloat16).
+    fn write_weight_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: crate::tensor::HostTensor,
+    ) -> Result<(), ProviderExecutionError> {
+        self.write_tensor(id, tensor)
+    }
+
     /// Reads back a tensor previously written through [`Self::write_tensor`]
     /// or produced by a completed Kernel invocation. See that method's
     /// documentation for why this is host-tensor-shaped and provisional.
