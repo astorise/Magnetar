@@ -342,15 +342,15 @@ fn fast_greedy_selection_matches_the_general_path() {
         );
         request.parameters.greedy = true;
         request.step_index = (rng.next_u64() % 3) as usize;
-        request.policy.suppress_pad = rng.next_u64() % 2 == 0;
-        request.policy.suppress_additional_special_tokens = rng.next_u64() % 2 == 0;
+        request.policy.suppress_pad = rng.next_u64().is_multiple_of(2);
+        request.policy.suppress_additional_special_tokens = rng.next_u64().is_multiple_of(2);
         request.stop.minimum_generated_tokens = Some(2);
-        request.stop.mask_stop_tokens_before_minimum = rng.next_u64() % 2 == 0;
+        request.stop.mask_stop_tokens_before_minimum = rng.next_u64().is_multiple_of(2);
         request.stop.stop_token_ids = vec![(rng.next_u64() % u64::from(vocabulary)) as u32];
         request.banned_token_ids = (0..(rng.next_u64() % 4))
             .map(|_| (rng.next_u64() % u64::from(vocabulary)) as u32)
             .collect();
-        if round % 5 == 0 {
+        if round.is_multiple_of(5) {
             // A banned run past the vocabulary's end.
             request.banned_token_ids.push(TokenId::MAX);
         }
