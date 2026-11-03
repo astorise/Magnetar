@@ -68,6 +68,23 @@ Discarding a step or a commit failure needs nothing new: a replayed step writes 
 - **Nothing allocates or synchronizes during capture.** Any device allocation, host transfer or synchronization while capturing fails the capture. The embedding lookup checks token ids on the host at replay, from the replay input, instead of downloading its device flag.
 - **Validation.** For every resource the captured work reads or writes, the capture records its device address and length. A replay first checks that each resource still has exactly that buffer.
 
+## Evidence
+
+Real Qwen2.5-0.5B, greedy, on an RTX 3060, GPU CI run 41652697101 (Runtime f2cec40, CUDA Provider with this change). Both profiles come from the same run; the per-node one is the disable control (`MAGNETAR_QUALIFICATION_STEP_REPLAY=0`).
+
+| 64-token decode profile | Per node | Replayed |
+|---|---|---|
+| TPOT | 12.84 ms | 7.99 ms |
+| Waiting for the Device (`output_materialize`) | 1.76 ms | 6.84 ms |
+| `kernel_execute` + `node_dispatch` + `kv_append` + `kernel_resolve` | 8.55 ms | 0.34 ms |
+| `step_replay` (offset write, checks, graph launch) | | 0.09 ms |
+| Inter-token latency growth | -0.003 ms/token | -0.022 ms/token |
+
+- Qualification campaign (128 tokens, 5 measured runs): TPOT median 8.0 ms, 125.6 tok/s, warm TTFT 42.5 ms. It was 13.4 ms, 74.7 tok/s in run 41611795148.
+- Replayed steps are bit-identical to per-node ones over the 16-step reference prompt, and 13 of the 16 steps replay: prefill and the first two decode steps run per node. CUDA logits stay within 1.3e-5 of the independent corpus.
+- The step is now bound by the Device: 6.84 of its 7.99 ms are spent waiting for the GPU, close to the 5.5 ms the f32 weight reads take at the card's bandwidth. Half precision (B02) is what reduces it further.
+- Capture costs one step: 0.12 ms of host time, on top of a normal per-node step. Peak RSS is unchanged (1.38 GB). A capture holds no buffer of its own beyond the 8-byte offset; the graph executable's own Device memory is not measured.
+
 ## Risks / Trade-offs
 
 - Address reuse, stream changes and Device loss invalidate capture generations before replay.
