@@ -120,7 +120,9 @@ fn a_nested_leaf_is_subtracted_from_the_leaf_containing_it() {
             .host_micros
     };
     assert!(time(StepPhase::KernelExecute) >= 6_000);
-    let dispatch = time(StepPhase::NodeDispatch);
-    assert!((3_000..6_000).contains(&dispatch), "{dispatch}");
+    assert!(time(StepPhase::NodeDispatch) >= 3_000);
+    // Without the subtraction, the outer leaf would also hold the inner
+    // one's time and the leaves would add up to more than the step. No
+    // upper bound on a single leaf: a preempted spin can last any time.
     assert!(step.attributed_micros() <= step.wall_micros);
 }
