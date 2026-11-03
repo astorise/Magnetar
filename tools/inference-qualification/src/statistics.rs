@@ -10,7 +10,7 @@ const MAD_NORMAL_CONSISTENCY: f64 = 1.4826;
 
 /// Half-width of the robust noise band, in scaled MADs, that two medians
 /// must clear before a difference counts as a measured change.
-const NOISE_BAND_SCALED_MADS: f64 = 2.0;
+pub const NOISE_BAND_SCALED_MADS: f64 = 2.0;
 
 /// Order statistics and dispersion of one metric's raw samples. The raw
 /// samples themselves are retained separately by the campaign report;
