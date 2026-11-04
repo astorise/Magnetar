@@ -2103,3 +2103,24 @@ fn key_count_attention_ignores_the_store_tail_and_kv_write_writes_in_place() {
             .contains(KEY_COUNT_FEATURE)
     );
 }
+
+/// `read_tensor_rows`' default: the requested rows of a rank-2 tensor,
+/// nothing for a range past its end or a tensor of another rank.
+#[test]
+fn read_tensor_rows_returns_the_requested_rows_only() {
+    let executor = ReferenceCpuExecutor::new();
+    let id = TensorResourceId::new("rows");
+    executor.write_tensor(
+        id.clone(),
+        HostTensor::new([3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap(),
+    );
+    let last = executor.read_tensor_rows(&id, 2, 1).unwrap();
+    assert_eq!(last.shape, vec![1, 2]);
+    assert_eq!(last.data, vec![5.0, 6.0]);
+    let middle = executor.read_tensor_rows(&id, 0, 2).unwrap();
+    assert_eq!(middle.data, vec![1.0, 2.0, 3.0, 4.0]);
+    assert!(executor.read_tensor_rows(&id, 2, 2).is_none());
+    let flat = TensorResourceId::new("flat");
+    executor.write_tensor(flat.clone(), HostTensor::new([4], vec![1.0; 4]).unwrap());
+    assert!(executor.read_tensor_rows(&flat, 0, 1).is_none());
+}
