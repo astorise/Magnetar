@@ -530,11 +530,30 @@ pub struct KernelRegistry {
     /// "Revocation Of Active Kernel": "Runtime SHALL stop new dispatches to
     /// it."
     revoked_kernels: BTreeSet<String>,
+    /// Replaced, by every method that changes what a selection can return,
+    /// with a value no registry has had (`next_registry_revision`), so a caller holding selections made earlier (a cached
+    /// Prepared Execution Plan) can tell whether they still stand.
+    revision: u64,
+}
+
+/// A revision no registry has had: unique across registries, so a cached
+/// selection cannot match a different registry that reached the same
+/// count of changes.
+fn next_registry_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl KernelRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The registry's state revision: equal revisions mean no entry,
+    /// status, feature, generation, revocation or policy changed between
+    /// them.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &KernelRegistryEntry> {
@@ -556,6 +575,7 @@ impl KernelRegistry {
     /// executable pointer through this call, implementing "Registry Does
     /// Not Own Native Handles".
     pub fn register_prepared_kernel(&mut self, prepared: PreparedKernel) {
+        self.revision = next_registry_revision();
         self.artifact_observations.push(
             KernelArtifactObservation::new(KernelArtifactObservationKind::PreparedKernelRegistered)
                 .with_artifact(prepared.kernel.stable_key())
@@ -613,6 +633,7 @@ impl KernelRegistry {
         &mut self,
         id: &PreparedKernelId,
     ) -> Result<(), KernelArtifactError> {
+        self.revision = next_registry_revision();
         let prepared = self.prepared_kernels.get_mut(id).ok_or_else(|| {
             KernelArtifactError::PreparedHandleInvalid {
                 reason: format!("unknown Prepared Kernel {id}"),
@@ -633,6 +654,7 @@ impl KernelRegistry {
         &mut self,
         id: &PreparedKernelId,
     ) -> Result<(), KernelArtifactError> {
+        self.revision = next_registry_revision();
         let prepared = self.prepared_kernels.get_mut(id).ok_or_else(|| {
             KernelArtifactError::PreparedHandleInvalid {
                 reason: format!("unknown Prepared Kernel {id}"),
@@ -659,6 +681,7 @@ impl KernelRegistry {
         id: &PreparedKernelId,
         policy: RollbackWindowPolicy,
     ) -> Result<(), KernelArtifactError> {
+        self.revision = next_registry_revision();
         if policy.retain_previous_generation
             && self
                 .previous_generations
@@ -724,6 +747,7 @@ impl KernelRegistry {
         kernel: &KernelId,
         candidate: PreparedKernelId,
     ) -> Result<(), KernelRegistryError> {
+        self.revision = next_registry_revision();
         if self.revoked_kernels.contains(&kernel.stable_key()) {
             return Err(KernelRegistryError::KernelRevoked {
                 kernel: kernel.stable_key(),
@@ -788,6 +812,7 @@ impl KernelRegistry {
         qualification_status: crate::kernel_qualification::QualificationStatus,
         policy: &crate::kernel_qualification::KernelEligibilityPolicy,
     ) -> Result<(), KernelRegistryError> {
+        self.revision = next_registry_revision();
         crate::kernel_qualification::evaluate_eligibility(trust, qualification_status, policy)
             .map_err(|error| KernelRegistryError::PromotionNotEligible {
                 kernel: format!("{}: {error}", kernel.stable_key()),
@@ -806,6 +831,7 @@ impl KernelRegistry {
         candidate: PreparedKernelId,
         required_device: &DeviceBinding,
     ) -> Result<(), KernelRegistryError> {
+        self.revision = next_registry_revision();
         let device_matches = self
             .prepared_kernels
             .get(&candidate)
@@ -824,6 +850,7 @@ impl KernelRegistry {
     /// available only while a retained previous generation still exists and
     /// remains dispatchable.
     pub fn rollback_generation(&mut self, kernel: &KernelId) -> Result<(), KernelRegistryError> {
+        self.revision = next_registry_revision();
         let key = kernel.stable_key();
         let previous = self
             .previous_generations
@@ -868,6 +895,7 @@ impl KernelRegistry {
     /// invocations are unaffected -- this only stops new candidate lookups
     /// (see `candidate_for_entry`) from selecting it.
     pub fn revoke_kernel(&mut self, kernel: &KernelId, reason: impl Into<String>) {
+        self.revision = next_registry_revision();
         self.revoke_kernel_with_policy(kernel, reason, RevocationInFlightPolicy::AllowToComplete);
     }
 
@@ -885,6 +913,7 @@ impl KernelRegistry {
         reason: impl Into<String>,
         in_flight_policy: RevocationInFlightPolicy,
     ) {
+        self.revision = next_registry_revision();
         let key = kernel.stable_key();
         self.revoked_kernels.insert(key.clone());
         if let Some(entry) = self.entries.get_mut(&key) {
@@ -903,6 +932,7 @@ impl KernelRegistry {
     }
 
     pub fn set_provider_status(&mut self, status: ProviderStatusSnapshot) {
+        self.revision = next_registry_revision();
         let provider = status.provider.clone();
         let reason = match status.provider_health_compat() {
             HealthState::Draining => Some("provider draining"),
@@ -919,6 +949,7 @@ impl KernelRegistry {
     }
 
     pub fn set_device_status(&mut self, status: DeviceStatus) {
+        self.revision = next_registry_revision();
         let device = status.device.clone();
         let reason = match status.availability {
             HealthState::Available | HealthState::Degraded | HealthState::Draining => None,
@@ -938,6 +969,7 @@ impl KernelRegistry {
         provider: ProviderBinding,
         features: impl IntoIterator<Item = impl Into<String>>,
     ) {
+        self.revision = next_registry_revision();
         self.provider_features
             .insert(provider, features.into_iter().map(Into::into).collect());
     }
@@ -947,6 +979,7 @@ impl KernelRegistry {
         device: DeviceBinding,
         features: impl IntoIterator<Item = impl Into<String>>,
     ) {
+        self.revision = next_registry_revision();
         self.device_features
             .insert(device, features.into_iter().map(Into::into).collect());
     }
@@ -968,6 +1001,7 @@ impl KernelRegistry {
         &mut self,
         advertisement: KernelAdvertisement,
     ) -> Result<(), KernelRegistryError> {
+        self.revision = next_registry_revision();
         self.register_advertisement(advertisement, KernelRegistrationAuthority::Provider)
     }
 
@@ -975,6 +1009,7 @@ impl KernelRegistry {
         &mut self,
         advertisement: KernelAdvertisement,
     ) -> Result<(), KernelRegistryError> {
+        self.revision = next_registry_revision();
         self.register_advertisement(
             advertisement,
             KernelRegistrationAuthority::RuntimeTestFixture,
@@ -986,6 +1021,7 @@ impl KernelRegistry {
         advertisement: KernelAdvertisement,
         authority: KernelRegistrationAuthority,
     ) -> Result<(), KernelRegistryError> {
+        self.revision = next_registry_revision();
         self.observations.push(
             KernelObservation::new(KernelObservationKind::KernelAdvertisementReceived)
                 .with_kernel(&advertisement.id),
@@ -1016,6 +1052,7 @@ impl KernelRegistry {
     }
 
     pub fn invalidate_provider(&mut self, provider: &ProviderBinding, reason: impl Into<String>) {
+        self.revision = next_registry_revision();
         let reason = reason.into();
         for entry in self.entries.values_mut() {
             if &entry.advertisement.id.provider == provider {
@@ -1031,6 +1068,7 @@ impl KernelRegistry {
     }
 
     pub fn invalidate_device(&mut self, device: &DeviceBinding, reason: impl Into<String>) {
+        self.revision = next_registry_revision();
         let reason = reason.into();
         for entry in self.entries.values_mut() {
             if entry.advertisement.devices.contains(device) {
@@ -1046,6 +1084,7 @@ impl KernelRegistry {
     }
 
     pub fn revoke_conformance_profile(&mut self, profile: impl Into<String>) {
+        self.revision = next_registry_revision();
         let profile = profile.into();
         self.revoked_conformance_profiles.insert(profile.clone());
         for entry in self.entries.values_mut() {
@@ -1062,6 +1101,7 @@ impl KernelRegistry {
     }
 
     pub fn apply_policy_change(&mut self, generation: u64) {
+        self.revision = next_registry_revision();
         self.policy_generation = generation;
         for entry in self.entries.values_mut() {
             entry.active = false;

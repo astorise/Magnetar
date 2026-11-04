@@ -39,6 +39,14 @@ A fourth pass, `fuse_gated_matmul`, runs after `silu-mul`: it folds `silu-mul(ma
 
 Folding each RMSNorm into the matmuls reading it (`rmsnorm-matmul`, `rmsnorm-matmul-bias`, `rmsnorm-gated-matmul`, each block normalizing its row in shared memory with the RMSNorm Kernel's exact arithmetic) was tried and not kept. It was bit-identical and removed 49 launches per decode step, but campaign TPOT went from 4.7 to 4.8 ms (run 41801348531): every block repeats the normalization, and the LM head's 4748 blocks and the gated projection's 304 pay for that far more than the launches saved. Warm TTFT improved (29.4 to 26.3 ms), so a prefill-only or few-tile variant may still be worth measuring.
 
+### Prepared plans reused across requests
+
+A resident `ProductionLoadedModel` already cached each prompt length's graphs. It still prepared that length's prefill and decode Prepared Execution Plans for every request, selecting a Kernel for every node. That cost 11.8 ms of a 26 ms warm TTFT on CUDA (run 41819510428).
+
+`CachedGraphs` now also keeps the plans last prepared for its graphs, keyed by what they were prepared against: the Model Instance and its mutation version, the Provider, and `KernelRegistry::revision()`. Each request gets a copy of the cached plans while that key matches; a plan itself is never shared. Every registry method that can change a selection result replaces the revision with a value no registry has had: registration, retirement, generation promotion and rollback, revocation, Provider and Device statuses and features, policy changes. A cached plan therefore cannot outlive a registry change. A test checks that the copy equals a fresh preparation and that a registry change prepares the plans again.
+
+RTX 3060, Qwen2.5-0.5B, run 41829321682: plan preparation 11.8 -> 0.35 ms per request, warm TTFT median 27.3 -> 15.3 ms. TPOT is unchanged at 4.4 ms, logits are unchanged (1.3e-5 vs the corpus), and the tokens are the same.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
