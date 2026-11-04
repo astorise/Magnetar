@@ -799,6 +799,14 @@ fn real_checkpoint_qualification_campaign() {
                 report.load.as_ref().unwrap().resources.peak_resident_bytes,
                 report.exceptions,
             );
+            // The measured tokens (identical across measured runs, asserted
+            // above), so two campaigns can be compared token for token.
+            if let Some(tokens) = measured_token_ids.first() {
+                eprintln!(
+                    "[{device}] {} prompt tokens: generated token ids {tokens:?}",
+                    report.manifest.prompt_tokens
+                );
+            }
             write_report_if_requested(&report);
         }
     }
