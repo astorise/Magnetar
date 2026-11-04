@@ -450,8 +450,7 @@ pub fn fuse_rmsnorm_matmuls(
                 node.inputs[0] == *output
                     && !node.inputs[1..].contains(output)
                     && !transposes_a(node)
-                    && rmsnorm_fused_operator_name(node.operator.name())
-                        .is_some_and(|fused| advertised(fused))
+                    && rmsnorm_fused_operator_name(node.operator.name()).is_some_and(&advertised)
             });
         if fusable {
             fusions.push((
