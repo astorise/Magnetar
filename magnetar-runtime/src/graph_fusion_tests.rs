@@ -160,3 +160,78 @@ fn residual_and_swiglu_pairs_of_the_real_qwen_graph_are_fused_after_the_biases()
         assert_eq!(fuse_silu_mul(&fused).1, 0);
     }
 }
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn each_layers_swiglu_projection_becomes_one_gated_matmul() {
+    let mut fixture = e2e_fixture().expect("fixture builds");
+    fixture.config.attention_bias = true;
+    let layers = fixture.config.architecture.layer_count as usize;
+    let (graphs, _definition, _instance) =
+        crate::first_native_runtime::build_first_native_graphs_from_real_qwen_component(
+            &fixture, 3,
+        )
+        .expect("the real Qwen Component builds a bias-bearing graph");
+    for graph in [&graphs.prefill, &graphs.decode] {
+        let (biased, _) = fuse_matmul_bias(graph, is_weight);
+        let (residual, _) = fuse_matmul_residual(&biased);
+        let (swiglu, _) = fuse_silu_mul(&residual);
+        // Without the silu-mul pass first, nothing matches.
+        assert_eq!(fuse_gated_matmul(&residual).1, 0);
+        let (fused, removed) = fuse_gated_matmul(&swiglu);
+        assert_eq!(removed, 2 * layers, "the up matmul and silu-mul per layer");
+        assert_eq!(fused.nodes.len(), swiglu.nodes.len() - removed);
+        assert_eq!(fused.edges.len(), swiglu.edges.len() - removed);
+        let gated: Vec<_> = fused
+            .nodes
+            .values()
+            .filter(|node| node.operator.name() == GATED_MATMUL_OPERATOR)
+            .collect();
+        assert_eq!(gated.len(), layers);
+        assert!(
+            !fused
+                .nodes
+                .values()
+                .any(|node| node.operator.name() == SILU_MUL_OPERATOR)
+        );
+        for node in &gated {
+            assert_eq!(node.inputs.len(), 3);
+            assert!(!is_weight(&node.inputs[0]));
+            assert!(is_weight(&node.inputs[1]) && is_weight(&node.inputs[2]));
+            // It writes what the silu-mul wrote, and is that edge's producer.
+            assert!(swiglu.nodes.values().any(|silu_mul| {
+                silu_mul.operator.name() == SILU_MUL_OPERATOR && silu_mul.outputs == node.outputs
+            }));
+            assert_eq!(
+                fused.edges[&node.outputs[0]].producer.as_ref(),
+                Some(&node.id)
+            );
+            for input in &node.inputs {
+                if let Some(edge) = fused.edges.get(input) {
+                    assert!(edge.consumers.contains(&node.id), "{input}");
+                }
+            }
+        }
+        // No edge names a node that is gone.
+        for edge in fused.edges.values() {
+            for consumer in &edge.consumers {
+                assert!(
+                    fused.nodes.contains_key(consumer),
+                    "{} -> {consumer}",
+                    edge.id
+                );
+            }
+            if let Some(producer) = &edge.producer {
+                assert!(
+                    fused.nodes.contains_key(producer),
+                    "{} <- {producer}",
+                    edge.id
+                );
+            }
+        }
+        let order = first_native_graph_execution_order_for_tests(&fused)
+            .expect("the fused graph still has a valid execution order");
+        assert_eq!(order.len(), fused.nodes.len());
+        assert_eq!(fuse_gated_matmul(&fused).1, 0);
+    }
+}
