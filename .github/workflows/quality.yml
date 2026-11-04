@@ -361,8 +361,8 @@ jobs:
   # Component integration (task 15.6): Component submodules only, sparse
   # checkout. Split out from the single consolidated `submodule-integration`
   # job below now that `components/qwen` is real (task group 11);
-  # `components/llama` remains a template and simply passes trivially until
-  # it has real content of its own.
+  # `components/nemotron`, `gemma`, `kimi`, `mistral` and `deepseek` are
+  # templates and pass trivially until they have real content of their own.
   component-integration:
     name: quality / component integration
     runs-on: ubuntu-latest
@@ -370,7 +370,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Checkout Component submodules
-        run: git submodule update --init -- components/qwen components/llama
+        run: git submodule update --init -- components/qwen components/llama components/nemotron components/gemma components/kimi components/mistral components/deepseek
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Cache Cargo data
@@ -381,7 +381,12 @@ jobs:
           set -euo pipefail
           for manifest in \
             components/qwen/Cargo.toml \
-            components/llama/Cargo.toml
+            components/llama/Cargo.toml \
+            components/nemotron/Cargo.toml \
+            components/gemma/Cargo.toml \
+            components/kimi/Cargo.toml \
+            components/mistral/Cargo.toml \
+            components/deepseek/Cargo.toml
           do
             echo "::group::$manifest"
             cargo test --locked --manifest-path "$manifest"
@@ -516,6 +521,11 @@ jobs:
           for manifest in \
             components/qwen/Cargo.toml \
             components/llama/Cargo.toml \
+            components/nemotron/Cargo.toml \
+            components/gemma/Cargo.toml \
+            components/kimi/Cargo.toml \
+            components/mistral/Cargo.toml \
+            components/deepseek/Cargo.toml \
             formats/gguf/Cargo.toml \
             formats/safetensors/Cargo.toml \
             providers/cpu/Cargo.toml \
