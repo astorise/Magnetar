@@ -45,6 +45,8 @@ The decision is made once per request, when its KV state is created, and it hold
 
 A store is admitted once, at its full capacity: `capacity * width * 4` bytes per layer and role, at most `prompt + max_new_tokens` rows. That is up to twice what the concat path holds at its peak, with nothing copied per step. Finished or failed requests release stores through `release_pending_kv_resource` and the request-state release, which are extended to stores.
 
+A new store starts as zeros. `ProviderExecutionApi::write_zeroed_tensor` lets the Provider set them where the store lives; the CUDA Provider zeroes the allocation on the Device. The default declines, and the Runtime then writes a host tensor of zeros as before. Either way, every value is zero.
+
 ## Risks / Trade-offs
 
 - **Unwritten rows.** A Provider bug that reads beyond `key_count` would read rows written by a failed step or never written. The conformance tests fill the store's tail with NaN and require the attention result to stay identical.
@@ -68,3 +70,9 @@ Real Qwen2.5-0.5B, greedy, on an RTX 3060 (GPU CI):
 | Decode throughput | 68.0 tok/s | 74.7 tok/s |
 
 Reference CPU on the same checkpoint: logits unchanged (5.4e-5, same tokens), commit 0.47 -> 0.10 ms. Its `kv-write` writes a copy of the store, so its KV append does not improve; `providers/cpu` and CUDA write in place.
+
+Device-zeroed stores: GPU CI run 41835571121 (Runtime d20a619, CUDA Provider 100e5ba), against run 41829321682:
+- The stores are no longer built on the host or uploaded.
+- CUDA logits are unchanged (1.3e-5, same tokens), and 13 of 16 steps still replay.
+- No gain is measurable on the campaign's prompt. Each of its 48 stores holds about 68 KB, and the warm TTFT median is 15.6 ms against 15.3 ms, within run-to-run spread. The prefill's KV append fell from 2.4 to 1.6 ms, but every prefill phase fell by about as much between those two runs, so that drop does not isolate the change.
+- What is removed grows with `prompt + max_new_tokens`: at 4096 + 512 rows, it is about 113 MB per request. The campaign does not run contexts that long yet.
