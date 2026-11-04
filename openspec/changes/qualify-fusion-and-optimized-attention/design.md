@@ -41,6 +41,13 @@ Evidence:
 - **Short prompt.** Its TPOT moved from 4.4 to 4.5 ms, which is the combine launch the split attention adds to each layer.
 - **What remains at 4096 tokens.** The prefill attention is about 1.9 of the 3.4 s: 0.37 TFLOP/s, with one key per step and a per-key rescale. The layer matmuls are about 0.9 s. These are the next targets.
 
+Register-resident tiled prefill attention (GPU CI run 41883061198, CUDA Provider 5a8d6ac):
+- **What changed.** The tiled kernel is now compiled per head dimension: 4, 8, 16, 32, 64, 96 and 128. Every per-query loop is unrolled, so each query's q, scores and output stay in registers instead of local memory. Keys are taken 16 at a time: their scores, their max and their normalized mean of V are computed together, then merged into the running mean. That replaces a per-key rescale with two divisions. Blocks serve 64 queries instead of 32, so each K/V tile read from global memory serves twice as many queries.
+- **Kernel times.** Prefill attention per layer went from 1.54 to 0.50 ms at 512 rows, and from 80.5 to 20.7 ms at 4096 rows (about 1.4 TFLOP/s).
+- **End to end.** Warm TTFT median went from 220 to 194 ms at 512 prompt tokens, and from 3372 to 1891 ms at 4096. TPOT is unchanged: 4.5, 4.8 and 6.7 ms.
+- **Logits.** CUDA logits are 1.5e-5 from the independent corpus, with the same tokens; 13 of 16 steps replay.
+- **What remains at 4096 tokens.** The layer matmuls (about 0.9 s) and the attention (about 0.5 s) now dominate.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
