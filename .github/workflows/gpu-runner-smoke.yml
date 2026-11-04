@@ -233,6 +233,9 @@ jobs:
           MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
+          # Besides the short prompt, one campaign per long context: what a
+          # cost that grows with context length looks like.
+          MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
           MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports
           MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
         run: |

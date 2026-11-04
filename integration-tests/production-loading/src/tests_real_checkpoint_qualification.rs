@@ -61,7 +61,7 @@ use magnetar_runtime::phase_attribution::{PhaseAttributionReport, StepKind};
 use magnetar_runtime::production_model_ingestion::{
     ProductionArtifactPayloadSource, ProductionModelArtifactIngestor, ProductionModelSource,
 };
-use magnetar_runtime::tokenizer::Tokenizer;
+use magnetar_runtime::tokenizer::{EncodeInput, Tokenizer};
 use magnetar_runtime::{
     E2eFixture, GenerationParameters, GenerationStreamEvent, ModelArtifactSource,
     ProductionGenerationRequest, ProductionLoadedModel, PromptInput, Provider,
@@ -89,7 +89,9 @@ struct CampaignTarget<'a> {
     payload_source: &'a dyn ProductionArtifactPayloadSource,
     trust_store: ModelTrustStore,
     provider: Arc<dyn Provider>,
-    prompt: &'static str,
+    prompt: PromptInput,
+    /// Recorded in the manifest's flags.
+    prompt_label: String,
     max_new_tokens: usize,
     protocol: CampaignProtocol,
 }
@@ -156,7 +158,7 @@ fn run_campaign(target: CampaignTarget<'_>, hardware: HardwareCapabilityMatrix) 
             let outcome = model
                 .generate_streaming(
                     ProductionGenerationRequest {
-                        prompt: PromptInput::PlainText(target.prompt.into()),
+                        prompt: target.prompt.clone(),
                         parameters: GenerationParameters::greedy(),
                         stop_conditions: StopConditions::default(),
                         max_new_tokens: Some(target.max_new_tokens),
@@ -197,7 +199,7 @@ fn run_campaign(target: CampaignTarget<'_>, hardware: HardwareCapabilityMatrix) 
 
     let prompt_tokens = runs.first().map_or(0, |run| run.trace.prompt_tokens);
     let mut flags = BTreeMap::new();
-    flags.insert("prompt".into(), target.prompt.into());
+    flags.insert("prompt".into(), target.prompt_label);
     let mut campaign = Campaign::new(RunManifest {
         schema_version: REPORT_SCHEMA_VERSION.into(),
         harness: HARNESS.into(),
@@ -250,22 +252,28 @@ fn profile_matrix(prompt_tokens: usize, max_new_tokens: usize) -> Vec<ProfileCel
         generated_tokens: max_new_tokens,
         status: CellStatus::Run,
     }];
-    cells.extend(standard_profile_grid().into_iter().map(
-        |(concurrency, context_tokens, generated_tokens)| ProfileCell {
-            concurrency,
-            context_tokens,
-            generated_tokens,
-            status: CellStatus::Skipped {
-                reason: if concurrency > 1 {
-                    "ProductionLoadedModel serves one request at a time; concurrent \
+    let run_cell = (1, prompt_tokens, max_new_tokens);
+    cells.extend(
+        standard_profile_grid()
+            .into_iter()
+            .filter(|cell| *cell != run_cell)
+            .map(
+                |(concurrency, context_tokens, generated_tokens)| ProfileCell {
+                    concurrency,
+                    context_tokens,
+                    generated_tokens,
+                    status: CellStatus::Skipped {
+                        reason: if concurrency > 1 {
+                            "ProductionLoadedModel serves one request at a time; concurrent \
                      serving is connect-production-cli-and-service (A05) scope"
-                        .into()
-                } else {
-                    "not part of this bounded single-request campaign profile".into()
+                                .into()
+                        } else {
+                            "not part of this bounded single-request campaign profile".into()
+                        },
+                    },
                 },
-            },
-        },
-    ));
+            ),
+    );
     cells
 }
 
@@ -550,7 +558,8 @@ fn fixture_only_campaign_is_measured_but_cannot_qualify_production_performance()
             payload_source: ingested.payload_source.as_ref(),
             trust_store,
             provider: Arc::new(ReferenceCpuProvider::new()),
-            prompt: "hi",
+            prompt: PromptInput::PlainText("hi".into()),
+            prompt_label: "hi".into(),
             max_new_tokens: 4,
             protocol: sequential_protocol(1, 5),
         },
@@ -725,69 +734,126 @@ fn real_checkpoint_qualification_campaign() {
         checkpoint,
     } = load_real_checkpoint(max_new_tokens);
 
+    let prompts = campaign_prompts(tokenizer.as_ref());
     for (device, provider) in providers {
-        let fixture = production_model_fixture(
-            ingested.manifest.clone(),
-            tokenizer_metadata.clone(),
-            Arc::clone(&tokenizer),
-        )
-        .expect("production fixture builds from the real ingested checkpoint");
-        let report = run_campaign(
-            CampaignTarget {
-                evidence_class: EvidenceClass::RealCheckpoint,
-                checkpoint: checkpoint.clone(),
-                fixture,
-                payload_source: ingested.payload_source.as_ref(),
-                trust_store: trust_store.clone(),
-                provider,
-                prompt: REAL_PROMPT,
-                max_new_tokens,
-                protocol: sequential_protocol(1, measured_runs),
-            },
-            hardware_matrix(Some((device, true))),
-        );
+        for (prompt, prompt_label) in &prompts {
+            let fixture = production_model_fixture(
+                ingested.manifest.clone(),
+                tokenizer_metadata.clone(),
+                Arc::clone(&tokenizer),
+            )
+            .expect("production fixture builds from the real ingested checkpoint");
+            let report = run_campaign(
+                CampaignTarget {
+                    evidence_class: EvidenceClass::RealCheckpoint,
+                    checkpoint: checkpoint.clone(),
+                    fixture,
+                    payload_source: ingested.payload_source.as_ref(),
+                    trust_store: trust_store.clone(),
+                    provider: Arc::clone(&provider),
+                    prompt: prompt.clone(),
+                    prompt_label: prompt_label.clone(),
+                    max_new_tokens,
+                    protocol: sequential_protocol(1, measured_runs),
+                },
+                hardware_matrix(Some((device, true))),
+            );
 
-        assert_complete_trace(&report, max_new_tokens);
-        assert!(
-            !report
-                .exceptions
-                .contains(&CampaignException::FixtureOnlyEvidence)
-        );
-        assert!(
-            !report.verdict.qualifies_production_performance,
-            "A02/A07/A08 are still pending gates, so no production qualification is claimed"
-        );
-        let measured_token_ids: Vec<_> = report
-            .samples
-            .iter()
-            .map(|sample| &sample.generated_token_ids)
-            .collect();
-        assert!(
-            measured_token_ids.windows(2).all(|pair| pair[0] == pair[1]),
-            "greedy generation on a resident instance is deterministic across runs"
-        );
-        let stats = &report.warm_statistics;
-        eprintln!(
-            "[{device}] load {:.0} ms; warm TTFT median {:.1} ms, TPOT median {:.1} ms, \
-             decode {:.2} tok/s; peak RSS {:?}; exceptions {:?}",
-            report.load.as_ref().unwrap().duration_ms,
-            stats
-                .time_to_first_token_ms
-                .as_ref()
-                .map_or(f64::NAN, |s| s.median),
-            stats
-                .time_per_output_token_ms
-                .as_ref()
-                .map_or(f64::NAN, |s| s.median),
-            stats
-                .decode_throughput_tokens_per_second
-                .as_ref()
-                .map_or(f64::NAN, |s| s.median),
-            report.load.as_ref().unwrap().resources.peak_resident_bytes,
-            report.exceptions,
-        );
-        write_report_if_requested(&report);
+            assert_complete_trace(&report, max_new_tokens);
+            assert!(
+                !report
+                    .exceptions
+                    .contains(&CampaignException::FixtureOnlyEvidence)
+            );
+            assert!(
+                !report.verdict.qualifies_production_performance,
+                "A02/A07/A08 are still pending gates, so no production qualification is claimed"
+            );
+            let measured_token_ids: Vec<_> = report
+                .samples
+                .iter()
+                .map(|sample| &sample.generated_token_ids)
+                .collect();
+            assert!(
+                measured_token_ids.windows(2).all(|pair| pair[0] == pair[1]),
+                "greedy generation on a resident instance is deterministic across runs"
+            );
+            let stats = &report.warm_statistics;
+            eprintln!(
+                "[{device}] {} prompt tokens: load {:.0} ms; warm TTFT median {:.1} ms, \
+             TPOT median {:.1} ms, decode {:.2} tok/s; peak RSS {:?}; exceptions {:?}",
+                report.manifest.prompt_tokens,
+                report.load.as_ref().unwrap().duration_ms,
+                stats
+                    .time_to_first_token_ms
+                    .as_ref()
+                    .map_or(f64::NAN, |s| s.median),
+                stats
+                    .time_per_output_token_ms
+                    .as_ref()
+                    .map_or(f64::NAN, |s| s.median),
+                stats
+                    .decode_throughput_tokens_per_second
+                    .as_ref()
+                    .map_or(f64::NAN, |s| s.median),
+                report.load.as_ref().unwrap().resources.peak_resident_bytes,
+                report.exceptions,
+            );
+            write_report_if_requested(&report);
+        }
     }
+}
+
+/// A natural passage the long-context prompts repeat.
+const LONG_CONTEXT_PASSAGE: &str = "Paris is the capital and largest city of France. \
+    It lies on the Seine, in the north of the country, at the heart of the \
+    Ile-de-France region. The city is known for its museums, its architecture \
+    and its cafes, and it has been a major centre of finance, diplomacy, \
+    commerce, culture, fashion and science for centuries. ";
+
+/// The campaign's prompts: the short [`REAL_PROMPT`], then one prompt of
+/// exactly each token count in `MAGNETAR_QUALIFICATION_CONTEXT_TOKENS`
+/// (comma-separated, e.g. `512,4096`; none by default). A long prompt
+/// repeats [`LONG_CONTEXT_PASSAGE`]'s tokens and ends with
+/// [`REAL_PROMPT`]'s, so every length asks the same question.
+fn campaign_prompts(tokenizer: &(dyn Tokenizer + Send + Sync)) -> Vec<(PromptInput, String)> {
+    let mut prompts = vec![(
+        PromptInput::PlainText(REAL_PROMPT.into()),
+        REAL_PROMPT.to_string(),
+    )];
+    let Ok(lengths) = std::env::var("MAGNETAR_QUALIFICATION_CONTEXT_TOKENS") else {
+        return prompts;
+    };
+    let encode = |text: &str| {
+        tokenizer
+            .encode(EncodeInput::new(text))
+            .expect("the real tokenizer encodes the campaign prompt")
+            .token_ids
+    };
+    let passage = encode(LONG_CONTEXT_PASSAGE);
+    let question = encode(REAL_PROMPT);
+    for length in lengths.split(',').map(str::trim).filter(|l| !l.is_empty()) {
+        let length: usize = length
+            .parse()
+            .expect("MAGNETAR_QUALIFICATION_CONTEXT_TOKENS lists token counts");
+        assert!(
+            length > question.len(),
+            "a {length}-token context cannot hold the {}-token question",
+            question.len()
+        );
+        let mut token_ids: Vec<_> = passage
+            .iter()
+            .copied()
+            .cycle()
+            .take(length - question.len())
+            .collect();
+        token_ids.extend_from_slice(&question);
+        prompts.push((
+            PromptInput::TokenIds(token_ids),
+            format!("{length} tokens: the repeated Paris passage, then {REAL_PROMPT:?}"),
+        ));
+    }
+    prompts
 }
 
 /// Positions per bucket in the decode cost profile.
