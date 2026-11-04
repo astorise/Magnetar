@@ -929,7 +929,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
-        "matmul" | "batched-matmul" | "matmul-bias" | "matmul-residual" => {
+        "matmul" | "batched-matmul" | "matmul-bias" | "matmul-residual" | "gated-matmul" => {
             OperatorAttributeSchema::default()
                 .with_rule(
                     "transpose_a",

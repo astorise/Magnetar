@@ -228,3 +228,25 @@ fn operator_layout_kind_maps_every_layout_descriptor_variant() {
         TensorLayoutKind::QuantizedPacked
     );
 }
+
+/// Fused matmul Operators take the matmul they replace's attributes, so a
+/// fused node keeping explicit ones still validates.
+#[test]
+fn fused_matmul_operators_accept_the_matmul_attributes() {
+    let catalog = initial_operator_catalog();
+    let mut attributes = BTreeMap::new();
+    attributes.insert("transpose_a".into(), OperatorAttributeValue::Boolean(false));
+    attributes.insert("transpose_b".into(), OperatorAttributeValue::Boolean(false));
+    for name in ["matmul", "matmul-bias", "matmul-residual", "gated-matmul"] {
+        let spec = catalog
+            .get(&OperatorId::magnetar(
+                name,
+                1,
+                OperatorFamily::LinearAlgebra,
+            ))
+            .unwrap_or_else(|error| panic!("{name} is in the catalog: {error:?}"));
+        spec.attributes
+            .validate(&attributes)
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+    }
+}
