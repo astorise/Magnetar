@@ -11389,3 +11389,53 @@ fn dropping_the_engine_releases_captures_its_requests_never_released() {
     // Captured and replayed, then released when the engine dropped.
     assert_eq!(executor.counts(), (1, 2, 0));
 }
+
+/// A request reuses the plans prepared for its graphs while the Model
+/// Instance, the Provider and the Kernel Registry are unchanged, and
+/// prepares them again when the registry changes.
+#[test]
+fn cached_graphs_reuse_prepared_plans_until_the_registry_changes() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_with_model_execution_engine(&fixture);
+    let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let graphs = CachedGraphs::new(
+        first_native_component_graphs_for_prompt(&fixture, 2).expect("component graphs build"),
+    );
+    let provider = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+    let first = graphs
+        .prepared_plans(&runtime, &instance, 2, &provider)
+        .unwrap();
+    let second = graphs
+        .prepared_plans(&runtime, &instance, 2, &provider)
+        .unwrap();
+    assert_eq!(graphs.preparations(), 1);
+    assert_eq!(first.prefill, second.prefill);
+    assert_eq!(first.decode, second.decode);
+    // The copy is what a fresh preparation returns.
+    let fresh = prepare_first_native_execution_plans_for_provider(
+        &runtime,
+        &instance,
+        FirstNativeComponentGraphs::clone(&graphs),
+        2,
+        &provider,
+    )
+    .unwrap();
+    assert_eq!(fresh.prefill, second.prefill);
+    assert_eq!(fresh.decode, second.decode);
+    // Any registry change invalidates the cached plans.
+    let before = runtime.kernel_registry().revision();
+    runtime.kernel_registry_mut().set_provider_features(
+        provider.clone(),
+        std::collections::BTreeSet::<String>::new(),
+    );
+    assert_ne!(runtime.kernel_registry().revision(), before);
+    graphs
+        .prepared_plans(&runtime, &instance, 2, &provider)
+        .unwrap();
+    assert_eq!(graphs.preparations(), 2);
+    // Unchanged again: the new plans are reused.
+    graphs
+        .prepared_plans(&runtime, &instance, 2, &provider)
+        .unwrap();
+    assert_eq!(graphs.preparations(), 2);
+}

@@ -1468,6 +1468,23 @@ pub(crate) struct CachedGraphs {
     graphs: FirstNativeComponentGraphs,
     pub(crate) prefill_memo: GraphExecutionMemo,
     pub(crate) decode_memo: GraphExecutionMemo,
+    /// The Prepared Execution Plans last prepared for these graphs, with
+    /// what they were prepared against. A request whose key matches starts
+    /// from a copy instead of selecting a Kernel for every node again.
+    plans: std::sync::Mutex<Option<(PlanCacheKey, FirstNativePreparedPlans)>>,
+    /// How many times `prepared_plans` had to prepare (tests).
+    preparations: std::sync::atomic::AtomicU64,
+}
+
+/// Everything a first-native plan preparation depends on besides its
+/// graphs: the Model Instance and its revision, the Provider and the
+/// Kernel Registry's state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlanCacheKey {
+    instance: ModelInstanceId,
+    mutation_version: u64,
+    provider: ProviderBinding,
+    registry_revision: u64,
 }
 
 impl CachedGraphs {
@@ -1476,7 +1493,51 @@ impl CachedGraphs {
             graphs,
             prefill_memo: GraphExecutionMemo::default(),
             decode_memo: GraphExecutionMemo::default(),
+            plans: std::sync::Mutex::new(None),
+            preparations: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Prepared plans for these graphs: a copy of the cached ones when
+    /// they were prepared against exactly `runtime`'s current instance
+    /// revision, `provider` and registry revision, freshly prepared (and
+    /// cached) otherwise. A plan is never shared: every request mutates
+    /// its own copy.
+    pub(crate) fn prepared_plans(
+        &self,
+        runtime: &Runtime,
+        instance: &ModelInstanceId,
+        prompt_token_count: u64,
+        provider: &ProviderBinding,
+    ) -> Result<FirstNativePreparedPlans, E2eConformanceError> {
+        let status = require_ready_first_native_instance(runtime, instance)?;
+        let key = PlanCacheKey {
+            instance: instance.clone(),
+            mutation_version: status.status().mutation_version,
+            provider: provider.clone(),
+            registry_revision: runtime.kernel_registry().revision(),
+        };
+        if let Some((cached_key, plans)) = self.plans.lock().unwrap().as_ref()
+            && *cached_key == key
+        {
+            return Ok(plans.clone());
+        }
+        let plans = prepare_first_native_execution_plans_for_provider(
+            runtime,
+            instance,
+            FirstNativeComponentGraphs::clone(&self.graphs),
+            prompt_token_count,
+            provider,
+        )?;
+        self.preparations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.plans.lock().unwrap() = Some((key, plans.clone()));
+        Ok(plans)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preparations(&self) -> u64 {
+        self.preparations.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -7526,6 +7587,7 @@ pub fn require_ready_first_native_instance<'a>(
 /// publishes. Public alongside it (task group 12) so an embedder can hold
 /// `&mut prefill`/`&mut decode` to build a
 /// [`crate::inference_api::RuntimeGenerationExecutionPlans`].
+#[derive(Clone)]
 pub struct FirstNativePreparedPlans {
     pub prefill: PreparedExecutionPlan,
     pub prefill_node_count: usize,
@@ -8968,16 +9030,16 @@ impl ProductionLoadedModel {
             .phase_ledger_mut()
             .record(clock, StepPhase::GraphBuild);
         let clock = self.runtime.phase_ledger().clock();
-        let prepared_plans = prepare_first_native_execution_plans_for_provider(
-            &self.runtime,
-            &self.instance,
-            FirstNativeComponentGraphs::clone(&component_graphs),
-            tokenized.token_ids.len() as u64,
-            &self.provider_binding,
-        )
-        .map_err(|error| InferenceApiError::GraphPlanningFailed {
-            reason: error.to_string(),
-        })?;
+        let prepared_plans = component_graphs
+            .prepared_plans(
+                &self.runtime,
+                &self.instance,
+                tokenized.token_ids.len() as u64,
+                &self.provider_binding,
+            )
+            .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                reason: error.to_string(),
+            })?;
         let generation_request = build_generation_request(
             GenerationRequestId::new("production-generation")?,
             Some(session.clone()),
