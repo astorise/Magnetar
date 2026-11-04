@@ -9,6 +9,10 @@
 //! which tokens survive is a correctness bug, not a speedup.
 
 use super::*;
+use crate::{
+    ModelDigest, SpecialToken, TokenIdRange, TokenizerArtifactId, TokenizerFamily, TokenizerId,
+    TokenizerRevision,
+};
 
 /// Deterministic pseudorandom source, so a failure reproduces exactly.
 struct Rng(u64);
@@ -283,4 +287,117 @@ fn greedy_selection_matches_softmax_and_rank_over_the_eligible_candidates() {
         greedy_selection(&candidates, true),
         Err(SamplingError::NoEligibleToken)
     ));
+}
+
+fn fast_path_tokenizer(vocabulary: u32) -> TokenizerMetadata {
+    TokenizerMetadata {
+        id: TokenizerId::new("fast-path").unwrap(),
+        artifact: TokenizerArtifactId::new("fast-path-tokenizer").unwrap(),
+        digest: ModelDigest::sha256(b"tokenizer"),
+        family: TokenizerFamily::new("fast-path").unwrap(),
+        revision: TokenizerRevision::new("1.0.0").unwrap(),
+        vocabulary_size: vocabulary,
+        added_token_count: 0,
+        token_id_range: TokenIdRange::new(0, vocabulary),
+        model_max_length: None,
+        special_tokens: vec![
+            SpecialToken::new(SpecialTokenKind::Eos, "<eos>", vocabulary - 1),
+            SpecialToken::new(SpecialTokenKind::Pad, "<pad>", 3),
+        ],
+        additional_special_tokens: vec![SpecialToken::new(
+            SpecialTokenKind::Additional,
+            "<extra>",
+            vocabulary - 2,
+        )],
+        byte_fallback: false,
+        normalization: None,
+        pre_tokenizer: None,
+        supports_offsets: false,
+        supports_token_type_ids: false,
+        supports_browser: false,
+    }
+}
+
+/// The greedy fast path selects the same token, with the same rank, as the
+/// general candidate path, which an allowed list naming every token forces
+/// without changing which tokens are eligible.
+#[test]
+fn fast_greedy_selection_matches_the_general_path() {
+    let mut rng = Rng(0x5eed_fa57);
+    let mut selected = 0;
+    for round in 0..200u32 {
+        let vocabulary = 64 + (rng.next_u64() % 64) as u32;
+        let mut scores: Vec<f32> = (0..vocabulary).map(|_| rng.score()).collect();
+        for _ in 0..3 {
+            let index = (rng.next_u64() % u64::from(vocabulary)) as usize;
+            scores[index] = match rng.next_u64() % 3 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                _ => f32::NEG_INFINITY,
+            };
+        }
+        let mut request = SamplingRequest::host_scores(
+            SamplingRequestId::new(format!("fast-{round}")).unwrap(),
+            scores,
+            fast_path_tokenizer(vocabulary),
+        );
+        request.parameters.greedy = true;
+        request.parameters.sampling_enabled = false;
+        // Temperature rounding can tie scores; a tiny temperature overflows
+        // finite scores to infinity.
+        request.parameters.temperature = [1.0, 0.7, 0.0, 1.3, 1e-38][(round % 5) as usize];
+        request.step_index = (rng.next_u64() % 3) as usize;
+        request.policy.suppress_pad = rng.next_u64().is_multiple_of(2);
+        request.policy.suppress_additional_special_tokens = rng.next_u64().is_multiple_of(2);
+        request.stop.minimum_generated_tokens = Some(2);
+        request.stop.mask_stop_tokens_before_minimum = rng.next_u64().is_multiple_of(2);
+        request.stop.stop_token_ids = vec![(rng.next_u64() % u64::from(vocabulary)) as u32];
+        request.banned_token_ids = (0..(rng.next_u64() % 4))
+            .map(|_| (rng.next_u64() % u64::from(vocabulary)) as u32)
+            .collect();
+        if round.is_multiple_of(5) {
+            // A banned run past the vocabulary's end.
+            request.banned_token_ids.push(TokenId::MAX);
+        }
+        let fast = select_next_token(&request);
+        let mut general = request.clone();
+        general.parameters.allowed_token_ids = Some((0..vocabulary).collect());
+        let general = select_next_token(&general);
+        match (fast, general) {
+            (Ok(fast), Ok(general)) => {
+                selected += 1;
+                assert_eq!(
+                    fast.selected_token_id, general.selected_token_id,
+                    "round {round}"
+                );
+                assert_eq!(fast.token_rank, general.token_rank, "round {round}");
+                assert_eq!(fast.finish_hint, general.finish_hint, "round {round}");
+            }
+            (Err(fast), Err(general)) => {
+                assert_eq!(format!("{fast:?}"), format!("{general:?}"), "round {round}");
+            }
+            (fast, general) => panic!("round {round}: {fast:?} vs {general:?}"),
+        }
+    }
+    // Most rounds select a token rather than agree on an error.
+    assert!(selected > 150, "only {selected} rounds selected a token");
+}
+
+#[test]
+fn fast_greedy_selection_breaks_temperature_ties_like_the_general_path() {
+    // Tokens 4 and 5 divide by 0.7 to the same f32; the lower id wins.
+    let mut scores = vec![-1.0_f32; 16];
+    scores[4] = 1.400_000_1;
+    scores[5] = 1.400_000_2;
+    let mut request = SamplingRequest::host_scores(
+        SamplingRequestId::new("fast-tie").unwrap(),
+        scores,
+        fast_path_tokenizer(16),
+    );
+    request.parameters.greedy = true;
+    request.parameters.sampling_enabled = false;
+    request.parameters.temperature = 0.7;
+    assert_ne!(1.400_000_1_f32, 1.400_000_2_f32);
+    assert_eq!(1.400_000_1_f32 / 0.7, 1.400_000_2_f32 / 0.7);
+    assert_eq!(select_next_token(&request).unwrap().selected_token_id, 4);
 }

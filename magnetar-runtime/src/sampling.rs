@@ -492,6 +492,19 @@ pub fn select_next_token(request: &SamplingRequest) -> Result<SamplingResult, Sa
         .as_ref()
         .ok_or(SamplingError::LogitsUnavailable)?
         .host_scores(&request.policy)?;
+    if let Some(selected) = fast_greedy_selection(request, scores)? {
+        return Ok(SamplingResult {
+            request_id: request.request_id.clone(),
+            selected_token_id: selected.token_id,
+            selection_mode: SamplingSelectionMode::Greedy,
+            token_rank: Some(selected.rank),
+            token_probability: None,
+            token_log_probability: None,
+            finish_hint: finish_hint_for(request, selected.token_id),
+            diagnostics: diagnostics_for(request, SamplingSelectionMode::Greedy),
+            updated_rng_state: None,
+        });
+    }
     let tokenizer =
         request
             .tokenizer
@@ -740,6 +753,42 @@ fn apply_token_constraints(
     request: &SamplingRequest,
     candidates: &mut [Candidate],
 ) -> Result<(), SamplingError> {
+    for range in excluded_candidate_positions(request, candidates.len())? {
+        for candidate in &mut candidates[range] {
+            candidate.eligible = false;
+        }
+    }
+    let allowed = request
+        .parameters
+        .allowed_token_ids
+        .as_ref()
+        .map(|ids| ids.iter().copied().collect::<BTreeSet<_>>());
+    if let Some(mask) = &request.allowed_token_mask {
+        for (index, candidate) in candidates.iter_mut().enumerate() {
+            if !mask[index] {
+                candidate.eligible = false;
+            }
+        }
+    }
+    if let Some(allowed) = &allowed {
+        for candidate in candidates.iter_mut() {
+            if !allowed.contains(&candidate.token_id) {
+                candidate.eligible = false;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The candidate positions (of `len`) the special-token, stop-token and
+/// banned-token rules make ineligible. Candidates are indexed by token id
+/// (`token_id_range.start` plus position, see `select_next_token`), so a
+/// rule naming token ids marks exactly those positions instead of every
+/// candidate of the vocabulary looking itself up in every rule's set.
+fn excluded_candidate_positions(
+    request: &SamplingRequest,
+    len: usize,
+) -> Result<Vec<std::ops::Range<usize>>, SamplingError> {
     let tokenizer =
         request
             .tokenizer
@@ -759,11 +808,6 @@ fn apply_token_constraints(
         .chain(request.parameters.banned_token_ids.iter())
         .copied()
         .collect::<BTreeSet<_>>();
-    let allowed = request
-        .parameters
-        .allowed_token_ids
-        .as_ref()
-        .map(|ids| ids.iter().copied().collect::<BTreeSet<_>>());
     let minimum_active = request
         .stop
         .minimum_generated_tokens
@@ -790,12 +834,8 @@ fn apply_token_constraints(
             first..first + 1
         }
     };
-    let len = candidates.len();
-    let mut exclude = |token_id: TokenId| {
-        for candidate in &mut candidates[positions_of(token_id, len)] {
-            candidate.eligible = false;
-        }
-    };
+    let mut excluded = Vec::new();
+    let mut exclude = |token_id: TokenId| excluded.push(positions_of(token_id, len));
     for (token_id, kind) in special {
         let suppressed = match kind {
             SpecialTokenKind::Pad => request.policy.suppress_pad,
@@ -819,21 +859,80 @@ fn apply_token_constraints(
     for token_id in banned {
         exclude(token_id);
     }
-    if let Some(mask) = &request.allowed_token_mask {
-        for (index, candidate) in candidates.iter_mut().enumerate() {
-            if !mask[index] {
-                candidate.eligible = false;
+    Ok(excluded)
+}
+
+/// The greedy selection without building a vocabulary-sized candidate
+/// vector, for the requests whose eligible candidates the special-token,
+/// stop-token and banned-token rules alone decide and that report no
+/// probability: their best candidate is the [`candidate_order`] minimum of
+/// the finite, non-excluded scores, ranked 1, exactly what the general path
+/// selects (temperature scaling, top-k and top-p never remove or reorder the
+/// best candidate, and none of those apply here). `None` for any other
+/// request.
+fn fast_greedy_selection(
+    request: &SamplingRequest,
+    scores: &[f32],
+) -> Result<Option<SelectedCandidate>, SamplingError> {
+    let parameters = &request.parameters;
+    let greedy = parameters.greedy || !parameters.sampling_enabled || parameters.temperature == 0.0;
+    if !greedy
+        || request.policy.allow_probability_metadata
+        || request.allowed_token_mask.is_some()
+        || parameters.allowed_token_ids.is_some()
+        || penalties_enabled(parameters)
+        || parameters.top_k.is_some()
+        || parameters.top_p.is_some()
+    {
+        return Ok(None);
+    }
+    validate_temperature(request)?;
+    let tokenizer =
+        request
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| SamplingError::TokenizerMetadataMissing {
+                message: "sampling requires tokenizer metadata".into(),
+            })?;
+    let mut excluded = excluded_candidate_positions(request, scores.len())?;
+    excluded.sort_by_key(|range| range.start);
+    let start = tokenizer.token_id_range.start;
+    // Compare the scores `apply_temperature` would produce: its rounding
+    // can tie two scores, and a tie selects the lower token id.
+    let temperature = parameters.temperature;
+    let mut best: Option<(f32, TokenId)> = None;
+    let mut consider = |range: std::ops::Range<usize>| {
+        for (index, &score) in scores[range.clone()].iter().enumerate() {
+            if !score.is_finite() {
+                continue;
+            }
+            let score = if temperature == 0.0 {
+                score
+            } else {
+                score / temperature
+            };
+            let key = (score, start.saturating_add((range.start + index) as u32));
+            if best.is_none_or(|current| candidate_order(key, current).is_lt()) {
+                best = Some(key);
             }
         }
-    }
-    if let Some(allowed) = &allowed {
-        for candidate in candidates.iter_mut() {
-            if !allowed.contains(&candidate.token_id) {
-                candidate.eligible = false;
-            }
+    };
+    let mut next = 0;
+    for range in excluded {
+        if range.start > next {
+            consider(next..range.start);
         }
+        next = next.max(range.end);
     }
-    Ok(())
+    if next < scores.len() {
+        consider(next..scores.len());
+    }
+    let (_, token_id) = best.ok_or(SamplingError::NoEligibleToken)?;
+    Ok(Some(SelectedCandidate {
+        token_id,
+        probability: f32::NAN,
+        rank: 1,
+    }))
 }
 
 fn apply_penalties(
@@ -894,22 +993,29 @@ fn apply_penalties(
     Ok(())
 }
 
-fn apply_temperature(
-    request: &SamplingRequest,
-    candidates: &mut [Candidate],
-) -> Result<(), SamplingError> {
+/// The errors [`apply_temperature`] reports for `request`'s temperature.
+fn validate_temperature(request: &SamplingRequest) -> Result<(), SamplingError> {
     let temperature = request.parameters.temperature;
     if !temperature.is_finite() || temperature < 0.0 {
         return Err(SamplingError::TemperatureInvalid {
             message: "temperature must be finite and non-negative".into(),
         });
     }
+    if temperature == 0.0 && request.policy.temperature_zero == TemperatureZeroPolicy::Invalid {
+        return Err(SamplingError::TemperatureInvalid {
+            message: "temperature zero is invalid by policy".into(),
+        });
+    }
+    Ok(())
+}
+
+fn apply_temperature(
+    request: &SamplingRequest,
+    candidates: &mut [Candidate],
+) -> Result<(), SamplingError> {
+    validate_temperature(request)?;
+    let temperature = request.parameters.temperature;
     if temperature == 0.0 {
-        if request.policy.temperature_zero == TemperatureZeroPolicy::Invalid {
-            return Err(SamplingError::TemperatureInvalid {
-                message: "temperature zero is invalid by policy".into(),
-            });
-        }
         return Ok(());
     }
     for candidate in candidates.iter_mut().filter(|candidate| candidate.eligible) {

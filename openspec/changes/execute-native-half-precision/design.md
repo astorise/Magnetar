@@ -45,6 +45,19 @@ Real Qwen2.5-0.5B, greedy, on an RTX 3060, GPU CI run 41688972164 (Runtime e808b
 - Replayed steps are still bit-identical to per-node ones, and 13 of 16 steps still replay.
 - A first attempt converted each whole weight before its upload and raised peak RSS to 1.66 GB (run 41686324411). Uploading a chunk of 1 Mi values at a time removed that.
 
+Device time of one decode matmul per projection shape (run 41718804397, `decode_matmul_bandwidth`, 200 back-to-back launches, so the smallest shapes read as their launch cost):
+
+| `[1, k] x [k, n]` | f32 | bfloat16 |
+|---|---|---|
+| 896 x 896 (Q, O) | 13.1 us, 246 GB/s | 5.5 us, 293 GB/s |
+| 896 x 128 (K, V) | 4.8 us | 4.9 us |
+| 896 x 4864 (gate, up) | 55.4 us, 314 GB/s | 30.4 us, 286 GB/s |
+| 4864 x 896 (down) | 55.6 us, 313 GB/s | 35.8 us, 243 GB/s |
+| 896 x 151936 (LM head) | 1601 us, 340 GB/s | 823 us, 331 GB/s |
+
+- The projections take about 117 us per layer in bfloat16 against 83 us at the card's 360 GB/s; the K and V matmuls are launch-bound and the down projection reaches the lowest bandwidth. They are the next decode GEMV targets.
+- A compact Kernel reading 8 weights per load was not kept. Taken for every shape, it raised TPOT to 6.4 ms (run 41715792007): 256 columns per block leave 896-column projections 4 blocks for 28 SMs. On the LM head alone it saved 18 us (805 against 823 us), not worth its Kernel.
+
 ### Implementation boundary and data flow
 
 Propagate storage, compute and accumulation dtypes independently through tensor metadata, graph validation and Kernel Registry eligibility. Materialize native half storage; keep F32 reductions explicit. CUDA owns Tensor Core kernels and alignment handling, and Reference CPU remains the correctness oracle.
