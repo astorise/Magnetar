@@ -248,6 +248,19 @@ jobs:
           export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
           export MAGNETAR_QUALIFICATION_SUMMARY_PATH="$GITHUB_STEP_SUMMARY"
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
+      - name: Real-checkpoint long-context campaign with Tensor Cores off (disable control)
+        # The same 512- and 4096-token campaigns on the bit-identical
+        # CUDA-core matmuls: their generated tokens and timings are the
+        # comparison for the Tensor Core prefill matmuls.
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CUDA_TENSOR_CORES: "0"
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
+          MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
+        run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
       - name: Upload qualification reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
