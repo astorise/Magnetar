@@ -4681,17 +4681,28 @@ fn execute_first_native_graph_nodes(
                             store_descriptor.clone(),
                             Some(target),
                         )?;
-                        let zeros = HostTensor::new(
-                            [capacity, width],
-                            vec![0.0; (capacity * width) as usize],
-                        )
-                        .map_err(runtime_generation_failed)?;
-                        dispatch_ctx
+                        // Zeroed where the store lives when the Provider can,
+                        // instead of building and uploading host zeros: at
+                        // prefill, one store per layer and role.
+                        let zeroed = dispatch_ctx
                             .provider
-                            .write_tensor_value(store_id, TensorValue::Host(zeros))
+                            .write_zeroed_tensor(&store_id, &[capacity, width])
                             .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
                                 reason: error.to_string(),
                             })?;
+                        if !zeroed {
+                            let zeros = HostTensor::new(
+                                [capacity, width],
+                                vec![0.0; (capacity * width) as usize],
+                            )
+                            .map_err(runtime_generation_failed)?;
+                            dispatch_ctx
+                                .provider
+                                .write_tensor_value(store_id, TensorValue::Host(zeros))
+                                .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                                    reason: error.to_string(),
+                                })?;
+                        }
                     }
                     let mut attributes = BTreeMap::new();
                     attributes.insert(

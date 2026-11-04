@@ -10815,6 +10815,9 @@ struct ReplayingExecutor {
     /// Selects greedy tokens "on the Device" (`select_greedy_column`).
     select_greedy: AtomicBool,
     greedy_selections: AtomicU64,
+    /// Zeroes KV stores "on the Device" (`write_zeroed_tensor`).
+    zero_on_provider: AtomicBool,
+    zeroed_tensors: AtomicU64,
 }
 
 #[derive(Default)]
@@ -10842,6 +10845,8 @@ impl ReplayingExecutor {
             invalidate_next_replay: AtomicBool::new(false),
             select_greedy: AtomicBool::new(false),
             greedy_selections: AtomicU64::new(0),
+            zero_on_provider: AtomicBool::new(false),
+            zeroed_tensors: AtomicU64::new(0),
         }
     }
 
@@ -10967,6 +10972,24 @@ impl ProviderExecutionApi for ReplayingExecutor {
             self.poison_if_recording();
         }
         self.inner.write_tensor_value(id, value)
+    }
+
+    fn write_zeroed_tensor(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+    ) -> Result<bool, ProviderExecutionError> {
+        if !self.zero_on_provider.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.poison_if_recording();
+        let len = shape.iter().product::<u64>() as usize;
+        let zeros = HostTensor::new(shape.to_vec(), vec![0.0; len])
+            .map_err(|_| Self::failure("zeroed tensor shape"))?;
+        self.zeroed_tensors.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .write_tensor_value(id.clone(), TensorValue::Host(zeros))
+            .map(|()| true)
     }
     fn write_tensor_value_admitted(
         &self,
@@ -11159,8 +11182,23 @@ fn run_replaying_decode(
     decode_steps: usize,
     before_step: impl Fn(&ReplayingExecutor, usize),
 ) -> (Vec<Vec<u32>>, Arc<ReplayingExecutor>, Runtime) {
+    run_replaying_decode_on(
+        Arc::new(ReplayingExecutor::new()),
+        replay,
+        release_request,
+        decode_steps,
+        before_step,
+    )
+}
+
+fn run_replaying_decode_on(
+    executor: Arc<ReplayingExecutor>,
+    replay: bool,
+    release_request: bool,
+    decode_steps: usize,
+    before_step: impl Fn(&ReplayingExecutor, usize),
+) -> (Vec<Vec<u32>>, Arc<ReplayingExecutor>, Runtime) {
     let fixture = e2e_fixture().expect("fixture builds");
-    let executor = Arc::new(ReplayingExecutor::new());
     let provider = Arc::new(ReplayingProvider {
         inner: ReferenceCpuProvider::new(),
         executor: executor.clone(),
@@ -11226,6 +11264,25 @@ fn run_replaying_decode(
             .unwrap();
     }
     (steps, executor, runtime)
+}
+
+/// A Provider that zeroes the in-place KV stores itself
+/// (`write_zeroed_tensor`) gets one call per layer and role at prefill, and
+/// every step's logits are bit-identical to those of host-written zeros.
+#[test]
+fn provider_zeroed_kv_stores_match_host_written_zeros() {
+    let decode_steps = 4;
+    let (host, host_executor, _) = run_replaying_decode(true, true, decode_steps, |_, _| {});
+    assert_eq!(host_executor.zeroed_tensors.load(Ordering::SeqCst), 0);
+    let executor = Arc::new(ReplayingExecutor::new());
+    executor.zero_on_provider.store(true, Ordering::SeqCst);
+    let (zeroed, executor, _) =
+        run_replaying_decode_on(executor, true, true, decode_steps, |_, _| {});
+    assert_eq!(zeroed, host);
+    assert_eq!(
+        executor.zeroed_tensors.load(Ordering::SeqCst),
+        2 * E2E_FIXTURE_LAYERS
+    );
 }
 
 /// `keep-sampling-on-device`: a replayed plain greedy decode step can have
