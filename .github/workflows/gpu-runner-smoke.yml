@@ -90,6 +90,11 @@ jobs:
         # Kernel; diagnostic only.
         timeout-minutes: 10
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml decode_matmul_bandwidth -- --ignored --nocapture
+      - name: CUDA long-context kernel times (diagnostic)
+        # The Device time of each prefill matmul shape and of the attention
+        # at 512 and 4096 rows; diagnostic only.
+        timeout-minutes: 15
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml long_context_kernel_times -- --ignored --nocapture
       - name: Build and test the real first-native Qwen Component against a real CudaProvider
         # #58: `integration-tests/cuda-first-native` runs the real
         # first-native pipeline (magnetar-runtime, driven by the checked-in
