@@ -37,3 +37,18 @@
 [submodule "providers/tpu"]
 	path = providers/tpu
 	url = https://github.com/astorise/Magnetar-provider-TPU.git
+[submodule "components/nemotron"]
+	path = components/nemotron
+	url = https://github.com/astorise/Magnetar-component-Nemotron.git
+[submodule "components/gemma"]
+	path = components/gemma
+	url = https://github.com/astorise/Magnetar-component-Gemma.git
+[submodule "components/kimi"]
+	path = components/kimi
+	url = https://github.com/astorise/Magnetar-component-Kimi.git
+[submodule "components/mistral"]
+	path = components/mistral
+	url = https://github.com/astorise/Magnetar-component-Mistral.git
+[submodule "components/deepseek"]
+	path = components/deepseek
+	url = https://github.com/astorise/Magnetar-component-DeepSeek.git

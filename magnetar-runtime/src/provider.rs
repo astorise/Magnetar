@@ -985,6 +985,27 @@ pub trait ProviderExecutionApi: Send + Sync {
     fn release_step_capture(&self, id: &StepCaptureId) {
         let _ = id;
     }
+
+    /// Greedy next-token selection on the Device (`keep-sampling-on-device`
+    /// B10): the column of `logits`' row `row` with the highest score
+    /// divided by `temperature` (left as is when it is 0), among the
+    /// columns outside `excluded` whose raw score is finite, ties going to
+    /// the lowest column -- exactly the Runtime's host greedy selection.
+    /// Only the chosen column crosses back to the host.
+    ///
+    /// `None` when this Provider does not select on the Device, or no
+    /// column is eligible: the caller then downloads the logits and selects
+    /// on the host, which also reports why nothing was eligible.
+    fn select_greedy_column(
+        &self,
+        logits: &TensorResourceId,
+        row: u64,
+        excluded: &[std::ops::Range<u64>],
+        temperature: f32,
+    ) -> Option<u64> {
+        let _ = (logits, row, excluded, temperature);
+        None
+    }
 }
 
 fn step_capture_unsupported(phase: ProviderExecutionPhase) -> ProviderExecutionError {

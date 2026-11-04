@@ -4957,12 +4957,20 @@ fn execute_first_native_graph_nodes(
 /// Replays a request's captured decode step at `absolute_position`
 /// (`capture-and-replay-cuda-graphs`). `None` when the capture can no longer
 /// be replayed: the step must run per node.
+/// A plain greedy step's Device selection: the excluded logits columns and
+/// the temperature (`sampling::device_greedy_plan`).
+type DeviceGreedyPlan = (Vec<std::ops::Range<u64>>, f32);
+
+/// Replays a recorded decode step. With `greedy`, the Provider selects the
+/// step's token on the Device when it can: the output then holds no logits
+/// and the selected column comes back instead.
 fn replay_decode_step(
     runtime: &mut Runtime,
     recorded: &RecordedDecodeStep,
     ids_tensor: HostTensor,
     absolute_position: u64,
-) -> Result<Option<FirstNativeGraphExecutionOutput>, InferenceApiError> {
+    greedy: Option<&DeviceGreedyPlan>,
+) -> Result<Option<(FirstNativeGraphExecutionOutput, Option<u64>)>, InferenceApiError> {
     let Some(offset) = absolute_position.checked_sub(recorded.position) else {
         return Ok(None);
     };
@@ -4987,18 +4995,31 @@ fn replay_decode_step(
         return Ok(None);
     }
     let materialize_clock = runtime.phase_ledger().clock();
-    let bindings = materialize_first_native_graph_bindings(
-        &*executor,
-        &BTreeMap::from([(TensorEdgeId::new("logits"), recorded.logits.clone())]),
-    )?;
+    let (logits_resource, logits_shape) = &recorded.logits;
+    let last_row = logits_shape
+        .first()
+        .map_or(0, |rows| rows.saturating_sub(1));
+    let selected = greedy.and_then(|(excluded, temperature)| {
+        executor.select_greedy_column(logits_resource, last_row, excluded, *temperature)
+    });
+    let bindings = match selected {
+        Some(_) => BTreeMap::new(),
+        None => materialize_first_native_graph_bindings(
+            &*executor,
+            &BTreeMap::from([(TensorEdgeId::new("logits"), recorded.logits.clone())]),
+        )?,
+    };
     runtime
         .phase_ledger_mut()
         .record(materialize_clock, StepPhase::OutputMaterialize);
     Ok(Some((
-        recorded.dispatch.clone(),
-        bindings,
-        layer_kv,
-        recorded.provider.clone(),
+        (
+            recorded.dispatch.clone(),
+            bindings,
+            layer_kv,
+            recorded.provider.clone(),
+        ),
+        selected,
     )))
 }
 
@@ -5054,17 +5075,25 @@ fn materialize_first_native_graph_bindings(
     Ok(materialized_bindings)
 }
 
-impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
-    fn execute_generation_step(
+impl E2eRuntimeModelExecutionEngine {
+    /// One generation step; with `greedy` (a plain greedy sampling
+    /// request), a replayed decode step's token may be selected on the
+    /// Device instead of returning its logits.
+    fn execute_step(
         &self,
         runtime: &mut Runtime,
         request: &GenerationRequest,
         generated_tokens: &[TokenId],
         execution_plan: Option<&mut PreparedExecutionPlan>,
+        greedy: Option<&crate::SamplingRequest>,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         let forced_token = self.forced_token;
 
         let vocab = self.fixture.config.architecture.vocabulary_size as usize;
+        let greedy_plan = greedy
+            .filter(|_| forced_token.is_none())
+            .and_then(|greedy| crate::sampling::device_greedy_plan(greedy, vocab));
+        let mut device_greedy_column = None;
         let kv_clock = runtime.phase_ledger().clock();
         let mut kv_state = if generated_tokens.is_empty() {
             self.create_prefill_kv_state(runtime, request)?
@@ -5246,7 +5275,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                             reason: "decode requires a newly admitted token".into(),
                         }
                     })?;
-                    self.execute_decode_graph(
+                    let (output, selected) = self.execute_decode_graph(
                         runtime,
                         request,
                         &kv_state,
@@ -5258,7 +5287,10 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
                         generated_tokens.len(),
                         &mut node_events,
                         kv_store_capacity,
-                    )?
+                        greedy_plan.as_ref(),
+                    )?;
+                    device_greedy_column = selected;
+                    output
                 };
             // `execute_first_native_graph` topologically validates the graph (via
             // `first_native_graph_execution_order`) as its first action -- reaching
@@ -5275,14 +5307,20 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
             // under.
             kv_state.provider = Some(resolved_provider);
             let logits_clock = runtime.phase_ledger().clock();
-            let logits_tensor = bindings
-                .remove(&TensorEdgeId::new("logits"))
-                .ok_or_else(|| InferenceApiError::GenerationFailed {
-                    reason: "first-native graph produced no logits output".into(),
-                })?;
-            let output_rows = logits_tensor.data.len() / vocab.max(1);
-            let last_row_start = output_rows.saturating_sub(1) * vocab;
-            let logits = logits_tensor.data[last_row_start..last_row_start + vocab].to_vec();
+            // A token selected on the Device leaves its logits there.
+            let logits = if device_greedy_column.is_some() {
+                Vec::new()
+            } else {
+                let logits_tensor =
+                    bindings
+                        .remove(&TensorEdgeId::new("logits"))
+                        .ok_or_else(|| InferenceApiError::GenerationFailed {
+                            reason: "first-native graph produced no logits output".into(),
+                        })?;
+                let output_rows = logits_tensor.data.len() / vocab.max(1);
+                let last_row_start = output_rows.saturating_sub(1) * vocab;
+                logits_tensor.data[last_row_start..last_row_start + vocab].to_vec()
+            };
             runtime
                 .phase_ledger_mut()
                 .record(logits_clock, StepPhase::LogitsExtract);
@@ -5324,9 +5362,40 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         runtime
             .phase_ledger_mut()
             .record(evidence_clock, StepPhase::EvidenceBuild);
-        Ok(RuntimeModelExecutionStep::new(logits, evidence)
+        let mut step = RuntimeModelExecutionStep::new(logits, evidence)
             .with_kv_commit(kv_commit)
-            .with_node_events(node_events))
+            .with_node_events(node_events);
+        step.device_greedy_column = device_greedy_column;
+        Ok(step)
+    }
+}
+
+impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
+    fn execute_generation_step(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+        execution_plan: Option<&mut PreparedExecutionPlan>,
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
+        self.execute_step(runtime, request, generated_tokens, execution_plan, None)
+    }
+
+    fn execute_generation_step_selecting(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+        execution_plan: Option<&mut PreparedExecutionPlan>,
+        greedy: &crate::SamplingRequest,
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
+        self.execute_step(
+            runtime,
+            request,
+            generated_tokens,
+            execution_plan,
+            Some(greedy),
+        )
     }
 
     fn commit_generation_step(
@@ -5748,7 +5817,8 @@ impl E2eRuntimeModelExecutionEngine {
         decode_index: usize,
         node_events: &mut Vec<PerNodeCausalEvent>,
         kv_store_capacity: Option<u64>,
-    ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
+        greedy: Option<&DeviceGreedyPlan>,
+    ) -> Result<(FirstNativeGraphExecutionOutput, Option<u64>), InferenceApiError> {
         let ids_tensor =
             HostTensor::new([1], vec![token as f32]).map_err(runtime_generation_failed)?;
         let key = Self::kv_state_key(request);
@@ -5760,9 +5830,13 @@ impl E2eRuntimeModelExecutionEngine {
             && kv_state.layer_kv.values().all(|layer| layer.rows.is_some());
         if replayable {
             if let Some(recorded) = self.step_replay.recorded(&key) {
-                if let Some(output) =
-                    replay_decode_step(runtime, &recorded, ids_tensor.clone(), absolute_position)?
-                {
+                if let Some(output) = replay_decode_step(
+                    runtime,
+                    &recorded,
+                    ids_tensor.clone(),
+                    absolute_position,
+                    greedy,
+                )? {
                     return Ok(output);
                 }
                 // Invalidated: this step runs per node, a later one may
@@ -5784,7 +5858,7 @@ impl E2eRuntimeModelExecutionEngine {
                 )? {
                     Some((recorded, output)) => {
                         self.step_replay.record(key, recorded);
-                        return Ok(output);
+                        return Ok((output, None));
                     }
                     None => self.step_replay.decline(key),
                 }
@@ -5805,6 +5879,7 @@ impl E2eRuntimeModelExecutionEngine {
             Some(&graphs.decode_memo),
             kv_store_capacity,
         )
+        .map(|output| (output, None))
     }
 
     /// Runs one decode step per node inside a step capture. `None` when the
