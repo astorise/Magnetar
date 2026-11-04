@@ -761,6 +761,29 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::Any,
         ),
+        // A matmul-family Operator reading `rmsnorm(x, norm)`, produced
+        // only by `graph_fusion::fuse_rmsnorm_matmuls`.
+        (
+            "rmsnorm-matmul",
+            OperatorFamily::LinearAlgebra,
+            3,
+            1,
+            ShapeRule::Any,
+        ),
+        (
+            "rmsnorm-matmul-bias",
+            OperatorFamily::LinearAlgebra,
+            4,
+            1,
+            ShapeRule::Any,
+        ),
+        (
+            "rmsnorm-gated-matmul",
+            OperatorFamily::LinearAlgebra,
+            4,
+            1,
+            ShapeRule::Any,
+        ),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         (
             "rmsnorm",
@@ -942,6 +965,25 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
                 .with_rule(
                     "accumulation_dtype",
                     OperatorAttributeRule::optional(OperatorAttributeKind::DType),
+                )
+        }
+        "rmsnorm-matmul" | "rmsnorm-matmul-bias" | "rmsnorm-gated-matmul" => {
+            OperatorAttributeSchema::default()
+                .with_rule(
+                    "transpose_a",
+                    OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+                )
+                .with_rule(
+                    "transpose_b",
+                    OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+                )
+                .with_rule(
+                    "accumulation_dtype",
+                    OperatorAttributeRule::optional(OperatorAttributeKind::DType),
+                )
+                .with_rule(
+                    "epsilon",
+                    OperatorAttributeRule::required(OperatorAttributeKind::Float),
                 )
         }
         "attention" | "paged-attention" => OperatorAttributeSchema::default()

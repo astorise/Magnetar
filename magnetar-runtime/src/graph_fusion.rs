@@ -16,6 +16,11 @@
 //! - `gated-matmul`: `silu-mul(matmul(a, gate), matmul(a, up))`, after
 //!   the `silu-mul` pass: each layer's whole SwiGLU projection, both
 //!   weights read by one Kernel. It folds three nodes, not two.
+//! - `rmsnorm-matmul`, `rmsnorm-matmul-bias`, `rmsnorm-gated-matmul`:
+//!   an `rmsnorm` whose every consumer is one of `matmul`, `matmul-bias`
+//!   or `gated-matmul` reading it as `a`, after the passes above. Each
+//!   consumer normalizes its own input, so the `rmsnorm` node disappears
+//!   even when several matmuls read it (each layer's Q, K and V).
 //!
 //! Every fused Operator computes exactly the two operations it replaces,
 //! in the same order (floating-point addition and multiplication of two
@@ -42,6 +47,26 @@ pub const SILU_MUL_OPERATOR: &str = "silu-mul";
 
 /// `silu(matmul(a, gate)) * matmul(a, up)`, inputs `[a, gate, up]`.
 pub const GATED_MATMUL_OPERATOR: &str = "gated-matmul";
+
+/// `matmul(rmsnorm(x, norm), b)`, inputs `[x, norm, b]`; takes `matmul`'s
+/// attributes and the `rmsnorm`'s `epsilon`.
+pub const RMSNORM_MATMUL_OPERATOR: &str = "rmsnorm-matmul";
+
+/// `matmul-bias(rmsnorm(x, norm), b, bias)`, inputs `[x, norm, b, bias]`.
+pub const RMSNORM_MATMUL_BIAS_OPERATOR: &str = "rmsnorm-matmul-bias";
+
+/// `gated-matmul(rmsnorm(x, norm), gate, up)`, inputs `[x, norm, gate, up]`.
+pub const RMSNORM_GATED_MATMUL_OPERATOR: &str = "rmsnorm-gated-matmul";
+
+/// The `rmsnorm-` Operator that normalizes a `consumer` Operator's input.
+pub fn rmsnorm_fused_operator_name(consumer: &str) -> Option<&'static str> {
+    match consumer {
+        "matmul" => Some(RMSNORM_MATMUL_OPERATOR),
+        MATMUL_BIAS_OPERATOR => Some(RMSNORM_MATMUL_BIAS_OPERATOR),
+        GATED_MATMUL_OPERATOR => Some(RMSNORM_GATED_MATMUL_OPERATOR),
+        _ => None,
+    }
+}
 
 /// The `matmul-bias` Operator id.
 pub fn matmul_bias_operator() -> OperatorId {
@@ -365,6 +390,111 @@ pub fn fuse_gated_matmul(graph: &ExecutionGraph) -> (ExecutionGraph, usize) {
         }
     }
     (fused, 2 * fusions.len())
+}
+
+/// Folds every `rmsnorm(x, norm)` whose output is read only as the first
+/// input of `matmul`, `matmul-bias` or `gated-matmul` nodes into those
+/// consumers: each becomes its `rmsnorm-` Operator (see
+/// [`rmsnorm_fused_operator_name`]) with inputs `[x, norm, ...]` and the
+/// `rmsnorm`'s `epsilon`, and the `rmsnorm` node and its output edge
+/// disappear. `advertised` says which fused Operators the Provider runs;
+/// an `rmsnorm` with any consumer it cannot fuse is left alone. Only a
+/// last-dimension norm (no `normalized_dimension`) of a rank-2 input by a
+/// rank-1 weight, read by non-transposed matmuls, is fused. Returns the
+/// rewritten graph and how many `rmsnorm` nodes it removed.
+pub fn fuse_rmsnorm_matmuls(
+    graph: &ExecutionGraph,
+    advertised: impl Fn(&str) -> bool,
+) -> (ExecutionGraph, usize) {
+    use crate::operator::OperatorAttributeValue;
+    let transposes_a = |node: &crate::execution_graph::ExecutionNode| {
+        node.attributes.get("transpose_a") == Some(&OperatorAttributeValue::Boolean(true))
+    };
+    let mut fusions = Vec::new();
+    for (norm_id, norm) in &graph.nodes {
+        if norm.operator.name() != "rmsnorm"
+            || norm.inputs.len() != 2
+            || norm.outputs.len() != 1
+            || norm.attributes.contains_key("normalized_dimension")
+        {
+            continue;
+        }
+        let Some(epsilon) = norm.attributes.get("epsilon").cloned() else {
+            continue;
+        };
+        let (input, weight, output) = (&norm.inputs[0], &norm.inputs[1], &norm.outputs[0]);
+        let (Some(input_edge), Some(weight_edge), Some(output_edge)) = (
+            graph.edges.get(input),
+            graph.edges.get(weight),
+            graph.edges.get(output),
+        ) else {
+            continue;
+        };
+        let input_dims = &input_edge.descriptor.shape.dimensions;
+        let weight_dims = &weight_edge.descriptor.shape.dimensions;
+        if input_dims.len() != 2
+            || weight_dims.len() != 1
+            || input_dims.last() != weight_dims.first()
+            || output_edge.kv_cache.is_some()
+            || output_edge.prefix_cache.is_some()
+        {
+            continue;
+        }
+        let consumers: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.inputs.contains(output))
+            .collect();
+        let fusable = !consumers.is_empty()
+            && consumers.iter().all(|(_, node)| {
+                node.inputs[0] == *output
+                    && !node.inputs[1..].contains(output)
+                    && !transposes_a(node)
+                    && rmsnorm_fused_operator_name(node.operator.name())
+                        .is_some_and(|fused| advertised(fused))
+            });
+        if fusable {
+            fusions.push((
+                norm_id.clone(),
+                consumers
+                    .iter()
+                    .map(|(id, _)| (*id).clone())
+                    .collect::<Vec<_>>(),
+                epsilon,
+            ));
+        }
+    }
+    let mut fused = graph.clone();
+    for (norm_id, consumers, epsilon) in &fusions {
+        let norm = fused
+            .nodes
+            .remove(norm_id)
+            .expect("each fused rmsnorm is a graph node");
+        let (input, weight, output) = (&norm.inputs[0], &norm.inputs[1], &norm.outputs[0]);
+        fused.edges.remove(output);
+        for consumer_id in consumers {
+            let consumer = fused
+                .nodes
+                .get_mut(consumer_id)
+                .expect("each fused consumer is a graph node");
+            let name = rmsnorm_fused_operator_name(consumer.operator.name())
+                .expect("only fusable consumers are recorded");
+            consumer.operator = OperatorId::magnetar(name, 1, consumer.operator.family());
+            let rest = consumer.inputs.split_off(1);
+            consumer.inputs = vec![input.clone(), weight.clone()];
+            consumer.inputs.extend(rest);
+            consumer
+                .attributes
+                .insert("epsilon".into(), epsilon.clone());
+        }
+        for edge_id in [input, weight] {
+            if let Some(edge) = fused.edges.get_mut(edge_id) {
+                edge.consumers.remove(norm_id);
+                edge.consumers.extend(consumers.iter().cloned());
+            }
+        }
+    }
+    (fused, fusions.len())
 }
 
 #[cfg(test)]
