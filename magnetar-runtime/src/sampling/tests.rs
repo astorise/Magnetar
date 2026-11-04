@@ -401,3 +401,28 @@ fn fast_greedy_selection_breaks_temperature_ties_like_the_general_path() {
     assert_eq!(1.400_000_1_f32 / 0.7, 1.400_000_2_f32 / 0.7);
     assert_eq!(select_next_token(&request).unwrap().selected_token_id, 4);
 }
+
+/// A Device selection is offered only for a plain greedy request whose
+/// policy allows Provider assistance (on by default).
+#[test]
+fn device_greedy_plan_honours_the_provider_assisted_policy() {
+    let mut request = SamplingRequest::host_scores(
+        SamplingRequestId::new("device-plan").unwrap(),
+        Vec::new(),
+        fast_path_tokenizer(16),
+    );
+    request.parameters.greedy = true;
+    request.parameters.sampling_enabled = false;
+    assert!(request.policy.allow_provider_assisted);
+    let (excluded, temperature) = crate::sampling::device_greedy_plan(&request, 16)
+        .expect("a plain greedy request is offered to the Provider");
+    assert_eq!(temperature, request.parameters.temperature);
+    // The special tokens the host path excludes are excluded here too.
+    assert!(!excluded.is_empty());
+    request.policy.allow_provider_assisted = false;
+    assert!(crate::sampling::device_greedy_plan(&request, 16).is_none());
+    // Not plain greedy: probability metadata needs the host path.
+    request.policy.allow_provider_assisted = true;
+    request.policy.allow_probability_metadata = true;
+    assert!(crate::sampling::device_greedy_plan(&request, 16).is_none());
+}

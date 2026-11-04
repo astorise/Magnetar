@@ -314,6 +314,10 @@ pub struct SamplingPolicy {
     pub allow_logits_materialization: bool,
     pub host_staging: HostStagingPolicy,
     pub temperature_zero: TemperatureZeroPolicy,
+    /// Whether a Provider may select the token where the logits are
+    /// (`keep-sampling-on-device`). On by default: a Device selection
+    /// returns exactly the host selection's token; `false` keeps every
+    /// selection on the host.
     pub allow_provider_assisted: bool,
     pub allow_eos_before_min_length: bool,
     pub suppress_pad: bool,
@@ -329,7 +333,7 @@ impl Default for SamplingPolicy {
             allow_logits_materialization: false,
             host_staging: HostStagingPolicy::Forbid,
             temperature_zero: TemperatureZeroPolicy::Greedy,
-            allow_provider_assisted: false,
+            allow_provider_assisted: true,
             allow_eos_before_min_length: false,
             suppress_pad: true,
             suppress_bos_after_beginning: true,
@@ -896,7 +900,8 @@ pub(crate) fn device_greedy_plan(
     request: &SamplingRequest,
     columns: usize,
 ) -> Option<(Vec<std::ops::Range<u64>>, f32)> {
-    if !is_plain_greedy(request)
+    if !request.policy.allow_provider_assisted
+        || !is_plain_greedy(request)
         || validate_temperature(request).is_err()
         || request.tokenizer.is_none()
     {
