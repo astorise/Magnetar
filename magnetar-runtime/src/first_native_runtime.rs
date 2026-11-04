@@ -4195,6 +4195,10 @@ pub(crate) enum MaterializedEdges<'a> {
     All,
     /// Only these edges, when the graph produced them.
     Only(&'a [&'a str]),
+    /// Only the last row of each of these rank-2 edges (a prefill's
+    /// logits: only the last prompt row's distribution is sampled), read
+    /// through `read_tensor_rows` so the other rows stay on the Device.
+    LastRow(&'a [&'a str]),
 }
 
 /// [`execute_first_native_graph`], generalized to additionally accept graph inputs
@@ -4942,11 +4946,14 @@ fn execute_first_native_graph_nodes(
         reason: "first-native graph executed no nodes".into(),
     })?;
     let materialize_clock = dispatch_ctx.runtime.phase_ledger().clock();
-    if let MaterializedEdges::Only(edges) = materialized {
+    if let MaterializedEdges::Only(edges) | MaterializedEdges::LastRow(edges) = materialized {
         bindings.retain(|edge_id, _| edges.contains(&edge_id.as_str()));
     }
-    let materialized_bindings =
-        materialize_first_native_graph_bindings(&*dispatch_ctx.provider, &bindings)?;
+    let materialized_bindings = if let MaterializedEdges::LastRow(_) = materialized {
+        materialize_last_rows(&*dispatch_ctx.provider, &bindings)?
+    } else {
+        materialize_first_native_graph_bindings(&*dispatch_ctx.provider, &bindings)?
+    };
     dispatch_ctx
         .runtime
         .phase_ledger_mut()
@@ -5265,7 +5272,8 @@ impl E2eRuntimeModelExecutionEngine {
                         None,
                         Some(0),
                         &mut node_events,
-                        MaterializedEdges::Only(&["logits"]),
+                        // Only the last prompt row's logits are sampled.
+                        MaterializedEdges::LastRow(&["logits"]),
                         Some(&component_graphs.prefill_memo),
                         kv_store_capacity,
                     )?
@@ -5368,6 +5376,28 @@ impl E2eRuntimeModelExecutionEngine {
         step.device_greedy_column = device_greedy_column;
         Ok(step)
     }
+}
+
+/// [`materialize_first_native_graph_bindings`] for only the last row of
+/// each rank-2 binding.
+fn materialize_last_rows(
+    provider: &dyn ProviderExecutionApi,
+    bindings: &BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)>,
+) -> Result<BTreeMap<TensorEdgeId, HostTensor>, InferenceApiError> {
+    let mut materialized = BTreeMap::new();
+    for (edge_id, (resource_id, shape)) in bindings {
+        let rows = shape.first().copied().unwrap_or(0);
+        let tensor = (shape.len() == 2 && rows > 0)
+            .then(|| provider.read_tensor_rows(resource_id, rows - 1, 1))
+            .flatten()
+            .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+                reason: format!(
+                    "no last row materialized for graph edge '{edge_id}' (resource '{resource_id}', shape {shape:?})"
+                ),
+            })?;
+        materialized.insert(edge_id.clone(), tensor);
+    }
+    Ok(materialized)
 }
 
 impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {

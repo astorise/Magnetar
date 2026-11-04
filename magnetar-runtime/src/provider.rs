@@ -695,6 +695,26 @@ pub trait ProviderExecutionApi: Send + Sync {
         None
     }
 
+    /// Rows `first_row..first_row + rows` of a rank-2 tensor, shaped
+    /// `[rows, columns]`: what a caller needing only part of a large output
+    /// (a prefill's last logits row) downloads. The default reads the whole
+    /// tensor and slices it; a Device Provider reads only those rows.
+    fn read_tensor_rows(
+        &self,
+        id: &TensorResourceId,
+        first_row: u64,
+        rows: u64,
+    ) -> Option<crate::tensor::HostTensor> {
+        let tensor = self.read_tensor(id)?;
+        let [_, columns] = tensor.shape[..] else {
+            return None;
+        };
+        let start = usize::try_from(first_row.checked_mul(columns)?).ok()?;
+        let end = usize::try_from(first_row.checked_add(rows)?.checked_mul(columns)?).ok()?;
+        let data = tensor.data.get(start..end)?.to_vec();
+        crate::tensor::HostTensor::new([rows, columns], data).ok()
+    }
+
     /// Drops a tensor previously written through [`Self::write_tensor`] from
     /// this Provider's opaque storage. `Ok(true)` if a resource was
     /// actually present and removed, `Ok(false)` if `id` was already absent
