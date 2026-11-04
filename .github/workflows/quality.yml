@@ -439,6 +439,13 @@ jobs:
   provider-integration:
     name: quality / provider integration
     runs-on: ubuntu-latest
+    # One target directory for every Provider crate: each is its own Cargo
+    # workspace, so separate `target/` directories rebuilt wasmtime, naga,
+    # cranelift and the rest once per Provider and ran the runner out of
+    # disk while building the WGPU Provider (runs 41723849927 and
+    # 41813087922).
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/providers
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
