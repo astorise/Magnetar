@@ -836,6 +836,20 @@ pub trait ProviderExecutionApi: Send + Sync {
         Ok(())
     }
 
+    /// Writes `id` as an f32 tensor of `shape` whose values are all zero,
+    /// exactly as [`Self::write_tensor_value`] would write a host tensor of
+    /// zeros, but without the caller building or transferring one. Returns
+    /// `Ok(false)` when this Provider does not offer it (the default); the
+    /// caller then writes the zeros itself.
+    fn write_zeroed_tensor(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+    ) -> Result<bool, ProviderExecutionError> {
+        let _ = (id, shape);
+        Ok(false)
+    }
+
     /// The [`TensorValue`] counterpart to [`Self::write_tensor_admitted`]:
     /// admits `value`'s byte size (when it is [`TensorValue::Host`]; a
     /// Provider whose [`TensorValue::Opaque`] resources have their own
