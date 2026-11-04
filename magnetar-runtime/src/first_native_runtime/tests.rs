@@ -10812,6 +10812,9 @@ struct ReplayingExecutor {
     /// Test hooks.
     fail_capture: AtomicBool,
     invalidate_next_replay: AtomicBool,
+    /// Selects greedy tokens "on the Device" (`select_greedy_column`).
+    select_greedy: AtomicBool,
+    greedy_selections: AtomicU64,
 }
 
 #[derive(Default)]
@@ -10837,6 +10840,8 @@ impl ReplayingExecutor {
             state: Mutex::new(ReplayingState::default()),
             fail_capture: AtomicBool::new(false),
             invalidate_next_replay: AtomicBool::new(false),
+            select_greedy: AtomicBool::new(false),
+            greedy_selections: AtomicU64::new(0),
         }
     }
 
@@ -11082,6 +11087,39 @@ impl ProviderExecutionApi for ReplayingExecutor {
     fn release_step_capture(&self, id: &StepCaptureId) {
         self.state.lock().unwrap().captures.remove(id);
     }
+    /// An independent greedy selection over the stored logits row, as a
+    /// Device Provider would run it.
+    fn select_greedy_column(
+        &self,
+        logits: &TensorResourceId,
+        row: u64,
+        excluded: &[std::ops::Range<u64>],
+        temperature: f32,
+    ) -> Option<u64> {
+        if !self.select_greedy.load(Ordering::SeqCst) {
+            return None;
+        }
+        let tensor = self.inner.read_tensor(logits)?;
+        let columns = *tensor.shape.last()? as usize;
+        let scores = &tensor.data[row as usize * columns..(row as usize + 1) * columns];
+        let mut best: Option<(f32, u64)> = None;
+        for (column, &score) in scores.iter().enumerate() {
+            let column = column as u64;
+            if !score.is_finite() || excluded.iter().any(|range| range.contains(&column)) {
+                continue;
+            }
+            let score = if temperature == 0.0 {
+                score
+            } else {
+                score / temperature
+            };
+            if best.is_none_or(|(value, _)| score > value) {
+                best = Some((score, column));
+            }
+        }
+        self.greedy_selections.fetch_add(1, Ordering::SeqCst);
+        best.map(|(_, column)| column)
+    }
 }
 
 /// Reference CPU's metadata, Devices and Kernels, executed by a
@@ -11188,6 +11226,124 @@ fn run_replaying_decode(
             .unwrap();
     }
     (steps, executor, runtime)
+}
+
+/// `keep-sampling-on-device`: a replayed plain greedy decode step can have
+/// its token selected by the Provider instead of returning its logits, and
+/// the selected token is the one host sampling picks from those logits.
+#[test]
+fn replayed_greedy_steps_select_their_token_on_the_provider() {
+    let decode_steps = 6;
+    // The logits each step produces, with host selection.
+    let (logits, _, _) = run_replaying_decode(true, true, decode_steps, |_, _| {});
+    let fixture = e2e_fixture().expect("fixture builds");
+    let executor = Arc::new(ReplayingExecutor::new());
+    executor.select_greedy.store(true, Ordering::SeqCst);
+    let provider = Arc::new(ReplayingProvider {
+        inner: ReferenceCpuProvider::new(),
+        executor: executor.clone(),
+    });
+    let mut runtime =
+        build_runtime_with_model_execution_engine_and_provider(&fixture, provider).unwrap();
+    let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let tokenized = tokenize_prompt_input(
+        &fixture.tokenizer,
+        TokenizationRequest::new(PromptInput::TokenIds(vec![1, 2])),
+        None,
+    )
+    .unwrap();
+    let request = prepare_generation(
+        &runtime,
+        build_generation_request(
+            GenerationRequestId::new("step-replay").unwrap(),
+            None,
+            GenerationModelReference::ModelInstance(instance.clone()),
+            generation_tokenizer_reference(&fixture),
+            tokenized,
+            decode_steps + 1,
+            GenerationParameters::greedy(),
+            StopConditions::default(),
+            StreamingMode::Disabled,
+        ),
+    )
+    .unwrap();
+    let engine = new_kv_lifecycle_engine(&fixture);
+    engine.step_replay.set_enabled(true);
+    let mut plans = first_native_plans_for_prompt(
+        &runtime,
+        &fixture,
+        &instance,
+        request.input_token_ids.len() as u64,
+    )
+    .unwrap();
+    let prefill = engine
+        .execute_generation_step(&mut runtime, &request, &[], Some(&mut plans.prefill))
+        .unwrap();
+    engine
+        .commit_generation_step(&mut runtime, &request, &[], 1, &prefill)
+        .unwrap();
+    let mut generated = vec![1];
+    let mut selected_steps = 0;
+    for (index, step_logits) in logits.iter().enumerate().skip(1) {
+        let greedy = crate::generation::sampling_request_for(
+            &request,
+            &generated,
+            Vec::new(),
+            SamplingPolicy::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            crate::sampling::device_greedy_plan(&greedy, step_logits.len()).is_some(),
+            "a greedy request without logits is a Device selection candidate"
+        );
+        let step = engine
+            .execute_generation_step_selecting(
+                &mut runtime,
+                &request,
+                &generated,
+                Some(&mut plans.decode),
+                &greedy,
+            )
+            .unwrap();
+        // What host sampling picks from this step's logits.
+        let host_logits: Vec<f32> = step_logits
+            .iter()
+            .map(|bits| f32::from_bits(*bits))
+            .collect();
+        let (host, _) =
+            decode_step_from_sampling(&request, &generated, host_logits, SamplingPolicy::default())
+                .unwrap();
+        match step.device_greedy_column {
+            Some(column) => {
+                selected_steps += 1;
+                assert!(step.logits.is_empty(), "step {index}");
+                let (device, _) = crate::generation::decode_step_from_device_greedy(
+                    &request, &generated, &greedy, column,
+                )
+                .unwrap();
+                assert_eq!(
+                    device.selected_token_id, host.selected_token_id,
+                    "step {index}"
+                );
+                assert_eq!(device.token_rank, host.token_rank, "step {index}");
+                assert_eq!(device.finish_hint, host.finish_hint, "step {index}");
+            }
+            None => assert_eq!(step.logits.len(), step_logits.len(), "step {index}"),
+        }
+        let token = (index % 3 + 1) as TokenId;
+        engine
+            .commit_generation_step(&mut runtime, &request, &generated, token, &step)
+            .unwrap();
+        generated.push(token);
+    }
+    // Only replayed steps (after the capture at the second decode step)
+    // select on the Provider.
+    assert_eq!(selected_steps, decode_steps - 2);
+    assert_eq!(
+        executor.greedy_selections.load(Ordering::SeqCst),
+        selected_steps as u64
+    );
 }
 
 #[test]

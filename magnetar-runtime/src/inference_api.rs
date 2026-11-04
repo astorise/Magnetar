@@ -1162,6 +1162,9 @@ pub(crate) struct RuntimeModelExecutionStep {
     /// `InferenceApiObservation`s by the generation loop that calls
     /// `execute_generation_step`.
     pub(crate) node_events: Vec<crate::first_native_runtime::PerNodeCausalEvent>,
+    /// The logits column a Provider selected on the Device for a plain
+    /// greedy step (`keep-sampling-on-device`); `logits` is then empty.
+    pub(crate) device_greedy_column: Option<u64>,
 }
 
 impl RuntimeModelExecutionStep {
@@ -1171,6 +1174,7 @@ impl RuntimeModelExecutionStep {
             evidence,
             kv_commit: None,
             node_events: Vec::new(),
+            device_greedy_column: None,
         }
     }
 
@@ -1267,6 +1271,23 @@ pub(crate) trait RuntimeModelExecutionEngine: Send + Sync {
         execution_plan: Option<&mut PreparedExecutionPlan>,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError>;
 
+    /// [`Self::execute_generation_step`] for a step whose token
+    /// `greedy` (a plain greedy sampling request, without logits) selects:
+    /// an engine may have the Provider select it on the Device and return
+    /// [`RuntimeModelExecutionStep::device_greedy_column`] instead of the
+    /// logits. The default returns the logits.
+    fn execute_generation_step_selecting(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+        execution_plan: Option<&mut PreparedExecutionPlan>,
+        greedy: &crate::SamplingRequest,
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
+        let _ = greedy;
+        self.execute_generation_step(runtime, request, generated_tokens, execution_plan)
+    }
+
     fn commit_generation_step(
         &self,
         _runtime: &mut Runtime,
@@ -1309,6 +1330,23 @@ impl SharedRuntimeModelExecutionEngine {
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
         self.0
             .execute_generation_step(runtime, request, generated_tokens, execution_plan)
+    }
+
+    pub(crate) fn execute_generation_step_selecting(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+        execution_plan: Option<&mut PreparedExecutionPlan>,
+        greedy: &crate::SamplingRequest,
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
+        self.0.execute_generation_step_selecting(
+            runtime,
+            request,
+            generated_tokens,
+            execution_plan,
+            greedy,
+        )
     }
 
     pub(crate) fn commit_generation_step(
@@ -1771,14 +1809,38 @@ fn run_generation_loop_inner(
             StepKind::Decode
         });
         let step_started_at = std::time::Instant::now();
-        let mut runtime_step =
-            match executor.execute_generation_step(runtime, request, &generated, execution_plan) {
-                Ok(runtime_step) => runtime_step,
-                Err(error) => {
-                    observe_generation_execution_error(observer, correlation_id.clone(), &error);
-                    return Err(error);
-                }
-            };
+        // A plain greedy step may have its token selected on the Device,
+        // unless its logits are observed.
+        let greedy = on_logits
+            .is_none()
+            .then(|| {
+                crate::generation::sampling_request_for(
+                    request,
+                    &generated,
+                    Vec::new(),
+                    sampling_policy.clone(),
+                    None,
+                )
+                .ok()
+            })
+            .flatten();
+        let executed = match &greedy {
+            Some(greedy) => executor.execute_generation_step_selecting(
+                runtime,
+                request,
+                &generated,
+                execution_plan,
+                greedy,
+            ),
+            None => executor.execute_generation_step(runtime, request, &generated, execution_plan),
+        };
+        let mut runtime_step = match executed {
+            Ok(runtime_step) => runtime_step,
+            Err(error) => {
+                observe_generation_execution_error(observer, correlation_id.clone(), &error);
+                return Err(error);
+            }
+        };
         let step_millis = step_started_at.elapsed().as_millis() as u64;
         if is_prefill_step {
             prefill_millis = Some(step_millis);
@@ -1908,16 +1970,21 @@ fn run_generation_loop_inner(
                 .record(clock, StepPhase::LogitsObserve);
         }
         let sampling_clock = runtime.phase_ledger().clock();
-        let (sampling, step) = decode_step_from_sampling_with_rng(
-            request,
-            &generated,
-            // Moved, not copied: nothing reads a step's logits after
-            // sampling (`commit_generation_step` only commits its KV).
-            std::mem::take(&mut runtime_step.logits),
-            sampling_policy.clone(),
-            rng_state.take(),
-        )
-        .map_err(|error| {
+        let selected = match (runtime_step.device_greedy_column, &greedy) {
+            (Some(column), Some(greedy)) => crate::generation::decode_step_from_device_greedy(
+                request, &generated, greedy, column,
+            ),
+            _ => decode_step_from_sampling_with_rng(
+                request,
+                &generated,
+                // Moved, not copied: nothing reads a step's logits after
+                // sampling (`commit_generation_step` only commits its KV).
+                std::mem::take(&mut runtime_step.logits),
+                sampling_policy.clone(),
+                rng_state.take(),
+            ),
+        };
+        let (sampling, step) = selected.map_err(|error| {
             let error = InferenceApiError::from(error);
             observe_generation_execution_error(observer, correlation_id.clone(), &error);
             error

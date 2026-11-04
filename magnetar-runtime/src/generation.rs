@@ -607,6 +607,40 @@ pub fn decode_step_from_sampling_with_rng(
     policy: SamplingPolicy,
     rng_state: Option<SamplingRngState>,
 ) -> Result<(SamplingResult, DecodeStepOutput), GenerationError> {
+    let sampling_request =
+        sampling_request_for(request, generated_so_far, logits, policy, rng_state)?;
+    let sampling_result = crate::select_next_token(&sampling_request).map_err(|error| {
+        GenerationError::SamplingModeUnsupported {
+            message: error.to_string(),
+        }
+    })?;
+    let step = decode_step(request, generated_so_far, sampling_result.selected_token_id)?;
+    Ok((sampling_result, step))
+}
+
+/// The decode step whose plain greedy token a Provider selected on the
+/// Device as `column` (`keep-sampling-on-device`): exactly what
+/// [`decode_step_from_sampling_with_rng`] returns for the same logits.
+/// `sampling_request` is the one [`sampling_request_for`] built for it.
+pub(crate) fn decode_step_from_device_greedy(
+    request: &GenerationRequest,
+    generated_so_far: &[TokenId],
+    sampling_request: &SamplingRequest,
+    column: u64,
+) -> Result<(SamplingResult, DecodeStepOutput), GenerationError> {
+    let sampling_result = crate::sampling::device_greedy_result(sampling_request, column);
+    let step = decode_step(request, generated_so_far, sampling_result.selected_token_id)?;
+    Ok((sampling_result, step))
+}
+
+/// The sampling request a generation step's `logits` are selected with.
+pub(crate) fn sampling_request_for(
+    request: &GenerationRequest,
+    generated_so_far: &[TokenId],
+    logits: Vec<f32>,
+    policy: SamplingPolicy,
+    rng_state: Option<SamplingRngState>,
+) -> Result<SamplingRequest, GenerationError> {
     let mut sampling_request = SamplingRequest::host_scores(
         SamplingRequestId::new(format!(
             "{}.step{}",
@@ -645,14 +679,7 @@ pub fn decode_step_from_sampling_with_rng(
     };
     sampling_request.policy = policy;
     sampling_request.correlation_id = request.correlation_id.clone();
-
-    let sampling_result = crate::select_next_token(&sampling_request).map_err(|error| {
-        GenerationError::SamplingModeUnsupported {
-            message: error.to_string(),
-        }
-    })?;
-    let step = decode_step(request, generated_so_far, sampling_result.selected_token_id)?;
-    Ok((sampling_result, step))
+    Ok(sampling_request)
 }
 
 pub fn stop_reason_for(request: &GenerationRequest, generated: &[TokenId]) -> Option<FinishReason> {

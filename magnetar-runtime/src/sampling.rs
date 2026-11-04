@@ -870,20 +870,84 @@ fn excluded_candidate_positions(
 /// selects (temperature scaling, top-k and top-p never remove or reorder the
 /// best candidate, and none of those apply here). `None` for any other
 /// request.
+/// Whether `request` is a plain greedy selection: the highest eligible
+/// score after the special/stop/banned exclusions, with no probability
+/// metadata, masks, allowed list, penalties or top-k/top-p. Only such a
+/// request takes the one-pass host path or a Device selection.
+fn is_plain_greedy(request: &SamplingRequest) -> bool {
+    let parameters = &request.parameters;
+    let greedy = parameters.greedy || !parameters.sampling_enabled || parameters.temperature == 0.0;
+    greedy
+        && !request.policy.allow_probability_metadata
+        && request.allowed_token_mask.is_none()
+        && parameters.allowed_token_ids.is_none()
+        && !penalties_enabled(parameters)
+        && parameters.top_k.is_none()
+        && parameters.top_p.is_none()
+        && request.processors.is_empty()
+}
+
+/// What a Provider needs to select a plain greedy request's token on the
+/// Device (`ProviderExecutionApi::select_greedy_column`) for logits of
+/// `columns` values: the excluded columns and the temperature. `None` when
+/// the request is not plain greedy or is invalid; the host path then runs
+/// and reports why.
+pub(crate) fn device_greedy_plan(
+    request: &SamplingRequest,
+    columns: usize,
+) -> Option<(Vec<std::ops::Range<u64>>, f32)> {
+    if !is_plain_greedy(request)
+        || validate_temperature(request).is_err()
+        || request.tokenizer.is_none()
+    {
+        return None;
+    }
+    // Validated as the request carrying `columns` logits would be.
+    let mut sized = request.clone();
+    sized.vocabulary_size = u32::try_from(columns).ok()?;
+    sized.logits = Some(LogitsReference::RuntimeTensor {
+        id: "device-logits".into(),
+    });
+    if sized.validate().is_err() {
+        return None;
+    }
+    let excluded = excluded_candidate_positions(request, columns).ok()?;
+    Some((
+        excluded
+            .into_iter()
+            .map(|range| range.start as u64..range.end as u64)
+            .collect(),
+        request.parameters.temperature,
+    ))
+}
+
+/// The result of a plain greedy request whose token a Provider selected:
+/// what [`select_next_token`]'s one-pass host path returns for `column`.
+pub(crate) fn device_greedy_result(request: &SamplingRequest, column: u64) -> SamplingResult {
+    let start = request
+        .tokenizer
+        .as_ref()
+        .map_or(0, |tokenizer| tokenizer.token_id_range.start);
+    let token_id = start.saturating_add(column as u32);
+    SamplingResult {
+        request_id: request.request_id.clone(),
+        selected_token_id: token_id,
+        selection_mode: SamplingSelectionMode::Greedy,
+        token_rank: Some(1),
+        token_probability: None,
+        token_log_probability: None,
+        finish_hint: finish_hint_for(request, token_id),
+        diagnostics: diagnostics_for(request, SamplingSelectionMode::Greedy),
+        updated_rng_state: None,
+    }
+}
+
 fn fast_greedy_selection(
     request: &SamplingRequest,
     scores: &[f32],
 ) -> Result<Option<SelectedCandidate>, SamplingError> {
     let parameters = &request.parameters;
-    let greedy = parameters.greedy || !parameters.sampling_enabled || parameters.temperature == 0.0;
-    if !greedy
-        || request.policy.allow_probability_metadata
-        || request.allowed_token_mask.is_some()
-        || parameters.allowed_token_ids.is_some()
-        || penalties_enabled(parameters)
-        || parameters.top_k.is_some()
-        || parameters.top_p.is_some()
-    {
+    if !is_plain_greedy(request) {
         return Ok(None);
     }
     validate_temperature(request)?;
