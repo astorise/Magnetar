@@ -34,6 +34,14 @@ Promotion requires appropriate real hardware and a real checkpoint, error/cancel
 
 Before any sampling moves to the Device, greedy selection without probability metadata, masks, penalties or top-k/top-p takes a one-pass host path (`fast_greedy_selection`), tested against the general path on random scores. On an RTX 3060 with Qwen2.5-0.5B (GPU CI run 41718804397) it cut host sampling from 0.48 to 0.20 ms per token, and campaign TPOT from 5.3 to 5.0 ms (199.0 tok/s), logits and tokens unchanged. What remains is the 151936-value logits download and one pass over it, which this change targets.
 
+### Device greedy selection (first step)
+
+A plain greedy step whose logits nobody observes asks the engine to select its token where the logits are. `ProviderExecutionApi::select_greedy_column` (`None` by default) takes the logits resource and row, the excluded columns (special, stop and banned tokens, from the same `excluded_candidate_positions` the host path uses) and the temperature. It returns the column host greedy selection would pick: the highest finite score after the temperature division, ties going to the lowest column. A replayed decode step calls it instead of downloading its logits row. The generation loop then builds the `SamplingResult` the one-pass host path returns. Otherwise, the step downloads its logits and selects on the host as before: when the Provider cannot select, when nothing is eligible, for per-node steps, and for observed logits.
+
+The CUDA Provider maps each eligible column to a 64-bit key: the score's bits in an order-preserving unsigned form (-0 as +0) above the column's complement. `atomicMax` keeps the largest key, so the answer does not depend on block order, and only 8 bytes are downloaded. The Runtime test checks every replayed step's Provider-selected token against host sampling of the same logits. The CUDA conformance test checks the kernel against a host selection with ties, signed zeros, non-finite scores, exclusions and four temperatures.
+
+RTX 3060, Qwen2.5-0.5B, GPU CI run 41806201426: campaign TPOT median 4.7 -> 4.4 ms (213.4 -> 229.6 tok/s). Host sampling (0.22 ms per token) is gone from the decode step. CUDA tokens still match Reference CPU's, and CUDA logits stay within 1.3e-5 of the independent corpus.
+
 ## Risks / Trade-offs
 
 - A faster sampler cannot reorder penalties or claim deterministic equality across profiles that only promise distributional equivalence.
