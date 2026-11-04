@@ -12,6 +12,35 @@ Deliver the explicitly enumerated B06, B07 outcomes through Provider kernels; Ru
 
 Qualify each fused pattern and attention profile independently, then expose portable operator semantics through existing dispatch. Cover numerical order, GQA, masks, position conventions, tails, long contexts and both prefill/decode workspace budgets.
 
+### Long-context CUDA kernels (first increment)
+
+The long-context campaign (`qualify-real-checkpoint-performance`) showed that Qwen2.5-0.5B on an RTX 3060 spent its 512- and 4096-token time in Device work, not Runtime host costs. `long_context_kernel_times` (CUDA Provider, ignored, release only, run 41850538460) timed each layer's work. Each prefill matmul reached 0.8-1.0 TFLOP/s. The prefill attention took 2.6 ms per layer at 512 rows and 156 ms at 4096. A decode step's attention took 463 us per layer over 4096 keys, which is 11 ms of a 16 ms step.
+
+- **LM head on the last prompt row only (Runtime).** A prefill materializes only the last row of its logits. When a `matmul` or `matmul-bias` node's single output is such an edge, the Runtime hands it the last row of its `a` input alone. That row is read back: 896 floats for Qwen2.5-0.5B. Each output row depends only on the same input row, so the logits are unchanged. `prefill_lm_head_runs_on_the_last_row_only` checks that the logits invocation sees one row and that the logits match the oracle.
+- **Split decode attention (CUDA).** One-row attention gives each chunk of 128 admitted keys its own block. One warp reads each K row, coalesced, and adds its products with a fixed butterfly. The weights are normalized before they weight V. `attention_combine_kernel` merges the chunks in chunk order, each weighted by its share of the softmax mass. The output is deterministic, and a weighted mean of V rows. The grid covers every K/V row, so a captured step replays at any later key count, and empty chunks are skipped. The chunk partials live in a scratch buffer that is grown only outside a capture and never freed while a capture may read it.
+- **Tiled prefill attention (CUDA).** Each block serves 32 queries of one head, with 4 threads per query. K and V are staged through shared memory one tile of keys at a time. Each query keeps a running max, a running sum and the weighted mean of the V rows seen so far (online softmax), so its output stays within the V rows' range. The kernel serves uncaptured multi-row attention whose head dimension is a multiple of 4, up to 128. Other cases keep the existing kernels.
+- **Tiled prefill matmuls (CUDA).** From 64 rows, each thread computes 8 rows x 4 columns of one split-K slice. The block's `a` rows are staged through shared memory 256 inners at a time. Each output still adds its slice sums inner-ascending, and its slices in slice order, so it is bit-identical to the one-row kernel. The conformance test checks this at 64 and 130 rows.
+
+Conformance:
+- The CUDA attention test adds decode over 300 and 1000 keys (the latter windowed), and prefill cases: multi-tile at 130 and 300 rows (the latter windowed), offset queries (40 of 200 rows) and a 128-dimension head.
+- Large finite V values stay finite on both new kernels. The first split-kernel version summed unnormalized weights times V and overflowed; `block_attention_keeps_large_finite_values_finite` caught it (run 41856997166).
+
+Evidence:
+- **Setup.** RTX 3060, Qwen2.5-0.5B, greedy, 128 new tokens, 5 measured runs. The baseline is run 41845390146; the LM head alone is run 41855543895; the four changes together are run 41859746720.
+
+| | Before | LM head only | All four |
+|---|---|---|---|
+| Warm TTFT median, 5 / 512 / 4096 prompt tokens | 15.0 / 743 / 9381 ms | 14.1 / 573 / 7940 ms | 15.0 / 220 / 3372 ms |
+| TPOT median, 5 / 512 / 4096 prompt tokens | 4.4 / 5.8 / 16.4 ms | 4.4 / 5.7 / 16.1 ms | 4.5 / 4.8 / 6.7 ms |
+| Decode throughput at 4096 prompt tokens | 60.8 tok/s | 62.2 tok/s | 149.0 tok/s |
+| Prefill matmuls, 4096 rows | 0.8-1.0 TFLOP/s | | 3.1-3.7 TFLOP/s |
+| Prefill attention per layer, 512 / 4096 rows | 2.6 / 156 ms | | 1.5 / 81 ms |
+| Decode attention per layer, 512 / 4096 keys | 39 / 463 us | | 23 / 85 us |
+
+- **Logits.** With the LM head alone, CUDA logits are unchanged (1.3e-5 vs. the independent corpus). The new attention kernels sum in a different order: 2.7e-5, the same tokens, and 13 of 16 steps still replay.
+- **Short prompt.** Its TPOT moved from 4.4 to 4.5 ms, which is the combine launch the split attention adds to each layer.
+- **What remains at 4096 tokens.** The prefill attention is about 1.9 of the 3.4 s: 0.37 TFLOP/s, with one key per step and a per-key rescale. The layer matmuls are about 0.9 s. These are the next targets.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.

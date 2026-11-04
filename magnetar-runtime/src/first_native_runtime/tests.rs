@@ -10818,6 +10818,8 @@ struct ReplayingExecutor {
     /// Zeroes KV stores "on the Device" (`write_zeroed_tensor`).
     zero_on_provider: AtomicBool,
     zeroed_tensors: AtomicU64,
+    /// The `a` row count of each invocation writing the logits edge.
+    logits_rows: Mutex<Vec<u64>>,
 }
 
 #[derive(Default)]
@@ -10847,6 +10849,7 @@ impl ReplayingExecutor {
             greedy_selections: AtomicU64::new(0),
             zero_on_provider: AtomicBool::new(false),
             zeroed_tensors: AtomicU64::new(0),
+            logits_rows: Mutex::default(),
         }
     }
 
@@ -10907,6 +10910,22 @@ impl ProviderExecutionApi for ReplayingExecutor {
         invocation: &KernelInvocation,
         memory: &mut MemoryManager,
     ) -> Result<ProviderExecutionHandle, ProviderExecutionError> {
+        if invocation
+            .outputs
+            .iter()
+            .any(|output| output.resource.id.as_str() == "edge.logits")
+            && let Some(a) = invocation.inputs.first()
+        {
+            self.logits_rows.lock().unwrap().push(
+                a.resource
+                    .descriptor
+                    .shape
+                    .dimensions
+                    .first()
+                    .copied()
+                    .unwrap_or(0),
+            );
+        }
         if let Some(recording) = self.state.lock().unwrap().recording.as_mut() {
             recording.invocations.push((
                 advertisement.clone(),
@@ -11264,6 +11283,23 @@ fn run_replaying_decode_on(
             .unwrap();
     }
     (steps, executor, runtime)
+}
+
+/// A prefill materializes only its last logits row, so its LM head runs on
+/// the last hidden row alone, and that row's logits are the full graph's
+/// (Reference CPU computes each row independently, in the same order).
+#[test]
+fn prefill_lm_head_runs_on_the_last_row_only() {
+    let (steps, executor, _) = run_replaying_decode(false, true, 1, |_, _| {});
+    // One prefill of the 2-token prompt, then one decode step.
+    assert_eq!(*executor.logits_rows.lock().unwrap(), vec![1, 1]);
+    let fixture = e2e_fixture().expect("fixture builds");
+    let expected = e2e_forward(&fixture, &[1, 2]).unwrap();
+    let prefill: Vec<f32> = steps[0].iter().map(|bits| f32::from_bits(*bits)).collect();
+    assert_eq!(prefill.len(), expected.len());
+    for (actual, expected) in prefill.iter().zip(&expected) {
+        assert!((actual - expected).abs() <= 1e-4, "{actual} vs {expected}");
+    }
 }
 
 /// A Provider that zeroes the in-place KV stores itself

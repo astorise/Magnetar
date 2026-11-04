@@ -4561,6 +4561,11 @@ fn execute_first_native_graph_nodes(
             };
             inputs.push(value);
         }
+        if let MaterializedEdges::LastRow(edges) = materialized
+            && last_row_suffices(node, edges)
+        {
+            last_row_only(&*dispatch_ctx.provider, &mut inputs[0])?;
+        }
         dispatch_ctx
             .runtime
             .phase_ledger_mut()
@@ -5452,6 +5457,45 @@ impl E2eRuntimeModelExecutionEngine {
 
 /// [`materialize_first_native_graph_bindings`] for only the last row of
 /// each rank-2 binding.
+/// Whether `node` may run on the last row of its first input only: a
+/// row-wise matmul whose single output is an edge of which only the last
+/// row is materialized (a prefill's logits: the LM head then reads one row
+/// instead of every prompt row). Each output row of these Operators depends
+/// on the same row of `a` alone, so that row is unchanged.
+fn last_row_suffices(node: &ExecutionNode, materialized_last_rows: &[&str]) -> bool {
+    matches!(node.operator.name(), "matmul" | "matmul-bias")
+        && node.inputs.len() >= 2
+        && matches!(node.outputs.as_slice(), [output]
+            if materialized_last_rows.contains(&output.as_str()))
+}
+
+/// Replaces a rank-2 `value` of more than one row by its last row. A
+/// resident value's row is read back (one row, a few KB) and goes to the
+/// Kernel as a fresh input.
+fn last_row_only(
+    provider: &dyn ProviderExecutionApi,
+    value: &mut NodeValue,
+) -> Result<(), InferenceApiError> {
+    let (rows, cols) = value.rows_cols()?;
+    if rows <= 1 {
+        return Ok(());
+    }
+    let row = match value {
+        NodeValue::Host(tensor) => {
+            let start = usize::try_from((rows - 1) * cols).ok();
+            start
+                .and_then(|start| tensor.data.get(start..))
+                .and_then(|row| HostTensor::new([1, cols], row.to_vec()).ok())
+        }
+        NodeValue::Resident { id, .. } => provider.read_tensor_rows(id, rows - 1, 1),
+    }
+    .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
+        reason: "the last row of a matmul input could not be read".into(),
+    })?;
+    *value = NodeValue::Host(row);
+    Ok(())
+}
+
 fn materialize_last_rows(
     provider: &dyn ProviderExecutionApi,
     bindings: &BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)>,
