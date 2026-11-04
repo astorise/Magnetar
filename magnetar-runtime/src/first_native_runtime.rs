@@ -1546,9 +1546,7 @@ impl ComponentGraphCache {
         };
         let is_weight = |edge: &TensorEdgeId| weight_tensor_name_from_edge(edge.as_str()).is_some();
         type Pass<'a> = Box<dyn Fn(&ExecutionGraph) -> (ExecutionGraph, usize) + 'a>;
-        let advertised =
-            |operator: &str| provider_advertises_operator(runtime, &provider, operator);
-        let passes: [(&str, Pass<'_>); 5] = [
+        let passes: [(&str, Pass<'_>); 4] = [
             (
                 crate::graph_fusion::MATMUL_BIAS_OPERATOR,
                 Box::new(|graph| crate::graph_fusion::fuse_matmul_bias(graph, is_weight)),
@@ -1565,12 +1563,6 @@ impl ComponentGraphCache {
             (
                 crate::graph_fusion::GATED_MATMUL_OPERATOR,
                 Box::new(crate::graph_fusion::fuse_gated_matmul),
-            ),
-            // Last: it folds into the fused matmuls above. It checks each
-            // consumer's own fused Operator.
-            (
-                crate::graph_fusion::RMSNORM_MATMUL_OPERATOR,
-                Box::new(|graph| crate::graph_fusion::fuse_rmsnorm_matmuls(graph, advertised)),
             ),
         ];
         for (operator, pass) in passes {
@@ -2903,42 +2895,6 @@ fn dispatch_qwen_matmul_fused(
     )
 }
 
-/// A `graph_fusion::fuse_rmsnorm_matmuls` node: inputs `[x, norm, b, ...]`,
-/// output `[rows of x, columns of b]`.
-fn dispatch_qwen_rmsnorm_matmul(
-    ctx: &mut FirstNativeDispatchContext<'_>,
-    operation_id: &str,
-    operator: OperatorId,
-    inputs: Vec<NodeValue>,
-    epsilon: f64,
-    output_target: Option<OutputTarget>,
-) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
-    let (rows, _) = inputs[0].rows_cols()?;
-    let (_, cols) = inputs[2].rows_cols()?;
-    let descriptor = TensorDescriptor::new(
-        ShapeDescriptor::new([rows, cols]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-        LayoutDescriptor::Contiguous,
-    );
-    let names = ["x", "norm", "b", "extra"];
-    let resources = inputs
-        .into_iter()
-        .zip(names)
-        .map(|(value, name)| node_input_resource(operation_id, name, value))
-        .collect();
-    let mut attributes = BTreeMap::new();
-    attributes.insert("epsilon".into(), OperatorAttributeValue::Float(epsilon));
-    dispatch_reference_cpu_operator_pre_admitted(
-        ctx,
-        operation_id,
-        operator,
-        resources,
-        descriptor,
-        output_target,
-        attributes,
-    )
-}
-
 fn dispatch_qwen_matmul(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,
@@ -3819,31 +3775,6 @@ fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
-        "rmsnorm-matmul" | "rmsnorm-matmul-bias" | "rmsnorm-gated-matmul" => {
-            let arity = if node.operator.name() == "rmsnorm-matmul" {
-                3
-            } else {
-                4
-            };
-            if inputs.len() != arity {
-                return Err(InferenceApiError::GraphPlanningFailed {
-                    reason: format!(
-                        "graph node '{node_id}' expects {arity} {} inputs",
-                        node.operator.name()
-                    ),
-                });
-            }
-            let epsilon = node_attribute_f64(node, "epsilon")?;
-            dispatch_qwen_rmsnorm_matmul(
-                ctx,
-                node_id,
-                node.operator.clone(),
-                inputs,
-                epsilon,
-                Some(output_target),
-            )
-            .map(|(dispatch, value)| (dispatch, vec![value]))
-        }
         "silu-mul" => {
             if inputs.len() != 2 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -4506,9 +4437,6 @@ fn execute_first_native_graph_nodes(
                 | "matmul-bias"
                 | "matmul-residual"
                 | "gated-matmul"
-                | "rmsnorm-matmul"
-                | "rmsnorm-matmul-bias"
-                | "rmsnorm-gated-matmul"
                 | "silu-mul"
                 | "attention"
                 | "silu"

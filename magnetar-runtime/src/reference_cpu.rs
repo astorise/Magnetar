@@ -1202,9 +1202,6 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("matmul-residual", OperatorFamily::LinearAlgebra),
         baseline_advertisement("silu-mul", OperatorFamily::Activation),
         baseline_advertisement("gated-matmul", OperatorFamily::LinearAlgebra),
-        baseline_advertisement("rmsnorm-matmul", OperatorFamily::LinearAlgebra),
-        baseline_advertisement("rmsnorm-matmul-bias", OperatorFamily::LinearAlgebra),
-        baseline_advertisement("rmsnorm-gated-matmul", OperatorFamily::LinearAlgebra),
         embedding,
         baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
         baseline_advertisement("rope", OperatorFamily::PositionEncoding),
@@ -2175,35 +2172,6 @@ impl ReferenceCpuExecutor {
                     matmul(&a, &gate, transpose_a, transpose_b).map_err(KernelError::from)?;
                 let up = matmul(&a, &up, transpose_a, transpose_b).map_err(KernelError::from)?;
                 mul(&silu(&gate), &up).map_err(KernelError::from)?
-            }
-            // `graph_fusion::fuse_rmsnorm_matmuls`: the `rmsnorm`, then
-            // the matmul-family Operator that read it.
-            "rmsnorm-matmul" | "rmsnorm-matmul-bias" | "rmsnorm-gated-matmul" => {
-                let x = self.input_tensor(invocation, 0)?;
-                let norm = self.input_tensor(invocation, 1)?;
-                let epsilon = Self::attribute_float(&invocation.attributes, "epsilon", 1e-6);
-                let a = rmsnorm(&x, &norm, epsilon).map_err(KernelError::from)?;
-                let b = self.input_tensor(invocation, 2)?;
-                let transpose_a =
-                    Self::attribute_bool(&invocation.attributes, "transpose_a", false);
-                let transpose_b =
-                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
-                Self::require_f32_accumulation(&invocation.attributes)?;
-                let product =
-                    matmul(&a, &b, transpose_a, transpose_b).map_err(KernelError::from)?;
-                match name {
-                    "rmsnorm-matmul" => product,
-                    "rmsnorm-matmul-bias" => {
-                        let bias = self.input_tensor(invocation, 3)?;
-                        add(&product, &bias).map_err(KernelError::from)?
-                    }
-                    _ => {
-                        let up = self.input_tensor(invocation, 3)?;
-                        let up =
-                            matmul(&a, &up, transpose_a, transpose_b).map_err(KernelError::from)?;
-                        mul(&silu(&product), &up).map_err(KernelError::from)?
-                    }
-                }
             }
             "embedding" => {
                 let table = self.input_tensor(invocation, 0)?;
