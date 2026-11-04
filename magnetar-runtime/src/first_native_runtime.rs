@@ -1546,7 +1546,7 @@ impl ComponentGraphCache {
         };
         let is_weight = |edge: &TensorEdgeId| weight_tensor_name_from_edge(edge.as_str()).is_some();
         type Pass<'a> = Box<dyn Fn(&ExecutionGraph) -> (ExecutionGraph, usize) + 'a>;
-        let passes: [(&str, Pass<'_>); 3] = [
+        let passes: [(&str, Pass<'_>); 4] = [
             (
                 crate::graph_fusion::MATMUL_BIAS_OPERATOR,
                 Box::new(|graph| crate::graph_fusion::fuse_matmul_bias(graph, is_weight)),
@@ -1558,6 +1558,11 @@ impl ComponentGraphCache {
             (
                 crate::graph_fusion::SILU_MUL_OPERATOR,
                 Box::new(crate::graph_fusion::fuse_silu_mul),
+            ),
+            // After `silu-mul`, whose nodes it folds with both matmuls.
+            (
+                crate::graph_fusion::GATED_MATMUL_OPERATOR,
+                Box::new(crate::graph_fusion::fuse_gated_matmul),
             ),
         ];
         for (operator, pass) in passes {
@@ -3747,7 +3752,7 @@ fn dispatch_first_native_graph_node(
             dispatch_qwen_matmul(ctx, node_id, a, b, Some(output_target))
                 .map(|(dispatch, value)| (dispatch, vec![value]))
         }
-        "matmul-bias" | "matmul-residual" => {
+        "matmul-bias" | "matmul-residual" | "gated-matmul" => {
             if inputs.len() != 3 {
                 return Err(InferenceApiError::GraphPlanningFailed {
                     reason: format!(
@@ -4431,6 +4436,7 @@ fn execute_first_native_graph_nodes(
             "matmul"
                 | "matmul-bias"
                 | "matmul-residual"
+                | "gated-matmul"
                 | "silu-mul"
                 | "attention"
                 | "silu"

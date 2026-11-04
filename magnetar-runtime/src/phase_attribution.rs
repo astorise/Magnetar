@@ -130,6 +130,7 @@ const OPERATOR_LABELS: &[&str] = &[
     "attention",
     "concat",
     "embedding",
+    "gated-matmul",
     "matmul",
     "matmul-bias",
     "matmul-residual",

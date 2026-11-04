@@ -1201,6 +1201,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("matmul-bias", OperatorFamily::LinearAlgebra),
         baseline_advertisement("matmul-residual", OperatorFamily::LinearAlgebra),
         baseline_advertisement("silu-mul", OperatorFamily::Activation),
+        baseline_advertisement("gated-matmul", OperatorFamily::LinearAlgebra),
         embedding,
         baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
         baseline_advertisement("rope", OperatorFamily::PositionEncoding),
@@ -2154,6 +2155,22 @@ impl ReferenceCpuExecutor {
             "silu-mul" => {
                 let gate = self.input_tensor(invocation, 0)?;
                 let up = self.input_tensor(invocation, 1)?;
+                mul(&silu(&gate), &up).map_err(KernelError::from)?
+            }
+            // `graph_fusion::fuse_gated_matmul`: both matmuls, then the
+            // `silu-mul` they fed.
+            "gated-matmul" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let gate = self.input_tensor(invocation, 1)?;
+                let up = self.input_tensor(invocation, 2)?;
+                let transpose_a =
+                    Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                let transpose_b =
+                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                Self::require_f32_accumulation(&invocation.attributes)?;
+                let gate =
+                    matmul(&a, &gate, transpose_a, transpose_b).map_err(KernelError::from)?;
+                let up = matmul(&a, &up, transpose_a, transpose_b).map_err(KernelError::from)?;
                 mul(&silu(&gate), &up).map_err(KernelError::from)?
             }
             "embedding" => {

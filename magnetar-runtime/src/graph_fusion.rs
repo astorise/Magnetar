@@ -13,6 +13,9 @@
 //! - `matmul-residual`: `residual-add(residual, matmul(a, b))` (the output
 //!   and down projections feeding each layer's two residual additions).
 //! - `silu-mul`: `mul(silu(gate), up)` (each layer's SwiGLU gate).
+//! - `gated-matmul`: `silu-mul(matmul(a, gate), matmul(a, up))`, after
+//!   the `silu-mul` pass: each layer's whole SwiGLU projection, both
+//!   weights read by one Kernel. It folds three nodes, not two.
 //!
 //! Every fused Operator computes exactly the two operations it replaces,
 //! in the same order (floating-point addition and multiplication of two
@@ -37,6 +40,9 @@ pub const MATMUL_RESIDUAL_OPERATOR: &str = "matmul-residual";
 /// `silu(gate) * up`, elementwise.
 pub const SILU_MUL_OPERATOR: &str = "silu-mul";
 
+/// `silu(matmul(a, gate)) * matmul(a, up)`, inputs `[a, gate, up]`.
+pub const GATED_MATMUL_OPERATOR: &str = "gated-matmul";
+
 /// The `matmul-bias` Operator id.
 pub fn matmul_bias_operator() -> OperatorId {
     OperatorId::magnetar(MATMUL_BIAS_OPERATOR, 1, OperatorFamily::LinearAlgebra)
@@ -50,6 +56,11 @@ pub fn matmul_residual_operator() -> OperatorId {
 /// The `silu-mul` Operator id.
 pub fn silu_mul_operator() -> OperatorId {
     OperatorId::magnetar(SILU_MUL_OPERATOR, 1, OperatorFamily::Activation)
+}
+
+/// The `gated-matmul` Operator id.
+pub fn gated_matmul_operator() -> OperatorId {
+    OperatorId::magnetar(GATED_MATMUL_OPERATOR, 1, OperatorFamily::LinearAlgebra)
 }
 
 /// One fusion found by a pass.
@@ -269,6 +280,91 @@ pub fn fuse_silu_mul(graph: &ExecutionGraph) -> (ExecutionGraph, usize) {
         });
     }
     (apply(graph, &fusions, silu_mul_operator()), fusions.len())
+}
+
+/// Folds every `silu-mul(matmul(a, gate), matmul(a, up))` whose two
+/// matmuls read the same `a`, have one consumer each and produce the same
+/// shape into one `gated-matmul` node with inputs `[a, gate, up]`. The
+/// fused node keeps the gate matmul's id and writes the `silu-mul`'s
+/// output. Returns the rewritten graph and how many nodes it removed (two
+/// per fusion).
+pub fn fuse_gated_matmul(graph: &ExecutionGraph) -> (ExecutionGraph, usize) {
+    let index = EdgeIndex::new(graph);
+    let mut fusions = Vec::new();
+    for (silu_mul_id, silu_mul) in &graph.nodes {
+        if silu_mul.operator.name() != SILU_MUL_OPERATOR
+            || silu_mul.inputs.len() != 2
+            || silu_mul.outputs.len() != 1
+        {
+            continue;
+        }
+        let (gate_edge, up_edge) = (&silu_mul.inputs[0], &silu_mul.inputs[1]);
+        if gate_edge == up_edge {
+            continue;
+        }
+        let (Some(gate_id), Some(up_id)) = (
+            index.sole_producer(graph, gate_edge, "matmul", 2),
+            index.sole_producer(graph, up_edge, "matmul", 2),
+        ) else {
+            continue;
+        };
+        let (gate, up) = (&graph.nodes[gate_id], &graph.nodes[up_id]);
+        let (Some(gate_shape), Some(up_shape)) =
+            (graph.edges.get(gate_edge), graph.edges.get(up_edge))
+        else {
+            continue;
+        };
+        if gate.inputs[0] != up.inputs[0]
+            || gate.attributes != up.attributes
+            || gate_shape.descriptor.shape != up_shape.descriptor.shape
+        {
+            continue;
+        }
+        fusions.push((
+            gate_id.clone(),
+            up_id.clone(),
+            silu_mul_id.clone(),
+            gate_edge.clone(),
+            up_edge.clone(),
+        ));
+    }
+    let mut fused = graph.clone();
+    for (gate_id, up_id, silu_mul_id, gate_edge, up_edge) in &fusions {
+        let silu_mul = fused
+            .nodes
+            .remove(silu_mul_id)
+            .expect("each fused silu-mul is a graph node");
+        let up = fused
+            .nodes
+            .remove(up_id)
+            .expect("each fused up matmul is a graph node");
+        let output = silu_mul.outputs[0].clone();
+        let up_weight = up.inputs[1].clone();
+        let gate = fused
+            .nodes
+            .get_mut(gate_id)
+            .expect("each fused gate matmul is a graph node");
+        gate.operator = gated_matmul_operator();
+        gate.inputs.push(up_weight.clone());
+        gate.outputs = vec![output.clone()];
+        fused.edges.remove(gate_edge);
+        fused.edges.remove(up_edge);
+        // `a` was read by both matmuls; the up weight now by the gate's id.
+        if let Some(edge) = fused.edges.get_mut(&up.inputs[0]) {
+            edge.consumers.remove(up_id);
+        }
+        if let Some(edge) = fused.edges.get_mut(&up_weight)
+            && edge.consumers.remove(up_id)
+        {
+            edge.consumers.insert(gate_id.clone());
+        }
+        if let Some(edge) = fused.edges.get_mut(&output)
+            && edge.producer.as_ref() == Some(silu_mul_id)
+        {
+            edge.producer = Some(gate_id.clone());
+        }
+    }
+    (fused, 2 * fusions.len())
 }
 
 #[cfg(test)]

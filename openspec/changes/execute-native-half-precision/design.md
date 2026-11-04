@@ -56,6 +56,8 @@ Device time of one decode matmul per projection shape (run 41718804397, `decode_
 | 896 x 151936 (LM head) | 1601 us, 340 GB/s | 823 us, 331 GB/s |
 
 - The projections take about 117 us per layer in bfloat16 against 83 us at the card's 360 GB/s; the K and V matmuls are launch-bound and the down projection reaches the lowest bandwidth. They are the next decode GEMV targets.
+- Issuing each split-K slice's next 8 weight loads before adding their products (the same adds in the same order, so the same results) keeps more bytes in flight: TPOT 5.0 -> 4.8 ms, 208.6 tok/s (run 41782528330), the down projection 35.8 -> 30.7 us, 896 x 896 5.5 -> 5.0 us. CUDA logits unchanged (1.335e-5).
+- Also splitting `k` across blocks, with the last block of a tile adding the partial sums in block order, was not kept: TPOT 5.0 ms (run 41784908855). The 896 x 896 projections slowed to 8.0 us, and the 896 x 128 ones barely moved, being launch-bound rather than short of SMs.
 - A compact Kernel reading 8 weights per load was not kept. Taken for every shape, it raised TPOT to 6.4 ms (run 41715792007): 256 columns per block leave 896-column projections 4 blocks for 28 SMs. On the LM head alone it saved 18 us (805 against 823 us), not worth its Kernel.
 
 ### Implementation boundary and data flow

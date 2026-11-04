@@ -2026,6 +2026,25 @@ fn reference_cpu_matmul_residual_and_silu_mul_are_bit_identical_to_their_pairs()
     );
     let unfused = mul(&silu(&gate), &up).unwrap();
     assert_eq!(bits(&fused), bits(&unfused));
+
+    // `gated-matmul`: both matmuls of `a`, then their `silu-mul`.
+    let gate_weight = reference_cpu_host_tensor([k, n], values(k * n, 6));
+    let up_weight = reference_cpu_host_tensor([k, n], values(k * n, 7));
+    let fused = run(
+        "gated-matmul",
+        vec![
+            ("a", a.clone()),
+            ("gate", gate_weight.clone()),
+            ("up", up_weight.clone()),
+        ],
+        vec![m, n],
+    );
+    let unfused = mul(
+        &silu(&matmul(&a, &gate_weight, false, false).unwrap()),
+        &matmul(&a, &up_weight, false, false).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bits(&fused), bits(&unfused));
 }
 
 /// `append-kv-history-in-place`: attention over the first `key_count` rows

@@ -752,6 +752,15 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             ShapeRule::Any,
         ),
         ("silu-mul", OperatorFamily::Activation, 2, 1, ShapeRule::Any),
+        // `silu(matmul(a, gate)) * matmul(a, up)`, produced only by
+        // `graph_fusion::fuse_gated_matmul`.
+        (
+            "gated-matmul",
+            OperatorFamily::LinearAlgebra,
+            3,
+            1,
+            ShapeRule::Any,
+        ),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         (
             "rmsnorm",
@@ -920,7 +929,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
 
 fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     match name {
-        "matmul" | "batched-matmul" | "matmul-bias" | "matmul-residual" => {
+        "matmul" | "batched-matmul" | "matmul-bias" | "matmul-residual" | "gated-matmul" => {
             OperatorAttributeSchema::default()
                 .with_rule(
                     "transpose_a",
