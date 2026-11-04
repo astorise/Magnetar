@@ -48,6 +48,25 @@ Register-resident tiled prefill attention (GPU CI run 41883061198, CUDA Provider
 - **Logits.** CUDA logits are 1.5e-5 from the independent corpus, with the same tokens; 13 of 16 steps replay.
 - **What remains at 4096 tokens.** The layer matmuls (about 0.9 s) and the attention (about 0.5 s) now dominate.
 
+Tensor Core prefill matmuls (CUDA Provider 67996fc; GPU CI runs 41901349874 and 41904874231):
+- **Scope.** From 64 rows, `matmul`, `matmul-bias`, `matmul-residual` and `gated-matmul` against compact weights run `mma.sync.m16n8k16` (bfloat16 inputs, f32 accumulation) on Devices of compute capability 8.0 or later.
+- **Separate module.** The Tensor Core kernels are compiled for `compute_80` into a module of their own, loaded only on such a Device, so the main kernel source still builds everywhere. A test requires that module to load on a compute capability 8.0+ Device, so a compilation failure cannot silently leave prefills on the CUDA cores.
+- **Precision.** Compact weights enter the Tensor Cores exactly. Each f32 activation is split into two bfloat16 terms, hi = bf16(a) and lo = bf16(a - hi). Both terms are multiplied, which keeps about 16 significant bits of the activation and doubles the Tensor Core work.
+  - Results match the CUDA-core kernels to within f32 accumulation order, not bit for bit. The conformance test compares rows within 1e-5 · k of each other, relative to max(1, |value|).
+  - A dedicated test sets every activation to 1 + 2^-12, which bfloat16 alone rounds to 1, and checks that the low term is kept.
+- **Disable control.** `MAGNETAR_CUDA_TENSOR_CORES=0` keeps the bit-identical CUDA-core tile kernels.
+- **Kernel times.** Prefill matmuls went from 3.1-3.7 TFLOP/s to 7.0-7.4 TFLOP/s at 4096 rows, and from 3.0-3.6 to 4.7-6.3 TFLOP/s at 512 rows. The small K and V projections (896 x 128) gain least.
+
+| Same run (41904874231), RTX 3060 | Tensor Cores off | Tensor Cores |
+|---|---|---|
+| Warm TTFT median, 512 prompt tokens | 194.6 ms | 98.6 ms |
+| Warm TTFT median, 4096 prompt tokens | 1893 ms | 1008 ms |
+| TPOT median, 5 / 512 / 4096 prompt tokens | 4.5 / 4.8 / 6.7 ms | 4.5 / 4.8 / 6.7 ms |
+| Generated tokens, 5 / 512 / 4096 prompt tokens | | identical, 128 of 128 each |
+
+- **Numerics.** The logit corpus covers a 5-token prompt, which stays below the Tensor Core threshold: 1.5e-5, unchanged. For long prompts, the campaign prints each prompt's generated tokens. In the same GPU job, the Tensor-Cores-off campaign produced the same 128 greedy tokens after 512- and 4096-token prompts, consistent across the 5 measured runs.
+- **Limits.** The activation split doubles the Tensor Core work. A single-term bfloat16 activation would be about twice as fast, but its precision is not qualified.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
