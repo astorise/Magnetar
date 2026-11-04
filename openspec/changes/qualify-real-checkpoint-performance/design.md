@@ -24,6 +24,23 @@ The first increment covers A01 and A04 fully and A03 for discovery and explicit 
 - A02: `ProductionLoadedModel::generate_streaming_with_logits` (additive; observation only, existing entry points unchanged) hands each step's full pre-sampling logits to the harness. A `LogitReference` keeps per step the sampled token, the top 32 logits and a SHA-256 of the full vector. The checked-in corpus `integration-tests/production-loading/fixtures/qualification/qwen2.5-0.5b-instruct-7ae5576-reference-cpu-f32.json` (Reference CPU, pinned prompt token ids, 16 greedy tokens) is the reference every Provider is compared to, so GPU CI compares CUDA to Reference CPU without re-running it. Initial profile `f32-cross-provider-v1`: identical greedy tokens and the reference's top 8 logits within 5e-2 absolute; failures keep every step's differences. Lifecycle checks on the same instance: stream order and a single final `Finished`, capture not changing tokens, cancellation keeping exactly the delivered prefix, and resume from prompt + prefix reproducing the remaining tokens with logits inside the profile.
 - No WIT change. Device memory is `not_measured` until a Provider exposes telemetry; A07 and A08 are pending gates and the A02 evidence is a separate artifact, so no campaign report from this increment can qualify production performance.
 
+### Long-context campaign cells
+
+`MAGNETAR_QUALIFICATION_CONTEXT_TOKENS` (comma-separated, none by default) adds one campaign per listed prompt length after the short prompt.
+- **The prompt.** A long prompt holds exactly that many tokens: a passage's tokens repeated, then the short prompt's question. Every length therefore asks the same question.
+- **The report.** The cell actually run is no longer listed again among the skipped standard cells.
+- **The GPU job.** It runs 512 and 4096: the grid cells (1 session, 512 or 4096 context, 128 generated).
+
+They showed where long contexts spend their time (run 41845390146, RTX 3060, Qwen2.5-0.5B):
+
+| Prompt tokens | Warm TTFT median | TPOT median | Decode |
+|---|---|---|---|
+| 5 | 15.0 ms | 4.4 ms | 229 tok/s |
+| 512 | 743 ms | 5.8 ms | 173 tok/s |
+| 4096 | 9381 ms | 16.4 ms | 61 tok/s |
+
+`qualify-fusion-and-optimized-attention` records the kernels that cut this to 220 ms and 3372 ms TTFT, and to 4.8 ms and 6.7 ms TPOT.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
