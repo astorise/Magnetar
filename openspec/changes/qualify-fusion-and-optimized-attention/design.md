@@ -123,6 +123,26 @@ Pipelined Tensor Core prefill attention (CUDA Provider 9bba019, then 311a549 wit
 - **Numerics.** The 76 CUDA Provider tests pass on the Device, including every attention conformance case and the large-finite-value test. The generated tokens are identical with the Tensor Cores on and off, 128 of 128 each after 5-, 512- and 4096-token prompts, and the CUDA logits against the Reference CPU corpus pass.
 - **Long-context work overall.** Warm TTFT at 4096 prompt tokens went from 9381 to 482 ms, and at 512 from 743 to 63 ms. TPOT at 4096 went from 16.4 to 6.7 ms.
 
+Opt-in one-term activations for the pipelined matmuls (CUDA Provider 8e2ec2d; GPU CI run 42054671809; withdrawn):
+
+- **Profile.** `MAGNETAR_CUDA_TENSOR_CORE_ACTIVATIONS=bf16` feeds the pipelined matmuls only the hi bfloat16 term of each activation. This halves their `mma` work and their activation staging, and keeps about 8 significant bits of each activation instead of 16. Attention and the plain Tensor Core matmuls keep their split terms. The two-term split stays the default.
+- **First attempts.** Instantiating the matmul for both profiles gave each kernel two copies of its static shared stages. The gated matmul needed 67.5 KB, over the 48 KB limit, and the Tensor Core module failed to load (run 42045694178). The profile is now a runtime flag. A test bounded at 1e-4 near `f32::MAX` then failed under the profile, at 2^-8 by design (run 42050195147); its bound now follows the profile.
+
+| RTX 3060, same run | Two terms (default) | One term (opt-in) |
+|---|---|---|
+| Prefill matmuls, 4096 rows (896 x 896, x 4864, 4864 x 896) | 9.1-10.4 TFLOP/s | 10.1-11.9 TFLOP/s |
+| Warm TTFT median, 512 / 4096 prompt tokens | 59.0 / 464.5 ms | 56.0 / 425.3 ms |
+| Tensor Cores off | 193.6 / 1887.2 ms | |
+
+- **Numerics.** The 73 Provider tests that apply pass under the profile; the activation-precision test skips itself. The generated tokens are identical across the three campaigns, 128 of 128 each after 5-, 512- and 4096-token prompts.
+- **Decision.** Halving the `mma` work gained only 7-15% per matmul and 8% of TTFT at 4096 tokens. That does not justify the lost activation precision, so the profile is withdrawn and the two-term split is the only one.
+
+Wide 128-column pipelined matmul tiles (CUDA Provider 59be2c3; GPU CI run 42086941078; withdrawn):
+
+- **Hypothesis.** A 128-column tile stages each `a` term once for twice the columns, so a matmul bound by staging would speed up. The wide kernels served grids of at least 56 blocks and passed an f64 reference test.
+- **Result.** The prefill matmuls ran at 10.0-10.8 TFLOP/s at 4096 rows, against 9.1-10.4 before. Warm TTFT was 468.1 ms at 4096 prompt tokens, against 464.5, which is within noise. Tokens were identical with the Tensor Cores on and off.
+- **Reading.** Counting both bfloat16 terms, 10.4 TFLOP/s of matmul is about 20.8 TFLOP/s of `mma` work, about 81% of the RTX 3060's dense bfloat16 rate with f32 accumulation (about 25.6 TFLOP/s). The two-term matmuls are therefore close to their Tensor Core bound. The one-term profile, with half the `mma` work, reached only about 46% of that rate and was limited elsewhere. Larger tiles cannot recover much, so the wide kernels are withdrawn.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
