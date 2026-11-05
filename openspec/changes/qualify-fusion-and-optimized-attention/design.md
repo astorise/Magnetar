@@ -65,7 +65,11 @@ Tensor Core prefill matmuls (CUDA Provider 67996fc; GPU CI runs 41901349874 and 
 | Generated tokens, 5 / 512 / 4096 prompt tokens | | identical, 128 of 128 each |
 
 - **Numerics.** The logit corpus covers a 5-token prompt, which stays below the Tensor Core threshold: 1.5e-5, unchanged. For long prompts, the campaign prints each prompt's generated tokens. In the same GPU job, the Tensor-Cores-off campaign produced the same 128 greedy tokens after 512- and 4096-token prompts, consistent across the 5 measured runs.
-- **Limits.** The activation split doubles the Tensor Core work. A single-term bfloat16 activation would be about twice as fast, but its precision is not qualified.
+- **Limits.** The activation split doubles the Tensor Core work.
+- **Rejected follow-ups.** Two measurements show these kernels are bound by something other than the `mma` work and the stage barriers. Each was reverted:
+  - **One bfloat16 term per activation** (opt-in profile, run 41918957621). Tokens were identical to the two-term and Tensor-Cores-off campaigns. There was no speed-up: warm TTFT was 106.2 ms against 106.5 ms at 512 prompt tokens, and 1020 ms against 1038 ms at 4096. Prefill matmuls ran at the same TFLOP/s.
+  - **32 inners per staged tile instead of 16** (run 41922809583). This halves the barriers and stage loops per inner, but gave no measurable gain. Prefill matmuls ran at 6.2-6.7 TFLOP/s for 4096 rows, against 6.4-7.4 in earlier runs. Warm TTFT was 98.6 ms at 512 prompt tokens and 1019 ms at 4096.
+  - **What is left.** The remaining costs are the per-element f32-to-bfloat16 staging of `a`, which every column block repeats, and the transposed scalar stores of `b`. Going further means a pipelined design (`cp.async`, `ldmatrix`, larger tiles), not more tuning of this kernel.
 
 ### Identity, eligibility and recovery
 
