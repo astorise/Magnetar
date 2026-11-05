@@ -143,6 +143,20 @@ Wide 128-column pipelined matmul tiles (CUDA Provider 59be2c3; GPU CI run 420869
 - **Result.** The prefill matmuls ran at 10.0-10.8 TFLOP/s at 4096 rows, against 9.1-10.4 before. Warm TTFT was 468.1 ms at 4096 prompt tokens, against 464.5, which is within noise. Tokens were identical with the Tensor Cores on and off.
 - **Reading.** Counting both bfloat16 terms, 10.4 TFLOP/s of matmul is about 20.8 TFLOP/s of `mma` work, about 81% of the RTX 3060's dense bfloat16 rate with f32 accumulation (about 25.6 TFLOP/s). The two-term matmuls are therefore close to their Tensor Core bound. The one-term profile, with half the `mma` work, reached only about 46% of that rate and was limited elsewhere. Larger tiles cannot recover much, so the wide kernels are withdrawn.
 
+Grouped split decode attention (CUDA Provider 237a95e, 6bd677a, 6670d3d; GPU CI runs 42095869891, 42099368803, 42103018558):
+
+- **Why decode.** After the prefill work, a decode step at 4096 tokens of context took 6.7 ms, against 4.5 ms after a short prompt. The difference was mostly decode attention, at 78 us per layer. Reading K and V once (4.2 MB per layer) would take about 12 us on the RTX 3060.
+- **Grouped kernel.** `attention_split_kernel` scored each query head separately, so the 7 query heads sharing a KV head each re-read its K and V, which do not fit the 3 MB L2. Also, 64 of its threads weighted V by walking 128 keys serially. In `attention_split_gqa_kernel`, block (64-key chunk, KV head) stages K and V once with coalesced loads, scores every query head of the group from shared memory, runs a warp-shuffle softmax per head, and spreads the V weighting over all threads. Its partials keep the split layout. It serves 64-dimension heads with at most 8 query heads per KV head; other shapes keep the per-head kernel.
+- **Staging and combine.** The staging loop now has a fixed trip count, unrolled in batches of 8, so several loads are in flight per thread. `attention_combine_kernel` had recomputed every chunk's weight, with an exponential, for each output dimension, in serial passes. It now computes the maximum and the chunk weights once into dynamic shared memory. Each dimension's weighted sum is split across up to 8 lanes of chunks and added in lane order, so results do not depend on scheduling.
+
+| RTX 3060 | Before | Grouped | + staging, shared weights | + lane-split combine |
+|---|---|---|---|---|
+| Decode attention per layer, 512 / 4096 keys | 23.0 / 78 us | 13.8 / 61.2 us | 12.7 / 54.4 us | 13.4 / 43.6 us |
+| TPOT median, 5 / 512 / 4096 prompt tokens | 4.5 / 4.8 / 6.7 ms | 4.3 / 4.4 / 6.2 ms | 4.3 / 4.4 / 6.0 ms | 4.3 / 4.4 / 5.8 ms |
+
+- **Numerics.** The 77 CUDA Provider tests pass on the Device. They include new decode cases against the Reference CPU: one exact chunk, 4100 keys ending in a partial chunk, and one query head per KV head with a window. A large-finite-value test covers the grouped kernel. The generated tokens are identical with the Tensor Cores on and off, 128 of 128 each after 5-, 512- and 4096-token prompts. The CUDA logits match the Reference CPU corpus, and 13 of 16 decode steps still replay from a captured graph.
+- **What remains.** At 512 keys the decode attention is now mostly fixed launch cost. At 4096 keys it is about 3.5 times its K/V read time.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
