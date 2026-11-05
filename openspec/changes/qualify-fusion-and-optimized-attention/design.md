@@ -106,7 +106,22 @@ Pipelined Tensor Core prefill matmuls (CUDA Provider 4050f95; GPU CI run 4199956
 
 - **Numerics.** The generated tokens are identical with the Tensor Cores on and off, 128 of 128 each after 5-, 512- and 4096-token prompts. The CUDA logits against the Reference CPU corpus passed in the same run.
 - **What remains at 4096 tokens.** The layer matmuls are now about 0.3 s (about 12 ms per layer, gate and up counted separately) and the prefill attention about 0.2 s (8.1 ms per layer). The K and V projections (896 x 128) stay at 4.3 TFLOP/s: 16 column blocks do not fill the Device.
-- **Long-context work overall.** Warm TTFT at 4096 prompt tokens went from 9381 to 554 ms, and at 512 from 743 to 64 ms. TPOT at 4096 went from 16.4 to 6.7 ms.
+
+Pipelined Tensor Core prefill attention (CUDA Provider 9bba019, then 311a549 without the superseded kernel; GPU CI run 42031696029):
+
+- **Why attention, not a fused QKV matmul.** The pipelined matmuls already reach 10.7 TFLOP/s. With two bfloat16 terms per activation and f32 accumulation, the RTX 3060's ceiling is about 12.8 TFLOP/s, so a fused QKV matmul would save a few milliseconds at most. The prefill attention took 8.1 ms per layer at 4096 rows, about twice its Tensor Core bound.
+- **Kernel.** `attention_tcp_kernel` keeps the arithmetic of the first Tensor Core attention: three bfloat16 products per f32 product, online softmax, and probabilities normalized by the running sum. K and V are split into their hi and lo terms once per attention by `tc_split_kernel`; before, every query block re-split them, and with grouped-query attention each of the 7 query heads sharing a KV head did so too. Key tiles of 32 stream through two `cp.async` stages. Fragments are read with `ldmatrix`, and V uses `.trans` from its natural layout, so the transposed scalar stores are gone.
+- **Scope.** The kernel handles causal, windowed, offset and grouped-query attention, as before. It needs `kv_model_dim` to be a multiple of 8. Captured launches and other shapes use the tiled CUDA-core kernels. `MAGNETAR_CUDA_TENSOR_CORES=0` still keeps every prefill on the CUDA cores. The first Tensor Core attention kernel is removed.
+
+| RTX 3060 | First Tensor Core attention | Pipelined |
+|---|---|---|
+| Prefill attention per layer, 512 / 4096 rows | 0.26 / 8.06 ms | 0.16 / 4.80 ms |
+| Warm TTFT median, 512 / 4096 prompt tokens | 64.4 / 553.8 ms | 63.1 / 481.5 ms |
+| Tensor Cores off, same run | | 193.5 / 1894.9 ms |
+| TPOT median, 5 / 512 / 4096 prompt tokens | 4.5 / 4.8 / 6.7 ms | 4.5 / 4.8 / 6.7 ms |
+
+- **Numerics.** The 76 CUDA Provider tests pass on the Device, including every attention conformance case and the large-finite-value test. The generated tokens are identical with the Tensor Cores on and off, 128 of 128 each after 5-, 512- and 4096-token prompts, and the CUDA logits against the Reference CPU corpus pass.
+- **Long-context work overall.** Warm TTFT at 4096 prompt tokens went from 9381 to 482 ms, and at 512 from 743 to 63 ms. TPOT at 4096 went from 16.4 to 6.7 ms.
 
 ### Identity, eligibility and recovery
 
