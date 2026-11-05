@@ -89,7 +89,24 @@ Tensor Core prefill attention (CUDA Provider 286ea5d; GPU CI run 41986235007):
 | TPOT median, 5 / 512 / 4096 prompt tokens | 4.5 / 4.8 / 6.7 ms | 4.5 / 4.8 / 6.7 ms |
 
 - **Numerics.** The generated tokens are identical with the Tensor Cores on and off, 128 of 128 each after 5-, 512- and 4096-token prompts. CUDA logits stay 1.5e-5 from the independent corpus, and 13 of 16 steps replay.
-- **Long-context work overall.** Warm TTFT at 4096 prompt tokens went from 9381 to 715 ms, and at 512 from 743 to 96 ms. TPOT at 4096 went from 16.4 to 6.7 ms.
+
+Pipelined Tensor Core prefill matmuls (CUDA Provider 4050f95; GPU CI run 41999569272):
+
+- **Kernels.** `tc_split_kernel` splits `a` into its hi and lo bfloat16 terms once per matmul, instead of once per column block. `matmul_tcp_kernel` and `gated_matmul_tcp_kernel` then compute 128 x 64 output tiles on 8 warps. Two shared-memory stages are filled by `cp.async`, so the next 16 inners load while the current ones compute. Fragments are read with `ldmatrix`; the weight uses `.trans` and keeps its natural [k][n] layout, with no transposed scalar stores.
+- **Precision.** The products and f32 accumulation are the same as in the plain Tensor Core kernel. The near-`f32::MAX` truncation of the hi term is kept. The activation-precision test now covers both kernels.
+- **Scope.** The pipelined kernels need `k` and `n` to be multiples of 8 (16-byte rows) and an untransposed `a`. Other shapes keep the plain Tensor Core kernel. `MAGNETAR_CUDA_TENSOR_CORES=0` still keeps every prefill on the CUDA cores.
+
+| RTX 3060 | Plain Tensor Core matmuls | Pipelined |
+|---|---|---|
+| Prefill matmuls, 4096 rows (896 x 896, x 4864, 4864 x 896) | 6.2-7.4 TFLOP/s | 9.2-10.7 TFLOP/s |
+| Prefill matmuls, 512 rows (same shapes) | 4.7-6.3 TFLOP/s | 7.3-9.6 TFLOP/s |
+| Warm TTFT median, 512 / 4096 prompt tokens | 96.1 / 715 ms | 64.4 / 553.8 ms |
+| Tensor Cores off, same run | | 193.3 / 1890 ms |
+| TPOT median, 5 / 512 / 4096 prompt tokens | 4.5 / 4.8 / 6.7 ms | 4.5 / 4.8 / 6.7 ms |
+
+- **Numerics.** The generated tokens are identical with the Tensor Cores on and off, 128 of 128 each after 5-, 512- and 4096-token prompts. The CUDA logits against the Reference CPU corpus passed in the same run.
+- **What remains at 4096 tokens.** The layer matmuls are now about 0.3 s (about 12 ms per layer, gate and up counted separately) and the prefill attention about 0.2 s (8.1 ms per layer). The K and V projections (896 x 128) stay at 4.3 TFLOP/s: 16 column blocks do not fill the Device.
+- **Long-context work overall.** Warm TTFT at 4096 prompt tokens went from 9381 to 554 ms, and at 512 from 743 to 64 ms. TPOT at 4096 went from 16.4 to 6.7 ms.
 
 ### Identity, eligibility and recovery
 
