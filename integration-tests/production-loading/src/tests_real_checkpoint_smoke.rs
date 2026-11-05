@@ -32,7 +32,6 @@ use magnetar_loader_huggingface::{
     HuggingFaceChatTemplateFormatter, HuggingFaceIngestor, HuggingFaceTokenizer,
     parse_tokenizer_config,
 };
-use magnetar_runtime::model::ModelDigest;
 use magnetar_runtime::model::ModelTrustStore;
 use magnetar_runtime::production_model_ingestion::{
     ProductionModelArtifactIngestor, ProductionModelSource,
@@ -151,12 +150,29 @@ pub(crate) fn verified_profile_source(
     dir: &std::path::Path,
     profile: &RealCheckpointProfile,
 ) -> ProductionModelSource {
-    let weights_bytes = fs::read(dir.join("model.safetensors"))
+    // Hashed in 8 MB reads: a multi-gigabyte checkpoint never sits in
+    // memory whole just to be verified.
+    let mut weights = fs::File::open(dir.join("model.safetensors"))
         .expect("model.safetensors is readable in the checkpoint directory");
-    let actual_digest = ModelDigest::sha256(&weights_bytes);
-    drop(weights_bytes);
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    let mut buffer = vec![0u8; 8 << 20];
+    loop {
+        let read = std::io::Read::read(&mut weights, &mut buffer)
+            .expect("model.safetensors reads to its end");
+        if read == 0 {
+            break;
+        }
+        sha2::Digest::update(&mut hasher, &buffer[..read]);
+    }
+    let actual_digest = format!(
+        "sha256:{}",
+        sha2::Digest::finalize(hasher)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
     assert_eq!(
-        actual_digest.value, profile.weights_sha256,
+        actual_digest, profile.weights_sha256,
         "the downloaded model.safetensors does not match {} revision {}'s declared content \
          digest -- re-download it",
         profile.repo, profile.revision

@@ -293,13 +293,11 @@ jobs:
           verify tokenizer.json "$TOKENIZER_JSON_SHA256"
           verify tokenizer_config.json "$TOKENIZER_CONFIG_JSON_SHA256"
           echo "MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR=$dir" >> "$GITHUB_ENV"
-      - name: Qwen2.5-1.5B-Instruct greedy tokens on Reference CPU and real CUDA
-        # The same 16 greedy tokens on both Providers for this checkpoint.
-        timeout-minutes: 40
-        run: |
-          MAGNETAR_REAL_CHECKPOINT_PROFILE=qwen2.5-1.5b-instruct MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR" \
-            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda -- --include-ignored --test-threads=1 --nocapture
       - name: Qwen2.5-1.5B-Instruct long-context campaign on CUDA
+        # Its Reference CPU comparison is left out: this checkpoint in f32
+        # (about 6 GB) does not fit the runner's memory next to the test.
+        # The same campaign with the Tensor Cores off is the control: both
+        # must generate the same tokens (checked below).
         timeout-minutes: 30
         env:
           MAGNETAR_REAL_CHECKPOINT_PROFILE: qwen2.5-1.5b-instruct
@@ -309,8 +307,35 @@ jobs:
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
         run: |
+          set -o pipefail
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR" \
-            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qwen2.5-1.5b-instruct-tensor-cores.log"
+      - name: Qwen2.5-1.5B-Instruct long-context campaign with Tensor Cores off (disable control)
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CUDA_TENSOR_CORES: "0"
+          MAGNETAR_REAL_CHECKPOINT_PROFILE: qwen2.5-1.5b-instruct
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
+          MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
+        run: |
+          set -o pipefail
+          MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qwen2.5-1.5b-instruct-no-tensor-cores.log"
+      - name: Qwen2.5-1.5B-Instruct generates the same tokens with the Tensor Cores on and off
+        run: |
+          set -eu
+          on="$(grep 'generated token ids' "$RUNNER_TEMP/qwen2.5-1.5b-instruct-tensor-cores.log")"
+          off="$(grep 'generated token ids' "$RUNNER_TEMP/qwen2.5-1.5b-instruct-no-tensor-cores.log")"
+          test -n "$on"
+          if [ "$on" != "$off" ]; then
+            echo "::error::Qwen2.5-1.5B-Instruct: tokens differ with the Tensor Cores on and off"
+            diff <(echo "$on") <(echo "$off") || true
+            exit 1
+          fi
+          echo "$on"
       - name: Download the pinned real DeepSeek-R1-Distill-Qwen-1.5B checkpoint
         # qualify-additional-model-and-state-families F01: a further real
         # checkpoint, pinned by exact revision; the JSON files by the sha256
@@ -343,13 +368,11 @@ jobs:
           verify tokenizer.json "$TOKENIZER_JSON_SHA256"
           verify tokenizer_config.json "$TOKENIZER_CONFIG_JSON_SHA256"
           echo "MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR=$dir" >> "$GITHUB_ENV"
-      - name: DeepSeek-R1-Distill-Qwen-1.5B greedy tokens on Reference CPU and real CUDA
-        # The same 16 greedy tokens on both Providers for this checkpoint.
-        timeout-minutes: 40
-        run: |
-          MAGNETAR_REAL_CHECKPOINT_PROFILE=deepseek-r1-distill-qwen-1.5b MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR" \
-            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda -- --include-ignored --test-threads=1 --nocapture
       - name: DeepSeek-R1-Distill-Qwen-1.5B long-context campaign on CUDA
+        # Its Reference CPU comparison is left out: this checkpoint in f32
+        # (about 6 GB) does not fit the runner's memory next to the test.
+        # The same campaign with the Tensor Cores off is the control: both
+        # must generate the same tokens (checked below).
         timeout-minutes: 30
         env:
           MAGNETAR_REAL_CHECKPOINT_PROFILE: deepseek-r1-distill-qwen-1.5b
@@ -359,8 +382,35 @@ jobs:
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
         run: |
+          set -o pipefail
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR" \
-            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/deepseek-r1-distill-qwen-1.5b-tensor-cores.log"
+      - name: DeepSeek-R1-Distill-Qwen-1.5B long-context campaign with Tensor Cores off (disable control)
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CUDA_TENSOR_CORES: "0"
+          MAGNETAR_REAL_CHECKPOINT_PROFILE: deepseek-r1-distill-qwen-1.5b
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
+          MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
+        run: |
+          set -o pipefail
+          MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/deepseek-r1-distill-qwen-1.5b-no-tensor-cores.log"
+      - name: DeepSeek-R1-Distill-Qwen-1.5B generates the same tokens with the Tensor Cores on and off
+        run: |
+          set -eu
+          on="$(grep 'generated token ids' "$RUNNER_TEMP/deepseek-r1-distill-qwen-1.5b-tensor-cores.log")"
+          off="$(grep 'generated token ids' "$RUNNER_TEMP/deepseek-r1-distill-qwen-1.5b-no-tensor-cores.log")"
+          test -n "$on"
+          if [ "$on" != "$off" ]; then
+            echo "::error::DeepSeek-R1-Distill-Qwen-1.5B: tokens differ with the Tensor Cores on and off"
+            diff <(echo "$on") <(echo "$off") || true
+            exit 1
+          fi
+          echo "$on"
       - name: Upload qualification reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
