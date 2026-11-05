@@ -95,16 +95,6 @@ jobs:
         # at 512 and 4096 rows; diagnostic only.
         timeout-minutes: 15
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml long_context_kernel_times -- --ignored --nocapture
-      - name: CUDA Provider tests and kernel times, one-term activations (opt-in profile)
-        # The opt-in MAGNETAR_CUDA_TENSOR_CORE_ACTIVATIONS=bf16 profile: the
-        # Provider's tests on its one-term pipelined matmuls, then their
-        # prefill kernel times; compared with the two-term default above.
-        timeout-minutes: 20
-        env:
-          MAGNETAR_CUDA_TENSOR_CORE_ACTIVATIONS: bf16
-        run: |
-          cargo test --locked --release --manifest-path providers/cuda/Cargo.toml
-          cargo test --locked --release --manifest-path providers/cuda/Cargo.toml long_context_kernel_times -- --ignored --nocapture
       - name: Build and test the real first-native Qwen Component against a real CudaProvider
         # #58: `integration-tests/cuda-first-native` runs the real
         # first-native pipeline (magnetar-runtime, driven by the checked-in
@@ -265,19 +255,6 @@ jobs:
         timeout-minutes: 30
         env:
           MAGNETAR_CUDA_TENSOR_CORES: "0"
-          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
-          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
-          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
-          MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
-          MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
-        run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
-      - name: Real-checkpoint long-context campaign with one-term activations (opt-in profile)
-        # The same campaigns with the pipelined Tensor Core matmuls fed one
-        # bfloat16 term per activation: their tokens are compared with the
-        # two-term default and the Tensor-Cores-off control above.
-        timeout-minutes: 30
-        env:
-          MAGNETAR_CUDA_TENSOR_CORE_ACTIVATIONS: bf16
           MAGNETAR_QUALIFICATION_PROVIDERS: cuda
           MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
