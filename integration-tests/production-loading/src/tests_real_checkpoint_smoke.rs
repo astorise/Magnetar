@@ -44,16 +44,82 @@ use magnetar_runtime::{
 };
 use std::{fs, path::PathBuf, sync::Arc};
 
-/// `Qwen/Qwen2.5-0.5B-Instruct`'s exact pinned commit on Hugging Face:
-/// <https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/commit/7ae557604adf67be50417f59c2c2f167def9a775>.
-pub(crate) const CHECKPOINT_REVISION: &str = "7ae557604adf67be50417f59c2c2f167def9a775";
-/// `model.safetensors`' declared LFS sha256 at that exact revision (from
-/// the Hugging Face Hub API's own `siblings[].lfs.sha256` for this file),
-/// verified against the real downloaded bytes before this test trusts
-/// them at all.
-pub(crate) const CHECKPOINT_WEIGHTS_SHA256: &str =
-    "sha256:fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe";
-const REAL_VOCAB_SIZE: u64 = 151_936;
+/// A real public checkpoint the real-checkpoint tests can run against,
+/// pinned by exact Hugging Face revision and `model.safetensors` sha256
+/// (the Hub API's own `siblings[].lfs.sha256` for that file at that
+/// revision), verified against the downloaded bytes before anything
+/// trusts them.
+pub(crate) struct RealCheckpointProfile {
+    /// The value of `MAGNETAR_REAL_CHECKPOINT_PROFILE` that selects it.
+    pub(crate) id: &'static str,
+    /// `owner/name` on Hugging Face.
+    pub(crate) repo: &'static str,
+    pub(crate) revision: &'static str,
+    pub(crate) weights_sha256: &'static str,
+    pub(crate) vocab_size: u64,
+}
+
+/// <https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/commit/7ae557604adf67be50417f59c2c2f167def9a775>:
+/// 24 layers, 896 hidden, 14 attention / 2 KV heads of 64 dimensions. The
+/// default, and the only profile the logit corpus covers.
+pub(crate) const QWEN2_5_0_5B_INSTRUCT: RealCheckpointProfile = RealCheckpointProfile {
+    id: "qwen2.5-0.5b-instruct",
+    repo: "Qwen/Qwen2.5-0.5B-Instruct",
+    revision: "7ae557604adf67be50417f59c2c2f167def9a775",
+    weights_sha256: "sha256:fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe",
+    vocab_size: 151_936,
+};
+
+/// <https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/commit/989aa7980e4cf806f80c7fef2b1adb7bc71aa306>:
+/// 28 layers, 1536 hidden, 12 attention / 2 KV heads of 128 dimensions.
+pub(crate) const QWEN2_5_1_5B_INSTRUCT: RealCheckpointProfile = RealCheckpointProfile {
+    id: "qwen2.5-1.5b-instruct",
+    repo: "Qwen/Qwen2.5-1.5B-Instruct",
+    revision: "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+    weights_sha256: "sha256:dd924a11b4c220f385b51ffa522daea7c9f3d850e31b162bb5661df483c6d3ee",
+    vocab_size: 151_936,
+};
+
+/// <https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B/commit/ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562>:
+/// a Qwen2 checkpoint (the Qwen Component serves it) with Qwen2.5-1.5B's
+/// shape, rope_theta 10000 and an untied LM head.
+pub(crate) const DEEPSEEK_R1_DISTILL_QWEN_1_5B: RealCheckpointProfile = RealCheckpointProfile {
+    id: "deepseek-r1-distill-qwen-1.5b",
+    repo: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    revision: "ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562",
+    weights_sha256: "sha256:58858233513d76b8703e72eed6ce16807b523328188e13329257fb9594462945",
+    vocab_size: 151_936,
+};
+
+const PROFILES: [&RealCheckpointProfile; 3] = [
+    &QWEN2_5_0_5B_INSTRUCT,
+    &QWEN2_5_1_5B_INSTRUCT,
+    &DEEPSEEK_R1_DISTILL_QWEN_1_5B,
+];
+
+/// The profile `MAGNETAR_REAL_CHECKPOINT_PROFILE` names, Qwen2.5-0.5B-
+/// Instruct when unset. An unknown name fails rather than falling back.
+pub(crate) fn active_profile() -> &'static RealCheckpointProfile {
+    match std::env::var("MAGNETAR_REAL_CHECKPOINT_PROFILE") {
+        Err(_) => &QWEN2_5_0_5B_INSTRUCT,
+        Ok(id) => PROFILES
+            .into_iter()
+            .find(|profile| profile.id == id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "MAGNETAR_REAL_CHECKPOINT_PROFILE={id} names no pinned checkpoint; known: {:?}",
+                    PROFILES.map(|profile| profile.id)
+                )
+            }),
+    }
+}
+
+/// `Qwen/Qwen2.5-0.5B-Instruct`'s exact pinned commit, the logit corpus's
+/// checkpoint.
+pub(crate) const CHECKPOINT_REVISION: &str = QWEN2_5_0_5B_INSTRUCT.revision;
+/// Its `model.safetensors` sha256.
+pub(crate) const CHECKPOINT_WEIGHTS_SHA256: &str = QWEN2_5_0_5B_INSTRUCT.weights_sha256;
+const REAL_VOCAB_SIZE: u64 = QWEN2_5_0_5B_INSTRUCT.vocab_size;
 
 pub(crate) fn checkpoint_dir() -> Option<PathBuf> {
     std::env::var_os("MAGNETAR_QWEN_REAL_CHECKPOINT_DIR").map(PathBuf::from)
@@ -61,32 +127,42 @@ pub(crate) fn checkpoint_dir() -> Option<PathBuf> {
 
 pub(crate) fn require_checkpoint_dir() -> PathBuf {
     checkpoint_dir().unwrap_or_else(|| {
+        let profile = active_profile();
         panic!(
-            "MAGNETAR_QWEN_REAL_CHECKPOINT_DIR is not set. Download Qwen/Qwen2.5-0.5B-Instruct \
-             revision {CHECKPOINT_REVISION} (config.json, generation_config.json, \
-             tokenizer.json, tokenizer_config.json, model.safetensors) into a directory and set \
-             that env var to it before running this test with --include-ignored -- see this \
-             file's own module doc comment for the exact recipe."
+            "MAGNETAR_QWEN_REAL_CHECKPOINT_DIR is not set. Download {} revision {} \
+             (config.json, generation_config.json, tokenizer.json, tokenizer_config.json, \
+             model.safetensors) into a directory and set that env var to it before running this \
+             test with --include-ignored -- see this file's own module doc comment for the exact \
+             recipe.",
+            profile.repo, profile.revision
         )
     })
 }
 
-/// Verifies `dir/model.safetensors`' real sha256 against
-/// [`CHECKPOINT_WEIGHTS_SHA256`] and returns the checkpoint's real,
+/// Verifies `dir/model.safetensors`' real sha256 against the active
+/// profile's pinned digest and returns the checkpoint's real,
 /// pinned-revision-authorized [`ProductionModelSource`].
 pub(crate) fn verified_checkpoint_source(dir: &std::path::Path) -> ProductionModelSource {
+    verified_profile_source(dir, active_profile())
+}
+
+/// [`verified_checkpoint_source`] for an explicit profile.
+pub(crate) fn verified_profile_source(
+    dir: &std::path::Path,
+    profile: &RealCheckpointProfile,
+) -> ProductionModelSource {
     let weights_bytes = fs::read(dir.join("model.safetensors"))
         .expect("model.safetensors is readable in the checkpoint directory");
     let actual_digest = ModelDigest::sha256(&weights_bytes);
+    drop(weights_bytes);
     assert_eq!(
-        actual_digest.value, CHECKPOINT_WEIGHTS_SHA256,
-        "the downloaded model.safetensors does not match revision {CHECKPOINT_REVISION}'s \
-         declared content digest -- re-download it"
+        actual_digest.value, profile.weights_sha256,
+        "the downloaded model.safetensors does not match {} revision {}'s declared content \
+         digest -- re-download it",
+        profile.repo, profile.revision
     );
     ProductionModelSource::authorized_local_bundle(
-        ModelArtifactSource::HuggingFace(format!(
-            "Qwen/Qwen2.5-0.5B-Instruct@{CHECKPOINT_REVISION}"
-        )),
+        ModelArtifactSource::HuggingFace(format!("{}@{}", profile.repo, profile.revision)),
         dir.to_path_buf(),
     )
 }
@@ -307,7 +383,7 @@ fn real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda() {
 
     let mut ingested = HuggingFaceIngestor::new()
         .ingest(&source)
-        .expect("real Qwen2.5-0.5B-Instruct bundle ingests");
+        .expect("real pinned checkpoint bundle ingests");
     ingested.manifest.generation = Some(ModelGenerationDefaults {
         max_tokens: Some(16),
         ..Default::default()
@@ -321,8 +397,8 @@ fn real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda() {
     let real_tokenizer = HuggingFaceTokenizer::from_bytes(
         &tokenizer_json,
         Some(&tokenizer_config),
-        "qwen2.5-0.5b-instruct",
-        Some(REAL_VOCAB_SIZE),
+        active_profile().id,
+        Some(active_profile().vocab_size),
     )
     .expect("real tokenizer.json loads and matches the declared vocab_size");
     let tokenizer_metadata = real_tokenizer.metadata().clone();
@@ -375,7 +451,31 @@ fn real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda() {
         "Reference CPU and CUDA must decode to the same real text"
     );
     eprintln!(
-        "real Qwen2.5-0.5B-Instruct multi-token decode matched on CPU and CUDA: {:?}",
+        "real {} multi-token decode matched on CPU and CUDA: {:?}",
+        active_profile().repo,
         cpu_outcome.text
     );
+}
+
+/// Every pinned profile has a distinct id, a full sha256 and a 40-hex
+/// revision, so `MAGNETAR_REAL_CHECKPOINT_PROFILE` selects one exactly.
+#[test]
+fn real_checkpoint_profiles_are_distinct_and_fully_pinned() {
+    for (index, profile) in PROFILES.iter().enumerate() {
+        assert!(
+            PROFILES[index + 1..]
+                .iter()
+                .all(|other| other.id != profile.id),
+            "duplicate profile id {}",
+            profile.id
+        );
+        assert_eq!(profile.revision.len(), 40, "{}", profile.id);
+        assert!(profile.revision.chars().all(|c| c.is_ascii_hexdigit()));
+        let digest = profile
+            .weights_sha256
+            .strip_prefix("sha256:")
+            .expect("sha256: prefix");
+        assert_eq!(digest.len(), 64, "{}", profile.id);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }

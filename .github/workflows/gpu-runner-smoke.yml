@@ -261,6 +261,106 @@ jobs:
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
         run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
+      - name: Download the pinned real Qwen2.5-1.5B-Instruct checkpoint
+        # qualify-additional-model-and-state-families F01: a further real
+        # checkpoint, pinned by exact revision; the JSON files by the sha256
+        # each had at that revision, model.safetensors by its LFS sha256,
+        # which the tests verify (`RealCheckpointProfile` qwen2.5-1.5b-instruct).
+        env:
+          REVISION: 989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+          CONFIG_JSON_SHA256: 98d2ff8cc47488d08a2b0b3acf4eb99ef210779b42bd48605f6b8e36acdbf670
+          GENERATION_CONFIG_JSON_SHA256: e558847a8b4402616f1273797b015104dc266fe4b520056fca88823ba8f8ebe6
+          TOKENIZER_JSON_SHA256: c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539
+          TOKENIZER_CONFIG_JSON_SHA256: 5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583
+        run: |
+          set -eux
+          dir="$RUNNER_TEMP/qwen2.5-1.5b-instruct-$REVISION"
+          mkdir -p "$dir"
+          for file in config.json generation_config.json tokenizer.json tokenizer_config.json model.safetensors; do
+            curl -fsSL "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct/resolve/$REVISION/$file" -o "$dir/$file"
+          done
+          verify() {
+            local file="$1" expected="$2"
+            local actual
+            actual="$(sha256sum "$dir/$file" | cut -d' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$file sha256 mismatch: expected $expected, got $actual"
+              exit 1
+            fi
+          }
+          verify config.json "$CONFIG_JSON_SHA256"
+          verify generation_config.json "$GENERATION_CONFIG_JSON_SHA256"
+          verify tokenizer.json "$TOKENIZER_JSON_SHA256"
+          verify tokenizer_config.json "$TOKENIZER_CONFIG_JSON_SHA256"
+          echo "MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Qwen2.5-1.5B-Instruct greedy tokens on Reference CPU and real CUDA
+        # The same 16 greedy tokens on both Providers for this checkpoint.
+        timeout-minutes: 40
+        run: |
+          MAGNETAR_REAL_CHECKPOINT_PROFILE=qwen2.5-1.5b-instruct MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda -- --include-ignored --test-threads=1 --nocapture
+      - name: Qwen2.5-1.5B-Instruct long-context campaign on CUDA
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REAL_CHECKPOINT_PROFILE: qwen2.5-1.5b-instruct
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
+          MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
+        run: |
+          MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
+      - name: Download the pinned real DeepSeek-R1-Distill-Qwen-1.5B checkpoint
+        # qualify-additional-model-and-state-families F01: a further real
+        # checkpoint, pinned by exact revision; the JSON files by the sha256
+        # each had at that revision, model.safetensors by its LFS sha256,
+        # which the tests verify (`RealCheckpointProfile` deepseek-r1-distill-qwen-1.5b).
+        env:
+          REVISION: ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562
+          CONFIG_JSON_SHA256: 37bd455e9679d2959536270fed49d25cc7c290a64f6e52abb97c71345a9cee41
+          GENERATION_CONFIG_JSON_SHA256: 72cbec1015da9ed03ad025483005cbf6481403abf947adfd54e504d1a66a2126
+          TOKENIZER_JSON_SHA256: 88145e3c3249adc2546ede277e9819d6e405e19072456e4b521cbc724bd60773
+          TOKENIZER_CONFIG_JSON_SHA256: 8ac8c85fb242563c2260baec0909debd69d718af6a0b3d90e6cab62b4d341cd5
+        run: |
+          set -eux
+          dir="$RUNNER_TEMP/deepseek-r1-distill-qwen-1.5b-$REVISION"
+          mkdir -p "$dir"
+          for file in config.json generation_config.json tokenizer.json tokenizer_config.json model.safetensors; do
+            curl -fsSL "https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B/resolve/$REVISION/$file" -o "$dir/$file"
+          done
+          verify() {
+            local file="$1" expected="$2"
+            local actual
+            actual="$(sha256sum "$dir/$file" | cut -d' ' -f1)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$file sha256 mismatch: expected $expected, got $actual"
+              exit 1
+            fi
+          }
+          verify config.json "$CONFIG_JSON_SHA256"
+          verify generation_config.json "$GENERATION_CONFIG_JSON_SHA256"
+          verify tokenizer.json "$TOKENIZER_JSON_SHA256"
+          verify tokenizer_config.json "$TOKENIZER_CONFIG_JSON_SHA256"
+          echo "MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR=$dir" >> "$GITHUB_ENV"
+      - name: DeepSeek-R1-Distill-Qwen-1.5B greedy tokens on Reference CPU and real CUDA
+        # The same 16 greedy tokens on both Providers for this checkpoint.
+        timeout-minutes: 40
+        run: |
+          MAGNETAR_REAL_CHECKPOINT_PROFILE=deepseek-r1-distill-qwen-1.5b MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_checkpoint_multi_token_decode_matches_between_cpu_and_cuda -- --include-ignored --test-threads=1 --nocapture
+      - name: DeepSeek-R1-Distill-Qwen-1.5B long-context campaign on CUDA
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REAL_CHECKPOINT_PROFILE: deepseek-r1-distill-qwen-1.5b
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
+          MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
+        run: |
+          MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
       - name: Upload qualification reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

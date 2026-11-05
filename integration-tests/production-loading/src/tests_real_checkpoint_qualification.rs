@@ -39,8 +39,7 @@
 
 use crate::test_support::{VOCAB_SIZE, register_real_qwen_component, write_tiny_production_bundle};
 use crate::tests_real_checkpoint_smoke::{
-    CHECKPOINT_REVISION, CHECKPOINT_WEIGHTS_SHA256, require_checkpoint_dir,
-    verified_checkpoint_source,
+    active_profile, require_checkpoint_dir, verified_checkpoint_source,
 };
 use magnetar_inference_qualification::campaign::{
     Campaign, CampaignException, CampaignProtocol, CampaignReport, CellStatus, CheckpointIdentity,
@@ -69,7 +68,6 @@ use magnetar_runtime::{
 };
 use std::{collections::BTreeMap, fs, ops::ControlFlow, path::PathBuf, sync::Arc, time::Instant};
 
-const REAL_VOCAB_SIZE: u64 = 151_936;
 const REAL_PROMPT: &str = "The capital of France is";
 const HARNESS: &str = "integration-tests/production-loading::tests_real_checkpoint_qualification";
 
@@ -679,7 +677,7 @@ fn load_real_checkpoint(max_new_tokens: usize) -> RealCheckpoint {
     register_real_qwen_component();
     let mut ingested = HuggingFaceIngestor::new()
         .ingest(&source)
-        .expect("real Qwen2.5-0.5B-Instruct bundle ingests");
+        .expect("real pinned checkpoint bundle ingests");
     ingested.manifest.generation = Some(ModelGenerationDefaults {
         max_tokens: Some(u32::try_from(max_new_tokens).expect("token budget fits u32")),
         ..Default::default()
@@ -691,8 +689,8 @@ fn load_real_checkpoint(max_new_tokens: usize) -> RealCheckpoint {
     let tokenizer = HuggingFaceTokenizer::from_bytes(
         &tokenizer_json,
         Some(&tokenizer_config),
-        "qwen2.5-0.5b-instruct",
-        Some(REAL_VOCAB_SIZE),
+        active_profile().id,
+        Some(active_profile().vocab_size),
     )
     .expect("real tokenizer.json loads");
     let tokenizer_metadata = tokenizer.metadata().clone();
@@ -704,9 +702,9 @@ fn load_real_checkpoint(max_new_tokens: usize) -> RealCheckpoint {
         tokenizer: Arc::new(tokenizer),
         trust_store,
         checkpoint: CheckpointIdentity {
-            name: "Qwen/Qwen2.5-0.5B-Instruct".into(),
-            revision: Some(CHECKPOINT_REVISION.into()),
-            weights_digest: Some(CHECKPOINT_WEIGHTS_SHA256.into()),
+            name: active_profile().repo.into(),
+            revision: Some(active_profile().revision.into()),
+            weights_digest: Some(active_profile().weights_sha256.into()),
             // `verified_checkpoint_source` recomputed this digest from the
             // downloaded bytes (it panics otherwise).
             digest_verified: true,
