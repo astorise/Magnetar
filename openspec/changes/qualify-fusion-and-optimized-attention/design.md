@@ -71,6 +71,26 @@ Tensor Core prefill matmuls (CUDA Provider 67996fc; GPU CI runs 41901349874 and 
   - **32 inners per staged tile instead of 16** (run 41922809583). This halves the barriers and stage loops per inner, but gave no measurable gain. Prefill matmuls ran at 6.2-6.7 TFLOP/s for 4096 rows, against 6.4-7.4 in earlier runs. Warm TTFT was 98.6 ms at 512 prompt tokens and 1019 ms at 4096.
   - **What is left.** The remaining costs are the per-element f32-to-bfloat16 staging of `a`, which every column block repeats, and the transposed scalar stores of `b`. Going further means a pipelined design (`cp.async`, `ldmatrix`, larger tiles), not more tuning of this kernel.
 
+Tensor Core prefill attention (CUDA Provider 286ea5d; GPU CI run 41986235007):
+- **Kernel.** `attention_tc_kernel` serves 64 queries of one head per block: 4 warps of 16 queries, taking keys 64 at a time.
+- **Arithmetic.** S = Q K^T and P V run as `m16n8k16` bfloat16 `mma` with f32 accumulation.
+  - Every f32 operand enters as two bfloat16 terms, and each product is computed as hi*hi + hi*lo + lo*hi, keeping about 16 significant bits.
+  - Softmax is online per query row.
+  - Each key tile's probabilities are divided by the new running sum before they weight V, so the output stays a weighted mean of V rows. A large-finite-value test covers this kernel.
+  - The 1/8 scale is folded into Q, which is exact for 64 dimensions.
+- **Scope.** It handles causal, windowed, offset and grouped-query attention. It serves uncaptured attention of at least 16 query rows with 64-dimension heads, on Devices whose Tensor Core module loaded. `MAGNETAR_CUDA_TENSOR_CORES=0` keeps the CUDA-core kernels.
+- **Tests.** The conformance test gains a 64-dimension case of 200 queries over 1000 keys with a 150-key window, and a 16-row case.
+
+| RTX 3060, Qwen2.5-0.5B | Before (run 41922809583) | After (run 41986235007) |
+|---|---|---|
+| Prefill attention per layer, 512 / 4096 rows | 0.49 / 20.6 ms | 0.26 / 8.2 ms |
+| Warm TTFT median, 512 / 4096 prompt tokens | 98.6 / 1019 ms | 96.1 / 715 ms |
+| Tensor Cores off, same run | | 193.6 / 1889 ms |
+| TPOT median, 5 / 512 / 4096 prompt tokens | 4.5 / 4.8 / 6.7 ms | 4.5 / 4.8 / 6.7 ms |
+
+- **Numerics.** The generated tokens are identical with the Tensor Cores on and off, 128 of 128 each after 5-, 512- and 4096-token prompts. CUDA logits stay 1.5e-5 from the independent corpus, and 13 of 16 steps replay.
+- **Long-context work overall.** Warm TTFT at 4096 prompt tokens went from 9381 to 715 ms, and at 512 from 743 to 96 ms. TPOT at 4096 went from 16.4 to 6.7 ms.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.
