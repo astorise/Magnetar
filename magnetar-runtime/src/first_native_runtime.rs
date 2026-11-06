@@ -1430,6 +1430,40 @@ fn in_place_kv_supported(runtime: &Runtime, provider: &ProviderBinding) -> bool 
     attention && provider_advertises_operator(runtime, provider, "kv-write")
 }
 
+/// Every `rope` node of a Component-built graph must declare exactly the
+/// per-frequency scaling the bound configuration carries. A Component that
+/// predates `model-config` 1.4.0, or does not understand the scheme, would
+/// otherwise build an unscaled graph for a scaled checkpoint and degrade
+/// every token silently; one that declares a scaling the checkpoint does
+/// not have is just as wrong.
+fn validate_rope_frequency_scaling(
+    graph: &ExecutionGraph,
+    config: &ModelArchitectureConfig,
+) -> Result<(), E2eConformanceError> {
+    let expected = config.rope_frequency_scaling.map(|scaling| match scaling {
+        crate::RopeFrequencyScaling::Llama3(llama3) => llama3,
+    });
+    for (node_id, node) in &graph.nodes {
+        if node.operator.name() != "rope" {
+            continue;
+        }
+        let declared = crate::operator::RopeLlama3Scaling::from_attributes(&node.attributes)
+            .map_err(|reason| E2eConformanceError::ModelComponentFailed {
+                reason: format!("rope node '{node_id:?}': {reason}"),
+            })?;
+        if declared != expected {
+            return Err(E2eConformanceError::ModelComponentFailed {
+                reason: format!(
+                    "rope node '{node_id:?}' declares frequency scaling {declared:?}, but the \
+                     checkpoint's configuration requires {expected:?}; the Model Component \
+                     does not implement this model's RoPE"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Whether every active `rope` Kernel of `provider` honours the Llama 3
 /// frequency-scaling attributes (and there is at least one).
 fn rope_llama3_scaling_supported(runtime: &Runtime, provider: &ProviderBinding) -> bool {
@@ -3991,6 +4025,7 @@ fn dispatch_first_native_graph_node(
                 dimension: head_dimension,
                 position_mode: fixture.config.rope.position_mode,
                 dynamic_scaling_supported: fixture.config.rope.dynamic_scaling_supported,
+                frequency_scaling: fixture.config.rope.frequency_scaling,
             };
             // `output_target` is not passed when RoPE's output edge carries
             // KV-cache semantics (`rope_k`): `execute_first_native_graph_nodes`
@@ -8049,6 +8084,7 @@ fn architecture_config_from_first_native_model_config(
         rms_norm_eps: config.rmsnorm_epsilon,
         rope_theta: config.rope.base,
         rope_scaling_factor: config.rope.scale.map(|value| value as f32),
+        rope_frequency_scaling: config.rope.frequency_scaling,
         tie_word_embeddings: config.tied_embeddings,
         attention_bias: config.attention_bias,
         bos_token_id: None,
@@ -8096,6 +8132,7 @@ fn first_native_model_config_from_architecture_config(
             dimension: config.head_dim,
             position_mode: FirstNativeRopePositionMode::Sequential,
             dynamic_scaling_supported: false,
+            frequency_scaling: config.rope_frequency_scaling,
         },
         rmsnorm_epsilon: config.rms_norm_eps,
         tied_embeddings: config.tie_word_embeddings,
@@ -9703,7 +9740,7 @@ pub fn register_inference_component_artifact(
     // keep authorizing `1.2.0` alongside `1.3.0` here, not merely replace
     // one with the other, or every still-`1.2.0`-compiled Component fails
     // `UnauthorizedImport`/`CapabilityVersionMismatch`.
-    for version in ["1.2.0", "1.3.0"] {
+    for version in ["1.2.0", "1.3.0", "1.4.0"] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),
             capability.clone() as Arc<dyn HostCapability>,
@@ -9999,6 +10036,8 @@ fn build_first_native_graphs_with_runtime(
 
         validate_first_scope_graph(&prefill)?;
         validate_first_scope_graph(&decode)?;
+        validate_rope_frequency_scaling(&prefill, config)?;
+        validate_rope_frequency_scaling(&decode, config)?;
         capability.clear_session(&engine_key);
         model_config_capability.clear_config(&engine_key);
         Ok(FirstNativeComponentGraphs {
@@ -10071,6 +10110,7 @@ fn build_first_native_prefill_graph_segment_with_runtime(
             output_edge_name: "logits".to_string(),
         };
 
+        let expected_scaling = architecture_config.clone();
         model_config_capability.bind_config(&engine_key, architecture_config);
         capability.prepare_session(&engine_key, session_context);
         let segment_result = manager
@@ -10095,6 +10135,7 @@ fn build_first_native_prefill_graph_segment_with_runtime(
             })?;
 
         validate_first_scope_graph(&segment)?;
+        validate_rope_frequency_scaling(&segment, &expected_scaling)?;
         capability.clear_session(&engine_key);
         model_config_capability.clear_config(&engine_key);
         Ok(segment)
@@ -10181,6 +10222,7 @@ fn build_first_native_decode_graph_segment_with_runtime(
             output_edge_name: "logits".to_string(),
         };
 
+        let expected_scaling = architecture_config.clone();
         model_config_capability.bind_config(&engine_key, architecture_config);
         capability.prepare_session(&engine_key, session_context);
         let segment_result = manager
@@ -10205,6 +10247,7 @@ fn build_first_native_decode_graph_segment_with_runtime(
             })?;
 
         validate_first_scope_graph(&segment)?;
+        validate_rope_frequency_scaling(&segment, &expected_scaling)?;
         capability.clear_session(&engine_key);
         model_config_capability.clear_config(&engine_key);
         Ok(segment)

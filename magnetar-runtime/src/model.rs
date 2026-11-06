@@ -640,6 +640,11 @@ pub struct ModelArchitectureConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f64,
     pub rope_scaling_factor: Option<f32>,
+    /// Per-frequency RoPE scaling the checkpoint declares (e.g. Hugging
+    /// Face `rope_scaling.rope_type = "llama3"`), exposed to the Model
+    /// Component through `model-config`'s `rope-scaling` (`1.4.0`). The
+    /// Component, not the Runtime, turns it into `rope` node attributes.
+    pub rope_frequency_scaling: Option<RopeFrequencyScaling>,
     pub tie_word_embeddings: bool,
     /// Whether `self_attn.{q,k,v}_proj` carry an additive bias term, a real
     /// Hugging Face Qwen2/2.5 architectural default (not `config.json`-
@@ -649,6 +654,23 @@ pub struct ModelArchitectureConfig {
     pub attention_bias: bool,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
+}
+
+/// A per-frequency RoPE scaling scheme, mirroring `model-config`'s
+/// `rope-frequency-scaling` variant.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RopeFrequencyScaling {
+    Llama3(crate::operator::RopeLlama3Scaling),
+}
+
+impl RopeFrequencyScaling {
+    /// The `frequency_scaling` attribute value a `rope` node carries for
+    /// this scheme.
+    pub fn attribute_value(&self) -> &'static str {
+        match self {
+            Self::Llama3(_) => crate::operator::RopeLlama3Scaling::ATTRIBUTE_VALUE,
+        }
+    }
 }
 
 impl ModelArchitectureConfig {
@@ -688,6 +710,11 @@ impl ModelArchitectureConfig {
         self.head_dim
             .checked_mul(self.num_attention_heads as u64)
             .ok_or(ModelArtifactError::SizeOverflow)?;
+        if let Some(RopeFrequencyScaling::Llama3(scaling)) = &self.rope_frequency_scaling {
+            scaling
+                .validate()
+                .map_err(|message| ModelArtifactError::InvalidManifest { message })?;
+        }
         Ok(())
     }
 }
