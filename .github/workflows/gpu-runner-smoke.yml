@@ -68,6 +68,11 @@ jobs:
         run: |
           set -eux
           nvidia-smi
+          # Host memory and cores bound which experts can stay off the
+          # Device (execute-and-cache-moe-experts F05).
+          free -g
+          nproc
+          df -h "$RUNNER_TEMP"
           command -v nvcc
           nvcc --version
           test -d "${CUDA_HOME:-/usr/local/cuda}"
