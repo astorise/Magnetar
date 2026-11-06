@@ -63,3 +63,14 @@ replays a captured decode step) and synchronizes the producing stream at
 the boundary: capture per GPU, chained by events, is the next step.
 Qwen1.5-MoE-A2.7B does not fit one 12 GB GPU; across two it generates "
 Paris. The country is famous for its fashion, food, and art…".
+
+### Multi-GPU step capture (in progress)
+
+Opt-in (`MAGNETAR_CUDA_MULTI_CAPTURE=1`) while it is qualified. Run
+42300438672 (commit `853796c`) reproduced the uncaptured two-GPU figures
+(Qwen2.5-0.5B balanced: TPOT 11.41 ms, same tokens as one GPU; Qwen1.5-MoE:
+TPOT 18.96 ms) and the captured run's failure: a boundary copy refused
+with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` while neither stream was
+capturing -- cudarc's deferred report of an earlier free of GPU 1's stale
+copy made while GPU 0 was capturing. Stale copies are now kept while any
+capture is open and freed afterwards.
