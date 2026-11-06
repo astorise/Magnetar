@@ -546,14 +546,10 @@ jobs:
           echo "MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
       - name: Q8_0 GGUF on CUDA with packed weights
         # The quantized matrices are stored packed and the decode matmul
-        # reads them packed. Diagnostic: its failure must not hide whether
-        # the declined (dequantized) control below works.
-        continue-on-error: true
+        # reads them packed.
         timeout-minutes: 20
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
-          # Diagnostic: attribute any Device error to the call that caused it.
-          CUDA_LAUNCH_BLOCKING: "1"
         shell: bash
         run: |
           set -o pipefail
@@ -561,7 +557,9 @@ jobs:
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log"
       - name: Q8_0 GGUF on CUDA with packed weights declined (disable control)
         # MAGNETAR_CUDA_PACKED_WEIGHTS=0: Model Loading dequantizes the same
-        # weights to f32 at load, as before direct quantized execution.
+        # weights to f32 at load, as before direct quantized execution. Runs
+        # even when the packed run failed, to tell the two apart.
+        if: ${{ !cancelled() }}
         timeout-minutes: 20
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
