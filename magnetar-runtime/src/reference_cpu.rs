@@ -782,6 +782,168 @@ pub fn silu(input: &HostTensor) -> HostTensor {
     }
 }
 
+/// Logistic sigmoid, `1 / (1 + exp(-x))`.
+pub fn sigmoid(input: &HostTensor) -> HostTensor {
+    let data = input
+        .data
+        .iter()
+        .map(|&x| 1.0 / (1.0 + (-x).exp()))
+        .collect::<Vec<_>>();
+    HostTensor {
+        shape: input.shape.clone(),
+        data,
+    }
+}
+
+/// `out[t, :] = x[t, :] * scale[t]`, `scale` of shape `[T, 1]` or `[T]`.
+pub fn row_scale(x: &HostTensor, scale: &HostTensor) -> Result<HostTensor, ReferenceCpuError> {
+    let (rows, cols) = rows_cols_of(x, "row-scale's x")?;
+    if scale.data.len() as u64 != rows || !(scale.shape == [rows] || scale.shape == [rows, 1]) {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "row-scale expects a [{rows}, 1] scale for x {:?}, got {:?}",
+                x.shape, scale.shape
+            ),
+        ));
+    }
+    let data = x
+        .data
+        .iter()
+        .enumerate()
+        .map(|(index, value)| value * scale.data[index / cols as usize])
+        .collect::<Vec<_>>();
+    Ok(HostTensor {
+        shape: x.shape.clone(),
+        data,
+    })
+}
+
+fn rows_cols_of(tensor: &HostTensor, what: &str) -> Result<(u64, u64), ReferenceCpuError> {
+    match tensor.shape[..] {
+        [rows, cols] => Ok((rows, cols)),
+        _ => Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("{what} must be 2D, got {:?}", tensor.shape),
+        )),
+    }
+}
+
+/// The experts one token routes to, with their combination weights:
+/// `softmax(logits)` in f32, the `top_k` largest probabilities (ties to the
+/// lower expert index), divided by their sum when `normalize`. Shared by
+/// every Provider's `moe-experts` so routing is identical everywhere.
+pub fn moe_route(logits: &[f32], top_k: usize, normalize: bool) -> Vec<(usize, f32)> {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    let mut order: Vec<usize> = (0..logits.len()).collect();
+    order.sort_by(|&a, &b| exps[b].total_cmp(&exps[a]).then(a.cmp(&b)));
+    let mut chosen: Vec<(usize, f32)> = order
+        .into_iter()
+        .take(top_k)
+        .map(|expert| (expert, exps[expert] / sum))
+        .collect();
+    if normalize {
+        let total: f32 = chosen.iter().map(|(_, weight)| weight).sum();
+        for (_, weight) in &mut chosen {
+            *weight /= total;
+        }
+    }
+    chosen
+}
+
+/// `moe-experts`' routing attributes: `experts` routed experts, the
+/// `top_k` chosen per token, renormalized when `normalize`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MoeRouting {
+    pub experts: u64,
+    pub top_k: u64,
+    pub normalize: bool,
+}
+
+/// The `moe-experts` Operator (`execute-and-cache-moe-experts` F02): for
+/// each row of `h [T, H]`, route through [`moe_route`] on `logits [T, E]`
+/// and sum `weight * down_e(silu(gate_e(h)) * up_e(h))` over the chosen
+/// experts. The stacked weights are `gate`/`up [H, E*I]` (expert `e` owns
+/// columns `[e*I, (e+1)*I)`) and `down [I, E*H]` (columns `[e*H,
+/// (e+1)*H)`). Each expert's partial sum accumulates in f32 in column
+/// order, then the experts add in routing order.
+pub fn moe_experts(
+    h: &HostTensor,
+    logits: &HostTensor,
+    [gate, up, down]: [&HostTensor; 3],
+    routing: MoeRouting,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let MoeRouting {
+        experts,
+        top_k,
+        normalize,
+    } = routing;
+    let shape_error =
+        |reason: String| ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason);
+    let (tokens, hidden) = rows_cols_of(h, "moe-experts' h")?;
+    let (logit_rows, logit_cols) = rows_cols_of(logits, "moe-experts' logits")?;
+    let (gate_rows, gate_cols) = rows_cols_of(gate, "moe-experts' gate")?;
+    let (down_rows, down_cols) = rows_cols_of(down, "moe-experts' down")?;
+    if experts == 0 || top_k == 0 || top_k > experts {
+        return Err(shape_error(format!(
+            "moe-experts routes top {top_k} of {experts} experts"
+        )));
+    }
+    if logit_rows != tokens || logit_cols != experts {
+        return Err(shape_error(format!(
+            "moe-experts expects [{tokens}, {experts}] logits, got {:?}",
+            logits.shape
+        )));
+    }
+    if gate_rows != hidden || !gate_cols.is_multiple_of(experts) || up.shape != gate.shape {
+        return Err(shape_error(format!(
+            "moe-experts expects gate and up of [{hidden}, {experts} * I], got {:?} and {:?}",
+            gate.shape, up.shape
+        )));
+    }
+    let intermediate = gate_cols / experts;
+    if down_rows != intermediate || down_cols != experts * hidden {
+        return Err(shape_error(format!(
+            "moe-experts expects down of [{intermediate}, {experts} * {hidden}], got {:?}",
+            down.shape
+        )));
+    }
+    let (hidden, intermediate) = (hidden as usize, intermediate as usize);
+    let (gate_cols, down_cols) = (gate_cols as usize, down_cols as usize);
+    let mut out = vec![0.0_f32; tokens as usize * hidden];
+    let mut activated = vec![0.0_f32; intermediate];
+    for token in 0..tokens as usize {
+        let x = &h.data[token * hidden..(token + 1) * hidden];
+        let row_logits = &logits.data[token * experts as usize..(token + 1) * experts as usize];
+        for (expert, weight) in moe_route(row_logits, top_k as usize, normalize) {
+            for (j, value) in activated.iter_mut().enumerate() {
+                let column = expert * intermediate + j;
+                let (mut g, mut u) = (0.0_f32, 0.0_f32);
+                for (k, &xk) in x.iter().enumerate() {
+                    g += xk * gate.data[k * gate_cols + column];
+                    u += xk * up.data[k * gate_cols + column];
+                }
+                *value = g * (1.0 / (1.0 + (-g).exp())) * u;
+            }
+            let row = &mut out[token * hidden..(token + 1) * hidden];
+            for (c, slot) in row.iter_mut().enumerate() {
+                let column = expert * hidden + c;
+                let mut sum = 0.0_f32;
+                for (j, &a) in activated.iter().enumerate() {
+                    sum += a * down.data[j * down_cols + column];
+                }
+                *slot += weight * sum;
+            }
+        }
+    }
+    Ok(HostTensor {
+        shape: vec![tokens, hidden as u64],
+        data: out,
+    })
+}
+
 /// GELU activation using the tanh approximation.
 pub fn gelu(input: &HostTensor) -> HostTensor {
     const SQRT_2_OVER_PI: f32 = 0.797_884_6;
@@ -1242,6 +1404,8 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("matmul-residual", OperatorFamily::LinearAlgebra),
         baseline_advertisement("silu-mul", OperatorFamily::Activation),
         baseline_advertisement("gated-matmul", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("moe-experts", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("row-scale", OperatorFamily::Tensor),
         embedding,
         baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
         rope,
@@ -2213,6 +2377,38 @@ impl ReferenceCpuExecutor {
                 let up = matmul(&a, &up, transpose_a, transpose_b).map_err(KernelError::from)?;
                 mul(&silu(&gate), &up).map_err(KernelError::from)?
             }
+            "moe-experts" => {
+                let h = self.input_tensor(invocation, 0)?;
+                let logits = self.input_tensor(invocation, 1)?;
+                let gate = self.input_tensor(invocation, 2)?;
+                let up = self.input_tensor(invocation, 3)?;
+                let down = self.input_tensor(invocation, 4)?;
+                let integer = |name: &str| {
+                    Self::attribute_integer(&invocation.attributes, name)
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                            attribute: name.into(),
+                        })
+                };
+                let normalize =
+                    Self::attribute_bool(&invocation.attributes, "normalize_top_k", false);
+                moe_experts(
+                    &h,
+                    &logits,
+                    [&gate, &up, &down],
+                    MoeRouting {
+                        experts: integer("experts")?,
+                        top_k: integer("top_k")?,
+                        normalize,
+                    },
+                )
+                .map_err(KernelError::from)?
+            }
+            "row-scale" => {
+                let x = self.input_tensor(invocation, 0)?;
+                let scale = self.input_tensor(invocation, 1)?;
+                row_scale(&x, &scale).map_err(KernelError::from)?
+            }
             "embedding" => {
                 let table = self.input_tensor(invocation, 0)?;
                 let ids = self.input_tensor(invocation, 1)?;
@@ -2404,6 +2600,7 @@ impl ReferenceCpuExecutor {
                 match kind {
                     "silu" => silu(&input),
                     "gelu" => gelu(&input),
+                    "sigmoid" => sigmoid(&input),
                     other => {
                         return Err(KernelError::KernelAttributeUnsupported {
                             attribute: format!("activation kind '{other}' is not implemented"),

@@ -892,6 +892,19 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::Any,
         ),
+        // `execute-and-cache-moe-experts` F02: routed mixture of experts.
+        // Inputs `h [T, H]`, router logits `[T, E]`, stacked expert
+        // weights `gate [H, E*I]`, `up [H, E*I]`, `down [I, E*H]`; output
+        // `[T, H]`. See [`moe_experts_reference`].
+        (
+            "moe-experts",
+            OperatorFamily::LinearAlgebra,
+            5,
+            1,
+            ShapeRule::Any,
+        ),
+        // `out[t, :] = x[t, :] * s[t]` for `s` of shape `[T, 1]`.
+        ("row-scale", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         (
             "rmsnorm",
@@ -1192,6 +1205,19 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "accumulation_dtype",
                 OperatorAttributeRule::optional(OperatorAttributeKind::DType),
+            ),
+        "moe-experts" => OperatorAttributeSchema::default()
+            .with_rule(
+                "experts",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "top_k",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "normalize_top_k",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
             ),
         "activation" => OperatorAttributeSchema::default().with_rule(
             "kind",

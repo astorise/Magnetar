@@ -4085,6 +4085,67 @@ fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        "moe-experts" => {
+            if inputs.len() != 5 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 5 moe-experts inputs"),
+                });
+            }
+            let (rows, cols) = inputs[0].rows_cols()?;
+            let output_descriptor = f32_tensor_descriptor_from_shape(&[rows, cols]);
+            let resources = ["h", "logits", "gate", "up", "down"]
+                .into_iter()
+                .zip(inputs)
+                .map(|(role, value)| node_input_resource(node_id, role, value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("moe-experts", OperatorFamily::LinearAlgebra),
+                resources,
+                output_descriptor,
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "row-scale" => {
+            if inputs.len() != 2 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 2 row-scale inputs"),
+                });
+            }
+            let x = inputs.remove(0);
+            let scale = inputs.remove(0);
+            dispatch_qwen_binary_same_shape(
+                ctx,
+                node_id,
+                "row-scale",
+                OperatorFamily::Tensor,
+                x,
+                scale,
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "activation" => {
+            if inputs.len() != 1 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 1 activation input"),
+                });
+            }
+            let input = inputs.remove(0);
+            dispatch_qwen_unary(
+                ctx,
+                node_id,
+                "activation",
+                OperatorFamily::Activation,
+                input,
+                node.attributes.clone(),
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "silu" => {
             if inputs.len() != 1 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -7952,7 +8013,7 @@ const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:b99ca7fef19992c794561cd0bb4d58ee6442383e3e603a8edc8ae77891d9fe01";
+    "sha256:f9238fc4f8d4e593160ad99787b2660681a6b7822a3205fcd16135efba6d201c";
 
 /// A Component artifact an embedder (e.g. `magnetar-cli`, the "deployment /
 /// CLI / Component source adapter" layer in this task's own design) has
@@ -8156,6 +8217,39 @@ fn weight_shapes_for_architecture_config(
             vec![q_dim, config.hidden_size],
         );
         shapes.insert(format!("{prefix}.post_attn_norm"), vec![config.hidden_size]);
+        if let Some(moe) = &config.mixture_of_experts {
+            // `execute-and-cache-moe-experts` F02: stacked expert weights,
+            // each expert a column range (see the `moe-experts` Operator).
+            let hidden = config.hidden_size;
+            let experts = u64::from(moe.experts);
+            let intermediate = moe.expert_intermediate_size;
+            shapes.insert(format!("{prefix}.moe.router_proj"), vec![hidden, experts]);
+            shapes.insert(
+                format!("{prefix}.moe.experts_gate_proj"),
+                vec![hidden, experts * intermediate],
+            );
+            shapes.insert(
+                format!("{prefix}.moe.experts_up_proj"),
+                vec![hidden, experts * intermediate],
+            );
+            shapes.insert(
+                format!("{prefix}.moe.experts_down_proj"),
+                vec![intermediate, experts * hidden],
+            );
+            if let Some(shared) = moe.shared_expert_intermediate_size {
+                shapes.insert(
+                    format!("{prefix}.moe.shared_gate_proj"),
+                    vec![hidden, shared],
+                );
+                shapes.insert(format!("{prefix}.moe.shared_up_proj"), vec![hidden, shared]);
+                shapes.insert(
+                    format!("{prefix}.moe.shared_down_proj"),
+                    vec![shared, hidden],
+                );
+                shapes.insert(format!("{prefix}.moe.shared_expert_gate"), vec![hidden, 1]);
+            }
+            continue;
+        }
         shapes.insert(
             format!("{prefix}.mlp.gate_proj"),
             vec![config.hidden_size, config.intermediate_size],
@@ -8209,6 +8303,7 @@ fn architecture_config_from_first_native_model_config(
         rope_frequency_scaling: config.rope.frequency_scaling,
         tie_word_embeddings: config.tied_embeddings,
         attention_bias: config.attention_bias,
+        mixture_of_experts: config.mixture_of_experts,
         bos_token_id: None,
         eos_token_id: None,
     }
@@ -8259,6 +8354,7 @@ fn first_native_model_config_from_architecture_config(
         rmsnorm_epsilon: config.rms_norm_eps,
         tied_embeddings: config.tie_word_embeddings,
         attention_bias: config.attention_bias,
+        mixture_of_experts: config.mixture_of_experts,
         require_bos: false,
         require_pad: false,
         expected_added_tokens: None,
@@ -9620,15 +9716,17 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
     // additive evolution over `1.2.0`'s `attention-bias` field (task
     // 10.5's sibling QKV bias support), itself additive over `1.1.0`'s
     // `model-config` shape, itself additive over `1.0.0`'s
-    // `graph-builder`-only world.
+    // `graph-builder`-only world. `1.5.0` (`execute-and-cache-moe-experts`)
+    // adds `model-config.mixture-of-experts`, and the Component also checks
+    // `rope-scaling` (`1.4.0`).
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.3.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.5.0");
     manager.provide_capability(
         graph_builder_interface,
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.3.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.5.0");
     manager.provide_capability(
         model_config_interface,
         model_config_capability.clone() as Arc<dyn HostCapability>,
@@ -9862,7 +9960,7 @@ pub fn register_inference_component_artifact(
     // keep authorizing `1.2.0` alongside `1.3.0` here, not merely replace
     // one with the other, or every still-`1.2.0`-compiled Component fails
     // `UnauthorizedImport`/`CapabilityVersionMismatch`.
-    for version in ["1.2.0", "1.3.0", "1.4.0"] {
+    for version in ["1.2.0", "1.3.0", "1.4.0", "1.5.0"] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),
             capability.clone() as Arc<dyn HostCapability>,

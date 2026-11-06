@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.4.0;
+package magnetar:model-component-graph@1.5.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -194,6 +194,29 @@ interface model-config {
   /// A new function, not a new `architecture-config` field, so Components
   /// compiled against earlier versions keep linking.
   rope-scaling: func() -> option<rope-frequency-scaling>;
+
+  /// A decoder MLP made of routed experts (`execute-and-cache-moe-experts`
+  /// F02). Added in `1.5.0`.
+  record moe-config {
+    /// Routed experts per layer.
+    experts: u32,
+    /// Experts each token is routed to.
+    experts-per-token: u32,
+    /// Each routed expert's intermediate size.
+    expert-intermediate-size: u64,
+    /// The always-active shared expert's intermediate size, if any.
+    shared-expert-intermediate-size: option<u64>,
+    /// Whether the chosen experts' probabilities are renormalized to sum
+    /// to one.
+    normalize-top-k: bool,
+  }
+
+  /// Added in `1.5.0`: the mixture of experts every decoder layer's MLP is,
+  /// `none` for a dense checkpoint. A Component that does not understand a
+  /// declared mixture of experts must refuse to build a graph rather than
+  /// build a dense one. A new function, not a new `architecture-config`
+  /// field, so Components compiled against earlier versions keep linking.
+  mixture-of-experts: func() -> option<moe-config>;
 }
 
 /// World a Model Component satisfies to produce graphs through this

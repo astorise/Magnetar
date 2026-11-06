@@ -2262,3 +2262,131 @@ fn llama3_frequency_scaling_attributes_round_trip_and_reject_unknown_schemes() {
     );
     assert!(RopeBandedFrequencyScaling::from_attributes(&inverted).is_err());
 }
+
+fn moe_fixture_value(seed: u64, index: usize) -> f32 {
+    let x = (seed * 1_000_003 + index as u64 * 7919) % 2003;
+    x as f32 / 2003.0 - 0.5
+}
+
+fn moe_fixture(shape: &[u64], seed: u64) -> HostTensor {
+    let len = shape.iter().product::<u64>() as usize;
+    HostTensor::new(
+        shape.to_vec(),
+        (0..len)
+            .map(|i| moe_fixture_value(seed, i))
+            .collect::<Vec<f32>>(),
+    )
+    .unwrap()
+}
+
+/// The columns `[first, first + count)` of a row-major `[rows, cols]` matrix.
+fn columns(tensor: &HostTensor, first: u64, count: u64) -> HostTensor {
+    let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+    let mut data = Vec::new();
+    for row in 0..rows {
+        let start = (row * cols + first) as usize;
+        data.extend_from_slice(&tensor.data[start..start + count as usize]);
+    }
+    HostTensor::new([rows, count], data).unwrap()
+}
+
+#[test]
+fn moe_route_picks_the_top_k_probabilities_with_ties_to_the_lower_expert() {
+    let routed = moe_route(&[0.0, 2.0, 1.0, 2.0], 2, false);
+    assert_eq!(routed.iter().map(|(e, _)| *e).collect::<Vec<_>>(), [1, 3]);
+    let total: f32 = [0.0_f32, 2.0, 1.0, 2.0].iter().map(|x| x.exp()).sum();
+    assert!((routed[0].1 - 2.0_f32.exp() / total).abs() < 1e-6);
+    let normalized = moe_route(&[0.0, 2.0, 1.0, 2.0], 2, true);
+    assert!((normalized[0].1 - 0.5).abs() < 1e-6);
+    assert!((normalized[1].1 - 0.5).abs() < 1e-6);
+}
+
+/// `moe-experts` against an independent per-expert evaluation with the
+/// plain matmul/silu/mul Kernels.
+#[test]
+fn moe_experts_matches_per_expert_dense_evaluation() {
+    let (tokens, hidden, intermediate, experts, top_k) = (3_u64, 8_u64, 6_u64, 5_u64, 2_u64);
+    let h = moe_fixture(&[tokens, hidden], 1);
+    let logits = moe_fixture(&[tokens, experts], 2);
+    let gate = moe_fixture(&[hidden, experts * intermediate], 3);
+    let up = moe_fixture(&[hidden, experts * intermediate], 4);
+    let down = moe_fixture(&[intermediate, experts * hidden], 5);
+    for normalize in [false, true] {
+        let routing = MoeRouting {
+            experts,
+            top_k,
+            normalize,
+        };
+        let actual = moe_experts(&h, &logits, [&gate, &up, &down], routing).unwrap();
+        assert_eq!(actual.shape, vec![tokens, hidden]);
+        for token in 0..tokens {
+            let x = HostTensor::new(
+                [1, hidden],
+                h.data[(token * hidden) as usize..((token + 1) * hidden) as usize].to_vec(),
+            )
+            .unwrap();
+            let row_logits =
+                &logits.data[(token * experts) as usize..((token + 1) * experts) as usize];
+            let mut expected = vec![0.0_f32; hidden as usize];
+            for (expert, weight) in moe_route(row_logits, top_k as usize, normalize) {
+                let e = expert as u64;
+                let g = matmul(
+                    &x,
+                    &columns(&gate, e * intermediate, intermediate),
+                    false,
+                    false,
+                )
+                .unwrap();
+                let u = matmul(
+                    &x,
+                    &columns(&up, e * intermediate, intermediate),
+                    false,
+                    false,
+                )
+                .unwrap();
+                let activated = mul(&silu(&g), &u).unwrap();
+                let y = matmul(
+                    &activated,
+                    &columns(&down, e * hidden, hidden),
+                    false,
+                    false,
+                )
+                .unwrap();
+                for (slot, value) in expected.iter_mut().zip(&y.data) {
+                    *slot += weight * value;
+                }
+            }
+            let row = &actual.data[(token * hidden) as usize..((token + 1) * hidden) as usize];
+            for (a, e) in row.iter().zip(&expected) {
+                assert!((a - e).abs() < 1e-5, "token {token}: {a} vs {e}");
+            }
+        }
+    }
+    assert!(
+        moe_experts(
+            &h,
+            &logits,
+            [&gate, &up, &down],
+            MoeRouting {
+                experts,
+                top_k: experts + 1,
+                normalize: false
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn row_scale_scales_each_row_and_sigmoid_is_logistic() {
+    let x = HostTensor::new([2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let scale = HostTensor::new([2, 1], vec![2.0, -1.0]).unwrap();
+    assert_eq!(
+        row_scale(&x, &scale).unwrap().data,
+        vec![2.0, 4.0, 6.0, -4.0, -5.0, -6.0]
+    );
+    assert!(row_scale(&x, &HostTensor::new([3, 1], vec![1.0; 3]).unwrap()).is_err());
+    let s = sigmoid(&HostTensor::new([2], vec![0.0, 2.0]).unwrap());
+    assert_eq!(s.data[0], 0.5);
+    assert!((s.data[1] - 1.0 / (1.0 + (-2.0_f32).exp())).abs() < 1e-7);
+}

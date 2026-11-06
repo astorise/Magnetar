@@ -652,8 +652,30 @@ pub struct ModelArchitectureConfig {
     /// model class itself). `o_proj`/MLP/`lm_head` never carry bias in this
     /// baseline.
     pub attention_bias: bool,
+    /// The routed mixture of experts every decoder layer's MLP is, when the
+    /// checkpoint declares one (`execute-and-cache-moe-experts` F02),
+    /// exposed to the Model Component through `model-config`'s
+    /// `mixture-of-experts` (`1.5.0`).
+    pub mixture_of_experts: Option<MixtureOfExpertsConfig>,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
+}
+
+/// A decoder MLP made of routed experts, mirroring `model-config`'s
+/// `moe-config` record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixtureOfExpertsConfig {
+    /// Routed experts per layer.
+    pub experts: u32,
+    /// Experts each token is routed to.
+    pub experts_per_token: u32,
+    /// Each routed expert's intermediate size.
+    pub expert_intermediate_size: u64,
+    /// The always-active shared expert's intermediate size, if any.
+    pub shared_expert_intermediate_size: Option<u64>,
+    /// Whether the chosen experts' probabilities are renormalized to sum
+    /// to one.
+    pub normalize_top_k: bool,
 }
 
 /// A per-frequency RoPE scaling scheme, mirroring `model-config`'s
@@ -711,6 +733,23 @@ impl ModelArchitectureConfig {
         self.head_dim
             .checked_mul(self.num_attention_heads as u64)
             .ok_or(ModelArtifactError::SizeOverflow)?;
+        if let Some(moe) = &self.mixture_of_experts
+            && (moe.experts == 0
+                || moe.experts_per_token == 0
+                || moe.experts_per_token > moe.experts
+                || moe.expert_intermediate_size == 0
+                || moe.shared_expert_intermediate_size == Some(0))
+        {
+            return Err(ModelArtifactError::InvalidManifest {
+                message: format!(
+                    "mixture of experts routes {} of {} experts of intermediate size {} (shared {:?})",
+                    moe.experts_per_token,
+                    moe.experts,
+                    moe.expert_intermediate_size,
+                    moe.shared_expert_intermediate_size
+                ),
+            });
+        }
         if let Some(RopeFrequencyScaling::Banded(scaling)) = &self.rope_frequency_scaling {
             scaling
                 .validate()

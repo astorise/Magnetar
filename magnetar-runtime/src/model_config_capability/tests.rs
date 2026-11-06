@@ -20,6 +20,7 @@ fn sample_config() -> ModelArchitectureConfig {
         rope_frequency_scaling: None,
         tie_word_embeddings: true,
         attention_bias: true,
+        mixture_of_experts: None,
         bos_token_id: None,
         eos_token_id: Some(151643),
     }
@@ -117,5 +118,41 @@ fn rope_scaling_is_none_without_and_a_llama3_variant_with_a_declared_scheme() {
         capability
             .call("instance-2", "rope-scaling", &[ComponentValue::U32(1)])
             .is_err()
+    );
+}
+
+#[test]
+fn mixture_of_experts_is_none_for_a_dense_model_and_a_record_for_a_routed_one() {
+    let capability = ModelConfigCapability::new();
+    capability.bind_config("dense", sample_config());
+    assert_eq!(
+        capability.call("dense", "mixture-of-experts", &[]).unwrap(),
+        vec![ComponentValue::Option(None)]
+    );
+    let mut config = sample_config();
+    config.mixture_of_experts = Some(MixtureOfExpertsConfig {
+        experts: 60,
+        experts_per_token: 4,
+        expert_intermediate_size: 1408,
+        shared_expert_intermediate_size: Some(5632),
+        normalize_top_k: false,
+    });
+    capability.bind_config("routed", config);
+    assert_eq!(
+        capability
+            .call("routed", "mixture-of-experts", &[])
+            .unwrap(),
+        vec![ComponentValue::Option(Some(Box::new(
+            ComponentValue::Record(vec![
+                ("experts".into(), ComponentValue::U32(60)),
+                ("experts-per-token".into(), ComponentValue::U32(4)),
+                ("expert-intermediate-size".into(), ComponentValue::S64(1408)),
+                (
+                    "shared-expert-intermediate-size".into(),
+                    ComponentValue::Option(Some(Box::new(ComponentValue::S64(5632))))
+                ),
+                ("normalize-top-k".into(), ComponentValue::Bool(false)),
+            ])
+        )))]
     );
 }
