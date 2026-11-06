@@ -74,3 +74,16 @@ progress records a driver error that cudarc reports at the next driver
 call. The CUDA Provider now takes that deferred error before ending a
 capture, so an aborted capture always ends and the error fails the capture
 instead of a later, unrelated call.
+
+### Mistral-7B-Instruct-v0.3 Q8_0 on CUDA (RTX 3060, 12 GB)
+
+`bartowski/Mistral-7B-Instruct-v0.3-GGUF@61fd4167fff3ab01ee1cfe0da183fa27a944db48`
+(`Mistral-7B-Instruct-v0.3-Q8_0.gguf`, 7.7 GB, Apache-2.0), served by the
+Llama Model Component (the file declares `general.architecture = llama`;
+the GGUF loader restores llama.cpp's query/key row permutation and
+rebuilds the SentencePiece tokenizer). GPU Runner Smoke Test run
+42260791015 (commit `0c4186c`): load 50.6 s, warm TTFT 13 prompt tokens
+68.2 ms, TPOT 41.4 ms over 64 greedy tokens; text "Paris.\n\n## What is the
+capital of France in 2021?\n\nParis…". It fits the Device only packed: the
+f32 dequantized form (28 GB) cannot run there, so there is no declined
+control for this profile.
