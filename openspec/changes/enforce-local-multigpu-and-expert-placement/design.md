@@ -43,3 +43,23 @@ Land compatibility scaffolding and baseline tests before optimized execution. Ke
 ## Open questions
 
 Select exact hardware/checkpoint, numerical and downstream-quality thresholds, resource budgets and SLOs per qualification profile before promoting it. The roadmap's reference CPU/CUDA and Qwen checkpoint are the initial comparison, not evidence that other targets are available. Any Tachyon-facing interface additionally needs its independent repository audit and owner agreement. These decisions gate implementation promotion, not creation of this proposal.
+
+## Evidence: staged layer segments on two RTX 3060 (step 1, uncaptured)
+
+`CudaMultiProvider` over GPUs 0 and 1, the Runtime's `LayerPlacement`
+handed over before any weight write. GPU Runner Smoke Test run 42284508413
+(commit `4686a72`), 64 greedy tokens after a warm-up:
+
+| Checkpoint | GPUs, placement | Load | Warm TTFT | TPOT |
+|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct Q8_0 | 1, fill | 3.8 s | 14.2 ms | 4.56 ms |
+| Qwen2.5-0.5B-Instruct Q8_0 | 2, balanced | 3.9 s | 14.8 ms | 11.34 ms |
+| Qwen1.5-MoE-A2.7B-Chat Q8_0 (15 GB) | 2, fill | 99.2 s | 33.0 ms | 18.73 ms |
+
+The two-GPU Qwen2.5-0.5B run generates exactly the single-GPU tokens (the
+CI step fails otherwise). Its TPOT is 2.5x the single GPU's because a step
+spanning two GPUs is not captured into CUDA graphs yet (the single GPU
+replays a captured decode step) and synchronizes the producing stream at
+the boundary: capture per GPU, chained by events, is the next step.
+Qwen1.5-MoE-A2.7B does not fit one 12 GB GPU; across two it generates "
+Paris. The country is famous for its fashion, food, and art…".
