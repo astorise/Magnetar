@@ -2126,7 +2126,7 @@ fn read_tensor_rows_returns_the_requested_rows_only() {
 }
 
 /// Llama 3.2 1B's `rope_scaling` (`config.json`).
-const LLAMA_3_2_SCALING: RopeLlama3Scaling = RopeLlama3Scaling {
+const LLAMA_3_2_SCALING: RopeBandedFrequencyScaling = RopeBandedFrequencyScaling {
     factor: 32.0,
     low_freq_factor: 1.0,
     high_freq_factor: 4.0,
@@ -2135,7 +2135,7 @@ const LLAMA_3_2_SCALING: RopeLlama3Scaling = RopeLlama3Scaling {
 
 /// Hugging Face `_compute_llama3_parameters`, in `f64`.
 fn hugging_face_llama3_inverse_frequency(
-    scaling: &RopeLlama3Scaling,
+    scaling: &RopeBandedFrequencyScaling,
     inverse_frequency: f64,
 ) -> f64 {
     let original = scaling.original_context_length as f64;
@@ -2186,7 +2186,7 @@ fn rope_applies_llama3_frequency_scaling_per_pair() {
     let cols = head_count * head_width;
     let input = rng.tensor(rows as u64, cols as u64);
     let (base, offset) = (500_000.0_f32, 9_000_u64);
-    let scaling = RopeLlama3Scaling {
+    let scaling = RopeBandedFrequencyScaling {
         factor: 8.0,
         low_freq_factor: 1.0,
         high_freq_factor: 4.0,
@@ -2237,10 +2237,13 @@ fn rope_applies_llama3_frequency_scaling_per_pair() {
 #[test]
 fn llama3_frequency_scaling_attributes_round_trip_and_reject_unknown_schemes() {
     let mut attributes = BTreeMap::new();
-    assert_eq!(RopeLlama3Scaling::from_attributes(&attributes), Ok(None));
+    assert_eq!(
+        RopeBandedFrequencyScaling::from_attributes(&attributes),
+        Ok(None)
+    );
     LLAMA_3_2_SCALING.insert_attributes(&mut attributes);
     assert_eq!(
-        RopeLlama3Scaling::from_attributes(&attributes),
+        RopeBandedFrequencyScaling::from_attributes(&attributes),
         Ok(Some(LLAMA_3_2_SCALING))
     );
     let mut yarn = attributes.clone();
@@ -2248,14 +2251,14 @@ fn llama3_frequency_scaling_attributes_round_trip_and_reject_unknown_schemes() {
         "frequency_scaling".into(),
         OperatorAttributeValue::String("yarn".into()),
     );
-    assert!(RopeLlama3Scaling::from_attributes(&yarn).is_err());
+    assert!(RopeBandedFrequencyScaling::from_attributes(&yarn).is_err());
     let mut missing = attributes.clone();
     missing.remove("low_frequency_factor");
-    assert!(RopeLlama3Scaling::from_attributes(&missing).is_err());
+    assert!(RopeBandedFrequencyScaling::from_attributes(&missing).is_err());
     let mut inverted = attributes;
     inverted.insert(
         "high_frequency_factor".into(),
         OperatorAttributeValue::Float(0.5),
     );
-    assert!(RopeLlama3Scaling::from_attributes(&inverted).is_err());
+    assert!(RopeBandedFrequencyScaling::from_attributes(&inverted).is_err());
 }

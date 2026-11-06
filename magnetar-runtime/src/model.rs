@@ -660,7 +660,8 @@ pub struct ModelArchitectureConfig {
 /// `rope-frequency-scaling` variant.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RopeFrequencyScaling {
-    Llama3(crate::operator::RopeLlama3Scaling),
+    /// Wavelength-banded scaling (Hugging Face `rope_type = "llama3"`).
+    Banded(crate::operator::RopeBandedFrequencyScaling),
 }
 
 impl RopeFrequencyScaling {
@@ -668,7 +669,7 @@ impl RopeFrequencyScaling {
     /// this scheme.
     pub fn attribute_value(&self) -> &'static str {
         match self {
-            Self::Llama3(_) => crate::operator::RopeLlama3Scaling::ATTRIBUTE_VALUE,
+            Self::Banded(_) => crate::operator::RopeBandedFrequencyScaling::ATTRIBUTE_VALUE,
         }
     }
 }
@@ -710,7 +711,7 @@ impl ModelArchitectureConfig {
         self.head_dim
             .checked_mul(self.num_attention_heads as u64)
             .ok_or(ModelArtifactError::SizeOverflow)?;
-        if let Some(RopeFrequencyScaling::Llama3(scaling)) = &self.rope_frequency_scaling {
+        if let Some(RopeFrequencyScaling::Banded(scaling)) = &self.rope_frequency_scaling {
             scaling
                 .validate()
                 .map_err(|message| ModelArtifactError::InvalidManifest { message })?;

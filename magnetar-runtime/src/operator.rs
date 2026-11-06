@@ -259,47 +259,49 @@ impl Default for OperatorDeterminism {
     }
 }
 
-/// Kernel feature a `rope` Kernel advertises when it honours the Llama 3
-/// frequency-scaling attributes ([`RopeLlama3Scaling`]). The Runtime sends
+/// Kernel feature a `rope` Kernel advertises when it honours the banded
+/// frequency-scaling attributes ([`RopeBandedFrequencyScaling`]). The Runtime sends
 /// those attributes only to a Provider whose every active `rope` Kernel
 /// advertises it, and otherwise refuses the model: a Kernel that ignored them
 /// would rotate with unscaled frequencies and silently degrade every token.
-pub const ROPE_LLAMA3_SCALING_FEATURE: &str = "llama3-frequency-scaling";
+pub const ROPE_BANDED_FREQUENCY_SCALING_FEATURE: &str = "banded-frequency-scaling";
 
-/// Llama 3 RoPE frequency scaling (Hugging Face `rope_scaling.rope_type =
-/// "llama3"`). Unlike linear position scaling it rescales each pair's
+/// Wavelength-banded RoPE frequency scaling: a model-family-neutral scheme
+/// (a source format may name it after the family that introduced it, e.g.
+/// a Hugging Face `rope_type`; the loader maps that name onto this one).
+/// Unlike linear position scaling it rescales each pair's
 /// inverse frequency by its wavelength: short wavelengths (high frequencies)
 /// are kept, wavelengths longer than `original_context_length /
 /// low_freq_factor` are divided by `factor`, and the band in between is
 /// interpolated smoothly.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RopeLlama3Scaling {
+pub struct RopeBandedFrequencyScaling {
     pub factor: f64,
     pub low_freq_factor: f64,
     pub high_freq_factor: f64,
     pub original_context_length: u64,
 }
 
-impl RopeLlama3Scaling {
+impl RopeBandedFrequencyScaling {
     /// The `frequency_scaling` attribute value naming this scheme.
-    pub const ATTRIBUTE_VALUE: &'static str = "llama3";
+    pub const ATTRIBUTE_VALUE: &'static str = "banded";
 
     pub fn validate(&self) -> Result<(), String> {
         let positive = |name: &str, value: f64| {
             if value.is_finite() && value > 0.0 {
                 Ok(())
             } else {
-                Err(format!("llama3 RoPE {name} must be finite and positive"))
+                Err(format!("banded RoPE {name} must be finite and positive"))
             }
         };
         positive("factor", self.factor)?;
         positive("low_freq_factor", self.low_freq_factor)?;
         positive("high_freq_factor", self.high_freq_factor)?;
         if self.high_freq_factor <= self.low_freq_factor {
-            return Err("llama3 RoPE high_freq_factor must exceed low_freq_factor".into());
+            return Err("banded RoPE high_freq_factor must exceed low_freq_factor".into());
         }
         if self.original_context_length == 0 {
-            return Err("llama3 RoPE original_max_position_embeddings must be positive".into());
+            return Err("banded RoPE original_max_position_embeddings must be positive".into());
         }
         Ok(())
     }
@@ -365,14 +367,14 @@ impl RopeLlama3Scaling {
         let float = |name: &str| match attributes.get(name) {
             Some(OperatorAttributeValue::Float(value)) => Ok(*value),
             _ => Err(format!(
-                "llama3 frequency scaling requires a float '{name}'"
+                "banded frequency scaling requires a float '{name}'"
             )),
         };
         let original_context_length = match attributes.get("original_context_length") {
             Some(OperatorAttributeValue::Integer(value)) if *value > 0 => *value as u64,
             _ => {
                 return Err(
-                    "llama3 frequency scaling requires a positive integer 'original_context_length'"
+                    "banded frequency scaling requires a positive integer 'original_context_length'"
                         .into(),
                 );
             }
@@ -1155,9 +1157,9 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
                 "head_count",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             )
-            // Llama 3 frequency scaling ([`RopeLlama3Scaling`]); absent means
+            // banded frequency scaling ([`RopeBandedFrequencyScaling`]); absent means
             // unscaled frequencies. Sent only to Kernels advertising
-            // [`ROPE_LLAMA3_SCALING_FEATURE`].
+            // [`ROPE_BANDED_FREQUENCY_SCALING_FEATURE`].
             .with_rule(
                 "frequency_scaling",
                 OperatorAttributeRule::optional(OperatorAttributeKind::String),

@@ -84,8 +84,8 @@ fn rope_scaling_is_none_without_and_a_llama3_variant_with_a_declared_scheme() {
         vec![ComponentValue::Option(None)]
     );
     let mut config = sample_config();
-    config.rope_frequency_scaling = Some(RopeFrequencyScaling::Llama3(
-        crate::operator::RopeLlama3Scaling {
+    config.rope_frequency_scaling = Some(RopeFrequencyScaling::Banded(
+        crate::operator::RopeBandedFrequencyScaling {
             factor: 32.0,
             low_freq_factor: 1.0,
             high_freq_factor: 4.0,
@@ -100,7 +100,7 @@ fn rope_scaling_is_none_without_and_a_llama3_variant_with_a_declared_scheme() {
     let ComponentValue::Variant(case, Some(payload)) = variant.as_ref() else {
         panic!("expected a variant with a payload, got {variant:?}");
     };
-    assert_eq!(case, "llama3");
+    assert_eq!(case, "banded");
     assert_eq!(
         **payload,
         ComponentValue::Record(vec![

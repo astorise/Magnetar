@@ -64,9 +64,10 @@ It is qualified through the Model Component boundary, so the Runtime gains no Ll
 
 - **Component selection.** The campaign loads each checkpoint with the registered Model Component whose manifest declares the ingested architecture family (`compatibility.architecture_families`). It never selects by model name. `llama` resolves to the Llama Component; `qwen2` (Qwen2.5 and DeepSeek-R1-Distill) resolves to the Qwen Component.
 - **Contract.** `magnetar:model-component-graph@1.4.0` adds `model-config.rope-scaling`. It is a new function, not a new `architecture-config` field, so Components compiled against 1.2.0/1.3.0 still link. It returns the checkpoint's per-frequency scheme as normalized by the loader. The Hugging Face loader reads `rope_type` and refuses schemes it does not implement (`yarn`, `dynamic`, ...) instead of ingesting them as unscaled.
-- **The Component declares, the Runtime forwards.** The Llama Component (`9c81b3a`, which also implements the 1.3.0 segment exports) declares the scheme on its `rope` nodes as the portable `frequency_scaling` attributes. The Runtime forwards node attributes unchanged.
+- **The Component declares, the Runtime forwards.** The Llama Component (`334d221`, which also implements the 1.3.0 segment exports) declares the scheme on its `rope` nodes as the portable `frequency_scaling` attributes. The Runtime forwards node attributes unchanged.
+- **The Core names the scheme, not a family.** The operator, its Kernel feature and the WIT case call it `banded` (kept, interpolated and divided wavelength bands). Only the Hugging Face loader knows that `rope_type = "llama3"` maps onto it. The `quality / model-family isolation` guard enforces this.
   - It refuses a Component-built graph whose `rope` nodes do not declare exactly the bound configuration's scaling, for example the Qwen Component (1.3.0) given a Llama 3 checkpoint.
-  - It refuses a Provider whose `rope` Kernels do not advertise `llama3-frequency-scaling`.
+  - It refuses a Provider whose `rope` Kernels do not advertise `banded-frequency-scaling`.
 - **Kernels.** Reference CPU, the CPU Provider and the CUDA Provider rescale each pair's inverse frequency with the same f32 operations:
   - Reference CPU matches Hugging Face's `_compute_llama3_parameters` within 1e-5 relative, across all three bands.
   - CUDA matches the CPU Provider in conformance.

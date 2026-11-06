@@ -4,7 +4,7 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:c20eff09129d913a12046c19eca0804a52bc26c3dd0f787bda951e780336e01b"
+    value: "sha256:985f9ef3ee0c02f3e536ea4d3e28da51fc6623afd82a391763da5f8dd6505388"
 component:
   name: "magnetar.llama.real"
   version: "0.1.2"

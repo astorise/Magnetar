@@ -1441,16 +1441,17 @@ fn validate_rope_frequency_scaling(
     config: &ModelArchitectureConfig,
 ) -> Result<(), E2eConformanceError> {
     let expected = config.rope_frequency_scaling.map(|scaling| match scaling {
-        crate::RopeFrequencyScaling::Llama3(llama3) => llama3,
+        crate::RopeFrequencyScaling::Banded(banded) => banded,
     });
     for (node_id, node) in &graph.nodes {
         if node.operator.name() != "rope" {
             continue;
         }
-        let declared = crate::operator::RopeLlama3Scaling::from_attributes(&node.attributes)
-            .map_err(|reason| E2eConformanceError::ModelComponentFailed {
-                reason: format!("rope node '{node_id:?}': {reason}"),
-            })?;
+        let declared =
+            crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes)
+                .map_err(|reason| E2eConformanceError::ModelComponentFailed {
+                    reason: format!("rope node '{node_id:?}': {reason}"),
+                })?;
         if declared != expected {
             return Err(E2eConformanceError::ModelComponentFailed {
                 reason: format!(
@@ -1464,9 +1465,9 @@ fn validate_rope_frequency_scaling(
     Ok(())
 }
 
-/// Whether every active `rope` Kernel of `provider` honours the Llama 3
+/// Whether every active `rope` Kernel of `provider` honours the banded
 /// frequency-scaling attributes (and there is at least one).
-fn rope_llama3_scaling_supported(runtime: &Runtime, provider: &ProviderBinding) -> bool {
+fn rope_banded_scaling_supported(runtime: &Runtime, provider: &ProviderBinding) -> bool {
     let mut rope = false;
     for entry in runtime.kernel_registry().entries() {
         if !entry.active
@@ -1479,7 +1480,7 @@ fn rope_llama3_scaling_supported(runtime: &Runtime, provider: &ProviderBinding) 
             .advertisement
             .id
             .features
-            .contains(crate::operator::ROPE_LLAMA3_SCALING_FEATURE)
+            .contains(crate::operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE)
         {
             return false;
         }
@@ -3460,7 +3461,7 @@ fn dispatch_qwen_rope(
     head_count: u64,
     rope_config: &FirstNativeRopeConfig,
     pairing: RopePairing,
-    frequency_scaling: Option<&crate::operator::RopeLlama3Scaling>,
+    frequency_scaling: Option<&crate::operator::RopeBandedFrequencyScaling>,
     position_offset: u64,
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
@@ -3502,13 +3503,13 @@ fn dispatch_qwen_rope(
             .as_ref()
             .and_then(|plan| plan.node_bindings.first())
             .map(|binding| binding.provider.clone())
-            && !rope_llama3_scaling_supported(ctx.runtime, &provider)
+            && !rope_banded_scaling_supported(ctx.runtime, &provider)
         {
             return Err(InferenceApiError::KernelUnavailable {
                 reason: format!(
-                    "operation '{operation_id}' needs Llama 3 RoPE frequency scaling, which \
+                    "operation '{operation_id}' needs banded RoPE frequency scaling, which \
                      Provider {provider:?} does not advertise ('{}')",
-                    crate::operator::ROPE_LLAMA3_SCALING_FEATURE
+                    crate::operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE
                 ),
             });
         }
@@ -4010,15 +4011,14 @@ fn dispatch_first_native_graph_node(
             let position_offset = absolute_position_override
                 .map(Ok)
                 .unwrap_or_else(|| node_attribute_u64(node, "position_offset"))?;
-            // Per-frequency scaling (e.g. Llama 3) is model-family
+            // Per-frequency scaling is model-family
             // semantics: the Model Component declares it on the node and the
             // Runtime forwards it unchanged, never deriving it itself.
-            let frequency_scaling = crate::operator::RopeLlama3Scaling::from_attributes(
-                &node.attributes,
-            )
-            .map_err(|reason| InferenceApiError::GraphPlanningFailed {
-                reason: format!("graph node '{node_id}': {reason}"),
-            })?;
+            let frequency_scaling =
+                crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes)
+                    .map_err(|reason| InferenceApiError::GraphPlanningFailed {
+                        reason: format!("graph node '{node_id}': {reason}"),
+                    })?;
             let rope_config = FirstNativeRopeConfig {
                 base,
                 scale: fixture.config.rope.scale,

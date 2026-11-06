@@ -11555,14 +11555,14 @@ fn llama3_rope_scaling_is_declared_by_the_component_and_required_of_it() {
         &trust,
     )
     .expect("the real Llama Component must register");
-    let scaling = crate::operator::RopeLlama3Scaling {
+    let scaling = crate::operator::RopeBandedFrequencyScaling {
         factor: 32.0,
         low_freq_factor: 1.0,
         high_freq_factor: 4.0,
         original_context_length: 8192,
     };
     let mut fixture = e2e_fixture().expect("fixture builds");
-    fixture.config.rope.frequency_scaling = Some(crate::RopeFrequencyScaling::Llama3(scaling));
+    fixture.config.rope.frequency_scaling = Some(crate::RopeFrequencyScaling::Banded(scaling));
     let architecture = architecture_config_from_first_native_model_config(&fixture.config);
     assert_eq!(
         architecture.rope_frequency_scaling, fixture.config.rope.frequency_scaling,
@@ -11582,7 +11582,7 @@ fn llama3_rope_scaling_is_declared_by_the_component_and_required_of_it() {
             if node.operator.name() == "rope" {
                 rope_nodes += 1;
                 assert_eq!(
-                    crate::operator::RopeLlama3Scaling::from_attributes(&node.attributes),
+                    crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes),
                     Ok(Some(scaling))
                 );
             }

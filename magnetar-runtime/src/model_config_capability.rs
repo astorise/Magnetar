@@ -113,21 +113,21 @@ fn encode_rope_scaling(scaling: Option<&RopeFrequencyScaling>) -> ComponentValue
     let field = |name: &str, value: ComponentValue| (name.to_string(), value);
     ComponentValue::Option(scaling.map(|scaling| {
         Box::new(match scaling {
-            RopeFrequencyScaling::Llama3(llama3) => ComponentValue::Variant(
-                "llama3".into(),
+            RopeFrequencyScaling::Banded(banded) => ComponentValue::Variant(
+                "banded".into(),
                 Some(Box::new(ComponentValue::Record(vec![
-                    field("factor", ComponentValue::F64(llama3.factor)),
+                    field("factor", ComponentValue::F64(banded.factor)),
                     field(
                         "low-freq-factor",
-                        ComponentValue::F64(llama3.low_freq_factor),
+                        ComponentValue::F64(banded.low_freq_factor),
                     ),
                     field(
                         "high-freq-factor",
-                        ComponentValue::F64(llama3.high_freq_factor),
+                        ComponentValue::F64(banded.high_freq_factor),
                     ),
                     field(
                         "original-max-position-embeddings",
-                        ComponentValue::S64(llama3.original_context_length as i64),
+                        ComponentValue::S64(banded.original_context_length as i64),
                     ),
                 ]))),
             ),
