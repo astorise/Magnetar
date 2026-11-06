@@ -558,8 +558,9 @@ jobs:
       - name: Q8_0 GGUF on CUDA with packed weights declined (disable control)
         # MAGNETAR_CUDA_PACKED_WEIGHTS=0: Model Loading dequantizes the same
         # weights to f32 at load, as before direct quantized execution. Runs
-        # even when the packed run failed, to tell the two apart.
-        if: ${{ !cancelled() }}
+        # even when the packed run failed, to tell the two apart -- once the
+        # checkpoint was downloaded.
+        if: ${{ !cancelled() && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
         timeout-minutes: 20
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
