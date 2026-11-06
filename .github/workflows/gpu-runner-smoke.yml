@@ -434,6 +434,104 @@ jobs:
             exit 1
           fi
           echo "$on"
+      - name: Download the pinned real Llama-3.2-1B-Instruct checkpoint
+        # qualify-additional-model-and-state-families F01: the first
+        # non-Qwen2 checkpoint, served by the Llama Model Component
+        # (selected by its manifest's architecture family). Gated: the
+        # download authenticates with the HF_TOKEN secret. model.safetensors
+        # is pinned by its LFS sha256, which the tests verify
+        # (`RealCheckpointProfile` llama-3.2-1b-instruct); the JSON files,
+        # which have no LFS digest, by the git blob id each had at that
+        # revision.
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          REVISION: 9213176726f574b556790deb65791e0c5aa438b6
+          CONFIG_JSON_BLOB: 3e3aaf51a035cb5092d9f6827a0dc074657ba88c
+          GENERATION_CONFIG_JSON_BLOB: 75ae08310d6d23df373ee2644b497192b3cce6d8
+          TOKENIZER_JSON_BLOB: 5cc5f00a5b203e90a27a3bd60d1ec393b07971e8
+          TOKENIZER_CONFIG_JSON_BLOB: 4ff488a165e900e5129cda7c20ab32d568d2a475
+        shell: bash
+        run: |
+          set -eu
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::the HF_TOKEN secret is required to download the gated Llama 3.2 checkpoint"
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/llama-3.2-1b-instruct-$REVISION"
+          mkdir -p "$dir"
+          for file in config.json generation_config.json tokenizer.json tokenizer_config.json model.safetensors; do
+            curl -fsSL -H "Authorization: Bearer $HF_TOKEN" \
+              "https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/$REVISION/$file" -o "$dir/$file"
+          done
+          verify() {
+            local file="$1" expected="$2"
+            local actual
+            actual="$(git hash-object "$dir/$file")"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$file git blob id mismatch: expected $expected, got $actual"
+              exit 1
+            fi
+          }
+          verify config.json "$CONFIG_JSON_BLOB"
+          verify generation_config.json "$GENERATION_CONFIG_JSON_BLOB"
+          verify tokenizer.json "$TOKENIZER_JSON_BLOB"
+          verify tokenizer_config.json "$TOKENIZER_CONFIG_JSON_BLOB"
+          echo "MAGNETAR_LLAMA_3_2_1B_INSTRUCT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Llama-3.2-1B-Instruct long-context campaign on CUDA
+        # Its Reference CPU comparison is left out: this checkpoint in f32
+        # (about 5 GB) does not fit the runner's memory next to the test.
+        # The same campaign with the Tensor Cores off is the control: both
+        # must generate the same tokens (checked below).
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REAL_CHECKPOINT_PROFILE: llama-3.2-1b-instruct
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
+          MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
+          MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
+        shell: bash
+        run: |
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$RUNNER_TEMP/qualification-reports/llama-3.2-1b-instruct-tensor-cores"
+          set -o pipefail
+          mkdir -p "$MAGNETAR_QUALIFICATION_REPORT_DIR"
+          export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
+          MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_LLAMA_3_2_1B_INSTRUCT_DIR" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
+      - name: Llama-3.2-1B-Instruct long-context campaign with Tensor Cores off (disable control)
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CUDA_TENSOR_CORES: "0"
+          MAGNETAR_REAL_CHECKPOINT_PROFILE: llama-3.2-1b-instruct
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
+          MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
+          MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
+        shell: bash
+        run: |
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$RUNNER_TEMP/qualification-reports/llama-3.2-1b-instruct-no-tensor-cores"
+          set -o pipefail
+          mkdir -p "$MAGNETAR_QUALIFICATION_REPORT_DIR"
+          export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
+          MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_LLAMA_3_2_1B_INSTRUCT_DIR" \
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
+      - name: Llama-3.2-1B-Instruct generates the same tokens with the Tensor Cores on and off
+        shell: bash
+        run: |
+          set -eu
+          on="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/llama-3.2-1b-instruct-tensor-cores/campaign.log")"
+          off="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/llama-3.2-1b-instruct-no-tensor-cores/campaign.log")"
+          test -n "$on"
+          if [ "$on" != "$off" ]; then
+            echo "::error::Llama-3.2-1B-Instruct: tokens differ with the Tensor Cores on and off"
+            diff <(echo "$on") <(echo "$off") || true
+            exit 1
+          fi
+          echo "$on"
+          grep 'generated text' "$RUNNER_TEMP/qualification-reports/llama-3.2-1b-instruct-tensor-cores/campaign.log" || true
       - name: Upload qualification reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

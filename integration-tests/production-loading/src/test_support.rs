@@ -29,6 +29,43 @@ pub(crate) fn register_real_qwen_component() {
     register_qwen_component_artifact(component_bytes, manifest_bytes);
 }
 
+/// The real, checked-in Model Components this crate ships, registered the
+/// way an embedder registers its own: each under the digest of its bytes,
+/// trusted because the embedder (here, this test crate) trusts the bytes
+/// it ships.
+const REAL_COMPONENTS: [&str; 2] = ["qwen-real", "llama-real"];
+
+/// Registers [`REAL_COMPONENTS`] and returns the digest of the one whose
+/// manifest declares `family` (`compatibility.architecture_families`) --
+/// the checkpoint's architecture selects its Model Component, never its
+/// name. Panics when none declares it.
+pub(crate) fn real_component_for_architecture_family(
+    family: &str,
+) -> magnetar_runtime::ComponentDigest {
+    for name in REAL_COMPONENTS {
+        let path = format!(
+            "{}/../../magnetar-runtime/fixtures/components/{name}.component.wasm",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = fs::read(&path).expect("checked-in real Component .wasm is readable");
+        let manifest = fs::read(format!("{path}.magnetar-component.yaml"))
+            .expect("checked-in real Component manifest is readable");
+        let digest = magnetar_runtime::ComponentDigest::sha256(&bytes);
+        let trust = magnetar_runtime::ComponentTrustStore::default().trust_digest(&digest.value);
+        let registered =
+            magnetar_runtime::register_inference_component_artifact(bytes, manifest, &trust)
+                .unwrap_or_else(|error| panic!("the real {name} Component registers: {error}"));
+        if registered
+            .manifest
+            .supported_architecture_families
+            .contains(family)
+        {
+            return registered.digest;
+        }
+    }
+    panic!("no real Model Component declares architecture family '{family}'")
+}
+
 pub(crate) const HIDDEN_SIZE: u64 = 4;
 pub(crate) const LAYER_COUNT: u64 = 1;
 pub(crate) const ATTENTION_HEAD_COUNT: u64 = 2;
