@@ -43,3 +43,34 @@ Land compatibility scaffolding and baseline tests before optimized execution. Ke
 ## Open questions
 
 Select exact hardware/checkpoint, numerical and downstream-quality thresholds, resource budgets and SLOs per qualification profile before promoting it. The roadmap's reference CPU/CUDA and Qwen checkpoint are the initial comparison, not evidence that other targets are available. Any Tachyon-facing interface additionally needs its independent repository audit and owner agreement. These decisions gate implementation promotion, not creation of this proposal.
+
+## Evidence: Q8_0 phase 1 on CUDA (RTX 3060)
+
+Checkpoint: Qwen/Qwen2.5-0.5B-Instruct-GGUF `qwen2.5-0.5b-instruct-q8_0.gguf`
+(revision `9217f5db79a29953eb74d5343926648285ec7e67`), loaded through the
+Qwen Model Component (architecture family `qwen2`, artifact format `gguf`),
+greedy decoding of 64 tokens after a warm-up request. GPU Runner Smoke Test
+run 42243870149 (commit `f57c764`):
+
+| Mode | Load | Warm TTFT | TPOT (64 tokens) |
+|---|---|---|---|
+| Packed weights stored (`MAGNETAR_CUDA_PACKED_WEIGHTS` unset) | 732 ms | 13.8 ms | 4.50 ms |
+| Packed weights declined (`MAGNETAR_CUDA_PACKED_WEIGHTS=0`, dequantized to f32 at load) | 4276 ms | 14.3 ms | 7.20 ms |
+
+Both modes generate the same 64 token ids (" Paris. The capital of the United
+States is Washington, D. C. …"); the CI step fails if they differ.
+
+What runs packed in phase 1: quantized projections are stored as the
+checkpoint's transposed `[out, in]` blocks (`layout=transposed`); decode
+matmuls of up to 64 rows read them packed (`q8_matmul_rows_kernel`), the
+gated MLP reads both projections in one launch with no intermediate
+(`q8_gated_matmul_rows_kernel`, so the decode step still captures into a
+CUDA graph), and the embedding reads its table row by row. Longer prefill
+matmuls dequantize the weight for that call only (phase 2: Tensor Core
+prefill from packed weights).
+
+Capture finding: a device buffer freed while a CUDA graph capture is in
+progress records a driver error that cudarc reports at the next driver
+call. The CUDA Provider now takes that deferred error before ending a
+capture, so an aborted capture always ends and the error fails the capture
+instead of a later, unrelated call.
