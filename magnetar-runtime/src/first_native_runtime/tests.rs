@@ -4449,6 +4449,7 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
             dimension: 2,
             position_mode: FirstNativeRopePositionMode::Sequential,
             dynamic_scaling_supported: false,
+            frequency_scaling: None,
         },
         rmsnorm_epsilon: 1e-6,
         tied_embeddings: false,
@@ -5707,6 +5708,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             architecture.attention_head_count,
             &fixture.config.rope,
             RopePairing::HalfSplit,
+            None,
             0,
             None,
         )?;
@@ -5718,6 +5720,7 @@ fn execute_qwen_prefill_hidden_states_through_dispatch(
             architecture.kv_head_count,
             &fixture.config.rope,
             RopePairing::HalfSplit,
+            None,
             0,
             None,
         )?;
@@ -5984,6 +5987,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             architecture.attention_head_count,
             &fixture.config.rope,
             RopePairing::HalfSplit,
+            None,
             absolute_position,
             None,
         )?;
@@ -5995,6 +5999,7 @@ fn execute_qwen_decode_hidden_states_through_dispatch(
             architecture.kv_head_count,
             &fixture.config.rope,
             RopePairing::HalfSplit,
+            None,
             absolute_position,
             None,
         )?;
@@ -11531,4 +11536,65 @@ fn cached_graphs_reuse_prepared_plans_until_the_registry_changes() {
         .prepared_plans(&runtime, &instance, 2, &provider)
         .unwrap();
     assert_eq!(graphs.preparations(), 2);
+}
+
+/// `model-config` 1.4.0's `rope-scaling`: the real Llama Component reads a
+/// checkpoint's Llama 3 frequency scaling and declares it on every `rope`
+/// node itself (the Runtime only forwards node attributes), while a
+/// Component that predates it (the real Qwen Component, compiled against
+/// 1.3.0) is refused for a scaled checkpoint instead of silently building
+/// an unscaled graph.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn llama3_rope_scaling_is_declared_by_the_component_and_required_of_it() {
+    let llama_digest = ComponentDigest::sha256(LLAMA_REAL_COMPONENT_BYTES);
+    let trust = ComponentTrustStore::default().trust_digest(&llama_digest.value);
+    register_inference_component_artifact(
+        LLAMA_REAL_COMPONENT_BYTES.to_vec(),
+        LLAMA_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &trust,
+    )
+    .expect("the real Llama Component must register");
+    let scaling = crate::operator::RopeBandedFrequencyScaling {
+        factor: 32.0,
+        low_freq_factor: 1.0,
+        high_freq_factor: 4.0,
+        original_context_length: 8192,
+    };
+    let mut fixture = e2e_fixture().expect("fixture builds");
+    fixture.config.rope.frequency_scaling = Some(crate::RopeFrequencyScaling::Banded(scaling));
+    let architecture = architecture_config_from_first_native_model_config(&fixture.config);
+    assert_eq!(
+        architecture.rope_frequency_scaling, fixture.config.rope.frequency_scaling,
+        "the configuration conversion keeps the scaling"
+    );
+
+    let (graphs, _definition, _instance) = build_first_native_graphs_from_named_component(
+        &llama_digest,
+        &architecture,
+        &fixture.identity,
+        2,
+    )
+    .expect("the Llama Component builds graphs for a Llama 3 scaled checkpoint");
+    let mut rope_nodes = 0;
+    for graph in [&graphs.prefill, &graphs.decode] {
+        for node in graph.nodes.values() {
+            if node.operator.name() == "rope" {
+                rope_nodes += 1;
+                assert_eq!(
+                    crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes),
+                    Ok(Some(scaling))
+                );
+            }
+        }
+    }
+    assert!(rope_nodes > 0);
+
+    let Err(error) = build_first_native_graphs_from_real_qwen_component(&fixture, 2) else {
+        panic!("a Component that does not declare the scaling must be refused");
+    };
+    assert!(
+        error.to_string().contains("frequency scaling"),
+        "unexpected error: {error}"
+    );
 }

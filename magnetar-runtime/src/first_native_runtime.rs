@@ -1430,6 +1430,65 @@ fn in_place_kv_supported(runtime: &Runtime, provider: &ProviderBinding) -> bool 
     attention && provider_advertises_operator(runtime, provider, "kv-write")
 }
 
+/// Every `rope` node of a Component-built graph must declare exactly the
+/// per-frequency scaling the bound configuration carries. A Component that
+/// predates `model-config` 1.4.0, or does not understand the scheme, would
+/// otherwise build an unscaled graph for a scaled checkpoint and degrade
+/// every token silently; one that declares a scaling the checkpoint does
+/// not have is just as wrong.
+fn validate_rope_frequency_scaling(
+    graph: &ExecutionGraph,
+    config: &ModelArchitectureConfig,
+) -> Result<(), E2eConformanceError> {
+    let expected = config.rope_frequency_scaling.map(|scaling| match scaling {
+        crate::RopeFrequencyScaling::Banded(banded) => banded,
+    });
+    for (node_id, node) in &graph.nodes {
+        if node.operator.name() != "rope" {
+            continue;
+        }
+        let declared =
+            crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes)
+                .map_err(|reason| E2eConformanceError::ModelComponentFailed {
+                    reason: format!("rope node '{node_id:?}': {reason}"),
+                })?;
+        if declared != expected {
+            return Err(E2eConformanceError::ModelComponentFailed {
+                reason: format!(
+                    "rope node '{node_id:?}' declares frequency scaling {declared:?}, but the \
+                     checkpoint's configuration requires {expected:?}; the Model Component \
+                     does not implement this model's RoPE"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether every active `rope` Kernel of `provider` honours the banded
+/// frequency-scaling attributes (and there is at least one).
+fn rope_banded_scaling_supported(runtime: &Runtime, provider: &ProviderBinding) -> bool {
+    let mut rope = false;
+    for entry in runtime.kernel_registry().entries() {
+        if !entry.active
+            || &entry.advertisement.id.provider != provider
+            || entry.advertisement.implemented_operator.name() != "rope"
+        {
+            continue;
+        }
+        if !entry
+            .advertisement
+            .id
+            .features
+            .contains(crate::operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE)
+        {
+            return false;
+        }
+        rope = true;
+    }
+    rope
+}
+
 /// What every step derives from a graph alone: its plan fingerprint and
 /// its execution order. A cached graph never changes, so each is computed
 /// at most once instead of on every step.
@@ -3402,6 +3461,7 @@ fn dispatch_qwen_rope(
     head_count: u64,
     rope_config: &FirstNativeRopeConfig,
     pairing: RopePairing,
+    frequency_scaling: Option<&crate::operator::RopeBandedFrequencyScaling>,
     position_offset: u64,
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
@@ -3434,6 +3494,27 @@ fn dispatch_qwen_rope(
         "head_count".into(),
         OperatorAttributeValue::Integer(head_count as i64),
     );
+    if let Some(scaling) = frequency_scaling {
+        // A Kernel that ignored these attributes would rotate with unscaled
+        // frequencies and silently degrade every token: refuse a Provider
+        // whose `rope` Kernels do not all declare that they honour them.
+        if let Some(provider) = ctx
+            .prepared_plan
+            .as_ref()
+            .and_then(|plan| plan.node_bindings.first())
+            .map(|binding| binding.provider.clone())
+            && !rope_banded_scaling_supported(ctx.runtime, &provider)
+        {
+            return Err(InferenceApiError::KernelUnavailable {
+                reason: format!(
+                    "operation '{operation_id}' needs banded RoPE frequency scaling, which \
+                     Provider {provider:?} does not advertise ('{}')",
+                    crate::operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE
+                ),
+            });
+        }
+        scaling.insert_attributes(&mut attributes);
+    }
     let output_descriptor = f32_tensor_descriptor_from_shape(input.shape());
     dispatch_reference_cpu_operator_pre_admitted(
         ctx,
@@ -3930,12 +4011,21 @@ fn dispatch_first_native_graph_node(
             let position_offset = absolute_position_override
                 .map(Ok)
                 .unwrap_or_else(|| node_attribute_u64(node, "position_offset"))?;
+            // Per-frequency scaling is model-family
+            // semantics: the Model Component declares it on the node and the
+            // Runtime forwards it unchanged, never deriving it itself.
+            let frequency_scaling =
+                crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes)
+                    .map_err(|reason| InferenceApiError::GraphPlanningFailed {
+                        reason: format!("graph node '{node_id}': {reason}"),
+                    })?;
             let rope_config = FirstNativeRopeConfig {
                 base,
                 scale: fixture.config.rope.scale,
                 dimension: head_dimension,
                 position_mode: fixture.config.rope.position_mode,
                 dynamic_scaling_supported: fixture.config.rope.dynamic_scaling_supported,
+                frequency_scaling: fixture.config.rope.frequency_scaling,
             };
             // `output_target` is not passed when RoPE's output edge carries
             // KV-cache semantics (`rope_k`): `execute_first_native_graph_nodes`
@@ -3963,6 +4053,7 @@ fn dispatch_first_native_graph_node(
                 head_count,
                 &rope_config,
                 pairing,
+                frequency_scaling.as_ref(),
                 position_offset,
                 (!output_has_kv_semantics).then_some(output_target),
             )
@@ -7993,6 +8084,7 @@ fn architecture_config_from_first_native_model_config(
         rms_norm_eps: config.rmsnorm_epsilon,
         rope_theta: config.rope.base,
         rope_scaling_factor: config.rope.scale.map(|value| value as f32),
+        rope_frequency_scaling: config.rope.frequency_scaling,
         tie_word_embeddings: config.tied_embeddings,
         attention_bias: config.attention_bias,
         bos_token_id: None,
@@ -8040,6 +8132,7 @@ fn first_native_model_config_from_architecture_config(
             dimension: config.head_dim,
             position_mode: FirstNativeRopePositionMode::Sequential,
             dynamic_scaling_supported: false,
+            frequency_scaling: config.rope_frequency_scaling,
         },
         rmsnorm_epsilon: config.rms_norm_eps,
         tied_embeddings: config.tie_word_embeddings,
@@ -9647,7 +9740,7 @@ pub fn register_inference_component_artifact(
     // keep authorizing `1.2.0` alongside `1.3.0` here, not merely replace
     // one with the other, or every still-`1.2.0`-compiled Component fails
     // `UnauthorizedImport`/`CapabilityVersionMismatch`.
-    for version in ["1.2.0", "1.3.0"] {
+    for version in ["1.2.0", "1.3.0", "1.4.0"] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),
             capability.clone() as Arc<dyn HostCapability>,
@@ -9943,6 +10036,8 @@ fn build_first_native_graphs_with_runtime(
 
         validate_first_scope_graph(&prefill)?;
         validate_first_scope_graph(&decode)?;
+        validate_rope_frequency_scaling(&prefill, config)?;
+        validate_rope_frequency_scaling(&decode, config)?;
         capability.clear_session(&engine_key);
         model_config_capability.clear_config(&engine_key);
         Ok(FirstNativeComponentGraphs {
@@ -10015,6 +10110,7 @@ fn build_first_native_prefill_graph_segment_with_runtime(
             output_edge_name: "logits".to_string(),
         };
 
+        let expected_scaling = architecture_config.clone();
         model_config_capability.bind_config(&engine_key, architecture_config);
         capability.prepare_session(&engine_key, session_context);
         let segment_result = manager
@@ -10039,6 +10135,7 @@ fn build_first_native_prefill_graph_segment_with_runtime(
             })?;
 
         validate_first_scope_graph(&segment)?;
+        validate_rope_frequency_scaling(&segment, &expected_scaling)?;
         capability.clear_session(&engine_key);
         model_config_capability.clear_config(&engine_key);
         Ok(segment)
@@ -10125,6 +10222,7 @@ fn build_first_native_decode_graph_segment_with_runtime(
             output_edge_name: "logits".to_string(),
         };
 
+        let expected_scaling = architecture_config.clone();
         model_config_capability.bind_config(&engine_key, architecture_config);
         capability.prepare_session(&engine_key, session_context);
         let segment_result = manager
@@ -10149,6 +10247,7 @@ fn build_first_native_decode_graph_segment_with_runtime(
             })?;
 
         validate_first_scope_graph(&segment)?;
+        validate_rope_frequency_scaling(&segment, &expected_scaling)?;
         capability.clear_session(&engine_key);
         model_config_capability.clear_config(&engine_key);
         Ok(segment)
@@ -11434,6 +11533,7 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             architecture.attention_head_count,
             &fixture.config.rope,
             RopePairing::HalfSplit,
+            None,
             0,
             None,
         ),

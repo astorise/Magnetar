@@ -37,7 +37,10 @@
 //! telemetry are recorded as pending gates / not measured, so the verdict
 //! stays unqualified until those land.
 
-use crate::test_support::{VOCAB_SIZE, register_real_qwen_component, write_tiny_production_bundle};
+use crate::test_support::{
+    VOCAB_SIZE, real_component_for_architecture_family, register_real_qwen_component,
+    write_tiny_production_bundle,
+};
 use crate::tests_real_checkpoint_smoke::{
     active_profile, require_checkpoint_dir, verified_checkpoint_source,
 };
@@ -60,7 +63,7 @@ use magnetar_runtime::phase_attribution::{PhaseAttributionReport, StepKind};
 use magnetar_runtime::production_model_ingestion::{
     ProductionArtifactPayloadSource, ProductionModelArtifactIngestor, ProductionModelSource,
 };
-use magnetar_runtime::tokenizer::{EncodeInput, Tokenizer};
+use magnetar_runtime::tokenizer::{DecodeInput, EncodeInput, Tokenizer};
 use magnetar_runtime::{
     E2eFixture, GenerationParameters, GenerationStreamEvent, ModelArtifactSource,
     ProductionGenerationRequest, ProductionLoadedModel, PromptInput, Provider,
@@ -87,6 +90,9 @@ struct CampaignTarget<'a> {
     payload_source: &'a dyn ProductionArtifactPayloadSource,
     trust_store: ModelTrustStore,
     provider: Arc<dyn Provider>,
+    /// The registered Model Component serving the checkpoint, selected by
+    /// its architecture family; `None` keeps the built-in Qwen Component.
+    component: Option<magnetar_runtime::ComponentDigest>,
     prompt: PromptInput,
     /// Recorded in the manifest's flags.
     prompt_label: String,
@@ -115,11 +121,12 @@ fn run_campaign(target: CampaignTarget<'_>, hardware: HardwareCapabilityMatrix) 
     let provider_metadata = target.provider.metadata();
     let load_probe = IntervalProbe::begin();
     let load_started = Instant::now();
-    let mut model = ProductionLoadedModel::load(
+    let mut model = ProductionLoadedModel::load_with_component(
         target.fixture,
         target.payload_source,
         target.trust_store,
         target.provider,
+        target.component,
     )
     .expect("the campaign's model loads on its Provider");
     let load = LoadSample {
@@ -556,6 +563,7 @@ fn fixture_only_campaign_is_measured_but_cannot_qualify_production_performance()
             payload_source: ingested.payload_source.as_ref(),
             trust_store,
             provider: Arc::new(ReferenceCpuProvider::new()),
+            component: None,
             prompt: PromptInput::PlainText("hi".into()),
             prompt_label: "hi".into(),
             max_new_tokens: 4,
@@ -669,6 +677,9 @@ struct RealCheckpoint {
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
     trust_store: ModelTrustStore,
     checkpoint: CheckpointIdentity,
+    /// The real Model Component whose manifest declares the checkpoint's
+    /// architecture family.
+    component: magnetar_runtime::ComponentDigest,
 }
 
 fn load_real_checkpoint(max_new_tokens: usize) -> RealCheckpoint {
@@ -696,7 +707,9 @@ fn load_real_checkpoint(max_new_tokens: usize) -> RealCheckpoint {
     let tokenizer_metadata = tokenizer.metadata().clone();
     let trust_store =
         ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
+    let component = real_component_for_architecture_family(&ingested.manifest.architecture.family);
     RealCheckpoint {
+        component,
         ingested,
         tokenizer_metadata,
         tokenizer: Arc::new(tokenizer),
@@ -730,6 +743,7 @@ fn real_checkpoint_qualification_campaign() {
         tokenizer,
         trust_store,
         checkpoint,
+        component,
     } = load_real_checkpoint(max_new_tokens);
 
     let prompts = campaign_prompts(tokenizer.as_ref());
@@ -749,6 +763,7 @@ fn real_checkpoint_qualification_campaign() {
                     payload_source: ingested.payload_source.as_ref(),
                     trust_store: trust_store.clone(),
                     provider: Arc::clone(&provider),
+                    component: Some(component.clone()),
                     prompt: prompt.clone(),
                     prompt_label: prompt_label.clone(),
                     max_new_tokens,
@@ -804,6 +819,19 @@ fn real_checkpoint_qualification_campaign() {
                     "[{device}] {} prompt tokens: generated token ids {tokens:?}",
                     report.manifest.prompt_tokens
                 );
+                // The decoded text, so a reader can see the model answers
+                // coherently (the token comparison alone cannot show that).
+                if let Ok(decoded) = tokenizer.decode(DecodeInput {
+                    token_ids: tokens.to_vec(),
+                    skip_special_tokens: false,
+                    clean_up_tokenization_spaces: false,
+                    streaming_state: None,
+                }) {
+                    eprintln!(
+                        "[{device}] {} prompt tokens: generated text {:?}",
+                        report.manifest.prompt_tokens, decoded.text
+                    );
+                }
             }
             write_report_if_requested(&report);
         }
@@ -897,11 +925,12 @@ fn real_checkpoint_decode_cost_profile() {
             Arc::clone(&real.tokenizer),
         )
         .unwrap();
-        let mut model = ProductionLoadedModel::load(
+        let mut model = ProductionLoadedModel::load_with_component(
             fixture,
             real.ingested.payload_source.as_ref(),
             real.trust_store.clone(),
             provider,
+            Some(real.component.clone()),
         )
         .expect("the real checkpoint loads");
         model.set_step_replay(step_replay);

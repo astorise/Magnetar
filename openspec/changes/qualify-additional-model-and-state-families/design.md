@@ -53,6 +53,38 @@ Limits:
 - The 1.5B checkpoints have no Reference CPU or logit-corpus comparison yet; a bfloat16 Reference CPU path would make one affordable.
 - The Hugging Face loader ignores `add_bos_token`, which DeepSeek-R1-Distill sets. Tokens still match across Providers, but its prompts are not yet encoded exactly as upstream.
 
+### First non-Qwen2 checkpoint: Llama 3.2 (F01, second increment)
+
+`meta-llama/Llama-3.2-1B-Instruct` (revision `9213176`, gated) is the first checkpoint the Qwen Component cannot serve:
+
+- Shape: 16 layers, 2048 hidden, 32 query / 8 KV heads of 64 dimensions, tied LM head.
+- RoPE: rope_theta 500000 with Llama 3 per-frequency RoPE scaling (`rope_scaling.rope_type = "llama3"`, factor 32).
+
+It is qualified through the Model Component boundary, so the Runtime gains no Llama-specific semantics:
+
+- **Component selection.** The campaign loads each checkpoint with the registered Model Component whose manifest declares the ingested architecture family (`compatibility.architecture_families`). It never selects by model name. `llama` resolves to the Llama Component; `qwen2` (Qwen2.5 and DeepSeek-R1-Distill) resolves to the Qwen Component.
+- **Contract.** `magnetar:model-component-graph@1.4.0` adds `model-config.rope-scaling`. It is a new function, not a new `architecture-config` field, so Components compiled against 1.2.0/1.3.0 still link. It returns the checkpoint's per-frequency scheme as normalized by the loader. The Hugging Face loader reads `rope_type` and refuses schemes it does not implement (`yarn`, `dynamic`, ...) instead of ingesting them as unscaled.
+- **The Component declares, the Runtime forwards.** The Llama Component (`334d221`, which also implements the 1.3.0 segment exports) declares the scheme on its `rope` nodes as the portable `frequency_scaling` attributes. The Runtime forwards node attributes unchanged.
+- **The Core names the scheme, not a family.** The operator, its Kernel feature and the WIT case call it `banded` (kept, interpolated and divided wavelength bands). Only the Hugging Face loader knows that `rope_type = "llama3"` maps onto it. The `quality / model-family isolation` guard enforces this.
+  - It refuses a Component-built graph whose `rope` nodes do not declare exactly the bound configuration's scaling, for example the Qwen Component (1.3.0) given a Llama 3 checkpoint.
+  - It refuses a Provider whose `rope` Kernels do not advertise `banded-frequency-scaling`.
+- **Kernels.** Reference CPU, the CPU Provider and the CUDA Provider rescale each pair's inverse frequency with the same f32 operations:
+  - Reference CPU matches Hugging Face's `_compute_llama3_parameters` within 1e-5 relative, across all three bands.
+  - CUDA matches the CPU Provider in conformance.
+
+Evidence (RTX 3060, GPU CI run 42186542821):
+
+| Warm medians | 5 / 512 / 4096 prompt tokens: TTFT | TPOT |
+|---|---|---|
+| Llama-3.2-1B-Instruct | 27.2 / 127.9 / 1087.8 ms | 10.0 / 10.2 / 11.4 ms |
+| Same, Tensor Cores off | 27.2 / 475.3 / 4502.5 ms | 10.0 / 10.2 / 11.5 ms |
+
+- The same 128 greedy tokens with the Tensor Cores on and off, after all three prompts. The text is coherent at every length: " Paris. It is located on the Seine River and is known for its rich history, cultural landmarks, and iconic architecture..." after 4096 tokens.
+- The Qwen2 checkpoints, now loaded through the same family-selected path, still pass every earlier check. DeepSeek-R1-Distill generates the same tokens as before the change (run 42144929355).
+- Limits:
+  - No Reference CPU or logit comparison yet. The checkpoint in f32 (about 5 GB) does not fit the runner next to the test.
+  - The plain-text prompt is encoded without `<|begin_of_text|>`, the same `add_bos_token` gap as DeepSeek-R1-Distill.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.

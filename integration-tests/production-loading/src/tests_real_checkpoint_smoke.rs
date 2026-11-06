@@ -90,10 +90,24 @@ pub(crate) const DEEPSEEK_R1_DISTILL_QWEN_1_5B: RealCheckpointProfile = RealChec
     vocab_size: 151_936,
 };
 
-const PROFILES: [&RealCheckpointProfile; 3] = [
+/// <https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/commit/9213176726f574b556790deb65791e0c5aa438b6>:
+/// a `llama` checkpoint (the Llama Component serves it): 16 layers, 2048
+/// hidden, 32 attention / 8 KV heads of 64 dimensions, tied embeddings,
+/// rope_theta 500000 with Llama 3 frequency scaling (factor 32). Gated:
+/// downloading it needs an accepted license and a Hugging Face token.
+pub(crate) const LLAMA_3_2_1B_INSTRUCT: RealCheckpointProfile = RealCheckpointProfile {
+    id: "llama-3.2-1b-instruct",
+    repo: "meta-llama/Llama-3.2-1B-Instruct",
+    revision: "9213176726f574b556790deb65791e0c5aa438b6",
+    weights_sha256: "sha256:1ff795ff6a07e6a68085d206fb84417da2f083f68391c2843cd2b8ac6df8538f",
+    vocab_size: 128_256,
+};
+
+const PROFILES: [&RealCheckpointProfile; 4] = [
     &QWEN2_5_0_5B_INSTRUCT,
     &QWEN2_5_1_5B_INSTRUCT,
     &DEEPSEEK_R1_DISTILL_QWEN_1_5B,
+    &LLAMA_3_2_1B_INSTRUCT,
 ];
 
 /// The profile `MAGNETAR_REAL_CHECKPOINT_PROFILE` names, Qwen2.5-0.5B-

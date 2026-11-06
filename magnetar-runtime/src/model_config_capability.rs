@@ -16,8 +16,8 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use crate::ModelArchitectureConfig;
 use crate::component::{ComponentError, ComponentValue, HostCapability};
+use crate::{ModelArchitectureConfig, RopeFrequencyScaling};
 
 const CAPABILITY_NAME: &str = "magnetar:model-component-graph/model-config";
 
@@ -108,6 +108,33 @@ fn encode_architecture_config(config: &ModelArchitectureConfig) -> ComponentValu
     ])
 }
 
+/// `option<rope-frequency-scaling>` (`1.4.0`).
+fn encode_rope_scaling(scaling: Option<&RopeFrequencyScaling>) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Option(scaling.map(|scaling| {
+        Box::new(match scaling {
+            RopeFrequencyScaling::Banded(banded) => ComponentValue::Variant(
+                "banded".into(),
+                Some(Box::new(ComponentValue::Record(vec![
+                    field("factor", ComponentValue::F64(banded.factor)),
+                    field(
+                        "low-freq-factor",
+                        ComponentValue::F64(banded.low_freq_factor),
+                    ),
+                    field(
+                        "high-freq-factor",
+                        ComponentValue::F64(banded.high_freq_factor),
+                    ),
+                    field(
+                        "original-max-position-embeddings",
+                        ComponentValue::S64(banded.original_context_length as i64),
+                    ),
+                ]))),
+            ),
+        })
+    }))
+}
+
 fn rejected(instance_key: &str, message: impl Into<String>) -> ComponentError {
     ComponentError::CapabilityCallRejected {
         capability: CAPABILITY_NAME.to_string(),
@@ -124,12 +151,12 @@ impl HostCapability for ModelConfigCapability {
         arguments: &[ComponentValue],
     ) -> Result<Vec<ComponentValue>, ComponentError> {
         match operation {
-            "model-config" => {
+            "model-config" | "rope-scaling" => {
                 if !arguments.is_empty() {
                     return Err(rejected(
                         instance_key,
                         format!(
-                            "'model-config' expects 0 argument(s), got {}",
+                            "'{operation}' expects 0 argument(s), got {}",
                             arguments.len()
                         ),
                     ));
@@ -141,7 +168,11 @@ impl HostCapability for ModelConfigCapability {
                         "no model architecture configuration bound for this instance",
                     )
                 })?;
-                Ok(vec![encode_architecture_config(config)])
+                Ok(vec![if operation == "model-config" {
+                    encode_architecture_config(config)
+                } else {
+                    encode_rope_scaling(config.rope_frequency_scaling.as_ref())
+                }])
             }
             other => Err(rejected(
                 instance_key,

@@ -322,6 +322,12 @@ pub struct FirstNativeRopeConfig {
     pub dimension: u64,
     pub position_mode: FirstNativeRopePositionMode,
     pub dynamic_scaling_supported: bool,
+    /// The checkpoint's per-frequency scaling, carried so this config and
+    /// [`crate::ModelArchitectureConfig`] convert into each other without
+    /// loss. The Runtime never turns it into attributes itself: the Model
+    /// Component reads it through `model-config` and declares it on its
+    /// `rope` nodes.
+    pub frequency_scaling: Option<crate::RopeFrequencyScaling>,
 }
 
 impl FirstNativeRopeConfig {
@@ -332,6 +338,7 @@ impl FirstNativeRopeConfig {
             dimension: head_dimension,
             position_mode: FirstNativeRopePositionMode::Sequential,
             dynamic_scaling_supported: false,
+            frequency_scaling: None,
         }
     }
 

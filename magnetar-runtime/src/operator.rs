@@ -259,6 +259,137 @@ impl Default for OperatorDeterminism {
     }
 }
 
+/// Kernel feature a `rope` Kernel advertises when it honours the banded
+/// frequency-scaling attributes ([`RopeBandedFrequencyScaling`]). The Runtime sends
+/// those attributes only to a Provider whose every active `rope` Kernel
+/// advertises it, and otherwise refuses the model: a Kernel that ignored them
+/// would rotate with unscaled frequencies and silently degrade every token.
+pub const ROPE_BANDED_FREQUENCY_SCALING_FEATURE: &str = "banded-frequency-scaling";
+
+/// Wavelength-banded RoPE frequency scaling: a model-family-neutral scheme
+/// (a source format may name it after the family that introduced it, e.g.
+/// a Hugging Face `rope_type`; the loader maps that name onto this one).
+/// Unlike linear position scaling it rescales each pair's
+/// inverse frequency by its wavelength: short wavelengths (high frequencies)
+/// are kept, wavelengths longer than `original_context_length /
+/// low_freq_factor` are divided by `factor`, and the band in between is
+/// interpolated smoothly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeBandedFrequencyScaling {
+    pub factor: f64,
+    pub low_freq_factor: f64,
+    pub high_freq_factor: f64,
+    pub original_context_length: u64,
+}
+
+impl RopeBandedFrequencyScaling {
+    /// The `frequency_scaling` attribute value naming this scheme.
+    pub const ATTRIBUTE_VALUE: &'static str = "banded";
+
+    pub fn validate(&self) -> Result<(), String> {
+        let positive = |name: &str, value: f64| {
+            if value.is_finite() && value > 0.0 {
+                Ok(())
+            } else {
+                Err(format!("banded RoPE {name} must be finite and positive"))
+            }
+        };
+        positive("factor", self.factor)?;
+        positive("low_freq_factor", self.low_freq_factor)?;
+        positive("high_freq_factor", self.high_freq_factor)?;
+        if self.high_freq_factor <= self.low_freq_factor {
+            return Err("banded RoPE high_freq_factor must exceed low_freq_factor".into());
+        }
+        if self.original_context_length == 0 {
+            return Err("banded RoPE original_max_position_embeddings must be positive".into());
+        }
+        Ok(())
+    }
+
+    /// The scaled inverse frequency of one rotated pair, in `f32` exactly as
+    /// every Kernel computes it so Providers agree bit for bit on the
+    /// frequency table.
+    pub fn scale_frequency(&self, frequency: f32) -> f32 {
+        let factor = self.factor as f32;
+        let low = self.low_freq_factor as f32;
+        let high = self.high_freq_factor as f32;
+        let original = self.original_context_length as f32;
+        let wavelength = std::f32::consts::TAU / frequency;
+        if wavelength < original / high {
+            frequency
+        } else if wavelength > original / low {
+            frequency / factor
+        } else {
+            let smooth = (original / wavelength - low) / (high - low);
+            (1.0 - smooth) * frequency / factor + smooth * frequency
+        }
+    }
+
+    /// Writes this scaling as `rope` attributes.
+    pub fn insert_attributes(&self, attributes: &mut BTreeMap<String, OperatorAttributeValue>) {
+        attributes.insert(
+            "frequency_scaling".into(),
+            OperatorAttributeValue::String(Self::ATTRIBUTE_VALUE.into()),
+        );
+        attributes.insert(
+            "frequency_scaling_factor".into(),
+            OperatorAttributeValue::Float(self.factor),
+        );
+        attributes.insert(
+            "low_frequency_factor".into(),
+            OperatorAttributeValue::Float(self.low_freq_factor),
+        );
+        attributes.insert(
+            "high_frequency_factor".into(),
+            OperatorAttributeValue::Float(self.high_freq_factor),
+        );
+        attributes.insert(
+            "original_context_length".into(),
+            OperatorAttributeValue::Integer(self.original_context_length as i64),
+        );
+    }
+
+    /// Reads the scaling a `rope` invocation carries: `None` when it has no
+    /// `frequency_scaling` attribute, an error for an unknown scheme or a
+    /// missing or invalid parameter (never a silent fallback to unscaled
+    /// frequencies).
+    pub fn from_attributes(
+        attributes: &BTreeMap<String, OperatorAttributeValue>,
+    ) -> Result<Option<Self>, String> {
+        match attributes.get("frequency_scaling") {
+            None => return Ok(None),
+            Some(OperatorAttributeValue::String(value)) if value == Self::ATTRIBUTE_VALUE => {}
+            Some(OperatorAttributeValue::String(value)) => {
+                return Err(format!("frequency_scaling '{value}' is not implemented"));
+            }
+            Some(_) => return Err("frequency_scaling must be a string".into()),
+        }
+        let float = |name: &str| match attributes.get(name) {
+            Some(OperatorAttributeValue::Float(value)) => Ok(*value),
+            _ => Err(format!(
+                "banded frequency scaling requires a float '{name}'"
+            )),
+        };
+        let original_context_length = match attributes.get("original_context_length") {
+            Some(OperatorAttributeValue::Integer(value)) if *value > 0 => *value as u64,
+            _ => {
+                return Err(
+                    "banded frequency scaling requires a positive integer 'original_context_length'"
+                        .into(),
+                );
+            }
+        };
+        let scaling = Self {
+            factor: float("frequency_scaling_factor")?,
+            low_freq_factor: float("low_frequency_factor")?,
+            high_freq_factor: float("high_frequency_factor")?,
+            original_context_length,
+        };
+        scaling.validate()?;
+        Ok(Some(scaling))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum OperatorAttributeKind {
     Boolean,
@@ -1024,6 +1155,29 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             // identifier or other naming convention).
             .with_rule(
                 "head_count",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            // banded frequency scaling ([`RopeBandedFrequencyScaling`]); absent means
+            // unscaled frequencies. Sent only to Kernels advertising
+            // [`ROPE_BANDED_FREQUENCY_SCALING_FEATURE`].
+            .with_rule(
+                "frequency_scaling",
+                OperatorAttributeRule::optional(OperatorAttributeKind::String),
+            )
+            .with_rule(
+                "frequency_scaling_factor",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "low_frequency_factor",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "high_frequency_factor",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "original_context_length",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             ),
         "rmsnorm" | "layernorm" => OperatorAttributeSchema::default()
