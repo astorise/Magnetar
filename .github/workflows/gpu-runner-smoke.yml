@@ -550,6 +550,8 @@ jobs:
         timeout-minutes: 20
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
+          # Diagnostic: attribute any Device error to the call that caused it.
+          CUDA_LAUNCH_BLOCKING: "1"
         shell: bash
         run: |
           set -o pipefail
