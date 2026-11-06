@@ -306,11 +306,15 @@ jobs:
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
+          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports/qwen2.5-1.5b-instruct-tensor-cores
+          MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
         shell: bash
         run: |
           set -o pipefail
+          mkdir -p "$MAGNETAR_QUALIFICATION_REPORT_DIR"
+          export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR" \
-            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qwen2.5-1.5b-instruct-tensor-cores.log"
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
       - name: Qwen2.5-1.5B-Instruct long-context campaign with Tensor Cores off (disable control)
         timeout-minutes: 30
         env:
@@ -321,17 +325,21 @@ jobs:
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
+          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports/qwen2.5-1.5b-instruct-no-tensor-cores
+          MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
         shell: bash
         run: |
           set -o pipefail
+          mkdir -p "$MAGNETAR_QUALIFICATION_REPORT_DIR"
+          export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR" \
-            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qwen2.5-1.5b-instruct-no-tensor-cores.log"
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
       - name: Qwen2.5-1.5B-Instruct generates the same tokens with the Tensor Cores on and off
         shell: bash
         run: |
           set -eu
-          on="$(grep 'generated token ids' "$RUNNER_TEMP/qwen2.5-1.5b-instruct-tensor-cores.log")"
-          off="$(grep 'generated token ids' "$RUNNER_TEMP/qwen2.5-1.5b-instruct-no-tensor-cores.log")"
+          on="$(grep 'generated token ids' "${{ runner.temp }}/qualification-reports/qwen2.5-1.5b-instruct-tensor-cores/campaign.log")"
+          off="$(grep 'generated token ids' "${{ runner.temp }}/qualification-reports/qwen2.5-1.5b-instruct-no-tensor-cores/campaign.log")"
           test -n "$on"
           if [ "$on" != "$off" ]; then
             echo "::error::Qwen2.5-1.5B-Instruct: tokens differ with the Tensor Cores on and off"
@@ -384,11 +392,15 @@ jobs:
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
+          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports/deepseek-r1-distill-qwen-1.5b-tensor-cores
+          MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
         shell: bash
         run: |
           set -o pipefail
+          mkdir -p "$MAGNETAR_QUALIFICATION_REPORT_DIR"
+          export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR" \
-            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/deepseek-r1-distill-qwen-1.5b-tensor-cores.log"
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
       - name: DeepSeek-R1-Distill-Qwen-1.5B long-context campaign with Tensor Cores off (disable control)
         timeout-minutes: 30
         env:
@@ -399,17 +411,21 @@ jobs:
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
+          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports/deepseek-r1-distill-qwen-1.5b-no-tensor-cores
+          MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
         shell: bash
         run: |
           set -o pipefail
+          mkdir -p "$MAGNETAR_QUALIFICATION_REPORT_DIR"
+          export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR" \
-            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/deepseek-r1-distill-qwen-1.5b-no-tensor-cores.log"
+            cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
       - name: DeepSeek-R1-Distill-Qwen-1.5B generates the same tokens with the Tensor Cores on and off
         shell: bash
         run: |
           set -eu
-          on="$(grep 'generated token ids' "$RUNNER_TEMP/deepseek-r1-distill-qwen-1.5b-tensor-cores.log")"
-          off="$(grep 'generated token ids' "$RUNNER_TEMP/deepseek-r1-distill-qwen-1.5b-no-tensor-cores.log")"
+          on="$(grep 'generated token ids' "${{ runner.temp }}/qualification-reports/deepseek-r1-distill-qwen-1.5b-tensor-cores/campaign.log")"
+          off="$(grep 'generated token ids' "${{ runner.temp }}/qualification-reports/deepseek-r1-distill-qwen-1.5b-no-tensor-cores/campaign.log")"
           test -n "$on"
           if [ "$on" != "$off" ]; then
             echo "::error::DeepSeek-R1-Distill-Qwen-1.5B: tokens differ with the Tensor Cores on and off"
