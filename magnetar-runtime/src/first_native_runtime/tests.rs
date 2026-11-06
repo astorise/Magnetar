@@ -4998,11 +4998,12 @@ fn production_loaded_model_load_with_component_permits_a_component_with_no_decla
 /// astorise/Magnetar#75's required negative proof, at the same
 /// `ProductionLoadedModel::load_with_component` layer
 /// `production_loaded_model_load_with_component_matches_the_singleton_path`
-/// exercises for the family gate: the real checked-in Qwen Component now
-/// declares `compatibility.artifact_formats: [huggingface]` in its own
-/// manifest (see `qwen-real.component.wasm.magnetar-component.yaml`).
-/// Pairing it with a hand-built Model Artifact manifest whose
-/// `architecture.family` is `"qwen2"` (so the *family* gate passes) but
+/// exercises for the family gate: the real checked-in Llama Component,
+/// registered with its manifest narrowed to
+/// `compatibility.artifact_formats: [huggingface]` (the checked-in one
+/// declares both formats). Pairing it with a hand-built Model Artifact
+/// manifest whose `architecture.family` is `"llama"` (so the *family* gate
+/// passes) but
 /// whose `artifact_format` is [`ArtifactFormat::Gguf`] must be rejected by
 /// the *format* gate alone -- proving `load_with_component`'s new
 /// `artifact_formats` check is real and independent of the pre-existing
@@ -5081,9 +5082,10 @@ fn production_loaded_model_load_with_component_rejects_a_format_mismatched_compo
         signatures: Vec::new(),
         source: None,
         architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
-        // The real checked-in Llama Component declares
-        // `compatibility.artifact_formats: [huggingface]` -- `Gguf` here is
-        // the one and only thing that must trigger the rejection below.
+        // The real Llama Component, registered below with a manifest that
+        // declares `compatibility.artifact_formats: [huggingface]` only --
+        // `Gguf` here is the one and only thing that must trigger the
+        // rejection below.
         artifact_format: ArtifactFormat::Gguf,
     };
 
@@ -5095,9 +5097,13 @@ fn production_loaded_model_load_with_component_rejects_a_format_mismatched_compo
 
     let component_trust = ComponentTrustStore::default()
         .trust_digest(&ComponentDigest::sha256(LLAMA_REAL_COMPONENT_BYTES).value);
+    let huggingface_only = String::from_utf8(LLAMA_REAL_COMPONENT_MANIFEST_BYTES.to_vec())
+        .unwrap()
+        .replace("    - gguf\n", "");
+    assert!(!huggingface_only.contains("- gguf"));
     let digest = register_inference_component_artifact(
         LLAMA_REAL_COMPONENT_BYTES.to_vec(),
-        LLAMA_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        huggingface_only.into_bytes(),
         &component_trust,
     )
     .expect("registration succeeds")

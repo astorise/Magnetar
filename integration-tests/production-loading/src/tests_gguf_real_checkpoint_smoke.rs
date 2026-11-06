@@ -322,21 +322,37 @@ fn real_public_q8_0_gguf_checkpoint_loads_and_generates_on_reference_cpu() {
     );
 }
 
-/// `execute-direct-quantized-weights` (B03): the real `Q8_0` export on
-/// CUDA, its quantized matrices stored packed and read packed by the decode
+/// A real, pinned `Q8_0` GGUF checkpoint generated on CUDA by
+/// [`generate_q8_0_gguf_on_cuda`].
+struct CudaQ8Checkpoint {
+    /// Prefixes every printed line, which the GPU workflow greps.
+    label: &'static str,
+    /// The environment variable naming the directory holding `model.gguf`.
+    dir_env: &'static str,
+    /// `repo@revision` and file, for the error and the artifact source.
+    repository: &'static str,
+    revision: &'static str,
+    file: &'static str,
+    sha256: &'static str,
+}
+
+/// `execute-direct-quantized-weights` (B03): a real `Q8_0` export on CUDA,
+/// its quantized matrices stored packed and read packed by the decode
 /// matmul -- or, with `MAGNETAR_CUDA_PACKED_WEIGHTS=0` (the disable
-/// control), dequantized to f32 at load as before. Prints the greedy
+/// control), dequantized to f32 at load as before. The Model Component is
+/// the one declaring the file's own architecture family. Prints the greedy
 /// tokens and the warm TTFT/TPOT so the GPU workflow can compare the two
-/// runs. Skips without a CUDA Device unless `MAGNETAR_REQUIRE_CUDA=1`.
-#[test]
-#[ignore = "downloads/holds a ~650MB real quantized checkpoint and needs a CUDA Device"]
-fn real_public_q8_0_gguf_checkpoint_generates_on_cuda() {
+/// runs. Skips without a CUDA Device unless `MAGNETAR_REQUIRE_CUDA=1`. The
+/// file is never read whole: ingestion streams its digest, checked against
+/// the pinned one before anything is trusted.
+fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
     use magnetar_runtime::{
         GenerationParameters, GenerationStreamEvent, ProductionGenerationRequest,
         ProductionLoadedModel, PromptInput, Provider, StopConditions,
     };
     use std::{ops::ControlFlow, time::Instant};
 
+    let label = checkpoint.label;
     let cuda = magnetar_provider_cuda::CudaProvider::new();
     if !cuda.is_available() {
         assert!(
@@ -346,11 +362,32 @@ fn real_public_q8_0_gguf_checkpoint_generates_on_cuda() {
         eprintln!("skipped: no CUDA-capable Device");
         return;
     }
-    let dir = require_q8_0_checkpoint_dir();
-    let source = verified_q8_0_checkpoint_source(&dir);
+    let dir = std::env::var_os(checkpoint.dir_env)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} is not set. Download {} revision {}'s {} into a directory as 'model.gguf' \
+                 and set that env var to it before running this test with --include-ignored.",
+                checkpoint.dir_env, checkpoint.repository, checkpoint.revision, checkpoint.file
+            )
+        });
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::HuggingFace(format!(
+            "{}@{}",
+            checkpoint.repository, checkpoint.revision
+        )),
+        dir.clone(),
+    );
+    let load_started = Instant::now();
     let mut ingested = GgufIngestor::new()
         .ingest(&source)
-        .expect("real quantized Qwen2.5-0.5B-Instruct GGUF file ingests");
+        .expect("the real quantized GGUF file ingests");
+    assert_eq!(
+        ingested.manifest.id.digest.value, checkpoint.sha256,
+        "the downloaded model.gguf does not match revision {}'s declared content digest -- \
+         re-download it",
+        checkpoint.revision
+    );
     let vocab_size = ingested
         .manifest
         .architecture_config
@@ -361,12 +398,9 @@ fn real_public_q8_0_gguf_checkpoint_generates_on_cuda() {
         max_tokens: Some(64),
         ..Default::default()
     });
-    let file_bytes = fs::read(dir.join("model.gguf")).unwrap();
-    let artifact = magnetar_format_gguf::parse(&file_bytes).expect("real GGUF file parses");
-    drop(file_bytes);
-    let tokenizer = GgufTokenizer::from_gguf_metadata(
-        &artifact.metadata,
-        "qwen2.5-0.5b-instruct-q8-0-gguf",
+    let tokenizer = magnetar_loader_gguf::load_gguf_tokenizer(
+        &source,
+        format!("{}-tokenizer", ingested.manifest.id.name.as_str()),
         Some(vocab_size),
     )
     .expect("real tokenizer builds from the checkpoint's own embedded vocabulary");
@@ -384,7 +418,6 @@ fn real_public_q8_0_gguf_checkpoint_generates_on_cuda() {
     )
     .expect("production fixture builds from the real ingested quantized GGUF checkpoint");
 
-    let load_started = Instant::now();
     let mut model = ProductionLoadedModel::load_with_component(
         fixture,
         ingested.payload_source.as_ref(),
@@ -419,12 +452,53 @@ fn real_public_q8_0_gguf_checkpoint_generates_on_cuda() {
     let tpot = (token_times[token_times.len() - 1] - ttft) / (token_times.len() - 1) as f64;
     let packed = std::env::var("MAGNETAR_CUDA_PACKED_WEIGHTS").as_deref() != Ok("0");
     eprintln!(
-        "[cuda q8_0 gguf] packed weights {}: load {load_ms:.0} ms; warm TTFT {ttft:.1} ms, \
+        "[{label}] family {}: packed weights {}: load {load_ms:.0} ms; warm TTFT {ttft:.1} ms, \
          TPOT {tpot:.2} ms over {} tokens",
+        ingested.manifest.architecture.family,
         if packed { "on" } else { "off" },
         tokens.len()
     );
-    eprintln!("[cuda q8_0 gguf] generated token ids {tokens:?}");
-    eprintln!("[cuda q8_0 gguf] generated text {:?}", outcome.text);
+    eprintln!("[{label}] generated token ids {tokens:?}");
+    eprintln!("[{label}] generated text {:?}", outcome.text);
     model.unload().expect("the real checkpoint unloads");
+}
+
+/// The real `Qwen2.5-0.5B-Instruct` `Q8_0` export on CUDA.
+#[test]
+#[ignore = "downloads/holds a ~650MB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_q8_0_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda q8_0 gguf",
+        dir_env: "MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR",
+        repository: "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        revision: CHECKPOINT_REVISION,
+        file: "qwen2.5-0.5b-instruct-q8_0.gguf",
+        sha256: Q8_0_CHECKPOINT_SHA256,
+    });
+}
+
+/// `bartowski/Mistral-7B-Instruct-v0.3-GGUF`'s exact pinned commit:
+/// <https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/commit/61fd4167fff3ab01ee1cfe0da183fa27a944db48>
+/// (Apache-2.0). The file declares `general.architecture = llama`, so the
+/// Llama Model Component serves it; its query and key projections arrive
+/// in llama.cpp's interleaved row order, which the GGUF loader restores.
+const MISTRAL_7B_Q8_0_REVISION: &str = "61fd4167fff3ab01ee1cfe0da183fa27a944db48";
+/// `Mistral-7B-Instruct-v0.3-Q8_0.gguf`'s sha256 (7,702,565,088 bytes) at
+/// that revision, as Hugging Face declares it.
+const MISTRAL_7B_Q8_0_SHA256: &str =
+    "sha256:404857e776114baada71a08ebd3bba79d721ec7fca99705e7e7b892ae8bc583f";
+
+/// Mistral 7B Instruct v0.3 `Q8_0` on CUDA: 7.7 GB packed, which fits a
+/// 12 GB Device only because the quantized matrices stay packed.
+#[test]
+#[ignore = "downloads/holds a 7.7GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_q8_0_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b q8_0 gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_Q8_0_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-Q8_0.gguf",
+        sha256: MISTRAL_7B_Q8_0_SHA256,
+    });
 }

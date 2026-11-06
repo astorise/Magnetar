@@ -114,16 +114,42 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 /// `tied=false`: declares `output.weight` explicitly, matching
 /// `write_tiny_production_bundle`'s own untied `lm_head.weight`.
 fn write_tiny_gguf_bundle(dir: &std::path::Path) {
+    write_tiny_gguf_bundle_for(dir, "qwen2");
+}
+
+/// llama.cpp's `LlamaModel.permute` of a `[rows, cols]` row-major
+/// projection's rows (`w.reshape(n_head, 2, rows / n_head / 2, cols)
+/// .swapaxes(1, 2)`): within each head, upstream row `half * head_dim / 2
+/// + i` is stored at row `2 * i + half`.
+fn llama_cpp_permute_rows(values: &[f32], rows: u64, cols: u64) -> Vec<f32> {
+    let (head_dim, cols) = (HEAD_DIMENSION, cols as usize);
+    let mut stored = vec![0.0; values.len()];
+    for upstream in 0..rows {
+        let (head, within) = (upstream / head_dim, upstream % head_dim);
+        let (half, i) = (within / (head_dim / 2), within % (head_dim / 2));
+        let row = (head * head_dim + 2 * i + half) as usize;
+        let upstream = upstream as usize;
+        stored[row * cols..(row + 1) * cols]
+            .copy_from_slice(&values[upstream * cols..(upstream + 1) * cols]);
+    }
+    stored
+}
+
+/// [`write_tiny_gguf_bundle`] under `architecture`'s key schema. For
+/// `llama`, the query and key projections are stored in llama.cpp's
+/// permuted row order, as its converter writes them.
+fn write_tiny_gguf_bundle_for(dir: &std::path::Path, architecture: &str) {
     let q_dim = ATTENTION_HEAD_COUNT * HEAD_DIMENSION;
     let kv_dim = KV_HEAD_COUNT * HEAD_DIMENSION;
+    let key = |name: &str| format!("{architecture}.{name}");
 
     let mut kvs = vec![
-        kv_string("general.architecture", "qwen2"),
-        kv_uint32("qwen2.embedding_length", HIDDEN_SIZE as u32),
-        kv_uint32("qwen2.feed_forward_length", INTERMEDIATE_SIZE as u32),
-        kv_uint32("qwen2.block_count", LAYER_COUNT as u32),
-        kv_uint32("qwen2.attention.head_count", ATTENTION_HEAD_COUNT as u32),
-        kv_uint32("qwen2.attention.head_count_kv", KV_HEAD_COUNT as u32),
+        kv_string("general.architecture", architecture),
+        kv_uint32(&key("embedding_length"), HIDDEN_SIZE as u32),
+        kv_uint32(&key("feed_forward_length"), INTERMEDIATE_SIZE as u32),
+        kv_uint32(&key("block_count"), LAYER_COUNT as u32),
+        kv_uint32(&key("attention.head_count"), ATTENTION_HEAD_COUNT as u32),
+        kv_uint32(&key("attention.head_count_kv"), KV_HEAD_COUNT as u32),
         kv_uint32("tokenizer.ggml.bos_token_id", 0),
         kv_uint32("tokenizer.ggml.eos_token_id", 1),
         kv_string("tokenizer.ggml.model", "gpt2"),
@@ -210,7 +236,12 @@ fn write_tiny_gguf_bundle(dir: &std::path::Path) {
         .into_iter()
         .map(|(hf_name_seed, gguf_name, ne)| {
             let element_count: u64 = ne.iter().product();
-            let values = tensor_values(&hf_name_seed, element_count);
+            let mut values = tensor_values(&hf_name_seed, element_count);
+            if architecture == "llama"
+                && (gguf_name.ends_with("attn_q.weight") || gguf_name.ends_with("attn_k.weight"))
+            {
+                values = llama_cpp_permute_rows(&values, ne[1], ne[0]);
+            }
             GgufTensor {
                 name: gguf_name,
                 ne,
@@ -374,9 +405,9 @@ fn gguf_and_huggingface_ingestion_of_identical_weights_produce_identical_generat
 }
 
 #[test]
-fn rejects_a_non_qwen2_gguf_architecture() {
+fn rejects_an_unsupported_gguf_architecture() {
     let dir = tempfile::tempdir().unwrap();
-    let kvs = vec![kv_string("general.architecture", "llama")];
+    let kvs = vec![kv_string("general.architecture", "gemma3")];
     let tensors = [GgufTensor {
         name: "token_embd.weight".into(),
         ne: vec![HIDDEN_SIZE, VOCAB_SIZE],
@@ -399,4 +430,127 @@ fn rejects_a_non_qwen2_gguf_architecture() {
         error,
         magnetar_runtime::production_model_ingestion::ProductionIngestionError::UnsupportedFormat { .. }
     ));
+}
+
+/// The greedy tokens `ingested` generates for token ids `[2, 3]` on the
+/// Reference CPU, through the real Model Component declaring its family.
+fn reference_cpu_tokens(
+    ingested: &magnetar_runtime::production_model_ingestion::ProductionIngestionResult,
+    tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+) -> Vec<u32> {
+    let component = crate::test_support::real_component_for_architecture_family(
+        &ingested.manifest.architecture.family,
+    );
+    let fixture = production_model_fixture(
+        ingested.manifest.clone(),
+        tokenizer.metadata().clone(),
+        tokenizer,
+    )
+    .expect("production fixture builds from real ingested data");
+    let mut model = magnetar_runtime::ProductionLoadedModel::load_with_component(
+        fixture,
+        ingested.payload_source.as_ref(),
+        ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone()),
+        Arc::new(magnetar_runtime::ReferenceCpuProvider::new()),
+        Some(component),
+    )
+    .expect("the model loads with the Component declaring its family");
+    let outcome = model
+        .generate(
+            magnetar_runtime::ProductionGenerationRequest {
+                prompt: PromptInput::TokenIds(vec![2, 3]),
+                parameters: magnetar_runtime::GenerationParameters::greedy(),
+                stop_conditions: magnetar_runtime::StopConditions::default(),
+                max_new_tokens: Some(6),
+                max_generation_millis: None,
+            },
+            None,
+        )
+        .expect("generation succeeds");
+    outcome.result.output.generated_token_ids
+}
+
+/// A `llama`-architecture GGUF file stores its query and key projections
+/// in llama.cpp's permuted row order; the GGUF loader restores the
+/// upstream order, so the same weights loaded from a Hugging Face Llama
+/// bundle and from the GGUF file generate identical tokens through the
+/// Llama Model Component. With heads of 4 rows the permutation moves rows,
+/// so a missing or wrong restoration changes the rotary pairs.
+#[test]
+fn llama_gguf_and_huggingface_ingestion_of_identical_weights_produce_identical_generation() {
+    let hf_dir = tempfile::tempdir().unwrap();
+    write_tiny_production_bundle(hf_dir.path());
+    let config = fs::read_to_string(hf_dir.path().join("config.json"))
+        .unwrap()
+        .replace("Qwen2ForCausalLM", "LlamaForCausalLM")
+        .replace(r#""model_type": "qwen2""#, r#""model_type": "llama""#);
+    fs::write(hf_dir.path().join("config.json"), config).unwrap();
+    let hf_source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(hf_dir.path().to_path_buf()),
+        hf_dir.path().to_path_buf(),
+    );
+    let hf_ingested = magnetar_loader_huggingface::HuggingFaceIngestor::new()
+        .ingest(&hf_source)
+        .expect("real Hugging Face Llama bundle ingestion succeeds");
+    assert_eq!(hf_ingested.manifest.architecture.family, "llama");
+    let hf_tokenizer = magnetar_loader_huggingface::HuggingFaceTokenizer::from_bytes(
+        &fs::read(hf_dir.path().join("tokenizer.json")).unwrap(),
+        None,
+        "hf-llama-cross-check",
+        Some(VOCAB_SIZE),
+    )
+    .expect("real tokenizer.json loads");
+    let hf_tokens = reference_cpu_tokens(&hf_ingested, Arc::new(hf_tokenizer));
+
+    let gguf_dir = tempfile::tempdir().unwrap();
+    write_tiny_gguf_bundle_for(gguf_dir.path(), "llama");
+    let gguf_source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::LocalPath(gguf_dir.path().to_path_buf()),
+        gguf_dir.path().to_path_buf(),
+    );
+    let gguf_ingested = GgufIngestor::new()
+        .ingest(&gguf_source)
+        .expect("real llama GGUF ingestion succeeds");
+    assert_eq!(gguf_ingested.manifest.architecture.family, "llama");
+    let gguf_tokenizer =
+        magnetar_loader_gguf::load_gguf_tokenizer(&gguf_source, "gguf-llama-cross-check", None)
+            .expect("real tokenizer builds from embedded vocabulary");
+    let gguf_tokens = reference_cpu_tokens(&gguf_ingested, Arc::new(gguf_tokenizer));
+
+    // Every tensor reaches Model Loading with the same bytes from both
+    // ingestors: the restored query/key rows above all.
+    let read =
+        |ingested: &magnetar_runtime::production_model_ingestion::ProductionIngestionResult,
+         name: &str| {
+            let tensor = ingested
+                .manifest
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == name)
+                .unwrap_or_else(|| panic!("tensor '{name}' is declared"));
+            ingested
+                .payload_source
+                .read_payload(
+                    &magnetar_runtime::production_model_ingestion::ProductionPayloadRange {
+                        identity: tensor.name.clone(),
+                        offset: tensor.offset_bytes.unwrap(),
+                        length: tensor.size_bytes.unwrap(),
+                        digest: tensor.digest.clone(),
+                    },
+                )
+                .unwrap()
+        };
+    for tensor in &hf_ingested.manifest.tensors {
+        assert_eq!(
+            read(&gguf_ingested, &tensor.name),
+            read(&hf_ingested, &tensor.name),
+            "tensor '{}' differs between the two ingestors",
+            tensor.name
+        );
+    }
+    assert_eq!(
+        gguf_tokens, hf_tokens,
+        "identical weights through the Safetensors and the llama GGUF ingestors must generate \
+         identical tokens"
+    );
 }
