@@ -187,8 +187,9 @@ jobs:
         env:
           MAGNETAR_QUALIFICATION_PROVIDERS: cuda
           MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
-          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports
-        run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_logits_match_the_reference_corpus -- --include-ignored --test-threads=1 --nocapture
+        run: |
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$RUNNER_TEMP/qualification-reports"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_logits_match_the_reference_corpus -- --include-ignored --test-threads=1 --nocapture
       - name: Real-checkpoint CUDA decode cost profile (diagnostic)
         # qualify-real-checkpoint-performance: where a CUDA decode step's
         # cost goes -- one warmed-up 64-token request, inter-token latency
@@ -200,8 +201,8 @@ jobs:
           MAGNETAR_QUALIFICATION_PROVIDERS: cuda
           MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
           MAGNETAR_QUALIFICATION_PROFILE_TOKENS: "64"
-          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports
         run: |
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$RUNNER_TEMP/qualification-reports"
           set -eux
           export MAGNETAR_QUALIFICATION_SUMMARY_PATH="$GITHUB_STEP_SUMMARY"
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_decode_cost_profile -- --include-ignored --test-threads=1 --nocapture
@@ -214,8 +215,8 @@ jobs:
           MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
           MAGNETAR_QUALIFICATION_PROFILE_TOKENS: "64"
           MAGNETAR_QUALIFICATION_STEP_REPLAY: "0"
-          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports
         run: |
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$RUNNER_TEMP/qualification-reports"
           set -eux
           export MAGNETAR_QUALIFICATION_SUMMARY_PATH="$GITHUB_STEP_SUMMARY"
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_decode_cost_profile -- --include-ignored --test-threads=1 --nocapture
@@ -241,9 +242,9 @@ jobs:
           # Besides the short prompt, one campaign per long context: what a
           # cost that grows with context length looks like.
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
-          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports
           MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
         run: |
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$RUNNER_TEMP/qualification-reports"
           set -eux
           export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
           export MAGNETAR_QUALIFICATION_SUMMARY_PATH="$GITHUB_STEP_SUMMARY"
@@ -306,10 +307,10 @@ jobs:
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
-          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports/qwen2.5-1.5b-instruct-tensor-cores
           MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
         shell: bash
         run: |
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$RUNNER_TEMP/qualification-reports/qwen2.5-1.5b-instruct-tensor-cores"
           set -o pipefail
           mkdir -p "$MAGNETAR_QUALIFICATION_REPORT_DIR"
           export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
@@ -325,10 +326,10 @@ jobs:
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
-          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports/qwen2.5-1.5b-instruct-no-tensor-cores
           MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
         shell: bash
         run: |
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$RUNNER_TEMP/qualification-reports/qwen2.5-1.5b-instruct-no-tensor-cores"
           set -o pipefail
           mkdir -p "$MAGNETAR_QUALIFICATION_REPORT_DIR"
           export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
@@ -338,8 +339,8 @@ jobs:
         shell: bash
         run: |
           set -eu
-          on="$(grep 'generated token ids' "${{ runner.temp }}/qualification-reports/qwen2.5-1.5b-instruct-tensor-cores/campaign.log")"
-          off="$(grep 'generated token ids' "${{ runner.temp }}/qualification-reports/qwen2.5-1.5b-instruct-no-tensor-cores/campaign.log")"
+          on="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/qwen2.5-1.5b-instruct-tensor-cores/campaign.log")"
+          off="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/qwen2.5-1.5b-instruct-no-tensor-cores/campaign.log")"
           test -n "$on"
           if [ "$on" != "$off" ]; then
             echo "::error::Qwen2.5-1.5B-Instruct: tokens differ with the Tensor Cores on and off"
@@ -392,10 +393,10 @@ jobs:
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
-          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports/deepseek-r1-distill-qwen-1.5b-tensor-cores
           MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
         shell: bash
         run: |
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$RUNNER_TEMP/qualification-reports/deepseek-r1-distill-qwen-1.5b-tensor-cores"
           set -o pipefail
           mkdir -p "$MAGNETAR_QUALIFICATION_REPORT_DIR"
           export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
@@ -411,10 +412,10 @@ jobs:
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
-          MAGNETAR_QUALIFICATION_REPORT_DIR: ${{ runner.temp }}/qualification-reports/deepseek-r1-distill-qwen-1.5b-no-tensor-cores
           MAGNETAR_QUALIFICATION_CODE_REVISION: ${{ github.sha }}
         shell: bash
         run: |
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$RUNNER_TEMP/qualification-reports/deepseek-r1-distill-qwen-1.5b-no-tensor-cores"
           set -o pipefail
           mkdir -p "$MAGNETAR_QUALIFICATION_REPORT_DIR"
           export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
@@ -424,8 +425,8 @@ jobs:
         shell: bash
         run: |
           set -eu
-          on="$(grep 'generated token ids' "${{ runner.temp }}/qualification-reports/deepseek-r1-distill-qwen-1.5b-tensor-cores/campaign.log")"
-          off="$(grep 'generated token ids' "${{ runner.temp }}/qualification-reports/deepseek-r1-distill-qwen-1.5b-no-tensor-cores/campaign.log")"
+          on="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/deepseek-r1-distill-qwen-1.5b-tensor-cores/campaign.log")"
+          off="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/deepseek-r1-distill-qwen-1.5b-no-tensor-cores/campaign.log")"
           test -n "$on"
           if [ "$on" != "$off" ]; then
             echo "::error::DeepSeek-R1-Distill-Qwen-1.5B: tokens differ with the Tensor Cores on and off"
