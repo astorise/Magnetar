@@ -1430,6 +1430,30 @@ fn in_place_kv_supported(runtime: &Runtime, provider: &ProviderBinding) -> bool 
     attention && provider_advertises_operator(runtime, provider, "kv-write")
 }
 
+/// Whether every active `rope` Kernel of `provider` honours the Llama 3
+/// frequency-scaling attributes (and there is at least one).
+fn rope_llama3_scaling_supported(runtime: &Runtime, provider: &ProviderBinding) -> bool {
+    let mut rope = false;
+    for entry in runtime.kernel_registry().entries() {
+        if !entry.active
+            || &entry.advertisement.id.provider != provider
+            || entry.advertisement.implemented_operator.name() != "rope"
+        {
+            continue;
+        }
+        if !entry
+            .advertisement
+            .id
+            .features
+            .contains(crate::operator::ROPE_LLAMA3_SCALING_FEATURE)
+        {
+            return false;
+        }
+        rope = true;
+    }
+    rope
+}
+
 /// What every step derives from a graph alone: its plan fingerprint and
 /// its execution order. A cached graph never changes, so each is computed
 /// at most once instead of on every step.
@@ -3402,6 +3426,7 @@ fn dispatch_qwen_rope(
     head_count: u64,
     rope_config: &FirstNativeRopeConfig,
     pairing: RopePairing,
+    frequency_scaling: Option<&crate::operator::RopeLlama3Scaling>,
     position_offset: u64,
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
@@ -3434,6 +3459,27 @@ fn dispatch_qwen_rope(
         "head_count".into(),
         OperatorAttributeValue::Integer(head_count as i64),
     );
+    if let Some(scaling) = frequency_scaling {
+        // A Kernel that ignored these attributes would rotate with unscaled
+        // frequencies and silently degrade every token: refuse a Provider
+        // whose `rope` Kernels do not all declare that they honour them.
+        if let Some(provider) = ctx
+            .prepared_plan
+            .as_ref()
+            .and_then(|plan| plan.node_bindings.first())
+            .map(|binding| binding.provider.clone())
+            && !rope_llama3_scaling_supported(ctx.runtime, &provider)
+        {
+            return Err(InferenceApiError::KernelUnavailable {
+                reason: format!(
+                    "operation '{operation_id}' needs Llama 3 RoPE frequency scaling, which \
+                     Provider {provider:?} does not advertise ('{}')",
+                    crate::operator::ROPE_LLAMA3_SCALING_FEATURE
+                ),
+            });
+        }
+        scaling.insert_attributes(&mut attributes);
+    }
     let output_descriptor = f32_tensor_descriptor_from_shape(input.shape());
     dispatch_reference_cpu_operator_pre_admitted(
         ctx,
@@ -3930,6 +3976,15 @@ fn dispatch_first_native_graph_node(
             let position_offset = absolute_position_override
                 .map(Ok)
                 .unwrap_or_else(|| node_attribute_u64(node, "position_offset"))?;
+            // Per-frequency scaling (e.g. Llama 3) is model-family
+            // semantics: the Model Component declares it on the node and the
+            // Runtime forwards it unchanged, never deriving it itself.
+            let frequency_scaling = crate::operator::RopeLlama3Scaling::from_attributes(
+                &node.attributes,
+            )
+            .map_err(|reason| InferenceApiError::GraphPlanningFailed {
+                reason: format!("graph node '{node_id}': {reason}"),
+            })?;
             let rope_config = FirstNativeRopeConfig {
                 base,
                 scale: fixture.config.rope.scale,
@@ -3963,6 +4018,7 @@ fn dispatch_first_native_graph_node(
                 head_count,
                 &rope_config,
                 pairing,
+                frequency_scaling.as_ref(),
                 position_offset,
                 (!output_has_kv_semantics).then_some(output_target),
             )
@@ -11434,6 +11490,7 @@ fn check_operator_coverage(fixture: &E2eFixture) -> Result<BTreeSet<String>, E2e
             architecture.attention_head_count,
             &fixture.config.rope,
             RopePairing::HalfSplit,
+            None,
             0,
             None,
         ),

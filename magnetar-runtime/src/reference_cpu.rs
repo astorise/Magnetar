@@ -138,7 +138,8 @@ use crate::memory::{
     MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
 };
 use crate::operator::{
-    OperatorAttributeValue, OperatorFamily, OperatorId, OperatorSpec, TensorLayoutKind, TensorRole,
+    OperatorAttributeValue, OperatorFamily, OperatorId, OperatorSpec, ROPE_LLAMA3_SCALING_FEATURE,
+    RopeLlama3Scaling, TensorLayoutKind, TensorRole,
 };
 use crate::provider::{
     PROVIDER_API_VERSION, Provider, ProviderError, ProviderExecutionApi, ProviderMetadata,
@@ -452,6 +453,36 @@ pub fn rope_with_pairing(
     head_count: u64,
     pairing: RopePairing,
 ) -> Result<HostTensor, ReferenceCpuError> {
+    rope_with_frequency_scaling(
+        input,
+        base,
+        scale,
+        dimension,
+        position_offset,
+        head_count,
+        pairing,
+        None,
+    )
+}
+
+/// [`rope_with_pairing`] with optional Llama 3 frequency scaling applied to
+/// each pair's inverse frequency ([`RopeLlama3Scaling::scale_frequency`]).
+#[allow(clippy::too_many_arguments)]
+pub fn rope_with_frequency_scaling(
+    input: &HostTensor,
+    base: f32,
+    scale: f32,
+    dimension: u64,
+    position_offset: u64,
+    head_count: u64,
+    pairing: RopePairing,
+    frequency_scaling: Option<&RopeLlama3Scaling>,
+) -> Result<HostTensor, ReferenceCpuError> {
+    if let Some(scaling) = frequency_scaling {
+        scaling.validate().map_err(|reason| {
+            ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason)
+        })?;
+    }
     let (rows, cols) = input.rows_cols()?;
     if head_count == 0 || !cols.is_multiple_of(head_count) {
         return Err(ReferenceCpuError::new(
@@ -491,7 +522,10 @@ pub fn rope_with_pairing(
         for head in 0..head_count as usize {
             let col_base = row_start + head * head_width;
             for pair in 0..half {
-                let frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
+                let mut frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
+                if let Some(scaling) = frequency_scaling {
+                    frequency = scaling.scale_frequency(frequency);
+                }
                 let angle = position * frequency;
                 let (sin, cos) = angle.sin_cos();
                 let (first, second) = match pairing {
@@ -1195,6 +1229,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
     // Honours the `key_count` attribute (`append-kv-history-in-place`).
     attention.id.features.insert(KEY_COUNT_FEATURE.to_string());
     let embedding = baseline_advertisement("embedding", OperatorFamily::Tensor);
+    // Honours the Llama 3 frequency-scaling attributes.
+    let mut rope = baseline_advertisement("rope", OperatorFamily::PositionEncoding);
+    rope.id
+        .features
+        .insert(ROPE_LLAMA3_SCALING_FEATURE.to_string());
 
     vec![
         baseline_advertisement("matmul", OperatorFamily::LinearAlgebra),
@@ -1204,7 +1243,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("gated-matmul", OperatorFamily::LinearAlgebra),
         embedding,
         baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
-        baseline_advertisement("rope", OperatorFamily::PositionEncoding),
+        rope,
         attention,
         baseline_advertisement("softmax", OperatorFamily::Activation),
         baseline_advertisement("silu", OperatorFamily::Activation),
@@ -2250,7 +2289,9 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
-                rope_with_pairing(
+                let frequency_scaling = RopeLlama3Scaling::from_attributes(&invocation.attributes)
+                    .map_err(|attribute| KernelError::KernelAttributeUnsupported { attribute })?;
+                rope_with_frequency_scaling(
                     &input,
                     base,
                     scale,
@@ -2258,6 +2299,7 @@ impl ReferenceCpuExecutor {
                     position_offset,
                     head_count,
                     pairing,
+                    frequency_scaling.as_ref(),
                 )
                 .map_err(KernelError::from)?
             }

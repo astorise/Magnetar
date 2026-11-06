@@ -2124,3 +2124,138 @@ fn read_tensor_rows_returns_the_requested_rows_only() {
     executor.write_tensor(flat.clone(), HostTensor::new([4], vec![1.0; 4]).unwrap());
     assert!(executor.read_tensor_rows(&flat, 0, 1).is_none());
 }
+
+/// Llama 3.2 1B's `rope_scaling` (`config.json`).
+const LLAMA_3_2_SCALING: RopeLlama3Scaling = RopeLlama3Scaling {
+    factor: 32.0,
+    low_freq_factor: 1.0,
+    high_freq_factor: 4.0,
+    original_context_length: 8192,
+};
+
+/// Hugging Face `_compute_llama3_parameters`, in `f64`.
+fn hugging_face_llama3_inverse_frequency(
+    scaling: &RopeLlama3Scaling,
+    inverse_frequency: f64,
+) -> f64 {
+    let original = scaling.original_context_length as f64;
+    let low_wavelength = original / scaling.low_freq_factor;
+    let high_wavelength = original / scaling.high_freq_factor;
+    let wavelength = 2.0 * std::f64::consts::PI / inverse_frequency;
+    let scaled = if wavelength > low_wavelength {
+        inverse_frequency / scaling.factor
+    } else {
+        inverse_frequency
+    };
+    if wavelength < high_wavelength || wavelength > low_wavelength {
+        return scaled;
+    }
+    let smooth = (original / wavelength - scaling.low_freq_factor)
+        / (scaling.high_freq_factor - scaling.low_freq_factor);
+    (1.0 - smooth) * scaled / scaling.factor + smooth * scaled
+}
+
+#[test]
+fn llama3_frequency_scaling_matches_hugging_face() {
+    let (base, dimension) = (500_000.0_f64, 64_usize);
+    let mut regimes = [false; 3];
+    for pair in 0..dimension / 2 {
+        let inverse = base.powf(-2.0 * pair as f64 / dimension as f64);
+        let expected = hugging_face_llama3_inverse_frequency(&LLAMA_3_2_SCALING, inverse);
+        let actual = LLAMA_3_2_SCALING.scale_frequency(inverse as f32) as f64;
+        assert!(
+            (actual - expected).abs() <= expected * 1e-5,
+            "pair {pair}: {actual} vs {expected}"
+        );
+        let ratio = expected / inverse;
+        regimes[if ratio > 0.999 {
+            0
+        } else if ratio < 1.0 / 31.99 {
+            2
+        } else {
+            1
+        }] = true;
+    }
+    assert_eq!(regimes, [true; 3], "kept, smoothed and divided bands");
+}
+
+#[test]
+fn rope_applies_llama3_frequency_scaling_per_pair() {
+    let mut rng = Rng(0x11a3);
+    let (rows, head_count, head_width) = (2_usize, 2_usize, 16_usize);
+    let cols = head_count * head_width;
+    let input = rng.tensor(rows as u64, cols as u64);
+    let (base, offset) = (500_000.0_f32, 9_000_u64);
+    let scaling = RopeLlama3Scaling {
+        factor: 8.0,
+        low_freq_factor: 1.0,
+        high_freq_factor: 4.0,
+        original_context_length: 64,
+    };
+    let rotated = rope_with_frequency_scaling(
+        &input,
+        base,
+        1.0,
+        head_width as u64,
+        offset,
+        head_count as u64,
+        RopePairing::HalfSplit,
+        Some(&scaling),
+    )
+    .unwrap();
+    let half = head_width / 2;
+    for row in 0..rows {
+        let position = (offset as usize + row) as f32;
+        for head in 0..head_count {
+            let start = row * cols + head * head_width;
+            for pair in 0..half {
+                let frequency =
+                    scaling.scale_frequency(base.powf(-2.0 * pair as f32 / head_width as f32));
+                let (sin, cos) = (position * frequency).sin_cos();
+                let (a, b) = (input.data[start + pair], input.data[start + pair + half]);
+                assert_eq!(rotated.data[start + pair], a * cos - b * sin);
+                assert_eq!(rotated.data[start + pair + half], a * sin + b * cos);
+            }
+        }
+    }
+    let unscaled = rope_with_pairing(
+        &input,
+        base,
+        1.0,
+        head_width as u64,
+        offset,
+        head_count as u64,
+        RopePairing::HalfSplit,
+    )
+    .unwrap();
+    assert_ne!(
+        rotated.data, unscaled.data,
+        "the scaling changes the rotation"
+    );
+}
+
+#[test]
+fn llama3_frequency_scaling_attributes_round_trip_and_reject_unknown_schemes() {
+    let mut attributes = BTreeMap::new();
+    assert_eq!(RopeLlama3Scaling::from_attributes(&attributes), Ok(None));
+    LLAMA_3_2_SCALING.insert_attributes(&mut attributes);
+    assert_eq!(
+        RopeLlama3Scaling::from_attributes(&attributes),
+        Ok(Some(LLAMA_3_2_SCALING))
+    );
+    let mut yarn = attributes.clone();
+    yarn.insert(
+        "frequency_scaling".into(),
+        OperatorAttributeValue::String("yarn".into()),
+    );
+    assert!(RopeLlama3Scaling::from_attributes(&yarn).is_err());
+    let mut missing = attributes.clone();
+    missing.remove("low_frequency_factor");
+    assert!(RopeLlama3Scaling::from_attributes(&missing).is_err());
+    let mut inverted = attributes;
+    inverted.insert(
+        "high_frequency_factor".into(),
+        OperatorAttributeValue::Float(0.5),
+    );
+    assert!(RopeLlama3Scaling::from_attributes(&inverted).is_err());
+}
