@@ -5059,7 +5059,7 @@ fn production_loaded_model_load_with_component_rejects_a_format_mismatched_compo
     let manifest = ModelManifest {
         schema_version: crate::MODEL_ARTIFACT_SCHEMA_VERSION,
         id,
-        architecture: ModelArchitecture::new("qwen2", "format-mismatch-test"),
+        architecture: ModelArchitecture::new("llama", "format-mismatch-test"),
         parts,
         storage_dtype: Some(ModelDType::F32),
         compute_dtype: None,
@@ -5081,7 +5081,7 @@ fn production_loaded_model_load_with_component_rejects_a_format_mismatched_compo
         signatures: Vec::new(),
         source: None,
         architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
-        // The real checked-in Qwen Component declares
+        // The real checked-in Llama Component declares
         // `compatibility.artifact_formats: [huggingface]` -- `Gguf` here is
         // the one and only thing that must trigger the rejection below.
         artifact_format: ArtifactFormat::Gguf,
@@ -5094,10 +5094,10 @@ fn production_loaded_model_load_with_component_rejects_a_format_mismatched_compo
         .expect("production fixture builds against the canonical config");
 
     let component_trust = ComponentTrustStore::default()
-        .trust_digest(&ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES).value);
+        .trust_digest(&ComponentDigest::sha256(LLAMA_REAL_COMPONENT_BYTES).value);
     let digest = register_inference_component_artifact(
-        QWEN_REAL_COMPONENT_BYTES.to_vec(),
-        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        LLAMA_REAL_COMPONENT_BYTES.to_vec(),
+        LLAMA_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
         &component_trust,
     )
     .expect("registration succeeds")
@@ -5117,9 +5117,9 @@ fn production_loaded_model_load_with_component_rejects_a_format_mismatched_compo
         Some(digest),
     ) {
         Ok(_) => panic!(
-            "a GGUF-declared Model Artifact paired with a real Qwen Component that declares \
+            "a GGUF-declared Model Artifact paired with a real Component that declares \
              `compatibility.artifact_formats: [huggingface]` must be rejected, even though the \
-             architecture family (`qwen2`) matches"
+             architecture family (`llama`) matches"
         ),
         Err(error) => {
             assert!(
