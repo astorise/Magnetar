@@ -44,6 +44,7 @@ pub mod kernel_qualification;
 pub mod kernel_registry;
 pub mod kernel_selection_policy;
 pub mod kv_cache;
+pub mod layer_placement;
 pub mod memory;
 pub mod model;
 pub mod model_component;

@@ -353,8 +353,35 @@ fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
     use std::{ops::ControlFlow, time::Instant};
 
     let label = checkpoint.label;
-    let cuda = magnetar_provider_cuda::CudaProvider::new();
-    if !cuda.is_available() {
+    // `MAGNETAR_CUDA_DEVICES=0,1`: one Provider spanning those GPUs, the
+    // Runtime placing the layers across them
+    // (`enforce-local-multigpu-and-expert-placement` G05).
+    let ordinals: Option<Vec<usize>> = std::env::var("MAGNETAR_CUDA_DEVICES").ok().map(|list| {
+        list.split(',')
+            .map(|ordinal| {
+                ordinal
+                    .trim()
+                    .parse()
+                    .expect("MAGNETAR_CUDA_DEVICES lists GPU ordinals")
+            })
+            .collect()
+    });
+    let (cuda, device_count): (Arc<dyn Provider>, usize) = match &ordinals {
+        Some(ordinals) => {
+            let multi = magnetar_provider_cuda::multi::CudaMultiProvider::for_devices(
+                ordinals,
+                "magnetar:provider/cuda",
+            );
+            let available = multi.is_available();
+            (Arc::new(multi), if available { ordinals.len() } else { 0 })
+        }
+        None => {
+            let single = magnetar_provider_cuda::CudaProvider::new();
+            let available = single.is_available();
+            (Arc::new(single), usize::from(available))
+        }
+    };
+    if device_count == 0 {
         assert!(
             std::env::var("MAGNETAR_REQUIRE_CUDA").as_deref() != Ok("1"),
             "MAGNETAR_REQUIRE_CUDA=1 but no CUDA-capable Device is available"
@@ -422,7 +449,7 @@ fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
         fixture,
         ingested.payload_source.as_ref(),
         trust_store,
-        Arc::new(cuda) as Arc<dyn Provider>,
+        cuda,
         Some(component),
     )
     .expect("the real Q8_0 checkpoint loads on CUDA");
@@ -452,9 +479,10 @@ fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
     let tpot = (token_times[token_times.len() - 1] - ttft) / (token_times.len() - 1) as f64;
     let packed = std::env::var("MAGNETAR_CUDA_PACKED_WEIGHTS").as_deref() != Ok("0");
     eprintln!(
-        "[{label}] family {}: packed weights {}: load {load_ms:.0} ms; warm TTFT {ttft:.1} ms, \
-         TPOT {tpot:.2} ms over {} tokens",
+        "[{label}] family {}, {device_count} GPU(s), placement {:?}: packed weights {}: load \
+         {load_ms:.0} ms; warm TTFT {ttft:.1} ms, TPOT {tpot:.2} ms over {} tokens",
         ingested.manifest.architecture.family,
+        std::env::var("MAGNETAR_LAYER_PLACEMENT").unwrap_or_else(|_| "fill".into()),
         if packed { "on" } else { "off" },
         tokens.len()
     );
@@ -500,5 +528,31 @@ fn real_public_mistral_7b_q8_0_gguf_checkpoint_generates_on_cuda() {
         revision: MISTRAL_7B_Q8_0_REVISION,
         file: "Mistral-7B-Instruct-v0.3-Q8_0.gguf",
         sha256: MISTRAL_7B_Q8_0_SHA256,
+    });
+}
+
+/// `RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf`'s exact pinned commit
+/// (the `Q8_0` export of `Qwen/Qwen1.5-MoE-A2.7B-Chat`): 24 layers of 60
+/// routed experts (top 4) and a shared expert.
+const QWEN_MOE_Q8_0_REVISION: &str = "947580e7b3904cd4081810d0efec4520a75609c7";
+/// `Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf`'s sha256 (15,226,010,336 bytes) at
+/// that revision, as Hugging Face declares it.
+const QWEN_MOE_Q8_0_SHA256: &str =
+    "sha256:d20e59b6180c775c648703fd63b8df7d01fc107672441fc3746c41f1dcaf904c";
+
+/// Qwen1.5-MoE-A2.7B-Chat `Q8_0` on CUDA (`execute-and-cache-moe-experts`
+/// F02): 15 GB packed, more than one 12 GB GPU holds, so it runs with
+/// `MAGNETAR_CUDA_DEVICES` listing two, the Runtime placing its layers
+/// across them.
+#[test]
+#[ignore = "downloads/holds a 15GB real quantized checkpoint and needs two CUDA Devices"]
+fn real_public_qwen_moe_a2_7b_q8_0_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda qwen1.5-moe-a2.7b q8_0 gguf",
+        dir_env: "MAGNETAR_QWEN_MOE_GGUF_Q8_0_REAL_CHECKPOINT_DIR",
+        repository: "RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf",
+        revision: QWEN_MOE_Q8_0_REVISION,
+        file: "Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf",
+        sha256: QWEN_MOE_Q8_0_SHA256,
     });
 }

@@ -9036,6 +9036,60 @@ pub struct ProductionLoadedModel {
     step_replay: StepReplay,
 }
 
+/// The share of a Device's memory a layer placement may fill with weights:
+/// the rest holds activations, KV history and Kernel workspace.
+const LAYER_PLACEMENT_WEIGHT_SHARE: (u64, u64) = (85, 100);
+
+/// `enforce-local-multigpu-and-expert-placement` G05: when `provider`
+/// exposes several Devices, the Runtime places the Model Instance's decoder
+/// layers across them ([`crate::layer_placement::LayerPlacement::plan`],
+/// policy from [`crate::layer_placement::LayerPlacementPolicy::from_env`])
+/// and hands the plan to the Provider before any weight is written. A
+/// single-Device Provider gets no plan.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn apply_production_layer_placement(
+    provider: &dyn Provider,
+    manifest: &ModelManifest,
+) -> Result<(), InferenceApiError> {
+    use crate::layer_placement::{LayerPlacement, LayerPlacementPolicy, LayerWeightBytes};
+    let devices: Vec<_> = provider
+        .devices()
+        .iter()
+        .map(|device| {
+            let metadata = device.metadata();
+            let budget = metadata.memory_capacity / LAYER_PLACEMENT_WEIGHT_SHARE.1
+                * LAYER_PLACEMENT_WEIGHT_SHARE.0;
+            (metadata.id.clone(), budget)
+        })
+        .collect();
+    if devices.len() < 2 {
+        return Ok(());
+    }
+    let Some(layer_count) = manifest
+        .architecture_config
+        .as_ref()
+        .map(|config| config.num_hidden_layers)
+    else {
+        return Ok(());
+    };
+    let bytes = LayerWeightBytes::from_weights(
+        layer_count,
+        manifest
+            .tensors
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), tensor.size_bytes.unwrap_or(0))),
+    );
+    let failed = |reason: String| InferenceApiError::ModelLoadingFailed { reason };
+    let placement = LayerPlacement::plan(&bytes, &devices, LayerPlacementPolicy::from_env())
+        .map_err(|error| failed(format!("layer placement: {error}")))?;
+    let execution = provider.execution_api().ok_or_else(|| {
+        failed("a multi-Device Provider exposes no execution API to place layers on".into())
+    })?;
+    execution
+        .apply_layer_placement(&placement)
+        .map_err(|error| failed(format!("layer placement: {error}")))
+}
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 impl ProductionLoadedModel {
     pub fn load(
@@ -9132,6 +9186,7 @@ impl ProductionLoadedModel {
                 reason: error.to_string(),
             }
         })?;
+        apply_production_layer_placement(&*provider, &fixture.manifest)?;
         let instance = load_production_model_instance_for_provider(
             &mut runtime,
             &fixture.manifest,

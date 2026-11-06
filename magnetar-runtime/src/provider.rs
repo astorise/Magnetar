@@ -988,6 +988,29 @@ pub trait ProviderExecutionApi: Send + Sync {
         false
     }
 
+    /// Takes the Runtime's placement of the Model Instance's decoder layers
+    /// across this Provider's Devices (`enforce-local-multigpu-and-expert-
+    /// placement` G05), before any weight is written: every later weight
+    /// goes to its layer's Device and every Kernel runs where its weights
+    /// are, the Provider moving activations across segment boundaries
+    /// explicitly. The default accepts a single-segment placement (nothing
+    /// to do) and rejects any other: such a Provider has one Device.
+    fn apply_layer_placement(
+        &self,
+        placement: &crate::layer_placement::LayerPlacement,
+    ) -> Result<(), ProviderExecutionError> {
+        if placement.segments().len() <= 1 {
+            return Ok(());
+        }
+        Err(ProviderExecutionError::new(
+            ProviderExecutionErrorCode::UnsupportedOperation,
+            ProviderExecutionPhase::Submit,
+            ProviderBinding::new("unknown"),
+            None,
+            "this Provider does not place layers across Devices",
+        ))
+    }
+
     /// Starts recording every Kernel invocation and resource access until
     /// [`Self::end_step_capture`] or [`Self::abort_step_capture`]. Every
     /// integer attribute named in `request.advancing_attributes` that a

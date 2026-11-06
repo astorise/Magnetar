@@ -588,6 +588,28 @@ jobs:
             exit 1
           fi
           echo "$packed"
+      - name: Q8_0 GGUF across two GPUs (layer segments)
+        # enforce-local-multigpu-and-expert-placement G05: one Provider over
+        # both GPUs, the Runtime placing half the layers on each
+        # (balanced); the tokens must match the single-GPU packed run.
+        if: ${{ !cancelled() && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_LAYER_PLACEMENT: balanced
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus.log"
+          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
+          split="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus.log")"
+          grep -h 'GPU(s)' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/*.log
+          if [ "$single" != "$split" ]; then
+            echo "::error::Q8_0 GGUF: tokens differ between one GPU and two"
+            diff <(echo "$single") <(echo "$split") || true
+            exit 1
+          fi
       - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q8_0 GGUF checkpoint
         # 7.7 GB (Apache-2.0), pinned by its sha256, which the test verifies:
         # it fits a 12 GB Device only because its quantized matrices stay
@@ -616,6 +638,37 @@ jobs:
           # SentencePiece decoding strips the text's leading space.
           grep -Eq 'generated text " ?Paris' "$RUNNER_TEMP/qualification-reports/mistral-7b-q8_0-gguf/packed.log" || {
             echo "::error::Mistral 7B Q8_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Download the pinned real Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF checkpoint
+        # execute-and-cache-moe-experts F02: 15 GB packed, more than one
+        # 12 GB GPU, pinned by its sha256, which the test verifies. The
+        # Mistral checkpoint is removed first to free the disk.
+        if: ${{ !cancelled() }}
+        env:
+          REVISION: 947580e7b3904cd4081810d0efec4520a75609c7
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "${MAGNETAR_MISTRAL_7B_GGUF_Q8_0_REAL_CHECKPOINT_DIR:-/nonexistent}"
+          df -h "$RUNNER_TEMP"
+          dir="$RUNNER_TEMP/qwen1.5-moe-a2.7b-chat-q8_0-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf/resolve/$REVISION/Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_QWEN_MOE_GGUF_Q8_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF across two GPUs
+        if: ${{ !cancelled() && env.MAGNETAR_QWEN_MOE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_qwen_moe_a2_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf/two-gpus.log"
+          grep -Eq 'generated text " ?Paris' "$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf/two-gpus.log" || {
+            echo "::error::Qwen1.5-MoE Q8_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
             exit 1
           }
       - name: Upload qualification reports
