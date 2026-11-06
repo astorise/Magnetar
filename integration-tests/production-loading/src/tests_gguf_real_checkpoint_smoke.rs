@@ -240,19 +240,32 @@ fn real_public_q8_0_gguf_checkpoint_loads_and_generates_on_reference_cpu() {
         .expect("architecture config was normalized");
     assert_eq!(config.num_hidden_layers, 24);
     assert_eq!(config.hidden_size, 896);
-    // Every projection weight in a real Q8_0 export is quantized; if
-    // dequantize-then-transpose sequencing were wrong, ingestion would
-    // either fail structurally or (worse) silently produce a corrupted
-    // tensor -- this only reaches generation at all because every such
-    // tensor was already resolved to real F32 content by ingestion time.
+    // Every projection weight in a real Q8_0 export is quantized, and now
+    // reaches Model Loading packed (`execute-direct-quantized-weights`):
+    // its storage dtype is kept and every quantized projection declares
+    // transposed storage instead of being transposed byte by byte, which
+    // would corrupt its blocks. Model Loading dequantizes them for Reference
+    // CPU, which declines packed weights.
+    let quantized: Vec<_> = ingested
+        .manifest
+        .tensors
+        .iter()
+        .filter(|tensor| tensor.storage_dtype == magnetar_runtime::model::ModelDType::Q8)
+        .collect();
     assert!(
-        ingested
-            .manifest
-            .tensors
-            .iter()
-            .all(|tensor| tensor.storage_dtype == magnetar_runtime::model::ModelDType::F32),
-        "every tensor must have been dequantized to F32 by the time ingestion returns"
+        !quantized.is_empty(),
+        "a Q8_0 export keeps quantized tensors"
     );
+    for tensor in &quantized {
+        let projection = tensor.name == "lm_head" || tensor.name.contains("proj");
+        assert_eq!(
+            tensor.layout.as_deref()
+                == Some(magnetar_runtime::packed_weight::TRANSPOSED_STORAGE_LAYOUT),
+            projection,
+            "{} declares transposed storage exactly when it is a projection",
+            tensor.name
+        );
+    }
     ingested.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
         max_tokens: Some(8),
         ..Default::default()
@@ -307,4 +320,111 @@ fn real_public_q8_0_gguf_checkpoint_loads_and_generates_on_reference_cpu() {
         "real Qwen2.5-0.5B-Instruct Q8_0 GGUF generated: {:?}",
         outcome.text
     );
+}
+
+/// `execute-direct-quantized-weights` (B03): the real `Q8_0` export on
+/// CUDA, its quantized matrices stored packed and read packed by the decode
+/// matmul -- or, with `MAGNETAR_CUDA_PACKED_WEIGHTS=0` (the disable
+/// control), dequantized to f32 at load as before. Prints the greedy
+/// tokens and the warm TTFT/TPOT so the GPU workflow can compare the two
+/// runs. Skips without a CUDA Device unless `MAGNETAR_REQUIRE_CUDA=1`.
+#[test]
+#[ignore = "downloads/holds a ~650MB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_q8_0_gguf_checkpoint_generates_on_cuda() {
+    use magnetar_runtime::{
+        GenerationParameters, GenerationStreamEvent, ProductionGenerationRequest,
+        ProductionLoadedModel, PromptInput, Provider, StopConditions,
+    };
+    use std::{ops::ControlFlow, time::Instant};
+
+    let cuda = magnetar_provider_cuda::CudaProvider::new();
+    if !cuda.is_available() {
+        assert!(
+            std::env::var("MAGNETAR_REQUIRE_CUDA").as_deref() != Ok("1"),
+            "MAGNETAR_REQUIRE_CUDA=1 but no CUDA-capable Device is available"
+        );
+        eprintln!("skipped: no CUDA-capable Device");
+        return;
+    }
+    let dir = require_q8_0_checkpoint_dir();
+    let source = verified_q8_0_checkpoint_source(&dir);
+    let mut ingested = GgufIngestor::new()
+        .ingest(&source)
+        .expect("real quantized Qwen2.5-0.5B-Instruct GGUF file ingests");
+    let vocab_size = ingested
+        .manifest
+        .architecture_config
+        .as_ref()
+        .expect("architecture config was normalized")
+        .vocab_size;
+    ingested.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(64),
+        ..Default::default()
+    });
+    let file_bytes = fs::read(dir.join("model.gguf")).unwrap();
+    let artifact = magnetar_format_gguf::parse(&file_bytes).expect("real GGUF file parses");
+    drop(file_bytes);
+    let tokenizer = GgufTokenizer::from_gguf_metadata(
+        &artifact.metadata,
+        "qwen2.5-0.5b-instruct-q8-0-gguf",
+        Some(vocab_size),
+    )
+    .expect("real tokenizer builds from the checkpoint's own embedded vocabulary");
+    let tokenizer_metadata = tokenizer.metadata().clone();
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
+    let trust_store =
+        ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
+    let component = crate::test_support::real_component_for_architecture_family(
+        &ingested.manifest.architecture.family,
+    );
+    let fixture = production_model_fixture(
+        ingested.manifest.clone(),
+        tokenizer_metadata,
+        Arc::clone(&tokenizer),
+    )
+    .expect("production fixture builds from the real ingested quantized GGUF checkpoint");
+
+    let load_started = Instant::now();
+    let mut model = ProductionLoadedModel::load_with_component(
+        fixture,
+        ingested.payload_source.as_ref(),
+        trust_store,
+        Arc::new(cuda) as Arc<dyn Provider>,
+        Some(component),
+    )
+    .expect("the real Q8_0 checkpoint loads on CUDA");
+    let load_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
+    let request = |max_new_tokens| ProductionGenerationRequest {
+        prompt: PromptInput::PlainText("The capital of France is".into()),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(max_new_tokens),
+        max_generation_millis: None,
+    };
+    model.generate(request(4), None).expect("warmup generates");
+
+    let mut token_times = Vec::new();
+    let started = Instant::now();
+    let outcome = model
+        .generate_streaming(request(64), None, &mut |event| {
+            if let GenerationStreamEvent::Token { .. } = event {
+                token_times.push(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+            ControlFlow::Continue(())
+        })
+        .expect("the real Q8_0 checkpoint generates on CUDA");
+    let tokens = &outcome.result.output.generated_token_ids;
+    assert!(tokens.len() > 1, "generated more than one token");
+    let ttft = token_times[0];
+    let tpot = (token_times[token_times.len() - 1] - ttft) / (token_times.len() - 1) as f64;
+    let packed = std::env::var("MAGNETAR_CUDA_PACKED_WEIGHTS").as_deref() != Ok("0");
+    eprintln!(
+        "[cuda q8_0 gguf] packed weights {}: load {load_ms:.0} ms; warm TTFT {ttft:.1} ms, \
+         TPOT {tpot:.2} ms over {} tokens",
+        if packed { "on" } else { "off" },
+        tokens.len()
+    );
+    eprintln!("[cuda q8_0 gguf] generated token ids {tokens:?}");
+    eprintln!("[cuda q8_0 gguf] generated text {:?}", outcome.text);
+    model.unload().expect("the real checkpoint unloads");
 }

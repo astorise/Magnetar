@@ -1294,7 +1294,7 @@ fn slice_tensor_bytes<'a>(
 /// Verifies `raw.len()` against the shape/dtype-implied byte count, verifies
 /// a declared non-F32 digest against `raw` before conversion (Decision 8),
 /// and converts F16/BF16 to F32 explicitly.
-fn tensor_from_raw_bytes(
+pub fn tensor_from_raw_bytes(
     tensor: &ModelTensorMetadata,
     raw: &[u8],
 ) -> Result<HostTensor, ModelLoadingError> {
@@ -1371,6 +1371,13 @@ fn tensor_from_raw_bytes(
             ));
         }
     };
+    // A tensor stored transposed (`TRANSPOSED_STORAGE_LAYOUT`) holds its
+    // declared `[rows, cols]` matrix as `[cols, rows]`: converted in stored
+    // order above, then transposed into the declared shape.
+    let data = match stored_transposed_dims(tensor)? {
+        Some((rows, cols)) => crate::packed_weight::transpose(&data, cols as usize, rows as usize),
+        None => data,
+    };
     HostTensor::new(tensor.shape.clone(), data).map_err(|error| {
         ModelLoadingError::new(
             ModelLoadingErrorCode::MaterializationFailed,
@@ -1380,21 +1387,39 @@ fn tensor_from_raw_bytes(
     })
 }
 
-/// Reads, validates, converts, and returns exactly one tensor's `HostTensor`
-/// content from a bounded [`crate::ProductionArtifactPayloadSource`] --
-/// the per-tensor building block [`crate::first_native_runtime::
-/// stream_materialize_model_instance_weights`] calls in a loop instead of
-/// requiring the entire model to first exist as a whole-model
-/// `BTreeMap<String, HostTensor>` (`implement-production-qwen-model-loading`
-/// task group 6 / "Production Model Loading Supports Bounded Tensor Payload
-/// Access"). The returned `HostTensor` is this function's only allocation
-/// surviving past its own call -- nothing here accumulates state across
-/// tensors, so peak transient host staging stays bounded by whatever the
-/// caller does with each `HostTensor` before requesting the next one.
-pub fn host_tensor_from_payload_source(
+/// The declared `[rows, cols]` of a tensor whose layout declares transposed
+/// storage, `None` for any other layout. Transposed storage is only
+/// meaningful for a 2D tensor; any other layout value is rejected rather
+/// than ignored, since reading the bytes as untransposed would silently
+/// produce the wrong matrix.
+fn stored_transposed_dims(
+    tensor: &ModelTensorMetadata,
+) -> Result<Option<(u64, u64)>, ModelLoadingError> {
+    let reject = |reason: String| {
+        Err(ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!("tensor '{}' {reason}", tensor.name),
+        ))
+    };
+    match tensor.layout.as_deref() {
+        None => Ok(None),
+        Some(crate::packed_weight::TRANSPOSED_STORAGE_LAYOUT) => match tensor.shape.as_slice() {
+            [rows, cols] => Ok(Some((*rows, *cols))),
+            shape => reject(format!(
+                "declares transposed storage but has the non-2D shape {shape:?}"
+            )),
+        },
+        Some(other) => reject(format!("declares the unsupported storage layout '{other}'")),
+    }
+}
+
+/// Reads exactly one tensor's declared byte range from `payload_source`,
+/// unconverted.
+pub fn read_tensor_payload(
     tensor: &ModelTensorMetadata,
     payload_source: &dyn crate::ProductionArtifactPayloadSource,
-) -> Result<HostTensor, ModelLoadingError> {
+) -> Result<Vec<u8>, ModelLoadingError> {
     let (offset, length) = match (tensor.offset_bytes, tensor.size_bytes) {
         (Some(offset), Some(size)) => (offset, size),
         _ => {
@@ -1414,13 +1439,89 @@ pub fn host_tensor_from_payload_source(
         length,
         digest: tensor.digest.clone(),
     };
-    let raw = payload_source.read_payload(&range).map_err(|error| {
+    payload_source.read_payload(&range).map_err(|error| {
         ModelLoadingError::new(
             ModelLoadingErrorCode::MaterializationFailed,
             Some(ModelLoadingPhase::MaterializeWeights),
             format!("tensor '{}' payload read failed: {error}", tensor.name),
         )
-    })?;
+    })
+}
+
+/// The packed form of a block-quantized 2D weight
+/// (`execute-direct-quantized-weights`), from the tensor's own validated
+/// storage bytes: `Ok(None)` when its storage dtype has no packed form
+/// (only `Q8_0` does so far), it is not a matrix, or its stored rows are
+/// not whole blocks. The bytes are checked
+/// against the shape and against the declared content digest first, as for
+/// any other storage dtype.
+pub fn packed_weight_from_raw_bytes(
+    tensor: &ModelTensorMetadata,
+    raw: &[u8],
+) -> Result<Option<crate::packed_weight::PackedWeight>, ModelLoadingError> {
+    let format = match tensor.storage_dtype {
+        ModelDType::Q8 => crate::packed_weight::PackedWeightFormat::Q8_0,
+        _ => return Ok(None),
+    };
+    let [rows, cols] = tensor.shape.as_slice() else {
+        return Ok(None);
+    };
+    let transposed = stored_transposed_dims(tensor)?.is_some();
+    let (stored_rows, stored_cols) = if transposed {
+        (*cols, *rows)
+    } else {
+        (*rows, *cols)
+    };
+    // Stored rows that are not whole blocks (a block spanning two rows)
+    // have no packed matrix form; such a tensor is only ever dequantized.
+    if !stored_cols.is_multiple_of(format.block_elements()) {
+        return Ok(None);
+    }
+    if let Some(expected_digest) = &tensor.digest {
+        expected_digest.verify_bytes(raw).map_err(|error| {
+            ModelLoadingError::new(
+                ModelLoadingErrorCode::MaterializationFailed,
+                Some(ModelLoadingPhase::MaterializeWeights),
+                format!(
+                    "tensor '{}' storage bytes do not match its declared content digest: {error}",
+                    tensor.name
+                ),
+            )
+        })?;
+    }
+    crate::packed_weight::PackedWeight::new(
+        format,
+        stored_rows,
+        stored_cols,
+        transposed,
+        raw.to_vec(),
+    )
+    .map(Some)
+    .map_err(|reason| {
+        ModelLoadingError::new(
+            ModelLoadingErrorCode::MaterializationFailed,
+            Some(ModelLoadingPhase::MaterializeWeights),
+            format!("tensor '{}' {reason}", tensor.name),
+        )
+    })
+}
+
+/// Reads, validates, converts, and returns exactly one tensor's `HostTensor`
+/// content from a bounded [`crate::ProductionArtifactPayloadSource`] --
+/// the per-tensor building block [`crate::first_native_runtime::
+/// stream_materialize_model_instance_weights`] calls in a loop instead of
+/// requiring the entire model to first exist as a whole-model
+/// `BTreeMap<String, HostTensor>` (`implement-production-qwen-model-loading`
+/// task group 6 / "Production Model Loading Supports Bounded Tensor Payload
+/// Access"). The returned `HostTensor` is this function's only allocation
+/// surviving past its own call -- nothing here accumulates state across
+/// tensors, so peak transient host staging stays bounded by whatever the
+/// caller does with each `HostTensor` before requesting the next one.
+pub fn host_tensor_from_payload_source(
+    tensor: &ModelTensorMetadata,
+    payload_source: &dyn crate::ProductionArtifactPayloadSource,
+) -> Result<HostTensor, ModelLoadingError> {
+    let raw = read_tensor_payload(tensor, payload_source)?;
     tensor_from_raw_bytes(tensor, &raw)
 }
 

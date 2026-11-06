@@ -532,6 +532,54 @@ jobs:
           fi
           echo "$on"
           grep 'generated text' "$RUNNER_TEMP/qualification-reports/llama-3.2-1b-instruct-tensor-cores/campaign.log" || true
+      - name: Download the pinned real Qwen2.5-0.5B-Instruct Q8_0 GGUF checkpoint
+        # execute-direct-quantized-weights (B03): a genuinely Q8_0-quantized
+        # export, pinned by its sha256, which the test verifies.
+        env:
+          REVISION: 9217f5db79a29953eb74d5343926648285ec7e67
+        shell: bash
+        run: |
+          set -eu
+          dir="$RUNNER_TEMP/qwen2.5-0.5b-instruct-q8_0-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/$REVISION/qwen2.5-0.5b-instruct-q8_0.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Q8_0 GGUF on CUDA with packed weights
+        # The quantized matrices are stored packed and the decode matmul
+        # reads them packed.
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/qualification-reports/q8_0-gguf"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log"
+      - name: Q8_0 GGUF on CUDA with packed weights declined (disable control)
+        # MAGNETAR_CUDA_PACKED_WEIGHTS=0: Model Loading dequantizes the same
+        # weights to f32 at load, as before direct quantized execution.
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_PACKED_WEIGHTS: "0"
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/dequantized.log"
+      - name: Q8_0 GGUF generates the same tokens packed and dequantized
+        shell: bash
+        run: |
+          set -eu
+          packed="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
+          dequantized="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/dequantized.log")"
+          test -n "$packed"
+          grep -h 'packed weights\|generated text' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/*.log
+          if [ "$packed" != "$dequantized" ]; then
+            echo "::error::Q8_0 GGUF: tokens differ between packed and dequantized weights"
+            diff <(echo "$packed") <(echo "$dequantized") || true
+            exit 1
+          fi
+          echo "$packed"
       - name: Upload qualification reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

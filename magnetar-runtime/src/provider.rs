@@ -687,6 +687,23 @@ pub trait ProviderExecutionApi: Send + Sync {
         self.write_tensor(id, tensor)
     }
 
+    /// Offers a Model Instance weight in its packed, block-quantized form
+    /// (`execute-direct-quantized-weights`). A Provider that computes
+    /// directly from `weight`'s format stores it under `id` and answers
+    /// [`crate::packed_weight::PackedWeightWrite::Stored`]; every Kernel
+    /// reading `id` must then accept it, dequantizing it itself where it
+    /// has no direct path. Any other Provider answers `Declined` and stores
+    /// nothing, and Model Loading writes the dequantized `f32` weight
+    /// through [`Self::write_weight_tensor`] instead.
+    fn write_packed_weight_tensor(
+        &self,
+        id: TensorResourceId,
+        weight: crate::packed_weight::PackedWeight,
+    ) -> Result<crate::packed_weight::PackedWeightWrite, ProviderExecutionError> {
+        let _ = (id, weight);
+        Ok(crate::packed_weight::PackedWeightWrite::Declined)
+    }
+
     /// Reads back a tensor previously written through [`Self::write_tensor`]
     /// or produced by a completed Kernel invocation. See that method's
     /// documentation for why this is host-tensor-shaped and provisional.

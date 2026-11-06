@@ -7402,19 +7402,14 @@ pub fn stream_materialize_model_instance_weights(
 ) -> Result<(), InferenceApiError> {
     let mut transaction = WeightMaterializationTransaction::begin(runtime, instance)?;
     for tensor in tensors {
-        let stage_result = host_tensor_from_payload_source(tensor, payload_source)
-            .map_err(|error| InferenceApiError::ModelLoadingFailed {
-                reason: error.to_string(),
-            })
-            .and_then(|host_tensor| {
-                transaction.stage_weight(
-                    runtime,
-                    instance,
-                    artifact_owner,
-                    &tensor.name,
-                    &host_tensor,
-                )
-            });
+        let stage_result = stream_stage_tensor(
+            &mut transaction,
+            runtime,
+            instance,
+            artifact_owner,
+            tensor,
+            payload_source,
+        );
         if let Err(error) = stage_result {
             transaction.abort(runtime);
             if let Ok(model_instance) = runtime.model_instances_mut().instance_mut(instance) {
@@ -7424,6 +7419,48 @@ pub fn stream_materialize_model_instance_weights(
         }
     }
     transaction.commit(runtime, instance)
+}
+
+/// Reads one tensor's storage bytes and stages it: a block-quantized
+/// matrix is first offered packed to the Provider
+/// (`execute-direct-quantized-weights`), and only dequantized to `f32` when
+/// the Provider declines it; everything else is converted to `f32` as
+/// before. The bytes are read once either way.
+fn stream_stage_tensor(
+    transaction: &mut WeightMaterializationTransaction,
+    runtime: &mut Runtime,
+    instance: &ModelInstanceId,
+    artifact_owner: &str,
+    tensor: &ModelTensorMetadata,
+    payload_source: &dyn ProductionArtifactPayloadSource,
+) -> Result<(), InferenceApiError> {
+    let loading_failed =
+        |error: crate::model_loading::ModelLoadingError| InferenceApiError::ModelLoadingFailed {
+            reason: error.to_string(),
+        };
+    let raw = crate::model_loading::read_tensor_payload(tensor, payload_source)
+        .map_err(loading_failed)?;
+    if let Some(packed) =
+        crate::model_loading::packed_weight_from_raw_bytes(tensor, &raw).map_err(loading_failed)?
+        && transaction.stage_packed_weight(
+            runtime,
+            instance,
+            artifact_owner,
+            &tensor.name,
+            packed,
+        )?
+    {
+        return Ok(());
+    }
+    let host_tensor =
+        crate::model_loading::tensor_from_raw_bytes(tensor, &raw).map_err(loading_failed)?;
+    transaction.stage_weight(
+        runtime,
+        instance,
+        artifact_owner,
+        &tensor.name,
+        &host_tensor,
+    )
 }
 
 /// Stages weight materialization one resource at a time -- Memory Manager
@@ -7562,8 +7599,88 @@ impl WeightMaterializationTransaction {
                 ),
             });
         }
-        let resource_id = TensorResourceId::new(format!("model.{instance}.weight.{name}"));
         let byte_size = tensor.data.len() as u64 * std::mem::size_of::<f32>() as u64;
+        self.admit_and_write(
+            runtime,
+            instance,
+            artifact_owner,
+            name,
+            byte_size,
+            |executor, resource_id| {
+                executor
+                    .write_weight_tensor(resource_id, tensor.clone())
+                    .map(|()| true)
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// Offers `weight`, the packed form of the declared weight `name`, to
+    /// the Provider (`execute-direct-quantized-weights`). `Ok(true)`: the
+    /// Provider stored it and it is staged exactly like a dequantized
+    /// weight, admitted at its packed size. `Ok(false)`: the Provider
+    /// declined and nothing was staged; the caller stages the dequantized
+    /// weight instead. The caller has verified the packed bytes against
+    /// the tensor's declared content digest.
+    fn stage_packed_weight(
+        &mut self,
+        runtime: &mut Runtime,
+        instance: &ModelInstanceId,
+        artifact_owner: &str,
+        name: &str,
+        weight: crate::packed_weight::PackedWeight,
+    ) -> Result<bool, InferenceApiError> {
+        let declared = runtime
+            .model_instance(instance)
+            .map_err(InferenceApiError::from)?
+            .definition()
+            .required_weight_shapes
+            .get(name)
+            .cloned();
+        if let Some((expected_shape, _)) = &declared
+            && expected_shape.as_slice() != weight.logical_shape().as_slice()
+        {
+            return Err(InferenceApiError::WeightShapeOrDtypeMismatch {
+                reason: format!(
+                    "packed weight '{name}' has logical shape {:?} but the artifact declares {expected_shape:?}",
+                    weight.logical_shape()
+                ),
+            });
+        }
+        let byte_size = weight.bytes().len() as u64;
+        self.admit_and_write(
+            runtime,
+            instance,
+            artifact_owner,
+            name,
+            byte_size,
+            |executor, resource_id| {
+                executor
+                    .write_packed_weight_tensor(resource_id, weight)
+                    .map(|written| written == crate::packed_weight::PackedWeightWrite::Stored)
+            },
+        )
+    }
+
+    /// Admits `byte_size` bytes for `name` through the Memory Manager, runs
+    /// `write` against the Provider, then registers the resource's
+    /// residency -- in that order, each step's error surfacing immediately.
+    /// `write` answers whether the Provider stored the resource; `false`
+    /// (a declined packed weight) releases the admission and stages
+    /// nothing.
+    fn admit_and_write(
+        &mut self,
+        runtime: &mut Runtime,
+        instance: &ModelInstanceId,
+        artifact_owner: &str,
+        name: &str,
+        byte_size: u64,
+        write: impl FnOnce(
+            &dyn ProviderExecutionApi,
+            TensorResourceId,
+        ) -> Result<bool, crate::scheduler::ProviderExecutionError>,
+    ) -> Result<bool, InferenceApiError> {
+        let resource_id = TensorResourceId::new(format!("model.{instance}.weight.{name}"));
         // Admission SHALL precede Provider materialization: reserve the
         // resource's memory before writing its bytes into Provider-owned
         // storage, not after.
@@ -7578,19 +7695,24 @@ impl WeightMaterializationTransaction {
             .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
                 reason: format!("failed to account weight resource '{name}': {error}"),
             })?;
-        if let Err(error) = self
-            .executor
-            .write_weight_tensor(resource_id.clone(), tensor.clone())
-        {
-            // Admission above already succeeded: release it before
-            // propagating, so a write failure leaves no trace in the
-            // Memory Manager ledger.
-            let _ = runtime.memory_mut().release(allocation.id);
-            return Err(InferenceApiError::ProviderTensorWriteFailed {
-                reason: format!(
-                    "failed to write weight resource '{name}' to Provider storage: {error}"
-                ),
-            });
+        match write(self.executor.as_ref(), resource_id.clone()) {
+            Ok(true) => {}
+            // Declined: nothing was stored, so nothing is admitted either.
+            Ok(false) => {
+                let _ = runtime.memory_mut().release(allocation.id);
+                return Ok(false);
+            }
+            Err(error) => {
+                // Admission above already succeeded: release it before
+                // propagating, so a write failure leaves no trace in the
+                // Memory Manager ledger.
+                let _ = runtime.memory_mut().release(allocation.id);
+                return Err(InferenceApiError::ProviderTensorWriteFailed {
+                    reason: format!(
+                        "failed to write weight resource '{name}' to Provider storage: {error}"
+                    ),
+                });
+            }
         }
         if let Err(error) = runtime.memory_mut().record_tensor_residency(
             TensorResidency::new(
@@ -7623,7 +7745,7 @@ impl WeightMaterializationTransaction {
             resource_id,
             allocation: allocation.id,
         });
-        Ok(())
+        Ok(true)
     }
 
     /// Releases every resource staged so far this attempt -- Provider

@@ -55,6 +55,7 @@ pub mod multi_device_placement;
 pub mod observability;
 pub mod operator;
 pub mod operator_scope;
+pub mod packed_weight;
 pub mod phase_attribution;
 pub mod planning;
 pub mod prefix_cache;
