@@ -114,3 +114,15 @@ tensors to `layers.N.moe.shared_{gate,up,down}_proj` and
 `[H, 1]`. The Hugging Face per-expert layout (60 separate tensors per
 projection) is out of this first profile: at 14.3B parameters its f32
 dequantized form cannot run on the qualification hardware.
+
+## Evidence: Qwen1.5-MoE-A2.7B-Chat Q8_0 on two RTX 3060 (12 GB each)
+
+GPU Runner Smoke Test run 42282603030 (commit `29905a7`): the 15 GB packed
+checkpoint, more than one GPU holds, loaded on `CudaMultiProvider` over
+both GPUs with the Runtime's `Fill` layer placement
+(`enforce-local-multigpu-and-expert-placement` G05), routed experts read
+packed by `moe-experts` on the Device. Load 100.1 s; warm TTFT 33.3 ms;
+TPOT 19.01 ms over 64 greedy tokens (about 53 tokens/s), without step
+capture across the two GPUs. Text: " Paris. The country is famous for its
+fashion, food, and art. It is also known for its beautiful architecture,
+such as the Eiffel Tower and the Louvre Museum…".
