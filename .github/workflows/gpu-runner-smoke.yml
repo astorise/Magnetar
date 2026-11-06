@@ -610,6 +610,24 @@ jobs:
             diff <(echo "$single") <(echo "$split") || true
             exit 1
           fi
+      - name: Q8_0 GGUF across two GPUs with multi-GPU step capture (diagnostic)
+        # Opt-in capture across GPUs while it is qualified; its failure does
+        # not fail the job, and its tokens must still match one GPU's.
+        if: ${{ !cancelled() && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_LAYER_PLACEMENT: balanced
+          MAGNETAR_CUDA_MULTI_CAPTURE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-captured.log"
+          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
+          captured="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-captured.log")"
+          test "$single" = "$captured"
       - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q8_0 GGUF checkpoint
         # 7.7 GB (Apache-2.0), pinned by its sha256, which the test verifies:
         # it fits a 12 GB Device only because its quantized matrices stay
