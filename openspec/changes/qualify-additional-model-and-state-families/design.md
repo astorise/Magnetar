@@ -12,6 +12,47 @@ Deliver the explicitly enumerated F01, F04 outcomes through Model Components and
 
 Qualify a second dense family and added Qwen versions before widening claims. Specialized MLA/GQA/SWA/sparse or KDA/recurrent families use explicit portable state schemas and operators; family semantics stay in Components, not Runtime Core.
 
+### First additional dense checkpoints (F01, first increment)
+
+Pinned real-checkpoint profiles: the real-checkpoint tests read `MAGNETAR_REAL_CHECKPOINT_PROFILE` from a table pinned by Hugging Face revision and `model.safetensors` sha256. The variable defaults to Qwen2.5-0.5B-Instruct, the logit corpus's checkpoint. The GPU workflow pins each checkpoint's JSON files by sha256.
+
+| Profile | Revision | Shape |
+|---|---|---|
+| Qwen/Qwen2.5-1.5B-Instruct | `989aa79` | 28 layers, 1536 hidden, 12 query / 2 KV heads of 128 dimensions, tied LM head |
+| deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B | `ad9f0ae` | the same Qwen2 shape, rope_theta 10000, untied LM head; served by the Qwen Component |
+
+What qualifying them required:
+
+- **128-dimension attention.** The Tensor Core prefill attention and the grouped split decode attention served only 64-dimension heads. Both are now templates on the head dimension:
+  - The prefill attention uses 68 KB of dynamic shared memory for 128 dimensions, so the launcher raises the function's 48 KB limit.
+  - The decode attention uses 32-key chunks for 128 dimensions.
+  - Five 128-dimension cases joined the Reference CPU conformance (CUDA Provider `acb47db`).
+- **Prefill activation memory.** Every graph edge's output stayed Provider-resident until the step ended. At 4096 prompt tokens, Qwen2.5-1.5B ran its 12 GB RTX 3060 out of memory at layer 24 (run 42127910391).
+  - A prefill now releases each node output once its last reader has run. It keeps graph inputs, weights, KV stores and the edges it materializes.
+  - Decode steps keep their resources, because a captured step replays against them.
+- **Shared special tokens.** DeepSeek-R1-Distill declares its end-of-sequence token as its pad token. The tokenizer metadata now accepts one token in several roles. One role declared twice, or one id with two texts, is still a conflict.
+- **Bounded verification memory.** The `model.safetensors` digest is computed in 8 MB reads. The 1.5B checkpoints in f32 (about 6 GB) do not fit the runner next to a Reference CPU run (exit 137, runs 42116467880 and 42116844824). Their check is therefore the same campaign with the Tensor Cores off, which must generate the same tokens.
+
+Evidence (RTX 3060, GPU CI run 42137496729):
+
+| Warm medians | 5 / 512 / 4096 prompt tokens: TTFT | TPOT |
+|---|---|---|
+| Qwen2.5-0.5B-Instruct | 14.6 / 53.6 / 478.3 ms | 4.4 / 4.4 / 5.0 ms |
+| Qwen2.5-1.5B-Instruct | 33.4 / 171.7 / 1480.8 ms | 12.1 / 12.2 / 14.1 ms |
+| Same, Tensor Cores off | 33.4 / 643.2 / 6086.4 ms | 12.2 / 12.2 / 14.2 ms |
+| DeepSeek-R1-Distill-Qwen-1.5B | 33.2 / 172.2 / 1491.1 ms | 12.0 / 12.2 / 14.1 ms |
+| Same, Tensor Cores off | 33.5 / 643.4 / 6083.6 ms | 12.1 / 12.2 / 14.1 ms |
+
+- Both 1.5B checkpoints generate the same 128 greedy tokens with the Tensor Cores on and off, after 5-, 512- and 4096-token prompts.
+- Qwen2.5-0.5B keeps its Reference CPU comparison, its logit corpus match and 13 of 16 replayed decode steps.
+- Releasing prefill intermediates also lowered Qwen2.5-0.5B's warm TTFT at 512 prompt tokens from 62.7 to 53.6 ms, and its TPOT at 4096 from 5.8 to 5.0 ms (run 42106862830 before).
+- A 1.5B decode step reads about 3.1 GB of bfloat16 weights. At 12.1 ms, that is about 70% of the RTX 3060's memory bandwidth.
+
+Limits:
+
+- The 1.5B checkpoints have no Reference CPU or logit-corpus comparison yet; a bfloat16 Reference CPU path would make one affordable.
+- The Hugging Face loader ignores `add_bos_token`, which DeepSeek-R1-Distill sets. Tokens still match across Providers, but its prompts are not yet encoded exactly as upstream.
+
 ### Identity, eligibility and recovery
 
 Inputs retain validated artifact/model/Component identities, dtype/layout, phase, shape and version provenance where relevant. Runtime checks trust, ResourceAffinity, capability support and MemoryManager admission before policy ranks candidates. Plans and state reference immutable generations and opaque leases. Cancellation stops future submissions; in-flight work retains its leases until completion. On Device loss or incompatible state, invalidate affected work and replan or fail explicitly; never silently rebind resources or restore an untrusted generation.

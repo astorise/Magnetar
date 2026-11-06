@@ -198,14 +198,23 @@ impl TokenizerMetadata {
         }
         self.token_id_range.validate()?;
         let mut kinds = BTreeSet::new();
-        let mut ids = BTreeSet::new();
+        let mut texts = std::collections::BTreeMap::new();
         for token in self
             .special_tokens
             .iter()
             .chain(self.additional_special_tokens.iter())
         {
             token.validate(&self.token_id_range)?;
-            if !kinds.insert((token.kind, token.text.clone())) || !ids.insert(token.id) {
+            // One token may serve several roles (a checkpoint whose pad
+            // token is its end-of-sequence token, as DeepSeek-R1-Distill
+            // and Llama declare): a conflict is one role declared twice, or
+            // one id carrying two different texts.
+            if !kinds.insert((token.kind, token.text.clone())) {
+                return Err(TokenizerError::SpecialTokenConflict);
+            }
+            if let Some(text) = texts.insert(token.id, token.text.clone())
+                && text != token.text
+            {
                 return Err(TokenizerError::SpecialTokenConflict);
             }
         }

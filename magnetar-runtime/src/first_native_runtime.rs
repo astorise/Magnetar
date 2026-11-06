@@ -4478,8 +4478,33 @@ fn execute_first_native_graph_nodes(
     // history is kept in place (`append-kv-history-in-place`).
     let mut layer_rows: Vec<Option<u64>> = vec![None; layer_count];
     let mut last_dispatch: Option<KernelDispatchResult> = None;
+    // A prefill (several rows) keeps no intermediate past its last reader:
+    // every edge's own resource stays Provider-resident until the step
+    // ends otherwise, which for a long prompt is the whole graph's
+    // activations at once (Qwen2.5-1.5B at 4096 tokens: about 9 GB, past a
+    // 12 GB Device next to its weights). Decode steps keep theirs: a
+    // captured step replays against the same resources.
+    let release_intermediates = sequence_length.is_some_and(|rows| rows > 1)
+        && matches!(
+            materialized,
+            MaterializedEdges::Only(_) | MaterializedEdges::LastRow(_)
+        );
+    let kept_edges: &[&str] = match materialized {
+        MaterializedEdges::Only(edges) | MaterializedEdges::LastRow(edges) => edges,
+        MaterializedEdges::All => &[],
+    };
+    let mut last_reader: BTreeMap<&TensorEdgeId, usize> = BTreeMap::new();
+    if release_intermediates {
+        for (index, node_id) in order.iter().enumerate() {
+            if let Some(node) = graph.nodes.get(node_id) {
+                for edge_id in &node.inputs {
+                    last_reader.insert(edge_id, index);
+                }
+            }
+        }
+    }
 
-    for node_id in order {
+    for (node_index, node_id) in order.iter().enumerate() {
         let node =
             graph
                 .nodes
@@ -4978,6 +5003,28 @@ fn execute_first_native_graph_nodes(
             .runtime
             .phase_ledger_mut()
             .record(bind_clock, StepPhase::NodeOutputBind);
+        if release_intermediates {
+            for edge_id in &node.inputs {
+                if last_reader.get(edge_id) != Some(&node_index)
+                    || kept_edges.contains(&edge_id.as_str())
+                    || graph
+                        .edges
+                        .get(edge_id)
+                        .is_none_or(|edge| edge.kv_cache.is_some())
+                {
+                    continue;
+                }
+                // Only a node output's own resource: never a graph input,
+                // a weight or a KV store an edge resolves to.
+                let own = graph_edge_resource_id(edge_id.as_str());
+                if bindings.get(edge_id).is_some_and(|(id, _)| *id == own) {
+                    bindings.remove(edge_id);
+                    let _ = dispatch_ctx
+                        .provider
+                        .release_admitted_tensor(dispatch_ctx.runtime.memory_mut(), &own);
+                }
+            }
+        }
         last_dispatch = Some(dispatch_result);
     }
 
