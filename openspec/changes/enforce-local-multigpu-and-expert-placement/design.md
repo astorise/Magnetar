@@ -74,3 +74,17 @@ with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` while neither stream was
 capturing -- cudarc's deferred report of an earlier free of GPU 1's stale
 copy made while GPU 0 was capturing. Stale copies are now kept while any
 capture is open and freed afterwards.
+
+Qualified and on by default (`MAGNETAR_CUDA_MULTI_CAPTURE=0` disables it).
+Run 42311822286 (commit `8f159ad`), 64 greedy tokens:
+
+| Checkpoint | GPUs | Step capture | TPOT |
+|---|---|---|---|
+| Qwen2.5-0.5B-Instruct Q8_0 | 1 | yes | 4.48 ms |
+| Qwen2.5-0.5B-Instruct Q8_0 | 2 (balanced) | yes | 4.67 ms |
+| Qwen2.5-0.5B-Instruct Q8_0 | 2 (balanced) | no (control) | 11.61 ms |
+| Qwen1.5-MoE-A2.7B-Chat Q8_0 | 2 (fill) | yes | 14.01 ms |
+
+All Qwen2.5-0.5B runs generate identical tokens. Staged layer segments
+cost 0.2 ms per token over one GPU once captured; Qwen1.5-MoE went from
+18.5 ms to 14.0 ms, about 180 GB/s of the 2.5 GB of weights a token reads.

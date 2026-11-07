@@ -126,3 +126,6 @@ TPOT 19.01 ms over 64 greedy tokens (about 53 tokens/s), without step
 capture across the two GPUs. Text: " Paris. The country is famous for its
 fashion, food, and art. It is also known for its beautiful architecture,
 such as the Eiffel Tower and the Louvre Museum…".
+
+With multi-GPU step capture (run 42311822286, commit `8f159ad`): TPOT
+14.01 ms (was 18.73 ms uncaptured), same text.
