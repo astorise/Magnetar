@@ -88,3 +88,46 @@ Run 42311822286 (commit `8f159ad`), 64 greedy tokens:
 All Qwen2.5-0.5B runs generate identical tokens. Staged layer segments
 cost 0.2 ms per token over one GPU once captured; Qwen1.5-MoE went from
 18.5 ms to 14.0 ms, about 180 GB/s of the 2.5 GB of weights a token reads.
+
+## Tensor parallelism (chosen 9 November 2026)
+
+Layer segments add capacity, not speed: one GPU works at a time. On the
+2 x RTX 3060 profile a decode token is bound by weight bytes (Qwen1.5-MoE:
+2.5 GB per token, 14.0 ms captured), so the faster layout splits every
+weight between the GPUs and lets both read their half at once, at the
+cost of two reductions per layer (expected about 8 ms per token for
+Qwen1.5-MoE, about 22 ms for Mistral 7B instead of 41 ms).
+
+### Who decides what
+
+- **The Model Component** declares the parallel semantics of its own
+  graph, as node attributes (no WIT change; attributes are free-form):
+  `tensor_parallel = "column"` on a matmul whose output columns may be
+  split (each GPU computes its share of output features), `"row"` on a
+  matmul whose input features are split (each GPU produces a partial
+  sum), `"heads"` on rope/attention/kv nodes that operate per head, and
+  `"local"` on elementwise nodes between them. Nothing generic guesses a
+  layer's structure from weight names.
+- **The Runtime** turns the declared semantics into a
+  `TensorParallelPlan` (which weight is split by columns, by rows or
+  replicated, and over which Devices) from the graph and the Devices'
+  capacities, and hands it to the Provider before any weight is written,
+  as it does a `LayerPlacement`.
+- **The Provider** (`CudaMultiProvider`) stores each weight shard on its
+  GPU and runs every invocation on every GPU over that GPU's shard
+  (SPMD), with shapes and per-head attributes divided accordingly. After
+  a `row` matmul it reduces the partial sums (peer copy and add, in the
+  captured step) so the residual stream stays replicated. A final
+  `column` matmul whose output the Runtime reads (the output head) is
+  gathered on one GPU.
+
+### Phases, each qualified by identical tokens to one GPU
+
+1. MLP: `gate`/`up` column, `down` row, one reduction per layer;
+   attention replicated. Dense Qwen2.5-0.5B, then Mistral 7B.
+2. Attention by heads: `q`/`k`/`v` column (whole heads, K/V heads split
+   with their query groups), rope, attention and the KV history per head
+   shard, `o` row.
+3. Mixture of experts: router replicated, each routed and shared expert's
+   intermediate dimension split (column/row), one reduction per layer.
+4. Output head column-split with a gather; embedding replicated.
