@@ -12,7 +12,7 @@
 - [ ] 2.2 Add the positive conformance case: when a real model is partitioned across distinct local GPUs, verify logits and multi-step tokens match the unsplit reference and movement/capacity costs are recorded.
 - [ ] 2.3 Add the failure/isolation case: when a Device is lost or a required peer link/collective is unavailable, verify dependent plans invalidate and only an explicitly authorized replan may resume with compatible state.
 
-- [ ] 2.4 Confirm in CI whether the GeForce RTX 3060 pair has peer access (log `cuDeviceCanAccessPeer`, make the two-GPU joined-capture test report when it skips); if peer access can be enabled, compare direct-read reductions with the host-staged ones. https://github.com/Zagitta/gpu-unlock does not provide peer access (it unlocks full-rate FP16/BF16/TF32 tensor cores, relevant to prefill); see design.md, "Hardware limit: no peer access between the CI's two RTX 3060".
+- [ ] 2.4 Confirm in CI whether the GeForce RTX 3060 pair has peer access (log `cuDeviceCanAccessPeer`, make the two-GPU joined-capture test report when it skips); if peer access can be enabled, compare direct-read reductions with the host-staged ones. Peer access on GeForce needs a patched NVIDIA open kernel module (BAR1 P2P, e.g. the aikitoria fork) on the runner host, with Resizable BAR covering each GPU's VRAM and IOMMU passthrough; the CI prints the runner's readiness. https://github.com/Zagitta/gpu-unlock does not provide peer access (it unlocks full-rate FP16/BF16/TF32 tensor cores, relevant to prefill); see design.md, "Hardware limit: no peer access between the CI's two RTX 3060".
 
 ## 3. G06 Conditional expert parallelism
 

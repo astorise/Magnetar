@@ -75,6 +75,23 @@ jobs:
           df -h "$RUNNER_TEMP"
           command -v nvcc
           nvcc --version
+      - name: GPU peer-to-peer readiness (diagnostic)
+        # Whether the two GPUs can read each other's memory, and what a
+        # driver-level peer-access patch would need (each GPU's BAR1 large
+        # enough to map its VRAM, IOMMU off or passthrough): see the
+        # multi-GPU design, "Hardware limit: no peer access". Diagnostic
+        # only.
+        continue-on-error: true
+        run: |
+          set -u
+          nvidia-smi --query-gpu=index,name,pci.bus_id,driver_version,memory.total --format=csv || true
+          nvidia-smi -q -d MEMORY | grep -A3 -i "BAR1" || true
+          nvidia-smi topo -m || true
+          nvidia-smi topo -p2p r || true
+          cat /proc/cmdline 2>/dev/null || true
+          ls /sys/kernel/iommu_groups 2>/dev/null | wc -l || true
+          cat /proc/driver/nvidia/version 2>/dev/null || true
+          ls /proc/driver/nvidia/gpus 2>/dev/null || true
           test -d "${CUDA_HOME:-/usr/local/cuda}"
       - name: Install Rust
         run: |

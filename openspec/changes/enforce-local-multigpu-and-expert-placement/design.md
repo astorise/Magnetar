@@ -369,3 +369,38 @@ the missing peer access. Applying it means changing the CI runner's host
 kernel command line, which is the runner administrator's decision; if
 done, the long-context prefill campaigns (Tensor Cores on and off) would
 measure it.
+
+### Peer access through a patched open kernel module (read 10 November 2026)
+
+NVIDIA blocks peer-to-peer over PCIe on GeForce cards in its driver, not
+in hardware. On Linux, patched builds of NVIDIA's open-source kernel
+modules enable it through BAR1: each GPU maps all of its VRAM into its
+PCIe BAR1 and peers write to it directly (DMA), without going through
+host memory.
+
+- tinygrad/open-gpu-kernel-modules (branches `550.54.15-p2p`,
+  `565.57.01-p2p`): "P2P support added for 4090's"; "NOTE: This is not a
+  hack, this is using PCIe according to the spec"; needs "large BAR
+  support and IOMMU off"; "Not sure all the cache flushes are right".
+- aikitoria/open-gpu-kernel-modules (branch `615.78.08-p2p`, driver
+  615.78.08): "The patch supports RTX 30-, 40-, and 50-series GPUs,
+  including models below the 3090, 4090, and 5090"; "each GPU needs
+  Resizable BAR and a BAR1 aperture large enough to map its usable VRAM.
+  The IOMMU must be configured for passthrough" (`iommu=pt`, which
+  "removes DMA isolation"); Above 4G Decoding and Resizable BAR enabled
+  in firmware; ACS on root ports must not force GPU traffic through the
+  root complex. Install: the matching NVIDIA driver, then `./install.sh`,
+  then reboot. Verified with `p2pBandwidthLatencyTest` (P2P latency about
+  0.4 us against 14 us without).
+- Neither names the RTX 3060 (GA106) as tested; Ampere is covered by the
+  aikitoria fork's statement. The modules must match the installed driver
+  version exactly, and the configuration is not supported by NVIDIA.
+
+For the CI runner this means a host change (BIOS, kernel command line,
+driver and kernel modules) the runner's administrator must make; the
+container cannot do it. The "GPU peer-to-peer readiness (diagnostic)"
+step now prints what it needs: each GPU's BAR1 size against its 12 GB of
+VRAM, `nvidia-smi topo -p2p r`, the kernel command line and IOMMU groups,
+and the driver version. If peer access is enabled, the CUDA Provider uses
+it with no change: copies and reductions between GPUs then read the peer's
+memory in Kernels instead of crossing host memory.
