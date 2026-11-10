@@ -639,10 +639,12 @@ jobs:
           MAGNETAR_REQUIRE_CUDA: "1"
           MAGNETAR_CUDA_DEVICES: "0,1"
           MAGNETAR_MULTI_GPU: tensor
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
         shell: bash
         run: |
           set -o pipefail
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor.log"
+          grep -h '\[step capture\]' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor.log" | sort | uniq -c | head -20 || true
           single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
           tensor="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor.log")"
           grep -h 'GPU(s)\|TPOT\|generated text' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/two-gpus-tensor.log || true

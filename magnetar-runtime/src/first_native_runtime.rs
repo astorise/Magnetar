@@ -5278,6 +5278,16 @@ fn execute_first_native_graph_nodes(
 /// the temperature (`sampling::device_greedy_plan`).
 type DeviceGreedyPlan = (Vec<std::ops::Range<u64>>, f32);
 
+/// Reports why a decode step was not captured or not replayed, when
+/// `MAGNETAR_STEP_CAPTURE_TRACE=1`: either silently falls back to running
+/// the step per node, so a Provider's capture support is otherwise only
+/// visible in step times.
+fn trace_step_capture(what: &str, reason: impl std::fmt::Display) {
+    if std::env::var("MAGNETAR_STEP_CAPTURE_TRACE").as_deref() == Ok("1") {
+        eprintln!("[step capture] {what}: {reason}");
+    }
+}
+
 /// Replays a recorded decode step. With `greedy`, the Provider selects the
 /// step's token on the Device when it can: the output then holds no logits
 /// and the selected column comes back instead.
@@ -5308,7 +5318,8 @@ fn replay_decode_step(
     runtime
         .phase_ledger_mut()
         .record(replay_clock, StepPhase::StepReplay);
-    if replayed.is_err() {
+    if let Err(error) = replayed {
+        trace_step_capture("replay invalidated", format!("{error:?}"));
         return Ok(None);
     }
     let materialize_clock = runtime.phase_ledger().clock();
@@ -6236,6 +6247,7 @@ impl E2eRuntimeModelExecutionEngine {
                     kv_store_capacity,
                 )? {
                     Some((recorded, output)) => {
+                        trace_step_capture("captured", format!("decode step {decode_index}"));
                         self.step_replay.record(key, recorded);
                         return Ok((output, None));
                     }
@@ -6288,6 +6300,7 @@ impl E2eRuntimeModelExecutionEngine {
         };
         let executor = resolve_kernel_execution_provider(runtime, &provider_binding)?;
         if !executor.supports_step_capture() {
+            trace_step_capture("capture skipped", "the Provider does not support it");
             return Ok(None);
         }
         // The input is written before the capture starts, as the per-node
@@ -6320,7 +6333,8 @@ impl E2eRuntimeModelExecutionEngine {
         runtime
             .phase_ledger_mut()
             .record(capture_clock, StepPhase::StepCapture);
-        if begun.is_err() {
+        if let Err(error) = begun {
+            trace_step_capture("capture not begun", error);
             return Ok(None);
         }
         let events_before = node_events.len();
@@ -6346,11 +6360,15 @@ impl E2eRuntimeModelExecutionEngine {
         );
         let end_clock = runtime.phase_ledger().clock();
         let captured = match executed {
-            Ok(output) => executor
-                .end_step_capture()
-                .ok()
-                .map(|capture| (capture, output)),
-            Err(_) => {
+            Ok(output) => match executor.end_step_capture() {
+                Ok(capture) => Some((capture, output)),
+                Err(error) => {
+                    trace_step_capture("capture not ended", error);
+                    None
+                }
+            },
+            Err(error) => {
+                trace_step_capture("captured step failed", format!("{error:?}"));
                 executor.abort_step_capture();
                 None
             }
@@ -6364,6 +6382,7 @@ impl E2eRuntimeModelExecutionEngine {
         };
         let logits = graph_edge_resource_id("logits");
         let Some(logits_shape) = executor.resident_shape(&logits) else {
+            trace_step_capture("capture dropped", "the logits are not resident");
             executor.release_step_capture(&capture);
             node_events.truncate(events_before);
             return Ok(None);
