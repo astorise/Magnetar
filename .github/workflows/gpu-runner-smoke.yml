@@ -95,6 +95,12 @@ jobs:
         # Kernel; diagnostic only.
         timeout-minutes: 10
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml decode_matmul_bandwidth -- --ignored --nocapture
+      - name: CUDA mixture-of-experts decode kernel times (diagnostic)
+        # The Device time of each Kernel of a Qwen1.5-MoE-A2.7B decode
+        # step, packed Q8_0, against the weight bytes it reads; diagnostic
+        # only.
+        timeout-minutes: 10
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml moe_decode_kernel_times -- --ignored --nocapture
       - name: CUDA long-context kernel times (diagnostic)
         # The Device time of each prefill matmul shape and of the attention
         # at 512 and 4096 rows; diagnostic only.
