@@ -293,3 +293,35 @@ passes. The one-graph tensor-parallel capture still fails at its first
 reduction (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`) and falls back to
 per-node steps (Qwen2.5-0.5B 18.6 ms, Mistral 7B 24.4 ms, Qwen1.5-MoE
 27.1 ms); a two-GPU Kernel-level test of the join now isolates it.
+
+## Hardware limit: no peer access between the CI's two RTX 3060
+
+The CI runner's two GeForce RTX 3060 (12 GB) most likely do not offer
+direct peer-to-peer access to each other's memory: NVIDIA generally
+disables peer access on GeForce cards. The evidence so far is indirect:
+
+- a device-to-device copy between the two GPUs' contexts through unified
+  addressing failed with `CUDA_ERROR_INVALID_VALUE`;
+- the copy between GPUs then fell back to the driver's peer copy
+  (`cuMemcpyPeerAsync`, staged by the driver), which works but cannot be
+  recorded by a step capture, so the one-graph tensor-parallel capture
+  failed at its first reduction;
+- the two-GPU joined-capture conformance test returns early without peer
+  access, and its output is not shown in CI, so it likely passed without
+  testing anything.
+
+Consequences, and what the code does about them:
+
+- Copies and reductions between GPUs read the peer's memory in Kernels
+  only when `cuDeviceCanAccessPeer` reports access and enabling it
+  succeeds, per GPU (`CudaKernels::set_peer_access`).
+- Without peer access, a tensor-parallel reduction crosses through a
+  page-locked, portable host buffer kept per reduced tensor (two PCIe
+  hops of a few KB): ordinary asynchronous copies a step capture records.
+- Layer-segment crossings keep the driver's peer copy, outside captures.
+
+To do later: retry with peer access unlocked on these GeForce cards using
+https://github.com/Zagitta/gpu-unlock, then confirm it explicitly (log
+`cuDeviceCanAccessPeer` in CI, and make the two-GPU joined-capture test
+report when it skips), and compare the direct-read reductions against the
+host-staged ones.

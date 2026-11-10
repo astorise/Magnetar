@@ -12,6 +12,8 @@
 - [ ] 2.2 Add the positive conformance case: when a real model is partitioned across distinct local GPUs, verify logits and multi-step tokens match the unsplit reference and movement/capacity costs are recorded.
 - [ ] 2.3 Add the failure/isolation case: when a Device is lost or a required peer link/collective is unavailable, verify dependent plans invalidate and only an explicitly authorized replan may resume with compatible state.
 
+- [ ] 2.4 Retry multi-GPU tensor parallelism with peer access unlocked on the CI's GeForce RTX 3060 pair (https://github.com/Zagitta/gpu-unlock): confirm `cuDeviceCanAccessPeer` in CI, make the two-GPU joined-capture test report when it skips, and compare direct-read reductions with the host-staged ones (see design.md, "Hardware limit: no peer access between the CI's two RTX 3060").
+
 ## 3. G06 Conditional expert parallelism
 
 - [ ] 3.1 Implement G06: Multi-GPU MoE SHALL qualify expert placement, duplication and load balancing under explicit interconnect capacity, routing ownership and per-Device budgets.
