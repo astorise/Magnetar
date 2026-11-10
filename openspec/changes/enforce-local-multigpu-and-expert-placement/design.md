@@ -196,3 +196,23 @@ bandwidth-bound step would take about 60 % of one GPU's time (25 ms); the
 remaining gap is the replicated part and one reduction per layer. Qwen2.5-
 0.5B is launch-bound, not bandwidth-bound, so splitting it cannot pay:
 the captured step stays about 1 ms slower than one GPU's.
+
+### Evidence: phase 3 (mixture of experts) on two RTX 3060
+
+GPU Runner Smoke Test run 42789852734 (commit `9ea6b35`), Qwen1.5-MoE-A2.7B-
+Chat `Q8_0` (15 GB, more than one GPU holds), 64 greedy tokens:
+
+| Run | TPOT | TTFT | Load |
+|---|---|---|---|
+| Two GPUs, layer segments, captured | 14.02 ms | 33.0 ms | 98.6 s |
+| Two GPUs, tensor parallel (experts whole per GPU, shared expert split), captured | 14.66 ms | 35.6 ms | 107.6 s |
+
+The tensor-parallel run answers "Paris" with the same token ids as the
+layer-segment run, and the CUDA expert-share conformance test passes on
+the GPU. It is not faster. A decode step reads about 2.4 GB of `Q8_0`
+weights (4 routed experts, the shared expert, attention and the output
+head), about 7 ms at the RTX 3060's bandwidth, yet takes 14 ms on two GPUs
+in sequence: this model's decode step is not bandwidth-bound, so halving
+each GPU's expert reads does not shorten it. Where its time goes (the
+expert kernels, routing, or the per-layer fixed cost) is the next thing
+to measure; tensor parallelism stays opt-in (`MAGNETAR_MULTI_GPU=tensor`).
