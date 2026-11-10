@@ -320,8 +320,38 @@ Consequences, and what the code does about them:
   hops of a few KB): ordinary asynchronous copies a step capture records.
 - Layer-segment crossings keep the driver's peer copy, outside captures.
 
-To do later: retry with peer access unlocked on these GeForce cards using
-https://github.com/Zagitta/gpu-unlock, then confirm it explicitly (log
+To do later: confirm the missing peer access explicitly (log
 `cuDeviceCanAccessPeer` in CI, and make the two-GPU joined-capture test
-report when it skips), and compare the direct-read reductions against the
-host-staged ones.
+report when it skips); if a way to enable peer access on these GeForce
+cards is found, compare direct-read reductions against the host-staged
+ones.
+
+### https://github.com/Zagitta/gpu-unlock (read 10 November 2026)
+
+It does not unlock peer access: its README never mentions peer-to-peer
+or GPU-to-GPU access. It unlocks GeForce tensor-core throughput, which
+NVIDIA caps "to half speed for FP16, BF16 and TF32 math with FP32
+accumulation" ("Up to 2x FP16 / BF16 / TF32 tensor throughput"):
+
+- Mechanism: a Linux kernel module loaded from the initramfs, before the
+  unmodified NVIDIA driver binds the card ("neither a UEFI application
+  nor a patched NVIDIA driver"); it writes the tensor-core speed
+  selectors and resets the function.
+- Ampere RTX 30 is listed as "Stable, 100+ user reports", the RTX 3060
+  12 GB included (27 to 51 TFLOPS BF16, user-reported); Ada and Turing
+  are experimental, Blackwell unsupported. Linux only; no driver version
+  requirement; no BAR or IOMMU requirement.
+- Install: `make install` (root), then `gpu_unlock.targets=all` (or a
+  `lspci -D` address) on the kernel command line, and a reboot; verify
+  with `journalctl -k -b | grep gpu_unlock`. Suspend resets it (the module
+  re-applies it on resume); hibernation is not covered. GPL-2.0-only,
+  with NVIDIA firmware under NVIDIA's terms.
+- The README claims bit-identical outputs, gains for prefill, fine-tuning
+  and image generation, and "No change" for LLM decode and INT8/FP8/INT4.
+
+For Magnetar it bears on the Tensor Core prefill path (bf16/f16 inputs,
+f32 accumulation), not on decode, which is bandwidth-bound, and not on
+the missing peer access. Applying it means changing the CI runner's host
+kernel command line, which is the runner administrator's decision; if
+done, the long-context prefill campaigns (Tensor Cores on and off) would
+measure it.
