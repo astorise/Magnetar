@@ -263,3 +263,22 @@ segments against tensor parallel):
 `moe-experts` is now the largest Kernel of a mixture-of-experts layer: its
 routing runs on one thread per token, and its down projection reads its
 experts one after the other.
+
+### Evidence: warp routing and concurrent expert reads
+
+GPU Runner Smoke Test run 42822781072 (commit `be9fc30`): `moe-experts`
+with 60 experts held takes 144.5 us (254 GB/s), unchanged; with 30 held,
+77.7 us. Its time follows the routed experts it reads (about 36 us per
+expert's three matrices, 255 GB/s): the routing and the order of the down
+projection's reads were not its cost, and it runs near the 250-290 GB/s
+the other `Q8_0` Kernels now reach. Qwen1.5-MoE TPOT: 11.33 ms (layer
+segments), 12.28 ms (tensor parallel); Mistral 7B: 28.07 ms (one GPU),
+20.62 ms (tensor parallel). All token checks pass.
+
+Summed per layer, a Qwen1.5-MoE decode step is now mostly weight reads at
+that bandwidth (about 10 ms of 11.3). Tensor parallelism halves each
+GPU's expert and shared-expert reads but adds two reductions per layer
+(48 per step), each issued from the host between per-GPU graphs: on
+Qwen2.5-0.5B, 24 reductions cost 1.3 ms over one GPU. That overhead, not
+the Kernels, is what keeps the tensor-parallel MoE step behind layer
+segments.
