@@ -282,3 +282,14 @@ GPU's expert and shared-expert reads but adds two reductions per layer
 Qwen2.5-0.5B, 24 reductions cost 1.3 ms over one GPU. That overhead, not
 the Kernels, is what keeps the tensor-parallel MoE step behind layer
 segments.
+
+### Evidence: copies between GPUs as Kernels
+
+GPU Runner Smoke Test run 42861791878 (commit `b0805c2`): with copies and
+reductions between GPUs done by Kernels reading the peer's memory (peer
+access enabled), layer segments are back to their captured times
+(Qwen2.5-0.5B 3.40 ms, Qwen1.5-MoE 11.31 ms) and every token check
+passes. The one-graph tensor-parallel capture still fails at its first
+reduction (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`) and falls back to
+per-node steps (Qwen2.5-0.5B 18.6 ms, Mistral 7B 24.4 ms, Qwen1.5-MoE
+27.1 ms); a two-GPU Kernel-level test of the join now isolates it.
