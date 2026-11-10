@@ -349,6 +349,20 @@ accumulation" ("Up to 2x FP16 / BF16 / TF32 tensor throughput"):
 - The README claims bit-identical outputs, gains for prefill, fine-tuning
   and image generation, and "No change" for LLM decode and INT8/FP8/INT4.
 
+- It does not change how the GPU identifies itself: its card table
+  (`kernel/gpu_unlock/recipes.c`) only matches the PCI device ID the card
+  already reports (GA106 among others); it rewrites no device, subsystem
+  or vendor ID and no strap, does not present a GeForce as a professional
+  card, and touches nothing related to peer access. On Ampere it opens two
+  privilege masks (`WPR_CFG_PLM`, `FEAT_PLM`) and writes the speed
+  selectors `FEAT_OVR_SM_SPD` (0x0082381c) and `FEAT_OVR_SM_SPD_1`
+  (0x00823820).
+- Its "How Ampere was unlocked" document says it reaches those registers
+  through a buffer overflow in NVIDIA's signed SEC2 Booter (ROP, the
+  cmpunlocker "V67" payload), a path it labels "RESEARCH-ONLY": it relies
+  on exploiting a firmware vulnerability, which weighs on whether to run
+  it on shared CI hardware.
+
 For Magnetar it bears on the Tensor Core prefill path (bf16/f16 inputs,
 f32 accumulation), not on decode, which is bandwidth-bound, and not on
 the missing peer access. Applying it means changing the CI runner's host
