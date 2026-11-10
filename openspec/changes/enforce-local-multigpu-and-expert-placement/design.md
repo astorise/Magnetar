@@ -131,3 +131,26 @@ Qwen1.5-MoE, about 22 ms for Mistral 7B instead of 41 ms).
 3. Mixture of experts: router replicated, each routed and shared expert's
    intermediate dimension split (column/row), one reduction per layer.
 4. Output head column-split with a gather; embedding replicated.
+
+### Evidence: phase 1 (MLP) on two RTX 3060, uncaptured
+
+GPU Runner Smoke Test run 42762058770 (commit `cabf303`), real
+Qwen2.5-0.5B-Instruct `Q8_0` GGUF, greedy, 64 tokens:
+
+| Run | TPOT | TTFT | Load |
+|---|---|---|---|
+| One GPU, captured | 4.49 ms | 13.5 ms | 3.8 s |
+| Two GPUs, layer segments, captured | 4.65 ms | 15.6 ms | 3.9 s |
+| Two GPUs, layer segments, uncaptured | 11.60 ms | 14.6 ms | 3.9 s |
+| Two GPUs, tensor parallel (MLP), uncaptured | 20.40 ms | 26.4 ms | 4.6 s |
+
+The tensor-parallel run reports the plan applied and generates the same
+token ids as one GPU (" Paris. The capital of the United States is
+Washington, D. C. ..."). Correctness is established; speed is not yet:
+every invocation runs on both GPUs one after the other from the host, and
+each of the 24 reductions per step waits on both streams. This model is
+far too small to gain from splitting (its decode is launch-bound, not
+bandwidth-bound); the gain is expected on bandwidth-bound models (Mistral
+7B, Qwen1.5-MoE) once steps are captured: each GPU's work captured as its
+own graph, the reductions recorded between them, as the layer-segment
+capture already does for its crossings.
