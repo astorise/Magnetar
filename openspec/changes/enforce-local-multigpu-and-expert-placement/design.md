@@ -238,3 +238,28 @@ matmul Kernel runs at half the bandwidth, which also explains Mistral 7B
 (7.7 GB in 41 ms, 188 GB/s). Each lane now loads 16 quants per step
 instead of 4; tensor parallelism can only pay off once the step is
 bandwidth-bound.
+
+### Evidence: 16-byte `Q8_0` loads
+
+GPU Runner Smoke Test run 42804244356 (commit `edfb8dc`), every token
+check passing (packed against dequantized, one GPU against two, layer
+segments against tensor parallel):
+
+| Kernel | Before | After |
+|---|---|---|
+| attention projection `[2048, 2048]` | 32.1 us (139 GB/s) | 21.6 us (207 GB/s) |
+| shared expert up / down | 75.8 / 78.6 us | 46.2 / 51.8 us (265 / 237 GB/s) |
+| output head `[2048, 151936]` | 2019 us (164 GB/s) | 1135 us (291 GB/s) |
+| `moe-experts`, 60 experts | 144.8 us | 146.3 us (unchanged) |
+
+| Run | TPOT before | TPOT after |
+|---|---|---|
+| Qwen2.5-0.5B `Q8_0`, one GPU | 4.49 ms | 3.31 ms |
+| Mistral 7B `Q8_0`, one GPU | 41.54 ms | 28.03 ms |
+| Mistral 7B `Q8_0`, two GPUs, tensor parallel | 28.77 ms | 20.67 ms |
+| Qwen1.5-MoE `Q8_0`, two GPUs, layer segments | 14.02 ms | 11.36 ms |
+| Qwen1.5-MoE `Q8_0`, two GPUs, tensor parallel | 14.66 ms | 12.35 ms |
+
+`moe-experts` is now the largest Kernel of a mixture-of-experts layer: its
+routing runs on one thread per token, and its down projection reads its
+experts one after the other.
