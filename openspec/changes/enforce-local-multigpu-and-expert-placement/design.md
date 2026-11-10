@@ -404,3 +404,25 @@ VRAM, `nvidia-smi topo -p2p r`, the kernel command line and IOMMU groups,
 and the driver version. If peer access is enabled, the CUDA Provider uses
 it with no change: copies and reductions between GPUs then read the peer's
 memory in Kernels instead of crossing host memory.
+
+### Evidence: one graph per tensor-parallel step, reductions through host memory
+
+GPU Runner Smoke Test run 42889157162 (commit `0b6785f`): with reductions
+crossing through page-locked host memory (no peer access), every
+tensor-parallel decode step is captured as one graph spanning both GPUs
+("captured: decode step 2" on all three models), and every token check
+passes.
+
+| Run | One GPU | Layer segments | Tensor parallel, one graph per GPU (earlier) | Tensor parallel, one graph |
+|---|---|---|---|---|
+| Qwen2.5-0.5B `Q8_0` | 3.30 ms | 3.40 ms | 4.61 ms | 4.46 ms |
+| Mistral 7B `Q8_0` | 28.09 ms | - | 20.62 ms | 20.73 ms |
+| Qwen1.5-MoE `Q8_0` | - | 11.32 ms | 12.28 ms | 11.74 ms |
+
+Issuing the step as one graph removed the host's part of the cost but
+not the reductions' own latency: each now crosses PCIe twice through host
+memory, on the critical path of every layer. Mistral 7B stays 26 % faster
+than one GPU; the mixture-of-experts model stays slightly behind layer
+segments. Peer access (a direct write into the other GPU, about 0.4 us
+latency in the patched-driver measurements against about 14 us without)
+is what would shorten each reduction.
