@@ -216,3 +216,25 @@ in sequence: this model's decode step is not bandwidth-bound, so halving
 each GPU's expert reads does not shorten it. Where its time goes (the
 expert kernels, routing, or the per-layer fixed cost) is the next thing
 to measure; tensor parallelism stays opt-in (`MAGNETAR_MULTI_GPU=tensor`).
+
+### Where a mixture-of-experts decode step's time goes
+
+GPU Runner Smoke Test run 42797632531 timed each Kernel of a
+Qwen1.5-MoE-A2.7B decode step (`moe_decode_kernel_times`, packed `Q8_0`,
+one token):
+
+| Kernel | Time | Bandwidth of the bytes read |
+|---|---|---|
+| `moe-experts`, 60 experts held | 144.8 us | 254 GB/s |
+| attention projection `[2048, 2048]` | 32.1 us | 139 GB/s |
+| shared expert up `[2048, 5632]` / down `[5632, 2048]` | 75.8 / 78.6 us | 162 / 156 GB/s |
+| router `[2048, 60]` | 7.2 us | 18 GB/s |
+| output head `[2048, 151936]` | 2019 us | 164 GB/s |
+
+The same GPU's bf16 matmul reaches 285-340 GB/s. Summed per layer (four
+attention projections, the shared expert, the routed experts, the router
+and small Kernels) the step comes to the measured 14 ms: the `Q8_0`
+matmul Kernel runs at half the bandwidth, which also explains Mistral 7B
+(7.7 GB in 41 ms, 188 GB/s). Each lane now loads 16 quants per step
+instead of 4; tensor parallelism can only pay off once the step is
+bandwidth-bound.
