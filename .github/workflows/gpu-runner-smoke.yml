@@ -651,6 +651,25 @@ jobs:
             diff <(echo "$single") <(echo "$tensor") || true
             exit 1
           fi
+      - name: Q8_0 GGUF across two GPUs, tensor parallel without step capture (disable control)
+        # MAGNETAR_CUDA_MULTI_CAPTURE=0: the tensor-parallel step runs
+        # uncaptured, each invocation launched on both GPUs from the host;
+        # the tokens must still match one GPU's.
+        if: ${{ !cancelled() && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_MULTI_GPU: tensor
+          MAGNETAR_CUDA_MULTI_CAPTURE: "0"
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor-uncaptured.log"
+          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
+          uncaptured="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor-uncaptured.log")"
+          grep -h 'GPU(s)' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor-uncaptured.log" || true
+          test "$single" = "$uncaptured"
       - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q8_0 GGUF checkpoint
         # 7.7 GB (Apache-2.0), pinned by its sha256, which the test verifies:
         # it fits a 12 GB Device only because its quantized matrices stay
@@ -681,6 +700,33 @@ jobs:
             echo "::error::Mistral 7B Q8_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
             exit 1
           }
+      - name: Mistral-7B-Instruct-v0.3 Q8_0 GGUF across two GPUs (tensor parallel)
+        # Phase 1 on a bandwidth-bound model: every MLP split across both
+        # GPUs. Must still answer "Paris"; the token ids are compared with
+        # one GPU's and a divergence is reported (summation order differs
+        # across GPUs, so a late greedy tie may flip).
+        if: ${{ !cancelled() && env.MAGNETAR_MISTRAL_7B_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_MULTI_GPU: tensor
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q8_0-gguf"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/two-gpus-tensor.log"
+          grep -h 'GPU(s)' "$dir"/*.log || true
+          grep -Eq 'generated text " ?Paris' "$dir/two-gpus-tensor.log" || {
+            echo "::error::Mistral 7B Q8_0 tensor parallel: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          single="$(grep 'generated token ids' "$dir/packed.log" || true)"
+          tensor="$(grep 'generated token ids' "$dir/two-gpus-tensor.log")"
+          if [ -n "$single" ] && [ "$single" != "$tensor" ]; then
+            echo "::warning::Mistral 7B Q8_0: token ids differ between one GPU and two in tensor parallel"
+            diff <(echo "$single") <(echo "$tensor") || true
+          fi
       - name: Download the pinned real Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF checkpoint
         # execute-and-cache-moe-experts F02: 15 GB packed, more than one
         # 12 GB GPU, pinned by its sha256, which the test verifies. The
