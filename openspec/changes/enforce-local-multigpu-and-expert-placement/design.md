@@ -154,3 +154,20 @@ bandwidth-bound); the gain is expected on bandwidth-bound models (Mistral
 7B, Qwen1.5-MoE) once steps are captured: each GPU's work captured as its
 own graph, the reductions recorded between them, as the layer-segment
 capture already does for its crossings.
+
+### Evidence: phase 1 on Mistral 7B, and the first captured attempt
+
+GPU Runner Smoke Test run 42769663567 (commit `92f7632`):
+
+| Run | TPOT | TTFT |
+|---|---|---|
+| Mistral-7B-Instruct-v0.3 `Q8_0`, one GPU | 41.45 ms | 68.9 ms |
+| Mistral-7B-Instruct-v0.3 `Q8_0`, two GPUs, tensor parallel (MLP) | 30.16 ms | 49.1 ms |
+| Qwen2.5-0.5B `Q8_0`, two GPUs, tensor parallel, capture on | 19.85 ms | 23.1 ms |
+| Qwen2.5-0.5B `Q8_0`, two GPUs, tensor parallel, capture off | 19.11 ms | 22.8 ms |
+
+Mistral 7B is 27 % faster per token on two GPUs with only its MLP split,
+answers "Paris" and generates the same token ids as one GPU (no
+divergence was reported). On Qwen2.5-0.5B the captured run is no faster
+than the uncaptured one: the step falls back to per-node execution, which
+`MAGNETAR_STEP_CAPTURE_TRACE=1` now reports with its reason.
