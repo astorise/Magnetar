@@ -109,6 +109,17 @@ impl TensorParallelPlan {
         Ok(Self { devices, shards })
     }
 
+    /// A plan splitting each named weight (by canonical name) as given.
+    pub fn new(
+        devices: Vec<DeviceId>,
+        shards: impl IntoIterator<Item = (String, WeightShard)>,
+    ) -> Self {
+        Self {
+            devices,
+            shards: shards.into_iter().collect(),
+        }
+    }
+
     pub fn devices(&self) -> &[DeviceId] {
         &self.devices
     }

@@ -453,6 +453,13 @@ fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
         Some(component),
     )
     .expect("the real Q8_0 checkpoint loads on CUDA");
+    let tensor_parallel = model.tensor_parallel();
+    if std::env::var("MAGNETAR_MULTI_GPU").as_deref() == Ok("tensor") && device_count > 1 {
+        assert!(
+            tensor_parallel,
+            "MAGNETAR_MULTI_GPU=tensor over {device_count} GPUs must split the model"
+        );
+    }
     let load_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
     let request = |max_new_tokens| ProductionGenerationRequest {
         prompt: PromptInput::PlainText("The capital of France is".into()),
@@ -479,10 +486,12 @@ fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
     let tpot = (token_times[token_times.len() - 1] - ttft) / (token_times.len() - 1) as f64;
     let packed = std::env::var("MAGNETAR_CUDA_PACKED_WEIGHTS").as_deref() != Ok("0");
     eprintln!(
-        "[{label}] family {}, {device_count} GPU(s), placement {:?}: packed weights {}: load \
+        "[{label}] family {}, {device_count} GPU(s), placement {:?}, tensor parallel {}: \
+         packed weights {}: load \
          {load_ms:.0} ms; warm TTFT {ttft:.1} ms, TPOT {tpot:.2} ms over {} tokens",
         ingested.manifest.architecture.family,
         std::env::var("MAGNETAR_LAYER_PLACEMENT").unwrap_or_else(|_| "fill".into()),
+        if tensor_parallel { "on" } else { "off" },
         if packed { "on" } else { "off" },
         tokens.len()
     );

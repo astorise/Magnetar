@@ -628,6 +628,29 @@ jobs:
           uncaptured="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-uncaptured.log")"
           grep -h 'GPU(s)' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/*.log
           test "$single" = "$uncaptured"
+      - name: Q8_0 GGUF across two GPUs (tensor parallel)
+        # enforce-local-multigpu-and-expert-placement tensor parallelism,
+        # phase 1: every MLP split across both GPUs (gate/up by columns,
+        # down by rows, one reduction per layer), attention replicated. The
+        # tokens must match one GPU's.
+        if: ${{ !cancelled() && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_MULTI_GPU: tensor
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor.log"
+          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
+          tensor="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor.log")"
+          grep -h 'GPU(s)\|TPOT\|generated text' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/two-gpus-tensor.log || true
+          if [ "$single" != "$tensor" ]; then
+            echo "::error::Q8_0 GGUF: tokens differ between one GPU and two in tensor parallel"
+            diff <(echo "$single") <(echo "$tensor") || true
+            exit 1
+          fi
       - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q8_0 GGUF checkpoint
         # 7.7 GB (Apache-2.0), pinned by its sha256, which the test verifies:
         # it fits a 12 GB Device only because its quantized matrices stay

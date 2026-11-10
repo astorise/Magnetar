@@ -1657,6 +1657,11 @@ impl ComponentGraphCache {
         self.entries.lock().unwrap().clear();
     }
 
+    pub(crate) fn tensor_parallel(&self) -> bool {
+        self.tensor_parallel
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Records whether the Provider splits the model by tensor parallelism.
     /// Forgets every cached graph, like [`Self::set_fusion_provider`].
     pub(crate) fn set_tensor_parallel(&self, enabled: bool) {
@@ -9296,6 +9301,12 @@ impl ProductionLoadedModel {
 
     pub fn materialization_count(&self) -> usize {
         self.materialization_count
+    }
+
+    /// Whether this instance runs split across Devices by tensor
+    /// parallelism (`MAGNETAR_MULTI_GPU=tensor` with a plan that splits).
+    pub fn tensor_parallel(&self) -> bool {
+        self.graph_cache.tensor_parallel()
     }
 
     /// Turns graph fusion (`graph_fusion`) on or off for later requests. On
