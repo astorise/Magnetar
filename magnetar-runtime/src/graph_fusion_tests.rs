@@ -235,3 +235,41 @@ fn each_layers_swiglu_projection_becomes_one_gated_matmul() {
         assert_eq!(fuse_gated_matmul(&fused).1, 0);
     }
 }
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn row_parallel_matmuls_keep_their_addends_only_under_tensor_parallelism() {
+    let mut fixture = e2e_fixture().expect("fixture builds");
+    fixture.config.attention_bias = true;
+    let layers = fixture.config.architecture.layer_count as usize;
+    let (graphs, _definition, _instance) =
+        crate::first_native_runtime::build_first_native_graphs_from_real_qwen_component(
+            &fixture, 3,
+        )
+        .expect("the real Qwen Component builds a bias-bearing graph");
+    for graph in [&graphs.prefill, &graphs.decode] {
+        let (biased, bias_count) = fuse_matmul_bias_tensor_parallel(graph, is_weight);
+        assert_eq!(bias_count, 3 * layers, "q/k/v are not row-parallel");
+        let (fused, residual_count) = fuse_matmul_residual_tensor_parallel(&biased);
+        assert_eq!(
+            residual_count, layers,
+            "o_proj only: down_proj is row-parallel"
+        );
+        // Every matmul left feeding a residual-add is row-parallel.
+        for node in fused.nodes.values() {
+            if node.operator.name() == "residual-add" {
+                let producers: Vec<_> = fused
+                    .nodes
+                    .values()
+                    .filter(|producer| {
+                        producer.operator.name() == "matmul"
+                            && producer.outputs.iter().any(|out| node.inputs.contains(out))
+                    })
+                    .collect();
+                assert_eq!(producers.len(), 1);
+                assert!(is_row_parallel(&fused, &producers[0].id));
+            }
+        }
+        assert_eq!(fuse_matmul_residual(&fused).1, layers);
+    }
+}

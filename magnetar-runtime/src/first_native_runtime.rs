@@ -1268,6 +1268,9 @@ pub(crate) struct ComponentGraphCache {
     /// The Provider graphs are fused for (`graph_fusion`), or `None` to
     /// keep every graph exactly as its Component built it.
     fusion: Arc<Mutex<Option<ProviderBinding>>>,
+    /// Whether the Provider splits the model by tensor parallelism, so
+    /// row-parallel matmuls must keep their addends unfused.
+    tensor_parallel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One prompt length's graphs.
@@ -1654,6 +1657,14 @@ impl ComponentGraphCache {
         self.entries.lock().unwrap().clear();
     }
 
+    /// Records whether the Provider splits the model by tensor parallelism.
+    /// Forgets every cached graph, like [`Self::set_fusion_provider`].
+    pub(crate) fn set_tensor_parallel(&self, enabled: bool) {
+        self.tensor_parallel
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.entries.lock().unwrap().clear();
+    }
+
     /// Applies every fusion the fusion Provider currently advertises to
     /// freshly built graphs; graphs are returned unchanged otherwise.
     pub(crate) fn optimize(
@@ -1665,15 +1676,30 @@ impl ComponentGraphCache {
             return graphs;
         };
         let is_weight = |edge: &TensorEdgeId| weight_tensor_name_from_edge(edge.as_str()).is_some();
+        let tensor_parallel = self
+            .tensor_parallel
+            .load(std::sync::atomic::Ordering::Relaxed);
         type Pass<'a> = Box<dyn Fn(&ExecutionGraph) -> (ExecutionGraph, usize) + 'a>;
         let passes: [(&str, Pass<'_>); 4] = [
             (
                 crate::graph_fusion::MATMUL_BIAS_OPERATOR,
-                Box::new(|graph| crate::graph_fusion::fuse_matmul_bias(graph, is_weight)),
+                Box::new(move |graph| {
+                    if tensor_parallel {
+                        crate::graph_fusion::fuse_matmul_bias_tensor_parallel(graph, is_weight)
+                    } else {
+                        crate::graph_fusion::fuse_matmul_bias(graph, is_weight)
+                    }
+                }),
             ),
             (
                 crate::graph_fusion::MATMUL_RESIDUAL_OPERATOR,
-                Box::new(crate::graph_fusion::fuse_matmul_residual),
+                Box::new(move |graph| {
+                    if tensor_parallel {
+                        crate::graph_fusion::fuse_matmul_residual_tensor_parallel(graph)
+                    } else {
+                        crate::graph_fusion::fuse_matmul_residual(graph)
+                    }
+                }),
             ),
             (
                 crate::graph_fusion::SILU_MUL_OPERATOR,
@@ -8016,7 +8042,7 @@ const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:f9238fc4f8d4e593160ad99787b2660681a6b7822a3205fcd16135efba6d201c";
+    "sha256:b5ca87518844e73b1db9dfc6a1590651aa9431c9b32c5fec8a01f0591a3cf83e";
 
 /// A Component artifact an embedder (e.g. `magnetar-cli`, the "deployment /
 /// CLI / Component source adapter" layer in this task's own design) has
@@ -9039,6 +9065,54 @@ pub struct ProductionLoadedModel {
     step_replay: StepReplay,
 }
 
+/// `enforce-local-multigpu-and-expert-placement` tensor parallelism: with
+/// `MAGNETAR_MULTI_GPU=tensor` and a Provider exposing several Devices,
+/// the Runtime builds the Model Component's graphs, derives from the parallel
+/// semantics it declared which weights are split
+/// ([`crate::tensor_parallel::TensorParallelPlan`]) and hands the plan to the
+/// Provider before any weight is written. `false` when no plan applies
+/// (the layer placement then decides).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn apply_production_tensor_parallel(
+    provider: &dyn Provider,
+    fixture: &E2eFixture,
+    component_digest: Option<&ComponentDigest>,
+) -> Result<bool, InferenceApiError> {
+    if std::env::var("MAGNETAR_MULTI_GPU").as_deref() != Ok("tensor") {
+        return Ok(false);
+    }
+    let devices: Vec<_> = provider
+        .devices()
+        .iter()
+        .map(|device| device.metadata().id.clone())
+        .collect();
+    let (Some(digest), Some(config), true) = (
+        component_digest,
+        fixture.manifest.architecture_config.as_ref(),
+        devices.len() > 1,
+    ) else {
+        return Ok(false);
+    };
+    let failed = |reason: String| InferenceApiError::ModelLoadingFailed { reason };
+    let (graphs, _definition, _instance) =
+        build_first_native_graphs_from_named_component(digest, config, &fixture.identity, 2)
+            .map_err(|error| failed(format!("tensor parallelism: {error}")))?;
+    let plan = crate::tensor_parallel::TensorParallelPlan::from_graphs(
+        [&graphs.prefill, &graphs.decode],
+        devices,
+    )
+    .map_err(|error| failed(format!("tensor parallelism: {error}")))?;
+    if !plan.splits() {
+        return Ok(false);
+    }
+    provider
+        .execution_api()
+        .ok_or_else(|| failed("a multi-Device Provider exposes no execution API".into()))?
+        .apply_tensor_parallel(&plan)
+        .map_err(|error| failed(format!("tensor parallelism: {error}")))?;
+    Ok(true)
+}
+
 /// The share of a Device's memory a layer placement may fill with weights:
 /// the rest holds activations, KV history and Kernel workspace.
 const LAYER_PLACEMENT_WEIGHT_SHARE: (u64, u64) = (85, 100);
@@ -9189,7 +9263,12 @@ impl ProductionLoadedModel {
                 reason: error.to_string(),
             }
         })?;
-        apply_production_layer_placement(&*provider, &fixture.manifest)?;
+        let tensor_parallel =
+            apply_production_tensor_parallel(&*provider, &fixture, component_digest.as_ref())?;
+        if !tensor_parallel {
+            apply_production_layer_placement(&*provider, &fixture.manifest)?;
+        }
+        graph_cache.set_tensor_parallel(tensor_parallel);
         let instance = load_production_model_instance_for_provider(
             &mut runtime,
             &fixture.manifest,

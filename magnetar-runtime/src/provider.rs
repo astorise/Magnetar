@@ -1011,6 +1011,27 @@ pub trait ProviderExecutionApi: Send + Sync {
         ))
     }
 
+    /// Takes the Runtime's tensor-parallel plan (which weights are split
+    /// across this Provider's Devices, and how) before any weight is
+    /// written: every later weight is stored as each Device's shard, and
+    /// every invocation runs on every Device over its shard. The default
+    /// accepts a plan that splits nothing and rejects any other.
+    fn apply_tensor_parallel(
+        &self,
+        plan: &crate::tensor_parallel::TensorParallelPlan,
+    ) -> Result<(), ProviderExecutionError> {
+        if !plan.splits() {
+            return Ok(());
+        }
+        Err(ProviderExecutionError::new(
+            ProviderExecutionErrorCode::UnsupportedOperation,
+            ProviderExecutionPhase::Submit,
+            ProviderBinding::new("unknown"),
+            None,
+            "this Provider does not split weights across Devices",
+        ))
+    }
+
     /// Starts recording every Kernel invocation and resource access until
     /// [`Self::end_step_capture`] or [`Self::abort_step_capture`]. Every
     /// integer attribute named in `request.advancing_attributes` that a

@@ -16,6 +16,18 @@ use std::{
 };
 
 pub const OPERATOR_CATALOG_VERSION: CapabilityVersion = CapabilityVersion::new(1, 0, 0);
+
+/// Optional on every Operator (`enforce-local-multigpu-and-expert-placement`
+/// tensor parallelism): how the Model Component declares the node may be
+/// split across Devices. `column`: a matmul whose output features may be
+/// split; `row`: a matmul whose input features are split, each Device
+/// producing a partial sum; `heads`: a node operating per attention head;
+/// `local`: an elementwise node applied to each Device's share. A
+/// Provider that does not split ignores it.
+pub const TENSOR_PARALLEL_ATTRIBUTE: &str = "tensor_parallel";
+
+/// The values [`TENSOR_PARALLEL_ATTRIBUTE`] takes.
+pub const TENSOR_PARALLEL_KINDS: [&str; 4] = ["column", "row", "heads", "local"];
 pub const OPERATOR_NAMESPACE: &str = "magnetar:operator";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -487,7 +499,22 @@ impl OperatorAttributeSchema {
                 None => {}
             }
         }
+        if let Some(value) = attributes.get(TENSOR_PARALLEL_ATTRIBUTE) {
+            match value {
+                OperatorAttributeValue::String(kind)
+                    if TENSOR_PARALLEL_KINDS.contains(&kind.as_str()) => {}
+                _ => {
+                    return Err(OperatorError::OperatorAttributeInvalid {
+                        attribute: TENSOR_PARALLEL_ATTRIBUTE.into(),
+                        reason: format!("must be one of {TENSOR_PARALLEL_KINDS:?}"),
+                    });
+                }
+            }
+        }
         for name in attributes.keys() {
+            if name == TENSOR_PARALLEL_ATTRIBUTE {
+                continue;
+            }
             if !self.rules.contains_key(name) {
                 return Err(OperatorError::OperatorAttributeInvalid {
                     attribute: name.clone(),

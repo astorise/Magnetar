@@ -152,12 +152,41 @@ fn apply(graph: &ExecutionGraph, fusions: &[Fusion], fused_operator: OperatorId)
     fused
 }
 
+/// Whether `node` is a matmul its Component declared row-parallel: when
+/// the model is split across Devices it produces partial sums, so an addend (bias, residual) must be
+/// added once after they are reduced, never fused into each partial.
+fn is_row_parallel(graph: &ExecutionGraph, node: &crate::execution_graph::ExecutionNodeId) -> bool {
+    graph.nodes.get(node).is_some_and(|node| {
+        matches!(
+            node.attributes.get(crate::operator::TENSOR_PARALLEL_ATTRIBUTE),
+            Some(crate::operator::OperatorAttributeValue::String(kind)) if kind == "row"
+        )
+    })
+}
+
 /// Folds every `add(matmul(a, b), bias)` whose `bias` is a rank-1 weight
 /// matching the matmul output's last dimension into one `matmul-bias`
 /// node. Returns the rewritten graph and how many pairs were fused.
 pub fn fuse_matmul_bias(
     graph: &ExecutionGraph,
     is_weight: impl Fn(&TensorEdgeId) -> bool,
+) -> (ExecutionGraph, usize) {
+    fuse_matmul_bias_with(graph, is_weight, false)
+}
+
+/// [`fuse_matmul_bias`] for a model split across Devices by tensor
+/// parallelism: row-parallel matmuls keep their bias add unfused.
+pub fn fuse_matmul_bias_tensor_parallel(
+    graph: &ExecutionGraph,
+    is_weight: impl Fn(&TensorEdgeId) -> bool,
+) -> (ExecutionGraph, usize) {
+    fuse_matmul_bias_with(graph, is_weight, true)
+}
+
+fn fuse_matmul_bias_with(
+    graph: &ExecutionGraph,
+    is_weight: impl Fn(&TensorEdgeId) -> bool,
+    tensor_parallel: bool,
 ) -> (ExecutionGraph, usize) {
     let index = EdgeIndex::new(graph);
     let mut fusions = Vec::new();
@@ -169,6 +198,9 @@ pub fn fuse_matmul_bias(
         let Some(matmul_id) = index.sole_producer(graph, intermediate, "matmul", 2) else {
             continue;
         };
+        if tensor_parallel && is_row_parallel(graph, matmul_id) {
+            continue;
+        }
         if index.produced.contains_key(bias) || !is_weight(bias) {
             continue;
         }
@@ -199,6 +231,19 @@ pub fn fuse_matmul_bias(
 /// whose residual has the matmul output's shape into one `matmul-residual`
 /// node with inputs `[a, b, residual]`.
 pub fn fuse_matmul_residual(graph: &ExecutionGraph) -> (ExecutionGraph, usize) {
+    fuse_matmul_residual_with(graph, false)
+}
+
+/// [`fuse_matmul_residual`] for a model split across Devices by tensor
+/// parallelism: row-parallel matmuls keep their residual add unfused.
+pub fn fuse_matmul_residual_tensor_parallel(graph: &ExecutionGraph) -> (ExecutionGraph, usize) {
+    fuse_matmul_residual_with(graph, true)
+}
+
+fn fuse_matmul_residual_with(
+    graph: &ExecutionGraph,
+    tensor_parallel: bool,
+) -> (ExecutionGraph, usize) {
     let index = EdgeIndex::new(graph);
     let mut fusions = Vec::new();
     for (add_id, add) in &graph.nodes {
@@ -217,6 +262,9 @@ pub fn fuse_matmul_residual(graph: &ExecutionGraph) -> (ExecutionGraph, usize) {
         let Some((matmul_id, intermediate, residual)) = candidate else {
             continue;
         };
+        if tensor_parallel && is_row_parallel(graph, matmul_id) {
+            continue;
+        }
         if intermediate == residual {
             continue;
         }

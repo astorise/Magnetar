@@ -71,6 +71,7 @@ pub mod sampling;
 pub mod scheduler;
 pub mod session;
 pub mod tensor;
+pub mod tensor_parallel;
 pub mod tokenizer;
 
 pub use adapter::*;
