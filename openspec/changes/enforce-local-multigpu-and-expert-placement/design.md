@@ -171,3 +171,28 @@ answers "Paris" and generates the same token ids as one GPU (no
 divergence was reported). On Qwen2.5-0.5B the captured run is no faster
 than the uncaptured one: the step falls back to per-node execution, which
 `MAGNETAR_STEP_CAPTURE_TRACE=1` now reports with its reason.
+
+### Evidence: captured tensor-parallel steps
+
+The second GPU's capture could not open while the first GPU's stream was
+already capturing in thread-local mode (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`,
+reported by `MAGNETAR_STEP_CAPTURE_TRACE=1`). Each GPU now allocates what
+its capture needs before any begins, and a tensor-parallel Provider
+captures in relaxed mode. GPU Runner Smoke Test run 42781954300 (commit
+`d438429`), 64 greedy tokens, decode step 2 captured in both models:
+
+| Run | TPOT | TTFT |
+|---|---|---|
+| Qwen2.5-0.5B `Q8_0`, one GPU | 4.49 ms | 13.9 ms |
+| Qwen2.5-0.5B `Q8_0`, two GPUs, tensor parallel, captured | 5.52 ms | 25.1 ms |
+| Qwen2.5-0.5B `Q8_0`, two GPUs, tensor parallel, uncaptured (control) | 18.73 ms | 22.9 ms |
+| Mistral-7B-Instruct-v0.3 `Q8_0`, one GPU | 41.54 ms | 68.8 ms |
+| Mistral-7B-Instruct-v0.3 `Q8_0`, two GPUs, tensor parallel, captured | 28.77 ms | 49.5 ms |
+
+Both models generate the same token ids as one GPU. Mistral 7B is 31 %
+faster per token. With its MLP (about 80 % of a layer's weight bytes)
+split and attention, embedding and output head replicated, a perfectly
+bandwidth-bound step would take about 60 % of one GPU's time (25 ms); the
+remaining gap is the replicated part and one reduction per layer. Qwen2.5-
+0.5B is launch-bound, not bandwidth-bound, so splitting it cannot pay:
+the captured step stays about 1 ms slower than one GPU's.
