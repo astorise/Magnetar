@@ -713,12 +713,14 @@ jobs:
           MAGNETAR_REQUIRE_CUDA: "1"
           MAGNETAR_CUDA_DEVICES: "0,1"
           MAGNETAR_MULTI_GPU: tensor
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
         shell: bash
         run: |
           set -o pipefail
           dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q8_0-gguf"
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/two-gpus-tensor.log"
           grep -h 'GPU(s)' "$dir"/*.log || true
+          grep -h '\[step capture\]' "$dir/two-gpus-tensor.log" | sort | uniq -c | head -20 || true
           grep -Eq 'generated text " ?Paris' "$dir/two-gpus-tensor.log" || {
             echo "::error::Mistral 7B Q8_0 tensor parallel: the continuation does not start with 'Paris'"
             exit 1
