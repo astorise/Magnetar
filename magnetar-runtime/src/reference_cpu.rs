@@ -872,8 +872,25 @@ pub struct MoeRouting {
 pub fn moe_experts(
     h: &HostTensor,
     logits: &HostTensor,
+    weights: [&HostTensor; 3],
+    routing: MoeRouting,
+) -> Result<HostTensor, ReferenceCpuError> {
+    moe_experts_local(h, logits, weights, routing, 0, routing.experts)
+}
+
+/// [`moe_experts`] over the `count` experts from `first` only: the stacked
+/// weights hold just those experts (gate/up `[H, count*I]`, down `[I,
+/// count*H]`), routing still chooses among all `routing.experts` with the
+/// full logits, and tokens routed elsewhere contribute nothing -- each
+/// Device's share of an expert-split layer, summed across Devices
+/// (`enforce-local-multigpu-and-expert-placement` tensor parallelism).
+pub fn moe_experts_local(
+    h: &HostTensor,
+    logits: &HostTensor,
     [gate, up, down]: [&HostTensor; 3],
     routing: MoeRouting,
+    first: u64,
+    count: u64,
 ) -> Result<HostTensor, ReferenceCpuError> {
     let MoeRouting {
         experts,
@@ -891,25 +908,31 @@ pub fn moe_experts(
             "moe-experts routes top {top_k} of {experts} experts"
         )));
     }
+    if count == 0 || first.checked_add(count).is_none_or(|end| end > experts) {
+        return Err(shape_error(format!(
+            "moe-experts holds experts [{first}, {first} + {count}) of {experts}"
+        )));
+    }
     if logit_rows != tokens || logit_cols != experts {
         return Err(shape_error(format!(
             "moe-experts expects [{tokens}, {experts}] logits, got {:?}",
             logits.shape
         )));
     }
-    if gate_rows != hidden || !gate_cols.is_multiple_of(experts) || up.shape != gate.shape {
+    if gate_rows != hidden || !gate_cols.is_multiple_of(count) || up.shape != gate.shape {
         return Err(shape_error(format!(
-            "moe-experts expects gate and up of [{hidden}, {experts} * I], got {:?} and {:?}",
+            "moe-experts expects gate and up of [{hidden}, {count} * I], got {:?} and {:?}",
             gate.shape, up.shape
         )));
     }
-    let intermediate = gate_cols / experts;
-    if down_rows != intermediate || down_cols != experts * hidden {
+    let intermediate = gate_cols / count;
+    if down_rows != intermediate || down_cols != count * hidden {
         return Err(shape_error(format!(
-            "moe-experts expects down of [{intermediate}, {experts} * {hidden}], got {:?}",
+            "moe-experts expects down of [{intermediate}, {count} * {hidden}], got {:?}",
             down.shape
         )));
     }
+    let (first, count) = (first as usize, count as usize);
     let (hidden, intermediate) = (hidden as usize, intermediate as usize);
     let (gate_cols, down_cols) = (gate_cols as usize, down_cols as usize);
     let mut out = vec![0.0_f32; tokens as usize * hidden];
@@ -918,6 +941,9 @@ pub fn moe_experts(
         let x = &h.data[token * hidden..(token + 1) * hidden];
         let row_logits = &logits.data[token * experts as usize..(token + 1) * experts as usize];
         for (expert, weight) in moe_route(row_logits, top_k as usize, normalize) {
+            let Some(expert) = expert.checked_sub(first).filter(|local| *local < count) else {
+                continue;
+            };
             for (j, value) in activated.iter_mut().enumerate() {
                 let column = expert * intermediate + j;
                 let (mut g, mut u) = (0.0_f32, 0.0_f32);
@@ -943,6 +969,29 @@ pub fn moe_experts(
         data: out,
     })
 }
+
+/// The experts a `moe-experts` invocation holds: `expert_first` and
+/// `expert_count` when set (a Device's share of an expert-split layer),
+/// else all `experts`.
+pub fn moe_local_experts(
+    attributes: &std::collections::BTreeMap<String, crate::operator::OperatorAttributeValue>,
+    experts: u64,
+) -> (u64, u64) {
+    let integer = |name: &str| match attributes.get(name) {
+        Some(crate::operator::OperatorAttributeValue::Integer(value)) if *value >= 0 => {
+            Some(*value as u64)
+        }
+        _ => None,
+    };
+    let first = integer(MOE_EXPERT_FIRST_ATTRIBUTE).unwrap_or(0);
+    let count = integer(MOE_EXPERT_COUNT_ATTRIBUTE).unwrap_or(experts.saturating_sub(first));
+    (first, count)
+}
+
+/// `moe-experts`' first held expert (see [`moe_local_experts`]).
+pub const MOE_EXPERT_FIRST_ATTRIBUTE: &str = "expert_first";
+/// `moe-experts`' held expert count (see [`moe_local_experts`]).
+pub const MOE_EXPERT_COUNT_ATTRIBUTE: &str = "expert_count";
 
 /// GELU activation using the tanh approximation.
 pub fn gelu(input: &HostTensor) -> HostTensor {
@@ -2392,17 +2441,14 @@ impl ReferenceCpuExecutor {
                 };
                 let normalize =
                     Self::attribute_bool(&invocation.attributes, "normalize_top_k", false);
-                moe_experts(
-                    &h,
-                    &logits,
-                    [&gate, &up, &down],
-                    MoeRouting {
-                        experts: integer("experts")?,
-                        top_k: integer("top_k")?,
-                        normalize,
-                    },
-                )
-                .map_err(KernelError::from)?
+                let routing = MoeRouting {
+                    experts: integer("experts")?,
+                    top_k: integer("top_k")?,
+                    normalize,
+                };
+                let (first, count) = moe_local_experts(&invocation.attributes, routing.experts);
+                moe_experts_local(&h, &logits, [&gate, &up, &down], routing, first, count)
+                    .map_err(KernelError::from)?
             }
             "row-scale" => {
                 let x = self.input_tensor(invocation, 0)?;

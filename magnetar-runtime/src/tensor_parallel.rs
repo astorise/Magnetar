@@ -25,6 +25,10 @@ pub enum WeightShard {
     Columns,
     /// Each Device holds a contiguous range of input rows.
     Rows,
+    /// A stacked expert weight (`moe-experts`' `gate`/`up` `[H, E*I]` or
+    /// `down` `[I, E*H]`): each Device holds a contiguous range of whole
+    /// experts, its columns.
+    Experts { experts: u64 },
 }
 
 /// Why a plan cannot be built.
@@ -80,9 +84,21 @@ impl TensorParallelPlan {
                     Some(OperatorAttributeValue::String(kind)) if kind == "row" => {
                         WeightShard::Rows
                     }
+                    Some(OperatorAttributeValue::String(kind)) if kind == "experts" => {
+                        match node.attributes.get("experts") {
+                            Some(OperatorAttributeValue::Integer(experts)) if *experts > 0 => {
+                                WeightShard::Experts {
+                                    experts: *experts as u64,
+                                }
+                            }
+                            _ => continue,
+                        }
+                    }
                     _ => continue,
                 };
                 let weight_inputs: &[usize] = match (node.operator.name(), shard) {
+                    ("moe-experts", WeightShard::Experts { .. }) => &[2, 3, 4],
+                    (_, WeightShard::Experts { .. }) => continue,
                     ("matmul" | "matmul-residual", _) => &[1],
                     ("matmul-bias", WeightShard::Columns) => &[1, 2],
                     ("matmul-bias", WeightShard::Rows) => &[1],

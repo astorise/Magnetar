@@ -762,6 +762,36 @@ jobs:
             echo "::error::Qwen1.5-MoE Q8_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
             exit 1
           }
+      - name: Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF across two GPUs (tensor parallel)
+        # Phase 3: the routed experts split whole across both GPUs (each
+        # routes over all 60, computes its 30, one reduction), the shared
+        # expert split like a dense MLP, attention replicated. Compared with
+        # the layer-segment run above; a divergence is reported (summation
+        # order differs across GPUs, so a late greedy tie may flip).
+        if: ${{ !cancelled() && env.MAGNETAR_QWEN_MOE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_MULTI_GPU: tensor
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_qwen_moe_a2_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/two-gpus-tensor.log"
+          grep -h 'GPU(s)' "$dir"/*.log || true
+          grep -h '\[step capture\]' "$dir/two-gpus-tensor.log" | sort | uniq -c | head -20 || true
+          grep -Eq 'generated text " ?Paris' "$dir/two-gpus-tensor.log" || {
+            echo "::error::Qwen1.5-MoE Q8_0 tensor parallel: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          layers="$(grep 'generated token ids' "$dir/two-gpus.log" || true)"
+          tensor="$(grep 'generated token ids' "$dir/two-gpus-tensor.log")"
+          if [ -n "$layers" ] && [ "$layers" != "$tensor" ]; then
+            echo "::warning::Qwen1.5-MoE Q8_0: token ids differ between layer segments and tensor parallel"
+            diff <(echo "$layers") <(echo "$tensor") || true
+          fi
       - name: Upload qualification reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

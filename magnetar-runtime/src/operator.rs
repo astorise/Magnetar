@@ -22,12 +22,14 @@ pub const OPERATOR_CATALOG_VERSION: CapabilityVersion = CapabilityVersion::new(1
 /// split across Devices. `column`: a matmul whose output features may be
 /// split; `row`: a matmul whose input features are split, each Device
 /// producing a partial sum; `heads`: a node operating per attention head;
-/// `local`: an elementwise node applied to each Device's share. A
-/// Provider that does not split ignores it.
+/// `local`: an elementwise node applied to each Device's share;
+/// `experts`: a `moe-experts` node whose experts may be split, whole, each
+/// Device producing a partial sum over the experts it holds. A Provider
+/// that does not split ignores it.
 pub const TENSOR_PARALLEL_ATTRIBUTE: &str = "tensor_parallel";
 
 /// The values [`TENSOR_PARALLEL_ATTRIBUTE`] takes.
-pub const TENSOR_PARALLEL_KINDS: [&str; 4] = ["column", "row", "heads", "local"];
+pub const TENSOR_PARALLEL_KINDS: [&str; 5] = ["column", "row", "heads", "local", "experts"];
 pub const OPERATOR_NAMESPACE: &str = "magnetar:operator";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1245,6 +1247,14 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "normalize_top_k",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+            )
+            .with_rule(
+                "expert_first",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "expert_count",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             ),
         "activation" => OperatorAttributeSchema::default().with_rule(
             "kind",

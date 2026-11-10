@@ -2390,3 +2390,46 @@ fn row_scale_scales_each_row_and_sigmoid_is_logistic() {
     assert_eq!(s.data[0], 0.5);
     assert!((s.data[1] - 1.0 / (1.0 + (-2.0_f32).exp())).abs() < 1e-7);
 }
+
+/// Splitting a `moe-experts` layer's experts across Devices: each share
+/// routes over every expert but sums only the experts it holds, and the
+/// shares add up to the whole layer.
+#[test]
+fn moe_expert_shares_add_up_to_the_whole_layer() {
+    let (tokens, hidden, intermediate, experts, top_k) = (4_u64, 8_u64, 6_u64, 5_u64, 3_u64);
+    let h = moe_fixture(&[tokens, hidden], 11);
+    let logits = moe_fixture(&[tokens, experts], 12);
+    let gate = moe_fixture(&[hidden, experts * intermediate], 13);
+    let up = moe_fixture(&[hidden, experts * intermediate], 14);
+    let down = moe_fixture(&[intermediate, experts * hidden], 15);
+    let routing = MoeRouting {
+        experts,
+        top_k,
+        normalize: true,
+    };
+    let whole = moe_experts(&h, &logits, [&gate, &up, &down], routing).unwrap();
+    let mut summed = vec![0.0_f32; whole.data.len()];
+    for (first, count) in [(0_u64, 2_u64), (2, 3)] {
+        let share = moe_experts_local(
+            &h,
+            &logits,
+            [
+                &columns(&gate, first * intermediate, count * intermediate),
+                &columns(&up, first * intermediate, count * intermediate),
+                &columns(&down, first * hidden, count * hidden),
+            ],
+            routing,
+            first,
+            count,
+        )
+        .unwrap();
+        for (slot, value) in summed.iter_mut().zip(&share.data) {
+            *slot += value;
+        }
+    }
+    for (a, e) in summed.iter().zip(&whole.data) {
+        assert!((a - e).abs() < 1e-5, "{a} vs {e}");
+    }
+    // A share reaching past the last expert is refused.
+    assert!(moe_experts_local(&h, &logits, [&gate, &up, &down], routing, 1, experts).is_err());
+}

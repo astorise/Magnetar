@@ -11709,4 +11709,42 @@ fn the_qwen_component_builds_a_mixture_of_experts_graph_when_the_config_declares
             && node.attributes.get("kind")
                 == Some(&OperatorAttributeValue::String("sigmoid".into()))
     }));
+
+    // Tensor parallelism: whole experts split, the shared expert split like
+    // a dense MLP, the router and the shared expert's gate replicated.
+    let (graphs, _definition, _instance) =
+        build_first_native_graphs_from_named_component(&digest, &routed, &fixture.identity, 2)
+            .expect("the Qwen Component builds graphs");
+    let plan = crate::tensor_parallel::TensorParallelPlan::from_graphs(
+        [&graphs.prefill, &graphs.decode],
+        vec![DeviceId::new("a"), DeviceId::new("b")],
+    )
+    .expect("the plan is consistent");
+    use crate::tensor_parallel::WeightShard;
+    let shard = |suffix: &str| plan.shard_for_weight(&format!("layers.0.{suffix}"));
+    let experts = Some(WeightShard::Experts { experts: 6 });
+    let named = |suffix: &str| {
+        moe_nodes[0]
+            .inputs
+            .iter()
+            .chain(nodes.iter().flat_map(|node| &node.inputs))
+            .filter_map(|edge| edge.as_str().strip_prefix("weight."))
+            .find(|name| name.starts_with("layers.0.") && name.ends_with(suffix))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no layer 0 weight ending in {suffix}"))
+    };
+    for (suffix, expected) in [
+        ("experts_gate_proj", experts),
+        ("experts_up_proj", experts),
+        ("experts_down_proj", experts),
+        ("shared_gate_proj", Some(WeightShard::Columns)),
+        ("shared_up_proj", Some(WeightShard::Columns)),
+        ("shared_down_proj", Some(WeightShard::Rows)),
+        ("router_proj", None),
+        ("shared_expert_gate", None),
+    ] {
+        let name = named(suffix);
+        let canonical = name.strip_prefix("layers.0.").unwrap();
+        assert_eq!(shard(canonical), expected, "{name}");
+    }
 }
