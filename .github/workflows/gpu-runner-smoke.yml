@@ -713,6 +713,33 @@ jobs:
             echo "::warning::Q8_0 GGUF (Qwen2.5-0.5B): token ids differ between int8 (default) and f32 activations"
             diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
           fi
+      - name: Q8_0 GGUF (Qwen2.5-0.5B) on the optimized CPU Provider
+        # execute-quantized-weights-on-cpu: the packed weights stay in host
+        # memory in their checkpoint encoding and the matmuls read them with
+        # int8 activations (AVX2 when available). Must answer "Paris";
+        # token ids that differ from the CUDA run are a warning (int8
+        # rounding can flip a near-tie).
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CPU_PROFILE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/q8_0-gguf"
+          mkdir -p "$dir"
+          lscpu | grep -E 'Model name|^CPU\(s\)|Flags' | cut -c1-200 || true
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_native_cpu -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/cpu-native.log"
+          grep -h 'TPOT\|cpu-native profile' "$dir/cpu-native.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/cpu-native.log" || {
+            echo "::error::Q8_0 GGUF (Qwen2.5-0.5B) on the optimized CPU Provider: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          cuda="$(grep -m1 'generated token ids' "$dir/packed.log" | sed 's/^.*generated token ids//' || true)"
+          cpu="$(grep -m1 'generated token ids' "$dir/cpu-native.log" | sed 's/^.*generated token ids//')"
+          if [ "$cuda" != "$cpu" ]; then
+            echo "::warning::Q8_0 GGUF (Qwen2.5-0.5B): token ids differ between the optimized CPU Provider and CUDA"
+          fi
       - name: Q8_0 GGUF across two GPUs (layer segments)
         # enforce-local-multigpu-and-expert-placement G05: one Provider over
         # both GPUs, the Runtime placing half the layers on each
@@ -976,6 +1003,33 @@ jobs:
           if [ "$f32" != "$int8" ]; then
             echo "::warning::Mistral-7B-Instruct-v0.3 Q4_K_M GGUF: token ids differ between int8 (default) and f32 activations"
             diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
+          fi
+      - name: Mistral-7B-Instruct-v0.3 Q4_K_M GGUF on the optimized CPU Provider
+        # execute-quantized-weights-on-cpu: the packed weights stay in host
+        # memory in their checkpoint encoding and the matmuls read them with
+        # int8 activations (AVX2 when available). Must answer "Paris";
+        # token ids that differ from the CUDA run are a warning (int8
+        # rounding can flip a near-tie).
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CPU_PROFILE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q4_k_m-gguf"
+          mkdir -p "$dir"
+          lscpu | grep -E 'Model name|^CPU\(s\)|Flags' | cut -c1-200 || true
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_native_cpu -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/cpu-native.log"
+          grep -h 'TPOT\|cpu-native profile' "$dir/cpu-native.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/cpu-native.log" || {
+            echo "::error::Mistral-7B-Instruct-v0.3 Q4_K_M GGUF on the optimized CPU Provider: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          cuda="$(grep -m1 'generated token ids' "$dir/packed.log" | sed 's/^.*generated token ids//' || true)"
+          cpu="$(grep -m1 'generated token ids' "$dir/cpu-native.log" | sed 's/^.*generated token ids//')"
+          if [ "$cuda" != "$cpu" ]; then
+            echo "::warning::Mistral-7B-Instruct-v0.3 Q4_K_M GGUF: token ids differ between the optimized CPU Provider and CUDA"
           fi
       - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q3_K_M GGUF checkpoint
         # 3.5 GB, pinned by its sha256, which the test verifies: mostly Q3_K
