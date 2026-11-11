@@ -229,3 +229,27 @@ on the GPU.
 
 Both answer "Paris. The capital of Germany is Berlin. ...".
 
+
+## Evidence: packed IQ4_XS and IQ4_NL (run 43077027825, commit `a0fa2d0`)
+
+`IQ4_NL` and `IQ4_XS` are dequantized by ports of `dequantize_row_iq4_nl`
+and `dequantize_row_iq4_xs` that match gguf-py bit for bit, and read
+packed on CUDA with int8 activations only. Their first Kernels looked
+the 16-entry non-linear table up in constant memory and ran at 32 GB/s
+(Mistral 7B at 110 ms per token): lanes reading different entries
+serialize the warp. The table now lives in four immediate words and
+`__byte_perm` selects each byte.
+
+| Kernel, one token, int8 activations | constant-memory table | `__byte_perm` |
+|---|---|---|
+| `IQ4_XS` `[4096, 4096]` | 280.0 us (32 GB/s) | 36.8 us (242 GB/s) |
+| `IQ4_XS` `[4096, 14336]` | 1013.0 us (31 GB/s) | 109.1 us (286 GB/s) |
+| `IQ4_XS` `[14336, 4096]` | 979.3 us (32 GB/s) | 109.4 us (285 GB/s) |
+| `IQ4_NL` `[4096, 14336]` | 950.4 us (35 GB/s) | 118.4 us (279 GB/s) |
+
+| Mistral 7B, one GPU | File | TPOT | TTFT | Load |
+|---|---|---|---|---|
+| `IQ4_XS` | 3.9 GB | 17.47 ms | 47.6 ms | 35.3 s |
+| `IQ4_NL` | 4.1 GB | 18.11 ms | 46.6 ms | 29.1 s |
+
+Both generate the same token ids as `Q8_0` ("Paris." ...).
