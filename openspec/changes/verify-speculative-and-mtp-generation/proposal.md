@@ -1,56 +1,54 @@
 ## Why
 
-The 29 October 2026 inference optimization roadmap identifies execution gaps beyond Magnetar v1.0.0. Existing contracts provide the foundation, but do not establish production performance for this scope. This change covers E08, E09, F03 and belongs at the following boundary: Model Component candidate semantics; Runtime verification; Providers. It extends local AI execution or its explicitly separated tooling; cluster orchestration remains outside Magnetar Core.
+Single-stream decode on Magnetar's CUDA profile is bandwidth-bound: every token reads all active weights once (Mistral 7B `Q8_0`: 28 ms per token on an RTX 3060, about 270-305 GB/s on its projections). The decode matmul Kernels already serve up to eight rows of activations per weight read (`Q8_MATMUL_ROWS`), so checking several candidate tokens in one target pass costs about as much as producing one. Speculative decoding turns that into throughput: propose `k` tokens cheaply, verify them in one target pass, keep the longest accepted prefix plus the target's own next token.
+
+Public measurements confirm the size of the effect and its limits. A November 2026 test of multi-token-prediction (MTP) heads with llama.cpp (Qwen3.8 Flash-Next, 125B MoE, NVIDIA RTX Spark and Apple M5 Max) reports +62 % on Python code (31.5 to 50.9 tokens/s) and +72 % (47.9 to 82.6) with more than 80 % of drafts accepted, +33-36 % on French prose with 58-59 % accepted, and no effect on prefill.
+
+The roadmap change this proposal belonged to stayed generic (E08 exact speculative decoding, E09 adaptive MTP verification, F03 draft/MTP model semantics). This revision makes it concrete and staged so each stage ships and is qualified alone:
+
+1. **n-gram (prompt lookup) drafts**: no extra model, best on code and on answers that copy their context.
+2. **A small draft model** of the same tokenizer family (for example Qwen2.5-0.5B drafting for a Qwen2.5 7B target).
+3. **MTP heads** once a Model Component declares them (DeepSeek-V3, Qwen3-Next and similar families; none of today's Components do).
 
 ## What Changes
 
-- `E08` (P2, effort XL): Exact speculative decoding.
-- `E09` (P2, effort L): Adaptive compatible MTP verification.
-- `F03` (P2, effort L): Explicit draft and MTP model semantics.
-
-Separate draft proposal from target acceptance and committed KV. Start with exact draft/verify and optional n-gram candidates; model-specific MTP is a separate optional extension. Adapt verification length only within qualified budgets and preserve target distribution under stochastic sampling.
-
-Status: **Proposed implementation; production status requires the qualification gates below.** All tasks are future work; authoring or validating this proposal does not implement an optimization. Indicative waves, dependencies, priorities, acceptance profiles and unresolved decisions are recorded in the [roadmap coverage index](../../../docs/roadmaps/inference-optimizations-2026-2028.md).
+- **Runtime verification (all stages)**: a verify step runs the target on the last committed token plus `k` candidates in one pass, accepts the longest prefix the target agrees with, appends the target's correction, and commits KV rows only for accepted tokens. Greedy output is token-for-token identical to target-only decoding; stochastic sampling uses rejection sampling that preserves the target distribution.
+- **Graph contract (additive WIT, `model-component-graph@1.6.0`)**: `build-extend-graph(cached-token-count, sequence-length)` builds a graph for `sequence-length` new tokens on top of `cached-token-count` committed ones (position offset, KV append, causal attention over history plus the new tokens). Components already build such graphs internally; only the export is new. Components that do not export it keep working; speculation is then Unsupported for them.
+- **Stage 1**: an n-gram draft source in the Runtime (suffix match over the prompt and generated tokens).
+- **Stage 2**: a draft-model source: a second Model Instance sharing the target's tokenizer, with its own KV, resynchronized to the accepted tokens after each verification.
+- **Stage 3**: MTP: an additive, versioned graph-contract extension through which a Component declares MTP heads and emits their candidate logits; the Runtime treats them as another draft source with the same verification.
+- **Controls**: speculation is off by default, opt-in per Model Instance or request, with a bounded draft length and adaptive length within that bound; a disable control and per-request statistics (proposed, accepted, acceptance rate).
 
 ## Capabilities
 
 ### New Capabilities
 
-- `speculative-generation`: an implementation/qualification profile for this work, extending the existing capabilities listed below rather than replacing their baseline contracts.
+- `speculative-generation`: draft sources, exact verification, KV commit rules, controls and statistics.
 
 ### Modified Capabilities
 
-None by default; profile-specific replacements, where required, are enumerated in the delta specs and compatibility section.
+- `model-component-graph-contract`: additive `build-extend-graph` (stage 1) and, later, an additive MTP head declaration (stage 3).
 
 ## Impact
 
-Owning layer: Model Component candidate semantics; Runtime verification; Providers. Implementation may span Magnetar and the appropriate pinned Component, Provider, Format or Loader repositories; submodule revisions are updated only after their own validation. No runtime code, dependencies, WIT or canonical specifications are changed by this proposal.
-
-Existing contracts to reuse:
-- [`generation`](../../specs/generation/spec.md)
-- [`sampling`](../../specs/sampling/spec.md)
-- [`model-component`](../../specs/model-component/spec.md)
-- [`model-component-graph-contract`](../../specs/model-component-graph-contract/spec.md)
-- [`kv-cache`](../../specs/kv-cache/spec.md)
+- **Owning layers**: Runtime (draft sources, verification, acceptance, KV commit, scheduling); Model Components (exporting extend graphs, later MTP heads); Providers (unchanged contracts: multi-row decode Kernels and attention over history plus new tokens already exist in `providers/cuda` and `providers/cpu`; any gap is a Provider task, not a contract change).
+- **WIT**: one additive function in a new minor version; existing exports and signatures unchanged; old Components link and run without speculation.
+- **Resource Affinity**: draft and target state stay bound to their own Model Instance, Provider and Device; a draft model may run on another Device of the same Provider or another Provider only through normal resolution. KV and drafts are request-scoped and never shared across sessions.
+- **Authority**: none added. Draft sources read only the request's own tokens; a draft model is an ordinary, trust-verified Model Instance.
+- **Memory**: verification adds up to `k` rows of activations and KV per step; a draft model adds its weights and KV and goes through Memory Manager admission like any instance.
 
 ## Dependencies
 
-- `A08`: [`qualify-real-checkpoint-performance`](../qualify-real-checkpoint-performance/proposal.md).
-- `B10`: [`keep-sampling-on-device`](../keep-sampling-on-device/proposal.md).
-- `E01`: [`serve-continuous-batches-with-qos`](../serve-continuous-batches-with-qos/proposal.md).
-- `F02`, only for a MoE-specific draft/MTP profile: [`execute-and-cache-moe-experts`](../execute-and-cache-moe-experts/proposal.md).
-
-Dependencies are exit-gate prerequisites, not a ban on independent design or hardware experiments. `F03` has a model-conditional dependency: ordinary `E08` draft/verify can land before optional MTP, while `E09` requires both; MoE is required only for a MoE-specific MTP profile.
-
-## Compatibility and authority
-
-Keep the existing F32/single-Device first-native profile valid. Components import only authorized portable graph/model/compute/state Capabilities and export model graph or scoped result Capabilities where this scope needs them; tooling-only changes add no Component imports/exports. They never choose Providers or Devices or receive native handles. Provider implementations expose real Devices and only qualified compute/movement profiles; native kernels, allocation, streams, events and compiler objects remain Provider-owned. Runtime derives ResourceAffinity and resolves eligible candidates before ranking.
-
-No WIT change is assumed by this draft. Prefer existing contracts. If new portable operators, state or result schemas are necessary, first design a versioned additive WIT extension, validate old/new linking and reject unsupported profiles explicitly; do not alter existing signatures in place. Stateful work uses versioned leases, committed token boundaries and completion-safe retirement, and revalidates trust, affinity and capacity after failure. No optimization creates implicit movement or grants filesystem, network, process, source-control, secret or service authority. Any external adapter declares explicit allowed sources, destinations and identities outside Runtime Core.
+- `A08` [`qualify-real-checkpoint-performance`](../qualify-real-checkpoint-performance/proposal.md) for the campaigns.
+- `B10` [`keep-sampling-on-device`](../keep-sampling-on-device/proposal.md) for stochastic acceptance on the Device (greedy acceptance does not need it).
+- `E01` [`serve-continuous-batches-with-qos`](../serve-continuous-batches-with-qos/proposal.md) only for speculation inside continuous batches.
+- `F02` [`execute-and-cache-moe-experts`](../execute-and-cache-moe-experts/proposal.md) only for MoE MTP profiles.
 
 ## Non-goals
 
-- No claim of delivered performance or production support from contracts, fixtures or Device discovery alone.
-- No vendor code in Runtime Core, model-family Provider or native types in WIT.
-- No automatic checkpoint downloads, cluster management or mandatory Tachyon dependency.
-- No work outside E08, E09, F03 except the explicitly named qualification and compatibility prerequisites.
+- No speculation during prefill (the measured gain is decode-only).
+- No change to sampling semantics: speculation never changes greedy output and never changes the stochastic output distribution.
+- No Component control over acceptance, commits, Providers or Devices.
+- No tree-structured drafts (multiple branches per step) in this change.
+- No automatic draft-model download or selection outside explicit configuration.
+- No claim of a speedup before the qualification campaigns below.

@@ -1,33 +1,33 @@
-## 1. Scope and compatibility
+## 1. Contract and operators
 
-- [ ] 1.1 Reconcile E08, E09, F03 with the existing contracts linked in proposal.md and record the exact initial supported profile.
-- [ ] 1.2 Confirm upstream exit-gate dependencies, hardware access, checkpoint authorization, numeric/quality thresholds and memory/SLO budgets.
-- [ ] 1.3 Prefer current WIT; if new portable operators/state/results are needed, design a versioned additive extension, migration and unsupported behavior before implementation.
+- [ ] 1.1 Add `build-extend-graph(cached-token-count, sequence-length)` to `model-component-graph@1.6.0` (additive); validate old/new linking; export it from `components/qwen` and `components/llama`; rebuild and repin their fixtures.
+- [ ] 1.2 Check `attention` with `T` queries over `cached + T` keys (causal aligned to the last key) in Reference CPU, `providers/cpu` and `providers/cuda` against the reference; extend any Provider that lacks it.
+- [ ] 1.3 Report speculation Unsupported for instances whose Component lacks the export.
 
-## 2. E08 Exact speculative decoding
+## 2. Verification and n-gram drafts (stage 1)
 
-- [ ] 2.1 Implement E08: Speculative generation SHALL implement draft/verify with target-distribution-preserving acceptance, rejection correction, isolated provisional KV and an ordinary target fallback; n-gram lookup MAY replace a costlier draft.
-- [ ] 2.2 Add the positive conformance case: when draft candidates are verified by the target model, verify greedy results match target-only execution and stochastic tests validate the target distribution.
-- [ ] 2.3 Add the failure/isolation case: when drafts are rejected, unavailable or too costly at current concurrency, verify unaccepted KV is discarded and target-only generation resumes without committing draft tokens.
+- [ ] 2.1 Implement the verify step: extend graph over the last committed token plus `k` drafts, greedy acceptance, the target's correction, KV commit of accepted rows only.
+- [ ] 2.2 Implement the n-gram draft source over the request's prompt and generated tokens.
+- [ ] 2.3 Add `GenerationParameters` speculation settings, the instance default, the disable control and drafted/accepted usage counts.
+- [ ] 2.4 Capture and replay verify steps for a small set of draft lengths; adaptive length within the bound; per-request fallback to target-only steps.
+- [ ] 2.5 Tests: greedy identity with target-only generation (tiny bundle on Reference CPU, real checkpoint on CUDA); all-rejected and all-accepted steps; cancellation during verification leaves committed KV unchanged; no cross-request draft input.
+- [ ] 2.6 Campaign: Qwen2.5 and Mistral 7B (`Q8_0`, `Q4_K_M`) on the RTX 3060, code and prose prompts: acceptance rate, tokens per step, TPOT with and without speculation.
 
-## 3. E09 Adaptive compatible MTP verification
+## 3. Draft model (stage 2)
 
-- [ ] 3.1 Implement E09: Adaptive verification length SHALL use only declared compatible MTP/draft profiles, bounded confidence/concurrency decisions and the exact verification semantics.
-- [ ] 3.2 Add the positive conformance case: when a compatible model supplies MTP candidates under changing load, verify verification length changes within budget and net accepted-token throughput and quality are measured.
-- [ ] 3.3 Add the failure/isolation case: when the head contract is absent or speculative overhead exceeds benefit, verify MTP is disabled and exact target-only generation remains available.
+- [ ] 3.1 Implement the draft-model source: a second trust-verified Model Instance with tokenizer identity checked, its KV advanced or trimmed to the accepted prefix.
+- [ ] 3.2 Implement stochastic acceptance (rejection sampling) once on-device sampling provides per-row distributions; until then stochastic requests stay target-only.
+- [ ] 3.3 Tests: tokenizer mismatch rejected; greedy identity; a statistical test of the output distribution under stochastic sampling.
+- [ ] 3.4 Campaign: Qwen2.5-0.5B drafting for a Qwen2.5 7B target (or the nearest available pair), including memory and the draft's own cost.
 
-## 4. F03 Explicit draft and MTP model semantics
+## 4. MTP heads (stage 3)
 
-- [ ] 4.1 Implement F03: Model Components SHALL declare supported draft/MTP heads, candidate-token semantics, required state and verification compatibility without owning token acceptance or selecting Devices.
-- [ ] 4.2 Add the positive conformance case: when a compatible Component supplies candidates to generic speculation, verify Runtime target verification owns commits and the Component receives only inference-scoped portable resources.
-- [ ] 4.3 Add the failure/isolation case: when a model has no compatible draft/MTP head, verify the extension is Unsupported without preventing ordinary dense or MoE execution.
+- [ ] 4.1 Add the additive MTP head declaration to the graph contract.
+- [ ] 4.2 Read declared heads' candidates as a draft source; Unsupported for Components without heads.
+- [ ] 4.3 Qualify on the first Component for a model family that ships MTP heads (DeepSeek-V3 / Qwen3-Next class), with the same identity tests and campaign.
 
-## 5. Qualification, rollout and documentation
+## 5. Validation and documentation
 
-- [ ] 5.1 Run affected cargo fmt/check/clippy/tests and conformance in both relevant workspaces and affected extension repositories; keep baseline F32 tests passing.
-- [ ] 5.2 Validate any changed WIT and old/new linking, OpenSpec deltas and native/wasm boundaries; test Linux, Windows/macOS and ARM where applicable, with explicit hardware skips.
-- [ ] 5.3 Exercise cancellation, failure, memory pressure, invalid artifact/state reuse and tenant/session isolation; prove lease retirement waits for completion.
-- [ ] 5.4 Execute versioned before/after real-checkpoint campaigns on appropriate real hardware using shared V0 evidence, recording tail latency, total memory, I/O, numeric and downstream quality. Do not mark skipped hardware passed.
-- [ ] 5.5 Check third-party licenses, SBOM, signatures/provenance and artifact reproducibility where native libraries or generated artifacts change.
-- [ ] 5.6 Verify targeted disable, safe fallback/Unsupported, pinned mode and generation rollback; document support limits, public architecture/API migration and measurements.
-- [ ] 5.7 Update the roadmap coverage/support matrix with evidence and actual maturity only after implementation gates pass; archive only completed scope.
+- [ ] 5.1 cargo fmt/clippy/tests in the Runtime, affected Providers and Components; WIT validation; native and `wasm32` builds.
+- [ ] 5.2 Document the controls, the exactness guarantee, the measured gains per prompt class and the limits (no prefill effect, acceptance-dependent).
+- [ ] 5.3 Update the roadmap coverage index (E08 for stages 1-2, F03 and E09 for stage 3) only with qualified evidence.
