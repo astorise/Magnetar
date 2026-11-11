@@ -629,7 +629,7 @@ jobs:
           echo "$on"
           grep 'generated text' "$RUNNER_TEMP/qualification-reports/llama-3.2-1b-instruct-tensor-cores/campaign.log" || true
       - name: Download the pinned real Qwen2.5-0.5B-Instruct Q8_0 GGUF checkpoint
-        if: ${{ (env.SUITE_GGUF == 'true' || env.SUITE_MULTI_GPU == 'true') }}
+        if: ${{ !cancelled() && (env.SUITE_GGUF == 'true' || env.SUITE_MULTI_GPU == 'true') }}
         # execute-direct-quantized-weights (B03): a genuinely Q8_0-quantized
         # export, pinned by its sha256, which the test verifies.
         env:
@@ -689,7 +689,9 @@ jobs:
         # block (the default, multiplied with __dp4a). Outputs may differ
         # from the default run, so token ids are compared as a report (a
         # warning), but the answer must still start with "Paris".
-        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        # Also the f32-activation reference the tensor-parallel steps
+        # compare against exactly.
+        if: ${{ !cancelled() && (env.SUITE_GGUF == 'true' || env.SUITE_MULTI_GPU == 'true') && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
         timeout-minutes: 30
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
@@ -754,8 +756,11 @@ jobs:
       - name: Q8_0 GGUF across two GPUs (tensor parallel)
         # enforce-local-multigpu-and-expert-placement tensor parallelism,
         # phase 1: every MLP split across both GPUs (gate/up by columns,
-        # down by rows, one reduction per layer), attention replicated. The
-        # tokens must match one GPU's.
+        # down by rows, one reduction per layer), attention replicated. With
+        # f32 activations the tokens must match one GPU's: the reduction
+        # sums partials in another order, a difference of an ulp that int8
+        # activations can turn into a whole quantization step, so the
+        # exact comparison runs with them off and the default run follows.
         if: ${{ !cancelled() && env.SUITE_MULTI_GPU == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
         timeout-minutes: 20
         env:
@@ -763,23 +768,49 @@ jobs:
           MAGNETAR_CUDA_DEVICES: "0,1"
           MAGNETAR_MULTI_GPU: tensor
           MAGNETAR_STEP_CAPTURE_TRACE: "1"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "0"
         shell: bash
         run: |
           set -o pipefail
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor.log"
           grep -h '\[step capture\]' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor.log" | sort | uniq -c | head -20 || true
-          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
+          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/f32-activations.log")"
           tensor="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor.log")"
           grep -h 'GPU(s)\|TPOT\|generated text' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/two-gpus-tensor.log || true
           if [ "$single" != "$tensor" ]; then
-            echo "::error::Q8_0 GGUF: tokens differ between one GPU and two in tensor parallel"
+            echo "::error::Q8_0 GGUF: with f32 activations, tokens differ between one GPU and two in tensor parallel"
             diff <(echo "$single") <(echo "$tensor") || true
             exit 1
+          fi
+      - name: Q8_0 GGUF across two GPUs (tensor parallel, int8 activations)
+        # The default int8 activations in tensor parallel: must answer
+        # "Paris"; token ids that differ from one GPU's are a warning.
+        if: ${{ !cancelled() && env.SUITE_MULTI_GPU == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_MULTI_GPU: tensor
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/q8_0-gguf"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/two-gpus-tensor-int8.log"
+          grep -h 'GPU(s)\|TPOT\|generated text' "$dir/two-gpus-tensor-int8.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/two-gpus-tensor-int8.log" || {
+            echo "::error::Q8_0 GGUF tensor parallel with int8 activations: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          single="$(grep 'generated token ids' "$dir/packed.log" || true)"
+          tensor="$(grep 'generated token ids' "$dir/two-gpus-tensor-int8.log")"
+          if [ "$single" != "$tensor" ]; then
+            echo "::warning::Q8_0 GGUF: with int8 activations, token ids differ between one GPU and two in tensor parallel"
+            diff <(echo "$single" | tr ',' '\n') <(echo "$tensor" | tr ',' '\n') | head -20 || true
           fi
       - name: Q8_0 GGUF across two GPUs, tensor parallel without step capture (disable control)
         # MAGNETAR_CUDA_MULTI_CAPTURE=0: the tensor-parallel step runs
         # uncaptured, each invocation launched on both GPUs from the host;
-        # the tokens must still match one GPU's.
+        # with f32 activations the tokens must still match one GPU's.
         if: ${{ !cancelled() && env.SUITE_MULTI_GPU == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
         timeout-minutes: 20
         env:
@@ -787,16 +818,17 @@ jobs:
           MAGNETAR_CUDA_DEVICES: "0,1"
           MAGNETAR_MULTI_GPU: tensor
           MAGNETAR_CUDA_MULTI_CAPTURE: "0"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "0"
         shell: bash
         run: |
           set -o pipefail
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor-uncaptured.log"
-          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
+          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/f32-activations.log")"
           uncaptured="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor-uncaptured.log")"
           grep -h 'GPU(s)' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor-uncaptured.log" || true
           test "$single" = "$uncaptured"
       - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q8_0 GGUF checkpoint
-        if: ${{ (env.SUITE_GGUF == 'true' || env.SUITE_MULTI_GPU == 'true') }}
+        if: ${{ !cancelled() && (env.SUITE_GGUF == 'true' || env.SUITE_MULTI_GPU == 'true') }}
         # 7.7 GB (Apache-2.0), pinned by its sha256, which the test verifies:
         # it fits a 12 GB Device only because its quantized matrices stay
         # packed (execute-direct-quantized-weights). The file declares
