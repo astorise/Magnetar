@@ -87,3 +87,28 @@ rebuilds the SentencePiece tokenizer). GPU Runner Smoke Test run
 capital of France in 2021?\n\nParis…". It fits the Device only packed: the
 f32 dequantized form (28 GB) cannot run there, so there is no declined
 control for this profile.
+
+## Evidence: packed Q4_K (with Q6_K dequantized) on the RTX 3060
+
+GPU Runner Smoke Test run 42986314772 (commit `ee188ac`): the CUDA Q4_K
+conformance test (decode matmul, bias and residual addends, gated matmul,
+exact download) passes on the GPU, and Mistral-7B-Instruct-v0.3 `Q4_K_M`
+loads and answers "Paris".
+
+| Kernel, one token | `Q8_0` | `Q4_K` |
+|---|---|---|
+| `[4096, 4096]` | 66.4 us (269 GB/s) | 57.4 us (164 GB/s) |
+| `[4096, 14336]` | 204.8 us (305 GB/s) | 176.4 us (187 GB/s) |
+| `[14336, 4096]` | 224.0 us (279 GB/s) | 189.8 us (174 GB/s) |
+
+| Mistral 7B, one GPU | TPOT | TTFT | Load |
+|---|---|---|---|
+| `Q8_0` | 28.09 ms | 74.3 ms | 50.7 s |
+| `Q4_K_M` | 34.98 ms | 99.7 ms | 42.6 s |
+
+`Q4_K` reads 47 % fewer bytes but its first decode Kernel is
+compute-bound (integer-to-float conversion of every nibble, software f16
+conversion per lane), and `Q4_K_M`'s `Q6_K` tensors (output head, half
+of `ffn_down`, `attn_v`) are dequantized to bf16 at load, so the export
+is slower per token than `Q8_0`. Next: exact cheap conversions in the
+Q4_K Kernels, then packed `Q6_K`.
