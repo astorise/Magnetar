@@ -7666,6 +7666,11 @@ impl WeightMaterializationTransaction {
                         | ModelDType::Q3K
                         | ModelDType::Iq4Nl
                         | ModelDType::Iq4Xs
+                        | ModelDType::Iq2Xxs
+                        | ModelDType::Iq2Xs
+                        | ModelDType::Iq2S
+                        | ModelDType::Iq3Xxs
+                        | ModelDType::Iq3S
                         | ModelDType::Q4K
                         | ModelDType::Q5K
                         | ModelDType::Q6K

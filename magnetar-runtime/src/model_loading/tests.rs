@@ -335,7 +335,7 @@ fn host_tensors_from_artifact_bytes_rejects_shape_size_mismatch() {
 #[path = "k_quant_golden.rs"]
 mod k_quant_golden;
 
-/// `Q2_K`, `Q3_K`, `Q6_K`, `Q4_K`, `IQ4_NL` and `IQ4_XS` dequantization match llama.cpp's reference
+/// The k-quant and i-quant dequantizations match llama.cpp's reference
 /// implementation bit for bit on random super-blocks.
 #[test]
 fn k_quant_dequantization_matches_the_gguf_reference_bit_for_bit() {
@@ -364,6 +364,31 @@ fn k_quant_dequantization_matches_the_gguf_reference_bit_for_bit() {
     assert_eq!(xs.len(), IQ4_XS_GOLDEN_BITS.len());
     for (index, (value, bits)) in xs.iter().zip(IQ4_XS_GOLDEN_BITS).enumerate() {
         assert_eq!(value.to_bits(), bits, "IQ4_XS value {index}: {value}");
+    }
+    let values = dequantize_iq2_xxs(&IQ2_XXS_GOLDEN_BYTES);
+    assert_eq!(values.len(), IQ2_XXS_GOLDEN_BITS.len());
+    for (index, (value, bits)) in values.iter().zip(IQ2_XXS_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ2_XXS value {index}: {value}");
+    }
+    let values = dequantize_iq2_xs(&IQ2_XS_GOLDEN_BYTES);
+    assert_eq!(values.len(), IQ2_XS_GOLDEN_BITS.len());
+    for (index, (value, bits)) in values.iter().zip(IQ2_XS_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ2_XS value {index}: {value}");
+    }
+    let values = dequantize_iq2_s(&IQ2_S_GOLDEN_BYTES);
+    assert_eq!(values.len(), IQ2_S_GOLDEN_BITS.len());
+    for (index, (value, bits)) in values.iter().zip(IQ2_S_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ2_S value {index}: {value}");
+    }
+    let values = dequantize_iq3_xxs(&IQ3_XXS_GOLDEN_BYTES);
+    assert_eq!(values.len(), IQ3_XXS_GOLDEN_BITS.len());
+    for (index, (value, bits)) in values.iter().zip(IQ3_XXS_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ3_XXS value {index}: {value}");
+    }
+    let values = dequantize_iq3_s(&IQ3_S_GOLDEN_BYTES);
+    assert_eq!(values.len(), IQ3_S_GOLDEN_BITS.len());
+    for (index, (value, bits)) in values.iter().zip(IQ3_S_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ3_S value {index}: {value}");
     }
     let q4 = dequantize_q4_k(&Q4_K_GOLDEN_BYTES);
     assert_eq!(q4.len(), Q4_K_GOLDEN_BITS.len());

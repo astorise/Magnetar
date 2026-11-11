@@ -357,6 +357,16 @@ pub enum ModelDType {
     /// eight 6-bit sub-block scales, 4-bit indices into the `IQ4_NL`
     /// table).
     Iq4Xs,
+    /// GGUF `block_iq2_xxs`: 256 values in 66 bytes: an `f16` scale and, per 32 values, four 8-value grid indices, four 7-bit sign indices and a 4-bit scale.
+    Iq2Xxs,
+    /// GGUF `block_iq2_xs`: 256 values in 74 bytes: an `f16` scale, 9-bit grid indices with 7-bit sign indices, 4-bit scales per 16 values.
+    Iq2Xs,
+    /// GGUF `block_iq2_s`: 256 values in 82 bytes: an `f16` scale, 10-bit grid indices, explicit sign bytes, 4-bit scales per 16 values.
+    Iq2S,
+    /// GGUF `block_iq3_xxs`: 256 values in 98 bytes: an `f16` scale, 4-value grid indices and, per 32 values, four 7-bit sign indices and a 4-bit scale.
+    Iq3Xxs,
+    /// GGUF `block_iq3_s`: 256 values in 110 bytes: an `f16` scale, 9-bit 4-value grid indices, explicit sign bytes, 4-bit scales per 32 values.
+    Iq3S,
     /// GGUF `block_q3_K`: 256 values in 110 bytes (2-bit quants plus a
     /// high-bit mask, sixteen 6-bit sub-block scales, one `f16` scale).
     Q3K,
@@ -388,6 +398,11 @@ impl ModelDType {
             "q3_k" | "q3k" => Some(Self::Q3K),
             "iq4_nl" | "iq4nl" => Some(Self::Iq4Nl),
             "iq4_xs" | "iq4xs" => Some(Self::Iq4Xs),
+            "iq2_xxs" | "iq2xxs" => Some(Self::Iq2Xxs),
+            "iq2_xs" | "iq2xs" => Some(Self::Iq2Xs),
+            "iq2_s" | "iq2s" => Some(Self::Iq2S),
+            "iq3_xxs" | "iq3xxs" => Some(Self::Iq3Xxs),
+            "iq3_s" | "iq3s" => Some(Self::Iq3S),
             "q4_k" | "q4k" => Some(Self::Q4K),
             "q5_k" | "q5k" => Some(Self::Q5K),
             "q6_k" | "q6k" => Some(Self::Q6K),
@@ -411,12 +426,18 @@ impl ModelDType {
             Self::Bf16 => DTypeDescriptor::portable(ComputeDType::BrainFloat16),
             Self::F32 => DTypeDescriptor::portable(ComputeDType::Float32),
             Self::F64 => DTypeDescriptor::portable(ComputeDType::Float64),
-            Self::Q2K | Self::Q3K | Self::Iq4Nl | Self::Iq4Xs => {
-                DTypeDescriptor::ProviderSpecific {
-                    id: String::new(),
-                    size_bytes: 1,
-                }
-            }
+            Self::Q2K
+            | Self::Q3K
+            | Self::Iq4Nl
+            | Self::Iq4Xs
+            | Self::Iq2Xxs
+            | Self::Iq2Xs
+            | Self::Iq2S
+            | Self::Iq3Xxs
+            | Self::Iq3S => DTypeDescriptor::ProviderSpecific {
+                id: String::new(),
+                size_bytes: 1,
+            },
             Self::Q4K => DTypeDescriptor::ProviderSpecific {
                 id: String::new(),
                 size_bytes: 1,
@@ -443,6 +464,11 @@ pub enum ModelQuantizationFormat {
     GgufQ3K,
     GgufIq4Nl,
     GgufIq4Xs,
+    GgufIq2Xxs,
+    GgufIq2Xs,
+    GgufIq2S,
+    GgufIq3Xxs,
+    GgufIq3S,
     GgufQ4K,
     GgufQ5K,
     GgufQ6K,
@@ -465,6 +491,11 @@ impl ModelQuantizationFormat {
             "gguf-q3-k" | "q3_k" => Some(Self::GgufQ3K),
             "gguf-iq4-nl" | "iq4_nl" => Some(Self::GgufIq4Nl),
             "gguf-iq4-xs" | "iq4_xs" => Some(Self::GgufIq4Xs),
+            "gguf-iq2-xxs" | "iq2_xxs" => Some(Self::GgufIq2Xxs),
+            "gguf-iq2-xs" | "iq2_xs" => Some(Self::GgufIq2Xs),
+            "gguf-iq2-s" | "iq2_s" => Some(Self::GgufIq2S),
+            "gguf-iq3-xxs" | "iq3_xxs" => Some(Self::GgufIq3Xxs),
+            "gguf-iq3-s" | "iq3_s" => Some(Self::GgufIq3S),
             "gguf-q4-k" | "q4_k" => Some(Self::GgufQ4K),
             "gguf-q5-k" | "q5_k" => Some(Self::GgufQ5K),
             "gguf-q6-k" | "q6_k" => Some(Self::GgufQ6K),

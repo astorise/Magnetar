@@ -1037,6 +1037,16 @@ const IQ4_NL_BLOCK_BYTES: u64 = 18;
 /// `block_iq4_xs`: `2 (d) + 2 (scales_h) + 4 (scales_l) + 128 (qs) = 136`
 /// bytes for 256 values.
 const IQ4_XS_BLOCK_BYTES: u64 = 136;
+/// `block_iq2_xxs`: 66 bytes for 256 values.
+const IQ2_XXS_BLOCK_BYTES: u64 = 66;
+/// `block_iq2_xs`: 74 bytes for 256 values.
+const IQ2_XS_BLOCK_BYTES: u64 = 74;
+/// `block_iq2_s`: 82 bytes for 256 values.
+const IQ2_S_BLOCK_BYTES: u64 = 82;
+/// `block_iq3_xxs`: 98 bytes for 256 values.
+const IQ3_XXS_BLOCK_BYTES: u64 = 98;
+/// `block_iq3_s`: 110 bytes for 256 values.
+const IQ3_S_BLOCK_BYTES: u64 = 110;
 /// `kvalues_iq4nl`: the non-linear values the `IQ4_NL`/`IQ4_XS` 4-bit
 /// indices select.
 pub const IQ4_NL_VALUES: [i8; 16] = [
@@ -1092,12 +1102,17 @@ fn expected_storage_bytes(
         ModelDType::Q3K => block_based(QK_BLOCK_ELEMENTS, Q3_K_BLOCK_BYTES, "Q3_K"),
         ModelDType::Iq4Nl => block_based(Q8_0_BLOCK_ELEMENTS, IQ4_NL_BLOCK_BYTES, "IQ4_NL"),
         ModelDType::Iq4Xs => block_based(QK_BLOCK_ELEMENTS, IQ4_XS_BLOCK_BYTES, "IQ4_XS"),
+        ModelDType::Iq2Xxs => block_based(QK_BLOCK_ELEMENTS, IQ2_XXS_BLOCK_BYTES, "IQ2_XXS"),
+        ModelDType::Iq2Xs => block_based(QK_BLOCK_ELEMENTS, IQ2_XS_BLOCK_BYTES, "IQ2_XS"),
+        ModelDType::Iq2S => block_based(QK_BLOCK_ELEMENTS, IQ2_S_BLOCK_BYTES, "IQ2_S"),
+        ModelDType::Iq3Xxs => block_based(QK_BLOCK_ELEMENTS, IQ3_XXS_BLOCK_BYTES, "IQ3_XXS"),
+        ModelDType::Iq3S => block_based(QK_BLOCK_ELEMENTS, IQ3_S_BLOCK_BYTES, "IQ3_S"),
         other => Err(ModelLoadingError::new(
             ModelLoadingErrorCode::StorageDTypeUnsupported,
             Some(ModelLoadingPhase::MaterializeWeights),
             format!(
                 "tensor '{}' declares unsupported storage dtype {other:?} (only F32, F16, BF16, \
-                 Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL and IQ4_XS are supported)",
+                 Q8_0, the k-quants and the IQ2, IQ3 and IQ4 i-quants are supported)",
                 tensor.name
             ),
         )),
@@ -1312,6 +1327,137 @@ pub(crate) fn dequantize_iq4_xs(raw: &[u8]) -> Vec<f32> {
                 &block[8 + 16 * i..24 + 16 * i],
                 &mut out,
             );
+        }
+    }
+    out
+}
+
+/// `ksigns_iq2xs[index]`: the 7-bit sign pattern `index` plus an eighth
+/// sign bit making the count of negative values even.
+pub const fn iq_signs(index: u32) -> u8 {
+    let index = index & 0x7F;
+    (index | ((index.count_ones() & 1) << 7)) as u8
+}
+
+/// Pushes the eight values of a grid entry (`grid`, one per byte), times
+/// `scale`, negated where `signs` has a bit set.
+fn push_signed_grid(scale: f32, grid: u64, signs: u8, out: &mut Vec<f32>) {
+    for j in 0..8 {
+        let value = scale * f32::from((grid >> (8 * j)) as u8);
+        out.push(if signs >> j & 1 == 1 { -value } else { value });
+    }
+}
+
+fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"))
+}
+
+/// Dequantizes `block_iq2_xxs` super-blocks (66 bytes), porting
+/// `ggml-quants.c`'s `dequantize_row_iq2_xxs`: per 32 values, two words --
+/// four grid indices, then four 7-bit sign indices and a 4-bit scale
+/// (`d * (0.5 + scale) * 0.25`).
+pub(crate) fn dequantize_iq2_xxs(raw: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(raw.len() / IQ2_XXS_BLOCK_BYTES as usize * 256);
+    for block in raw.as_chunks::<{ IQ2_XXS_BLOCK_BYTES as usize }>().0 {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for ib in 0..8 {
+            let grids = u32_at(block, 2 + 8 * ib);
+            let aux = u32_at(block, 6 + 8 * ib);
+            let db = d * (0.5 + (aux >> 28) as f32) * 0.25;
+            for l in 0..4 {
+                let grid = iq_grids::IQ2XXS_GRID[((grids >> (8 * l)) & 0xFF) as usize];
+                push_signed_grid(db, grid, iq_signs(aux >> (7 * l)), &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Dequantizes `block_iq2_xs` super-blocks (74 bytes), porting
+/// `dequantize_row_iq2_xs`: 16-bit codes (9-bit grid index, 7-bit sign
+/// index), then a 4-bit scale per 16 values.
+pub(crate) fn dequantize_iq2_xs(raw: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(raw.len() / IQ2_XS_BLOCK_BYTES as usize * 256);
+    for block in raw.as_chunks::<{ IQ2_XS_BLOCK_BYTES as usize }>().0 {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for ib in 0..8 {
+            for l in 0..4 {
+                let at = 2 + 2 * (4 * ib + l);
+                let code = u32::from(u16::from_le_bytes([block[at], block[at + 1]]));
+                let scale = (block[66 + ib] >> (4 * (l / 2))) & 0xF;
+                let db = d * (0.5 + f32::from(scale)) * 0.25;
+                let grid = iq_grids::IQ2XS_GRID[(code & 511) as usize];
+                push_signed_grid(db, grid, iq_signs(code >> 9), &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Dequantizes `block_iq2_s` super-blocks (82 bytes), porting
+/// `dequantize_row_iq2_s`: 10-bit grid indices (low bytes, then two high
+/// bits each in `qh`), one explicit sign byte per 8 values, a 4-bit scale
+/// per 16 values.
+pub(crate) fn dequantize_iq2_s(raw: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(raw.len() / IQ2_S_BLOCK_BYTES as usize * 256);
+    for block in raw.as_chunks::<{ IQ2_S_BLOCK_BYTES as usize }>().0 {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for ib in 0..8 {
+            for l in 0..4 {
+                let index = usize::from(block[2 + 4 * ib + l])
+                    | ((usize::from(block[66 + ib]) >> (2 * l)) & 3) << 8;
+                let scale = (block[74 + ib] >> (4 * (l / 2))) & 0xF;
+                let db = d * (0.5 + f32::from(scale)) * 0.25;
+                let grid = iq_grids::IQ2S_GRID[index];
+                push_signed_grid(db, grid, block[34 + 4 * ib + l], &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Dequantizes `block_iq3_xxs` super-blocks (98 bytes), porting
+/// `dequantize_row_iq3_xxs`: 4-value grid indices, then per 32 values a
+/// word of four 7-bit sign indices and a 4-bit scale (`d * (0.5 + scale)
+/// * 0.5`).
+pub(crate) fn dequantize_iq3_xxs(raw: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(raw.len() / IQ3_XXS_BLOCK_BYTES as usize * 256);
+    for block in raw.as_chunks::<{ IQ3_XXS_BLOCK_BYTES as usize }>().0 {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for ib in 0..8 {
+            let aux = u32_at(block, 66 + 4 * ib);
+            let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+            for l in 0..4 {
+                let low = iq_grids::IQ3XXS_GRID[usize::from(block[2 + 8 * ib + 2 * l])];
+                let high = iq_grids::IQ3XXS_GRID[usize::from(block[3 + 8 * ib + 2 * l])];
+                let grid = u64::from(low) | (u64::from(high) << 32);
+                push_signed_grid(db, grid, iq_signs(aux >> (7 * l)), &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Dequantizes `block_iq3_s` super-blocks (110 bytes), porting
+/// `dequantize_row_iq3_s`: 9-bit 4-value grid indices (low bytes, high
+/// bits in `qh`), one explicit sign byte per 8 values, a 4-bit scale per
+/// 32 values (`d * (1 + 2 scale)`).
+pub(crate) fn dequantize_iq3_s(raw: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(raw.len() / IQ3_S_BLOCK_BYTES as usize * 256);
+    for block in raw.as_chunks::<{ IQ3_S_BLOCK_BYTES as usize }>().0 {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for ib in 0..8 {
+            let scale = (block[106 + ib / 2] >> (4 * (ib % 2))) & 0xF;
+            let db = d * f32::from(1 + 2 * scale);
+            let index = |i: usize| {
+                usize::from(block[2 + 8 * ib + i]) | ((usize::from(block[66 + ib]) >> i) & 1) << 8
+            };
+            for l in 0..4 {
+                let low = iq_grids::IQ3S_GRID[index(2 * l)];
+                let high = iq_grids::IQ3S_GRID[index(2 * l + 1)];
+                let grid = u64::from(low) | (u64::from(high) << 32);
+                push_signed_grid(db, grid, block[74 + 4 * ib + l], &mut out);
+            }
         }
     }
     out
@@ -1557,6 +1703,11 @@ pub fn tensor_from_raw_bytes(
         ModelDType::Q3K => dequantize_q3_k(raw),
         ModelDType::Iq4Nl => dequantize_iq4_nl(raw),
         ModelDType::Iq4Xs => dequantize_iq4_xs(raw),
+        ModelDType::Iq2Xxs => dequantize_iq2_xxs(raw),
+        ModelDType::Iq2Xs => dequantize_iq2_xs(raw),
+        ModelDType::Iq2S => dequantize_iq2_s(raw),
+        ModelDType::Iq3Xxs => dequantize_iq3_xxs(raw),
+        ModelDType::Iq3S => dequantize_iq3_s(raw),
         other => {
             return Err(ModelLoadingError::new(
                 ModelLoadingErrorCode::StorageDTypeUnsupported,
@@ -1648,8 +1799,8 @@ pub fn read_tensor_payload(
 /// The packed form of a block-quantized 2D weight
 /// (`execute-direct-quantized-weights`), from the tensor's own validated
 /// storage bytes: `Ok(None)` when its storage dtype has no packed form
-/// (`Q8_0`, the `Q2_K`, `Q3_K`, `Q4_K` and `Q6_K` k-quants, `IQ4_NL`
-/// and `IQ4_XS`), it is not a matrix, or its stored rows are
+/// (`Q8_0`, the `Q2_K`, `Q3_K`, `Q4_K` and `Q6_K` k-quants, and the
+/// IQ2, IQ3 and IQ4 i-quants), it is not a matrix, or its stored rows are
 /// not whole blocks. The bytes are checked
 /// against the shape and against the declared content digest first, as for
 /// any other storage dtype.
@@ -1665,6 +1816,11 @@ pub fn packed_weight_from_raw_bytes(
         ModelDType::Q3K => crate::packed_weight::PackedWeightFormat::Q3K,
         ModelDType::Iq4Nl => crate::packed_weight::PackedWeightFormat::Iq4Nl,
         ModelDType::Iq4Xs => crate::packed_weight::PackedWeightFormat::Iq4Xs,
+        ModelDType::Iq2Xxs => crate::packed_weight::PackedWeightFormat::Iq2Xxs,
+        ModelDType::Iq2Xs => crate::packed_weight::PackedWeightFormat::Iq2Xs,
+        ModelDType::Iq2S => crate::packed_weight::PackedWeightFormat::Iq2S,
+        ModelDType::Iq3Xxs => crate::packed_weight::PackedWeightFormat::Iq3Xxs,
+        ModelDType::Iq3S => crate::packed_weight::PackedWeightFormat::Iq3S,
         _ => return Ok(None),
     };
     let [rows, cols] = tensor.shape.as_slice() else {
@@ -2024,6 +2180,8 @@ pub fn allocation_released(allocation: &MemoryAllocation) -> bool {
             | MemoryAllocationState::Cancelled
     )
 }
+
+pub mod iq_grids;
 
 #[cfg(test)]
 mod tests;

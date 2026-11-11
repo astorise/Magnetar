@@ -647,6 +647,111 @@ fn real_public_mistral_7b_iq4_nl_gguf_checkpoint_generates_on_cuda() {
     });
 }
 
+/// `Mistral-7B-Instruct-v0.3-IQ3_M.gguf`'s sha256 (3,288,846,560 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ3_S`
+/// matrices.
+const MISTRAL_7B_IQ3_M_SHA256: &str =
+    "sha256:4ea14c5a6c787ac2703505f04a4ee746f746d1ace3ffd907af28f6f179e6b224";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ3_M` export on CUDA, its i-quant
+/// and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 3.3 GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq3_m_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq3_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ3_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ3_M.gguf",
+        sha256: MISTRAL_7B_IQ3_M_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf`'s sha256 (2,830,880,992 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ3_XXS`
+/// matrices.
+const MISTRAL_7B_IQ3_XXS_SHA256: &str =
+    "sha256:131c8b3e5ab9877dd921c81cc8674e797d7ca701a828c54552ae31d24111c123";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ3_XXS` export on CUDA, its i-quant
+/// and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 2.8 GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq3_xxs_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq3_xxs gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ3_XXS_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf",
+        sha256: MISTRAL_7B_IQ3_XXS_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ2_M.gguf`'s sha256 (2,504,249,568 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ2_S`
+/// matrices.
+const MISTRAL_7B_IQ2_M_SHA256: &str =
+    "sha256:b54e1139f0940dd0d59369389064488bc9663bfcd985e7c6e6d74da2ad2b4654";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ2_M` export on CUDA, its i-quant
+/// and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 2.5 GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq2_m_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq2_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ2_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ2_M.gguf",
+        sha256: MISTRAL_7B_IQ2_M_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ2_XS.gguf`'s sha256 (2,201,473,248 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ2_XS`
+/// matrices.
+const MISTRAL_7B_IQ2_XS_SHA256: &str =
+    "sha256:da7cb13e0d184c15e32dd1a7ceb3e496463a95eadb75e8497d006f8786e4e414";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ2_XS` export on CUDA, its i-quant
+/// and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 2.2 GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq2_xs_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq2_xs gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ2_XS_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ2_XS.gguf",
+        sha256: MISTRAL_7B_IQ2_XS_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ2_XXS.gguf`'s sha256 (1,994,903,776 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ2_XXS`
+/// matrices.
+const MISTRAL_7B_IQ2_XXS_SHA256: &str =
+    "sha256:5d993ed907dfdfe24e24d4f081a7b999c45498ecce39902983115d0d09d013db";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ2_XXS` export on CUDA, its i-quant
+/// and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 2.0 GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq2_xxs_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq2_xxs gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ2_XXS_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ2_XXS.gguf",
+        sha256: MISTRAL_7B_IQ2_XXS_SHA256,
+    });
+}
+
 /// `RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf`'s exact pinned commit
 /// (the `Q8_0` export of `Qwen/Qwen1.5-MoE-A2.7B-Chat`): 24 layers of 60
 /// routed experts (top 4) and a shared expert.
