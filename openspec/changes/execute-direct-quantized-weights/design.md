@@ -194,3 +194,14 @@ Int8 activations are therefore the default for the decode-step packed
 matmuls; `MAGNETAR_CUDA_INT8_ACTIVATIONS=0` keeps f32 activations (the
 disable control the gguf suite runs, reporting any token difference as
 a warning).
+
+Tensor parallelism (run 43043157212): with f32 activations, Qwen2.5-0.5B
+`Q8_0` in tensor parallel (captured and uncaptured) generates exactly the
+one-GPU tokens; with int8 activations it diverges at the sixth token
+(" Paris. The capital of France is Paris..." instead of "... of the
+United States ..."), still answering "Paris". The reduction sums the row
+shards' partials in another order, an ulp that a rounding boundary can
+turn into a whole quantization step, so exact equality with one GPU is
+only required with f32 activations. Mistral 7B `Q8_0` in tensor parallel
+with int8 activations generates the one-GPU tokens, at 19.31 ms per token
+(20.6 ms with f32 activations, 26.10 ms on one GPU).
