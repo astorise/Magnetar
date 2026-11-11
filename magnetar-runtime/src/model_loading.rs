@@ -1900,7 +1900,7 @@ pub fn host_tensor_from_payload_source(
 /// (never flushed to zero), `+Inf`/`-Inf` map to `f32` infinities, and
 /// `NaN` maps to a `f32` `NaN` preserving the sign bit and (widened)
 /// mantissa payload rather than canonicalizing to one fixed `NaN` pattern.
-pub(crate) fn f16_to_f32(bits: u16) -> f32 {
+pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exponent = (bits >> 10) & 0x1F;
     let mantissa = u32::from(bits & 0x3FF);

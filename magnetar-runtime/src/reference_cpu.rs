@@ -165,6 +165,15 @@ use std::{
 
 /// Stable, package-qualified Reference CPU Provider identity.
 pub const REFERENCE_CPU_PROVIDER_NAME: &str = "magnetar:provider/reference-cpu";
+/// The optimized CPU Provider (`execute-quantized-weights-on-cpu`): like
+/// Reference CPU it executes in host memory.
+pub const NATIVE_CPU_PROVIDER_NAME: &str = "magnetar:provider/cpu-native";
+
+/// Whether `provider` executes its Kernels on host-resident tensors (the
+/// CPU Providers) rather than on a Device's own memory.
+pub fn host_memory_provider(provider: &str) -> bool {
+    provider == REFERENCE_CPU_PROVIDER_NAME || provider == NATIVE_CPU_PROVIDER_NAME
+}
 
 /// How many recent Kernel observations an executor keeps.
 pub const KERNEL_OBSERVATION_LOG_CAPACITY: usize = 4096;

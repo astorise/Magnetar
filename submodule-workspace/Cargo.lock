@@ -978,6 +978,7 @@ dependencies = [
  "magnetar-inference-qualification",
  "magnetar-loader-gguf",
  "magnetar-loader-huggingface",
+ "magnetar-provider-cpu",
  "magnetar-provider-cuda",
  "magnetar-runtime",
  "serde_json",

@@ -346,13 +346,8 @@ struct CudaQ8Checkpoint {
 /// file is never read whole: ingestion streams its digest, checked against
 /// the pinned one before anything is trusted.
 fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
-    use magnetar_runtime::{
-        GenerationParameters, GenerationStreamEvent, ProductionGenerationRequest,
-        ProductionLoadedModel, PromptInput, Provider, StopConditions,
-    };
-    use std::{ops::ControlFlow, time::Instant};
+    use magnetar_runtime::Provider;
 
-    let label = checkpoint.label;
     // `MAGNETAR_CUDA_DEVICES=0,1`: one Provider spanning those GPUs, the
     // Runtime placing the layers across them
     // (`enforce-local-multigpu-and-expert-placement` G05).
@@ -389,6 +384,45 @@ fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
         eprintln!("skipped: no CUDA-capable Device");
         return;
     }
+    generate_gguf_with(
+        checkpoint,
+        cuda,
+        device_count,
+        &format!("{device_count} GPU(s)"),
+    );
+}
+
+/// The real GGUF checkpoint on the optimized CPU Provider
+/// (`execute-quantized-weights-on-cpu`): packed weights stay in host memory
+/// in their checkpoint encoding.
+fn generate_gguf_on_native_cpu(checkpoint: &CudaQ8Checkpoint) {
+    let executor = magnetar_provider_cpu::native::NativeCpuExecutor::new();
+    let threads = executor.threads();
+    let provider = magnetar_provider_cpu::native::NativeCpuProvider::with_executor(executor);
+    generate_gguf_with(
+        checkpoint,
+        Arc::new(provider),
+        1,
+        &format!(
+            "cpu-native {threads} thread(s) {:?}",
+            magnetar_provider_cpu::native::simd_level()
+        ),
+    );
+}
+
+fn generate_gguf_with(
+    checkpoint: &CudaQ8Checkpoint,
+    cuda: Arc<dyn magnetar_runtime::Provider>,
+    device_count: usize,
+    devices: &str,
+) {
+    use magnetar_runtime::{
+        GenerationParameters, GenerationStreamEvent, ProductionGenerationRequest,
+        ProductionLoadedModel, PromptInput, StopConditions,
+    };
+    use std::{ops::ControlFlow, time::Instant};
+
+    let label = checkpoint.label;
     let dir = std::env::var_os(checkpoint.dir_env)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -452,7 +486,7 @@ fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
         cuda,
         Some(component),
     )
-    .expect("the real Q8_0 checkpoint loads on CUDA");
+    .expect("the real quantized checkpoint loads");
     let tensor_parallel = model.tensor_parallel();
     if std::env::var("MAGNETAR_MULTI_GPU").as_deref() == Ok("tensor") && device_count > 1 {
         assert!(
@@ -479,14 +513,15 @@ fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
             }
             ControlFlow::Continue(())
         })
-        .expect("the real Q8_0 checkpoint generates on CUDA");
+        .expect("the real quantized checkpoint generates");
     let tokens = &outcome.result.output.generated_token_ids;
     assert!(tokens.len() > 1, "generated more than one token");
     let ttft = token_times[0];
     let tpot = (token_times[token_times.len() - 1] - ttft) / (token_times.len() - 1) as f64;
-    let packed = std::env::var("MAGNETAR_CUDA_PACKED_WEIGHTS").as_deref() != Ok("0");
+    let packed = std::env::var("MAGNETAR_CUDA_PACKED_WEIGHTS").as_deref() != Ok("0")
+        && std::env::var("MAGNETAR_CPU_PACKED_WEIGHTS").as_deref() != Ok("0");
     eprintln!(
-        "[{label}] family {}, {device_count} GPU(s), placement {:?}, tensor parallel {}: \
+        "[{label}] family {}, {devices}, placement {:?}, tensor parallel {}: \
          packed weights {}: load \
          {load_ms:.0} ms; warm TTFT {ttft:.1} ms, TPOT {tpot:.2} ms over {} tokens",
         ingested.manifest.architecture.family,
@@ -498,6 +533,36 @@ fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
     eprintln!("[{label}] generated token ids {tokens:?}");
     eprintln!("[{label}] generated text {:?}", outcome.text);
     model.unload().expect("the real checkpoint unloads");
+}
+
+/// The real `Qwen2.5-0.5B-Instruct` `Q8_0` export on the optimized CPU
+/// Provider.
+#[test]
+#[ignore = "downloads/holds a ~650MB real quantized checkpoint"]
+fn real_public_q8_0_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native q8_0 gguf",
+        dir_env: "MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR",
+        repository: "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        revision: CHECKPOINT_REVISION,
+        file: "qwen2.5-0.5b-instruct-q8_0.gguf",
+        sha256: Q8_0_CHECKPOINT_SHA256,
+    });
+}
+
+/// The real `Mistral-7B-Instruct-v0.3` `Q4_K_M` export on the optimized
+/// CPU Provider.
+#[test]
+#[ignore = "downloads/holds a 4.4GB real quantized checkpoint"]
+fn real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native mistral-7b q4_k_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+        sha256: MISTRAL_7B_Q4_K_M_SHA256,
+    });
 }
 
 /// The real `Qwen2.5-0.5B-Instruct` `Q8_0` export on CUDA.

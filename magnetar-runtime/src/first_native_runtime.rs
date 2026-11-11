@@ -2256,7 +2256,7 @@ fn resolved_kernel_memory_class(
     let Some(binding) = prepared_plan.node_binding(node) else {
         return KernelMemoryClass::Host;
     };
-    if binding.provider.as_str() == REFERENCE_CPU_PROVIDER_NAME {
+    if crate::reference_cpu::host_memory_provider(binding.provider.as_str()) {
         KernelMemoryClass::Host
     } else {
         KernelMemoryClass::Device
@@ -2286,7 +2286,7 @@ fn resolved_output_placement(
             REFERENCE_CPU_PROVIDER_NAME,
         ));
     };
-    if binding.provider.as_str() == REFERENCE_CPU_PROVIDER_NAME {
+    if crate::reference_cpu::host_memory_provider(binding.provider.as_str()) {
         return MemoryPlacement::ProviderOwnedOpaque(binding.provider.clone());
     }
     match &binding.device {
@@ -10959,7 +10959,9 @@ fn kernel_memory_class_for_edge(
                 KernelMemoryClass::PinnedHost
             }
             MemoryAllocationClass::BrowserLinearMemory => KernelMemoryClass::BrowserLinearMemory,
-            _ if provider.as_str() == REFERENCE_CPU_PROVIDER_NAME => KernelMemoryClass::Host,
+            _ if crate::reference_cpu::host_memory_provider(provider.as_str()) => {
+                KernelMemoryClass::Host
+            }
             _ => KernelMemoryClass::Device,
         },
     }
