@@ -683,6 +683,34 @@ jobs:
             exit 1
           fi
           echo "$packed"
+      - name: Q8_0 GGUF (Qwen2.5-0.5B) with int8 activations
+        # MAGNETAR_CUDA_INT8_ACTIVATIONS=1: the packed decode matmuls read
+        # their activations rounded to 8 bits per 32-value block and
+        # multiply with __dp4a. Outputs may differ from the f32-activation
+        # run, so token ids are compared as a report (a warning), but the
+        # answer must still start with "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/q8_0-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/int8.log"
+          grep -h 'TPOT' "$dir/packed.log" "$dir/int8.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/int8.log" || {
+            echo "::error::Q8_0 GGUF (Qwen2.5-0.5B): with int8 activations the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+          f32="$(grep -m1 'generated token ids' "$dir/packed.log" || true)"
+          int8="$(grep -m1 'generated token ids' "$dir/int8.log")"
+          if [ "$f32" != "$int8" ]; then
+            echo "::warning::Q8_0 GGUF (Qwen2.5-0.5B): token ids differ with int8 activations"
+            diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
+          fi
       - name: Q8_0 GGUF across two GPUs (layer segments)
         # enforce-local-multigpu-and-expert-placement G05: one Provider over
         # both GPUs, the Runtime placing half the layers on each
@@ -800,6 +828,34 @@ jobs:
             echo "::error::Mistral 7B Q8_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
             exit 1
           }
+      - name: Mistral-7B-Instruct-v0.3 Q8_0 GGUF with int8 activations
+        # MAGNETAR_CUDA_INT8_ACTIVATIONS=1: the packed decode matmuls read
+        # their activations rounded to 8 bits per 32-value block and
+        # multiply with __dp4a. Outputs may differ from the f32-activation
+        # run, so token ids are compared as a report (a warning), but the
+        # answer must still start with "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q8_0-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/int8.log"
+          grep -h 'TPOT' "$dir/packed.log" "$dir/int8.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/int8.log" || {
+            echo "::error::Mistral-7B-Instruct-v0.3 Q8_0 GGUF: with int8 activations the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+          f32="$(grep -m1 'generated token ids' "$dir/packed.log" || true)"
+          int8="$(grep -m1 'generated token ids' "$dir/int8.log")"
+          if [ "$f32" != "$int8" ]; then
+            echo "::warning::Mistral-7B-Instruct-v0.3 Q8_0 GGUF: token ids differ with int8 activations"
+            diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
+          fi
       - name: Mistral-7B-Instruct-v0.3 Q8_0 GGUF across two GPUs (tensor parallel)
         # Phase 1 on a bandwidth-bound model: every MLP split across both
         # GPUs. Must still answer "Paris"; the token ids are compared with
@@ -861,6 +917,34 @@ jobs:
             echo "::error::Mistral 7B Q4_K_M: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
             exit 1
           }
+      - name: Mistral-7B-Instruct-v0.3 Q4_K_M GGUF with int8 activations
+        # MAGNETAR_CUDA_INT8_ACTIVATIONS=1: the packed decode matmuls read
+        # their activations rounded to 8 bits per 32-value block and
+        # multiply with __dp4a. Outputs may differ from the f32-activation
+        # run, so token ids are compared as a report (a warning), but the
+        # answer must still start with "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q4_k_m-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/int8.log"
+          grep -h 'TPOT' "$dir/packed.log" "$dir/int8.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/int8.log" || {
+            echo "::error::Mistral-7B-Instruct-v0.3 Q4_K_M GGUF: with int8 activations the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+          f32="$(grep -m1 'generated token ids' "$dir/packed.log" || true)"
+          int8="$(grep -m1 'generated token ids' "$dir/int8.log")"
+          if [ "$f32" != "$int8" ]; then
+            echo "::warning::Mistral-7B-Instruct-v0.3 Q4_K_M GGUF: token ids differ with int8 activations"
+            diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
+          fi
       - name: Download the pinned real Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF checkpoint
         # execute-and-cache-moe-experts F02: 15 GB packed, more than one
         # 12 GB GPU, pinned by its sha256, which the test verifies. The
