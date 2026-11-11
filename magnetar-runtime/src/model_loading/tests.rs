@@ -331,3 +331,23 @@ fn host_tensors_from_artifact_bytes_rejects_shape_size_mismatch() {
         .expect_err("shape/size mismatch must be rejected");
     assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
 }
+
+#[path = "k_quant_golden.rs"]
+mod k_quant_golden;
+
+/// `Q6_K` and `Q4_K` dequantization match llama.cpp's reference
+/// implementation bit for bit on random super-blocks.
+#[test]
+fn k_quant_dequantization_matches_the_gguf_reference_bit_for_bit() {
+    use k_quant_golden::*;
+    let q6 = dequantize_q6_k(&Q6_K_GOLDEN_BYTES);
+    assert_eq!(q6.len(), Q6_K_GOLDEN_BITS.len());
+    for (index, (value, bits)) in q6.iter().zip(Q6_K_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "Q6_K value {index}: {value}");
+    }
+    let q4 = dequantize_q4_k(&Q4_K_GOLDEN_BYTES);
+    assert_eq!(q4.len(), Q4_K_GOLDEN_BITS.len());
+    for (index, (value, bits)) in q4.iter().zip(Q4_K_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "Q4_K value {index}: {value}");
+    }
+}

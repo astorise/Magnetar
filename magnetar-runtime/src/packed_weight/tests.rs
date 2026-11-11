@@ -49,3 +49,50 @@ fn dequantizes_q8_0_and_applies_the_transposed_storage() {
         untransposed.dequantize_stored()
     );
 }
+
+/// A `Q4_K` packed weight dequantizes through `ggml-quants.c`'s
+/// `dequantize_row_q4_K` arithmetic, and its transposed storage applies
+/// like `Q8_0`'s.
+#[test]
+fn dequantizes_q4_k_and_applies_the_transposed_storage() {
+    // Two stored rows of one 256-value super-block each.
+    let mut bytes = Vec::new();
+    for row in 0..2u8 {
+        bytes.extend(0x3c00_u16.to_le_bytes()); // d = 1.0
+        bytes.extend(0x3800_u16.to_le_bytes()); // dmin = 0.5
+        // Sub-blocks 0..3: scale 2 + row, min 1; 4..7 from the high bits.
+        bytes.extend([
+            2 + row,
+            2 + row,
+            2 + row,
+            2 + row,
+            1,
+            1,
+            1,
+            1,
+            0x13,
+            0x13,
+            0x13,
+            0x13,
+        ]);
+        bytes.extend((0..128u32).map(|i| (i * 7 + u32::from(row)) as u8));
+    }
+    let weight = PackedWeight::new(PackedWeightFormat::Q4K, 2, 256, true, bytes.clone())
+        .expect("two rows of one super-block");
+    assert_eq!(weight.logical_shape(), [256, 2]);
+    let stored = weight.dequantize_stored();
+    assert_eq!(stored, crate::model_loading::dequantize_q4_k(&bytes));
+    // Element 0 of row 0: low nibble of qs[0] = 0, so -dmin * min = -0.5.
+    assert_eq!(stored[0], -0.5);
+    // Element 32 of row 0: high nibble of qs[0] = 0 -> -0.5 too; element 1:
+    // low nibble of qs[1] = 7 -> 1.0 * 2 * 7 - 0.5.
+    assert_eq!(stored[1], 13.5);
+    let logical = weight.dequantize();
+    assert_eq!(logical.shape, vec![256, 2]);
+    for row in 0..2 {
+        for col in 0..256 {
+            assert_eq!(logical.data[col * 2 + row], stored[row * 256 + col]);
+        }
+    }
+    assert!(PackedWeight::new(PackedWeightFormat::Q4K, 1, 128, true, vec![0; 72]).is_err());
+}

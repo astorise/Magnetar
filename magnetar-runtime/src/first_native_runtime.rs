@@ -7664,6 +7664,7 @@ impl WeightMaterializationTransaction {
                         | ModelDType::Q8
                         | ModelDType::Q4K
                         | ModelDType::Q5K
+                        | ModelDType::Q6K
                 ))
         {
             return Err(InferenceApiError::WeightShapeOrDtypeMismatch {

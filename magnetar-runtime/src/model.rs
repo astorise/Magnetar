@@ -349,6 +349,9 @@ pub enum ModelDType {
     F64,
     Q4K,
     Q5K,
+    /// GGUF `block_q6_K`: 256 values in 210 bytes (6-bit quants, sixteen
+    /// signed 8-bit sub-block scales, one `f16` scale).
+    Q6K,
     Q8,
 }
 
@@ -370,6 +373,7 @@ impl ModelDType {
             "f64" | "fp64" | "float64" => Some(Self::F64),
             "q4_k" | "q4k" => Some(Self::Q4K),
             "q5_k" | "q5k" => Some(Self::Q5K),
+            "q6_k" | "q6k" => Some(Self::Q6K),
             "q8" | "q8_0" => Some(Self::Q8),
             _ => None,
         }
@@ -398,6 +402,10 @@ impl ModelDType {
                 id: String::new(),
                 size_bytes: 1,
             },
+            Self::Q6K => DTypeDescriptor::ProviderSpecific {
+                id: String::new(),
+                size_bytes: 1,
+            },
             Self::Q8 => DTypeDescriptor::ProviderSpecific {
                 id: String::new(),
                 size_bytes: 1,
@@ -410,6 +418,7 @@ impl ModelDType {
 pub enum ModelQuantizationFormat {
     GgufQ4K,
     GgufQ5K,
+    GgufQ6K,
     /// GGUF's `Q8_0` block quantization (`ggml_type` 8): 32 elements per
     /// 34-byte block (2-byte `f16` scale + 32 `i8` quants). Paired with
     /// [`ModelDType::Q8`], which `ModelDType::parse` already accepts under
@@ -427,6 +436,7 @@ impl ModelQuantizationFormat {
         match value.to_ascii_lowercase().as_str() {
             "gguf-q4-k" | "q4_k" => Some(Self::GgufQ4K),
             "gguf-q5-k" | "q5_k" => Some(Self::GgufQ5K),
+            "gguf-q6-k" | "q6_k" => Some(Self::GgufQ6K),
             "gguf-q8-0" | "q8_0" => Some(Self::GgufQ8),
             "gptq" => Some(Self::Gptq),
             "awq" => Some(Self::Awq),
