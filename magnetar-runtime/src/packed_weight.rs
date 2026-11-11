@@ -50,13 +50,21 @@ pub enum PackedWeightFormat {
     /// packing sixteen 6-bit scales, then an `f16` `d`; `value = d *
     /// (scale - 32) * (q - 4)` per 16-value sub-block.
     Q3K,
+    /// GGUF `block_iq4_nl`: 32 values per block, 18 bytes -- an `f16`
+    /// `d`, then 16 bytes of 4-bit indices into [`crate::model_loading::
+    /// IQ4_NL_VALUES`]; `value = d * table[index]`.
+    Iq4Nl,
+    /// GGUF `block_iq4_xs`: 256 values per super-block, 136 bytes -- an
+    /// `f16` `d`, eight 6-bit sub-block scales in six bytes, then 128
+    /// bytes of `IQ4_NL` indices; `value = d * (scale - 32) * table[index]`.
+    Iq4Xs,
 }
 
 impl PackedWeightFormat {
     pub const fn block_elements(self) -> u64 {
         match self {
-            Self::Q8_0 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q6K => 256,
+            Self::Q8_0 | Self::Iq4Nl => 32,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q6K | Self::Iq4Xs => 256,
         }
     }
 
@@ -67,6 +75,8 @@ impl PackedWeightFormat {
             Self::Q6K => 210,
             Self::Q2K => 84,
             Self::Q3K => 110,
+            Self::Iq4Nl => 18,
+            Self::Iq4Xs => 136,
         }
     }
 
@@ -77,6 +87,8 @@ impl PackedWeightFormat {
             Self::Q6K => "q6_k",
             Self::Q2K => "q2_k",
             Self::Q3K => "q3_k",
+            Self::Iq4Nl => "iq4_nl",
+            Self::Iq4Xs => "iq4_xs",
         }
     }
 }
@@ -162,7 +174,8 @@ impl PackedWeight {
     }
 
     /// The stored values in row-major stored order, dequantized exactly as
-    /// `ggml-quants.c`'s `dequantize_row_q8_0` and `dequantize_row_q{2,3,4,6}_K`
+    /// `ggml-quants.c`'s `dequantize_row_q8_0`, `dequantize_row_q{2,3,4,6}_K` and
+    /// `dequantize_row_iq4_{nl,xs}`
     /// do.
     pub fn dequantize_stored(&self) -> Vec<f32> {
         match self.format {
@@ -170,6 +183,8 @@ impl PackedWeight {
             PackedWeightFormat::Q6K => crate::model_loading::dequantize_q6_k(&self.bytes),
             PackedWeightFormat::Q2K => crate::model_loading::dequantize_q2_k(&self.bytes),
             PackedWeightFormat::Q3K => crate::model_loading::dequantize_q3_k(&self.bytes),
+            PackedWeightFormat::Iq4Nl => crate::model_loading::dequantize_iq4_nl(&self.bytes),
+            PackedWeightFormat::Iq4Xs => crate::model_loading::dequantize_iq4_xs(&self.bytes),
             PackedWeightFormat::Q8_0 => self
                 .bytes
                 .as_chunks::<34>()

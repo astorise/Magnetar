@@ -605,6 +605,48 @@ fn real_public_mistral_7b_q2_k_gguf_checkpoint_generates_on_cuda() {
     });
 }
 
+/// `Mistral-7B-Instruct-v0.3-IQ4_XS.gguf`'s sha256 (3,911,962,848 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly
+/// `IQ4_XS` matrices.
+const MISTRAL_7B_IQ4_XS_SHA256: &str =
+    "sha256:0f027bb80c65d1a81c5c4b88b9bc79337d30058b7a78b036a033b9f0b44b7a0d";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ4_XS` export on CUDA, its
+/// i-quant and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 4GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq4_xs_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq4_xs gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ4_XS_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ4_XS.gguf",
+        sha256: MISTRAL_7B_IQ4_XS_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ4_NL.gguf`'s sha256 (4,130,066,656 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly
+/// `IQ4_NL` matrices.
+const MISTRAL_7B_IQ4_NL_SHA256: &str =
+    "sha256:c2048801d2895ac26048eae97ccf4d502f07fbde782564f12692063d54415643";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ4_NL` export on CUDA, its
+/// i-quant and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 4GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq4_nl_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq4_nl gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ4_NL_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ4_NL.gguf",
+        sha256: MISTRAL_7B_IQ4_NL_SHA256,
+    });
+}
+
 /// `RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf`'s exact pinned commit
 /// (the `Q8_0` export of `Qwen/Qwen1.5-MoE-A2.7B-Chat`): 24 layers of 60
 /// routed experts (top 4) and a shared expert.

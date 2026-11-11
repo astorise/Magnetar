@@ -335,7 +335,7 @@ fn host_tensors_from_artifact_bytes_rejects_shape_size_mismatch() {
 #[path = "k_quant_golden.rs"]
 mod k_quant_golden;
 
-/// `Q2_K`, `Q3_K`, `Q6_K` and `Q4_K` dequantization match llama.cpp's reference
+/// `Q2_K`, `Q3_K`, `Q6_K`, `Q4_K`, `IQ4_NL` and `IQ4_XS` dequantization match llama.cpp's reference
 /// implementation bit for bit on random super-blocks.
 #[test]
 fn k_quant_dequantization_matches_the_gguf_reference_bit_for_bit() {
@@ -354,6 +354,16 @@ fn k_quant_dequantization_matches_the_gguf_reference_bit_for_bit() {
     assert_eq!(q3.len(), Q3_K_GOLDEN_BITS.len());
     for (index, (value, bits)) in q3.iter().zip(Q3_K_GOLDEN_BITS).enumerate() {
         assert_eq!(value.to_bits(), bits, "Q3_K value {index}: {value}");
+    }
+    let nl = dequantize_iq4_nl(&IQ4_NL_GOLDEN_BYTES);
+    assert_eq!(nl.len(), IQ4_NL_GOLDEN_BITS.len());
+    for (index, (value, bits)) in nl.iter().zip(IQ4_NL_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ4_NL value {index}: {value}");
+    }
+    let xs = dequantize_iq4_xs(&IQ4_XS_GOLDEN_BYTES);
+    assert_eq!(xs.len(), IQ4_XS_GOLDEN_BITS.len());
+    for (index, (value, bits)) in xs.iter().zip(IQ4_XS_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ4_XS value {index}: {value}");
     }
     let q4 = dequantize_q4_k(&Q4_K_GOLDEN_BYTES);
     assert_eq!(q4.len(), Q4_K_GOLDEN_BITS.len());

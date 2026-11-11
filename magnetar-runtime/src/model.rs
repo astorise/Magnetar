@@ -350,6 +350,13 @@ pub enum ModelDType {
     /// GGUF `block_q2_K`: 256 values in 84 bytes (2-bit quants, sixteen
     /// 4-bit sub-block scales and mins, `f16` `d` and `dmin`).
     Q2K,
+    /// GGUF `block_iq4_nl`: 32 values in 18 bytes (an `f16` scale and
+    /// 4-bit indices into a fixed 16-value non-linear table).
+    Iq4Nl,
+    /// GGUF `block_iq4_xs`: 256 values in 136 bytes (an `f16` scale,
+    /// eight 6-bit sub-block scales, 4-bit indices into the `IQ4_NL`
+    /// table).
+    Iq4Xs,
     /// GGUF `block_q3_K`: 256 values in 110 bytes (2-bit quants plus a
     /// high-bit mask, sixteen 6-bit sub-block scales, one `f16` scale).
     Q3K,
@@ -379,6 +386,8 @@ impl ModelDType {
             "f64" | "fp64" | "float64" => Some(Self::F64),
             "q2_k" | "q2k" => Some(Self::Q2K),
             "q3_k" | "q3k" => Some(Self::Q3K),
+            "iq4_nl" | "iq4nl" => Some(Self::Iq4Nl),
+            "iq4_xs" | "iq4xs" => Some(Self::Iq4Xs),
             "q4_k" | "q4k" => Some(Self::Q4K),
             "q5_k" | "q5k" => Some(Self::Q5K),
             "q6_k" | "q6k" => Some(Self::Q6K),
@@ -402,10 +411,12 @@ impl ModelDType {
             Self::Bf16 => DTypeDescriptor::portable(ComputeDType::BrainFloat16),
             Self::F32 => DTypeDescriptor::portable(ComputeDType::Float32),
             Self::F64 => DTypeDescriptor::portable(ComputeDType::Float64),
-            Self::Q2K | Self::Q3K => DTypeDescriptor::ProviderSpecific {
-                id: String::new(),
-                size_bytes: 1,
-            },
+            Self::Q2K | Self::Q3K | Self::Iq4Nl | Self::Iq4Xs => {
+                DTypeDescriptor::ProviderSpecific {
+                    id: String::new(),
+                    size_bytes: 1,
+                }
+            }
             Self::Q4K => DTypeDescriptor::ProviderSpecific {
                 id: String::new(),
                 size_bytes: 1,
@@ -430,6 +441,8 @@ impl ModelDType {
 pub enum ModelQuantizationFormat {
     GgufQ2K,
     GgufQ3K,
+    GgufIq4Nl,
+    GgufIq4Xs,
     GgufQ4K,
     GgufQ5K,
     GgufQ6K,
@@ -450,6 +463,8 @@ impl ModelQuantizationFormat {
         match value.to_ascii_lowercase().as_str() {
             "gguf-q2-k" | "q2_k" => Some(Self::GgufQ2K),
             "gguf-q3-k" | "q3_k" => Some(Self::GgufQ3K),
+            "gguf-iq4-nl" | "iq4_nl" => Some(Self::GgufIq4Nl),
+            "gguf-iq4-xs" | "iq4_xs" => Some(Self::GgufIq4Xs),
             "gguf-q4-k" | "q4_k" => Some(Self::GgufQ4K),
             "gguf-q5-k" | "q5_k" => Some(Self::GgufQ5K),
             "gguf-q6-k" | "q6_k" => Some(Self::GgufQ6K),
