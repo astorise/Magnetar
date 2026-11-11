@@ -426,3 +426,12 @@ than one GPU; the mixture-of-experts model stays slightly behind layer
 segments. Peer access (a direct write into the other GPU, about 0.4 us
 latency in the patched-driver measurements against about 14 us without)
 is what would shorten each reduction.
+
+### Evidence: the CI runner's peer-to-peer readiness (run 42996324549)
+
+- Two GeForce RTX 3060 12 GB at `0000:01:00.0` and `0000:03:00.0`, driver 595.71.05.
+- **BAR1 is 256 MiB per GPU**: Resizable BAR is not active. The BAR1 peer-access patch needs each GPU's BAR1 to map its whole 12 GB, so it cannot work until Resizable BAR and Above 4G Decoding are enabled in the host firmware.
+- Topology `PHB` (the GPUs meet at the CPU's PCIe host bridge); `nvidia-smi topo -p2p r` reports `CNS` ("chipset not supported") both ways.
+- The host runs Talos Linux with `module.sig_enforce=1`: an unsigned, patched NVIDIA kernel module would be refused at load. Using the patch there means building a signed Talos system extension with the patched open modules for driver 595.71.05 (or a matching patched branch), besides the firmware change.
+
+Peer access on this runner therefore needs, in order: Resizable BAR and Above 4G in firmware (check BAR1 grows to at least 16 GB), then a signed Talos extension carrying the patched modules, then `iommu=pt` on the kernel command line. Until then, reductions go through host memory as now.
