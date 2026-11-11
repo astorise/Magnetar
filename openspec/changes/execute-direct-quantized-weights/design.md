@@ -159,3 +159,33 @@ for its weights, and generates the same 64 token ids as `Q8_0` ("Paris").
 The `Q4_K` and small `Q6_K` Kernels still reach 145-220 GB/s against
 270-305 GB/s for `Q8_0`: their remaining cost is per-value decoding, not
 bytes.
+
+### Int8 activations with `__dp4a` (run 43030585200, commit `74b71be`)
+
+With `MAGNETAR_CUDA_INT8_ACTIVATIONS=1` (off by default) a packed decode
+matmul quantizes its activation rows per 32-value block (signed bytes,
+one f32 scale) and multiplies with `__dp4a`. The conformance test against
+the Reference CPU on the rounded activations passes on the GPU.
+
+| Kernel, one token | f32 activations | int8 activations |
+|---|---|---|
+| `Q8_0` `[4096, 4096]` | 67.3 us (265 GB/s) | 64.6 us (276 GB/s) |
+| `Q8_0` `[4096, 14336]` | 204.7 us (305 GB/s) | 199.4 us (313 GB/s) |
+| `Q8_0` `[14336, 4096]` | 223.8 us (279 GB/s) | 200.0 us (312 GB/s) |
+| `Q4_K` `[4096, 4096]` | 52.8 us (179 GB/s) | 39.3 us (240 GB/s) |
+| `Q4_K` `[4096, 14336]` | 148.2 us (223 GB/s) | 108.4 us (305 GB/s) |
+| `Q4_K` `[14336, 4096]` | 179.4 us (184 GB/s) | 118.8 us (278 GB/s) |
+| `Q6_K` `[4096, 1024]` | 23.8 us (145 GB/s) | 17.9 us (192 GB/s) |
+| `Q6_K` `[14336, 4096]` | 232.8 us (207 GB/s) | 197.3 us (244 GB/s) |
+| `Q6_K` `[4096, 32768]` | 381.0 us (289 GB/s) | 336.9 us (327 GB/s) |
+
+| One GPU | TPOT f32 / int8 | TTFT f32 / int8 |
+|---|---|---|
+| Qwen2.5-0.5B `Q8_0` | 3.32 / 3.27 ms | 13.2 / 13.2 ms |
+| Mistral 7B `Q8_0` | 28.06 / 26.13 ms | 76.9 / 39.4 ms |
+| Mistral 7B `Q4_K_M` | 25.40 / 17.54 ms | 75.4 / 34.0 ms |
+
+All three generate exactly the same 64 token ids as with f32 activations.
+The short prompt's prefill (at most 64 rows) also goes through the
+packed Kernels, hence the TTFT halving. `Q4_K_M` with int8 activations
+runs at 17.54 ms per token, 37 % faster than `Q8_0` with f32 activations.
