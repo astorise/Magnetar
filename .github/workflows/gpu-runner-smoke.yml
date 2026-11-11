@@ -82,6 +82,7 @@ jobs:
         # multi-GPU design, "Hardware limit: no peer access". Diagnostic
         # only.
         continue-on-error: true
+        shell: bash
         run: |
           set -u
           mkdir -p "$RUNNER_TEMP/qualification-reports"
