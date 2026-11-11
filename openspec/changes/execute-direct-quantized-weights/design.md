@@ -189,3 +189,8 @@ All three generate exactly the same 64 token ids as with f32 activations.
 The short prompt's prefill (at most 64 rows) also goes through the
 packed Kernels, hence the TTFT halving. `Q4_K_M` with int8 activations
 runs at 17.54 ms per token, 37 % faster than `Q8_0` with f32 activations.
+
+Int8 activations are therefore the default for the decode-step packed
+matmuls; `MAGNETAR_CUDA_INT8_ACTIVATIONS=0` keeps f32 activations (the
+disable control the gguf suite runs, reporting any token difference as
+a warning).
