@@ -205,3 +205,27 @@ turn into a whole quantization step, so exact equality with one GPU is
 only required with f32 activations. Mistral 7B `Q8_0` in tensor parallel
 with int8 activations generates the one-GPU tokens, at 19.31 ms per token
 (20.6 ms with f32 activations, 26.10 ms on one GPU).
+
+## Evidence: packed Q2_K and Q3_K (run 43060525679, commit `614a3cb`)
+
+`Q2_K` and `Q3_K` are dequantized by ports of `dequantize_row_q2_K` and
+`dequantize_row_q3_K` that match gguf-py bit for bit, and read packed on
+CUDA with int8 activations only (without them a matmul dequantizes the
+weight for the call). The CUDA conformance test for both formats passes
+on the GPU.
+
+| Kernel, one token, int8 activations | `Q3_K` | `Q2_K` |
+|---|---|---|
+| `[4096, 4096]` | 36.7 us (197 GB/s) | 30.1 us (183 GB/s) |
+| `[4096, 14336]` | 94.7 us (266 GB/s) | 80.4 us (240 GB/s) |
+| `[14336, 4096]` | 96.1 us (262 GB/s) | 81.7 us (236 GB/s) |
+
+| Mistral 7B, one GPU, int8 activations | File | TPOT | TTFT | Load |
+|---|---|---|---|---|
+| `Q8_0` | 7.7 GB | 26.12 ms | 39.5 ms | 51.0 s |
+| `Q4_K_M` | 4.4 GB | 17.50 ms | 33.7 ms | 26.7 s |
+| `Q3_K_M` | 3.5 GB | 16.28 ms | 36.1 ms | 21.9 s |
+| `Q2_K` | 2.7 GB | 13.34 ms | 30.0 ms | 14.9 s |
+
+Both answer "Paris. The capital of Germany is Berlin. ...".
+
