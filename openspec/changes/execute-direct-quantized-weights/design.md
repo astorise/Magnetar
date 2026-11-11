@@ -133,3 +133,29 @@ tensors: about 1.2 G weights (output head, `attn_v`, half of
 `ffn_down`) read as bf16 are 2.4 GB per token against 3.4 GB for all
 `Q4_K` tensors; packed `Q6_K` (0.82 byte per weight) would cut a token's
 reads from about 5.8 GB to about 4.4 GB. Packed `Q6_K` is next.
+
+### Packed `Q6_K` (run 43023005841, commit `c447c4f`)
+
+`Q6_K` projections are now stored packed: each super-block's 208 bytes of
+quants and sub-block scales (16-byte aligned) and its `d` as an f32
+apart; `q6k_matmul_rows_kernel` reads two columns per warp. The CUDA
+`Q6_K` conformance test (exact download, matmul with bias and residual
+addends) passes on the GPU.
+
+| Kernel, one token | `Q6_K` |
+|---|---|
+| Mistral `attn_v` `[4096, 1024]` | 24.0 us (143 GB/s) |
+| Mistral `ffn_down` `[14336, 4096]` | 233.2 us (207 GB/s) |
+| Mistral output head `[4096, 32768]` | 386.4 us (285 GB/s) |
+
+| Mistral 7B, one GPU | TPOT | TTFT | Load |
+|---|---|---|---|
+| `Q8_0` | 28.04 ms | 76.7 ms | 50.4 s |
+| `Q4_K_M`, `Q6_K` as bf16 | 33.54 ms | 85.2 ms | 42.3 s |
+| `Q4_K_M`, `Q6_K` packed | 25.38 ms | 74.8 ms | 26.9 s |
+
+`Q4_K_M` is now 9 % faster per token than `Q8_0` with 47 % less VRAM
+for its weights, and generates the same 64 token ids as `Q8_0` ("Paris").
+The `Q4_K` and small `Q6_K` Kernels still reach 145-220 GB/s against
+270-305 GB/s for `Q8_0`: their remaining cost is per-value decoding, not
+bytes.
