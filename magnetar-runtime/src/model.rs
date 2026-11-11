@@ -347,6 +347,12 @@ pub enum ModelDType {
     Bf16,
     F32,
     F64,
+    /// GGUF `block_q2_K`: 256 values in 84 bytes (2-bit quants, sixteen
+    /// 4-bit sub-block scales and mins, `f16` `d` and `dmin`).
+    Q2K,
+    /// GGUF `block_q3_K`: 256 values in 110 bytes (2-bit quants plus a
+    /// high-bit mask, sixteen 6-bit sub-block scales, one `f16` scale).
+    Q3K,
     Q4K,
     Q5K,
     /// GGUF `block_q6_K`: 256 values in 210 bytes (6-bit quants, sixteen
@@ -371,6 +377,8 @@ impl ModelDType {
             "bf16" | "bfloat16" => Some(Self::Bf16),
             "f32" | "fp32" | "float32" => Some(Self::F32),
             "f64" | "fp64" | "float64" => Some(Self::F64),
+            "q2_k" | "q2k" => Some(Self::Q2K),
+            "q3_k" | "q3k" => Some(Self::Q3K),
             "q4_k" | "q4k" => Some(Self::Q4K),
             "q5_k" | "q5k" => Some(Self::Q5K),
             "q6_k" | "q6k" => Some(Self::Q6K),
@@ -394,6 +402,10 @@ impl ModelDType {
             Self::Bf16 => DTypeDescriptor::portable(ComputeDType::BrainFloat16),
             Self::F32 => DTypeDescriptor::portable(ComputeDType::Float32),
             Self::F64 => DTypeDescriptor::portable(ComputeDType::Float64),
+            Self::Q2K | Self::Q3K => DTypeDescriptor::ProviderSpecific {
+                id: String::new(),
+                size_bytes: 1,
+            },
             Self::Q4K => DTypeDescriptor::ProviderSpecific {
                 id: String::new(),
                 size_bytes: 1,
@@ -416,6 +428,8 @@ impl ModelDType {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ModelQuantizationFormat {
+    GgufQ2K,
+    GgufQ3K,
     GgufQ4K,
     GgufQ5K,
     GgufQ6K,
@@ -434,6 +448,8 @@ pub enum ModelQuantizationFormat {
 impl ModelQuantizationFormat {
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
+            "gguf-q2-k" | "q2_k" => Some(Self::GgufQ2K),
+            "gguf-q3-k" | "q3_k" => Some(Self::GgufQ3K),
             "gguf-q4-k" | "q4_k" => Some(Self::GgufQ4K),
             "gguf-q5-k" | "q5_k" => Some(Self::GgufQ5K),
             "gguf-q6-k" | "q6_k" => Some(Self::GgufQ6K),

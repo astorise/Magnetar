@@ -7662,6 +7662,8 @@ impl WeightMaterializationTransaction {
                         | ModelDType::F16
                         | ModelDType::Bf16
                         | ModelDType::Q8
+                        | ModelDType::Q2K
+                        | ModelDType::Q3K
                         | ModelDType::Q4K
                         | ModelDType::Q5K
                         | ModelDType::Q6K

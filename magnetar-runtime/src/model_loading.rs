@@ -1028,6 +1028,10 @@ const Q4_K_BLOCK_BYTES: u64 = 144;
 const Q5_K_BLOCK_BYTES: u64 = 176;
 /// `block_q6_K`: `128 (ql) + 64 (qh) + 16 (scales) + 2 (d) = 210` bytes.
 const Q6_K_BLOCK_BYTES: u64 = 210;
+/// `block_q2_K`: `16 (scales) + 64 (qs) + 2 (d) + 2 (dmin) = 84` bytes.
+const Q2_K_BLOCK_BYTES: u64 = 84;
+/// `block_q3_K`: `32 (hmask) + 64 (qs) + 12 (scales) + 2 (d) = 110` bytes.
+const Q3_K_BLOCK_BYTES: u64 = 110;
 /// Both K-quant formats' shared 12-byte packed 6-bit scale/min encoding.
 const K_SCALE_SIZE: usize = 12;
 
@@ -1074,12 +1078,14 @@ fn expected_storage_bytes(
         ModelDType::Q4K => block_based(QK_BLOCK_ELEMENTS, Q4_K_BLOCK_BYTES, "Q4_K"),
         ModelDType::Q5K => block_based(QK_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, "Q5_K"),
         ModelDType::Q6K => block_based(QK_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES, "Q6_K"),
+        ModelDType::Q2K => block_based(QK_BLOCK_ELEMENTS, Q2_K_BLOCK_BYTES, "Q2_K"),
+        ModelDType::Q3K => block_based(QK_BLOCK_ELEMENTS, Q3_K_BLOCK_BYTES, "Q3_K"),
         other => Err(ModelLoadingError::new(
             ModelLoadingErrorCode::StorageDTypeUnsupported,
             Some(ModelLoadingPhase::MaterializeWeights),
             format!(
                 "tensor '{}' declares unsupported storage dtype {other:?} (only F32, F16, BF16, \
-                 Q8_0, Q4_K, Q5_K and Q6_K are supported)",
+                 Q8_0, Q2_K, Q3_K, Q4_K, Q5_K and Q6_K are supported)",
                 tensor.name
             ),
         )),
@@ -1190,6 +1196,82 @@ pub(crate) fn dequantize_q6_k(raw: &[u8]) -> Vec<f32> {
         out.extend(values);
     }
     out
+}
+
+/// Dequantizes `block_q2_K` super-blocks (`raw.len()` a multiple of 84
+/// bytes), porting `ggml-quants.c`'s `dequantize_row_q2_K`: value `128 h +
+/// 32 j + 16 p + l` (h = 0..1, j = 0..3, p = 0..1, l = 0..15) is bits `2 j`
+/// of `qs[32 h + 16 p + l]`, under sub-block `8 h + 2 j + p` whose scale
+/// byte holds a 4-bit scale (low) and min (high): `d * scale * q - dmin *
+/// min`.
+pub(crate) fn dequantize_q2_k(raw: &[u8]) -> Vec<f32> {
+    let mut out =
+        Vec::with_capacity(raw.len() / Q2_K_BLOCK_BYTES as usize * QK_BLOCK_ELEMENTS as usize);
+    for block in raw.as_chunks::<{ Q2_K_BLOCK_BYTES as usize }>().0 {
+        let scales = &block[..16];
+        let qs = &block[16..80];
+        let d = f16_to_f32(u16::from_le_bytes([block[80], block[81]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[82], block[83]]));
+        for h in 0..2 {
+            for j in 0..4 {
+                for p in 0..2 {
+                    let sc = scales[8 * h + 2 * j + p];
+                    let dl = d * f32::from(sc & 0xF);
+                    let ml = dmin * f32::from(sc >> 4);
+                    for l in 0..16 {
+                        let q = (qs[32 * h + 16 * p + l] >> (2 * j)) & 3;
+                        out.push(dl * f32::from(q) - ml);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Dequantizes `block_q3_K` super-blocks (`raw.len()` a multiple of 110
+/// bytes), porting `ggml-quants.c`'s `dequantize_row_q3_K`: value `128 h +
+/// 32 j + 16 p + l` is bits `2 j` of `qs[32 h + 16 p + l]`, minus 4 unless
+/// bit `4 h + j` of `hmask[16 p + l]` is set, times `d * (scale - 32)` for
+/// sub-block `8 h + 2 j + p`'s 6-bit scale (low nibbles from the first
+/// eight scale bytes, high bit pairs from the last four).
+pub(crate) fn dequantize_q3_k(raw: &[u8]) -> Vec<f32> {
+    let mut out =
+        Vec::with_capacity(raw.len() / Q3_K_BLOCK_BYTES as usize * QK_BLOCK_ELEMENTS as usize);
+    for block in raw.as_chunks::<{ Q3_K_BLOCK_BYTES as usize }>().0 {
+        let hmask = &block[..32];
+        let qs = &block[32..96];
+        let packed = &block[96..108];
+        let d = f16_to_f32(u16::from_le_bytes([block[108], block[109]]));
+        let scales = q3_k_scales(packed);
+        for h in 0..2 {
+            for j in 0..4 {
+                for p in 0..2 {
+                    let dl = d * f32::from(scales[8 * h + 2 * j + p] - 32);
+                    for l in 0..16 {
+                        let q = i8::try_from((qs[32 * h + 16 * p + l] >> (2 * j)) & 3)
+                            .expect("two bits");
+                        let high = hmask[16 * p + l] & (1 << (4 * h + j)) != 0;
+                        out.push(dl * f32::from(q - if high { 0 } else { 4 }));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A `block_q3_K`'s sixteen 6-bit sub-block scales (0..63, before the -32
+/// offset): scale `i`'s low nibble is nibble `i / 8` of byte `i % 8`, its
+/// high bit pair bits `2 (i / 4)` of byte `8 + i % 4`.
+pub fn q3_k_scales(packed: &[u8]) -> [i8; 16] {
+    let mut scales = [0_i8; 16];
+    for (i, scale) in scales.iter_mut().enumerate() {
+        let low = (packed[i % 8] >> (4 * (i / 8))) & 0xF;
+        let high = (packed[8 + i % 4] >> (2 * (i / 4))) & 3;
+        *scale = i8::try_from(low | (high << 4)).expect("six bits");
+    }
+    scales
 }
 
 /// Dequantizes one `block_q5_K` region (`raw.len()` a multiple of 176
@@ -1402,6 +1484,8 @@ pub fn tensor_from_raw_bytes(
         ModelDType::Q4K => dequantize_q4_k(raw),
         ModelDType::Q5K => dequantize_q5_k(raw),
         ModelDType::Q6K => dequantize_q6_k(raw),
+        ModelDType::Q2K => dequantize_q2_k(raw),
+        ModelDType::Q3K => dequantize_q3_k(raw),
         other => {
             return Err(ModelLoadingError::new(
                 ModelLoadingErrorCode::StorageDTypeUnsupported,
@@ -1493,7 +1577,7 @@ pub fn read_tensor_payload(
 /// The packed form of a block-quantized 2D weight
 /// (`execute-direct-quantized-weights`), from the tensor's own validated
 /// storage bytes: `Ok(None)` when its storage dtype has no packed form
-/// (only `Q8_0`, `Q4_K` and `Q6_K` do so far), it is not a matrix, or its stored rows are
+/// (`Q8_0` and the `Q2_K`, `Q3_K`, `Q4_K` and `Q6_K` k-quants), it is not a matrix, or its stored rows are
 /// not whole blocks. The bytes are checked
 /// against the shape and against the declared content digest first, as for
 /// any other storage dtype.
@@ -1505,6 +1589,8 @@ pub fn packed_weight_from_raw_bytes(
         ModelDType::Q8 => crate::packed_weight::PackedWeightFormat::Q8_0,
         ModelDType::Q4K => crate::packed_weight::PackedWeightFormat::Q4K,
         ModelDType::Q6K => crate::packed_weight::PackedWeightFormat::Q6K,
+        ModelDType::Q2K => crate::packed_weight::PackedWeightFormat::Q2K,
+        ModelDType::Q3K => crate::packed_weight::PackedWeightFormat::Q3K,
         _ => return Ok(None),
     };
     let [rows, cols] = tensor.shape.as_slice() else {

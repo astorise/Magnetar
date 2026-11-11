@@ -977,6 +977,72 @@ jobs:
             echo "::warning::Mistral-7B-Instruct-v0.3 Q4_K_M GGUF: token ids differ between int8 (default) and f32 activations"
             diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
           fi
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q3_K_M GGUF checkpoint
+        # 3.5 GB, pinned by its sha256, which the test verifies: mostly Q3_K
+        # matrices, some Q4_K and Q6_K.
+        # The earlier Mistral exports are removed first to free the disk.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-q3_k_m-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-Q3_K_M.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_Q3_K_M_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 Q3_K_M GGUF on CUDA with packed weights
+        # Every k-quant matrix read packed, with int8 activations; it must
+        # still answer "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q3_K_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q3_k_m-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q3_k_m_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || {
+            echo "::error::Mistral 7B Q3_K_M: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q2_K GGUF checkpoint
+        # 2.7 GB, pinned by its sha256, which the test verifies: mostly Q2_K
+        # matrices, some Q3_K, Q4_K and Q6_K.
+        # The earlier Mistral exports are removed first to free the disk.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-q2_k-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-Q2_K.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_Q2_K_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 Q2_K GGUF on CUDA with packed weights
+        # Every k-quant matrix read packed, with int8 activations; it must
+        # still answer "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q2_K_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q2_k-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q2_k_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || {
+            echo "::error::Mistral 7B Q2_K: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
       - name: Download the pinned real Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF checkpoint
         # execute-and-cache-moe-experts F02: 15 GB packed, more than one
         # 12 GB GPU, pinned by its sha256, which the test verifies. The
