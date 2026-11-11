@@ -84,6 +84,8 @@ jobs:
         continue-on-error: true
         run: |
           set -u
+          mkdir -p "$RUNNER_TEMP/qualification-reports"
+          exec > >(tee "$RUNNER_TEMP/qualification-reports/p2p-readiness.txt") 2>&1
           nvidia-smi --query-gpu=index,name,pci.bus_id,driver_version,memory.total --format=csv || true
           nvidia-smi -q -d MEMORY | grep -A3 -i "BAR1" || true
           nvidia-smi topo -m || true
@@ -815,6 +817,12 @@ jobs:
             echo "::warning::Qwen1.5-MoE Q8_0: token ids differ between layer segments and tensor parallel"
             diff <(echo "$layers") <(echo "$tensor") || true
           fi
+      - name: GPU peer-to-peer readiness, again (diagnostic)
+        # The readiness printed at the start, repeated where the job's log
+        # tail keeps it.
+        if: always()
+        continue-on-error: true
+        run: cat "$RUNNER_TEMP/qualification-reports/p2p-readiness.txt" || true
       - name: Upload qualification reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
