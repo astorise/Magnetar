@@ -1493,7 +1493,7 @@ pub fn read_tensor_payload(
 /// The packed form of a block-quantized 2D weight
 /// (`execute-direct-quantized-weights`), from the tensor's own validated
 /// storage bytes: `Ok(None)` when its storage dtype has no packed form
-/// (only `Q8_0` and `Q4_K` do so far), it is not a matrix, or its stored rows are
+/// (only `Q8_0`, `Q4_K` and `Q6_K` do so far), it is not a matrix, or its stored rows are
 /// not whole blocks. The bytes are checked
 /// against the shape and against the declared content digest first, as for
 /// any other storage dtype.
@@ -1504,16 +1504,17 @@ pub fn packed_weight_from_raw_bytes(
     let format = match tensor.storage_dtype {
         ModelDType::Q8 => crate::packed_weight::PackedWeightFormat::Q8_0,
         ModelDType::Q4K => crate::packed_weight::PackedWeightFormat::Q4K,
+        ModelDType::Q6K => crate::packed_weight::PackedWeightFormat::Q6K,
         _ => return Ok(None),
     };
     let [rows, cols] = tensor.shape.as_slice() else {
         return Ok(None);
     };
     let transposed = stored_transposed_dims(tensor)?.is_some();
-    // Packed `Q4_K` serves projections (transposed storage, read by the
+    // Packed k-quants serve projections (transposed storage, read by the
     // decode matmul); an untransposed one, such as an embedding table, is
     // read row by row, which is only cheap dequantized once at load.
-    if format == crate::packed_weight::PackedWeightFormat::Q4K && !transposed {
+    if format != crate::packed_weight::PackedWeightFormat::Q8_0 && !transposed {
         return Ok(None);
     }
     let (stored_rows, stored_cols) = if transposed {

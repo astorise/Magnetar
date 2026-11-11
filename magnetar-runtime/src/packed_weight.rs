@@ -35,13 +35,18 @@ pub enum PackedWeightFormat {
     /// mins, then 128 bytes of 4-bit quants; `value = d * scale * q - dmin
     /// * min` per 32-value sub-block.
     Q4K,
+    /// GGUF `block_q6_K`: 256 values per super-block, 210 bytes -- 128
+    /// bytes of low 4-bit quants, 64 bytes of high 2-bit quants, sixteen
+    /// signed 8-bit sub-block scales, then an `f16` `d`; `value = d *
+    /// scale * (q - 32)` per 16-value sub-block.
+    Q6K,
 }
 
 impl PackedWeightFormat {
     pub const fn block_elements(self) -> u64 {
         match self {
             Self::Q8_0 => 32,
-            Self::Q4K => 256,
+            Self::Q4K | Self::Q6K => 256,
         }
     }
 
@@ -49,6 +54,7 @@ impl PackedWeightFormat {
         match self {
             Self::Q8_0 => 34,
             Self::Q4K => 144,
+            Self::Q6K => 210,
         }
     }
 
@@ -56,6 +62,7 @@ impl PackedWeightFormat {
         match self {
             Self::Q8_0 => "q8_0",
             Self::Q4K => "q4_k",
+            Self::Q6K => "q6_k",
         }
     }
 }
@@ -141,10 +148,12 @@ impl PackedWeight {
     }
 
     /// The stored values in row-major stored order, dequantized exactly as
-    /// `ggml-quants.c`'s `dequantize_row_q8_0` / `dequantize_row_q4_K` do.
+    /// `ggml-quants.c`'s `dequantize_row_q8_0` / `dequantize_row_q4_K` / `dequantize_row_q6_K`
+    /// do.
     pub fn dequantize_stored(&self) -> Vec<f32> {
         match self.format {
             PackedWeightFormat::Q4K => crate::model_loading::dequantize_q4_k(&self.bytes),
+            PackedWeightFormat::Q6K => crate::model_loading::dequantize_q6_k(&self.bytes),
             PackedWeightFormat::Q8_0 => self
                 .bytes
                 .as_chunks::<34>()

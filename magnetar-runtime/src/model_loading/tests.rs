@@ -351,3 +351,48 @@ fn k_quant_dequantization_matches_the_gguf_reference_bit_for_bit() {
         assert_eq!(value.to_bits(), bits, "Q4_K value {index}: {value}");
     }
 }
+
+/// A transposed `Q6_K` projection keeps its bytes packed and dequantizes
+/// exactly like the load-time path; an untransposed one (an embedding
+/// table, read row by row) stays dequantized at load.
+#[test]
+fn transposed_q6_k_projections_stay_packed() {
+    use k_quant_golden::*;
+    let metadata = |layout: Option<&str>| ModelTensorMetadata {
+        name: "w".to_string(),
+        // Logical `[in, out]`: two output columns of 256 values each.
+        shape: vec![256, 2],
+        storage_dtype: ModelDType::Q6K,
+        layout: layout.map(str::to_string),
+        shard: None,
+        offset_bytes: Some(0),
+        size_bytes: Some(Q6_K_GOLDEN_BYTES.len() as u64),
+        quantization: None,
+        expected_compute_dtype: None,
+        digest: None,
+    };
+    let packed = packed_weight_from_raw_bytes(
+        &metadata(Some(crate::packed_weight::TRANSPOSED_STORAGE_LAYOUT)),
+        &Q6_K_GOLDEN_BYTES,
+    )
+    .expect("valid bytes")
+    .expect("a transposed Q6_K projection is packed");
+    assert_eq!(
+        packed.format(),
+        crate::packed_weight::PackedWeightFormat::Q6K
+    );
+    assert_eq!(packed.logical_shape(), [256, 2]);
+    let stored = packed.dequantize_stored();
+    for (index, (value, bits)) in stored.iter().zip(Q6_K_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "Q6_K value {index}: {value}");
+    }
+    let untransposed = ModelTensorMetadata {
+        shape: vec![2, 256],
+        ..metadata(None)
+    };
+    assert!(
+        packed_weight_from_raw_bytes(&untransposed, &Q6_K_GOLDEN_BYTES)
+            .expect("valid bytes")
+            .is_none()
+    );
+}
