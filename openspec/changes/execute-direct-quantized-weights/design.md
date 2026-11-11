@@ -112,3 +112,24 @@ conversion per lane), and `Q4_K_M`'s `Q6_K` tensors (output head, half
 of `ffn_down`, `attn_v`) are dequantized to bf16 at load, so the export
 is slower per token than `Q8_0`. Next: exact cheap conversions in the
 Q4_K Kernels, then packed `Q6_K`.
+
+### Two columns per warp (run 43004068146, commit `0b508bd`)
+
+Cheaper conversions (magic-number nibble to float, `cvt.f32.f16`) changed
+nothing; giving each warp two output columns, so every activation load
+and scale decode serves two weight rows, did:
+
+| Kernel, one token | `Q4_K` before | `Q4_K` two columns |
+|---|---|---|
+| `[2048, 2048]` | -- | 17.5 us (135 GB/s) |
+| `[4096, 4096]` | 57.4 us (164 GB/s) | 51.2 us (184 GB/s) |
+| `[4096, 14336]` | 176.4 us (187 GB/s) | 149.5 us (221 GB/s) |
+| `[14336, 4096]` | 189.8 us (174 GB/s) | 179.8 us (184 GB/s) |
+| `[2048, 151936]` | -- | 994.9 us (176 GB/s) |
+
+Mistral 7B `Q4_K_M`, one GPU: TPOT 33.54 ms (was 34.98), TTFT 85.2 ms,
+still "Paris". The rest of the gap to `Q8_0` (28.0 ms) is the `Q6_K`
+tensors: about 1.2 G weights (output head, `attn_v`, half of
+`ffn_down`) read as bf16 are 2.4 GB per token against 3.4 GB for all
+`Q4_K` tensors; packed `Q6_K` (0.82 byte per weight) would cut a token's
+reads from about 5.8 GB to about 4.4 GB. Packed `Q6_K` is next.
