@@ -96,3 +96,19 @@ CUDA Provider does, removed it. With int8 activations the tokens diverge
 from the CUDA one-GPU run at the sixth token (the same near-tie seen in
 tensor parallel: "Paris. The capital of France is Paris ..."); with
 `MAGNETAR_CPU_INT8_ACTIVATIONS=0` they equal the CUDA f32 run.
+
+### On the GPU runner host (run 43107091711, commit `ef50d02`)
+
+Intel Core i7-7700 (4 cores, 8 threads), the container granted 3 threads
+(`available_parallelism`), first-increment Kernels:
+
+| Model | TPOT | TTFT | Load |
+|---|---|---|---|
+| Qwen2.5-0.5B `Q8_0` | 62.3 ms | 109 ms | 3.5 s |
+| Mistral 7B `Q4_K_M` | 1,368 ms | 2,143 ms | 24.0 s |
+
+Both answer "Paris". Mistral's profile: matmul 4.4 ms and matmul-residual
+6.0 ms per call (about 3.2 GB/s over the 4.4 GB of weights), and the
+embedding 254 ms per call: its `Q4_K` table is expanded at load and the
+Reference CPU Kernel copied the whole f32 table per lookup, now gathered
+in place.
