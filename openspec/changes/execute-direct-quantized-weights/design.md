@@ -253,3 +253,30 @@ serialize the warp. The table now lives in four immediate words and
 | `IQ4_NL` | 4.1 GB | 18.11 ms | 46.6 ms | 29.1 s |
 
 Both generate the same token ids as `Q8_0` ("Paris." ...).
+
+## Evidence: packed IQ2 and IQ3 (run 43085955878, commit `5fee34b`)
+
+`IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS` and `IQ3_S` are dequantized by
+ports of llama.cpp's routines over grids generated from gguf-py (bit
+exact), and read packed on CUDA with int8 activations, the grid copied to
+shared memory per block. The i-quant conformance test passes on the GPU.
+
+| Kernel, `[1, 4096] x [4096, 14336]`, int8 activations | Time | Bandwidth |
+|---|---|---|
+| `IQ3_XXS` | 99.5 us | 226 GB/s |
+| `IQ3_S` | 115.0 us | 219 GB/s |
+| `IQ2_XXS` | 87.8 us | 172 GB/s |
+| `IQ2_XS` | 96.3 us | 176 GB/s |
+| `IQ2_S` | 126.8 us | 148 GB/s |
+
+| Mistral 7B, one GPU | File | TPOT | TTFT | Load |
+|---|---|---|---|---|
+| `IQ3_M` | 3.3 GB | 17.69 ms | 61.8 ms | 18.2 s |
+| `IQ3_XXS` | 2.8 GB | 17.53 ms | 54.7 ms | 18.0 s |
+| `IQ2_M` | 2.5 GB | 18.85 ms | 53.1 ms | 15.1 s |
+| `IQ2_XS` | 2.2 GB | 16.25 ms | 46.0 ms | 14.5 s |
+| `IQ2_XXS` | 2.0 GB | 15.09 ms | 43.3 ms | 13.3 s |
+
+All five answer "Paris". The 2- and 3-bit i-quants decode no faster
+than `Q4_K_M` (17.5 ms): their Kernels are bound by grid lookups and sign
+handling, not bytes; their value is fitting larger models.

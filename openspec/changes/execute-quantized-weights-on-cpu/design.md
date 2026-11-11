@@ -68,3 +68,31 @@ Additive: a new Provider, unselected unless policy resolves it. Rollback is not 
 - Provider identity and packaging: a second crate in `magnetar-provider-cpu` or a feature of the existing one.
 - Default thread count: physical cores (needs topology detection) or `available_parallelism`.
 - Whether `wasm32` gets `simd128` kernels in this change or a follow-up.
+
+## Evidence: first increment (commit `43b7745`, local 4-core AVX2 host)
+
+`magnetar:provider/cpu-native` stores every packed format and reads them
+in its matmul, matmul-bias, matmul-residual and embedding Kernels; other
+operators run the Reference CPU kernels. Conformance tests against the
+Reference CPU pass for all twelve formats.
+
+| Kernel, one row, 4 threads, AVX2 | `[4096, 14336]` | `[14336, 4096]` |
+|---|---|---|
+| `Q8_0` | 3.16 ms (19.8 GB/s) | 3.37 ms (18.5 GB/s) |
+| `Q4_K` | 5.85 ms (5.6 GB/s) | 5.15 ms (6.4 GB/s) |
+| `Q6_K` | 5.46 ms (8.8 GB/s) | 7.24 ms (6.7 GB/s) |
+| `IQ4_XS` | 7.03 ms (4.4 GB/s) | 7.10 ms (4.4 GB/s) |
+| `Q2_K` | 6.61 ms (2.9 GB/s) | 7.25 ms (2.7 GB/s) |
+| `IQ2_XS` | 17.52 ms (1.0 GB/s) | 17.89 ms (0.9 GB/s) |
+
+`Q8_0` reaches the host's memory bandwidth; the other formats are bound
+by per-run decoding and scale handling (next increments).
+
+Qwen2.5-0.5B-Instruct `Q8_0` GGUF end to end: 73.8 ms per token, TTFT
+121.8 ms, load 1.7 s, "Paris". The first run took 5.8 s per token: the
+Runtime reads every node's inputs through `read_tensor_value`, which
+expanded each packed weight to f32 per step; answering `Opaque`, as the
+CUDA Provider does, removed it. With int8 activations the tokens diverge
+from the CUDA one-GPU run at the sixth token (the same near-tie seen in
+tensor parallel: "Paris. The capital of France is Paris ..."); with
+`MAGNETAR_CPU_INT8_ACTIVATIONS=0` they equal the CUDA f32 run.
