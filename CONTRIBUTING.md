@@ -35,7 +35,7 @@ cargo run --locked -p layering-check -- magnetar-runtime/src quality/layers.toml
 
 A new module needs an entry in `[modules]`. If the check reports an upward
 dependency, move the type down to the module that owns it and re-export it
-from its old path; do not add to the `[debt]` list. `--report` in front of
+from its old path. The map has no `[debt]` entry; do not add one. `--report` in front of
 the two paths prints every dependency with the items behind it.
 
 The Rust toolchain is pinned in `rust-toolchain.toml`; rustup installs it

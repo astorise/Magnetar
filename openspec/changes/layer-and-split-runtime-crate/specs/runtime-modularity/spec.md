@@ -2,11 +2,11 @@
 
 ### Requirement: Runtime Code Layers
 
-Runtime code SHALL be organised in layers: core types, graph and memory, kernel pipeline, Component engine, and Runtime orchestration. Every Runtime module SHALL be assigned to exactly one layer in a version-controlled layer map. A module SHALL depend only on modules of its own layer or of a lower layer.
+Runtime code SHALL be organised in layers: core types, graph and memory, model data, kernel pipeline, Component engine, and Runtime orchestration. Every Runtime module SHALL be assigned to exactly one layer in a version-controlled layer map. A module SHALL depend only on modules of its own layer or of a lower layer.
 
 #### Scenario: Lower layer does not reach the Inference API
 
-- **WHEN** the dependencies of a core, graph, kernel or Component engine module are listed
+- **WHEN** the dependencies of a core, graph, model data, kernel or Component engine module are listed
 - **THEN** none of them is a Runtime orchestration module such as `inference_api`, `runtime` or `first_native_runtime`
 
 #### Scenario: Module without a layer
@@ -16,7 +16,7 @@ Runtime code SHALL be organised in layers: core types, graph and memory, kernel 
 
 ### Requirement: Layer Crates
 
-The core types, graph and memory, kernel pipeline and Component engine layers SHALL each be built as a separate crate. The crate dependency graph SHALL be acyclic and SHALL follow the layer order. A module MAY stay in the Runtime orchestration crate when moving it lower would change a public type; the layer map SHALL record the reason.
+The core types, graph and memory, kernel pipeline and Component engine layers SHALL each be built as a separate crate. The model data layer SHALL be built outside the Runtime orchestration crate, as its own crate or as part of a lower-layer crate. The crate dependency graph SHALL be acyclic and SHALL follow the layer order. A module MAY stay in the Runtime orchestration crate when moving it lower would change a public type; the layer map SHALL record the reason.
 
 #### Scenario: Core crate builds alone
 

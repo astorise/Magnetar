@@ -22,9 +22,9 @@
 - [x] 3.7 `component`: move `WitInterface` to `capability`; re-export.
 - [x] 3.8 After each task above: unit and contract suites pass with the baseline counts; Clippy clean with `-D warnings`.
 - [x] 3.9a After tasks 3.1 to 3.7: public API diff against `d5231c7` shows no removed and no changed item; root and submodule workspaces build without source change; `magnetar-cli` (93) and `magnetar-inference-component` (14) tests pass.
-- [ ] 3.9 Model data (design D5b): split the model, tokenizer, session, adapter and Model Instance data types and their error enums from loading and lifecycle code; clear the seven `component*`/`model_*` and `kernel_*` debt entries that name them.
-- [ ] 3.10 `capability -> provider`: move the `ProviderError` enum to core; clear the entry.
-- [ ] 3.11 Debt list empty; remove the `[debt]` table from the layer map.
+- [x] 3.9 Model data (design D5b): add the `model-data` layer; assign `model` to it; move the Model Instance, session, adapter and tokenizer identities with their error enums to `model_identity`; move the kernel selection policy types to `kernel_selection_policy`; move `ComponentArtifactReference` to `binding`.
+- [x] 3.10 `capability -> provider`: move `ProviderError`, `ScheduledOperationId` and the Provider ABI descriptor types to `provider_status` and `provider_abi`.
+- [x] 3.11 Debt list empty; `[debt]` table removed from the layer map. Verified: gate clean, same 1,355 test names, public API diff against `d5231c7` with no removed and no changed item, root and submodule workspaces build, `magnetar-cli` and `magnetar-inference-component` tests pass.
 
 ## 4. Split `first_native_runtime` and monolithic tests
 
@@ -40,6 +40,7 @@
 
 - [ ] 5.1 `magnetar-core`: create the crate, move the core modules, re-export from `magnetar-runtime` at the same paths.
 - [ ] 5.2 `magnetar-graph`: same for the graph and memory modules.
+- [ ] 5.2a Model data: extract `model` and `model_identity` as `magnetar-model`, or fold them into `magnetar-graph`'s dependents as decided from their size (design D5b).
 - [ ] 5.3 `magnetar-kernel`: same for the kernel pipeline modules.
 - [ ] 5.4 `magnetar-component-engine`: same for the Component engine modules, `wit/` and the Component fixtures; forward the `wasmtime-component-engine` and `web-component-engine` features.
 - [ ] 5.5 After each extraction: compare the public API listing with the baseline, and report clean and incremental build times.

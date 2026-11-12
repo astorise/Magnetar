@@ -28,11 +28,12 @@ The module graph has cycles that cross every layer the audit proposes (see the p
 |---|---|---|
 | Core types (1) | `magnetar-core` | `capability`, `device`, `resolution`, `operator`, `artifact_signature`, and the modules this change creates to hold shared data types: `compute_types`, `binding`, `provider_status`, `provider_abi`, `trace_id` |
 | Graph and memory (2) | `magnetar-graph` | `execution_graph`, `graph_fusion`, `memory` |
-| Kernel pipeline (3) | `magnetar-kernel` | the `kernel*` modules except `kernel_optimization_orchestration`, plus `execution_stream` |
-| Component engine (3) | `magnetar-component-engine` | `component`, `component_wasmtime`, `component_web`, `model_component`, `graph_builder_capability`, `model_config_capability`, `wit/` |
-| Runtime orchestration (4) | `magnetar-runtime` | everything else |
+| Model data (3) | see D5b | `model`, `model_identity` |
+| Kernel pipeline (4) | `magnetar-kernel` | the `kernel*` modules except `kernel_optimization_orchestration`, plus `execution_stream` |
+| Component engine (4) | `magnetar-component-engine` | `component`, `component_wasmtime`, `component_web`, `model_component`, `graph_builder_capability`, `model_config_capability`, `wit/` |
+| Runtime orchestration (5) | `magnetar-runtime` | everything else |
 
-A module may depend on its own layer and on layers of a strictly lower rank. The kernel pipeline and the Component engine share rank 3 and do not depend on each other.
+A module may depend on its own layer and on layers of a strictly lower rank. The kernel pipeline and the Component engine share rank 4 and do not depend on each other.
 
 Seven modules stay in Runtime orchestration although the audit, or the first version of this design, placed them lower: `affinity`, `tensor`, `operator_scope`, `planning`, `scheduler`, `multi_device_placement`, `kernel_optimization_orchestration`. Each depends on orchestration by design (a `dyn Provider`, a `Runtime`, the Kernel Registry, the Inference API scope check). Their data types move down to core modules instead. The layer map records the reason for each under `[held]`.
 
@@ -73,9 +74,11 @@ Types keep their identity because they are defined once and re-exported, so trai
 
 ### D5b. The model data layer
 
-The ten upward dependencies that remain after the first pass share one cause. The Component engine names model data types (`ModelManifest`, `ModelArchitecture`, `ModelArchitectureConfig`, `ArtifactFormat`, `TokenizerFamily`), and the kernel pipeline names `ModelInstanceId`, `AdapterRevision` and the Model Instance selection and warmup types. These types cannot move alone: their constructors return `ModelArtifactError`, `ModelInstanceError`, `SessionError`, `AdapterError`, `TokenizerError` and `ProviderError`, and `ModelInstanceError` embeds `ModelArchitecture`.
+The last ten upward dependencies shared one cause. The Component engine names model data types (`ModelManifest`, `ModelArchitecture`, `ModelArchitectureConfig`, `ArtifactFormat`, `TokenizerFamily`), and the kernel pipeline names `ModelInstanceId`, `AdapterRevision` and the Model Instance selection and warmup types. Their constructors return `ModelArtifactError`, `ModelInstanceError`, `SessionError`, `AdapterError` and `TokenizerError`, and `ModelInstanceError` embeds `ModelArchitecture`.
 
-Resolution: add a `model-data` layer of rank 2, beside graph and memory, holding the model, tokenizer, session, adapter and Model Instance *data* types with their error enums, split from the loading, residency and lifecycle code that stays in Runtime orchestration. `capability -> provider` is resolved the same way, by moving the `ProviderError` enum to core. Whether `model-data` becomes a crate of its own or part of `magnetar-core` is decided when the split is done, from its size.
+Resolution: a `model-data` layer of rank 3, above graph and memory and below the kernel pipeline and the Component engine. It holds `model` (manifests, architecture and trust data; it uses only core types and the Memory Manager) and `model_identity` (the Model Instance, session, adapter and tokenizer identities with their lifecycle states and error enums). Loading, residency and lifecycle code stays in Runtime orchestration.
+
+Still open: whether `model-data` becomes a crate of its own (`magnetar-model`) or joins another crate. It is about 2,700 lines today.
 
 ### D6. Split of `first_native_runtime`
 
@@ -138,6 +141,6 @@ Rollback of any stage is a revert of its pull requests: no data, artifact format
 
 ## Open Questions
 
-- Is `model-data` (D5b) a crate of its own or part of `magnetar-core`?
+- Is `model-data` (D5b) a crate of its own?
 - Several moved types have `pub(crate)` constructors or fields used by higher modules (for example `ModelInstanceId::runtime_issued`). Across crates they need a public form or a different issuing path; each case is settled at extraction.
 - Should the new crates be published, or kept `publish = false` with `magnetar-runtime` vendoring them? D8 assumes publication, since crates.io requires every dependency of a published crate to be published.
