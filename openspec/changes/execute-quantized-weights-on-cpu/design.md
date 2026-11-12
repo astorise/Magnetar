@@ -126,3 +126,16 @@ Mistral's embedding now costs 0.014 ms per lookup (254 ms before); its
 matmuls (3.5 ms per call, matmul-residual 4.8 ms) are about 96 % of a
 token, near 5 GB/s over the weights on three threads: Kernel-bound, the
 next target, with attention (0.57 ms per call) the next operator.
+
+With the specialized `Q4_K` and `Q6_K` Kernels (run 43164691219, commit
+`f7aa61e`), same host and 3 threads:
+
+| Model | TPOT | TTFT | Load |
+|---|---|---|---|
+| Qwen2.5-0.5B `Q8_0` | 53.5 ms | 93.6 ms | 3.5 s |
+| Mistral 7B `Q4_K_M` | 379.0 ms (was 885.8) | 1,014 ms | 23.9 s |
+
+Both answer "Paris" and generate the same token ids as their CUDA runs.
+Mistral reads its 4.4 GB of weights at about 11.6 GB/s; its matmuls
+(1.4 ms per call, matmul-residual 2.0 ms) are about 91 % of a token and
+attention (0.57 ms per call, the Reference CPU kernel) about 5 %.
