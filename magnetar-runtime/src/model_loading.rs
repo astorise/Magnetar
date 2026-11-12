@@ -1628,7 +1628,7 @@ fn slice_tensor_bytes<'a>(
 /// Validates and decodes `raw` -- exactly `tensor`'s declared storage
 /// bytes, no more, no less -- into a `HostTensor`, shared by both the
 /// whole-buffer and streaming materialization paths (see
-/// [`slice_tensor_bytes`]'s doc comment for which path supplies `raw` how).
+/// `slice_tensor_bytes`'s doc comment for which path supplies `raw` how).
 /// Verifies `raw.len()` against the shape/dtype-implied byte count, verifies
 /// a declared non-F32 digest against `raw` before conversion (Decision 8),
 /// and converts F16/BF16 to F32 explicitly.
