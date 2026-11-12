@@ -6565,7 +6565,7 @@ struct QwenComponentPreflight {
 /// `validate_against_graphs` performs genuine semantic comparison against
 /// the Runtime-built graph rather than proving only that the two graphs
 /// happen to be the same size.
-struct QwenComponentGraphSemantics {
+pub(super) struct QwenComponentGraphSemantics {
     prefill_node_count: usize,
     decode_node_count: usize,
     prefill_operator_hash: u32,
@@ -6621,7 +6621,7 @@ impl QwenComponentGraphSemantics {
 }
 
 #[cfg(test)]
-fn build_first_native_graphs_from_component_output(
+pub(super) fn build_first_native_graphs_from_component_output(
     fixture: &E2eFixture,
     prompt_token_count: u64,
     component_graph_semantics: QwenComponentGraphSemantics,
@@ -6798,7 +6798,7 @@ fn validate_and_instantiate_trusted_qwen_component_before_first_native_planning(
 /// one queried across the Component boundary (the non-component fallback
 /// build, and tests not themselves exercising component/graph mismatch
 /// detection).
-fn qwen_component_graph_semantics_for_prompt(
+pub(super) fn qwen_component_graph_semantics_for_prompt(
     config: &FirstNativeModelConfig,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,

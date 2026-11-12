@@ -109,3 +109,14 @@ pub use weights::*;
 // them.
 #[cfg(test)]
 pub(crate) use tests::{check_eos_token_stops_generation, check_graph_production_and_execution};
+
+// Without a Component engine (`wasmtime-component-engine` off, or `wasm32`)
+// the test build of this module falls back to the Rust-synthesized graph
+// oracle, which lives in `tests`.
+#[cfg(all(
+    test,
+    not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))
+))]
+use tests::{
+    build_first_native_graphs_from_component_output, qwen_component_graph_semantics_for_prompt,
+};
