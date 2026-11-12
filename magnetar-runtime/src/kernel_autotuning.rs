@@ -50,7 +50,7 @@
 //!   [`run_kernel_autotuning_conformance`]: the twelve conformance
 //!   requirements from `specs/conformance/spec.md`.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::{
     CompiledKernelArtifactId, ComputeDType, DeviceBinding, KernelArtifactTrust, KernelId,
     MemoryPressureLevel, OperatorId, ProviderBinding, TensorLayoutKind,

@@ -37,7 +37,7 @@
 //!   the conformance checks from this change's benchmark-related
 //!   requirements.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use std::{collections::BTreeMap, error::Error, fmt};
 
 pub const KERNEL_BENCHMARK_CONTRACT_VERSION: &str = "0.1.0";

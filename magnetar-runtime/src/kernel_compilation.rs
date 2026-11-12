@@ -93,7 +93,7 @@
 //!   [`run_kernel_compilation_conformance`]: the conformance checks required
 //!   by `openspec/changes/define-provider-kernel-compilation-capability/specs/conformance/spec.md`.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::kernel_artifact::{
     CompiledKernelArtifact, CompiledKernelArtifactId, KernelArtifactColdPathOperation,
     KernelArtifactPath, KernelArtifactTrust, KernelSourceArtifact, KernelSourceArtifactId,

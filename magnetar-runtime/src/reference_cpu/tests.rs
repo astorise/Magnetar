@@ -626,7 +626,7 @@ fn concat_handles_rank_one_input() {
 }
 
 use crate::affinity::{FallbackClass, ResourceAffinity};
-use crate::compute::ComputeDType;
+use crate::compute_types::ComputeDType;
 use crate::device::DeviceType;
 use crate::kernel::{KernelImplementationFamily, KernelObservationKind};
 use crate::tensor::HostTensor;

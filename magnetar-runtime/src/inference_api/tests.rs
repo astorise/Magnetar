@@ -19,7 +19,7 @@ use crate::tokenizer::{
 
 use crate::affinity::{FallbackClass, ProviderBinding, ResourceAffinity};
 use crate::batching::BatchingPolicy;
-use crate::compute::TensorResourceId;
+use crate::compute_types::TensorResourceId;
 use crate::generation::GenerationOutput;
 use crate::generation::{
     CancellationMetadata, EosMode, EosOutputPolicy, EosPolicy, FinishReason,

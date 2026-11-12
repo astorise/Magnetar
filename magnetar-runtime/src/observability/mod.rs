@@ -1,5 +1,5 @@
 mod exporter;
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::runtime::next_runtime_observation_sequence;
 pub use exporter::{
     CustomEventRecord, CustomLogRecord, CustomMetricKind, CustomMetricRecord,

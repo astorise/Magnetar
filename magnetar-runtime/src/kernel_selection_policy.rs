@@ -122,7 +122,7 @@
 //!   this change's `specs/kernel-selection-policy/spec.md` and the
 //!   selection-policy requirements added to `specs/conformance/spec.md`.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::kernel_artifact::{KernelArtifactTrust, PreparedKernelId};
 use crate::kernel_benchmark::BenchmarkFreshness;
 use crate::kernel_qualification::QualificationStatus;
@@ -1330,7 +1330,7 @@ pub struct FallbackPolicy {
 /// Implements "Reference CPU Fallback" (proposal): host execution is gated
 /// on affinity, staging policy, and semantic support in addition to being
 /// present in the policy's ordered classes -- it is never a bare default.
-/// Reuses [`crate::compute::HostStagingPolicy`] (`Forbid`/`Permit`) rather
+/// Reuses [`crate::compute_types::HostStagingPolicy`] (`Forbid`/`Permit`) rather
 /// than introducing a second, competing staging-policy enum.
 pub fn evaluate_kernel_selection_fallback(
     policy: &FallbackPolicy,

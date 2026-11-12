@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod affinity;
 pub mod artifact_signature;
 pub mod batching;
+pub mod binding;
 pub mod capability;
 pub mod cli_boundary;
 pub mod component;
@@ -16,6 +17,7 @@ pub mod component_wasmtime;
 #[cfg(all(target_arch = "wasm32", feature = "web-component-engine"))]
 pub mod component_web;
 pub mod compute;
+pub mod compute_types;
 pub mod conformance;
 pub mod device;
 #[allow(dead_code)]

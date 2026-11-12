@@ -68,7 +68,7 @@
 //!   [`run_kernel_artifact_ingestion_conformance`]: executable conformance
 //!   evidence for `specs/conformance/spec.md`.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::kernel_artifact_manifest::{
     KernelArtifactStorageMode, KernelBlobDigest, KernelEvidenceReference, KernelEvidenceStatus,
     KernelExchangeBundle, KernelManifestError, KernelManifestLimits, KernelManifestV1,

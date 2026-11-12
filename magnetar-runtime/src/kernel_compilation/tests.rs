@@ -4,7 +4,7 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
-use crate::compute::ComputeDType;
+use crate::compute_types::ComputeDType;
 
 use crate::affinity::{DeviceBinding, ProviderBinding};
 use crate::kernel_artifact::CompiledKernelArtifactId;

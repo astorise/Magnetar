@@ -42,7 +42,7 @@
 //!   conformance checks from this change's `specs/kernel-cache/spec.md` and
 //!   the cache-related requirements of `specs/conformance/spec.md`.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::kernel_artifact::{CompiledKernelArtifactId, KernelArtifactTrust};
 use crate::kernel_qualification::QualificationStatus;
 use crate::{ComputeDType, TensorLayoutKind};

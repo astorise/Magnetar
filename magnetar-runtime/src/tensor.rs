@@ -10,7 +10,7 @@
 //! a live, tracked `TensorResource` without exposing raw pointers, native
 //! handles, or Provider internals.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::{
     CorrelationId, DTypeDescriptor, KernelError, MemoryPlacement, ResourceAffinity,
     ShapeDescriptor, TensorDescriptor, TensorResidency, TensorResourceId, ViewDescriptor,

@@ -83,7 +83,7 @@
 //!   this change's `specs/generated-kernel-qualification/spec.md` and the
 //!   qualification-related requirements of `specs/conformance/spec.md`.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::kernel_artifact::{CompiledKernelArtifactId, KernelArtifactTrust};
 use crate::{ComputeDType, OperatorId, ProviderBinding, TensorLayoutKind};
 use std::{

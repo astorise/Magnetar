@@ -58,7 +58,7 @@
 //!   [`crate::ExecutionNode`] carries no source code, binary, or native
 //!   handle field.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::{
     ComputeDType, DeviceBinding, KernelDeterminism, KernelId, KernelOperatorVersionRange,
     KernelPrecisionMetadata, KernelShapeConstraints, KernelSpecializationTemplateId, OperatorId,

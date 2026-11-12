@@ -141,7 +141,7 @@
 //! See `kernel_manifest_multi_target_bundle_validates_with_distinct_architectures`
 //! in this crate's test suite for the executable version of this example.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::{
     CompiledKernelArtifact, CompiledKernelArtifactId, ComputeDType, CorrectnessOracleIdentity,
     KernelArtifactProvenance, KernelCacheEntry, KernelCacheKey, KernelOperatorVersionRange,

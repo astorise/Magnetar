@@ -4,7 +4,7 @@
 //! source rather than Runtime implementation source.
 
 use crate::affinity::ProviderBinding;
-use crate::compute::ComputeDType;
+use crate::compute_types::ComputeDType;
 use crate::operator::{OperatorFamily, OperatorId, TensorLayoutKind};
 use std::collections::BTreeSet;
 fn conformance_axis() -> KernelSpecializationAxis {

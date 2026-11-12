@@ -1,6 +1,6 @@
 use crate::affinity::*;
-use crate::compute::redact_backend_diagnostic;
 use crate::compute::*;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::device::Device;
 use crate::memory::*;
 use crate::observability::*;

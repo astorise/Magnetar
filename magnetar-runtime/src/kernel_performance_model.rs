@@ -51,7 +51,7 @@
 //!   [`run_kernel_performance_conformance`]: the fourteen conformance
 //!   requirements from `specs/conformance/spec.md`.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::{
     BenchmarkContext, CompiledKernelArtifactId, EligibleCandidate, GenerationPhase,
     KernelArtifactTrust, KernelAutotuningCandidate, KernelAutotuningPlan, KernelId,
