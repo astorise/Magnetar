@@ -4,6 +4,27 @@
 //! rather than Runtime implementation source (task 9.1).
 
 use super::*;
+
+/// Source text of every production file of this module, in one string, for
+/// the static guards below that assert on the absence or presence of a
+/// coding pattern. `tests.rs` itself is not included.
+const FIRST_NATIVE_SOURCE: &str = concat!(
+    include_str!("mod.rs"),
+    include_str!("chat_session.rs"),
+    include_str!("component_graphs.rs"),
+    include_str!("conformance_report.rs"),
+    include_str!("dispatch.rs"),
+    include_str!("engine.rs"),
+    include_str!("executor.rs"),
+    include_str!("fixture.rs"),
+    include_str!("graph_execution.rs"),
+    include_str!("kv_state.rs"),
+    include_str!("prepared_plans.rs"),
+    include_str!("production.rs"),
+    include_str!("segments.rs"),
+    include_str!("weights.rs"),
+);
+
 use crate::planning::*;
 use crate::scheduler::*;
 use crate::{CapabilityVersion, Device, ExecutionGraphSemanticFingerprint};
@@ -2596,7 +2617,7 @@ fn tensor_value_into_host_fails_structurally_for_a_device_resident_only_provider
 /// absence of a coding pattern, not a computed result.
 #[test]
 fn first_native_dispatch_source_contains_no_provider_downcast() {
-    let source = include_str!("../first_native_runtime.rs");
+    let source = FIRST_NATIVE_SOURCE;
     assert!(
         !source.contains("downcast_ref"),
         "first_native_runtime.rs must not recover a concrete Provider type via \
@@ -2640,7 +2661,7 @@ fn first_native_dispatch_source_contains_no_provider_downcast() {
 /// Component instead of only the CLI's hardcoded singleton).
 #[test]
 fn first_native_dispatch_has_no_production_fallback_and_fails_closed_instead() {
-    let source = include_str!("../first_native_runtime.rs");
+    let source = FIRST_NATIVE_SOURCE;
     assert!(
         !source.contains("non-strict-fixture-fallback"),
         "the non-strict-fixture-fallback Cargo feature was deliberately removed (task 12.6); \
@@ -2674,9 +2695,9 @@ fn qwen_component_production_loader_has_no_embedded_fixture() {
     // Normalized to `\n` regardless of this checkout's line-ending
     // convention (a real bug this test itself had: it panicked on Windows
     // CI, whose checkout uses CRLF, before this normalization was added).
-    let source = include_str!("../first_native_runtime.rs").replace("\r\n", "\n");
+    let source = FIRST_NATIVE_SOURCE.replace("\r\n", "\n");
     let production_loader_start = source
-        .find("not(test)\n))]\nfn qwen_real_component_package()")
+        .find("not(test)\n))]\npub(super) fn qwen_real_component_package()")
         .expect("the production (not(test)) qwen_real_component_package overload exists");
     // Covers qwen_real_component_package's thin not(test) wrapper and its
     // two siblings immediately after it in the source:
@@ -2738,7 +2759,7 @@ fn qwen_component_production_loader_has_no_embedded_fixture() {
 /// for the same structural reason.
 #[test]
 fn production_chat_formatted_generation_entry_point_is_public() {
-    let source = include_str!("../first_native_runtime.rs");
+    let source = FIRST_NATIVE_SOURCE;
     assert!(
         source.contains("pub fn run_production_qwen_generation_for_provider_with_prompt("),
         "run_production_qwen_generation_for_provider_with_prompt must be declared `pub fn` -- \
@@ -2760,7 +2781,7 @@ fn production_chat_formatted_generation_entry_point_is_public() {
 /// `pub(crate)`/`pub(super)`/private, and only source inspection proves it.
 #[test]
 fn production_request_generation_entry_point_is_public() {
-    let source = include_str!("../first_native_runtime.rs");
+    let source = FIRST_NATIVE_SOURCE;
     assert!(
         source.contains("pub fn run_production_qwen_generation_for_provider_with_request("),
         "run_production_qwen_generation_for_provider_with_request must be declared `pub fn` -- \
@@ -2900,7 +2921,7 @@ mod resolve_qwen_component_from_env_var_tests {
 /// instead of taking the whole `MemoryManager`.
 #[test]
 fn first_native_dispatch_never_takes_runtime_memory_manager() {
-    let source = include_str!("../first_native_runtime.rs");
+    let source = FIRST_NATIVE_SOURCE;
     let occurrences = source
         .matches("std::mem::take(runtime.memory_mut())")
         .count();
@@ -5425,7 +5446,7 @@ fn qwen_operator_sequence_hash(codes: &[u32]) -> u32 {
 /// `run_e2e_local_inference_conformance` needs to check in production.
 fn check_execute_qwen_graph_nodes_transport_has_no_host_tensor_typed_calls()
 -> Result<(), E2eConformanceError> {
-    const SOURCE: &str = include_str!("../first_native_runtime.rs");
+    const SOURCE: &str = FIRST_NATIVE_SOURCE;
     let start = SOURCE
         .find("fn execute_first_native_graph_nodes(")
         .ok_or_else(|| E2eConformanceError::Internal {

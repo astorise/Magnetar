@@ -228,9 +228,9 @@ jobs:
   # arbitrary test id). Both files are now clean and added below.
   #
   # Deliberately still excluded, by classification rather than oversight:
-  # `first_native_runtime.rs` and `qwen_model_component.rs` are the two
+  # `first_native_runtime/` and `qwen_model_component.rs` are the two
   # files designated to legitimately carry Qwen-specific knowledge (see
-  # their own doc comments) -- but `first_native_runtime.rs` also hosts the
+  # their own doc comments) -- but `first_native_runtime/` also hosts the
   # *generic* production facade (`ProductionLoadedModel`,
   # `production_model_fixture`, `build_first_native_graphs_from_named_
   # component`), which this file-level exclusion left with zero coverage
@@ -299,10 +299,10 @@ jobs:
           done
           exit "$fail"
       # Tachyon integration audit MAG-05 (#80): the guard above deliberately
-      # excludes first_native_runtime.rs and qwen_model_component.rs (they
+      # excludes first_native_runtime/ and qwen_model_component.rs (they
       # legitimately carry Qwen-specific knowledge), which also means it has
       # zero visibility into the *generic* production facade that happens to
-      # live inside first_native_runtime.rs -- ProductionLoadedModel,
+      # live inside first_native_runtime/ -- ProductionLoadedModel,
       # production_model_fixture, build_first_native_graphs_from_named_component
       # -- and inference-components' own LoadedInferenceComponent::load. This
       # step scans exactly those specific bodies (not the whole file) against

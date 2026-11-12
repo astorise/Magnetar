@@ -18,6 +18,29 @@ fn read_workspace_file(path: &str) -> String {
         .unwrap_or_else(|error| panic!("read {path}: {error}"))
 }
 
+/// Every production file of the `first_native_runtime` directory module as
+/// one text; `tests.rs` is read separately where a check needs it.
+fn read_first_native_runtime_source() -> String {
+    let directory = workspace_root().join("magnetar-runtime/src/first_native_runtime");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&directory)
+        .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+        .map(|entry| entry.expect("directory entry is readable").path())
+        .filter(|path| {
+            path.extension().is_some_and(|extension| extension == "rs")
+                && path.file_name().is_some_and(|name| name != "tests.rs")
+        })
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn architecture_freeze_reopens_only_for_blockers() {
     let freeze = architecture_freeze_1();
@@ -147,7 +170,7 @@ fn final_cut_inventory_has_no_removal_required_p0_bypass() {
 
 #[test]
 fn first_native_decode_does_not_materialize_full_history() {
-    let source = read_workspace_file("magnetar-runtime/src/first_native_runtime.rs");
+    let source = read_first_native_runtime_source();
     for forbidden in [
         "extend_from_slice(generated_tokens)",
         "request.input_token_ids.clone()",
