@@ -913,9 +913,17 @@ impl ModelLoadingCoordinator {
                 .iter()
                 .map(|tensor| tensor.name.clone())
                 .collect(),
+            // An F32 tensor stored transposed is verified against its
+            // storage bytes before its transpose (`tensor_from_raw_bytes`),
+            // like F16/BF16, never as the transposed content staged.
             required_weight_digests: manifest
                 .tensors
                 .iter()
+                .filter(|tensor| {
+                    !(tensor.storage_dtype == ModelDType::F32
+                        && tensor.layout.as_deref()
+                            == Some(crate::packed_weight::TRANSPOSED_STORAGE_LAYOUT))
+                })
                 .filter_map(|tensor| {
                     tensor
                         .digest
@@ -1630,7 +1638,8 @@ fn slice_tensor_bytes<'a>(
 /// whole-buffer and streaming materialization paths (see
 /// `slice_tensor_bytes`'s doc comment for which path supplies `raw` how).
 /// Verifies `raw.len()` against the shape/dtype-implied byte count, verifies
-/// a declared non-F32 digest against `raw` before conversion (Decision 8),
+/// a declared non-F32 (or transposed F32) digest against `raw` before
+/// conversion (Decision 8),
 /// and converts F16/BF16 to F32 explicitly.
 pub fn tensor_from_raw_bytes(
     tensor: &ModelTensorMetadata,
@@ -1662,7 +1671,9 @@ pub fn tensor_from_raw_bytes(
             ),
         ));
     }
-    if tensor.storage_dtype != ModelDType::F32
+    let transposed =
+        tensor.layout.as_deref() == Some(crate::packed_weight::TRANSPOSED_STORAGE_LAYOUT);
+    if (tensor.storage_dtype != ModelDType::F32 || transposed)
         && let Some(expected_digest) = &tensor.digest
     {
         expected_digest.verify_bytes(raw).map_err(|error| {
@@ -1796,18 +1807,15 @@ pub fn read_tensor_payload(
     })
 }
 
-/// The packed form of a block-quantized 2D weight
-/// (`execute-direct-quantized-weights`), from the tensor's own validated
-/// storage bytes: `Ok(None)` when its storage dtype has no packed form
-/// (`Q8_0`, the `Q2_K`, `Q3_K`, `Q4_K` and `Q6_K` k-quants, and the
-/// IQ2, IQ3 and IQ4 i-quants), it is not a matrix, or its stored rows are
-/// not whole blocks. The bytes are checked
-/// against the shape and against the declared content digest first, as for
-/// any other storage dtype.
-pub fn packed_weight_from_raw_bytes(
+/// The packed format `tensor` keeps when offered packed, `None` when it is
+/// only ever dequantized: its storage dtype has no packed form (`Q8_0`, the
+/// `Q2_K`, `Q3_K`, `Q4_K` and `Q6_K` k-quants, and the IQ2, IQ3 and IQ4
+/// i-quants do), it is not a matrix, it is an untransposed k-quant or
+/// i-quant (an embedding table, read row by row), or its stored rows are
+/// not whole blocks.
+pub fn packed_weight_format(
     tensor: &ModelTensorMetadata,
-    raw: &[u8],
-) -> Result<Option<crate::packed_weight::PackedWeight>, ModelLoadingError> {
+) -> Result<Option<crate::packed_weight::PackedWeightFormat>, ModelLoadingError> {
     let format = match tensor.storage_dtype {
         ModelDType::Q8 => crate::packed_weight::PackedWeightFormat::Q8_0,
         ModelDType::Q4K => crate::packed_weight::PackedWeightFormat::Q4K,
@@ -1833,16 +1841,54 @@ pub fn packed_weight_from_raw_bytes(
     if format != crate::packed_weight::PackedWeightFormat::Q8_0 && !transposed {
         return Ok(None);
     }
-    let (stored_rows, stored_cols) = if transposed {
-        (*cols, *rows)
-    } else {
-        (*rows, *cols)
-    };
+    let stored_cols = if transposed { *rows } else { *cols };
     // Stored rows that are not whole blocks (a block spanning two rows)
     // have no packed matrix form; such a tensor is only ever dequantized.
     if !stored_cols.is_multiple_of(format.block_elements()) {
         return Ok(None);
     }
+    Ok(Some(format))
+}
+
+/// The bytes `tensor` occupies once materialized: its storage bytes when it
+/// stays packed ([`packed_weight_format`]) or is stored as `f32`, else its
+/// elements as `f32` (dequantized or converted at load). An upper bound
+/// for a Provider that keeps a narrower form, never an underestimate.
+pub fn resident_weight_bytes(tensor: &ModelTensorMetadata) -> u64 {
+    let stored = tensor.size_bytes.unwrap_or(0);
+    if tensor.storage_dtype == ModelDType::F32
+        || matches!(packed_weight_format(tensor), Ok(Some(_)))
+    {
+        return stored;
+    }
+    let elements = tensor.shape.iter().product::<u64>();
+    stored.max(elements.saturating_mul(4))
+}
+
+/// The packed form of a block-quantized 2D weight
+/// (`execute-direct-quantized-weights`), from the tensor's own validated
+/// storage bytes: `Ok(None)` when its storage dtype has no packed form
+/// (`Q8_0`, the `Q2_K`, `Q3_K`, `Q4_K` and `Q6_K` k-quants, and the
+/// IQ2, IQ3 and IQ4 i-quants), it is not a matrix, or its stored rows are
+/// not whole blocks. The bytes are checked
+/// against the shape and against the declared content digest first, as for
+/// any other storage dtype.
+pub fn packed_weight_from_raw_bytes(
+    tensor: &ModelTensorMetadata,
+    raw: &[u8],
+) -> Result<Option<crate::packed_weight::PackedWeight>, ModelLoadingError> {
+    let Some(format) = packed_weight_format(tensor)? else {
+        return Ok(None);
+    };
+    let [rows, cols] = tensor.shape.as_slice() else {
+        return Ok(None);
+    };
+    let transposed = stored_transposed_dims(tensor)?.is_some();
+    let (stored_rows, stored_cols) = if transposed {
+        (*cols, *rows)
+    } else {
+        (*rows, *cols)
+    };
     if let Some(expected_digest) = &tensor.digest {
         expected_digest.verify_bytes(raw).map_err(|error| {
             ModelLoadingError::new(

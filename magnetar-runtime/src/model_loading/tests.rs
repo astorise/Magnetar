@@ -441,3 +441,45 @@ fn transposed_q6_k_projections_stay_packed() {
             .is_none()
     );
 }
+
+/// A transposed F32 tensor's declared digest describes its storage bytes:
+/// they are verified before the transpose, and the materialized tensor is
+/// the declared (transposed) matrix.
+#[test]
+fn transposed_f32_tensors_verify_their_storage_digest() {
+    // Stored `[3, 2]`, declared `[2, 3]`.
+    let stored = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let (mut metadata, bytes) = artifact_bytes_test_tensor("weight.t", vec![2, 3], &stored);
+    metadata.layout = Some(crate::packed_weight::TRANSPOSED_STORAGE_LAYOUT.to_string());
+    metadata.digest = Some(crate::model::ModelDigest::sha256(&bytes));
+    let tensor = tensor_from_raw_bytes(&metadata, &bytes).expect("storage digest matches");
+    assert_eq!(tensor.shape, vec![2, 3]);
+    assert_eq!(tensor.data, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
+    let mut wrong = bytes.clone();
+    wrong[0] ^= 1;
+    let error = tensor_from_raw_bytes(&metadata, &wrong).expect_err("tampered bytes rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
+}
+
+/// A weight's resident bytes: its storage when it stays packed or is f32,
+/// else its elements as f32.
+#[test]
+fn resident_weight_bytes_count_what_the_provider_holds() {
+    let base = f16_tensor_metadata("weight.h", vec![4, 64], 4 * 64 * 2);
+    assert_eq!(resident_weight_bytes(&base), 4 * 64 * 4);
+    let (f32_tensor, _) = artifact_bytes_test_tensor("weight.f", vec![2], &[1.0, 2.0]);
+    assert_eq!(resident_weight_bytes(&f32_tensor), 8);
+    let q8 = ModelTensorMetadata {
+        storage_dtype: ModelDType::Q8,
+        size_bytes: Some(4 * 2 * 34),
+        ..f16_tensor_metadata("weight.q", vec![4, 64], 0)
+    };
+    assert_eq!(resident_weight_bytes(&q8), 4 * 2 * 34);
+    // An untransposed k-quant table is dequantized at load.
+    let q4k_table = ModelTensorMetadata {
+        storage_dtype: ModelDType::Q4K,
+        size_bytes: Some(4 * 144),
+        ..f16_tensor_metadata("weight.e", vec![4, 256], 0)
+    };
+    assert_eq!(resident_weight_bytes(&q4k_table), 4 * 256 * 4);
+}

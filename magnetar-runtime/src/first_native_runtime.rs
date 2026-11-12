@@ -9188,7 +9188,14 @@ fn apply_production_layer_placement(
         manifest
             .tensors
             .iter()
-            .map(|tensor| (tensor.name.as_str(), tensor.size_bytes.unwrap_or(0))),
+            // What each weight occupies on its Device, not its checkpoint
+            // bytes: an F16 or a dequantized quantized weight is larger.
+            .map(|tensor| {
+                (
+                    tensor.name.as_str(),
+                    crate::model_loading::resident_weight_bytes(tensor),
+                )
+            }),
     );
     let failed = |reason: String| InferenceApiError::ModelLoadingFailed { reason };
     let placement = LayerPlacement::plan(&bytes, &devices, LayerPlacementPolicy::from_env())

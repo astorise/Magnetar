@@ -84,3 +84,22 @@ fn fill_spills_to_the_next_device_and_rejects_what_cannot_fit() {
         .is_err()
     );
 }
+
+/// Balanced shares are soft: when stopping at them leaves too much for the
+/// later Devices, a placement that fits is still found.
+#[test]
+fn balanced_falls_back_to_a_placement_that_fits() {
+    let bytes = LayerWeightBytes {
+        layers: vec![10, 40, 20],
+        first: 0,
+        last: 0,
+    };
+    let devices = [(device("a"), 100), (device("b"), 50)];
+    let placement = LayerPlacement::plan(&bytes, &devices, LayerPlacementPolicy::Balanced).unwrap();
+    let ends: Vec<_> = placement
+        .segments()
+        .iter()
+        .map(|segment| (segment.device.as_str().to_string(), segment.end_layer))
+        .collect();
+    assert_eq!(ends, vec![("a".to_string(), 3)]);
+}

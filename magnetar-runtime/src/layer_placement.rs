@@ -174,8 +174,26 @@ impl LayerPlacement {
     }
 
     /// Places `bytes` on `devices` (in order, each with its byte budget)
-    /// under `policy`, every segment within its Device's budget.
+    /// under `policy`, every segment within its Device's budget. A balanced
+    /// share is a soft target: when stopping at the targets leaves too much
+    /// for the remaining Devices, the placement fills the Devices instead,
+    /// so a model is rejected only when no contiguous placement fits.
     pub fn plan(
+        bytes: &LayerWeightBytes,
+        devices: &[(DeviceId, u64)],
+        policy: LayerPlacementPolicy,
+    ) -> Result<Self, LayerPlacementError> {
+        match Self::plan_once(bytes, devices, policy) {
+            Err(LayerPlacementError::DoesNotFit { .. })
+                if policy == LayerPlacementPolicy::Balanced =>
+            {
+                Self::plan_once(bytes, devices, LayerPlacementPolicy::Fill)
+            }
+            result => result,
+        }
+    }
+
+    fn plan_once(
         bytes: &LayerWeightBytes,
         devices: &[(DeviceId, u64)],
         policy: LayerPlacementPolicy,
