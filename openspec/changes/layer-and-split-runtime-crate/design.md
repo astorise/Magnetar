@@ -78,7 +78,7 @@ The last ten upward dependencies shared one cause. The Component engine names mo
 
 Resolution: a `model-data` layer of rank 3, above graph and memory and below the kernel pipeline and the Component engine. It holds `model` (manifests, architecture and trust data; it uses only core types and the Memory Manager) and `model_identity` (the Model Instance, session, adapter and tokenizer identities with their lifecycle states and error enums). Loading, residency and lifecycle code stays in Runtime orchestration.
 
-Still open: whether `model-data` becomes a crate of its own (`magnetar-model`) or joins another crate. It is about 2,700 lines today.
+Still open: whether `model-data` becomes a crate of its own (`magnetar-model`) or joins another crate. It is about 2,900 lines today.
 
 ### D6. Split of `first_native_runtime`
 
