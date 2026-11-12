@@ -33,6 +33,7 @@
 # `syn`/`toml` only, so it belongs here for the same reason.
 members = [
     "magnetar-core",
+    "magnetar-graph",
     "magnetar-runtime",
     "tools/coverage-ratchet",
     "roadmap-contracts",

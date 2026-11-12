@@ -1,5 +1,10 @@
-use super::*;
+//! Tests of `graph_fusion` against graphs built by the real Qwen Component.
+//! They need `first_native_runtime`, so they live in this crate and not
+//! next to `graph_fusion` in `magnetar-graph`.
+
+use crate::execution_graph::*;
 use crate::first_native_runtime::{e2e_fixture, first_native_graph_execution_order_for_tests};
+use crate::graph_fusion::*;
 
 fn is_weight(edge: &TensorEdgeId) -> bool {
     edge.as_str().starts_with("weight.")

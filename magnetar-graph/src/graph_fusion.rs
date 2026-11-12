@@ -155,7 +155,11 @@ fn apply(graph: &ExecutionGraph, fusions: &[Fusion], fused_operator: OperatorId)
 /// Whether `node` is a matmul its Component declared row-parallel: when
 /// the model is split across Devices it produces partial sums, so an addend (bias, residual) must be
 /// added once after they are reduced, never fused into each partial.
-fn is_row_parallel(graph: &ExecutionGraph, node: &crate::execution_graph::ExecutionNodeId) -> bool {
+#[doc(hidden)]
+pub fn is_row_parallel(
+    graph: &ExecutionGraph,
+    node: &crate::execution_graph::ExecutionNodeId,
+) -> bool {
     graph.nodes.get(node).is_some_and(|node| {
         matches!(
             node.attributes.get(crate::operator::TENSOR_PARALLEL_ATTRIBUTE),
@@ -414,7 +418,3 @@ pub fn fuse_gated_matmul(graph: &ExecutionGraph) -> (ExecutionGraph, usize) {
     }
     (fused, 2 * fusions.len())
 }
-
-#[cfg(test)]
-#[path = "graph_fusion_tests.rs"]
-mod tests;

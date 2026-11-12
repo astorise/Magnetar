@@ -3822,10 +3822,11 @@ impl MemoryManager {
         self.allocations.contains_key(&id)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     /// Entry counts of every internal bookkeeping table, for regression
     /// tests asserting that bookkeeping stays proportional to live memory.
-    pub(crate) fn bookkeeping_sizes(&self) -> BTreeMap<&'static str, usize> {
+    #[doc(hidden)]
+    pub fn bookkeeping_sizes(&self) -> BTreeMap<&'static str, usize> {
         BTreeMap::from([
             ("live_allocations", self.allocations.len()),
             ("retired_allocations", self.retired.len()),
@@ -3841,9 +3842,10 @@ impl MemoryManager {
         ])
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     /// Allocations referenced by a tensor or resource residency record.
-    pub(crate) fn residency_allocations(&self) -> BTreeSet<MemoryAllocationId> {
+    #[doc(hidden)]
+    pub fn residency_allocations(&self) -> BTreeSet<MemoryAllocationId> {
         self.tensor_residency
             .values()
             .filter_map(|residency| residency.allocation)
@@ -5082,8 +5084,9 @@ impl MemoryManager {
 
     /// Recomputes every running total from `allocations`; tests compare it
     /// with the incrementally maintained one.
-    #[cfg(test)]
-    pub(crate) fn assert_allocation_totals_consistent(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn assert_allocation_totals_consistent(&self) {
         let mut recomputed = AllocationTotals::default();
         for allocation in self.allocations.values() {
             recomputed.add(allocation);

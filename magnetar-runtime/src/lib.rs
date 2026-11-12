@@ -22,13 +22,13 @@ pub mod conformance;
 pub use magnetar_core::device;
 #[allow(dead_code)]
 mod e2e_conformance;
-pub mod execution_graph;
+pub use magnetar_graph::execution_graph;
 pub mod execution_stream;
 pub mod first_native_implementation_cut;
 pub mod first_native_runtime;
 pub mod generation;
 pub mod graph_builder_capability;
-pub mod graph_fusion;
+pub use magnetar_graph::graph_fusion;
 pub mod inference_api;
 pub mod kernel;
 pub mod kernel_artifact;
@@ -47,7 +47,7 @@ pub mod kernel_registry;
 pub mod kernel_selection_policy;
 pub mod kv_cache;
 pub mod layer_placement;
-pub mod memory;
+pub use magnetar_graph::memory;
 pub mod model;
 pub mod model_component;
 pub mod model_config_capability;
@@ -143,5 +143,7 @@ pub use scheduler::*;
 pub use session::*;
 pub use tensor::*;
 pub use tokenizer::*;
+#[cfg(test)]
+mod graph_fusion_runtime_tests;
 #[cfg(test)]
 mod tests;

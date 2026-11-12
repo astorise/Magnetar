@@ -683,6 +683,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-graph"
+version = "1.0.0"
+dependencies = [
+ "magnetar-core",
+]
+
+[[package]]
 name = "magnetar-inference-qualification"
 version = "0.1.0"
 dependencies = [
@@ -705,6 +712,7 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "magnetar-core",
+ "magnetar-graph",
  "serde",
  "serde_json",
  "serde_norway",

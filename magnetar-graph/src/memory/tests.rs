@@ -5,15 +5,13 @@
 
 use super::*;
 
-use crate::affinity::{
-    DeviceAvailability, ProviderHealth, ProviderHealthReport, ProviderStatusSnapshot,
-};
-use crate::affinity::{DeviceBinding, FallbackClass, ProviderBinding, ResourceAffinity};
-use crate::compute::{ComputeDType, DTypeDescriptor, ShapeDescriptor, TensorDescriptor};
-use crate::compute::{HostStagingPolicy, TensorResourceId};
 use crate::compute_types::TensorMemoryClass;
 use crate::device::DeviceId;
 use crate::device::{DeviceMetadata, DeviceType};
+use crate::{ComputeDType, DTypeDescriptor, ShapeDescriptor, TensorDescriptor};
+use crate::{DeviceAvailability, ProviderHealth, ProviderHealthReport, ProviderStatusSnapshot};
+use crate::{DeviceBinding, FallbackClass, ProviderBinding, ResourceAffinity};
+use crate::{HostStagingPolicy, TensorResourceId};
 #[test]
 fn memory_manager_admission_uses_pressure_and_queue_policy() {
     let manager = MemoryManager::default();
