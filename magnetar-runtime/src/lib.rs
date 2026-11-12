@@ -65,6 +65,7 @@ pub mod prefix_cache;
 pub mod production_model_ingestion;
 pub mod provider;
 pub mod provider_roadmap;
+pub mod provider_status;
 pub mod qwen_model_component;
 pub mod reference_cpu;
 pub mod resolution;
@@ -75,6 +76,7 @@ pub mod session;
 pub mod tensor;
 pub mod tensor_parallel;
 pub mod tokenizer;
+pub mod trace_id;
 
 pub use adapter::*;
 pub use affinity::*;

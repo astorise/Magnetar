@@ -4,7 +4,7 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
-use crate::tensor::TensorAliasingKind;
+use crate::compute_types::TensorAliasingKind;
 
 #[test]
 fn kernel_result_tracks_aliasing_updates_alongside_readiness_and_residency() {

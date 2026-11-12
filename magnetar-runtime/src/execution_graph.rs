@@ -850,5 +850,15 @@ fn browser_layout_supported(layout: TensorLayoutKind) -> bool {
     )
 }
 
+impl From<crate::compute_types::TensorMutabilityKind> for TensorMutability {
+    fn from(value: crate::compute_types::TensorMutabilityKind) -> Self {
+        if value.allows_mutation() {
+            Self::Mutable
+        } else {
+            Self::Immutable
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

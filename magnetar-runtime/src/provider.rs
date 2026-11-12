@@ -537,7 +537,7 @@ pub enum TensorValue {
 
 impl TensorValue {
     /// Unwraps a host-visible value, or a structured
-    /// [`crate::tensor::TensorError::ResidencyUnavailable`] naming `id` if
+    /// [`crate::compute_types::TensorError::ResidencyUnavailable`] naming `id` if
     /// this value declined host materialization. The three call sites that
     /// genuinely need host bytes (weight binding, KV-history concatenation,
     /// final logits extraction) use this rather than matching `Host`/`Opaque`
@@ -545,10 +545,10 @@ impl TensorValue {
     pub fn into_host(
         self,
         id: &TensorResourceId,
-    ) -> Result<crate::tensor::HostTensor, crate::tensor::TensorError> {
+    ) -> Result<crate::tensor::HostTensor, crate::compute_types::TensorError> {
         match self {
             Self::Host(tensor) => Ok(tensor),
-            Self::Opaque => Err(crate::tensor::TensorError::residency_unavailable(format!(
+            Self::Opaque => Err(crate::compute_types::TensorError::residency_unavailable(format!(
                 "resource '{id}' is device-resident and declined host materialization"
             ))),
         }

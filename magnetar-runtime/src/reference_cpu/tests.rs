@@ -25,7 +25,7 @@ use crate::kernel::{
 };
 use crate::kernel_registry::validate_kernel_advertisement;
 use crate::memory::{MemoryManager, MemoryManagerConfig};
-use crate::observability::TraceId;
+use crate::trace_id::TraceId;
 use crate::operator::TensorLayoutKind;
 use crate::operator::{OperatorAttributeValue, TensorRole, initial_operator_catalog};
 use crate::planning::{

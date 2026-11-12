@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::component::{ComponentError, ComponentValue, HostCapability};
-use crate::compute::{
+use crate::compute_types::{
     ComputeDType, DTypeDescriptor, LayoutDescriptor, ShapeDescriptor, TensorDescriptor,
 };
 use crate::execution_graph::{

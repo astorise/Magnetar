@@ -5,6 +5,7 @@
 //! constraints, memory ownership, Resource Affinity, and policy before any
 //! Provider-owned execution path is reached.
 
+pub use crate::compute_types::KernelMemoryClass;
 use crate::{
     CapabilityVersion, ComputeDType, ComputePrecision, DTypeDescriptor, DeviceBinding, DeviceType,
     MemoryAllocationId, OperatorAttributeValue, OperatorId, OperatorMemoryBehavior, OperatorSpec,
@@ -149,18 +150,6 @@ impl KernelId {
             Err(_) => lookup(&self.stable_key()),
         })
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum KernelMemoryClass {
-    Host,
-    PinnedHost,
-    Device,
-    Unified,
-    Shared,
-    ProviderOwned,
-    BrowserLinearMemory,
-    FutureWebGpuBuffer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

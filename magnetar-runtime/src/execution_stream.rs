@@ -4,6 +4,7 @@
 //! dependencies with native queues, streams, events, fences, or worker pools,
 //! but those native objects stay outside this public contract.
 
+pub use crate::compute_types::CompletionTokenId;
 use crate::{
     DeviceBinding, MemoryAllocationId, PreparedExecutionSegmentId, PreparedKernelId,
     ProviderBinding, TensorResourceId,
@@ -182,32 +183,6 @@ impl ExecutionStream {
                 ExecutionStreamState::Ready => unreachable!("ready streams accept work"),
             })
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CompletionTokenId {
-    value: u64,
-    generation: u64,
-}
-
-impl CompletionTokenId {
-    pub const fn new(value: u64, generation: u64) -> Self {
-        Self { value, generation }
-    }
-
-    pub const fn value(self) -> u64 {
-        self.value
-    }
-
-    pub const fn generation(self) -> u64 {
-        self.generation
-    }
-}
-
-impl fmt::Display for CompletionTokenId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "completion-token:{}:{}", self.value, self.generation)
     }
 }
 

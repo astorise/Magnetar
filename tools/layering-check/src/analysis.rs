@@ -158,6 +158,9 @@ struct ModuleExports {
     /// Top-level modules whose whole public surface is re-exported
     /// (`pub use crate::other::*`).
     globs: BTreeSet<String>,
+    /// Names re-exported one by one from another top-level module
+    /// (`pub use crate::other::Name`): name -> that module.
+    forwarded: BTreeMap<String, String>,
 }
 
 fn analyze_with(sources: &dyn Sources, src_dir: &Path) -> Result<Analysis, String> {
@@ -305,6 +308,7 @@ fn collect_names(
         return;
     };
     names.extend(module_exports.names.iter().cloned());
+    names.extend(module_exports.forwarded.keys().cloned());
     for other in &module_exports.globs {
         collect_names(other, exports, visited, names);
     }
@@ -490,6 +494,12 @@ impl Walker<'_> {
                             exports.globs.extend(child.globs.iter().cloned());
                         }
                     }
+                } else if let Some(skip) = through_root
+                    && path.len() == skip + 2
+                {
+                    // `pub use crate::other::Name`: exported here, defined
+                    // (or forwarded again) there.
+                    exports.forwarded.insert(exported, path[skip].clone());
                 } else {
                     exports.names.insert(exported);
                 }
@@ -771,6 +781,21 @@ mod tests {
         assert_eq!(
             analysis.deps["b"]["a"],
             BTreeSet::from(["Used".to_string(), "helper".to_string()])
+        );
+    }
+
+    #[test]
+    fn named_reexport_of_another_module_points_at_the_definer() {
+        let analysis = analyze_sources(&[
+            ("lib.rs", "pub mod a; pub mod b; pub mod c; pub use b::*;"),
+            ("a.rs", "pub struct Moved;"),
+            ("b.rs", "pub use crate::a::Moved;"),
+            ("c.rs", "use crate::Moved;"),
+        ])
+        .unwrap();
+        assert_eq!(
+            analysis.deps["c"].keys().collect::<Vec<_>>(),
+            vec![&"a".to_string()]
         );
     }
 

@@ -5228,5 +5228,20 @@ fn contains_native_handle_marker(value: &str) -> bool {
     .any(|marker| lowered.contains(marker))
 }
 
+impl From<&MemoryPlacement> for crate::compute_types::TensorMemoryClass {
+    fn from(value: &MemoryPlacement) -> Self {
+        match value {
+            MemoryPlacement::HostOrdinary => Self::Host,
+            MemoryPlacement::HostPinned => Self::PinnedHost,
+            MemoryPlacement::Device(_) => Self::Device,
+            MemoryPlacement::UnifiedShared => Self::Unified,
+            MemoryPlacement::ProviderOwnedOpaque(_) => Self::ProviderOwned,
+            MemoryPlacement::ExternalBorrowed => Self::Shared,
+            MemoryPlacement::BrowserLinearMemory => Self::BrowserLinearMemory,
+            MemoryPlacement::StagedTemporary(inner) => Self::from(inner.as_ref()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

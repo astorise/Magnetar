@@ -13,7 +13,7 @@ use crate::compute::{ComputeDType, DTypeDescriptor, ShapeDescriptor, TensorDescr
 use crate::compute::{HostStagingPolicy, TensorResourceId};
 use crate::device::DeviceId;
 use crate::device::{DeviceMetadata, DeviceType};
-use crate::tensor::TensorMemoryClass;
+use crate::compute_types::TensorMemoryClass;
 #[test]
 fn memory_manager_admission_uses_pressure_and_queue_policy() {
     let manager = MemoryManager::default();
