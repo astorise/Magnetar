@@ -1,7 +1,7 @@
 //! Health, lifecycle, readiness, pressure and admission status of Providers,
 //! Devices and Capabilities.
 //!
-//! Core layer (`quality/layers.toml`). Re-exported from [`crate::affinity`],
+//! Core layer (`quality/layers.toml`). Re-exported from `magnetar_runtime::affinity`,
 //! where these types were first defined, so existing paths are unchanged.
 
 use crate::binding::*;

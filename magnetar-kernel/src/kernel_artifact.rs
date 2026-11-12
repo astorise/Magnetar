@@ -52,7 +52,7 @@
 //!   observation).
 //! - [`KernelArtifactConformanceReport`] / [`run_kernel_artifact_conformance`]:
 //!   a conformance report, in the shape of
-//!   [`crate::CliBoundaryConformanceReport`], asserting the guarantees above
+//!   `magnetar_runtime::CliBoundaryConformanceReport`, asserting the guarantees above
 //!   hold -- including the structural facts that [`crate::Device`] defines no
 //!   compilation method, `scheduler.rs` defines no compilation method, and
 //!   [`crate::ExecutionNode`] carries no source code, binary, or native
@@ -462,7 +462,7 @@ pub fn validate_compiled_artifact(
 /// "Runtime SHALL NOT silently reinterpret tensor dtype or layout to satisfy
 /// a Kernel Artifact. Required conversions SHALL remain explicit
 /// graph/runtime operations." (proposal, "DType And Layout Specialization").
-/// Mirrors [`crate::require_explicit_layout_conversion`]'s
+/// Mirrors `magnetar_runtime::require_explicit_layout_conversion`'s
 /// shape but lives at the artifact-contract level.
 pub fn require_explicit_specialization_conversion(
     required: bool,
@@ -1004,7 +1004,7 @@ impl KernelArtifactObservation {
 // ---------------------------------------------------------------------
 
 /// A single Kernel Artifact conformance check result, mirroring
-/// [`crate::CliBoundaryConformanceResult`].
+/// `magnetar_runtime::CliBoundaryConformanceResult`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelArtifactConformanceResult {
     pub requirement: String,

@@ -1,0 +1,29 @@
+[package]
+name = "magnetar-component-engine"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "Component engine of the Magnetar Runtime: Component artifacts and trust, the Wasmtime and web engines, and the Model Component graph contract."
+repository = "https://github.com/astorise/Magnetar"
+readme = "../README.md"
+keywords = ["ai", "inference", "runtime"]
+categories = ["science"]
+rust-version = "1.98"
+include = ["src/**/*.rs"]
+
+[features]
+default = ["wasmtime-component-engine"]
+wasmtime-component-engine = ["dep:wasmtime"]
+web-component-engine = []
+
+[dependencies]
+magnetar-core = { path = "../magnetar-core", version = "=1.0.0" }
+magnetar-graph = { path = "../magnetar-graph", version = "=1.0.0" }
+magnetar-model = { path = "../magnetar-model", version = "=1.0.0" }
+ed25519-dalek = { version = "3.0.0", features = ["signature"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_norway = "0.9"
+sha2 = "0.11"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmtime = { version = "50.0.0", optional = true, default-features = false, features = ["anyhow", "runtime", "component-model", "component-model-async", "cranelift", "std", "wat"] }

@@ -1,7 +1,7 @@
 //! Portable compute data types shared by every Runtime layer.
 //!
 //! Core layer (`quality/layers.toml`): nothing here depends on another
-//! Runtime module. The types are re-exported from [`crate::compute`], where
+//! Runtime module. The types are re-exported from `magnetar_runtime::compute`, where
 //! they were first defined, so `magnetar_runtime::compute::…` paths and the
 //! crate-root re-exports are unchanged.
 
@@ -111,7 +111,7 @@ impl ComputeDType {
     }
 }
 
-/// Public (not `pub(crate)`): unlike [`crate::model::ModelTrustDecision`]'s
+/// Public (not `pub(crate)`): unlike `magnetar_runtime::model::ModelTrustDecision`'s
 /// fields, this carries no authority -- it's a stateless text redaction the
 /// `magnetar-roadmap-contracts` crate's own release/security diagnostic
 /// contracts (#62) need to reproduce identically outside this crate.

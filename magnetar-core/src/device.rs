@@ -28,7 +28,7 @@ pub enum DeviceType {
 }
 
 /// Soft, Device-level execution limits, coarser than the per-Kernel
-/// constraints a Provider advertises on each [`crate::KernelAdvertisement`].
+/// constraints a Provider advertises on each `magnetar_runtime::KernelAdvertisement`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DeviceExecutionLimits {
     /// Maximum number of Kernel invocations this Device can usefully run

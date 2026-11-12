@@ -6,29 +6,31 @@
 use super::*;
 
 const UNIT_EXPORT_COMPONENT: &str =
-    include_str!("../../fixtures/components/unit-export.component.wat");
+    include_str!("../../../magnetar-runtime/fixtures/components/unit-export.component.wat");
 const HOST_ROUNDTRIP_COMPONENT: &str =
-    include_str!("../../fixtures/components/host-roundtrip.component.wat");
+    include_str!("../../../magnetar-runtime/fixtures/components/host-roundtrip.component.wat");
 const HOST_FAILURE_COMPONENT: &str =
-    include_str!("../../fixtures/components/host-failure.component.wat");
+    include_str!("../../../magnetar-runtime/fixtures/components/host-failure.component.wat");
 const COMPUTE_IMPORT_COMPONENT: &str =
-    include_str!("../../fixtures/components/compute-import.component.wat");
-const LOOP_COMPONENT: &str = include_str!("../../fixtures/components/loop.component.wat");
-const TRAPPING_COMPONENT: &str = include_str!("../../fixtures/components/trapping.component.wat");
+    include_str!("../../../magnetar-runtime/fixtures/components/compute-import.component.wat");
+const LOOP_COMPONENT: &str =
+    include_str!("../../../magnetar-runtime/fixtures/components/loop.component.wat");
+const TRAPPING_COMPONENT: &str =
+    include_str!("../../../magnetar-runtime/fixtures/components/trapping.component.wat");
 const U32_EXPORT_COMPONENT: &str =
-    include_str!("../../fixtures/components/u32-export.component.wat");
+    include_str!("../../../magnetar-runtime/fixtures/components/u32-export.component.wat");
 const WASI_FILESYSTEM_COMPONENT: &str =
-    include_str!("../../fixtures/components/wasi-filesystem.component.wat");
+    include_str!("../../../magnetar-runtime/fixtures/components/wasi-filesystem.component.wat");
 const WASI_ENVIRONMENT_COMPONENT: &str =
-    include_str!("../../fixtures/components/wasi-environment.component.wat");
+    include_str!("../../../magnetar-runtime/fixtures/components/wasi-environment.component.wat");
 const RESOURCE_IMPORT_COMPONENT: &str =
-    include_str!("../../fixtures/components/resource-import.component.wat");
+    include_str!("../../../magnetar-runtime/fixtures/components/resource-import.component.wat");
 const BOUNDED_LOOP_COMPONENT: &str =
-    include_str!("../../fixtures/components/bounded-loop.component.wat");
+    include_str!("../../../magnetar-runtime/fixtures/components/bounded-loop.component.wat");
 const QWEN_GRAPH_COMPONENT: &str =
-    include_str!("../../fixtures/components/qwen-graph.component.wat");
+    include_str!("../../../magnetar-runtime/fixtures/components/qwen-graph.component.wat");
 const CAPABILITY_ECHO_COMPONENT: &str =
-    include_str!("../../fixtures/components/capability-echo.component.wat");
+    include_str!("../../../magnetar-runtime/fixtures/components/capability-echo.component.wat");
 /// The first real, minimal Qwen Model Component (task 11.4,
 /// `model-component-graph-contract`): a compiled `magnetar-component-Qwen`
 /// (the `components/qwen` submodule) Component binary, built via
@@ -40,7 +42,7 @@ const CAPABILITY_ECHO_COMPONENT: &str =
 /// `components/qwen`'s source with the same two commands if that source
 /// changes.
 const QWEN_REAL_COMPONENT: &[u8] =
-    include_bytes!("../../fixtures/components/qwen-real.component.wasm");
+    include_bytes!("../../../magnetar-runtime/fixtures/components/qwen-real.component.wasm");
 
 /// Test-only [`HostCapability`] (`model-component-graph-contract`): answers
 /// `echo(x: u32) -> u32` with `x + 1`, real enough to prove the dynamic

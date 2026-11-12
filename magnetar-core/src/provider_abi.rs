@@ -1,7 +1,7 @@
 //! Provider ABI version and memory rule: the part of the Provider ABI that
 //! prepared Kernels are checked against.
 //!
-//! Core layer (`quality/layers.toml`). Re-exported from [`crate::provider`],
+//! Core layer (`quality/layers.toml`). Re-exported from `magnetar_runtime::provider`,
 //! where these items were first defined, so existing paths are unchanged.
 
 use crate::provider_status::ProviderError;

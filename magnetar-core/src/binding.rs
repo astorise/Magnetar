@@ -1,7 +1,7 @@
 //! Identifiers that bind a resource to where it may be used: execution
 //! context, affinity group, Provider, Device, Capability and artifact.
 //!
-//! Core layer (`quality/layers.toml`). Re-exported from [`crate::affinity`],
+//! Core layer (`quality/layers.toml`). Re-exported from `magnetar_runtime::affinity`,
 //! where these types were first defined, so existing paths are unchanged.
 
 use crate::capability::*;

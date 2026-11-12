@@ -79,7 +79,7 @@
 //!   [`SelectionCacheInvalidationTrigger`]: "Selection Caching".
 //! - [`KernelSelectionPolicyId`] / [`KernelOptimizationPolicy`]: "Model
 //!   Instance Kernel Policy" -- a `KernelSelectionPolicyId` is what a Model
-//!   Instance attaches (see [`crate::ModelInstanceDefinition`]),
+//!   Instance attaches (see `magnetar_runtime::ModelInstanceDefinition`),
 //!   mirroring how a Model Instance references a `TokenizerId` rather than
 //!   embedding a whole Tokenizer.
 //! - [`ModelComponentKernelRequest`] / [`validate_model_component_request`]:
@@ -1093,7 +1093,7 @@ impl SelectionCache {
 /// Kernel Policy" (proposal). Mirrors `TokenizerId`: a Model Instance
 /// references a policy identity rather than embedding the full
 /// [`KernelOptimizationPolicy`] (see
-/// [`crate::ModelInstanceDefinition::kernel_selection_policy`]).
+/// `magnetar_runtime::ModelInstanceDefinition::kernel_selection_policy`).
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KernelSelectionPolicyId(String);
 

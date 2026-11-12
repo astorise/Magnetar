@@ -1259,7 +1259,11 @@ fn runtime_source_does_not_restore_legacy_backend_or_plugin_surface() {
 
 #[test]
 fn public_component_api_does_not_expose_wasmtime_native_types() {
-    let public_sources = [include_str!("lib.rs"), include_str!("component.rs")];
+    let public_sources = [
+        include_str!("lib.rs"),
+        include_str!("../../magnetar-component-engine/src/lib.rs"),
+        include_str!("../../magnetar-component-engine/src/component.rs"),
+    ];
     let forbidden = [
         "wasmtime::Engine",
         "wasmtime::Config",

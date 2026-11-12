@@ -25,8 +25,8 @@ include = ["src/**/*.rs", "tests/**/*.rs", "fixtures/**", "wit/**/*.wit"]
 
 [features]
 default = ["wasmtime-component-engine"]
-wasmtime-component-engine = ["dep:wasmtime"]
-web-component-engine = []
+wasmtime-component-engine = ["dep:wasmtime", "magnetar-component-engine/wasmtime-component-engine"]
+web-component-engine = ["magnetar-component-engine/web-component-engine"]
 # Correctif 7 / task group 10, task 12.6: a build lacking a real Component
 # engine (`wasmtime-component-engine` off, or the `wasm32` target, which has
 # no Wasmtime engine at all) has no fallback graph source of any kind --
@@ -46,6 +46,7 @@ web-component-engine = []
 [dependencies]
 # Runtime layer crates (`quality/layers.toml`). Exact versions: one release
 # is one consistent set.
+magnetar-component-engine = { path = "../magnetar-component-engine", version = "=1.0.0", default-features = false }
 magnetar-core = { path = "../magnetar-core", version = "=1.0.0" }
 magnetar-graph = { path = "../magnetar-graph", version = "=1.0.0" }
 magnetar-kernel = { path = "../magnetar-kernel", version = "=1.0.0" }

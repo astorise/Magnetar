@@ -675,6 +675,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
+name = "magnetar-component-engine"
+version = "1.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "magnetar-core",
+ "magnetar-graph",
+ "magnetar-model",
+ "serde",
+ "serde_norway",
+ "sha2 0.11.1",
+ "wasmtime",
+]
+
+[[package]]
 name = "magnetar-core"
 version = "1.0.0"
 dependencies = [
@@ -737,6 +751,7 @@ version = "1.0.0"
 dependencies = [
  "ed25519-dalek",
  "flate2",
+ "magnetar-component-engine",
  "magnetar-core",
  "magnetar-graph",
  "magnetar-kernel",

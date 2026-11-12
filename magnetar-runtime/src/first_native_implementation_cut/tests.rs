@@ -191,3 +191,14 @@ fn first_native_decode_does_not_materialize_full_history() {
     assert!(source.contains("fn commit_generation_step"));
     assert!(source.contains("runtime.append_decode_kv_cache(&state.cache, 1)"));
 }
+
+// Moved from the `component` tests when `component` became part of
+// `magnetar-component-engine`: the function under test is a Runtime one.
+#[test]
+fn first_native_component_engine_accepts_native_controlled_wasi_capabilities() {
+    let capabilities = crate::ComponentEngineCapabilities::native();
+
+    assert!(crate::validate_first_native_component_engine_capabilities(&capabilities).is_ok());
+    assert!(capabilities.supports(crate::ComponentEngineFeature::ComponentModel));
+    assert!(capabilities.supports(crate::ComponentEngineFeature::ControlledWasi));
+}

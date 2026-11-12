@@ -1,7 +1,7 @@
 //! Correlation, trace and span identifiers carried by Runtime observations.
 //!
 //! Core layer (`quality/layers.toml`). Re-exported from
-//! [`crate::observability`], where these types were first defined, so
+//! `magnetar_runtime::observability`, where these types were first defined, so
 //! existing paths are unchanged.
 
 use std::fmt;

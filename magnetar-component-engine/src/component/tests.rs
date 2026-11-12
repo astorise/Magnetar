@@ -4,9 +4,7 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
-use crate::conformance::validate_first_native_component_engine_capabilities;
-
-use crate::session::InferenceSessionId;
+use crate::InferenceSessionId;
 use ed25519_dalek::Signer;
 use std::fs;
 fn component_artifact_package(
@@ -75,15 +73,6 @@ source:
 signatures: []
 "#
     )
-}
-
-#[test]
-fn first_native_component_engine_accepts_native_controlled_wasi_capabilities() {
-    let capabilities = ComponentEngineCapabilities::native();
-
-    assert!(validate_first_native_component_engine_capabilities(&capabilities).is_ok());
-    assert!(capabilities.supports(ComponentEngineFeature::ComponentModel));
-    assert!(capabilities.supports(ComponentEngineFeature::ControlledWasi));
 }
 
 #[test]

@@ -32,6 +32,7 @@
 # `tools/layering-check` (`layer-and-split-runtime-crate`) depends on
 # `syn`/`toml` only, so it belongs here for the same reason.
 members = [
+    "magnetar-component-engine",
     "magnetar-core",
     "magnetar-graph",
     "magnetar-kernel",

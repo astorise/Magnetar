@@ -21,7 +21,7 @@
 //!   (accepted/produced formats, Devices, architectures, modes, async /
 //!   cancellation / deadline support, size and concurrency limits, isolation
 //!   model, and specialization support). Advertising this descriptor is
-//!   entirely optional -- see [`crate::Provider::kernel_compilation_capability`],
+//!   entirely optional -- see `magnetar_runtime::Provider::kernel_compilation_capability`,
 //!   which defaults to `None`.
 //! - [`CompilationMode`]: portable behavior categories (not specific
 //!   languages). [`CompilationMode::LoadTimeJit`] never means token-loop
@@ -44,7 +44,7 @@
 //!   native driver handle.
 //! - [`ProviderKernelCompilationApi`]: the Runtime-to-Provider submit / poll
 //!   / cancel / result / release boundary, mirroring
-//!   [`crate::ProviderExecutionApi`]'s shape for execution.
+//!   `magnetar_runtime::ProviderExecutionApi`'s shape for execution.
 //! - [`CompilationCancellationSupport`] / [`evaluate_cancellation_request`]:
 //!   cancellation semantics are declared and structured; a cancelled job
 //!   never publishes valid partial output.
@@ -212,7 +212,7 @@ impl CompilationIsolationModel {
 /// What a Provider advertises about its Kernel Compilation Capability,
 /// implementing "Compilation Capability Descriptor" (proposal). Advertising
 /// this at all is optional -- see
-/// [`crate::Provider::kernel_compilation_capability`].
+/// `magnetar_runtime::Provider::kernel_compilation_capability`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCompilationCapabilityDescriptor {
     pub capability_version: CapabilityVersion,
@@ -886,7 +886,7 @@ pub fn evaluate_cancellation_request(
 // ---------------------------------------------------------------------
 
 /// Outcome of a cancellation attempt, mirroring
-/// [`crate::ProviderCancellationOutcome`]'s shape for execution.
+/// `magnetar_runtime::ProviderCancellationOutcome`'s shape for execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompilationCancellationOutcome {
     Accepted,
@@ -895,7 +895,7 @@ pub enum CompilationCancellationOutcome {
 }
 
 /// Runtime-to-Provider Kernel Compilation boundary, mirroring
-/// [`crate::ProviderExecutionApi`]'s submit/status/cancel/release
+/// `magnetar_runtime::ProviderExecutionApi`'s submit/status/cancel/release
 /// shape. Implements "Compilation Job Ownership" (proposal): Runtime MAY
 /// submit/poll/await/cancel/time-out/discard, and SHALL NOT reach into
 /// Provider-native job internals -- every method here returns only opaque
@@ -1079,7 +1079,7 @@ impl Default for KernelCompilationAbiOwnershipRules {
 /// "SHALL NOT expose Rust trait objects for kernel compilation" (proposal)
 /// even though the higher-level [`ProviderKernelCompilationApi`] (this
 /// crate's existing in-process Provider trait convention, matching
-/// [`crate::ProviderExecutionApi`]) is itself a trait object.
+/// `magnetar_runtime::ProviderExecutionApi`) is itself a trait object.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCompilationAbiDescriptor {
     pub descriptor_size: usize,
