@@ -42,7 +42,7 @@
 - [ ] 5.2 `magnetar-graph`: same for the graph and memory modules.
 - [ ] 5.2a Model data: extract `model` and `model_identity` as `magnetar-model`, or fold them into `magnetar-graph`'s dependents as decided from their size (design D5b).
 - [ ] 5.3 `magnetar-kernel`: same for the kernel pipeline modules.
-- [ ] 5.4 `magnetar-component-engine`: same for the Component engine modules, `wit/` and the Component fixtures; forward the `wasmtime-component-engine` and `web-component-engine` features.
+- [ ] 5.4 `magnetar-engine`: same for the Component engine modules, `wit/` and the Component fixtures; forward the `wasmtime-component-engine` and `web-component-engine` features.
 - [ ] 5.5 After each extraction: compare the public API listing with the baseline, and report clean and incremental build times.
 - [ ] 5.6 Cross-platform: build each crate on Linux, macOS and Windows, and `magnetar-core`, `magnetar-graph`, `magnetar-kernel` and the web Component engine for `wasm32`.
 

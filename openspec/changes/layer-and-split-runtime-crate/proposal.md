@@ -21,7 +21,7 @@ This change belongs in Magnetar because it only reorganises code the Runtime alr
 - Split `first_native_runtime.rs` into submodules by responsibility. Split its test file and `src/tests.rs` so that each test module sits next to the code it tests.
 - Keep `provider_roadmap` and `model_format_roadmap` as leaf modules: no lower layer depends on them today, and the gate keeps it so.
 - Add a CI gate that fails when a module depends on a higher layer. The upward dependencies that remain are listed as debt in the layer map; the gate rejects new ones and stale entries, so the list only shrinks.
-- Extract the four lower layers into workspace crates: `magnetar-core`, `magnetar-graph`, `magnetar-kernel`, `magnetar-component-engine`. `magnetar-runtime` keeps Runtime orchestration and re-exports the four crates, so every existing `magnetar_runtime::…` path still resolves.
+- Extract the four lower layers into workspace crates: `magnetar-core`, `magnetar-graph`, `magnetar-kernel`, `magnetar-engine`. `magnetar-runtime` keeps Runtime orchestration and re-exports the four crates, so every existing `magnetar_runtime::…` path still resolves.
 - Extend release publication, coverage and documentation gates to the new crates.
 
 ### Where this change departs from the audit
@@ -29,7 +29,7 @@ This change belongs in Magnetar because it only reorganises code the Runtime alr
 | Audit recommendation | Decision | Reason |
 |---|---|---|
 | A `magnetar-providers` crate holding "CPU & CUDA backends", fed by `first_native_runtime.rs` | Not created | Providers already live outside this repository as pinned submodules (`providers/cpu`, `providers/cuda`, …). `first_native_runtime.rs` holds Runtime orchestration and conformance code, with no Provider implementation. `reference_cpu` stays in the Runtime as the correctness baseline (`provider-roadmap` spec). |
-| A crate named `magnetar-wasm-host` | Named `magnetar-component-engine` | `Host` is not a primary Magnetar concept (`project-architecture` spec). |
+| A crate named `magnetar-wasm-host` | Named `magnetar-engine` | `Host` is not a primary Magnetar concept (`project-architecture` spec). |
 | Delete the "transitional" roadmap modules | Kept as leaf modules | `roadmap-contracts` and the external Formats and Loaders use their public items, and the `provider-roadmap` and `model-format-roadmap` specs are live. Inside the Runtime only `model_format_roadmap` uses `provider_roadmap`. |
 | Graph and kernel as sibling layers, `affinity`, `planning`, `scheduler`, `tensor` in low layers | Kernel pipeline sits above graph and memory; seven modules are held in Runtime orchestration | The kernel pipeline names `ExecutionGraph` and memory identifiers. The held modules depend on orchestration by design; their data types move down instead (`quality/layers.toml`, `[held]`). |
 | `magnetar-cli` has no tests | Not acted on here | The crate has 93 unit tests across its 13 modules. See Non-goals. |
@@ -47,7 +47,7 @@ This change belongs in Magnetar because it only reorganises code the Runtime alr
 ## Impact
 
 - `magnetar-runtime`: every module moves or changes its imports. No behaviour change, no new public item, no removed public item.
-- New crates `magnetar-core`, `magnetar-graph`, `magnetar-kernel`, `magnetar-component-engine` in the root workspace.
+- New crates `magnetar-core`, `magnetar-graph`, `magnetar-kernel`, `magnetar-engine` in the root workspace.
 - Consumers (`magnetar-cli`, `inference-components`, `roadmap-contracts`, the three integration test crates, and the 13 Component, Provider, Format and Loader repositories): no source change required. They are rebuilt and tested against the result.
 - `.github/workflows/quality.yml`, `release-publication.yml`, `quality/coverage-baseline.json`, `tools/coverage-ratchet`, `tools/release-publish`: paths and crate lists.
 - WIT contracts: unchanged. The `wit/` directory moves with the Component engine, and package names, interfaces and versions stay identical.

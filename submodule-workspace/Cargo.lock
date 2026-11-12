@@ -914,7 +914,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "magnetar-component-engine"
+name = "magnetar-core"
+version = "1.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "magnetar-engine"
 version = "1.0.0"
 dependencies = [
  "ed25519-dalek",
@@ -925,14 +933,6 @@ dependencies = [
  "serde_norway",
  "sha2 0.11.0",
  "wasmtime",
-]
-
-[[package]]
-name = "magnetar-core"
-version = "1.0.0"
-dependencies = [
- "ed25519-dalek",
- "sha2 0.11.0",
 ]
 
 [[package]]
@@ -1092,8 +1092,8 @@ version = "1.0.0"
 dependencies = [
  "ed25519-dalek",
  "flate2",
- "magnetar-component-engine",
  "magnetar-core",
+ "magnetar-engine",
  "magnetar-graph",
  "magnetar-kernel",
  "magnetar-model",

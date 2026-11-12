@@ -193,7 +193,7 @@ fn first_native_decode_does_not_materialize_full_history() {
 }
 
 // Moved from the `component` tests when `component` became part of
-// `magnetar-component-engine`: the function under test is a Runtime one.
+// `magnetar-engine`: the function under test is a Runtime one.
 #[test]
 fn first_native_component_engine_accepts_native_controlled_wasi_capabilities() {
     let capabilities = crate::ComponentEngineCapabilities::native();

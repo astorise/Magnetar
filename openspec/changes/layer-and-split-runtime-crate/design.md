@@ -30,7 +30,7 @@ The module graph has cycles that cross every layer the audit proposes (see the p
 | Graph and memory (2) | `magnetar-graph` | `execution_graph`, `graph_fusion`, `memory` |
 | Model data (3) | see D5b | `model`, `model_identity` |
 | Kernel pipeline (4) | `magnetar-kernel` | the `kernel*` modules except `kernel_optimization_orchestration`, plus `execution_stream` |
-| Component engine (4) | `magnetar-component-engine` | `component`, `component_wasmtime`, `component_web`, `model_component`, `graph_builder_capability`, `model_config_capability`, `wit/` |
+| Component engine (4) | `magnetar-engine` | `component`, `component_wasmtime`, `component_web`, `model_component`, `graph_builder_capability`, `model_config_capability`, `wit/` |
 | Runtime orchestration (5) | `magnetar-runtime` | everything else |
 
 A module may depend on its own layer and on layers of a strictly lower rank. The kernel pipeline and the Component engine share rank 4 and do not depend on each other.
@@ -112,7 +112,7 @@ Tests move next to the code they test in a second step. `src/tests.rs` is split 
 
 ### D8. Publication and versions
 
-The four new crates are published at the same version as `magnetar-runtime`, in dependency order, by the existing release workflow. `magnetar-runtime` depends on them with exact (`=`) versions, so one release is one consistent set. Feature flags `wasmtime-component-engine` and `web-component-engine` stay on `magnetar-runtime` and forward to `magnetar-component-engine`.
+The four new crates are published at the same version as `magnetar-runtime`, in dependency order, by the existing release workflow. `magnetar-runtime` depends on them with exact (`=`) versions, so one release is one consistent set. Feature flags `wasmtime-component-engine` and `web-component-engine` stay on `magnetar-runtime` and forward to `magnetar-engine`.
 
 Path dependencies are used in the workspace. The submodule workspace and the external repositories keep depending on `magnetar-runtime` only.
 
