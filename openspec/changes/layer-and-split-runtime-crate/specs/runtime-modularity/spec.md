@@ -16,7 +16,7 @@ Runtime code SHALL be organised in layers: core types, graph and memory, model d
 
 ### Requirement: Layer Crates
 
-The core types, graph and memory, kernel pipeline and Component engine layers SHALL each be built as a separate crate. The model data layer SHALL be built outside the Runtime orchestration crate, as its own crate or as part of a lower-layer crate. The crate dependency graph SHALL be acyclic and SHALL follow the layer order. A module MAY stay in the Runtime orchestration crate when moving it lower would change a public type; the layer map SHALL record the reason.
+The core types, graph and memory, model data, kernel pipeline and Component engine layers SHALL each be built as a separate crate. The crate dependency graph SHALL be acyclic and SHALL follow the layer order. A module MAY stay in the Runtime orchestration crate when moving it lower would change a public type; the layer map SHALL record the reason.
 
 #### Scenario: Core crate builds alone
 
@@ -88,3 +88,17 @@ No core, graph, kernel or Component engine module SHALL depend on the Provider r
 
 - **WHEN** a consumer names a type through its former roadmap module path
 - **THEN** the path resolves to the same type
+
+### Requirement: Sealed Authorities Stay Sealed
+
+Moving a type to a lower-layer crate SHALL NOT make public a field or constructor that was crate-private in order to seal an authority. Code that needs the sealed item SHALL live in the crate that owns it, or SHALL use the public API.
+
+#### Scenario: Model trust decision
+
+- **WHEN** a crate other than the one defining the Model trust decision needs a decision
+- **THEN** it obtains one from a Model trust store, and cannot construct one or write its fields
+
+#### Scenario: Item widened for a higher crate
+
+- **WHEN** a crate-private item becomes public because a higher-layer crate calls it
+- **THEN** the item carries no authority, and it is hidden from the generated documentation

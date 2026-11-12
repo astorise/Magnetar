@@ -81,7 +81,13 @@ Detailed architecture notes:
 
 Implemented today:
 
-- `magnetar-runtime`
+- `magnetar-runtime`, built from five layer crates that it re-exports:
+  `magnetar-core` (core types), `magnetar-graph` (execution graph and Memory
+  Manager), `magnetar-model` (model data and identities), `magnetar-kernel`
+  (kernel pipeline) and `magnetar-engine` (Component engine). Depend on
+  `magnetar-runtime`; every path it exposed before the split still resolves.
+  The layers and their allowed dependencies are in
+  [quality/layers.toml](quality/layers.toml).
 - `magnetar-cli`
 - Runtime lifecycle
 - Runtime configuration

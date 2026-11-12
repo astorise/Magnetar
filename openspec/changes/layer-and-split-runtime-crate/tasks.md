@@ -38,25 +38,28 @@
 
 ## 5. Extract layer crates
 
-- [ ] 5.1 `magnetar-core`: create the crate, move the core modules, re-export from `magnetar-runtime` at the same paths.
-- [ ] 5.2 `magnetar-graph`: same for the graph and memory modules.
-- [ ] 5.2a Model data: extract `model` and `model_identity` as `magnetar-model`, or fold them into `magnetar-graph`'s dependents as decided from their size (design D5b).
-- [ ] 5.3 `magnetar-kernel`: same for the kernel pipeline modules.
-- [ ] 5.4 `magnetar-engine`: same for the Component engine modules, `wit/` and the Component fixtures; forward the `wasmtime-component-engine` and `web-component-engine` features.
-- [ ] 5.5 After each extraction: compare the public API listing with the baseline, and report clean and incremental build times.
-- [ ] 5.6 Cross-platform: build each crate on Linux, macOS and Windows, and `magnetar-core`, `magnetar-graph`, `magnetar-kernel` and the web Component engine for `wasm32`.
+- [x] 5.1 `magnetar-core`: the ten core modules; `magnetar-runtime` re-exports each module at its former path.
+- [x] 5.2 `magnetar-graph`: `execution_graph`, `graph_fusion`, `memory`. Memory Manager inspection helpers used by Runtime tests sit behind a `test-support` feature.
+- [x] 5.3 `magnetar-model`: `model`, `model_identity`. `ModelTrustDecision` keeps its crate-private fields and constructors (design D9).
+- [x] 5.4 `magnetar-kernel`: the kernel pipeline modules, `execution_stream` and the Kernel Bundle fixtures.
+- [x] 5.5 `magnetar-engine`: the Component engine modules, with the `wasmtime-component-engine` and `web-component-engine` features forwarded from `magnetar-runtime`. `wit/` and the Component fixtures stay under `magnetar-runtime` (design D10).
+- [x] 5.6 Tests that need a higher layer stay in `magnetar-runtime`: graph fusion against the real Qwen Component, Kernel Registry against the Reference CPU Provider, one Component engine capability check.
+- [x] 5.7 After the extractions: every one of the 4,327 public type, trait, function, constant and module paths of the baseline (`d5231c7`) still resolves through `magnetar-runtime` (compiled probe); 1,703 workspace tests pass, none removed; Clippy, documentation and layering gates pass.
+- [x] 5.8 `wasm32-unknown-unknown`: `cargo check -p magnetar-runtime --all-features` passes with the layer crates.
+- [ ] 5.9 Record clean and incremental build times before and after the split.
+- [ ] 5.10 Build each crate on macOS and Windows (CI matrix).
 
 ## 6. Consumers and validation
 
-- [ ] 6.1 Build and test `magnetar-cli`, `inference-components`, `roadmap-contracts` and the three integration test crates without source change.
-- [ ] 6.2 Build and test each pinned Component, Provider, Format and Loader repository against the result without source change.
-- [ ] 6.3 Run the WIT validation gate and compare the WIT packages with the baseline (identical names, interfaces, versions).
+- [x] 6.1 `magnetar-cli`, `inference-components`, `roadmap-contracts` and the three integration test crates build without source change; `magnetar-cli` (93) and `magnetar-inference-component` (14) tests pass. `submodule-workspace/Cargo.lock` is updated.
+- [ ] 6.2 Pinned Component, Provider, Format and Loader repositories: they build inside the submodule workspace without source change, but each has its own `Cargo.lock`, which must gain the five layer crates before its `--locked` CI passes. Update each lockfile and bump the submodule pins.
+- [ ] 6.3 Run the WIT validation gate in CI. The WIT files are not moved or edited by this change.
 - [ ] 6.4 Run GPU CI (`cuda-first-native`, `multi-device-cpu-cuda`, real-checkpoint numerics): results identical to the baseline.
 
 ## 7. Release, coverage and documentation
 
-- [ ] 7.1 `tools/release-publish` and `release-publication.yml`: package and publish the five crates in dependency order with one version; dry run covers all five.
-- [ ] 7.2 `tools/coverage-ratchet` and `quality/coverage-baseline.json`: measure all Runtime crates; covered lines not lower than the baseline.
-- [ ] 7.3 Extend formatting, Clippy, test, documentation and `cargo-deny` gates to the new crates.
-- [ ] 7.4 Update `README.md`, the architecture documents under `docs/` and `openspec/config.yaml` with the crate layout and the layer map.
-- [ ] 7.5 Add a `CHANGELOG.md` entry stating that public paths are unchanged and listing the new crates.
+- [x] 7.1 `release-publication.yml` packages and publishes the six crates together; `cargo publish --dry-run` of the six passes locally, in dependency order.
+- [ ] 7.2 Coverage: confirm in CI that the workspace measurement is not below `quality/coverage-baseline.json` now that code sits in six crates. `tools/release-publish` SBOM: list the five layer crates.
+- [x] 7.3 Formatting, Clippy, test, documentation and `cargo-deny` gates run on the workspace and so cover the new crates; the layering, model-family isolation, test-placement and Wasmtime jobs name them explicitly.
+- [x] 7.4 `README.md`, `CONTRIBUTING.md`, `docs/quality.md`, `openspec/config.yaml` and `quality/layers.toml` describe the crate layout.
+- [x] 7.5 `CHANGELOG.md` entry: public paths unchanged, new crates listed.

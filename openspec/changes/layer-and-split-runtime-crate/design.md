@@ -28,9 +28,9 @@ The module graph has cycles that cross every layer the audit proposes (see the p
 |---|---|---|
 | Core types (1) | `magnetar-core` | `capability`, `device`, `resolution`, `operator`, `artifact_signature`, and the modules this change creates to hold shared data types: `compute_types`, `binding`, `provider_status`, `provider_abi`, `trace_id` |
 | Graph and memory (2) | `magnetar-graph` | `execution_graph`, `graph_fusion`, `memory` |
-| Model data (3) | see D5b | `model`, `model_identity` |
+| Model data (3) | `magnetar-model` | `model`, `model_identity` |
 | Kernel pipeline (4) | `magnetar-kernel` | the `kernel*` modules except `kernel_optimization_orchestration`, plus `execution_stream` |
-| Component engine (4) | `magnetar-engine` | `component`, `component_wasmtime`, `component_web`, `model_component`, `graph_builder_capability`, `model_config_capability`, `wit/` |
+| Component engine (4) | `magnetar-engine` | `component`, `component_wasmtime`, `component_web`, `model_component`, `graph_builder_capability`, `model_config_capability` |
 | Runtime orchestration (5) | `magnetar-runtime` | everything else |
 
 A module may depend on its own layer and on layers of a strictly lower rank. The kernel pipeline and the Component engine share rank 4 and do not depend on each other.
@@ -78,7 +78,7 @@ The last ten upward dependencies shared one cause. The Component engine names mo
 
 Resolution: a `model-data` layer of rank 3, above graph and memory and below the kernel pipeline and the Component engine. It holds `model` (manifests, architecture and trust data; it uses only core types and the Memory Manager) and `model_identity` (the Model Instance, session, adapter and tokenizer identities with their lifecycle states and error enums). Loading, residency and lifecycle code stays in Runtime orchestration.
 
-Still open: whether `model-data` becomes a crate of its own (`magnetar-model`) or joins another crate. It is about 2,900 lines today.
+It is its own crate, `magnetar-model` (about 2,900 lines): it depends on the Memory Manager, so it cannot join `magnetar-core`.
 
 ### D6. Split of `first_native_runtime`
 
@@ -112,9 +112,25 @@ Tests move next to the code they test in a second step. `src/tests.rs` is split 
 
 ### D8. Publication and versions
 
-The four new crates are published at the same version as `magnetar-runtime`, in dependency order, by the existing release workflow. `magnetar-runtime` depends on them with exact (`=`) versions, so one release is one consistent set. Feature flags `wasmtime-component-engine` and `web-component-engine` stay on `magnetar-runtime` and forward to `magnetar-engine`.
+The five new crates are published at the same version as `magnetar-runtime`, in dependency order, by the existing release workflow. `magnetar-runtime` depends on them with exact (`=`) versions, so one release is one consistent set. Feature flags `wasmtime-component-engine` and `web-component-engine` stay on `magnetar-runtime` and forward to `magnetar-engine`.
 
 Path dependencies are used in the workspace. The submodule workspace and the external repositories keep depending on `magnetar-runtime` only.
+
+### D9. Sealed authorities across crates
+
+Rust has no visibility between "this crate" and "everyone". A `pub(crate)` item that a higher crate needs can only become `pub`, and `#[doc(hidden)]` hides it without protecting it.
+
+`ModelTrustDecision` has crate-private fields and constructors on purpose: only `ModelTrustStore::evaluate` may issue a `Trusted` decision. It moves to `magnetar-model` together with `ModelTrustStore`, and stays sealed. The two Runtime uses change instead: Model Loading reads the decision through its public accessors, and the conformance checks and one test, which built decisions by hand, obtain them from a `ModelTrustStore` that trusts or rejects the fixture digest.
+
+Items widened to `#[doc(hidden)] pub` because a higher crate calls them carry no authority: validators of identifier syntax, `ModelInstanceId::runtime_issued`, `ResourceAffinity` merge, stride validation, a plan fingerprint constructor, a graph fusion predicate.
+
+### D10. WIT contracts and fixtures stay under `magnetar-runtime`
+
+No Rust code includes the WIT files. The CLI, the three integration test crates, `inference-components`, the release workflow and the documentation read `magnetar-runtime/wit` and `magnetar-runtime/fixtures/components` by path. Moving them would change about thirty references in this repository and the external ones for no gain. The Component engine tests read the fixtures from `../magnetar-runtime/fixtures`.
+
+### D11. Verifying public path stability across crates
+
+`cargo public-api` reads rustdoc JSON of one crate and does not follow re-exports of another crate, so after the split it lists every moved item as removed. The check is done by compilation instead: a probe crate with one `pub use` per public type, trait, function, constant and module path of the baseline listing (4,327 paths) must build against the new `magnetar-runtime`. Method signatures are not covered by the probe; the consumers (CLI, integration tests, external Providers, Formats and Loaders) compile unchanged.
 
 ## Risks / Trade-offs
 
@@ -141,6 +157,5 @@ Rollback of any stage is a revert of its pull requests: no data, artifact format
 
 ## Open Questions
 
-- Is `model-data` (D5b) a crate of its own?
 - Several moved types have `pub(crate)` constructors or fields used by higher modules (for example `ModelInstanceId::runtime_issued`). Across crates they need a public form or a different issuing path; each case is settled at extraction.
 - Should the new crates be published, or kept `publish = false` with `magnetar-runtime` vendoring them? D8 assumes publication, since crates.io requires every dependency of a published crate to be published.

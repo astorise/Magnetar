@@ -12,8 +12,8 @@ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-targets
 ```
 
-The commands above cover the root `[workspace]` only (`magnetar-runtime`,
-`roadmap-contracts`, `tools/coverage-ratchet`). If your change touches
+The commands above cover the root `[workspace]` only (`magnetar-runtime`
+and its layer crates, `roadmap-contracts`, the tools). If your change touches
 `magnetar-cli`, `inference-components`, or `integration-tests/*`, also run
 the same commands against `submodule-workspace/Cargo.toml` -- these crates
 depend on a submodule not present in every checkout, so a plain
@@ -23,20 +23,27 @@ exact commands.
 
 ### Runtime layers
 
-`magnetar-runtime` modules are assigned to layers in
-[quality/layers.toml](quality/layers.toml): core types, graph and memory,
-kernel pipeline, Component engine, Runtime orchestration. A module may use
-its own layer and lower ones. CI checks this on every pull request; run the
-same check locally with:
+The Runtime is six crates: `magnetar-core`, `magnetar-graph`,
+`magnetar-model`, `magnetar-kernel`, `magnetar-engine` and
+`magnetar-runtime`, which re-exports the five others. Every top-level module
+is assigned to a layer in [quality/layers.toml](quality/layers.toml) and may
+use its own layer and lower ones. CI checks this on every pull request; run
+the same check locally with:
 
 ```bash
-cargo run --locked -p layering-check -- magnetar-runtime/src quality/layers.toml
+cargo run --locked -p layering-check -- magnetar-core/src magnetar-graph/src magnetar-model/src magnetar-kernel/src magnetar-engine/src magnetar-runtime/src quality/layers.toml
 ```
 
 A new module needs an entry in `[modules]`. If the check reports an upward
 dependency, move the type down to the module that owns it and re-export it
-from its old path. The map has no `[debt]` entry; do not add one. `--report` in front of
-the two paths prints every dependency with the items behind it.
+from its old path. `--report` in front of the paths prints every dependency
+with the items behind it.
+
+A type that moves to a lower crate keeps its public path through
+`magnetar-runtime`. Do not widen a `pub(crate)` item that seals an authority
+(trust decisions, for example) to make it reachable from a higher crate:
+keep the code that needs it in the crate that owns it, or go through the
+public API.
 
 The Rust toolchain is pinned in `rust-toolchain.toml`; rustup installs it
 automatically when you run cargo in this directory. Do not install a different
