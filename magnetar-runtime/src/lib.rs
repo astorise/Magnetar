@@ -64,6 +64,7 @@ pub mod planning;
 pub mod prefix_cache;
 pub mod production_model_ingestion;
 pub mod provider;
+pub mod provider_abi;
 pub mod provider_roadmap;
 pub mod provider_status;
 pub mod qwen_model_component;

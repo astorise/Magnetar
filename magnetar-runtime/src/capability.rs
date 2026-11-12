@@ -1,4 +1,4 @@
-use crate::{ProviderError, WitInterface};
+use crate::ProviderError;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -121,4 +121,20 @@ pub(crate) fn parse_capability_version(value: &str) -> Result<CapabilityVersion,
         return Err(ProviderError::InvalidCapabilityVersion(value.into()));
     }
     Ok(version)
+}
+
+/// A WIT interface identified by its package-qualified name and version.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WitInterface {
+    pub name: String,
+    pub version: String,
+}
+
+impl WitInterface {
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+        }
+    }
 }

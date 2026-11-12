@@ -5,23 +5,22 @@ The project audit of 2026-11 rates every axis of Magnetar as solid except intern
 - `first_native_runtime.rs`: 12,980 lines and 75 public items. It mixes the model executor contract, the first-native fixture, KV state, multi-device segments, prepared plans, production generation, streaming, Component graph construction, chat sessions and the E2E conformance report.
 - `first_native_runtime/tests.rs` (11,600 lines) and `src/tests.rs` (6,542 lines): they reach private items through `use super::*`, so any move of production code drags them along.
 
-The audit proposes six crates in a strict DAG. Measured against the code, that target cannot be reached by moving files, because the modules are not layered today:
+The audit proposes six crates in a strict DAG. Measured against the code, that target cannot be reached by moving files, because the modules are not layered today. A syntax-level dependency analysis (the `layering-check` tool this change adds) found, on `main` after astorise/Magnetar#167:
 
-- `provider` → `inference_api` → `first_native_runtime` → `provider`.
-- `kernel_artifact` → `provider_roadmap` → `inference_api`: the lowest kernel type depends on the top-level API through a roadmap module.
-- `production_model_ingestion` → `model_format_roadmap` → `provider_roadmap`.
-- `kernel_registry` and `kernel_selection_policy` → `model_instance` → `inference_api`.
-- `tensor` → `compute`; `scheduler` ↔ `runtime` ↔ `planning`; `affinity` ↔ `compute` ↔ `provider`.
+- 55 of the 69 top-level modules in one dependency cycle.
+- 68 dependencies pointing from a lower layer to a higher one, against the audit's layering. More than half go to `compute`, which defines the data types every layer uses (`ComputeDType`, `TensorDescriptor`, `ShapeDescriptor`, `TensorResourceId`, `ComputeValidationError`) next to the Compute Capability contract itself.
+- The same pattern in `affinity` (bindings and status types next to `dyn Provider` resolution), `scheduler` (Provider execution errors), `provider` (ABI version), `tensor`, `observability` and `model_instance`.
+- Several modules that the audit places low depend on orchestration by design: `scheduler` schedules on a `Runtime`, `planning` plans a `ComputeGraph` against Provider metadata, `operator_scope` checks graphs against the Kernel Registry.
 
 This change belongs in Magnetar because it only reorganises code the Runtime already owns. It adds no responsibility and moves none across the Component, Runtime, Provider or Device boundaries.
 
 ## What Changes
 
 - Define five layers for Runtime code and the allowed dependency direction between them: core types, graph and memory, kernel pipeline, Component engine, Runtime orchestration.
-- Break the dependency cycles listed above, so that each module depends only on its own layer or a lower one.
+- Remove the upward dependencies, so that each module depends only on its own layer or a lower one. Shared data types move down to core modules and stay re-exported from their old paths.
 - Split `first_native_runtime.rs` into submodules by responsibility. Split its test file and `src/tests.rs` so that each test module sits next to the code it tests.
-- Move the types that lower layers need out of `provider_roadmap` and `model_format_roadmap` into the modules that own them. The roadmap modules keep their catalogs and re-export the moved types.
-- Add a CI gate that fails when a module depends on a higher layer.
+- Keep `provider_roadmap` and `model_format_roadmap` as leaf modules: no lower layer depends on them today, and the gate keeps it so.
+- Add a CI gate that fails when a module depends on a higher layer. The upward dependencies that remain are listed as debt in the layer map; the gate rejects new ones and stale entries, so the list only shrinks.
 - Extract the four lower layers into workspace crates: `magnetar-core`, `magnetar-graph`, `magnetar-kernel`, `magnetar-component-engine`. `magnetar-runtime` keeps Runtime orchestration and re-exports the four crates, so every existing `magnetar_runtime::…` path still resolves.
 - Extend release publication, coverage and documentation gates to the new crates.
 
@@ -31,7 +30,8 @@ This change belongs in Magnetar because it only reorganises code the Runtime alr
 |---|---|---|
 | A `magnetar-providers` crate holding "CPU & CUDA backends", fed by `first_native_runtime.rs` | Not created | Providers already live outside this repository as pinned submodules (`providers/cpu`, `providers/cuda`, …). `first_native_runtime.rs` holds Runtime orchestration and conformance code, with no Provider implementation. `reference_cpu` stays in the Runtime as the correctness baseline (`provider-roadmap` spec). |
 | A crate named `magnetar-wasm-host` | Named `magnetar-component-engine` | `Host` is not a primary Magnetar concept (`project-architecture` spec). |
-| Delete the "transitional" roadmap modules | Kept, made leaf modules | `kernel_artifact`, `conformance`, `production_model_ingestion`, `roadmap-contracts` and the external Formats and Loaders use them, and the `provider-roadmap` and `model-format-roadmap` specs are live. |
+| Delete the "transitional" roadmap modules | Kept as leaf modules | `roadmap-contracts` and the external Formats and Loaders use their public items, and the `provider-roadmap` and `model-format-roadmap` specs are live. Inside the Runtime only `model_format_roadmap` uses `provider_roadmap`. |
+| Graph and kernel as sibling layers, `affinity`, `planning`, `scheduler`, `tensor` in low layers | Kernel pipeline sits above graph and memory; seven modules are held in Runtime orchestration | The kernel pipeline names `ExecutionGraph` and memory identifiers. The held modules depend on orchestration by design; their data types move down instead (`quality/layers.toml`, `[held]`). |
 | `magnetar-cli` has no tests | Not acted on here | The crate has 93 unit tests across its 13 modules. See Non-goals. |
 
 ## Capabilities

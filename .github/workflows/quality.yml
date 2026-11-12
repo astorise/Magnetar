@@ -264,10 +264,12 @@ jobs:
           pattern='(qwen|llama|self_attn\.[a-z]+_proj|mlp\.(gate|up|down)_proj)'
           modules=(
             magnetar-runtime/src/affinity.rs
+            magnetar-runtime/src/binding.rs
             magnetar-runtime/src/capability.rs
             magnetar-runtime/src/component.rs
             magnetar-runtime/src/component_wasmtime.rs
             magnetar-runtime/src/compute.rs
+            magnetar-runtime/src/compute_types.rs
             magnetar-runtime/src/conformance.rs
             magnetar-runtime/src/device.rs
             magnetar-runtime/src/execution_graph.rs
@@ -278,9 +280,12 @@ jobs:
             magnetar-runtime/src/memory.rs
             magnetar-runtime/src/operator.rs
             magnetar-runtime/src/provider.rs
+            magnetar-runtime/src/provider_abi.rs
+            magnetar-runtime/src/provider_status.rs
             magnetar-runtime/src/reference_cpu.rs
             magnetar-runtime/src/scheduler.rs
             magnetar-runtime/src/tensor.rs
+            magnetar-runtime/src/trace_id.rs
           )
           fail=0
           for module in "${modules[@]}"; do
@@ -717,6 +722,25 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Test magnetar-cli
         run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-cli --all-targets --all-features
+
+  # Runtime layering gate (`layer-and-split-runtime-crate`, `quality` spec
+  # "Runtime Layering Gate"): every top-level module of `magnetar-runtime`
+  # has a layer in `quality/layers.toml` and depends only on its own layer
+  # or a lower one. The upward dependencies that still exist are listed in
+  # that file's `[debt]` table; a new one fails, and so does an entry that
+  # no longer matches, so the list only shrinks.
+  layering:
+    name: quality / runtime layering
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Check Runtime layers
+        run: cargo run --locked -p layering-check -- magnetar-runtime/src quality/layers.toml
 
   coverage-baseline-history:
     name: quality / coverage baseline history

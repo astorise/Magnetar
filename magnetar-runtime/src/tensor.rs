@@ -15,8 +15,8 @@ pub use crate::compute_types::{
     DimensionRole, TensorAliasingKind, TensorError, TensorMemoryClass, TensorMutabilityKind,
 };
 use crate::{
-    CorrelationId, DTypeDescriptor, KernelError, ResourceAffinity,
-    ShapeDescriptor, TensorDescriptor, TensorResidency, TensorResourceId, ViewDescriptor,
+    CorrelationId, DTypeDescriptor, KernelError, ResourceAffinity, ShapeDescriptor,
+    TensorDescriptor, TensorResidency, TensorResourceId, ViewDescriptor,
 };
 use std::{error::Error, fmt};
 

@@ -1,6 +1,5 @@
 use crate::affinity::*;
 use crate::capability::*;
-use crate::component::*;
 pub use crate::compute_types::*;
 use crate::device::*;
 use crate::planning::memory_pressure_diagnostic;

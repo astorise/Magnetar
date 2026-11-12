@@ -21,6 +21,23 @@ root-level `--workspace` never builds them (#64). See
 [docs/quality.md](docs/quality.md)'s "Submodule Workspace" section for the
 exact commands.
 
+### Runtime layers
+
+`magnetar-runtime` modules are assigned to layers in
+[quality/layers.toml](quality/layers.toml): core types, graph and memory,
+kernel pipeline, Component engine, Runtime orchestration. A module may use
+its own layer and lower ones. CI checks this on every pull request; run the
+same check locally with:
+
+```bash
+cargo run --locked -p layering-check -- magnetar-runtime/src quality/layers.toml
+```
+
+A new module needs an entry in `[modules]`. If the check reports an upward
+dependency, move the type down to the module that owns it and re-export it
+from its old path; do not add to the `[debt]` list. `--report` in front of
+the two paths prints every dependency with the items behind it.
+
 The Rust toolchain is pinned in `rust-toolchain.toml`; rustup installs it
 automatically when you run cargo in this directory. Do not install a different
 version to match CI -- CI uses the same pinned toolchain.

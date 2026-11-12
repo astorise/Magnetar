@@ -2,12 +2,17 @@
 
 ### Requirement: Runtime Layering Gate
 
-Continuous integration SHALL check on every pull request that no Runtime module or crate depends on a higher layer than its own, using the version-controlled layer map. A violation SHALL fail the pull request and SHALL name the module, the dependency and both layers.
+Continuous integration SHALL check on every pull request that no Runtime module or crate depends on a higher layer than its own, using the version-controlled layer map. A violation SHALL fail the pull request and SHALL name the module, the dependency and both layers. Upward dependencies that predate the gate MAY be listed as debt in the layer map; the gate SHALL fail when a listed dependency no longer exists, so that the list only shrinks.
 
 #### Scenario: Upward dependency
 
 - **WHEN** a pull request makes a kernel pipeline module use an item of the Inference API
 - **THEN** the layering gate fails and reports the module, the item's module and their layers
+
+#### Scenario: Removed debt
+
+- **WHEN** a pull request removes an upward dependency that the layer map lists as debt, without removing the entry
+- **THEN** the layering gate fails and names the stale entry
 
 #### Scenario: Layer map change
 

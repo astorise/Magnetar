@@ -25,7 +25,6 @@ use crate::kernel::{
 };
 use crate::kernel_registry::validate_kernel_advertisement;
 use crate::memory::{MemoryManager, MemoryManagerConfig};
-use crate::trace_id::TraceId;
 use crate::operator::TensorLayoutKind;
 use crate::operator::{OperatorAttributeValue, TensorRole, initial_operator_catalog};
 use crate::planning::{
@@ -39,6 +38,7 @@ use crate::scheduler::{
     ScheduledOperationId, SchedulingState,
 };
 use crate::tensor::ReferenceCpuErrorCode;
+use crate::trace_id::TraceId;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 struct Rng(u64);

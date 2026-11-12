@@ -1053,19 +1053,19 @@ impl KernelCompilationAbiFunctionTable {
 /// implicit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCompilationAbiOwnershipRules {
-    pub request_buffer: crate::provider::ProviderAbiMemoryRule,
-    pub result_buffer: crate::provider::ProviderAbiMemoryRule,
-    pub output_artifact: crate::provider::ProviderAbiMemoryRule,
-    pub diagnostic_buffer: crate::provider::ProviderAbiMemoryRule,
+    pub request_buffer: crate::provider_abi::ProviderAbiMemoryRule,
+    pub result_buffer: crate::provider_abi::ProviderAbiMemoryRule,
+    pub output_artifact: crate::provider_abi::ProviderAbiMemoryRule,
+    pub diagnostic_buffer: crate::provider_abi::ProviderAbiMemoryRule,
 }
 
 impl Default for KernelCompilationAbiOwnershipRules {
     fn default() -> Self {
         Self {
-            request_buffer: crate::provider::ProviderAbiMemoryRule::runtime_borrowed(),
-            result_buffer: crate::provider::ProviderAbiMemoryRule::provider_released(),
-            output_artifact: crate::provider::ProviderAbiMemoryRule::provider_released(),
-            diagnostic_buffer: crate::provider::ProviderAbiMemoryRule::provider_released(),
+            request_buffer: crate::provider_abi::ProviderAbiMemoryRule::runtime_borrowed(),
+            result_buffer: crate::provider_abi::ProviderAbiMemoryRule::provider_released(),
+            output_artifact: crate::provider_abi::ProviderAbiMemoryRule::provider_released(),
+            diagnostic_buffer: crate::provider_abi::ProviderAbiMemoryRule::provider_released(),
         }
     }
 }
@@ -1083,7 +1083,7 @@ impl Default for KernelCompilationAbiOwnershipRules {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCompilationAbiDescriptor {
     pub descriptor_size: usize,
-    pub abi_version: crate::provider::ProviderAbiVersion,
+    pub abi_version: crate::provider_abi::ProviderAbiVersion,
     pub functions: KernelCompilationAbiFunctionTable,
     pub ownership: KernelCompilationAbiOwnershipRules,
 }
@@ -1092,7 +1092,7 @@ impl KernelCompilationAbiDescriptor {
     pub fn current() -> Self {
         Self {
             descriptor_size: std::mem::size_of::<Self>(),
-            abi_version: crate::provider::ProviderAbiVersion::CURRENT,
+            abi_version: crate::provider_abi::ProviderAbiVersion::CURRENT,
             functions: KernelCompilationAbiFunctionTable::REQUIRED,
             ownership: KernelCompilationAbiOwnershipRules::default(),
         }
@@ -1105,7 +1105,7 @@ impl KernelCompilationAbiDescriptor {
                 reason: "descriptor size is smaller than the current layout".into(),
             });
         }
-        if self.abi_version.major != crate::provider::PROVIDER_ABI_MAJOR_VERSION {
+        if self.abi_version.major != crate::provider_abi::PROVIDER_ABI_MAJOR_VERSION {
             return Err(KernelCompilationError::AbiIncompatible {
                 reason: format!("unsupported ABI major version {}", self.abi_version.major),
             });

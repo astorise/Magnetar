@@ -3,6 +3,7 @@ use crate::capability::*;
 use crate::compute::*;
 use crate::device::*;
 use crate::kernel::*;
+pub use crate::provider_abi::*;
 use crate::resolution::{
     BuiltInResolutionPolicy, ResolutionCandidate, ResolutionContext, ResolutionDecision,
     ResolutionDecisionReason, ResolutionPolicy, ResolutionPolicyId,
@@ -17,25 +18,7 @@ use std::{
 };
 
 pub const PROVIDER_API_VERSION: u32 = 1;
-pub const PROVIDER_ABI_MAJOR_VERSION: u16 = 1;
-pub const PROVIDER_ABI_MINOR_VERSION: u16 = 0;
 pub const PROVIDER_ABI_FACTORY_SYMBOL_V1: &str = "magnetar_provider_v1";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProviderAbiVersion {
-    pub major: u16,
-    pub minor: u16,
-}
-impl ProviderAbiVersion {
-    pub const CURRENT: Self = Self {
-        major: PROVIDER_ABI_MAJOR_VERSION,
-        minor: PROVIDER_ABI_MINOR_VERSION,
-    };
-
-    pub const fn new(major: u16, minor: u16) -> Self {
-        Self { major, minor }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderLoadingMode {
@@ -116,44 +99,6 @@ pub enum ProviderAbiExecutionBehavior {
     Blocking,
     AsyncCapable,
     LongRunning,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderAbiMemoryOwner {
-    Runtime,
-    Provider,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderAbiRetentionPolicy {
-    BorrowedForCall,
-    RetainedUntilRelease,
-    OwnershipTransferred,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProviderAbiMemoryRule {
-    pub owner: ProviderAbiMemoryOwner,
-    pub retention: ProviderAbiRetentionPolicy,
-    pub release_required: bool,
-}
-
-impl ProviderAbiMemoryRule {
-    pub const fn runtime_borrowed() -> Self {
-        Self {
-            owner: ProviderAbiMemoryOwner::Runtime,
-            retention: ProviderAbiRetentionPolicy::BorrowedForCall,
-            release_required: false,
-        }
-    }
-
-    pub const fn provider_released() -> Self {
-        Self {
-            owner: ProviderAbiMemoryOwner::Provider,
-            retention: ProviderAbiRetentionPolicy::RetainedUntilRelease,
-            release_required: true,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -548,9 +493,9 @@ impl TensorValue {
     ) -> Result<crate::tensor::HostTensor, crate::compute_types::TensorError> {
         match self {
             Self::Host(tensor) => Ok(tensor),
-            Self::Opaque => Err(crate::compute_types::TensorError::residency_unavailable(format!(
-                "resource '{id}' is device-resident and declined host materialization"
-            ))),
+            Self::Opaque => Err(crate::compute_types::TensorError::residency_unavailable(
+                format!("resource '{id}' is device-resident and declined host materialization"),
+            )),
         }
     }
 }

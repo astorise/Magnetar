@@ -22,29 +22,34 @@ The module graph has cycles that cross every layer the audit proposes (see the p
 
 ### D1. Layers
 
-| Layer | Crate | Modules (target) |
+`quality/layers.toml` is the authoritative map. Summary:
+
+| Layer (rank) | Crate | Modules |
 |---|---|---|
-| 1. Core types | `magnetar-core` | `capability`, `device`, `tensor`, `operator`, `operator_scope`, `resolution`, `affinity`, `artifact_signature` |
-| 2. Graph and memory | `magnetar-graph` | `execution_graph`, `graph_fusion`, `execution_stream`, `planning`, `memory`, `scheduler`, `multi_device_placement` |
-| 2. Kernel pipeline | `magnetar-kernel` | the 15 `kernel*` modules |
-| 3. Component engine | `magnetar-component-engine` | `component`, `component_wasmtime`, `component_web`, `model_component`, `graph_builder_capability`, `model_config_capability`, `wit/` |
-| 4. Runtime orchestration | `magnetar-runtime` | `runtime`, `provider`, `compute`, `reference_cpu`, `model*`, `inference_api`, `generation`, `sampling`, `tokenizer`, `session`, `kv_cache`, `prefix_cache`, `batching`, `adapter`, `first_native*`, `conformance`, `cli_boundary`, `observability`, `phase_attribution`, `production_model_ingestion`, roadmap modules |
+| Core types (1) | `magnetar-core` | `capability`, `device`, `resolution`, `operator`, `artifact_signature`, and the modules this change creates to hold shared data types: `compute_types`, `binding`, `provider_status`, `provider_abi`, `trace_id` |
+| Graph and memory (2) | `magnetar-graph` | `execution_graph`, `graph_fusion`, `memory` |
+| Kernel pipeline (3) | `magnetar-kernel` | the `kernel*` modules except `kernel_optimization_orchestration`, plus `execution_stream` |
+| Component engine (3) | `magnetar-component-engine` | `component`, `component_wasmtime`, `component_web`, `model_component`, `graph_builder_capability`, `model_config_capability`, `wit/` |
+| Runtime orchestration (4) | `magnetar-runtime` | everything else |
 
-A module may depend on its own layer and on lower layers. Graph and kernel are both layer 2 and do not depend on each other, unless the cycle inventory (task 1.1) shows a one-way dependency, in which case the direction is recorded in the layer map.
+A module may depend on its own layer and on layers of a strictly lower rank. The kernel pipeline and the Component engine share rank 3 and do not depend on each other.
 
-The table is the target. Where the inventory shows that a module cannot sit in its target layer without changing a public type, the module stays in layer 4 and the layer map records why. `compute` and `provider` are the likely cases: both are used by almost every module, and both reach `inference_api`.
+Seven modules stay in Runtime orchestration although the audit, or the first version of this design, placed them lower: `affinity`, `tensor`, `operator_scope`, `planning`, `scheduler`, `multi_device_placement`, `kernel_optimization_orchestration`. Each depends on orchestration by design (a `dyn Provider`, a `Runtime`, the Kernel Registry, the Inference API scope check). Their data types move down to core modules instead. The layer map records the reason for each under `[held]`.
+
+`compute` and `provider` stay in Runtime orchestration: `compute` is the Compute Capability contract and its error model, `provider` is the Provider trait and registry.
 
 *Alternative: the audit's six crates including `magnetar-providers`.* Rejected, see the proposal.
 
-### D2. Order of work: layer in place, then extract
+### D2. Order of work: gate first, then layer in place, then extract
 
-1. Inventory and layer map.
-2. Break cycles inside `magnetar-runtime`.
-3. Turn on the layering gate.
-4. Split `first_native_runtime` and the monolithic test files.
-5. Extract crates bottom-up, one per pull request.
+1. Inventory, layer map, layering gate with a debt list of the existing upward dependencies.
+2. Remove upward dependencies inside `magnetar-runtime`; the debt list shrinks with each pull request.
+3. Split `first_native_runtime` and the monolithic test files.
+4. Extract crates bottom-up, one per pull request, once the debt list is empty for that crate's modules.
 
-*Alternative: extract crates first and fix what breaks.* Rejected: the first extraction would not compile until most cycles were gone, giving one unreviewable pull request.
+The gate comes first so that no new upward dependency lands while the existing ones are removed.
+
+*Alternative: extract crates first and fix what breaks.* Rejected: the first extraction would not compile until most upward dependencies were gone, giving one unreviewable pull request.
 
 ### D3. How cycles are broken
 
@@ -64,7 +69,13 @@ Types keep their identity because they are defined once and re-exported, so trai
 
 ### D5. Roadmap modules
 
-`provider_roadmap` and `model_format_roadmap` become leaf modules of layer 4: nothing in layers 1 to 3 depends on them. The types that `kernel_artifact`, `conformance` and `production_model_ingestion` use move to their owning modules and are re-exported from the roadmap modules.
+`provider_roadmap` and `model_format_roadmap` are leaf modules of Runtime orchestration: no module of layers 1 to 3 names them in code (the references in `kernel_artifact`, `conformance` and `production_model_ingestion` are documentation links). They stay as they are; the layering gate fails if a lower layer starts to depend on them.
+
+### D5b. The model data layer
+
+The ten upward dependencies that remain after the first pass share one cause. The Component engine names model data types (`ModelManifest`, `ModelArchitecture`, `ModelArchitectureConfig`, `ArtifactFormat`, `TokenizerFamily`), and the kernel pipeline names `ModelInstanceId`, `AdapterRevision` and the Model Instance selection and warmup types. These types cannot move alone: their constructors return `ModelArtifactError`, `ModelInstanceError`, `SessionError`, `AdapterError`, `TokenizerError` and `ProviderError`, and `ModelInstanceError` embeds `ModelArchitecture`.
+
+Resolution: add a `model-data` layer of rank 2, beside graph and memory, holding the model, tokenizer, session, adapter and Model Instance *data* types with their error enums, split from the loading, residency and lifecycle code that stays in Runtime orchestration. `capability -> provider` is resolved the same way, by moving the `ProviderError` enum to core. Whether `model-data` becomes a crate of its own or part of `magnetar-core` is decided when the split is done, from its size.
 
 ### D6. Split of `first_native_runtime`
 
@@ -89,7 +100,7 @@ Types keep their identity because they are defined once and re-exported, so trai
 
 ### D7. Layering gate
 
-A check in the root workspace reads a version-controlled layer map (`quality/layers.toml`: module or crate → layer) and fails when a `crate::…` path or a crate dependency points to a higher layer, or when a module is missing from the map. It runs in `quality.yml` on every pull request. It is a small tool next to `tools/coverage-ratchet`, with its own unit tests. Before extraction it checks module paths. After extraction, Cargo enforces crate direction and the tool keeps checking modules inside layer 4.
+`tools/layering-check` parses the crate with `syn`, skips `#[cfg(test)]` code, resolves crate-root re-exports and glob imports to the module that defines each item, and reads a version-controlled layer map (`quality/layers.toml`: module → layer, held modules with reasons, and a debt list). It fails when a module depends on a higher layer or on a different layer of the same rank and the edge is not in the debt list, when a debt entry no longer matches a dependency, or when a module is missing from the map. It runs in `quality.yml` on every pull request. It is a small tool next to `tools/coverage-ratchet`, with its own unit tests. Before extraction it checks module paths. After extraction, Cargo enforces crate direction and the tool keeps checking modules inside layer 4.
 
 ### D8. Publication and versions
 
@@ -122,5 +133,6 @@ Rollback of any stage is a revert of its pull requests: no data, artifact format
 
 ## Open Questions
 
-- Do `compute` and `provider` end in a lower layer, or stay in layer 4? Decided by the inventory in task 1.1.
+- Is `model-data` (D5b) a crate of its own or part of `magnetar-core`?
+- Several moved types have `pub(crate)` constructors or fields used by higher modules (for example `ModelInstanceId::runtime_issued`). Across crates they need a public form or a different issuing path; each case is settled at extraction.
 - Should the new crates be published, or kept `publish = false` with `magnetar-runtime` vendoring them? D8 assumes publication, since crates.io requires every dependency of a published crate to be published.

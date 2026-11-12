@@ -1,3 +1,4 @@
+pub use crate::capability::WitInterface;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -52,21 +53,6 @@ fn next_component_instance_id() -> ComponentInstanceId {
     ComponentInstanceId(
         NEXT_COMPONENT_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     )
-}
-
-/// A WIT interface identified by its package-qualified name and version.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct WitInterface {
-    pub name: String,
-    pub version: String,
-}
-impl WitInterface {
-    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            version: version.into(),
-        }
-    }
 }
 
 /// Declarative metadata for portable WebAssembly Component contracts.

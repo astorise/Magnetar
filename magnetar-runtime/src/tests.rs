@@ -5806,7 +5806,7 @@ fn kernel_compilation_abi_descriptor_validates_ownership_and_version() {
     ));
 
     let mut wrong_version = descriptor;
-    wrong_version.abi_version = crate::provider::ProviderAbiVersion::new(99, 0);
+    wrong_version.abi_version = crate::provider_abi::ProviderAbiVersion::new(99, 0);
     assert!(matches!(
         wrong_version.validate(),
         Err(KernelCompilationError::AbiIncompatible { .. })

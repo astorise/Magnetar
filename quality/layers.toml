@@ -1,0 +1,148 @@
+# Runtime layer map (`layer-and-split-runtime-crate`).
+#
+# Checked on every pull request by `tools/layering-check`:
+#
+#     cargo run -p layering-check -- magnetar-runtime/src quality/layers.toml
+#
+# A module may depend on modules of its own layer and of layers with a
+# strictly lower rank. Every top-level module of `magnetar-runtime` must be
+# listed. Test-only code (`#[cfg(test)]`) is not checked.
+
+[layers]
+core = 1
+graph = 2
+kernel = 3
+component-engine = 3
+runtime = 4
+
+[modules]
+# Core types: no dependency on another layer.
+artifact_signature = "core"
+binding = "core"
+capability = "core"
+compute_types = "core"
+device = "core"
+operator = "core"
+provider_abi = "core"
+provider_status = "core"
+resolution = "core"
+trace_id = "core"
+
+# Graph and memory.
+execution_graph = "graph"
+graph_fusion = "graph"
+memory = "graph"
+
+# Kernel pipeline. May use core and graph.
+execution_stream = "kernel"
+kernel = "kernel"
+kernel_artifact = "kernel"
+kernel_artifact_ingestion = "kernel"
+kernel_artifact_manifest = "kernel"
+kernel_autotuning = "kernel"
+kernel_benchmark = "kernel"
+kernel_cache = "kernel"
+kernel_compilation = "kernel"
+kernel_dispatch = "kernel"
+kernel_execution_plan = "kernel"
+kernel_performance_model = "kernel"
+kernel_qualification = "kernel"
+kernel_registry = "kernel"
+kernel_selection_policy = "kernel"
+
+# Component engine. May use core and graph, not the kernel pipeline.
+component = "component-engine"
+component_wasmtime = "component-engine"
+component_web = "component-engine"
+graph_builder_capability = "component-engine"
+model_component = "component-engine"
+model_config_capability = "component-engine"
+
+# Runtime orchestration.
+adapter = "runtime"
+affinity = "runtime"
+batching = "runtime"
+cli_boundary = "runtime"
+compute = "runtime"
+conformance = "runtime"
+e2e_conformance = "runtime"
+first_native_implementation_cut = "runtime"
+first_native_runtime = "runtime"
+generation = "runtime"
+inference_api = "runtime"
+kernel_optimization_orchestration = "runtime"
+kv_cache = "runtime"
+layer_placement = "runtime"
+model = "runtime"
+model_format_roadmap = "runtime"
+model_instance = "runtime"
+model_loading = "runtime"
+multi_device_placement = "runtime"
+observability = "runtime"
+operator_scope = "runtime"
+packed_weight = "runtime"
+phase_attribution = "runtime"
+planning = "runtime"
+prefix_cache = "runtime"
+production_model_ingestion = "runtime"
+provider = "runtime"
+provider_roadmap = "runtime"
+qwen_model_component = "runtime"
+reference_cpu = "runtime"
+runtime = "runtime"
+sampling = "runtime"
+scheduler = "runtime"
+session = "runtime"
+tensor = "runtime"
+tensor_parallel = "runtime"
+tokenizer = "runtime"
+
+# Modules kept in a higher layer than the one first planned for them, with
+# the dependency that keeps them there.
+
+[held.affinity]
+target = "core"
+reason = "AffinityResolution holds a `dyn Provider`, and AffinityError converts to ComputeError. Its data types moved to `binding` and `provider_status`."
+
+[held.tensor]
+target = "core"
+reason = "Tensor Resource handles name KernelError, MemoryPlacement and TensorResidency. Its descriptor types moved to `compute_types`."
+
+[held.operator_scope]
+target = "core"
+reason = "Checks an ExecutionGraph against KernelAdvertisement, KernelSelectionRequest and the Model Component's OperatorRequirement."
+
+[held.planning]
+target = "graph"
+reason = "Plans a ComputeGraph against ProviderMetadata and emits RuntimeEvent."
+
+[held.scheduler]
+target = "graph"
+reason = "Schedules on a `Runtime` and emits Runtime observations."
+
+[held.multi_device_placement]
+target = "graph"
+reason = "Places by KernelId and ModelInstanceId."
+
+[held.kernel_optimization_orchestration]
+target = "kernel"
+reason = "Applies the CLI boundary and Inference API scope checks."
+
+# Upward dependencies that still exist. The gate accepts exactly these: a
+# new one fails, and an entry that no longer matches fails too, so this
+# list only shrinks. All of them need the model, session, adapter, tokenizer
+# and Provider error types to move below the layers that name them.
+
+[debt]
+edges = [
+    "capability -> provider",
+    "component -> model",
+    "component -> session",
+    "kernel_execution_plan -> adapter",
+    "kernel_execution_plan -> model_instance",
+    "kernel_registry -> model_instance",
+    "kernel_selection_policy -> model_instance",
+    "model_component -> model",
+    "model_component -> tokenizer",
+    "model_config_capability -> model",
+]

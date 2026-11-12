@@ -11,9 +11,9 @@ use crate::affinity::{
 use crate::affinity::{DeviceBinding, FallbackClass, ProviderBinding, ResourceAffinity};
 use crate::compute::{ComputeDType, DTypeDescriptor, ShapeDescriptor, TensorDescriptor};
 use crate::compute::{HostStagingPolicy, TensorResourceId};
+use crate::compute_types::TensorMemoryClass;
 use crate::device::DeviceId;
 use crate::device::{DeviceMetadata, DeviceType};
-use crate::compute_types::TensorMemoryClass;
 #[test]
 fn memory_manager_admission_uses_pressure_and_queue_policy() {
     let manager = MemoryManager::default();

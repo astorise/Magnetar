@@ -6,6 +6,7 @@
 
 use crate::binding::*;
 use crate::compute_types::*;
+use std::{error::Error, fmt};
 
 /// Logical point at which resolution or re-resolution is being considered.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -695,4 +696,212 @@ pub enum HealthReport {
     Provider(ProviderHealthReport),
     Device(DeviceHealth),
     Capability(CapabilityHealth),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ProviderExecutionPhase {
+    Prepare,
+    Submit,
+    Observe,
+    Cancel,
+    Complete,
+    Release,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ProviderExecutionErrorCode {
+    ProviderHealthUnknown,
+    ProviderInitializing,
+    ProviderDegradedRejected,
+    ProviderSaturated,
+    ProviderDraining,
+    ProviderUnavailable,
+    ProviderInterrupted,
+    DeviceHealthUnknown,
+    DeviceSaturated,
+    DeviceUnavailable,
+    StaleHealthReport,
+    CapabilityUnavailable,
+    InvalidExecutionPlan,
+    IncompatibleResourceAffinity,
+    MemoryPlanRejected,
+    UnsupportedOperation,
+    UnsupportedDType,
+    UnsupportedLayout,
+    DataMovementFailed,
+    MaterializationFailed,
+    SubmissionFailed,
+    ExecutionFailed,
+    ExecutionInterrupted,
+    CancellationUnsupported,
+    CancellationFailed,
+    ResourceExhausted,
+    OutOfMemory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderExecutionDiagnostic {
+    pub provider: ProviderBinding,
+    pub device: Option<DeviceBinding>,
+    pub phase: ProviderExecutionPhase,
+    pub stable_reason: Option<ProviderExecutionErrorCode>,
+    pub detail: Option<String>,
+    pub trace_id: Option<String>,
+}
+
+impl ProviderExecutionDiagnostic {
+    pub fn new(provider: ProviderBinding, phase: ProviderExecutionPhase) -> Self {
+        Self {
+            provider,
+            device: None,
+            phase,
+            stable_reason: None,
+            detail: None,
+            trace_id: None,
+        }
+    }
+    pub fn with_device(mut self, device: Option<DeviceBinding>) -> Self {
+        self.device = device;
+        self
+    }
+    pub fn with_reason(mut self, reason: ProviderExecutionErrorCode) -> Self {
+        self.stable_reason = Some(reason);
+        self
+    }
+    pub fn with_detail(mut self, detail: impl AsRef<str>) -> Self {
+        self.detail = Some(redact_backend_diagnostic(detail.as_ref()));
+        self
+    }
+    pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderExecutionError {
+    pub code: ProviderExecutionErrorCode,
+    pub phase: ProviderExecutionPhase,
+    pub provider: ProviderBinding,
+    pub device: Option<DeviceBinding>,
+    pub message: String,
+    pub diagnostics: Vec<ProviderExecutionDiagnostic>,
+}
+
+impl ProviderExecutionError {
+    pub fn new(
+        code: ProviderExecutionErrorCode,
+        phase: ProviderExecutionPhase,
+        provider: ProviderBinding,
+        device: Option<DeviceBinding>,
+        message: impl Into<String>,
+    ) -> Self {
+        let diagnostic = ProviderExecutionDiagnostic::new(provider.clone(), phase)
+            .with_device(device.clone())
+            .with_reason(code);
+        Self {
+            code,
+            phase,
+            provider,
+            device,
+            message: message.into(),
+            diagnostics: vec![diagnostic],
+        }
+    }
+    pub fn with_diagnostic(mut self, diagnostic: ProviderExecutionDiagnostic) -> Self {
+        self.diagnostics.push(diagnostic);
+        self
+    }
+    pub fn scheduler_code(&self) -> SchedulerErrorCode {
+        match self.code {
+            ProviderExecutionErrorCode::ProviderHealthUnknown => {
+                SchedulerErrorCode::ProviderHealthUnknown
+            }
+            ProviderExecutionErrorCode::ProviderInitializing => {
+                SchedulerErrorCode::ProviderInitializing
+            }
+            ProviderExecutionErrorCode::ProviderDegradedRejected => {
+                SchedulerErrorCode::ProviderDegradedRejected
+            }
+            ProviderExecutionErrorCode::ProviderSaturated => SchedulerErrorCode::ProviderSaturated,
+            ProviderExecutionErrorCode::ProviderDraining => SchedulerErrorCode::ProviderDraining,
+            ProviderExecutionErrorCode::ProviderUnavailable => {
+                SchedulerErrorCode::ProviderUnavailable
+            }
+            ProviderExecutionErrorCode::ProviderInterrupted => {
+                SchedulerErrorCode::ProviderInterrupted
+            }
+            ProviderExecutionErrorCode::DeviceHealthUnknown => {
+                SchedulerErrorCode::DeviceHealthUnknown
+            }
+            ProviderExecutionErrorCode::DeviceSaturated => SchedulerErrorCode::DeviceSaturated,
+            ProviderExecutionErrorCode::DeviceUnavailable => SchedulerErrorCode::DeviceUnavailable,
+            ProviderExecutionErrorCode::StaleHealthReport => SchedulerErrorCode::StaleHealthReport,
+            ProviderExecutionErrorCode::InvalidExecutionPlan => {
+                SchedulerErrorCode::InvalidExecutionPlan
+            }
+            ProviderExecutionErrorCode::IncompatibleResourceAffinity => {
+                SchedulerErrorCode::ResourceAffinityConflict
+            }
+            ProviderExecutionErrorCode::MemoryPlanRejected
+            | ProviderExecutionErrorCode::OutOfMemory
+            | ProviderExecutionErrorCode::ResourceExhausted => {
+                SchedulerErrorCode::MemoryPlanInvalid
+            }
+            ProviderExecutionErrorCode::CancellationUnsupported => {
+                SchedulerErrorCode::CancellationUnsupported
+            }
+            ProviderExecutionErrorCode::CancellationFailed => {
+                SchedulerErrorCode::CancellationFailed
+            }
+            ProviderExecutionErrorCode::ExecutionInterrupted => {
+                SchedulerErrorCode::ExecutionInterrupted
+            }
+            ProviderExecutionErrorCode::CapabilityUnavailable
+            | ProviderExecutionErrorCode::UnsupportedOperation
+            | ProviderExecutionErrorCode::UnsupportedDType
+            | ProviderExecutionErrorCode::UnsupportedLayout
+            | ProviderExecutionErrorCode::DataMovementFailed
+            | ProviderExecutionErrorCode::MaterializationFailed
+            | ProviderExecutionErrorCode::SubmissionFailed
+            | ProviderExecutionErrorCode::ExecutionFailed => SchedulerErrorCode::ExecutionFailed,
+        }
+    }
+}
+
+impl fmt::Display for ProviderExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "provider execution error {:?} during {:?} for provider '{}': {}",
+            self.code, self.phase, self.provider, self.message
+        )
+    }
+}
+
+impl Error for ProviderExecutionError {}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SchedulerErrorCode {
+    InvalidExecutionPlan,
+    QueueCapacityExceeded,
+    ProviderHealthUnknown,
+    ProviderInitializing,
+    ProviderDegradedRejected,
+    ProviderSaturated,
+    ProviderDraining,
+    ProviderUnavailable,
+    ProviderInterrupted,
+    DeviceHealthUnknown,
+    DeviceSaturated,
+    DeviceUnavailable,
+    StaleHealthReport,
+    ResourceAffinityConflict,
+    MemoryPlanInvalid,
+    SubmissionFailed,
+    CancellationUnsupported,
+    CancellationFailed,
+    ExecutionFailed,
+    ExecutionInterrupted,
+    OperationTimeout,
 }
