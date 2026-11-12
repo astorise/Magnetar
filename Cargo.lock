@@ -699,6 +699,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-model"
+version = "1.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "magnetar-core",
+ "magnetar-graph",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sha2 0.11.1",
+]
+
+[[package]]
 name = "magnetar-roadmap-contracts"
 version = "0.1.0"
 dependencies = [
@@ -713,6 +726,7 @@ dependencies = [
  "flate2",
  "magnetar-core",
  "magnetar-graph",
+ "magnetar-model",
  "serde",
  "serde_json",
  "serde_norway",

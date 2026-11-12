@@ -8,8 +8,8 @@ use crate::{
     AdapterSetId, ArtifactFormat, FallbackClass, GenerationModelReference, MemoryManager,
     ModelArchitecture, ModelArtifactId, ModelArtifactKind, ModelArtifactSource, ModelDigest,
     ModelInstanceDefinition, ModelLoadingCoordinator, ModelLoadingRequest, ModelLoadingRequestId,
-    ModelName, ModelQuantizationPolicy, ModelRevision, ModelTrustDecision, ModelTrustStatus,
-    ResourceAffinity, TokenizerId,
+    ModelName, ModelQuantizationPolicy, ModelRevision, ModelTrustStore, ResourceAffinity,
+    TokenizerId,
 };
 use crate::{
     ExecutionGraphId, ExecutionGraphProducer, GraphKvCacheBehavior, GraphKvCacheMetadata,
@@ -1540,7 +1540,9 @@ fn qwen_component_integrates_with_model_loading_and_instance_and_graph_execution
         .load(
             request,
             &manifest,
-            &ModelTrustDecision::new(ModelTrustStatus::Trusted, "trusted fixture"),
+            &ModelTrustStore::default()
+                .trust_digest(manifest.id.digest.value.clone())
+                .evaluate(&manifest),
             &mut memory,
         )
         .unwrap();

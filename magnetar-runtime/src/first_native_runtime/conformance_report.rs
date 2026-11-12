@@ -905,7 +905,11 @@ pub(super) fn check_untrusted_artifact(fixture: &E2eFixture) -> Result<(), E2eCo
     match coordinator.load(
         request,
         &fixture.manifest,
-        &ModelTrustDecision::new(ModelTrustStatus::Rejected, "untrusted for this check"),
+        // A real `ModelTrustStore` verdict, never a hand-built decision:
+        // only the store can issue one.
+        &ModelTrustStore::default()
+            .reject_digest(fixture.manifest.id.digest.value.clone())
+            .evaluate(&fixture.manifest),
         &mut memory,
     ) {
         Err(_) => Ok(()),
@@ -1159,7 +1163,9 @@ pub(super) fn check_no_shortcut_model_loading_bypass_detected(
     let mut loaded = coordinator.load(
         request,
         &fixture.manifest,
-        &ModelTrustDecision::new(ModelTrustStatus::Trusted, "trusted E2E fixture"),
+        &ModelTrustStore::default()
+            .trust_digest(fixture.manifest.id.digest.value.clone())
+            .evaluate(&fixture.manifest),
         &mut memory,
     )?;
     // Simulate a caller that fabricates a "loaded" context without the real
@@ -1189,7 +1195,9 @@ pub(super) fn check_no_shortcut_model_component_bypass_detected(
     match coordinator.load(
         request,
         &fixture.manifest,
-        &ModelTrustDecision::new(ModelTrustStatus::Trusted, "trusted E2E fixture"),
+        &ModelTrustStore::default()
+            .trust_digest(fixture.manifest.id.digest.value.clone())
+            .evaluate(&fixture.manifest),
         &mut memory,
     ) {
         Err(_) => Ok(()),
@@ -1216,7 +1224,9 @@ pub(super) fn check_no_shortcut_memory_manager_bypass_detected(
     match coordinator.load(
         request,
         &fixture.manifest,
-        &ModelTrustDecision::new(ModelTrustStatus::Trusted, "trusted E2E fixture"),
+        &ModelTrustStore::default()
+            .trust_digest(fixture.manifest.id.digest.value.clone())
+            .evaluate(&fixture.manifest),
         &mut starved_memory,
     ) {
         Err(_) => Ok(()),

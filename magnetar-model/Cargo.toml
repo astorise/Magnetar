@@ -1,0 +1,21 @@
+[package]
+name = "magnetar-model"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "Model data of the Magnetar Runtime: manifests, architecture and trust data, and the identities of Model Instances, sessions, adapters and tokenizers."
+repository = "https://github.com/astorise/Magnetar"
+readme = "../README.md"
+keywords = ["ai", "inference", "runtime"]
+categories = ["science"]
+rust-version = "1.98"
+include = ["src/**/*.rs"]
+
+[dependencies]
+magnetar-core = { path = "../magnetar-core", version = "=1.0.0" }
+magnetar-graph = { path = "../magnetar-graph", version = "=1.0.0" }
+ed25519-dalek = { version = "3.0.0", features = ["signature"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_norway = "0.9"
+sha2 = "0.11"

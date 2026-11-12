@@ -606,7 +606,7 @@ pub enum ModelArtifactSource {
 /// declared, static compatibility property: every [`ModelManifest`]
 /// carries its own `artifact_format`, and a production bundle declares it
 /// explicitly via a small sidecar file (see
-/// `crate::production_model_ingestion::read_declared_artifact_format`)
+/// `crate::read_declared_artifact_format`)
 /// rather than Magnetar inferring it. Extensible: a future third format
 /// adds a variant here, not a new filesystem check.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -690,7 +690,7 @@ pub struct ModelManifest {
     /// [`ArtifactFormat::HuggingFace`]) -- Magnetar never infers it from
     /// filesystem structure. Compared against a registered Component's
     /// `compatibility.artifact_formats` to select/validate the ingestor
-    /// path; see `crate::production_model_ingestion::read_declared_artifact_format`
+    /// path; see `crate::read_declared_artifact_format`
     /// for where a production bundle's declared format is read.
     pub artifact_format: ArtifactFormat,
 }
@@ -1622,7 +1622,7 @@ struct RawModelManifest {
     /// [`ArtifactFormat::HuggingFace`] when absent. A production bundle
     /// never goes through this path; its format is always stamped by the
     /// concrete ingestor that produced it (see
-    /// `crate::production_model_ingestion::read_declared_artifact_format`).
+    /// `crate::read_declared_artifact_format`).
     #[serde(default)]
     artifact_format: Option<String>,
 }

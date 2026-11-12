@@ -34,6 +34,7 @@
 members = [
     "magnetar-core",
     "magnetar-graph",
+    "magnetar-model",
     "magnetar-runtime",
     "tools/coverage-ratchet",
     "roadmap-contracts",

@@ -619,7 +619,7 @@ impl ModelLoadingCoordinator {
         manifest: &ModelManifest,
         trust: &ModelTrustDecision,
     ) -> Result<ModelResidencyPlan, ModelLoadingError> {
-        match trust.status {
+        match trust.status() {
             ModelTrustStatus::Trusted => {}
             ModelTrustStatus::Rejected | ModelTrustStatus::PolicyDenied => {
                 self.observe(
@@ -632,7 +632,7 @@ impl ModelLoadingCoordinator {
                 return Err(ModelLoadingError::new(
                     ModelLoadingErrorCode::ModelArtifactUntrusted,
                     Some(ModelLoadingPhase::ReadManifest),
-                    trust.reason.clone(),
+                    trust.reason().to_string(),
                 ));
             }
             ModelTrustStatus::Revoked => {
@@ -646,7 +646,7 @@ impl ModelLoadingCoordinator {
                 return Err(ModelLoadingError::new(
                     ModelLoadingErrorCode::ModelArtifactRevoked,
                     Some(ModelLoadingPhase::ReadManifest),
-                    trust.reason.clone(),
+                    trust.reason().to_string(),
                 ));
             }
             ModelTrustStatus::Unknown => {

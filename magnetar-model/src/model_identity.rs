@@ -304,7 +304,8 @@ impl fmt::Display for AdapterError {
 
 impl Error for AdapterError {}
 
-pub(crate) fn validate_portable_identity(value: &str, label: &str) -> Result<(), AdapterError> {
+#[doc(hidden)]
+pub fn validate_portable_identity(value: &str, label: &str) -> Result<(), AdapterError> {
     if value.trim().is_empty()
         || value.contains('/')
         || value.contains('\\')
@@ -339,7 +340,8 @@ impl TokenizerFamily {
     }
 }
 
-pub(crate) fn validate_identity(value: &str, label: &str) -> Result<(), TokenizerError> {
+#[doc(hidden)]
+pub fn validate_identity(value: &str, label: &str) -> Result<(), TokenizerError> {
     if value.trim().is_empty()
         || value.contains('/')
         || value.contains('\\')
@@ -445,7 +447,8 @@ impl ModelInstanceId {
         Ok(Self(value))
     }
 
-    pub(crate) fn runtime_issued(sequence: u64) -> Self {
+    #[doc(hidden)]
+    pub fn runtime_issued(sequence: u64) -> Self {
         Self(format!("model-instance-{sequence}"))
     }
 
