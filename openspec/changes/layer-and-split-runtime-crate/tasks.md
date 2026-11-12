@@ -4,7 +4,7 @@
 - [x] 1.2 Write `quality/layers.toml`: each module's layer, the modules held in Runtime orchestration with the reason, and the debt list. `compute` and `provider` stay in Runtime orchestration.
 - [x] 1.3 Record the test baseline: 1,178 unit tests and 177 contract tests in `magnetar-runtime`, all passing.
 - [x] 1.4 Public API baseline: the commit before the first move is `d5231c7`; `cargo public-api -p magnetar-runtime -sss diff d5231c7..HEAD` lists removed, changed and added items.
-- [ ] 1.5 Record clean and incremental build times before the first crate extraction.
+- [x] 1.5 Build times at `d5231c7`, one run on a 4-core container: clean `cargo check -p magnetar-runtime` 53.1 s; after touching one Runtime file 3.0 s; clean test build 88.5 s.
 
 ## 2. Layering gate
 
@@ -46,7 +46,7 @@
 - [x] 5.6 Tests that need a higher layer stay in `magnetar-runtime`: graph fusion against the real Qwen Component, Kernel Registry against the Reference CPU Provider, one Component engine capability check.
 - [x] 5.7 After the extractions: every one of the 4,327 public type, trait, function, constant and module paths of the baseline (`d5231c7`) still resolves through `magnetar-runtime` (compiled probe); 1,703 workspace tests pass, none removed; Clippy, documentation and layering gates pass.
 - [x] 5.8 `wasm32-unknown-unknown`: `cargo check -p magnetar-runtime --all-features` passes with the layer crates.
-- [ ] 5.9 Record clean and incremental build times before and after the split.
+- [x] 5.9 Build times after the split, same machine, one run: clean check 44.6 s (53.1 s before); after touching a Runtime file 1.3 s, a `magnetar-kernel` file 2.0 s, a `magnetar-core` file 2.3 s (3.0 s before for any file); clean test build 72.4 s (88.5 s before).
 - [ ] 5.10 Build each crate on macOS and Windows (CI matrix).
 
 ## 6. Consumers and validation
