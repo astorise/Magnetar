@@ -112,3 +112,17 @@ Both answer "Paris". Mistral's profile: matmul 4.4 ms and matmul-residual
 embedding 254 ms per call: its `Q4_K` table is expanded at load and the
 Reference CPU Kernel copied the whole f32 table per lookup, now gathered
 in place.
+
+With the in-place f32 embedding and the faster Kernels (run 43112709258,
+commit `4d66c11`), same host and 3 threads:
+
+| Model | TPOT | TTFT | Load |
+|---|---|---|---|
+| Qwen2.5-0.5B `Q8_0` | 54.8 ms (was 62.3) | 95.8 ms | 3.5 s |
+| Mistral 7B `Q4_K_M` | 885.8 ms (was 1,368) | 1,655 ms | 24.6 s |
+
+Both answer "Paris" and generate the same token ids as their CUDA runs.
+Mistral's embedding now costs 0.014 ms per lookup (254 ms before); its
+matmuls (3.5 ms per call, matmul-residual 4.8 ms) are about 96 % of a
+token, near 5 GB/s over the weights on three threads: Kernel-bound, the
+next target, with attention (0.57 ms per call) the next operator.
