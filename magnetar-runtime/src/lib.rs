@@ -83,7 +83,6 @@ pub mod trace_id;
 pub use adapter::*;
 pub use affinity::*;
 pub use batching::*;
-pub use binding::*;
 pub use capability::*;
 pub use cli_boundary::*;
 pub use component::*;
@@ -92,7 +91,6 @@ pub use component_wasmtime::*;
 #[cfg(all(target_arch = "wasm32", feature = "web-component-engine"))]
 pub use component_web::*;
 pub use compute::*;
-pub use compute_types::*;
 pub use conformance::*;
 pub use device::*;
 pub use e2e_conformance::{
@@ -136,7 +134,6 @@ pub use planning::*;
 pub use prefix_cache::*;
 pub use production_model_ingestion::*;
 pub use provider::*;
-pub use provider_abi::*;
 pub use provider_status::*;
 pub use qwen_model_component::*;
 pub use reference_cpu::*;
