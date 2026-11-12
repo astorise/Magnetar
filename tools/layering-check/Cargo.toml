@@ -1,0 +1,13 @@
+[package]
+name = "layering-check"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Checks that Magnetar Runtime modules only depend on their own layer or a lower one."
+
+[dependencies]
+proc-macro2 = "1"
+serde = { version = "1.0", features = ["derive"] }
+syn = { version = "2", features = ["full", "visit"] }
+toml = "0.8"
