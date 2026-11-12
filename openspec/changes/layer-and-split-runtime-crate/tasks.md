@@ -3,7 +3,8 @@
 - [x] 1.1 Generate the module dependency graph of `magnetar-runtime` (non-test code) and list every upward dependency with the items that cause it (`layering-check --report`, `--cycles`).
 - [x] 1.2 Write `quality/layers.toml`: each module's layer, the modules held in Runtime orchestration with the reason, and the debt list. `compute` and `provider` stay in Runtime orchestration.
 - [x] 1.3 Record the test baseline: 1,178 unit tests and 177 contract tests in `magnetar-runtime`, all passing.
-- [ ] 1.4 Record the public API listing of `magnetar-runtime` at the commit before the first move, and clean and incremental build times.
+- [x] 1.4 Public API baseline: the commit before the first move is `d5231c7`; `cargo public-api -p magnetar-runtime -sss diff d5231c7..HEAD` lists removed, changed and added items.
+- [ ] 1.5 Record clean and incremental build times before the first crate extraction.
 
 ## 2. Layering gate
 
@@ -20,6 +21,7 @@
 - [x] 3.6 `scheduler` and `provider`: move the Provider execution error types to `provider_status` and the Provider ABI version and memory rule to `provider_abi`; re-export.
 - [x] 3.7 `component`: move `WitInterface` to `capability`; re-export.
 - [x] 3.8 After each task above: unit and contract suites pass with the baseline counts; Clippy clean with `-D warnings`.
+- [x] 3.9a After tasks 3.1 to 3.7: public API diff against `d5231c7` shows no removed and no changed item; root and submodule workspaces build without source change; `magnetar-cli` (93) and `magnetar-inference-component` (14) tests pass.
 - [ ] 3.9 Model data (design D5b): split the model, tokenizer, session, adapter and Model Instance data types and their error enums from loading and lifecycle code; clear the seven `component*`/`model_*` and `kernel_*` debt entries that name them.
 - [ ] 3.10 `capability -> provider`: move the `ProviderError` enum to core; clear the entry.
 - [ ] 3.11 Debt list empty; remove the `[debt]` table from the layer map.
