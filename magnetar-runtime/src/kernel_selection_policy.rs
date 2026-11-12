@@ -127,13 +127,12 @@ use crate::kernel_artifact::{KernelArtifactTrust, PreparedKernelId};
 use crate::kernel_benchmark::BenchmarkFreshness;
 use crate::kernel_qualification::QualificationStatus;
 use crate::kernel_registry::{KernelCandidateRejection, KernelRegistry};
-use crate::model_instance::{
-    KernelSelectionPolicy as ModelInstanceSelectionMode, PinnedKernelSelection,
-};
+use crate::model_identity::ModelInstanceError;
 use crate::{
     ComputeDType, HostStagingPolicy, KernelExecutionMode, KernelFallbackClass, KernelId,
     OperatorId, ProviderBinding, TensorLayoutKind,
 };
+use KernelSelectionPolicy as ModelInstanceSelectionMode;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -1136,12 +1135,12 @@ impl fmt::Display for KernelSelectionPolicyVersion {
 /// planned to happen.
 pub fn static_selection_required_during_warmup(
     mode: &ModelInstanceSelectionMode,
-    plan: &crate::model_instance::ModelInstanceWarmupPlan,
+    plan: &crate::model_identity::ModelInstanceWarmupPlan,
 ) -> bool {
     mode.is_pinned()
         && plan
             .steps
-            .contains(&crate::model_instance::ModelInstanceWarmupStep::KernelPreparationPlaceholder)
+            .contains(&crate::model_identity::ModelInstanceWarmupStep::KernelPreparationPlaceholder)
 }
 
 /// The top-level Kernel selection policy, implementing "Selection Policy
@@ -2269,3 +2268,66 @@ pub fn run_kernel_selection_policy_conformance() -> KernelSelectionPolicyConform
 
 #[cfg(test)]
 mod tests;
+
+/// Implements "Model Instance Interaction" from
+/// `openspec/changes/define-generated-kernel-qualification-cache-and-hot-swap-contract`:
+/// "A Model Instance MAY use dynamic Kernel selection or may pin a Kernel
+/// generation set for reproducibility. The policy SHALL be explicit." The
+/// enum itself makes the choice explicit -- there is no implicit third
+/// state, and [`PinnedKernelSelection`] carries only stable identity
+/// metadata, never a native handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelSelectionPolicy {
+    Dynamic,
+    Pinned(PinnedKernelSelection),
+}
+
+impl KernelSelectionPolicy {
+    pub const fn is_pinned(&self) -> bool {
+        matches!(self, Self::Pinned(_))
+    }
+}
+
+/// A pinned Kernel selection, implementing "For strict reproducibility, a
+/// Model Instance SHOULD be able to pin: KernelId, artifact digest, Prepared
+/// generation, qualification profile" (proposal).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PinnedKernelSelection {
+    pub kernel: KernelId,
+    pub artifact_digest: String,
+    pub prepared_generation: Option<u64>,
+    pub qualification_profile: Option<String>,
+    /// Implements "Reproducible Model Instance May Pin Tuning Record"
+    /// (`define-kernel-runtime-autotuning-and-specialization-contract`): a
+    /// pinned `KernelAutotuningRecord` fingerprint the Model Instance
+    /// consumes instead of live tuning. Live re-tuning SHALL NOT change this
+    /// value.
+    pub autotuning_record_fingerprint: Option<String>,
+}
+
+impl PinnedKernelSelection {
+    pub fn new(kernel: KernelId, artifact_digest: impl Into<String>) -> Self {
+        Self {
+            kernel,
+            artifact_digest: artifact_digest.into(),
+            prepared_generation: None,
+            qualification_profile: None,
+            autotuning_record_fingerprint: None,
+        }
+    }
+
+    pub fn with_autotuning_record_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.autotuning_record_fingerprint = Some(fingerprint.into());
+        self
+    }
+
+    /// Implements "Record artifact digest for reproducibility" and "Record
+    /// qualification profile" (tasks): a pinned selection SHALL identify
+    /// which artifact and profile it pins, never leaving either implicit.
+    pub fn validate(&self) -> Result<(), ModelInstanceError> {
+        if self.artifact_digest.trim().is_empty() {
+            return Err(ModelInstanceError::ModelInstancePolicyDenied);
+        }
+        Ok(())
+    }
+}

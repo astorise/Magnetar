@@ -1,3 +1,4 @@
+pub use crate::binding::ComponentArtifactReference;
 pub use crate::capability::WitInterface;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -115,11 +116,6 @@ impl ComponentDescriptor {
     pub fn artifact_reference(&self) -> ComponentArtifactReference<'_> {
         ComponentArtifactReference::LocalPath(&self.artifact_path)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ComponentArtifactReference<'a> {
-    LocalPath(&'a Path),
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]

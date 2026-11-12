@@ -1,4 +1,4 @@
-use crate::ProviderError;
+use crate::provider_status::ProviderError;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,

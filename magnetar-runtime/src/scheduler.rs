@@ -7,7 +7,7 @@ use crate::planning::provider_execution_id;
 use crate::planning::*;
 pub use crate::provider_status::{
     ProviderExecutionDiagnostic, ProviderExecutionError, ProviderExecutionErrorCode,
-    ProviderExecutionPhase, SchedulerErrorCode,
+    ProviderExecutionPhase, ScheduledOperationId, SchedulerErrorCode,
 };
 use crate::runtime::next_scheduled_operation_id;
 use crate::runtime::*;
@@ -16,21 +16,6 @@ use std::{
     error::Error,
     fmt,
 };
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ScheduledOperationId(u64);
-impl ScheduledOperationId {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-impl fmt::Display for ScheduledOperationId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SchedulingPolicy {

@@ -5,7 +5,12 @@
 //! where these types were first defined, so existing paths are unchanged.
 
 use crate::binding::*;
+use crate::capability::*;
 use crate::compute_types::*;
+use crate::device::*;
+use crate::provider_abi::*;
+use crate::resolution::*;
+use std::path::PathBuf;
 use std::{error::Error, fmt};
 
 /// Logical point at which resolution or re-resolution is being considered.
@@ -904,4 +909,224 @@ pub enum SchedulerErrorCode {
     ExecutionFailed,
     ExecutionInterrupted,
     OperationTimeout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ScheduledOperationId(u64);
+
+impl ScheduledOperationId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ScheduledOperationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Debug)]
+pub enum ProviderError {
+    ProviderAlreadyRegistered(String),
+    DeviceAlreadyRegistered(DeviceId),
+    DeviceProviderMismatch {
+        device: DeviceId,
+        expected: String,
+        found: String,
+    },
+    InvalidDevice(String),
+    IncompatibleApiVersion {
+        provider: String,
+        expected: u32,
+        found: u32,
+    },
+    InvalidCapability(String),
+    InvalidCapabilityVersion(String),
+    ConflictingCapability {
+        id: CapabilityId,
+        version: CapabilityVersion,
+    },
+    MissingCapabilityDependency {
+        capability: CapabilityId,
+        dependency: CapabilityId,
+        required: CapabilityVersion,
+    },
+    NoCompatibleProvider(CapabilityBinding),
+    PolicyRejectedProvider {
+        capability: CapabilityBinding,
+        policy: ResolutionPolicyId,
+    },
+    Discovery {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Load {
+        path: PathBuf,
+        message: String,
+    },
+    ProviderPathDenied {
+        path: PathBuf,
+    },
+    UnsupportedDynamicAbi {
+        path: PathBuf,
+        expected_symbol: &'static str,
+        expected_descriptor: ProviderAbiDescriptor,
+    },
+    InvalidAbiDescriptor(String),
+    UnsupportedAbiVersion {
+        expected: ProviderAbiVersion,
+        found: ProviderAbiVersion,
+    },
+    InvalidMetadata(String),
+    InvalidAdvertisement(String),
+    InvalidDeviceMetadata(String),
+    InitializationFailure(String),
+    ProviderNotReady(String),
+    ProviderDraining(String),
+    ProviderSaturated(String),
+    ExecutionRejected(String),
+    ExecutionFailed(String),
+    CancellationUnsupported(String),
+    ResourceInvalid(String),
+    PanicOrUnwindViolation(String),
+    InternalProviderError(String),
+    CancellationFailed {
+        operation: ScheduledOperationId,
+        reason: String,
+    },
+    Registration(String),
+    Lifecycle(String),
+}
+
+impl fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProviderAlreadyRegistered(x) => write!(f, "provider '{x}' is already registered"),
+            Self::DeviceAlreadyRegistered(id) => write!(f, "device '{id}' is already registered"),
+            Self::DeviceProviderMismatch {
+                device,
+                expected,
+                found,
+            } => write!(
+                f,
+                "device '{device}' is owned by provider '{found}', not registering provider '{expected}'"
+            ),
+            Self::InvalidDevice(message) => write!(f, "invalid device: {message}"),
+            Self::IncompatibleApiVersion {
+                provider,
+                expected,
+                found,
+            } => write!(
+                f,
+                "provider '{provider}' targets API {found}, but Magnetar supports API {expected}"
+            ),
+            Self::InvalidCapability(message) => write!(f, "invalid capability: {message}"),
+            Self::InvalidCapabilityVersion(version) => {
+                write!(f, "invalid capability semantic version '{version}'")
+            }
+            Self::ConflictingCapability { id, version } => {
+                write!(
+                    f,
+                    "capability '{id}@{version}' has a conflicting definition"
+                )
+            }
+            Self::MissingCapabilityDependency {
+                capability,
+                dependency,
+                required,
+            } => write!(
+                f,
+                "capability '{capability}' requires unavailable dependency '{dependency}@{required}'"
+            ),
+            Self::NoCompatibleProvider(capability) => {
+                write!(
+                    f,
+                    "no Provider implements compatible capability '{capability}'"
+                )
+            }
+            Self::PolicyRejectedProvider { capability, policy } => write!(
+                f,
+                "resolution policy '{policy}' rejected every Provider for capability '{capability}'"
+            ),
+            Self::Discovery { path, source } => write!(
+                f,
+                "could not discover providers in '{}': {source}",
+                path.display()
+            ),
+            Self::Load { path, message } => {
+                write!(f, "could not load provider '{}': {message}", path.display())
+            }
+            Self::ProviderPathDenied { path } => write!(
+                f,
+                "provider library '{}' is denied by loading policy",
+                path.display()
+            ),
+            Self::UnsupportedDynamicAbi {
+                path,
+                expected_symbol,
+                expected_descriptor,
+            } => write!(
+                f,
+                "provider library '{}' does not implement stable Provider ABI symbol '{expected_symbol}' v{}.{}; Rust trait-object factories are not supported as the stable dynamic ABI",
+                path.display(),
+                expected_descriptor.abi_version.major,
+                expected_descriptor.abi_version.minor
+            ),
+            Self::InvalidAbiDescriptor(message) => {
+                write!(f, "invalid Provider ABI descriptor: {message}")
+            }
+            Self::UnsupportedAbiVersion { expected, found } => write!(
+                f,
+                "unsupported Provider ABI version {}.{}, expected {}.{}",
+                found.major, found.minor, expected.major, expected.minor
+            ),
+            Self::InvalidMetadata(message) => write!(f, "invalid Provider metadata: {message}"),
+            Self::InvalidAdvertisement(message) => {
+                write!(f, "invalid Provider Capability advertisement: {message}")
+            }
+            Self::InvalidDeviceMetadata(message) => {
+                write!(f, "invalid Provider Device metadata: {message}")
+            }
+            Self::InitializationFailure(message) => {
+                write!(f, "provider initialization failed: {message}")
+            }
+            Self::ProviderNotReady(message) => write!(f, "provider is not ready: {message}"),
+            Self::ProviderDraining(message) => write!(f, "provider is draining: {message}"),
+            Self::ProviderSaturated(message) => write!(f, "provider is saturated: {message}"),
+            Self::ExecutionRejected(message) => write!(f, "provider rejected execution: {message}"),
+            Self::ExecutionFailed(message) => write!(f, "provider execution failed: {message}"),
+            Self::CancellationUnsupported(message) => {
+                write!(f, "provider cancellation is unsupported: {message}")
+            }
+            Self::ResourceInvalid(message) => write!(f, "provider resource is invalid: {message}"),
+            Self::PanicOrUnwindViolation(message) => {
+                write!(f, "provider violated panic/unwind ABI boundary: {message}")
+            }
+            Self::InternalProviderError(message) => {
+                write!(f, "internal provider error: {message}")
+            }
+            Self::CancellationFailed { operation, reason } => {
+                write!(
+                    f,
+                    "provider cancellation failed for operation '{operation}': {reason}"
+                )
+            }
+            Self::Registration(x) => write!(f, "provider registration failed: {x}"),
+            Self::Lifecycle(x) => write!(f, "provider lifecycle operation failed: {x}"),
+        }
+    }
+}
+
+impl Error for ProviderError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        if let Self::Discovery { source, .. } = self {
+            Some(source)
+        } else {
+            None
+        }
+    }
 }

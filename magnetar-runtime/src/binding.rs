@@ -7,7 +7,7 @@
 use crate::capability::*;
 use crate::device::*;
 use crate::resolution::*;
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{collections::BTreeMap, error::Error, fmt, path::Path};
 
 /// Process-local identity of a Runtime execution context.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -453,4 +453,9 @@ impl AffinityConstraints {
         self.affinity.fallback = self.affinity.fallback.max(incoming.fallback);
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComponentArtifactReference<'a> {
+    LocalPath(&'a Path),
 }

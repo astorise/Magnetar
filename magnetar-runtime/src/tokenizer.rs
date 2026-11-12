@@ -6,15 +6,15 @@
 //! client workspace tool. Tokenizer data is resolved through registered
 //! inference artifacts; implementations stay hidden behind this contract.
 
+use crate::model_identity::validate_identity;
+pub use crate::model_identity::{TokenId, TokenizerError, TokenizerFamily};
 use crate::{
     ComponentDigest, ComponentError, InferenceArtifactKind, InferenceArtifactReference,
     InferenceArtifactRegistry, MemoryAllocationClass, MemoryAllocationOwner,
     MemoryAllocationRequest, MemoryManager, MemoryPlacement, ModelArtifactKind, ModelDigest,
     ModelManifest,
 };
-use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
-
-pub type TokenId = u32;
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TokenizerId(String);
@@ -44,21 +44,6 @@ impl TokenizerArtifactId {
     pub fn new(value: impl Into<String>) -> Result<Self, TokenizerError> {
         let value = value.into();
         validate_identity(&value, "tokenizer artifact id")?;
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TokenizerFamily(String);
-
-impl TokenizerFamily {
-    pub fn new(value: impl Into<String>) -> Result<Self, TokenizerError> {
-        let value = value.into();
-        validate_identity(&value, "tokenizer family")?;
         Ok(Self(value))
     }
 
@@ -967,99 +952,3 @@ fn validate_model_references_tokenizer(
     }
     Ok(())
 }
-
-fn validate_identity(value: &str, label: &str) -> Result<(), TokenizerError> {
-    if value.trim().is_empty()
-        || value.contains('/')
-        || value.contains('\\')
-        || value.contains(':')
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-    {
-        return Err(TokenizerError::InvalidTokenizerArtifact {
-            artifact: format!("{label}:{value}"),
-        });
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TokenizerError {
-    TokenizerArtifactMissing { artifact: String },
-    InvalidTokenizerArtifact { artifact: String },
-    TokenizerIncompatibleWithModel,
-    UnsupportedTokenizerFamily { family: String },
-    InvalidTokenId { token_id: TokenId },
-    UnknownToken { token: String },
-    InvalidUtf8 { message: String },
-    DecodePendingPartial,
-    OffsetsUnsupported,
-    PaddingTokenMissing,
-    TruncationRequired { token_count: usize, limit: usize },
-    TruncationForbidden,
-    PromptTooLong { token_count: usize, limit: usize },
-    BatchInputInvalid { message: String },
-    SpecialTokenMissing,
-    SpecialTokenConflict,
-    VocabularyMismatch { expected: u32, actual: u32 },
-    AddedTokenMismatch { expected: u32, actual: u32 },
-    MemoryAllocationFailed,
-    StreamingStateInvalid,
-    ImplementationUnavailable,
-    UnsupportedTokenTypeIds,
-}
-
-impl fmt::Display for TokenizerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TokenizerArtifactMissing { artifact } => {
-                write!(f, "tokenizer artifact '{artifact}' is missing")
-            }
-            Self::InvalidTokenizerArtifact { artifact } => {
-                write!(f, "tokenizer artifact '{artifact}' is invalid")
-            }
-            Self::TokenizerIncompatibleWithModel => {
-                f.write_str("tokenizer is incompatible with model artifact")
-            }
-            Self::UnsupportedTokenizerFamily { family } => {
-                write!(f, "unsupported tokenizer family '{family}'")
-            }
-            Self::InvalidTokenId { token_id } => write!(f, "invalid token id {token_id}"),
-            Self::UnknownToken { token } => write!(f, "unknown token '{token}'"),
-            Self::InvalidUtf8 { message } => write!(f, "invalid utf-8 during decode: {message}"),
-            Self::DecodePendingPartial => f.write_str("decode has pending partial output"),
-            Self::OffsetsUnsupported => f.write_str("token offsets are unsupported"),
-            Self::PaddingTokenMissing => f.write_str("padding token is missing"),
-            Self::TruncationRequired { token_count, limit } => write!(
-                f,
-                "truncation is required for {token_count} tokens with limit {limit}"
-            ),
-            Self::TruncationForbidden => f.write_str("truncation is forbidden"),
-            Self::PromptTooLong { token_count, limit } => {
-                write!(f, "prompt has {token_count} tokens, limit is {limit}")
-            }
-            Self::BatchInputInvalid { message } => write!(f, "batch input invalid: {message}"),
-            Self::SpecialTokenMissing => f.write_str("required special token is missing"),
-            Self::SpecialTokenConflict => f.write_str("special token conflict"),
-            Self::VocabularyMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "vocabulary mismatch: expected {expected}, actual {actual}"
-                )
-            }
-            Self::AddedTokenMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "added token mismatch: expected {expected}, actual {actual}"
-                )
-            }
-            Self::MemoryAllocationFailed => f.write_str("tokenizer memory allocation failed"),
-            Self::StreamingStateInvalid => f.write_str("streaming decode state is invalid"),
-            Self::ImplementationUnavailable => f.write_str("tokenizer implementation unavailable"),
-            Self::UnsupportedTokenTypeIds => f.write_str("token type ids are unsupported"),
-        }
-    }
-}
-
-impl Error for TokenizerError {}

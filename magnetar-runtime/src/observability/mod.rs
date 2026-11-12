@@ -21,7 +21,6 @@ pub use exporter::{
 use crate::affinity::*;
 use crate::component::*;
 use crate::planning::*;
-use crate::scheduler::*;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

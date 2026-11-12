@@ -7,131 +7,20 @@
 //! weights, native handles, Device handles, Provider handles, memory pointers,
 //! prompts, and cache contents stay behind Runtime-owned boundaries.
 
+pub use crate::kernel_selection_policy::{KernelSelectionPolicy, PinnedKernelSelection};
+pub use crate::model_identity::{
+    ModelInstanceError, ModelInstanceId, ModelInstanceLifecycleState, ModelInstanceWarmupPlan,
+    ModelInstanceWarmupPolicy, ModelInstanceWarmupStep,
+};
 use crate::{
     AdapterSetId, CorrelationId, DeviceBinding, GenerationModelReference, InferenceSessionId,
-    KernelAutotuningPolicy, KernelId, KernelPerformanceFeedbackMode, KvCacheId, LoadedModelContext,
-    MemoryAllocationId, MemoryPressureLevel, ModelArchitecture, ModelArchitectureImplementation,
-    ModelArtifactId, ModelDType, ModelDigest, ModelResidencyId, PrefixCacheEntryId,
-    ProviderAdmissionDecision, ProviderBinding, ProviderHealthState, ProviderPressureLevel,
-    ProviderReadinessState, ResourceAffinity, TensorResourceId, TokenizerId,
-    reproducible_mode_blocks_adaptation,
+    KernelAutotuningPolicy, KernelPerformanceFeedbackMode, KvCacheId, LoadedModelContext,
+    MemoryAllocationId, MemoryPressureLevel, ModelArchitectureImplementation, ModelArtifactId,
+    ModelDType, ModelDigest, ModelResidencyId, PrefixCacheEntryId, ProviderAdmissionDecision,
+    ProviderBinding, ProviderHealthState, ProviderPressureLevel, ProviderReadinessState,
+    ResourceAffinity, TensorResourceId, TokenizerId, reproducible_mode_blocks_adaptation,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    error::Error,
-    fmt,
-};
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ModelInstanceId(String);
-
-impl ModelInstanceId {
-    pub fn new(value: impl Into<String>) -> Result<Self, ModelInstanceError> {
-        let value = value.into();
-        validate_instance_identity(&value)?;
-        Ok(Self(value))
-    }
-
-    pub(crate) fn runtime_issued(sequence: u64) -> Self {
-        Self(format!("model-instance-{sequence}"))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ModelInstanceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ModelInstanceLifecycleState {
-    Creating,
-    Loading,
-    Warming,
-    Ready,
-    Active,
-    Idle,
-    Draining,
-    Suspended,
-    Reloading,
-    Unloading,
-    Unloaded,
-    Failed,
-    Invalid,
-    Removed,
-}
-
-impl ModelInstanceLifecycleState {
-    pub const fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Unloaded | Self::Failed | Self::Invalid | Self::Removed
-        )
-    }
-
-    /// Whether this lifecycle state legitimately permits accepting
-    /// inference usage. `readiness == Ready` alone SHALL NOT be trusted as
-    /// sufficient (Correctif: Runtime-owned ModelInstance readiness
-    /// authority) -- a caller-forged or internally inconsistent
-    /// `readiness` value must not grant usage while the instance's own
-    /// lifecycle has not actually reached one of these states.
-    pub const fn supports_inference_use(self) -> bool {
-        matches!(self, Self::Ready | Self::Idle | Self::Active)
-    }
-
-    pub const fn allows_transition_to(self, next: Self) -> bool {
-        matches!(
-            (self, next),
-            (Self::Creating, Self::Loading)
-                | (Self::Creating, Self::Failed)
-                | (Self::Creating, Self::Invalid)
-                | (Self::Loading, Self::Warming)
-                | (Self::Loading, Self::Ready)
-                | (Self::Loading, Self::Failed)
-                | (Self::Warming, Self::Ready)
-                | (Self::Warming, Self::Failed)
-                | (Self::Ready, Self::Active)
-                | (Self::Ready, Self::Idle)
-                | (Self::Ready, Self::Draining)
-                | (Self::Ready, Self::Suspended)
-                | (Self::Ready, Self::Reloading)
-                | (Self::Ready, Self::Unloading)
-                | (Self::Ready, Self::Failed)
-                | (Self::Ready, Self::Invalid)
-                | (Self::Active, Self::Idle)
-                | (Self::Active, Self::Draining)
-                | (Self::Active, Self::Failed)
-                | (Self::Idle, Self::Active)
-                | (Self::Idle, Self::Draining)
-                | (Self::Idle, Self::Suspended)
-                | (Self::Idle, Self::Reloading)
-                | (Self::Idle, Self::Unloading)
-                | (Self::Idle, Self::Failed)
-                | (Self::Idle, Self::Invalid)
-                | (Self::Draining, Self::Unloading)
-                | (Self::Draining, Self::Reloading)
-                | (Self::Draining, Self::Failed)
-                | (Self::Suspended, Self::Loading)
-                | (Self::Suspended, Self::Reloading)
-                | (Self::Suspended, Self::Unloading)
-                | (Self::Suspended, Self::Failed)
-                | (Self::Reloading, Self::Loading)
-                | (Self::Reloading, Self::Ready)
-                | (Self::Reloading, Self::Failed)
-                | (Self::Unloading, Self::Unloaded)
-                | (Self::Unloading, Self::Failed)
-                | (Self::Unloaded, Self::Removed)
-                | (Self::Failed, Self::Unloading)
-                | (Self::Failed, Self::Invalid)
-                | (Self::Invalid, Self::Unloading)
-                | (Self::Invalid, Self::Removed)
-        )
-    }
-}
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ModelInstanceReadiness {
@@ -147,14 +36,6 @@ impl ModelInstanceReadiness {
     pub const fn accepts_generation(self) -> bool {
         matches!(self, Self::Ready)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ModelInstanceWarmupPolicy {
-    Disabled,
-    ValidateMetadataOnly,
-    ProviderInitialization,
-    Full,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -410,51 +291,6 @@ impl ModelInstanceReadinessChecks {
             return Err(ModelInstanceError::ModelInstanceBrowserFeatureUnsupported);
         }
         Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ModelInstanceWarmupStep {
-    ProviderInitialization,
-    KernelPreparationPlaceholder,
-    OperatorGraphPreparationPlaceholder,
-    ShapePlanPreparationPlaceholder,
-    TokenizerModelMetadataValidation,
-    SmallTestExecutionPlaceholder,
-    MemoryResidencyVerification,
-    AdapterReadinessVerification,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelInstanceWarmupPlan {
-    pub policy: ModelInstanceWarmupPolicy,
-    pub steps: Vec<ModelInstanceWarmupStep>,
-}
-
-impl ModelInstanceWarmupPlan {
-    pub fn for_policy(policy: ModelInstanceWarmupPolicy) -> Self {
-        let steps = match policy {
-            ModelInstanceWarmupPolicy::Disabled => Vec::new(),
-            ModelInstanceWarmupPolicy::ValidateMetadataOnly => {
-                vec![ModelInstanceWarmupStep::TokenizerModelMetadataValidation]
-            }
-            ModelInstanceWarmupPolicy::ProviderInitialization => vec![
-                ModelInstanceWarmupStep::ProviderInitialization,
-                ModelInstanceWarmupStep::TokenizerModelMetadataValidation,
-                ModelInstanceWarmupStep::MemoryResidencyVerification,
-            ],
-            ModelInstanceWarmupPolicy::Full => vec![
-                ModelInstanceWarmupStep::ProviderInitialization,
-                ModelInstanceWarmupStep::KernelPreparationPlaceholder,
-                ModelInstanceWarmupStep::OperatorGraphPreparationPlaceholder,
-                ModelInstanceWarmupStep::ShapePlanPreparationPlaceholder,
-                ModelInstanceWarmupStep::TokenizerModelMetadataValidation,
-                ModelInstanceWarmupStep::SmallTestExecutionPlaceholder,
-                ModelInstanceWarmupStep::MemoryResidencyVerification,
-                ModelInstanceWarmupStep::AdapterReadinessVerification,
-            ],
-        };
-        Self { policy, steps }
     }
 }
 
@@ -1764,141 +1600,6 @@ impl ModelInstanceManager {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ModelInstanceError {
-    ModelInstanceNotFound,
-    ModelInstanceNotReady,
-    ModelInstanceLoading,
-    ModelInstanceWarming,
-    ModelInstanceDraining,
-    ModelInstanceSuspended,
-    ModelInstanceUnloading,
-    ModelInstanceUnloaded,
-    ModelInstanceFailed,
-    ModelInstanceInvalid,
-    ModelInstanceRemoved,
-    ModelInstanceActive,
-    ModelInstanceBusy,
-    ModelInstanceSharingDenied,
-    ModelInstancePolicyDenied,
-    ModelInstanceReloadRequired,
-    ModelInstanceReloadFailed,
-    ModelInstanceUnloadFailed,
-    ModelInstanceWarmupFailed,
-    ModelInstanceProviderUnavailable,
-    ModelInstanceProviderNotReady,
-    ModelInstanceProviderFailed,
-    ModelInstanceDeviceUnavailable,
-    ModelInstanceDeviceLost,
-    ModelInstanceMemoryPressure,
-    ModelInstanceResidencyMissing,
-    ModelInstanceAdapterIncompatible,
-    ModelInstanceKernelPreparationFailed,
-    ModelInstanceAutotuningIncomplete,
-    ModelInstanceWeightsNotMaterialized,
-    ModelInstanceKvCacheInvalidated,
-    ModelInstancePrefixCacheInvalidated,
-    ModelInstanceBrowserFeatureUnsupported,
-    InvalidLifecycleTransition {
-        from: ModelInstanceLifecycleState,
-        to: ModelInstanceLifecycleState,
-    },
-    /// The caller-supplied architecture implementation's architecture
-    /// identity disagrees with the one the loading phase already resolved
-    /// for this artifact (`seal-runtime-model-trust-and-provenance-authority`).
-    ArchitectureMismatch {
-        expected: ModelArchitecture,
-        actual: ModelArchitecture,
-    },
-    /// The caller-supplied Resource Affinity names a provider or device
-    /// that disagrees with one the loading phase already resolved for this
-    /// artifact (`seal-runtime-model-trust-and-provenance-authority`).
-    AffinityMismatch {
-        reason: String,
-    },
-    InternalModelInstance {
-        reason: String,
-    },
-}
-
-impl fmt::Display for ModelInstanceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ModelInstanceNotFound => f.write_str("model instance not found"),
-            Self::ModelInstanceNotReady => f.write_str("model instance not ready"),
-            Self::ModelInstanceLoading => f.write_str("model instance loading"),
-            Self::ModelInstanceWarming => f.write_str("model instance warming"),
-            Self::ModelInstanceDraining => f.write_str("model instance draining"),
-            Self::ModelInstanceSuspended => f.write_str("model instance suspended"),
-            Self::ModelInstanceUnloading => f.write_str("model instance unloading"),
-            Self::ModelInstanceUnloaded => f.write_str("model instance unloaded"),
-            Self::ModelInstanceFailed => f.write_str("model instance failed"),
-            Self::ModelInstanceInvalid => f.write_str("model instance invalid"),
-            Self::ModelInstanceRemoved => f.write_str("model instance removed"),
-            Self::ModelInstanceActive => f.write_str("model instance active"),
-            Self::ModelInstanceBusy => f.write_str("model instance busy"),
-            Self::ModelInstanceSharingDenied => f.write_str("model instance sharing denied"),
-            Self::ModelInstancePolicyDenied => f.write_str("model instance policy denied"),
-            Self::ModelInstanceReloadRequired => f.write_str("model instance reload required"),
-            Self::ModelInstanceReloadFailed => f.write_str("model instance reload failed"),
-            Self::ModelInstanceUnloadFailed => f.write_str("model instance unload failed"),
-            Self::ModelInstanceWarmupFailed => f.write_str("model instance warmup failed"),
-            Self::ModelInstanceProviderUnavailable => {
-                f.write_str("model instance Provider unavailable")
-            }
-            Self::ModelInstanceProviderNotReady => f.write_str("model instance Provider not ready"),
-            Self::ModelInstanceProviderFailed => f.write_str("model instance Provider failed"),
-            Self::ModelInstanceDeviceUnavailable => {
-                f.write_str("model instance Device unavailable")
-            }
-            Self::ModelInstanceDeviceLost => f.write_str("model instance Device lost"),
-            Self::ModelInstanceMemoryPressure => f.write_str("model instance memory pressure"),
-            Self::ModelInstanceResidencyMissing => f.write_str("model instance residency missing"),
-            Self::ModelInstanceAdapterIncompatible => {
-                f.write_str("model instance adapter incompatible")
-            }
-            Self::ModelInstanceKernelPreparationFailed => {
-                f.write_str("model instance required Kernel preparation failed")
-            }
-            Self::ModelInstanceAutotuningIncomplete => {
-                f.write_str("model instance required Kernel Autotuning incomplete")
-            }
-            Self::ModelInstanceWeightsNotMaterialized => {
-                f.write_str("model instance weights not materialized")
-            }
-            Self::ModelInstanceKvCacheInvalidated => {
-                f.write_str("model instance KV cache invalidated")
-            }
-            Self::ModelInstancePrefixCacheInvalidated => {
-                f.write_str("model instance Prefix Cache invalidated")
-            }
-            Self::ModelInstanceBrowserFeatureUnsupported => {
-                f.write_str("model instance browser feature unsupported")
-            }
-            Self::InvalidLifecycleTransition { from, to } => {
-                write!(
-                    f,
-                    "invalid model instance transition from {from:?} to {to:?}"
-                )
-            }
-            Self::ArchitectureMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "model instance architecture {actual:?} disagrees with the loaded artifact's resolved architecture {expected:?}"
-                )
-            }
-            Self::AffinityMismatch { reason } => {
-                write!(f, "model instance affinity mismatch: {reason}")
-            }
-            Self::InternalModelInstance { reason } => {
-                write!(f, "internal model instance: {reason}")
-            }
-        }
-    }
-}
-
-impl Error for ModelInstanceError {}
-
 pub fn readiness_for_lifecycle(lifecycle: ModelInstanceLifecycleState) -> ModelInstanceReadiness {
     match lifecycle {
         ModelInstanceLifecycleState::Ready
@@ -1936,25 +1637,6 @@ pub fn readiness_error(
 // Generated Kernel Selection Policy
 // ---------------------------------------------------------------------
 
-/// Implements "Model Instance Interaction" from
-/// `openspec/changes/define-generated-kernel-qualification-cache-and-hot-swap-contract`:
-/// "A Model Instance MAY use dynamic Kernel selection or may pin a Kernel
-/// generation set for reproducibility. The policy SHALL be explicit." The
-/// enum itself makes the choice explicit -- there is no implicit third
-/// state, and [`PinnedKernelSelection`] carries only stable identity
-/// metadata, never a native handle.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum KernelSelectionPolicy {
-    Dynamic,
-    Pinned(PinnedKernelSelection),
-}
-
-impl KernelSelectionPolicy {
-    pub const fn is_pinned(&self) -> bool {
-        matches!(self, Self::Pinned(_))
-    }
-}
-
 /// Implements "Session Interaction"
 /// (`define-generated-kernel-qualification-cache-and-hot-swap-contract`):
 /// "Inference Sessions SHALL NOT own native Kernel state directly. Sessions
@@ -1982,70 +1664,6 @@ pub fn effective_performance_feedback_mode(
     kernel_selection: &KernelSelectionPolicy,
 ) -> KernelPerformanceFeedbackMode {
     reproducible_mode_blocks_adaptation(kernel_selection.is_pinned(), policy.performance_feedback)
-}
-
-/// A pinned Kernel selection, implementing "For strict reproducibility, a
-/// Model Instance SHOULD be able to pin: KernelId, artifact digest, Prepared
-/// generation, qualification profile" (proposal).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PinnedKernelSelection {
-    pub kernel: KernelId,
-    pub artifact_digest: String,
-    pub prepared_generation: Option<u64>,
-    pub qualification_profile: Option<String>,
-    /// Implements "Reproducible Model Instance May Pin Tuning Record"
-    /// (`define-kernel-runtime-autotuning-and-specialization-contract`): a
-    /// pinned `KernelAutotuningRecord` fingerprint the Model Instance
-    /// consumes instead of live tuning. Live re-tuning SHALL NOT change this
-    /// value.
-    pub autotuning_record_fingerprint: Option<String>,
-}
-
-impl PinnedKernelSelection {
-    pub fn new(kernel: KernelId, artifact_digest: impl Into<String>) -> Self {
-        Self {
-            kernel,
-            artifact_digest: artifact_digest.into(),
-            prepared_generation: None,
-            qualification_profile: None,
-            autotuning_record_fingerprint: None,
-        }
-    }
-
-    pub fn with_autotuning_record_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
-        self.autotuning_record_fingerprint = Some(fingerprint.into());
-        self
-    }
-
-    /// Implements "Record artifact digest for reproducibility" and "Record
-    /// qualification profile" (tasks): a pinned selection SHALL identify
-    /// which artifact and profile it pins, never leaving either implicit.
-    pub fn validate(&self) -> Result<(), ModelInstanceError> {
-        if self.artifact_digest.trim().is_empty() {
-            return Err(ModelInstanceError::ModelInstancePolicyDenied);
-        }
-        Ok(())
-    }
-}
-
-fn validate_instance_identity(value: &str) -> Result<(), ModelInstanceError> {
-    let lower = value.to_ascii_lowercase();
-    if value.trim().is_empty()
-        || value.contains('/')
-        || value.contains('\\')
-        || value.contains(':')
-        || value.contains("0x")
-        || lower.contains("provider")
-        || lower.contains("device")
-        || lower.contains("ptr")
-        || lower.contains("weight")
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-    {
-        return Err(ModelInstanceError::ModelInstancePolicyDenied);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

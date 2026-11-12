@@ -52,6 +52,7 @@ pub mod model;
 pub mod model_component;
 pub mod model_config_capability;
 pub mod model_format_roadmap;
+pub mod model_identity;
 pub mod model_instance;
 pub mod model_loading;
 pub mod multi_device_placement;
