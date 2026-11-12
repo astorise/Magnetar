@@ -1064,6 +1064,29 @@ jobs:
             echo "::error::Mistral 7B Q3_K_M: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
             exit 1
           }
+      - name: Mistral-7B-Instruct-v0.3 Q3_K_M GGUF on the optimized CPU Provider
+        # The specialized AVX2 Kernel for its dominant format; must answer
+        # "Paris", token ids that differ from the CUDA run are a warning.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q3_K_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CPU_PROFILE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q3_k_m-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q3_k_m_gguf_checkpoint_generates_on_native_cpu -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/cpu-native.log"
+          grep -h 'TPOT\|cpu-native profile' "$dir/cpu-native.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/cpu-native.log" || {
+            echo "::error::Mistral-7B-Instruct-v0.3 Q3_K_M GGUF on the optimized CPU Provider: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          cuda="$(grep -m1 'generated token ids' "$dir/packed.log" | sed 's/^.*generated token ids//' || true)"
+          cpu="$(grep -m1 'generated token ids' "$dir/cpu-native.log" | sed 's/^.*generated token ids//')"
+          if [ "$cuda" != "$cpu" ]; then
+            echo "::warning::Mistral-7B-Instruct-v0.3 Q3_K_M GGUF: token ids differ between the optimized CPU Provider and CUDA"
+          fi
       - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q2_K GGUF checkpoint
         # 2.7 GB, pinned by its sha256, which the test verifies: mostly Q2_K
         # matrices, some Q3_K, Q4_K and Q6_K.
@@ -1130,6 +1153,29 @@ jobs:
             echo "::error::Mistral 7B IQ4_XS: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
             exit 1
           }
+      - name: Mistral-7B-Instruct-v0.3 IQ4_XS GGUF on the optimized CPU Provider
+        # The specialized AVX2 Kernel for its dominant format; must answer
+        # "Paris", token ids that differ from the CUDA run are a warning.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_IQ4_XS_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CPU_PROFILE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-iq4_xs-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_iq4_xs_gguf_checkpoint_generates_on_native_cpu -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/cpu-native.log"
+          grep -h 'TPOT\|cpu-native profile' "$dir/cpu-native.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/cpu-native.log" || {
+            echo "::error::Mistral-7B-Instruct-v0.3 IQ4_XS GGUF on the optimized CPU Provider: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          cuda="$(grep -m1 'generated token ids' "$dir/packed.log" | sed 's/^.*generated token ids//' || true)"
+          cpu="$(grep -m1 'generated token ids' "$dir/cpu-native.log" | sed 's/^.*generated token ids//')"
+          if [ "$cuda" != "$cpu" ]; then
+            echo "::warning::Mistral-7B-Instruct-v0.3 IQ4_XS GGUF: token ids differ between the optimized CPU Provider and CUDA"
+          fi
       - name: Download the pinned real Mistral-7B-Instruct-v0.3 IQ4_NL GGUF checkpoint
         # 4.1 GB, pinned by its sha256, which the test verifies: mostly IQ4_NL
         # matrices.

@@ -139,3 +139,24 @@ Both answer "Paris" and generate the same token ids as their CUDA runs.
 Mistral reads its 4.4 GB of weights at about 11.6 GB/s; its matmuls
 (1.4 ms per call, matmul-residual 2.0 ms) are about 91 % of a token and
 attention (0.57 ms per call, the Reference CPU kernel) about 5 %.
+
+Specialized AVX2 Kernels for `Q2_K`, `Q3_K`, `IQ4_XS` and `IQ4_NL`
+(`magnetar-provider-cpu` commit `cf96c3f`), on the model of `Q4_K` and
+`Q6_K`: scales decoded once per super-block, quant bytes decoded straight
+into registers (`Q2_K`/`Q3_K` load each half's 32 bytes once for its four
+runs; `Q3_K` stays unsigned 0..7 with its −4 offset applied through the
+activation sums; the IQ4 formats map two runs of indices through the
+table with `vpshufb`). Local 4 cores, Mistral-shaped matmuls
+(`packed_matmul_bandwidth`):
+
+| Format | `[1, 4096] x [4096, 14336]` | `[1, 14336] x [14336, 4096]` | Before |
+|---|---|---|---|
+| `Q2_K` | 2.78 ms (6.9 GB/s) | 2.50 ms (7.7 GB/s) | about 2.5-3 GB/s |
+| `Q3_K` | 4.56 ms (5.5 GB/s) | 3.71 ms (6.8 GB/s) | generic run decoder |
+| `IQ4_XS` | 2.76 ms (11.3 GB/s) | 3.05 ms (10.2 GB/s) | about 5-5.7 GB/s |
+| `IQ4_NL` | 3.16 ms (10.4 GB/s) | 3.15 ms (10.5 GB/s) | generic run decoder |
+
+`Q8_0` already reads at 17-19 GB/s through the generic path and keeps it;
+the IQ2/IQ3 grids (about 1 GB/s) remain on the generic decoder. The GPU
+smoke `gguf` suite now also runs Mistral `Q3_K_M` and `IQ4_XS` on the
+optimized CPU Provider.
