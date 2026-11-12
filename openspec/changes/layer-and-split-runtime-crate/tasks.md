@@ -34,7 +34,7 @@
 - [x] 4.4 Verify: largest submodule 1,960 lines; the 1,355 test names are identical to the baseline; public API diff shows no removed and no changed item; Clippy, documentation and layering gates pass.
 - [ ] 4.5 Move each test of `first_native_runtime/tests.rs` (11,771 lines) next to the code it tests.
 - [ ] 4.6 Split `src/tests.rs`: tests using only public items go to `tests/contract_tests/`, the others to their module.
-- [ ] 4.7 Fix the test build without the `wasmtime-component-engine` feature: `cargo check -p magnetar-runtime --no-default-features --all-targets` fails with six unresolved test-oracle references. It failed the same way before the split and no CI job runs it.
+- [x] 4.7 The test build without `wasmtime-component-engine` compiles: `first_native_runtime` imports its graph oracle from `tests` under the same cfg. Seven tests fail in that configuration; they could not be built before, and no CI job runs it.
 
 ## 5. Extract layer crates
 
@@ -52,14 +52,14 @@
 ## 6. Consumers and validation
 
 - [x] 6.1 `magnetar-cli`, `inference-components`, `roadmap-contracts` and the three integration test crates build without source change; `magnetar-cli` (93) and `magnetar-inference-component` (14) tests pass. `submodule-workspace/Cargo.lock` is updated.
-- [ ] 6.2 Pinned Component, Provider, Format and Loader repositories: they build inside the submodule workspace without source change, but each has its own `Cargo.lock`, which must gain the five layer crates before its `--locked` CI passes. Update each lockfile and bump the submodule pins.
+- [x] 6.2 Pinned Provider, Format and Loader repositories: each `Cargo.lock` gains the five layer crates (one pull request per repository, no source change), and the eleven submodule pins point at those commits. With them, `cargo test --locked` passes in each of the eleven. Once the pull requests merge, re-pin to the merged commits. The Component repositories do not depend on `magnetar-runtime`.
 - [ ] 6.3 Run the WIT validation gate in CI. The WIT files are not moved or edited by this change.
 - [ ] 6.4 Run GPU CI (`cuda-first-native`, `multi-device-cpu-cuda`, real-checkpoint numerics): results identical to the baseline.
 
 ## 7. Release, coverage and documentation
 
 - [x] 7.1 `release-publication.yml` packages and publishes the six crates together; `cargo publish --dry-run` of the six passes locally, in dependency order.
-- [ ] 7.2 Coverage: confirm in CI that the workspace measurement is not below `quality/coverage-baseline.json` now that code sits in six crates. `tools/release-publish` SBOM: list the five layer crates.
+- [ ] 7.2 Coverage: confirm in CI that the workspace measurement is not below `quality/coverage-baseline.json` now that code sits in six crates. (The SBOM is generated from `cargo metadata` and lists the layer crates without change.)
 - [x] 7.3 Formatting, Clippy, test, documentation and `cargo-deny` gates run on the workspace and so cover the new crates; the layering, model-family isolation, test-placement and Wasmtime jobs name them explicitly.
 - [x] 7.4 `README.md`, `CONTRIBUTING.md`, `docs/quality.md`, `openspec/config.yaml` and `quality/layers.toml` describe the crate layout.
 - [x] 7.5 `CHANGELOG.md` entry: public paths unchanged, new crates listed.
