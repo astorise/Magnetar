@@ -8,9 +8,7 @@
 //! same paths inside macro invocations.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::Visit;
@@ -128,8 +126,13 @@ impl Sources for InMemory {
     }
 }
 
-pub fn analyze(src_dir: &Path) -> Result<Analysis, String> {
-    analyze_with(&Disk, src_dir)
+/// Analyzes one or more crates as one module graph. Each `src_dir` is a
+/// crate's `src` directory; the crate is named after the directory that
+/// holds it (`magnetar-core/src` -> `magnetar_core`), so that a path through
+/// another analyzed crate (`magnetar_core::tensor::X`) is followed like a
+/// `crate::` path.
+pub fn analyze(src_dirs: &[PathBuf]) -> Result<Analysis, String> {
+    analyze_with(&Disk, src_dirs)
 }
 
 #[cfg(test)]
@@ -140,7 +143,19 @@ pub fn analyze_sources(files: &[(&str, &str)]) -> Result<Analysis, String> {
             .map(|(path, text)| (PathBuf::from(path), (*text).to_string()))
             .collect(),
     );
-    analyze_with(&sources, Path::new(""))
+    analyze_with(&sources, &[PathBuf::new()])
+}
+
+#[cfg(test)]
+pub fn analyze_crates(src_dirs: &[&str], files: &[(&str, &str)]) -> Result<Analysis, String> {
+    let sources = InMemory(
+        files
+            .iter()
+            .map(|(path, text)| (PathBuf::from(path), (*text).to_string()))
+            .collect(),
+    );
+    let src_dirs: Vec<PathBuf> = src_dirs.iter().map(PathBuf::from).collect();
+    analyze_with(&sources, &src_dirs)
 }
 
 /// One raw reference from a top-level module to the crate root.
@@ -163,36 +178,50 @@ struct ModuleExports {
     forwarded: BTreeMap<String, String>,
 }
 
-fn analyze_with(sources: &dyn Sources, src_dir: &Path) -> Result<Analysis, String> {
-    let lib_path = src_dir.join("lib.rs");
-    let lib = parse(sources, &lib_path)?;
+fn crate_ident(src_dir: &Path) -> Option<String> {
+    let name = src_dir.parent()?.file_name()?.to_str()?;
+    Some(name.replace('-', "_"))
+}
+
+fn analyze_with(sources: &dyn Sources, src_dirs: &[PathBuf]) -> Result<Analysis, String> {
     let mut analysis = Analysis::default();
     let mut references = Vec::new();
     let mut idents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut exports: BTreeMap<String, ModuleExports> = BTreeMap::new();
+    let roots: BTreeSet<String> = src_dirs.iter().filter_map(|dir| crate_ident(dir)).collect();
+    let mut libs = Vec::new();
 
-    for item in &lib.items {
-        let syn::Item::Mod(module) = item else {
-            continue;
-        };
-        if is_test_only(&module.attrs) {
-            continue;
+    for src_dir in src_dirs {
+        let lib = parse(sources, &src_dir.join("lib.rs"))?;
+        for item in &lib.items {
+            let syn::Item::Mod(module) = item else {
+                continue;
+            };
+            if is_test_only(&module.attrs) {
+                continue;
+            }
+            let name = module.ident.to_string();
+            if !analysis.modules.insert(name.clone()) {
+                return Err(format!(
+                    "module `{name}` is defined by more than one analyzed crate"
+                ));
+            }
+            let mut walker = Walker {
+                sources,
+                roots: &roots,
+                top: name.clone(),
+                depth: 1,
+                references: &mut references,
+                idents: idents.entry(name.clone()).or_default(),
+                error: None,
+            };
+            let module_exports = walker.walk_module(module, src_dir, src_dir)?;
+            if let Some(error) = walker.error {
+                return Err(error);
+            }
+            exports.insert(name, module_exports);
         }
-        let name = module.ident.to_string();
-        analysis.modules.insert(name.clone());
-        let mut walker = Walker {
-            sources,
-            top: name.clone(),
-            depth: 1,
-            references: &mut references,
-            idents: idents.entry(name.clone()).or_default(),
-            error: None,
-        };
-        let module_exports = walker.walk_module(module, src_dir, src_dir)?;
-        if let Some(error) = walker.error {
-            return Err(error);
-        }
-        exports.insert(name, module_exports);
+        libs.push(lib);
     }
 
     // name -> modules exporting it at their root.
@@ -274,7 +303,7 @@ fn analyze_with(sources: &dyn Sources, src_dir: &Path) -> Result<Analysis, Strin
             for target in targets {
                 add(&mut analysis, &reference.from, target, first);
             }
-        } else if !is_test_only_module_name(first, &lib) {
+        } else if !libs.iter().any(|lib| is_test_only_module_name(first, lib)) {
             analysis
                 .unresolved
                 .entry(reference.from.clone())
@@ -386,6 +415,9 @@ fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
 
 struct Walker<'a> {
     sources: &'a dyn Sources,
+    /// Names of the analyzed crates: a path starting with one of them is a
+    /// path from that crate's root.
+    roots: &'a BTreeSet<String>,
     /// The top-level module being walked.
     top: String,
     /// Module nesting below the crate root (1 = the top-level module).
@@ -475,6 +507,7 @@ impl Walker<'_> {
                 }
                 let through_root = match path.first().map(String::as_str) {
                     Some("crate") => Some(1),
+                    Some(first) if self.roots.contains(first) => Some(1),
                     Some("super") => {
                         let supers = path.iter().take_while(|s| *s == "super").count();
                         (supers == self.depth).then_some(supers)
@@ -519,6 +552,7 @@ impl Walker<'_> {
                 &segments[supers..]
             }
             Some("self") => return,
+            Some(first) if self.roots.contains(first) => &segments[1..],
             Some(first) => {
                 self.idents.insert(first.to_string());
                 return;
@@ -543,7 +577,11 @@ impl Walker<'_> {
                     self.record_tokens(group.stream());
                     index += 1;
                 }
-                TokenTree::Ident(ident) if ident != "crate" && ident != "super" => {
+                TokenTree::Ident(ident)
+                    if ident != "crate"
+                        && ident != "super"
+                        && !self.roots.contains(&ident.to_string()) =>
+                {
                     self.idents.insert(ident.to_string());
                     index += 1;
                 }
@@ -797,6 +835,56 @@ mod tests {
             analysis.deps["c"].keys().collect::<Vec<_>>(),
             vec![&"a".to_string()]
         );
+    }
+
+    #[test]
+    fn paths_through_another_analyzed_crate_are_followed() {
+        let analysis = analyze_crates(
+            &["low-crate/src", "high/src"],
+            &[
+                ("low-crate/src/lib.rs", "pub mod tensor; pub use tensor::*;"),
+                (
+                    "low-crate/src/tensor.rs",
+                    "pub struct Tensor; pub struct Shape;",
+                ),
+                (
+                    "high/src/lib.rs",
+                    "pub use low_crate::tensor; pub use tensor::*; pub mod api; pub mod plan;",
+                ),
+                (
+                    "high/src/api.rs",
+                    "use crate::tensor::Tensor; use crate::Shape;",
+                ),
+                (
+                    "high/src/plan.rs",
+                    "use low_crate::tensor::Shape; use low_crate::Tensor;",
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            analysis.modules,
+            BTreeSet::from(["api".to_string(), "plan".to_string(), "tensor".to_string()])
+        );
+        let both = BTreeSet::from(["Shape".to_string(), "Tensor".to_string()]);
+        assert_eq!(analysis.deps["api"]["tensor"], both);
+        assert_eq!(analysis.deps["plan"]["tensor"], both);
+        assert!(analysis.unresolved.is_empty());
+    }
+
+    #[test]
+    fn a_module_defined_by_two_crates_is_an_error() {
+        let error = analyze_crates(
+            &["a/src", "b/src"],
+            &[
+                ("a/src/lib.rs", "pub mod same;"),
+                ("a/src/same.rs", ""),
+                ("b/src/lib.rs", "pub mod same;"),
+                ("b/src/same.rs", ""),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("`same` is defined by more than one analyzed crate"));
     }
 
     #[test]

@@ -2,23 +2,29 @@
 //! (`layer-and-split-runtime-crate`, `quality` spec "Runtime Layering Gate").
 //!
 //! Reads a version-controlled layer map (`quality/layers.toml`) and the
-//! source of one crate, and fails when a top-level module depends on a
+//! source of one or more crates, and fails when a top-level module depends on a
 //! module of a higher layer, or of a different layer of the same rank, or
 //! when a module has no layer.
 //!
 //! Usage:
 //!
 //! ```text
-//! layering-check <crate-src-dir> <layers.toml>            # gate
-//! layering-check --report <crate-src-dir> <layers.toml>   # every edge, with the items behind it
-//! layering-check --cycles <crate-src-dir>                 # dependency cycles, no map needed
-//! layering-check --debt <crate-src-dir> <layers.toml>     # upward edges, as `debt.edges` entries
+//! layering-check <crate-src-dir>... <layers.toml>            # gate
+//! layering-check --report <crate-src-dir>... <layers.toml>   # every edge, with the items behind it
+//! layering-check --cycles <crate-src-dir>...                 # dependency cycles, no map needed
+//! layering-check --debt <crate-src-dir>... <layers.toml>     # upward edges, as `debt.edges` entries
+//! ```
+//!
+//! Several crates are checked as one module graph: the Runtime layer
+//! crates and `magnetar-runtime` together.
+//!
+//! ```text
 //! ```
 
 mod analysis;
 mod layers;
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -30,13 +36,19 @@ fn main() -> ExitCode {
         _ => ("check", &args[..]),
     };
     let needs_map = mode != "cycles";
-    if rest.len() != if needs_map { 2 } else { 1 } {
+    if rest.len() < if needs_map { 2 } else { 1 } {
         eprintln!(
-            "usage: layering-check [--report|--debt] <crate-src-dir> <layers.toml>\n       layering-check --cycles <crate-src-dir>"
+            "usage: layering-check [--report|--debt] <crate-src-dir>... <layers.toml>\n       layering-check --cycles <crate-src-dir>..."
         );
         return ExitCode::from(2);
     }
-    let analysis = match analysis::analyze(Path::new(&rest[0])) {
+    let (src_dirs, map_path) = if needs_map {
+        (&rest[..rest.len() - 1], rest.last())
+    } else {
+        (rest, None)
+    };
+    let src_dirs: Vec<PathBuf> = src_dirs.iter().map(PathBuf::from).collect();
+    let analysis = match analysis::analyze(&src_dirs) {
         Ok(analysis) => analysis,
         Err(error) => {
             eprintln!("layering-check: {error}");
@@ -51,8 +63,9 @@ fn main() -> ExitCode {
         println!("{} dependency cycle(s)", cycles.len());
         return ExitCode::SUCCESS;
     }
-    let map = match std::fs::read_to_string(&rest[1])
-        .map_err(|error| format!("cannot read {}: {error}", rest[1]))
+    let map_path = map_path.expect("a mode that needs the layer map has one");
+    let map = match std::fs::read_to_string(map_path)
+        .map_err(|error| format!("cannot read {map_path}: {error}"))
         .and_then(|text| layers::LayerMap::parse(&text))
     {
         Ok(map) => map,
