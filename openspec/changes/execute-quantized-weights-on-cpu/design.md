@@ -160,3 +160,21 @@ table with `vpshufb`). Local 4 cores, Mistral-shaped matmuls
 the IQ2/IQ3 grids (about 1 GB/s) remain on the generic decoder. The GPU
 smoke `gguf` suite now also runs Mistral `Q3_K_M` and `IQ4_XS` on the
 optimized CPU Provider.
+
+GPU smoke run 43177850896 (commit `46e8853`), same host, 3 threads:
+
+| Mistral 7B | CPU TPOT | CPU matmul / matmul-residual per call | CUDA TPOT |
+|---|---|---|---|
+| `Q4_K_M` | 381.4 ms | 1.43 / 2.04 ms | 17.5 ms |
+| `IQ4_XS` | 508.6 ms | 2.24 / 1.99 ms | 17.5 ms |
+| `Q3_K_M` | 881.4 ms | 2.87 / 6.35 ms | 16.2 ms |
+
+All three answer "Paris" (`Q3_K_M`'s token ids differ from CUDA's after
+the first sentence, a warning). Neither export is all one format: the GGUF
+headers show `IQ4_XS` keeps `attn_v` in `Q5_K` in all 32 layers, and
+`Q3_K_M` keeps `attn_output` and 30 `ffn_down`/`attn_v` in `Q4_K` but two
+`ffn_down` and two `attn_v` in `Q5_K`. `Q5_K` is not a packed format yet,
+so those matrices are dequantized to `f32` at load and multiplied dense:
+they explain the gap to `Q4_K_M` (and the extra resident memory) rather
+than the new Kernels. Packing `Q5_K` (runtime format, CPU and CUDA
+Kernels) is the next step for these mixes.
