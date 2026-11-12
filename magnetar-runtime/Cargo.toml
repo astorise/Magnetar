@@ -48,6 +48,7 @@ web-component-engine = []
 # is one consistent set.
 magnetar-core = { path = "../magnetar-core", version = "=1.0.0" }
 magnetar-graph = { path = "../magnetar-graph", version = "=1.0.0" }
+magnetar-kernel = { path = "../magnetar-kernel", version = "=1.0.0" }
 magnetar-model = { path = "../magnetar-model", version = "=1.0.0" }
 ed25519-dalek = { version = "3.0.0", features = ["signature"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -35,7 +35,7 @@
 //!   candidate can never be selected.
 //! - [`KernelAutotuningSession`] / [`KernelAutotuningSessionState`]: the
 //!   tuning lifecycle state machine, distinct from
-//!   [`crate::session::InferenceSession`].
+//!   [`crate::InferenceSession`].
 //! - [`reject_decode_hot_path_trigger`]: "Normal token decode SHALL NOT
 //!   synchronously start an Autotuning Session" (proposal).
 //! - [`KernelAutotuningRecord`] / [`KernelAutotuningCache`]: tuning evidence
@@ -795,7 +795,7 @@ pub fn require_autotuning_enabled(
 /// Implements "The Model Instance SHALL remain in a non-ready or explicitly
 /// warming state until mandatory tuning is complete" and "Optional tuning
 /// SHALL not unnecessarily block readiness" (proposal). Intended for
-/// [`crate::model_instance::ModelInstanceReadinessChecks`]-style integration.
+/// [`crate::ModelInstanceReadinessChecks`]-style integration.
 pub fn model_instance_autotuning_ready(
     policy: &KernelAutotuningPolicy,
     required_tuning_complete: bool,
@@ -1561,7 +1561,7 @@ impl KernelAutotuningSession {
 /// Implements "Kernel Autotuning Session and Inference Session SHALL remain
 /// distinct concepts" and "An Inference Session SHALL NOT own arbitrary
 /// tuning/compiler authority" (proposal): structurally,
-/// [`crate::session::InferenceSession`] has no field of this type and no
+/// [`crate::InferenceSession`] has no field of this type and no
 /// method that constructs one -- the only way to obtain a session is through
 /// [`KernelAutotuningSessionIdAllocator`].
 pub const AUTOTUNING_SESSION_IS_NOT_INFERENCE_SESSION: bool = true;

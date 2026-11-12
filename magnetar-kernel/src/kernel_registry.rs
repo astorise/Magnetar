@@ -15,13 +15,14 @@
 //! [`run_kernel_registry_lifecycle_conformance`] for the exercised
 //! guarantees.
 
-use crate::affinity::*;
-use crate::compute::*;
+use crate::binding::*;
+use crate::compute_types::*;
 use crate::execution_graph::*;
 use crate::kernel::*;
 use crate::kernel_artifact::*;
-use crate::model_instance::*;
+use crate::model_identity::*;
 use crate::operator::*;
+use crate::provider_status::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::{error::Error, fmt};
 
@@ -2089,6 +2090,3 @@ pub fn run_kernel_registry_lifecycle_conformance() -> KernelRegistryLifecycleCon
 
     KernelRegistryLifecycleConformanceReport { results }
 }
-
-#[cfg(test)]
-mod tests;

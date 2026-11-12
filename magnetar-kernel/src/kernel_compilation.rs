@@ -21,7 +21,7 @@
 //!   (accepted/produced formats, Devices, architectures, modes, async /
 //!   cancellation / deadline support, size and concurrency limits, isolation
 //!   model, and specialization support). Advertising this descriptor is
-//!   entirely optional -- see [`crate::provider::Provider::kernel_compilation_capability`],
+//!   entirely optional -- see [`crate::Provider::kernel_compilation_capability`],
 //!   which defaults to `None`.
 //! - [`CompilationMode`]: portable behavior categories (not specific
 //!   languages). [`CompilationMode::LoadTimeJit`] never means token-loop
@@ -44,7 +44,7 @@
 //!   native driver handle.
 //! - [`ProviderKernelCompilationApi`]: the Runtime-to-Provider submit / poll
 //!   / cancel / result / release boundary, mirroring
-//!   [`crate::provider::ProviderExecutionApi`]'s shape for execution.
+//!   [`crate::ProviderExecutionApi`]'s shape for execution.
 //! - [`CompilationCancellationSupport`] / [`evaluate_cancellation_request`]:
 //!   cancellation semantics are declared and structured; a cancelled job
 //!   never publishes valid partial output.
@@ -77,7 +77,7 @@
 //!   caught and normalized into a structured failure.
 //! - [`KernelCompilationAbiDescriptor`]: the versioned, C-compatible-shaped
 //!   ABI extension descriptor (function table + buffer ownership rules),
-//!   mirroring [`crate::provider::ProviderAbiDescriptor`]. A Provider
+//!   mirroring [`crate::ProviderAbiDescriptor`]. A Provider
 //!   implementing Provider ABI v1 without this extension remains valid --
 //!   absence yields [`KernelCompilationError::Unavailable`], never Provider
 //!   corruption.
@@ -212,7 +212,7 @@ impl CompilationIsolationModel {
 /// What a Provider advertises about its Kernel Compilation Capability,
 /// implementing "Compilation Capability Descriptor" (proposal). Advertising
 /// this at all is optional -- see
-/// [`crate::provider::Provider::kernel_compilation_capability`].
+/// [`crate::Provider::kernel_compilation_capability`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCompilationCapabilityDescriptor {
     pub capability_version: CapabilityVersion,
@@ -895,7 +895,7 @@ pub enum CompilationCancellationOutcome {
 }
 
 /// Runtime-to-Provider Kernel Compilation boundary, mirroring
-/// [`crate::provider::ProviderExecutionApi`]'s submit/status/cancel/release
+/// [`crate::ProviderExecutionApi`]'s submit/status/cancel/release
 /// shape. Implements "Compilation Job Ownership" (proposal): Runtime MAY
 /// submit/poll/await/cancel/time-out/discard, and SHALL NOT reach into
 /// Provider-native job internals -- every method here returns only opaque
@@ -1024,7 +1024,7 @@ pub fn reject_hot_path_kernel_compilation(
 // ---------------------------------------------------------------------
 
 /// Which optional ABI functions a Provider's Kernel Compilation extension
-/// implements, mirroring [`crate::provider::ProviderAbiFunctionTable`]'s
+/// implements, mirroring [`crate::ProviderAbiFunctionTable`]'s
 /// shape. Implements "Provider ABI Extension" (proposal)'s submit/poll/
 /// cancel/release-job ABI functions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1047,7 +1047,7 @@ impl KernelCompilationAbiFunctionTable {
 }
 
 /// Buffer ownership rules for the Kernel Compilation ABI extension,
-/// mirroring [`crate::provider::ProviderAbiOwnershipRules`]. Implements "ABI
+/// mirroring [`crate::ProviderAbiOwnershipRules`]. Implements "ABI
 /// Buffer Ownership" (proposal): request, result, output artifact, and
 /// diagnostic buffers all have explicit ownership; no allocator ownership is
 /// implicit.
@@ -1079,7 +1079,7 @@ impl Default for KernelCompilationAbiOwnershipRules {
 /// "SHALL NOT expose Rust trait objects for kernel compilation" (proposal)
 /// even though the higher-level [`ProviderKernelCompilationApi`] (this
 /// crate's existing in-process Provider trait convention, matching
-/// [`crate::provider::ProviderExecutionApi`]) is itself a trait object.
+/// [`crate::ProviderExecutionApi`]) is itself a trait object.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCompilationAbiDescriptor {
     pub descriptor_size: usize,

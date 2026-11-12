@@ -322,7 +322,7 @@ pub(crate) struct CachedGraphs {
     /// The Prepared Execution Plans last prepared for these graphs, with
     /// what they were prepared against. A request whose key matches starts
     /// from a copy instead of selecting a Kernel for every node again.
-    pub(super) plans: std::sync::Mutex<Option<(PlanCacheKey, FirstNativePreparedPlans)>>,
+    pub(super) plans: std::sync::Mutex<Option<(FirstNativePlanCacheKey, FirstNativePreparedPlans)>>,
     /// How many times `prepared_plans` had to prepare (tests).
     pub(super) preparations: std::sync::atomic::AtomicU64,
 }
@@ -331,7 +331,7 @@ pub(crate) struct CachedGraphs {
 /// graphs: the Model Instance and its revision, the Provider and the
 /// Kernel Registry's state.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PlanCacheKey {
+pub(crate) struct FirstNativePlanCacheKey {
     pub(super) instance: ModelInstanceId,
     pub(super) mutation_version: u64,
     pub(super) provider: ProviderBinding,
@@ -362,7 +362,7 @@ impl CachedGraphs {
         provider: &ProviderBinding,
     ) -> Result<FirstNativePreparedPlans, E2eConformanceError> {
         let status = require_ready_first_native_instance(runtime, instance)?;
-        let key = PlanCacheKey {
+        let key = FirstNativePlanCacheKey {
             instance: instance.clone(),
             mutation_version: status.status().mutation_version,
             provider: provider.clone(),

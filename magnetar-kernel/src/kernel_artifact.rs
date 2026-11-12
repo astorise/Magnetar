@@ -462,7 +462,7 @@ pub fn validate_compiled_artifact(
 /// "Runtime SHALL NOT silently reinterpret tensor dtype or layout to satisfy
 /// a Kernel Artifact. Required conversions SHALL remain explicit
 /// graph/runtime operations." (proposal, "DType And Layout Specialization").
-/// Mirrors [`crate::provider_roadmap::require_explicit_layout_conversion`]'s
+/// Mirrors [`crate::require_explicit_layout_conversion`]'s
 /// shape but lives at the artifact-contract level.
 pub fn require_explicit_specialization_conversion(
     required: bool,

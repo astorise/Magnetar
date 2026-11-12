@@ -3,11 +3,9 @@
 //! Kept in its own file so coverage tooling classifies it as test
 //! source rather than Runtime implementation source.
 
-use super::*;
-use crate::affinity::{DeviceBinding, ProviderBinding};
-use crate::affinity::{
-    FallbackClass, HealthState, ProviderHealthReport, ProviderStatusSnapshot, ResourceAffinity,
-};
+use crate::Provider;
+use crate::REFERENCE_CPU_PROVIDER_NAME;
+use crate::ReferenceCpuProvider;
 use crate::capability::CapabilityVersion;
 use crate::device::DeviceId;
 use crate::kernel::KernelObservationKind;
@@ -16,10 +14,12 @@ use crate::kernel_artifact::{
     CompiledKernelArtifactId, PreparedKernel, PreparedKernelGeneration, PreparedKernelIdAllocator,
 };
 use crate::kernel_performance_model::KernelPerformanceMetricSummary;
+use crate::kernel_registry::*;
 use crate::operator::{OperatorFamily, OperatorId};
-use crate::provider::Provider;
-use crate::reference_cpu::REFERENCE_CPU_PROVIDER_NAME;
-use crate::reference_cpu::ReferenceCpuProvider;
+use crate::{DeviceBinding, ProviderBinding};
+use crate::{
+    FallbackClass, HealthState, ProviderHealthReport, ProviderStatusSnapshot, ResourceAffinity,
+};
 use std::collections::BTreeMap;
 #[test]
 fn candidate_state_cannot_skip_from_qualified_directly_to_retired() {

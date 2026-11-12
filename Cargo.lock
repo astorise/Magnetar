@@ -699,6 +699,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-kernel"
+version = "1.0.0"
+dependencies = [
+ "flate2",
+ "magnetar-core",
+ "magnetar-graph",
+ "magnetar-model",
+ "serde_json",
+ "sha2 0.11.1",
+ "tar",
+]
+
+[[package]]
 name = "magnetar-model"
 version = "1.0.0"
 dependencies = [
@@ -726,6 +739,7 @@ dependencies = [
  "flate2",
  "magnetar-core",
  "magnetar-graph",
+ "magnetar-kernel",
  "magnetar-model",
  "serde",
  "serde_json",

@@ -4,12 +4,12 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
-use crate::affinity::{DeviceBinding, ProviderBinding};
 use crate::capability::CapabilityVersion;
 use crate::device::DeviceId;
 use crate::kernel::KernelAdvertisement;
 use crate::kernel::{KernelId, KernelImplementationFamily, KernelOperatorVersionRange};
 use crate::operator::{OperatorFamily, OperatorId};
+use crate::{DeviceBinding, ProviderBinding};
 #[test]
 fn artifact_trust_is_only_ever_policy_controlled() {
     assert_eq!(

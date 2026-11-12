@@ -4,7 +4,7 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
-use crate::affinity::ProviderBinding;
+use crate::ProviderBinding;
 use crate::kernel_artifact::KernelArtifactProvenance;
 use crate::kernel_qualification::QualificationProfile;
 use crate::operator::{OperatorFamily, OperatorId};

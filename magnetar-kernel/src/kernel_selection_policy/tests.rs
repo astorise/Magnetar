@@ -4,22 +4,20 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
-use crate::affinity::ProviderBinding;
+use crate::ProviderBinding;
 use crate::kernel::{KernelId, KernelOperatorVersionRange};
 use crate::operator::{OperatorFamily, OperatorId};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use crate::compute::{ComputeDType, HostStagingPolicy};
+use crate::KernelSelectionPolicy;
 use crate::kernel::{KernelExecutionMode, KernelFallbackClass};
 use crate::kernel_artifact::KernelArtifactTrust;
 use crate::kernel_benchmark::{BenchmarkFreshness, BenchmarkStalenessReason};
 use crate::kernel_registry::KernelCandidateRejection;
-use crate::model_instance::KernelSelectionPolicy;
-use crate::model_instance::{
-    ModelInstanceWarmupPlan, ModelInstanceWarmupPolicy, PinnedKernelSelection,
-};
 use crate::operator::TensorLayoutKind;
+use crate::{ComputeDType, HostStagingPolicy};
+use crate::{ModelInstanceWarmupPlan, ModelInstanceWarmupPolicy, PinnedKernelSelection};
 fn selection_policy_identity(name: &str) -> CandidateIdentity {
     CandidateIdentity {
         kernel: selection_policy_kernel_id(name),

@@ -73,13 +73,13 @@
 //!   recommendation ever reaches
 //!   [`crate::kernel_registry::KernelRegistry::promote_generation`].
 //! - "Static Selection" and "Dynamic Selection" reuse
-//!   [`crate::model_instance::KernelSelectionPolicy`] (Dynamic/Pinned);
+//!   [`crate::KernelSelectionPolicy`] (Dynamic/Pinned);
 //!   [`static_selection_required_during_warmup`] is the load-time hook.
 //! - [`SelectionCacheKey`] / [`SelectionCache`] /
 //!   [`SelectionCacheInvalidationTrigger`]: "Selection Caching".
 //! - [`KernelSelectionPolicyId`] / [`KernelOptimizationPolicy`]: "Model
 //!   Instance Kernel Policy" -- a `KernelSelectionPolicyId` is what a Model
-//!   Instance attaches (see [`crate::model_instance::ModelInstanceDefinition`]),
+//!   Instance attaches (see [`crate::ModelInstanceDefinition`]),
 //!   mirroring how a Model Instance references a `TokenizerId` rather than
 //!   embedding a whole Tokenizer.
 //! - [`ModelComponentKernelRequest`] / [`validate_model_component_request`]:
@@ -98,7 +98,7 @@
 //! - [`CrossProviderMovement`] / [`validate_cross_provider_movement`]: "No
 //!   Hidden Cross-Provider Movement".
 //! - [`resolve_pinned_selection`] (over
-//!   [`crate::model_instance::PinnedKernelSelection`]): "Reproducible
+//!   [`crate::PinnedKernelSelection`]): "Reproducible
 //!   Profile" / pinned selection.
 //! - [`ExplorationPolicy`] / [`exploration_allowed`] /
 //!   [`eligible_for_exploration`] / [`CanaryPolicy`] /
@@ -1019,7 +1019,7 @@ pub fn apply_promotion_recommendation(
 // ---------------------------------------------------------------------
 //
 // "Static Selection" and "Dynamic Selection" (proposal) reuse
-// [`crate::model_instance::KernelSelectionPolicy`] (aliased here as
+// [`crate::KernelSelectionPolicy`] (aliased here as
 // `ModelInstanceSelectionMode`) -- the existing Dynamic/Pinned choice a
 // Model Instance already makes -- rather than introducing a second,
 // competing mode enum.
@@ -1093,7 +1093,7 @@ impl SelectionCache {
 /// Kernel Policy" (proposal). Mirrors `TokenizerId`: a Model Instance
 /// references a policy identity rather than embedding the full
 /// [`KernelOptimizationPolicy`] (see
-/// [`crate::model_instance::ModelInstanceDefinition::kernel_selection_policy`]).
+/// [`crate::ModelInstanceDefinition::kernel_selection_policy`]).
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KernelSelectionPolicyId(String);
 
@@ -1129,7 +1129,7 @@ impl fmt::Display for KernelSelectionPolicyVersion {
 /// Model Instance's warmup plan already includes a point at which static
 /// Kernel selection SHALL be resolved. A `Static`/pinned
 /// [`ModelInstanceSelectionMode`] has nothing to resolve unless the plan
-/// actually reaches [`crate::model_instance::ModelInstanceWarmupStep::KernelPreparationPlaceholder`]
+/// actually reaches [`crate::ModelInstanceWarmupStep::KernelPreparationPlaceholder`]
 /// -- `Disabled`/metadata-only warmup plans correctly report `false` here,
 /// so a caller does not attempt selection before Kernel preparation is even
 /// planned to happen.
@@ -1148,7 +1148,7 @@ pub fn static_selection_required_during_warmup(
 /// "A Model Instance SHALL own or reference an explicit Kernel selection
 /// policy." Named `KernelOptimizationPolicy` (not `KernelSelectionPolicy`)
 /// to avoid colliding with the existing, narrower
-/// [`crate::model_instance::KernelSelectionPolicy`] Dynamic/Pinned mode
+/// [`crate::KernelSelectionPolicy`] Dynamic/Pinned mode
 /// choice, which this struct's `selection_mode` field reuses directly.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KernelOptimizationPolicy {
@@ -1403,7 +1403,7 @@ pub fn validate_cross_provider_movement(
 
 /// Implements "Reproducible Profile" (proposal): what a reproducible
 /// execution policy MAY pin. Reuses
-/// [`crate::model_instance::PinnedKernelSelection`] -- the Model Instance's
+/// [`crate::PinnedKernelSelection`] -- the Model Instance's
 /// own KernelId/artifact-digest/prepared-generation/qualification-profile
 /// pin -- rather than introducing a second, competing pin representation.
 ///

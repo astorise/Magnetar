@@ -6,9 +6,9 @@
 use super::*;
 use crate::compute_types::ComputeDType;
 
-use crate::affinity::{DeviceBinding, ProviderBinding};
 use crate::kernel_artifact::CompiledKernelArtifactId;
 use crate::kernel_artifact::{KernelArtifactPath, KernelSourceFormat};
+use crate::{DeviceBinding, ProviderBinding};
 #[test]
 fn output_format_negotiation_requires_explicit_declaration() {
     let produced: std::collections::BTreeSet<String> =

@@ -4,14 +4,15 @@
 //! turns them into Provider-bound Kernel Invocations. It carries only stable
 //! metadata and never exposes raw Provider handles or function pointers.
 
-use crate::affinity::*;
-use crate::compute::*;
+use crate::binding::*;
+use crate::compute_types::*;
 use crate::device::*;
 use crate::kernel::*;
 use crate::kernel_execution_plan::PreparedPlanNodeExecution;
 use crate::kernel_registry::*;
 use crate::memory::*;
 use crate::operator::*;
+use crate::provider_status::*;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

@@ -3,7 +3,7 @@
 //! Kept in its own file so coverage tooling classifies it as test
 //! source rather than Runtime implementation source.
 
-use crate::affinity::ProviderBinding;
+use crate::ProviderBinding;
 use crate::compute_types::ComputeDType;
 use crate::operator::{OperatorFamily, OperatorId, TensorLayoutKind};
 use std::collections::BTreeSet;
