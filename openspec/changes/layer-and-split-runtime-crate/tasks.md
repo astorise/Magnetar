@@ -28,11 +28,13 @@
 
 ## 4. Split `first_native_runtime` and monolithic tests
 
-- [ ] 4.1 Confirm no open pull request touches `first_native_runtime.rs`; otherwise wait for it to merge.
-- [ ] 4.2 Convert `first_native_runtime` to a directory module and move code into the submodules of design D6, one move-only commit per submodule.
-- [ ] 4.3 Move each test of `first_native_runtime/tests.rs` next to the code it tests; widen visibility to `pub(super)`/`pub(crate)` only.
-- [ ] 4.4 Split `src/tests.rs`: tests using only public items go to `tests/contract_tests/`, the others to their module.
-- [ ] 4.5 Verify: no first-native submodule above 2,500 non-test lines; same test names and counts as the baseline; update the file lists and comments in `quality.yml` and `quality/coverage-baseline.json`.
+- [x] 4.1 Confirm no open pull request touches `first_native_runtime.rs` (astorise/Magnetar#167 merged; the two open pull requests are dependency updates).
+- [x] 4.2 Convert `first_native_runtime` to a directory module with thirteen submodules (design D6). One scripted commit: items keep their order and bodies, and file-private items become `pub(super)`.
+- [x] 4.3 Point the static guards that read the module's source text (seven tests, `first_native_implementation_cut`, `tools/check_generic_facade_family_isolation.py`) at the directory's production files.
+- [x] 4.4 Verify: largest submodule 1,960 lines; the 1,355 test names are identical to the baseline; public API diff shows no removed and no changed item; Clippy, documentation and layering gates pass.
+- [ ] 4.5 Move each test of `first_native_runtime/tests.rs` (11,771 lines) next to the code it tests.
+- [ ] 4.6 Split `src/tests.rs`: tests using only public items go to `tests/contract_tests/`, the others to their module.
+- [ ] 4.7 Fix the test build without the `wasmtime-component-engine` feature: `cargo check -p magnetar-runtime --no-default-features --all-targets` fails with six unresolved test-oracle references. It failed the same way before the split and no CI job runs it.
 
 ## 5. Extract layer crates
 

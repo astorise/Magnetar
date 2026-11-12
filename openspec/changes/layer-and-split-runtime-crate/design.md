@@ -79,24 +79,29 @@ Resolution: add a `model-data` layer of rank 2, beside graph and memory, holding
 
 ### D6. Split of `first_native_runtime`
 
-`first_native_runtime` becomes a directory module. Indicative submodules, following the existing public types:
+`first_native_runtime` is a directory module. `mod.rs` holds the imports, declares the submodules and re-exports them; each submodule starts with `use super::*;`.
 
 | Submodule | Contents |
 |---|---|
-| `executor` | `RuntimeModelExecutor`, prefill and decode inputs and results, `FirstNativeRuntimeError` |
-| `fixture` | `E2eFixture`, `FirstNativeFixtureGeneration` |
-| `kv_state` | `FirstNativeLayerKvState` and commit, discard, release |
-| `segments` | multi-device segment boundaries and provider run outcomes |
-| `prepared_plans` | `FirstNativePreparedPlans` and Kernel registration |
-| `production` | `ProductionGenerationRequest`, `ProductionLoadedModel`, the `run_production_qwen_generation*` entry points |
-| `streaming` | `GenerationStreamEvent` |
-| `component_graphs` | `RegisteredInferenceComponent`, `FirstNativeComponentGraphs` |
-| `chat_session` | `FirstNativeChatSession` |
-| `conformance_report` | `E2eConformanceError`, `E2eTestStatus`, `E2eTestResult`, `E2eConformanceReport` |
+| `executor` | `RuntimeModelExecutor`, prefill and decode inputs and results, `FirstNativeRuntimeError`, `E2eConformanceError` and its conversions |
+| `fixture` | `E2eFixture`, fixture weights and tokenizer, fixture Runtimes and instances |
+| `engine` | the model execution engine, the Component graph cache, decode step replay |
+| `dispatch` | per-operator dispatch through the Kernel Registry and prepared plans |
+| `graph_execution` | prefill and decode graph execution, node by node |
+| `kv_state` | KV update transaction: pending layers, commit, discard, release |
+| `segments` | Provider runs of the graph, whole and by multi-device segment |
+| `weights` | weight binding and transactional materialization |
+| `prepared_plans` | `FirstNativePreparedPlans` and plan preparation |
+| `production` | Component artifact resolution, `ProductionLoadedModel`, generation requests, `GenerationStreamEvent` and streaming |
+| `component_graphs` | `RegisteredInferenceComponent`, `FirstNativeComponentGraphs`, graph construction |
+| `chat_session` | fixture generation runs and `FirstNativeChatSession` |
+| `conformance_report` | the end-to-end conformance checks and `E2eConformanceReport` |
 
-`first_native_runtime/mod.rs` only declares and re-exports. No submodule exceeds 2,500 lines of non-test code. Tests move with the code they test. Items that tests reach through `super::*` become `pub(super)` or `pub(crate)`, never `pub`.
+No submodule exceeds 2,500 lines of non-test code. An item that was private to the single file is `pub(super)` in its submodule: visible in `first_native_runtime` and its children, exactly as before, and never `pub`.
 
-`src/tests.rs` is split the same way: each test moves to the module it exercises, or to `tests/contract_tests/` when it uses only public items.
+The split is one scripted commit, because every moved item also needs its visibility written out; a reviewer checks it with the public API diff and the unchanged test names.
+
+Tests move next to the code they test in a second step. `src/tests.rs` is split the same way: each test moves to the module it exercises, or to `tests/contract_tests/` when it uses only public items.
 
 ### D7. Layering gate
 
