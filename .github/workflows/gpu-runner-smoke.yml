@@ -17,8 +17,22 @@ name: GPU Runner Smoke Test
 # stays for an on-demand run. `concurrency.cancel-in-progress: false` below
 # already serializes every trigger of this workflow onto the one self-hosted
 # runner, so the schedule cannot pile up runs alongside a manual dispatch.
+#
+# Step groups: a manual dispatch's `suite` input picks groups (kernels,
+# dense, long-context, gguf, multi-gpu, moe); its default, "standard",
+# leaves out the long-context campaigns (Tensor Cores on and off, about a
+# third of the run), which the daily schedule still runs with every other
+# group. The CUDA Provider build and conformance tests always run.
 on:
   workflow_dispatch:
+    inputs:
+      suite:
+        description: >-
+          Comma-separated groups to run: kernels, dense, long-context, gguf,
+          multi-gpu, moe; or "standard" (all but long-context) or "all".
+          The daily schedule always runs "all".
+        required: false
+        default: standard
   schedule:
     - cron: "0 3 * * *"
 
@@ -39,6 +53,32 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
+      - name: Select suites
+        # workflow_dispatch's `suite` input picks step groups; the daily
+        # schedule runs every group. The CUDA Provider build and its
+        # conformance tests always run.
+        env:
+          SUITE: ${{ github.event_name == 'workflow_dispatch' && inputs.suite || 'all' }}
+        run: |
+          set -eu
+          suite="$(echo "$SUITE" | tr -d ' ')"
+          case ",$suite," in
+            *,all,*) suite="kernels,dense,long-context,gguf,multi-gpu,moe" ;;
+            *,standard,*) suite="$suite,kernels,dense,gguf,multi-gpu,moe" ;;
+          esac
+          for group in kernels dense long-context gguf multi-gpu moe; do
+            var="SUITE_$(echo "$group" | tr 'a-z-' 'A-Z_')"
+            case ",$suite," in
+              *",$group,"*) echo "$var=true" >> "$GITHUB_ENV"; echo "$group: on" ;;
+              *) echo "$var=false" >> "$GITHUB_ENV"; echo "$group: off" ;;
+            esac
+          done
+          for group in $(echo "$suite" | tr ',' ' '); do
+            case "$group" in
+              all|standard|kernels|dense|long-context|gguf|multi-gpu|moe) ;;
+              *) echo "::error::unknown suite group: $group"; exit 1 ;;
+            esac
+          done
       - name: Install build dependencies
         run: apt-get update && apt-get install -y --no-install-recommends git curl build-essential ca-certificates
       - name: Checkout
@@ -68,8 +108,33 @@ jobs:
         run: |
           set -eux
           nvidia-smi
+          # Host memory and cores bound which experts can stay off the
+          # Device (execute-and-cache-moe-experts F05).
+          free -g
+          nproc
+          df -h "$RUNNER_TEMP"
           command -v nvcc
           nvcc --version
+      - name: GPU peer-to-peer readiness (diagnostic)
+        # Whether the two GPUs can read each other's memory, and what a
+        # driver-level peer-access patch would need (each GPU's BAR1 large
+        # enough to map its VRAM, IOMMU off or passthrough): see the
+        # multi-GPU design, "Hardware limit: no peer access". Diagnostic
+        # only.
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/qualification-reports"
+          exec > >(tee "$RUNNER_TEMP/qualification-reports/p2p-readiness.txt") 2>&1
+          nvidia-smi --query-gpu=index,name,pci.bus_id,driver_version,memory.total --format=csv || true
+          nvidia-smi -q -d MEMORY | grep -A3 -i "BAR1" || true
+          nvidia-smi topo -m || true
+          nvidia-smi topo -p2p r || true
+          cat /proc/cmdline 2>/dev/null || true
+          ls /sys/kernel/iommu_groups 2>/dev/null | wc -l || true
+          cat /proc/driver/nvidia/version 2>/dev/null || true
+          ls /proc/driver/nvidia/gpus 2>/dev/null || true
           test -d "${CUDA_HOME:-/usr/local/cuda}"
       - name: Install Rust
         run: |
@@ -86,16 +151,26 @@ jobs:
         # P1 "explicit provider-hardware-cuda == Passed signal" finding).
         run: cargo test --locked --manifest-path providers/cuda/Cargo.toml -- --include-ignored
       - name: CUDA decode matmul bandwidth (diagnostic)
+        if: ${{ env.SUITE_KERNELS == 'true' }}
         # The Device time of each decode-step projection shape per matmul
         # Kernel; diagnostic only.
         timeout-minutes: 10
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml decode_matmul_bandwidth -- --ignored --nocapture
+      - name: CUDA mixture-of-experts decode kernel times (diagnostic)
+        if: ${{ env.SUITE_KERNELS == 'true' }}
+        # The Device time of each Kernel of a Qwen1.5-MoE-A2.7B decode
+        # step, packed Q8_0, against the weight bytes it reads; diagnostic
+        # only.
+        timeout-minutes: 10
+        run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml moe_decode_kernel_times -- --ignored --nocapture
       - name: CUDA long-context kernel times (diagnostic)
+        if: ${{ env.SUITE_KERNELS == 'true' }}
         # The Device time of each prefill matmul shape and of the attention
         # at 512 and 4096 rows; diagnostic only.
         timeout-minutes: 15
         run: cargo test --locked --release --manifest-path providers/cuda/Cargo.toml long_context_kernel_times -- --ignored --nocapture
       - name: Build and test the real first-native Qwen Component against a real CudaProvider
+        if: ${{ env.SUITE_DENSE == 'true' }}
         # #58: `integration-tests/cuda-first-native` runs the real
         # first-native pipeline (magnetar-runtime, driven by the checked-in
         # compiled qwen-real.component.wasm Component) against a real
@@ -107,6 +182,7 @@ jobs:
         # the one place its real-hardware path actually runs.
         run: cargo test --locked --manifest-path integration-tests/cuda-first-native/Cargo.toml
       - name: Build and test real multi-Device execution (Reference CPU + real CUDA, one Runtime)
+        if: ${{ env.SUITE_DENSE == 'true' }}
         # add-multi-device-cpu-cuda-execution-proof: the first real proof a
         # single Runtime can register two heterogeneous real Providers
         # simultaneously and dispatch one logical computation across both
@@ -116,6 +192,7 @@ jobs:
         # runner's real GPU, not just a compile check.
         run: cargo test --locked --manifest-path integration-tests/multi-device-cpu-cuda/Cargo.toml
       - name: Build and test real production Qwen loading on CUDA
+        if: ${{ env.SUITE_DENSE == 'true' }}
         # implement-production-qwen-model-loading task 12.3/12.7: the same
         # real ingested Hugging Face bundle, real tokenizer, and real
         # compiled Qwen Component the Reference CPU test proves, instead
@@ -128,6 +205,7 @@ jobs:
         # step) and would otherwise panic here for a missing env var.
         run: cargo test --locked --manifest-path integration-tests/production-loading/Cargo.toml tests_production_loading -- --include-ignored
       - name: Download the pinned real Qwen2.5-0.5B-Instruct checkpoint
+        if: ${{ (env.SUITE_DENSE == 'true' || env.SUITE_LONG_CONTEXT == 'true') }}
         # implement-production-qwen-model-loading task 12.4/12.5: pinned by
         # exact revision; `tests_real_checkpoint_smoke.rs` independently
         # verifies model.safetensors' real sha256 against the digest that
@@ -167,6 +245,7 @@ jobs:
           verify tokenizer_config.json "$TOKENIZER_CONFIG_JSON_SHA256"
           echo "MAGNETAR_QWEN_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
       - name: Test the real public checkpoint on Reference CPU and real CUDA
+        if: ${{ env.SUITE_DENSE == 'true' }}
         # task 12.4: full production pipeline (real config.json/tokenizer.
         # json/Safetensors -> real compiled Qwen Component -> real
         # Reference CPU dispatch) against a real, publicly downloaded
@@ -175,6 +254,7 @@ jobs:
         # Reference CPU and this same real CUDA hardware.
         run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_checkpoint -- --include-ignored --test-threads=1
       - name: Real-checkpoint CUDA logits against the Reference CPU corpus
+        if: ${{ env.SUITE_DENSE == 'true' }}
         # qualify-real-checkpoint-performance A02: CUDA's per-step logits
         # and greedy tokens for the pinned checkpoint are compared with the
         # checked-in Reference CPU corpus
@@ -191,6 +271,7 @@ jobs:
           export MAGNETAR_QUALIFICATION_REPORT_DIR="$RUNNER_TEMP/qualification-reports"
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_logits_match_the_reference_corpus -- --include-ignored --test-threads=1 --nocapture
       - name: Real-checkpoint CUDA decode cost profile (diagnostic)
+        if: ${{ env.SUITE_DENSE == 'true' }}
         # qualify-real-checkpoint-performance: where a CUDA decode step's
         # cost goes -- one warmed-up 64-token request, inter-token latency
         # by position bucket and its growth per token, the share of time
@@ -207,6 +288,7 @@ jobs:
           export MAGNETAR_QUALIFICATION_SUMMARY_PATH="$GITHUB_STEP_SUMMARY"
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_decode_cost_profile -- --include-ignored --test-threads=1 --nocapture
       - name: Real-checkpoint CUDA decode cost profile, per node (diagnostic)
+        if: ${{ env.SUITE_DENSE == 'true' }}
         # capture-and-replay-cuda-graphs' disable control: the same profile
         # with decode-step replay off, every step dispatched per node.
         timeout-minutes: 30
@@ -221,6 +303,7 @@ jobs:
           export MAGNETAR_QUALIFICATION_SUMMARY_PATH="$GITHUB_STEP_SUMMARY"
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_decode_cost_profile -- --include-ignored --test-threads=1 --nocapture
       - name: Real-checkpoint qualification campaign on CUDA (cost per token)
+        if: ${{ env.SUITE_DENSE == 'true' }}
         # qualify-real-checkpoint-performance A01/A04: one load, one cold
         # request, one warmup and five measured greedy requests of 128 new
         # tokens on the same resident CUDA instance, recording TTFT, TPOT,
@@ -250,6 +333,7 @@ jobs:
           export MAGNETAR_QUALIFICATION_SUMMARY_PATH="$GITHUB_STEP_SUMMARY"
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
       - name: Real-checkpoint long-context campaign with Tensor Cores off (disable control)
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         # The same 512- and 4096-token campaigns on the bit-identical
         # CUDA-core matmuls: their generated tokens and timings are the
         # comparison for the Tensor Core prefill matmuls.
@@ -263,6 +347,7 @@ jobs:
           MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "512,4096"
         run: cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
       - name: Download the pinned real Qwen2.5-1.5B-Instruct checkpoint
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         # qualify-additional-model-and-state-families F01: a further real
         # checkpoint, pinned by exact revision; the JSON files by the sha256
         # each had at that revision, model.safetensors by its LFS sha256,
@@ -295,6 +380,7 @@ jobs:
           verify tokenizer_config.json "$TOKENIZER_CONFIG_JSON_SHA256"
           echo "MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR=$dir" >> "$GITHUB_ENV"
       - name: Qwen2.5-1.5B-Instruct long-context campaign on CUDA
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         # Its Reference CPU comparison is left out: this checkpoint in f32
         # (about 6 GB) does not fit the runner's memory next to the test.
         # The same campaign with the Tensor Cores off is the control: both
@@ -317,6 +403,7 @@ jobs:
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR" \
             cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
       - name: Qwen2.5-1.5B-Instruct long-context campaign with Tensor Cores off (disable control)
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         timeout-minutes: 30
         env:
           MAGNETAR_CUDA_TENSOR_CORES: "0"
@@ -336,6 +423,7 @@ jobs:
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_QWEN2_5_1_5B_INSTRUCT_DIR" \
             cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
       - name: Qwen2.5-1.5B-Instruct generates the same tokens with the Tensor Cores on and off
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         shell: bash
         run: |
           set -eu
@@ -349,6 +437,7 @@ jobs:
           fi
           echo "$on"
       - name: Download the pinned real DeepSeek-R1-Distill-Qwen-1.5B checkpoint
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         # qualify-additional-model-and-state-families F01: a further real
         # checkpoint, pinned by exact revision; the JSON files by the sha256
         # each had at that revision, model.safetensors by its LFS sha256,
@@ -381,6 +470,7 @@ jobs:
           verify tokenizer_config.json "$TOKENIZER_CONFIG_JSON_SHA256"
           echo "MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR=$dir" >> "$GITHUB_ENV"
       - name: DeepSeek-R1-Distill-Qwen-1.5B long-context campaign on CUDA
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         # Its Reference CPU comparison is left out: this checkpoint in f32
         # (about 6 GB) does not fit the runner's memory next to the test.
         # The same campaign with the Tensor Cores off is the control: both
@@ -403,6 +493,7 @@ jobs:
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR" \
             cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
       - name: DeepSeek-R1-Distill-Qwen-1.5B long-context campaign with Tensor Cores off (disable control)
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         timeout-minutes: 30
         env:
           MAGNETAR_CUDA_TENSOR_CORES: "0"
@@ -422,6 +513,7 @@ jobs:
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_DEEPSEEK_R1_DISTILL_QWEN_1_5B_DIR" \
             cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
       - name: DeepSeek-R1-Distill-Qwen-1.5B generates the same tokens with the Tensor Cores on and off
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         shell: bash
         run: |
           set -eu
@@ -435,6 +527,7 @@ jobs:
           fi
           echo "$on"
       - name: Download the pinned real Llama-3.2-1B-Instruct checkpoint
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         # qualify-additional-model-and-state-families F01: the first
         # non-Qwen2 checkpoint, served by the Llama Model Component
         # (selected by its manifest's architecture family). Gated: the
@@ -478,6 +571,7 @@ jobs:
           verify tokenizer_config.json "$TOKENIZER_CONFIG_JSON_BLOB"
           echo "MAGNETAR_LLAMA_3_2_1B_INSTRUCT_DIR=$dir" >> "$GITHUB_ENV"
       - name: Llama-3.2-1B-Instruct long-context campaign on CUDA
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         # Its Reference CPU comparison is left out: this checkpoint in f32
         # (about 5 GB) does not fit the runner's memory next to the test.
         # The same campaign with the Tensor Cores off is the control: both
@@ -500,6 +594,7 @@ jobs:
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_LLAMA_3_2_1B_INSTRUCT_DIR" \
             cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
       - name: Llama-3.2-1B-Instruct long-context campaign with Tensor Cores off (disable control)
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         timeout-minutes: 30
         env:
           MAGNETAR_CUDA_TENSOR_CORES: "0"
@@ -519,6 +614,7 @@ jobs:
           MAGNETAR_QWEN_REAL_CHECKPOINT_DIR="$MAGNETAR_LLAMA_3_2_1B_INSTRUCT_DIR" \
             cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$MAGNETAR_QUALIFICATION_REPORT_DIR/campaign.log"
       - name: Llama-3.2-1B-Instruct generates the same tokens with the Tensor Cores on and off
+        if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         shell: bash
         run: |
           set -eu
@@ -532,6 +628,811 @@ jobs:
           fi
           echo "$on"
           grep 'generated text' "$RUNNER_TEMP/qualification-reports/llama-3.2-1b-instruct-tensor-cores/campaign.log" || true
+      - name: Download the pinned real Qwen2.5-0.5B-Instruct Q8_0 GGUF checkpoint
+        if: ${{ !cancelled() && (env.SUITE_GGUF == 'true' || env.SUITE_MULTI_GPU == 'true') }}
+        # execute-direct-quantized-weights (B03): a genuinely Q8_0-quantized
+        # export, pinned by its sha256, which the test verifies.
+        env:
+          REVISION: 9217f5db79a29953eb74d5343926648285ec7e67
+        shell: bash
+        run: |
+          set -eu
+          dir="$RUNNER_TEMP/qwen2.5-0.5b-instruct-q8_0-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/$REVISION/qwen2.5-0.5b-instruct-q8_0.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Q8_0 GGUF on CUDA with packed weights
+        # Also the one-GPU reference the two-GPU steps compare against.
+        if: ${{ env.SUITE_GGUF == 'true' || env.SUITE_MULTI_GPU == 'true' }}
+        # The quantized matrices are stored packed and the decode matmul
+        # reads them packed.
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/qualification-reports/q8_0-gguf"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log"
+      - name: Q8_0 GGUF on CUDA with packed weights declined (disable control)
+        # MAGNETAR_CUDA_PACKED_WEIGHTS=0: Model Loading dequantizes the same
+        # weights to f32 at load, as before direct quantized execution. Runs
+        # even when the packed run failed, to tell the two apart -- once the
+        # checkpoint was downloaded.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_PACKED_WEIGHTS: "0"
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/dequantized.log"
+      - name: Q8_0 GGUF generates the same tokens packed and dequantized
+        if: ${{ env.SUITE_GGUF == 'true' }}
+        shell: bash
+        run: |
+          set -eu
+          packed="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
+          dequantized="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/dequantized.log")"
+          test -n "$packed"
+          grep -h 'packed weights\|generated text' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/*.log
+          if [ "$packed" != "$dequantized" ]; then
+            echo "::error::Q8_0 GGUF: tokens differ between packed and dequantized weights"
+            diff <(echo "$packed") <(echo "$dequantized") || true
+            exit 1
+          fi
+          echo "$packed"
+      - name: Q8_0 GGUF (Qwen2.5-0.5B) with f32 activations (disable control)
+        # MAGNETAR_CUDA_INT8_ACTIVATIONS=0: the packed decode matmuls keep
+        # f32 activations instead of rounding them to 8 bits per 32-value
+        # block (the default, multiplied with __dp4a). Outputs may differ
+        # from the default run, so token ids are compared as a report (a
+        # warning), but the answer must still start with "Paris".
+        # Also the f32-activation reference the tensor-parallel steps
+        # compare against exactly.
+        if: ${{ !cancelled() && (env.SUITE_GGUF == 'true' || env.SUITE_MULTI_GPU == 'true') && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "0"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/q8_0-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/f32-activations.log"
+          grep -h 'TPOT' "$dir/packed.log" "$dir/f32-activations.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/f32-activations.log" || {
+            echo "::error::Q8_0 GGUF (Qwen2.5-0.5B): with f32 activations the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+          int8="$(grep -m1 'generated token ids' "$dir/packed.log" || true)"
+          f32="$(grep -m1 'generated token ids' "$dir/f32-activations.log")"
+          if [ "$f32" != "$int8" ]; then
+            echo "::warning::Q8_0 GGUF (Qwen2.5-0.5B): token ids differ between int8 (default) and f32 activations"
+            diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
+          fi
+      - name: Q8_0 GGUF (Qwen2.5-0.5B) on the optimized CPU Provider
+        # execute-quantized-weights-on-cpu: the packed weights stay in host
+        # memory in their checkpoint encoding and the matmuls read them with
+        # int8 activations (AVX2 when available). Must answer "Paris";
+        # token ids that differ from the CUDA run are a warning (int8
+        # rounding can flip a near-tie).
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CPU_PROFILE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/q8_0-gguf"
+          mkdir -p "$dir"
+          lscpu | grep -E 'Model name|^CPU\(s\)|Flags' | cut -c1-200 || true
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_native_cpu -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/cpu-native.log"
+          grep -h 'TPOT\|cpu-native profile' "$dir/cpu-native.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/cpu-native.log" || {
+            echo "::error::Q8_0 GGUF (Qwen2.5-0.5B) on the optimized CPU Provider: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          cuda="$(grep -m1 'generated token ids' "$dir/packed.log" | sed 's/^.*generated token ids//' || true)"
+          cpu="$(grep -m1 'generated token ids' "$dir/cpu-native.log" | sed 's/^.*generated token ids//')"
+          if [ "$cuda" != "$cpu" ]; then
+            echo "::warning::Q8_0 GGUF (Qwen2.5-0.5B): token ids differ between the optimized CPU Provider and CUDA"
+          fi
+      - name: Q8_0 GGUF across two GPUs (layer segments)
+        # enforce-local-multigpu-and-expert-placement G05: one Provider over
+        # both GPUs, the Runtime placing half the layers on each
+        # (balanced); the tokens must match the single-GPU packed run.
+        if: ${{ !cancelled() && env.SUITE_MULTI_GPU == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_LAYER_PLACEMENT: balanced
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus.log"
+          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
+          split="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus.log")"
+          grep -h 'GPU(s)' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/*.log
+          if [ "$single" != "$split" ]; then
+            echo "::error::Q8_0 GGUF: tokens differ between one GPU and two"
+            diff <(echo "$single") <(echo "$split") || true
+            exit 1
+          fi
+      - name: Q8_0 GGUF across two GPUs without step capture (disable control)
+        # MAGNETAR_CUDA_MULTI_CAPTURE=0: every step spanning the GPUs runs
+        # uncaptured; the tokens must still match one GPU's.
+        if: ${{ !cancelled() && env.SUITE_MULTI_GPU == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_LAYER_PLACEMENT: balanced
+          MAGNETAR_CUDA_MULTI_CAPTURE: "0"
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-uncaptured.log"
+          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/packed.log")"
+          uncaptured="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-uncaptured.log")"
+          grep -h 'GPU(s)' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/*.log
+          test "$single" = "$uncaptured"
+      - name: Q8_0 GGUF across two GPUs (tensor parallel)
+        # enforce-local-multigpu-and-expert-placement tensor parallelism,
+        # phase 1: every MLP split across both GPUs (gate/up by columns,
+        # down by rows, one reduction per layer), attention replicated. With
+        # f32 activations the tokens must match one GPU's: the reduction
+        # sums partials in another order, a difference of an ulp that int8
+        # activations can turn into a whole quantization step, so the
+        # exact comparison runs with them off and the default run follows.
+        if: ${{ !cancelled() && env.SUITE_MULTI_GPU == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_MULTI_GPU: tensor
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "0"
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor.log"
+          grep -h '\[step capture\]' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor.log" | sort | uniq -c | head -20 || true
+          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/f32-activations.log")"
+          tensor="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor.log")"
+          grep -h 'GPU(s)\|TPOT\|generated text' "$RUNNER_TEMP"/qualification-reports/q8_0-gguf/two-gpus-tensor.log || true
+          if [ "$single" != "$tensor" ]; then
+            echo "::error::Q8_0 GGUF: with f32 activations, tokens differ between one GPU and two in tensor parallel"
+            diff <(echo "$single") <(echo "$tensor") || true
+            exit 1
+          fi
+      - name: Q8_0 GGUF across two GPUs (tensor parallel, int8 activations)
+        # The default int8 activations in tensor parallel: must answer
+        # "Paris"; token ids that differ from one GPU's are a warning.
+        if: ${{ !cancelled() && env.SUITE_MULTI_GPU == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_MULTI_GPU: tensor
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/q8_0-gguf"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/two-gpus-tensor-int8.log"
+          grep -h 'GPU(s)\|TPOT\|generated text' "$dir/two-gpus-tensor-int8.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/two-gpus-tensor-int8.log" || {
+            echo "::error::Q8_0 GGUF tensor parallel with int8 activations: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          single="$(grep 'generated token ids' "$dir/packed.log" || true)"
+          tensor="$(grep 'generated token ids' "$dir/two-gpus-tensor-int8.log")"
+          if [ "$single" != "$tensor" ]; then
+            echo "::warning::Q8_0 GGUF: with int8 activations, token ids differ between one GPU and two in tensor parallel"
+            diff <(echo "$single" | tr ',' '\n') <(echo "$tensor" | tr ',' '\n') | head -20 || true
+          fi
+      - name: Q8_0 GGUF across two GPUs, tensor parallel without step capture (disable control)
+        # MAGNETAR_CUDA_MULTI_CAPTURE=0: the tensor-parallel step runs
+        # uncaptured, each invocation launched on both GPUs from the host;
+        # with f32 activations the tokens must still match one GPU's.
+        if: ${{ !cancelled() && env.SUITE_MULTI_GPU == 'true' && env.MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 20
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_MULTI_GPU: tensor
+          MAGNETAR_CUDA_MULTI_CAPTURE: "0"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "0"
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor-uncaptured.log"
+          single="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/f32-activations.log")"
+          uncaptured="$(grep 'generated token ids' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor-uncaptured.log")"
+          grep -h 'GPU(s)' "$RUNNER_TEMP/qualification-reports/q8_0-gguf/two-gpus-tensor-uncaptured.log" || true
+          test "$single" = "$uncaptured"
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q8_0 GGUF checkpoint
+        if: ${{ !cancelled() && (env.SUITE_GGUF == 'true' || env.SUITE_MULTI_GPU == 'true') }}
+        # 7.7 GB (Apache-2.0), pinned by its sha256, which the test verifies:
+        # it fits a 12 GB Device only because its quantized matrices stay
+        # packed (execute-direct-quantized-weights). The file declares
+        # `general.architecture = llama`, so the Llama Model Component serves it.
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          df -h "$RUNNER_TEMP"
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-q8_0-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-Q8_0.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_Q8_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 Q8_0 GGUF on CUDA with packed weights
+        # Also the one-GPU reference the two-GPU steps compare against.
+        if: ${{ env.SUITE_GGUF == 'true' || env.SUITE_MULTI_GPU == 'true' }}
+        # No dequantized control: 7B parameters in f32 exceed the Device.
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/qualification-reports/mistral-7b-q8_0-gguf"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/mistral-7b-q8_0-gguf/packed.log"
+          # SentencePiece decoding strips the text's leading space.
+          grep -Eq 'generated text " ?Paris' "$RUNNER_TEMP/qualification-reports/mistral-7b-q8_0-gguf/packed.log" || {
+            echo "::error::Mistral 7B Q8_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Mistral-7B-Instruct-v0.3 Q8_0 GGUF with f32 activations (disable control)
+        # MAGNETAR_CUDA_INT8_ACTIVATIONS=0: the packed decode matmuls keep
+        # f32 activations instead of rounding them to 8 bits per 32-value
+        # block (the default, multiplied with __dp4a). Outputs may differ
+        # from the default run, so token ids are compared as a report (a
+        # warning), but the answer must still start with "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "0"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q8_0-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/f32-activations.log"
+          grep -h 'TPOT' "$dir/packed.log" "$dir/f32-activations.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/f32-activations.log" || {
+            echo "::error::Mistral-7B-Instruct-v0.3 Q8_0 GGUF: with f32 activations the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+          int8="$(grep -m1 'generated token ids' "$dir/packed.log" || true)"
+          f32="$(grep -m1 'generated token ids' "$dir/f32-activations.log")"
+          if [ "$f32" != "$int8" ]; then
+            echo "::warning::Mistral-7B-Instruct-v0.3 Q8_0 GGUF: token ids differ between int8 (default) and f32 activations"
+            diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
+          fi
+      - name: Mistral-7B-Instruct-v0.3 Q8_0 GGUF across two GPUs (tensor parallel)
+        # Phase 1 on a bandwidth-bound model: every MLP split across both
+        # GPUs. Must still answer "Paris"; the token ids are compared with
+        # one GPU's and a divergence is reported (summation order differs
+        # across GPUs, so a late greedy tie may flip).
+        if: ${{ !cancelled() && env.SUITE_MULTI_GPU == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_MULTI_GPU: tensor
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q8_0-gguf"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/two-gpus-tensor.log"
+          grep -h 'GPU(s)' "$dir"/*.log || true
+          grep -h '\[step capture\]' "$dir/two-gpus-tensor.log" | sort | uniq -c | head -20 || true
+          grep -Eq 'generated text " ?Paris' "$dir/two-gpus-tensor.log" || {
+            echo "::error::Mistral 7B Q8_0 tensor parallel: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          single="$(grep 'generated token ids' "$dir/packed.log" || true)"
+          tensor="$(grep 'generated token ids' "$dir/two-gpus-tensor.log")"
+          if [ -n "$single" ] && [ "$single" != "$tensor" ]; then
+            echo "::warning::Mistral 7B Q8_0: token ids differ between one GPU and two in tensor parallel"
+            diff <(echo "$single") <(echo "$tensor") || true
+          fi
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q4_K_M GGUF checkpoint
+        # 4.4 GB, pinned by its sha256, which the test verifies: Q4_K
+        # matrices (read packed) with some Q6_K ones (dequantized at load).
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-q4_k_m-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 Q4_K_M GGUF on CUDA with packed weights
+        # Its decode reads about half the Q8_0 export's bytes; it must
+        # still answer "Paris". The token ids are printed next to the Q8_0
+        # run's (different quantizations, so they may differ).
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q4_k_m-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" "$RUNNER_TEMP/qualification-reports/mistral-7b-q8_0-gguf/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || {
+            echo "::error::Mistral 7B Q4_K_M: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Mistral-7B-Instruct-v0.3 Q4_K_M GGUF with f32 activations (disable control)
+        # MAGNETAR_CUDA_INT8_ACTIVATIONS=0: the packed decode matmuls keep
+        # f32 activations instead of rounding them to 8 bits per 32-value
+        # block (the default, multiplied with __dp4a). Outputs may differ
+        # from the default run, so token ids are compared as a report (a
+        # warning), but the answer must still start with "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_INT8_ACTIVATIONS: "0"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q4_k_m-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/f32-activations.log"
+          grep -h 'TPOT' "$dir/packed.log" "$dir/f32-activations.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/f32-activations.log" || {
+            echo "::error::Mistral-7B-Instruct-v0.3 Q4_K_M GGUF: with f32 activations the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+          int8="$(grep -m1 'generated token ids' "$dir/packed.log" || true)"
+          f32="$(grep -m1 'generated token ids' "$dir/f32-activations.log")"
+          if [ "$f32" != "$int8" ]; then
+            echo "::warning::Mistral-7B-Instruct-v0.3 Q4_K_M GGUF: token ids differ between int8 (default) and f32 activations"
+            diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
+          fi
+      - name: Mistral-7B-Instruct-v0.3 Q4_K_M GGUF on the optimized CPU Provider
+        # execute-quantized-weights-on-cpu: the packed weights stay in host
+        # memory in their checkpoint encoding and the matmuls read them with
+        # int8 activations (AVX2 when available). Must answer "Paris";
+        # token ids that differ from the CUDA run are a warning (int8
+        # rounding can flip a near-tie).
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CPU_PROFILE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q4_k_m-gguf"
+          mkdir -p "$dir"
+          lscpu | grep -E 'Model name|^CPU\(s\)|Flags' | cut -c1-200 || true
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_native_cpu -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/cpu-native.log"
+          grep -h 'TPOT\|cpu-native profile' "$dir/cpu-native.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/cpu-native.log" || {
+            echo "::error::Mistral-7B-Instruct-v0.3 Q4_K_M GGUF on the optimized CPU Provider: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          cuda="$(grep -m1 'generated token ids' "$dir/packed.log" | sed 's/^.*generated token ids//' || true)"
+          cpu="$(grep -m1 'generated token ids' "$dir/cpu-native.log" | sed 's/^.*generated token ids//')"
+          if [ "$cuda" != "$cpu" ]; then
+            echo "::warning::Mistral-7B-Instruct-v0.3 Q4_K_M GGUF: token ids differ between the optimized CPU Provider and CUDA"
+          fi
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q3_K_M GGUF checkpoint
+        # 3.5 GB, pinned by its sha256, which the test verifies: mostly Q3_K
+        # matrices, some Q4_K and Q6_K.
+        # The earlier Mistral exports are removed first to free the disk.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-q3_k_m-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-Q3_K_M.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_Q3_K_M_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 Q3_K_M GGUF on CUDA with packed weights
+        # Every k-quant matrix read packed, with int8 activations; it must
+        # still answer "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q3_K_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q3_k_m-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q3_k_m_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || {
+            echo "::error::Mistral 7B Q3_K_M: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Mistral-7B-Instruct-v0.3 Q3_K_M GGUF on the optimized CPU Provider
+        # The specialized AVX2 Kernel for its dominant format; must answer
+        # "Paris", token ids that differ from the CUDA run are a warning.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q3_K_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CPU_PROFILE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q3_k_m-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q3_k_m_gguf_checkpoint_generates_on_native_cpu -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/cpu-native.log"
+          grep -h 'TPOT\|cpu-native profile' "$dir/cpu-native.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/cpu-native.log" || {
+            echo "::error::Mistral-7B-Instruct-v0.3 Q3_K_M GGUF on the optimized CPU Provider: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          cuda="$(grep -m1 'generated token ids' "$dir/packed.log" | sed 's/^.*generated token ids//' || true)"
+          cpu="$(grep -m1 'generated token ids' "$dir/cpu-native.log" | sed 's/^.*generated token ids//')"
+          if [ "$cuda" != "$cpu" ]; then
+            echo "::warning::Mistral-7B-Instruct-v0.3 Q3_K_M GGUF: token ids differ between the optimized CPU Provider and CUDA"
+          fi
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 Q2_K GGUF checkpoint
+        # 2.7 GB, pinned by its sha256, which the test verifies: mostly Q2_K
+        # matrices, some Q3_K, Q4_K and Q6_K.
+        # The earlier Mistral exports are removed first to free the disk.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-q2_k-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-Q2_K.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_Q2_K_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 Q2_K GGUF on CUDA with packed weights
+        # Every k-quant matrix read packed, with int8 activations; it must
+        # still answer "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q2_K_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q2_k-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q2_k_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || {
+            echo "::error::Mistral 7B Q2_K: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 IQ4_XS GGUF checkpoint
+        # 3.9 GB, pinned by its sha256, which the test verifies: mostly IQ4_XS
+        # matrices.
+        # The earlier Mistral exports are removed first to free the disk.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-iq4_xs-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-IQ4_XS.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_IQ4_XS_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 IQ4_XS GGUF on CUDA with packed weights
+        # Every i-quant and k-quant matrix read packed, with int8
+        # activations; it must still answer "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_IQ4_XS_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-iq4_xs-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_iq4_xs_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || {
+            echo "::error::Mistral 7B IQ4_XS: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Mistral-7B-Instruct-v0.3 IQ4_XS GGUF on the optimized CPU Provider
+        # The specialized AVX2 Kernel for its dominant format; must answer
+        # "Paris", token ids that differ from the CUDA run are a warning.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_IQ4_XS_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_CPU_PROFILE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-iq4_xs-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_iq4_xs_gguf_checkpoint_generates_on_native_cpu -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/cpu-native.log"
+          grep -h 'TPOT\|cpu-native profile' "$dir/cpu-native.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/cpu-native.log" || {
+            echo "::error::Mistral-7B-Instruct-v0.3 IQ4_XS GGUF on the optimized CPU Provider: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          cuda="$(grep -m1 'generated token ids' "$dir/packed.log" | sed 's/^.*generated token ids//' || true)"
+          cpu="$(grep -m1 'generated token ids' "$dir/cpu-native.log" | sed 's/^.*generated token ids//')"
+          if [ "$cuda" != "$cpu" ]; then
+            echo "::warning::Mistral-7B-Instruct-v0.3 IQ4_XS GGUF: token ids differ between the optimized CPU Provider and CUDA"
+          fi
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 IQ4_NL GGUF checkpoint
+        # 4.1 GB, pinned by its sha256, which the test verifies: mostly IQ4_NL
+        # matrices.
+        # The earlier Mistral exports are removed first to free the disk.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-iq4_nl-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-IQ4_NL.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_IQ4_NL_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 IQ4_NL GGUF on CUDA with packed weights
+        # Every i-quant and k-quant matrix read packed, with int8
+        # activations; it must still answer "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_IQ4_NL_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-iq4_nl-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_iq4_nl_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || {
+            echo "::error::Mistral 7B IQ4_NL: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 IQ3_M GGUF checkpoint
+        # 3.3 GB, pinned by its sha256, which the test verifies: mostly IQ3_S
+        # matrices. The earlier Mistral exports are removed first.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-iq3_m-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-IQ3_M.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_IQ3_M_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 IQ3_M GGUF on CUDA with packed weights
+        # Every i-quant and k-quant matrix read packed, with int8
+        # activations; it must still answer "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_IQ3_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-iq3_m-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_iq3_m_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || {
+            echo "::error::Mistral 7B IQ3_M: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 IQ3_XXS GGUF checkpoint
+        # 2.8 GB, pinned by its sha256, which the test verifies: mostly IQ3_XXS
+        # matrices. The earlier Mistral exports are removed first.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-iq3_xxs-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_IQ3_XXS_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 IQ3_XXS GGUF on CUDA with packed weights
+        # Every i-quant and k-quant matrix read packed, with int8
+        # activations; it must still answer "Paris".
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_IQ3_XXS_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-iq3_xxs-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_iq3_xxs_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || {
+            echo "::error::Mistral 7B IQ3_XXS: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 IQ2_M GGUF checkpoint
+        # 2.5 GB, pinned by its sha256, which the test verifies: mostly IQ2_S
+        # matrices. The earlier Mistral exports are removed first.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-iq2_m-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-IQ2_M.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_IQ2_M_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 IQ2_M GGUF on CUDA with packed weights
+        # Every i-quant and k-quant matrix read packed, with int8
+        # activations; a continuation without "Paris" is a
+        # warning: a 2-bit export may lose it.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_IQ2_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-iq2_m-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_iq2_m_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || \
+            echo "::warning::Mistral 7B IQ2_M: the greedy continuation of 'The capital of France is' does not start with 'Paris' (a 2-bit export may lose it)"
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 IQ2_XS GGUF checkpoint
+        # 2.2 GB, pinned by its sha256, which the test verifies: mostly IQ2_XS
+        # matrices. The earlier Mistral exports are removed first.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-iq2_xs-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-IQ2_XS.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_IQ2_XS_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 IQ2_XS GGUF on CUDA with packed weights
+        # Every i-quant and k-quant matrix read packed, with int8
+        # activations; a continuation without "Paris" is a
+        # warning: a 2-bit export may lose it.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_IQ2_XS_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-iq2_xs-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_iq2_xs_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || \
+            echo "::warning::Mistral 7B IQ2_XS: the greedy continuation of 'The capital of France is' does not start with 'Paris' (a 2-bit export may lose it)"
+      - name: Download the pinned real Mistral-7B-Instruct-v0.3 IQ2_XXS GGUF checkpoint
+        # 2.0 GB, pinned by its sha256, which the test verifies: mostly IQ2_XXS
+        # matrices. The earlier Mistral exports are removed first.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        env:
+          REVISION: 61fd4167fff3ab01ee1cfe0da183fa27a944db48
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "$RUNNER_TEMP"/mistral-7b-instruct-v0.3-*
+          dir="$RUNNER_TEMP/mistral-7b-instruct-v0.3-iq2_xxs-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/$REVISION/Mistral-7B-Instruct-v0.3-IQ2_XXS.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_MISTRAL_7B_GGUF_IQ2_XXS_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Mistral-7B-Instruct-v0.3 IQ2_XXS GGUF on CUDA with packed weights
+        # Every i-quant and k-quant matrix read packed, with int8
+        # activations; a continuation without "Paris" is a
+        # warning: a 2-bit export may lose it.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_IQ2_XXS_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-iq2_xxs-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_iq2_xxs_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/packed.log"
+          grep -h 'GPU(s)\|generated text' "$dir/packed.log" || true
+          grep -Eq 'generated text " ?Paris' "$dir/packed.log" || \
+            echo "::warning::Mistral 7B IQ2_XXS: the greedy continuation of 'The capital of France is' does not start with 'Paris' (a 2-bit export may lose it)"
+      - name: Download the pinned real Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF checkpoint
+        # execute-and-cache-moe-experts F02: 15 GB packed, more than one
+        # 12 GB GPU, pinned by its sha256, which the test verifies. The
+        # Mistral checkpoint is removed first to free the disk.
+        if: ${{ !cancelled() && env.SUITE_MOE == 'true' }}
+        env:
+          REVISION: 947580e7b3904cd4081810d0efec4520a75609c7
+        shell: bash
+        run: |
+          set -eu
+          rm -rf "${MAGNETAR_MISTRAL_7B_GGUF_Q8_0_REAL_CHECKPOINT_DIR:-/nonexistent}"
+          df -h "$RUNNER_TEMP"
+          dir="$RUNNER_TEMP/qwen1.5-moe-a2.7b-chat-q8_0-gguf-$REVISION"
+          mkdir -p "$dir"
+          curl -fsSL "https://huggingface.co/RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf/resolve/$REVISION/Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf" -o "$dir/model.gguf"
+          echo "MAGNETAR_QWEN_MOE_GGUF_Q8_0_REAL_CHECKPOINT_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF across two GPUs
+        if: ${{ !cancelled() && env.SUITE_MOE == 'true' && env.MAGNETAR_QWEN_MOE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_qwen_moe_a2_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf/two-gpus.log"
+          grep -Eq 'generated text " ?Paris' "$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf/two-gpus.log" || {
+            echo "::error::Qwen1.5-MoE Q8_0: the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Qwen1.5-MoE-A2.7B-Chat Q8_0 GGUF across two GPUs (tensor parallel)
+        # Phase 3: the routed experts split whole across both GPUs (each
+        # routes over all 60, computes its 30, one reduction), the shared
+        # expert split like a dense MLP, attention replicated. Compared with
+        # the layer-segment run above; a divergence is reported (summation
+        # order differs across GPUs, so a late greedy tie may flip).
+        if: ${{ !cancelled() && env.SUITE_MOE == 'true' && env.MAGNETAR_QWEN_MOE_GGUF_Q8_0_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_CUDA_DEVICES: "0,1"
+          MAGNETAR_MULTI_GPU: tensor
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/qwen-moe-q8_0-gguf"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_qwen_moe_a2_7b_q8_0_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/two-gpus-tensor.log"
+          grep -h 'GPU(s)' "$dir"/*.log || true
+          grep -h '\[step capture\]' "$dir/two-gpus-tensor.log" | sort | uniq -c | head -20 || true
+          grep -Eq 'generated text " ?Paris' "$dir/two-gpus-tensor.log" || {
+            echo "::error::Qwen1.5-MoE Q8_0 tensor parallel: the continuation does not start with 'Paris'"
+            exit 1
+          }
+          layers="$(grep 'generated token ids' "$dir/two-gpus.log" || true)"
+          tensor="$(grep 'generated token ids' "$dir/two-gpus-tensor.log")"
+          if [ -n "$layers" ] && [ "$layers" != "$tensor" ]; then
+            echo "::warning::Qwen1.5-MoE Q8_0: token ids differ between layer segments and tensor parallel"
+            diff <(echo "$layers") <(echo "$tensor") || true
+          fi
+      - name: GPU peer-to-peer readiness, again (diagnostic)
+        # The readiness printed at the start, repeated where the job's log
+        # tail keeps it.
+        if: always()
+        continue-on-error: true
+        run: cat "$RUNNER_TEMP/qualification-reports/p2p-readiness.txt" || true
       - name: Upload qualification reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

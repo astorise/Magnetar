@@ -4168,11 +4168,22 @@ fn streaming_materialization_fixture() -> (
     ModelManifest,
     Arc<ReferenceCpuExecutor>,
 ) {
-    let manifest = manifest_with_tensors(vec![
+    streaming_materialization_fixture_for(manifest_with_tensors(vec![
         ("weight.a", vec![2, 2]),
         ("weight.b", vec![2, 2]),
         ("weight.c", vec![2, 2]),
-    ]);
+    ]))
+}
+
+/// [`streaming_materialization_fixture`] for an arbitrary manifest.
+fn streaming_materialization_fixture_for(
+    manifest: ModelManifest,
+) -> (
+    Runtime,
+    ModelInstanceId,
+    ModelManifest,
+    Arc<ReferenceCpuExecutor>,
+) {
     let mut coordinator = ModelLoadingCoordinator::new();
     coordinator.register_architecture(ModelArchitectureImplementation {
         architecture: manifest.architecture.clone(),
@@ -4253,6 +4264,79 @@ fn stream_materialize_model_instance_weights_succeeds_and_reads_each_tensor_once
         vec!["weight.a", "weight.b", "weight.c"],
         "each tensor must be read exactly once, in the manifest's own order"
     );
+}
+
+/// `execute-direct-quantized-weights`: a block-quantized, transposed-storage
+/// weight is first offered packed; a Provider that declines it (Reference
+/// CPU computes only from f32) receives the dequantized weight in its
+/// declared, untransposed shape, admitted at its f32 size.
+#[test]
+fn stream_materialization_dequantizes_a_declined_packed_weight_into_its_declared_shape() {
+    let mut manifest = manifest_with_tensors(vec![("weight.q", vec![32, 2])]);
+    manifest.tensors[0].storage_dtype = ModelDType::Q8;
+    manifest.tensors[0].layout = Some(crate::packed_weight::TRANSPOSED_STORAGE_LAYOUT.into());
+    manifest.tensors[0].size_bytes = Some(68);
+    let (mut runtime, instance, manifest, executor) =
+        streaming_materialization_fixture_for(manifest);
+    // Two stored rows of 32 quants: d = 0.5 then d = 2.0.
+    let mut bytes = 0x3800_u16.to_le_bytes().to_vec();
+    bytes.extend((0..32).map(|i| (i as i8 - 16) as u8));
+    bytes.extend(0x4000_u16.to_le_bytes());
+    bytes.extend((0..32).map(|i| (100 - i as i8) as u8));
+    let payload_source =
+        RecordingPayloadSource::new(BTreeMap::from([("weight.q".to_string(), bytes)]));
+
+    stream_materialize_model_instance_weights(
+        &mut runtime,
+        &instance,
+        "test",
+        &manifest.tensors,
+        &payload_source,
+    )
+    .expect("the declined packed weight materializes dequantized");
+
+    assert_eq!(payload_source.call_log(), vec!["weight.q"], "read once");
+    let resource = runtime
+        .model_instance(&instance)
+        .unwrap()
+        .definition()
+        .resource_bindings
+        .weights["weight.q"]
+        .clone();
+    let stored = executor.read_tensor(&resource).expect("stored as f32");
+    assert_eq!(stored.shape, vec![32, 2]);
+    for k in 0..32 {
+        assert_eq!(stored.data[k * 2], 0.5 * (k as f32 - 16.0));
+        assert_eq!(stored.data[k * 2 + 1], 2.0 * (100.0 - k as f32));
+    }
+    assert_eq!(active_allocation_bytes(&runtime), 64 * 4);
+}
+
+/// A transposed-storage layout on anything but a matrix, or an unknown
+/// layout, is refused rather than read as untransposed bytes.
+#[test]
+fn materialization_rejects_unusable_storage_layouts() {
+    for (shape, layout) in [
+        (vec![64], crate::packed_weight::TRANSPOSED_STORAGE_LAYOUT),
+        (vec![2, 2], "column-major-ish"),
+    ] {
+        let mut manifest = manifest_with_tensors(vec![("weight.a", shape)]);
+        manifest.tensors[0].layout = Some(layout.into());
+        let element_count: u64 = manifest.tensors[0].shape.iter().product();
+        let payload_source = RecordingPayloadSource::new(BTreeMap::from([(
+            "weight.a".to_string(),
+            f32_tensor_bytes(&vec![1.0; element_count as usize]),
+        )]));
+        let error = crate::model_loading::host_tensor_from_payload_source(
+            &manifest.tensors[0],
+            &payload_source,
+        )
+        .expect_err("the layout is refused");
+        assert!(
+            error.to_string().contains("layout") || error.to_string().contains("transposed"),
+            "{error}"
+        );
+    }
 }
 
 /// Task 6.6: a payload-read failure partway through a streaming attempt

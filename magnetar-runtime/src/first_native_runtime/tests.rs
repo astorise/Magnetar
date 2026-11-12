@@ -4454,6 +4454,7 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
         rmsnorm_epsilon: 1e-6,
         tied_embeddings: false,
         attention_bias: false,
+        mixture_of_experts: None,
         require_bos: false,
         require_pad: false,
         expected_added_tokens: None,
@@ -4998,11 +4999,12 @@ fn production_loaded_model_load_with_component_permits_a_component_with_no_decla
 /// astorise/Magnetar#75's required negative proof, at the same
 /// `ProductionLoadedModel::load_with_component` layer
 /// `production_loaded_model_load_with_component_matches_the_singleton_path`
-/// exercises for the family gate: the real checked-in Qwen Component now
-/// declares `compatibility.artifact_formats: [huggingface]` in its own
-/// manifest (see `qwen-real.component.wasm.magnetar-component.yaml`).
-/// Pairing it with a hand-built Model Artifact manifest whose
-/// `architecture.family` is `"qwen2"` (so the *family* gate passes) but
+/// exercises for the family gate: the real checked-in Llama Component,
+/// registered with its manifest narrowed to
+/// `compatibility.artifact_formats: [huggingface]` (the checked-in one
+/// declares both formats). Pairing it with a hand-built Model Artifact
+/// manifest whose `architecture.family` is `"llama"` (so the *family* gate
+/// passes) but
 /// whose `artifact_format` is [`ArtifactFormat::Gguf`] must be rejected by
 /// the *format* gate alone -- proving `load_with_component`'s new
 /// `artifact_formats` check is real and independent of the pre-existing
@@ -5059,7 +5061,7 @@ fn production_loaded_model_load_with_component_rejects_a_format_mismatched_compo
     let manifest = ModelManifest {
         schema_version: crate::MODEL_ARTIFACT_SCHEMA_VERSION,
         id,
-        architecture: ModelArchitecture::new("qwen2", "format-mismatch-test"),
+        architecture: ModelArchitecture::new("llama", "format-mismatch-test"),
         parts,
         storage_dtype: Some(ModelDType::F32),
         compute_dtype: None,
@@ -5081,9 +5083,10 @@ fn production_loaded_model_load_with_component_rejects_a_format_mismatched_compo
         signatures: Vec::new(),
         source: None,
         architecture_config: Some(architecture_config_from_first_native_model_config(&config)),
-        // The real checked-in Qwen Component declares
-        // `compatibility.artifact_formats: [huggingface]` -- `Gguf` here is
-        // the one and only thing that must trigger the rejection below.
+        // The real Llama Component, registered below with a manifest that
+        // declares `compatibility.artifact_formats: [huggingface]` only --
+        // `Gguf` here is the one and only thing that must trigger the
+        // rejection below.
         artifact_format: ArtifactFormat::Gguf,
     };
 
@@ -5093,11 +5096,27 @@ fn production_loaded_model_load_with_component_rejects_a_format_mismatched_compo
     let fixture = production_model_fixture(manifest, tokenizer_metadata, delegate_tokenizer)
         .expect("production fixture builds against the canonical config");
 
+    let huggingface_only = String::from_utf8(LLAMA_REAL_COMPONENT_MANIFEST_BYTES.to_vec())
+        .unwrap()
+        .replace("    - gguf\n", "");
+    assert!(!huggingface_only.contains("- gguf"));
+    // The registry caches a manifest per Component digest, so the narrowed
+    // manifest goes with a byte-distinct copy of the same Component: one
+    // trailing custom section (id 0, name "magnetar-test") changes its
+    // digest and nothing it does.
+    let mut component_bytes = LLAMA_REAL_COMPONENT_BYTES.to_vec();
+    let name = b"magnetar-test";
+    component_bytes.extend([0, (name.len() + 1) as u8, name.len() as u8]);
+    component_bytes.extend(name);
     let component_trust = ComponentTrustStore::default()
-        .trust_digest(&ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES).value);
+        .trust_digest(&ComponentDigest::sha256(&component_bytes).value);
+    let huggingface_only = huggingface_only.replace(
+        &ComponentDigest::sha256(LLAMA_REAL_COMPONENT_BYTES).value,
+        &ComponentDigest::sha256(&component_bytes).value,
+    );
     let digest = register_inference_component_artifact(
-        QWEN_REAL_COMPONENT_BYTES.to_vec(),
-        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        component_bytes,
+        huggingface_only.into_bytes(),
         &component_trust,
     )
     .expect("registration succeeds")
@@ -5117,9 +5136,9 @@ fn production_loaded_model_load_with_component_rejects_a_format_mismatched_compo
         Some(digest),
     ) {
         Ok(_) => panic!(
-            "a GGUF-declared Model Artifact paired with a real Qwen Component that declares \
+            "a GGUF-declared Model Artifact paired with a real Component that declares \
              `compatibility.artifact_formats: [huggingface]` must be rejected, even though the \
-             architecture family (`qwen2`) matches"
+             architecture family (`llama`) matches"
         ),
         Err(error) => {
             assert!(
@@ -11541,9 +11560,11 @@ fn cached_graphs_reuse_prepared_plans_until_the_registry_changes() {
 /// `model-config` 1.4.0's `rope-scaling`: the real Llama Component reads a
 /// checkpoint's Llama 3 frequency scaling and declares it on every `rope`
 /// node itself (the Runtime only forwards node attributes), while a
-/// Component that predates it (the real Qwen Component, compiled against
-/// 1.3.0) is refused for a scaled checkpoint instead of silently building
-/// an unscaled graph.
+/// Component that does not apply it (the real Qwen Component) refuses to
+/// build a graph for a scaled checkpoint -- it traps on a declared
+/// `rope-scaling` (1.5.0), and a Component predating 1.4.0 would be
+/// refused by the Runtime's own check -- instead of silently building an
+/// unscaled graph.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 #[test]
 fn llama3_rope_scaling_is_declared_by_the_component_and_required_of_it() {
@@ -11594,7 +11615,136 @@ fn llama3_rope_scaling_is_declared_by_the_component_and_required_of_it() {
         panic!("a Component that does not declare the scaling must be refused");
     };
     assert!(
-        error.to_string().contains("frequency scaling"),
+        error.to_string().contains("frequency scaling")
+            || error.to_string().starts_with("e2e-model-component-failed"),
         "unexpected error: {error}"
     );
+}
+
+/// `model-config` 1.5.0's `mixture-of-experts` (`execute-and-cache-moe-
+/// experts` F02): for a checkpoint that declares one, the real Qwen
+/// Component replaces every layer's dense MLP with `moe-experts` over the
+/// router logits and stacked expert weights, plus the shared expert scaled
+/// by `sigmoid` through `row-scale`; a dense checkpoint keeps its dense
+/// MLP and no MoE node.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn the_qwen_component_builds_a_mixture_of_experts_graph_when_the_config_declares_one() {
+    let digest = ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES);
+    let trust = ComponentTrustStore::default().trust_digest(&digest.value);
+    register_inference_component_artifact(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &trust,
+    )
+    .expect("the real Qwen Component must register");
+    let fixture = e2e_fixture().expect("fixture builds");
+    let dense = architecture_config_from_first_native_model_config(&fixture.config);
+    let moe = crate::MixtureOfExpertsConfig {
+        experts: 6,
+        experts_per_token: 2,
+        expert_intermediate_size: 4,
+        shared_expert_intermediate_size: Some(8),
+        normalize_top_k: false,
+    };
+    let routed = ModelArchitectureConfig {
+        mixture_of_experts: Some(moe),
+        ..dense.clone()
+    };
+    let operators = |config: &ModelArchitectureConfig| {
+        let (graphs, _definition, _instance) =
+            build_first_native_graphs_from_named_component(&digest, config, &fixture.identity, 2)
+                .expect("the Qwen Component builds graphs");
+        let mut nodes = Vec::new();
+        for graph in [&graphs.prefill, &graphs.decode] {
+            nodes.extend(graph.nodes.values().cloned());
+        }
+        nodes
+    };
+
+    let dense_nodes = operators(&dense);
+    assert!(
+        dense_nodes
+            .iter()
+            .all(|node| node.operator.name() != "moe-experts")
+    );
+
+    let nodes = operators(&routed);
+    let layers = u64::from(dense.num_hidden_layers);
+    let moe_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.operator.name() == "moe-experts")
+        .collect();
+    assert_eq!(
+        moe_nodes.len() as u64,
+        2 * layers,
+        "one per layer and phase"
+    );
+    for node in &moe_nodes {
+        assert_eq!(node.inputs.len(), 5);
+        assert_eq!(
+            node.attributes.get("experts"),
+            Some(&OperatorAttributeValue::Integer(6))
+        );
+        assert_eq!(
+            node.attributes.get("top_k"),
+            Some(&OperatorAttributeValue::Integer(2))
+        );
+        assert_eq!(
+            node.attributes.get("normalize_top_k"),
+            Some(&OperatorAttributeValue::Boolean(false))
+        );
+        assert!(node.inputs[2].as_str().ends_with("moe.experts_gate_proj"));
+        assert!(node.inputs[4].as_str().ends_with("moe.experts_down_proj"));
+    }
+    let count = |operator: &str| {
+        nodes
+            .iter()
+            .filter(|node| node.operator.name() == operator)
+            .count() as u64
+    };
+    assert_eq!(count("row-scale"), 2 * layers);
+    assert!(nodes.iter().any(|node| {
+        node.operator.name() == "activation"
+            && node.attributes.get("kind")
+                == Some(&OperatorAttributeValue::String("sigmoid".into()))
+    }));
+
+    // Tensor parallelism: whole experts split, the shared expert split like
+    // a dense MLP, the router and the shared expert's gate replicated.
+    let (graphs, _definition, _instance) =
+        build_first_native_graphs_from_named_component(&digest, &routed, &fixture.identity, 2)
+            .expect("the Qwen Component builds graphs");
+    let plan = crate::tensor_parallel::TensorParallelPlan::from_graphs(
+        [&graphs.prefill, &graphs.decode],
+        vec![DeviceId::new("a"), DeviceId::new("b")],
+    )
+    .expect("the plan is consistent");
+    use crate::tensor_parallel::WeightShard;
+    let shard = |suffix: &str| plan.shard_for_weight(&format!("layers.0.{suffix}"));
+    let experts = Some(WeightShard::Experts { experts: 6 });
+    let named = |suffix: &str| {
+        moe_nodes[0]
+            .inputs
+            .iter()
+            .chain(nodes.iter().flat_map(|node| &node.inputs))
+            .filter_map(|edge| edge.as_str().strip_prefix("weight."))
+            .find(|name| name.starts_with("layers.0.") && name.ends_with(suffix))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no layer 0 weight ending in {suffix}"))
+    };
+    for (suffix, expected) in [
+        ("experts_gate_proj", experts),
+        ("experts_up_proj", experts),
+        ("experts_down_proj", experts),
+        ("shared_gate_proj", Some(WeightShard::Columns)),
+        ("shared_up_proj", Some(WeightShard::Columns)),
+        ("shared_down_proj", Some(WeightShard::Rows)),
+        ("router_proj", None),
+        ("shared_expert_gate", None),
+    ] {
+        let name = named(suffix);
+        let canonical = name.strip_prefix("layers.0.").unwrap();
+        assert_eq!(shard(canonical), expected, "{name}");
+    }
 }

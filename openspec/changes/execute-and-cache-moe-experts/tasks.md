@@ -1,8 +1,8 @@
 ## 1. Scope and compatibility
 
-- [ ] 1.1 Reconcile F02, F05, B09 with the existing contracts linked in proposal.md and record the exact initial supported profile.
+- [x] 1.1 (initial profile: Qwen1.5-MoE-A2.7B, see design.md) Reconcile F02, F05, B09 with the existing contracts linked in proposal.md and record the exact initial supported profile.
 - [ ] 1.2 Confirm upstream exit-gate dependencies, hardware access, checkpoint authorization, numeric/quality thresholds and memory/SLO budgets.
-- [ ] 1.3 Prefer current WIT; if new portable operators/state/results are needed, design a versioned additive extension, migration and unsupported behavior before implementation.
+- [x] 1.3 (`model-config.mixture-of-experts`, WIT 1.5.0, additive) Prefer current WIT; if new portable operators/state/results are needed, design a versioned additive extension, migration and unsupported behavior before implementation.
 
 ## 2. F02 Complete MoE model execution
 

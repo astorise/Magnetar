@@ -240,19 +240,32 @@ fn real_public_q8_0_gguf_checkpoint_loads_and_generates_on_reference_cpu() {
         .expect("architecture config was normalized");
     assert_eq!(config.num_hidden_layers, 24);
     assert_eq!(config.hidden_size, 896);
-    // Every projection weight in a real Q8_0 export is quantized; if
-    // dequantize-then-transpose sequencing were wrong, ingestion would
-    // either fail structurally or (worse) silently produce a corrupted
-    // tensor -- this only reaches generation at all because every such
-    // tensor was already resolved to real F32 content by ingestion time.
+    // Every projection weight in a real Q8_0 export is quantized, and now
+    // reaches Model Loading packed (`execute-direct-quantized-weights`):
+    // its storage dtype is kept and every quantized projection declares
+    // transposed storage instead of being transposed byte by byte, which
+    // would corrupt its blocks. Model Loading dequantizes them for Reference
+    // CPU, which declines packed weights.
+    let quantized: Vec<_> = ingested
+        .manifest
+        .tensors
+        .iter()
+        .filter(|tensor| tensor.storage_dtype == magnetar_runtime::model::ModelDType::Q8)
+        .collect();
     assert!(
-        ingested
-            .manifest
-            .tensors
-            .iter()
-            .all(|tensor| tensor.storage_dtype == magnetar_runtime::model::ModelDType::F32),
-        "every tensor must have been dequantized to F32 by the time ingestion returns"
+        !quantized.is_empty(),
+        "a Q8_0 export keeps quantized tensors"
     );
+    for tensor in &quantized {
+        let projection = tensor.name == "lm_head" || tensor.name.contains("proj");
+        assert_eq!(
+            tensor.layout.as_deref()
+                == Some(magnetar_runtime::packed_weight::TRANSPOSED_STORAGE_LAYOUT),
+            projection,
+            "{} declares transposed storage exactly when it is a projection",
+            tensor.name
+        );
+    }
     ingested.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
         max_tokens: Some(8),
         ..Default::default()
@@ -307,4 +320,555 @@ fn real_public_q8_0_gguf_checkpoint_loads_and_generates_on_reference_cpu() {
         "real Qwen2.5-0.5B-Instruct Q8_0 GGUF generated: {:?}",
         outcome.text
     );
+}
+
+/// A real, pinned `Q8_0` GGUF checkpoint generated on CUDA by
+/// [`generate_q8_0_gguf_on_cuda`].
+struct CudaQ8Checkpoint {
+    /// Prefixes every printed line, which the GPU workflow greps.
+    label: &'static str,
+    /// The environment variable naming the directory holding `model.gguf`.
+    dir_env: &'static str,
+    /// `repo@revision` and file, for the error and the artifact source.
+    repository: &'static str,
+    revision: &'static str,
+    file: &'static str,
+    sha256: &'static str,
+}
+
+/// `execute-direct-quantized-weights` (B03): a real `Q8_0` export on CUDA,
+/// its quantized matrices stored packed and read packed by the decode
+/// matmul -- or, with `MAGNETAR_CUDA_PACKED_WEIGHTS=0` (the disable
+/// control), dequantized to f32 at load as before. The Model Component is
+/// the one declaring the file's own architecture family. Prints the greedy
+/// tokens and the warm TTFT/TPOT so the GPU workflow can compare the two
+/// runs. Skips without a CUDA Device unless `MAGNETAR_REQUIRE_CUDA=1`. The
+/// file is never read whole: ingestion streams its digest, checked against
+/// the pinned one before anything is trusted.
+fn generate_q8_0_gguf_on_cuda(checkpoint: &CudaQ8Checkpoint) {
+    use magnetar_runtime::Provider;
+
+    // `MAGNETAR_CUDA_DEVICES=0,1`: one Provider spanning those GPUs, the
+    // Runtime placing the layers across them
+    // (`enforce-local-multigpu-and-expert-placement` G05).
+    let ordinals: Option<Vec<usize>> = std::env::var("MAGNETAR_CUDA_DEVICES").ok().map(|list| {
+        list.split(',')
+            .map(|ordinal| {
+                ordinal
+                    .trim()
+                    .parse()
+                    .expect("MAGNETAR_CUDA_DEVICES lists GPU ordinals")
+            })
+            .collect()
+    });
+    let (cuda, device_count): (Arc<dyn Provider>, usize) = match &ordinals {
+        Some(ordinals) => {
+            let multi = magnetar_provider_cuda::multi::CudaMultiProvider::for_devices(
+                ordinals,
+                "magnetar:provider/cuda",
+            );
+            let available = multi.is_available();
+            (Arc::new(multi), if available { ordinals.len() } else { 0 })
+        }
+        None => {
+            let single = magnetar_provider_cuda::CudaProvider::new();
+            let available = single.is_available();
+            (Arc::new(single), usize::from(available))
+        }
+    };
+    if device_count == 0 {
+        assert!(
+            std::env::var("MAGNETAR_REQUIRE_CUDA").as_deref() != Ok("1"),
+            "MAGNETAR_REQUIRE_CUDA=1 but no CUDA-capable Device is available"
+        );
+        eprintln!("skipped: no CUDA-capable Device");
+        return;
+    }
+    generate_gguf_with(
+        checkpoint,
+        cuda,
+        device_count,
+        &format!("{device_count} GPU(s)"),
+    );
+}
+
+/// The real GGUF checkpoint on the optimized CPU Provider
+/// (`execute-quantized-weights-on-cpu`): packed weights stay in host memory
+/// in their checkpoint encoding.
+fn generate_gguf_on_native_cpu(checkpoint: &CudaQ8Checkpoint) {
+    let executor = magnetar_provider_cpu::native::NativeCpuExecutor::new();
+    let threads = executor.threads();
+    let provider = magnetar_provider_cpu::native::NativeCpuProvider::with_executor(executor);
+    generate_gguf_with(
+        checkpoint,
+        Arc::new(provider),
+        1,
+        &format!(
+            "cpu-native {threads} thread(s) {:?}",
+            magnetar_provider_cpu::native::simd_level()
+        ),
+    );
+}
+
+fn generate_gguf_with(
+    checkpoint: &CudaQ8Checkpoint,
+    cuda: Arc<dyn magnetar_runtime::Provider>,
+    device_count: usize,
+    devices: &str,
+) {
+    use magnetar_runtime::{
+        GenerationParameters, GenerationStreamEvent, ProductionGenerationRequest,
+        ProductionLoadedModel, PromptInput, StopConditions,
+    };
+    use std::{ops::ControlFlow, time::Instant};
+
+    let label = checkpoint.label;
+    let dir = std::env::var_os(checkpoint.dir_env)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} is not set. Download {} revision {}'s {} into a directory as 'model.gguf' \
+                 and set that env var to it before running this test with --include-ignored.",
+                checkpoint.dir_env, checkpoint.repository, checkpoint.revision, checkpoint.file
+            )
+        });
+    let source = ProductionModelSource::authorized_local_bundle(
+        ModelArtifactSource::HuggingFace(format!(
+            "{}@{}",
+            checkpoint.repository, checkpoint.revision
+        )),
+        dir.clone(),
+    );
+    let load_started = Instant::now();
+    let mut ingested = GgufIngestor::new()
+        .ingest(&source)
+        .expect("the real quantized GGUF file ingests");
+    assert_eq!(
+        ingested.manifest.id.digest.value, checkpoint.sha256,
+        "the downloaded model.gguf does not match revision {}'s declared content digest -- \
+         re-download it",
+        checkpoint.revision
+    );
+    let vocab_size = ingested
+        .manifest
+        .architecture_config
+        .as_ref()
+        .expect("architecture config was normalized")
+        .vocab_size;
+    ingested.manifest.generation = Some(magnetar_runtime::model::ModelGenerationDefaults {
+        max_tokens: Some(64),
+        ..Default::default()
+    });
+    let tokenizer = magnetar_loader_gguf::load_gguf_tokenizer(
+        &source,
+        format!("{}-tokenizer", ingested.manifest.id.name.as_str()),
+        Some(vocab_size),
+    )
+    .expect("real tokenizer builds from the checkpoint's own embedded vocabulary");
+    let tokenizer_metadata = tokenizer.metadata().clone();
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
+    let trust_store =
+        ModelTrustStore::default().trust_digest(ingested.manifest.id.digest.value.clone());
+    let component = crate::test_support::real_component_for_architecture_family(
+        &ingested.manifest.architecture.family,
+    );
+    let fixture = production_model_fixture(
+        ingested.manifest.clone(),
+        tokenizer_metadata,
+        Arc::clone(&tokenizer),
+    )
+    .expect("production fixture builds from the real ingested quantized GGUF checkpoint");
+
+    let mut model = ProductionLoadedModel::load_with_component(
+        fixture,
+        ingested.payload_source.as_ref(),
+        trust_store,
+        cuda,
+        Some(component),
+    )
+    .expect("the real quantized checkpoint loads");
+    let tensor_parallel = model.tensor_parallel();
+    if std::env::var("MAGNETAR_MULTI_GPU").as_deref() == Ok("tensor") && device_count > 1 {
+        assert!(
+            tensor_parallel,
+            "MAGNETAR_MULTI_GPU=tensor over {device_count} GPUs must split the model"
+        );
+    }
+    let load_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
+    let request = |max_new_tokens| ProductionGenerationRequest {
+        prompt: PromptInput::PlainText("The capital of France is".into()),
+        parameters: GenerationParameters::greedy(),
+        stop_conditions: StopConditions::default(),
+        max_new_tokens: Some(max_new_tokens),
+        max_generation_millis: None,
+    };
+    model.generate(request(4), None).expect("warmup generates");
+
+    let mut token_times = Vec::new();
+    let started = Instant::now();
+    let outcome = model
+        .generate_streaming(request(64), None, &mut |event| {
+            if let GenerationStreamEvent::Token { .. } = event {
+                token_times.push(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+            ControlFlow::Continue(())
+        })
+        .expect("the real quantized checkpoint generates");
+    let tokens = &outcome.result.output.generated_token_ids;
+    assert!(tokens.len() > 1, "generated more than one token");
+    let ttft = token_times[0];
+    let tpot = (token_times[token_times.len() - 1] - ttft) / (token_times.len() - 1) as f64;
+    let packed = std::env::var("MAGNETAR_CUDA_PACKED_WEIGHTS").as_deref() != Ok("0")
+        && std::env::var("MAGNETAR_CPU_PACKED_WEIGHTS").as_deref() != Ok("0");
+    eprintln!(
+        "[{label}] family {}, {devices}, placement {:?}, tensor parallel {}: \
+         packed weights {}: load \
+         {load_ms:.0} ms; warm TTFT {ttft:.1} ms, TPOT {tpot:.2} ms over {} tokens",
+        ingested.manifest.architecture.family,
+        std::env::var("MAGNETAR_LAYER_PLACEMENT").unwrap_or_else(|_| "fill".into()),
+        if tensor_parallel { "on" } else { "off" },
+        if packed { "on" } else { "off" },
+        tokens.len()
+    );
+    eprintln!("[{label}] generated token ids {tokens:?}");
+    eprintln!("[{label}] generated text {:?}", outcome.text);
+    model.unload().expect("the real checkpoint unloads");
+}
+
+/// The real `Qwen2.5-0.5B-Instruct` `Q8_0` export on the optimized CPU
+/// Provider.
+#[test]
+#[ignore = "downloads/holds a ~650MB real quantized checkpoint"]
+fn real_public_q8_0_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native q8_0 gguf",
+        dir_env: "MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR",
+        repository: "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        revision: CHECKPOINT_REVISION,
+        file: "qwen2.5-0.5b-instruct-q8_0.gguf",
+        sha256: Q8_0_CHECKPOINT_SHA256,
+    });
+}
+
+/// The real `Mistral-7B-Instruct-v0.3` `Q4_K_M` export on the optimized
+/// CPU Provider.
+#[test]
+#[ignore = "downloads/holds a 4.4GB real quantized checkpoint"]
+fn real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native mistral-7b q4_k_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+        sha256: MISTRAL_7B_Q4_K_M_SHA256,
+    });
+}
+
+/// The real `Qwen2.5-0.5B-Instruct` `Q8_0` export on CUDA.
+#[test]
+#[ignore = "downloads/holds a ~650MB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_q8_0_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda q8_0 gguf",
+        dir_env: "MAGNETAR_QWEN_GGUF_Q8_0_REAL_CHECKPOINT_DIR",
+        repository: "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        revision: CHECKPOINT_REVISION,
+        file: "qwen2.5-0.5b-instruct-q8_0.gguf",
+        sha256: Q8_0_CHECKPOINT_SHA256,
+    });
+}
+
+/// `bartowski/Mistral-7B-Instruct-v0.3-GGUF`'s exact pinned commit:
+/// <https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/commit/61fd4167fff3ab01ee1cfe0da183fa27a944db48>
+/// (Apache-2.0). The file declares `general.architecture = llama`, so the
+/// Llama Model Component serves it; its query and key projections arrive
+/// in llama.cpp's interleaved row order, which the GGUF loader restores.
+const MISTRAL_7B_Q8_0_REVISION: &str = "61fd4167fff3ab01ee1cfe0da183fa27a944db48";
+/// `Mistral-7B-Instruct-v0.3-Q8_0.gguf`'s sha256 (7,702,565,088 bytes) at
+/// that revision, as Hugging Face declares it.
+const MISTRAL_7B_Q8_0_SHA256: &str =
+    "sha256:404857e776114baada71a08ebd3bba79d721ec7fca99705e7e7b892ae8bc583f";
+
+/// Mistral 7B Instruct v0.3 `Q8_0` on CUDA: 7.7 GB packed, which fits a
+/// 12 GB Device only because the quantized matrices stay packed.
+#[test]
+#[ignore = "downloads/holds a 7.7GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_q8_0_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b q8_0 gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_Q8_0_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-Q8_0.gguf",
+        sha256: MISTRAL_7B_Q8_0_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-Q4_K_M.gguf`'s sha256 (4,372,812,000 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: `Q4_K`
+/// matrices, with `Q6_K` for some (llama.cpp's `Q4_K_M` mix).
+const MISTRAL_7B_Q4_K_M_SHA256: &str =
+    "sha256:1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6";
+
+/// The real `Mistral-7B-Instruct-v0.3` `Q4_K_M` export on CUDA: its `Q4_K`
+/// matrices stored packed and read packed by the decode matmul, its `Q6_K`
+/// ones dequantized at load.
+#[test]
+#[ignore = "downloads/holds a 4.4GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b q4_k_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+        sha256: MISTRAL_7B_Q4_K_M_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-Q3_K_M.gguf`'s sha256 (3,522,941,152 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `Q3_K`
+/// matrices, with `Q4_K` and `Q6_K` for some (llama.cpp's `Q3_K_M` mix).
+const MISTRAL_7B_Q3_K_M_SHA256: &str =
+    "sha256:145b11df092f04bbecb9fd99e83d1f3d8a6d1e53805682bfba1fe314f306e1d5";
+
+/// The real `Mistral-7B-Instruct-v0.3` `Q3_K_M` export on CUDA, every
+/// k-quant matrix stored packed.
+#[test]
+#[ignore = "downloads/holds a 3.5GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_q3_k_m_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b q3_k_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_Q3_K_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-Q3_K_M.gguf",
+        sha256: MISTRAL_7B_Q3_K_M_SHA256,
+    });
+}
+
+/// The real `Mistral-7B-Instruct-v0.3` `Q3_K_M` export on the optimized
+/// CPU Provider.
+#[test]
+#[ignore = "downloads/holds a 3.5GB real quantized checkpoint"]
+fn real_public_mistral_7b_q3_k_m_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native mistral-7b q3_k_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_Q3_K_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-Q3_K_M.gguf",
+        sha256: MISTRAL_7B_Q3_K_M_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-Q2_K.gguf`'s sha256 (2,722,877,664 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `Q2_K`
+/// matrices, with `Q3_K`, `Q4_K` and `Q6_K` for some (llama.cpp's `Q2_K`
+/// mix).
+const MISTRAL_7B_Q2_K_SHA256: &str =
+    "sha256:6696020e424ccf3bc4ab6ac2bc639220f3d09ad6a225d5c3e16033a1ff9a4885";
+
+/// The real `Mistral-7B-Instruct-v0.3` `Q2_K` export on CUDA, every
+/// k-quant matrix stored packed.
+#[test]
+#[ignore = "downloads/holds a 2.7GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_q2_k_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b q2_k gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_Q2_K_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-Q2_K.gguf",
+        sha256: MISTRAL_7B_Q2_K_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ4_XS.gguf`'s sha256 (3,911,962,848 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly
+/// `IQ4_XS` matrices.
+const MISTRAL_7B_IQ4_XS_SHA256: &str =
+    "sha256:0f027bb80c65d1a81c5c4b88b9bc79337d30058b7a78b036a033b9f0b44b7a0d";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ4_XS` export on CUDA, its
+/// i-quant and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 4GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq4_xs_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq4_xs gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ4_XS_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ4_XS.gguf",
+        sha256: MISTRAL_7B_IQ4_XS_SHA256,
+    });
+}
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ4_XS` export on the optimized
+/// CPU Provider.
+#[test]
+#[ignore = "downloads/holds a 4GB real quantized checkpoint"]
+fn real_public_mistral_7b_iq4_xs_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native mistral-7b iq4_xs gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ4_XS_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ4_XS.gguf",
+        sha256: MISTRAL_7B_IQ4_XS_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ4_NL.gguf`'s sha256 (4,130,066,656 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly
+/// `IQ4_NL` matrices.
+const MISTRAL_7B_IQ4_NL_SHA256: &str =
+    "sha256:c2048801d2895ac26048eae97ccf4d502f07fbde782564f12692063d54415643";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ4_NL` export on CUDA, its
+/// i-quant and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 4GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq4_nl_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq4_nl gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ4_NL_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ4_NL.gguf",
+        sha256: MISTRAL_7B_IQ4_NL_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ3_M.gguf`'s sha256 (3,288,846,560 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ3_S`
+/// matrices.
+const MISTRAL_7B_IQ3_M_SHA256: &str =
+    "sha256:4ea14c5a6c787ac2703505f04a4ee746f746d1ace3ffd907af28f6f179e6b224";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ3_M` export on CUDA, its i-quant
+/// and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 3.3 GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq3_m_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq3_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ3_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ3_M.gguf",
+        sha256: MISTRAL_7B_IQ3_M_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf`'s sha256 (2,830,880,992 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ3_XXS`
+/// matrices.
+const MISTRAL_7B_IQ3_XXS_SHA256: &str =
+    "sha256:131c8b3e5ab9877dd921c81cc8674e797d7ca701a828c54552ae31d24111c123";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ3_XXS` export on CUDA, its i-quant
+/// and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 2.8 GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq3_xxs_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq3_xxs gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ3_XXS_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf",
+        sha256: MISTRAL_7B_IQ3_XXS_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ2_M.gguf`'s sha256 (2,504,249,568 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ2_S`
+/// matrices.
+const MISTRAL_7B_IQ2_M_SHA256: &str =
+    "sha256:b54e1139f0940dd0d59369389064488bc9663bfcd985e7c6e6d74da2ad2b4654";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ2_M` export on CUDA, its i-quant
+/// and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 2.5 GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq2_m_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq2_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ2_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ2_M.gguf",
+        sha256: MISTRAL_7B_IQ2_M_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ2_XS.gguf`'s sha256 (2,201,473,248 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ2_XS`
+/// matrices.
+const MISTRAL_7B_IQ2_XS_SHA256: &str =
+    "sha256:da7cb13e0d184c15e32dd1a7ceb3e496463a95eadb75e8497d006f8786e4e414";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ2_XS` export on CUDA, its i-quant
+/// and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 2.2 GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq2_xs_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq2_xs gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ2_XS_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ2_XS.gguf",
+        sha256: MISTRAL_7B_IQ2_XS_SHA256,
+    });
+}
+
+/// `Mistral-7B-Instruct-v0.3-IQ2_XXS.gguf`'s sha256 (1,994,903,776 bytes) at
+/// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ2_XXS`
+/// matrices.
+const MISTRAL_7B_IQ2_XXS_SHA256: &str =
+    "sha256:5d993ed907dfdfe24e24d4f081a7b999c45498ecce39902983115d0d09d013db";
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ2_XXS` export on CUDA, its i-quant
+/// and k-quant matrices stored packed.
+#[test]
+#[ignore = "downloads/holds a 2.0 GB real quantized checkpoint and needs a CUDA Device"]
+fn real_public_mistral_7b_iq2_xxs_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda mistral-7b iq2_xxs gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ2_XXS_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ2_XXS.gguf",
+        sha256: MISTRAL_7B_IQ2_XXS_SHA256,
+    });
+}
+
+/// `RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf`'s exact pinned commit
+/// (the `Q8_0` export of `Qwen/Qwen1.5-MoE-A2.7B-Chat`): 24 layers of 60
+/// routed experts (top 4) and a shared expert.
+const QWEN_MOE_Q8_0_REVISION: &str = "947580e7b3904cd4081810d0efec4520a75609c7";
+/// `Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf`'s sha256 (15,226,010,336 bytes) at
+/// that revision, as Hugging Face declares it.
+const QWEN_MOE_Q8_0_SHA256: &str =
+    "sha256:d20e59b6180c775c648703fd63b8df7d01fc107672441fc3746c41f1dcaf904c";
+
+/// Qwen1.5-MoE-A2.7B-Chat `Q8_0` on CUDA (`execute-and-cache-moe-experts`
+/// F02): 15 GB packed, more than one 12 GB GPU holds, so it runs with
+/// `MAGNETAR_CUDA_DEVICES` listing two, the Runtime placing its layers
+/// across them.
+#[test]
+#[ignore = "downloads/holds a 15GB real quantized checkpoint and needs two CUDA Devices"]
+fn real_public_qwen_moe_a2_7b_q8_0_gguf_checkpoint_generates_on_cuda() {
+    generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
+        label: "cuda qwen1.5-moe-a2.7b q8_0 gguf",
+        dir_env: "MAGNETAR_QWEN_MOE_GGUF_Q8_0_REAL_CHECKPOINT_DIR",
+        repository: "RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf",
+        revision: QWEN_MOE_Q8_0_REVISION,
+        file: "Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf",
+        sha256: QWEN_MOE_Q8_0_SHA256,
+    });
 }

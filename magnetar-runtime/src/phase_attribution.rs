@@ -127,6 +127,7 @@ pub enum CounterAvailability {
 /// record through an operator name.
 const OPERATOR_LABELS: &[&str] = &[
     "add",
+    "activation",
     "attention",
     "concat",
     "embedding",
@@ -134,10 +135,12 @@ const OPERATOR_LABELS: &[&str] = &[
     "matmul",
     "matmul-bias",
     "matmul-residual",
+    "moe-experts",
     "mul",
     "residual-add",
     "rmsnorm",
     "rope",
+    "row-scale",
     "silu",
     "silu-mul",
     "softmax",

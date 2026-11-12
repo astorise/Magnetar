@@ -4,7 +4,7 @@ The 29 October 2026 inference optimization roadmap identifies execution gaps bey
 
 ## What Changes
 
-- `D08` (P1, effort L): Qualified quantized KV storage.
+- `D08` (P1, effort L): Qualified quantized KV storage, specified concretely in [`quantize-kv-history`](../quantize-kv-history/proposal.md).
 - `D09` (P2, effort XL): Explicit KV tier movement.
 
 Qualify quantized KV only together with compatible attention kernels. Treat GPU/RAM/SSD copies as explicit snapshots with bounded transfer, checksums and new destination leases, preserving canonical metadata and an authorized re-prefill fallback.

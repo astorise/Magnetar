@@ -298,13 +298,13 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
     let model_config_capability = Arc::new(crate::ModelConfigCapability::new());
     let mut engine = WasmtimeComponentEngine::new().unwrap();
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.3.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.5.0");
     engine.register_capability(
         graph_builder_interface.clone(),
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.3.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.5.0");
     engine.register_capability(
         model_config_interface.clone(),
         model_config_capability.clone() as Arc<dyn HostCapability>,
@@ -312,7 +312,7 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
 
     let export_interface = WitInterface::new(
         "magnetar:model-component-graph/model-component-graph-producer",
-        "1.3.0",
+        "1.5.0",
     );
     let definition = ComponentDefinition {
         id: ComponentDefinitionId::new(200),
@@ -385,6 +385,7 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
             rope_frequency_scaling: None,
             tie_word_embeddings: true,
             attention_bias: false,
+            mixture_of_experts: None,
             bos_token_id: None,
             eos_token_id: None,
         },

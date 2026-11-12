@@ -66,11 +66,11 @@ pub(crate) fn real_component_for_architecture_family(
     panic!("no real Model Component declares architecture family '{family}'")
 }
 
-pub(crate) const HIDDEN_SIZE: u64 = 4;
+pub(crate) const HIDDEN_SIZE: u64 = 8;
 pub(crate) const LAYER_COUNT: u64 = 1;
 pub(crate) const ATTENTION_HEAD_COUNT: u64 = 2;
 pub(crate) const KV_HEAD_COUNT: u64 = 2;
-pub(crate) const HEAD_DIMENSION: u64 = 2;
+pub(crate) const HEAD_DIMENSION: u64 = 4;
 pub(crate) const INTERMEDIATE_SIZE: u64 = 8;
 pub(crate) const VOCAB_SIZE: u64 = 16;
 

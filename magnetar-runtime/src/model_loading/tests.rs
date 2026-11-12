@@ -331,3 +331,155 @@ fn host_tensors_from_artifact_bytes_rejects_shape_size_mismatch() {
         .expect_err("shape/size mismatch must be rejected");
     assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
 }
+
+#[path = "k_quant_golden.rs"]
+mod k_quant_golden;
+
+/// The k-quant and i-quant dequantizations match llama.cpp's reference
+/// implementation bit for bit on random super-blocks.
+#[test]
+fn k_quant_dequantization_matches_the_gguf_reference_bit_for_bit() {
+    use k_quant_golden::*;
+    let q6 = dequantize_q6_k(&Q6_K_GOLDEN_BYTES);
+    assert_eq!(q6.len(), Q6_K_GOLDEN_BITS.len());
+    for (index, (value, bits)) in q6.iter().zip(Q6_K_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "Q6_K value {index}: {value}");
+    }
+    let q2 = dequantize_q2_k(&Q2_K_GOLDEN_BYTES);
+    assert_eq!(q2.len(), Q2_K_GOLDEN_BITS.len());
+    for (index, (value, bits)) in q2.iter().zip(Q2_K_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "Q2_K value {index}: {value}");
+    }
+    let q3 = dequantize_q3_k(&Q3_K_GOLDEN_BYTES);
+    assert_eq!(q3.len(), Q3_K_GOLDEN_BITS.len());
+    for (index, (value, bits)) in q3.iter().zip(Q3_K_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "Q3_K value {index}: {value}");
+    }
+    let nl = dequantize_iq4_nl(&IQ4_NL_GOLDEN_BYTES);
+    assert_eq!(nl.len(), IQ4_NL_GOLDEN_BITS.len());
+    for (index, (value, bits)) in nl.iter().zip(IQ4_NL_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ4_NL value {index}: {value}");
+    }
+    let xs = dequantize_iq4_xs(&IQ4_XS_GOLDEN_BYTES);
+    assert_eq!(xs.len(), IQ4_XS_GOLDEN_BITS.len());
+    for (index, (value, bits)) in xs.iter().zip(IQ4_XS_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ4_XS value {index}: {value}");
+    }
+    let values = dequantize_iq2_xxs(&IQ2_XXS_GOLDEN_BYTES);
+    assert_eq!(values.len(), IQ2_XXS_GOLDEN_BITS.len());
+    for (index, (value, bits)) in values.iter().zip(IQ2_XXS_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ2_XXS value {index}: {value}");
+    }
+    let values = dequantize_iq2_xs(&IQ2_XS_GOLDEN_BYTES);
+    assert_eq!(values.len(), IQ2_XS_GOLDEN_BITS.len());
+    for (index, (value, bits)) in values.iter().zip(IQ2_XS_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ2_XS value {index}: {value}");
+    }
+    let values = dequantize_iq2_s(&IQ2_S_GOLDEN_BYTES);
+    assert_eq!(values.len(), IQ2_S_GOLDEN_BITS.len());
+    for (index, (value, bits)) in values.iter().zip(IQ2_S_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ2_S value {index}: {value}");
+    }
+    let values = dequantize_iq3_xxs(&IQ3_XXS_GOLDEN_BYTES);
+    assert_eq!(values.len(), IQ3_XXS_GOLDEN_BITS.len());
+    for (index, (value, bits)) in values.iter().zip(IQ3_XXS_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ3_XXS value {index}: {value}");
+    }
+    let values = dequantize_iq3_s(&IQ3_S_GOLDEN_BYTES);
+    assert_eq!(values.len(), IQ3_S_GOLDEN_BITS.len());
+    for (index, (value, bits)) in values.iter().zip(IQ3_S_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "IQ3_S value {index}: {value}");
+    }
+    let q4 = dequantize_q4_k(&Q4_K_GOLDEN_BYTES);
+    assert_eq!(q4.len(), Q4_K_GOLDEN_BITS.len());
+    for (index, (value, bits)) in q4.iter().zip(Q4_K_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "Q4_K value {index}: {value}");
+    }
+}
+
+/// A transposed `Q6_K` projection keeps its bytes packed and dequantizes
+/// exactly like the load-time path; an untransposed one (an embedding
+/// table, read row by row) stays dequantized at load.
+#[test]
+fn transposed_q6_k_projections_stay_packed() {
+    use k_quant_golden::*;
+    let metadata = |layout: Option<&str>| ModelTensorMetadata {
+        name: "w".to_string(),
+        // Logical `[in, out]`: two output columns of 256 values each.
+        shape: vec![256, 2],
+        storage_dtype: ModelDType::Q6K,
+        layout: layout.map(str::to_string),
+        shard: None,
+        offset_bytes: Some(0),
+        size_bytes: Some(Q6_K_GOLDEN_BYTES.len() as u64),
+        quantization: None,
+        expected_compute_dtype: None,
+        digest: None,
+    };
+    let packed = packed_weight_from_raw_bytes(
+        &metadata(Some(crate::packed_weight::TRANSPOSED_STORAGE_LAYOUT)),
+        &Q6_K_GOLDEN_BYTES,
+    )
+    .expect("valid bytes")
+    .expect("a transposed Q6_K projection is packed");
+    assert_eq!(
+        packed.format(),
+        crate::packed_weight::PackedWeightFormat::Q6K
+    );
+    assert_eq!(packed.logical_shape(), [256, 2]);
+    let stored = packed.dequantize_stored();
+    for (index, (value, bits)) in stored.iter().zip(Q6_K_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "Q6_K value {index}: {value}");
+    }
+    let untransposed = ModelTensorMetadata {
+        shape: vec![2, 256],
+        ..metadata(None)
+    };
+    assert!(
+        packed_weight_from_raw_bytes(&untransposed, &Q6_K_GOLDEN_BYTES)
+            .expect("valid bytes")
+            .is_none()
+    );
+}
+
+/// A transposed F32 tensor's declared digest describes its storage bytes:
+/// they are verified before the transpose, and the materialized tensor is
+/// the declared (transposed) matrix.
+#[test]
+fn transposed_f32_tensors_verify_their_storage_digest() {
+    // Stored `[3, 2]`, declared `[2, 3]`.
+    let stored = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let (mut metadata, bytes) = artifact_bytes_test_tensor("weight.t", vec![2, 3], &stored);
+    metadata.layout = Some(crate::packed_weight::TRANSPOSED_STORAGE_LAYOUT.to_string());
+    metadata.digest = Some(crate::model::ModelDigest::sha256(&bytes));
+    let tensor = tensor_from_raw_bytes(&metadata, &bytes).expect("storage digest matches");
+    assert_eq!(tensor.shape, vec![2, 3]);
+    assert_eq!(tensor.data, vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
+    let mut wrong = bytes.clone();
+    wrong[0] ^= 1;
+    let error = tensor_from_raw_bytes(&metadata, &wrong).expect_err("tampered bytes rejected");
+    assert_eq!(error.code, ModelLoadingErrorCode::MaterializationFailed);
+}
+
+/// A weight's resident bytes: its storage when it stays packed or is f32,
+/// else its elements as f32.
+#[test]
+fn resident_weight_bytes_count_what_the_provider_holds() {
+    let base = f16_tensor_metadata("weight.h", vec![4, 64], 4 * 64 * 2);
+    assert_eq!(resident_weight_bytes(&base), 4 * 64 * 4);
+    let (f32_tensor, _) = artifact_bytes_test_tensor("weight.f", vec![2], &[1.0, 2.0]);
+    assert_eq!(resident_weight_bytes(&f32_tensor), 8);
+    let q8 = ModelTensorMetadata {
+        storage_dtype: ModelDType::Q8,
+        size_bytes: Some(4 * 2 * 34),
+        ..f16_tensor_metadata("weight.q", vec![4, 64], 0)
+    };
+    assert_eq!(resident_weight_bytes(&q8), 4 * 2 * 34);
+    // An untransposed k-quant table is dequantized at load.
+    let q4k_table = ModelTensorMetadata {
+        storage_dtype: ModelDType::Q4K,
+        size_bytes: Some(4 * 144),
+        ..f16_tensor_metadata("weight.e", vec![4, 256], 0)
+    };
+    assert_eq!(resident_weight_bytes(&q4k_table), 4 * 256 * 4);
+}

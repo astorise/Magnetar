@@ -16,6 +16,20 @@ use std::{
 };
 
 pub const OPERATOR_CATALOG_VERSION: CapabilityVersion = CapabilityVersion::new(1, 0, 0);
+
+/// Optional on every Operator (`enforce-local-multigpu-and-expert-placement`
+/// tensor parallelism): how the Model Component declares the node may be
+/// split across Devices. `column`: a matmul whose output features may be
+/// split; `row`: a matmul whose input features are split, each Device
+/// producing a partial sum; `heads`: a node operating per attention head;
+/// `local`: an elementwise node applied to each Device's share;
+/// `experts`: a `moe-experts` node whose experts may be split, whole, each
+/// Device producing a partial sum over the experts it holds. A Provider
+/// that does not split ignores it.
+pub const TENSOR_PARALLEL_ATTRIBUTE: &str = "tensor_parallel";
+
+/// The values [`TENSOR_PARALLEL_ATTRIBUTE`] takes.
+pub const TENSOR_PARALLEL_KINDS: [&str; 5] = ["column", "row", "heads", "local", "experts"];
 pub const OPERATOR_NAMESPACE: &str = "magnetar:operator";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -487,7 +501,22 @@ impl OperatorAttributeSchema {
                 None => {}
             }
         }
+        if let Some(value) = attributes.get(TENSOR_PARALLEL_ATTRIBUTE) {
+            match value {
+                OperatorAttributeValue::String(kind)
+                    if TENSOR_PARALLEL_KINDS.contains(&kind.as_str()) => {}
+                _ => {
+                    return Err(OperatorError::OperatorAttributeInvalid {
+                        attribute: TENSOR_PARALLEL_ATTRIBUTE.into(),
+                        reason: format!("must be one of {TENSOR_PARALLEL_KINDS:?}"),
+                    });
+                }
+            }
+        }
         for name in attributes.keys() {
+            if name == TENSOR_PARALLEL_ATTRIBUTE {
+                continue;
+            }
             if !self.rules.contains_key(name) {
                 return Err(OperatorError::OperatorAttributeInvalid {
                     attribute: name.clone(),
@@ -892,6 +921,19 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::Any,
         ),
+        // `execute-and-cache-moe-experts` F02: routed mixture of experts.
+        // Inputs `h [T, H]`, router logits `[T, E]`, stacked expert
+        // weights `gate [H, E*I]`, `up [H, E*I]`, `down [I, E*H]`; output
+        // `[T, H]`. See [`moe_experts_reference`].
+        (
+            "moe-experts",
+            OperatorFamily::LinearAlgebra,
+            5,
+            1,
+            ShapeRule::Any,
+        ),
+        // `out[t, :] = x[t, :] * s[t]` for `s` of shape `[T, 1]`.
+        ("row-scale", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         ("embedding", OperatorFamily::Tensor, 2, 1, ShapeRule::Any),
         (
             "rmsnorm",
@@ -1192,6 +1234,27 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "accumulation_dtype",
                 OperatorAttributeRule::optional(OperatorAttributeKind::DType),
+            ),
+        "moe-experts" => OperatorAttributeSchema::default()
+            .with_rule(
+                "experts",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "top_k",
+                OperatorAttributeRule::required(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "normalize_top_k",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
+            )
+            .with_rule(
+                "expert_first",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "expert_count",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             ),
         "activation" => OperatorAttributeSchema::default().with_rule(
             "kind",

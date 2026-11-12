@@ -687,6 +687,23 @@ pub trait ProviderExecutionApi: Send + Sync {
         self.write_tensor(id, tensor)
     }
 
+    /// Offers a Model Instance weight in its packed, block-quantized form
+    /// (`execute-direct-quantized-weights`). A Provider that computes
+    /// directly from `weight`'s format stores it under `id` and answers
+    /// [`crate::packed_weight::PackedWeightWrite::Stored`]; every Kernel
+    /// reading `id` must then accept it, dequantizing it itself where it
+    /// has no direct path. Any other Provider answers `Declined` and stores
+    /// nothing, and Model Loading writes the dequantized `f32` weight
+    /// through [`Self::write_weight_tensor`] instead.
+    fn write_packed_weight_tensor(
+        &self,
+        id: TensorResourceId,
+        weight: crate::packed_weight::PackedWeight,
+    ) -> Result<crate::packed_weight::PackedWeightWrite, ProviderExecutionError> {
+        let _ = (id, weight);
+        Ok(crate::packed_weight::PackedWeightWrite::Declined)
+    }
+
     /// Reads back a tensor previously written through [`Self::write_tensor`]
     /// or produced by a completed Kernel invocation. See that method's
     /// documentation for why this is host-tensor-shaped and provisional.
@@ -969,6 +986,50 @@ pub trait ProviderExecutionApi: Send + Sync {
     /// are only called when this returns `true`.
     fn supports_step_capture(&self) -> bool {
         false
+    }
+
+    /// Takes the Runtime's placement of the Model Instance's decoder layers
+    /// across this Provider's Devices (`enforce-local-multigpu-and-expert-
+    /// placement` G05), before any weight is written: every later weight
+    /// goes to its layer's Device and every Kernel runs where its weights
+    /// are, the Provider moving activations across segment boundaries
+    /// explicitly. The default accepts a single-segment placement (nothing
+    /// to do) and rejects any other: such a Provider has one Device.
+    fn apply_layer_placement(
+        &self,
+        placement: &crate::layer_placement::LayerPlacement,
+    ) -> Result<(), ProviderExecutionError> {
+        if placement.segments().len() <= 1 {
+            return Ok(());
+        }
+        Err(ProviderExecutionError::new(
+            ProviderExecutionErrorCode::UnsupportedOperation,
+            ProviderExecutionPhase::Submit,
+            ProviderBinding::new("unknown"),
+            None,
+            "this Provider does not place layers across Devices",
+        ))
+    }
+
+    /// Takes the Runtime's tensor-parallel plan (which weights are split
+    /// across this Provider's Devices, and how) before any weight is
+    /// written: every later weight is stored as each Device's shard, and
+    /// every invocation runs on every Device over its shard. The default
+    /// accepts a plan that splits nothing and rejects any other.
+    fn apply_tensor_parallel(
+        &self,
+        plan: &crate::tensor_parallel::TensorParallelPlan,
+    ) -> Result<(), ProviderExecutionError> {
+        if !plan.splits() {
+            return Ok(());
+        }
+        Err(ProviderExecutionError::new(
+            ProviderExecutionErrorCode::UnsupportedOperation,
+            ProviderExecutionPhase::Submit,
+            ProviderBinding::new("unknown"),
+            None,
+            "this Provider does not split weights across Devices",
+        ))
     }
 
     /// Starts recording every Kernel invocation and resource access until

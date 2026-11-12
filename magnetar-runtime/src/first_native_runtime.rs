@@ -1268,6 +1268,9 @@ pub(crate) struct ComponentGraphCache {
     /// The Provider graphs are fused for (`graph_fusion`), or `None` to
     /// keep every graph exactly as its Component built it.
     fusion: Arc<Mutex<Option<ProviderBinding>>>,
+    /// Whether the Provider splits the model by tensor parallelism, so
+    /// row-parallel matmuls must keep their addends unfused.
+    tensor_parallel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One prompt length's graphs.
@@ -1654,6 +1657,19 @@ impl ComponentGraphCache {
         self.entries.lock().unwrap().clear();
     }
 
+    pub(crate) fn tensor_parallel(&self) -> bool {
+        self.tensor_parallel
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Records whether the Provider splits the model by tensor parallelism.
+    /// Forgets every cached graph, like [`Self::set_fusion_provider`].
+    pub(crate) fn set_tensor_parallel(&self, enabled: bool) {
+        self.tensor_parallel
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.entries.lock().unwrap().clear();
+    }
+
     /// Applies every fusion the fusion Provider currently advertises to
     /// freshly built graphs; graphs are returned unchanged otherwise.
     pub(crate) fn optimize(
@@ -1665,15 +1681,30 @@ impl ComponentGraphCache {
             return graphs;
         };
         let is_weight = |edge: &TensorEdgeId| weight_tensor_name_from_edge(edge.as_str()).is_some();
+        let tensor_parallel = self
+            .tensor_parallel
+            .load(std::sync::atomic::Ordering::Relaxed);
         type Pass<'a> = Box<dyn Fn(&ExecutionGraph) -> (ExecutionGraph, usize) + 'a>;
         let passes: [(&str, Pass<'_>); 4] = [
             (
                 crate::graph_fusion::MATMUL_BIAS_OPERATOR,
-                Box::new(|graph| crate::graph_fusion::fuse_matmul_bias(graph, is_weight)),
+                Box::new(move |graph| {
+                    if tensor_parallel {
+                        crate::graph_fusion::fuse_matmul_bias_tensor_parallel(graph, is_weight)
+                    } else {
+                        crate::graph_fusion::fuse_matmul_bias(graph, is_weight)
+                    }
+                }),
             ),
             (
                 crate::graph_fusion::MATMUL_RESIDUAL_OPERATOR,
-                Box::new(crate::graph_fusion::fuse_matmul_residual),
+                Box::new(move |graph| {
+                    if tensor_parallel {
+                        crate::graph_fusion::fuse_matmul_residual_tensor_parallel(graph)
+                    } else {
+                        crate::graph_fusion::fuse_matmul_residual(graph)
+                    }
+                }),
             ),
             (
                 crate::graph_fusion::SILU_MUL_OPERATOR,
@@ -2225,7 +2256,7 @@ fn resolved_kernel_memory_class(
     let Some(binding) = prepared_plan.node_binding(node) else {
         return KernelMemoryClass::Host;
     };
-    if binding.provider.as_str() == REFERENCE_CPU_PROVIDER_NAME {
+    if crate::reference_cpu::host_memory_provider(binding.provider.as_str()) {
         KernelMemoryClass::Host
     } else {
         KernelMemoryClass::Device
@@ -2255,7 +2286,7 @@ fn resolved_output_placement(
             REFERENCE_CPU_PROVIDER_NAME,
         ));
     };
-    if binding.provider.as_str() == REFERENCE_CPU_PROVIDER_NAME {
+    if crate::reference_cpu::host_memory_provider(binding.provider.as_str()) {
         return MemoryPlacement::ProviderOwnedOpaque(binding.provider.clone());
     }
     match &binding.device {
@@ -4085,6 +4116,67 @@ fn dispatch_first_native_graph_node(
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
+        "moe-experts" => {
+            if inputs.len() != 5 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 5 moe-experts inputs"),
+                });
+            }
+            let (rows, cols) = inputs[0].rows_cols()?;
+            let output_descriptor = f32_tensor_descriptor_from_shape(&[rows, cols]);
+            let resources = ["h", "logits", "gate", "up", "down"]
+                .into_iter()
+                .zip(inputs)
+                .map(|(role, value)| node_input_resource(node_id, role, value))
+                .collect();
+            dispatch_reference_cpu_operator_pre_admitted(
+                ctx,
+                node_id,
+                dispatch_operator_id("moe-experts", OperatorFamily::LinearAlgebra),
+                resources,
+                output_descriptor,
+                Some(output_target),
+                node.attributes.clone(),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "row-scale" => {
+            if inputs.len() != 2 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 2 row-scale inputs"),
+                });
+            }
+            let x = inputs.remove(0);
+            let scale = inputs.remove(0);
+            dispatch_qwen_binary_same_shape(
+                ctx,
+                node_id,
+                "row-scale",
+                OperatorFamily::Tensor,
+                x,
+                scale,
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "activation" => {
+            if inputs.len() != 1 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 1 activation input"),
+                });
+            }
+            let input = inputs.remove(0);
+            dispatch_qwen_unary(
+                ctx,
+                node_id,
+                "activation",
+                OperatorFamily::Activation,
+                input,
+                node.attributes.clone(),
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
         "silu" => {
             if inputs.len() != 1 {
                 return Err(InferenceApiError::GraphPlanningFailed {
@@ -4619,6 +4711,9 @@ fn execute_first_native_graph_nodes(
                 | "matmul-residual"
                 | "gated-matmul"
                 | "silu-mul"
+                | "moe-experts"
+                | "row-scale"
+                | "activation"
                 | "attention"
                 | "silu"
                 | "add"
@@ -5183,6 +5278,16 @@ fn execute_first_native_graph_nodes(
 /// the temperature (`sampling::device_greedy_plan`).
 type DeviceGreedyPlan = (Vec<std::ops::Range<u64>>, f32);
 
+/// Reports why a decode step was not captured or not replayed, when
+/// `MAGNETAR_STEP_CAPTURE_TRACE=1`: either silently falls back to running
+/// the step per node, so a Provider's capture support is otherwise only
+/// visible in step times.
+fn trace_step_capture(what: &str, reason: impl std::fmt::Display) {
+    if std::env::var("MAGNETAR_STEP_CAPTURE_TRACE").as_deref() == Ok("1") {
+        eprintln!("[step capture] {what}: {reason}");
+    }
+}
+
 /// Replays a recorded decode step. With `greedy`, the Provider selects the
 /// step's token on the Device when it can: the output then holds no logits
 /// and the selected column comes back instead.
@@ -5213,7 +5318,8 @@ fn replay_decode_step(
     runtime
         .phase_ledger_mut()
         .record(replay_clock, StepPhase::StepReplay);
-    if replayed.is_err() {
+    if let Err(error) = replayed {
+        trace_step_capture("replay invalidated", format!("{error:?}"));
         return Ok(None);
     }
     let materialize_clock = runtime.phase_ledger().clock();
@@ -6141,6 +6247,7 @@ impl E2eRuntimeModelExecutionEngine {
                     kv_store_capacity,
                 )? {
                     Some((recorded, output)) => {
+                        trace_step_capture("captured", format!("decode step {decode_index}"));
                         self.step_replay.record(key, recorded);
                         return Ok((output, None));
                     }
@@ -6193,6 +6300,7 @@ impl E2eRuntimeModelExecutionEngine {
         };
         let executor = resolve_kernel_execution_provider(runtime, &provider_binding)?;
         if !executor.supports_step_capture() {
+            trace_step_capture("capture skipped", "the Provider does not support it");
             return Ok(None);
         }
         // The input is written before the capture starts, as the per-node
@@ -6225,7 +6333,8 @@ impl E2eRuntimeModelExecutionEngine {
         runtime
             .phase_ledger_mut()
             .record(capture_clock, StepPhase::StepCapture);
-        if begun.is_err() {
+        if let Err(error) = begun {
+            trace_step_capture("capture not begun", error);
             return Ok(None);
         }
         let events_before = node_events.len();
@@ -6251,11 +6360,15 @@ impl E2eRuntimeModelExecutionEngine {
         );
         let end_clock = runtime.phase_ledger().clock();
         let captured = match executed {
-            Ok(output) => executor
-                .end_step_capture()
-                .ok()
-                .map(|capture| (capture, output)),
-            Err(_) => {
+            Ok(output) => match executor.end_step_capture() {
+                Ok(capture) => Some((capture, output)),
+                Err(error) => {
+                    trace_step_capture("capture not ended", error);
+                    None
+                }
+            },
+            Err(error) => {
+                trace_step_capture("captured step failed", format!("{error:?}"));
                 executor.abort_step_capture();
                 None
             }
@@ -6269,6 +6382,7 @@ impl E2eRuntimeModelExecutionEngine {
         };
         let logits = graph_edge_resource_id("logits");
         let Some(logits_shape) = executor.resident_shape(&logits) else {
+            trace_step_capture("capture dropped", "the logits are not resident");
             executor.release_step_capture(&capture);
             node_events.truncate(events_before);
             return Ok(None);
@@ -7402,19 +7516,14 @@ pub fn stream_materialize_model_instance_weights(
 ) -> Result<(), InferenceApiError> {
     let mut transaction = WeightMaterializationTransaction::begin(runtime, instance)?;
     for tensor in tensors {
-        let stage_result = host_tensor_from_payload_source(tensor, payload_source)
-            .map_err(|error| InferenceApiError::ModelLoadingFailed {
-                reason: error.to_string(),
-            })
-            .and_then(|host_tensor| {
-                transaction.stage_weight(
-                    runtime,
-                    instance,
-                    artifact_owner,
-                    &tensor.name,
-                    &host_tensor,
-                )
-            });
+        let stage_result = stream_stage_tensor(
+            &mut transaction,
+            runtime,
+            instance,
+            artifact_owner,
+            tensor,
+            payload_source,
+        );
         if let Err(error) = stage_result {
             transaction.abort(runtime);
             if let Ok(model_instance) = runtime.model_instances_mut().instance_mut(instance) {
@@ -7424,6 +7533,48 @@ pub fn stream_materialize_model_instance_weights(
         }
     }
     transaction.commit(runtime, instance)
+}
+
+/// Reads one tensor's storage bytes and stages it: a block-quantized
+/// matrix is first offered packed to the Provider
+/// (`execute-direct-quantized-weights`), and only dequantized to `f32` when
+/// the Provider declines it; everything else is converted to `f32` as
+/// before. The bytes are read once either way.
+fn stream_stage_tensor(
+    transaction: &mut WeightMaterializationTransaction,
+    runtime: &mut Runtime,
+    instance: &ModelInstanceId,
+    artifact_owner: &str,
+    tensor: &ModelTensorMetadata,
+    payload_source: &dyn ProductionArtifactPayloadSource,
+) -> Result<(), InferenceApiError> {
+    let loading_failed =
+        |error: crate::model_loading::ModelLoadingError| InferenceApiError::ModelLoadingFailed {
+            reason: error.to_string(),
+        };
+    let raw = crate::model_loading::read_tensor_payload(tensor, payload_source)
+        .map_err(loading_failed)?;
+    if let Some(packed) =
+        crate::model_loading::packed_weight_from_raw_bytes(tensor, &raw).map_err(loading_failed)?
+        && transaction.stage_packed_weight(
+            runtime,
+            instance,
+            artifact_owner,
+            &tensor.name,
+            packed,
+        )?
+    {
+        return Ok(());
+    }
+    let host_tensor =
+        crate::model_loading::tensor_from_raw_bytes(tensor, &raw).map_err(loading_failed)?;
+    transaction.stage_weight(
+        runtime,
+        instance,
+        artifact_owner,
+        &tensor.name,
+        &host_tensor,
+    )
 }
 
 /// Stages weight materialization one resource at a time -- Memory Manager
@@ -7511,8 +7662,18 @@ impl WeightMaterializationTransaction {
                         | ModelDType::F16
                         | ModelDType::Bf16
                         | ModelDType::Q8
+                        | ModelDType::Q2K
+                        | ModelDType::Q3K
+                        | ModelDType::Iq4Nl
+                        | ModelDType::Iq4Xs
+                        | ModelDType::Iq2Xxs
+                        | ModelDType::Iq2Xs
+                        | ModelDType::Iq2S
+                        | ModelDType::Iq3Xxs
+                        | ModelDType::Iq3S
                         | ModelDType::Q4K
                         | ModelDType::Q5K
+                        | ModelDType::Q6K
                 ))
         {
             return Err(InferenceApiError::WeightShapeOrDtypeMismatch {
@@ -7562,8 +7723,88 @@ impl WeightMaterializationTransaction {
                 ),
             });
         }
-        let resource_id = TensorResourceId::new(format!("model.{instance}.weight.{name}"));
         let byte_size = tensor.data.len() as u64 * std::mem::size_of::<f32>() as u64;
+        self.admit_and_write(
+            runtime,
+            instance,
+            artifact_owner,
+            name,
+            byte_size,
+            |executor, resource_id| {
+                executor
+                    .write_weight_tensor(resource_id, tensor.clone())
+                    .map(|()| true)
+            },
+        )
+        .map(|_| ())
+    }
+
+    /// Offers `weight`, the packed form of the declared weight `name`, to
+    /// the Provider (`execute-direct-quantized-weights`). `Ok(true)`: the
+    /// Provider stored it and it is staged exactly like a dequantized
+    /// weight, admitted at its packed size. `Ok(false)`: the Provider
+    /// declined and nothing was staged; the caller stages the dequantized
+    /// weight instead. The caller has verified the packed bytes against
+    /// the tensor's declared content digest.
+    fn stage_packed_weight(
+        &mut self,
+        runtime: &mut Runtime,
+        instance: &ModelInstanceId,
+        artifact_owner: &str,
+        name: &str,
+        weight: crate::packed_weight::PackedWeight,
+    ) -> Result<bool, InferenceApiError> {
+        let declared = runtime
+            .model_instance(instance)
+            .map_err(InferenceApiError::from)?
+            .definition()
+            .required_weight_shapes
+            .get(name)
+            .cloned();
+        if let Some((expected_shape, _)) = &declared
+            && expected_shape.as_slice() != weight.logical_shape().as_slice()
+        {
+            return Err(InferenceApiError::WeightShapeOrDtypeMismatch {
+                reason: format!(
+                    "packed weight '{name}' has logical shape {:?} but the artifact declares {expected_shape:?}",
+                    weight.logical_shape()
+                ),
+            });
+        }
+        let byte_size = weight.bytes().len() as u64;
+        self.admit_and_write(
+            runtime,
+            instance,
+            artifact_owner,
+            name,
+            byte_size,
+            |executor, resource_id| {
+                executor
+                    .write_packed_weight_tensor(resource_id, weight)
+                    .map(|written| written == crate::packed_weight::PackedWeightWrite::Stored)
+            },
+        )
+    }
+
+    /// Admits `byte_size` bytes for `name` through the Memory Manager, runs
+    /// `write` against the Provider, then registers the resource's
+    /// residency -- in that order, each step's error surfacing immediately.
+    /// `write` answers whether the Provider stored the resource; `false`
+    /// (a declined packed weight) releases the admission and stages
+    /// nothing.
+    fn admit_and_write(
+        &mut self,
+        runtime: &mut Runtime,
+        instance: &ModelInstanceId,
+        artifact_owner: &str,
+        name: &str,
+        byte_size: u64,
+        write: impl FnOnce(
+            &dyn ProviderExecutionApi,
+            TensorResourceId,
+        ) -> Result<bool, crate::scheduler::ProviderExecutionError>,
+    ) -> Result<bool, InferenceApiError> {
+        let resource_id = TensorResourceId::new(format!("model.{instance}.weight.{name}"));
         // Admission SHALL precede Provider materialization: reserve the
         // resource's memory before writing its bytes into Provider-owned
         // storage, not after.
@@ -7578,19 +7819,24 @@ impl WeightMaterializationTransaction {
             .map_err(|error| InferenceApiError::MemoryAdmissionFailed {
                 reason: format!("failed to account weight resource '{name}': {error}"),
             })?;
-        if let Err(error) = self
-            .executor
-            .write_weight_tensor(resource_id.clone(), tensor.clone())
-        {
-            // Admission above already succeeded: release it before
-            // propagating, so a write failure leaves no trace in the
-            // Memory Manager ledger.
-            let _ = runtime.memory_mut().release(allocation.id);
-            return Err(InferenceApiError::ProviderTensorWriteFailed {
-                reason: format!(
-                    "failed to write weight resource '{name}' to Provider storage: {error}"
-                ),
-            });
+        match write(self.executor.as_ref(), resource_id.clone()) {
+            Ok(true) => {}
+            // Declined: nothing was stored, so nothing is admitted either.
+            Ok(false) => {
+                let _ = runtime.memory_mut().release(allocation.id);
+                return Ok(false);
+            }
+            Err(error) => {
+                // Admission above already succeeded: release it before
+                // propagating, so a write failure leaves no trace in the
+                // Memory Manager ledger.
+                let _ = runtime.memory_mut().release(allocation.id);
+                return Err(InferenceApiError::ProviderTensorWriteFailed {
+                    reason: format!(
+                        "failed to write weight resource '{name}' to Provider storage: {error}"
+                    ),
+                });
+            }
         }
         if let Err(error) = runtime.memory_mut().record_tensor_residency(
             TensorResidency::new(
@@ -7623,7 +7869,7 @@ impl WeightMaterializationTransaction {
             resource_id,
             allocation: allocation.id,
         });
-        Ok(())
+        Ok(true)
     }
 
     /// Releases every resource staged so far this attempt -- Provider
@@ -7830,7 +8076,7 @@ const QWEN_REAL_COMPONENT_NAME: &str = "magnetar.qwen.real";
 /// structurally, not just by convention.
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 const QWEN_REAL_COMPONENT_DIGEST: &str =
-    "sha256:b99ca7fef19992c794561cd0bb4d58ee6442383e3e603a8edc8ae77891d9fe01";
+    "sha256:b09b2dcc852ef4f2010f6e98c8f156043679e2349155abb4ac54b16b56152d3a";
 
 /// A Component artifact an embedder (e.g. `magnetar-cli`, the "deployment /
 /// CLI / Component source adapter" layer in this task's own design) has
@@ -8034,6 +8280,39 @@ fn weight_shapes_for_architecture_config(
             vec![q_dim, config.hidden_size],
         );
         shapes.insert(format!("{prefix}.post_attn_norm"), vec![config.hidden_size]);
+        if let Some(moe) = &config.mixture_of_experts {
+            // `execute-and-cache-moe-experts` F02: stacked expert weights,
+            // each expert a column range (see the `moe-experts` Operator).
+            let hidden = config.hidden_size;
+            let experts = u64::from(moe.experts);
+            let intermediate = moe.expert_intermediate_size;
+            shapes.insert(format!("{prefix}.moe.router_proj"), vec![hidden, experts]);
+            shapes.insert(
+                format!("{prefix}.moe.experts_gate_proj"),
+                vec![hidden, experts * intermediate],
+            );
+            shapes.insert(
+                format!("{prefix}.moe.experts_up_proj"),
+                vec![hidden, experts * intermediate],
+            );
+            shapes.insert(
+                format!("{prefix}.moe.experts_down_proj"),
+                vec![intermediate, experts * hidden],
+            );
+            if let Some(shared) = moe.shared_expert_intermediate_size {
+                shapes.insert(
+                    format!("{prefix}.moe.shared_gate_proj"),
+                    vec![hidden, shared],
+                );
+                shapes.insert(format!("{prefix}.moe.shared_up_proj"), vec![hidden, shared]);
+                shapes.insert(
+                    format!("{prefix}.moe.shared_down_proj"),
+                    vec![shared, hidden],
+                );
+                shapes.insert(format!("{prefix}.moe.shared_expert_gate"), vec![hidden, 1]);
+            }
+            continue;
+        }
         shapes.insert(
             format!("{prefix}.mlp.gate_proj"),
             vec![config.hidden_size, config.intermediate_size],
@@ -8087,6 +8366,7 @@ fn architecture_config_from_first_native_model_config(
         rope_frequency_scaling: config.rope.frequency_scaling,
         tie_word_embeddings: config.tied_embeddings,
         attention_bias: config.attention_bias,
+        mixture_of_experts: config.mixture_of_experts,
         bos_token_id: None,
         eos_token_id: None,
     }
@@ -8137,6 +8417,7 @@ fn first_native_model_config_from_architecture_config(
         rmsnorm_epsilon: config.rms_norm_eps,
         tied_embeddings: config.tie_word_embeddings,
         attention_bias: config.attention_bias,
+        mixture_of_experts: config.mixture_of_experts,
         require_bos: false,
         require_pad: false,
         expected_added_tokens: None,
@@ -8818,6 +9099,115 @@ pub struct ProductionLoadedModel {
     step_replay: StepReplay,
 }
 
+/// `enforce-local-multigpu-and-expert-placement` tensor parallelism: with
+/// `MAGNETAR_MULTI_GPU=tensor` and a Provider exposing several Devices,
+/// the Runtime builds the Model Component's graphs, derives from the parallel
+/// semantics it declared which weights are split
+/// ([`crate::tensor_parallel::TensorParallelPlan`]) and hands the plan to the
+/// Provider before any weight is written. `false` when no plan applies
+/// (the layer placement then decides).
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn apply_production_tensor_parallel(
+    provider: &dyn Provider,
+    fixture: &E2eFixture,
+    component_digest: Option<&ComponentDigest>,
+) -> Result<bool, InferenceApiError> {
+    if std::env::var("MAGNETAR_MULTI_GPU").as_deref() != Ok("tensor") {
+        return Ok(false);
+    }
+    let devices: Vec<_> = provider
+        .devices()
+        .iter()
+        .map(|device| device.metadata().id.clone())
+        .collect();
+    let (Some(digest), Some(config), true) = (
+        component_digest,
+        fixture.manifest.architecture_config.as_ref(),
+        devices.len() > 1,
+    ) else {
+        return Ok(false);
+    };
+    let failed = |reason: String| InferenceApiError::ModelLoadingFailed { reason };
+    let (graphs, _definition, _instance) =
+        build_first_native_graphs_from_named_component(digest, config, &fixture.identity, 2)
+            .map_err(|error| failed(format!("tensor parallelism: {error}")))?;
+    let plan = crate::tensor_parallel::TensorParallelPlan::from_graphs(
+        [&graphs.prefill, &graphs.decode],
+        devices,
+    )
+    .map_err(|error| failed(format!("tensor parallelism: {error}")))?;
+    if !plan.splits() {
+        return Ok(false);
+    }
+    provider
+        .execution_api()
+        .ok_or_else(|| failed("a multi-Device Provider exposes no execution API".into()))?
+        .apply_tensor_parallel(&plan)
+        .map_err(|error| failed(format!("tensor parallelism: {error}")))?;
+    Ok(true)
+}
+
+/// The share of a Device's memory a layer placement may fill with weights:
+/// the rest holds activations, KV history and Kernel workspace.
+const LAYER_PLACEMENT_WEIGHT_SHARE: (u64, u64) = (85, 100);
+
+/// `enforce-local-multigpu-and-expert-placement` G05: when `provider`
+/// exposes several Devices, the Runtime places the Model Instance's decoder
+/// layers across them ([`crate::layer_placement::LayerPlacement::plan`],
+/// policy from [`crate::layer_placement::LayerPlacementPolicy::from_env`])
+/// and hands the plan to the Provider before any weight is written. A
+/// single-Device Provider gets no plan.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn apply_production_layer_placement(
+    provider: &dyn Provider,
+    manifest: &ModelManifest,
+) -> Result<(), InferenceApiError> {
+    use crate::layer_placement::{LayerPlacement, LayerPlacementPolicy, LayerWeightBytes};
+    let devices: Vec<_> = provider
+        .devices()
+        .iter()
+        .map(|device| {
+            let metadata = device.metadata();
+            let budget = metadata.memory_capacity / LAYER_PLACEMENT_WEIGHT_SHARE.1
+                * LAYER_PLACEMENT_WEIGHT_SHARE.0;
+            (metadata.id.clone(), budget)
+        })
+        .collect();
+    if devices.len() < 2 {
+        return Ok(());
+    }
+    let Some(layer_count) = manifest
+        .architecture_config
+        .as_ref()
+        .map(|config| config.num_hidden_layers)
+    else {
+        return Ok(());
+    };
+    let bytes = LayerWeightBytes::from_weights(
+        layer_count,
+        manifest
+            .tensors
+            .iter()
+            // What each weight occupies on its Device, not its checkpoint
+            // bytes: an F16 or a dequantized quantized weight is larger.
+            .map(|tensor| {
+                (
+                    tensor.name.as_str(),
+                    crate::model_loading::resident_weight_bytes(tensor),
+                )
+            }),
+    );
+    let failed = |reason: String| InferenceApiError::ModelLoadingFailed { reason };
+    let placement = LayerPlacement::plan(&bytes, &devices, LayerPlacementPolicy::from_env())
+        .map_err(|error| failed(format!("layer placement: {error}")))?;
+    let execution = provider.execution_api().ok_or_else(|| {
+        failed("a multi-Device Provider exposes no execution API to place layers on".into())
+    })?;
+    execution
+        .apply_layer_placement(&placement)
+        .map_err(|error| failed(format!("layer placement: {error}")))
+}
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
 impl ProductionLoadedModel {
     pub fn load(
@@ -8914,6 +9304,12 @@ impl ProductionLoadedModel {
                 reason: error.to_string(),
             }
         })?;
+        let tensor_parallel =
+            apply_production_tensor_parallel(&*provider, &fixture, component_digest.as_ref())?;
+        if !tensor_parallel {
+            apply_production_layer_placement(&*provider, &fixture.manifest)?;
+        }
+        graph_cache.set_tensor_parallel(tensor_parallel);
         let instance = load_production_model_instance_for_provider(
             &mut runtime,
             &fixture.manifest,
@@ -8941,6 +9337,12 @@ impl ProductionLoadedModel {
 
     pub fn materialization_count(&self) -> usize {
         self.materialization_count
+    }
+
+    /// Whether this instance runs split across Devices by tensor
+    /// parallelism (`MAGNETAR_MULTI_GPU=tensor` with a plan that splits).
+    pub fn tensor_parallel(&self) -> bool {
+        self.graph_cache.tensor_parallel()
     }
 
     /// Turns graph fusion (`graph_fusion`) on or off for later requests. On
@@ -9498,15 +9900,17 @@ fn qwen_real_component_runtime() -> Result<&'static QwenRealComponentRuntime, E2
     // additive evolution over `1.2.0`'s `attention-bias` field (task
     // 10.5's sibling QKV bias support), itself additive over `1.1.0`'s
     // `model-config` shape, itself additive over `1.0.0`'s
-    // `graph-builder`-only world.
+    // `graph-builder`-only world. `1.5.0` (`execute-and-cache-moe-experts`)
+    // adds `model-config.mixture-of-experts`, and the Component also checks
+    // `rope-scaling` (`1.4.0`).
     let graph_builder_interface =
-        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.3.0");
+        WitInterface::new("magnetar:model-component-graph/graph-builder", "1.5.0");
     manager.provide_capability(
         graph_builder_interface,
         capability.clone() as Arc<dyn HostCapability>,
     );
     let model_config_interface =
-        WitInterface::new("magnetar:model-component-graph/model-config", "1.3.0");
+        WitInterface::new("magnetar:model-component-graph/model-config", "1.5.0");
     manager.provide_capability(
         model_config_interface,
         model_config_capability.clone() as Arc<dyn HostCapability>,
@@ -9740,7 +10144,7 @@ pub fn register_inference_component_artifact(
     // keep authorizing `1.2.0` alongside `1.3.0` here, not merely replace
     // one with the other, or every still-`1.2.0`-compiled Component fails
     // `UnauthorizedImport`/`CapabilityVersionMismatch`.
-    for version in ["1.2.0", "1.3.0", "1.4.0"] {
+    for version in ["1.2.0", "1.3.0", "1.4.0", "1.5.0"] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),
             capability.clone() as Arc<dyn HostCapability>,
@@ -10562,7 +10966,9 @@ fn kernel_memory_class_for_edge(
                 KernelMemoryClass::PinnedHost
             }
             MemoryAllocationClass::BrowserLinearMemory => KernelMemoryClass::BrowserLinearMemory,
-            _ if provider.as_str() == REFERENCE_CPU_PROVIDER_NAME => KernelMemoryClass::Host,
+            _ if crate::reference_cpu::host_memory_provider(provider.as_str()) => {
+                KernelMemoryClass::Host
+            }
             _ => KernelMemoryClass::Device,
         },
     }

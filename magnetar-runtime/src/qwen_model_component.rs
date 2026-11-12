@@ -375,6 +375,9 @@ pub struct FirstNativeModelConfig {
     /// Whether `self_attn.{q,k,v}_proj` carry an additive bias term -- see
     /// [`crate::ModelArchitectureConfig::attention_bias`]'s doc comment.
     pub attention_bias: bool,
+    /// The routed mixture of experts every layer's MLP is -- see
+    /// [`crate::ModelArchitectureConfig::mixture_of_experts`].
+    pub mixture_of_experts: Option<crate::MixtureOfExpertsConfig>,
     /// Whether tokenizer compatibility SHALL require a BOS special token.
     pub require_bos: bool,
     /// Whether tokenizer compatibility SHALL require a pad special token.
@@ -397,6 +400,7 @@ impl FirstNativeModelConfig {
             rmsnorm_epsilon: 1e-6,
             tied_embeddings: false,
             attention_bias: false,
+            mixture_of_experts: None,
             require_bos: false,
             require_pad: false,
             expected_added_tokens: None,
@@ -754,6 +758,26 @@ pub fn validate_first_native_tensor_inventory(
         // the first time).
         if expected.ends_with("mlp.gate_up_proj") {
             continue;
+        }
+        // A mixture-of-experts layer (`execute-and-cache-moe-experts` F02)
+        // has a router and stacked experts instead of the dense MLP.
+        if let Some((layer, mlp)) = expected
+            .strip_prefix("layers.")
+            .and_then(|rest| rest.split_once(".mlp."))
+        {
+            let router = format!("layers.{layer}.moe.router_proj");
+            if present.contains(router.as_str()) {
+                for projection in ["router_proj", "experts_gate_proj", "experts_up_proj"]
+                    .into_iter()
+                    .chain((mlp == "down_proj").then_some("experts_down_proj"))
+                {
+                    let name = format!("layers.{layer}.moe.{projection}");
+                    if !present.contains(name.as_str()) {
+                        return Err(QwenComponentError::TensorInventoryMissing { tensor: name });
+                    }
+                }
+                continue;
+            }
         }
         if !present.contains(expected.as_str()) {
             return Err(QwenComponentError::TensorInventoryMissing { tensor: expected });

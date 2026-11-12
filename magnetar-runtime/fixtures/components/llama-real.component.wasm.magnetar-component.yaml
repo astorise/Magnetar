@@ -4,7 +4,7 @@ artifact:
   kind: component
   digest:
     algorithm: sha256
-    value: "sha256:985f9ef3ee0c02f3e536ea4d3e28da51fc6623afd82a391763da5f8dd6505388"
+    value: "sha256:9dc8d933aec9c3ce3eabdbee7e71b73a1e0ec7e6982a8987f86846e629fa0193"
 component:
   name: "magnetar.llama.real"
   version: "0.1.2"
@@ -18,6 +18,7 @@ compatibility:
     - llama
   artifact_formats:
     - huggingface
+    - gguf
 wit:
   imports:
     - package: "magnetar:model-component-graph"

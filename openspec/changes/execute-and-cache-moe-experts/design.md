@@ -43,3 +43,89 @@ Land compatibility scaffolding and baseline tests before optimized execution. Ke
 ## Open questions
 
 Select exact hardware/checkpoint, numerical and downstream-quality thresholds, resource budgets and SLOs per qualification profile before promoting it. The roadmap's reference CPU/CUDA and Qwen checkpoint are the initial comparison, not evidence that other targets are available. Any Tachyon-facing interface additionally needs its independent repository audit and owner agreement. These decisions gate implementation promotion, not creation of this proposal.
+
+## Initial profile: Qwen1.5-MoE-A2.7B (F02 first, then F05)
+
+Chosen 6 November 2026. Checkpoint: `Qwen/Qwen1.5-MoE-A2.7B-Chat` (Hugging
+Face `model_type = qwen2_moe`; llama.cpp GGUF `general.architecture =
+qwen2moe`), pinned as the `Q8_0` GGUF export
+`RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf@947580e7b3904cd4081810d0efec4520a75609c7`
+(`Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf`, 15,226,010,336 bytes, sha256
+`d20e59b6180c775c648703fd63b8df7d01fc107672441fc3746c41f1dcaf904c`). 24
+decoder layers, hidden 2048, 16 heads (no GQA), QKV bias, 60 routed experts
+of intermediate 1408, top-4 without renormalization (`norm_topk_prob =
+false`), and one shared expert of intermediate 5632 scaled by
+`sigmoid(x . w_shared_gate)`. At 15 GB packed it exceeds the 12 GB
+qualification Device, so F05 (experts outside VRAM) is required, not
+simulated.
+
+### Layer semantics (the Component's graph)
+
+```
+h        = rmsnorm(x, post_attn_norm)
+logits   = matmul(h, router)                      # [T, E], router [H, E]
+routed   = moe-experts(h, logits, experts_gate, experts_up, experts_down)
+shared   = matmul(silu-mul(matmul(h, shared_gate_proj), matmul(h, shared_up_proj)), shared_down_proj)
+scale    = activation(matmul(h, shared_expert_gate), kind = sigmoid)   # [T, 1]
+out      = x + routed + row-scale(shared, scale)
+```
+
+The existing fusion passes turn the shared expert into a `gated-matmul`.
+
+### New portable Operators (catalog additions, no WIT signature change)
+
+- `moe-experts` (5 inputs, 1 output; attributes `experts`, `top_k`,
+  `normalize_top_k`): per token row, `p = softmax(logits)` in f32, the
+  `top_k` largest `p` (ties to the lower expert index), optionally divided
+  by their sum, and `out = sum_k p_k * down_e(silu(gate_e(h)) * up_e(h))`.
+  The stacked expert weights are 2D: `experts_gate`/`experts_up` are
+  `[H, E * I]` (expert `e` owns columns `[e*I, (e+1)*I)`) and
+  `experts_down` is `[I, E * H]` (expert `e` owns columns `[e*H,
+  (e+1)*H)`). This is exactly the logical view of llama.cpp's stacked
+  `[E, out, in]` `ffn_*_exps` storage read as transposed storage (`[E*out,
+  in]` rows), so packed `Q8_0` experts reuse `execute-direct-quantized-
+  weights` unchanged, each expert a contiguous range of stored rows -- the
+  unit F05 caches.
+- `row-scale` (2 inputs): `out[t, :] = x[t, :] * s[t]`, `s` of shape `[T, 1]`.
+- `activation` gains `kind = sigmoid`.
+
+Routing is data-dependent but stays on the Device: a Provider must not
+download indices to choose experts on the decode path (it would break
+step capture); prefill may group tokens by expert.
+
+### Model configuration (WIT `1.5.0`, additive)
+
+`model-config.mixture-of-experts: func() -> option<moe-config>` with
+`moe-config { experts, experts-per-token, expert-intermediate-size,
+shared-expert-intermediate-size: option<u64>, normalize-top-k }` -- a new
+function, as `rope-scaling` was in `1.4.0`, so Components compiled against
+earlier versions keep linking. The Runtime's `ModelArchitectureConfig`
+gains the matching optional `mixture_of_experts`. A Component that does not
+understand a declared MoE configuration must refuse to build a graph.
+
+### Ownership
+
+The Qwen Model Component declares the `qwen2moe` (GGUF) and `qwen2_moe`
+(Hugging Face) families and emits the graph above. `loaders/gguf` maps
+`ffn_gate_inp` to `layers.N.moe.router_proj`, `ffn_{gate,up,down}_exps` to
+`layers.N.moe.experts_{gate,up,down}_proj` (stacked, 2D), the `shexp`
+tensors to `layers.N.moe.shared_{gate,up,down}_proj` and
+`ffn_gate_inp_shexp` (`[H]`) to `layers.N.moe.shared_expert_gate` declared
+`[H, 1]`. The Hugging Face per-expert layout (60 separate tensors per
+projection) is out of this first profile: at 14.3B parameters its f32
+dequantized form cannot run on the qualification hardware.
+
+## Evidence: Qwen1.5-MoE-A2.7B-Chat Q8_0 on two RTX 3060 (12 GB each)
+
+GPU Runner Smoke Test run 42282603030 (commit `29905a7`): the 15 GB packed
+checkpoint, more than one GPU holds, loaded on `CudaMultiProvider` over
+both GPUs with the Runtime's `Fill` layer placement
+(`enforce-local-multigpu-and-expert-placement` G05), routed experts read
+packed by `moe-experts` on the Device. Load 100.1 s; warm TTFT 33.3 ms;
+TPOT 19.01 ms over 64 greedy tokens (about 53 tokens/s), without step
+capture across the two GPUs. Text: " Paris. The country is famous for its
+fashion, food, and art. It is also known for its beautiful architecture,
+such as the Eiffel Tower and the Louvre Museum…".
+
+With multi-GPU step capture (run 42311822286, commit `8f159ad`): TPOT
+14.01 ms (was 18.73 ms uncaptured), same text.

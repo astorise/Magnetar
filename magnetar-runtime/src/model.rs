@@ -347,8 +347,34 @@ pub enum ModelDType {
     Bf16,
     F32,
     F64,
+    /// GGUF `block_q2_K`: 256 values in 84 bytes (2-bit quants, sixteen
+    /// 4-bit sub-block scales and mins, `f16` `d` and `dmin`).
+    Q2K,
+    /// GGUF `block_iq4_nl`: 32 values in 18 bytes (an `f16` scale and
+    /// 4-bit indices into a fixed 16-value non-linear table).
+    Iq4Nl,
+    /// GGUF `block_iq4_xs`: 256 values in 136 bytes (an `f16` scale,
+    /// eight 6-bit sub-block scales, 4-bit indices into the `IQ4_NL`
+    /// table).
+    Iq4Xs,
+    /// GGUF `block_iq2_xxs`: 256 values in 66 bytes: an `f16` scale and, per 32 values, four 8-value grid indices, four 7-bit sign indices and a 4-bit scale.
+    Iq2Xxs,
+    /// GGUF `block_iq2_xs`: 256 values in 74 bytes: an `f16` scale, 9-bit grid indices with 7-bit sign indices, 4-bit scales per 16 values.
+    Iq2Xs,
+    /// GGUF `block_iq2_s`: 256 values in 82 bytes: an `f16` scale, 10-bit grid indices, explicit sign bytes, 4-bit scales per 16 values.
+    Iq2S,
+    /// GGUF `block_iq3_xxs`: 256 values in 98 bytes: an `f16` scale, 4-value grid indices and, per 32 values, four 7-bit sign indices and a 4-bit scale.
+    Iq3Xxs,
+    /// GGUF `block_iq3_s`: 256 values in 110 bytes: an `f16` scale, 9-bit 4-value grid indices, explicit sign bytes, 4-bit scales per 32 values.
+    Iq3S,
+    /// GGUF `block_q3_K`: 256 values in 110 bytes (2-bit quants plus a
+    /// high-bit mask, sixteen 6-bit sub-block scales, one `f16` scale).
+    Q3K,
     Q4K,
     Q5K,
+    /// GGUF `block_q6_K`: 256 values in 210 bytes (6-bit quants, sixteen
+    /// signed 8-bit sub-block scales, one `f16` scale).
+    Q6K,
     Q8,
 }
 
@@ -368,8 +394,18 @@ impl ModelDType {
             "bf16" | "bfloat16" => Some(Self::Bf16),
             "f32" | "fp32" | "float32" => Some(Self::F32),
             "f64" | "fp64" | "float64" => Some(Self::F64),
+            "q2_k" | "q2k" => Some(Self::Q2K),
+            "q3_k" | "q3k" => Some(Self::Q3K),
+            "iq4_nl" | "iq4nl" => Some(Self::Iq4Nl),
+            "iq4_xs" | "iq4xs" => Some(Self::Iq4Xs),
+            "iq2_xxs" | "iq2xxs" => Some(Self::Iq2Xxs),
+            "iq2_xs" | "iq2xs" => Some(Self::Iq2Xs),
+            "iq2_s" | "iq2s" => Some(Self::Iq2S),
+            "iq3_xxs" | "iq3xxs" => Some(Self::Iq3Xxs),
+            "iq3_s" | "iq3s" => Some(Self::Iq3S),
             "q4_k" | "q4k" => Some(Self::Q4K),
             "q5_k" | "q5k" => Some(Self::Q5K),
+            "q6_k" | "q6k" => Some(Self::Q6K),
             "q8" | "q8_0" => Some(Self::Q8),
             _ => None,
         }
@@ -390,11 +426,27 @@ impl ModelDType {
             Self::Bf16 => DTypeDescriptor::portable(ComputeDType::BrainFloat16),
             Self::F32 => DTypeDescriptor::portable(ComputeDType::Float32),
             Self::F64 => DTypeDescriptor::portable(ComputeDType::Float64),
+            Self::Q2K
+            | Self::Q3K
+            | Self::Iq4Nl
+            | Self::Iq4Xs
+            | Self::Iq2Xxs
+            | Self::Iq2Xs
+            | Self::Iq2S
+            | Self::Iq3Xxs
+            | Self::Iq3S => DTypeDescriptor::ProviderSpecific {
+                id: String::new(),
+                size_bytes: 1,
+            },
             Self::Q4K => DTypeDescriptor::ProviderSpecific {
                 id: String::new(),
                 size_bytes: 1,
             },
             Self::Q5K => DTypeDescriptor::ProviderSpecific {
+                id: String::new(),
+                size_bytes: 1,
+            },
+            Self::Q6K => DTypeDescriptor::ProviderSpecific {
                 id: String::new(),
                 size_bytes: 1,
             },
@@ -408,8 +460,18 @@ impl ModelDType {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ModelQuantizationFormat {
+    GgufQ2K,
+    GgufQ3K,
+    GgufIq4Nl,
+    GgufIq4Xs,
+    GgufIq2Xxs,
+    GgufIq2Xs,
+    GgufIq2S,
+    GgufIq3Xxs,
+    GgufIq3S,
     GgufQ4K,
     GgufQ5K,
+    GgufQ6K,
     /// GGUF's `Q8_0` block quantization (`ggml_type` 8): 32 elements per
     /// 34-byte block (2-byte `f16` scale + 32 `i8` quants). Paired with
     /// [`ModelDType::Q8`], which `ModelDType::parse` already accepts under
@@ -425,8 +487,18 @@ pub enum ModelQuantizationFormat {
 impl ModelQuantizationFormat {
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
+            "gguf-q2-k" | "q2_k" => Some(Self::GgufQ2K),
+            "gguf-q3-k" | "q3_k" => Some(Self::GgufQ3K),
+            "gguf-iq4-nl" | "iq4_nl" => Some(Self::GgufIq4Nl),
+            "gguf-iq4-xs" | "iq4_xs" => Some(Self::GgufIq4Xs),
+            "gguf-iq2-xxs" | "iq2_xxs" => Some(Self::GgufIq2Xxs),
+            "gguf-iq2-xs" | "iq2_xs" => Some(Self::GgufIq2Xs),
+            "gguf-iq2-s" | "iq2_s" => Some(Self::GgufIq2S),
+            "gguf-iq3-xxs" | "iq3_xxs" => Some(Self::GgufIq3Xxs),
+            "gguf-iq3-s" | "iq3_s" => Some(Self::GgufIq3S),
             "gguf-q4-k" | "q4_k" => Some(Self::GgufQ4K),
             "gguf-q5-k" | "q5_k" => Some(Self::GgufQ5K),
+            "gguf-q6-k" | "q6_k" => Some(Self::GgufQ6K),
             "gguf-q8-0" | "q8_0" => Some(Self::GgufQ8),
             "gptq" => Some(Self::Gptq),
             "awq" => Some(Self::Awq),
@@ -652,8 +724,30 @@ pub struct ModelArchitectureConfig {
     /// model class itself). `o_proj`/MLP/`lm_head` never carry bias in this
     /// baseline.
     pub attention_bias: bool,
+    /// The routed mixture of experts every decoder layer's MLP is, when the
+    /// checkpoint declares one (`execute-and-cache-moe-experts` F02),
+    /// exposed to the Model Component through `model-config`'s
+    /// `mixture-of-experts` (`1.5.0`).
+    pub mixture_of_experts: Option<MixtureOfExpertsConfig>,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
+}
+
+/// A decoder MLP made of routed experts, mirroring `model-config`'s
+/// `moe-config` record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixtureOfExpertsConfig {
+    /// Routed experts per layer.
+    pub experts: u32,
+    /// Experts each token is routed to.
+    pub experts_per_token: u32,
+    /// Each routed expert's intermediate size.
+    pub expert_intermediate_size: u64,
+    /// The always-active shared expert's intermediate size, if any.
+    pub shared_expert_intermediate_size: Option<u64>,
+    /// Whether the chosen experts' probabilities are renormalized to sum
+    /// to one.
+    pub normalize_top_k: bool,
 }
 
 /// A per-frequency RoPE scaling scheme, mirroring `model-config`'s
@@ -711,6 +805,23 @@ impl ModelArchitectureConfig {
         self.head_dim
             .checked_mul(self.num_attention_heads as u64)
             .ok_or(ModelArtifactError::SizeOverflow)?;
+        if let Some(moe) = &self.mixture_of_experts
+            && (moe.experts == 0
+                || moe.experts_per_token == 0
+                || moe.experts_per_token > moe.experts
+                || moe.expert_intermediate_size == 0
+                || moe.shared_expert_intermediate_size == Some(0))
+        {
+            return Err(ModelArtifactError::InvalidManifest {
+                message: format!(
+                    "mixture of experts routes {} of {} experts of intermediate size {} (shared {:?})",
+                    moe.experts_per_token,
+                    moe.experts,
+                    moe.expert_intermediate_size,
+                    moe.shared_expert_intermediate_size
+                ),
+            });
+        }
         if let Some(RopeFrequencyScaling::Banded(scaling)) = &self.rope_frequency_scaling {
             scaling
                 .validate()

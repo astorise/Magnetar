@@ -978,6 +978,7 @@ dependencies = [
  "magnetar-inference-qualification",
  "magnetar-loader-gguf",
  "magnetar-loader-huggingface",
+ "magnetar-provider-cpu",
  "magnetar-provider-cuda",
  "magnetar-runtime",
  "serde_json",
@@ -991,6 +992,7 @@ version = "1.0.0"
 dependencies = [
  "magnetar-format-gguf",
  "magnetar-runtime",
+ "sha2 0.11.0",
  "tokenizers",
 ]
 
