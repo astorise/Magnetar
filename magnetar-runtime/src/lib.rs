@@ -6,10 +6,10 @@
 
 pub mod adapter;
 pub mod affinity;
-pub mod artifact_signature;
+pub use magnetar_core::artifact_signature;
 pub mod batching;
-pub mod binding;
-pub mod capability;
+pub use magnetar_core::binding;
+pub use magnetar_core::capability;
 pub mod cli_boundary;
 pub mod component;
 #[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
@@ -17,9 +17,9 @@ pub mod component_wasmtime;
 #[cfg(all(target_arch = "wasm32", feature = "web-component-engine"))]
 pub mod component_web;
 pub mod compute;
-pub mod compute_types;
+pub use magnetar_core::compute_types;
 pub mod conformance;
-pub mod device;
+pub use magnetar_core::device;
 #[allow(dead_code)]
 mod e2e_conformance;
 pub mod execution_graph;
@@ -57,7 +57,7 @@ pub mod model_instance;
 pub mod model_loading;
 pub mod multi_device_placement;
 pub mod observability;
-pub mod operator;
+pub use magnetar_core::operator;
 pub mod operator_scope;
 pub mod packed_weight;
 pub mod phase_attribution;
@@ -65,12 +65,12 @@ pub mod planning;
 pub mod prefix_cache;
 pub mod production_model_ingestion;
 pub mod provider;
-pub mod provider_abi;
+pub use magnetar_core::provider_abi;
 pub mod provider_roadmap;
-pub mod provider_status;
+pub use magnetar_core::provider_status;
 pub mod qwen_model_component;
 pub mod reference_cpu;
-pub mod resolution;
+pub use magnetar_core::resolution;
 pub mod runtime;
 pub mod sampling;
 pub mod scheduler;
@@ -78,7 +78,7 @@ pub mod session;
 pub mod tensor;
 pub mod tensor_parallel;
 pub mod tokenizer;
-pub mod trace_id;
+pub use magnetar_core::trace_id;
 
 pub use adapter::*;
 pub use affinity::*;

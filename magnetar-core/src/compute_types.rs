@@ -698,7 +698,8 @@ pub(crate) fn validate_layout_bounds(
     }
 }
 
-pub(crate) fn validate_strides(
+#[doc(hidden)]
+pub fn validate_strides(
     shape: &ShapeDescriptor,
     strides_elements: &[i64],
     offset_elements: u64,

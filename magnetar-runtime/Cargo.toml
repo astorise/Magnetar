@@ -44,6 +44,9 @@ web-component-engine = []
 # a non-test build, with or without any feature.
 
 [dependencies]
+# Runtime layer crates (`quality/layers.toml`). Exact versions: one release
+# is one consistent set.
+magnetar-core = { path = "../magnetar-core", version = "=1.0.0" }
 ed25519-dalek = { version = "3.0.0", features = ["signature"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

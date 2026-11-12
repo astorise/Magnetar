@@ -377,7 +377,8 @@ impl AffinityConstraints {
     pub fn require_fallback(&mut self, fallback: FallbackClass) {
         self.affinity.fallback = self.affinity.fallback.max(fallback);
     }
-    pub(crate) fn merge(&mut self, incoming: &ResourceAffinity) -> Result<(), AffinityError> {
+    #[doc(hidden)]
+    pub fn merge(&mut self, incoming: &ResourceAffinity) -> Result<(), AffinityError> {
         if let Some(found) = &incoming.provider {
             match &self.affinity.provider {
                 Some(expected) if expected != found => {

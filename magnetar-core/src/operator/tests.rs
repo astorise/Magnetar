@@ -6,7 +6,7 @@
 use super::*;
 use crate::{ShapeDescriptor, TensorDescriptor};
 
-use crate::compute::LayoutDescriptor;
+use crate::compute_types::LayoutDescriptor;
 #[test]
 fn operator_catalog_contains_required_families_and_initial_operators() {
     let families = OperatorFamily::ALL
