@@ -184,6 +184,24 @@ submodules, not first-party code, so they are not members of this workspace
 -- they keep their own manifests, checked independently (see
 `.github/workflows/quality.yml`'s `submodule-integration` job).
 
+## Module CI
+
+Each Component, Provider, Format and Loader repository runs its own checks
+through the reusable workflow `.github/workflows/submodule-ci.yml` (see
+[SUBMODULES.md](../SUBMODULES.md), "Module CI"). To reproduce them locally,
+from a Magnetar checkout with the module at its submodule path:
+
+```bash
+cargo fmt --manifest-path providers/cpu/Cargo.toml -- --check
+cargo clippy --locked --manifest-path providers/cpu/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path providers/cpu/Cargo.toml
+cargo deny --manifest-path providers/cpu/Cargo.toml check
+```
+
+Replace `providers/cpu` with the module's path. A module that depends on
+another one by path needs it checked out too (`git submodule update --init
+-- formats/safetensors` for `loaders/huggingface`).
+
 ## Coverage Policy
 
 The accepted baseline is stored in `quality/coverage-baseline.json`.

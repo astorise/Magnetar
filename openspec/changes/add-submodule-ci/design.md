@@ -25,7 +25,7 @@ The GPU runner used today, `arc-gpu-magnetar`, belongs to the Magnetar repositor
 
 ### D1. One reusable workflow, hosted in Magnetar
 
-`.github/workflows/submodule-ci.yml` in Magnetar is triggered by `workflow_call`. Inputs: the module's path in Magnetar (`providers/cuda`), whether it needs a Magnetar checkout, extra system packages (the WGPU Provider's software Vulkan driver), and whether to run the GPU job. Each module repository has a workflow of about fifteen lines that calls it on `pull_request` and on `push` to `main`.
+`.github/workflows/submodule-ci.yml` in Magnetar is triggered by `workflow_call`. Inputs: the module's path in Magnetar (`providers/cuda`), the sibling modules it depends on by path, extra system packages (the WGPU Provider's software Vulkan driver), whether to run Clippy and `cargo-deny`, and whether to run the GPU job, with its runner label and container image. Each module repository has a workflow of about fifteen lines that calls it on `pull_request` and on `push` to `main`.
 
 Callers reference the workflow at Magnetar's `main`, not at a commit SHA. The workflow must match Magnetar's layout and toolchain, which move with `main`; a SHA pin would need thirteen updates for every change to it. Third-party actions inside the workflow stay pinned by SHA, as in `quality.yml`.
 
@@ -47,16 +47,18 @@ A coordinated change then works as follows: push the Magnetar branch first, then
 
 ### D3. What the workflow runs
 
-For a module that depends on the Runtime, from the module's directory inside the Magnetar checkout:
+From the Magnetar checkout, on the module's manifest:
 
 1. `cargo fmt --check`
 2. `cargo clippy --locked --all-targets -- -D warnings`
 3. `cargo test --locked`
-4. `cargo deny check` on the module's manifest
+4. `cargo deny check`
 
-These are the commands Magnetar's integration jobs already run on the pinned commit, so a module that passes here passes there for the same Magnetar revision.
+Magnetar's integration jobs run `cargo test --locked` on every pinned module and `cargo-deny` on five of them; formatting and Clippy are new for modules. Checked before writing the workflow: formatting passes in all thirteen modules, and Clippy passes in the eleven that depend on the Runtime.
 
-For a Component repository, the same four steps run in the repository itself, with the Component build and WIT validation that Magnetar's `component integration` job performs.
+Clippy and `cargo-deny` are inputs, on by default. The two Components call the workflow with Clippy off: their package names (`magnetar-component-Qwen`, `magnetar-component-Llama`) fail the `non_snake_case` lint on the crate name. Fixing that means renaming the crates or allowing the lint in them, which is their repositories' decision and not part of this change.
+
+Components do not depend on the Runtime and could build alone. They use the same layout as the other modules anyway (inside a Magnetar checkout, at their submodule path): one code path in the workflow, and the toolchain Magnetar pins. Magnetar's `component integration` job builds them the same way.
 
 `--locked` is kept: the module's `Cargo.lock` is part of what is tested. When Magnetar's `main` changes the Runtime's dependency set, a module's next run fails on the stale lockfile; that is the signal to refresh it, and it now appears in the module repository instead of at the next pin update.
 

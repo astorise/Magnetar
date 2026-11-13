@@ -1,0 +1,246 @@
+name: Module CI
+
+# Reusable workflow (`add-submodule-ci`): the checks a Component, Provider,
+# Format or Loader repository runs on its own pull requests and on pushes to
+# its default branch. Defined once here; each module repository calls it
+# from a short workflow of its own:
+#
+#   jobs:
+#     module:
+#       uses: astorise/Magnetar/.github/workflows/submodule-ci.yml@main
+#       with:
+#         module-path: providers/cpu
+#
+# A module is built inside a Magnetar checkout, at its submodule path: the
+# modules that depend on the Runtime do so by relative path
+# (`../../magnetar-runtime`), and the Rust toolchain is the one Magnetar
+# pins. Magnetar is checked out at the branch named like the module's branch
+# when it exists, otherwise at `main`, so that a change spanning Magnetar and
+# a module can be green on both sides before either merges.
+#
+# This does not replace `quality.yml`'s integration jobs or
+# `gpu-runner-smoke.yml`: those verify the combination Magnetar pins.
+on:
+  workflow_call:
+    inputs:
+      module-path:
+        description: The module's submodule path in Magnetar, e.g. providers/cpu.
+        required: true
+        type: string
+      siblings:
+        description: >-
+          Space-separated submodule paths this module depends on by relative
+          path, checked out at the commits Magnetar pins.
+        required: false
+        type: string
+        default: ""
+      apt-packages:
+        description: Space-separated system packages the module's tests need.
+        required: false
+        type: string
+        default: ""
+      clippy:
+        description: Run Clippy with warnings denied.
+        required: false
+        type: boolean
+        default: true
+      deny:
+        description: Run cargo-deny on the module's own dependency graph.
+        required: false
+        type: boolean
+        default: true
+      gpu:
+        description: Also run the module's tests on a self-hosted GPU runner.
+        required: false
+        type: boolean
+        default: false
+      gpu-runner:
+        description: Label of the self-hosted GPU runner.
+        required: false
+        type: string
+        default: ""
+      gpu-container-image:
+        description: Container image for the GPU job.
+        required: false
+        type: string
+        default: nvidia/cuda:13.5.0-cudnn-devel-ubuntu24.04
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: module / checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Select the Magnetar revision
+        id: magnetar
+        # The branch name reaches the shell through the environment, never
+        # through expression interpolation.
+        env:
+          MODULE_BRANCH: ${{ github.head_ref || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref=main
+          if [ "$MODULE_BRANCH" != main ] && git ls-remote --exit-code --heads \
+              https://github.com/astorise/Magnetar.git "refs/heads/$MODULE_BRANCH" > /dev/null 2>&1; then
+            ref="$MODULE_BRANCH"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Testing against Magnetar branch: $ref"
+      - name: Checkout Magnetar
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: astorise/Magnetar
+          ref: ${{ steps.magnetar.outputs.ref }}
+          path: Magnetar
+      - name: Checkout sibling modules at the commits Magnetar pins
+        if: ${{ inputs.siblings != '' }}
+        working-directory: Magnetar
+        env:
+          SIBLINGS: ${{ inputs.siblings }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # one path per word, by design
+          git submodule update --init -- $SIBLINGS
+      - name: Checkout the module under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: Magnetar/${{ inputs.module-path }}
+      - name: Report the revisions under test
+        working-directory: Magnetar
+        env:
+          MODULE_PATH: ${{ inputs.module-path }}
+          MAGNETAR_REF: ${{ steps.magnetar.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Magnetar: $(git rev-parse HEAD) ($MAGNETAR_REF)"
+          echo "$MODULE_PATH: $(git -C "$MODULE_PATH" rev-parse HEAD)"
+      - name: Install system packages
+        if: ${{ inputs.apt-packages != '' }}
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # shellcheck disable=SC2086 # one package per word, by design
+          sudo apt-get install -y $APT_PACKAGES
+      - name: Install pinned Rust toolchain
+        working-directory: Magnetar
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: Magnetar/${{ inputs.module-path }}
+      - name: Check formatting
+        working-directory: Magnetar
+        env:
+          MODULE_PATH: ${{ inputs.module-path }}
+        run: cargo fmt --manifest-path "$MODULE_PATH/Cargo.toml" -- --check
+      - name: Clippy
+        if: ${{ inputs.clippy }}
+        working-directory: Magnetar
+        env:
+          MODULE_PATH: ${{ inputs.module-path }}
+        run: cargo clippy --locked --manifest-path "$MODULE_PATH/Cargo.toml" --all-targets -- -D warnings
+      - name: Test
+        # `--locked`: the module's committed Cargo.lock is part of what is
+        # tested. A failure here that names the lockfile means the Runtime's
+        # dependency set changed; refresh it with `cargo update -w` in the
+        # module, inside a Magnetar checkout.
+        working-directory: Magnetar
+        env:
+          MODULE_PATH: ${{ inputs.module-path }}
+        run: cargo test --locked --manifest-path "$MODULE_PATH/Cargo.toml"
+      - name: Install cargo-deny
+        if: ${{ inputs.deny }}
+        uses: taiki-e/install-action@98b24ef8830c90613ec3b57343df3abde2b66e56 # cargo-deny
+      - name: Check the module's dependency graph (advisories, bans, licenses, sources)
+        if: ${{ inputs.deny }}
+        working-directory: Magnetar
+        env:
+          MODULE_PATH: ${{ inputs.module-path }}
+        run: cargo deny --manifest-path "$MODULE_PATH/Cargo.toml" check
+
+  gpu:
+    name: module / gpu
+    # A self-hosted runner executes the pull request's code, so this job
+    # runs for pushes and for pull requests from branches of the module
+    # repository itself, never for a pull request from a fork.
+    if: >-
+      ${{ inputs.gpu && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ${{ inputs.gpu-runner || 'self-hosted' }}
+    container:
+      image: ${{ inputs.gpu-container-image }}
+      options: --gpus all
+    # One runner: queue the runs instead of cancelling a test in flight.
+    concurrency:
+      group: module-gpu-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Install build dependencies
+        run: apt-get update && apt-get install -y --no-install-recommends git curl build-essential ca-certificates
+      - name: Select the Magnetar revision
+        id: magnetar
+        env:
+          MODULE_BRANCH: ${{ github.head_ref || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref=main
+          if [ "$MODULE_BRANCH" != main ] && git ls-remote --exit-code --heads \
+              https://github.com/astorise/Magnetar.git "refs/heads/$MODULE_BRANCH" > /dev/null 2>&1; then
+            ref="$MODULE_BRANCH"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Testing against Magnetar branch: $ref"
+      - name: Checkout Magnetar
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: astorise/Magnetar
+          ref: ${{ steps.magnetar.outputs.ref }}
+          path: Magnetar
+      - name: Checkout sibling modules at the commits Magnetar pins
+        if: ${{ inputs.siblings != '' }}
+        env:
+          SIBLINGS: ${{ inputs.siblings }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The container's git refuses a workspace it does not own.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/Magnetar"
+          cd Magnetar
+          # shellcheck disable=SC2086 # one path per word, by design
+          git submodule update --init -- $SIBLINGS
+      - name: Checkout the module under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: Magnetar/${{ inputs.module-path }}
+      - name: Verify a GPU is visible
+        # Fails the job when there is no GPU: this job never passes by
+        # skipping hardware tests.
+        run: |
+          set -eux
+          nvidia-smi
+          command -v nvcc
+          nvcc --version
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install pinned Rust toolchain
+        working-directory: Magnetar
+        run: rustup show
+      - name: Test on real hardware, hardware-gated tests included
+        working-directory: Magnetar
+        env:
+          MODULE_PATH: ${{ inputs.module-path }}
+        run: cargo test --locked --manifest-path "$MODULE_PATH/Cargo.toml" -- --include-ignored
