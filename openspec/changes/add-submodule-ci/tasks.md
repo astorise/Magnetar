@@ -9,17 +9,19 @@
 
 ## 2. First adopter: CPU Provider
 
-- [ ] 2.1 Add the caller workflow to the CPU Provider repository (`pull_request`, `push` to `main`).
-- [ ] 2.2 Validate on a pull request with no same-name Magnetar branch: the four checks run against Magnetar's `main` and pass.
-- [ ] 2.3 Validate the coordinated case: a Magnetar branch and a CPU Provider branch of the same name; the run log names the Magnetar branch.
-- [ ] 2.4 Validate failure reporting: a deliberately failing test on a scratch branch produces a failed check; a stale lockfile produces a failure that names the lockfile. Delete the scratch branches.
+- [x] 2.1 Caller workflow in the CPU Provider repository (`pull_request`, `push` to `main`): astorise/Magnetar-provider-CPU#17, a draft that references the workflow at the Magnetar branch adding it.
+- [x] 2.2 Coordinated case validated in CI: the run log names the Magnetar branch of the same name, and formatting, Clippy, the 39 tests and `cargo-deny` pass.
+- [x] 2.3 Stale lockfile reproduced locally with the pre-split lockfile: `cargo test --locked` fails with "cannot update the lock file ... because --locked was passed".
+- [ ] 2.4 After astorise/Magnetar#169 is merged: switch the reference to `@main`, confirm the run against Magnetar's `main` passes, mark the pull request ready.
+- [ ] 2.5 Failing test reported as a failed check: not exercised in CI (the session can push only to the pull request's own branch, so a scratch branch was not available).
 
 ## 3. Other module repositories
 
-- [ ] 3.1 Providers CUDA, Metal, NPU, ROCm, TPU, WGPU: caller workflow (WGPU with the software Vulkan driver package).
-- [ ] 3.2 Formats GGUF and safetensors, Loaders GGUF and Hugging Face: caller workflow; Loaders check out their Format sibling.
-- [ ] 3.3 Components Qwen and Llama: caller workflow, Component variant.
-- [ ] 3.4 Confirm each repository's first run passes on its `main`.
+- [x] 3.1 Providers CUDA, Metal, NPU, ROCm, TPU, WGPU: caller workflow as draft pull requests (CUDA with `providers/cpu` as sibling, WGPU with the software Vulkan driver package).
+- [x] 3.2 Formats GGUF and safetensors, Loaders GGUF and Hugging Face: caller workflow as draft pull requests; each Loader checks out its Format sibling.
+- [x] 3.3 Components Qwen and Llama: caller workflow as draft pull requests, Clippy off.
+- [ ] 3.4 Confirm each repository's first run passes; fix or report what does not.
+- [ ] 3.5 After astorise/Magnetar#169 is merged: switch the twelve references to `@main` and mark the pull requests ready.
 
 ## 4. CUDA Provider GPU job
 
