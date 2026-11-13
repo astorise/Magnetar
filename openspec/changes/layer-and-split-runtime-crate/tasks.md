@@ -52,7 +52,7 @@
 ## 6. Consumers and validation
 
 - [x] 6.1 `magnetar-cli`, `inference-components`, `roadmap-contracts` and the three integration test crates build without source change; `magnetar-cli` (93) and `magnetar-inference-component` (14) tests pass. `submodule-workspace/Cargo.lock` is updated.
-- [x] 6.2 Pinned Provider, Format and Loader repositories: each `Cargo.lock` gains the five layer crates (one pull request per repository, no source change), and the eleven submodule pins point at those commits. With them, `cargo test --locked` passes in each of the eleven. Once the pull requests merge, re-pin to the merged commits. The Component repositories do not depend on `magnetar-runtime`.
+- [x] 6.2 Pinned Provider, Format and Loader repositories: each `Cargo.lock` gains the five layer crates (one pull request per repository, no source change), and the eleven submodule pins point at those commits. With them, `cargo test --locked` passes in each of the eleven. The eleven pull requests are merged and the pins point at the merged commits. The Component repositories do not depend on `magnetar-runtime`.
 - [ ] 6.3 Run the WIT validation gate in CI. The WIT files are not moved or edited by this change.
 - [ ] 6.4 Run GPU CI (`cuda-first-native`, `multi-device-cpu-cuda`, real-checkpoint numerics): results identical to the baseline.
 
