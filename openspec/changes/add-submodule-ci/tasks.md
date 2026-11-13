@@ -20,7 +20,7 @@
 - [x] 3.1 Providers CUDA, Metal, NPU, ROCm, TPU, WGPU: caller workflow as draft pull requests (CUDA with `providers/cpu` as sibling, WGPU with the software Vulkan driver package).
 - [x] 3.2 Formats GGUF and safetensors, Loaders GGUF and Hugging Face: caller workflow as draft pull requests; each Loader checks out its Format sibling.
 - [x] 3.3 Components Qwen and Llama: caller workflow as draft pull requests, Clippy off.
-- [ ] 3.4 Confirm each repository's first run passes; fix or report what does not.
+- [x] 3.4 First runs: all thirteen repositories pass on their current head. Two findings fixed on the way: the WGPU Provider also depends on `providers/cpu` by path (sibling added), and the two Formats locked `wasmtime` 50.0.0, affected by RUSTSEC-2026-0422, -0423 and -0424 (lockfiles updated to 50.0.1, which Magnetar and the other modules already used).
 - [ ] 3.5 After astorise/Magnetar#169 is merged: switch the twelve references to `@main` and mark the pull requests ready.
 
 ## 4. CUDA Provider GPU job
