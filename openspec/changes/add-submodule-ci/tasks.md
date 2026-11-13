@@ -12,7 +12,7 @@
 - [x] 2.1 Caller workflow in the CPU Provider repository (`pull_request`, `push` to `main`): astorise/Magnetar-provider-CPU#17, a draft that references the workflow at the Magnetar branch adding it.
 - [x] 2.2 Coordinated case validated in CI: the run log names the Magnetar branch of the same name, and formatting, Clippy, the 39 tests and `cargo-deny` pass.
 - [x] 2.3 Stale lockfile reproduced locally with the pre-split lockfile: `cargo test --locked` fails with "cannot update the lock file ... because --locked was passed".
-- [ ] 2.4 After astorise/Magnetar#169 is merged: switch the reference to `@main`, confirm the run against Magnetar's `main` passes, mark the pull request ready.
+- [ ] 2.4 After astorise/Magnetar#169 is merged: switch the reference to `@main` and confirm the run against Magnetar's `main` passes. The pull request was marked ready by the maintainer and is still open.
 - [ ] 2.5 Failing test reported as a failed check: not exercised in CI (the session can push only to the pull request's own branch, so a scratch branch was not available).
 
 ## 3. Other module repositories
@@ -21,13 +21,13 @@
 - [x] 3.2 Formats GGUF and safetensors, Loaders GGUF and Hugging Face: caller workflow as draft pull requests; each Loader checks out its Format sibling.
 - [x] 3.3 Components Qwen and Llama: caller workflow as draft pull requests, Clippy off.
 - [x] 3.4 First runs: all thirteen repositories pass on their current head. Two findings fixed on the way: the WGPU Provider also depends on `providers/cpu` by path (sibling added), and the two Formats locked `wasmtime` 50.0.0, affected by RUSTSEC-2026-0422, -0423 and -0424 (lockfiles updated to 50.0.1, which Magnetar and the other modules already used).
-- [ ] 3.5 After astorise/Magnetar#169 is merged: switch the twelve references to `@main` and mark the pull requests ready.
+- [ ] 3.5 The twelve pull requests were merged while still referencing the workflow at the Magnetar branch `claude/awesome-davinci-t65edq`; their runs on `main` pass (checked on the CUDA and WGPU Providers). After astorise/Magnetar#169 is merged: one follow-up pull request per repository to switch the reference to `@main`. Until then the Magnetar branch must not be deleted, or every module run fails to load the workflow.
 
 ## 4. CUDA Provider GPU job
 
-- [ ] 4.1 Runner label recorded in `SUBMODULES.md`: `arc-gpu-magnetar-provider-cuda`. Still to confirm: the runner is registered and online for the CUDA Provider repository, and it can run the `nvidia/cuda` container image with `--gpus all`.
+- [x] 4.1 Runner label recorded in `SUBMODULES.md`: `arc-gpu-magnetar-provider-cuda`. The runner is online for the CUDA Provider repository and runs the `nvidia/cuda` container image with `--gpus all` (`nvidia-smi` and `nvcc` steps pass).
 - [x] 4.2 GPU job enabled in the CUDA Provider's caller workflow (astorise/Magnetar-provider-CUDA#35) with that label.
-- [ ] 4.3 Validate: a pull request from a repository branch runs the Provider's tests on real hardware; the hardware-gated tests are executed, not skipped.
+- [x] 4.3 Validated on astorise/Magnetar-provider-CUDA#35 and on the push to `main` that merged it: the GPU job reports 96 passed, 0 failed, 0 ignored, including the `tests_hardware_hot_path` tests and the Provider conformance profiles.
 - [ ] 4.4 Validate: with the GPU made unavailable to the container, the job fails.
 - [x] 4.5 The GPU job's condition runs it only for non-pull-request events and for pull requests whose head repository is the module repository itself. Read from the workflow; not exercised with a real fork.
 
