@@ -1,0 +1,16 @@
+[package]
+name = "magnetar-core"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "Core types of the Magnetar Runtime: capabilities, devices, bindings, compute data types, operators and Provider status."
+repository = "https://github.com/astorise/Magnetar"
+readme = "../README.md"
+keywords = ["ai", "inference", "runtime"]
+categories = ["science"]
+rust-version = "1.98"
+include = ["src/**/*.rs"]
+
+[dependencies]
+ed25519-dalek = { version = "3.0.0", features = ["signature"] }
+sha2 = "0.11"

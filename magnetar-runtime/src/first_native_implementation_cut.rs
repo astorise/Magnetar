@@ -110,7 +110,7 @@ pub const fn phase_0_migration_inventory() -> &'static [MigrationBypassInventory
         },
         MigrationBypassInventoryEntry {
             kind: MigrationBypassKind::FullSequenceDecodeShortcut,
-            path: "magnetar-runtime/src/first_native_runtime.rs",
+            path: "magnetar-runtime/src/first_native_runtime/",
             symbol: "removed; decode uses execute_qwen_decode_hidden_states_through_dispatch \
                      (test oracle now in first_native_runtime/tests.rs)",
             disposition: MigrationBypassDisposition::Deprecated,

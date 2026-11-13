@@ -1,0 +1,23 @@
+[package]
+name = "magnetar-kernel"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "Kernel pipeline of the Magnetar Runtime: Kernel Artifacts, ingestion, compilation, qualification, cache, registry, selection, autotuning and prepared execution plans."
+repository = "https://github.com/astorise/Magnetar"
+readme = "../README.md"
+keywords = ["ai", "inference", "runtime"]
+categories = ["science"]
+rust-version = "1.98"
+include = ["src/**/*.rs", "fixtures/**"]
+
+[dependencies]
+magnetar-core = { path = "../magnetar-core", version = "=1.0.0" }
+magnetar-graph = { path = "../magnetar-graph", version = "=1.0.0" }
+magnetar-model = { path = "../magnetar-model", version = "=1.0.0" }
+serde_json = "1.0"
+sha2 = "0.11"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

@@ -49,7 +49,7 @@ cargo test --locked --workspace --all-targets
 Run concrete Wasmtime Component Engine tests:
 
 ```bash
-cargo test --locked -p magnetar-runtime --all-targets --features wasmtime-component-engine
+cargo test --locked -p magnetar-engine -p magnetar-runtime --all-targets --features magnetar-engine/wasmtime-component-engine,magnetar-runtime/wasmtime-component-engine
 ```
 
 Run hardware-independent Provider conformance tests:
@@ -84,7 +84,7 @@ workspace surface and the Wasmtime Component Engine surface separately:
 
 ```bash
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
-RUSTDOCFLAGS="-D warnings" cargo doc --locked -p magnetar-runtime --no-deps --features wasmtime-component-engine
+RUSTDOCFLAGS="-D warnings" cargo doc --locked -p magnetar-engine -p magnetar-runtime --no-deps --features magnetar-engine/wasmtime-component-engine,magnetar-runtime/wasmtime-component-engine
 ```
 
 PowerShell:
@@ -92,7 +92,7 @@ PowerShell:
 ```powershell
 $env:RUSTDOCFLAGS="-D warnings"
 cargo doc --locked --workspace --no-deps
-cargo doc --locked -p magnetar-runtime --no-deps --features wasmtime-component-engine
+cargo doc --locked -p magnetar-engine -p magnetar-runtime --no-deps --features magnetar-engine/wasmtime-component-engine,magnetar-runtime/wasmtime-component-engine
 ```
 
 Validate WIT packages:
@@ -152,7 +152,9 @@ reason, never as a skipped CI step.
 ## Submodule Workspace
 
 The commands above cover the root `[workspace]`
-(`magnetar-runtime`, `roadmap-contracts`, `tools/coverage-ratchet`) --
+(`magnetar-runtime` and its layer crates `magnetar-core`, `magnetar-graph`,
+`magnetar-model`, `magnetar-kernel`, `magnetar-engine`; `roadmap-contracts`;
+the tools) --
 crates with no dependency on an externalized submodule, so a plain checkout
 without `submodules: recursive` can build them.
 
@@ -181,6 +183,24 @@ graph reaches external submodule crates that declare neither `license` nor
 submodules, not first-party code, so they are not members of this workspace
 -- they keep their own manifests, checked independently (see
 `.github/workflows/quality.yml`'s `submodule-integration` job).
+
+## Module CI
+
+Each Component, Provider, Format and Loader repository runs its own checks
+through the reusable workflow `.github/workflows/submodule-ci.yml` (see
+[SUBMODULES.md](../SUBMODULES.md), "Module CI"). To reproduce them locally,
+from a Magnetar checkout with the module at its submodule path:
+
+```bash
+cargo fmt --manifest-path providers/cpu/Cargo.toml -- --check
+cargo clippy --locked --manifest-path providers/cpu/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path providers/cpu/Cargo.toml
+cargo deny --manifest-path providers/cpu/Cargo.toml check
+```
+
+Replace `providers/cpu` with the module's path. A module that depends on
+another one by path needs it checked out too (`git submodule update --init
+-- formats/safetensors` for `loaders/huggingface`).
 
 ## Coverage Policy
 

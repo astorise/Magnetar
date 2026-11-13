@@ -25,8 +25,8 @@ include = ["src/**/*.rs", "tests/**/*.rs", "fixtures/**", "wit/**/*.wit"]
 
 [features]
 default = ["wasmtime-component-engine"]
-wasmtime-component-engine = ["dep:wasmtime"]
-web-component-engine = []
+wasmtime-component-engine = ["dep:wasmtime", "magnetar-engine/wasmtime-component-engine"]
+web-component-engine = ["magnetar-engine/web-component-engine"]
 # Correctif 7 / task group 10, task 12.6: a build lacking a real Component
 # engine (`wasmtime-component-engine` off, or the `wasm32` target, which has
 # no Wasmtime engine at all) has no fallback graph source of any kind --
@@ -44,6 +44,13 @@ web-component-engine = []
 # a non-test build, with or without any feature.
 
 [dependencies]
+# Runtime layer crates (`quality/layers.toml`). Exact versions: one release
+# is one consistent set.
+magnetar-engine = { path = "../magnetar-engine", version = "=1.0.0", default-features = false }
+magnetar-core = { path = "../magnetar-core", version = "=1.0.0" }
+magnetar-graph = { path = "../magnetar-graph", version = "=1.0.0" }
+magnetar-kernel = { path = "../magnetar-kernel", version = "=1.0.0" }
+magnetar-model = { path = "../magnetar-model", version = "=1.0.0" }
 ed25519-dalek = { version = "3.0.0", features = ["signature"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -54,3 +61,7 @@ sha2 = "0.11"
 wasmtime = { version = "50.0.0", optional = true, default-features = false, features = ["anyhow", "runtime", "component-model", "component-model-async", "cranelift", "std", "wat"] }
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[dev-dependencies]
+# `first_native_runtime` tests inspect Memory Manager bookkeeping.
+magnetar-graph = { path = "../magnetar-graph", version = "=1.0.0", features = ["test-support"] }

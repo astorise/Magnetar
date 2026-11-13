@@ -1,0 +1,20 @@
+[package]
+name = "magnetar-graph"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "Execution graph, graph fusion and the Memory Manager of the Magnetar Runtime."
+repository = "https://github.com/astorise/Magnetar"
+readme = "../README.md"
+keywords = ["ai", "inference", "runtime"]
+categories = ["science"]
+rust-version = "1.98"
+include = ["src/**/*.rs"]
+
+[features]
+# Inspection helpers of the Memory Manager for the tests of the crates built
+# on top of this one. Never enabled in a non-test build.
+test-support = []
+
+[dependencies]
+magnetar-core = { path = "../magnetar-core", version = "=1.0.0" }

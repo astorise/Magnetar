@@ -10,7 +10,7 @@ use crate::inference_api::validate_inference_scope;
 use crate::reference_cpu::FallbackPolicyContext;
 use std::collections::BTreeSet;
 
-use crate::compute::ComputeDType;
+use crate::compute_types::ComputeDType;
 use crate::kernel::{
     KernelDequantizationBehavior, KernelQuantizationMetadata, KernelQuantizationMethod,
 };

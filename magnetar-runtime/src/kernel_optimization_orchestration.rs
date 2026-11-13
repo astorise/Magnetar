@@ -122,7 +122,7 @@
 //! - [`OptimizationObservationKind`] / [`OptimizationObservation`]:
 //!   "Observability Separation", "Correlation" and "Redaction" -- metadata
 //!   values are always passed through
-//!   `crate::compute::redact_backend_diagnostic`, mirroring
+//!   `crate::compute_types::redact_backend_diagnostic`, mirroring
 //!   [`crate::kernel_artifact::KernelArtifactObservation`].
 //! - [`KernelOptimizationError`]: the structured error categories from the
 //!   proposal's "Error Model" section.
@@ -133,7 +133,7 @@
 //!   `specs/conformance/spec.md`.
 
 use crate::cli_boundary::reject_cli_owned_authority;
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::inference_api::validate_inference_scope;
 use crate::kernel_artifact::PreparedKernelId;
 use crate::kernel_artifact::{

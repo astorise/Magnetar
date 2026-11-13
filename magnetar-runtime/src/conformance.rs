@@ -1,7 +1,7 @@
 use crate::affinity::*;
 use crate::component::*;
-use crate::compute::redact_backend_diagnostic;
 use crate::compute::*;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::device::DeviceType;
 use crate::provider::*;
 use crate::reference_cpu::{REFERENCE_CPU_DEVICE_ID, REFERENCE_CPU_PROVIDER_NAME};

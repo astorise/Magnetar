@@ -10,10 +10,13 @@
 //! a live, tracked `TensorResource` without exposing raw pointers, native
 //! handles, or Provider internals.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
+pub use crate::compute_types::{
+    DimensionRole, TensorAliasingKind, TensorError, TensorMemoryClass, TensorMutabilityKind,
+};
 use crate::{
-    CorrelationId, DTypeDescriptor, KernelError, MemoryPlacement, ResourceAffinity,
-    ShapeDescriptor, TensorDescriptor, TensorResidency, TensorResourceId, ViewDescriptor,
+    CorrelationId, DTypeDescriptor, KernelError, ResourceAffinity, ShapeDescriptor,
+    TensorDescriptor, TensorResidency, TensorResourceId, ViewDescriptor,
 };
 use std::{error::Error, fmt};
 
@@ -97,53 +100,6 @@ impl TensorReadiness {
     }
 }
 
-/// Explicit Tensor Resource mutability, finer-grained than the coarse
-/// mutable/immutable classification used on Execution Graph edges.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum TensorMutabilityKind {
-    #[default]
-    Immutable,
-    Mutable,
-    SingleWriter,
-    MultiReader,
-    RuntimeInternal,
-    ProviderOwned,
-}
-impl TensorMutabilityKind {
-    pub const fn allows_mutation(self) -> bool {
-        matches!(
-            self,
-            Self::Mutable | Self::SingleWriter | Self::RuntimeInternal | Self::ProviderOwned
-        )
-    }
-}
-impl From<TensorMutabilityKind> for crate::execution_graph::TensorMutability {
-    fn from(value: TensorMutabilityKind) -> Self {
-        if value.allows_mutation() {
-            Self::Mutable
-        } else {
-            Self::Immutable
-        }
-    }
-}
-
-/// Explicit Tensor Resource aliasing relationship.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum TensorAliasingKind {
-    #[default]
-    NoAlias,
-    ReadOnlyAlias,
-    MutableAlias,
-    InputOutputAlias,
-    ViewAlias,
-    InternalTemporaryAlias,
-}
-impl TensorAliasingKind {
-    pub const fn requires_in_place_support(self) -> bool {
-        matches!(self, Self::MutableAlias | Self::InputOutputAlias)
-    }
-}
-
 /// Validate aliasing before Kernel dispatch. A Kernel SHALL not mutate an
 /// input unless mutation is declared and allowed.
 pub fn validate_aliasing_for_dispatch(
@@ -171,41 +127,6 @@ pub fn validate_mutability_for_dispatch(
     Ok(())
 }
 
-/// Portable classification of where a Tensor Resource's storage lives.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum TensorMemoryClass {
-    Host,
-    PinnedHost,
-    Device,
-    Unified,
-    Shared,
-    ProviderOwned,
-    BrowserLinearMemory,
-    FutureWebgpuBuffer,
-}
-impl TensorMemoryClass {
-    pub const fn is_host_accessible(self) -> bool {
-        matches!(
-            self,
-            Self::Host | Self::PinnedHost | Self::Unified | Self::Shared
-        )
-    }
-}
-impl From<&MemoryPlacement> for TensorMemoryClass {
-    fn from(value: &MemoryPlacement) -> Self {
-        match value {
-            MemoryPlacement::HostOrdinary => Self::Host,
-            MemoryPlacement::HostPinned => Self::PinnedHost,
-            MemoryPlacement::Device(_) => Self::Device,
-            MemoryPlacement::UnifiedShared => Self::Unified,
-            MemoryPlacement::ProviderOwnedOpaque(_) => Self::ProviderOwned,
-            MemoryPlacement::ExternalBorrowed => Self::Shared,
-            MemoryPlacement::BrowserLinearMemory => Self::BrowserLinearMemory,
-            MemoryPlacement::StagedTemporary(inner) => Self::from(inner.as_ref()),
-        }
-    }
-}
-
 /// Validate that a Tensor Resource's memory class is one a Kernel accepts.
 /// An empty `supported` list means the Kernel does not constrain placement.
 pub fn validate_memory_class_for_kernel(
@@ -219,17 +140,6 @@ pub fn validate_memory_class_for_kernel(
             class: resource_class,
         })
     }
-}
-
-/// Semantic role of one Shape dimension, for descriptors that choose to
-/// annotate it. Purely advisory metadata; it does not change validation.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum DimensionRole {
-    Batch,
-    Sequence,
-    Hidden,
-    Head,
-    Other,
 }
 
 /// Subsystem that currently owns a Tensor Resource's lifecycle transitions.
@@ -382,174 +292,6 @@ impl TensorView {
         }
     }
 }
-
-/// Structured Tensor failure categories.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TensorError {
-    DescriptorInvalid { reason: String },
-    ResourceNotFound { id: TensorResourceId },
-    ResourceNotReady { reason: String },
-    ResourceInvalid { reason: String },
-    ResourceReleased,
-    ShapeInvalid { reason: String },
-    ShapeMismatch { reason: String },
-    RankUnsupported { rank: u64 },
-    DTypeUnsupported { reason: String },
-    DTypeConversionRequired { reason: String },
-    DTypeConversionUnsupported { reason: String },
-    LayoutUnsupported { reason: String },
-    LayoutConversionRequired { reason: String },
-    LayoutConversionUnsupported { reason: String },
-    MemoryClassUnsupported { class: TensorMemoryClass },
-    ResidencyUnavailable { reason: String },
-    ResourceAffinityConflict { reason: String },
-    AliasingViolation { reason: String },
-    MutabilityViolation { reason: String },
-    ViewInvalid { reason: String },
-    ViewBaseUnavailable { base: TensorResourceId },
-    SizeUnknown { reason: String },
-    MaterializationFailed { reason: String },
-    TransferFailed { reason: String },
-    BrowserFeatureUnsupported { feature: String },
-    Internal { reason: String },
-}
-impl TensorError {
-    pub fn descriptor_invalid(reason: impl AsRef<str>) -> Self {
-        Self::DescriptorInvalid {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn resource_not_ready(reason: impl AsRef<str>) -> Self {
-        Self::ResourceNotReady {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn resource_invalid(reason: impl AsRef<str>) -> Self {
-        Self::ResourceInvalid {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn shape_invalid(reason: impl AsRef<str>) -> Self {
-        Self::ShapeInvalid {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn shape_mismatch(reason: impl AsRef<str>) -> Self {
-        Self::ShapeMismatch {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn dtype_unsupported(reason: impl AsRef<str>) -> Self {
-        Self::DTypeUnsupported {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn layout_unsupported(reason: impl AsRef<str>) -> Self {
-        Self::LayoutUnsupported {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn residency_unavailable(reason: impl AsRef<str>) -> Self {
-        Self::ResidencyUnavailable {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn resource_affinity_conflict(reason: impl AsRef<str>) -> Self {
-        Self::ResourceAffinityConflict {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn aliasing_violation(reason: impl AsRef<str>) -> Self {
-        Self::AliasingViolation {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn mutability_violation(reason: impl AsRef<str>) -> Self {
-        Self::MutabilityViolation {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn view_invalid(reason: impl AsRef<str>) -> Self {
-        Self::ViewInvalid {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn size_unknown(reason: impl AsRef<str>) -> Self {
-        Self::SizeUnknown {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn materialization_failed(reason: impl AsRef<str>) -> Self {
-        Self::MaterializationFailed {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn transfer_failed(reason: impl AsRef<str>) -> Self {
-        Self::TransferFailed {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-    pub fn internal(reason: impl AsRef<str>) -> Self {
-        Self::Internal {
-            reason: redact_backend_diagnostic(reason.as_ref()),
-        }
-    }
-}
-impl fmt::Display for TensorError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DescriptorInvalid { reason } => write!(f, "tensor descriptor invalid: {reason}"),
-            Self::ResourceNotFound { id } => write!(f, "tensor resource not found: {id}"),
-            Self::ResourceNotReady { reason } => write!(f, "tensor resource not ready: {reason}"),
-            Self::ResourceInvalid { reason } => write!(f, "tensor resource invalid: {reason}"),
-            Self::ResourceReleased => write!(f, "tensor resource was released"),
-            Self::ShapeInvalid { reason } => write!(f, "tensor shape invalid: {reason}"),
-            Self::ShapeMismatch { reason } => write!(f, "tensor shape mismatch: {reason}"),
-            Self::RankUnsupported { rank } => write!(f, "tensor rank {rank} is unsupported"),
-            Self::DTypeUnsupported { reason } => write!(f, "tensor dtype unsupported: {reason}"),
-            Self::DTypeConversionRequired { reason } => {
-                write!(f, "tensor dtype conversion required: {reason}")
-            }
-            Self::DTypeConversionUnsupported { reason } => {
-                write!(f, "tensor dtype conversion unsupported: {reason}")
-            }
-            Self::LayoutUnsupported { reason } => write!(f, "tensor layout unsupported: {reason}"),
-            Self::LayoutConversionRequired { reason } => {
-                write!(f, "tensor layout conversion required: {reason}")
-            }
-            Self::LayoutConversionUnsupported { reason } => {
-                write!(f, "tensor layout conversion unsupported: {reason}")
-            }
-            Self::MemoryClassUnsupported { class } => {
-                write!(f, "tensor memory class unsupported: {class:?}")
-            }
-            Self::ResidencyUnavailable { reason } => {
-                write!(f, "tensor residency unavailable: {reason}")
-            }
-            Self::ResourceAffinityConflict { reason } => {
-                write!(f, "tensor resource affinity conflict: {reason}")
-            }
-            Self::AliasingViolation { reason } => write!(f, "tensor aliasing violation: {reason}"),
-            Self::MutabilityViolation { reason } => {
-                write!(f, "tensor mutability violation: {reason}")
-            }
-            Self::ViewInvalid { reason } => write!(f, "tensor view invalid: {reason}"),
-            Self::ViewBaseUnavailable { base } => {
-                write!(f, "tensor view base unavailable: {base}")
-            }
-            Self::SizeUnknown { reason } => write!(f, "tensor size unknown: {reason}"),
-            Self::MaterializationFailed { reason } => {
-                write!(f, "tensor materialization failed: {reason}")
-            }
-            Self::TransferFailed { reason } => write!(f, "tensor transfer failed: {reason}"),
-            Self::BrowserFeatureUnsupported { feature } => {
-                write!(f, "tensor browser feature unsupported: {feature}")
-            }
-            Self::Internal { reason } => write!(f, "internal tensor error: {reason}"),
-        }
-    }
-}
-impl Error for TensorError {}
 
 /// Kinds of Tensor observations Runtime SHOULD emit.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

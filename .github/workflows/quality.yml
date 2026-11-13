@@ -119,7 +119,7 @@ jobs:
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Test Wasmtime Component Engine
-        run: cargo test --locked -p magnetar-runtime --all-targets --features wasmtime-component-engine
+        run: cargo test --locked -p magnetar-engine -p magnetar-runtime --all-targets --features magnetar-engine/wasmtime-component-engine,magnetar-runtime/wasmtime-component-engine
 
   wasm32-component-engine:
     name: quality / wasm32 component engine
@@ -177,7 +177,7 @@ jobs:
       - name: Build workspace documentation
         run: cargo doc --locked --workspace --no-deps
       - name: Build Wasmtime Component Engine documentation
-        run: cargo doc --locked -p magnetar-runtime --no-deps --features wasmtime-component-engine
+        run: cargo doc --locked -p magnetar-engine -p magnetar-runtime --no-deps --features magnetar-engine/wasmtime-component-engine,magnetar-runtime/wasmtime-component-engine
 
   wit:
     name: quality / wit
@@ -228,9 +228,9 @@ jobs:
   # arbitrary test id). Both files are now clean and added below.
   #
   # Deliberately still excluded, by classification rather than oversight:
-  # `first_native_runtime.rs` and `qwen_model_component.rs` are the two
+  # `first_native_runtime/` and `qwen_model_component.rs` are the two
   # files designated to legitimately carry Qwen-specific knowledge (see
-  # their own doc comments) -- but `first_native_runtime.rs` also hosts the
+  # their own doc comments) -- but `first_native_runtime/` also hosts the
   # *generic* production facade (`ProductionLoadedModel`,
   # `production_model_fixture`, `build_first_native_graphs_from_named_
   # component`), which this file-level exclusion left with zero coverage
@@ -264,23 +264,28 @@ jobs:
           pattern='(qwen|llama|self_attn\.[a-z]+_proj|mlp\.(gate|up|down)_proj)'
           modules=(
             magnetar-runtime/src/affinity.rs
-            magnetar-runtime/src/capability.rs
-            magnetar-runtime/src/component.rs
-            magnetar-runtime/src/component_wasmtime.rs
+            magnetar-core/src/binding.rs
+            magnetar-core/src/capability.rs
+            magnetar-engine/src/component.rs
+            magnetar-engine/src/component_wasmtime.rs
             magnetar-runtime/src/compute.rs
+            magnetar-core/src/compute_types.rs
             magnetar-runtime/src/conformance.rs
-            magnetar-runtime/src/device.rs
-            magnetar-runtime/src/execution_graph.rs
-            magnetar-runtime/src/graph_builder_capability.rs
-            magnetar-runtime/src/kernel.rs
-            magnetar-runtime/src/kernel_compilation.rs
-            magnetar-runtime/src/kernel_execution_plan.rs
-            magnetar-runtime/src/memory.rs
-            magnetar-runtime/src/operator.rs
+            magnetar-core/src/device.rs
+            magnetar-graph/src/execution_graph.rs
+            magnetar-engine/src/graph_builder_capability.rs
+            magnetar-kernel/src/kernel.rs
+            magnetar-kernel/src/kernel_compilation.rs
+            magnetar-kernel/src/kernel_execution_plan.rs
+            magnetar-graph/src/memory.rs
+            magnetar-core/src/operator.rs
             magnetar-runtime/src/provider.rs
+            magnetar-core/src/provider_abi.rs
+            magnetar-core/src/provider_status.rs
             magnetar-runtime/src/reference_cpu.rs
             magnetar-runtime/src/scheduler.rs
             magnetar-runtime/src/tensor.rs
+            magnetar-core/src/trace_id.rs
           )
           fail=0
           for module in "${modules[@]}"; do
@@ -294,10 +299,10 @@ jobs:
           done
           exit "$fail"
       # Tachyon integration audit MAG-05 (#80): the guard above deliberately
-      # excludes first_native_runtime.rs and qwen_model_component.rs (they
+      # excludes first_native_runtime/ and qwen_model_component.rs (they
       # legitimately carry Qwen-specific knowledge), which also means it has
       # zero visibility into the *generic* production facade that happens to
-      # live inside first_native_runtime.rs -- ProductionLoadedModel,
+      # live inside first_native_runtime/ -- ProductionLoadedModel,
       # production_model_fixture, build_first_native_graphs_from_named_component
       # -- and inference-components' own LoadedInferenceComponent::load. This
       # step scans exactly those specific bodies (not the whole file) against
@@ -355,7 +360,7 @@ jobs:
               echo "::error file=$file::inline 'mod tests { ... }' found -- move its body to a sibling tests.rs and declare 'mod tests;' here instead (see #54/#63)"
               fail=1
             fi
-          done < <(find magnetar-runtime/src roadmap-contracts/src -name '*.rs' -print0)
+          done < <(find magnetar-core/src magnetar-graph/src magnetar-model/src magnetar-kernel/src magnetar-engine/src magnetar-runtime/src roadmap-contracts/src -name '*.rs' -print0)
           exit "$fail"
 
   # Component integration (task 15.6): Component submodules only, sparse
@@ -717,6 +722,27 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Test magnetar-cli
         run: cargo test --locked --manifest-path submodule-workspace/Cargo.toml -p magnetar-cli --all-targets --all-features
+
+  # Runtime layering gate (`layer-and-split-runtime-crate`, `quality` spec
+  # "Runtime Layering Gate"): every top-level module of the Runtime crates
+  # has a layer in `quality/layers.toml` and depends only on its own layer
+  # or a lower one. Cargo enforces the direction between crates; this job
+  # also covers the modules that share a crate.
+  layering:
+    name: quality / runtime layering
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Check Runtime layers
+        run: >-
+          cargo run --locked -p layering-check --
+          magnetar-core/src magnetar-graph/src magnetar-model/src magnetar-kernel/src
+          magnetar-engine/src magnetar-runtime/src quality/layers.toml
 
   coverage-baseline-history:
     name: quality / coverage baseline history

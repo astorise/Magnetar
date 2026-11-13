@@ -12,7 +12,7 @@ use crate::model::{
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use crate::compute::ComputeDType;
+use crate::compute_types::ComputeDType;
 use crate::kernel::{
     KernelDequantizationBehavior, KernelQuantizationMetadata, KernelQuantizationMethod,
 };

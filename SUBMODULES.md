@@ -67,6 +67,47 @@ Magnetar-to-module compatibility matrix (task 15.4).
   compatible-version ranges per module rather than the current
   one-pinned-commit-at-a-time model.
 
+## Module CI
+
+Two levels of checks cover a module (`add-submodule-ci`):
+
+| Check | Where it runs | What it answers |
+|---|---|---|
+| Module CI | the module's repository, on each pull request and push to `main` | does this module change pass its own checks against the current Runtime? |
+| Integration jobs | this repository's `quality.yml`, on each pull request | does the combination this repository pins work together? |
+| Daily GPU run | this repository's `gpu-runner-smoke.yml` | does the pinned combination work on real hardware, long campaigns included? |
+
+Module CI is one reusable workflow, `.github/workflows/submodule-ci.yml`
+in this repository, called from a short workflow in each module
+repository. It builds the module inside a Magnetar checkout, at its
+submodule path, and runs formatting, Clippy, `cargo test --locked` and
+`cargo-deny`.
+
+- **Which Magnetar revision.** The branch of this repository named like
+  the module's branch when it exists, otherwise `main`. For a change that
+  spans both repositories, push the Magnetar branch first, then the module
+  branch under the same name: the module is then tested against the
+  Magnetar branch. The run's first step prints the revision it used.
+- **A check that fails on the lockfile.** `--locked` is deliberate: the
+  module's `Cargo.lock` lists the Runtime's crates and their dependencies.
+  When this repository's `main` changes that set, the module's next run
+  fails and names the lockfile. Refresh it in the module, inside a Magnetar
+  checkout, with `cargo update -w`, and commit the result.
+- **GPU.** The CUDA Provider also runs its tests, hardware-gated ones
+  included, on a self-hosted GPU runner. That job runs for pushes and for
+  pull requests from branches of the repository itself, never for a pull
+  request from a fork, and fails when no GPU is visible. The runner is
+  `arc-gpu-magnetar-provider-cuda`, registered for the CUDA Provider
+  repository; the job uses the same container image as
+  `gpu-runner-smoke.yml` unless the caller names another one.
+- **Components.** `components/qwen` and `components/llama` call the
+  workflow with Clippy off: their package names
+  (`magnetar-component-Qwen`, `magnetar-component-Llama`) trip the
+  `non_snake_case` lint on the crate name, which predates Module CI.
+
+Module CI does not replace the integration jobs: a pin update in this
+repository is still verified here, at the pinned commit.
+
 ## Compatibility matrix
 
 | `magnetar-runtime` | Module | Commit | Notes |

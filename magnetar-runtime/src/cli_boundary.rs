@@ -12,7 +12,7 @@
 //!
 //! This module does not implement a new boundary mechanism. It composes the
 //! already Runtime-owned [`crate::inference_api::validate_inference_scope`]
-//! check and `crate::compute::redact_backend_diagnostic` redaction utility
+//! check and `crate::compute_types::redact_backend_diagnostic` redaction utility
 //! behind:
 //!
 //! - [`CliBoundaryError`]: the CLI-side structured error model from the
@@ -36,7 +36,7 @@
 //! [`CliBoundaryError`]; Runtime other than this module has no CLI-specific
 //! code.
 
-use crate::compute::redact_backend_diagnostic;
+use crate::compute_types::redact_backend_diagnostic;
 use crate::inference_api::{
     FORBIDDEN_INFERENCE_API_SCOPES, InferenceApiError, validate_inference_scope,
 };

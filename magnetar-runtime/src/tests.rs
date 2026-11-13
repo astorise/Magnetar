@@ -1259,7 +1259,11 @@ fn runtime_source_does_not_restore_legacy_backend_or_plugin_surface() {
 
 #[test]
 fn public_component_api_does_not_expose_wasmtime_native_types() {
-    let public_sources = [include_str!("lib.rs"), include_str!("component.rs")];
+    let public_sources = [
+        include_str!("lib.rs"),
+        include_str!("../../magnetar-engine/src/lib.rs"),
+        include_str!("../../magnetar-engine/src/component.rs"),
+    ];
     let forbidden = [
         "wasmtime::Engine",
         "wasmtime::Config",
@@ -5806,7 +5810,7 @@ fn kernel_compilation_abi_descriptor_validates_ownership_and_version() {
     ));
 
     let mut wrong_version = descriptor;
-    wrong_version.abi_version = crate::provider::ProviderAbiVersion::new(99, 0);
+    wrong_version.abi_version = crate::provider_abi::ProviderAbiVersion::new(99, 0);
     assert!(matches!(
         wrong_version.validate(),
         Err(KernelCompilationError::AbiIncompatible { .. })

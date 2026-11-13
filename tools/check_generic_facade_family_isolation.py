@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Tachyon integration audit MAG-05 (#80): the existing `quality / model-family
-isolation` guard excludes first_native_runtime.rs and qwen_model_component.rs
+isolation` guard excludes first_native_runtime/ and qwen_model_component.rs
 entirely, because those files are explicitly designated to legitimately carry
 Qwen-specific knowledge (the Qwen singleton path, the Qwen test-oracle graph).
 That exclusion means the guard has zero visibility into the *generic*
-production facade that happens to live inside first_native_runtime.rs too --
+production facade that happens to live inside first_native_runtime/ too --
 ProductionLoadedModel, production_model_fixture,
 build_first_native_graphs_from_named_component,
 register_inference_component_artifact -- and inference-components' own
@@ -75,10 +75,17 @@ def check(label: str, body: str, allowed: set[str]) -> list[str]:
 
 def main() -> int:
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
-    runtime_path = root / "magnetar-runtime/src/first_native_runtime.rs"
+    # `first_native_runtime` is a directory module
+    # (`layer-and-split-runtime-crate`): scan its production files as one
+    # text, `tests.rs` excluded.
+    runtime_dir = root / "magnetar-runtime/src/first_native_runtime"
     inference_path = root / "inference-components/src/lib.rs"
 
-    runtime_src = runtime_path.read_text(encoding="utf-8")
+    runtime_src = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(runtime_dir.glob("*.rs"))
+        if path.name != "tests.rs"
+    )
     inference_src = inference_path.read_text(encoding="utf-8")
 
     errors: list[str] = []

@@ -914,6 +914,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-core"
+version = "1.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "magnetar-engine"
+version = "1.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "magnetar-core",
+ "magnetar-graph",
+ "magnetar-model",
+ "serde",
+ "serde_norway",
+ "sha2 0.11.0",
+ "wasmtime",
+]
+
+[[package]]
 name = "magnetar-format-gguf"
 version = "1.0.0"
 dependencies = [
@@ -926,6 +948,13 @@ version = "1.0.0"
 dependencies = [
  "magnetar-runtime",
  "serde_json",
+]
+
+[[package]]
+name = "magnetar-graph"
+version = "1.0.0"
+dependencies = [
+ "magnetar-core",
 ]
 
 [[package]]
@@ -987,6 +1016,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-kernel"
+version = "1.0.0"
+dependencies = [
+ "flate2",
+ "magnetar-core",
+ "magnetar-graph",
+ "magnetar-model",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+]
+
+[[package]]
 name = "magnetar-loader-gguf"
 version = "1.0.0"
 dependencies = [
@@ -1007,6 +1049,19 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tokenizers",
+]
+
+[[package]]
+name = "magnetar-model"
+version = "1.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "magnetar-core",
+ "magnetar-graph",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -1037,6 +1092,11 @@ version = "1.0.0"
 dependencies = [
  "ed25519-dalek",
  "flate2",
+ "magnetar-core",
+ "magnetar-engine",
+ "magnetar-graph",
+ "magnetar-kernel",
+ "magnetar-model",
  "serde",
  "serde_json",
  "serde_norway",

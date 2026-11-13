@@ -4,6 +4,7 @@
 //! together. It is not a client conversation, model artifact, provider handle,
 //! device handle, workspace, tool state, or raw prompt store.
 
+pub use crate::model_identity::{InferenceSessionId, SessionError, SessionLifecycleState};
 use crate::{
     CorrelationId, FallbackClass, GenerationModelReference, GenerationParameters,
     GenerationTokenizerReference, KvCacheId, KvCachePolicy, MemoryAdmissionDecision,
@@ -11,74 +12,7 @@ use crate::{
     MemoryAllocationRequest, MemoryManager, MemoryPlacement, ResourceAffinity,
     StreamingDecodeState,
 };
-use std::{collections::BTreeSet, error::Error, fmt};
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct InferenceSessionId(String);
-
-impl InferenceSessionId {
-    pub fn new(value: impl Into<String>) -> Result<Self, SessionError> {
-        let value = value.into();
-        validate_session_identity(&value)?;
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for InferenceSessionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionLifecycleState {
-    Creating,
-    Ready,
-    Active,
-    Idle,
-    Draining,
-    Cancelled,
-    Failed,
-    Closed,
-    Expired,
-}
-
-impl SessionLifecycleState {
-    pub const fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Cancelled | Self::Failed | Self::Closed | Self::Expired
-        )
-    }
-
-    pub const fn allows_transition_to(self, next: Self) -> bool {
-        matches!(
-            (self, next),
-            (Self::Creating, Self::Ready)
-                | (Self::Creating, Self::Failed)
-                | (Self::Ready, Self::Active)
-                | (Self::Ready, Self::Draining)
-                | (Self::Ready, Self::Closed)
-                | (Self::Ready, Self::Expired)
-                | (Self::Active, Self::Idle)
-                | (Self::Active, Self::Draining)
-                | (Self::Active, Self::Cancelled)
-                | (Self::Active, Self::Failed)
-                | (Self::Idle, Self::Active)
-                | (Self::Idle, Self::Draining)
-                | (Self::Idle, Self::Closed)
-                | (Self::Idle, Self::Expired)
-                | (Self::Draining, Self::Closed)
-                | (Self::Draining, Self::Expired)
-                | (Self::Cancelled, Self::Closed)
-                | (Self::Failed, Self::Closed)
-        )
-    }
-}
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SessionConcurrencyPolicy {
@@ -670,128 +604,6 @@ pub struct SessionObservation {
     pub correlation_id: Option<CorrelationId>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SessionError {
-    SessionCreationFailed {
-        reason: String,
-    },
-    SessionNotFound,
-    SessionNotReady,
-    SessionActive,
-    SessionClosed,
-    SessionExpired,
-    SessionCancelled,
-    SessionDraining,
-    SessionPolicyDenied {
-        reason: String,
-    },
-    ModelUnavailable {
-        reason: String,
-    },
-    TokenizerIncompatible {
-        reason: String,
-    },
-    MemoryAdmissionFailed {
-        reason: String,
-    },
-    MemoryBudgetExceeded {
-        reason: String,
-    },
-    GenerationFailed {
-        reason: String,
-    },
-    StreamingFailed {
-        reason: String,
-    },
-    CancellationFailed {
-        reason: String,
-    },
-    OperationQueued,
-    OperationRejected {
-        reason: String,
-    },
-    ConcurrencyViolation,
-    ResourceCleanupFailed {
-        reason: String,
-    },
-    RuntimeShutdown,
-    Unauthorized,
-    InvalidLifecycleTransition {
-        from: SessionLifecycleState,
-        to: SessionLifecycleState,
-    },
-    InternalSession {
-        reason: String,
-    },
-}
-
-impl fmt::Display for SessionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SessionCreationFailed { reason } => {
-                write!(f, "session creation failed: {reason}")
-            }
-            Self::SessionNotFound => f.write_str("session not found"),
-            Self::SessionNotReady => f.write_str("session not ready"),
-            Self::SessionActive => f.write_str("session active"),
-            Self::SessionClosed => f.write_str("session closed"),
-            Self::SessionExpired => f.write_str("session expired"),
-            Self::SessionCancelled => f.write_str("session cancelled"),
-            Self::SessionDraining => f.write_str("session draining"),
-            Self::SessionPolicyDenied { reason } => write!(f, "session policy denied: {reason}"),
-            Self::ModelUnavailable { reason } => write!(f, "model unavailable: {reason}"),
-            Self::TokenizerIncompatible { reason } => write!(f, "tokenizer incompatible: {reason}"),
-            Self::MemoryAdmissionFailed { reason } => {
-                write!(f, "session memory admission failed: {reason}")
-            }
-            Self::MemoryBudgetExceeded { reason } => {
-                write!(f, "session memory budget exceeded: {reason}")
-            }
-            Self::GenerationFailed { reason } => write!(f, "session generation failed: {reason}"),
-            Self::StreamingFailed { reason } => write!(f, "session streaming failed: {reason}"),
-            Self::CancellationFailed { reason } => {
-                write!(f, "session cancellation failed: {reason}")
-            }
-            Self::OperationQueued => f.write_str("session operation queued"),
-            Self::OperationRejected { reason } => write!(f, "session operation rejected: {reason}"),
-            Self::ConcurrencyViolation => f.write_str("session concurrency violation"),
-            Self::ResourceCleanupFailed { reason } => {
-                write!(f, "session resource cleanup failed: {reason}")
-            }
-            Self::RuntimeShutdown => f.write_str("runtime shutdown"),
-            Self::Unauthorized => f.write_str("session access unauthorized"),
-            Self::InvalidLifecycleTransition { from, to } => {
-                write!(
-                    f,
-                    "invalid session lifecycle transition from {from:?} to {to:?}"
-                )
-            }
-            Self::InternalSession { reason } => write!(f, "internal session error: {reason}"),
-        }
-    }
-}
-
-impl Error for SessionError {}
-
 pub fn runtime_session_affinity(execution_context: crate::ExecutionContextId) -> ResourceAffinity {
     ResourceAffinity::new(FallbackClass::Transparent).with_execution_context(execution_context)
-}
-
-fn validate_session_identity(value: &str) -> Result<(), SessionError> {
-    if value.trim().is_empty()
-        || value.contains('/')
-        || value.contains('\\')
-        || value.contains(':')
-        || value.contains("provider")
-        || value.contains("device")
-        || value.contains("0x")
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-    {
-        return Err(SessionError::SessionCreationFailed {
-            reason: "session id must be opaque, portable, and free of raw handles".into(),
-        });
-    }
-    Ok(())
 }

@@ -1,0 +1,139 @@
+# Runtime layer map (`layer-and-split-runtime-crate`).
+#
+# Checked on every pull request by `tools/layering-check`, on the six Runtime
+# crates as one module graph:
+#
+#     cargo run -p layering-check -- magnetar-core/src magnetar-graph/src \
+#         magnetar-model/src magnetar-kernel/src magnetar-engine/src \
+#         magnetar-runtime/src quality/layers.toml
+#
+# A module may depend on modules of its own layer and of layers with a
+# strictly lower rank. Every top-level module of the Runtime crates must be
+# listed. Test-only code (`#[cfg(test)]`) is not checked. Each layer below
+# Runtime orchestration is one crate: core -> magnetar-core, graph ->
+# magnetar-graph, model-data -> magnetar-model, kernel -> magnetar-kernel,
+# component-engine -> magnetar-engine.
+
+[layers]
+core = 1
+graph = 2
+model-data = 3
+kernel = 4
+component-engine = 4
+runtime = 5
+
+[modules]
+# Core types: no dependency on another layer.
+artifact_signature = "core"
+binding = "core"
+capability = "core"
+compute_types = "core"
+device = "core"
+operator = "core"
+provider_abi = "core"
+provider_status = "core"
+resolution = "core"
+trace_id = "core"
+
+# Graph and memory.
+execution_graph = "graph"
+graph_fusion = "graph"
+memory = "graph"
+
+# Model data: manifests, identities and their errors. May use core and graph.
+model = "model-data"
+model_identity = "model-data"
+
+# Kernel pipeline. May use core, graph and model data.
+execution_stream = "kernel"
+kernel = "kernel"
+kernel_artifact = "kernel"
+kernel_artifact_ingestion = "kernel"
+kernel_artifact_manifest = "kernel"
+kernel_autotuning = "kernel"
+kernel_benchmark = "kernel"
+kernel_cache = "kernel"
+kernel_compilation = "kernel"
+kernel_dispatch = "kernel"
+kernel_execution_plan = "kernel"
+kernel_performance_model = "kernel"
+kernel_qualification = "kernel"
+kernel_registry = "kernel"
+kernel_selection_policy = "kernel"
+
+# Component engine. May use core, graph and model data, not the kernel pipeline.
+component = "component-engine"
+component_wasmtime = "component-engine"
+component_web = "component-engine"
+graph_builder_capability = "component-engine"
+model_component = "component-engine"
+model_config_capability = "component-engine"
+
+# Runtime orchestration.
+adapter = "runtime"
+affinity = "runtime"
+batching = "runtime"
+cli_boundary = "runtime"
+compute = "runtime"
+conformance = "runtime"
+e2e_conformance = "runtime"
+first_native_implementation_cut = "runtime"
+first_native_runtime = "runtime"
+generation = "runtime"
+inference_api = "runtime"
+kernel_optimization_orchestration = "runtime"
+kv_cache = "runtime"
+layer_placement = "runtime"
+model_format_roadmap = "runtime"
+model_instance = "runtime"
+model_loading = "runtime"
+multi_device_placement = "runtime"
+observability = "runtime"
+operator_scope = "runtime"
+packed_weight = "runtime"
+phase_attribution = "runtime"
+planning = "runtime"
+prefix_cache = "runtime"
+production_model_ingestion = "runtime"
+provider = "runtime"
+provider_roadmap = "runtime"
+qwen_model_component = "runtime"
+reference_cpu = "runtime"
+runtime = "runtime"
+sampling = "runtime"
+scheduler = "runtime"
+session = "runtime"
+tensor = "runtime"
+tensor_parallel = "runtime"
+tokenizer = "runtime"
+
+# Modules kept in a higher layer than the one first planned for them, with
+# the dependency that keeps them there.
+
+[held.affinity]
+target = "core"
+reason = "AffinityResolution holds a `dyn Provider`, and AffinityError converts to ComputeError. Its data types moved to `binding` and `provider_status`."
+
+[held.tensor]
+target = "core"
+reason = "Tensor Resource handles name KernelError, MemoryPlacement and TensorResidency. Its descriptor types moved to `compute_types`."
+
+[held.operator_scope]
+target = "core"
+reason = "Checks an ExecutionGraph against KernelAdvertisement, KernelSelectionRequest and the Model Component's OperatorRequirement."
+
+[held.planning]
+target = "graph"
+reason = "Plans a ComputeGraph against ProviderMetadata and emits RuntimeEvent."
+
+[held.scheduler]
+target = "graph"
+reason = "Schedules on a `Runtime` and emits Runtime observations."
+
+[held.multi_device_placement]
+target = "graph"
+reason = "Places by KernelId and ModelInstanceId."
+
+[held.kernel_optimization_orchestration]
+target = "kernel"
+reason = "Applies the CLI boundary and Inference API scope checks."

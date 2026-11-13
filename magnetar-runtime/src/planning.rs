@@ -2,6 +2,7 @@ use crate::affinity::*;
 use crate::capability::*;
 use crate::compute::effective_compute_advertisement;
 use crate::compute::*;
+pub use crate::compute_types::{MemoryPlanningError, MemoryPressureReport};
 use crate::observability::*;
 use crate::provider::*;
 use crate::resolution::*;
@@ -353,17 +354,6 @@ pub struct BufferLifetime {
     pub reuses: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MemoryPressureReport {
-    pub estimated_required_bytes: u64,
-    pub estimated_peak_bytes: u64,
-    pub selected_provider: Option<ProviderBinding>,
-    pub selected_device: Option<DeviceBinding>,
-    pub rejected_device_limit: Option<u64>,
-    pub materialization_cost_bytes: u64,
-    pub transfer_buffer_cost_bytes: u64,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MemoryPlanningDecision {
     Allocate { requirement: String },
@@ -411,100 +401,6 @@ pub struct MemoryPlan {
     pub diagnostics: Vec<MemoryPlanningDiagnostic>,
     pub output_affinity: ResourceAffinity,
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MemoryPlanningError {
-    MemoryPlanningFailed {
-        reason: String,
-        report: MemoryPressureReport,
-    },
-    OutOfMemory {
-        required: u64,
-        limit: u64,
-        report: MemoryPressureReport,
-    },
-    ResourceExhausted {
-        reason: String,
-        report: MemoryPressureReport,
-    },
-    SizeOverflow {
-        reason: String,
-        report: MemoryPressureReport,
-    },
-    IncompatibleResourceAffinity(AffinityError),
-    UnsupportedLayout {
-        layout: ComputeLayout,
-        report: MemoryPressureReport,
-    },
-    MaterializationRequired {
-        reason: String,
-        report: MemoryPressureReport,
-    },
-    TransferRequired {
-        reason: String,
-        report: MemoryPressureReport,
-    },
-    ProviderMemoryLimitExceeded {
-        provider: ProviderBinding,
-        required: u64,
-        limit: u64,
-        report: MemoryPressureReport,
-    },
-    DeviceMemoryLimitExceeded {
-        device: DeviceBinding,
-        required: u64,
-        limit: u64,
-        report: MemoryPressureReport,
-    },
-}
-impl fmt::Display for MemoryPlanningError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MemoryPlanningFailed { reason, .. } => {
-                write!(f, "memory planning failed: {reason}")
-            }
-            Self::OutOfMemory {
-                required, limit, ..
-            } => write!(
-                f,
-                "memory planning requires {required} bytes but only {limit} bytes are available"
-            ),
-            Self::ResourceExhausted { reason, .. } => write!(f, "resource exhausted: {reason}"),
-            Self::SizeOverflow { reason, .. } => write!(f, "memory size overflow: {reason}"),
-            Self::IncompatibleResourceAffinity(error) => {
-                write!(f, "incompatible memory resource affinity: {error}")
-            }
-            Self::UnsupportedLayout { layout, .. } => {
-                write!(f, "memory planning does not support layout {layout:?}")
-            }
-            Self::MaterializationRequired { reason, .. } => {
-                write!(f, "memory planning requires materialization: {reason}")
-            }
-            Self::TransferRequired { reason, .. } => {
-                write!(f, "memory planning requires explicit transfer: {reason}")
-            }
-            Self::ProviderMemoryLimitExceeded {
-                provider,
-                required,
-                limit,
-                ..
-            } => write!(
-                f,
-                "provider '{provider}' memory limit exceeded: required {required}, limit {limit}"
-            ),
-            Self::DeviceMemoryLimitExceeded {
-                device,
-                required,
-                limit,
-                ..
-            } => write!(
-                f,
-                "device '{device}' memory limit exceeded: required {required}, limit {limit}"
-            ),
-        }
-    }
-}
-impl Error for MemoryPlanningError {}
 
 pub(crate) fn memory_pressure_diagnostic(report: &MemoryPressureReport) -> ComputeDiagnostic {
     let mut diagnostic = ComputeDiagnostic::new();

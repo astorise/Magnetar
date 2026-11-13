@@ -5,6 +5,8 @@
 //! Runtime validates adapter artifacts, plans memory through Memory Manager,
 //! and activates loaded adapter residency only through explicit policy.
 
+use crate::model_identity::validate_portable_identity;
+pub use crate::model_identity::{AdapterError, AdapterLifecycleState, AdapterRevision};
 use crate::{
     CapabilityBinding, ComputeDType, CorrelationId, DeviceBinding, GenerationModelReference,
     InferenceSessionId, MemoryAdmissionDecision, MemoryAdmissionRequest, MemoryAllocationClass,
@@ -13,7 +15,7 @@ use crate::{
     ModelQuantization, ModelRevision, ModelTensorMetadata, ProviderBinding, ResourceAffinity,
     TokenizerId,
 };
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{collections::BTreeSet, fmt};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AdapterArtifactId {
@@ -81,21 +83,6 @@ impl AdapterName {
     pub fn new(value: impl Into<String>) -> Result<Self, AdapterError> {
         let value = value.into();
         validate_portable_identity(&value, "adapter name")?;
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct AdapterRevision(String);
-
-impl AdapterRevision {
-    pub fn new(value: impl Into<String>) -> Result<Self, AdapterError> {
-        let value = value.into();
-        validate_portable_identity(&value, "adapter revision")?;
         Ok(Self(value))
     }
 
@@ -440,63 +427,6 @@ impl Default for AdapterSessionPolicy {
             sharing: AdapterSharingPolicy::PrivateToSession,
             unload_on_session_close: true,
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AdapterLifecycleState {
-    Requested,
-    Validating,
-    Planning,
-    Allocating,
-    Materializing,
-    Ready,
-    Active,
-    Inactive,
-    Merging,
-    Merged,
-    Unmerging,
-    Draining,
-    Unloading,
-    Unloaded,
-    Failed,
-    Invalid,
-}
-
-impl AdapterLifecycleState {
-    pub const fn allows_transition_to(self, next: Self) -> bool {
-        matches!(
-            (self, next),
-            (Self::Requested, Self::Validating)
-                | (Self::Requested, Self::Failed)
-                | (Self::Validating, Self::Planning)
-                | (Self::Validating, Self::Invalid)
-                | (Self::Validating, Self::Failed)
-                | (Self::Planning, Self::Allocating)
-                | (Self::Planning, Self::Failed)
-                | (Self::Allocating, Self::Materializing)
-                | (Self::Allocating, Self::Failed)
-                | (Self::Materializing, Self::Ready)
-                | (Self::Materializing, Self::Failed)
-                | (Self::Ready, Self::Active)
-                | (Self::Ready, Self::Inactive)
-                | (Self::Ready, Self::Merging)
-                | (Self::Ready, Self::Draining)
-                | (Self::Active, Self::Inactive)
-                | (Self::Active, Self::Draining)
-                | (Self::Active, Self::Merging)
-                | (Self::Inactive, Self::Active)
-                | (Self::Inactive, Self::Unloading)
-                | (Self::Merging, Self::Merged)
-                | (Self::Merging, Self::Failed)
-                | (Self::Merged, Self::Unmerging)
-                | (Self::Merged, Self::Draining)
-                | (Self::Unmerging, Self::Ready)
-                | (Self::Unmerging, Self::Failed)
-                | (Self::Draining, Self::Unloading)
-                | (Self::Unloading, Self::Unloaded)
-                | (Self::Unloading, Self::Failed)
-        )
     }
 }
 
@@ -850,141 +780,6 @@ impl AdapterObservation {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AdapterError {
-    AdapterArtifactNotFound,
-    AdapterArtifactInvalid {
-        reason: String,
-    },
-    AdapterArtifactUntrusted,
-    AdapterArtifactRevoked,
-    AdapterMethodUnsupported {
-        method: String,
-    },
-    BaseModelIncompatible,
-    ArchitectureIncompatible,
-    TargetModuleMissing {
-        target: String,
-    },
-    TargetTensorMismatch {
-        target: String,
-    },
-    TokenizerIncompatible,
-    StorageDTypeUnsupported {
-        dtype: ModelDType,
-    },
-    ComputeDTypeUnsupported {
-        dtype: ComputeDType,
-    },
-    QuantizationUnsupported,
-    AdapterRankUnsupported {
-        rank: u32,
-    },
-    AdapterShapeMismatch {
-        tensor: String,
-    },
-    MemoryFeasibilityFailed {
-        reason: String,
-    },
-    MemoryAllocationFailed {
-        reason: String,
-    },
-    AdapterLoadingQueued,
-    AdapterLoadingTimeout,
-    ProviderCapabilityUnavailable,
-    ProviderAdapterUnsupported,
-    ProviderNotReady,
-    ProviderSaturated,
-    DeviceUnavailable,
-    DeviceMemoryInsufficient,
-    ActivationDenied,
-    ActivationConflict,
-    MultipleAdaptersUnsupported,
-    MergeUnsupported,
-    MergeFailed,
-    UnmergeUnsupported,
-    UnmergeFailed,
-    KvCacheIncompatible,
-    PrefixCacheInvalidated,
-    UnloadFailed,
-    BrowserFeatureUnsupported,
-    InvalidLifecycleTransition {
-        from: AdapterLifecycleState,
-        to: AdapterLifecycleState,
-    },
-    InternalAdapter {
-        reason: String,
-    },
-}
-
-impl fmt::Display for AdapterError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AdapterArtifactNotFound => f.write_str("adapter artifact not found"),
-            Self::AdapterArtifactInvalid { reason } => {
-                write!(f, "adapter artifact invalid: {reason}")
-            }
-            Self::AdapterArtifactUntrusted => f.write_str("adapter artifact untrusted"),
-            Self::AdapterArtifactRevoked => f.write_str("adapter artifact revoked"),
-            Self::AdapterMethodUnsupported { method } => {
-                write!(f, "adapter method unsupported: {method}")
-            }
-            Self::BaseModelIncompatible => f.write_str("base model incompatible"),
-            Self::ArchitectureIncompatible => f.write_str("architecture incompatible"),
-            Self::TargetModuleMissing { target } => write!(f, "target module missing: {target}"),
-            Self::TargetTensorMismatch { target } => write!(f, "target tensor mismatch: {target}"),
-            Self::TokenizerIncompatible => f.write_str("tokenizer incompatible"),
-            Self::StorageDTypeUnsupported { dtype } => {
-                write!(f, "storage dtype unsupported: {dtype:?}")
-            }
-            Self::ComputeDTypeUnsupported { dtype } => {
-                write!(f, "compute dtype unsupported: {dtype:?}")
-            }
-            Self::QuantizationUnsupported => f.write_str("adapter quantization unsupported"),
-            Self::AdapterRankUnsupported { rank } => {
-                write!(f, "adapter rank unsupported: {rank}")
-            }
-            Self::AdapterShapeMismatch { tensor } => {
-                write!(f, "adapter shape mismatch: {tensor}")
-            }
-            Self::MemoryFeasibilityFailed { reason } => {
-                write!(f, "adapter memory feasibility failed: {reason}")
-            }
-            Self::MemoryAllocationFailed { reason } => {
-                write!(f, "adapter memory allocation failed: {reason}")
-            }
-            Self::AdapterLoadingQueued => f.write_str("adapter loading queued"),
-            Self::AdapterLoadingTimeout => f.write_str("adapter loading timeout"),
-            Self::ProviderCapabilityUnavailable => f.write_str("Provider capability unavailable"),
-            Self::ProviderAdapterUnsupported => f.write_str("Provider adapter unsupported"),
-            Self::ProviderNotReady => f.write_str("Provider not ready"),
-            Self::ProviderSaturated => f.write_str("Provider saturated"),
-            Self::DeviceUnavailable => f.write_str("Device unavailable"),
-            Self::DeviceMemoryInsufficient => f.write_str("Device memory insufficient"),
-            Self::ActivationDenied => f.write_str("adapter activation denied"),
-            Self::ActivationConflict => f.write_str("adapter activation conflict"),
-            Self::MultipleAdaptersUnsupported => f.write_str("multiple adapters unsupported"),
-            Self::MergeUnsupported => f.write_str("adapter merge unsupported"),
-            Self::MergeFailed => f.write_str("adapter merge failed"),
-            Self::UnmergeUnsupported => f.write_str("adapter unmerge unsupported"),
-            Self::UnmergeFailed => f.write_str("adapter unmerge failed"),
-            Self::KvCacheIncompatible => f.write_str("KV cache incompatible"),
-            Self::PrefixCacheInvalidated => f.write_str("Prefix Cache invalidated"),
-            Self::UnloadFailed => f.write_str("adapter unload failed"),
-            Self::BrowserFeatureUnsupported => f.write_str("browser adapter feature unsupported"),
-            Self::InvalidLifecycleTransition { from, to } => {
-                write!(
-                    f,
-                    "invalid adapter lifecycle transition from {from:?} to {to:?}"
-                )
-            }
-            Self::InternalAdapter { reason } => write!(f, "internal adapter error: {reason}"),
-        }
-    }
-}
-
-impl Error for AdapterError {}
-
 pub fn validate_adapter_compatibility(
     adapter: &AdapterArtifact,
     base_model: &AdapterBaseModelCompatibility,
@@ -1147,24 +942,6 @@ pub fn activation_uses_adapter(
         }
         _ => Ok(()),
     }
-}
-
-fn validate_portable_identity(value: &str, label: &str) -> Result<(), AdapterError> {
-    if value.trim().is_empty()
-        || value.contains('/')
-        || value.contains('\\')
-        || value.contains(':')
-        || value.to_ascii_lowercase().contains("provider")
-        || value.to_ascii_lowercase().contains("device")
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-    {
-        return Err(AdapterError::AdapterArtifactInvalid {
-            reason: format!("{label} must use a portable non-Provider, non-Device identifier"),
-        });
-    }
-    Ok(())
 }
 
 fn validate_target_module_name(value: &str) -> Result<(), AdapterError> {
