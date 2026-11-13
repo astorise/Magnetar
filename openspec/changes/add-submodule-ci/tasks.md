@@ -29,10 +29,10 @@
 - [ ] 4.2 Enable the GPU job in the CUDA Provider's caller workflow.
 - [ ] 4.3 Validate: a pull request from a repository branch runs the Provider's tests on real hardware; the hardware-gated tests are executed, not skipped.
 - [ ] 4.4 Validate: with the GPU made unavailable to the container, the job fails.
-- [ ] 4.5 Confirm from the workflow condition that a fork pull request does not start the GPU job.
+- [x] 4.5 The GPU job's condition runs it only for non-pull-request events and for pull requests whose head repository is the module repository itself. Read from the workflow; not exercised with a real fork.
 
 ## 5. Documentation
 
-- [ ] 5.1 `SUBMODULES.md`: the two levels of checks (module CI, Magnetar integration), the same-name branch rule for coordinated changes, and what to do when a module check fails on a stale lockfile.
-- [ ] 5.2 `docs/quality.md` and `CONTRIBUTING.md`: how to reproduce a module's checks locally inside a Magnetar checkout.
+- [x] 5.1 `SUBMODULES.md`: the two levels of checks (module CI, Magnetar integration), the same-name branch rule for coordinated changes, and what to do when a module check fails on a stale lockfile.
+- [x] 5.2 `docs/quality.md` and `CONTRIBUTING.md`: how to reproduce a module's checks locally inside a Magnetar checkout.
 - [ ] 5.3 Each module repository's `README.md`: a short section on its CI and on the Magnetar revision it is tested against.

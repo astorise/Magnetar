@@ -21,6 +21,16 @@ root-level `--workspace` never builds them (#64). See
 [docs/quality.md](docs/quality.md)'s "Submodule Workspace" section for the
 exact commands.
 
+### Module repositories
+
+Each Component, Provider, Format and Loader repository runs its own checks
+on its pull requests, through this repository's reusable workflow
+`.github/workflows/submodule-ci.yml`. For a change that spans this
+repository and a module, push this repository's branch first, then the
+module's branch under the same name: the module is then tested against
+your branch here. See [SUBMODULES.md](SUBMODULES.md), "Module CI", and
+[docs/quality.md](docs/quality.md) for the local commands.
+
 ### Runtime layers
 
 The Runtime is six crates: `magnetar-core`, `magnetar-graph`,
