@@ -35,4 +35,4 @@
 
 - [x] 5.1 `SUBMODULES.md`: the two levels of checks (module CI, Magnetar integration), the same-name branch rule for coordinated changes, and what to do when a module check fails on a stale lockfile.
 - [x] 5.2 `docs/quality.md` and `CONTRIBUTING.md`: how to reproduce a module's checks locally inside a Magnetar checkout.
-- [ ] 5.3 Each module repository's `README.md`: a "Continuous integration" section (what runs, which Magnetar revision, how to reproduce locally). Written and pushed in the thirteen repositories; pull requests open.
+- [x] 5.3 Each module repository's `README.md` has a "Continuous integration" section: what runs, which Magnetar revision, what a lockfile failure means, how to reproduce locally. Merged in the thirteen repositories; Magnetar's pins include those commits.
