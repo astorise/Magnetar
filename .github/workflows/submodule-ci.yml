@@ -73,7 +73,7 @@ env:
 
 jobs:
   checks:
-    name: module / checks
+    name: checks
     runs-on: ubuntu-latest
     steps:
       - name: Select the Magnetar revision
@@ -170,7 +170,7 @@ jobs:
         run: cargo deny --manifest-path "$MODULE_PATH/Cargo.toml" check
 
   gpu:
-    name: module / gpu
+    name: gpu
     # A self-hosted runner executes the pull request's code, so this job
     # runs for pushes and for pull requests from branches of the module
     # repository itself, never for a pull request from a fork.
