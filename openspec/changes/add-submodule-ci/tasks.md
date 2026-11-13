@@ -12,7 +12,7 @@
 - [x] 2.1 Caller workflow in the CPU Provider repository (`pull_request`, `push` to `main`): astorise/Magnetar-provider-CPU#17, a draft that references the workflow at the Magnetar branch adding it.
 - [x] 2.2 Coordinated case validated in CI: the run log names the Magnetar branch of the same name, and formatting, Clippy, the 39 tests and `cargo-deny` pass.
 - [x] 2.3 Stale lockfile reproduced locally with the pre-split lockfile: `cargo test --locked` fails with "cannot update the lock file ... because --locked was passed".
-- [ ] 2.4 After astorise/Magnetar#169 is merged: switch the reference to `@main` and confirm the run against Magnetar's `main` passes. The pull request was marked ready by the maintainer and is still open.
+- [x] 2.4 After astorise/Magnetar#169 was merged: reference switched to `@main` in astorise/Magnetar-provider-CPU#17, whose run passed with the workflow loaded from Magnetar's `main`; merged.
 - [ ] 2.5 Failing test reported as a failed check: not exercised in CI (the session can push only to the pull request's own branch, so a scratch branch was not available).
 
 ## 3. Other module repositories
@@ -21,7 +21,7 @@
 - [x] 3.2 Formats GGUF and safetensors, Loaders GGUF and Hugging Face: caller workflow as draft pull requests; each Loader checks out its Format sibling.
 - [x] 3.3 Components Qwen and Llama: caller workflow as draft pull requests, Clippy off.
 - [x] 3.4 First runs: all thirteen repositories pass on their current head. Two findings fixed on the way: the WGPU Provider also depends on `providers/cpu` by path (sibling added), and the two Formats locked `wasmtime` 50.0.0, affected by RUSTSEC-2026-0422, -0423 and -0424 (lockfiles updated to 50.0.1, which Magnetar and the other modules already used).
-- [ ] 3.5 The twelve pull requests were merged while still referencing the workflow at the Magnetar branch `claude/awesome-davinci-t65edq`; their runs on `main` pass (checked on the CUDA and WGPU Providers). After astorise/Magnetar#169 is merged: one follow-up pull request per repository to switch the reference to `@main`. Until then the Magnetar branch must not be deleted, or every module run fails to load the workflow.
+- [x] 3.5 The twelve other pull requests had been merged while still referencing the workflow at the Magnetar branch that added it. After astorise/Magnetar#169 was merged, one follow-up pull request per repository switched the reference to `@main`; all twelve passed and are merged. Magnetar's submodule pins now point at those commits.
 
 ## 4. CUDA Provider GPU job
 
@@ -35,4 +35,4 @@
 
 - [x] 5.1 `SUBMODULES.md`: the two levels of checks (module CI, Magnetar integration), the same-name branch rule for coordinated changes, and what to do when a module check fails on a stale lockfile.
 - [x] 5.2 `docs/quality.md` and `CONTRIBUTING.md`: how to reproduce a module's checks locally inside a Magnetar checkout.
-- [ ] 5.3 Each module repository's `README.md`: a short section on its CI and on the Magnetar revision it is tested against.
+- [x] 5.3 Each module repository's `README.md` has a "Continuous integration" section: what runs, which Magnetar revision, what a lockfile failure means, how to reproduce locally. Merged in the thirteen repositories; Magnetar's pins include those commits.
