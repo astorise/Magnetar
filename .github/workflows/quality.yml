@@ -104,7 +104,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install cargo-deny
-        uses: taiki-e/install-action@85b8c964f8994926657d167d871f45a4b9d3467d # cargo-deny
+        uses: taiki-e/install-action@98b24ef8830c90613ec3b57343df3abde2b66e56 # cargo-deny
       - name: Check advisories, bans, licenses and sources
         run: cargo deny --all-features check
 
@@ -186,7 +186,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install wasm-tools
-        uses: taiki-e/install-action@9a736acb53a18aa23c819f670901f6ca3ccfaf9d # wasm-tools
+        uses: taiki-e/install-action@36e7ca32567fd52c73be82cff7b13e34787b1414 # wasm-tools
       - name: Validate WIT packages
         shell: bash
         run: |
@@ -483,7 +483,7 @@ jobs:
       - name: Build and test the WGPU Provider
         run: cargo test --locked --manifest-path providers/wgpu/Cargo.toml
       - name: Install cargo-deny
-        uses: taiki-e/install-action@85b8c964f8994926657d167d871f45a4b9d3467d # cargo-deny
+        uses: taiki-e/install-action@98b24ef8830c90613ec3b57343df3abde2b66e56 # cargo-deny
       # The root `deny` job above never sees this submodule (it checks out
       # without submodules by design, `externalize-runtime-extension-
       # modules`'s "zero compile-time dependency on any externalized
@@ -674,7 +674,7 @@ jobs:
       # submodule recursively, so it is the natural place to close the
       # rest.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@85b8c964f8994926657d167d871f45a4b9d3467d # cargo-deny
+        uses: taiki-e/install-action@98b24ef8830c90613ec3b57343df3abde2b66e56 # cargo-deny
       - name: Check the submodule workspace's dependency graph (advisories, bans, licenses, sources)
         # `--allow wildcard --allow unlicensed`: `magnetar-format-safetensors`
         # and `magnetar-loader-huggingface` (external submodules this
@@ -775,7 +775,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@61b160225e09dfa2ea62afd328f7c2eafb5d2e54 # cargo-llvm-cov
+        uses: taiki-e/install-action@3f7c3597aa4e6da3f315e128de702ce61e7b2877 # cargo-llvm-cov
       - name: Cache Cargo data
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Prepare coverage output
