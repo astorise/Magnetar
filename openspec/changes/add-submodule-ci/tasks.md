@@ -25,8 +25,8 @@
 
 ## 4. CUDA Provider GPU job
 
-- [ ] 4.1 Confirm the GPU runner is registered for the CUDA Provider repository; record its label and container image in `SUBMODULES.md`.
-- [ ] 4.2 Enable the GPU job in the CUDA Provider's caller workflow.
+- [ ] 4.1 Runner label recorded in `SUBMODULES.md`: `arc-gpu-magnetar-provider-cuda`. Still to confirm: the runner is registered and online for the CUDA Provider repository, and it can run the `nvidia/cuda` container image with `--gpus all`.
+- [x] 4.2 GPU job enabled in the CUDA Provider's caller workflow (astorise/Magnetar-provider-CUDA#35) with that label.
 - [ ] 4.3 Validate: a pull request from a repository branch runs the Provider's tests on real hardware; the hardware-gated tests are executed, not skipped.
 - [ ] 4.4 Validate: with the GPU made unavailable to the container, the job fails.
 - [x] 4.5 The GPU job's condition runs it only for non-pull-request events and for pull requests whose head repository is the module repository itself. Read from the workflow; not exercised with a real fork.

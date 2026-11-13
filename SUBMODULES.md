@@ -96,7 +96,10 @@ submodule path, and runs formatting, Clippy, `cargo test --locked` and
 - **GPU.** The CUDA Provider also runs its tests, hardware-gated ones
   included, on a self-hosted GPU runner. That job runs for pushes and for
   pull requests from branches of the repository itself, never for a pull
-  request from a fork, and fails when no GPU is visible.
+  request from a fork, and fails when no GPU is visible. The runner is
+  `arc-gpu-magnetar-provider-cuda`, registered for the CUDA Provider
+  repository; the job uses the same container image as
+  `gpu-runner-smoke.yml` unless the caller names another one.
 - **Components.** `components/qwen` and `components/llama` call the
   workflow with Clippy off: their package names
   (`magnetar-component-Qwen`, `magnetar-component-Llama`) trip the
