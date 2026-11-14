@@ -202,3 +202,8 @@ and `Q3_K_M`'s matmul-residual (its `Q4_K`/`Q5_K` `attn_output` and
 `ffn_down`) drops from 6.35 to 1.87 ms. `Q3_K_M`'s plain matmuls
 (`Q3_K` `q`/`k`/`gate`/`up`) stay at 2.86 ms per call: the `Q3_K` kernel
 (about 5 GB/s locally, half of `Q4_K`) is now its limit.
+
+The `Q3_K` kernel now unpacks each super-block's sixteen scales with SSE
+and places each run's bits with constant shifts: a Mistral-shaped matmul
+on 4 local cores drops from about 4.5 ms (5.5 GB/s) to 2.4-3.1 ms
+(8-10.5 GB/s), level with `Q4_K`.
