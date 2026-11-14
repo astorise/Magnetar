@@ -69,7 +69,7 @@ Magnetar-to-module compatibility matrix (task 15.4).
 
 ## Module CI
 
-Two levels of checks cover a module (`add-submodule-ci`):
+Two levels of checks cover a module (the `submodule-ci` specification):
 
 | Check | Where it runs | What it answers |
 |---|---|---|
