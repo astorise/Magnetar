@@ -81,7 +81,7 @@ fn dequantizes_q4_k_and_applies_the_transposed_storage() {
         .expect("two rows of one super-block");
     assert_eq!(weight.logical_shape(), [256, 2]);
     let stored = weight.dequantize_stored();
-    assert_eq!(stored, crate::model_loading::dequantize_q4_k(&bytes));
+    assert_eq!(stored, crate::quantization::dequantize_q4_k(&bytes));
     // Element 0 of row 0: low nibble of qs[0] = 0, so -dmin * min = -0.5.
     assert_eq!(stored[0], -0.5);
     // Element 32 of row 0: high nibble of qs[0] = 0 -> -0.5 too; element 1:

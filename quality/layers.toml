@@ -20,7 +20,8 @@ graph = 2
 model-data = 3
 kernel = 4
 component-engine = 4
-runtime = 5
+provider-api = 5
+runtime = 6
 
 [modules]
 # Core types: no dependency on another layer.
@@ -68,6 +69,11 @@ component_web = "component-engine"
 graph_builder_capability = "component-engine"
 model_component = "component-engine"
 model_config_capability = "component-engine"
+
+# Provider API (`extract-provider-api-crate`): what Providers implement and
+# call. May use every layer below it, never Runtime orchestration or the
+# Component engine.
+quantization = "provider-api"
 
 # Runtime orchestration.
 adapter = "runtime"

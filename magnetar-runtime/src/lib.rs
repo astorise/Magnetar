@@ -68,6 +68,7 @@ pub mod provider;
 pub use magnetar_core::provider_abi;
 pub mod provider_roadmap;
 pub use magnetar_core::provider_status;
+pub mod quantization;
 pub mod qwen_model_component;
 pub mod reference_cpu;
 pub use magnetar_core::resolution;

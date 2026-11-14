@@ -16,7 +16,7 @@
 //! transpose (a checkpoint stores a projection as `[out, in]` with its
 //! blocks along `in`; the graph multiplies by `[in, out]`).
 
-use crate::model_loading::f16_to_f32;
+use crate::quantization::f16_to_f32;
 use crate::tensor::HostTensor;
 
 /// [`crate::model::ModelTensorMetadata::layout`] value declaring that a
@@ -59,19 +59,19 @@ pub enum PackedWeightFormat {
     /// bytes of `IQ4_NL` indices; `value = d * (scale - 32) * table[index]`.
     Iq4Xs,
     /// GGUF `block_iq2_xxs`: 256 values per super-block, 66 bytes of grid
-    /// indices, signs and scales (`crate::model_loading::dequantize_iq2_xxs`).
+    /// indices, signs and scales (`crate::quantization::dequantize_iq2_xxs`).
     Iq2Xxs,
     /// GGUF `block_iq2_xs`: 256 values per super-block, 74 bytes of grid
-    /// indices, signs and scales (`crate::model_loading::dequantize_iq2_xs`).
+    /// indices, signs and scales (`crate::quantization::dequantize_iq2_xs`).
     Iq2Xs,
     /// GGUF `block_iq2_s`: 256 values per super-block, 82 bytes of grid
-    /// indices, signs and scales (`crate::model_loading::dequantize_iq2_s`).
+    /// indices, signs and scales (`crate::quantization::dequantize_iq2_s`).
     Iq2S,
     /// GGUF `block_iq3_xxs`: 256 values per super-block, 98 bytes of grid
-    /// indices, signs and scales (`crate::model_loading::dequantize_iq3_xxs`).
+    /// indices, signs and scales (`crate::quantization::dequantize_iq3_xxs`).
     Iq3Xxs,
     /// GGUF `block_iq3_s`: 256 values per super-block, 110 bytes of grid
-    /// indices, signs and scales (`crate::model_loading::dequantize_iq3_s`).
+    /// indices, signs and scales (`crate::quantization::dequantize_iq3_s`).
     Iq3S,
 }
 
@@ -213,17 +213,17 @@ impl PackedWeight {
     /// do.
     pub fn dequantize_stored(&self) -> Vec<f32> {
         match self.format {
-            PackedWeightFormat::Q4K => crate::model_loading::dequantize_q4_k(&self.bytes),
-            PackedWeightFormat::Q6K => crate::model_loading::dequantize_q6_k(&self.bytes),
-            PackedWeightFormat::Q2K => crate::model_loading::dequantize_q2_k(&self.bytes),
-            PackedWeightFormat::Q3K => crate::model_loading::dequantize_q3_k(&self.bytes),
-            PackedWeightFormat::Iq4Nl => crate::model_loading::dequantize_iq4_nl(&self.bytes),
-            PackedWeightFormat::Iq4Xs => crate::model_loading::dequantize_iq4_xs(&self.bytes),
-            PackedWeightFormat::Iq2Xxs => crate::model_loading::dequantize_iq2_xxs(&self.bytes),
-            PackedWeightFormat::Iq2Xs => crate::model_loading::dequantize_iq2_xs(&self.bytes),
-            PackedWeightFormat::Iq2S => crate::model_loading::dequantize_iq2_s(&self.bytes),
-            PackedWeightFormat::Iq3Xxs => crate::model_loading::dequantize_iq3_xxs(&self.bytes),
-            PackedWeightFormat::Iq3S => crate::model_loading::dequantize_iq3_s(&self.bytes),
+            PackedWeightFormat::Q4K => crate::quantization::dequantize_q4_k(&self.bytes),
+            PackedWeightFormat::Q6K => crate::quantization::dequantize_q6_k(&self.bytes),
+            PackedWeightFormat::Q2K => crate::quantization::dequantize_q2_k(&self.bytes),
+            PackedWeightFormat::Q3K => crate::quantization::dequantize_q3_k(&self.bytes),
+            PackedWeightFormat::Iq4Nl => crate::quantization::dequantize_iq4_nl(&self.bytes),
+            PackedWeightFormat::Iq4Xs => crate::quantization::dequantize_iq4_xs(&self.bytes),
+            PackedWeightFormat::Iq2Xxs => crate::quantization::dequantize_iq2_xxs(&self.bytes),
+            PackedWeightFormat::Iq2Xs => crate::quantization::dequantize_iq2_xs(&self.bytes),
+            PackedWeightFormat::Iq2S => crate::quantization::dequantize_iq2_s(&self.bytes),
+            PackedWeightFormat::Iq3Xxs => crate::quantization::dequantize_iq3_xxs(&self.bytes),
+            PackedWeightFormat::Iq3S => crate::quantization::dequantize_iq3_s(&self.bytes),
             PackedWeightFormat::Q8_0 => self
                 .bytes
                 .as_chunks::<34>()
