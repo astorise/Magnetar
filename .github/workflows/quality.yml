@@ -657,12 +657,15 @@ jobs:
         run: |
           set -euo pipefail
           pattern='magnetar-(component|format|provider|loader)-'
-          if grep -qE "$pattern" magnetar-runtime/Cargo.toml; then
+          # `magnetar-provider-api` is this workspace's own contract crate
+          # (layer 5), not an externalized Provider, so it is allowed.
+          externalized() { grep -E "$pattern" | grep -vE 'magnetar-provider-api' || true; }
+          if [ -n "$(externalized < magnetar-runtime/Cargo.toml)" ]; then
             echo "::error file=magnetar-runtime/Cargo.toml::magnetar-runtime must not depend on an externalized Component/Provider/Format crate"
             exit 1
           fi
           tree_output="$(cargo tree --manifest-path magnetar-runtime/Cargo.toml --all-features)"
-          if grep -qE "$pattern" <<< "$tree_output"; then
+          if [ -n "$(externalized <<< "$tree_output")" ]; then
             echo "::error file=magnetar-runtime/Cargo.toml::magnetar-runtime's resolved dependency graph includes an externalized Component/Provider/Format crate"
             exit 1
           fi
