@@ -268,3 +268,10 @@ the Reference CPU kernel) and 0.027 ms on Qwen2.5-0.5B (0.116 ms). TPOT:
 
 All answer "Paris". Attention is now under 1 % of a Mistral token; the
 matmuls remain the cost.
+
+The IQ2_XXS, IQ2_XS and IQ3_XXS kernels computed each group's eighth sign
+bit with `count_ones` (emulated: the kernels' target features exclude
+`popcnt`); a 128-entry table built at compile time replaces it. Local
+Mistral-shaped matmuls, 4 cores, noisy host: `IQ2_XXS` about 4.6 to
+3.1 ms, `IQ3_XXS` about 4.5 to 3.5 ms, `IQ2_XS` about 5.3 to 3.8 ms, with
+`Q4_K` at 2.6-3.3 ms on the same runs.
