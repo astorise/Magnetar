@@ -36,6 +36,22 @@ Magnetar-to-module compatibility matrix (task 15.4).
 | `providers/npu` | [Magnetar-provider-NPU](https://github.com/astorise/Magnetar-provider-NPU) | Real device-discovery skeleton, no compute Kernels: `NpuProvider::new()` dynamically loads the real oneAPI Level Zero loader library and calls the real `zeInit(ZE_INIT_FLAG_VPU_ONLY)`/`zeDriverGet` API (declarations transcribed directly from the real, public `ze_api.h` header), gracefully reporting unavailable when no Level Zero NPU driver is found -- true on every machine and CI runner this repository currently has. No Intel NPU hardware exists anywhere in this repository's tooling to implement or verify real compute Kernels against -- see its own README |
 | `providers/tpu` | [Magnetar-provider-TPU](https://github.com/astorise/Magnetar-provider-TPU) | Real device-discovery skeleton, no compute Kernels: `TpuProvider::new()` dynamically loads the real Google Coral `libedgetpu` runtime library and calls the real `edgetpu_list_devices` API (declarations transcribed directly from the real, public `edgetpu_c.h` header), gracefully reporting unavailable when no Coral Edge TPU is attached -- true on every machine and CI runner this repository currently has. Targets the real, purchasable local Coral Edge TPU accelerator, not Google Cloud TPU (a cloud service with no local device to discover). No Coral hardware exists anywhere in this repository's tooling to implement or verify real compute Kernels against -- see its own README |
 
+## Providers depend on `magnetar-provider-api`
+
+Every Provider (`providers/cpu`, `cuda`, `metal`, `npu`, `rocm`, `tpu`,
+`wgpu`) depends on the layer crates it needs (`magnetar-provider-api`,
+plus `magnetar-core`, `magnetar-graph` and `magnetar-kernel` where it uses
+their types), not on `magnetar-runtime` (`extract-provider-api-crate`,
+section 5). A change confined to the Runtime orchestration crate, the
+Component engine or the generation engine therefore does not reach a
+Provider's lockfile.
+
+One exception remains: `providers/cuda` keeps `magnetar-runtime` as a
+`[dev-dependency]`, because its tests drive the real `Runtime` and the
+Provider conformance suite. Its normal dependency graph is free of the
+Runtime, but its lockfile still follows the Runtime's own dependencies
+until those tests move out of the crate.
+
 ## Versioning and release ownership
 
 - **Each module versions itself independently.** A module's `Cargo.toml`
