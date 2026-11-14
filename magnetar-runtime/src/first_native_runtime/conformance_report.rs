@@ -1968,3 +1968,6 @@ pub(super) fn elapsed_millis(start: SystemTime) -> u64 {
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests;

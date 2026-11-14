@@ -952,3 +952,6 @@ fn validate_model_references_tokenizer(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

@@ -343,3 +343,6 @@ impl From<MemoryError> for E2eConformanceError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -607,3 +607,6 @@ pub struct SessionObservation {
 pub fn runtime_session_affinity(execution_context: crate::ExecutionContextId) -> ResourceAffinity {
     ResourceAffinity::new(FallbackClass::Transparent).with_execution_context(execution_context)
 }
+
+#[cfg(test)]
+mod tests;

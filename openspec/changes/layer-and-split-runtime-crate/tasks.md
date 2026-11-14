@@ -32,8 +32,8 @@
 - [x] 4.2 Convert `first_native_runtime` to a directory module with thirteen submodules (design D6). One scripted commit: items keep their order and bodies, and file-private items become `pub(super)`.
 - [x] 4.3 Point the static guards that read the module's source text (seven tests, `first_native_implementation_cut`, `tools/check_generic_facade_family_isolation.py`) at the directory's production files.
 - [x] 4.4 Verify: largest submodule 1,960 lines; the 1,355 test names are identical to the baseline; public API diff shows no removed and no changed item; Clippy, documentation and layering gates pass.
-- [ ] 4.5 Move each test of `first_native_runtime/tests.rs` (11,771 lines) next to the code it tests.
-- [ ] 4.6 Split `src/tests.rs`: tests using only public items go to `tests/contract_tests/`, the others to their module.
+- [x] 4.5 Move each test of `first_native_runtime/tests.rs` (11,771 lines) next to the code it tests: 161 tests now sit in `first_native_runtime/<module>/tests.rs`, placed by which module's items each one uses most. The shared mock executors and fixtures, the ten source-text guards that cover the whole module and the tests in the inline `resolve_qwen_component_from_env_var_tests` module stay in `first_native_runtime/tests.rs` (7,162 lines). Same 773 test names before and after; all pass.
+- [x] 4.6 Split `src/tests.rs` (6,630 lines, 155 tests): 24 tests that use no shared helper and compile against the public API moved to `tests/contract_tests/`; 66 moved to the `tests.rs` of the module they exercise (`compute`, `generation`, `inference_api`, `model_format_roadmap`, `model_instance`, `model_loading`, `provider_roadmap`, `reference_cpu`, `runtime`, `session`, `tokenizer`). 65 stay in `src/tests.rs` (3,598 lines) with the shared helpers: their subject now lives in a layer crate but they need Runtime-only helpers, or they read source text by relative path. Seven helpers that the destination files already defined identically were removed from `src/tests.rs`. Same 950 test names in the crate before and after; 1,703 workspace tests pass with default and with all features.
 - [x] 4.7 The test build without `wasmtime-component-engine` compiles: `first_native_runtime` imports its graph oracle from `tests` under the same cfg. Seven tests fail in that configuration; they could not be built before, and no CI job runs it.
 
 ## 5. Extract layer crates
@@ -47,19 +47,19 @@
 - [x] 5.7 After the extractions: every one of the 4,327 public type, trait, function, constant and module paths of the baseline (`d5231c7`) still resolves through `magnetar-runtime` (compiled probe); 1,703 workspace tests pass, none removed; Clippy, documentation and layering gates pass.
 - [x] 5.8 `wasm32-unknown-unknown`: `cargo check -p magnetar-runtime --all-features` passes with the layer crates.
 - [x] 5.9 Build times after the split, same machine, one run: clean check 44.6 s (53.1 s before); after touching a Runtime file 1.3 s, a `magnetar-kernel` file 2.0 s, a `magnetar-core` file 2.3 s (3.0 s before for any file); clean test build 72.4 s (88.5 s before).
-- [ ] 5.10 Build each crate on macOS and Windows (CI matrix).
+- [x] 5.10 Build each crate on macOS and Windows (CI matrix). Done: the `ubuntu`/`windows`/`macos` matrix jobs passed on astorise/Magnetar#169.
 
 ## 6. Consumers and validation
 
 - [x] 6.1 `magnetar-cli`, `inference-components`, `roadmap-contracts` and the three integration test crates build without source change; `magnetar-cli` (93) and `magnetar-inference-component` (14) tests pass. `submodule-workspace/Cargo.lock` is updated.
 - [x] 6.2 Pinned Provider, Format and Loader repositories: each `Cargo.lock` gains the five layer crates (one pull request per repository, no source change), and the eleven submodule pins point at those commits. With them, `cargo test --locked` passes in each of the eleven. The eleven pull requests are merged and the pins point at the merged commits. The Component repositories do not depend on `magnetar-runtime`.
-- [ ] 6.3 Run the WIT validation gate in CI. The WIT files are not moved or edited by this change.
-- [ ] 6.4 Run GPU CI (`cuda-first-native`, `multi-device-cpu-cuda`, real-checkpoint numerics): results identical to the baseline.
+- [x] 6.3 Run the WIT validation gate in CI. The WIT files are not moved or edited by this change. Done: `quality / wit` passed on astorise/Magnetar#169.
+- [x] 6.4 Run GPU CI (`cuda-first-native`, `multi-device-cpu-cuda`, real-checkpoint numerics): results identical to the baseline. Done: `gpu-runner-smoke.yml`, suite `all`, dispatched on this branch at `b2c8f38` (six crates, tests split next to their modules), passed in 67 minutes.
 
 ## 7. Release, coverage and documentation
 
 - [x] 7.1 `release-publication.yml` packages and publishes the six crates together; `cargo publish --dry-run` of the six passes locally, in dependency order.
-- [ ] 7.2 Coverage: confirm in CI that the workspace measurement is not below `quality/coverage-baseline.json` now that code sits in six crates. (The SBOM is generated from `cargo metadata` and lists the layer crates without change.)
+- [x] 7.2 Coverage: confirm in CI that the workspace measurement is not below `quality/coverage-baseline.json` now that code sits in six crates. (The SBOM is generated from `cargo metadata` and lists the layer crates without change.) Done: `quality / coverage` passed on astorise/Magnetar#169.
 - [x] 7.3 Formatting, Clippy, test, documentation and `cargo-deny` gates run on the workspace and so cover the new crates; the layering, model-family isolation, test-placement and Wasmtime jobs name them explicitly.
 - [x] 7.4 `README.md`, `CONTRIBUTING.md`, `docs/quality.md`, `openspec/config.yaml` and `quality/layers.toml` describe the crate layout.
 - [x] 7.5 `CHANGELOG.md` entry: public paths unchanged, new crates listed.

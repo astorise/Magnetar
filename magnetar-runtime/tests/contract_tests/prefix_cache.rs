@@ -1,3 +1,4 @@
+use magnetar_runtime::PrefixCachePrivacyPolicy;
 use magnetar_runtime::{
     ComputeDType, FallbackClass, GenerationModelReference, KvCache, KvCacheId,
     KvCacheLayoutMetadata, KvCachePolicy, KvCacheResidency, KvCacheScope, KvCacheSharingPolicy,
@@ -274,4 +275,24 @@ fn prefix_cache_tracks_memory_and_backing_kv_cache_lifecycle() {
         .find(|item| item.id == allocation)
         .unwrap();
     assert_eq!(released.state, MemoryAllocationState::Active);
+}
+
+#[test]
+fn inference_api_prefix_cache_policy_covers_scope_sharing_ttl_budget_privacy_reuse() {
+    let policy = PrefixCachePolicy {
+        enabled: true,
+        allow_partial_reuse: true,
+        require_sealed_kv_cache_for_sharing: true,
+        sharing: PrefixCacheSharingPolicy::SessionLocal,
+        privacy: PrefixCachePrivacyPolicy::default(),
+        max_memory_bytes: Some(1 << 20),
+        max_prefix_tokens: Some(1024),
+        ttl_millis: Some(60_000),
+        idle_ttl_millis: Some(5_000),
+        persist_after_session_close: false,
+    };
+    assert!(policy.enabled);
+    assert!(policy.allow_partial_reuse);
+    assert_eq!(policy.sharing, PrefixCacheSharingPolicy::SessionLocal);
+    assert_eq!(policy.ttl_millis, Some(60_000));
 }
