@@ -187,3 +187,18 @@ each value's fifth bit (AVX2 kernel: 4.32 ms / 9.3 GB/s and 3.96 ms /
 product before), and CUDA reads it directly too (dequantize, f32 and
 `__dp4a` decode Kernels). The `Q3_K_M` and `IQ4_XS` mixes therefore keep
 every quantized matrix packed.
+
+GPU smoke run 43612369661 (commit `5d2352e`, `Q5_K` packed), same host,
+3 threads; the CUDA `Q5_K` conformance test passes:
+
+| Mistral 7B | CPU TPOT | CPU matmul / matmul-residual per call | CUDA TPOT |
+|---|---|---|---|
+| `Q4_K_M` | 379.0 ms | 1.42 / 2.03 ms | 17.5 ms |
+| `IQ4_XS` | 395.3 ms (was 508.6) | 1.50 / 1.94 ms | 16.5 ms (was 17.5) |
+| `Q3_K_M` | 602.8 ms (was 881.4) | 2.86 / 1.87 ms | 15.1 ms (was 16.2) |
+
+All answer "Paris". With `Q5_K` packed, `IQ4_XS` runs at `Q4_K_M`'s pace
+and `Q3_K_M`'s matmul-residual (its `Q4_K`/`Q5_K` `attn_output` and
+`ffn_down`) drops from 6.35 to 1.87 ms. `Q3_K_M`'s plain matmuls
+(`Q3_K` `q`/`k`/`gate`/`up`) stay at 2.86 ms per call: the `Q3_K` kernel
+(about 5 GB/s locally, half of `Q4_K`) is now its limit.
