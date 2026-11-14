@@ -207,3 +207,15 @@ The `Q3_K` kernel now unpacks each super-block's sixteen scales with SSE
 and places each run's bits with constant shifts: a Mistral-shaped matmul
 on 4 local cores drops from about 4.5 ms (5.5 GB/s) to 2.4-3.1 ms
 (8-10.5 GB/s), level with `Q4_K`.
+
+GPU smoke run 43620986794 (commit `435bad2`), same host, 3 threads:
+
+| Mistral 7B | CPU TPOT | CPU matmul / matmul-residual per call |
+|---|---|---|
+| `Q4_K_M` | 373.1 ms | 1.39 / 2.00 ms |
+| `IQ4_XS` | 400.3 ms | 1.53 / 1.97 ms |
+| `Q3_K_M` | 375.8 ms (was 602.8) | 1.48 (was 2.86) / 1.88 ms |
+
+All answer "Paris". `Q3_K_M` now runs at `Q4_K_M`'s pace on the CPU:
+every Mistral mix tried is bounded by memory bandwidth, not by a format's
+decode.
