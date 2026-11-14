@@ -161,7 +161,7 @@ jobs:
         run: cargo test --locked --manifest-path "$MODULE_PATH/Cargo.toml"
       - name: Install cargo-deny
         if: ${{ inputs.deny }}
-        uses: taiki-e/install-action@98b24ef8830c90613ec3b57343df3abde2b66e56 # cargo-deny
+        uses: taiki-e/install-action@189504a963cde105ae7493e3447085686df99d38 # cargo-deny
       - name: Check the module's dependency graph (advisories, bans, licenses, sources)
         if: ${{ inputs.deny }}
         working-directory: Magnetar
