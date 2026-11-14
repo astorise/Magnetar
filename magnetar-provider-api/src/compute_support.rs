@@ -7,7 +7,7 @@
 //! advertisement, execution) so that a Provider can implement the
 //! Capability without depending on it.
 
-use crate::affinity::*;
+use crate::binding::*;
 use crate::capability::*;
 use crate::compute_types::*;
 use crate::device::*;
@@ -196,7 +196,8 @@ impl ComputeOperationSupport {
         self.precision_modes.extend(precision_modes);
         self
     }
-    pub(crate) fn supports(
+    #[doc(hidden)]
+    pub fn supports(
         &self,
         operation: &ComputeOperationDescriptor,
     ) -> Result<(), ComputeValidationError> {
@@ -363,7 +364,8 @@ impl OperationFamilySupport {
             portable: true,
         }
     }
-    pub(crate) fn operation_support(&self) -> ComputeOperationSupport {
+    #[doc(hidden)]
+    pub fn operation_support(&self) -> ComputeOperationSupport {
         ComputeOperationSupport {
             dtypes: self.dtypes.portable.clone(),
             provider_specific_dtypes: self.dtypes.provider_specific.clone(),
@@ -427,7 +429,8 @@ impl OperationSchemaSupport {
             portable: true,
         }
     }
-    pub(crate) fn operation_support(&self) -> ComputeOperationSupport {
+    #[doc(hidden)]
+    pub fn operation_support(&self) -> ComputeOperationSupport {
         OperationFamilySupport {
             family: self.family,
             dtypes: self.dtypes.clone(),
@@ -481,7 +484,8 @@ impl DataMovementSupport {
             allow_host_staging: support.allow_host_staging,
         }
     }
-    pub(crate) fn movement_support(&self) -> ComputeDataMovementSupport {
+    #[doc(hidden)]
+    pub fn movement_support(&self) -> ComputeDataMovementSupport {
         ComputeDataMovementSupport {
             dtypes: self.dtypes.portable.clone(),
             provider_specific_dtypes: self.dtypes.provider_specific.clone(),
@@ -537,7 +541,8 @@ pub enum ComputeDataMovementSource {
 }
 
 impl ComputeDataMovementSource {
-    pub(crate) fn tensor(&self) -> Option<&TensorResourceDescriptor> {
+    #[doc(hidden)]
+    pub fn tensor(&self) -> Option<&TensorResourceDescriptor> {
         match self {
             Self::Host(_) => None,
             Self::Tensor(tensor) => Some(tensor),
@@ -709,7 +714,8 @@ impl ComputeDataMovementSupport {
         self.allow_host_staging = true;
         self
     }
-    pub(crate) fn supports(
+    #[doc(hidden)]
+    pub fn supports(
         &self,
         _provider: &ProviderBinding,
         movement: &ComputeDataMovementDescriptor,
@@ -1472,4 +1478,264 @@ pub(crate) fn memory_pressure_diagnostic(report: &MemoryPressureReport) -> Compu
         report.materialization_cost_bytes,
         report.transfer_buffer_cost_bytes
     ))
+}
+
+impl From<AffinityError> for ComputeError {
+    fn from(error: AffinityError) -> Self {
+        let message = error.to_string();
+        match error {
+            AffinityError::ProviderMismatch { expected, found } => ComputeError::new(
+                ComputeErrorCode::ProviderPinnedResource,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new()
+                    .with_provider(found)
+                    .with_rejected_candidate(expected),
+            )
+            .with_recovery_hint(RecoveryHint::ProviderPinned),
+            AffinityError::DeviceMismatch { expected: _, found } => ComputeError::new(
+                ComputeErrorCode::DeviceBoundResource,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_device(found))
+            .with_recovery_hint(RecoveryHint::ExplicitTransferRequired),
+            AffinityError::CapabilityMismatch {
+                id,
+                expected,
+                found: _,
+            } => ComputeError::new(
+                ComputeErrorCode::CapabilityVersionMismatch,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new().with_capability(CapabilityBinding::new(id, expected)),
+            ),
+            AffinityError::ArtifactMismatch { .. } => ComputeError::new(
+                ComputeErrorCode::ArtifactFingerprintMismatch,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ProviderPinned),
+            AffinityError::ExecutionContextMismatch { .. } => ComputeError::new(
+                ComputeErrorCode::ProviderPinnedResource,
+                ComputeErrorPhase::Interruption,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ProviderPinned),
+            AffinityError::AffinityGroupMismatch { .. } => ComputeError::new(
+                ComputeErrorCode::AffinityGroupMismatch,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ExplicitTransferRequired),
+            AffinityError::BoundProviderUnavailable(provider) => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Interruption,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_provider(provider))
+            .with_recovery_hint(RecoveryHint::ProviderPinned),
+            AffinityError::BoundDeviceUnavailable(device) => ComputeError::new(
+                ComputeErrorCode::DeviceUnavailable,
+                ComputeErrorPhase::Interruption,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_device(device))
+            .with_recovery_hint(RecoveryHint::ProviderPinned),
+            AffinityError::DeviceProviderMismatch {
+                device,
+                provider,
+                owner,
+            } => ComputeError::new(
+                ComputeErrorCode::DeviceBoundResource,
+                ComputeErrorPhase::AffinityValidation,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new()
+                    .with_device(device)
+                    .with_provider(owner)
+                    .with_rejected_candidate(provider),
+            ),
+            AffinityError::ProviderDoesNotImplementCapability {
+                provider,
+                capability,
+            } => ComputeError::new(
+                ComputeErrorCode::UnsupportedOperation,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new()
+                    .with_provider(provider)
+                    .with_capability(capability),
+            ),
+            AffinityError::NoCompatibleProvider(capability) => ComputeError::new(
+                ComputeErrorCode::NoCompatibleProvider,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_capability(capability)),
+            AffinityError::PolicyRejectedProvider {
+                capability,
+                policy: _,
+            } => ComputeError::new(
+                ComputeErrorCode::PolicyRejectedProvider,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_capability(capability)),
+            AffinityError::RuntimeNotInitialized => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+        }
+    }
+}
+
+impl From<ComputeValidationError> for ComputeError {
+    fn from(error: ComputeValidationError) -> Self {
+        let message = error.to_string();
+        match error {
+            ComputeValidationError::UnknownOperationFamily(family) => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedOperationFamily, message)
+                    .with_diagnostic(
+                        ComputeDiagnostic::new()
+                            .with_backend_message(format!("unknown operation family: {family}")),
+                    )
+            }
+            ComputeValidationError::UnknownOperationSchema(operation) => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedOperation, message)
+                    .with_diagnostic(
+                        ComputeDiagnostic::new()
+                            .with_backend_message(format!("unknown operation schema: {operation}")),
+                    )
+            }
+            ComputeValidationError::InvalidGraph { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidGraph, message)
+            }
+            ComputeValidationError::MissingInput { .. } => {
+                ComputeError::validation(ComputeErrorCode::MissingInput, message)
+            }
+            ComputeValidationError::MissingOutput { .. } => {
+                ComputeError::validation(ComputeErrorCode::MissingOutput, message)
+            }
+            ComputeValidationError::CyclicGraph { .. } => {
+                ComputeError::validation(ComputeErrorCode::CyclicGraph, message)
+            }
+            ComputeValidationError::InvalidState { .. } => ComputeError::new(
+                ComputeErrorCode::InvalidState,
+                ComputeErrorPhase::Submission,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputeValidationError::InvalidOperationAttribute { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidOperationAttribute, message)
+            }
+            ComputeValidationError::InvalidOperationArity { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidOperationArity, message)
+            }
+            ComputeValidationError::InvalidOutputDescriptor { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidOutputDescriptor, message)
+            }
+            ComputeValidationError::InvalidShape { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidShape, message)
+            }
+            ComputeValidationError::InvalidLayout { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidLayout, message)
+            }
+            ComputeValidationError::SizeOverflow { .. } => {
+                ComputeError::validation(ComputeErrorCode::SizeOverflow, message)
+            }
+            ComputeValidationError::UnsupportedOperationFamily { provider, family } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedOperationFamily, message)
+                    .with_diagnostic(
+                        ComputeDiagnostic::new()
+                            .with_provider(provider)
+                            .with_operation_family(family),
+                    )
+            }
+            ComputeValidationError::UnsupportedOperationSchema {
+                provider,
+                operation,
+            } => ComputeError::validation(ComputeErrorCode::UnsupportedOperation, message)
+                .with_diagnostic(
+                    ComputeDiagnostic::new()
+                        .with_provider(provider)
+                        .with_backend_message(format!("unsupported operation schema: {operation}")),
+                ),
+            ComputeValidationError::UnsupportedAdvertisement { provider, reason } => {
+                ComputeError::validation(ComputeErrorCode::NoCompatibleProvider, message)
+                    .with_diagnostic(
+                        ComputeDiagnostic::new()
+                            .with_provider(provider)
+                            .with_backend_message(reason),
+                    )
+            }
+            ComputeValidationError::UnsupportedDType { family, .. }
+            | ComputeValidationError::UnsupportedProviderDType { family, .. } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedDType, message)
+                    .with_diagnostic(ComputeDiagnostic::new().with_operation_family(family))
+            }
+            ComputeValidationError::UnsupportedLayout { family, layout: _ } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedLayout, message)
+                    .with_diagnostic(ComputeDiagnostic::new().with_operation_family(family))
+            }
+            ComputeValidationError::UnsupportedPrecision { family, .. } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedOperation, message)
+                    .with_diagnostic(ComputeDiagnostic::new().with_operation_family(family))
+            }
+            ComputeValidationError::UnsupportedDataMovement { provider, .. } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedDataMovement, message)
+                    .with_diagnostic(ComputeDiagnostic::new().with_provider(provider))
+                    .with_recovery_hint(RecoveryHint::ExplicitTransferRequired)
+            }
+            ComputeValidationError::InvalidHostBuffer { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidHostBuffer, message)
+            }
+            ComputeValidationError::InvalidTransfer { .. } => {
+                ComputeError::validation(ComputeErrorCode::InvalidTransfer, message)
+                    .with_recovery_hint(RecoveryHint::ExplicitTransferRequired)
+            }
+            ComputeValidationError::UnsupportedConversion { .. } => {
+                ComputeError::validation(ComputeErrorCode::UnsupportedConversion, message)
+            }
+            ComputeValidationError::MaterializationRequired { .. } => {
+                ComputeError::validation(ComputeErrorCode::MaterializationRequired, message)
+                    .with_recovery_hint(RecoveryHint::ExplicitMaterializationRequired)
+            }
+            ComputeValidationError::MemoryPlanning(error) => ComputeError::from(error),
+            ComputeValidationError::ProviderUnavailable(provider) => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_provider(provider))
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            ComputeValidationError::IncompatibleResourceAffinity(error) => {
+                ComputeError::from(error)
+            }
+        }
+    }
 }

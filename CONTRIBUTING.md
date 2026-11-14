@@ -33,15 +33,17 @@ your branch here. See [SUBMODULES.md](SUBMODULES.md), "Module CI", and
 
 ### Runtime layers
 
-The Runtime is six crates: `magnetar-core`, `magnetar-graph`,
-`magnetar-model`, `magnetar-kernel`, `magnetar-engine` and
-`magnetar-runtime`, which re-exports the five others. Every top-level module
+The Runtime is seven crates: `magnetar-core`, `magnetar-graph`,
+`magnetar-model`, `magnetar-kernel`, `magnetar-provider-api`,
+`magnetar-engine` and `magnetar-runtime`, which re-exports the six others.
+`magnetar-provider-api` holds what Providers implement and call; it must
+not depend on `magnetar-runtime` or `magnetar-engine`. Every top-level module
 is assigned to a layer in [quality/layers.toml](quality/layers.toml) and may
 use its own layer and lower ones. CI checks this on every pull request; run
 the same check locally with:
 
 ```bash
-cargo run --locked -p layering-check -- magnetar-core/src magnetar-graph/src magnetar-model/src magnetar-kernel/src magnetar-engine/src magnetar-runtime/src quality/layers.toml
+cargo run --locked -p layering-check -- magnetar-core/src magnetar-graph/src magnetar-model/src magnetar-kernel/src magnetar-provider-api/src magnetar-engine/src magnetar-runtime/src quality/layers.toml
 ```
 
 A new module needs an entry in `[modules]`. If the check reports an upward

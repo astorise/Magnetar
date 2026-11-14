@@ -4,7 +4,7 @@
 //! semantics the Model Component declared on its graph's nodes
 //! ([`crate::operator::TENSOR_PARALLEL_ATTRIBUTE`]). The Runtime hands the
 //! plan to the Provider before any weight is written
-//! ([`crate::provider::ProviderExecutionApi::apply_tensor_parallel`]); the
+//! ([`crate::ProviderExecutionApi::apply_tensor_parallel`]); the
 //! Provider stores each Device's shard and runs every invocation on every
 //! Device over its shard, reducing a `row` matmul's partial sums.
 //!

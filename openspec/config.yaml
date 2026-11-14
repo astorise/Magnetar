@@ -2,9 +2,10 @@ schema: spec-driven
 
 context: |
   Magnetar is a Rust-first local AI Runtime with a v1.0.0 release baseline.
-  The root workspace contains `magnetar-runtime` and the five layer crates it
+  The root workspace contains `magnetar-runtime` and the six layer crates it
   re-exports (`magnetar-core`, `magnetar-graph`, `magnetar-model`,
-  `magnetar-kernel`, `magnetar-engine`; layers in `quality/layers.toml`),
+  `magnetar-kernel`, `magnetar-provider-api`, `magnetar-engine`; layers in
+  `quality/layers.toml`),
   `roadmap-contracts`, `tools/coverage-ratchet`, `tools/release-publish`, and
   `tools/layering-check`. A second workspace,
   `submodule-workspace`, contains `magnetar-cli`, `inference-components`, and

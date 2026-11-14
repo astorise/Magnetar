@@ -7,12 +7,13 @@
 
 use crate::affinity::*;
 use crate::capability::*;
-use crate::provider_api::*;
 use crate::provider_status::ProviderError;
 use crate::resolution::{
     BuiltInResolutionPolicy, ResolutionCandidate, ResolutionContext, ResolutionDecision,
     ResolutionDecisionReason, ResolutionPolicy,
 };
+use magnetar_core::provider_abi::*;
+use magnetar_provider_api::provider_api::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},

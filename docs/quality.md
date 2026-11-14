@@ -153,7 +153,8 @@ reason, never as a skipped CI step.
 
 The commands above cover the root `[workspace]`
 (`magnetar-runtime` and its layer crates `magnetar-core`, `magnetar-graph`,
-`magnetar-model`, `magnetar-kernel`, `magnetar-engine`; `roadmap-contracts`;
+`magnetar-model`, `magnetar-kernel`, `magnetar-provider-api`,
+`magnetar-engine`; `roadmap-contracts`;
 the tools) --
 crates with no dependency on an externalized submodule, so a plain checkout
 without `submodules: recursive` can build them.

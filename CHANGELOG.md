@@ -18,7 +18,8 @@
 ### Changed
 
 - `magnetar-runtime` is split into layer crates: `magnetar-core`,
-  `magnetar-graph`, `magnetar-model`, `magnetar-kernel` and `magnetar-engine`.
+  `magnetar-graph`, `magnetar-model`, `magnetar-kernel`,
+  `magnetar-provider-api` and `magnetar-engine`.
   `magnetar-runtime` re-exports all of them, so existing
   `magnetar_runtime::...` paths are unchanged. `first_native_runtime` is a
   directory module of thirteen submodules. A CI gate checks module layering

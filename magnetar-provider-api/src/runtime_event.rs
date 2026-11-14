@@ -6,9 +6,10 @@
 //! and by Provider execution results, so defined below the code that emits
 //! them.
 
-use crate::affinity::*;
+use crate::binding::*;
 use crate::compute_types::redact_backend_diagnostic;
-use crate::planning::*;
+use crate::execution::*;
+use crate::provider_status::*;
 use crate::trace_id::*;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

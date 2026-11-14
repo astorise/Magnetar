@@ -1,0 +1,17 @@
+[package]
+name = "magnetar-provider-api"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "Provider API of the Magnetar Runtime: the contract Providers implement and call (Provider and ProviderExecutionApi, execution plans and requests, compute advertisements, tensors, packed weights, quantization tables and shared operator semantics)."
+repository = "https://github.com/astorise/Magnetar"
+readme = "../README.md"
+keywords = ["ai", "inference", "runtime"]
+categories = ["science"]
+rust-version = "1.98"
+include = ["src/**/*.rs"]
+
+[dependencies]
+magnetar-core = { path = "../magnetar-core", version = "=1.0.0" }
+magnetar-graph = { path = "../magnetar-graph", version = "=1.0.0" }
+magnetar-kernel = { path = "../magnetar-kernel", version = "=1.0.0" }

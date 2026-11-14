@@ -4,15 +4,15 @@
 # crates as one module graph:
 #
 #     cargo run -p layering-check -- magnetar-core/src magnetar-graph/src \
-#         magnetar-model/src magnetar-kernel/src magnetar-engine/src \
-#         magnetar-runtime/src quality/layers.toml
+#         magnetar-model/src magnetar-kernel/src magnetar-provider-api/src \
+#         magnetar-engine/src magnetar-runtime/src quality/layers.toml
 #
 # A module may depend on modules of its own layer and of layers with a
 # strictly lower rank. Every top-level module of the Runtime crates must be
 # listed. Test-only code (`#[cfg(test)]`) is not checked. Each layer below
 # Runtime orchestration is one crate: core -> magnetar-core, graph ->
 # magnetar-graph, model-data -> magnetar-model, kernel -> magnetar-kernel,
-# component-engine -> magnetar-engine.
+# component-engine -> magnetar-engine, provider-api -> magnetar-provider-api.
 
 [layers]
 core = 1
