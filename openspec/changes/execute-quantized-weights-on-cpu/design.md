@@ -245,3 +245,10 @@ about 1 GB/s (14-17 ms per Mistral-shaped matmul locally against 3 ms for
 `Q4_K`), so the vectorized grid kernels bring them within 1.3-1.6x of
 `Q4_K_M` despite reading fewer bytes: the per-run grid lookups remain
 their cost.
+
+The optimized CPU Provider runs `attention` natively: K and V are read in
+place up to `key_count` (the Reference CPU kernel copied both whole
+caches per call), every (head, query) pair goes to the pool, and the dot
+products and weighted value sums vectorize. Mistral-shaped decode step
+over a 2048-row cache, 4 local cores: 64 keys 6.2 ms to 0.07 ms, 2048
+keys 121 ms to 2.4 ms.
