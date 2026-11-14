@@ -54,7 +54,7 @@
 - [x] 6.1 `magnetar-cli`, `inference-components`, `roadmap-contracts` and the three integration test crates build without source change; `magnetar-cli` (93) and `magnetar-inference-component` (14) tests pass. `submodule-workspace/Cargo.lock` is updated.
 - [x] 6.2 Pinned Provider, Format and Loader repositories: each `Cargo.lock` gains the five layer crates (one pull request per repository, no source change), and the eleven submodule pins point at those commits. With them, `cargo test --locked` passes in each of the eleven. The eleven pull requests are merged and the pins point at the merged commits. The Component repositories do not depend on `magnetar-runtime`.
 - [x] 6.3 Run the WIT validation gate in CI. The WIT files are not moved or edited by this change. Done: `quality / wit` passed on astorise/Magnetar#169.
-- [ ] 6.4 Run GPU CI (`cuda-first-native`, `multi-device-cpu-cuda`, real-checkpoint numerics): results identical to the baseline.
+- [x] 6.4 Run GPU CI (`cuda-first-native`, `multi-device-cpu-cuda`, real-checkpoint numerics): results identical to the baseline. Done: `gpu-runner-smoke.yml`, suite `all`, dispatched on this branch at `b2c8f38` (six crates, tests split next to their modules), passed in 67 minutes.
 
 ## 7. Release, coverage and documentation
 
