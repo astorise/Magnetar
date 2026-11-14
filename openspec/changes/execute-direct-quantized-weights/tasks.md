@@ -7,7 +7,7 @@
 ## 2. B03 Direct GGUF quantized execution
 
 - [ ] 2.1 Implement B03: Providers SHALL compute directly from validated Q8_0 and then Q4_K/Q5_K packed weights, preserving block scales, zero conventions and layouts without mandatory whole-model F32 dequantization.
-- [x] 2.2 (Q8_0 on CUDA; Q4_K/Q5_K pending) Add the positive conformance case: when a real checkpoint in a supported quantized profile generates multiple tokens, verify kernel and residency evidence proves packed-weight computation and quality passes.
+- [x] 2.2 (Q8_0, Q4_K, Q5_K and Q6_K on CUDA and the optimized CPU Provider) Add the positive conformance case: when a real checkpoint in a supported quantized profile generates multiple tokens, verify kernel and residency evidence proves packed-weight computation and quality passes.
 - [ ] 2.3 Add the failure/isolation case: when a block is truncated or quantization metadata is incompatible, verify ingestion or preparation rejects it before dispatch and does not silently relabel dequantized execution as direct.
 
 ## 3. B04 Direct GPTQ and AWQ matrix execution
