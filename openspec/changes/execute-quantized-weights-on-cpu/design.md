@@ -229,3 +229,19 @@ scalar loop over every value. Mistral-shaped matmuls on 4 local cores:
 (3-6.7 GB/s), `IQ3_XXS`/`S` from 14-17 ms to 3.1-5.2 ms (4.3-8.2 GB/s).
 The GPU smoke `gguf` suite now also runs Mistral `IQ3_M` and `IQ2_M` on
 the optimized CPU Provider.
+
+GPU smoke run 43638297268 (commit `f43947f`; its CUDA build step failed on
+a stale CUDA pin's lockfile, fixed in `2687d39`, but every CPU step ran),
+same host, 3 threads, Mistral 7B on the optimized CPU Provider:
+
+| Export | CPU TPOT | matmul / matmul-residual per call | CUDA TPOT |
+|---|---|---|---|
+| `Q4_K_M` | 374.9 ms | 1.41 / 2.01 ms | 17.4 ms |
+| `IQ3_M` | 581.5 ms | 2.36 / 2.71 ms | 17.7 ms |
+| `IQ2_M` | 485.2 ms | 1.81 / 2.61 ms | 17.7 ms |
+
+Both answer "Paris". With the scalar decoder these exports' matmuls ran at
+about 1 GB/s (14-17 ms per Mistral-shaped matmul locally against 3 ms for
+`Q4_K`), so the vectorized grid kernels bring them within 1.3-1.6x of
+`Q4_K_M` despite reading fewer bytes: the per-run grid lookups remain
+their cost.
