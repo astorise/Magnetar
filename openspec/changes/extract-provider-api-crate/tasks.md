@@ -7,14 +7,14 @@
 
 ## 2. Move Provider-facing data types down (inside `magnetar-runtime`)
 
-- [ ] 2.1 Add the `provider-api` layer to `quality/layers.toml` (rank above the kernel pipeline and the Component engine, below Runtime orchestration).
+- [x] 2.1 Add the `provider-api` layer to `quality/layers.toml` (rank above the kernel pipeline and the Component engine, below Runtime orchestration). Done: layer `provider-api`, rank 5; Runtime orchestration is rank 6.
 - [ ] 2.2 `scheduler` and `planning`: move the execution request, handle, result and status types and the execution plan and memory plan types to an `execution` module; re-export from their old modules.
 - [ ] 2.3 `compute`: move the Provider compute advertisement, support and error types to `compute_support`; re-export.
 - [ ] 2.4 `affinity`: move `AffinityResource` and `AffinityResolution` to `affinity_resolution`; re-export.
-- [ ] 2.5 `reference_cpu`: move the operator semantics Providers reuse to `operator_semantics`; re-export.
-- [ ] 2.6 `model_loading`: move the quantization tables and decoders to `quantization`; re-export. `packed_weight` no longer depends on `model_loading`.
+- [x] 2.5 `reference_cpu`: move the operator semantics Providers reuse to `operator_semantics`; re-export. Done: `NATIVE_CPU_PROVIDER_NAME`, `sigmoid`, `row_scale`, `moe_route`, `MoeRouting`, `moe_experts`, `moe_experts_local`, `moe_local_experts`, the two expert attribute names and the shared `rows_cols_of` helper are in `operator_semantics`; `reference_cpu` re-exports the public ones. 950 test names unchanged, 1,703 tests pass, probe compiles.
+- [x] 2.6 `model_loading`: move the quantization tables and decoders to `quantization`; re-export. `packed_weight` no longer depends on `model_loading`. Done: the 15 block-size constants, `K_SCALE_SIZE`, `IQ4_NL_VALUES`, the twelve `dequantize_*` decoders with their helpers, the scale unpackers, the `iq_grids` tables and the four half-precision conversions (`f16_to_f32`, `bf16_to_f32`, `f32_to_f16`, `f32_to_bf16`) are in `quantization`; `model_loading` re-exports the items that were public. `packed_weight` no longer names `model_loading`. 950 test names unchanged, 1,703 tests pass, probe compiles.
 - [ ] 2.7 Split `provider`: the contract (traits, metadata, registry, tensor value, step capture) is assigned to the `provider-api` layer; `ProviderLoader` and the loading policy move to a `provider_loading` module in Runtime orchestration and stay re-exported from `provider`.
-- [ ] 2.8 Assign `tensor`, `packed_weight`, `tensor_parallel` and `layer_placement` to the `provider-api` layer. Layering gate passes with no debt entry.
+- [ ] 2.8 Assign `tensor`, `packed_weight`, `tensor_parallel` and `layer_placement` to the `provider-api` layer. Layering gate passes with no debt entry. Progress: `tensor` is assigned (its hold entry is gone; the gate passes with no debt entry); `packed_weight`, `tensor_parallel` and `layer_placement` remain.
 - [ ] 2.9 After each task above: same test functions as the baseline, all passing; Clippy and documentation gates clean.
 
 ## 3. Extract the crate
