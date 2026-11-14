@@ -358,6 +358,11 @@ fn k_quant_dequantization_matches_the_gguf_reference_bit_for_bit() {
     for (index, (value, bits)) in q6.iter().zip(Q6_K_GOLDEN_BITS).enumerate() {
         assert_eq!(value.to_bits(), bits, "Q6_K value {index}: {value}");
     }
+    let q5 = dequantize_q5_k(&Q5_K_GOLDEN_BYTES);
+    assert_eq!(q5.len(), Q5_K_GOLDEN_BITS.len());
+    for (index, (value, bits)) in q5.iter().zip(Q5_K_GOLDEN_BITS).enumerate() {
+        assert_eq!(value.to_bits(), bits, "Q5_K value {index}: {value}");
+    }
     let q2 = dequantize_q2_k(&Q2_K_GOLDEN_BYTES);
     assert_eq!(q2.len(), Q2_K_GOLDEN_BITS.len());
     for (index, (value, bits)) in q2.iter().zip(Q2_K_GOLDEN_BITS).enumerate() {

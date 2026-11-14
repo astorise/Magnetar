@@ -178,3 +178,12 @@ so those matrices are dequantized to `f32` at load and multiplied dense:
 they explain the gap to `Q4_K_M` (and the extra resident memory) rather
 than the new Kernels. Packing `Q5_K` (runtime format, CPU and CUDA
 Kernels) is the next step for these mixes.
+
+`Q5_K` is now a packed format (Runtime `PackedWeightFormat::Q5K`, its
+dequantization bit-exact against gguf-py 0.19.0): the optimized CPU
+Provider decodes it with Q4_K's layout plus the 32-byte high-bit plane as
+each value's fifth bit (AVX2 kernel: 4.32 ms / 9.3 GB/s and 3.96 ms /
+10.2 GB/s on the two Mistral shapes, 4 local cores, against the f32 dense
+product before), and CUDA reads it directly too (dequantize, f32 and
+`__dp4a` decode Kernels). The `Q3_K_M` and `IQ4_XS` mixes therefore keep
+every quantized matrix packed.

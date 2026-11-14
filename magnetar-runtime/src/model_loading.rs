@@ -1359,7 +1359,7 @@ pub fn read_tensor_payload(
 
 /// The packed format `tensor` keeps when offered packed, `None` when it is
 /// only ever dequantized: its storage dtype has no packed form (`Q8_0`, the
-/// `Q2_K`, `Q3_K`, `Q4_K` and `Q6_K` k-quants, and the IQ2, IQ3 and IQ4
+/// `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K` and `Q6_K` k-quants, and the IQ2, IQ3 and IQ4
 /// i-quants do), it is not a matrix, it is an untransposed k-quant or
 /// i-quant (an embedding table, read row by row), or its stored rows are
 /// not whole blocks.
@@ -1369,6 +1369,7 @@ pub fn packed_weight_format(
     let format = match tensor.storage_dtype {
         ModelDType::Q8 => crate::packed_weight::PackedWeightFormat::Q8_0,
         ModelDType::Q4K => crate::packed_weight::PackedWeightFormat::Q4K,
+        ModelDType::Q5K => crate::packed_weight::PackedWeightFormat::Q5K,
         ModelDType::Q6K => crate::packed_weight::PackedWeightFormat::Q6K,
         ModelDType::Q2K => crate::packed_weight::PackedWeightFormat::Q2K,
         ModelDType::Q3K => crate::packed_weight::PackedWeightFormat::Q3K,
@@ -1418,7 +1419,7 @@ pub fn resident_weight_bytes(tensor: &ModelTensorMetadata) -> u64 {
 /// The packed form of a block-quantized 2D weight
 /// (`execute-direct-quantized-weights`), from the tensor's own validated
 /// storage bytes: `Ok(None)` when its storage dtype has no packed form
-/// (`Q8_0`, the `Q2_K`, `Q3_K`, `Q4_K` and `Q6_K` k-quants, and the
+/// (`Q8_0`, the `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K` and `Q6_K` k-quants, and the
 /// IQ2, IQ3 and IQ4 i-quants), it is not a matrix, or its stored rows are
 /// not whole blocks. The bytes are checked
 /// against the shape and against the declared content digest first, as for
