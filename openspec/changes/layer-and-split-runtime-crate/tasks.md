@@ -32,7 +32,7 @@
 - [x] 4.2 Convert `first_native_runtime` to a directory module with thirteen submodules (design D6). One scripted commit: items keep their order and bodies, and file-private items become `pub(super)`.
 - [x] 4.3 Point the static guards that read the module's source text (seven tests, `first_native_implementation_cut`, `tools/check_generic_facade_family_isolation.py`) at the directory's production files.
 - [x] 4.4 Verify: largest submodule 1,960 lines; the 1,355 test names are identical to the baseline; public API diff shows no removed and no changed item; Clippy, documentation and layering gates pass.
-- [ ] 4.5 Move each test of `first_native_runtime/tests.rs` (11,771 lines) next to the code it tests.
+- [x] 4.5 Move each test of `first_native_runtime/tests.rs` (11,771 lines) next to the code it tests: 161 tests now sit in `first_native_runtime/<module>/tests.rs`, placed by which module's items each one uses most. The shared mock executors and fixtures, the ten source-text guards that cover the whole module and the tests in the inline `resolve_qwen_component_from_env_var_tests` module stay in `first_native_runtime/tests.rs` (7,162 lines). Same 773 test names before and after; all pass.
 - [ ] 4.6 Split `src/tests.rs`: tests using only public items go to `tests/contract_tests/`, the others to their module.
 - [x] 4.7 The test build without `wasmtime-component-engine` compiles: `first_native_runtime` imports its graph oracle from `tests` under the same cfg. Seven tests fail in that configuration; they could not be built before, and no CI job runs it.
 

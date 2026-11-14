@@ -627,3 +627,6 @@ impl FirstNativeChatSession {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

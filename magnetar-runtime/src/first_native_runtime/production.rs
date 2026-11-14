@@ -1807,3 +1807,6 @@ pub(super) fn expect_single_string_invocation_result(
         }),
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -943,3 +943,6 @@ pub(super) fn inference_component_runtime_limits() -> ComponentResourceLimits {
         require_memory_limit: true,
     }
 }
+
+#[cfg(test)]
+mod tests;
