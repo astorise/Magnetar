@@ -462,3 +462,20 @@ fn browser_compatible_cache_can_use_linear_memory_without_native_handles() {
     );
     assert!(cache.residency.provider_resource.is_none());
 }
+
+#[test]
+fn inference_api_kv_cache_policy_covers_enabled_scope_budget_reuse_eviction_privacy() {
+    let policy = KvCachePolicy {
+        enabled: true,
+        max_cache_tokens: Some(2048),
+        max_cache_memory_bytes: Some(1 << 20),
+        sharing: KvCacheSharingPolicy::AllowWithinSession,
+        retention: KvCacheRetentionPolicy::RetainForPrefixReuse,
+        prefix_reuse_allowed: true,
+        privacy_redaction_required: true,
+    };
+    assert!(policy.enabled);
+    assert!(policy.prefix_reuse_allowed);
+    assert!(policy.privacy_redaction_required);
+    assert_eq!(policy.sharing, KvCacheSharingPolicy::AllowWithinSession);
+}

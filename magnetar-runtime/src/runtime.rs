@@ -84,8 +84,6 @@ static NEXT_EXECUTION_CONTEXT_ID: std::sync::atomic::AtomicU64 =
 static NEXT_AFFINITY_GROUP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static NEXT_SCHEDULED_OPERATION_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
-static NEXT_RUNTIME_OBSERVATION_SEQUENCE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
 static NEXT_INFERENCE_SESSION_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
@@ -101,9 +99,6 @@ pub(crate) fn next_scheduled_operation_id() -> ScheduledOperationId {
     ScheduledOperationId::new(
         NEXT_SCHEDULED_OPERATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     )
-}
-pub(crate) fn next_runtime_observation_sequence() -> u64 {
-    NEXT_RUNTIME_OBSERVATION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 pub(crate) fn next_inference_session_id() -> InferenceSessionId {
     InferenceSessionId::new(format!(

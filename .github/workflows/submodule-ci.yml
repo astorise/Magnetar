@@ -1,6 +1,6 @@
 name: Module CI
 
-# Reusable workflow (`add-submodule-ci`): the checks a Component, Provider,
+# Reusable workflow (`submodule-ci` specification): the checks a Component, Provider,
 # Format or Loader repository runs on its own pull requests and on pushes to
 # its default branch. Defined once here; each module repository calls it
 # from a short workflow of its own:

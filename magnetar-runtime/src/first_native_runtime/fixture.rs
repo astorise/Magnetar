@@ -873,3 +873,6 @@ pub(super) fn load_fixture_instance_with_weights_for_provider(
     .map_err(E2eConformanceError::from)?;
     Ok(instance)
 }
+
+#[cfg(test)]
+mod tests;

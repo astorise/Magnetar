@@ -4,12 +4,14 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
+use crate::affinity::*;
 use crate::affinity::{
     AffinityError, CapabilityBinding, CapabilityHealth, DeviceBinding, FallbackClass, HealthState,
     ProviderBinding, ProviderHealth, ProviderStatusSnapshot, ResourceAffinity,
 };
 use crate::capability::{Capability, CapabilityDescriptor, CapabilityId, CapabilityVersion};
 use crate::component::WitInterface;
+use crate::compute::*;
 use crate::compute::{
     ComputeDType, ComputeDataMovementDescriptor, ComputeDataMovementKind,
     ComputeDataMovementSupport, ComputeGraph, ComputeGraphId, ComputeLayout, ComputeNode,
@@ -25,6 +27,8 @@ use crate::planning::{MemoryPlanningDecision, MemoryPlanningError};
 use crate::provider::{
     Provider, ProviderError, ProviderExecutionApi, ProviderMetadata, ProviderRegistry,
 };
+use crate::scheduler::*;
+use crate::tests::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -467,4 +471,152 @@ fn builder_does_not_register_kernels_for_a_rejected_provider() {
     // registry as candidates that can never resolve.
     assert!(runtime.providers().provider("failed").is_none());
     assert_eq!(runtime.startup_diagnostics().len(), 1);
+}
+
+#[test]
+fn provider_execution_rejects_mismatched_provider_request_and_maps_cancellation() {
+    let api = Arc::new(TestProviderExecutionApi::new());
+    *api.cancel_outcome.lock().unwrap() = ProviderCancellationOutcome::Accepted;
+    let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+    provider.execution_api = Some(api);
+    provider.metadata.compute_operation_support.insert(
+        ComputeOperationFamily::Elementwise,
+        ComputeOperationSupport::new()
+            .with_dtypes([ComputeDType::Float32])
+            .with_layouts([ComputeLayout::Dense]),
+    );
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+    let descriptor = TensorDescriptor::materialized(
+        ShapeDescriptor::new([2, 2]),
+        DTypeDescriptor::portable(ComputeDType::Float32),
+    );
+    let graph = ComputeGraph::new(ComputeGraphId::new("provider-cancel")).with_node(
+        ComputeNode::new(
+            ComputeNodeId::new("node"),
+            ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
+                .with_dtype(ComputeDType::Float32)
+                .with_layout(ComputeLayout::Dense),
+        )
+        .with_output(ComputeNodeOutput::new(
+            ComputeOutputId::new("out"),
+            descriptor,
+        )),
+    );
+    let plan = runtime.plan_compute_execution(&graph).unwrap();
+    let mut scheduler = runtime.scheduler(1);
+    let operation_id = runtime
+        .schedule_compute_execution(&mut scheduler, plan)
+        .unwrap();
+    let mut request = runtime
+        .prepare_provider_execution(scheduler.operation(operation_id).unwrap())
+        .unwrap();
+    request.provider = ProviderBinding::new("other-provider");
+
+    assert!(matches!(
+        runtime.submit_provider_execution(request),
+        Err(ProviderExecutionError {
+            code: ProviderExecutionErrorCode::InvalidExecutionPlan,
+            phase: ProviderExecutionPhase::Submit,
+            ..
+        })
+    ));
+
+    let request = runtime
+        .prepare_provider_execution(scheduler.operation(operation_id).unwrap())
+        .unwrap();
+    let handle = runtime.submit_provider_execution(request).unwrap();
+    assert_eq!(
+        runtime.cancel_provider_execution(&handle).unwrap(),
+        ProviderCancellationOutcome::Accepted
+    );
+}
+
+#[test]
+fn availability_policy_prefers_healthy_candidates() {
+    let compute = compute_capability();
+    let mut degraded = provider_with_capabilities("a-degraded", [compute.clone()]);
+    degraded.health = ProviderHealth::Degraded;
+    let healthy = provider_with_capabilities("z-healthy", [compute.clone()]);
+    let runtime = Runtime::builder()
+        .config(RuntimeConfig {
+            resolution_policy: BuiltInResolutionPolicy::Availability,
+            ..RuntimeConfig::default()
+        })
+        .register_provider(Arc::new(degraded))
+        .register_provider(Arc::new(healthy))
+        .build()
+        .unwrap();
+
+    let providers = runtime.resolve_component_import(&WitInterface::new(
+        COMPUTE_WIT_INTERFACE,
+        COMPUTE_CAPABILITY_VERSION.to_string(),
+    ));
+
+    assert_eq!(providers.unwrap()[0].metadata().name, "z-healthy");
+}
+
+#[test]
+fn phase_aware_resolution_rejects_restart_after_observable_output() {
+    let compute = compute_capability();
+    let provider = provider_with_capabilities("provider-a", [compute.clone()]);
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+
+    assert!(matches!(
+        runtime.resolve_with_affinity_at_phase(
+            &compute,
+            &[],
+            FallbackClass::Restartable,
+            ExecutionPhase::AfterObservableOutput,
+            true,
+        ),
+        Err(AffinityError::PolicyRejectedProvider { .. })
+    ));
+}
+
+#[test]
+fn affinity_resolution_rejects_foreign_context_and_preserves_groups() {
+    let compute = compute_capability();
+    let first = Runtime::builder()
+        .register_provider(Arc::new(provider_with_capabilities(
+            "provider-a",
+            [compute.clone()],
+        )))
+        .build()
+        .unwrap();
+    let second = Runtime::builder()
+        .register_provider(Arc::new(provider_with_capabilities(
+            "provider-a",
+            [compute.clone()],
+        )))
+        .build()
+        .unwrap();
+
+    let ungrouped = first
+        .resolve_with_affinity(&compute, &[], FallbackClass::ProviderPinned)
+        .unwrap()
+        .into_affinity();
+    assert_eq!(ungrouped.group(), None);
+
+    let grouped = first
+        .resolve_with_affinity(&compute, &[&ungrouped], FallbackClass::ProviderPinned)
+        .unwrap()
+        .into_affinity();
+    assert!(grouped.group().is_some());
+
+    let inherited = first
+        .resolve_with_affinity(&compute, &[&grouped], FallbackClass::ProviderPinned)
+        .unwrap()
+        .into_affinity();
+    assert_eq!(inherited.group(), grouped.group());
+
+    assert!(matches!(
+        second.resolve_with_affinity(&compute, &[&grouped], FallbackClass::ProviderPinned),
+        Err(AffinityError::ExecutionContextMismatch { .. })
+    ));
 }

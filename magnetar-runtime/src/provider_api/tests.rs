@@ -5,96 +5,16 @@
 
 use super::*;
 use crate::affinity::{
-    CapabilityBinding, CapabilityHealth, HealthState, ProviderBinding, ProviderHealth,
-    ProviderHealthReport, ProviderLifecycleState, ProviderReadinessState, ProviderStatusSnapshot,
+    HealthState, ProviderBinding, ProviderHealthReport, ProviderLifecycleState,
+    ProviderReadinessState, ProviderStatusSnapshot,
 };
 use crate::capability::CapabilityId;
 use crate::compute::{ComputeError, ComputeErrorCode, ComputeErrorPhase};
 use crate::device::{Device, DeviceDescriptor, DeviceId, DeviceMetadata, DeviceType};
-use crate::kernel::KernelAdvertisement;
-use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 
 use crate::capability::{Capability, CapabilityDescriptor, CapabilityVersion};
 use crate::component::WitInterface;
-struct TestProvider {
-    metadata: ProviderMetadata,
-    initialized: AtomicBool,
-    shut_down: AtomicBool,
-    fail_initialization: bool,
-    health: ProviderHealth,
-    status_snapshot: Option<ProviderStatusSnapshot>,
-    capability_health: BTreeMap<CapabilityId, HealthState>,
-    devices: Vec<Arc<dyn Device>>,
-    execution_api: Option<Arc<dyn ProviderExecutionApi>>,
-    kernel_advertisements: Vec<KernelAdvertisement>,
-}
-
-impl TestProvider {
-    fn new(name: &str) -> Self {
-        Self {
-            metadata: ProviderMetadata::new(name, "1", "test", "test"),
-            initialized: AtomicBool::new(false),
-            shut_down: AtomicBool::new(false),
-            fail_initialization: false,
-            health: ProviderHealth::Available,
-            status_snapshot: None,
-            capability_health: BTreeMap::new(),
-            devices: Vec::new(),
-            execution_api: None,
-            kernel_advertisements: Vec::new(),
-        }
-    }
-}
-
-impl Provider for TestProvider {
-    fn metadata(&self) -> ProviderMetadata {
-        self.metadata.clone()
-    }
-    fn kernel_advertisements(&self) -> Vec<KernelAdvertisement> {
-        self.kernel_advertisements.clone()
-    }
-    fn register(&self, _registry: &mut ProviderRegistry) -> Result<(), ProviderError> {
-        Ok(())
-    }
-    fn health(&self) -> ProviderHealth {
-        self.health
-    }
-    fn status_snapshot(&self) -> ProviderStatusSnapshot {
-        self.status_snapshot
-            .clone()
-            .unwrap_or_else(|| ProviderStatusSnapshot::from_health_report(self.health_report()))
-    }
-    fn capability_health(&self, capability: &CapabilityBinding) -> Option<CapabilityHealth> {
-        Some(CapabilityHealth::new(
-            ProviderBinding::new(&self.metadata.name),
-            capability.clone(),
-            self.capability_health
-                .get(capability.id())
-                .copied()
-                .unwrap_or(self.health),
-        ))
-    }
-    fn initialize(&self) -> Result<(), ProviderError> {
-        if self.fail_initialization {
-            return Err(ProviderError::Lifecycle("unavailable".into()));
-        }
-        self.initialized.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-    fn devices(&self) -> Vec<Arc<dyn Device>> {
-        self.devices.clone()
-    }
-    fn shutdown(&self) -> Result<(), ProviderError> {
-        self.shut_down.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-    fn execution_api(&self) -> Option<Arc<dyn ProviderExecutionApi>> {
-        self.execution_api.clone()
-    }
-}
 
 #[test]
 fn device_registration_rejects_duplicate_ids_and_mismatched_owners() {
@@ -147,40 +67,6 @@ fn provider_lifecycle_transitions_and_drain_completion_are_explicit() {
     assert!(draining.pinned_work_allowed_during_drain());
     draining.in_flight_operations = 0;
     assert!(draining.is_drain_complete());
-}
-
-#[test]
-fn reject_incompatible() {
-    let mut p = TestProvider::new("old");
-    p.metadata.api_version += 1;
-    assert!(matches!(
-        ProviderLoader::new().register_provider(Arc::new(p)),
-        Err(ProviderError::IncompatibleApiVersion { .. })
-    ));
-}
-
-#[test]
-fn reject_duplicate() {
-    let mut m = ProviderLoader::new();
-    m.register_provider(Arc::new(TestProvider::new("same")))
-        .unwrap();
-    assert!(matches!(
-        m.register_provider(Arc::new(TestProvider::new("same"))),
-        Err(ProviderError::ProviderAlreadyRegistered(_))
-    ));
-}
-
-#[test]
-fn dynamic_provider_loading_denies_paths_by_default() {
-    let mut loader = ProviderLoader::new();
-    let path = std::path::PathBuf::from("target/test-provider.dll");
-
-    let result = unsafe { loader.load_dynamic(&path) };
-
-    assert!(matches!(
-        result,
-        Err(ProviderError::ProviderPathDenied { path: denied }) if denied == path
-    ));
 }
 
 #[test]
@@ -241,26 +127,6 @@ fn provider_abi_handles_lifecycle_and_errors_are_internal_runtime_contracts() {
     assert_eq!(compute_error.phase, ComputeErrorPhase::Resolution);
 }
 
-#[test]
-fn load_valid_provider() {
-    let p = Arc::new(TestProvider::new("valid"));
-    let mut m = ProviderLoader::new();
-    m.register_provider(p.clone()).unwrap();
-    assert!(m.provider("valid").is_some());
-    assert!(p.initialized.load(Ordering::SeqCst));
-}
-
-#[test]
-fn provider_shutdown_releases_registered_provider() {
-    let p = TestProvider::new("provider");
-    let p = Arc::new(p);
-    let mut m = ProviderLoader::new();
-    m.register_provider(p.clone()).unwrap();
-    assert!(m.provider("provider").is_some());
-    m.shutdown().unwrap();
-    assert!(p.shut_down.load(Ordering::SeqCst));
-}
-
 fn capability(name: &str, version: CapabilityVersion) -> Capability {
     Capability::new(
         CapabilityId::new(name),
@@ -268,26 +134,6 @@ fn capability(name: &str, version: CapabilityVersion) -> Capability {
         CapabilityDescriptor::new("test capability")
             .with_contract(WitInterface::new(name, version.to_string())),
     )
-}
-
-#[test]
-fn registers_capabilities_and_resolves_fallbacks_by_name() {
-    let capability = capability("magnetar:runtime/execute", CapabilityVersion::new(1, 0, 0));
-    let mut primary = TestProvider::new("a-primary");
-    primary.metadata.capabilities.insert(capability.clone());
-    let mut fallback = TestProvider::new("z-fallback");
-    fallback.metadata.capabilities.insert(capability.clone());
-    let mut loader = ProviderLoader::new();
-    loader.register_provider(Arc::new(fallback)).unwrap();
-    loader.register_provider(Arc::new(primary)).unwrap();
-
-    assert!(loader.registry().has_capability(&capability));
-    let names = loader
-        .resolve_providers(&capability)
-        .into_iter()
-        .map(|provider| provider.metadata().name)
-        .collect::<Vec<_>>();
-    assert_eq!(names, ["a-primary", "z-fallback"]);
 }
 
 #[test]
@@ -326,29 +172,6 @@ fn semantic_versions_select_the_latest_compatible_capability() {
             .is_none()
     );
     assert!(!CapabilityVersion::new(0, 1, 1).is_compatible_with(CapabilityVersion::new(0, 1, 0)));
-}
-
-#[test]
-fn dynamic_provider_loading_rejects_legacy_trait_object_factory_contract() {
-    let mut loader = ProviderLoader::new();
-    let root = std::path::PathBuf::from("target");
-    let path = root.join("test-provider.dll");
-    let policy = ProviderLoadingPolicy::development([root]);
-
-    let result = unsafe { loader.load_dynamic_with_policy(&path, &policy) };
-
-    assert!(matches!(
-        result,
-        Err(ProviderError::UnsupportedDynamicAbi {
-            expected_symbol: PROVIDER_ABI_FACTORY_SYMBOL_V1,
-            expected_descriptor,
-            ..
-        }) if expected_descriptor.abi_version == ProviderAbiVersion::CURRENT
-    ));
-    assert!(
-        !include_str!("../provider.rs").contains("Box<dyn Provider>"),
-        "stable dynamic loading must not use Rust trait-object factories"
-    );
 }
 
 #[test]

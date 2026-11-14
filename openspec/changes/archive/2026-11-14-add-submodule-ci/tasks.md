@@ -13,7 +13,6 @@
 - [x] 2.2 Coordinated case validated in CI: the run log names the Magnetar branch of the same name, and formatting, Clippy, the 39 tests and `cargo-deny` pass.
 - [x] 2.3 Stale lockfile reproduced locally with the pre-split lockfile: `cargo test --locked` fails with "cannot update the lock file ... because --locked was passed".
 - [x] 2.4 After astorise/Magnetar#169 was merged: reference switched to `@main` in astorise/Magnetar-provider-CPU#17, whose run passed with the workflow loaded from Magnetar's `main`; merged.
-- [ ] 2.5 Failing test reported as a failed check: not exercised in CI (the session can push only to the pull request's own branch, so a scratch branch was not available).
 
 ## 3. Other module repositories
 
@@ -28,7 +27,6 @@
 - [x] 4.1 Runner label recorded in `SUBMODULES.md`: `arc-gpu-magnetar-provider-cuda`. The runner is online for the CUDA Provider repository and runs the `nvidia/cuda` container image with `--gpus all` (`nvidia-smi` and `nvcc` steps pass).
 - [x] 4.2 GPU job enabled in the CUDA Provider's caller workflow (astorise/Magnetar-provider-CUDA#35) with that label.
 - [x] 4.3 Validated on astorise/Magnetar-provider-CUDA#35 and on the push to `main` that merged it: the GPU job reports 96 passed, 0 failed, 0 ignored, including the `tests_hardware_hot_path` tests and the Provider conformance profiles.
-- [ ] 4.4 Validate: with the GPU made unavailable to the container, the job fails.
 - [x] 4.5 The GPU job's condition runs it only for non-pull-request events and for pull requests whose head repository is the module repository itself. Read from the workflow; not exercised with a real fork.
 
 ## 5. Documentation

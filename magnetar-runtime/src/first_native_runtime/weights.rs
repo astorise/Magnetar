@@ -660,3 +660,6 @@ impl WeightMaterializationTransaction {
             .map_err(InferenceApiError::from)
     }
 }
+
+#[cfg(test)]
+mod tests;

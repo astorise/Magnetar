@@ -1,47 +1,73 @@
-use crate::adapter::*;
 use crate::affinity::*;
-use crate::batching::*;
+
 use crate::capability::*;
+
 use crate::component::*;
+
 use crate::compute::*;
-use crate::conformance::*;
+
 use crate::device::*;
+
 use crate::e2e_conformance::*;
+
 use crate::execution_graph::*;
+
 use crate::generation::*;
+
 use crate::inference_api::*;
+
 use crate::kernel::*;
+
 use crate::kernel_artifact::*;
+
 use crate::kernel_artifact_ingestion::*;
+
 use crate::kernel_artifact_manifest::*;
-use crate::kernel_autotuning::*;
+
 use crate::kernel_cache::*;
+
 use crate::kernel_compilation::*;
+
 use crate::kernel_dispatch::*;
+
 use crate::kernel_execution_plan::*;
+
 use crate::kernel_registry::*;
+
 use crate::kernel_selection_policy::*;
-use crate::kv_cache::*;
+
 use crate::memory::*;
+
 use crate::model::*;
-use crate::model_format_roadmap::*;
+
 use crate::model_instance::*;
+
 use crate::model_loading::*;
+
 use crate::observability::*;
+
 use crate::operator::*;
+
 use crate::planning::*;
-use crate::prefix_cache::*;
+
 use crate::production_model_ingestion::*;
+
 use crate::provider::*;
-use crate::provider_roadmap::*;
+
 use crate::reference_cpu::*;
+
 use crate::resolution::*;
+
 use crate::runtime::*;
-use crate::sampling::*;
+
 use crate::scheduler::*;
+
 use crate::session::*;
+
 use crate::tensor::*;
+
 use crate::tokenizer::*;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -50,20 +76,22 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-struct TestProvider {
-    metadata: ProviderMetadata,
-    initialized: AtomicBool,
-    shut_down: AtomicBool,
-    fail_initialization: bool,
-    health: ProviderHealth,
-    status_snapshot: Option<ProviderStatusSnapshot>,
-    capability_health: BTreeMap<CapabilityId, HealthState>,
-    devices: Vec<Arc<dyn Device>>,
-    execution_api: Option<Arc<dyn ProviderExecutionApi>>,
-    kernel_advertisements: Vec<KernelAdvertisement>,
+
+pub(crate) struct TestProvider {
+    pub(crate) metadata: ProviderMetadata,
+    pub(crate) initialized: AtomicBool,
+    pub(crate) shut_down: AtomicBool,
+    pub(crate) fail_initialization: bool,
+    pub(crate) health: ProviderHealth,
+    pub(crate) status_snapshot: Option<ProviderStatusSnapshot>,
+    pub(crate) capability_health: BTreeMap<CapabilityId, HealthState>,
+    pub(crate) devices: Vec<Arc<dyn Device>>,
+    pub(crate) execution_api: Option<Arc<dyn ProviderExecutionApi>>,
+    pub(crate) kernel_advertisements: Vec<KernelAdvertisement>,
 }
+
 impl TestProvider {
-    fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         Self {
             metadata: ProviderMetadata::new(name, "1", "test", "test"),
             initialized: AtomicBool::new(false),
@@ -79,7 +107,7 @@ impl TestProvider {
     }
 }
 
-fn capability(name: &str, version: CapabilityVersion) -> Capability {
+pub(crate) fn capability(name: &str, version: CapabilityVersion) -> Capability {
     Capability::new(
         CapabilityId::new(name),
         version,
@@ -87,7 +115,8 @@ fn capability(name: &str, version: CapabilityVersion) -> Capability {
             .with_contract(WitInterface::new(name, version.to_string())),
     )
 }
-fn provider_with_capabilities(
+
+pub(crate) fn provider_with_capabilities(
     name: &str,
     capabilities: impl IntoIterator<Item = Capability>,
 ) -> TestProvider {
@@ -95,7 +124,8 @@ fn provider_with_capabilities(
     provider.metadata.capabilities.extend(capabilities);
     provider
 }
-fn simple_elementwise_compute_graph(name: &str) -> ComputeGraph {
+
+pub(crate) fn simple_elementwise_compute_graph(name: &str) -> ComputeGraph {
     let descriptor = TensorDescriptor::materialized(
         ShapeDescriptor::new([2, 2]),
         DTypeDescriptor::portable(ComputeDType::Float32),
@@ -113,6 +143,7 @@ fn simple_elementwise_compute_graph(name: &str) -> ComputeGraph {
         )),
     )
 }
+
 impl Provider for TestProvider {
     fn metadata(&self) -> ProviderMetadata {
         self.metadata.clone()
@@ -159,14 +190,16 @@ impl Provider for TestProvider {
         self.execution_api.clone()
     }
 }
-struct TestProviderExecutionApi {
-    submitted: Mutex<Vec<ProviderExecutionRequest>>,
-    released: AtomicBool,
-    cancel_outcome: Mutex<ProviderCancellationOutcome>,
-    outputs: Mutex<Vec<TensorResourceDescriptor>>,
+
+pub(crate) struct TestProviderExecutionApi {
+    pub(crate) submitted: Mutex<Vec<ProviderExecutionRequest>>,
+    pub(crate) released: AtomicBool,
+    pub(crate) cancel_outcome: Mutex<ProviderCancellationOutcome>,
+    pub(crate) outputs: Mutex<Vec<TensorResourceDescriptor>>,
 }
+
 impl TestProviderExecutionApi {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             submitted: Mutex::new(Vec::new()),
             released: AtomicBool::new(false),
@@ -175,6 +208,7 @@ impl TestProviderExecutionApi {
         }
     }
 }
+
 impl ProviderExecutionApi for TestProviderExecutionApi {
     fn submit(
         &self,
@@ -219,6 +253,7 @@ impl ProviderExecutionApi for TestProviderExecutionApi {
         Ok(())
     }
 }
+
 #[test]
 fn runtime_enumerates_provider_devices_with_metadata() {
     let mut provider = TestProvider::new("cuda");
@@ -255,6 +290,7 @@ fn runtime_enumerates_provider_devices_with_metadata() {
         Some("cuda")
     );
 }
+
 #[test]
 fn capability_validation_rejects_invalid_and_conflicting_definitions() {
     let mut registry = ProviderRegistry::default();
@@ -282,7 +318,7 @@ fn capability_validation_rejects_invalid_and_conflicting_definitions() {
     ));
 }
 
-fn first_native_report_fixture(provider_summary: &str) -> E2eConformanceReport {
+pub(crate) fn first_native_report_fixture(provider_summary: &str) -> E2eConformanceReport {
     E2eConformanceReport {
         suite_version: E2E_SUITE_VERSION.into(),
         fixture_version: E2E_FIXTURE_VERSION.into(),
@@ -315,59 +351,6 @@ fn first_native_report_fixture(provider_summary: &str) -> E2eConformanceReport {
 }
 
 #[test]
-fn first_native_native_execution_evidence_requires_registry_kernel_and_reference_cpu_path() {
-    let report = first_native_report_fixture(REFERENCE_CPU_PROVIDER_NAME);
-    assert!(validate_first_native_native_execution_evidence(&report).is_ok());
-
-    let mut missing_kernel_evidence = report.clone();
-    missing_kernel_evidence.kernel_coverage.clear();
-    assert!(matches!(
-        validate_first_native_native_execution_evidence(&missing_kernel_evidence),
-        Err(E2eConformanceError::KernelCoverageMissing { .. })
-    ));
-
-    let non_reference_provider = first_native_report_fixture("candle-provider");
-    assert!(matches!(
-        validate_first_native_native_execution_evidence(&non_reference_provider),
-        Err(E2eConformanceError::BoundaryViolation { .. })
-    ));
-}
-
-#[test]
-fn first_native_native_execution_evidence_rejects_shortcut_reports() {
-    let mut report = first_native_report_fixture(REFERENCE_CPU_PROVIDER_NAME);
-    report
-        .test_cases
-        .retain(|test| test.name != "success-path-no-shortcut-validated");
-
-    assert!(matches!(
-        validate_first_native_native_execution_evidence(&report),
-        Err(E2eConformanceError::BoundaryViolation { .. })
-    ));
-}
-
-#[test]
-fn first_native_component_engine_rejects_non_native_or_ambient_test_profile() {
-    let capabilities = ComponentEngineCapabilities::test();
-
-    assert!(matches!(
-        validate_first_native_component_engine_capabilities(&capabilities),
-        Err(FirstNativeModelExecutionProfileError::ComponentEngineProfileMismatch)
-    ));
-
-    let mut capabilities = ComponentEngineCapabilities::native();
-    capabilities.controlled_wasi = false;
-    assert!(matches!(
-        validate_first_native_component_engine_capabilities(&capabilities),
-        Err(
-            FirstNativeModelExecutionProfileError::ComponentEngineFeatureMissing(
-                ComponentEngineFeature::ControlledWasi
-            )
-        )
-    ));
-}
-
-#[test]
 fn compute_v1_import_is_not_satisfied_by_compute_v2_provider() {
     let provider = provider_with_capabilities("portable-compute", [compute_capability()]);
     let runtime = Runtime::builder()
@@ -382,6 +365,7 @@ fn compute_v1_import_is_not_satisfied_by_compute_v2_provider() {
                 && capability.version() == CapabilityVersion::new(1, 1, 0)
     ));
 }
+
 #[test]
 fn compute_wit_defines_the_stabilized_run_surface() {
     let wit = include_str!("../wit/compute.wit");
@@ -466,22 +450,7 @@ fn compute_wit_defines_the_stabilized_run_surface() {
     assert!(!wit.contains("queue"));
     assert!(!wit.contains("custom-operation"));
 }
-#[test]
-fn compute_operation_requests_reject_unknown_family_ids() {
-    let provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
 
-    assert!(matches!(
-        runtime.validate_compute_operation_requests(
-            "portable-compute",
-            &[ComputeOperationRequest::new("backend-kernel-name")]
-        ),
-        Err(ComputeValidationError::UnknownOperationFamily(_))
-    ));
-}
 #[test]
 fn scheduler_accepts_validated_plans_and_runs_fifo() {
     let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
@@ -687,6 +656,7 @@ fn provider_execution_api_submits_validated_scheduled_work() {
         ))
     );
 }
+
 #[test]
 fn provider_execution_completion_preserves_output_affinity_and_releases() {
     let api = Arc::new(TestProviderExecutionApi::new());
@@ -755,66 +725,7 @@ fn provider_execution_completion_preserves_output_affinity_and_releases() {
     );
     assert!(api.released.load(Ordering::SeqCst));
 }
-#[test]
-fn provider_execution_rejects_mismatched_provider_request_and_maps_cancellation() {
-    let api = Arc::new(TestProviderExecutionApi::new());
-    *api.cancel_outcome.lock().unwrap() = ProviderCancellationOutcome::Accepted;
-    let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
-    provider.execution_api = Some(api);
-    provider.metadata.compute_operation_support.insert(
-        ComputeOperationFamily::Elementwise,
-        ComputeOperationSupport::new()
-            .with_dtypes([ComputeDType::Float32])
-            .with_layouts([ComputeLayout::Dense]),
-    );
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let descriptor = TensorDescriptor::materialized(
-        ShapeDescriptor::new([2, 2]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-    );
-    let graph = ComputeGraph::new(ComputeGraphId::new("provider-cancel")).with_node(
-        ComputeNode::new(
-            ComputeNodeId::new("node"),
-            ComputeOperationDescriptor::new(ComputeOperationFamily::Elementwise)
-                .with_dtype(ComputeDType::Float32)
-                .with_layout(ComputeLayout::Dense),
-        )
-        .with_output(ComputeNodeOutput::new(
-            ComputeOutputId::new("out"),
-            descriptor,
-        )),
-    );
-    let plan = runtime.plan_compute_execution(&graph).unwrap();
-    let mut scheduler = runtime.scheduler(1);
-    let operation_id = runtime
-        .schedule_compute_execution(&mut scheduler, plan)
-        .unwrap();
-    let mut request = runtime
-        .prepare_provider_execution(scheduler.operation(operation_id).unwrap())
-        .unwrap();
-    request.provider = ProviderBinding::new("other-provider");
 
-    assert!(matches!(
-        runtime.submit_provider_execution(request),
-        Err(ProviderExecutionError {
-            code: ProviderExecutionErrorCode::InvalidExecutionPlan,
-            phase: ProviderExecutionPhase::Submit,
-            ..
-        })
-    ));
-
-    let request = runtime
-        .prepare_provider_execution(scheduler.operation(operation_id).unwrap())
-        .unwrap();
-    let handle = runtime.submit_provider_execution(request).unwrap();
-    assert_eq!(
-        runtime.cancel_provider_execution(&handle).unwrap(),
-        ProviderCancellationOutcome::Accepted
-    );
-}
 #[test]
 fn scheduler_rejects_over_capacity_and_cancels_queued_work() {
     let mut provider = provider_with_capabilities("portable-compute", [compute_capability()]);
@@ -864,26 +775,7 @@ fn scheduler_rejects_over_capacity_and_cancels_queued_work() {
     );
     assert_eq!(scheduler.submit_next(&runtime).unwrap(), None);
 }
-#[test]
-fn compute_providers_register_and_resolve_compatibly() {
-    let mut provider = TestProvider::new("portable-compute");
-    provider.metadata.capabilities.insert(compute_capability());
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
 
-    assert_eq!(
-        runtime
-            .resolve_component_import(&WitInterface::new(
-                COMPUTE_WIT_INTERFACE,
-                COMPUTE_CAPABILITY_VERSION.to_string(),
-            ))
-            .unwrap()
-            .len(),
-        1
-    );
-}
 #[test]
 fn resolution_policy_records_selected_provider_capability_and_reason() {
     let compute = compute_capability();
@@ -917,6 +809,7 @@ fn resolution_policy_records_selected_provider_capability_and_reason() {
         ResolutionDecisionReason::SelectedDeterministically
     );
 }
+
 #[test]
 fn policy_rejection_is_structured_when_all_candidates_are_unhealthy() {
     let compute = compute_capability();
@@ -938,29 +831,7 @@ fn policy_rejection_is_structured_when_all_candidates_are_unhealthy() {
                 && policy == BuiltInResolutionPolicy::Deterministic.id()
     ));
 }
-#[test]
-fn availability_policy_prefers_healthy_candidates() {
-    let compute = compute_capability();
-    let mut degraded = provider_with_capabilities("a-degraded", [compute.clone()]);
-    degraded.health = ProviderHealth::Degraded;
-    let healthy = provider_with_capabilities("z-healthy", [compute.clone()]);
-    let runtime = Runtime::builder()
-        .config(RuntimeConfig {
-            resolution_policy: BuiltInResolutionPolicy::Availability,
-            ..RuntimeConfig::default()
-        })
-        .register_provider(Arc::new(degraded))
-        .register_provider(Arc::new(healthy))
-        .build()
-        .unwrap();
 
-    let providers = runtime.resolve_component_import(&WitInterface::new(
-        COMPUTE_WIT_INTERFACE,
-        COMPUTE_CAPABILITY_VERSION.to_string(),
-    ));
-
-    assert_eq!(providers.unwrap()[0].metadata().name, "z-healthy");
-}
 #[test]
 fn capability_health_rejects_unavailable_implementation() {
     let compute = compute_capability();
@@ -1198,44 +1069,6 @@ fn scheduler_and_provider_execution_reject_stale_provider_status() {
         Err(error) if error.code == ProviderExecutionErrorCode::StaleHealthReport
     ));
 }
-#[test]
-fn phase_aware_resolution_rejects_restart_after_observable_output() {
-    let compute = compute_capability();
-    let provider = provider_with_capabilities("provider-a", [compute.clone()]);
-    let runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-
-    assert!(matches!(
-        runtime.resolve_with_affinity_at_phase(
-            &compute,
-            &[],
-            FallbackClass::Restartable,
-            ExecutionPhase::AfterObservableOutput,
-            true,
-        ),
-        Err(AffinityError::PolicyRejectedProvider { .. })
-    ));
-}
-
-#[test]
-fn provider_loading_policy_is_explicit_for_dynamic_and_development_modes() {
-    let root = std::path::PathBuf::from("target/providers");
-    let provider = root.join("provider.dll");
-    let outside = std::path::PathBuf::from("target/other/provider.dll");
-    let dynamic = ProviderLoadingPolicy::dynamic_library([root.clone()]);
-    let development = ProviderLoadingPolicy::development([root.clone()]);
-
-    assert_eq!(dynamic.mode, ProviderLoadingMode::DynamicLibrary);
-    assert!(!dynamic.development_mode);
-    assert!(dynamic.allows(&provider));
-    assert!(!dynamic.allows(&outside));
-    assert_eq!(development.mode, ProviderLoadingMode::DevelopmentProvider);
-    assert!(development.development_mode);
-    assert!(development.allows(&provider));
-    assert!(!ProviderLoadingPolicy::default().allows(&provider));
-}
 
 #[test]
 fn runtime_source_does_not_restore_legacy_backend_or_plugin_surface() {
@@ -1286,14 +1119,6 @@ fn public_component_api_does_not_expose_wasmtime_native_types() {
 }
 
 #[test]
-fn execution_context_default_allocates_unique_ids() {
-    let first = ExecutionContext::default();
-    let second = ExecutionContext::default();
-    assert_ne!(first.id(), second.id());
-    assert_ne!(first.id(), ExecutionContextId::default());
-}
-
-#[test]
 fn affinity_resolution_reports_unavailable_bound_provider_without_fallback() {
     let compute = compute_capability();
     let mut fallback = provider_with_capabilities("fallback", [compute.clone()]);
@@ -1308,48 +1133,6 @@ fn affinity_resolution_reports_unavailable_bound_provider_without_fallback() {
     assert!(matches!(
         runtime.resolve_with_affinity(&compute, &[&dependency], FallbackClass::ProviderPinned),
         Err(AffinityError::BoundProviderUnavailable(provider)) if provider.as_str() == "missing"
-    ));
-}
-
-#[test]
-fn affinity_resolution_rejects_foreign_context_and_preserves_groups() {
-    let compute = compute_capability();
-    let first = Runtime::builder()
-        .register_provider(Arc::new(provider_with_capabilities(
-            "provider-a",
-            [compute.clone()],
-        )))
-        .build()
-        .unwrap();
-    let second = Runtime::builder()
-        .register_provider(Arc::new(provider_with_capabilities(
-            "provider-a",
-            [compute.clone()],
-        )))
-        .build()
-        .unwrap();
-
-    let ungrouped = first
-        .resolve_with_affinity(&compute, &[], FallbackClass::ProviderPinned)
-        .unwrap()
-        .into_affinity();
-    assert_eq!(ungrouped.group(), None);
-
-    let grouped = first
-        .resolve_with_affinity(&compute, &[&ungrouped], FallbackClass::ProviderPinned)
-        .unwrap()
-        .into_affinity();
-    assert!(grouped.group().is_some());
-
-    let inherited = first
-        .resolve_with_affinity(&compute, &[&grouped], FallbackClass::ProviderPinned)
-        .unwrap()
-        .into_affinity();
-    assert_eq!(inherited.group(), grouped.group());
-
-    assert!(matches!(
-        second.resolve_with_affinity(&compute, &[&grouped], FallbackClass::ProviderPinned),
-        Err(AffinityError::ExecutionContextMismatch { .. })
     ));
 }
 
@@ -1371,44 +1154,7 @@ fn affinity_resolution_rejects_shutdown_runtime() {
     ));
 }
 
-#[test]
-fn inference_artifact_registry_handles_tokenizer_template_adapter_and_quantization() {
-    let mut registry = InferenceArtifactRegistry::default();
-    for kind in [
-        InferenceArtifactKind::Tokenizer,
-        InferenceArtifactKind::PromptTemplate,
-        InferenceArtifactKind::Adapter,
-        InferenceArtifactKind::Quantization,
-    ] {
-        let id = format!("{kind:?}").to_ascii_lowercase();
-        registry
-            .register(
-                InferenceArtifactReference::new(kind, &id, ComponentDigest::sha256(id.as_bytes()))
-                    .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(registry.resolve(kind, &id, None).unwrap().kind, kind);
-    }
-    assert!(matches!(
-        registry.resolve(InferenceArtifactKind::Tokenizer, "C:\\tokenizer.json", None),
-        Err(ComponentError::ArtifactRejected { .. })
-    ));
-}
-
-#[test]
-fn component_discovery_returns_only_wasm_artifacts() {
-    let directory =
-        std::env::temp_dir().join(format!("magnetar-components-{}", std::process::id()));
-    fs::create_dir_all(&directory).unwrap();
-    fs::write(directory.join("valid.wasm"), []).unwrap();
-    fs::write(directory.join("ignored.txt"), []).unwrap();
-
-    let discovered = ComponentManager::discover([&directory]).unwrap();
-    fs::remove_dir_all(&directory).unwrap();
-    assert_eq!(discovered, vec![directory.join("valid.wasm")]);
-}
-
-fn temp_component_artifact_dir(label: &str) -> std::path::PathBuf {
+pub(crate) fn temp_component_artifact_dir(label: &str) -> std::path::PathBuf {
     let directory = std::env::temp_dir().join(format!(
         "magnetar-component-artifact-{label}-{}",
         std::process::id()
@@ -1418,7 +1164,7 @@ fn temp_component_artifact_dir(label: &str) -> std::path::PathBuf {
     directory
 }
 
-fn trust_store_yaml(digest: &str) -> String {
+pub(crate) fn trust_store_yaml(digest: &str) -> String {
     format!(
         r#"schema: magnetar-component-trust
 schema_version: 1
@@ -1537,18 +1283,7 @@ fn admit_kernel_output_replaces_and_releases_the_previous_allocation_for_the_sam
     assert_eq!(active_for_owner(&manager), 1);
 }
 
-#[test]
-fn memory_manager_distinguishes_storage_and_compute_dtype_costs() {
-    let dtype = MemoryDTypeRelation::new(
-        DTypeDescriptor::portable(ComputeDType::SInt8),
-        DTypeDescriptor::portable(ComputeDType::BrainFloat16),
-    );
-
-    assert_eq!(dtype.storage_size_bytes(8).unwrap(), 8);
-    assert_eq!(dtype.compute_workspace_bytes(8).unwrap(), 16);
-}
-
-fn generation_tokenizer_metadata() -> TokenizerMetadata {
+pub(crate) fn generation_tokenizer_metadata() -> TokenizerMetadata {
     TokenizerMetadata {
         id: TokenizerId::new("fixture").unwrap(),
         artifact: TokenizerArtifactId::new("fixture-tokenizer").unwrap(),
@@ -1570,110 +1305,8 @@ fn generation_tokenizer_metadata() -> TokenizerMetadata {
     }
 }
 
-/// One token may serve several special roles (DeepSeek-R1-Distill's pad
-/// token is its end-of-sequence token); one id carrying two texts, or one
-/// role declared twice, is still a conflict.
-#[test]
-fn tokenizer_metadata_accepts_one_token_in_several_roles_but_not_one_id_with_two_texts() {
-    let mut shared = generation_tokenizer_metadata();
-    shared
-        .special_tokens
-        .push(SpecialToken::new(SpecialTokenKind::Pad, "<eos>", 299));
-    shared.validate().unwrap();
-
-    let mut clash = generation_tokenizer_metadata();
-    clash
-        .special_tokens
-        .push(SpecialToken::new(SpecialTokenKind::Pad, "<pad>", 299));
-    assert_eq!(clash.validate(), Err(TokenizerError::SpecialTokenConflict));
-
-    let mut twice = generation_tokenizer_metadata();
-    twice
-        .special_tokens
-        .push(SpecialToken::new(SpecialTokenKind::Eos, "<eos>", 297));
-    assert_eq!(twice.validate(), Err(TokenizerError::SpecialTokenConflict));
-}
-
-fn generation_request() -> GenerationRequest {
-    let metadata = generation_tokenizer_metadata();
-    GenerationRequest {
-        request_id: GenerationRequestId::new("gen-1").unwrap(),
-        session: None,
-        model: GenerationModelReference::LoadedModelContext("model-context".into()),
-        tokenizer: GenerationTokenizerReference {
-            tokenizer_id: metadata.id.clone(),
-            metadata,
-        },
-        input_token_ids: vec![2, 3, 4],
-        prompt_token_count: 3,
-        max_new_tokens: 4,
-        max_total_tokens: Some(8),
-        model_context_length: Some(8),
-        parameters: GenerationParameters::default(),
-        stop_conditions: StopConditions {
-            eos: EosPolicy {
-                mode: EosMode::Stop,
-                output: EosOutputPolicy::Exclude,
-                eos_token_ids: vec![299],
-            },
-            stop_token_ids: vec![298],
-            stop_token_patterns: vec![vec![10, 11]],
-            stop_text_sequences: vec!["stop".into()],
-            prepared_stop_sequences: vec![TokenStopPattern {
-                text: "xy".into(),
-                token_ids: vec![121, 122],
-                exact: true,
-            }],
-            ..StopConditions::default()
-        },
-        streaming: StreamingMode::TokenIds,
-        priority: GenerationPriority {
-            priority: 3,
-            deadline_millis: Some(100),
-        },
-        cancellation: CancellationMetadata::default(),
-        memory: GenerationMemoryEstimate {
-            input_token_buffer_bytes: 12,
-            output_token_buffer_bytes: 16,
-            logits_buffer_bytes: 32,
-            sampling_workspace_bytes: 8,
-            prefill_workspace_bytes: 8,
-            decode_workspace_bytes: 8,
-            kv_cache_placeholder_bytes: 8,
-            prefix_cache_placeholder_bytes: 0,
-            placement: MemoryPlacement::HostOrdinary,
-            queue_allowed: false,
-        },
-        correlation_id: Some(CorrelationId::new("corr-1")),
-        trace_id: Some(TraceId::new("trace-1")),
-    }
-}
-
 #[derive(Clone)]
-struct TestGenerationExecutor {
-    vocabulary_size: usize,
-    evidence: RuntimeGenerationExecutionEvidence,
-}
-
-impl RuntimeModelExecutionEngine for TestGenerationExecutor {
-    fn execute_generation_step(
-        &self,
-        _runtime: &mut Runtime,
-        _request: &GenerationRequest,
-        generated_tokens: &[TokenId],
-        _execution_plan: Option<&mut PreparedExecutionPlan>,
-    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
-        let mut logits = vec![0.0f32; self.vocabulary_size];
-        logits[(11 + generated_tokens.len()) % self.vocabulary_size] = 10.0;
-        Ok(RuntimeModelExecutionStep::new(
-            logits,
-            self.evidence.clone(),
-        ))
-    }
-}
-
-#[derive(Clone)]
-struct FailingGenerationExecutor;
+pub(crate) struct FailingGenerationExecutor;
 
 impl RuntimeModelExecutionEngine for FailingGenerationExecutor {
     fn execute_generation_step(
@@ -1690,7 +1323,7 @@ impl RuntimeModelExecutionEngine for FailingGenerationExecutor {
 }
 
 #[derive(Clone)]
-struct FailingKernelGenerationExecutor;
+pub(crate) struct FailingKernelGenerationExecutor;
 
 impl RuntimeModelExecutionEngine for FailingKernelGenerationExecutor {
     fn execute_generation_step(
@@ -1706,64 +1339,10 @@ impl RuntimeModelExecutionEngine for FailingKernelGenerationExecutor {
     }
 }
 
-fn runtime_with_model_execution_engine(
-    vocabulary_size: usize,
-    evidence: RuntimeGenerationExecutionEvidence,
-) -> Runtime {
-    Runtime::builder()
-        .register_provider(Arc::new(ReferenceCpuProvider::new()))
-        .model_execution_engine(Arc::new(TestGenerationExecutor {
-            vocabulary_size,
-            evidence,
-        }))
-        .build()
-        .unwrap()
-}
-
-#[test]
-fn generation_request_validation_is_token_based_and_context_aware() {
-    let request = generation_request();
-    request.validate().unwrap();
-    assert_eq!(request.prompt_token_count, request.input_token_ids.len());
-    assert!(matches!(
-        request.model,
-        GenerationModelReference::LoadedModelContext(_)
-    ));
-}
-
-#[test]
-fn generation_request_rejects_invalid_input_tokens() {
-    let mut request = generation_request();
-    request.input_token_ids.push(999);
-    request.prompt_token_count += 1;
-
-    assert!(matches!(
-        request.validate(),
-        Err(GenerationError::InputTokensInvalid { .. })
-    ));
-}
-
-#[test]
-fn generation_request_rejects_prompt_that_exceeds_limits_without_truncation() {
-    let mut request = generation_request();
-    request.max_new_tokens = 20;
-
-    assert!(matches!(
-        request.validate(),
-        Err(GenerationError::PromptTooLong { .. })
-    ));
-}
-
-#[test]
-fn generation_contract_has_no_authoritative_provider_or_device_selector() {
-    let request = generation_request();
-
-    assert_eq!(request.priority.priority, 3);
-    assert!(request.correlation_id.is_some());
-    assert!(request.trace_id.is_some());
-}
-
-fn reference_cpu_host_tensor(shape: impl Into<Vec<u64>>, data: impl Into<Vec<f32>>) -> HostTensor {
+pub(crate) fn reference_cpu_host_tensor(
+    shape: impl Into<Vec<u64>>,
+    data: impl Into<Vec<f32>>,
+) -> HostTensor {
     HostTensor::new(shape, data).unwrap()
 }
 
@@ -1778,7 +1357,7 @@ fn reference_cpu_provider_status_snapshot_reports_health_and_lifecycle() {
     assert!(snapshot.diagnostics.is_empty());
 }
 
-fn reference_cpu_resource(
+pub(crate) fn reference_cpu_resource(
     id: &str,
     shape: impl Into<Vec<u64>>,
 ) -> (TensorResourceId, KernelResource) {
@@ -1795,114 +1374,6 @@ fn reference_cpu_resource(
         resource_id,
         KernelResource::new(descriptor, KernelMemoryClass::Host),
     )
-}
-
-/// `reach-architecture-freeze-1` task 5.4/5.5: a real Operator with more
-/// than one declared output ("split") dispatched through the same generic
-/// `KernelInvocation`/`execute_invocation` path every other Kernel uses,
-/// proving `KernelInvocation.outputs: Vec<..>` and
-/// `store_output(invocation, index, ..)` actually produce a distinct,
-/// independently-readable resource per declared output -- not just that
-/// the types allow more than one.
-#[test]
-fn reference_cpu_split_kernel_produces_a_dedicated_resource_per_output() {
-    let provider = ReferenceCpuProvider::new();
-    let executor = provider.executor();
-    let advertisements = provider.kernel_advertisements();
-    let advertisement = advertisements
-        .iter()
-        .find(|advertisement| advertisement.id.name == "split")
-        .unwrap();
-    let catalog = initial_operator_catalog();
-    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
-
-    let (input_id, input_resource) = reference_cpu_resource("split-in", [2, 4]);
-    let (_left_id, left_resource) = reference_cpu_resource("split-left", [2, 2]);
-    let (_right_id, right_resource) = reference_cpu_resource("split-right", [2, 2]);
-    executor.write_tensor(
-        input_id,
-        reference_cpu_host_tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
-    );
-
-    let invocation = KernelInvocation::new(
-        KernelInvocationId::new("invocation-split"),
-        advertisement.implemented_operator.clone(),
-        advertisement.id.clone(),
-        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
-        ResourceAffinity::new(FallbackClass::Transparent),
-    )
-    .with_input(input_resource)
-    .with_output(left_resource.clone())
-    .with_output(right_resource.clone());
-
-    let result = executor.execute_invocation(advertisement, operator, &invocation);
-    assert_eq!(result.status, KernelResultStatus::Succeeded);
-    assert_eq!(
-        result.updated_resources.len(),
-        2,
-        "split must report both output resources as updated, not just one"
-    );
-
-    let left = executor.read_tensor(&left_resource.resource.id).unwrap();
-    let right = executor.read_tensor(&right_resource.resource.id).unwrap();
-    assert_eq!(left.shape, vec![2, 2]);
-    assert_eq!(right.shape, vec![2, 2]);
-    // Each row of the [2, 4] input splits into its first-half/second-half
-    // elements, landing in two independently-readable resources.
-    assert_eq!(left.data, vec![1.0, 2.0, 5.0, 6.0]);
-    assert_eq!(right.data, vec![3.0, 4.0, 7.0, 8.0]);
-}
-
-#[test]
-fn reference_cpu_execution_tracks_output_through_memory_manager() {
-    let provider = ReferenceCpuProvider::new();
-    let executor = provider.executor();
-    let advertisements = provider.kernel_advertisements();
-    let advertisement = advertisements
-        .iter()
-        .find(|advertisement| advertisement.id.name == "matmul")
-        .unwrap();
-    let catalog = initial_operator_catalog();
-    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
-    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
-
-    let (a_id, a_resource) = reference_cpu_resource("mm-a", [2, 2]);
-    let (b_id, b_resource) = reference_cpu_resource("mm-b", [2, 2]);
-    let (_out_id, out_resource) = reference_cpu_resource("mm-out", [2, 2]);
-    executor.write_tensor(
-        a_id,
-        reference_cpu_host_tensor([2, 2], [1.0, 0.0, 0.0, 1.0]),
-    );
-    executor.write_tensor(
-        b_id,
-        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
-    );
-
-    let invocation = KernelInvocation::new(
-        KernelInvocationId::new("invocation-memory"),
-        advertisement.implemented_operator.clone(),
-        advertisement.id.clone(),
-        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
-        ResourceAffinity::new(FallbackClass::Transparent),
-    )
-    .with_input(a_resource)
-    .with_input(b_resource)
-    .with_output(out_resource.clone());
-
-    let result = executor.execute_invocation_with_memory_manager(
-        advertisement,
-        operator,
-        &invocation,
-        &mut memory,
-    );
-    assert_eq!(result.status, KernelResultStatus::Succeeded);
-
-    let residency = memory
-        .tensor_residency(&out_resource.resource.id)
-        .expect("Memory Manager should record residency for the output tensor");
-    assert!(residency.provider_owned);
-    assert!(residency.allocation.is_some());
-    assert!(memory.allocations().next().is_some());
 }
 
 /// `unify-provider-output-admission-and-residency` task 2.4: an output
@@ -2133,44 +1604,6 @@ fn reference_cpu_write_tensor_admitted_releases_previous_allocation_for_same_res
     );
 }
 
-/// `implement-device-resident-multi-step-cuda-decode` task 4.4:
-/// `copy_tensor_admitted` duplicates a resource's bytes to a fresh
-/// identity, admitted the same way `write_tensor_admitted` already is.
-#[test]
-fn reference_cpu_copy_tensor_admitted_duplicates_bytes_to_a_fresh_identity() {
-    let executor = ReferenceCpuExecutor::new();
-    let mut memory = MemoryManager::default();
-    let source_id = TensorResourceId::new("copy-source");
-    executor
-        .write_tensor_admitted(
-            &mut memory,
-            source_id.clone(),
-            reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
-            MemoryAllocationClass::Tensor,
-            MemoryAllocationOwner::Session("test-session".into()),
-        )
-        .expect("source write succeeds");
-
-    let dest_id = TensorResourceId::new("copy-destination");
-    executor
-        .copy_tensor_admitted(
-            &mut memory,
-            &source_id,
-            dest_id.clone(),
-            MemoryAllocationClass::Tensor,
-            MemoryAllocationOwner::Session("test-session".into()),
-        )
-        .expect("copy succeeds");
-
-    assert_eq!(
-        executor
-            .read_tensor(&dest_id)
-            .expect("destination resource is present")
-            .data,
-        vec![1.0, 2.0, 3.0, 4.0]
-    );
-}
-
 /// A second copy to the same destination identity replaces (and releases)
 /// the first, matching `write_tensor_admitted`'s own replacement
 /// discipline -- the exact bounded-growth requirement the KV pending/
@@ -2226,69 +1659,6 @@ fn reference_cpu_copy_tensor_admitted_replaces_a_previous_allocation_at_the_same
     );
 }
 
-#[test]
-fn reference_cpu_copy_tensor_admitted_rejects_a_missing_source() {
-    let executor = ReferenceCpuExecutor::new();
-    let mut memory = MemoryManager::default();
-    let error = executor
-        .copy_tensor_admitted(
-            &mut memory,
-            &TensorResourceId::new("does-not-exist"),
-            TensorResourceId::new("copy-destination-3"),
-            MemoryAllocationClass::Tensor,
-            MemoryAllocationOwner::Session("test-session".into()),
-        )
-        .expect_err("copying a nonexistent source must fail structurally");
-    assert!(matches!(error, TensorValueAdmissionError::Memory(_)));
-}
-
-#[test]
-fn reference_cpu_releases_admitted_output_reservation_when_kernel_execution_fails() {
-    let provider = ReferenceCpuProvider::new();
-    let executor = provider.executor();
-    let advertisements = provider.kernel_advertisements();
-    let advertisement = advertisements
-        .iter()
-        .find(|advertisement| advertisement.id.name == "matmul")
-        .unwrap();
-    let catalog = initial_operator_catalog();
-    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
-    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
-
-    let (_a_id, a_resource) = reference_cpu_resource("mem-release-a", [2, 2]);
-    let (_b_id, b_resource) = reference_cpu_resource("mem-release-b", [2, 2]);
-    let (_out_id, out_resource) = reference_cpu_resource("mem-release-out", [2, 2]);
-    // Inputs are intentionally left unwritten so the Kernel itself fails
-    // (`input_tensor` finds no materialized data) after admission already
-    // succeeded, exercising the rollback path rather than the admission
-    // rejection path.
-
-    let invocation = KernelInvocation::new(
-        KernelInvocationId::new("invocation-memory-release"),
-        advertisement.implemented_operator.clone(),
-        advertisement.id.clone(),
-        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
-        ResourceAffinity::new(FallbackClass::Transparent),
-    )
-    .with_input(a_resource)
-    .with_input(b_resource)
-    .with_output(out_resource);
-
-    let result = executor.execute_invocation_with_memory_manager(
-        advertisement,
-        operator,
-        &invocation,
-        &mut memory,
-    );
-    assert_eq!(result.status, KernelResultStatus::Failed);
-    assert!(
-        !memory
-            .allocations()
-            .any(|allocation| allocation.state == MemoryAllocationState::Active),
-        "the output reservation admitted before dispatch must be released when the Kernel itself fails"
-    );
-}
-
 /// Builds a real, fully consistent `matmul` `KernelDispatchPlan` against
 /// Reference CPU -- Provider affinity set, two inputs, one output, all
 /// agreeing -- for `kernel_dispatcher_revalidate_*` below to mutate one
@@ -2299,7 +1669,8 @@ fn reference_cpu_releases_admitted_output_reservation_when_kernel_execution_fail
 /// Provider/Device/ResourceAffinity consistency check
 /// (audit-complet-cuda-hot-path-2026-09-08's Correctif A), not Kernel
 /// Registry selection itself.
-fn matmul_dispatch_plan_for_revalidation_tests() -> (KernelRegistry, KernelDispatchPlan) {
+pub(crate) fn matmul_dispatch_plan_for_revalidation_tests() -> (KernelRegistry, KernelDispatchPlan)
+{
     let mut registry = KernelRegistry::new();
     for advertisement in ReferenceCpuProvider::new().kernel_advertisements() {
         registry
@@ -2494,7 +1865,7 @@ fn kernel_dispatcher_revalidate_rejects_prepared_plan_device_mismatch() {
     ));
 }
 
-fn tensor_resource_for_test(id: &str) -> TensorResource {
+pub(crate) fn tensor_resource_for_test(id: &str) -> TensorResource {
     let descriptor = TensorDescriptor::materialized(
         ShapeDescriptor::new([2, 2]),
         DTypeDescriptor::portable(ComputeDType::Float32),
@@ -2516,26 +1887,7 @@ fn tensor_lifecycle_rejects_declared_to_ready_skip() {
     assert!(matches!(error, TensorError::ResourceInvalid { .. }));
 }
 
-#[test]
-fn tensor_view_becomes_unavailable_once_base_is_terminal() {
-    let view = TensorView::new(
-        TensorResourceId::new("base"),
-        ViewDescriptor::from_resource(TensorResourceId::new("base"), 0, [1, 1]),
-        ShapeDescriptor::new([2, 2]),
-        DTypeDescriptor::portable(ComputeDType::Float32),
-        ResourceAffinity::new(FallbackClass::Transparent),
-    );
-    assert!(
-        view.validate_against_base(TensorLifecycleState::Ready)
-            .is_ok()
-    );
-    let error = view
-        .validate_against_base(TensorLifecycleState::Released)
-        .unwrap_err();
-    assert!(matches!(error, TensorError::ViewBaseUnavailable { .. }));
-}
-
-fn permissive_operator_spec(memory: OperatorMemoryBehavior) -> OperatorSpec {
+pub(crate) fn permissive_operator_spec(memory: OperatorMemoryBehavior) -> OperatorSpec {
     OperatorSpec::new(
         OperatorId::new(
             OPERATOR_NAMESPACE,
@@ -2550,7 +1902,7 @@ fn permissive_operator_spec(memory: OperatorMemoryBehavior) -> OperatorSpec {
     .with_memory(memory)
 }
 
-fn contiguous_f32_tensor() -> TensorDescriptor {
+pub(crate) fn contiguous_f32_tensor() -> TensorDescriptor {
     TensorDescriptor::materialized(
         ShapeDescriptor::new([2, 2]),
         DTypeDescriptor::portable(ComputeDType::Float32),
@@ -2619,159 +1971,7 @@ fn operator_validate_invocation_rejects_mutation_of_immutable_input() {
 // Runtime Inference API
 // ---------------------------------------------------------------------
 
-#[test]
-fn inference_api_model_reference_resolves_through_local_registry() {
-    let reference = ModelRef::new("qwen-test").unwrap();
-    let artifact = ModelArtifactId::new(
-        ModelArtifactKind::ModelWeights,
-        ModelName::new("qwen").unwrap(),
-        ModelRevision::new("1").unwrap(),
-        ModelDigest::sha256(b"weights"),
-    );
-    let mut registry = ModelRegistry::new();
-    registry.register(reference.clone(), artifact.clone());
-
-    let result = registry
-        .resolve(&ModelResolutionRequest::new(reference))
-        .unwrap();
-    assert_eq!(result.artifact, artifact);
-}
-
-#[test]
-fn inference_api_model_reference_resolution_fails_for_unregistered_reference() {
-    let registry = ModelRegistry::new();
-    let reference = ModelRef::new("unknown-model").unwrap();
-    let error = registry
-        .resolve(&ModelResolutionRequest::new(reference))
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        InferenceApiError::ModelResolutionFailed { .. }
-    ));
-}
-
-#[test]
-fn inference_api_session_creation_rejects_forbidden_allowed_capabilities() {
-    let runtime = &mut Runtime::builder().build().unwrap();
-    let mut request = session_creation_request();
-    request.allowed_capabilities.insert("shell".into());
-
-    let error = create_inference_session(runtime, request).unwrap_err();
-    assert!(matches!(error, InferenceApiError::PolicyDenied { .. }));
-}
-
-#[test]
-fn inference_api_session_creation_succeeds_with_inference_only_capabilities() {
-    let runtime = &mut Runtime::builder().build().unwrap();
-    let mut request = session_creation_request();
-    request.allowed_capabilities.insert("generation".into());
-
-    let session = create_inference_session(runtime, request).unwrap();
-    let status = session_status(
-        runtime,
-        &session,
-        &SessionAccessPolicy::authorize(session.clone()),
-    )
-    .unwrap();
-    assert_eq!(status.id, session);
-    assert!(!status.raw_prompt_available);
-    assert!(!status.raw_handles_available);
-}
-
-#[test]
-fn inference_api_admission_state_reports_structured_backpressure() {
-    assert_eq!(
-        AdmissionState::from(&MemoryAdmissionDecision::Admit {
-            reason: "ok".into()
-        }),
-        AdmissionState::Accepted
-    );
-    assert!(matches!(
-        AdmissionState::from(&MemoryAdmissionDecision::Queue {
-            reason: "busy".into()
-        }),
-        AdmissionState::Queued { .. }
-    ));
-    assert!(matches!(
-        AdmissionState::from(&MemoryAdmissionDecision::Reject {
-            reason: "no memory".into()
-        }),
-        AdmissionState::Rejected { .. }
-    ));
-    assert!(matches!(
-        AdmissionState::from(&MemoryAdmissionDecision::RetryLater {
-            reason: "pressure".into()
-        }),
-        AdmissionState::Delayed { .. }
-    ));
-}
-
-#[test]
-fn inference_api_submit_generation_admits_compatible_request_into_batch() {
-    let mut runtime = Runtime::builder().build().unwrap();
-    let policy = BatchingPolicy {
-        allow_queueing: false,
-        ..BatchingPolicy::default()
-    };
-    let batch = runtime.create_continuous_batch(policy);
-    let request = generation_request();
-
-    let (state, slot) = submit_generation(&mut runtime, &batch, &request).unwrap();
-    assert_eq!(state, AdmissionState::Accepted);
-    assert!(slot.is_some());
-}
-
-#[test]
-fn inference_api_submit_generation_reports_queued_when_batch_policy_enqueues() {
-    let mut runtime = Runtime::builder().build().unwrap();
-    let batch = runtime.create_continuous_batch(BatchingPolicy::default());
-    let request = generation_request();
-
-    let (state, slot) = submit_generation(&mut runtime, &batch, &request).unwrap();
-    assert!(matches!(state, AdmissionState::Queued { .. }));
-    assert!(slot.is_some());
-}
-
-#[test]
-fn inference_api_submit_generation_reports_rejection_when_batch_policy_denies() {
-    let mut runtime = Runtime::builder().build().unwrap();
-    let policy = BatchingPolicy {
-        max_active_operations: 0,
-        ..BatchingPolicy::default()
-    };
-    let batch = runtime.create_continuous_batch(policy);
-    let request = generation_request();
-
-    let error = submit_generation(&mut runtime, &batch, &request).unwrap_err();
-    assert!(matches!(
-        error,
-        InferenceApiError::GenerationRejected { .. }
-    ));
-}
-
-#[test]
-fn inference_api_submit_generation_observed_emits_generation_accepted() {
-    let mut runtime = Runtime::builder().build().unwrap();
-    let policy = BatchingPolicy {
-        allow_queueing: false,
-        ..BatchingPolicy::default()
-    };
-    let batch = runtime.create_continuous_batch(policy);
-    let request = generation_request();
-    let mut observer = InferenceApiObserver::new();
-
-    let (state, _) =
-        submit_generation_observed(&mut runtime, &batch, &request, &mut observer).unwrap();
-    assert_eq!(state, AdmissionState::Accepted);
-    assert!(
-        observer
-            .observations()
-            .iter()
-            .any(|observation| observation.kind == InferenceApiObservationKind::GenerationAccepted)
-    );
-}
-
-fn model_instance_definition() -> ModelInstanceDefinition {
+pub(crate) fn model_instance_definition() -> ModelInstanceDefinition {
     ModelInstanceDefinition {
         artifact: ModelArtifactId::new(
             ModelArtifactKind::ModelWeights,
@@ -2815,121 +2015,9 @@ fn model_instance_definition() -> ModelInstanceDefinition {
 /// `Ready -> Ready` lifecycle transition exists). Requires a
 /// `ReferenceCpuProvider` already registered on `runtime` and `instance`'s
 /// placement pinned to it.
-fn reach_ready_with_real_weight(runtime: &mut Runtime, instance: &ModelInstanceId) {
+pub(crate) fn reach_ready_with_real_weight(runtime: &mut Runtime, instance: &ModelInstanceId) {
     let weights = BTreeMap::from([("weight".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
     materialize_model_instance_weights(runtime, instance, "test", &weights).unwrap();
-}
-
-/// Implements `seal-model-instance-readiness-authority` round 3, the
-/// audit's own resume scenario: state that made an instance eligible for
-/// `Ready` can change while it is suspended, so `resume_model_instance`
-/// must re-derive readiness against *current* Runtime state, not assume
-/// whatever was true before suspension still holds. Proven here by
-/// invalidating the weight evidence during suspension (removing its
-/// `TensorResidency`, a legitimate way real state can regress -- e.g. a
-/// rollback or eviction elsewhere) rather than by mutating a `Provider`'s
-/// status snapshot, which this test double has no interior mutability to
-/// do after registration; both exercise the same property: resume must
-/// look at current state, not trust the state from before suspension.
-#[test]
-fn inference_api_resume_model_instance_revalidates_and_rejects_stale_evidence() {
-    let mut runtime = Runtime::builder()
-        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .build()
-        .unwrap();
-    let mut definition = model_instance_definition();
-    definition.placement = ModelInstancePlacement::new(
-        ResourceAffinity::new(FallbackClass::Transparent)
-            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
-    );
-    let instance = runtime.model_instances_mut().create(definition).unwrap();
-    reach_ready_with_real_weight(&mut runtime, &instance);
-    assert_eq!(
-        model_instance_status(&runtime, &instance)
-            .unwrap()
-            .lifecycle,
-        ModelInstanceLifecycleState::Ready
-    );
-
-    suspend_model_instance(
-        &mut runtime,
-        &instance,
-        ModelInstanceSuspensionReason::AdministrativePolicy,
-    )
-    .unwrap();
-
-    // While suspended, the weight evidence that made this instance Ready
-    // becomes invalid (its TensorResidency is removed) -- simulating real
-    // state regressing during the suspension window, exactly the scenario
-    // the audit's own resume test targets.
-    let weight_resource = runtime
-        .model_instance(&instance)
-        .unwrap()
-        .definition
-        .resource_bindings
-        .weights
-        .get("weight")
-        .unwrap()
-        .clone();
-    runtime
-        .memory_mut()
-        .remove_tensor_residency(&weight_resource);
-
-    resume_model_instance(&mut runtime, &instance).unwrap_err();
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(!status.readiness.accepts_generation());
-}
-
-/// Implements `seal-model-instance-readiness-authority` round 3, audit
-/// test 25 "Inventaire incomplet": a manifest declaring multiple mandatory
-/// tensors, with only some of them bound, must not reach Ready even
-/// though every bound entry is individually real (residency-backed,
-/// Provider-written, and -- since `bind-model-loading-evidence-to-
-/// validated-artifact` -- Runtime-evidenced). Round 2's fix only checked
-/// that whatever *was* bound was real; it never checked the bound set was
-/// *complete*. Materializes "weight.a" for real through the one authorized
-/// transaction (which has no knowledge of `required_weight_names` --
-/// that's `derive_effective_readiness_checks`'s own concern -- so it marks
-/// the instance Ready on its own terms); a subsequent `warm_model_instance`
-/// re-derivation must then find the mandatory inventory still incomplete
-/// and demote it, the same defense-in-depth property the resume-
-/// revalidation test above proves for stale residency.
-#[test]
-fn inference_api_warm_model_instance_rejects_incomplete_mandatory_weight_inventory() {
-    let mut runtime = Runtime::builder()
-        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .build()
-        .unwrap();
-    let mut definition = model_instance_definition();
-    definition.placement = ModelInstancePlacement::new(
-        ResourceAffinity::new(FallbackClass::Transparent)
-            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
-    );
-    definition.required_weight_names =
-        BTreeSet::from(["weight.a".to_string(), "weight.b".to_string()]);
-    let instance = runtime.model_instances_mut().create(definition).unwrap();
-
-    // Really materialize only "weight.a" -- "weight.b" stays entirely
-    // absent.
-    let weights = BTreeMap::from([("weight.a".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
-    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
-
-    let plan = ModelInstanceWarmupPlan {
-        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
-        steps: Vec::new(),
-    };
-    warm_model_instance(
-        &mut runtime,
-        &instance,
-        &plan,
-        &ModelInstanceReadinessChecks::default(),
-    )
-    .unwrap_err();
-
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(!status.readiness.accepts_generation());
 }
 
 /// Implements `seal-model-instance-readiness-authority` round 3, audit
@@ -3024,183 +2112,6 @@ fn inference_api_warm_model_instance_rejects_residency_without_provider_write() 
     assert!(!status.readiness.accepts_generation());
 }
 
-/// Implements `runtime-owned-model-instance-readiness-authority`. An
-/// external audit of PR #36 found `warm_model_instance` trusted a caller's
-/// `weights_materialized: true` claim outright, even though
-/// `ModelInstanceReadinessChecks::default()` sets it `true` -- a caller
-/// using the default checks against an instance whose weights were never
-/// materialized could reach `Ready`. Covers the audit's test 18.1 (warmup
-/// without materialization must not reach Ready) and 18.3 (a forged
-/// `weights_materialized=true` claim against empty bindings is rejected).
-#[test]
-fn inference_api_warm_model_instance_rejects_forged_weights_materialized_claim() {
-    let mut runtime = Runtime::builder().build().unwrap();
-    let instance = runtime
-        .model_instances_mut()
-        .create(model_instance_definition())
-        .unwrap();
-    assert!(
-        runtime
-            .model_instance(&instance)
-            .unwrap()
-            .definition
-            .resource_bindings
-            .weights
-            .is_empty(),
-        "test precondition: no weights ever bound"
-    );
-
-    let plan = ModelInstanceWarmupPlan {
-        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
-        steps: Vec::new(),
-    };
-    // The caller asserts every fact is satisfied, exactly matching
-    // `ModelInstanceReadinessChecks::default()` -- the audit's own
-    // exploit scenario (section 11).
-    let forged_checks = ModelInstanceReadinessChecks::default();
-    assert!(forged_checks.weights_materialized);
-
-    warm_model_instance(&mut runtime, &instance, &plan, &forged_checks).unwrap_err();
-
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(!status.readiness.accepts_generation());
-}
-
-/// Implements `runtime-owned-model-instance-readiness-authority`, test
-/// 18.2: `WarmupPolicy::Disabled` calls `ModelInstance::validate_readiness`
-/// directly, without the lifecycle transition `warmup()`'s other policies
-/// perform first -- so before this fix, a caller-forged `readiness =
-/// Ready` could be published while `lifecycle` stayed `Loading`, an
-/// internally inconsistent state. This test isolates that specific gap
-/// from `weights_materialized` derivation (covered separately above) by
-/// directly binding a weight resource, so the *only* thing preventing
-/// `Ready` here is the lifecycle/readiness consistency check.
-#[test]
-fn inference_api_warm_model_instance_disabled_policy_cannot_forge_ready_readiness() {
-    let mut runtime = Runtime::builder().build().unwrap();
-    let instance = runtime
-        .model_instances_mut()
-        .create(model_instance_definition())
-        .unwrap();
-    runtime
-        .model_instances_mut()
-        .instance_mut(&instance)
-        .unwrap()
-        .definition
-        .resource_bindings
-        .weights
-        .insert("weight".into(), TensorResourceId::new("test.weight"));
-    assert_eq!(
-        model_instance_status(&runtime, &instance)
-            .unwrap()
-            .lifecycle,
-        ModelInstanceLifecycleState::Loading,
-        "test precondition: still Loading, no transition has run"
-    );
-
-    let plan = ModelInstanceWarmupPlan {
-        policy: ModelInstanceWarmupPolicy::Disabled,
-        steps: Vec::new(),
-    };
-    let checks = ModelInstanceReadinessChecks::default();
-
-    // Disabled policy's own contract (`ModelInstance::warmup`) means this
-    // call does not have to fail -- `validate_readiness`'s own `Result`
-    // reflects whether the checks *themselves* are internally coherent,
-    // which they are. What matters is `self.readiness` afterward.
-    let _ = warm_model_instance(&mut runtime, &instance, &plan, &checks);
-
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_eq!(
-        status.lifecycle,
-        ModelInstanceLifecycleState::Loading,
-        "Disabled policy must not transition the lifecycle"
-    );
-    assert_ne!(
-        status.readiness,
-        ModelInstanceReadiness::Ready,
-        "readiness must not report Ready while lifecycle is still Loading"
-    );
-}
-
-/// Implements `runtime-owned-model-instance-readiness-authority`, test
-/// 18.4: an internally inconsistent `lifecycle: Loading, readiness: Ready`
-/// state -- however it might arise -- must never grant `acquire_usage` or
-/// `generation_reference`. This is the structural safety net: it holds
-/// regardless of which caller-forgeable path produced the inconsistency.
-#[test]
-fn model_instance_acquire_usage_rejects_ready_readiness_with_incompatible_lifecycle() {
-    let mut manager = ModelInstanceManager::new();
-    let id = manager.create(model_instance_definition()).unwrap();
-    assert_eq!(
-        manager.instance(&id).unwrap().lifecycle,
-        ModelInstanceLifecycleState::Loading
-    );
-
-    // Force the inconsistent state directly (bypassing every public
-    // entry point) to prove the check in `acquire_usage`/
-    // `generation_reference` itself, independent of how the
-    // inconsistency might be produced.
-    manager.instance_mut(&id).unwrap().readiness = ModelInstanceReadiness::Ready;
-    assert_eq!(
-        manager.instance(&id).unwrap().lifecycle,
-        ModelInstanceLifecycleState::Loading
-    );
-    assert_eq!(
-        manager.instance(&id).unwrap().readiness,
-        ModelInstanceReadiness::Ready
-    );
-
-    assert!(matches!(
-        manager.instance_mut(&id).unwrap().acquire_usage(0),
-        Err(ModelInstanceError::ModelInstanceLoading)
-    ));
-    assert!(matches!(
-        manager.generation_reference(&id),
-        Err(ModelInstanceError::ModelInstanceLoading)
-    ));
-}
-
-/// Implements `runtime-owned-model-instance-readiness-authority`, test
-/// 18.5: the happy path -- real weight materialization, a Provider the
-/// Runtime can actually resolve, and no forged claims -- still reaches
-/// Ready and accepts usage. Closing the forgery gap must not regress the
-/// legitimate warmup path.
-#[test]
-fn inference_api_warm_model_instance_reaches_ready_when_weights_and_provider_are_real() {
-    let mut runtime = Runtime::builder()
-        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .build()
-        .unwrap();
-    let mut definition = model_instance_definition();
-    definition.placement = ModelInstancePlacement::new(
-        ResourceAffinity::new(FallbackClass::Transparent)
-            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
-    );
-    let instance = runtime.model_instances_mut().create(definition).unwrap();
-    // Real, Provider-backed evidence, not just a residency record or a
-    // bare map entry: `weights_materialized` derivation resolves each
-    // residency's recorded Provider and reads the tensor back from it, so
-    // a residency whose Provider never actually received a `write_tensor`
-    // call does not count (Correctif: Runtime-owned ModelInstance
-    // readiness authority, round 3 -- closing the "synthetic residency"
-    // forgery a further audit of PR #36 demonstrated: a caller could
-    // previously construct a valid-looking `TensorResidency` for a
-    // resource no Provider ever wrote).
-    reach_ready_with_real_weight(&mut runtime, &instance);
-
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(status.readiness.accepts_generation());
-    assert!(
-        runtime
-            .model_instances_mut()
-            .acquire_usage(&instance, 0)
-            .is_ok()
-    );
-}
-
 /// `bind-model-loading-evidence-to-validated-artifact`: a weight binding
 /// assembled by hand -- real Memory Manager allocation, real
 /// `Provider::write_tensor` call, real `TensorResidency` record, real
@@ -3283,286 +2194,6 @@ fn inference_api_warm_model_instance_rejects_hand_assembled_binding_without_evid
     assert!(!status.readiness.accepts_generation());
 }
 
-/// `bind-model-loading-evidence-to-validated-artifact`: materialization
-/// evidence is looked up by the instance's own id, so Model Instance B
-/// cannot become materialized by having its weight bindings set to match
-/// Model Instance A's already-legitimately-materialized bindings -- B's
-/// lookup only ever finds evidence `commit` minted for B's own id (none),
-/// regardless of what A's evidence says.
-#[test]
-fn inference_api_warm_model_instance_rejects_bindings_copied_from_another_instance() {
-    let mut runtime = Runtime::builder()
-        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .build()
-        .unwrap();
-    let mut definition_a = model_instance_definition();
-    definition_a.placement = ModelInstancePlacement::new(
-        ResourceAffinity::new(FallbackClass::Transparent)
-            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
-    );
-    let instance_a = runtime.model_instances_mut().create(definition_a).unwrap();
-    reach_ready_with_real_weight(&mut runtime, &instance_a);
-
-    let mut definition_b = model_instance_definition();
-    definition_b.placement = ModelInstancePlacement::new(
-        ResourceAffinity::new(FallbackClass::Transparent)
-            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
-    );
-    let instance_b = runtime.model_instances_mut().create(definition_b).unwrap();
-
-    // Copy A's already-legitimate bindings directly onto B -- the exact
-    // "reuse another instance's materialization" scenario the audit's own
-    // "Artifact mismatch" test asks for, here proven for same-artifact
-    // reuse across two distinct instances (the stronger, more general
-    // case: even identical bindings for the identical artifact do not
-    // transfer, because evidence is instance-scoped, not artifact-scoped).
-    let copied_weights = runtime
-        .model_instance(&instance_a)
-        .unwrap()
-        .definition
-        .resource_bindings
-        .weights
-        .clone();
-    runtime
-        .model_instances_mut()
-        .instance_mut(&instance_b)
-        .unwrap()
-        .definition
-        .resource_bindings
-        .weights = copied_weights;
-
-    let plan = ModelInstanceWarmupPlan {
-        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
-        steps: Vec::new(),
-    };
-    warm_model_instance(
-        &mut runtime,
-        &instance_b,
-        &plan,
-        &ModelInstanceReadinessChecks::default(),
-    )
-    .unwrap_err();
-
-    let status_b = model_instance_status(&runtime, &instance_b).unwrap();
-    assert_ne!(status_b.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(!status_b.readiness.accepts_generation());
-    // A remains legitimately Ready throughout -- this is not a mutation of
-    // A's own state, only B reading A's (still-valid) bindings.
-    assert_eq!(
-        model_instance_status(&runtime, &instance_a)
-            .unwrap()
-            .lifecycle,
-        ModelInstanceLifecycleState::Ready
-    );
-}
-
-/// `bind-model-loading-evidence-to-validated-artifact`: materialization
-/// evidence records the `ModelArtifactId` that was current when it was
-/// minted; if a Model Instance's declared artifact later differs from what
-/// its evidence recorded, the evidence no longer matches and readiness
-/// must reject it. `artifact` has no dedicated setter, but the field
-/// remains `pub` on `ModelInstanceDefinition` -- unlike `resource_bindings`,
-/// reassigning it can only ever make otherwise-valid evidence stop
-/// matching (fail closed), never let a caller borrow a *different*
-/// instance's evidence, since evidence lookup is keyed by instance id, not
-/// artifact id (see the previous test). Proven directly here rather than
-/// left as a hypothetical.
-#[test]
-fn inference_api_warm_model_instance_rejects_evidence_after_artifact_reassignment() {
-    let mut runtime = Runtime::builder()
-        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .build()
-        .unwrap();
-    let mut definition = model_instance_definition();
-    definition.placement = ModelInstancePlacement::new(
-        ResourceAffinity::new(FallbackClass::Transparent)
-            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
-    );
-    let instance = runtime.model_instances_mut().create(definition).unwrap();
-    reach_ready_with_real_weight(&mut runtime, &instance);
-    assert_eq!(
-        model_instance_status(&runtime, &instance)
-            .unwrap()
-            .lifecycle,
-        ModelInstanceLifecycleState::Ready
-    );
-
-    runtime
-        .model_instances_mut()
-        .instance_mut(&instance)
-        .unwrap()
-        .definition
-        .artifact = ModelArtifactId::new(
-        ModelArtifactKind::ModelWeights,
-        ModelName::new("qwen").unwrap(),
-        ModelRevision::new("2-different".to_string()).unwrap(),
-        ModelDigest::sha256(b"different weights"),
-    );
-
-    let plan = ModelInstanceWarmupPlan {
-        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
-        steps: Vec::new(),
-    };
-    warm_model_instance(
-        &mut runtime,
-        &instance,
-        &plan,
-        &ModelInstanceReadinessChecks::default(),
-    )
-    .unwrap_err();
-
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(!status.readiness.accepts_generation());
-}
-
-/// `bind-model-loading-evidence-to-validated-artifact`: closes the
-/// companion P1 the same audit round identified -- a Provider that never
-/// implements host-memory tensor readback (`read_tensor` always returning
-/// `None`, its documented default) must still be able to reach
-/// `weights_materialized: true` through the authorized transaction, since
-/// readiness derivation no longer calls `read_tensor` at all.
-/// `TestProviderExecutionApi` does not override `write_tensor`/
-/// `read_tensor`, so it inherits the trait's real default bodies -- a
-/// faithful stand-in for a device-only Provider, not a mock that merely
-/// asserts it was never called.
-#[test]
-fn inference_api_warm_model_instance_reaches_ready_without_provider_read_tensor_support() {
-    let mut provider = TestProvider::new(REFERENCE_CPU_PROVIDER_NAME);
-    provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
-    let mut runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let mut definition = model_instance_definition();
-    definition.placement = ModelInstancePlacement::new(
-        ResourceAffinity::new(FallbackClass::Transparent)
-            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
-    );
-    let instance = runtime.model_instances_mut().create(definition).unwrap();
-
-    // Confirm this Provider genuinely does not support host readback,
-    // rather than assuming the trait default -- if a future change to
-    // `TestProviderExecutionApi` overrides `read_tensor`, this assertion
-    // (not just the one below) would catch that this test no longer tests
-    // what it claims to.
-    let probe_resource = TensorResourceId::new("probe");
-    let executor = runtime
-        .providers()
-        .provider(REFERENCE_CPU_PROVIDER_NAME)
-        .and_then(|provider| provider.execution_api())
-        .unwrap();
-    executor
-        .write_tensor(probe_resource.clone(), HostTensor::new([1], [0.0]).unwrap())
-        .unwrap();
-    assert!(executor.read_tensor(&probe_resource).is_none());
-
-    let weights = BTreeMap::from([("weight".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
-    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
-
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(status.readiness.accepts_generation());
-}
-
-/// A further audit of PR #36 found that `WeightMaterializationTransaction::
-/// commit` called `ModelInstanceManager::mark_ready` unconditionally right
-/// after staging succeeded and evidence was minted -- so
-/// `materialize_model_instance_weights(..., &BTreeMap::new())` against an
-/// instance with a non-empty mandatory inventory could still reach
-/// `Ready`, bypassing the exact same Runtime-derived readiness gate
-/// `warm_model_instance`/`resume_model_instance` already correctly use.
-/// Non-compliant with `model-loading`'s pre-existing "Model Loading Does
-/// Not Bypass Instance Readiness" ("Successful materialization alone
-/// SHALL not imply Model Instance readiness") and "Partial Loading
-/// Policy" requirements. Proven here at the exact public entrypoint the
-/// bug was in, not only through `warm_model_instance` (which was already
-/// correct on its own and could not, by itself, prove this bypass was
-/// closed).
-#[test]
-fn inference_api_materialize_model_instance_weights_does_not_ready_with_empty_map() {
-    let mut runtime = Runtime::builder()
-        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .build()
-        .unwrap();
-    let mut definition = model_instance_definition();
-    definition.placement = ModelInstancePlacement::new(
-        ResourceAffinity::new(FallbackClass::Transparent)
-            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
-    );
-    definition.required_weight_names =
-        BTreeSet::from(["weight.a".to_string(), "weight.b".to_string()]);
-    let instance = runtime.model_instances_mut().create(definition).unwrap();
-
-    materialize_model_instance_weights(&mut runtime, &instance, "test", &BTreeMap::new()).unwrap();
-
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(!status.readiness.accepts_generation());
-}
-
-/// Same root gap as the empty-map test above, for a strict subset of a
-/// multi-tensor mandatory inventory -- audit scenario "subset partiel":
-/// `commit` minted an evidence record that was *exactly correct* for what
-/// it staged, but exact correctness for an incomplete set is still
-/// incomplete, and `commit` never checked completeness before marking
-/// Ready.
-#[test]
-fn inference_api_materialize_model_instance_weights_does_not_ready_with_partial_inventory() {
-    let mut runtime = Runtime::builder()
-        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .build()
-        .unwrap();
-    let mut definition = model_instance_definition();
-    definition.placement = ModelInstancePlacement::new(
-        ResourceAffinity::new(FallbackClass::Transparent)
-            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
-    );
-    definition.required_weight_names = BTreeSet::from([
-        "weight.a".to_string(),
-        "weight.b".to_string(),
-        "weight.c".to_string(),
-    ]);
-    let instance = runtime.model_instances_mut().create(definition).unwrap();
-
-    let weights = BTreeMap::from([
-        ("weight.a".to_string(), HostTensor::new([1], [0.0]).unwrap()),
-        ("weight.b".to_string(), HostTensor::new([1], [0.0]).unwrap()),
-    ]);
-    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
-
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(!status.readiness.accepts_generation());
-
-    // The partial materialization itself still succeeded for real: its
-    // evidence exists and matches exactly what was staged, proving
-    // `commit`'s gate rejects on inventory completeness specifically, not
-    // by failing to publish anything at all (which would also incidentally
-    // "fix" the symptom without fixing the actual defect).
-    assert_eq!(
-        runtime
-            .model_instance(&instance)
-            .unwrap()
-            .definition
-            .resource_bindings
-            .weights
-            .len(),
-        2
-    );
-
-    // Completing the inventory in a second, independent call reaches
-    // Ready -- proving incremental/progressive materialization (which
-    // `commit`'s own evidence-recomputation is designed to support) still
-    // works once the gate this fix adds is actually satisfied.
-    let remaining =
-        BTreeMap::from([("weight.c".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
-    materialize_model_instance_weights(&mut runtime, &instance, "test", &remaining).unwrap();
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(status.readiness.accepts_generation());
-}
-
 /// Audit scenario "Provider non-ready": a complete mandatory inventory
 /// staged and evidenced for real, but the pinned Provider's own status
 /// model reports it does not currently accept new work -- `commit` must
@@ -3610,195 +2241,7 @@ fn inference_api_materialize_model_instance_weights_does_not_ready_when_provider
     assert!(!status.readiness.accepts_generation());
 }
 
-/// Implements `runtime-owned-model-instance-readiness-authority` round 2,
-/// audit test 23.3: a `TensorResourceId` inserted directly into
-/// `resource_bindings.weights`, with no matching `TensorResidency`, must
-/// not let `warm_model_instance` derive `weights_materialized = true` --
-/// the exact gap a follow-up audit of PR #36 found: the round-1 fix only
-/// checked the map was non-empty, not that its entries were real.
-#[test]
-fn inference_api_warm_model_instance_rejects_weight_binding_without_residency() {
-    let mut runtime = Runtime::builder().build().unwrap();
-    let instance = runtime
-        .model_instances_mut()
-        .create(model_instance_definition())
-        .unwrap();
-    // Insert a plausible-looking `TensorResourceId` directly -- no
-    // `MemoryManager::allocate`, no `record_tensor_residency`. This is
-    // exactly what a caller with `&mut Runtime` could always do, and what
-    // this Change's derivation must not trust.
-    runtime
-        .model_instances_mut()
-        .instance_mut(&instance)
-        .unwrap()
-        .definition
-        .resource_bindings
-        .weights
-        .insert("weight".into(), TensorResourceId::new("forged.weight"));
-    assert!(
-        runtime
-            .memory()
-            .tensor_residency(&TensorResourceId::new("forged.weight"))
-            .is_none(),
-        "test precondition: no residency was ever recorded for this resource"
-    );
-
-    let plan = ModelInstanceWarmupPlan {
-        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
-        steps: Vec::new(),
-    };
-    warm_model_instance(
-        &mut runtime,
-        &instance,
-        &plan,
-        &ModelInstanceReadinessChecks::default(),
-    )
-    .unwrap_err();
-
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(!status.readiness.accepts_generation());
-}
-
-/// Implements `runtime-owned-model-instance-readiness-authority` round 2,
-/// audit test 23.5: a Provider that is registered and offers a real
-/// `execution_api()` but whose own status model reports it as not
-/// accepting new work (here: `Saturated` pressure) must make
-/// `provider_ready` derive `false`, even though the caller claims `true`
-/// -- the round-1 fix only checked the Provider "exists and is executable
-/// in principle" (`execution_api().is_some()`), not "is ready now".
-#[test]
-fn inference_api_warm_model_instance_rejects_provider_that_rejects_new_work() {
-    let mut provider = TestProvider::new("saturated-provider");
-    provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
-    let mut snapshot = ProviderStatusSnapshot::from_health_report(ProviderHealthReport::new(
-        ProviderBinding::new("saturated-provider"),
-        HealthState::Available,
-    ));
-    snapshot.pressure = ProviderPressureLevel::Saturated;
-    snapshot.admission = provider_admission_from_dimensions(
-        snapshot.lifecycle,
-        snapshot.health,
-        snapshot.readiness,
-        snapshot.pressure,
-    );
-    provider.status_snapshot = Some(snapshot);
-    assert!(
-        !provider.status_snapshot().accepts_new_work_by_default(),
-        "test precondition: this Provider's own status model rejects new work"
-    );
-
-    let mut runtime = Runtime::builder()
-        .register_provider(Arc::new(provider))
-        .build()
-        .unwrap();
-    let mut definition = model_instance_definition();
-    definition.placement = ModelInstancePlacement::new(
-        ResourceAffinity::new(FallbackClass::Transparent)
-            .with_provider(ProviderBinding::new("saturated-provider")),
-    );
-    let instance = runtime.model_instances_mut().create(definition).unwrap();
-    let allocation = runtime
-        .memory_mut()
-        .allocate(MemoryAllocationRequest::new(
-            MemoryAllocationClass::Tensor,
-            1,
-            MemoryPlacement::HostOrdinary,
-            MemoryAllocationOwner::InferenceArtifact("test".into()),
-        ))
-        .unwrap();
-    let weight_resource = TensorResourceId::new("test.weight");
-    runtime
-        .memory_mut()
-        .record_tensor_residency(
-            TensorResidency::new(
-                weight_resource.clone(),
-                MemoryPlacement::HostOrdinary,
-                ResourceAffinity::new(FallbackClass::Transparent),
-            )
-            .with_allocation(allocation.id),
-        )
-        .unwrap();
-    runtime
-        .model_instances_mut()
-        .instance_mut(&instance)
-        .unwrap()
-        .definition
-        .resource_bindings
-        .weights
-        .insert("weight".into(), weight_resource);
-
-    let plan = ModelInstanceWarmupPlan {
-        policy: ModelInstanceWarmupPolicy::ValidateMetadataOnly,
-        steps: Vec::new(),
-    };
-    // Real weight evidence is present; only `provider_ready` should be
-    // what fails this attempt.
-    warm_model_instance(
-        &mut runtime,
-        &instance,
-        &plan,
-        &ModelInstanceReadinessChecks::default(),
-    )
-    .unwrap_err();
-
-    let status = model_instance_status(&runtime, &instance).unwrap();
-    assert_ne!(status.lifecycle, ModelInstanceLifecycleState::Ready);
-    assert!(!status.readiness.accepts_generation());
-}
-
-#[test]
-fn inference_api_create_model_instance_observed_emits_model_instance_selected() {
-    let manifest = minimal_model_manifest();
-    let mut load_runtime = Runtime::builder()
-        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
-        .build()
-        .unwrap();
-    let mut coordinator = ModelLoadingCoordinator::new();
-    coordinator.register_architecture(ModelArchitectureImplementation {
-        architecture: manifest.architecture.clone(),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    });
-    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    let loaded = load_model(
-        &mut coordinator,
-        &mut load_runtime,
-        ModelLoadingApiRequest::new(core),
-        &manifest,
-    )
-    .unwrap();
-
-    let mut runtime = Runtime::builder().build().unwrap();
-    let architecture = ModelArchitectureImplementation {
-        architecture: manifest.architecture.clone(),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    };
-    let mut observer = InferenceApiObserver::new();
-    let instance = create_model_instance_observed(
-        &mut runtime,
-        &loaded,
-        architecture,
-        ResourceAffinity::new(FallbackClass::Transparent),
-        &mut observer,
-    )
-    .unwrap();
-
-    assert_eq!(
-        model_instance_status(&runtime, &instance).unwrap().artifact,
-        manifest.id
-    );
-    assert!(
-        observer
-            .observations()
-            .iter()
-            .any(|observation| observation.kind
-                == InferenceApiObservationKind::ModelInstanceSelected)
-    );
-}
-
-fn minimal_model_manifest() -> ModelManifest {
+pub(crate) fn minimal_model_manifest() -> ModelManifest {
     ModelManifest {
         schema_version: MODEL_ARTIFACT_SCHEMA_VERSION,
         id: ModelArtifactId::new(
@@ -3833,221 +2276,10 @@ fn minimal_model_manifest() -> ModelManifest {
     }
 }
 
-#[test]
-fn inference_api_load_model_wires_coordinator_and_memory_manager() {
-    let manifest = minimal_model_manifest();
-    let mut coordinator = ModelLoadingCoordinator::new();
-    coordinator.register_architecture(ModelArchitectureImplementation {
-        architecture: manifest.architecture.clone(),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    });
-    let mut runtime = Runtime::builder()
-        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
-        .build()
-        .unwrap();
-
-    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    let mut request = ModelLoadingApiRequest::new(core);
-    request.tokenizer_reference = Some(TokenizerId::new("fixture").unwrap());
-    request.adapter_references = vec![AdapterArtifactId {
-        name: AdapterName::new("lora-a").unwrap(),
-        revision: AdapterRevision::new("1").unwrap(),
-        digest: AdapterDigest {
-            algorithm: "sha256".into(),
-            value: "deadbeef".into(),
-        },
-    }];
-    request.layout_policy = Some(TensorLayoutKind::Contiguous);
-    request.provider_preferences = vec![ProviderBinding::new("reference-cpu")];
-
-    let loaded = load_model(&mut coordinator, &mut runtime, request, &manifest).unwrap();
-    assert_eq!(loaded.artifact, manifest.id);
-    assert_eq!(loaded.state, ModelLoadingState::Ready);
-}
-
-#[test]
-fn inference_api_load_model_observed_emits_loading_lifecycle_observations() {
-    let manifest = minimal_model_manifest();
-    let mut coordinator = ModelLoadingCoordinator::new();
-    coordinator.register_architecture(ModelArchitectureImplementation {
-        architecture: manifest.architecture.clone(),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    });
-    let mut runtime = Runtime::builder()
-        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
-        .build()
-        .unwrap();
-    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    let mut observer = InferenceApiObserver::new();
-
-    load_model_observed(
-        &mut coordinator,
-        &mut runtime,
-        ModelLoadingApiRequest::new(core),
-        &manifest,
-        &mut observer,
-    )
-    .unwrap();
-
-    let kinds: Vec<_> = observer
-        .observations()
-        .iter()
-        .map(|observation| observation.kind)
-        .collect();
-    assert!(kinds.contains(&InferenceApiObservationKind::ModelLoadingRequested));
-    assert!(kinds.contains(&InferenceApiObservationKind::ModelLoaded));
-}
-
-/// `seal-runtime-model-trust-and-provenance-authority` P0-A: `load_model`
-/// no longer accepts a caller-supplied trust decision at all -- trust is
-/// evaluated from the performing `Runtime`'s own sealed configuration. A
-/// `Runtime` built without trusting this manifest's digest must reject the
-/// load, proving there is no parameter through which a caller could still
-/// supply a favorable decision for an untrusted artifact.
-#[test]
-fn inference_api_load_model_rejects_when_runtime_trust_store_does_not_trust_digest() {
-    let manifest = minimal_model_manifest();
-    let mut coordinator = ModelLoadingCoordinator::new();
-    coordinator.register_architecture(ModelArchitectureImplementation {
-        architecture: manifest.architecture.clone(),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    });
-    // Sealed with an empty trust store -- trusts nothing, matching
-    // `RuntimeBuilder::trust_store`'s documented default.
-    let mut runtime = Runtime::builder().build().unwrap();
-    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-
-    let error = load_model(
-        &mut coordinator,
-        &mut runtime,
-        ModelLoadingApiRequest::new(core),
-        &manifest,
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("ModelArtifactUntrusted"));
-}
-
-/// P0-B: `create_model_instance` cross-checks the caller-supplied
-/// architecture against `loaded.plan().architecture`, which the loading
-/// phase already resolved from the same manifest -- a disagreement is
-/// rejected rather than silently accepted.
-#[test]
-fn runtime_create_model_instance_rejects_architecture_disagreeing_with_resolved_plan() {
-    let manifest = minimal_model_manifest();
-    let mut coordinator = ModelLoadingCoordinator::new();
-    coordinator.register_architecture(ModelArchitectureImplementation {
-        architecture: manifest.architecture.clone(),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    });
-    let mut runtime = Runtime::builder()
-        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
-        .build()
-        .unwrap();
-    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    let loaded = load_model(
-        &mut coordinator,
-        &mut runtime,
-        ModelLoadingApiRequest::new(core),
-        &manifest,
-    )
-    .unwrap();
-
-    let disagreeing_architecture = ModelArchitectureImplementation {
-        architecture: ModelArchitecture::new("a-different-family", "a-different-identifier"),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    };
-    let error = runtime
-        .create_model_instance(
-            &loaded,
-            disagreeing_architecture,
-            ResourceAffinity::new(FallbackClass::Transparent),
-        )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        ModelInstanceError::ArchitectureMismatch { .. }
-    ));
-
-    // Agreeing architecture is unaffected.
-    runtime
-        .create_model_instance(
-            &loaded,
-            ModelArchitectureImplementation {
-                architecture: manifest.architecture.clone(),
-                kind: ModelArchitectureImplementationKind::TestFixture,
-                required_capabilities: Vec::new(),
-            },
-            ResourceAffinity::new(FallbackClass::Transparent),
-        )
-        .unwrap();
-}
-
-/// P0-B: when the loading phase *did* resolve a provider binding for the
-/// plan, a caller-supplied affinity naming a different provider is
-/// rejected. Nothing in today's real loading pipeline resolves
-/// `plan.provider_binding` yet (confirmed by inspection: it is
-/// unconditionally `None` at construction), so this forces the scenario
-/// directly on the loaded plan rather than only exercising the
-/// permissive "unresolved" branch every other test already covers.
-#[test]
-fn runtime_create_model_instance_rejects_affinity_disagreeing_with_resolved_provider_binding() {
-    let manifest = minimal_model_manifest();
-    let mut coordinator = ModelLoadingCoordinator::new();
-    coordinator.register_architecture(ModelArchitectureImplementation {
-        architecture: manifest.architecture.clone(),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    });
-    let mut runtime = Runtime::builder()
-        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
-        .build()
-        .unwrap();
-    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    let mut loaded = load_model(
-        &mut coordinator,
-        &mut runtime,
-        ModelLoadingApiRequest::new(core),
-        &manifest,
-    )
-    .unwrap();
-    loaded.plan.provider_binding = Some(ProviderBinding::new("resolved-provider"));
-
-    let disagreeing_affinity = ResourceAffinity::new(FallbackClass::Transparent)
-        .with_provider(ProviderBinding::new("a-different-provider"));
-    let error = runtime
-        .create_model_instance(
-            &loaded,
-            ModelArchitectureImplementation {
-                architecture: manifest.architecture.clone(),
-                kind: ModelArchitectureImplementationKind::TestFixture,
-                required_capabilities: Vec::new(),
-            },
-            disagreeing_affinity,
-        )
-        .unwrap_err();
-    assert!(matches!(error, ModelInstanceError::AffinityMismatch { .. }));
-
-    let agreeing_affinity = ResourceAffinity::new(FallbackClass::Transparent)
-        .with_provider(ProviderBinding::new("resolved-provider"));
-    runtime
-        .create_model_instance(
-            &loaded,
-            ModelArchitectureImplementation {
-                architecture: manifest.architecture.clone(),
-                kind: ModelArchitectureImplementationKind::TestFixture,
-                required_capabilities: Vec::new(),
-            },
-            agreeing_affinity,
-        )
-        .unwrap();
-}
-
-fn manifest_with_one_tensor(shape: Vec<u64>, storage_dtype: ModelDType) -> ModelManifest {
+pub(crate) fn manifest_with_one_tensor(
+    shape: Vec<u64>,
+    storage_dtype: ModelDType,
+) -> ModelManifest {
     ModelManifest {
         tensors: vec![ModelTensorMetadata {
             name: "the-only-tensor".into(),
@@ -4065,7 +2297,7 @@ fn manifest_with_one_tensor(shape: Vec<u64>, storage_dtype: ModelDType) -> Model
     }
 }
 
-fn manifest_with_tensors(tensors: Vec<(&str, Vec<u64>)>) -> ModelManifest {
+pub(crate) fn manifest_with_tensors(tensors: Vec<(&str, Vec<u64>)>) -> ModelManifest {
     let tensors = tensors
         .into_iter()
         .map(|(name, shape)| {
@@ -4099,14 +2331,14 @@ fn manifest_with_tensors(tensors: Vec<(&str, Vec<u64>)>) -> ModelManifest {
 /// and *when*, proving no tensor is read more than once and no tensor is
 /// read out of the order [`stream_materialize_model_instance_weights`]
 /// was given.
-struct RecordingPayloadSource {
-    bytes_by_name: BTreeMap<String, Vec<u8>>,
-    calls: std::sync::Mutex<Vec<String>>,
-    fail_for: Option<String>,
+pub(crate) struct RecordingPayloadSource {
+    pub(crate) bytes_by_name: BTreeMap<String, Vec<u8>>,
+    pub(crate) calls: std::sync::Mutex<Vec<String>>,
+    pub(crate) fail_for: Option<String>,
 }
 
 impl RecordingPayloadSource {
-    fn new(bytes_by_name: BTreeMap<String, Vec<u8>>) -> Self {
+    pub(crate) fn new(bytes_by_name: BTreeMap<String, Vec<u8>>) -> Self {
         Self {
             bytes_by_name,
             calls: std::sync::Mutex::new(Vec::new()),
@@ -4114,12 +2346,12 @@ impl RecordingPayloadSource {
         }
     }
 
-    fn failing_for(mut self, name: &str) -> Self {
+    pub(crate) fn failing_for(mut self, name: &str) -> Self {
         self.fail_for = Some(name.to_string());
         self
     }
 
-    fn call_log(&self) -> Vec<String> {
+    pub(crate) fn call_log(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -4144,7 +2376,7 @@ impl ProductionArtifactPayloadSource for RecordingPayloadSource {
     }
 }
 
-fn active_allocation_bytes(runtime: &Runtime) -> u64 {
+pub(crate) fn active_allocation_bytes(runtime: &Runtime) -> u64 {
     runtime
         .memory()
         .allocations()
@@ -4153,7 +2385,7 @@ fn active_allocation_bytes(runtime: &Runtime) -> u64 {
         .sum()
 }
 
-fn f32_tensor_bytes(values: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_tensor_bytes(values: &[f32]) -> Vec<u8> {
     values
         .iter()
         .flat_map(|value| value.to_le_bytes())
@@ -4166,7 +2398,7 @@ fn f32_tensor_bytes(values: &[f32]) -> Vec<u8> {
 /// that instance is bound to (obtained before the `ReferenceCpuProvider`
 /// itself is moved into the Runtime, since it shares state with whatever
 /// gets registered).
-fn streaming_materialization_fixture() -> (
+pub(crate) fn streaming_materialization_fixture() -> (
     Runtime,
     ModelInstanceId,
     ModelManifest,
@@ -4180,7 +2412,7 @@ fn streaming_materialization_fixture() -> (
 }
 
 /// [`streaming_materialization_fixture`] for an arbitrary manifest.
-fn streaming_materialization_fixture_for(
+pub(crate) fn streaming_materialization_fixture_for(
     manifest: ModelManifest,
 ) -> (
     Runtime,
@@ -4223,7 +2455,7 @@ fn streaming_materialization_fixture_for(
     (runtime, instance, manifest, executor)
 }
 
-fn streaming_fixture_payload_bytes() -> BTreeMap<String, Vec<u8>> {
+pub(crate) fn streaming_fixture_payload_bytes() -> BTreeMap<String, Vec<u8>> {
     BTreeMap::from([
         (
             "weight.a".to_string(),
@@ -4343,132 +2575,6 @@ fn materialization_rejects_unusable_storage_layouts() {
     }
 }
 
-/// Task 6.6: a payload-read failure partway through a streaming attempt
-/// rolls back every tensor staged so far in that attempt -- no orphan
-/// Provider tensor, no leaked Memory Manager allocation -- exercised at
-/// the first, middle, and last tensor in a three-tensor manifest.
-#[test]
-fn stream_materialize_model_instance_weights_rolls_back_on_failure_at_any_position() {
-    for failing_tensor in ["weight.a", "weight.b", "weight.c"] {
-        let (mut runtime, instance, manifest, executor) = streaming_materialization_fixture();
-        let payload_source = RecordingPayloadSource::new(streaming_fixture_payload_bytes())
-            .failing_for(failing_tensor);
-        let active_allocations_before = active_allocation_bytes(&runtime);
-
-        let error = stream_materialize_model_instance_weights(
-            &mut runtime,
-            &instance,
-            "test",
-            &manifest.tensors,
-            &payload_source,
-        )
-        .expect_err(&format!(
-            "a payload failure for '{failing_tensor}' must propagate"
-        ));
-        assert!(matches!(
-            error,
-            InferenceApiError::ModelLoadingFailed { .. }
-        ));
-
-        assert_ne!(
-            runtime.model_instance(&instance).unwrap().lifecycle(),
-            ModelInstanceLifecycleState::Ready,
-            "failing on '{failing_tensor}' must not leave the instance Ready"
-        );
-        assert_eq!(
-            active_allocation_bytes(&runtime),
-            active_allocations_before,
-            "failing on '{failing_tensor}' must leave no leaked Memory Manager allocation"
-        );
-        for tensor in &manifest.tensors {
-            let resource_id =
-                TensorResourceId::new(format!("model.{instance}.weight.{}", tensor.name));
-            assert!(
-                executor.read_tensor(&resource_id).is_none(),
-                "failing on '{failing_tensor}' must leave no orphan Provider tensor for '{}'",
-                tensor.name
-            );
-        }
-    }
-}
-
-/// Task 6.7: peak transient host staging is bounded independently of total
-/// model size. The exactly-once-per-tensor, in-order call log the other
-/// two streaming tests already assert *is* the proof this function never
-/// buffers ahead: this test additionally scales the tensor count well
-/// past the tiny three-tensor fixture (50 tensors) to show that scaling up
-/// the tensor *count* changes nothing about the one-tensor-at-a-time
-/// shape of each `read_payload` call -- `stream_materialize_model_
-/// instance_weights`'s loop body holds exactly one `HostTensor` local
-/// variable at a time (never a growing collection), so this property does
-/// not degrade as the model grows.
-#[test]
-fn stream_materialize_model_instance_weights_scales_tensor_count_without_buffering_ahead() {
-    const TENSOR_COUNT: usize = 50;
-    let names: Vec<String> = (0..TENSOR_COUNT).map(|i| format!("weight.{i}")).collect();
-    let manifest = manifest_with_tensors(
-        names
-            .iter()
-            .map(|name| (name.as_str(), vec![4, 4]))
-            .collect(),
-    );
-    let mut coordinator = ModelLoadingCoordinator::new();
-    coordinator.register_architecture(ModelArchitectureImplementation {
-        architecture: manifest.architecture.clone(),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    });
-    let mut runtime = Runtime::builder()
-        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
-        .build()
-        .unwrap();
-    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    let loaded = load_model(
-        &mut coordinator,
-        &mut runtime,
-        ModelLoadingApiRequest::new(core),
-        &manifest,
-    )
-    .unwrap();
-    let instance = runtime
-        .create_model_instance(
-            &loaded,
-            ModelArchitectureImplementation {
-                architecture: manifest.architecture.clone(),
-                kind: ModelArchitectureImplementationKind::TestFixture,
-                required_capabilities: Vec::new(),
-            },
-            ResourceAffinity::new(FallbackClass::Transparent),
-        )
-        .unwrap();
-
-    let bytes_by_name: BTreeMap<String, Vec<u8>> = names
-        .iter()
-        .map(|name| (name.clone(), f32_tensor_bytes(&[1.0; 16])))
-        .collect();
-    let payload_source = RecordingPayloadSource::new(bytes_by_name);
-
-    stream_materialize_model_instance_weights(
-        &mut runtime,
-        &instance,
-        "test",
-        &manifest.tensors,
-        &payload_source,
-    )
-    .expect("streaming materialization of 50 tensors succeeds");
-
-    assert_eq!(
-        runtime.model_instance(&instance).unwrap().lifecycle(),
-        ModelInstanceLifecycleState::Ready
-    );
-    assert_eq!(
-        payload_source.call_log(),
-        names,
-        "still exactly once, in order, at scale"
-    );
-}
-
 /// P0-C: `materialize_model_instance_weights` rejects content whose shape
 /// disagrees with the manifest's declared shape for that tensor name, even
 /// though this tensor has no content digest (permissive elsewhere, but not
@@ -4585,112 +2691,6 @@ fn materialize_model_instance_weights_rejects_quantized_declared_dtype() {
     ));
 }
 
-/// P0-C regression guard: matching shape and F32 dtype still materializes
-/// normally.
-#[test]
-fn materialize_model_instance_weights_accepts_matching_shape_and_dtype() {
-    let manifest = manifest_with_one_tensor(vec![2, 2], ModelDType::F32);
-    let mut coordinator = ModelLoadingCoordinator::new();
-    coordinator.register_architecture(ModelArchitectureImplementation {
-        architecture: manifest.architecture.clone(),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    });
-    let mut runtime = Runtime::builder()
-        .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
-        .build()
-        .unwrap();
-    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    let loaded = load_model(
-        &mut coordinator,
-        &mut runtime,
-        ModelLoadingApiRequest::new(core),
-        &manifest,
-    )
-    .unwrap();
-    let instance = runtime
-        .create_model_instance(
-            &loaded,
-            ModelArchitectureImplementation {
-                architecture: manifest.architecture.clone(),
-                kind: ModelArchitectureImplementationKind::TestFixture,
-                required_capabilities: Vec::new(),
-            },
-            ResourceAffinity::new(FallbackClass::Transparent),
-        )
-        .unwrap();
-
-    let matching_weights = BTreeMap::from([(
-        "the-only-tensor".to_string(),
-        HostTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
-    )]);
-    materialize_model_instance_weights(&mut runtime, &instance, "test", &matching_weights).unwrap();
-    assert_eq!(
-        runtime.model_instance(&instance).unwrap().lifecycle(),
-        ModelInstanceLifecycleState::Ready
-    );
-}
-
-/// `support-gguf-quantized-tensor-dequantization`: a manifest declaring a quantized
-/// storage dtype (`Q8_0`/`Q4_K`/`Q5_K`) backed by already-dequantized F32
-/// content -- exactly the shape `host_tensors_from_artifact_bytes`
-/// produces for a real quantized GGUF tensor -- materializes successfully
-/// through the same shape/dtype whitelist `materialize_model_instance_
-/// weights_rejects_quantized_declared_dtype` proves still rejects a
-/// genuinely unsupported dtype, mirroring F16/BF16's own already-working
-/// "declared non-F32, content already F32" acceptance.
-#[test]
-fn materialize_model_instance_weights_accepts_dequantized_content_for_a_quantized_declared_dtype() {
-    for quantized_dtype in [ModelDType::Q8, ModelDType::Q4K, ModelDType::Q5K] {
-        let manifest = manifest_with_one_tensor(vec![2, 2], quantized_dtype);
-        let mut coordinator = ModelLoadingCoordinator::new();
-        coordinator.register_architecture(ModelArchitectureImplementation {
-            architecture: manifest.architecture.clone(),
-            kind: ModelArchitectureImplementationKind::TestFixture,
-            required_capabilities: Vec::new(),
-        });
-        let mut runtime = Runtime::builder()
-            .register_provider(std::sync::Arc::new(ReferenceCpuProvider::new()))
-            .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
-            .build()
-            .unwrap();
-        let core =
-            ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-        let loaded = load_model(
-            &mut coordinator,
-            &mut runtime,
-            ModelLoadingApiRequest::new(core),
-            &manifest,
-        )
-        .unwrap();
-        let instance = runtime
-            .create_model_instance(
-                &loaded,
-                ModelArchitectureImplementation {
-                    architecture: manifest.architecture.clone(),
-                    kind: ModelArchitectureImplementationKind::TestFixture,
-                    required_capabilities: Vec::new(),
-                },
-                ResourceAffinity::new(FallbackClass::Transparent),
-            )
-            .unwrap();
-
-        let dequantized_weights = BTreeMap::from([(
-            "the-only-tensor".to_string(),
-            HostTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
-        )]);
-        materialize_model_instance_weights(&mut runtime, &instance, "test", &dequantized_weights)
-            .unwrap_or_else(|error| {
-                panic!("{quantized_dtype:?} declared dtype with dequantized F32 content must materialize, got: {error}")
-            });
-        assert_eq!(
-            runtime.model_instance(&instance).unwrap().lifecycle(),
-            ModelInstanceLifecycleState::Ready
-        );
-    }
-}
-
 /// `implement-production-qwen-model-loading` task 5.4: an F16/BF16 storage
 /// dtype's explicit-conversion-to-F32 is recorded as a residency plan
 /// diagnostic, never silent; an F32-storage manifest carries no such note.
@@ -4796,7 +2796,7 @@ fn materialize_model_instance_weights_accepts_f16_and_bf16_declared_dtype() {
 // other state -- see this Change's design.md ("D2: Relocate tests by
 // what they actually test, not wholesale") for the full reasoning.
 
-fn sealed_creation_manifest() -> ModelManifest {
+pub(crate) fn sealed_creation_manifest() -> ModelManifest {
     ModelManifest::from_yaml_str(&format!(
         r#"
 schema: magnetar-model-artifact
@@ -4833,7 +2833,7 @@ tensors:
     .unwrap()
 }
 
-fn sealed_creation_implementation() -> ModelArchitectureImplementation {
+pub(crate) fn sealed_creation_implementation() -> ModelArchitectureImplementation {
     ModelArchitectureImplementation {
         architecture: ModelArchitecture::new("qwen", "qwen2"),
         kind: ModelArchitectureImplementationKind::TestFixture,
@@ -4841,7 +2841,7 @@ fn sealed_creation_implementation() -> ModelArchitectureImplementation {
     }
 }
 
-fn sealed_creation_definition() -> ModelInstanceDefinition {
+pub(crate) fn sealed_creation_definition() -> ModelInstanceDefinition {
     let manifest = sealed_creation_manifest();
     let mut coordinator = ModelLoadingCoordinator::new();
     coordinator.register_architecture(sealed_creation_implementation());
@@ -4867,7 +2867,7 @@ fn sealed_creation_definition() -> ModelInstanceDefinition {
     )
 }
 
-fn sealed_creation_bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId) {
+pub(crate) fn sealed_creation_bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId) {
     if runtime
         .providers()
         .provider(REFERENCE_CPU_PROVIDER_NAME)
@@ -4884,243 +2884,8 @@ fn sealed_creation_bind_fake_weight(runtime: &mut Runtime, id: &ModelInstanceId)
     materialize_model_instance_weights(runtime, id, "test", &weights).unwrap();
 }
 
-fn sealed_creation_reach_ready(runtime: &mut Runtime, id: &ModelInstanceId) {
+pub(crate) fn sealed_creation_reach_ready(runtime: &mut Runtime, id: &ModelInstanceId) {
     sealed_creation_bind_fake_weight(runtime, id);
-}
-
-/// A further audit of PR #36 found that `ModelInstanceDefinition`'s
-/// `#[derive(Clone)]` copies every field -- including the already-sealed
-/// `resource_bindings` -- regardless of the caller's own inability to name
-/// those fields directly, and that `ModelInstanceManager::create` accepted
-/// a caller-supplied definition as-is. So an external caller with only
-/// `pub` access (`ModelInstance::definition()`, `Clone`,
-/// `ModelInstanceManager::create`) could clone a `Ready` instance's
-/// definition -- carrying its real weight bindings -- into a brand-new
-/// instance, aliasing live Provider resources across two distinct
-/// `ModelInstanceId`s. Fixed by having `create` unconditionally reset
-/// `resource_bindings` regardless of what the supplied definition
-/// contained.
-#[test]
-fn cloned_definition_does_not_inherit_weight_authority() {
-    let mut runtime = Runtime::initialize(RuntimeConfig::default());
-    let id_a = runtime
-        .model_instances_mut()
-        .create(sealed_creation_definition())
-        .unwrap();
-    sealed_creation_reach_ready(&mut runtime, &id_a);
-    assert_eq!(
-        runtime.model_instance(&id_a).unwrap().lifecycle(),
-        ModelInstanceLifecycleState::Ready
-    );
-
-    let cloned = runtime.model_instance(&id_a).unwrap().definition().clone();
-    let id_b = runtime.model_instances_mut().create(cloned).unwrap();
-
-    // B must not be Ready on arrival -- creation alone never implies
-    // readiness, cloned definition or not.
-    assert_ne!(
-        runtime.model_instance(&id_b).unwrap().lifecycle(),
-        ModelInstanceLifecycleState::Ready
-    );
-
-    // The real regression: an *empty* materialization attempt on B must
-    // not be able to "adopt" A's already-committed bindings by minting
-    // fresh evidence over whatever `resource_bindings.weights` happens to
-    // contain. If `create` had not reset it, this would have reached
-    // `Ready` for B using A's real Provider resource, with zero bytes
-    // actually staged by this call.
-    materialize_model_instance_weights(&mut runtime, &id_b, "test", &BTreeMap::new()).unwrap();
-    assert_ne!(
-        runtime.model_instance(&id_b).unwrap().lifecycle(),
-        ModelInstanceLifecycleState::Ready
-    );
-
-    // A is unaffected throughout -- this is not a mutation of A's own
-    // state, only B's (failed) attempt to inherit it.
-    assert_eq!(
-        runtime.model_instance(&id_a).unwrap().lifecycle(),
-        ModelInstanceLifecycleState::Ready
-    );
-}
-
-/// Same root cause as the test above, exercised through `reload` (which
-/// also calls `ModelInstanceManager::create` internally with a
-/// caller-supplied replacement definition) rather than a direct `create`
-/// call.
-#[test]
-fn reload_replacement_does_not_inherit_original_weight_authority() {
-    let mut runtime = Runtime::initialize(RuntimeConfig::default());
-    let id = runtime
-        .model_instances_mut()
-        .create(sealed_creation_definition())
-        .unwrap();
-    sealed_creation_reach_ready(&mut runtime, &id);
-    let existing_definition = runtime.model_instance(&id).unwrap().definition().clone();
-
-    let replacement_id = runtime
-        .model_instances_mut()
-        .reload(
-            &id,
-            ModelInstanceReloadRequest {
-                replacement: existing_definition,
-                migrate_sessions: false,
-                allow_active_semantic_mutation: false,
-            },
-        )
-        .unwrap();
-
-    assert_ne!(
-        runtime.model_instance(&replacement_id).unwrap().lifecycle(),
-        ModelInstanceLifecycleState::Ready
-    );
-}
-
-/// Proves `ModelInstanceManager::create_checked`'s own checks-validation
-/// contract directly: `checks.validate()` must run and reject before
-/// `create` is ever reached, and readiness checks are evaluated
-/// independently afterward. `Runtime::create_model_instance` has no
-/// parameter through which a caller can inject custom
-/// `ModelInstanceCreationChecks`, so this cannot be re-expressed through
-/// it.
-#[test]
-fn sealed_creation_and_readiness_checks_gate_ready_state() {
-    let mut manager = ModelInstanceManager::new();
-    let denied = ModelInstanceCreationChecks {
-        artifact_trusted: false,
-        ..ModelInstanceCreationChecks::default()
-    };
-    assert_eq!(
-        manager.create_checked(sealed_creation_definition(), &denied),
-        Err(ModelInstanceError::ModelInstancePolicyDenied)
-    );
-
-    let id = manager
-        .create_checked(
-            sealed_creation_definition(),
-            &ModelInstanceCreationChecks::default(),
-        )
-        .unwrap();
-    let checks = ModelInstanceReadinessChecks {
-        provider_ready: false,
-        ..ModelInstanceReadinessChecks::default()
-    };
-    assert_eq!(
-        manager
-            .instance_mut(&id)
-            .unwrap()
-            .validate_readiness(&checks),
-        Err(ModelInstanceError::ModelInstanceProviderNotReady)
-    );
-}
-
-/// Proves pre-create usage-dependency fields (`kv_cache_dependencies`,
-/// `prefix_cache_dependencies`) set directly on a hand-built definition
-/// are honored by `create`. `Runtime::create_model_instance` builds its
-/// definition internally from `architecture`/`affinity` alone, with no
-/// way for a caller to inject these before creation.
-#[test]
-fn sealed_creation_adapter_activation_records_mutation_and_invalidates_dependent_caches() {
-    let mut manager = ModelInstanceManager::new();
-    let mut def = sealed_creation_definition();
-    def.usage
-        .kv_cache_dependencies
-        .insert(KvCacheId::new("cache-a").unwrap());
-    def.usage
-        .prefix_cache_dependencies
-        .insert(PrefixCacheEntryId::new("prefix-a").unwrap());
-    let id = manager.create(def).unwrap();
-
-    let report = manager
-        .activate_adapters(&id, AdapterSetId::empty(), "session:opaque", true)
-        .unwrap();
-
-    assert_eq!(report.kv_caches.len(), 1);
-    assert_eq!(report.prefix_entries.len(), 1);
-    assert_eq!(
-        manager.instance(&id).unwrap().definition().mutation_version,
-        1
-    );
-    assert!(
-        manager
-            .observations()
-            .iter()
-            .any(|event| event.kind == ModelInstanceObservationKind::CacheInvalidation)
-    );
-}
-
-/// Proves pre-create session/usage/adapter dependency fields are honored
-/// by `create` and correctly released on unload, and that `create`
-/// unconditionally resets `resource_bindings` regardless of what the
-/// caller-supplied `def` pre-populated -- so an out-of-band memory
-/// allocation id set here cannot be pre-populated on `def` before
-/// `create`, only injected afterward via the two narrow, post-creation
-/// mutations `ModelInstance` still allows
-/// (`set_provider_resource`/`track_memory_allocation`).
-#[test]
-fn sealed_creation_unload_releases_memory_provider_resources_adapters_and_cache_dependencies() {
-    let mut def = sealed_creation_definition();
-    def.associated_sessions
-        .insert(InferenceSessionId::new("session-unload").unwrap());
-    def.usage
-        .kv_cache_dependencies
-        .insert(KvCacheId::new("cache-unload").unwrap());
-    def.usage
-        .prefix_cache_dependencies
-        .insert(PrefixCacheEntryId::new("prefix-unload").unwrap());
-    def.usage.adapter_dependencies.insert(AdapterSetId::empty());
-    let mut runtime = Runtime::initialize(RuntimeConfig::default());
-    let id = runtime.model_instances_mut().create(def).unwrap();
-    sealed_creation_reach_ready(&mut runtime, &id);
-    {
-        let instance = runtime.model_instances_mut().instance_mut(&id).unwrap();
-        instance.set_provider_resource(Some(ProviderModelResource {
-            provider: ProviderBinding::new("provider-a"),
-            handle_kind: "opaque-model".into(),
-            release_required: true,
-        }));
-        // A deliberately out-of-band id: `reach_ready` above issues its own
-        // real allocation from the same `MemoryManager`, whose ids start
-        // at 1, so a fixture id of `1` here would silently collide in the
-        // `BTreeSet` and undercount `released_memory_allocations`.
-        instance.track_memory_allocation(MemoryAllocationId::new(999));
-    }
-
-    let report = runtime
-        .model_instances_mut()
-        .unload(&id, ModelInstanceUnloadPolicy::DrainActiveUse)
-        .unwrap();
-
-    assert_eq!(report.invalidated.kv_caches.len(), 1);
-    assert_eq!(report.invalidated.prefix_entries.len(), 1);
-    assert_eq!(report.invalidated.adapters_released.len(), 1);
-    // +1 relative to the fixture's single pre-set `memory_allocations`
-    // entry: `reach_ready`'s own Memory Manager allocation for the bound
-    // weight is released on unload too.
-    assert_eq!(report.released_memory_allocations.len(), 2);
-    assert_eq!(report.released_provider_resources.len(), 1);
-    assert!(!report.dangling_session_references);
-    assert_eq!(
-        runtime.model_instance(&id).unwrap().lifecycle(),
-        ModelInstanceLifecycleState::Unloaded
-    );
-}
-
-/// Proves pre-create `policy.browser_linear_memory_limit_bytes` is
-/// enforced by `create` itself. `Runtime::create_model_instance` builds
-/// `policy: ModelInstancePolicy::default()` internally with no way for a
-/// caller to override it before creation.
-#[test]
-fn sealed_creation_browser_policy_rejects_native_or_oversized_instance_features() {
-    let mut def = sealed_creation_definition();
-    def.policy = ModelInstancePolicy {
-        browser_linear_memory_limit_bytes: Some(1),
-        ..ModelInstancePolicy::default()
-    };
-    let mut manager = ModelInstanceManager::new();
-    assert_eq!(
-        manager.create(def),
-        Err(ModelInstanceError::ModelInstanceBrowserFeatureUnsupported)
-    );
 }
 
 // The following helpers and tests were relocated from
@@ -5133,209 +2898,7 @@ fn sealed_creation_browser_policy_rejects_native_or_oversized_instance_features(
 // concerns `inference_api::load_model`'s `Runtime`-sealed wrapper does not
 // re-expose 1:1.
 
-fn sealed_loading_digest() -> String {
-    "sha256:0000000000000000000000000000000000000000000000000000000000000001".into()
-}
-
-fn sealed_loading_valid_manifest() -> ModelManifest {
-    ModelManifest::from_yaml_str(&format!(
-        r#"
-schema: magnetar-model-artifact
-schema_version: 1
-kind: model-bundle
-digest: {}
-model:
-  name: qwen.example
-  revision: r1
-architecture:
-  family: qwen
-  identifier: qwen2
-storage_dtype: int8
-compute_dtype: bf16
-supported_compute_dtypes: [bf16, fp16]
-artifacts:
-  weights:
-    kind: model-weights
-    digest: {}
-    size_bytes: 128
-  config:
-    kind: model-config
-    digest: {}
-    size_bytes: 16
-quantization:
-  format: q4_k
-  workspace_bytes: 64
-shards:
-  - id: shard0
-    digest: {}
-    size_bytes: 128
-    order: 0
-tensors:
-  - name: transformer.wte.weight
-    shape: [4, 8]
-    storage_dtype: int8
-    shard: shard0
-"#,
-        sealed_loading_digest(),
-        sealed_loading_digest(),
-        sealed_loading_digest(),
-        sealed_loading_digest()
-    ))
-    .unwrap()
-}
-
-fn sealed_loading_trusted(manifest: &ModelManifest) -> ModelTrustDecision {
-    ModelTrustStore::default()
-        .trust_digest(manifest.id.digest.value.clone())
-        .evaluate(manifest)
-}
-
-fn sealed_loading_coordinator() -> ModelLoadingCoordinator {
-    let mut coordinator = ModelLoadingCoordinator::new();
-    coordinator.register_architecture(ModelArchitectureImplementation {
-        architecture: ModelArchitecture::new("qwen", "qwen2"),
-        kind: ModelArchitectureImplementationKind::TestFixture,
-        required_capabilities: Vec::new(),
-    });
-    coordinator
-}
-
-#[test]
-fn sealed_loading_unsupported_quantization_requires_explicit_policy() {
-    let manifest = sealed_loading_valid_manifest();
-    let mut coordinator = sealed_loading_coordinator();
-    let mut memory = MemoryManager::default();
-    let request =
-        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-
-    let error = coordinator
-        .load(
-            request,
-            &manifest,
-            &sealed_loading_trusted(&manifest),
-            &mut memory,
-        )
-        .unwrap_err();
-
-    assert_eq!(error.code, ModelLoadingErrorCode::QuantizationUnsupported);
-}
-
-#[test]
-fn sealed_loading_memory_manager_rejection_maps_to_loading_error() {
-    let manifest = sealed_loading_valid_manifest();
-    let mut coordinator = sealed_loading_coordinator();
-    let mut memory = MemoryManager::new(MemoryManagerConfig {
-        max_runtime_bytes: Some(1),
-        ..MemoryManagerConfig::default()
-    });
-    let mut request =
-        ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
-    request.quantization_policy = ModelQuantizationPolicy::DequantizeAtLoad;
-
-    let error = coordinator
-        .load(
-            request,
-            &manifest,
-            &sealed_loading_trusted(&manifest),
-            &mut memory,
-        )
-        .unwrap_err();
-
-    assert_eq!(error.code, ModelLoadingErrorCode::MemoryAllocationFailed);
-}
-
-#[test]
-fn inference_api_session_close_transitions_lifecycle_to_closed() {
-    let mut runtime = Runtime::builder().build().unwrap();
-    let mut request = session_creation_request();
-    request.allowed_capabilities.insert("generation".into());
-    let session = create_inference_session(&mut runtime, request).unwrap();
-
-    close_inference_session(&mut runtime, &session).unwrap();
-
-    let status = session_status(
-        &runtime,
-        &session,
-        &SessionAccessPolicy::authorize(session.clone()),
-    )
-    .unwrap();
-    assert_eq!(status.lifecycle, SessionLifecycleState::Closed);
-}
-
-#[test]
-fn inference_api_kv_cache_policy_covers_enabled_scope_budget_reuse_eviction_privacy() {
-    let policy = KvCachePolicy {
-        enabled: true,
-        max_cache_tokens: Some(2048),
-        max_cache_memory_bytes: Some(1 << 20),
-        sharing: KvCacheSharingPolicy::AllowWithinSession,
-        retention: KvCacheRetentionPolicy::RetainForPrefixReuse,
-        prefix_reuse_allowed: true,
-        privacy_redaction_required: true,
-    };
-    assert!(policy.enabled);
-    assert!(policy.prefix_reuse_allowed);
-    assert!(policy.privacy_redaction_required);
-    assert_eq!(policy.sharing, KvCacheSharingPolicy::AllowWithinSession);
-}
-
-#[test]
-fn inference_api_prefix_cache_policy_covers_scope_sharing_ttl_budget_privacy_reuse() {
-    let policy = PrefixCachePolicy {
-        enabled: true,
-        allow_partial_reuse: true,
-        require_sealed_kv_cache_for_sharing: true,
-        sharing: PrefixCacheSharingPolicy::SessionLocal,
-        privacy: PrefixCachePrivacyPolicy::default(),
-        max_memory_bytes: Some(1 << 20),
-        max_prefix_tokens: Some(1024),
-        ttl_millis: Some(60_000),
-        idle_ttl_millis: Some(5_000),
-        persist_after_session_close: false,
-    };
-    assert!(policy.enabled);
-    assert!(policy.allow_partial_reuse);
-    assert_eq!(policy.sharing, PrefixCacheSharingPolicy::SessionLocal);
-    assert_eq!(policy.ttl_millis, Some(60_000));
-}
-
-#[test]
-fn inference_api_generation_result_reports_error_for_failed_finish_reason() {
-    let request = generation_request();
-    let output = GenerationOutput::new(&request, Vec::new(), FinishReason::ProviderError);
-
-    let result = GenerationResult::new(output);
-    assert!(result.error.is_some());
-}
-
-#[test]
-fn inference_api_diagnostics_and_status_debug_output_never_exposes_raw_pointer_markers() {
-    let runtime = Runtime::builder().build().unwrap();
-    let diagnostics = runtime_diagnostics(&runtime);
-    let instance = runtime
-        .model_instances()
-        .instances()
-        .next()
-        .map(ModelInstance::status);
-
-    let debug_output = format!("{diagnostics:?} {instance:?}");
-    assert!(!debug_output.contains("0x"));
-    assert!(!debug_output.to_ascii_lowercase().contains("pointer"));
-}
-
-#[test]
-fn inference_api_usage_report_never_carries_raw_prompt_text() {
-    let usage = GenerationUsage::new(3, 4, FinishReason::EosToken);
-    let memory = GenerationMemoryEstimate::default();
-
-    let report = UsageReport::from_generation(&usage, &memory, Some(true), Some(12));
-    assert_eq!(report.prompt_token_count, 3);
-    assert_eq!(report.generated_token_count, 4);
-    assert_eq!(report.cache_hit, Some(true));
-    assert!(!report.cancelled);
-}
-
-fn session_creation_request() -> SessionCreationRequest {
+pub(crate) fn session_creation_request() -> SessionCreationRequest {
     let metadata = generation_tokenizer_metadata();
     SessionCreationRequest {
         model: GenerationModelReference::LoadedModelContext("model-context".into()),
@@ -5352,192 +2915,6 @@ fn session_creation_request() -> SessionCreationRequest {
     }
 }
 
-#[test]
-fn inference_api_model_resolution_source_placeholders_fail_structured() {
-    let mut registry = ModelRegistry::new();
-    let reference = ModelRef::new("qwen-test").unwrap();
-    registry.register(
-        reference.clone(),
-        ModelArtifactId::new(
-            ModelArtifactKind::ModelWeights,
-            ModelName::new("qwen").unwrap(),
-            ModelRevision::new("1").unwrap(),
-            ModelDigest::sha256(b"weights"),
-        ),
-    );
-
-    for source in [
-        ModelResolutionSource::FutureExternalSource,
-        ModelResolutionSource::FutureTachyonSource,
-    ] {
-        let mut request = ModelResolutionRequest::new(reference.clone());
-        request.source = source;
-        let error = registry.resolve(&request).unwrap_err();
-        assert!(matches!(
-            error,
-            InferenceApiError::ModelResolutionFailed { .. }
-        ));
-    }
-}
-
-#[test]
-fn inference_api_model_resolution_local_registry_source_still_resolves() {
-    let reference = ModelRef::new("qwen-test").unwrap();
-    let artifact = ModelArtifactId::new(
-        ModelArtifactKind::ModelWeights,
-        ModelName::new("qwen").unwrap(),
-        ModelRevision::new("1").unwrap(),
-        ModelDigest::sha256(b"weights"),
-    );
-    let mut registry = ModelRegistry::new();
-    registry.register(reference.clone(), artifact.clone());
-
-    let mut request = ModelResolutionRequest::new(reference);
-    request.source = ModelResolutionSource::LocalRegistry;
-    assert_eq!(registry.resolve(&request).unwrap().artifact, artifact);
-}
-
-#[test]
-fn inference_api_generation_api_request_carries_privacy_policy() {
-    let request = GenerationApiRequest::new(
-        generation_request(),
-        SessionRedactionPolicy::RedactRawInputs,
-    );
-    assert_eq!(request.privacy, SessionRedactionPolicy::RedactRawInputs);
-}
-
-#[test]
-fn inference_api_run_generation_loop_cancels_during_decode() {
-    let mut request = generation_request();
-    request.parameters = GenerationParameters::greedy();
-    request.stop_conditions = StopConditions::default();
-    request.max_new_tokens = 5;
-    let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
-
-    let mut runtime = runtime_with_model_execution_engine(
-        vocabulary_size,
-        RuntimeGenerationExecutionEvidence::complete(),
-    );
-    let mut observer = InferenceApiObserver::new();
-
-    let result = run_generation_loop(
-        &mut runtime,
-        &request,
-        SamplingPolicy::default(),
-        CacheUsageSummary::default(),
-        |generated| !generated.is_empty(),
-        &mut observer,
-    )
-    .unwrap();
-
-    assert_eq!(result.output.finish_reason, FinishReason::Cancelled);
-    assert_eq!(result.output.generated_token_count, 1);
-    let kinds: Vec<_> = observer
-        .observations()
-        .iter()
-        .map(|observation| observation.kind)
-        .collect();
-    assert!(kinds.contains(&InferenceApiObservationKind::GenerationCancelled));
-    assert!(kinds.contains(&InferenceApiObservationKind::StreamInterrupted));
-    assert!(!kinds.contains(&InferenceApiObservationKind::GenerationCompleted));
-}
-
-#[test]
-fn inference_api_run_generation_loop_observes_executor_failure_before_returning() {
-    let mut request = generation_request();
-    request.parameters = GenerationParameters::greedy();
-    request.stop_conditions = StopConditions::default();
-    let mut runtime = Runtime::builder()
-        .register_provider(Arc::new(ReferenceCpuProvider::new()))
-        .model_execution_engine(Arc::new(FailingGenerationExecutor))
-        .build()
-        .unwrap();
-    let mut observer = InferenceApiObserver::new();
-
-    let error = run_generation_loop(
-        &mut runtime,
-        &request,
-        SamplingPolicy::default(),
-        CacheUsageSummary::default(),
-        |_generated| false,
-        &mut observer,
-    )
-    .unwrap_err();
-
-    assert!(matches!(
-        error,
-        InferenceApiError::ProviderUnavailable { .. }
-    ));
-    let kinds: Vec<_> = observer
-        .observations()
-        .iter()
-        .map(|observation| observation.kind)
-        .collect();
-    assert!(kinds.contains(&InferenceApiObservationKind::DecodeStarted));
-    assert!(kinds.contains(&InferenceApiObservationKind::ProviderUnavailable));
-    assert!(kinds.contains(&InferenceApiObservationKind::StreamInterrupted));
-    assert!(!kinds.contains(&InferenceApiObservationKind::StreamClosed));
-}
-
-#[test]
-fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
-    let mut request = generation_request();
-    request.parameters = GenerationParameters::greedy();
-    request.stop_conditions = StopConditions::default();
-    let mut observer = InferenceApiObserver::new();
-    let mut runtime = Runtime::builder().build().unwrap();
-    let error = run_generation_loop(
-        &mut runtime,
-        &request,
-        SamplingPolicy::default(),
-        CacheUsageSummary::default(),
-        |_generated| false,
-        &mut observer,
-    )
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        InferenceApiError::ProviderUnavailable { .. }
-    ));
-    assert!(
-        observer
-            .observations()
-            .iter()
-            .any(|observation| observation.kind
-                == InferenceApiObservationKind::ProviderUnavailable)
-    );
-    assert!(
-        observer
-            .observations()
-            .iter()
-            .any(|observation| observation.kind == InferenceApiObservationKind::StreamInterrupted)
-    );
-
-    request.request_id = GenerationRequestId::new("gen-2").unwrap();
-    let mut observer = InferenceApiObserver::new();
-    let mut runtime = Runtime::builder()
-        .register_provider(Arc::new(ReferenceCpuProvider::new()))
-        .model_execution_engine(Arc::new(FailingKernelGenerationExecutor))
-        .build()
-        .unwrap();
-    let error = run_generation_loop(
-        &mut runtime,
-        &request,
-        SamplingPolicy::default(),
-        CacheUsageSummary::default(),
-        |_generated| false,
-        &mut observer,
-    )
-    .unwrap_err();
-    assert!(matches!(error, InferenceApiError::KernelUnavailable { .. }));
-    assert!(
-        observer
-            .observations()
-            .iter()
-            .any(|observation| observation.kind == InferenceApiObservationKind::KernelUnavailable)
-    );
-}
-
 // ---------------------------------------------------------------------
 // cli_boundary
 // ---------------------------------------------------------------------
@@ -5546,110 +2923,11 @@ fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
 // kernel_artifact
 // ---------------------------------------------------------------------
 
-#[test]
-fn kernel_artifact_error_ids_match_proposal_error_model() {
-    let cases: &[(KernelArtifactError, &str)] = &[
-        (
-            KernelArtifactError::ArtifactInvalid { reason: "x".into() },
-            "kernel-artifact-invalid",
-        ),
-        (
-            KernelArtifactError::DigestMismatch {
-                expected: "a".into(),
-                found: "b".into(),
-            },
-            "kernel-artifact-digest-mismatch",
-        ),
-        (
-            KernelArtifactError::FormatUnsupported { format: "x".into() },
-            "kernel-artifact-format-unsupported",
-        ),
-        (
-            KernelArtifactError::Untrusted {
-                artifact: "x".into(),
-            },
-            "kernel-artifact-untrusted",
-        ),
-        (
-            KernelArtifactError::OperatorIncompatible { reason: "x".into() },
-            "kernel-artifact-operator-incompatible",
-        ),
-        (
-            KernelArtifactError::DTypeIncompatible { reason: "x".into() },
-            "kernel-artifact-dtype-incompatible",
-        ),
-        (
-            KernelArtifactError::LayoutIncompatible { reason: "x".into() },
-            "kernel-artifact-layout-incompatible",
-        ),
-        (
-            KernelArtifactError::ShapeIncompatible { reason: "x".into() },
-            "kernel-artifact-shape-incompatible",
-        ),
-        (
-            KernelArtifactError::TargetIncompatible { target: "x".into() },
-            "kernel-artifact-target-incompatible",
-        ),
-        (
-            KernelArtifactError::ProviderIncompatible {
-                provider: "x".into(),
-            },
-            "kernel-artifact-provider-incompatible",
-        ),
-        (
-            KernelArtifactError::DriverIncompatible { reason: "x".into() },
-            "kernel-artifact-driver-incompatible",
-        ),
-        (
-            KernelArtifactError::CompilerIncompatible { reason: "x".into() },
-            "kernel-artifact-compiler-incompatible",
-        ),
-        (
-            KernelArtifactError::PreparationUnavailable { reason: "x".into() },
-            "kernel-preparation-unavailable",
-        ),
-        (
-            KernelArtifactError::PreparationFailed { reason: "x".into() },
-            "kernel-preparation-failed",
-        ),
-        (
-            KernelArtifactError::PreparedHandleInvalid { reason: "x".into() },
-            "kernel-prepared-handle-invalid",
-        ),
-        (
-            KernelArtifactError::PreparedGenerationInUse { generation: 1 },
-            "kernel-prepared-generation-in-use",
-        ),
-        (
-            KernelArtifactError::PreparedDestroyFailed { reason: "x".into() },
-            "kernel-prepared-destroy-failed",
-        ),
-        (
-            KernelArtifactError::PreparedNotReady { kernel: "x".into() },
-            "kernel-prepared-not-ready",
-        ),
-        (
-            KernelArtifactError::HotPathCompilationDenied {
-                operation: "x".into(),
-            },
-            "kernel-hot-path-compilation-denied",
-        ),
-        (
-            KernelArtifactError::InternalKernelArtifactError { reason: "x".into() },
-            "internal-kernel-artifact-error",
-        ),
-    ];
-    for (error, expected_id) in cases {
-        assert_eq!(error.id(), *expected_id);
-        assert!(!error.to_string().is_empty());
-    }
-}
-
 // ---------------------------------------------------------------------
 // kernel_artifact_manifest
 // ---------------------------------------------------------------------
 
-fn temp_kernel_bundle_dir(label: &str) -> std::path::PathBuf {
+pub(crate) fn temp_kernel_bundle_dir(label: &str) -> std::path::PathBuf {
     let directory = std::env::temp_dir().join(format!(
         "magnetar-kernel-bundle-{label}-{}",
         std::process::id()
@@ -5659,7 +2937,7 @@ fn temp_kernel_bundle_dir(label: &str) -> std::path::PathBuf {
     directory
 }
 
-fn write_kernel_bundle(directory: &std::path::Path, blob_bytes: &[u8]) -> String {
+pub(crate) fn write_kernel_bundle(directory: &std::path::Path, blob_bytes: &[u8]) -> String {
     let digest = KernelBlobDigest::of_bytes(blob_bytes);
     fs::write(
         directory.join("blobs").join("sha256").join(&digest.value),
@@ -5769,35 +3047,6 @@ fn ingestion_concurrent_transactions_are_isolated() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn compilation_capability_descriptor_validation_requires_declared_formats_and_isolation() {
-    let mut descriptor = KernelCompilationCapabilityDescriptor::unsupported();
-    descriptor.support_level = CompilationSupportLevel::SourceCompilation;
-    assert!(matches!(
-        descriptor.validate(),
-        Err(KernelCompilationError::DescriptorInvalid { .. })
-    ));
-
-    descriptor
-        .accepted_source_formats
-        .insert(KernelSourceFormat::new("triton", "source").with_version("3"));
-    assert!(matches!(
-        descriptor.validate(),
-        Err(KernelCompilationError::DescriptorInvalid { .. })
-    ));
-
-    descriptor
-        .produced_compiled_formats
-        .insert("nvidia:ptx@9".into());
-    assert!(matches!(
-        descriptor.validate(),
-        Err(KernelCompilationError::DescriptorInvalid { .. })
-    ));
-
-    descriptor.isolation_model = CompilationIsolationModel::SandboxedSubprocess;
-    assert!(descriptor.validate().is_ok());
-}
-
-#[test]
 fn kernel_compilation_abi_descriptor_validates_ownership_and_version() {
     let descriptor = KernelCompilationAbiDescriptor::current();
     assert!(descriptor.validate().is_ok());
@@ -5817,50 +3066,6 @@ fn kernel_compilation_abi_descriptor_validates_ownership_and_version() {
     ));
 }
 
-#[test]
-fn failed_compilation_never_mutates_existing_known_good_artifact() {
-    let operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
-    let v1 = CompiledKernelArtifact::new(
-        CompiledKernelArtifactId::from_digest("v1-digest"),
-        "cubin",
-        "nvcc",
-        "12.4",
-        "sm_90",
-        operator,
-    );
-    let crash = normalize_compiler_crash("replacement compile crashed");
-    let preserved = preserve_known_good_artifact_on_failure(&v1, &crash);
-    assert_eq!(preserved, &v1);
-}
-
-#[test]
-fn compilation_result_wraps_compiled_artifact_with_compilation_provenance() {
-    let operator = OperatorId::magnetar("matmul", 1, OperatorFamily::LinearAlgebra);
-    let artifact = CompiledKernelArtifact::new(
-        CompiledKernelArtifactId::from_digest("digest-result"),
-        "ptx",
-        "triton",
-        "3.1",
-        "sm_90",
-        operator,
-    );
-    let mut allocator = CompilationJobIdAllocator::default();
-    let result = CompilationResult {
-        job: allocator.allocate(),
-        artifact: artifact.clone(),
-        compiler: CompilerIdentity {
-            name: Some("triton".into()),
-            version: Some("3.1".into()),
-            ..CompilerIdentity::default()
-        },
-        specialization: CompilationSpecialization::default(),
-        duration_millis: Some(1200),
-    };
-    assert_eq!(result.artifact, artifact);
-    assert_eq!(result.compiler.name.as_deref(), Some("triton"));
-    assert_eq!(result.duration_millis, Some(1200));
-}
-
 // ---------------------------------------------------------------------
 // kernel_qualification
 // ---------------------------------------------------------------------
@@ -5873,28 +3078,6 @@ fn compilation_result_wraps_compiled_artifact_with_compilation_provenance() {
 // kernel_autotuning
 // ---------------------------------------------------------------------
 
-#[test]
-fn kernel_autotuning_qualification_coverage_never_implicitly_inherits() {
-    let exact = QualificationCoverage::ExactInstance {
-        fingerprint: "instance-a".into(),
-    };
-    assert!(exact.covers("instance-a"));
-    assert!(!exact.covers("instance-b"));
-
-    let enumerated = QualificationCoverage::EnumeratedInstances {
-        fingerprints: BTreeSet::from(["instance-a".to_string(), "instance-b".to_string()]),
-    };
-    assert!(enumerated.covers("instance-b"));
-    assert!(!enumerated.covers("instance-c"));
-
-    let unauthorized_envelope = QualificationCoverage::DeclaredEnvelope { authorized: false };
-    assert!(!unauthorized_envelope.covers("any-instance"));
-    let authorized_envelope = QualificationCoverage::DeclaredEnvelope { authorized: true };
-    assert!(authorized_envelope.covers("any-instance"));
-
-    assert!(!QualificationCoverage::RequiresPerInstanceQualification.covers("any-instance"));
-}
-
 // ---------------------------------------------------------------------
 // kernel_cache
 // ---------------------------------------------------------------------
@@ -5902,19 +3085,6 @@ fn kernel_autotuning_qualification_coverage_never_implicitly_inherits() {
 // ---------------------------------------------------------------------
 // kernel_registry generated-kernel lifecycle
 // ---------------------------------------------------------------------
-
-#[test]
-fn kernel_out_of_device_memory_error_round_trips_code_id_and_display() {
-    let error = KernelError::KernelOutOfDeviceMemory {
-        reason: "requested 8GiB, 2GiB free".into(),
-    };
-    assert_eq!(error.code(), KernelErrorCode::KernelOutOfDeviceMemory);
-    assert_eq!(error.id(), "kernel-out-of-device-memory");
-    assert_ne!(error.code(), KernelErrorCode::KernelExecutionFailed);
-    let rendered = error.to_string();
-    assert!(rendered.contains("out of device memory"));
-    assert!(rendered.contains("8GiB"));
-}
 
 #[test]
 fn model_instance_kernel_selection_policy_is_explicit() {
@@ -5979,7 +3149,7 @@ fn session_inherits_model_instance_kernel_policy_and_owns_no_native_kernel_state
 // kernel_selection_policy
 // ---------------------------------------------------------------------
 
-fn selection_policy_kernel_id(name: &str) -> KernelId {
+pub(crate) fn selection_policy_kernel_id(name: &str) -> KernelId {
     KernelId::new(
         ProviderBinding::new("selection-policy-provider"),
         name,
@@ -5990,7 +3160,7 @@ fn selection_policy_kernel_id(name: &str) -> KernelId {
     )
 }
 
-fn selection_policy_identity(name: &str) -> CandidateIdentity {
+pub(crate) fn selection_policy_identity(name: &str) -> CandidateIdentity {
     CandidateIdentity {
         kernel: selection_policy_kernel_id(name),
         provider: ProviderBinding::new("selection-policy-provider"),
@@ -6135,7 +3305,7 @@ fn model_instance_definition_can_reference_a_kernel_selection_policy() {
 // `magnetar-runtime` ever depending on a concrete format-parser crate.
 // ---------------------------------------------------------------------
 
-fn artifact_bytes_test_tensor(
+pub(crate) fn artifact_bytes_test_tensor(
     name: &str,
     shape: Vec<u64>,
     data: &[f32],
@@ -6185,14 +3355,18 @@ fn host_tensors_from_artifact_bytes_honors_nonzero_data_section_start() {
     assert_eq!(tensor.data, vec![1.0, 2.0, 3.0, 4.0]);
 }
 
-fn f16_bytes(values: &[u16]) -> Vec<u8> {
+pub(crate) fn f16_bytes(values: &[u16]) -> Vec<u8> {
     values
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect()
 }
 
-fn f16_tensor_metadata(name: &str, shape: Vec<u64>, byte_len: usize) -> ModelTensorMetadata {
+pub(crate) fn f16_tensor_metadata(
+    name: &str,
+    shape: Vec<u64>,
+    byte_len: usize,
+) -> ModelTensorMetadata {
     ModelTensorMetadata {
         name: name.to_string(),
         shape,
@@ -6205,31 +3379,6 @@ fn f16_tensor_metadata(name: &str, shape: Vec<u64>, byte_len: usize) -> ModelTen
         expected_compute_dtype: None,
         digest: None,
     }
-}
-
-/// `implement-production-qwen-model-loading` task 5.6: numeric edge cases
-/// for F16 -> F32 conversion -- +0/-0, a subnormal, the largest finite
-/// magnitude, both infinities, and NaN (payload/sign preserved, not
-/// canonicalized).
-#[test]
-fn f16_to_f32_handles_every_numeric_class_exactly() {
-    assert_eq!(f16_to_f32(0x0000).to_bits(), 0f32.to_bits());
-    assert_eq!(f16_to_f32(0x8000).to_bits(), (-0f32).to_bits());
-    // Smallest positive subnormal f16 (2^-24) must renormalize exactly.
-    assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
-    // Largest subnormal f16 mantissa.
-    assert_eq!(f16_to_f32(0x03FF), 2f32.powi(-14) * (1023.0 / 1024.0));
-    // Largest finite f16 magnitude (65504).
-    assert_eq!(f16_to_f32(0x7BFF), 65504.0f32);
-    assert_eq!(f16_to_f32(0xFBFF), -65504.0f32);
-    assert!(f16_to_f32(0x7C00).is_infinite() && f16_to_f32(0x7C00) > 0.0);
-    assert!(f16_to_f32(0xFC00).is_infinite() && f16_to_f32(0xFC00) < 0.0);
-    let nan = f16_to_f32(0x7E00);
-    assert!(nan.is_nan());
-    assert_eq!(nan.to_bits() >> 31, 0, "sign bit must be preserved for NaN");
-    let signed_nan = f16_to_f32(0xFE00);
-    assert!(signed_nan.is_nan());
-    assert_eq!(signed_nan.to_bits() >> 31, 1);
 }
 
 /// Same edge-case coverage for BF16 -> F32 (task 5.6), which -- because
@@ -6294,7 +3443,7 @@ fn f32_to_f16_round_trips_every_possible_f16_bit_pattern_exactly() {
     }
 }
 
-fn quantized_tensor_metadata(
+pub(crate) fn quantized_tensor_metadata(
     name: &str,
     dtype: ModelDType,
     element_count: u64,
@@ -6429,68 +3578,11 @@ fn host_tensors_from_artifact_bytes_verifies_f16_digest_against_original_bytes()
 // provider_roadmap
 // ---------------------------------------------------------------------
 
-#[test]
-fn provider_roadmap_optimized_provider_does_not_redefine_operator_semantics() {
-    // A fused kernel that does not preserve portable Operator/graph
-    // semantics is rejected outright, regardless of how it declares itself.
-    let non_preserving = KernelFusionMetadata {
-        operator_group: vec![OperatorId::magnetar(
-            "softmax",
-            1,
-            OperatorFamily::Activation,
-        )],
-        preserves_graph_semantics: false,
-    };
-    let precision = KernelPrecisionMetadata {
-        tolerance_profile: Some("operator-default".into()),
-        ..KernelPrecisionMetadata::default()
-    };
-    let fallback_hints = BTreeSet::from([KernelFallbackClass::AlternateKernel]);
-    let outcome = validate_fused_kernel_declaration(FusedKernelDeclaration {
-        fusion: Some(&non_preserving),
-        precision: &precision,
-        fallback_hints: &fallback_hints,
-    });
-    assert!(matches!(
-        outcome,
-        Err(ProviderRoadmapError::ProviderFusionInvalid { .. })
-    ));
-}
-
-#[test]
-fn provider_roadmap_benchmarks_stay_separate_from_conformance() {
-    // A benchmark result is never accepted anywhere a conformance decision
-    // is made: a report whose only entry is a correctness failure is not
-    // conformant no matter how good a (structurally separate) benchmark
-    // result would look.
-    let fast_but_wrong = ProviderRoadmapConformanceReport {
-        results: vec![ProviderRoadmapConformanceResult {
-            requirement: "optimized matmul matches Reference CPU".into(),
-            passed: false,
-            diagnostic: Some("output differs beyond tolerance".into()),
-        }],
-    };
-    assert!(!fast_but_wrong.is_conformant());
-
-    let benchmark = ProviderRoadmapBenchmarkResult {
-        category: ProviderRoadmapBenchmarkCategory::TokensPerSecond,
-        provider: "cuda".into(),
-        value: 999.0,
-        unit: "tokens/sec".into(),
-    };
-    // The benchmark result exists purely as data; nothing consumes it as
-    // conformance input.
-    assert_eq!(
-        benchmark.category,
-        ProviderRoadmapBenchmarkCategory::TokensPerSecond
-    );
-}
-
 // ---------------------------------------------------------------------
 // model_format_roadmap
 // ---------------------------------------------------------------------
 
-fn tensor(name: &str, shape: Vec<u64>) -> ModelTensorMetadata {
+pub(crate) fn tensor(name: &str, shape: Vec<u64>) -> ModelTensorMetadata {
     ModelTensorMetadata {
         name: name.into(),
         shape,
@@ -6503,128 +3595,4 @@ fn tensor(name: &str, shape: Vec<u64>) -> ModelTensorMetadata {
         expected_compute_dtype: None,
         digest: None,
     }
-}
-
-#[test]
-fn model_format_roadmap_detects_missing_and_duplicate_shard_tensors() {
-    let mut index = ShardIndex::default();
-    index.shards.push(ModelShard {
-        id: ModelShardId::new("shard-0").unwrap(),
-        digest: ModelDigest::parse(format!("sha256:{}", "3".repeat(64))).unwrap(),
-        size_bytes: 1024,
-        order: 0,
-    });
-    index.tensor_shard_map.insert(
-        "layer.0.weight".into(),
-        ModelShardId::new("shard-0").unwrap(),
-    );
-    assert!(detect_missing_shards(&index).is_ok());
-
-    index.tensor_shard_map.insert(
-        "layer.1.weight".into(),
-        ModelShardId::new("shard-missing").unwrap(),
-    );
-    assert!(matches!(
-        detect_missing_shards(&index),
-        Err(ModelFormatRoadmapError::ShardMissing { .. })
-    ));
-
-    let duplicate = vec![
-        tensor("layer.0.weight", vec![4, 4]),
-        tensor("layer.0.weight", vec![4, 4]),
-    ];
-    assert!(detect_duplicate_tensor_names(&duplicate).is_err());
-
-    let inconsistent = vec![
-        tensor("layer.0.weight", vec![4, 4]),
-        tensor("layer.0.weight", vec![8, 8]),
-    ];
-    assert!(matches!(
-        validate_shard_tensor_shape_consistency(&inconsistent),
-        Err(ModelFormatRoadmapError::ShardIndexInvalid { .. })
-    ));
-
-    let ordered = vec![
-        ModelShard {
-            id: ModelShardId::new("shard-0").unwrap(),
-            digest: ModelDigest::parse(format!("sha256:{}", "4".repeat(64))).unwrap(),
-            size_bytes: 1,
-            order: 0,
-        },
-        ModelShard {
-            id: ModelShardId::new("shard-1").unwrap(),
-            digest: ModelDigest::parse(format!("sha256:{}", "5".repeat(64))).unwrap(),
-            size_bytes: 1,
-            order: 0,
-        },
-    ];
-    assert!(matches!(
-        validate_shard_loading_order(&ordered),
-        Err(ModelFormatRoadmapError::ShardIndexInvalid { .. })
-    ));
-}
-
-#[test]
-fn model_format_roadmap_normalizes_lora_adapter_without_activating_or_trusting_it() {
-    let base_model = AdapterBaseModelCompatibility {
-        model_name: ModelName::new("qwen").unwrap(),
-        model_revision: ModelRevision::new("v1").unwrap(),
-        model_artifact: None,
-        tokenizer: None,
-        architecture: AdapterArchitectureCompatibility {
-            family: "qwen".into(),
-            implementation: "qwen2".into(),
-            hidden_size: Some(4096),
-            layer_count: Some(32),
-            position_encoding: None,
-            target_modules: BTreeSet::from(["q_proj".to_string()]),
-            supported_storage_dtypes: BTreeSet::from([ModelDType::F16]),
-            supported_compute_dtypes: BTreeSet::from([ComputeDType::Float16]),
-            supported_quantization_formats: BTreeSet::new(),
-        },
-    };
-    let metadata = LoraAdapterFormatMetadata {
-        target_modules: vec!["q_proj".into()],
-        rank: 8,
-        alpha: 16,
-        scaling: Some(2.0),
-        dropout: Some(0.1),
-        base_model,
-        tensors: vec![tensor("q_proj.lora_a", vec![4096, 8])],
-        storage_dtype: ModelDType::F16,
-        compute_dtype: Some(ComputeDType::Float16),
-        quantization: None,
-        required_capabilities: Vec::new(),
-        license: None,
-        provenance: None,
-    };
-    let id = AdapterArtifactId::new(
-        AdapterName::new("support-lora").unwrap(),
-        AdapterRevision::new("r1").unwrap(),
-        AdapterDigest::parse(format!("sha256:{}", "8".repeat(64))).unwrap(),
-    );
-    let artifact = normalize_lora_adapter(id, &metadata);
-    assert_eq!(artifact.method, AdapterMethod::Lora);
-    assert_eq!(artifact.rank, Some(8));
-    assert_eq!(artifact.alpha, Some(16));
-    assert_eq!(artifact.trust, AdapterTrustStatus::Unknown);
-    assert_eq!(artifact.targets.len(), 1);
-}
-
-#[test]
-fn model_format_roadmap_conformance_fixture_kinds_cover_twelve_categories() {
-    assert_eq!(MODEL_FORMAT_CONFORMANCE_FIXTURES.len(), 12);
-    for fixture in MODEL_FORMAT_CONFORMANCE_FIXTURES {
-        assert!(!fixture.id().is_empty());
-    }
-}
-
-#[test]
-fn model_format_roadmap_observation_redacts_metadata() {
-    let observation =
-        ModelFormatRoadmapObservation::new(ModelFormatRoadmapObservationKind::ManifestNormalized)
-            .with_artifact("fixture-model")
-            .with_redacted_metadata("path", "/etc/secret/model.safetensors");
-    assert_eq!(observation.artifact.as_deref(), Some("fixture-model"));
-    assert!(observation.redacted_metadata.contains_key("path"));
 }

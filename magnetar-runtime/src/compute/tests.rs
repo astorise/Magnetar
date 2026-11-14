@@ -1458,3 +1458,41 @@ fn layout_descriptor_packed_quantized_tracks_dequantization_requirements() {
         Some("requires dequantize_placeholder before use")
     );
 }
+
+#[test]
+fn compute_operation_requests_reject_unknown_family_ids() {
+    let provider = provider_with_capabilities("portable-compute", [compute_capability()]);
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+
+    assert!(matches!(
+        runtime.validate_compute_operation_requests(
+            "portable-compute",
+            &[ComputeOperationRequest::new("backend-kernel-name")]
+        ),
+        Err(ComputeValidationError::UnknownOperationFamily(_))
+    ));
+}
+
+#[test]
+fn compute_providers_register_and_resolve_compatibly() {
+    let mut provider = TestProvider::new("portable-compute");
+    provider.metadata.capabilities.insert(compute_capability());
+    let runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .resolve_component_import(&WitInterface::new(
+                COMPUTE_WIT_INTERFACE,
+                COMPUTE_CAPABILITY_VERSION.to_string(),
+            ))
+            .unwrap()
+            .len(),
+        1
+    );
+}

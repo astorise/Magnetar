@@ -532,3 +532,6 @@ pub fn load_first_native_segment_with_provider_and_weights(
     )?;
     Ok((runtime, instance, provider_binding))
 }
+
+#[cfg(test)]
+mod tests;

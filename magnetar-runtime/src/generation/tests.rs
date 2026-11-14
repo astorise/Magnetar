@@ -4,11 +4,15 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
+use crate::batching::*;
+use crate::inference_api::*;
 use crate::memory::MemoryPlacement;
 use crate::model::ModelDigest;
 use crate::observability::{CorrelationId, TraceId};
+use crate::runtime::*;
 use crate::sampling::SamplingPolicy;
 use crate::scheduler::ProviderExecutionErrorCode;
+use crate::session::*;
 use crate::tokenizer::{
     SpecialToken, SpecialTokenKind, TokenIdRange, TokenStopPattern, TokenizerArtifactId,
     TokenizerFamily, TokenizerId, TokenizerMetadata, TokenizerRevision,
@@ -300,4 +304,130 @@ fn generation_memory_admission_uses_memory_manager_policy() {
         memory_admission(&request, &manager).unwrap(),
         MemoryAdmissionDecision::Reject { .. }
     ));
+}
+
+#[test]
+fn generation_request_validation_is_token_based_and_context_aware() {
+    let request = generation_request();
+    request.validate().unwrap();
+    assert_eq!(request.prompt_token_count, request.input_token_ids.len());
+    assert!(matches!(
+        request.model,
+        GenerationModelReference::LoadedModelContext(_)
+    ));
+}
+
+#[test]
+fn generation_request_rejects_invalid_input_tokens() {
+    let mut request = generation_request();
+    request.input_token_ids.push(999);
+    request.prompt_token_count += 1;
+
+    assert!(matches!(
+        request.validate(),
+        Err(GenerationError::InputTokensInvalid { .. })
+    ));
+}
+
+#[test]
+fn generation_request_rejects_prompt_that_exceeds_limits_without_truncation() {
+    let mut request = generation_request();
+    request.max_new_tokens = 20;
+
+    assert!(matches!(
+        request.validate(),
+        Err(GenerationError::PromptTooLong { .. })
+    ));
+}
+
+#[test]
+fn generation_contract_has_no_authoritative_provider_or_device_selector() {
+    let request = generation_request();
+
+    assert_eq!(request.priority.priority, 3);
+    assert!(request.correlation_id.is_some());
+    assert!(request.trace_id.is_some());
+}
+
+#[test]
+fn inference_api_submit_generation_admits_compatible_request_into_batch() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let policy = BatchingPolicy {
+        allow_queueing: false,
+        ..BatchingPolicy::default()
+    };
+    let batch = runtime.create_continuous_batch(policy);
+    let request = generation_request();
+
+    let (state, slot) = submit_generation(&mut runtime, &batch, &request).unwrap();
+    assert_eq!(state, AdmissionState::Accepted);
+    assert!(slot.is_some());
+}
+
+#[test]
+fn inference_api_submit_generation_reports_queued_when_batch_policy_enqueues() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let batch = runtime.create_continuous_batch(BatchingPolicy::default());
+    let request = generation_request();
+
+    let (state, slot) = submit_generation(&mut runtime, &batch, &request).unwrap();
+    assert!(matches!(state, AdmissionState::Queued { .. }));
+    assert!(slot.is_some());
+}
+
+#[test]
+fn inference_api_submit_generation_reports_rejection_when_batch_policy_denies() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let policy = BatchingPolicy {
+        max_active_operations: 0,
+        ..BatchingPolicy::default()
+    };
+    let batch = runtime.create_continuous_batch(policy);
+    let request = generation_request();
+
+    let error = submit_generation(&mut runtime, &batch, &request).unwrap_err();
+    assert!(matches!(
+        error,
+        InferenceApiError::GenerationRejected { .. }
+    ));
+}
+
+#[test]
+fn inference_api_submit_generation_observed_emits_generation_accepted() {
+    let mut runtime = Runtime::builder().build().unwrap();
+    let policy = BatchingPolicy {
+        allow_queueing: false,
+        ..BatchingPolicy::default()
+    };
+    let batch = runtime.create_continuous_batch(policy);
+    let request = generation_request();
+    let mut observer = InferenceApiObserver::new();
+
+    let (state, _) =
+        submit_generation_observed(&mut runtime, &batch, &request, &mut observer).unwrap();
+    assert_eq!(state, AdmissionState::Accepted);
+    assert!(
+        observer
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == InferenceApiObservationKind::GenerationAccepted)
+    );
+}
+
+#[test]
+fn inference_api_generation_result_reports_error_for_failed_finish_reason() {
+    let request = generation_request();
+    let output = GenerationOutput::new(&request, Vec::new(), FinishReason::ProviderError);
+
+    let result = GenerationResult::new(output);
+    assert!(result.error.is_some());
+}
+
+#[test]
+fn inference_api_generation_api_request_carries_privacy_policy() {
+    let request = GenerationApiRequest::new(
+        generation_request(),
+        SessionRedactionPolicy::RedactRawInputs,
+    );
+    assert_eq!(request.privacy, SessionRedactionPolicy::RedactRawInputs);
 }

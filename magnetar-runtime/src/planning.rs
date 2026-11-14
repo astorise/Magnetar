@@ -1,201 +1,18 @@
+// The execution and memory plan types live in `execution`; they keep their paths here.
 use crate::affinity::*;
-use crate::capability::*;
 use crate::compute::effective_compute_advertisement;
 use crate::compute::*;
 pub use crate::compute_types::{MemoryPlanningError, MemoryPressureReport};
-use crate::observability::*;
+pub(crate) use crate::execution::*;
+pub use crate::execution::{
+    BufferLifetime, ComputeExecutionClassification, ComputeExecutionPhase, ComputeExecutionPlan,
+    ExecutionConstraint, ExecutionDiagnostic, ExecutionInput, ExecutionOutput, ExecutionPlanId,
+    ExecutionStep, ExecutionStepKind, MemoryPlan, MemoryPlanningDecision, MemoryPlanningDiagnostic,
+    MemoryRegionKind, MemoryRequirement, TensorLifetime,
+};
 use crate::provider::*;
 use crate::resolution::*;
-use crate::scheduler::runtime_events_for_execution_plan;
-use crate::scheduler::*;
 use std::{error::Error, fmt};
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ExecutionPlanId(String);
-impl ExecutionPlanId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-impl fmt::Display for ExecutionPlanId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ComputeExecutionPhase {
-    Validation,
-    Resolution,
-    Planning,
-    DataMovement,
-    Materialization,
-    MemoryAllocation,
-    ProviderSubmission,
-    Execution,
-    Completion,
-    Cancellation,
-    Interruption,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ComputeExecutionClassification {
-    Transparent,
-    Restartable,
-    ProviderPinned,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExecutionStepKind {
-    ValidateGraph,
-    ResolveProvider,
-    ResolveDevice,
-    ValidateCapabilityVersion,
-    ValidateOperationSchema,
-    ValidateDType,
-    ValidateLayout,
-    ValidatePrecisionPolicy,
-    ValidateDeterminism,
-    BindInputResource,
-    BindOutputResource,
-    PreserveProviderPinnedAffinity,
-    PreserveDeviceBoundAffinity,
-    PreserveAffinityGroup,
-    RejectIncompatibleResourceChain,
-    Upload,
-    Download,
-    Copy,
-    Transfer,
-    Materialize,
-    AllocateMemory,
-    ValidateMemory,
-    SubmitToProvider,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionStep {
-    pub id: String,
-    pub phase: ComputeExecutionPhase,
-    pub kind: ExecutionStepKind,
-    pub provider: ProviderBinding,
-    pub device: Option<DeviceBinding>,
-    pub dependencies: Vec<String>,
-}
-impl ExecutionStep {
-    pub fn new(
-        id: impl Into<String>,
-        phase: ComputeExecutionPhase,
-        kind: ExecutionStepKind,
-        provider: ProviderBinding,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            phase,
-            kind,
-            provider,
-            device: None,
-            dependencies: Vec::new(),
-        }
-    }
-    pub fn with_device(mut self, device: Option<DeviceBinding>) -> Self {
-        self.device = device;
-        self
-    }
-    pub fn depends_on(mut self, dependency: impl Into<String>) -> Self {
-        self.dependencies.push(dependency.into());
-        self
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionInput {
-    pub id: ComputeInputId,
-    pub descriptor: TensorDescriptor,
-    pub resource: Option<TensorResourceId>,
-    pub affinity: ResourceAffinity,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionOutput {
-    pub id: ComputeOutputId,
-    pub descriptor: TensorDescriptor,
-    pub affinity: ResourceAffinity,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExecutionConstraint {
-    ResolutionPolicy(ResolutionPolicyId),
-    CapabilityVersion(CapabilityBinding),
-    Provider(ProviderBinding),
-    Device(DeviceBinding),
-    ResourceAffinity(ResourceAffinity),
-    AffinityGroup(AffinityGroupId),
-    OperationSchema(ComputeOperationId),
-    DType(ComputeDType),
-    Layout(ComputeLayout),
-    PrecisionPolicy(ComputePrecision),
-    DeterministicBehavior,
-    MemoryRequirement(String),
-    ExplicitTransferRequired(TensorResourceId),
-    ExplicitTransferRequirement(String),
-    ExplicitMaterializationRequired(String),
-    NoHiddenCpuStaging,
-    NoImplicitProviderMigration,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExecutionDiagnostic {
-    SelectedProvider(ProviderBinding),
-    SelectedDevice(DeviceBinding),
-    SelectedCapability(CapabilityBinding),
-    ResolutionDecision(ResolutionDecision),
-    RejectedProviderCandidate {
-        provider: ProviderBinding,
-        reason: ResolutionRejectionReason,
-    },
-    Memory(MemoryPlanningDiagnostic),
-    TransferRequired {
-        resource: TensorResourceId,
-        from: ResourceAffinity,
-        to: ResourceAffinity,
-    },
-    MaterializationRequired {
-        source: String,
-    },
-    PolicyDecisionReason(ResolutionDecisionReason),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ComputeExecutionPlan {
-    pub id: ExecutionPlanId,
-    pub trace_id: TraceId,
-    pub graph: ComputeGraphId,
-    pub provider: ProviderBinding,
-    pub device: Option<DeviceBinding>,
-    pub capability: CapabilityBinding,
-    pub policy: ResolutionPolicyId,
-    pub classification: ComputeExecutionClassification,
-    pub inputs: Vec<ExecutionInput>,
-    pub outputs: Vec<ExecutionOutput>,
-    pub constraints: Vec<ExecutionConstraint>,
-    pub steps: Vec<ExecutionStep>,
-    pub memory_plan: MemoryPlan,
-    pub diagnostics: Vec<ExecutionDiagnostic>,
-    pub(crate) validated: bool,
-}
-impl ComputeExecutionPlan {
-    pub fn is_validated(&self) -> bool {
-        self.validated
-    }
-    pub fn trace_id(&self) -> &TraceId {
-        &self.trace_id
-    }
-    pub fn observations(&self) -> Vec<RuntimeEvent> {
-        runtime_events_for_execution_plan(self)
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComputePlanningError {
@@ -289,207 +106,6 @@ impl fmt::Display for ComputePlanningError {
 }
 impl Error for ComputePlanningError {}
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum MemoryRegionKind {
-    GraphInput,
-    GraphOutput,
-    Intermediate,
-    Temporary,
-    Materialization,
-    Transfer,
-    HostStaging,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemoryRequirement {
-    pub id: String,
-    pub region: MemoryRegionKind,
-    pub byte_size: u64,
-    pub affinity: ResourceAffinity,
-    pub reusable: bool,
-}
-impl MemoryRequirement {
-    pub fn new(
-        id: impl Into<String>,
-        region: MemoryRegionKind,
-        byte_size: u64,
-        affinity: ResourceAffinity,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            region,
-            byte_size,
-            affinity,
-            reusable: false,
-        }
-    }
-    pub const fn reusable(mut self) -> Self {
-        self.reusable = true;
-        self
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TensorLifetime {
-    pub id: String,
-    pub first_step: usize,
-    pub last_step: usize,
-    pub byte_size: u64,
-    pub affinity: ResourceAffinity,
-}
-impl TensorLifetime {
-    pub fn overlaps(&self, other: &Self) -> bool {
-        self.first_step <= other.last_step && other.first_step <= self.last_step
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BufferLifetime {
-    pub id: String,
-    pub source: String,
-    pub first_step: usize,
-    pub last_step: usize,
-    pub byte_size: u64,
-    pub affinity: ResourceAffinity,
-    pub reuses: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MemoryPlanningDecision {
-    Allocate { requirement: String },
-    Reuse { requirement: String, buffer: String },
-    PreservePinnedResource { resource: TensorResourceId },
-    RequireMaterialization { requirement: String },
-    RequireTransfer { requirement: String },
-    AccountHostStaging { requirement: String },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MemoryPlanningDiagnostic {
-    EstimatedRequirement {
-        requirement: String,
-        bytes: u64,
-    },
-    PeakBytes {
-        bytes: u64,
-    },
-    ProviderLimit {
-        provider: ProviderBinding,
-        max_bytes: u64,
-    },
-    DeviceLimit {
-        device: DeviceBinding,
-        max_bytes: u64,
-    },
-    MaterializationCost {
-        bytes: u64,
-    },
-    TransferCost {
-        bytes: u64,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemoryPlan {
-    pub provider: ProviderBinding,
-    pub graph: Option<ComputeGraphId>,
-    pub requirements: Vec<MemoryRequirement>,
-    pub tensor_lifetimes: Vec<TensorLifetime>,
-    pub buffer_lifetimes: Vec<BufferLifetime>,
-    pub pressure: MemoryPressureReport,
-    pub decisions: Vec<MemoryPlanningDecision>,
-    pub diagnostics: Vec<MemoryPlanningDiagnostic>,
-    pub output_affinity: ResourceAffinity,
-}
-
-pub(crate) fn memory_pressure_diagnostic(report: &MemoryPressureReport) -> ComputeDiagnostic {
-    let mut diagnostic = ComputeDiagnostic::new();
-    if let Some(provider) = &report.selected_provider {
-        diagnostic = diagnostic.with_provider(provider.clone());
-    }
-    if let Some(device) = &report.selected_device {
-        diagnostic = diagnostic.with_device(device.clone());
-    }
-    diagnostic.with_backend_message(format!(
-        "memory pressure: required={} peak={} materialization={} transfer={}",
-        report.estimated_required_bytes,
-        report.estimated_peak_bytes,
-        report.materialization_cost_bytes,
-        report.transfer_buffer_cost_bytes
-    ))
-}
-
-impl MemoryPlan {
-    pub(crate) fn new(
-        provider: ProviderBinding,
-        graph: Option<ComputeGraphId>,
-        execution_context: ExecutionContextId,
-    ) -> Self {
-        let output_affinity = ResourceAffinity::new(FallbackClass::ProviderPinned)
-            .with_provider(provider.clone())
-            .with_capability(CapabilityBinding::new(
-                CapabilityId::new(COMPUTE_CAPABILITY_ID),
-                COMPUTE_CAPABILITY_VERSION,
-            ))
-            .with_execution_context(execution_context);
-        Self {
-            provider: provider.clone(),
-            graph,
-            requirements: Vec::new(),
-            tensor_lifetimes: Vec::new(),
-            buffer_lifetimes: Vec::new(),
-            pressure: MemoryPressureReport {
-                selected_provider: Some(provider),
-                ..MemoryPressureReport::default()
-            },
-            decisions: Vec::new(),
-            diagnostics: Vec::new(),
-            output_affinity,
-        }
-    }
-    pub(crate) fn add_requirement(
-        &mut self,
-        requirement: MemoryRequirement,
-    ) -> Result<(), MemoryPlanningError> {
-        self.pressure.estimated_required_bytes = self
-            .pressure
-            .estimated_required_bytes
-            .checked_add(requirement.byte_size)
-            .ok_or_else(|| MemoryPlanningError::SizeOverflow {
-                reason: "total memory requirements overflow u64".into(),
-                report: self.pressure.clone(),
-            })?;
-        self.pressure.estimated_peak_bytes = self
-            .pressure
-            .estimated_peak_bytes
-            .checked_add(requirement.byte_size)
-            .ok_or_else(|| MemoryPlanningError::SizeOverflow {
-                reason: "peak memory requirements overflow u64".into(),
-                report: self.pressure.clone(),
-            })?;
-        self.diagnostics
-            .push(MemoryPlanningDiagnostic::EstimatedRequirement {
-                requirement: requirement.id.clone(),
-                bytes: requirement.byte_size,
-            });
-        self.diagnostics.push(MemoryPlanningDiagnostic::PeakBytes {
-            bytes: self.pressure.estimated_peak_bytes,
-        });
-        self.requirements.push(requirement);
-        Ok(())
-    }
-    pub(crate) fn find_reusable_buffer(&self, lifetime: &TensorLifetime) -> Option<String> {
-        self.buffer_lifetimes
-            .iter()
-            .find(|buffer| {
-                buffer.byte_size >= lifetime.byte_size
-                    && buffer.last_step < lifetime.first_step
-                    && buffer.affinity.validate_with(&lifetime.affinity).is_ok()
-            })
-            .map(|buffer| buffer.id.clone())
-    }
-}
-
 pub(crate) fn provider_memory_limit(metadata: &ProviderMetadata) -> u64 {
     let advertisement = effective_compute_advertisement(metadata);
     advertisement
@@ -510,18 +126,6 @@ pub(crate) fn provider_memory_limit(metadata: &ProviderMetadata) -> u64 {
         )
         .min()
         .unwrap_or(u64::MAX)
-}
-
-pub(crate) fn memory_bytes(
-    descriptor: &TensorDescriptor,
-    report: &MemoryPressureReport,
-) -> Result<u64, MemoryPlanningError> {
-    descriptor
-        .byte_size()
-        .map_err(|error| MemoryPlanningError::SizeOverflow {
-            reason: error.to_string(),
-            report: report.clone(),
-        })
 }
 
 pub(crate) fn memory_error_from_compute_validation(
@@ -669,14 +273,6 @@ pub(crate) fn execution_plan_id(
     ExecutionPlanId::new(format!("plan:{graph}:{provider}"))
 }
 
-pub(crate) fn provider_execution_id(
-    operation: ScheduledOperationId,
-    plan: &ExecutionPlanId,
-    provider: &ProviderBinding,
-) -> ProviderExecutionId {
-    ProviderExecutionId::new(format!("provider-execution:{operation}:{plan}:{provider}"))
-}
-
 pub(crate) fn classify_execution_plan(inputs: &[ExecutionInput]) -> ComputeExecutionClassification {
     if inputs.iter().any(|input| {
         input.resource.is_some() && input.affinity.fallback() == FallbackClass::ProviderPinned
@@ -722,5 +318,129 @@ pub(crate) fn execution_phase_from_step_kind(kind: &ExecutionStepKind) -> Comput
         }
         ExecutionStepKind::SubmitToProvider => ComputeExecutionPhase::ProviderSubmission,
         _ => ComputeExecutionPhase::Validation,
+    }
+}
+
+impl From<ComputePlanningError> for ComputeError {
+    fn from(error: ComputePlanningError) -> Self {
+        let message = error.to_string();
+        match error {
+            ComputePlanningError::PlanningFailed { .. } => ComputeError::new(
+                ComputeErrorCode::PlanningFailed,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::NoCompatibleProvider { capability } => ComputeError::new(
+                ComputeErrorCode::NoCompatibleProvider,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_capability(capability))
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::NoCompatibleDevice { provider } => ComputeError::new(
+                ComputeErrorCode::NoCompatibleDevice,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_provider(provider))
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::PolicyRejectedProvider { capability, .. } => ComputeError::new(
+                ComputeErrorCode::PolicyRejectedProvider,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_capability(capability))
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::UnsupportedOperation(operation) => ComputeError::new(
+                ComputeErrorCode::UnsupportedOperation,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_diagnostic(
+                ComputeDiagnostic::new()
+                    .with_backend_message(format!("unsupported operation schema: {operation}")),
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::UnsupportedDType(_) => ComputeError::new(
+                ComputeErrorCode::UnsupportedDType,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::UnsupportedLayout(_) => ComputeError::new(
+                ComputeErrorCode::UnsupportedLayout,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::UnsupportedPrecisionPolicy(_) => ComputeError::new(
+                ComputeErrorCode::UnsupportedOperation,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::IncompatibleResourceAffinity(error) => ComputeError::from(error),
+            ComputePlanningError::UnresolvedAffinityGroup(_) => ComputeError::new(
+                ComputeErrorCode::AffinityGroupMismatch,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+            ComputePlanningError::MemoryPlanFailed(error) => ComputeError::from(error),
+            ComputePlanningError::DataMovementRequired { .. } => ComputeError::new(
+                ComputeErrorCode::DataMovementRequired,
+                ComputeErrorPhase::DataMovement,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ExplicitTransferRequired),
+            ComputePlanningError::UnsupportedTransfer { .. } => ComputeError::new(
+                ComputeErrorCode::UnsupportedTransfer,
+                ComputeErrorPhase::DataMovement,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ExplicitTransferRequired),
+            ComputePlanningError::MaterializationRequired { .. } => ComputeError::new(
+                ComputeErrorCode::MaterializationRequired,
+                ComputeErrorPhase::Materialization,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::ExplicitMaterializationRequired),
+            ComputePlanningError::ProviderUnavailable(provider) => ComputeError::new(
+                ComputeErrorCode::ProviderUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_provider(provider))
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            ComputePlanningError::DeviceUnavailable(device) => ComputeError::new(
+                ComputeErrorCode::DeviceUnavailable,
+                ComputeErrorPhase::Resolution,
+                ComputeErrorSeverity::Recoverable,
+                message,
+            )
+            .with_diagnostic(ComputeDiagnostic::new().with_device(device))
+            .with_recovery_hint(RecoveryHint::RetryBeforeState),
+            ComputePlanningError::InvalidExecutionPlan { .. } => ComputeError::new(
+                ComputeErrorCode::InvalidExecutionPlan,
+                ComputeErrorPhase::Planning,
+                ComputeErrorSeverity::Terminal,
+                message,
+            )
+            .with_recovery_hint(RecoveryHint::NotRetryable),
+        }
     }
 }
