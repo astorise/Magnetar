@@ -763,6 +763,21 @@ fn real_public_mistral_7b_iq3_m_gguf_checkpoint_generates_on_cuda() {
     });
 }
 
+/// The real `Mistral-7B-Instruct-v0.3` `IQ3_M` export on the optimized
+/// CPU Provider.
+#[test]
+#[ignore = "downloads/holds a real quantized checkpoint"]
+fn real_public_mistral_7b_iq3_m_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native mistral-7b iq3_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ3_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ3_M.gguf",
+        sha256: MISTRAL_7B_IQ3_M_SHA256,
+    });
+}
+
 /// `Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf`'s sha256 (2,830,880,992 bytes) at
 /// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ3_XXS`
 /// matrices.
@@ -797,6 +812,21 @@ const MISTRAL_7B_IQ2_M_SHA256: &str =
 fn real_public_mistral_7b_iq2_m_gguf_checkpoint_generates_on_cuda() {
     generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
         label: "cuda mistral-7b iq2_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ2_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ2_M.gguf",
+        sha256: MISTRAL_7B_IQ2_M_SHA256,
+    });
+}
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ2_M` export on the optimized
+/// CPU Provider.
+#[test]
+#[ignore = "downloads/holds a real quantized checkpoint"]
+fn real_public_mistral_7b_iq2_m_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native mistral-7b iq2_m gguf",
         dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ2_M_REAL_CHECKPOINT_DIR",
         repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
         revision: MISTRAL_7B_Q8_0_REVISION,
