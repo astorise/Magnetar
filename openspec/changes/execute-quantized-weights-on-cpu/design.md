@@ -178,3 +178,45 @@ so those matrices are dequantized to `f32` at load and multiplied dense:
 they explain the gap to `Q4_K_M` (and the extra resident memory) rather
 than the new Kernels. Packing `Q5_K` (runtime format, CPU and CUDA
 Kernels) is the next step for these mixes.
+
+`Q5_K` is now a packed format (Runtime `PackedWeightFormat::Q5K`, its
+dequantization bit-exact against gguf-py 0.19.0): the optimized CPU
+Provider decodes it with Q4_K's layout plus the 32-byte high-bit plane as
+each value's fifth bit (AVX2 kernel: 4.32 ms / 9.3 GB/s and 3.96 ms /
+10.2 GB/s on the two Mistral shapes, 4 local cores, against the f32 dense
+product before), and CUDA reads it directly too (dequantize, f32 and
+`__dp4a` decode Kernels). The `Q3_K_M` and `IQ4_XS` mixes therefore keep
+every quantized matrix packed.
+
+GPU smoke run 43612369661 (commit `5d2352e`, `Q5_K` packed), same host,
+3 threads; the CUDA `Q5_K` conformance test passes:
+
+| Mistral 7B | CPU TPOT | CPU matmul / matmul-residual per call | CUDA TPOT |
+|---|---|---|---|
+| `Q4_K_M` | 379.0 ms | 1.42 / 2.03 ms | 17.5 ms |
+| `IQ4_XS` | 395.3 ms (was 508.6) | 1.50 / 1.94 ms | 16.5 ms (was 17.5) |
+| `Q3_K_M` | 602.8 ms (was 881.4) | 2.86 / 1.87 ms | 15.1 ms (was 16.2) |
+
+All answer "Paris". With `Q5_K` packed, `IQ4_XS` runs at `Q4_K_M`'s pace
+and `Q3_K_M`'s matmul-residual (its `Q4_K`/`Q5_K` `attn_output` and
+`ffn_down`) drops from 6.35 to 1.87 ms. `Q3_K_M`'s plain matmuls
+(`Q3_K` `q`/`k`/`gate`/`up`) stay at 2.86 ms per call: the `Q3_K` kernel
+(about 5 GB/s locally, half of `Q4_K`) is now its limit.
+
+The `Q3_K` kernel now unpacks each super-block's sixteen scales with SSE
+and places each run's bits with constant shifts: a Mistral-shaped matmul
+on 4 local cores drops from about 4.5 ms (5.5 GB/s) to 2.4-3.1 ms
+(8-10.5 GB/s), level with `Q4_K`.
+
+GPU smoke run 43620986794 (commit `435bad2`), same host, 3 threads:
+
+| Mistral 7B | CPU TPOT | CPU matmul / matmul-residual per call |
+|---|---|---|
+| `Q4_K_M` | 373.1 ms | 1.39 / 2.00 ms |
+| `IQ4_XS` | 400.3 ms | 1.53 / 1.97 ms |
+| `Q3_K_M` | 375.8 ms (was 602.8) | 1.48 (was 2.86) / 1.88 ms |
+
+All answer "Paris". `Q3_K_M` now runs at `Q4_K_M`'s pace on the CPU,
+although it reads less (3.5 against 4.4 GB of weights: about 9.4 and
+11.8 GB/s per token), so the low-bit decode still costs more per byte
+than `Q4_K`'s.
