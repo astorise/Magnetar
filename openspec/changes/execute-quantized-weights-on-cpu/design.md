@@ -216,6 +216,7 @@ GPU smoke run 43620986794 (commit `435bad2`), same host, 3 threads:
 | `IQ4_XS` | 400.3 ms | 1.53 / 1.97 ms |
 | `Q3_K_M` | 375.8 ms (was 602.8) | 1.48 (was 2.86) / 1.88 ms |
 
-All answer "Paris". `Q3_K_M` now runs at `Q4_K_M`'s pace on the CPU:
-every Mistral mix tried is bounded by memory bandwidth, not by a format's
-decode.
+All answer "Paris". `Q3_K_M` now runs at `Q4_K_M`'s pace on the CPU,
+although it reads less (3.5 against 4.4 GB of weights: about 9.4 and
+11.8 GB/s per token), so the low-bit decode still costs more per byte
+than `Q4_K`'s.
