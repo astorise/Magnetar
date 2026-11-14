@@ -479,9 +479,11 @@ pub fn reject_experimental_flag_enabled_by_default(
 /// and `providers/tpu` (Google Coral `libedgetpu`) submodules -- each a
 /// real device-discovery-only Provider with no compute Kernels yet and no
 /// matching hardware in this repository's own CI, so each stays disabled
-/// by default like every other non-baseline Provider. `openvino-provider`
-/// and `qnn-provider` remain distinct, not-yet-implemented roadmap
-/// hardware families (see `magnetar_runtime::provider_roadmap::
+/// by default like every other non-baseline Provider. `providers/qualcomm`
+/// (QNN backend discovery, no compute Kernels, nothing verified on Qualcomm
+/// hardware) is the first step toward `qnn-provider`, which stays disabled
+/// and unclaimed. `openvino-provider` remains a distinct, not-yet-implemented
+/// roadmap hardware family (see `magnetar_runtime::provider_roadmap::
 /// ProviderRoadmapHardwareFamily`) -- OpenVINO and Qualcomm QNN are not
 /// the same hardware `providers/npu` targets (Intel NPU via Level Zero),
 /// so they are not satisfied by it.

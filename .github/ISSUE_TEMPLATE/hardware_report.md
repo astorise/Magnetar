@@ -1,6 +1,6 @@
 ---
 name: Hardware / Provider report
-about: A Provider (CUDA, ROCm, Metal, WGPU, NPU, TPU, ...) misbehaves on real hardware, or you have hardware this project's own tooling lacks
+about: A Provider (CUDA, ROCm, Metal, WGPU, NPU, TPU, Qualcomm, ...) misbehaves on real hardware, or you have hardware this project's own tooling lacks
 title: "[P?] "
 labels: []
 ---
@@ -15,7 +15,7 @@ hardware are genuinely useful here.
 
 ## Provider and hardware
 
-- Provider: <!-- providers/cuda, providers/rocm, providers/metal, providers/wgpu, providers/npu, providers/tpu, providers/cpu -->
+- Provider: <!-- providers/cuda, providers/rocm, providers/metal, providers/wgpu, providers/npu, providers/tpu, providers/qualcomm, providers/cpu -->
 - Device / GPU model:
 - Driver version:
 - OS and version:

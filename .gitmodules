@@ -52,3 +52,6 @@
 [submodule "components/deepseek"]
 	path = components/deepseek
 	url = https://github.com/astorise/Magnetar-component-DeepSeek.git
+[submodule "providers/qualcomm"]
+	path = providers/qualcomm
+	url = https://github.com/astorise/Magnetar-provider-Qualcomm.git

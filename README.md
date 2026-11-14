@@ -122,7 +122,12 @@ Implemented today:
   discovery only, via Google Coral's `libedgetpu` API, targeting the real
   local Edge TPU accelerator (not Google Cloud TPU, a cloud service with
   no local device), gracefully unavailable everywhere this repository's
-  tooling can verify (no Coral hardware).
+  tooling can verify (no Coral hardware). External Qualcomm Provider
+  (`providers/qualcomm`): backend discovery only, via run-time loading of
+  Qualcomm AI Runtime (QNN) libraries for Hexagon HTP, Adreno GPU and CPU
+  from explicitly configured directories, one Device per backend found,
+  gracefully unavailable everywhere this repository's tooling can verify
+  (no QAIRT SDK, no Qualcomm hardware); no compute Kernels yet.
 - Model Artifact, Model Loading, Model Instance, Tokenizer, Generation,
   Sampling, Session, KV Cache, Prefix Cache, Continuous Batching, Runtime
   Inference API, and E2E conformance contract surfaces
@@ -175,7 +180,7 @@ Implemented only as a baseline, fixture, or incomplete production surface:
 
 Deferred or unsupported for v1.0:
 
-- OpenVINO and QNN Providers
+- OpenVINO Provider, and QNN compute (`providers/qualcomm` covers discovery only)
 - Native Metal FFI (`providers/metal` is an honest, unconditionally-
   unavailable placeholder -- no macOS environment exists in this
   repository's tooling to implement or verify it; `providers/wgpu`
@@ -186,6 +191,9 @@ Deferred or unsupported for v1.0:
 - NPU compute Kernels (`providers/npu` does real device discovery only,
   via Intel's oneAPI Level Zero API -- no Intel NPU hardware exists in
   this repository's tooling to implement or verify compute)
+- Qualcomm compute Kernels (`providers/qualcomm` does backend discovery
+  only, verified against a mock and a fake library -- no QAIRT SDK or
+  Qualcomm hardware exists in this repository's tooling)
 - TPU compute Kernels (`providers/tpu` does real device discovery only,
   via Google Coral's `libedgetpu` API, targeting the real local Edge TPU
   accelerator, not Google Cloud TPU -- no Coral hardware exists in this
