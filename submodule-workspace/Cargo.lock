@@ -1088,7 +1088,10 @@ name = "magnetar-provider-cuda"
 version = "1.0.0"
 dependencies = [
  "cudarc",
- "magnetar-runtime",
+ "magnetar-core",
+ "magnetar-graph",
+ "magnetar-kernel",
+ "magnetar-provider-api",
 ]
 
 [[package]]
