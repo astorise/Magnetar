@@ -252,3 +252,19 @@ caches per call), every (head, query) pair goes to the pool, and the dot
 products and weighted value sums vectorize. Mistral-shaped decode step
 over a 2048-row cache, 4 local cores: 64 keys 6.2 ms to 0.07 ms, 2048
 keys 121 ms to 2.4 ms.
+
+GPU smoke run 43649106260 (commit `23580a5`), same host, 3 threads: the
+native attention costs 0.067 ms per call on Mistral 7B (0.56 ms through
+the Reference CPU kernel) and 0.027 ms on Qwen2.5-0.5B (0.116 ms). TPOT:
+
+| Model | TPOT (before) |
+|---|---|
+| Qwen2.5-0.5B `Q8_0` | 51.7 ms (53.5) |
+| Mistral 7B `Q4_K_M` | 358.3 ms (375) |
+| Mistral 7B `Q3_K_M` | 358.6 ms (376) |
+| Mistral 7B `IQ4_XS` | 374.6 ms (400) |
+| Mistral 7B `IQ3_M` | 558.6 ms (582) |
+| Mistral 7B `IQ2_M` | 468.6 ms (485) |
+
+All answer "Paris". Attention is now under 1 % of a Mistral token; the
+matmuls remain the cost.
