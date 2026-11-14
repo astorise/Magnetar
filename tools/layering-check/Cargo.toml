@@ -9,5 +9,5 @@ description = "Checks that Magnetar Runtime modules only depend on their own lay
 [dependencies]
 proc-macro2 = "1"
 serde = { version = "1.0", features = ["derive"] }
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 toml = "1.0"
