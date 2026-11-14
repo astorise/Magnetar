@@ -51,6 +51,8 @@ Stays in `magnetar-runtime`: `ProviderLoader`, `ProviderLoadingMode`, `ProviderL
 
 The table is the target. The inventory fixes the exact item list, in particular which types `ComputeExecutionPlan` and `ProviderMetadata` pull with them.
 
+**As built.** The inventory (a closure over the identifiers each moved item names) gave a smaller set than the table. `affinity_resolution` is not needed: the Provider contract names neither affinity type. Three modules were added: `runtime_event` (the observation event types that an execution plan and a Provider result carry), `provider_api` (the contract half of `provider`, with `provider` kept as a facade) and `provider_loading` (the loader half, in Runtime orchestration). The `ComputeError` family and `memory_pressure_diagnostic` moved with `compute_support`. `reference_cpu::dtype_conversion` in the inventory is an unrelated associated function with the same name.
+
 ### D3. Items that need a decision at move time
 
 - **`ProviderExecutionRequest::from_operation(&ScheduledOperation)`**. An inherent method cannot be defined outside the type's crate. Either `ScheduledOperation` (a data struct: id, plan, state, order, diagnostics, result) moves down with its embedded types, or the method stays reachable through a public extension trait in `magnetar-runtime`. Moving the struct is preferred if its embedded types are data only: it keeps the method path unchanged.
