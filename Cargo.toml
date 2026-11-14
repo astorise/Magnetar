@@ -29,8 +29,8 @@
 # reason; the harness that feeds it real-checkpoint timings lives in the
 # submodule workspace (`integration-tests/production-loading`).
 #
-# `magnetar-core`, `magnetar-graph`, `magnetar-model`, `magnetar-kernel` and
-# `magnetar-engine` (`layer-and-split-runtime-crate`) are the layers of
+# `magnetar-core`, `magnetar-graph`, `magnetar-model`, `magnetar-kernel`,
+# `magnetar-provider-api` and `magnetar-engine` (`layer-and-split-runtime-crate`) are the layers of
 # `magnetar-runtime`, which re-exports them; none depends on a submodule.
 #
 # `tools/layering-check` (`layer-and-split-runtime-crate`) depends on
@@ -41,6 +41,7 @@ members = [
     "magnetar-graph",
     "magnetar-kernel",
     "magnetar-model",
+    "magnetar-provider-api",
     "magnetar-runtime",
     "tools/coverage-ratchet",
     "roadmap-contracts",

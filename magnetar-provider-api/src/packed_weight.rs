@@ -4,7 +4,7 @@
 //! A packed weight keeps a checkpoint's validated quantized bytes as they
 //! were stored instead of expanding them to `f32` at load. Model Loading
 //! offers one to the Instance's Provider through
-//! [`crate::provider::ProviderExecutionApi::write_packed_weight_tensor`]; a
+//! [`crate::ProviderExecutionApi::write_packed_weight_tensor`]; a
 //! Provider that computes directly from the format stores it, any other
 //! declines, and Model Loading then dequantizes it to `f32` exactly as
 //! before. Which of the two happened is never hidden: the Provider's answer
@@ -19,7 +19,7 @@
 use crate::quantization::f16_to_f32;
 use crate::tensor::HostTensor;
 
-/// [`crate::model::ModelTensorMetadata::layout`] value declaring that a
+/// `magnetar_runtime::model::ModelTensorMetadata::layout` value declaring that a
 /// tensor's bytes store the transpose of its declared (logical) shape:
 /// a 2D tensor declared `[rows, cols]` is stored as `[cols, rows]`.
 pub const TRANSPOSED_STORAGE_LAYOUT: &str = "transposed";
@@ -266,7 +266,8 @@ impl PackedWeight {
 }
 
 /// The row-major transpose of a `rows x cols` matrix.
-pub(crate) fn transpose(values: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+#[doc(hidden)]
+pub fn transpose(values: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0.0_f32; values.len()];
     for row in 0..rows {
         for col in 0..cols {
@@ -276,7 +277,7 @@ pub(crate) fn transpose(values: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
-/// A Provider's answer to [`crate::provider::ProviderExecutionApi::write_packed_weight_tensor`].
+/// A Provider's answer to [`crate::ProviderExecutionApi::write_packed_weight_tensor`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackedWeightWrite {
     /// The Provider stored the packed bytes and computes from them.

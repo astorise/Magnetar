@@ -27,8 +27,6 @@ pub(super) const FIRST_NATIVE_SOURCE: &str = concat!(
 
 use crate::planning::*;
 
-use crate::scheduler::*;
-
 use crate::{CapabilityVersion, Device};
 
 use std::sync::atomic::{AtomicBool, Ordering};

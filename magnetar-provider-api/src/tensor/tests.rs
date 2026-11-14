@@ -4,11 +4,9 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
-use crate::affinity::{FallbackClass, ResourceAffinity};
-use crate::compute::{
-    ComputeDType, DTypeDescriptor, ShapeDescriptor, TensorDescriptor, TensorResourceId,
-};
 use crate::memory::{MemoryPlacement, TensorResidency};
+use crate::{ComputeDType, DTypeDescriptor, ShapeDescriptor, TensorDescriptor, TensorResourceId};
+use crate::{FallbackClass, ResourceAffinity};
 
 fn tensor_resource_for_test(id: &str) -> TensorResource {
     let descriptor = TensorDescriptor::materialized(
