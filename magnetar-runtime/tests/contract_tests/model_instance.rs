@@ -11,6 +11,7 @@ use magnetar_runtime::{
     ModelResidencyId, ModelTrustStore, ProviderAdmissionDecision, ProviderHealthState,
     ProviderPressureLevel, ProviderReadinessState, ResourceAffinity, Runtime, TokenizerId,
 };
+use magnetar_runtime::{ModelInstance, runtime_diagnostics};
 
 fn digest() -> String {
     "sha256:0000000000000000000000000000000000000000000000000000000000000001".into()
@@ -759,4 +760,19 @@ fn failure_handling_prevents_failed_and_invalid_instances_from_accepting_work() 
         runtime.model_instances_mut().generation_reference(&invalid),
         Err(ModelInstanceError::ModelInstanceInvalid)
     );
+}
+
+#[test]
+fn inference_api_diagnostics_and_status_debug_output_never_exposes_raw_pointer_markers() {
+    let runtime = Runtime::builder().build().unwrap();
+    let diagnostics = runtime_diagnostics(&runtime);
+    let instance = runtime
+        .model_instances()
+        .instances()
+        .next()
+        .map(ModelInstance::status);
+
+    let debug_output = format!("{diagnostics:?} {instance:?}");
+    assert!(!debug_output.contains("0x"));
+    assert!(!debug_output.to_ascii_lowercase().contains("pointer"));
 }

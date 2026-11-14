@@ -408,3 +408,6 @@ pub fn prepare_first_native_execution_plans_for_provider(
         decode_node_count: graphs.decode_node_count,
     })
 }
+
+#[cfg(test)]
+mod tests;

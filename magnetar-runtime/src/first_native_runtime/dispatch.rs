@@ -1665,3 +1665,6 @@ pub(super) fn dispatch_qwen_attention(
         attributes,
     )
 }
+
+#[cfg(test)]
+mod tests;

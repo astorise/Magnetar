@@ -698,3 +698,60 @@ fn provider_roadmap_quantized_path_requires_explicit_metadata() {
     };
     assert!(validate_quantization_declaration(&complete).is_ok());
 }
+
+#[test]
+fn provider_roadmap_optimized_provider_does_not_redefine_operator_semantics() {
+    // A fused kernel that does not preserve portable Operator/graph
+    // semantics is rejected outright, regardless of how it declares itself.
+    let non_preserving = KernelFusionMetadata {
+        operator_group: vec![OperatorId::magnetar(
+            "softmax",
+            1,
+            OperatorFamily::Activation,
+        )],
+        preserves_graph_semantics: false,
+    };
+    let precision = KernelPrecisionMetadata {
+        tolerance_profile: Some("operator-default".into()),
+        ..KernelPrecisionMetadata::default()
+    };
+    let fallback_hints = BTreeSet::from([KernelFallbackClass::AlternateKernel]);
+    let outcome = validate_fused_kernel_declaration(FusedKernelDeclaration {
+        fusion: Some(&non_preserving),
+        precision: &precision,
+        fallback_hints: &fallback_hints,
+    });
+    assert!(matches!(
+        outcome,
+        Err(ProviderRoadmapError::ProviderFusionInvalid { .. })
+    ));
+}
+
+#[test]
+fn provider_roadmap_benchmarks_stay_separate_from_conformance() {
+    // A benchmark result is never accepted anywhere a conformance decision
+    // is made: a report whose only entry is a correctness failure is not
+    // conformant no matter how good a (structurally separate) benchmark
+    // result would look.
+    let fast_but_wrong = ProviderRoadmapConformanceReport {
+        results: vec![ProviderRoadmapConformanceResult {
+            requirement: "optimized matmul matches Reference CPU".into(),
+            passed: false,
+            diagnostic: Some("output differs beyond tolerance".into()),
+        }],
+    };
+    assert!(!fast_but_wrong.is_conformant());
+
+    let benchmark = ProviderRoadmapBenchmarkResult {
+        category: ProviderRoadmapBenchmarkCategory::TokensPerSecond,
+        provider: "cuda".into(),
+        value: 999.0,
+        unit: "tokens/sec".into(),
+    };
+    // The benchmark result exists purely as data; nothing consumes it as
+    // conformance input.
+    assert_eq!(
+        benchmark.category,
+        ProviderRoadmapBenchmarkCategory::TokensPerSecond
+    );
+}

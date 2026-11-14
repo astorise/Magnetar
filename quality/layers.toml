@@ -20,7 +20,8 @@ graph = 2
 model-data = 3
 kernel = 4
 component-engine = 4
-runtime = 5
+provider-api = 5
+runtime = 6
 
 [modules]
 # Core types: no dependency on another layer.
@@ -69,6 +70,20 @@ graph_builder_capability = "component-engine"
 model_component = "component-engine"
 model_config_capability = "component-engine"
 
+# Provider API (`extract-provider-api-crate`): what Providers implement and
+# call. May use every layer below it, never Runtime orchestration or the
+# Component engine.
+compute_support = "provider-api"
+execution = "provider-api"
+layer_placement = "provider-api"
+operator_semantics = "provider-api"
+packed_weight = "provider-api"
+provider_api = "provider-api"
+quantization = "provider-api"
+runtime_event = "provider-api"
+tensor = "provider-api"
+tensor_parallel = "provider-api"
+
 # Runtime orchestration.
 adapter = "runtime"
 affinity = "runtime"
@@ -83,19 +98,18 @@ generation = "runtime"
 inference_api = "runtime"
 kernel_optimization_orchestration = "runtime"
 kv_cache = "runtime"
-layer_placement = "runtime"
 model_format_roadmap = "runtime"
 model_instance = "runtime"
 model_loading = "runtime"
 multi_device_placement = "runtime"
 observability = "runtime"
 operator_scope = "runtime"
-packed_weight = "runtime"
 phase_attribution = "runtime"
 planning = "runtime"
 prefix_cache = "runtime"
 production_model_ingestion = "runtime"
 provider = "runtime"
+provider_loading = "runtime"
 provider_roadmap = "runtime"
 qwen_model_component = "runtime"
 reference_cpu = "runtime"
@@ -103,8 +117,6 @@ runtime = "runtime"
 sampling = "runtime"
 scheduler = "runtime"
 session = "runtime"
-tensor = "runtime"
-tensor_parallel = "runtime"
 tokenizer = "runtime"
 
 # Modules kept in a higher layer than the one first planned for them, with
@@ -113,10 +125,6 @@ tokenizer = "runtime"
 [held.affinity]
 target = "core"
 reason = "AffinityResolution holds a `dyn Provider`, and AffinityError converts to ComputeError. Its data types moved to `binding` and `provider_status`."
-
-[held.tensor]
-target = "core"
-reason = "Tensor Resource handles name KernelError, MemoryPlacement and TensorResidency. Its descriptor types moved to `compute_types`."
 
 [held.operator_scope]
 target = "core"

@@ -51,6 +51,8 @@ Stays in `magnetar-runtime`: `ProviderLoader`, `ProviderLoadingMode`, `ProviderL
 
 The table is the target. The inventory fixes the exact item list, in particular which types `ComputeExecutionPlan` and `ProviderMetadata` pull with them.
 
+**As built.** The inventory (a closure over the identifiers each moved item names) gave a smaller set than the table. `affinity_resolution` is not needed: the Provider contract names neither affinity type. Three modules were added: `runtime_event` (the observation event types that an execution plan and a Provider result carry), `provider_api` (the contract half of `provider`, with `provider` kept as a facade) and `provider_loading` (the loader half, in Runtime orchestration). The `ComputeError` family and `memory_pressure_diagnostic` moved with `compute_support`. `reference_cpu::dtype_conversion` in the inventory is an unrelated associated function with the same name.
+
 ### D3. Items that need a decision at move time
 
 - **`ProviderExecutionRequest::from_operation(&ScheduledOperation)`**. An inherent method cannot be defined outside the type's crate. Either `ScheduledOperation` (a data struct: id, plan, state, order, diagnostics, result) moves down with its embedded types, or the method stays reachable through a public extension trait in `magnetar-runtime`. Moving the struct is preferred if its embedded types are data only: it keeps the method path unchanged.
@@ -74,6 +76,14 @@ Providers depend on `magnetar-provider-api` with a caret requirement on the majo
 After the crate is on `main`, each Provider repository gets one pull request: `magnetar-provider-api` replaces `magnetar-runtime` in `[dependencies]`, `magnetar_runtime::` paths become `magnetar_provider_api::` (or the lower layer crate's), `magnetar-runtime` moves to `[dev-dependencies]` where the conformance suite or the Reference CPU oracle is used, and the release workflow checks the new crate on crates.io. Submodule pins in Magnetar follow.
 
 A Provider that has not switched keeps building: it still depends on `magnetar-runtime`, which re-exports everything.
+
+### D7. Where the crate lives
+
+`magnetar-provider-api` stays in the Magnetar workspace, next to the five other layer crates, and is published with them. It is not placed in a repository of its own pinned as a submodule.
+
+Two reasons. First, the crate depends on `magnetar-core`, `magnetar-graph` and `magnetar-kernel`, and `magnetar-runtime` depends on it. In a separate repository, one release of Magnetar would be published in two rounds with a round trip between the repositories (core, graph and kernel; then the API crate; then the Runtime), which is the release coupling this change is meant to remove for Providers. Second, the root workspace deliberately has no submodule among its members, so that a plain `cargo build` works in a checkout without submodules (see the comment in `Cargo.toml`); a Runtime that depends on a submodule crate would end that.
+
+What Providers gain does not depend on the location: they depend on one small crate whose contents change rarely, so Runtime changes above it stop reaching their lockfiles. A separate repository could be reconsidered together with moving `magnetar-core`, `magnetar-graph` and `magnetar-kernel` there, which gives a single direction (contract repository first, Magnetar second); that is a larger change than this one and is not proposed here.
 
 ## Risks / Trade-offs
 

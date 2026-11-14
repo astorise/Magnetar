@@ -1799,3 +1799,6 @@ pub(super) fn materialize_first_native_graph_bindings(
     }
     Ok(materialized_bindings)
 }
+
+#[cfg(test)]
+mod tests;
