@@ -75,6 +75,14 @@ After the crate is on `main`, each Provider repository gets one pull request: `m
 
 A Provider that has not switched keeps building: it still depends on `magnetar-runtime`, which re-exports everything.
 
+### D7. Where the crate lives
+
+`magnetar-provider-api` stays in the Magnetar workspace, next to the five other layer crates, and is published with them. It is not placed in a repository of its own pinned as a submodule.
+
+Two reasons. First, the crate depends on `magnetar-core`, `magnetar-graph` and `magnetar-kernel`, and `magnetar-runtime` depends on it. In a separate repository, one release of Magnetar would be published in two rounds with a round trip between the repositories (core, graph and kernel; then the API crate; then the Runtime), which is the release coupling this change is meant to remove for Providers. Second, the root workspace deliberately has no submodule among its members, so that a plain `cargo build` works in a checkout without submodules (see the comment in `Cargo.toml`); a Runtime that depends on a submodule crate would end that.
+
+What Providers gain does not depend on the location: they depend on one small crate whose contents change rarely, so Runtime changes above it stop reaching their lockfiles. A separate repository could be reconsidered together with moving `magnetar-core`, `magnetar-graph` and `magnetar-kernel` there, which gives a single direction (contract repository first, Magnetar second); that is a larger change than this one and is not proposed here.
+
 ## Risks / Trade-offs
 
 - **A Provider-facing type turns out to depend on orchestration** → it stays in `magnetar-runtime`, the layer map records why, and the Provider that needs it keeps `magnetar-runtime` as a normal dependency until a follow-up.
