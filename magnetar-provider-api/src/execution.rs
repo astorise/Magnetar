@@ -7,9 +7,10 @@
 //! code that plans and schedules (`planning`, `scheduler`) so that a
 //! Provider can name them without depending on it.
 
-use crate::affinity::*;
+use crate::binding::*;
 use crate::capability::*;
-use crate::compute::*;
+use crate::compute_support::*;
+use crate::compute_types::*;
 use crate::provider_status::{
     ProviderExecutionDiagnostic, ScheduledOperationId, SchedulerErrorCode,
 };
@@ -195,7 +196,12 @@ pub struct ComputeExecutionPlan {
     pub steps: Vec<ExecutionStep>,
     pub memory_plan: MemoryPlan,
     pub diagnostics: Vec<ExecutionDiagnostic>,
-    pub(crate) validated: bool,
+    /// Set by `Runtime::plan_compute` once its validation passed, and only
+    /// there: a plan built anywhere else keeps this `false`. The field is
+    /// public because the Runtime lives in another crate; it is not part of
+    /// the Provider contract.
+    #[doc(hidden)]
+    pub validated: bool,
 }
 
 impl ComputeExecutionPlan {
@@ -326,7 +332,8 @@ pub struct MemoryPlan {
 }
 
 impl MemoryPlan {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         provider: ProviderBinding,
         graph: Option<ComputeGraphId>,
         execution_context: ExecutionContextId,
@@ -353,7 +360,8 @@ impl MemoryPlan {
             output_affinity,
         }
     }
-    pub(crate) fn add_requirement(
+    #[doc(hidden)]
+    pub fn add_requirement(
         &mut self,
         requirement: MemoryRequirement,
     ) -> Result<(), MemoryPlanningError> {
@@ -384,7 +392,8 @@ impl MemoryPlan {
         self.requirements.push(requirement);
         Ok(())
     }
-    pub(crate) fn find_reusable_buffer(&self, lifetime: &TensorLifetime) -> Option<String> {
+    #[doc(hidden)]
+    pub fn find_reusable_buffer(&self, lifetime: &TensorLifetime) -> Option<String> {
         self.buffer_lifetimes
             .iter()
             .find(|buffer| {
@@ -396,7 +405,8 @@ impl MemoryPlan {
     }
 }
 
-pub(crate) fn memory_bytes(
+#[doc(hidden)]
+pub fn memory_bytes(
     descriptor: &TensorDescriptor,
     report: &MemoryPressureReport,
 ) -> Result<u64, MemoryPlanningError> {

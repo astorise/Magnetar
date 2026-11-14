@@ -4,13 +4,13 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
-use crate::affinity::{
+use crate::capability::CapabilityId;
+use crate::device::{Device, DeviceDescriptor, DeviceId, DeviceMetadata, DeviceType};
+use crate::{ComputeError, ComputeErrorCode, ComputeErrorPhase};
+use crate::{
     HealthState, ProviderBinding, ProviderHealthReport, ProviderLifecycleState,
     ProviderReadinessState, ProviderStatusSnapshot,
 };
-use crate::capability::CapabilityId;
-use crate::compute::{ComputeError, ComputeErrorCode, ComputeErrorPhase};
-use crate::device::{Device, DeviceDescriptor, DeviceId, DeviceMetadata, DeviceType};
 use std::sync::Arc;
 
 use crate::capability::{Capability, CapabilityDescriptor, CapabilityVersion};

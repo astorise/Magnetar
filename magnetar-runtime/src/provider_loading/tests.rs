@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::capability::CapabilityVersion;
-use crate::provider_api::*;
 use crate::tests::*;
+use magnetar_provider_api::provider_api::*;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 

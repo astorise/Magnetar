@@ -283,8 +283,10 @@ jobs:
             magnetar-core/src/provider_abi.rs
             magnetar-core/src/provider_status.rs
             magnetar-runtime/src/reference_cpu.rs
+            magnetar-provider-api/src/execution.rs
+            magnetar-provider-api/src/operator_semantics.rs
             magnetar-runtime/src/scheduler.rs
-            magnetar-runtime/src/tensor.rs
+            magnetar-provider-api/src/tensor.rs
             magnetar-core/src/trace_id.rs
           )
           fail=0
@@ -360,7 +362,7 @@ jobs:
               echo "::error file=$file::inline 'mod tests { ... }' found -- move its body to a sibling tests.rs and declare 'mod tests;' here instead (see #54/#63)"
               fail=1
             fi
-          done < <(find magnetar-core/src magnetar-graph/src magnetar-model/src magnetar-kernel/src magnetar-engine/src magnetar-runtime/src roadmap-contracts/src -name '*.rs' -print0)
+          done < <(find magnetar-core/src magnetar-graph/src magnetar-model/src magnetar-kernel/src magnetar-provider-api/src magnetar-engine/src magnetar-runtime/src roadmap-contracts/src -name '*.rs' -print0)
           exit "$fail"
 
   # Component integration (task 15.6): Component submodules only, sparse
@@ -742,7 +744,19 @@ jobs:
         run: >-
           cargo run --locked -p layering-check --
           magnetar-core/src magnetar-graph/src magnetar-model/src magnetar-kernel/src
-          magnetar-engine/src magnetar-runtime/src quality/layers.toml
+          magnetar-provider-api/src magnetar-engine/src magnetar-runtime/src quality/layers.toml
+      # The Provider API crate is what Providers depend on instead of the whole
+      # Runtime (`extract-provider-api-crate`): it must never pull in the
+      # Runtime or the Component engine, not even for its tests.
+      - name: Check the Provider API crate's dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="$(cargo tree --locked -p magnetar-provider-api -e normal,build,dev --prefix none)"
+          if grep -E '^magnetar-(runtime|engine) ' <<<"$tree"; then
+            echo '::error::magnetar-provider-api depends on magnetar-runtime or magnetar-engine'
+            exit 1
+          fi
 
   coverage-baseline-history:
     name: quality / coverage baseline history

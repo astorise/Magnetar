@@ -1,11 +1,14 @@
-use crate::affinity::*;
+use crate::binding::*;
 use crate::capability::*;
-use crate::compute::*;
+use crate::compute_support::*;
+use crate::compute_types::*;
 use crate::device::*;
+use crate::execution::*;
 use crate::kernel::*;
+use crate::provider_abi::*;
 pub use crate::provider_abi::*;
 pub use crate::provider_status::ProviderError;
-use crate::scheduler::*;
+use crate::provider_status::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -137,7 +140,7 @@ pub trait Provider: Send + Sync {
     /// device-resident-only Provider, e.g. `CudaProvider`) SHALL override
     /// this to `false`, so the generic first-native generation entry point
     /// can fail a multi-step decode request early and explicitly with
-    /// [`crate::inference_api::InferenceApiError::Unsupported`] before any
+    /// `magnetar_runtime::InferenceApiError::Unsupported` before any
     /// real prefill work runs, instead of the request failing several
     /// layers deeper inside KV-history concatenation once it is already
     /// too late to avoid paying for that work.
@@ -975,7 +978,8 @@ impl ProviderRegistry {
         self.capability(&capability.id, capability.version)
             .is_some()
     }
-    pub(crate) fn clear(&mut self) {
+    #[doc(hidden)]
+    pub fn clear(&mut self) {
         self.devices.clear();
         self.device_providers.clear();
         self.capabilities.clear();
@@ -1117,6 +1121,3 @@ impl From<ProviderError> for ComputeError {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

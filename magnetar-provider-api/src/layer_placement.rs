@@ -3,7 +3,7 @@
 //! G05, staged layer segments first). The Runtime decides which contiguous
 //! range of layers each Device holds, from the weights' sizes and each
 //! Device's memory capacity, and hands the plan to the Provider
-//! ([`crate::provider::ProviderExecutionApi::apply_layer_placement`]) before
+//! ([`crate::ProviderExecutionApi::apply_layer_placement`]) before
 //! any weight is written. The Provider stores each weight on its layer's
 //! Device and runs each Kernel where its weights are, moving activations
 //! across a segment boundary explicitly.
