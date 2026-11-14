@@ -73,7 +73,9 @@ model_config_capability = "component-engine"
 # Provider API (`extract-provider-api-crate`): what Providers implement and
 # call. May use every layer below it, never Runtime orchestration or the
 # Component engine.
+operator_semantics = "provider-api"
 quantization = "provider-api"
+tensor = "provider-api"
 
 # Runtime orchestration.
 adapter = "runtime"
@@ -109,7 +111,6 @@ runtime = "runtime"
 sampling = "runtime"
 scheduler = "runtime"
 session = "runtime"
-tensor = "runtime"
 tensor_parallel = "runtime"
 tokenizer = "runtime"
 
@@ -119,10 +120,6 @@ tokenizer = "runtime"
 [held.affinity]
 target = "core"
 reason = "AffinityResolution holds a `dyn Provider`, and AffinityError converts to ComputeError. Its data types moved to `binding` and `provider_status`."
-
-[held.tensor]
-target = "core"
-reason = "Tensor Resource handles name KernelError, MemoryPlacement and TensorResidency. Its descriptor types moved to `compute_types`."
 
 [held.operator_scope]
 target = "core"

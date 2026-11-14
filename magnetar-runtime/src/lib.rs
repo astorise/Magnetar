@@ -59,6 +59,7 @@ pub mod multi_device_placement;
 pub mod observability;
 pub use magnetar_core::operator;
 pub mod operator_scope;
+pub mod operator_semantics;
 pub mod packed_weight;
 pub mod phase_attribution;
 pub mod planning;
