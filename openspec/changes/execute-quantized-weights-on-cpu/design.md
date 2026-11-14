@@ -220,3 +220,12 @@ All answer "Paris". `Q3_K_M` now runs at `Q4_K_M`'s pace on the CPU,
 although it reads less (3.5 against 4.4 GB of weights: about 9.4 and
 11.8 GB/s per token), so the low-bit decode still costs more per byte
 than `Q4_K`'s.
+
+The IQ2/IQ3 formats get a vectorized kernel: each run's four grid entries
+are gathered into one AVX2 register and its sign bytes expanded into a
+byte mask (shuffle, AND, compare) that flips the activations, instead of a
+scalar loop over every value. Mistral-shaped matmuls on 4 local cores:
+`IQ2_XXS`/`XS`/`S` from 15-17 ms (about 1 GB/s) to 2.8-5.7 ms
+(3-6.7 GB/s), `IQ3_XXS`/`S` from 14-17 ms to 3.1-5.2 ms (4.3-8.2 GB/s).
+The GPU smoke `gguf` suite now also runs Mistral `IQ3_M` and `IQ2_M` on
+the optimized CPU Provider.
