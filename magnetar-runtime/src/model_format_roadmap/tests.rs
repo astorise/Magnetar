@@ -4,11 +4,14 @@
 //! source rather than Runtime implementation source.
 
 use super::*;
+use crate::adapter::*;
+use crate::model::*;
 use crate::model::{
     ArtifactFormat, MODEL_ARTIFACT_SCHEMA_VERSION, ModelArchitecture, ModelArtifactId,
     ModelArtifactKind, ModelDType, ModelDigest, ModelLicenseMetadata, ModelManifest, ModelName,
     ModelRevision,
 };
+use crate::tests::*;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -456,4 +459,128 @@ fn model_format_roadmap_conformance_report_is_conformant() {
         );
     }
     assert!(report.is_conformant());
+}
+
+#[test]
+fn model_format_roadmap_detects_missing_and_duplicate_shard_tensors() {
+    let mut index = ShardIndex::default();
+    index.shards.push(ModelShard {
+        id: ModelShardId::new("shard-0").unwrap(),
+        digest: ModelDigest::parse(format!("sha256:{}", "3".repeat(64))).unwrap(),
+        size_bytes: 1024,
+        order: 0,
+    });
+    index.tensor_shard_map.insert(
+        "layer.0.weight".into(),
+        ModelShardId::new("shard-0").unwrap(),
+    );
+    assert!(detect_missing_shards(&index).is_ok());
+
+    index.tensor_shard_map.insert(
+        "layer.1.weight".into(),
+        ModelShardId::new("shard-missing").unwrap(),
+    );
+    assert!(matches!(
+        detect_missing_shards(&index),
+        Err(ModelFormatRoadmapError::ShardMissing { .. })
+    ));
+
+    let duplicate = vec![
+        tensor("layer.0.weight", vec![4, 4]),
+        tensor("layer.0.weight", vec![4, 4]),
+    ];
+    assert!(detect_duplicate_tensor_names(&duplicate).is_err());
+
+    let inconsistent = vec![
+        tensor("layer.0.weight", vec![4, 4]),
+        tensor("layer.0.weight", vec![8, 8]),
+    ];
+    assert!(matches!(
+        validate_shard_tensor_shape_consistency(&inconsistent),
+        Err(ModelFormatRoadmapError::ShardIndexInvalid { .. })
+    ));
+
+    let ordered = vec![
+        ModelShard {
+            id: ModelShardId::new("shard-0").unwrap(),
+            digest: ModelDigest::parse(format!("sha256:{}", "4".repeat(64))).unwrap(),
+            size_bytes: 1,
+            order: 0,
+        },
+        ModelShard {
+            id: ModelShardId::new("shard-1").unwrap(),
+            digest: ModelDigest::parse(format!("sha256:{}", "5".repeat(64))).unwrap(),
+            size_bytes: 1,
+            order: 0,
+        },
+    ];
+    assert!(matches!(
+        validate_shard_loading_order(&ordered),
+        Err(ModelFormatRoadmapError::ShardIndexInvalid { .. })
+    ));
+}
+
+#[test]
+fn model_format_roadmap_normalizes_lora_adapter_without_activating_or_trusting_it() {
+    let base_model = AdapterBaseModelCompatibility {
+        model_name: ModelName::new("qwen").unwrap(),
+        model_revision: ModelRevision::new("v1").unwrap(),
+        model_artifact: None,
+        tokenizer: None,
+        architecture: AdapterArchitectureCompatibility {
+            family: "qwen".into(),
+            implementation: "qwen2".into(),
+            hidden_size: Some(4096),
+            layer_count: Some(32),
+            position_encoding: None,
+            target_modules: BTreeSet::from(["q_proj".to_string()]),
+            supported_storage_dtypes: BTreeSet::from([ModelDType::F16]),
+            supported_compute_dtypes: BTreeSet::from([ComputeDType::Float16]),
+            supported_quantization_formats: BTreeSet::new(),
+        },
+    };
+    let metadata = LoraAdapterFormatMetadata {
+        target_modules: vec!["q_proj".into()],
+        rank: 8,
+        alpha: 16,
+        scaling: Some(2.0),
+        dropout: Some(0.1),
+        base_model,
+        tensors: vec![tensor("q_proj.lora_a", vec![4096, 8])],
+        storage_dtype: ModelDType::F16,
+        compute_dtype: Some(ComputeDType::Float16),
+        quantization: None,
+        required_capabilities: Vec::new(),
+        license: None,
+        provenance: None,
+    };
+    let id = AdapterArtifactId::new(
+        AdapterName::new("support-lora").unwrap(),
+        AdapterRevision::new("r1").unwrap(),
+        AdapterDigest::parse(format!("sha256:{}", "8".repeat(64))).unwrap(),
+    );
+    let artifact = normalize_lora_adapter(id, &metadata);
+    assert_eq!(artifact.method, AdapterMethod::Lora);
+    assert_eq!(artifact.rank, Some(8));
+    assert_eq!(artifact.alpha, Some(16));
+    assert_eq!(artifact.trust, AdapterTrustStatus::Unknown);
+    assert_eq!(artifact.targets.len(), 1);
+}
+
+#[test]
+fn model_format_roadmap_conformance_fixture_kinds_cover_twelve_categories() {
+    assert_eq!(MODEL_FORMAT_CONFORMANCE_FIXTURES.len(), 12);
+    for fixture in MODEL_FORMAT_CONFORMANCE_FIXTURES {
+        assert!(!fixture.id().is_empty());
+    }
+}
+
+#[test]
+fn model_format_roadmap_observation_redacts_metadata() {
+    let observation =
+        ModelFormatRoadmapObservation::new(ModelFormatRoadmapObservationKind::ManifestNormalized)
+            .with_artifact("fixture-model")
+            .with_redacted_metadata("path", "/etc/secret/model.safetensors");
+    assert_eq!(observation.artifact.as_deref(), Some("fixture-model"));
+    assert!(observation.redacted_metadata.contains_key("path"));
 }

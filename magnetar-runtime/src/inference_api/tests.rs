@@ -12,6 +12,7 @@ use crate::adapter::{
 use crate::generation::{GenerationModelReference, GenerationRequestId};
 use crate::model::ModelDigest;
 use crate::session::InferenceSessionId;
+use crate::tests::*;
 use crate::tokenizer::{
     FixtureTokenizer, SpecialToken, SpecialTokenKind, TokenIdRange, TokenizerArtifactId,
     TokenizerFamily, TokenizerId, TokenizerMetadata, TokenizerRevision,
@@ -1027,4 +1028,221 @@ fn inference_api_model_instance_warmup_reports_lifecycle_conflict_when_already_r
         error,
         InferenceApiError::ModelInstanceUnavailable { .. }
     ));
+}
+
+#[test]
+fn inference_api_create_model_instance_observed_emits_model_instance_selected() {
+    let manifest = minimal_model_manifest();
+    let mut load_runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let loaded = load_model(
+        &mut coordinator,
+        &mut load_runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder().build().unwrap();
+    let architecture = ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    };
+    let mut observer = InferenceApiObserver::new();
+    let instance = create_model_instance_observed(
+        &mut runtime,
+        &loaded,
+        architecture,
+        ResourceAffinity::new(FallbackClass::Transparent),
+        &mut observer,
+    )
+    .unwrap();
+
+    assert_eq!(
+        model_instance_status(&runtime, &instance).unwrap().artifact,
+        manifest.id
+    );
+    assert!(
+        observer
+            .observations()
+            .iter()
+            .any(|observation| observation.kind
+                == InferenceApiObservationKind::ModelInstanceSelected)
+    );
+}
+
+#[test]
+fn inference_api_load_model_observed_emits_loading_lifecycle_observations() {
+    let manifest = minimal_model_manifest();
+    let mut coordinator = ModelLoadingCoordinator::new();
+    coordinator.register_architecture(ModelArchitectureImplementation {
+        architecture: manifest.architecture.clone(),
+        kind: ModelArchitectureImplementationKind::TestFixture,
+        required_capabilities: Vec::new(),
+    });
+    let mut runtime = Runtime::builder()
+        .trust_store(ModelTrustStore::default().trust_digest(manifest.id.digest.value.clone()))
+        .build()
+        .unwrap();
+    let core = ModelLoadingRequest::new(ModelLoadingRequestId::new("load-1"), manifest.id.clone());
+    let mut observer = InferenceApiObserver::new();
+
+    load_model_observed(
+        &mut coordinator,
+        &mut runtime,
+        ModelLoadingApiRequest::new(core),
+        &manifest,
+        &mut observer,
+    )
+    .unwrap();
+
+    let kinds: Vec<_> = observer
+        .observations()
+        .iter()
+        .map(|observation| observation.kind)
+        .collect();
+    assert!(kinds.contains(&InferenceApiObservationKind::ModelLoadingRequested));
+    assert!(kinds.contains(&InferenceApiObservationKind::ModelLoaded));
+}
+
+#[test]
+fn inference_api_run_generation_loop_cancels_during_decode() {
+    let mut request = generation_request();
+    request.parameters = GenerationParameters::greedy();
+    request.stop_conditions = StopConditions::default();
+    request.max_new_tokens = 5;
+    let vocabulary_size = request.tokenizer.metadata.vocabulary_size as usize;
+
+    let mut runtime = runtime_with_model_execution_engine(
+        vocabulary_size,
+        RuntimeGenerationExecutionEvidence::complete(),
+    );
+    let mut observer = InferenceApiObserver::new();
+
+    let result = run_generation_loop(
+        &mut runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |generated| !generated.is_empty(),
+        &mut observer,
+    )
+    .unwrap();
+
+    assert_eq!(result.output.finish_reason, FinishReason::Cancelled);
+    assert_eq!(result.output.generated_token_count, 1);
+    let kinds: Vec<_> = observer
+        .observations()
+        .iter()
+        .map(|observation| observation.kind)
+        .collect();
+    assert!(kinds.contains(&InferenceApiObservationKind::GenerationCancelled));
+    assert!(kinds.contains(&InferenceApiObservationKind::StreamInterrupted));
+    assert!(!kinds.contains(&InferenceApiObservationKind::GenerationCompleted));
+}
+
+#[test]
+fn inference_api_run_generation_loop_observes_executor_failure_before_returning() {
+    let mut request = generation_request();
+    request.parameters = GenerationParameters::greedy();
+    request.stop_conditions = StopConditions::default();
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .model_execution_engine(Arc::new(FailingGenerationExecutor))
+        .build()
+        .unwrap();
+    let mut observer = InferenceApiObserver::new();
+
+    let error = run_generation_loop(
+        &mut runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated| false,
+        &mut observer,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        InferenceApiError::ProviderUnavailable { .. }
+    ));
+    let kinds: Vec<_> = observer
+        .observations()
+        .iter()
+        .map(|observation| observation.kind)
+        .collect();
+    assert!(kinds.contains(&InferenceApiObservationKind::DecodeStarted));
+    assert!(kinds.contains(&InferenceApiObservationKind::ProviderUnavailable));
+    assert!(kinds.contains(&InferenceApiObservationKind::StreamInterrupted));
+    assert!(!kinds.contains(&InferenceApiObservationKind::StreamClosed));
+}
+
+#[test]
+fn inference_api_run_generation_loop_reports_provider_and_kernel_unavailable() {
+    let mut request = generation_request();
+    request.parameters = GenerationParameters::greedy();
+    request.stop_conditions = StopConditions::default();
+    let mut observer = InferenceApiObserver::new();
+    let mut runtime = Runtime::builder().build().unwrap();
+    let error = run_generation_loop(
+        &mut runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated| false,
+        &mut observer,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        InferenceApiError::ProviderUnavailable { .. }
+    ));
+    assert!(
+        observer
+            .observations()
+            .iter()
+            .any(|observation| observation.kind
+                == InferenceApiObservationKind::ProviderUnavailable)
+    );
+    assert!(
+        observer
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == InferenceApiObservationKind::StreamInterrupted)
+    );
+
+    request.request_id = GenerationRequestId::new("gen-2").unwrap();
+    let mut observer = InferenceApiObserver::new();
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(ReferenceCpuProvider::new()))
+        .model_execution_engine(Arc::new(FailingKernelGenerationExecutor))
+        .build()
+        .unwrap();
+    let error = run_generation_loop(
+        &mut runtime,
+        &request,
+        SamplingPolicy::default(),
+        CacheUsageSummary::default(),
+        |_generated| false,
+        &mut observer,
+    )
+    .unwrap_err();
+    assert!(matches!(error, InferenceApiError::KernelUnavailable { .. }));
+    assert!(
+        observer
+            .observations()
+            .iter()
+            .any(|observation| observation.kind == InferenceApiObservationKind::KernelUnavailable)
+    );
 }

@@ -10,6 +10,13 @@
 //! replaced and require exact equality, not approximate.
 
 use super::*;
+use crate::e2e_conformance::*;
+use crate::inference_api::*;
+use crate::memory::*;
+use crate::model_instance::*;
+use crate::runtime::*;
+use crate::tests::*;
+use std::sync::Arc;
 
 use crate::affinity::ProviderPressureLevel;
 use crate::affinity::{CapabilityBinding, ExecutionContextId, ProviderBinding};
@@ -2432,4 +2439,327 @@ fn moe_expert_shares_add_up_to_the_whole_layer() {
     }
     // A share reaching past the last expert is refused.
     assert!(moe_experts_local(&h, &logits, [&gate, &up, &down], routing, 1, experts).is_err());
+}
+
+#[test]
+fn first_native_native_execution_evidence_requires_registry_kernel_and_reference_cpu_path() {
+    let report = first_native_report_fixture(REFERENCE_CPU_PROVIDER_NAME);
+    assert!(validate_first_native_native_execution_evidence(&report).is_ok());
+
+    let mut missing_kernel_evidence = report.clone();
+    missing_kernel_evidence.kernel_coverage.clear();
+    assert!(matches!(
+        validate_first_native_native_execution_evidence(&missing_kernel_evidence),
+        Err(E2eConformanceError::KernelCoverageMissing { .. })
+    ));
+
+    let non_reference_provider = first_native_report_fixture("candle-provider");
+    assert!(matches!(
+        validate_first_native_native_execution_evidence(&non_reference_provider),
+        Err(E2eConformanceError::BoundaryViolation { .. })
+    ));
+}
+
+#[test]
+fn first_native_native_execution_evidence_rejects_shortcut_reports() {
+    let mut report = first_native_report_fixture(REFERENCE_CPU_PROVIDER_NAME);
+    report
+        .test_cases
+        .retain(|test| test.name != "success-path-no-shortcut-validated");
+
+    assert!(matches!(
+        validate_first_native_native_execution_evidence(&report),
+        Err(E2eConformanceError::BoundaryViolation { .. })
+    ));
+}
+
+/// `reach-architecture-freeze-1` task 5.4/5.5: a real Operator with more
+/// than one declared output ("split") dispatched through the same generic
+/// `KernelInvocation`/`execute_invocation` path every other Kernel uses,
+/// proving `KernelInvocation.outputs: Vec<..>` and
+/// `store_output(invocation, index, ..)` actually produce a distinct,
+/// independently-readable resource per declared output -- not just that
+/// the types allow more than one.
+#[test]
+fn reference_cpu_split_kernel_produces_a_dedicated_resource_per_output() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "split")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+
+    let (input_id, input_resource) = reference_cpu_resource("split-in", [2, 4]);
+    let (_left_id, left_resource) = reference_cpu_resource("split-left", [2, 2]);
+    let (_right_id, right_resource) = reference_cpu_resource("split-right", [2, 2]);
+    executor.write_tensor(
+        input_id,
+        reference_cpu_host_tensor([2, 4], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+    );
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-split"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(input_resource)
+    .with_output(left_resource.clone())
+    .with_output(right_resource.clone());
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    assert_eq!(
+        result.updated_resources.len(),
+        2,
+        "split must report both output resources as updated, not just one"
+    );
+
+    let left = executor.read_tensor(&left_resource.resource.id).unwrap();
+    let right = executor.read_tensor(&right_resource.resource.id).unwrap();
+    assert_eq!(left.shape, vec![2, 2]);
+    assert_eq!(right.shape, vec![2, 2]);
+    // Each row of the [2, 4] input splits into its first-half/second-half
+    // elements, landing in two independently-readable resources.
+    assert_eq!(left.data, vec![1.0, 2.0, 5.0, 6.0]);
+    assert_eq!(right.data, vec![3.0, 4.0, 7.0, 8.0]);
+}
+
+#[test]
+fn reference_cpu_execution_tracks_output_through_memory_manager() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+
+    let (a_id, a_resource) = reference_cpu_resource("mm-a", [2, 2]);
+    let (b_id, b_resource) = reference_cpu_resource("mm-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("mm-out", [2, 2]);
+    executor.write_tensor(
+        a_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 0.0, 0.0, 1.0]),
+    );
+    executor.write_tensor(
+        b_id,
+        reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+    );
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-memory"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource.clone());
+
+    let result = executor.execute_invocation_with_memory_manager(
+        advertisement,
+        operator,
+        &invocation,
+        &mut memory,
+    );
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+
+    let residency = memory
+        .tensor_residency(&out_resource.resource.id)
+        .expect("Memory Manager should record residency for the output tensor");
+    assert!(residency.provider_owned);
+    assert!(residency.allocation.is_some());
+    assert!(memory.allocations().next().is_some());
+}
+
+/// `implement-device-resident-multi-step-cuda-decode` task 4.4:
+/// `copy_tensor_admitted` duplicates a resource's bytes to a fresh
+/// identity, admitted the same way `write_tensor_admitted` already is.
+#[test]
+fn reference_cpu_copy_tensor_admitted_duplicates_bytes_to_a_fresh_identity() {
+    let executor = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let source_id = TensorResourceId::new("copy-source");
+    executor
+        .write_tensor_admitted(
+            &mut memory,
+            source_id.clone(),
+            reference_cpu_host_tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session("test-session".into()),
+        )
+        .expect("source write succeeds");
+
+    let dest_id = TensorResourceId::new("copy-destination");
+    executor
+        .copy_tensor_admitted(
+            &mut memory,
+            &source_id,
+            dest_id.clone(),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session("test-session".into()),
+        )
+        .expect("copy succeeds");
+
+    assert_eq!(
+        executor
+            .read_tensor(&dest_id)
+            .expect("destination resource is present")
+            .data,
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+}
+
+#[test]
+fn reference_cpu_releases_admitted_output_reservation_when_kernel_execution_fails() {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul")
+        .unwrap();
+    let catalog = initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+
+    let (_a_id, a_resource) = reference_cpu_resource("mem-release-a", [2, 2]);
+    let (_b_id, b_resource) = reference_cpu_resource("mem-release-b", [2, 2]);
+    let (_out_id, out_resource) = reference_cpu_resource("mem-release-out", [2, 2]);
+    // Inputs are intentionally left unwritten so the Kernel itself fails
+    // (`input_tensor` finds no materialized data) after admission already
+    // succeeded, exercising the rollback path rather than the admission
+    // rejection path.
+
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-memory-release"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(a_resource)
+    .with_input(b_resource)
+    .with_output(out_resource);
+
+    let result = executor.execute_invocation_with_memory_manager(
+        advertisement,
+        operator,
+        &invocation,
+        &mut memory,
+    );
+    assert_eq!(result.status, KernelResultStatus::Failed);
+    assert!(
+        !memory
+            .allocations()
+            .any(|allocation| allocation.state == MemoryAllocationState::Active),
+        "the output reservation admitted before dispatch must be released when the Kernel itself fails"
+    );
+}
+
+/// `bind-model-loading-evidence-to-validated-artifact`: closes the
+/// companion P1 the same audit round identified -- a Provider that never
+/// implements host-memory tensor readback (`read_tensor` always returning
+/// `None`, its documented default) must still be able to reach
+/// `weights_materialized: true` through the authorized transaction, since
+/// readiness derivation no longer calls `read_tensor` at all.
+/// `TestProviderExecutionApi` does not override `write_tensor`/
+/// `read_tensor`, so it inherits the trait's real default bodies -- a
+/// faithful stand-in for a device-only Provider, not a mock that merely
+/// asserts it was never called.
+#[test]
+fn inference_api_warm_model_instance_reaches_ready_without_provider_read_tensor_support() {
+    let mut provider = TestProvider::new(REFERENCE_CPU_PROVIDER_NAME);
+    provider.execution_api = Some(Arc::new(TestProviderExecutionApi::new()));
+    let mut runtime = Runtime::builder()
+        .register_provider(Arc::new(provider))
+        .build()
+        .unwrap();
+    let mut definition = model_instance_definition();
+    definition.placement = ModelInstancePlacement::new(
+        ResourceAffinity::new(FallbackClass::Transparent)
+            .with_provider(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+    );
+    let instance = runtime.model_instances_mut().create(definition).unwrap();
+
+    // Confirm this Provider genuinely does not support host readback,
+    // rather than assuming the trait default -- if a future change to
+    // `TestProviderExecutionApi` overrides `read_tensor`, this assertion
+    // (not just the one below) would catch that this test no longer tests
+    // what it claims to.
+    let probe_resource = TensorResourceId::new("probe");
+    let executor = runtime
+        .providers()
+        .provider(REFERENCE_CPU_PROVIDER_NAME)
+        .and_then(|provider| provider.execution_api())
+        .unwrap();
+    executor
+        .write_tensor(probe_resource.clone(), HostTensor::new([1], [0.0]).unwrap())
+        .unwrap();
+    assert!(executor.read_tensor(&probe_resource).is_none());
+
+    let weights = BTreeMap::from([("weight".to_string(), HostTensor::new([1], [0.0]).unwrap())]);
+    materialize_model_instance_weights(&mut runtime, &instance, "test", &weights).unwrap();
+
+    let status = model_instance_status(&runtime, &instance).unwrap();
+    assert_eq!(status.lifecycle, ModelInstanceLifecycleState::Ready);
+    assert!(status.readiness.accepts_generation());
+}
+
+/// Task 6.6: a payload-read failure partway through a streaming attempt
+/// rolls back every tensor staged so far in that attempt -- no orphan
+/// Provider tensor, no leaked Memory Manager allocation -- exercised at
+/// the first, middle, and last tensor in a three-tensor manifest.
+#[test]
+fn stream_materialize_model_instance_weights_rolls_back_on_failure_at_any_position() {
+    for failing_tensor in ["weight.a", "weight.b", "weight.c"] {
+        let (mut runtime, instance, manifest, executor) = streaming_materialization_fixture();
+        let payload_source = RecordingPayloadSource::new(streaming_fixture_payload_bytes())
+            .failing_for(failing_tensor);
+        let active_allocations_before = active_allocation_bytes(&runtime);
+
+        let error = stream_materialize_model_instance_weights(
+            &mut runtime,
+            &instance,
+            "test",
+            &manifest.tensors,
+            &payload_source,
+        )
+        .expect_err(&format!(
+            "a payload failure for '{failing_tensor}' must propagate"
+        ));
+        assert!(matches!(
+            error,
+            InferenceApiError::ModelLoadingFailed { .. }
+        ));
+
+        assert_ne!(
+            runtime.model_instance(&instance).unwrap().lifecycle(),
+            ModelInstanceLifecycleState::Ready,
+            "failing on '{failing_tensor}' must not leave the instance Ready"
+        );
+        assert_eq!(
+            active_allocation_bytes(&runtime),
+            active_allocations_before,
+            "failing on '{failing_tensor}' must leave no leaked Memory Manager allocation"
+        );
+        for tensor in &manifest.tensors {
+            let resource_id =
+                TensorResourceId::new(format!("model.{instance}.weight.{}", tensor.name));
+            assert!(
+                executor.read_tensor(&resource_id).is_none(),
+                "failing on '{failing_tensor}' must leave no orphan Provider tensor for '{}'",
+                tensor.name
+            );
+        }
+    }
 }
