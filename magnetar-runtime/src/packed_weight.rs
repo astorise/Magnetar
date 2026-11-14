@@ -51,7 +51,7 @@ pub enum PackedWeightFormat {
     /// (scale - 32) * (q - 4)` per 16-value sub-block.
     Q3K,
     /// GGUF `block_iq4_nl`: 32 values per block, 18 bytes -- an `f16`
-    /// `d`, then 16 bytes of 4-bit indices into [`crate::model_loading::
+    /// `d`, then 16 bytes of 4-bit indices into [`crate::quantization::
     /// IQ4_NL_VALUES`]; `value = d * table[index]`.
     Iq4Nl,
     /// GGUF `block_iq4_xs`: 256 values per super-block, 136 bytes -- an
