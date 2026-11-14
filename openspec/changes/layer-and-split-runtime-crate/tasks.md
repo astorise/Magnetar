@@ -47,19 +47,19 @@
 - [x] 5.7 After the extractions: every one of the 4,327 public type, trait, function, constant and module paths of the baseline (`d5231c7`) still resolves through `magnetar-runtime` (compiled probe); 1,703 workspace tests pass, none removed; Clippy, documentation and layering gates pass.
 - [x] 5.8 `wasm32-unknown-unknown`: `cargo check -p magnetar-runtime --all-features` passes with the layer crates.
 - [x] 5.9 Build times after the split, same machine, one run: clean check 44.6 s (53.1 s before); after touching a Runtime file 1.3 s, a `magnetar-kernel` file 2.0 s, a `magnetar-core` file 2.3 s (3.0 s before for any file); clean test build 72.4 s (88.5 s before).
-- [ ] 5.10 Build each crate on macOS and Windows (CI matrix).
+- [x] 5.10 Build each crate on macOS and Windows (CI matrix). Done: the `ubuntu`/`windows`/`macos` matrix jobs passed on astorise/Magnetar#169.
 
 ## 6. Consumers and validation
 
 - [x] 6.1 `magnetar-cli`, `inference-components`, `roadmap-contracts` and the three integration test crates build without source change; `magnetar-cli` (93) and `magnetar-inference-component` (14) tests pass. `submodule-workspace/Cargo.lock` is updated.
 - [x] 6.2 Pinned Provider, Format and Loader repositories: each `Cargo.lock` gains the five layer crates (one pull request per repository, no source change), and the eleven submodule pins point at those commits. With them, `cargo test --locked` passes in each of the eleven. The eleven pull requests are merged and the pins point at the merged commits. The Component repositories do not depend on `magnetar-runtime`.
-- [ ] 6.3 Run the WIT validation gate in CI. The WIT files are not moved or edited by this change.
+- [x] 6.3 Run the WIT validation gate in CI. The WIT files are not moved or edited by this change. Done: `quality / wit` passed on astorise/Magnetar#169.
 - [ ] 6.4 Run GPU CI (`cuda-first-native`, `multi-device-cpu-cuda`, real-checkpoint numerics): results identical to the baseline.
 
 ## 7. Release, coverage and documentation
 
 - [x] 7.1 `release-publication.yml` packages and publishes the six crates together; `cargo publish --dry-run` of the six passes locally, in dependency order.
-- [ ] 7.2 Coverage: confirm in CI that the workspace measurement is not below `quality/coverage-baseline.json` now that code sits in six crates. (The SBOM is generated from `cargo metadata` and lists the layer crates without change.)
+- [x] 7.2 Coverage: confirm in CI that the workspace measurement is not below `quality/coverage-baseline.json` now that code sits in six crates. (The SBOM is generated from `cargo metadata` and lists the layer crates without change.) Done: `quality / coverage` passed on astorise/Magnetar#169.
 - [x] 7.3 Formatting, Clippy, test, documentation and `cargo-deny` gates run on the workspace and so cover the new crates; the layering, model-family isolation, test-placement and Wasmtime jobs name them explicitly.
 - [x] 7.4 `README.md`, `CONTRIBUTING.md`, `docs/quality.md`, `openspec/config.yaml` and `quality/layers.toml` describe the crate layout.
 - [x] 7.5 `CHANGELOG.md` entry: public paths unchanged, new crates listed.
