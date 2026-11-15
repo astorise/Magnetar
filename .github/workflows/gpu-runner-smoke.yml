@@ -713,6 +713,17 @@ jobs:
             echo "::warning::Q8_0 GGUF (Qwen2.5-0.5B): token ids differ between int8 (default) and f32 activations"
             diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
           fi
+      - name: CPU packed matmul bandwidth (diagnostic)
+        # The optimized CPU Provider's decode matmul time per format on
+        # Mistral shapes, on this host. Informational only.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -o pipefail
+          lscpu | grep -E 'Model name|^CPU\(s\)' || true
+          cargo test --locked --release --manifest-path providers/cpu/Cargo.toml --lib packed_matmul_bandwidth -- --ignored --nocapture 2>&1 | grep -E 'threads|GB/s' || true
       - name: Q8_0 GGUF (Qwen2.5-0.5B) on the optimized CPU Provider
         # execute-quantized-weights-on-cpu: the packed weights stay in host
         # memory in their checkpoint encoding and the matmuls read them with

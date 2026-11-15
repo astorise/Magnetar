@@ -297,3 +297,13 @@ Mistral 7B on the optimized CPU Provider:
 All answer "Paris". On this host (i7-7700) the gathered IQ kernels stay
 about 25 % above `Q4_K` per matmul call, where the local host measured
 them level or below; why the two hosts differ is not measured yet.
+
+Why `IQ3_M` and `IQ2_M` trail `Q4_K_M` on the GPU runner (GPU smoke run
+43688842289, CPU packed matmul bandwidth diagnostic, 3 threads): not a
+Gather Data Sampling mitigation, which that i7-7700 does not carry
+("Vulnerable: No microcode"). Gathers are faster there too: `IQ3_S` reads
+its grids in 3.5 ms with gathers against 5.3-5.5 ms with scalar loads,
+`IQ2_S` 3.3 against 3.9-4.3 ms, while `Q4_K` takes 2.4-2.6 ms. The
+remaining gap is the IQ decode's per-run work (grid gather, sign mask,
+two scales) on that core; the scalar-load path tried for it was
+reverted.
