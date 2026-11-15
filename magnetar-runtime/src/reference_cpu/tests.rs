@@ -2966,10 +2966,37 @@ fn per_head_and_scale_less_rmsnorm_normalize_each_block() {
         ]
         .concat(),
     );
-    // Heads that do not tile the row are refused.
+    // Heads that do not tile the row are refused, and so is a non-positive
+    // head attribute, with or without its partner.
     let mut wrong = heads.clone();
     wrong[2].1 = OperatorAttributeValue::Integer(3);
-    assert!(invoke_extended("rmsnorm", &[input], &[1, 4], &wrong).is_none());
+    assert!(invoke_extended("rmsnorm", std::slice::from_ref(&input), &[1, 4], &wrong).is_none());
+    for attributes in [
+        vec![
+            ("epsilon", float(epsilon)),
+            ("head_count", OperatorAttributeValue::Integer(-2)),
+            ("head_dimension", OperatorAttributeValue::Integer(-2)),
+        ],
+        vec![
+            ("epsilon", float(epsilon)),
+            ("head_count", OperatorAttributeValue::Integer(-1)),
+        ],
+        vec![
+            ("epsilon", float(epsilon)),
+            ("head_dimension", OperatorAttributeValue::Integer(0)),
+        ],
+    ] {
+        assert!(
+            invoke_extended(
+                "rmsnorm",
+                std::slice::from_ref(&input),
+                &[1, 4],
+                &attributes
+            )
+            .is_none(),
+            "{attributes:?}"
+        );
+    }
 }
 
 #[test]

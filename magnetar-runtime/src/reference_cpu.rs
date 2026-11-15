@@ -2383,10 +2383,18 @@ impl ReferenceCpuExecutor {
             "rmsnorm" => {
                 let input = self.input_tensor(invocation, 0)?;
                 let epsilon = Self::attribute_float(&invocation.attributes, "epsilon", 1e-6);
-                let head_count = Self::attribute_integer(&invocation.attributes, "head_count");
-                let head_dimension =
-                    Self::attribute_integer(&invocation.attributes, "head_dimension");
-                let heads = match (head_count, head_dimension) {
+                // Present head attributes must both be positive integers:
+                // a malformed one is refused, never read as absent.
+                let head = |name: &str| match invocation.attributes.get(name) {
+                    None => Ok(None),
+                    Some(OperatorAttributeValue::Integer(value)) if *value > 0 => {
+                        Ok(Some(*value as u64))
+                    }
+                    Some(other) => Err(KernelError::KernelAttributeUnsupported {
+                        attribute: format!("rmsnorm {name} {other:?} must be a positive integer"),
+                    }),
+                };
+                let heads = match (head("head_count")?, head("head_dimension")?) {
                     (Some(count), Some(dimension)) => Some((count, dimension)),
                     (None, None) => None,
                     _ => {
