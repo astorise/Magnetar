@@ -296,4 +296,4 @@ Mistral 7B on the optimized CPU Provider:
 
 All answer "Paris". On this host (i7-7700) the gathered IQ kernels stay
 about 25 % above `Q4_K` per matmul call, where the local host measured
-them level or below: gathers are slower on this older core.
+them level or below; why the two hosts differ is not measured yet.
