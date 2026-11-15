@@ -41,6 +41,10 @@ const CAPABILITY_ECHO_COMPONENT: &str =
 /// not reasonably hand-writable as WAT. Regenerate from
 /// `components/qwen`'s source with the same two commands if that source
 /// changes.
+/// Imports `model-config@1.6.0` and reads `layer-layout` and `options` back
+/// through the canonical ABI (`add-layer-layout-model-config`).
+const LAYER_LAYOUT_PROBE_COMPONENT: &str =
+    include_str!("../../../magnetar-runtime/fixtures/components/layer-layout-probe.component.wat");
 const QWEN_REAL_COMPONENT: &[u8] =
     include_bytes!("../../../magnetar-runtime/fixtures/components/qwen-real.component.wasm");
 
@@ -388,6 +392,9 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
             tie_word_embeddings: true,
             attention_bias: false,
             mixture_of_experts: None,
+            layer_layout: None,
+            final_logit_softcapping: None,
+            per_layer_input_size: None,
             bos_token_id: None,
             eos_token_id: None,
         },
@@ -1318,4 +1325,90 @@ fn epoch_deadline_ticks_rounds_up_and_never_expires_immediately() {
     assert_eq!(epoch_deadline_ticks(Some(1)), 1);
     assert_eq!(epoch_deadline_ticks(Some(50)), 50);
     assert_eq!(epoch_deadline_ticks(None), DISABLED_EPOCH_DEADLINE);
+}
+
+#[test]
+fn wasmtime_engine_lowers_the_1_6_0_layer_layout_and_options_into_a_real_component() {
+    let directory = std::env::temp_dir().join(format!(
+        "magnetar-wasmtime-layer-layout-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join("layer-layout-probe.component.wasm");
+    std::fs::write(&artifact, LAYER_LAYOUT_PROBE_COMPONENT).unwrap();
+
+    let model_config_capability = Arc::new(crate::ModelConfigCapability::new());
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let interface = WitInterface::new("magnetar:model-component-graph/model-config", "1.6.0");
+    engine.register_capability(
+        interface.clone(),
+        model_config_capability.clone() as Arc<dyn HostCapability>,
+    );
+    let export_interface = WitInterface::new("example:test/layer-layout-probe", "1.0.0");
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(201),
+        metadata: crate::ComponentMetadata::new("layer-layout-probe", "1", "1.6.0 probe")
+            .with_import(interface.clone())
+            .with_export(export_interface.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let mut link_plan = ComponentLinkPlan::default();
+    link_plan.insert_for_test(crate::ComponentEndpoint::Capability { interface });
+    let instance = engine.instantiate(&prepared, &link_plan).unwrap();
+
+    let layer = |sliding_window, head_dim| crate::LayerSpec {
+        sliding_window,
+        head_dim,
+        num_key_value_heads: 1,
+        rope_theta: 10_000.0,
+        partial_rotary_factor: None,
+        value_from_key: false,
+        kv_source_layer: None,
+        intermediate_size: 8,
+    };
+    model_config_capability.bind_config(
+        instance.engine_key(),
+        crate::ModelArchitectureConfig {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            vocab_size: 258,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            layer_layout: Some(vec![layer(Some(512), 2), layer(None, 128)]),
+            final_logit_softcapping: Some(30.0),
+            per_layer_input_size: Some(256),
+            ..Default::default()
+        },
+    );
+    let result = engine
+        .invoke(
+            &instance,
+            &ComponentInvocation::new(
+                crate::ComponentInstanceId::new(201),
+                export_interface,
+                "run",
+            ),
+        )
+        .unwrap();
+    // 2 layers, per-layer input 256, layer 0's window 512, layer 1's head
+    // dimension 128, softcap 30.
+    assert_eq!(
+        result,
+        ComponentInvocationResult::single(ComponentValue::U32(
+            30 * 10_000_000 + 2 * 1_000_000 + 256 * 1000 + 512 + 128
+        ))
+    );
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
 }

@@ -1,4 +1,4 @@
-package magnetar:model-component-graph@1.5.0;
+package magnetar:model-component-graph@1.6.0;
 
 /// Runtime-owned graph-builder Capability (`model-component-graph-contract`):
 /// a Model Component calls these operations to incrementally describe an
@@ -217,6 +217,52 @@ interface model-config {
   /// build a dense one. A new function, not a new `architecture-config`
   /// field, so Components compiled against earlier versions keep linking.
   mixture-of-experts: func() -> option<moe-config>;
+
+  /// One decoder layer's attention and feed-forward geometry. Added in
+  /// `1.6.0`. Family-neutral: it describes what differs *between layers* of a
+  /// checkpoint (sliding vs. full attention, head widths, KV head counts,
+  /// RoPE per attention kind, shared KV, feed-forward width), not any model
+  /// family. The Runtime derives every field from the checkpoint's
+  /// configuration; a Component never recomputes a per-layer rule.
+  record layer-spec {
+    /// Look-back window in tokens; `none` attends over the whole context.
+    sliding-window: option<u32>,
+    /// Width of one attention head in this layer.
+    head-dimension: u64,
+    /// Key/value heads in this layer.
+    num-key-value-heads: u32,
+    /// RoPE base of this layer.
+    rope-theta: f64,
+    /// Fraction of each head that is rotated, the rest staying
+    /// position-independent; `none` rotates the whole head.
+    partial-rotary-factor: option<f64>,
+    /// The layer has no value projection: V is derived from the raw key
+    /// projection.
+    value-from-key: bool,
+    /// The layer computes no K/V of its own and attends over those of this
+    /// earlier layer, which must have the same head width and KV head count.
+    kv-source-layer: option<u32>,
+    /// Width of the layer's dense feed-forward.
+    intermediate-size: u64,
+  }
+
+  /// Added in `1.6.0`: one `layer-spec` per decoder layer
+  /// (`num-hidden-layers` entries), `none` for a checkpoint whose layers are
+  /// uniform and fully described by `architecture-config`. A Component that
+  /// needs a layout and gets `none` must refuse to build a graph.
+  layer-layout: func() -> option<list<layer-spec>>;
+
+  /// Checkpoint-wide options `architecture-config` cannot carry. Added in
+  /// `1.6.0`.
+  record architecture-options {
+    /// `cap * tanh(logits / cap)` applied to the logits.
+    final-logit-softcapping: option<f64>,
+    /// Width of the per-layer input embeddings, `none` for none. A Component
+    /// that does not implement them must refuse to build a graph.
+    per-layer-input-size: option<u32>,
+  }
+
+  options: func() -> architecture-options;
 }
 
 /// World a Model Component satisfies to produce graphs through this

@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::component::{ComponentError, ComponentValue, HostCapability};
-use crate::{MixtureOfExpertsConfig, ModelArchitectureConfig, RopeFrequencyScaling};
+use crate::{LayerSpec, MixtureOfExpertsConfig, ModelArchitectureConfig, RopeFrequencyScaling};
 
 const CAPABILITY_NAME: &str = "magnetar:model-component-graph/model-config";
 
@@ -161,6 +161,80 @@ fn encode_mixture_of_experts(moe: Option<&MixtureOfExpertsConfig>) -> ComponentV
     }))
 }
 
+/// `option<list<layer-spec>>` (`1.6.0`).
+fn encode_layer_layout(layout: Option<&[LayerSpec]>) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Option(layout.map(|layout| {
+        Box::new(ComponentValue::List(
+            layout
+                .iter()
+                .map(|layer| {
+                    ComponentValue::Record(vec![
+                        field(
+                            "sliding-window",
+                            ComponentValue::Option(
+                                layer
+                                    .sliding_window
+                                    .map(|window| Box::new(ComponentValue::U32(window))),
+                            ),
+                        ),
+                        field("head-dimension", ComponentValue::S64(layer.head_dim as i64)),
+                        field(
+                            "num-key-value-heads",
+                            ComponentValue::U32(layer.num_key_value_heads),
+                        ),
+                        field("rope-theta", ComponentValue::F64(layer.rope_theta)),
+                        field(
+                            "partial-rotary-factor",
+                            ComponentValue::Option(
+                                layer
+                                    .partial_rotary_factor
+                                    .map(|factor| Box::new(ComponentValue::F64(factor))),
+                            ),
+                        ),
+                        field("value-from-key", ComponentValue::Bool(layer.value_from_key)),
+                        field(
+                            "kv-source-layer",
+                            ComponentValue::Option(
+                                layer
+                                    .kv_source_layer
+                                    .map(|source| Box::new(ComponentValue::U32(source))),
+                            ),
+                        ),
+                        field(
+                            "intermediate-size",
+                            ComponentValue::S64(layer.intermediate_size as i64),
+                        ),
+                    ])
+                })
+                .collect(),
+        ))
+    }))
+}
+
+/// `architecture-options` (`1.6.0`).
+fn encode_options(config: &ModelArchitectureConfig) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Record(vec![
+        field(
+            "final-logit-softcapping",
+            ComponentValue::Option(
+                config
+                    .final_logit_softcapping
+                    .map(|cap| Box::new(ComponentValue::F64(cap))),
+            ),
+        ),
+        field(
+            "per-layer-input-size",
+            ComponentValue::Option(
+                config
+                    .per_layer_input_size
+                    .map(|size| Box::new(ComponentValue::U32(size))),
+            ),
+        ),
+    ])
+}
+
 fn rejected(instance_key: &str, message: impl Into<String>) -> ComponentError {
     ComponentError::CapabilityCallRejected {
         capability: CAPABILITY_NAME.to_string(),
@@ -177,7 +251,7 @@ impl HostCapability for ModelConfigCapability {
         arguments: &[ComponentValue],
     ) -> Result<Vec<ComponentValue>, ComponentError> {
         match operation {
-            "model-config" | "rope-scaling" | "mixture-of-experts" => {
+            "model-config" | "rope-scaling" | "mixture-of-experts" | "layer-layout" | "options" => {
                 if !arguments.is_empty() {
                     return Err(rejected(
                         instance_key,
@@ -197,7 +271,11 @@ impl HostCapability for ModelConfigCapability {
                 Ok(vec![match operation {
                     "model-config" => encode_architecture_config(config),
                     "rope-scaling" => encode_rope_scaling(config.rope_frequency_scaling.as_ref()),
-                    _ => encode_mixture_of_experts(config.mixture_of_experts.as_ref()),
+                    "mixture-of-experts" => {
+                        encode_mixture_of_experts(config.mixture_of_experts.as_ref())
+                    }
+                    "layer-layout" => encode_layer_layout(config.layer_layout.as_deref()),
+                    _ => encode_options(config),
                 }])
             }
             other => Err(rejected(

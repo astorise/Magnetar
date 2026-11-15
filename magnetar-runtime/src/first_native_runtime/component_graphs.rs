@@ -290,7 +290,10 @@ pub fn register_inference_component_artifact(
     // keep authorizing `1.2.0` alongside `1.3.0` here, not merely replace
     // one with the other, or every still-`1.2.0`-compiled Component fails
     // `UnauthorizedImport`/`CapabilityVersionMismatch`.
-    for version in ["1.2.0", "1.3.0", "1.4.0", "1.5.0"] {
+    // `1.6.0` (`add-layer-layout-model-config`) adds `model-config`'s
+    // `layer-layout` and `options`; Components compiled against an earlier
+    // version keep linking.
+    for version in ["1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0"] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),
             capability.clone() as Arc<dyn HostCapability>,
