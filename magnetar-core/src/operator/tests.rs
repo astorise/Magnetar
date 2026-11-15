@@ -412,3 +412,84 @@ fn optional_inputs_scalar_mul_and_the_layered_model_attributes_validate() {
         assert_eq!(rule.kind, value.kind(), "{operator}.{name}");
     }
 }
+
+/// `dispatch-layered-model-forms`: only the optional forms a Kernel could
+/// ignore need a declared feature; the baseline forms and the attributes'
+/// default values need none.
+#[test]
+fn required_kernel_features_name_only_non_baseline_forms() {
+    let attributes = |pairs: &[(&str, OperatorAttributeValue)]| {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let none = BTreeMap::new();
+    assert!(required_kernel_features("attention", &none, 3).is_empty());
+    assert!(required_kernel_features("rmsnorm", &none, 2).is_empty());
+    assert!(required_kernel_features("rope", &none, 1).is_empty());
+    assert!(required_kernel_features("moe-experts", &none, 5).is_empty());
+    assert!(required_kernel_features("matmul", &none, 2).is_empty());
+    assert_eq!(
+        required_kernel_features(
+            "attention",
+            &attributes(&[("scale", OperatorAttributeValue::Float(1.0))]),
+            3
+        ),
+        vec![ATTENTION_SCALE_FEATURE]
+    );
+    assert_eq!(
+        required_kernel_features(
+            "embedding",
+            &attributes(&[("scale", OperatorAttributeValue::Float(2.0))]),
+            2
+        ),
+        vec![EMBEDDING_SCALE_FEATURE]
+    );
+    assert_eq!(
+        required_kernel_features(
+            "rmsnorm",
+            &attributes(&[
+                ("head_count", OperatorAttributeValue::Integer(2)),
+                ("head_dimension", OperatorAttributeValue::Integer(4)),
+            ]),
+            1
+        ),
+        vec![RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE]
+    );
+    assert!(
+        required_kernel_features(
+            "rope",
+            &attributes(&[("partial_rotary_factor", OperatorAttributeValue::Float(1.0))]),
+            1
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        required_kernel_features(
+            "rope",
+            &attributes(&[("partial_rotary_factor", OperatorAttributeValue::Float(0.25))]),
+            1
+        ),
+        vec![ROPE_PARTIAL_ROTARY_FEATURE]
+    );
+    assert!(
+        required_kernel_features(
+            "moe-experts",
+            &attributes(&[("activation", OperatorAttributeValue::String("silu".into()))]),
+            5
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        required_kernel_features(
+            "moe-experts",
+            &attributes(&[(
+                "activation",
+                OperatorAttributeValue::String("gelu_tanh".into())
+            )]),
+            6
+        ),
+        vec![MOE_EXPERTS_ACTIVATION_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE]
+    );
+}

@@ -1539,20 +1539,53 @@ pub(super) fn dispatch_qwen_rmsnorm(
     epsilon: f32,
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
+    dispatch_rmsnorm_node(
+        ctx,
+        operation_id,
+        input,
+        Some(weight),
+        epsilon,
+        &BTreeMap::new(),
+        output_target,
+    )
+}
+
+/// The `rmsnorm` node attributes forwarded to the Kernel when the graph sets
+/// them (`dispatch-layered-model-forms`): per-head normalization and a
+/// scale-less RMSNorm.
+const RMSNORM_NODE_ATTRIBUTES: [&str; 3] = ["head_count", "head_dimension", "with_scale"];
+
+/// [`dispatch_qwen_rmsnorm`] for a graph node: no weight for a scale-less
+/// RMSNorm, and the node's per-head attributes.
+pub(super) fn dispatch_rmsnorm_node(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    input: NodeValue,
+    weight: Option<NodeValue>,
+    epsilon: f32,
+    node_attributes: &BTreeMap<String, OperatorAttributeValue>,
+    output_target: Option<OutputTarget>,
+) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
     let mut attributes = BTreeMap::new();
     attributes.insert(
         "epsilon".into(),
         OperatorAttributeValue::Float(epsilon as f64),
     );
+    for name in RMSNORM_NODE_ATTRIBUTES {
+        if let Some(value) = node_attributes.get(name) {
+            attributes.insert(name.into(), value.clone());
+        }
+    }
     let output_descriptor = f32_tensor_descriptor_from_shape(input.shape());
+    let mut resources = vec![node_input_resource(operation_id, "input", input)];
+    if let Some(weight) = weight {
+        resources.push(node_input_resource(operation_id, "weight", weight));
+    }
     dispatch_reference_cpu_operator_pre_admitted(
         ctx,
         operation_id,
         dispatch_operator_id("rmsnorm", OperatorFamily::Normalization),
-        vec![
-            node_input_resource(operation_id, "input", input),
-            node_input_resource(operation_id, "weight", weight),
-        ],
+        resources,
         output_descriptor,
         output_target,
         attributes,
@@ -1576,6 +1609,36 @@ pub(super) fn dispatch_qwen_rope(
     rope_config: &FirstNativeRopeConfig,
     pairing: RopePairing,
     frequency_scaling: Option<&crate::operator::RopeBandedFrequencyScaling>,
+    position_offset: u64,
+    output_target: Option<OutputTarget>,
+) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
+    dispatch_rope_node(
+        ctx,
+        operation_id,
+        input,
+        head_count,
+        rope_config,
+        pairing,
+        frequency_scaling,
+        None,
+        position_offset,
+        output_target,
+    )
+}
+
+/// [`dispatch_qwen_rope`] for a graph node, with its partial rotation
+/// (`dispatch-layered-model-forms`): only the first
+/// `floor(factor * dimension / 2)` pairs rotate.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_rope_node(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    input: NodeValue,
+    head_count: u64,
+    rope_config: &FirstNativeRopeConfig,
+    pairing: RopePairing,
+    frequency_scaling: Option<&crate::operator::RopeBandedFrequencyScaling>,
+    partial_rotary_factor: Option<f64>,
     position_offset: u64,
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
@@ -1608,6 +1671,12 @@ pub(super) fn dispatch_qwen_rope(
         "head_count".into(),
         OperatorAttributeValue::Integer(head_count as i64),
     );
+    if let Some(factor) = partial_rotary_factor {
+        attributes.insert(
+            "partial_rotary_factor".into(),
+            OperatorAttributeValue::Float(factor),
+        );
+    }
     if let Some(scaling) = frequency_scaling {
         // A Kernel that ignored these attributes would rotate with unscaled
         // frequencies and silently degrade every token: refuse a Provider
@@ -1695,29 +1764,6 @@ pub(super) fn dispatch_qwen_attention(
         if let Some(value) = node_attributes.get(name) {
             attributes.insert(name.into(), value.clone());
         }
-    }
-    if attributes.contains_key("scale")
-        && let Some(provider) = ctx
-            .prepared_plan
-            .as_ref()
-            .and_then(|plan| plan.node_bindings.first())
-            .map(|binding| binding.provider.clone())
-        && !provider_kernels_declare(
-            ctx.runtime,
-            &provider,
-            "attention",
-            crate::operator::ATTENTION_SCALE_FEATURE,
-        )
-    {
-        // A Kernel that ignored `scale` would compute every score with the
-        // wrong temperature.
-        return Err(InferenceApiError::KernelUnavailable {
-            reason: format!(
-                "operation '{operation_id}' needs an attention score scale, which Provider \
-                 {provider:?} does not advertise ('{}')",
-                crate::operator::ATTENTION_SCALE_FEATURE
-            ),
-        });
     }
     let output_descriptor = f32_tensor_descriptor_from_shape(q.shape());
     dispatch_reference_cpu_operator_pre_admitted(

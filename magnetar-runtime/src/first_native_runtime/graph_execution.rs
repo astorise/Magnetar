@@ -259,6 +259,31 @@ pub(super) fn dispatch_first_native_graph_node(
         let owner = ctx.output_owner(kv_cache_id);
         (output_resource_id, placement, owner)
     };
+    // Optional operator forms a Kernel could ignore reach only Providers
+    // whose every Kernel for the operator declares them
+    // (`dispatch-layered-model-forms`).
+    if let Some(provider) = ctx
+        .prepared_plan
+        .as_ref()
+        .and_then(|plan| plan.node_bindings.first())
+        .map(|binding| binding.provider.clone())
+    {
+        for feature in crate::operator::required_kernel_features(
+            node.operator.name(),
+            &node.attributes,
+            node.inputs.len(),
+        ) {
+            if !provider_kernels_declare(ctx.runtime, &provider, node.operator.name(), feature) {
+                return Err(InferenceApiError::KernelUnavailable {
+                    reason: format!(
+                        "graph node '{node_id}' needs the '{feature}' form of operator '{}', \
+                         which Provider {provider:?} does not advertise",
+                        node.operator.name()
+                    ),
+                });
+            }
+        }
+    }
     match node.operator.name() {
         "embedding" => {
             if inputs.len() != 2 {
@@ -272,8 +297,15 @@ pub(super) fn dispatch_first_native_graph_node(
             let ids = inputs.remove(0);
             let table = inputs.remove(0);
             let sequence_length = ids.shape().first().copied().unwrap_or(0);
+            // The table's own row width: the hidden size for token
+            // embeddings, another width for e.g. per-layer input tables.
+            let width = table
+                .shape()
+                .get(1)
+                .copied()
+                .unwrap_or(architecture.hidden_size);
             let output_descriptor = TensorDescriptor::new(
-                ShapeDescriptor::new([sequence_length, architecture.hidden_size]),
+                ShapeDescriptor::new([sequence_length, width]),
                 DTypeDescriptor::portable(ComputeDType::Float32),
                 LayoutDescriptor::Contiguous,
             );
@@ -287,14 +319,16 @@ pub(super) fn dispatch_first_native_graph_node(
                 ],
                 output_descriptor,
                 Some(output_target),
-                BTreeMap::new(),
+                // `scale` (`dispatch-layered-model-forms`).
+                node.attributes.clone(),
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "rmsnorm" => {
-            if inputs.len() != 2 {
+            // One input for a scale-less RMSNorm (`dispatch-layered-model-forms`).
+            if !(1..=2).contains(&inputs.len()) {
                 return Err(InferenceApiError::GraphPlanningFailed {
-                    reason: format!("graph node '{node_id}' expects 2 rmsnorm inputs"),
+                    reason: format!("graph node '{node_id}' expects 1 or 2 rmsnorm inputs"),
                 });
             }
             // Both inputs are eligible for Resident passthrough now
@@ -306,10 +340,18 @@ pub(super) fn dispatch_first_native_graph_node(
             // materialization). Its output still targets the edge's final
             // identity directly, same as every other operator here.
             let input = inputs.remove(0);
-            let weight = inputs.remove(0);
+            let weight = inputs.pop();
             let epsilon = node_attribute_f64(node, "epsilon")? as f32;
-            dispatch_qwen_rmsnorm(ctx, node_id, input, weight, epsilon, Some(output_target))
-                .map(|(dispatch, value)| (dispatch, vec![value]))
+            dispatch_rmsnorm_node(
+                ctx,
+                node_id,
+                input,
+                weight,
+                epsilon,
+                &node.attributes,
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "matmul" => {
             if inputs.len() != 2 {
@@ -474,7 +516,18 @@ pub(super) fn dispatch_first_native_graph_node(
                         .is_none_or(|edge| edge.kv_cache.is_some())
                 })
             });
-            dispatch_qwen_rope(
+            let partial_rotary_factor = match node.attributes.get("partial_rotary_factor") {
+                None => None,
+                Some(OperatorAttributeValue::Float(factor)) => Some(*factor),
+                Some(_) => {
+                    return Err(InferenceApiError::GraphPlanningFailed {
+                        reason: format!(
+                            "graph node '{node_id}' attribute 'partial_rotary_factor' is not a float"
+                        ),
+                    });
+                }
+            };
+            dispatch_rope_node(
                 ctx,
                 node_id,
                 input,
@@ -482,6 +535,7 @@ pub(super) fn dispatch_first_native_graph_node(
                 &rope_config,
                 pairing,
                 frequency_scaling.as_ref(),
+                partial_rotary_factor,
                 position_offset,
                 (!output_has_kv_semantics).then_some(output_target),
             )
@@ -515,14 +569,16 @@ pub(super) fn dispatch_first_native_graph_node(
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }
         "moe-experts" => {
-            if inputs.len() != 5 {
+            // A sixth input scales each expert's output
+            // (`dispatch-layered-model-forms`).
+            if !(5..=6).contains(&inputs.len()) {
                 return Err(InferenceApiError::GraphPlanningFailed {
-                    reason: format!("graph node '{node_id}' expects 5 moe-experts inputs"),
+                    reason: format!("graph node '{node_id}' expects 5 or 6 moe-experts inputs"),
                 });
             }
             let (rows, cols) = inputs[0].rows_cols()?;
             let output_descriptor = f32_tensor_descriptor_from_shape(&[rows, cols]);
-            let resources = ["h", "logits", "gate", "up", "down"]
+            let resources = ["h", "logits", "gate", "up", "down", "per_expert_scale"]
                 .into_iter()
                 .zip(inputs)
                 .map(|(role, value)| node_input_resource(node_id, role, value))
@@ -568,6 +624,25 @@ pub(super) fn dispatch_first_native_graph_node(
                 ctx,
                 node_id,
                 "activation",
+                OperatorFamily::Activation,
+                input,
+                node.attributes.clone(),
+                Some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        "gelu" => {
+            if inputs.len() != 1 {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!("graph node '{node_id}' expects 1 gelu input"),
+                });
+            }
+            let input = inputs.remove(0);
+            // `approximate` (`dispatch-layered-model-forms`).
+            dispatch_qwen_unary(
+                ctx,
+                node_id,
+                "gelu",
                 OperatorFamily::Activation,
                 input,
                 node.attributes.clone(),
@@ -1174,6 +1249,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "row-scale"
                 | "activation"
                 | "attention"
+                | "gelu"
                 | "silu"
                 | "add"
                 | "mul"

@@ -140,9 +140,11 @@ use crate::memory::{
     MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
 };
 use crate::operator::{
-    ATTENTION_SCALE_FEATURE, OperatorAttributeValue, OperatorFamily, OperatorId, OperatorSpec,
-    ROPE_BANDED_FREQUENCY_SCALING_FEATURE, RopeBandedFrequencyScaling, TensorLayoutKind,
-    TensorRole,
+    ATTENTION_SCALE_FEATURE, EMBEDDING_SCALE_FEATURE, MOE_EXPERTS_ACTIVATION_FEATURE,
+    MOE_PER_EXPERT_SCALE_FEATURE, OperatorAttributeValue, OperatorFamily, OperatorId, OperatorSpec,
+    RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE,
+    ROPE_BANDED_FREQUENCY_SCALING_FEATURE, ROPE_PARTIAL_ROTARY_FEATURE, RopeBandedFrequencyScaling,
+    TensorLayoutKind, TensorRole,
 };
 pub use crate::operator_semantics::{
     MOE_EXPERT_COUNT_ATTRIBUTE, MOE_EXPERT_FIRST_ATTRIBUTE, MoeRouting, NATIVE_CPU_PROVIDER_NAME,
@@ -1321,12 +1323,40 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         .id
         .features
         .insert(ATTENTION_SCALE_FEATURE.to_string());
-    let embedding = baseline_advertisement("embedding", OperatorFamily::Tensor);
-    // Honours the banded frequency-scaling attributes.
-    let mut rope = baseline_advertisement("rope", OperatorFamily::PositionEncoding);
-    rope.id
-        .features
-        .insert(ROPE_BANDED_FREQUENCY_SCALING_FEATURE.to_string());
+    let with_features = |operator: &str, family: OperatorFamily, features: &[&str]| {
+        let mut advertisement = baseline_advertisement(operator, family);
+        advertisement
+            .id
+            .features
+            .extend(features.iter().map(|feature| feature.to_string()));
+        advertisement
+    };
+    // Honours every optional form of the layered-model attributes
+    // (`dispatch-layered-model-forms`).
+    let embedding = with_features(
+        "embedding",
+        OperatorFamily::Tensor,
+        &[EMBEDDING_SCALE_FEATURE],
+    );
+    let rmsnorm = with_features(
+        "rmsnorm",
+        OperatorFamily::Normalization,
+        &[RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE],
+    );
+    let moe_experts = with_features(
+        "moe-experts",
+        OperatorFamily::LinearAlgebra,
+        &[MOE_EXPERTS_ACTIVATION_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE],
+    );
+    // Honours the banded frequency-scaling attributes and partial rotation.
+    let rope = with_features(
+        "rope",
+        OperatorFamily::PositionEncoding,
+        &[
+            ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
+            ROPE_PARTIAL_ROTARY_FEATURE,
+        ],
+    );
 
     vec![
         baseline_advertisement("matmul", OperatorFamily::LinearAlgebra),
@@ -1334,10 +1364,10 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("matmul-residual", OperatorFamily::LinearAlgebra),
         baseline_advertisement("silu-mul", OperatorFamily::Activation),
         baseline_advertisement("gated-matmul", OperatorFamily::LinearAlgebra),
-        baseline_advertisement("moe-experts", OperatorFamily::LinearAlgebra),
+        moe_experts,
         baseline_advertisement("row-scale", OperatorFamily::Tensor),
         embedding,
-        baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
+        rmsnorm,
         rope,
         attention,
         baseline_advertisement("softmax", OperatorFamily::Activation),
@@ -2412,6 +2442,17 @@ impl ReferenceCpuExecutor {
                     1 => None,
                     _ => Some(self.input_tensor(invocation, 1)?),
                 };
+                if let Some(OperatorAttributeValue::Boolean(with_scale)) =
+                    invocation.attributes.get("with_scale")
+                    && *with_scale != weight.is_some()
+                {
+                    return Err(KernelError::KernelAttributeUnsupported {
+                        attribute: format!(
+                            "rmsnorm with_scale {with_scale} contradicts its {} input(s)",
+                            invocation.inputs.len()
+                        ),
+                    });
+                }
                 match (&weight, heads) {
                     // Today's form keeps its own weight shapes.
                     (Some(weight), None) => {

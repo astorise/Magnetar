@@ -899,3 +899,453 @@ fn attention_scale_is_sent_only_to_kernels_that_declare_it() {
         crate::operator::ATTENTION_SCALE_FEATURE
     ));
 }
+
+// ---------------------------------------------------------------------------
+// `dispatch-layered-model-forms`: every optional operator form of the
+// layered models, through the first-native engine.
+// ---------------------------------------------------------------------------
+
+/// A graph under construction, every weight a graph input.
+struct FormsGraph {
+    graph: ExecutionGraph,
+}
+
+impl FormsGraph {
+    fn input(&mut self, name: &str, shape: &[u64]) -> TensorEdgeId {
+        let id = TensorEdgeId::new(format!("input.{name}"));
+        self.graph.edges.insert(
+            id.clone(),
+            TensorEdge::new(id.clone(), f32_tensor_descriptor_from_shape(shape)),
+        );
+        id
+    }
+
+    fn node(
+        &mut self,
+        id: &str,
+        operator: &str,
+        family: OperatorFamily,
+        attributes: Vec<(&str, OperatorAttributeValue)>,
+        inputs: Vec<TensorEdgeId>,
+        shape: &[u64],
+    ) -> TensorEdgeId {
+        let node_id = ExecutionNodeId::new(id);
+        let output = TensorEdgeId::new(format!("edge.{id}"));
+        let mut node =
+            ExecutionNode::new(node_id.clone(), OperatorId::magnetar(operator, 1, family));
+        for edge in &inputs {
+            node = node.with_input(edge.clone());
+            self.graph
+                .edges
+                .get_mut(edge)
+                .unwrap()
+                .consumers
+                .insert(node_id.clone());
+        }
+        node = node.with_output(output.clone());
+        for (name, value) in attributes {
+            node = node.with_attribute(name, value);
+        }
+        self.graph.edges.insert(
+            output.clone(),
+            TensorEdge::new(output.clone(), f32_tensor_descriptor_from_shape(shape))
+                .with_producer(node_id.clone()),
+        );
+        self.graph.nodes.insert(node_id, node);
+        output
+    }
+}
+
+const FORMS_ROWS: u64 = 3;
+const FORMS_VOCAB: u64 = 5;
+const FORMS_HEADS: u64 = 2;
+const FORMS_HEAD_DIM: u64 = 4;
+const FORMS_WIDTH: u64 = FORMS_HEADS * FORMS_HEAD_DIM;
+const FORMS_EXPERTS: u64 = 3;
+const FORMS_EXPERT_WIDTH: u64 = 2;
+const FORMS_OUT: u64 = 6;
+
+fn forms_inputs() -> BTreeMap<String, HostTensor> {
+    let mut seed = 11u32;
+    let mut tensor = |shape: Vec<u64>| {
+        let count: u64 = shape.iter().product();
+        let values: Vec<f32> = (0..count)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((seed >> 16) % 1000) as f32 / 500.0 - 1.0
+            })
+            .collect();
+        HostTensor::new(shape, values).unwrap()
+    };
+    let mut inputs = BTreeMap::new();
+    inputs.insert(
+        "token_ids".into(),
+        HostTensor::new([FORMS_ROWS], vec![4.0, 1.0, 3.0]).unwrap(),
+    );
+    inputs.insert("table".into(), tensor(vec![FORMS_VOCAB, FORMS_WIDTH]));
+    inputs.insert("k_norm".into(), tensor(vec![FORMS_HEAD_DIM]));
+    inputs.insert("layer_scalar".into(), tensor(vec![1]));
+    inputs.insert("router".into(), tensor(vec![FORMS_WIDTH, FORMS_EXPERTS]));
+    inputs.insert(
+        "gate".into(),
+        tensor(vec![FORMS_WIDTH, FORMS_EXPERTS * FORMS_EXPERT_WIDTH]),
+    );
+    inputs.insert(
+        "up".into(),
+        tensor(vec![FORMS_WIDTH, FORMS_EXPERTS * FORMS_EXPERT_WIDTH]),
+    );
+    inputs.insert(
+        "down".into(),
+        tensor(vec![FORMS_EXPERT_WIDTH, FORMS_EXPERTS * FORMS_WIDTH]),
+    );
+    inputs.insert("per_expert_scale".into(), tensor(vec![FORMS_EXPERTS]));
+    inputs.insert("head".into(), tensor(vec![FORMS_WIDTH, FORMS_OUT]));
+    inputs
+}
+
+/// `embedding(scale) -> rmsnorm(per head, no weight) -> rmsnorm(per head,
+/// [head_dimension] weight) -> rope(partial) -> gelu(tanh) -> mul([1]) ->
+/// activation(scale) -> moe-experts(gelu_tanh, per_expert_scale) -> matmul
+/// -> activation(softcap) = logits`.
+fn forms_graph() -> ExecutionGraph {
+    let mut g = FormsGraph {
+        graph: ExecutionGraph::new(
+            ExecutionGraphId::new("layered-forms"),
+            ExecutionGraphPhase::Prefill,
+        ),
+    };
+    let rows = FORMS_ROWS;
+    let hidden = [rows, FORMS_WIDTH];
+    let inputs = forms_inputs();
+    let input = |g: &mut FormsGraph, name: &str| g.input(name, &inputs[name].shape.clone());
+    let heads = |g: &FormsGraph| {
+        let _ = g;
+        vec![
+            (
+                "head_count",
+                OperatorAttributeValue::Integer(FORMS_HEADS as i64),
+            ),
+            (
+                "head_dimension",
+                OperatorAttributeValue::Integer(FORMS_HEAD_DIM as i64),
+            ),
+        ]
+    };
+    let ids = input(&mut g, "token_ids");
+    let table = input(&mut g, "table");
+    let embedded = g.node(
+        "embed",
+        "embedding",
+        OperatorFamily::Tensor,
+        vec![("scale", OperatorAttributeValue::Float(2.0))],
+        vec![ids, table],
+        &hidden,
+    );
+    let x = embedded.clone();
+    let mut attributes = heads(&g);
+    attributes.push(("epsilon", OperatorAttributeValue::Float(1e-6)));
+    attributes.push(("with_scale", OperatorAttributeValue::Boolean(false)));
+    let x = g.node(
+        "v_norm",
+        "rmsnorm",
+        OperatorFamily::Normalization,
+        attributes,
+        vec![x],
+        &hidden,
+    );
+    let k_norm = input(&mut g, "k_norm");
+    let mut attributes = heads(&g);
+    attributes.push(("epsilon", OperatorAttributeValue::Float(1e-6)));
+    let x = g.node(
+        "k_norm",
+        "rmsnorm",
+        OperatorFamily::Normalization,
+        attributes,
+        vec![x, k_norm],
+        &hidden,
+    );
+    let x = g.node(
+        "rope",
+        "rope",
+        OperatorFamily::PositionEncoding,
+        vec![
+            ("base", OperatorAttributeValue::Float(4.0)),
+            (
+                "dimension",
+                OperatorAttributeValue::Integer(FORMS_HEAD_DIM as i64),
+            ),
+            (
+                "head_count",
+                OperatorAttributeValue::Integer(FORMS_HEADS as i64),
+            ),
+            ("position_offset", OperatorAttributeValue::Integer(0)),
+            (
+                "rotation_pairing",
+                OperatorAttributeValue::String("half_split".into()),
+            ),
+            ("partial_rotary_factor", OperatorAttributeValue::Float(0.5)),
+        ],
+        vec![x],
+        &hidden,
+    );
+    let x = g.node(
+        "gelu",
+        "gelu",
+        OperatorFamily::Activation,
+        vec![("approximate", OperatorAttributeValue::String("tanh".into()))],
+        vec![x],
+        &hidden,
+    );
+    let layer_scalar = input(&mut g, "layer_scalar");
+    let x = g.node(
+        "layer_scalar",
+        "mul",
+        OperatorFamily::Tensor,
+        vec![],
+        vec![x, layer_scalar],
+        &hidden,
+    );
+    let x = g.node(
+        "scale",
+        "activation",
+        OperatorFamily::Activation,
+        vec![
+            ("kind", OperatorAttributeValue::String("scale".into())),
+            ("factor", OperatorAttributeValue::Float(0.5)),
+        ],
+        vec![x],
+        &hidden,
+    );
+    let router = input(&mut g, "router");
+    let logits = g.node(
+        "router",
+        "matmul",
+        OperatorFamily::LinearAlgebra,
+        vec![],
+        vec![x.clone(), router],
+        &[rows, FORMS_EXPERTS],
+    );
+    let experts = ["gate", "up", "down", "per_expert_scale"].map(|name| input(&mut g, name));
+    let mut moe_inputs = vec![x, logits];
+    moe_inputs.extend(experts);
+    let x = g.node(
+        "experts",
+        "moe-experts",
+        OperatorFamily::LinearAlgebra,
+        vec![
+            (
+                "experts",
+                OperatorAttributeValue::Integer(FORMS_EXPERTS as i64),
+            ),
+            ("top_k", OperatorAttributeValue::Integer(2)),
+            ("normalize_top_k", OperatorAttributeValue::Boolean(true)),
+            (
+                "activation",
+                OperatorAttributeValue::String("gelu_tanh".into()),
+            ),
+        ],
+        moe_inputs,
+        &hidden,
+    );
+    // The scaled embeddings feed the head too, where RMSNorm cannot absorb
+    // their scale.
+    let x = g.node(
+        "residual",
+        "add",
+        OperatorFamily::Tensor,
+        vec![],
+        vec![x, embedded],
+        &hidden,
+    );
+    let head = input(&mut g, "head");
+    let x = g.node(
+        "head",
+        "matmul",
+        OperatorFamily::LinearAlgebra,
+        vec![],
+        vec![x, head],
+        &[rows, FORMS_OUT],
+    );
+    let softcapped = g.node(
+        "softcap",
+        "activation",
+        OperatorFamily::Activation,
+        vec![
+            ("kind", OperatorAttributeValue::String("softcap".into())),
+            ("cap", OperatorAttributeValue::Float(0.8)),
+        ],
+        vec![x],
+        &[rows, FORMS_OUT],
+    );
+    let mut graph = g.graph;
+    let mut edge = graph.edges.remove(&softcapped).unwrap();
+    edge.id = TensorEdgeId::new("logits");
+    graph.edges.insert(edge.id.clone(), edge);
+    graph
+        .nodes
+        .get_mut(&ExecutionNodeId::new("softcap"))
+        .unwrap()
+        .outputs = vec![TensorEdgeId::new("logits")];
+    graph
+}
+
+/// [`forms_graph`]'s logits computed on the host, by hand except for the
+/// routed experts (the shared `operator_semantics` function).
+fn forms_oracle() -> Vec<f32> {
+    let inputs = forms_inputs();
+    let rows = FORMS_ROWS as usize;
+    let (width, d, heads) = (
+        FORMS_WIDTH as usize,
+        FORMS_HEAD_DIM as usize,
+        FORMS_HEADS as usize,
+    );
+    let embedded: Vec<f32> = inputs["token_ids"]
+        .data
+        .iter()
+        .flat_map(|id| {
+            let row = *id as usize;
+            inputs["table"].data[row * width..(row + 1) * width]
+                .iter()
+                .map(|value| value * 2.0)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut x = embedded.clone();
+    let normalize = |x: &mut [f32], weight: Option<&[f32]>| {
+        for block in x.chunks_mut(d) {
+            let mean = block.iter().map(|v| v * v).sum::<f32>() / d as f32;
+            let inverse = 1.0 / (mean + 1e-6).sqrt();
+            for (index, value) in block.iter_mut().enumerate() {
+                *value *= inverse * weight.map_or(1.0, |weight| weight[index]);
+            }
+        }
+    };
+    normalize(&mut x, None);
+    normalize(&mut x, Some(&inputs["k_norm"].data));
+    // Partial half-split RoPE: floor(0.5 * 4 / 2) = 1 of 2 pairs rotates,
+    // with the full width as the frequency denominator.
+    for row in 0..rows {
+        for head in 0..heads {
+            let base = row * width + head * d;
+            let frequency = 4f32.powf(-0.0 / d as f32);
+            let angle = row as f32 * frequency;
+            let (a, b) = (x[base], x[base + d / 2]);
+            x[base] = a * angle.cos() - b * angle.sin();
+            x[base + d / 2] = a * angle.sin() + b * angle.cos();
+        }
+    }
+    let scalar = inputs["layer_scalar"].data[0];
+    for value in &mut x {
+        *value = crate::operator_semantics::gelu_tanh(*value) * scalar * 0.5;
+    }
+    let h = HostTensor::new([FORMS_ROWS, FORMS_WIDTH], x.clone()).unwrap();
+    let logits = host_matmul(&x, rows, &inputs["router"]);
+    let logits = HostTensor::new([FORMS_ROWS, FORMS_EXPERTS], logits).unwrap();
+    let experts = crate::operator_semantics::moe_experts_local_with(
+        &h,
+        &logits,
+        [&inputs["gate"], &inputs["up"], &inputs["down"]],
+        crate::operator_semantics::MoeRouting {
+            experts: FORMS_EXPERTS,
+            top_k: 2,
+            normalize: true,
+        },
+        0,
+        FORMS_EXPERTS,
+        crate::operator_semantics::MoeExpertOptions {
+            activation: crate::operator_semantics::MoeExpertActivation::GeluTanh,
+            per_expert_scale: Some(&inputs["per_expert_scale"]),
+        },
+    )
+    .unwrap();
+    let residual: Vec<f32> = experts
+        .data
+        .iter()
+        .zip(&embedded)
+        .map(|(a, b)| a + b)
+        .collect();
+    host_matmul(&residual, rows, &inputs["head"])
+        .into_iter()
+        .map(|value| 0.8 * (value / 0.8).tanh())
+        .collect()
+}
+
+/// Runs [`forms_graph`] on the Reference CPU and returns its logits, or
+/// the dispatch error.
+fn run_forms(
+    runtime: &mut Runtime,
+    instance: &ModelInstanceId,
+) -> Result<Vec<f32>, InferenceApiError> {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let graph = forms_graph();
+    let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+    let revision = require_ready_first_native_instance(runtime, instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let mut plan = prepare_first_native_plan_for_graph(
+        runtime,
+        &graph,
+        instance,
+        revision,
+        FORMS_ROWS,
+        PreparedExecutionPlanGeneration::new(1),
+        &provider,
+    )
+    .unwrap();
+    let bindings = forms_inputs()
+        .into_iter()
+        .map(|(name, tensor)| (TensorEdgeId::new(format!("input.{name}")), tensor))
+        .collect();
+    let (_, outputs, _, _) = execute_first_native_graph_materializing(
+        runtime,
+        &fixture,
+        instance,
+        &KvCacheId::new("forms").unwrap(),
+        &graph,
+        &mut plan,
+        bindings,
+        None,
+        Some(0),
+        &mut Vec::new(),
+        MaterializedEdges::Only(&["logits"]),
+        None,
+        None,
+    )?;
+    Ok(outputs[&TensorEdgeId::new("logits")].data.clone())
+}
+
+/// Every optional operator form reaches the Reference CPU with its
+/// attributes and operands, and the graph's logits match the host.
+#[test]
+fn every_layered_operator_form_reaches_the_kernel() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    let logits = run_forms(&mut runtime, &instance).unwrap();
+    assert_logits_close(&logits, &forms_oracle(), "layered forms");
+}
+
+/// The Reference CPU declares every optional form the dispatch gate can
+/// require, so a layered graph is never refused there.
+#[test]
+fn the_reference_cpu_declares_every_layered_form() {
+    use crate::operator::*;
+    let fixture = e2e_fixture().expect("fixture builds");
+    let runtime = build_runtime_trusting_fixture(&fixture);
+    let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+    for (operator, feature) in [
+        ("attention", ATTENTION_SCALE_FEATURE),
+        ("embedding", EMBEDDING_SCALE_FEATURE),
+        ("rmsnorm", RMSNORM_PER_HEAD_FEATURE),
+        ("rmsnorm", RMSNORM_WITHOUT_WEIGHT_FEATURE),
+        ("rope", ROPE_PARTIAL_ROTARY_FEATURE),
+        ("moe-experts", MOE_EXPERTS_ACTIVATION_FEATURE),
+        ("moe-experts", MOE_PER_EXPERT_SCALE_FEATURE),
+    ] {
+        assert!(
+            provider_kernels_declare(&runtime, &provider, operator, feature),
+            "{operator} declares {feature}"
+        );
+    }
+}
