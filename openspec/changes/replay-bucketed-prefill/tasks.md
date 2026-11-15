@@ -15,13 +15,13 @@
 ## 3. Prefill capture and replay
 
 - [x] 3.1 Recording key and table, the per-node / capture / replay sequence, and fallback on capture failure or invalidation.
-- [ ] 3.2 CUDA Provider: run the bucketed prefill under capture and fix every Kernel that allocates, synchronizes or downloads during capture. Multi-row attention done; the rest is driven by the GPU campaign's capture trace.
-- [ ] 3.3 Tests:
+- [x] 3.2 CUDA Provider: run the bucketed prefill under capture and fix every Kernel that allocates, synchronizes or downloads during capture. Multi-row attention is captured; packed row matmuls skip a replay's padding rows (`padding_rows`).
+- [x] 3.3 Tests (`prefill_buckets::tests`; CUDA `a_captured_prefill_attention_replays_at_its_captured_key_count_on_real_hardware`, `a_captured_packed_matmul_skips_a_replays_padding_rows`):
   - Runtime, with the test step-capture Provider: third request replays; an invalidated recording falls back;
   - CUDA, on real hardware: a captured bucketed prefill replays with identical logits.
 
 ## 4. Controls, qualification and documentation
 
-- [ ] 4.1 `set_prefill_replay`, `MAGNETAR_PREFILL_REPLAY=0`, phase ledger `prefill_replay`, and reporting of the pool's held bytes.
-- [ ] 4.2 GPU campaign: warm TTFT for short prompts (5, 12 and 40 tokens) on Qwen2.5-0.5B and Mistral 7B, replay against per node in the same run, with token and logit agreement and pool VRAM. Record the evidence in design.md.
-- [ ] 4.3 Run cargo fmt, clippy and tests in the affected workspaces and in the CUDA Provider.
+- [x] 4.1 `set_prefill_replay`, `MAGNETAR_PREFILL_REPLAY=0`, phase ledger (`step_replay` within a prefill step), and reporting of the pool's held bytes (`kv_pool_bytes`).
+- [x] 4.2 GPU campaign: warm TTFT for short prompts (5, 12 and 40 tokens) on Qwen2.5-0.5B and Mistral 7B, replay against per node in the same run, with token and logit agreement and pool VRAM. Record the evidence in design.md.
+- [x] 4.3 Run cargo fmt, clippy and tests in the affected workspaces and in the CUDA Provider.

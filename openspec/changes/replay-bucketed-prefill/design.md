@@ -98,6 +98,20 @@ With buckets at every multiple of 8 (runs 43723450794 and 43728214947), tokens a
 
 - **Where Mistral's replayed prefill spends its time.** 44.8 of its 45.1 ms are spent waiting for the Device; the replay itself costs 0.16 ms of host time. The per-node control spends 33.1 ms in all. On a 7B model the per-node host work is already hidden behind the Device, so replay has nothing to remove.
 - **Padding rows cost Device time in proportion.** 33.7 ms × 8/6 = 44.9 ms, and 33.7 ms × 16/6 = 89.9 ms (88.5 ms measured with 16-row buckets). With several rows, the packed matmuls are bound by compute, not by the weight reads: every padding row costs as much as a real one. The earlier explanation (one weight pass per 8 rows) was incomplete.
+- **Skipping the padding rows** (runs 43733967343 and 43739653525). With the packed row matmuls skipping a replay's padding rows, the replayed prefill no longer pays for them. Tokens are identical in every pair.
+
+| Warm TTFT | Bucket | Replayed | Control |
+|---|---|---|---|
+| Qwen2.5-0.5B, 5 tokens | 8 | 10.8 ms | 17.2 ms |
+| Qwen2.5-0.5B, 12 tokens | 16 | 17.2 ms | 18.4 ms |
+| Qwen2.5-0.5B, 40 tokens | 40 | 38.5 ms | 39.8 ms |
+| Mistral 7B `Q4_K_M`, 6 tokens | 8 | 32.2 ms | 33.8 ms |
+
+  - The replayed Mistral prefill waits 31.4 of its 31.7 ms for the Device; the replay itself costs 0.16 ms of host time. A 7B model is Device-bound, so replay mostly removes the per-node host work's 1.6 ms that was not hidden.
+  - Other Mistral exports, replayed prefill against the earlier padded replay (run 43728214947): `Q3_K_M` 32.8 ms (47.7), `IQ3_M` 60.3 ms (93.4), `IQ2_M` 49.4 ms (78.1).
+  - The packed `Q8_0` Qwen2.5-0.5B prefill replays in 3.4 ms.
+  - The first fix bounded every capture to 0 skipped rows, because the LM head is a one-row packed matmul after the logits row gather. A one-row launch now skips nothing.
+- **Not measured.** The bucket namespaces' intermediates are bounded by their budget, but their Device memory is not reported. The pooled KV stores hold 6.0 MiB on Qwen2.5-0.5B.
 - **The 40-token prompt.** Run 43717628081 padded it to 64 rows and measured 21.8 ms replayed. The prefill matmuls take the Tensor Core path from 64 rows, which is faster than the 40-row path. That is a kernel threshold, independent of replay.
 
 ## Risks / Trade-offs
