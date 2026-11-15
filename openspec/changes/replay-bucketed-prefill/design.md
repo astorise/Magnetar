@@ -86,6 +86,19 @@ GPU CI run 43717628081 (RTX 3060), replay against its disable control (`MAGNETAR
 - The 40-token prompt also changes kernels: at 64 rows the prefill matmuls take the Tensor Core path, which starts at 64 rows. Its gain is not replay alone.
 - Before this change, run 43693053049, which buckets per node without replay, gave a 19.2 ms warm TTFT for 5 tokens.
 
+With buckets at every multiple of 8 (runs 43723450794 and 43728214947), tokens are again identical in every pair:
+
+| Warm TTFT | Bucket | Replayed | Control |
+|---|---|---|---|
+| Qwen2.5-0.5B, 5 tokens | 8 | 10.9 ms | 15.9 ms |
+| Qwen2.5-0.5B, 12 tokens | 16 | 17.2 ms | 18.4 ms |
+| Qwen2.5-0.5B, 40 tokens | 40 | 38.5 ms | 39.8 ms |
+| Mistral 7B `Q4_K_M`, 6 tokens | 8 | 45.1 ms | 33.9 ms |
+
+- **Where Mistral's replayed prefill spends its time.** 44.8 of its 45.1 ms are spent waiting for the Device; the replay itself costs 0.16 ms of host time. The per-node control spends 33.1 ms in all. On a 7B model the per-node host work is already hidden behind the Device, so replay has nothing to remove.
+- **Padding rows cost Device time in proportion.** 33.7 ms × 8/6 = 44.9 ms, and 33.7 ms × 16/6 = 89.9 ms (88.5 ms measured with 16-row buckets). With several rows, the packed matmuls are bound by compute, not by the weight reads: every padding row costs as much as a real one. The earlier explanation (one weight pass per 8 rows) was incomplete.
+- **The 40-token prompt.** Run 43717628081 padded it to 64 rows and measured 21.8 ms replayed. The prefill matmuls take the Tensor Core path from 64 rows, which is faster than the 40-row path. That is a kernel threshold, independent of replay.
+
 ## Risks / Trade-offs
 
 - **VRAM held between requests.** The pool keeps stores admitted after their requests end. The budget, the Memory Manager reclaim and the disable control bound it, and the campaign reports it.
