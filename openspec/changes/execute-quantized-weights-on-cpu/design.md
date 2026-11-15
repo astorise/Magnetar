@@ -245,3 +245,55 @@ about 1 GB/s (14-17 ms per Mistral-shaped matmul locally against 3 ms for
 `Q4_K`), so the vectorized grid kernels bring them within 1.3-1.6x of
 `Q4_K_M` despite reading fewer bytes: the per-run grid lookups remain
 their cost.
+
+The optimized CPU Provider runs `attention` natively: K and V are read in
+place up to `key_count` (the Reference CPU kernel copied both whole
+caches per call), every (head, query) pair goes to the pool, and the dot
+products and weighted value sums vectorize. Mistral-shaped decode step
+over a 2048-row cache, 4 local cores: 64 keys 6.2 ms to 0.07 ms, 2048
+keys 121 ms to 2.4 ms.
+
+GPU smoke run 43649106260 (commit `23580a5`), same host, 3 threads: the
+native attention costs 0.067 ms per call on Mistral 7B (0.56 ms through
+the Reference CPU kernel) and 0.027 ms on Qwen2.5-0.5B (0.116 ms). TPOT:
+
+| Model | TPOT (before) |
+|---|---|
+| Qwen2.5-0.5B `Q8_0` | 51.7 ms (53.5) |
+| Mistral 7B `Q4_K_M` | 358.3 ms (375) |
+| Mistral 7B `Q3_K_M` | 358.6 ms (376) |
+| Mistral 7B `IQ4_XS` | 374.6 ms (400) |
+| Mistral 7B `IQ3_M` | 558.6 ms (582) |
+| Mistral 7B `IQ2_M` | 468.6 ms (485) |
+
+All answer "Paris". Attention is now under 1 % of a Mistral token; the
+matmuls remain the cost.
+
+The IQ2_XXS, IQ2_XS and IQ3_XXS kernels computed each group's eighth sign
+bit with `count_ones` (emulated: the kernels' target features exclude
+`popcnt`); a 128-entry table built at compile time replaces it. Local
+Mistral-shaped matmuls, 4 cores, noisy host: `IQ2_XXS` about 4.6 to
+3.1 ms, `IQ3_XXS` about 4.5 to 3.5 ms, `IQ2_XS` about 5.3 to 3.8 ms, with
+`Q4_K` at 2.6-3.3 ms on the same runs.
+
+GPU smoke run 43653339471 showed no change for Mistral `IQ3_M` (563.9 ms)
+and `IQ2_M` (467.3 ms): their GGUF headers show they are mostly `IQ3_S`
+and `IQ2_S`, which have no parity-coded signs. Their cost was the grid
+lookups: the kernels now fetch a run's magnitudes with one AVX2 gather
+(`vpgatherdd` for IQ3's eight 32-bit entries, `vpgatherdq` for IQ2's four
+64-bit ones) from indices built in vector registers. Every IQ2/IQ3
+format then runs a Mistral-shaped matmul in 2.0-2.5 ms on 4 local cores
+(3-5.7 ms before), below `Q4_K`'s 2.3-3.0 ms on the same runs.
+
+GPU smoke run 43684729957 (commit `2458d29`), same host, 3 threads,
+Mistral 7B on the optimized CPU Provider:
+
+| Export | TPOT (before) | matmul / matmul-residual per call |
+|---|---|---|
+| `Q4_K_M` | 361.4 ms (358.7) | 1.42 / 2.02 ms |
+| `IQ3_M` | 433.8 ms (563.9) | 1.78 / 2.16 ms |
+| `IQ2_M` | 441.7 ms (467.3) | 1.77 / 2.32 ms |
+
+All answer "Paris". On this host (i7-7700) the gathered IQ kernels stay
+about 25 % above `Q4_K` per matmul call, where the local host measured
+them level or below; why the two hosts differ is not measured yet.
