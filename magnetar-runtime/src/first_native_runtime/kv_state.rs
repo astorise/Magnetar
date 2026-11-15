@@ -366,7 +366,7 @@ impl E2eRuntimeModelExecutionEngine {
                 if let Some(output) = replay_decode_step(
                     runtime,
                     &recorded,
-                    ids_tensor.clone(),
+                    vec![ids_tensor.clone()],
                     absolute_position,
                     greedy,
                 )? {
@@ -434,6 +434,44 @@ impl E2eRuntimeModelExecutionEngine {
         kv_stores: Option<KvStoreSpec>,
     ) -> Result<Option<(RecordedDecodeStep, FirstNativeGraphExecutionOutput)>, InferenceApiError>
     {
+        self.capture_step(
+            runtime,
+            StepToCapture {
+                cache: &kv_state.cache,
+                graph: &graphs.decode,
+                memo: &graphs.decode_memo,
+                inputs: vec![(
+                    TensorEdgeId::new("input.token_ids"),
+                    TensorResourceId::new("input.token_ids"),
+                    ids_tensor,
+                )],
+                input_owner: MemoryAllocationOwner::Session(kv_state.cache.to_string()),
+                kv_history: Some(&kv_state.layer_kv),
+                position: absolute_position,
+                resource_namespace: None,
+            },
+            execution_plan,
+            model_instance,
+            node_events,
+            kv_stores,
+        )
+    }
+
+    /// Runs one step per node inside a step capture
+    /// (`capture-and-replay-cuda-graphs`): a decode step, or a bucketed
+    /// prefill (`replay-bucketed-prefill`). `None` when the Provider cannot
+    /// capture it: nothing is recorded, and the caller runs the step again
+    /// per node.
+    pub(super) fn capture_step(
+        &self,
+        runtime: &mut Runtime,
+        step: StepToCapture<'_>,
+        execution_plan: &mut PreparedExecutionPlan,
+        model_instance: &ModelInstanceId,
+        node_events: &mut Vec<PerNodeCausalEvent>,
+        kv_stores: Option<KvStoreSpec>,
+    ) -> Result<Option<(RecordedDecodeStep, FirstNativeGraphExecutionOutput)>, InferenceApiError>
+    {
         let Some(provider_binding) = execution_plan
             .node_bindings
             .first()
@@ -446,22 +484,26 @@ impl E2eRuntimeModelExecutionEngine {
             trace_step_capture("capture skipped", "the Provider does not support it");
             return Ok(None);
         }
-        // The input is written before the capture starts, as the per-node
-        // path writes it: a replay writes each step's token into it.
-        let input = TensorResourceId::new("input.token_ids");
-        let input_shape = ids_tensor.shape.clone();
+        // The inputs are written before the capture starts, as the per-node
+        // path writes them: a replay writes each step's values into them.
         let upload_clock = runtime.phase_ledger().clock();
-        executor
-            .write_tensor_value_admitted(
-                runtime.memory_mut(),
-                input.clone(),
-                TensorValue::Host(ids_tensor),
-                MemoryAllocationClass::Tensor,
-                MemoryAllocationOwner::Session(kv_state.cache.to_string()),
-            )
-            .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
-                reason: format!("failed to write graph input resource '{input}': {error}"),
-            })?;
+        let mut resident_inputs = BTreeMap::new();
+        let mut input_resources = Vec::new();
+        for (edge, resource, tensor) in step.inputs {
+            resident_inputs.insert(edge, (resource.clone(), tensor.shape.clone()));
+            executor
+                .write_tensor_value_admitted(
+                    runtime.memory_mut(),
+                    resource.clone(),
+                    TensorValue::Host(tensor),
+                    MemoryAllocationClass::Tensor,
+                    step.input_owner.clone(),
+                )
+                .map_err(|error| InferenceApiError::ProviderTensorWriteFailed {
+                    reason: format!("failed to write graph input resource '{resource}': {error}"),
+                })?;
+            input_resources.push(resource);
+        }
         runtime
             .phase_ledger_mut()
             .record(upload_clock, StepPhase::InputUpload);
@@ -486,20 +528,18 @@ impl E2eRuntimeModelExecutionEngine {
             runtime,
             &self.fixture,
             model_instance,
-            &kv_state.cache,
-            &graphs.decode,
+            step.cache,
+            step.graph,
             execution_plan,
             BTreeMap::new(),
-            BTreeMap::from([(
-                TensorEdgeId::new("input.token_ids"),
-                (input.clone(), input_shape),
-            )]),
-            Some(&kv_state.layer_kv),
-            Some(absolute_position),
+            resident_inputs,
+            step.kv_history,
+            Some(step.position),
             node_events,
             MaterializedEdges::Only(&[]),
-            Some(&graphs.decode_memo),
+            Some(step.memo),
             kv_stores,
+            step.resource_namespace,
         );
         let end_clock = runtime.phase_ledger().clock();
         let captured = match executed {
@@ -523,7 +563,10 @@ impl E2eRuntimeModelExecutionEngine {
             node_events.truncate(events_before);
             return Ok(None);
         };
-        let logits = graph_edge_resource_id("logits");
+        let logits = match step.resource_namespace {
+            Some(namespace) => TensorResourceId::new(format!("{namespace}.edge.logits")),
+            None => graph_edge_resource_id("logits"),
+        };
         let Some(logits_shape) = executor.resident_shape(&logits) else {
             trace_step_capture("capture dropped", "the logits are not resident");
             executor.release_step_capture(&capture);
@@ -545,8 +588,8 @@ impl E2eRuntimeModelExecutionEngine {
             capture,
             executor: executor.clone(),
             provider: provider.clone(),
-            position: absolute_position,
-            input,
+            position: step.position,
+            inputs: input_resources,
             logits: (logits, logits_shape),
             layer_kv: layer_kv.clone(),
             dispatch: dispatch.clone(),
@@ -572,6 +615,21 @@ impl E2eRuntimeModelExecutionEngine {
         }
         transaction.commit(runtime, &state.cache)
     }
+}
+
+/// A step [`E2eRuntimeModelExecutionEngine::capture_step`] runs inside a
+/// capture.
+pub(super) struct StepToCapture<'a> {
+    pub(super) cache: &'a KvCacheId,
+    pub(super) graph: &'a ExecutionGraph,
+    pub(super) memo: &'a GraphExecutionMemo,
+    /// Each graph input: its edge, the resource a replay writes it into,
+    /// and this step's value.
+    pub(super) inputs: Vec<(TensorEdgeId, TensorResourceId, HostTensor)>,
+    pub(super) input_owner: MemoryAllocationOwner,
+    pub(super) kv_history: Option<&'a LayerKvMap>,
+    pub(super) position: u64,
+    pub(super) resource_namespace: Option<&'a str>,
 }
 
 #[cfg(test)]

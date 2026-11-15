@@ -53,12 +53,15 @@ Non-goals: see proposal.md. They are chunked prefill, cross-request decode recor
   1. The first bucketed prefill for a key runs per node. It allocates every bucket-shaped intermediate once, as the first decode step does for decode.
   2. The second one runs inside `begin_step_capture` / `end_step_capture`. The advancing attributes are the decode ones (`position_offset`, `key_count`, `row_offset`); a prefill replays with offset 0.
   3. Later prefills replay it. A replay writes `input.token_ids` (`b` padded ids) and `input.logits_row`, then calls `replay_step(id, 0, inputs)` and downloads one logits row (or reads the Device greedy selection).
-- **Failure.** A failed capture or an invalidated replay falls back to the per-node prefill, as decode does. A failed capture declines further captures for that key. An invalidated replay drops the recording.
+- **Intermediates.** A recordable prefill writes its node outputs under the bucket's namespace (`prefill{b}.edge.*`, owned by `prefill{b}`), never under the decode graph's `edge.*` resources, and keeps them after their last reader. A decode step therefore never reallocates a buffer a prefill recording references. Store sets of one bucket share these intermediates; requests run one at a time on a loaded model. They stay allocated while the model is loaded: about `b` rows of every intermediate edge, which grows with the bucket. The campaign reports it.
+- **Inputs.** A replay writes the padded ids and the logits row into the bucket's own input resources (`prefill{b}.input.token_ids`, `prefill{b}.input.logits_row`).
+- **Failure.** A failed capture or an invalidated replay falls back to the per-node prefill, as decode does. A failed capture declines further captures for that key, whose prefills then run as unrecorded ones. An invalidated replay drops the recording; the next prefill of the key runs per node and the one after captures again. Dropping a pooled store set releases its recordings.
 
 ### CUDA Provider
 
 - **Captured kernels.** A prefill's Kernels must run inside a capture without allocating, synchronizing or downloading. This covers the tiled and Tensor Core prefill matmuls and attention, the RMSNorm, RoPE, gated MLP and `kv-write` multi-row paths, and the Device token check of `embedding`.
 - **Approach.** The capture already fails on any of these, so the first task is to run the bucketed prefill under capture and fix each Kernel that fails. The expected candidates are split-K workspaces sized per call and host-side shape checks.
+- **Attention.** The Tensor Core and tiled attention Kernels over several query rows were excluded from captures. They are now captured; having no replay offset, a capture holding one bounds its replay offset to 0, which is a prefill's.
 - **Attention bounds.** Captured block attention sizes its shared memory for the store capacity, which the capacity bucket fixes.
 
 ### Controls and reporting

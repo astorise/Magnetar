@@ -254,9 +254,9 @@ pub(super) fn dispatch_first_native_graph_node(
                 .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
                     reason: format!("graph node '{node_id}' has no output edge"),
                 })?;
-        let output_resource_id = TensorResourceId::new(format!("edge.{output_edge}"));
+        let output_resource_id = ctx.edge_resource(output_edge.as_str());
         let placement = resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id);
-        let owner = MemoryAllocationOwner::Session(kv_cache_id.to_string());
+        let owner = ctx.output_owner(kv_cache_id);
         (output_resource_id, placement, owner)
     };
     match node.operator.name() {
@@ -673,9 +673,9 @@ pub(super) fn dispatch_first_native_graph_node(
                         ),
                     })?;
             let second_output_target: OutputTarget = (
-                TensorResourceId::new(format!("edge.{second_output_edge}")),
+                ctx.edge_resource(second_output_edge.as_str()),
                 resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
-                MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                ctx.output_owner(kv_cache_id),
             );
             dispatch_qwen_split(
                 ctx,
@@ -808,6 +808,44 @@ pub(super) fn execute_first_native_graph_materializing(
     memo: Option<&GraphExecutionMemo>,
     kv_stores: Option<KvStoreSpec>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
+    execute_first_native_graph_namespaced(
+        runtime,
+        fixture,
+        model_instance,
+        kv_cache_id,
+        graph,
+        prepared_plan,
+        initial_bindings,
+        kv_history,
+        absolute_position_override,
+        node_events,
+        materialized,
+        memo,
+        kv_stores,
+        None,
+    )
+}
+
+/// [`execute_first_native_graph_materializing`] with node outputs under
+/// `resource_namespace` (see `FirstNativeDispatchContext::resource_namespace`),
+/// which also keeps every intermediate after its last reader.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_first_native_graph_namespaced(
+    runtime: &mut Runtime,
+    fixture: &E2eFixture,
+    model_instance: &ModelInstanceId,
+    kv_cache_id: &KvCacheId,
+    graph: &ExecutionGraph,
+    prepared_plan: &mut PreparedExecutionPlan,
+    initial_bindings: BTreeMap<TensorEdgeId, HostTensor>,
+    kv_history: Option<&LayerKvMap>,
+    absolute_position_override: Option<u64>,
+    node_events: &mut Vec<PerNodeCausalEvent>,
+    materialized: MaterializedEdges<'_>,
+    memo: Option<&GraphExecutionMemo>,
+    kv_stores: Option<KvStoreSpec>,
+    resource_namespace: Option<&str>,
+) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     execute_first_native_graph_with_resident_input(
         runtime,
         fixture,
@@ -823,6 +861,7 @@ pub(super) fn execute_first_native_graph_materializing(
         materialized,
         memo,
         kv_stores,
+        resource_namespace,
     )
 }
 
@@ -885,6 +924,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     materialized: MaterializedEdges<'_>,
     memo: Option<&GraphExecutionMemo>,
     kv_stores: Option<KvStoreSpec>,
+    resource_namespace: Option<&str>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     let prepare_clock = runtime.phase_ledger().clock();
     let computed_order;
@@ -958,6 +998,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
         node_events,
         materialized,
         kv_stores,
+        resource_namespace,
     )?;
     Ok((dispatch, bindings, layer_kv, provider_binding))
 }
@@ -979,6 +1020,7 @@ pub(super) fn execute_first_native_graph_nodes(
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
     kv_stores: Option<KvStoreSpec>,
+    resource_namespace: Option<&str>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
     let graph = fingerprinted.graph();
     // This step's token count, for `PlanGuardContext::sequence_length`
@@ -993,6 +1035,7 @@ pub(super) fn execute_first_native_graph_nodes(
         .and_then(|shape| shape.first().copied());
     let mut dispatch_ctx = FirstNativeDispatchContext {
         runtime,
+        resource_namespace: resource_namespace.map(str::to_string),
         provider: executor.clone(),
         prepared_plan: Some(prepared_plan),
         graph: Some(fingerprinted),
@@ -1080,6 +1123,7 @@ pub(super) fn execute_first_native_graph_nodes(
     // 12 GB Device next to its weights). Decode steps keep theirs: a
     // captured step replays against the same resources.
     let release_intermediates = sequence_length.is_some_and(|rows| rows > 1)
+        && resource_namespace.is_none()
         && matches!(
             materialized,
             MaterializedEdges::Only(_) | MaterializedEdges::LastRow(_) | MaterializedEdges::Row(..)
@@ -1230,7 +1274,7 @@ pub(super) fn execute_first_native_graph_nodes(
                     reason: format!("first-native graph is missing edge '{output_edge_id}'"),
                 }
             })?;
-            let output_resource_id = graph_edge_resource_id(output_edge_id.as_str());
+            let output_resource_id = dispatch_ctx.edge_resource(output_edge_id.as_str());
             // Whether the Kernel already wrote directly into `output_resource_id`
             // (Decision 3's pre-admission, `dispatch_first_native_graph_node`) or this
             // loop must still explicitly (re-)write it: KV-history
@@ -1645,7 +1689,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 }
                 // Only a node output's own resource: never a graph input,
                 // a weight or a KV store an edge resolves to.
-                let own = graph_edge_resource_id(edge_id.as_str());
+                let own = dispatch_ctx.edge_resource(edge_id.as_str());
                 if bindings.get(edge_id).is_some_and(|(id, _)| *id == own) {
                     bindings.remove(edge_id);
                     let _ = dispatch_ctx
@@ -1740,7 +1784,7 @@ pub(super) fn trace_step_capture(what: &str, reason: impl std::fmt::Display) {
 pub(super) fn replay_decode_step(
     runtime: &mut Runtime,
     recorded: &RecordedDecodeStep,
-    ids_tensor: HostTensor,
+    inputs: Vec<HostTensor>,
     absolute_position: u64,
     greedy: Option<&DeviceGreedyPlan>,
 ) -> Result<Option<(FirstNativeGraphExecutionOutput, Option<u64>)>, InferenceApiError> {
@@ -1759,7 +1803,7 @@ pub(super) fn replay_decode_step(
     let replayed = executor.replay_step(
         &recorded.capture,
         offset,
-        vec![(recorded.input.clone(), ids_tensor)],
+        recorded.inputs.iter().cloned().zip(inputs).collect(),
     );
     runtime
         .phase_ledger_mut()

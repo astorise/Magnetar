@@ -89,6 +89,53 @@ pub(super) struct StepReplayState {
     pub(super) recorded: Mutex<BTreeMap<String, RecordedDecodeStep>>,
     /// Requests whose capture failed: they run every step per node.
     pub(super) declined: Mutex<BTreeSet<String>>,
+    /// Bucketed prefill capture and replay (`replay-bucketed-prefill`).
+    pub(super) prefill_enabled: std::sync::atomic::AtomicBool,
+    pub(super) prefills: Mutex<PrefillRecordings>,
+}
+
+/// A prefill recording's key: the prefill graph, its bucket length and the
+/// pooled store set its KV stores belong to.
+pub(super) type PrefillRecordingKey = (ExecutionGraphSemanticFingerprint, u64, u64);
+
+/// Recorded bucketed prefills, and where each key is in its
+/// per-node / capture / replay sequence.
+#[derive(Default)]
+pub(super) struct PrefillRecordings {
+    pub(super) recorded: BTreeMap<PrefillRecordingKey, RecordedDecodeStep>,
+    /// Keys that ran per node, ready to capture.
+    pub(super) warmed: BTreeSet<PrefillRecordingKey>,
+    /// Keys whose capture failed: they run per node.
+    pub(super) declined: BTreeSet<PrefillRecordingKey>,
+}
+
+/// Where a bucketed prefill is in its key's sequence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PrefillRecordingStage {
+    /// Run per node, keeping its intermediates for a later capture.
+    Warm,
+    Capture,
+    Replay(Box<RecordedDecodeStepHandle>),
+    /// Run per node, as an unrecorded prefill.
+    Declined,
+}
+
+/// A recorded prefill, compared by its capture.
+#[derive(Clone)]
+pub(super) struct RecordedDecodeStepHandle(pub(super) RecordedDecodeStep);
+
+impl PartialEq for RecordedDecodeStepHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.capture == other.0.capture
+    }
+}
+
+impl Eq for RecordedDecodeStepHandle {}
+
+impl std::fmt::Debug for RecordedDecodeStepHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "RecordedDecodeStep({:?})", self.0.capture)
+    }
 }
 
 impl Default for StepReplayState {
@@ -97,6 +144,8 @@ impl Default for StepReplayState {
             enabled: std::sync::atomic::AtomicBool::new(true),
             recorded: Mutex::default(),
             declined: Mutex::default(),
+            prefill_enabled: std::sync::atomic::AtomicBool::new(true),
+            prefills: Mutex::default(),
         }
     }
 }
@@ -107,6 +156,11 @@ impl Drop for StepReplayState {
     fn drop(&mut self) {
         if let Ok(recorded) = self.recorded.get_mut() {
             for step in recorded.values() {
+                step.executor.release_step_capture(&step.capture);
+            }
+        }
+        if let Ok(prefills) = self.prefills.get_mut() {
+            for step in prefills.recorded.values() {
                 step.executor.release_step_capture(&step.capture);
             }
         }
@@ -148,6 +202,96 @@ impl StepReplay {
             .unwrap_or(true)
     }
 
+    pub(crate) fn set_prefill_enabled(&self, enabled: bool) {
+        self.0.prefill_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(super) fn prefill_enabled(&self) -> bool {
+        self.0.prefill_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Where a bucketed prefill of `key` is in its sequence.
+    pub(super) fn prefill_stage(&self, key: &PrefillRecordingKey) -> PrefillRecordingStage {
+        let Ok(prefills) = self.0.prefills.lock() else {
+            return PrefillRecordingStage::Declined;
+        };
+        if let Some(recorded) = prefills.recorded.get(key) {
+            PrefillRecordingStage::Replay(Box::new(RecordedDecodeStepHandle(recorded.clone())))
+        } else if prefills.declined.contains(key) {
+            PrefillRecordingStage::Declined
+        } else if prefills.warmed.contains(key) {
+            PrefillRecordingStage::Capture
+        } else {
+            PrefillRecordingStage::Warm
+        }
+    }
+
+    pub(super) fn prefill_warmed(&self, key: PrefillRecordingKey) {
+        if let Ok(mut prefills) = self.0.prefills.lock() {
+            prefills.warmed.insert(key);
+        }
+    }
+
+    pub(super) fn record_prefill(&self, key: PrefillRecordingKey, step: RecordedDecodeStep) {
+        if let Ok(mut prefills) = self.0.prefills.lock()
+            && let Some(replaced) = prefills.recorded.insert(key, step)
+        {
+            replaced.executor.release_step_capture(&replaced.capture);
+        }
+    }
+
+    pub(super) fn decline_prefill(&self, key: PrefillRecordingKey) {
+        if let Ok(mut prefills) = self.0.prefills.lock() {
+            prefills.warmed.remove(&key);
+            prefills.declined.insert(key);
+        }
+    }
+
+    /// Drops a recording that no longer replays: the key captures again
+    /// after one per-node run.
+    pub(super) fn invalidate_prefill(&self, key: &PrefillRecordingKey) {
+        let step = self.0.prefills.lock().ok().and_then(|mut prefills| {
+            prefills.warmed.remove(key);
+            prefills.recorded.remove(key)
+        });
+        if let Some(step) = step {
+            step.executor.release_step_capture(&step.capture);
+        }
+    }
+
+    /// Forgets every prefill of a pooled store set, releasing its
+    /// recordings: the set's stores are about to be released.
+    pub(super) fn release_prefill_set(&self, set: u64) {
+        let released: Vec<RecordedDecodeStep> = match self.0.prefills.lock() {
+            Ok(mut prefills) => {
+                prefills.warmed.retain(|key| key.2 != set);
+                prefills.declined.retain(|key| key.2 != set);
+                let keys: Vec<_> = prefills
+                    .recorded
+                    .keys()
+                    .filter(|key| key.2 == set)
+                    .cloned()
+                    .collect();
+                keys.iter()
+                    .filter_map(|key| prefills.recorded.remove(key))
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        for step in released {
+            step.executor.release_step_capture(&step.capture);
+        }
+    }
+
+    /// How many prefills are recorded (tests).
+    #[cfg(test)]
+    pub(super) fn prefill_recordings(&self) -> usize {
+        self.0
+            .prefills
+            .lock()
+            .map_or(0, |prefills| prefills.recorded.len())
+    }
+
     /// Forgets a request, releasing its capture.
     pub(super) fn release(&self, key: &str) {
         if let Ok(mut declined) = self.0.declined.lock() {
@@ -174,8 +318,9 @@ pub(super) struct RecordedDecodeStep {
     pub(super) provider: ProviderBinding,
     /// The absolute position of the captured step.
     pub(super) position: u64,
-    /// The input the captured step read its token from.
-    pub(super) input: TensorResourceId,
+    /// The inputs the captured step read, in the order a replay writes
+    /// them: its token ids, then (a prefill) its logits row.
+    pub(super) inputs: Vec<TensorResourceId>,
     /// The logits the captured step wrote, and their shape.
     pub(super) logits: (TensorResourceId, Vec<u64>),
     /// The KV state the captured step left, its row counts at `position`.
@@ -811,6 +956,181 @@ impl E2eRuntimeModelExecutionEngine {
 }
 
 impl E2eRuntimeModelExecutionEngine {
+    /// Runs a prefill: per node, or for a bucketed prefill whose stores
+    /// are pooled, along its recording's sequence (`replay-bucketed-prefill`):
+    /// the first prefill of a key runs per node keeping its intermediates,
+    /// the second runs inside a step capture, later ones replay it. A
+    /// replay may select a greedy token on the Device, returned with the
+    /// output.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_prefill_graph(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        kv_state: &FirstNativeExecutionKvState,
+        execution_plan: &mut PreparedExecutionPlan,
+        graphs: &CachedGraphs,
+        model_instance: &ModelInstanceId,
+        graph_length: u64,
+        bucketed: bool,
+        node_events: &mut Vec<PerNodeCausalEvent>,
+        kv_stores: Option<KvStoreSpec>,
+        greedy: Option<&DeviceGreedyPlan>,
+    ) -> Result<(FirstNativeGraphExecutionOutput, Option<u64>), InferenceApiError> {
+        let prompt_tokens = request.input_token_ids.len() as u64;
+        let sampled_row = prompt_tokens.saturating_sub(1);
+        // Right padding: the bucket's last rows repeat the last prompt
+        // token; no real row reads them.
+        let ids_tensor = HostTensor::new(
+            [graph_length],
+            super::prefill_buckets::pad_prompt_ids(&request.input_token_ids, graph_length as usize),
+        )
+        .map_err(runtime_generation_failed)?;
+        let row_tensor =
+            HostTensor::new([1], vec![sampled_row as f32]).map_err(runtime_generation_failed)?;
+        let ids_edge = TensorEdgeId::new("input.token_ids");
+        let row_edge = TensorEdgeId::new(super::prefill_buckets::LOGITS_ROW_INPUT);
+        let recording = self.prefill_recording_key(
+            runtime,
+            execution_plan,
+            graphs,
+            graph_length,
+            bucketed,
+            kv_stores,
+        )?;
+        let namespace = format!("prefill{graph_length}");
+        let stage = recording
+            .as_ref()
+            .map(|key| self.step_replay.prefill_stage(key));
+        let mut keeps_intermediates = matches!(
+            stage,
+            Some(PrefillRecordingStage::Warm | PrefillRecordingStage::Capture)
+        );
+        match (&recording, stage) {
+            (Some(key), Some(PrefillRecordingStage::Replay(recorded))) => {
+                if let Some(output) = replay_decode_step(
+                    runtime,
+                    &recorded.0,
+                    vec![ids_tensor.clone(), row_tensor.clone()],
+                    0,
+                    greedy,
+                )? {
+                    return Ok(output);
+                }
+                // Invalidated: run per node, and capture again later.
+                self.step_replay.invalidate_prefill(key);
+                keeps_intermediates = true;
+            }
+            (Some(key), Some(PrefillRecordingStage::Capture)) => {
+                let captured = self.capture_step(
+                    runtime,
+                    StepToCapture {
+                        cache: &kv_state.cache,
+                        graph: &graphs.prefill,
+                        memo: &graphs.prefill_memo,
+                        inputs: vec![
+                            (
+                                ids_edge.clone(),
+                                TensorResourceId::new(format!("{namespace}.{ids_edge}")),
+                                ids_tensor.clone(),
+                            ),
+                            (
+                                row_edge.clone(),
+                                TensorResourceId::new(format!("{namespace}.{row_edge}")),
+                                row_tensor.clone(),
+                            ),
+                        ],
+                        input_owner: MemoryAllocationOwner::Session(namespace.clone()),
+                        kv_history: None,
+                        position: 0,
+                        resource_namespace: Some(&namespace),
+                    },
+                    execution_plan,
+                    model_instance,
+                    node_events,
+                    kv_stores,
+                )?;
+                match captured {
+                    Some((recorded, output)) => {
+                        trace_step_capture("captured", format!("prefill of {graph_length} rows"));
+                        self.step_replay.record_prefill(key.clone(), recorded);
+                        return Ok((output, None));
+                    }
+                    None => {
+                        self.step_replay.decline_prefill(key.clone());
+                        keeps_intermediates = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut inputs = BTreeMap::from([(ids_edge, ids_tensor)]);
+        if graphs.logits_row {
+            inputs.insert(row_edge, row_tensor);
+        }
+        let output = execute_first_native_graph_namespaced(
+            runtime,
+            &self.fixture,
+            model_instance,
+            &kv_state.cache,
+            &graphs.prefill,
+            execution_plan,
+            inputs,
+            None,
+            Some(0),
+            node_events,
+            // Only the last prompt row's logits are sampled (the graph's
+            // one row with a logits row gather).
+            if bucketed && !graphs.logits_row {
+                MaterializedEdges::Row(&["logits"], sampled_row)
+            } else {
+                MaterializedEdges::LastRow(&["logits"])
+            },
+            Some(&graphs.prefill_memo),
+            kv_stores,
+            keeps_intermediates.then_some(namespace.as_str()),
+        )?;
+        if let Some(key) = recording.filter(|_| keeps_intermediates) {
+            self.step_replay.prefill_warmed(key);
+        }
+        Ok((output, None))
+    }
+
+    /// The recording key of a prefill that can be recorded: bucketed, with
+    /// the logits row gather, pooled stores, prefill replay on, and a
+    /// Provider that captures steps.
+    fn prefill_recording_key(
+        &self,
+        runtime: &Runtime,
+        execution_plan: &PreparedExecutionPlan,
+        graphs: &CachedGraphs,
+        graph_length: u64,
+        bucketed: bool,
+        kv_stores: Option<KvStoreSpec>,
+    ) -> Result<Option<PrefillRecordingKey>, InferenceApiError> {
+        let Some(set) = kv_stores.and_then(|spec| spec.pool_set) else {
+            return Ok(None);
+        };
+        if !bucketed || !graphs.logits_row || !self.step_replay.prefill_enabled() {
+            return Ok(None);
+        }
+        let Some(provider) = execution_plan
+            .node_bindings
+            .first()
+            .map(|binding| binding.provider.clone())
+        else {
+            return Ok(None);
+        };
+        if !resolve_kernel_execution_provider(runtime, &provider)?.supports_step_capture() {
+            return Ok(None);
+        }
+        Ok(Some((
+            graphs.prefill_memo.fingerprint(&graphs.prefill).clone(),
+            graph_length,
+            set,
+        )))
+    }
+
     /// A prefill's in-place KV stores: a pooled store set of the request's
     /// capacity bucket for a bucketed prefill (`replay-bucketed-prefill`),
     /// stores of exactly `rows_needed` rows owned by the request otherwise,
@@ -878,6 +1198,7 @@ impl E2eRuntimeModelExecutionEngine {
             return;
         };
         for set in sets {
+            self.step_replay.release_prefill_set(set.id);
             for layer in 0..self.fixture.config.architecture.layer_count as usize {
                 for role in ["k", "v"] {
                     release_pending_kv_resource(
@@ -1121,49 +1442,20 @@ impl E2eRuntimeModelExecutionEngine {
                 .is_empty()
             {
                 let bucketed = graph_length != prompt_token_count || component_graphs.logits_row;
-                // Right padding: the bucket's last rows repeat the last
-                // prompt token; no real row reads them.
-                let ids_tensor = HostTensor::new(
-                    [graph_length],
-                    crate::first_native_runtime::prefill_buckets::pad_prompt_ids(
-                        &request.input_token_ids,
-                        graph_length as usize,
-                    ),
-                )
-                .map_err(runtime_generation_failed)?;
-                let mut inputs =
-                    BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)]);
-                let sampled_row = prompt_token_count.saturating_sub(1);
-                if component_graphs.logits_row {
-                    inputs.insert(
-                        TensorEdgeId::new(
-                            crate::first_native_runtime::prefill_buckets::LOGITS_ROW_INPUT,
-                        ),
-                        HostTensor::new([1], vec![sampled_row as f32])
-                            .map_err(runtime_generation_failed)?,
-                    );
-                }
-                let mut output = execute_first_native_graph_materializing(
+                let (mut output, selected) = self.execute_prefill_graph(
                     runtime,
-                    &self.fixture,
-                    model_instance,
-                    &kv_state.cache,
-                    &component_graphs.prefill,
+                    request,
+                    &kv_state,
                     execution_plan,
-                    inputs,
-                    None,
-                    Some(0),
+                    &component_graphs,
+                    model_instance,
+                    graph_length,
+                    bucketed,
                     &mut node_events,
-                    // Only the last prompt row's logits are sampled
-                    // (the graph's one row with a logits row gather).
-                    if bucketed && !component_graphs.logits_row {
-                        MaterializedEdges::Row(&["logits"], sampled_row)
-                    } else {
-                        MaterializedEdges::LastRow(&["logits"])
-                    },
-                    Some(&component_graphs.prefill_memo),
                     kv_stores,
+                    greedy_plan.as_ref(),
                 )?;
+                device_greedy_column = selected;
                 if bucketed {
                     // The padding rows lie beyond the committed length:
                     // the first decode step writes row `n` over them.

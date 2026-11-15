@@ -423,6 +423,11 @@ pub(super) struct FirstNativeDispatchContext<'a> {
     /// from `active_advertisement`) is cloned to an owned value at the
     /// point of lookup instead, so the two never need to overlap.
     pub(super) runtime: &'a mut Runtime,
+    /// The namespace of this execution's node outputs, when they must
+    /// outlive the request and never share a resource with another graph's
+    /// (a recordable bucketed prefill, `replay-bucketed-prefill`). `None`:
+    /// `edge.{edge}`, owned by the request's KV cache.
+    pub(super) resource_namespace: Option<String>,
     /// Resolved generically from Runtime's provider registration through
     /// [`ProviderExecutionApi`] (Correctif 3): no downcast to a concrete
     /// Provider type is ever performed on this hot path.
@@ -975,6 +980,24 @@ pub(super) type OutputTarget = (TensorResourceId, MemoryPlacement, MemoryAllocat
 /// falls back to synthesizing a Kernel-internal id exactly as before,
 /// leaving admission to the Provider's own fallback self-admission path
 /// (`unify-provider-output-admission-and-residency`'s Decision 2).
+impl FirstNativeDispatchContext<'_> {
+    /// The resource a node output edge is written under.
+    pub(super) fn edge_resource(&self, edge: &str) -> TensorResourceId {
+        match &self.resource_namespace {
+            Some(namespace) => TensorResourceId::new(format!("{namespace}.edge.{edge}")),
+            None => graph_edge_resource_id(edge),
+        }
+    }
+
+    /// The Memory Manager owner of node outputs.
+    pub(super) fn output_owner(&self, kv_cache_id: &KvCacheId) -> MemoryAllocationOwner {
+        MemoryAllocationOwner::Session(match &self.resource_namespace {
+            Some(namespace) => namespace.clone(),
+            None => kv_cache_id.to_string(),
+        })
+    }
+}
+
 pub(super) fn resolve_output_target(
     ctx: &mut FirstNativeDispatchContext<'_>,
     operation_id: &str,

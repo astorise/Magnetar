@@ -280,3 +280,194 @@ fn a_production_model_shares_one_bucket_graph_across_prompt_lengths() {
     }
     assert_eq!(model.graph_cache.prompt_lengths(), vec![16]);
 }
+
+/// Bucketed prefills of several requests on a Provider that captures and
+/// replays steps ([`ReplayingExecutor`]), with pooled stores.
+struct ReplayHarness {
+    fixture: E2eFixture,
+    runtime: Runtime,
+    instance: ModelInstanceId,
+    engine: E2eRuntimeModelExecutionEngine,
+    executor: Arc<ReplayingExecutor>,
+}
+
+impl ReplayHarness {
+    fn new() -> Self {
+        let fixture = e2e_fixture().expect("fixture builds");
+        let executor = Arc::new(ReplayingExecutor::new());
+        let provider = Arc::new(ReplayingProvider {
+            inner: ReferenceCpuProvider::new(),
+            executor: executor.clone(),
+        });
+        let mut runtime =
+            build_runtime_with_model_execution_engine_and_provider(&fixture, provider).unwrap();
+        let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let mut engine = new_kv_lifecycle_engine(&fixture);
+        // Decode steps run per node: only prefills are captured here.
+        engine.step_replay.set_enabled(false);
+        let cache = ComponentGraphCache::default();
+        cache.set_prefill_buckets(vec![8, 16]);
+        engine.graph_cache = Some(cache);
+        Self {
+            fixture,
+            runtime,
+            instance,
+            engine,
+            executor,
+        }
+    }
+
+    /// One request: its prefill's logits, then `decode_steps` decode
+    /// steps' logits; released.
+    fn generate(&mut self, id: &str, prompt: &[TokenId], decode_steps: usize) -> Vec<Vec<f32>> {
+        let tokenized = tokenize_prompt_input(
+            &self.fixture.tokenizer,
+            TokenizationRequest::new(PromptInput::TokenIds(prompt.to_vec())),
+            None,
+        )
+        .unwrap();
+        let request = prepare_generation(
+            &self.runtime,
+            build_generation_request(
+                GenerationRequestId::new(id).unwrap(),
+                None,
+                GenerationModelReference::ModelInstance(self.instance.clone()),
+                generation_tokenizer_reference(&self.fixture),
+                tokenized,
+                decode_steps + 1,
+                GenerationParameters::greedy(),
+                StopConditions::default(),
+                StreamingMode::Disabled,
+            ),
+        )
+        .unwrap();
+        let cache = self.engine.graph_cache.clone().unwrap();
+        let length = cache.prefill_graph_length(prompt.len() as u64);
+        let graphs = match cache.get(length) {
+            Some(graphs) => graphs,
+            None => {
+                let graphs =
+                    first_native_component_graphs_for_prompt(&self.fixture, length).unwrap();
+                let graphs = Arc::new(cache.prepare(&self.runtime, graphs, length));
+                cache.insert(length, Arc::clone(&graphs));
+                graphs
+            }
+        };
+        let mut plans = graphs
+            .prepared_plans(
+                &self.runtime,
+                &self.instance,
+                length,
+                &ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME),
+            )
+            .unwrap();
+        let mut steps = Vec::new();
+        let prefill = self
+            .engine
+            .execute_generation_step(&mut self.runtime, &request, &[], Some(&mut plans.prefill))
+            .unwrap();
+        steps.push(prefill.logits.clone());
+        self.engine
+            .commit_generation_step(&mut self.runtime, &request, &[], 1, &prefill)
+            .unwrap();
+        let mut generated = vec![1];
+        for index in 1..=decode_steps {
+            let step = self
+                .engine
+                .execute_generation_step(
+                    &mut self.runtime,
+                    &request,
+                    &generated,
+                    Some(&mut plans.decode),
+                )
+                .unwrap();
+            steps.push(step.logits.clone());
+            let token = (index % 3 + 1) as TokenId;
+            self.engine
+                .commit_generation_step(&mut self.runtime, &request, &generated, token, &step)
+                .unwrap();
+            generated.push(token);
+        }
+        self.engine
+            .release_request_state(&mut self.runtime, &request)
+            .unwrap();
+        steps
+    }
+
+    fn captured_and_replayed(&self) -> (u64, u64) {
+        let state = self.executor.state.lock().unwrap();
+        (state.captured, state.replayed)
+    }
+}
+
+fn assert_close(actual: &[Vec<f32>], expected: &[Vec<f32>], what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}");
+    for (step, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(argmax(actual), argmax(expected), "{what}, step {step}");
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 1e-4,
+                "{what}, step {step}: {actual} vs {expected}"
+            );
+        }
+    }
+}
+
+/// The first bucketed prefill of a store set runs per node, the second is
+/// captured, later ones replay it; each request gets its own prompt's
+/// results, decode steps included.
+#[test]
+fn bucketed_prefills_are_captured_once_then_replayed() {
+    let decode_steps = 3;
+    let prompts: [&[TokenId]; 4] = [&[3, 9, 4], &[5, 2, 7, 7, 1], &[6], &[8, 1, 3, 2, 2, 5]];
+    let mut harness = ReplayHarness::new();
+    let mut counts = Vec::new();
+    for (index, prompt) in prompts.iter().enumerate() {
+        let steps = harness.generate(&format!("request-{index}"), prompt, decode_steps);
+        let (expected, _) = run(prompt, None, decode_steps);
+        assert_close(&steps, &expected, &format!("prompt {prompt:?}"));
+        counts.push(harness.captured_and_replayed());
+    }
+    // Per node, captured, then replayed twice.
+    assert_eq!(counts, vec![(0, 0), (1, 0), (1, 1), (1, 2)]);
+    assert_eq!(harness.engine.step_replay.prefill_recordings(), 1);
+}
+
+/// A replay the Provider invalidates runs per node with correct results;
+/// the recording is dropped and the key captures again.
+#[test]
+fn an_invalidated_prefill_recording_falls_back_per_node() {
+    let mut harness = ReplayHarness::new();
+    for index in 0..3 {
+        harness.generate(&format!("warm-{index}"), &[3, 9, 4], 1);
+    }
+    assert_eq!(harness.captured_and_replayed(), (1, 1));
+    harness
+        .executor
+        .invalidate_next_replay
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let prompt = [2, 6, 6, 1];
+    let steps = harness.generate("invalidated", &prompt, 1);
+    assert_close(&steps, &run(&prompt, None, 1).0, "invalidated replay");
+    assert_eq!(harness.engine.step_replay.prefill_recordings(), 0);
+    harness.generate("recapture", &prompt, 1);
+    harness.generate("replay", &prompt, 1);
+    assert_eq!(harness.captured_and_replayed(), (2, 2));
+}
+
+/// A failed capture declines the key: its prefills run per node.
+#[test]
+fn a_failed_prefill_capture_declines_its_key() {
+    let mut harness = ReplayHarness::new();
+    harness
+        .executor
+        .fail_capture
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for index in 0..4 {
+        let prompt = [3, 9, 4, index as TokenId + 1];
+        let steps = harness.generate(&format!("declined-{index}"), &prompt, 1);
+        assert_close(&steps, &run(&prompt, None, 1).0, "declined");
+    }
+    assert_eq!(harness.captured_and_replayed(), (0, 0));
+    assert_eq!(harness.engine.step_replay.prefill_recordings(), 0);
+}

@@ -320,6 +320,7 @@ jobs:
         env:
           MAGNETAR_QUALIFICATION_PROVIDERS: cuda
           MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           # Besides the short prompt, one campaign per long context: what a

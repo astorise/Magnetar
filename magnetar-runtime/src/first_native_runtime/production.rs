@@ -1236,6 +1236,8 @@ impl ProductionLoadedModel {
         let provider_supports_multi_step_decode = provider.supports_multi_step_decode();
         let graph_cache = ComponentGraphCache::default();
         let step_replay = StepReplay::default();
+        step_replay
+            .set_prefill_enabled(std::env::var("MAGNETAR_PREFILL_REPLAY").as_deref() != Ok("0"));
         let kv_pool = KvStorePool::default();
         let mut runtime = Runtime::builder()
             .register_provider(provider.clone())
@@ -1325,6 +1327,23 @@ impl ProductionLoadedModel {
                 buckets,
                 self.fixture.config.architecture.context_length,
             ));
+    }
+
+    /// Turns bucketed prefill replay (`replay-bucketed-prefill`) on or off
+    /// for later requests: prompt buckets, pooled KV stores for bucketed
+    /// requests, and prefill capture and replay together. On by default
+    /// where the Provider supports step capture; off with
+    /// `MAGNETAR_PREFILL_REPLAY=0`. Off, every prefill runs at its prompt's
+    /// exact length, per node.
+    pub fn set_prefill_replay(&mut self, enabled: bool) {
+        self.step_replay.set_prefill_enabled(enabled);
+        self.set_prefill_buckets(if enabled {
+            super::prefill_buckets::parse_prefill_buckets(
+                std::env::var("MAGNETAR_PREFILL_BUCKETS").ok().as_deref(),
+            )
+        } else {
+            Vec::new()
+        });
     }
 
     /// Bytes the pooled KV store sets hold, free or in use

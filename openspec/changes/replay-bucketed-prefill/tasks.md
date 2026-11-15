@@ -14,8 +14,8 @@
 
 ## 3. Prefill capture and replay
 
-- [ ] 3.1 Recording key and table, the per-node / capture / replay sequence, and fallback on capture failure or invalidation.
-- [ ] 3.2 CUDA Provider: run the bucketed prefill under capture and fix every Kernel that allocates, synchronizes or downloads during capture.
+- [x] 3.1 Recording key and table, the per-node / capture / replay sequence, and fallback on capture failure or invalidation.
+- [ ] 3.2 CUDA Provider: run the bucketed prefill under capture and fix every Kernel that allocates, synchronizes or downloads during capture. Multi-row attention done; the rest is driven by the GPU campaign's capture trace.
 - [ ] 3.3 Tests:
   - Runtime, with the test step-capture Provider: third request replays; an invalidated recording falls back;
   - CUDA, on real hardware: a captured bucketed prefill replays with identical logits.

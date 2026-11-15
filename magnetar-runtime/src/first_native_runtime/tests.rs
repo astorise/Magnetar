@@ -1872,6 +1872,7 @@ pub(super) fn execute_qwen_prefill_hidden_states_through_dispatch(
     )?;
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
+        resource_namespace: None,
         runtime,
         provider: provider.clone(),
         prepared_plan: Some(prepared_plan),
@@ -2147,6 +2148,7 @@ pub(super) fn execute_qwen_decode_hidden_states_through_dispatch(
     )?;
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
+        resource_namespace: None,
         runtime,
         provider: provider.clone(),
         prepared_plan: Some(prepared_plan),
@@ -5448,6 +5450,7 @@ pub(super) fn check_graph_dispatch_ignores_kernel_registry_preference_change_aft
     let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")?.clone();
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
+        resource_namespace: None,
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: Some(&mut plan),
