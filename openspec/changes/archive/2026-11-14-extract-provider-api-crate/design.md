@@ -105,6 +105,6 @@ Each step leaves `main` releasable. Rollback is a revert: no data, artifact form
 
 ## Open Questions
 
-- Does `ScheduledOperation` move with `ProviderExecutionRequest` (D3)?
-- Exact or caret version requirements between the layer crates (D5)?
+- Does `ScheduledOperation` move with `ProviderExecutionRequest` (D3)? Resolved: yes, it moved with it.
+- Exact or caret version requirements between the layer crates (D5)? Resolved: exact between the layer crates, caret in the Providers.
 - Should Formats and Loaders get a similar small dependency later (`magnetar-model` plus the ingestion types)? Out of scope here.
