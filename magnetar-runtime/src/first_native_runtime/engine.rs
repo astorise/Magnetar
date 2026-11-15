@@ -477,25 +477,37 @@ pub(super) fn validate_rope_frequency_scaling(
 /// Whether every active `rope` Kernel of `provider` honours the banded
 /// frequency-scaling attributes (and there is at least one).
 pub(super) fn rope_banded_scaling_supported(runtime: &Runtime, provider: &ProviderBinding) -> bool {
-    let mut rope = false;
+    provider_kernels_declare(
+        runtime,
+        provider,
+        "rope",
+        crate::operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
+    )
+}
+
+/// Whether `provider` has an active `operator` Kernel and every one of them
+/// advertises `feature`: an attribute only some Kernels honour must not
+/// reach the others.
+pub(super) fn provider_kernels_declare(
+    runtime: &Runtime,
+    provider: &ProviderBinding,
+    operator: &str,
+    feature: &str,
+) -> bool {
+    let mut found = false;
     for entry in runtime.kernel_registry().entries() {
         if !entry.active
             || &entry.advertisement.id.provider != provider
-            || entry.advertisement.implemented_operator.name() != "rope"
+            || entry.advertisement.implemented_operator.name() != operator
         {
             continue;
         }
-        if !entry
-            .advertisement
-            .id
-            .features
-            .contains(crate::operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE)
-        {
+        if !entry.advertisement.id.features.contains(feature) {
             return false;
         }
-        rope = true;
+        found = true;
     }
-    rope
+    found
 }
 
 /// What every step derives from a graph alone: its plan fingerprint and
@@ -870,7 +882,8 @@ impl E2eRuntimeModelExecutionEngine {
                     .max(self.prefill_graph_length(request.input_token_ids.len() as u64) as usize)
                     .max(1) as u32,
                 ComputeDType::Float32,
-            ),
+            )
+            .with_layer_row_widths(self.fixture.config.kv_row_widths()),
         );
         if let Some(session) = &request.session {
             cache = cache.with_session(session.clone());
@@ -1309,15 +1322,23 @@ impl E2eRuntimeModelExecutionEngine {
         })
     }
 
-    /// The bytes of one store set of `capacity` rows: every layer's K and V.
+    /// The bytes of one store set of `capacity` rows: the K and V of every
+    /// layer that keeps its own, at that layer's width
+    /// (`per-layer-kv-geometry`).
     fn kv_set_bytes(&self, capacity: u64) -> u64 {
-        let architecture = &self.fixture.config.architecture;
-        architecture
-            .layer_count
-            .saturating_mul(2)
-            .saturating_mul(capacity)
-            .saturating_mul(architecture.kv_head_count * architecture.head_dimension)
-            .saturating_mul(4)
+        self.fixture
+            .config
+            .kv_row_widths()
+            .into_iter()
+            .flatten()
+            .fold(0u64, |bytes, width| {
+                bytes.saturating_add(
+                    width
+                        .saturating_mul(2)
+                        .saturating_mul(capacity)
+                        .saturating_mul(4),
+                )
+            })
     }
 
     /// Releases the stores of sets the pool dropped.
@@ -1334,7 +1355,11 @@ impl E2eRuntimeModelExecutionEngine {
         };
         for set in sets {
             self.step_replay.release_prefill_set(set.id);
-            for layer in 0..self.fixture.config.architecture.layer_count as usize {
+            // A layer that reuses an earlier layer's K/V has no store.
+            for (layer, width) in self.fixture.config.kv_row_widths().iter().enumerate() {
+                if width.is_none() {
+                    continue;
+                }
                 for role in ["k", "v"] {
                     release_pending_kv_resource(
                         runtime,

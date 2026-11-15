@@ -1641,6 +1641,18 @@ pub(super) fn dispatch_qwen_rope(
     )
 }
 
+/// The `attention` node attributes forwarded to the Kernel when the graph
+/// sets them (`per-layer-kv-geometry`): a layer's own head geometry, its
+/// sliding window and its score scale. Absent geometry falls back to the
+/// architecture's.
+const ATTENTION_NODE_ATTRIBUTES: [&str; 5] = [
+    "head_count",
+    "kv_head_count",
+    "head_dimension",
+    "window_size",
+    "scale",
+];
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_qwen_attention(
     ctx: &mut FirstNativeDispatchContext<'_>,
@@ -1649,6 +1661,7 @@ pub(super) fn dispatch_qwen_attention(
     k: NodeValue,
     v: NodeValue,
     architecture: &ModelComponentArchitectureMetadata,
+    node_attributes: &BTreeMap<String, OperatorAttributeValue>,
     output_target: Option<OutputTarget>,
     key_count: Option<u64>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
@@ -1678,6 +1691,34 @@ pub(super) fn dispatch_qwen_attention(
         "attention_mask_kind".into(),
         OperatorAttributeValue::String("causal".into()),
     );
+    for name in ATTENTION_NODE_ATTRIBUTES {
+        if let Some(value) = node_attributes.get(name) {
+            attributes.insert(name.into(), value.clone());
+        }
+    }
+    if attributes.contains_key("scale")
+        && let Some(provider) = ctx
+            .prepared_plan
+            .as_ref()
+            .and_then(|plan| plan.node_bindings.first())
+            .map(|binding| binding.provider.clone())
+        && !provider_kernels_declare(
+            ctx.runtime,
+            &provider,
+            "attention",
+            crate::operator::ATTENTION_SCALE_FEATURE,
+        )
+    {
+        // A Kernel that ignored `scale` would compute every score with the
+        // wrong temperature.
+        return Err(InferenceApiError::KernelUnavailable {
+            reason: format!(
+                "operation '{operation_id}' needs an attention score scale, which Provider \
+                 {provider:?} does not advertise ('{}')",
+                crate::operator::ATTENTION_SCALE_FEATURE
+            ),
+        });
+    }
     let output_descriptor = f32_tensor_descriptor_from_shape(q.shape());
     dispatch_reference_cpu_operator_pre_admitted(
         ctx,

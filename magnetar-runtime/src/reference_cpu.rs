@@ -140,7 +140,7 @@ use crate::memory::{
     MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
 };
 use crate::operator::{
-    OperatorAttributeValue, OperatorFamily, OperatorId, OperatorSpec,
+    ATTENTION_SCALE_FEATURE, OperatorAttributeValue, OperatorFamily, OperatorId, OperatorSpec,
     ROPE_BANDED_FREQUENCY_SCALING_FEATURE, RopeBandedFrequencyScaling, TensorLayoutKind,
     TensorRole,
 };
@@ -1316,6 +1316,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
     });
     // Honours the `key_count` attribute (`append-kv-history-in-place`).
     attention.id.features.insert(KEY_COUNT_FEATURE.to_string());
+    // Honours the `scale` attribute.
+    attention
+        .id
+        .features
+        .insert(ATTENTION_SCALE_FEATURE.to_string());
     let embedding = baseline_advertisement("embedding", OperatorFamily::Tensor);
     // Honours the banded frequency-scaling attributes.
     let mut rope = baseline_advertisement("rope", OperatorFamily::PositionEncoding);

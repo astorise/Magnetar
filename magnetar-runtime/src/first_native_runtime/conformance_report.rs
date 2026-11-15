@@ -519,6 +519,7 @@ pub(super) fn check_operator_coverage(
             NodeValue::Host(one_row_hidden.clone()),
             NodeValue::Host(one_row_hidden.clone()),
             architecture,
+            &BTreeMap::new(),
             None,
             None,
         ),

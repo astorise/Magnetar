@@ -508,6 +508,7 @@ pub(super) fn dispatch_first_native_graph_node(
                 k,
                 v,
                 architecture,
+                &node.attributes,
                 Some(output_target),
                 key_count,
             )

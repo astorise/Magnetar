@@ -378,6 +378,14 @@ pub struct FirstNativeModelConfig {
     /// The routed mixture of experts every layer's MLP is -- see
     /// [`crate::ModelArchitectureConfig::mixture_of_experts`].
     pub mixture_of_experts: Option<crate::MixtureOfExpertsConfig>,
+    /// Each decoder layer's geometry when the layers differ -- see
+    /// [`crate::ModelArchitectureConfig::layer_layout`]. `None` when every
+    /// layer has `architecture`'s KV heads and head width.
+    pub layer_layout: Option<Vec<crate::LayerSpec>>,
+    /// See [`crate::ModelArchitectureConfig::final_logit_softcapping`].
+    pub final_logit_softcapping: Option<f64>,
+    /// See [`crate::ModelArchitectureConfig::per_layer_input_size`].
+    pub per_layer_input_size: Option<u32>,
     /// Whether tokenizer compatibility SHALL require a BOS special token.
     pub require_bos: bool,
     /// Whether tokenizer compatibility SHALL require a pad special token.
@@ -401,10 +409,40 @@ impl FirstNativeModelConfig {
             tied_embeddings: false,
             attention_bias: false,
             mixture_of_experts: None,
+            layer_layout: None,
+            final_logit_softcapping: None,
+            per_layer_input_size: None,
             require_bos: false,
             require_pad: false,
             expected_added_tokens: None,
             chat_template_required: false,
+        }
+    }
+
+    /// Each decoder layer's K (and V) row width, `kv_head_count *
+    /// head_dimension` of that layer, or `None` for a layer that attends
+    /// over an earlier layer's K/V and keeps none of its own
+    /// (`per-layer-kv-geometry`).
+    pub fn kv_row_widths(&self) -> Vec<Option<u64>> {
+        let layers = self.architecture.layer_count as usize;
+        match &self.layer_layout {
+            Some(layout) => layout
+                .iter()
+                .map(|layer| {
+                    layer
+                        .kv_source_layer
+                        .is_none()
+                        .then(|| (layer.num_key_value_heads as u64).saturating_mul(layer.head_dim))
+                })
+                .collect(),
+            None => vec![
+                Some(
+                    self.architecture
+                        .kv_head_count
+                        .saturating_mul(self.architecture.head_dimension)
+                );
+                layers
+            ],
         }
     }
 

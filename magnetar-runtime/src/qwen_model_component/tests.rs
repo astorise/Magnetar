@@ -1581,3 +1581,32 @@ fn qwen_component_integrates_with_model_loading_and_instance_and_graph_execution
         Some(qwen_component_compatibility_key(&identity))
     );
 }
+
+/// `per-layer-kv-geometry`: a uniform configuration's layers all keep K/V of
+/// `kv_head_count * head_dimension`; a layout gives each layer its own, and
+/// none to a layer reusing an earlier layer's K/V.
+#[test]
+fn kv_row_widths_follow_the_layer_layout() {
+    let mut config = small_config();
+    let uniform = config.architecture.kv_head_count * config.architecture.head_dimension;
+    assert_eq!(
+        config.kv_row_widths(),
+        vec![Some(uniform); config.architecture.layer_count as usize]
+    );
+    let layer = |kv_heads: u32, head_dim: u64, kv_source_layer: Option<u32>| crate::LayerSpec {
+        sliding_window: None,
+        head_dim,
+        num_key_value_heads: kv_heads,
+        rope_theta: 10_000.0,
+        partial_rotary_factor: None,
+        value_from_key: false,
+        kv_source_layer,
+        intermediate_size: 8,
+    };
+    config.layer_layout = Some(vec![
+        layer(1, 4, None),
+        layer(2, 8, None),
+        layer(1, 4, Some(0)),
+    ]);
+    assert_eq!(config.kv_row_widths(), vec![Some(4), Some(16), None]);
+}
