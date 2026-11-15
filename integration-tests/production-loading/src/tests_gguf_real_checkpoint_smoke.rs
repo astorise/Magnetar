@@ -502,7 +502,12 @@ fn generate_gguf_with(
         max_new_tokens: Some(max_new_tokens),
         max_generation_millis: None,
     };
-    model.generate(request(4), None).expect("warmup generates");
+    // Two warmups: with bucketed prefill replay (`replay-bucketed-prefill`)
+    // the first runs its prefill per node and the second captures it, so
+    // the measured request replays it, as every later request would.
+    for _ in 0..2 {
+        model.generate(request(4), None).expect("warmup generates");
+    }
 
     let mut token_times = Vec::new();
     let started = Instant::now();
