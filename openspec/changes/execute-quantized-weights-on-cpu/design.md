@@ -275,3 +275,12 @@ bit with `count_ones` (emulated: the kernels' target features exclude
 Mistral-shaped matmuls, 4 cores, noisy host: `IQ2_XXS` about 4.6 to
 3.1 ms, `IQ3_XXS` about 4.5 to 3.5 ms, `IQ2_XS` about 5.3 to 3.8 ms, with
 `Q4_K` at 2.6-3.3 ms on the same runs.
+
+GPU smoke run 43653339471 showed no change for Mistral `IQ3_M` (563.9 ms)
+and `IQ2_M` (467.3 ms): their GGUF headers show they are mostly `IQ3_S`
+and `IQ2_S`, which have no parity-coded signs. Their cost was the grid
+lookups: the kernels now fetch a run's magnitudes with one AVX2 gather
+(`vpgatherdd` for IQ3's eight 32-bit entries, `vpgatherdq` for IQ2's four
+64-bit ones) from indices built in vector registers. Every IQ2/IQ3
+format then runs a Mistral-shaped matmul in 2.0-2.5 ms on 4 local cores
+(3-5.7 ms before), below `Q4_K`'s 2.3-3.0 ms on the same runs.
