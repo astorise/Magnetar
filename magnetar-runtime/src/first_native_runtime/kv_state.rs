@@ -449,6 +449,7 @@ impl E2eRuntimeModelExecutionEngine {
                 kv_history: Some(&kv_state.layer_kv),
                 position: absolute_position,
                 resource_namespace: None,
+                advancing_attributes: &STEP_ADVANCING_ATTRIBUTES,
             },
             execution_plan,
             model_instance,
@@ -509,7 +510,8 @@ impl E2eRuntimeModelExecutionEngine {
             .record(upload_clock, StepPhase::InputUpload);
         let capture_clock = runtime.phase_ledger().clock();
         let request = StepCaptureRequest {
-            advancing_attributes: STEP_ADVANCING_ATTRIBUTES
+            advancing_attributes: step
+                .advancing_attributes
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect(),
@@ -630,6 +632,9 @@ pub(super) struct StepToCapture<'a> {
     pub(super) kv_history: Option<&'a LayerKvMap>,
     pub(super) position: u64,
     pub(super) resource_namespace: Option<&'a str>,
+    /// The attributes a replay's offset advances
+    /// (`StepCaptureRequest::advancing_attributes`).
+    pub(super) advancing_attributes: &'a [&'a str],
 }
 
 #[cfg(test)]

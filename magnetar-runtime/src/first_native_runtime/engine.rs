@@ -1077,11 +1077,14 @@ impl E2eRuntimeModelExecutionEngine {
         );
         match (&recording, stage) {
             (Some(key), Some(PrefillRecordingStage::Replay(recorded))) => {
-                if let Some(output) = replay_decode_step(
+                // The padding rows' outputs are never read: the packed
+                // matmuls skip them (`PADDING_ROWS_ATTRIBUTE`).
+                if let Some(output) = replay_recorded_step(
                     runtime,
                     &recorded.0,
                     vec![ids_tensor.clone(), row_tensor.clone()],
-                    0,
+                    graph_length - prompt_tokens,
+                    false,
                     greedy,
                 )? {
                     self.step_replay.touch_prefill_namespace(graph_length);
@@ -1114,6 +1117,7 @@ impl E2eRuntimeModelExecutionEngine {
                         kv_history: None,
                         position: 0,
                         resource_namespace: Some(&namespace),
+                        advancing_attributes: &[super::prefill_buckets::PADDING_ROWS_ATTRIBUTE],
                     },
                     execution_plan,
                     model_instance,

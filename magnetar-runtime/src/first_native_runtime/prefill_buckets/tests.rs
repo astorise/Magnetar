@@ -430,9 +430,18 @@ fn bucketed_prefills_are_captured_once_then_replayed() {
     }
     // Per node, captured, then replayed twice.
     assert_eq!(counts, vec![(0, 0), (1, 0), (1, 1), (1, 2)]);
+    // Every replay skips its prompt's padding rows: bucket 8 holds the
+    // replayed 1- and 6-token prompts with 7 and 2 padding rows.
+    let state = harness.executor.state.lock().unwrap();
+    assert_eq!(state.offsets, vec![7, 2]);
+    assert!(
+        state
+            .captures
+            .values()
+            .all(|capture| capture.advancing == vec![PADDING_ROWS_ATTRIBUTE.to_string()])
+    );
     // Everything the recording writes is the bucket's own or a pooled
     // store: a decode step never reallocates it.
-    let state = harness.executor.state.lock().unwrap();
     let written: BTreeSet<String> = state
         .captures
         .values()

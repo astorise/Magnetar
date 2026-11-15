@@ -6719,6 +6719,8 @@ pub(super) struct ReplayingState {
     pub(super) next_capture: u64,
     pub(super) captured: u64,
     pub(super) replayed: u64,
+    /// Each replay's offset, in order.
+    pub(super) offsets: Vec<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -6992,6 +6994,7 @@ impl ProviderExecutionApi for ReplayingExecutor {
             .ok_or_else(|| StepReplayError::Invalidated {
                 reason: "unknown capture".into(),
             })?;
+        self.state.lock().unwrap().offsets.push(offset);
         for (id, tensor) in inputs {
             self.inner.write_tensor(id, tensor);
         }

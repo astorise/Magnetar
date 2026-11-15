@@ -15,6 +15,12 @@ pub(crate) const DEFAULT_PREFILL_BUCKETS: [u64; 10] = [8, 16, 24, 32, 40, 48, 56
 /// `MAGNETAR_PREFILL_REPLAY_BYTES` is unset.
 pub(crate) const DEFAULT_PREFILL_INTERMEDIATE_BYTES: u64 = 1 << 30;
 
+/// The capture attribute a recorded bucketed prefill advances: its replay
+/// offset is the bucket's padding row count, which a Provider may skip in
+/// row-wise Kernels (their outputs are never read). Positions, key counts
+/// and KV rows do not advance in a prefill replay.
+pub(crate) const PADDING_ROWS_ATTRIBUTE: &str = "padding_rows";
+
 /// A bucket's resource namespace (`prefill{b}`): its intermediates, inputs
 /// and synthesized outputs.
 pub(crate) fn bucket_namespace(bucket: u64) -> String {

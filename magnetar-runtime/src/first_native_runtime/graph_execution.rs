@@ -1791,8 +1791,22 @@ pub(super) fn replay_decode_step(
     let Some(offset) = absolute_position.checked_sub(recorded.position) else {
         return Ok(None);
     };
+    replay_recorded_step(runtime, recorded, inputs, offset, true, greedy)
+}
+
+/// Replays a recorded step with `offset`: a decode step's position
+/// advance, whose KV rows advance with it (`advance_kv_rows`), or a
+/// bucketed prefill's padding rows, which its KV rows ignore.
+pub(super) fn replay_recorded_step(
+    runtime: &mut Runtime,
+    recorded: &RecordedDecodeStep,
+    inputs: Vec<HostTensor>,
+    offset: u64,
+    advance_kv_rows: bool,
+    greedy: Option<&DeviceGreedyPlan>,
+) -> Result<Option<(FirstNativeGraphExecutionOutput, Option<u64>)>, InferenceApiError> {
     let mut layer_kv = recorded.layer_kv.clone();
-    for layer in layer_kv.values_mut() {
+    for layer in layer_kv.values_mut().filter(|_| advance_kv_rows) {
         let Some(rows) = layer.rows.and_then(|rows| rows.checked_add(offset)) else {
             return Ok(None);
         };
