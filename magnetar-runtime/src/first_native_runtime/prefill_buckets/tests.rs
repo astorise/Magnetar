@@ -488,3 +488,35 @@ fn a_failed_prefill_capture_declines_its_key() {
     assert_eq!(harness.captured_and_replayed(), (0, 0));
     assert_eq!(harness.engine.step_replay.prefill_recordings(), 0);
 }
+
+/// Bucket namespaces stay within their budget: using another bucket
+/// releases the least recently used one's intermediates and recordings.
+#[test]
+fn bucket_intermediates_beyond_their_budget_are_released_least_recently_used_first() {
+    let mut harness = ReplayHarness::new();
+    let held = |harness: &ReplayHarness, bucket: u64| {
+        let prefix = format!("{}.", bucket_namespace(bucket));
+        harness
+            .runtime
+            .memory()
+            .tensor_residencies()
+            .filter(|residency| residency.tensor.as_str().starts_with(&prefix))
+            .count()
+    };
+    for index in 0..3 {
+        harness.generate(&format!("eight-{index}"), &[3, 9, 4], 1);
+    }
+    assert!(held(&harness, 8) > 0);
+    assert_eq!(harness.engine.step_replay.prefill_recordings(), 1);
+    // Room for one bucket only.
+    harness.engine.step_replay.set_prefill_intermediate_bytes(1);
+    let prompt = [5; 11];
+    let steps = harness.generate("sixteen", &prompt, 1);
+    assert_close(&steps, &run(&prompt, None, 1).0, "after an eviction");
+    assert_eq!(held(&harness, 8), 0, "bucket 8 was released");
+    assert!(held(&harness, 16) > 0, "the bucket in use is kept");
+    assert_eq!(harness.engine.step_replay.prefill_recordings(), 0);
+    // Bucket 8 starts its sequence again, with correct results.
+    let steps = harness.generate("eight-again", &[3, 9, 4], 1);
+    assert_close(&steps, &run(&[3, 9, 4], None, 1).0, "bucket 8 again");
+}

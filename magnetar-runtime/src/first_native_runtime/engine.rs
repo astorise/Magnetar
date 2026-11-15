@@ -92,6 +92,8 @@ pub(super) struct StepReplayState {
     /// Bucketed prefill capture and replay (`replay-bucketed-prefill`).
     pub(super) prefill_enabled: std::sync::atomic::AtomicBool,
     pub(super) prefills: Mutex<PrefillRecordings>,
+    /// The bytes every bucket namespace's intermediates may hold together.
+    pub(super) prefill_intermediate_bytes: std::sync::atomic::AtomicU64,
 }
 
 /// A prefill recording's key: the prefill graph, its bucket length and the
@@ -107,6 +109,10 @@ pub(super) struct PrefillRecordings {
     pub(super) warmed: BTreeSet<PrefillRecordingKey>,
     /// Keys whose capture failed: they run per node.
     pub(super) declined: BTreeSet<PrefillRecordingKey>,
+    /// Each bucket namespace holding intermediates, with when it was last
+    /// used.
+    pub(super) namespaces: BTreeMap<u64, u64>,
+    pub(super) tick: u64,
 }
 
 /// Where a bucketed prefill is in its key's sequence.
@@ -146,6 +152,12 @@ impl Default for StepReplayState {
             declined: Mutex::default(),
             prefill_enabled: std::sync::atomic::AtomicBool::new(true),
             prefills: Mutex::default(),
+            prefill_intermediate_bytes: std::sync::atomic::AtomicU64::new(
+                std::env::var("MAGNETAR_PREFILL_REPLAY_BYTES")
+                    .ok()
+                    .and_then(|bytes| bytes.trim().parse().ok())
+                    .unwrap_or(super::prefill_buckets::DEFAULT_PREFILL_INTERMEDIATE_BYTES),
+            ),
         }
     }
 }
@@ -270,6 +282,63 @@ impl StepReplay {
                     .recorded
                     .keys()
                     .filter(|key| key.2 == set)
+                    .cloned()
+                    .collect();
+                keys.iter()
+                    .filter_map(|key| prefills.recorded.remove(key))
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        for step in released {
+            step.executor.release_step_capture(&step.capture);
+        }
+    }
+
+    /// Bounds what every bucket namespace's intermediates hold together.
+    #[cfg(test)]
+    pub(super) fn set_prefill_intermediate_bytes(&self, bytes: u64) {
+        self.0
+            .prefill_intermediate_bytes
+            .store(bytes, Ordering::Relaxed);
+    }
+
+    /// Marks `bucket`'s namespace as just used.
+    pub(super) fn touch_prefill_namespace(&self, bucket: u64) {
+        if let Ok(mut prefills) = self.0.prefills.lock() {
+            prefills.tick += 1;
+            let tick = prefills.tick;
+            prefills.namespaces.insert(bucket, tick);
+        }
+    }
+
+    /// The buckets whose namespaces hold intermediates, least recently
+    /// used first.
+    pub(super) fn prefill_namespaces(&self) -> Vec<u64> {
+        let Ok(prefills) = self.0.prefills.lock() else {
+            return Vec::new();
+        };
+        let mut buckets: Vec<(u64, u64)> = prefills
+            .namespaces
+            .iter()
+            .map(|(bucket, tick)| (*tick, *bucket))
+            .collect();
+        buckets.sort_unstable();
+        buckets.into_iter().map(|(_, bucket)| bucket).collect()
+    }
+
+    /// Forgets every prefill of `bucket`, releasing its recordings: its
+    /// namespace's intermediates are about to be released.
+    pub(super) fn release_prefill_bucket(&self, bucket: u64) {
+        let released: Vec<RecordedDecodeStep> = match self.0.prefills.lock() {
+            Ok(mut prefills) => {
+                prefills.namespaces.remove(&bucket);
+                prefills.warmed.retain(|key| key.1 != bucket);
+                prefills.declined.retain(|key| key.1 != bucket);
+                let keys: Vec<_> = prefills
+                    .recorded
+                    .keys()
+                    .filter(|key| key.1 == bucket)
                     .cloned()
                     .collect();
                 keys.iter()
@@ -998,7 +1067,7 @@ impl E2eRuntimeModelExecutionEngine {
             bucketed,
             kv_stores,
         )?;
-        let namespace = format!("prefill{graph_length}");
+        let namespace = super::prefill_buckets::bucket_namespace(graph_length);
         let stage = recording
             .as_ref()
             .map(|key| self.step_replay.prefill_stage(key));
@@ -1015,6 +1084,7 @@ impl E2eRuntimeModelExecutionEngine {
                     0,
                     greedy,
                 )? {
+                    self.step_replay.touch_prefill_namespace(graph_length);
                     return Ok(output);
                 }
                 // Invalidated: run per node, and capture again later.
@@ -1054,6 +1124,7 @@ impl E2eRuntimeModelExecutionEngine {
                     Some((recorded, output)) => {
                         trace_step_capture("captured", format!("prefill of {graph_length} rows"));
                         self.step_replay.record_prefill(key.clone(), recorded);
+                        self.step_replay.touch_prefill_namespace(graph_length);
                         return Ok((output, None));
                     }
                     None => {
@@ -1092,8 +1163,68 @@ impl E2eRuntimeModelExecutionEngine {
         )?;
         if let Some(key) = recording.filter(|_| keeps_intermediates) {
             self.step_replay.prefill_warmed(key);
+            self.step_replay.touch_prefill_namespace(graph_length);
+            self.bound_prefill_intermediates(runtime, &output.3, graph_length);
         }
         Ok((output, None))
+    }
+
+    /// Keeps the bucket namespaces' intermediates within their budget
+    /// (`MAGNETAR_PREFILL_REPLAY_BYTES`): releases the least recently used
+    /// buckets' recordings and intermediates, never `current`'s.
+    fn bound_prefill_intermediates(
+        &self,
+        runtime: &mut Runtime,
+        provider: &ProviderBinding,
+        current: u64,
+    ) {
+        let budget = self
+            .step_replay
+            .0
+            .prefill_intermediate_bytes
+            .load(Ordering::Relaxed);
+        let held = |runtime: &Runtime, bucket: u64| -> u64 {
+            let owner =
+                MemoryAllocationOwner::Session(super::prefill_buckets::bucket_namespace(bucket));
+            runtime
+                .memory()
+                .allocations()
+                .filter(|allocation| {
+                    allocation.state == MemoryAllocationState::Active
+                        && allocation.request.owner == owner
+                })
+                .map(|allocation| allocation.request.size_bytes)
+                .sum()
+        };
+        let buckets = self.step_replay.prefill_namespaces();
+        let mut total: u64 = buckets.iter().map(|bucket| held(runtime, *bucket)).sum();
+        let Ok(executor) = resolve_kernel_execution_provider(runtime, provider) else {
+            return;
+        };
+        for bucket in buckets {
+            if total <= budget {
+                break;
+            }
+            if bucket == current {
+                continue;
+            }
+            total = total.saturating_sub(held(runtime, bucket));
+            self.step_replay.release_prefill_bucket(bucket);
+            let prefix = format!("{}.", super::prefill_buckets::bucket_namespace(bucket));
+            let resources: Vec<TensorResourceId> = runtime
+                .memory()
+                .tensor_residencies()
+                .filter(|residency| residency.tensor.as_str().starts_with(&prefix))
+                .map(|residency| residency.tensor.clone())
+                .collect();
+            for resource in &resources {
+                release_pending_kv_resource(runtime, &executor, resource);
+            }
+            trace_step_capture(
+                "released",
+                format!("prefill intermediates of {bucket} rows"),
+            );
+        }
     }
 
     /// The recording key of a prefill that can be recorded: bucketed, with

@@ -4,8 +4,22 @@
 
 use super::*;
 
-/// The prompt buckets used when `MAGNETAR_PREFILL_BUCKETS` is unset.
-pub(crate) const DEFAULT_PREFILL_BUCKETS: [u64; 4] = [16, 32, 64, 128];
+/// The prompt buckets used when `MAGNETAR_PREFILL_BUCKETS` is unset: every
+/// multiple of 8 rows up to 64, then 96 and 128. Packed CUDA matmuls read
+/// their weights once per 8 rows, so padding to the next multiple of 8
+/// adds no weight pass (run 43717628081: padding 6 rows to 16 cost a
+/// 7B model more than replay saved).
+pub(crate) const DEFAULT_PREFILL_BUCKETS: [u64; 10] = [8, 16, 24, 32, 40, 48, 56, 64, 96, 128];
+
+/// The bytes the bucket namespaces' intermediates may hold when
+/// `MAGNETAR_PREFILL_REPLAY_BYTES` is unset.
+pub(crate) const DEFAULT_PREFILL_INTERMEDIATE_BYTES: u64 = 1 << 30;
+
+/// A bucket's resource namespace (`prefill{b}`): its intermediates, inputs
+/// and synthesized outputs.
+pub(crate) fn bucket_namespace(bucket: u64) -> String {
+    format!("prefill{bucket}")
+}
 
 /// The Runtime-provided graph input naming the prompt row whose logits are
 /// sampled: `[n - 1]` for a prompt of `n` tokens.

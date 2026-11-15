@@ -336,7 +336,7 @@ jobs:
       - name: Real-checkpoint prefill replay campaign on CUDA (short prompts)
         if: ${{ env.SUITE_DENSE == 'true' }}
         # replay-bucketed-prefill: warm TTFT of 5-, 12- and 40-token
-        # prompts. Each is right-padded to its bucket (16 or 64 rows); the
+        # prompts. Each is right-padded to its bucket (8, 16 or 40 rows); the
         # cold request runs the prefill per node, the warmup captures it and
         # every measured request replays the captured CUDA graph.
         timeout-minutes: 30
@@ -1064,7 +1064,7 @@ jobs:
       - name: Mistral-7B-Instruct-v0.3 Q4_K_M GGUF with prefill replay off (disable control)
         # replay-bucketed-prefill's control on a 7B model: the measured
         # request's prefill at its exact length, per node, instead of a
-        # replayed bucket-16 graph. Greedy tokens must match.
+        # replayed bucket-8 graph. Greedy tokens must match.
         if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR != '' }}
         timeout-minutes: 30
         env:
