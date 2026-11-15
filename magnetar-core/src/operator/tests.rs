@@ -250,3 +250,165 @@ fn fused_matmul_operators_accept_the_matmul_attributes() {
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
     }
 }
+
+/// `extend-portable-operator-attributes`: optional trailing inputs, the
+/// `[1]` scalar operand of `mul`, the per-head RMSNorm weight and the new
+/// attributes.
+#[test]
+fn optional_inputs_scalar_mul_and_the_layered_model_attributes_validate() {
+    let catalog = initial_operator_catalog();
+    let f32_tensor = |shape: &[u64]| {
+        TensorDescriptor::materialized(
+            ShapeDescriptor::new(shape.to_vec()),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        )
+    };
+    let attributes = |pairs: &[(&str, OperatorAttributeValue)]| -> BTreeMap<_, _> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect()
+    };
+    let rmsnorm = catalog
+        .get(&OperatorId::magnetar(
+            "rmsnorm",
+            1,
+            OperatorFamily::Normalization,
+        ))
+        .unwrap();
+    let epsilon = attributes(&[("epsilon", OperatorAttributeValue::Float(1e-6))]);
+    let x = f32_tensor(&[2, 8]);
+    // Scale-less: one input. None at all is refused.
+    assert!(
+        rmsnorm
+            .validate_invocation(std::slice::from_ref(&x), std::slice::from_ref(&x), &epsilon)
+            .is_ok()
+    );
+    assert!(matches!(
+        rmsnorm.validate_invocation(&[], std::slice::from_ref(&x), &epsilon),
+        Err(OperatorError::InputArityInvalid { expected: 1, .. })
+    ));
+    // Per head: a [head_dimension] weight dividing the row.
+    let heads = attributes(&[
+        ("epsilon", OperatorAttributeValue::Float(1e-6)),
+        ("head_count", OperatorAttributeValue::Integer(2)),
+        ("head_dimension", OperatorAttributeValue::Integer(4)),
+    ]);
+    assert!(
+        rmsnorm
+            .validate_invocation(
+                &[x.clone(), f32_tensor(&[4])],
+                std::slice::from_ref(&x),
+                &heads
+            )
+            .is_ok()
+    );
+    assert!(
+        rmsnorm
+            .validate_invocation(
+                &[x.clone(), f32_tensor(&[3])],
+                std::slice::from_ref(&x),
+                &heads
+            )
+            .is_err()
+    );
+
+    let mul = catalog
+        .get(&OperatorId::magnetar("mul", 1, OperatorFamily::Tensor))
+        .unwrap();
+    let none = BTreeMap::new();
+    assert!(
+        mul.validate_invocation(
+            &[x.clone(), f32_tensor(&[1])],
+            std::slice::from_ref(&x),
+            &none
+        )
+        .is_ok()
+    );
+    assert!(
+        mul.validate_invocation(&[x.clone(), x.clone()], std::slice::from_ref(&x), &none)
+            .is_ok()
+    );
+    assert!(matches!(
+        mul.validate_invocation(
+            &[x.clone(), f32_tensor(&[8])],
+            std::slice::from_ref(&x),
+            &none
+        ),
+        Err(OperatorError::ShapeMismatch { .. })
+    ));
+    // The scalar may only be the second operand.
+    assert!(
+        mul.validate_invocation(
+            &[f32_tensor(&[1]), x.clone()],
+            std::slice::from_ref(&x),
+            &none
+        )
+        .is_err()
+    );
+
+    let moe = catalog
+        .get(&OperatorId::magnetar(
+            "moe-experts",
+            1,
+            OperatorFamily::LinearAlgebra,
+        ))
+        .unwrap();
+    assert_eq!((moe.min_inputs, moe.inputs), (5, 6));
+
+    for (operator, family, name, value) in [
+        (
+            "attention",
+            OperatorFamily::Attention,
+            "scale",
+            OperatorAttributeValue::Float(1.0),
+        ),
+        (
+            "rope",
+            OperatorFamily::PositionEncoding,
+            "partial_rotary_factor",
+            OperatorAttributeValue::Float(0.25),
+        ),
+        (
+            "gelu",
+            OperatorFamily::Activation,
+            "approximate",
+            OperatorAttributeValue::String("tanh".into()),
+        ),
+        (
+            "activation",
+            OperatorFamily::Activation,
+            "cap",
+            OperatorAttributeValue::Float(30.0),
+        ),
+        (
+            "activation",
+            OperatorFamily::Activation,
+            "factor",
+            OperatorAttributeValue::Float(0.5),
+        ),
+        (
+            "embedding",
+            OperatorFamily::Tensor,
+            "scale",
+            OperatorAttributeValue::Float(2.0),
+        ),
+        (
+            "moe-experts",
+            OperatorFamily::LinearAlgebra,
+            "activation",
+            OperatorAttributeValue::String("gelu_tanh".into()),
+        ),
+    ] {
+        let spec = catalog
+            .get(&OperatorId::magnetar(operator, 1, family))
+            .unwrap();
+        let rule = spec
+            .attributes
+            .rules
+            .get(name)
+            .unwrap_or_else(|| panic!("{operator} defines {name}"));
+        assert!(!rule.required, "{operator}.{name} is optional");
+        assert_eq!(rule.kind, value.kind(), "{operator}.{name}");
+    }
+}
