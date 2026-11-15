@@ -198,6 +198,12 @@ fn run_campaign(target: CampaignTarget<'_>, hardware: HardwareCapabilityMatrix) 
             run
         })
         .collect();
+    // replay-bucketed-prefill: what the pooled KV stores hold between
+    // requests.
+    eprintln!(
+        "[{provider_name}] pooled KV stores: {:.1} MiB",
+        model.kv_pool_bytes() as f64 / (1024.0 * 1024.0)
+    );
     model
         .unload()
         .expect("the campaign's model unloads cleanly");
