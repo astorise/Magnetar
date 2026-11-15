@@ -663,6 +663,7 @@ pub(super) fn build_runtime_with_model_execution_engine(fixture: &E2eFixture) ->
             graph_cache: None,
             copy_based_kv: false,
             step_replay: StepReplay::default(),
+            kv_pool: KvStorePool::default(),
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -700,6 +701,7 @@ pub(super) fn build_runtime_with_model_execution_engine_and_provider(
             graph_cache: None,
             copy_based_kv: false,
             step_replay: StepReplay::default(),
+            kv_pool: KvStorePool::default(),
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),

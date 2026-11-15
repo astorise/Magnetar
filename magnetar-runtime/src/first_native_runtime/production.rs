@@ -864,6 +864,7 @@ pub(super) fn prepare_production_generation(
             graph_cache: None,
             copy_based_kv: false,
             step_replay: StepReplay::default(),
+            kv_pool: KvStorePool::default(),
         }))
         .trust_store(trust_store)
         .build()
@@ -1047,6 +1048,9 @@ pub struct ProductionLoadedModel {
     pub(super) graph_cache: ComponentGraphCache,
     /// Shared with this instance's execution engine.
     pub(super) step_replay: StepReplay,
+    /// Pooled in-place KV stores of bucketed prefills, shared with the
+    /// engine (`replay-bucketed-prefill`).
+    pub(super) kv_pool: KvStorePool,
 }
 
 /// `enforce-local-multigpu-and-expert-placement` tensor parallelism: with
@@ -1232,6 +1236,7 @@ impl ProductionLoadedModel {
         let provider_supports_multi_step_decode = provider.supports_multi_step_decode();
         let graph_cache = ComponentGraphCache::default();
         let step_replay = StepReplay::default();
+        let kv_pool = KvStorePool::default();
         let mut runtime = Runtime::builder()
             .register_provider(provider.clone())
             .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
@@ -1243,6 +1248,7 @@ impl ProductionLoadedModel {
                 graph_cache: Some(graph_cache.clone()),
                 copy_based_kv: false,
                 step_replay: step_replay.clone(),
+                kv_pool: kv_pool.clone(),
             }))
             .trust_store(trust_store)
             .build()
@@ -1282,6 +1288,7 @@ impl ProductionLoadedModel {
             component_digest,
             graph_cache,
             step_replay,
+            kv_pool,
         })
     }
 
@@ -1318,6 +1325,12 @@ impl ProductionLoadedModel {
                 buckets,
                 self.fixture.config.architecture.context_length,
             ));
+    }
+
+    /// Bytes the pooled KV store sets hold, free or in use
+    /// (`replay-bucketed-prefill`).
+    pub fn kv_pool_bytes(&self) -> u64 {
+        self.kv_pool.held_bytes()
     }
 
     /// Turns decode-step capture and replay (`capture-and-replay-cuda-graphs`)

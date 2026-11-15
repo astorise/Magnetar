@@ -8,9 +8,9 @@
 
 ## 2. Runtime: KV store pool
 
-- [ ] 2.1 Capacity buckets, a per-instance pool keyed by capacity bucket, and Memory Manager accounting under a pool owner.
-- [ ] 2.2 Bounds (`MAGNETAR_KV_POOL_BYTES`, sets per bucket), LRU eviction, and reclaim before a refused admission.
-- [ ] 2.3 Tests: same addresses on reuse, row count reset, one live request per set, reclaim under pressure.
+- [x] 2.1 Capacity buckets, a per-instance pool keyed by capacity bucket, and Memory Manager accounting under a pool owner.
+- [x] 2.2 Bounds (`MAGNETAR_KV_POOL_BYTES`, sets per bucket), LRU eviction, and reclaim before a refused admission.
+- [x] 2.3 Tests (`first_native_runtime::kv_pool::tests`): same addresses on reuse, row count reset, one live request per set, reclaim under pressure.
 
 ## 3. Prefill capture and replay
 

@@ -2466,6 +2466,7 @@ pub(super) fn build_runtime_with_model_execution_engine_and_forced_token(
             graph_cache: None,
             copy_based_kv: false,
             step_replay: StepReplay::default(),
+            kv_pool: KvStorePool::default(),
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -5718,6 +5719,7 @@ pub(super) fn new_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelEx
         graph_cache: None,
         copy_based_kv: false,
         step_replay: StepReplay::default(),
+        kv_pool: KvStorePool::default(),
     }
 }
 

@@ -349,7 +349,7 @@ impl E2eRuntimeModelExecutionEngine {
         absolute_position: u64,
         decode_index: usize,
         node_events: &mut Vec<PerNodeCausalEvent>,
-        kv_store_capacity: Option<u64>,
+        kv_stores: Option<KvStoreSpec>,
         greedy: Option<&DeviceGreedyPlan>,
     ) -> Result<(FirstNativeGraphExecutionOutput, Option<u64>), InferenceApiError> {
         let ids_tensor =
@@ -358,7 +358,7 @@ impl E2eRuntimeModelExecutionEngine {
         // Only steps whose KV history is kept in place: their shapes and
         // resources are the same from one step to the next.
         let replayable = self.step_replay.is_enabled()
-            && kv_store_capacity.is_some()
+            && kv_stores.is_some()
             && !kv_state.layer_kv.is_empty()
             && kv_state.layer_kv.values().all(|layer| layer.rows.is_some());
         if replayable {
@@ -387,7 +387,7 @@ impl E2eRuntimeModelExecutionEngine {
                     ids_tensor.clone(),
                     absolute_position,
                     node_events,
-                    kv_store_capacity,
+                    kv_stores,
                 )? {
                     Some((recorded, output)) => {
                         trace_step_capture("captured", format!("decode step {decode_index}"));
@@ -411,7 +411,7 @@ impl E2eRuntimeModelExecutionEngine {
             node_events,
             MaterializedEdges::Only(&["logits"]),
             Some(&graphs.decode_memo),
-            kv_store_capacity,
+            kv_stores,
         )
         .map(|output| (output, None))
     }
@@ -431,7 +431,7 @@ impl E2eRuntimeModelExecutionEngine {
         ids_tensor: HostTensor,
         absolute_position: u64,
         node_events: &mut Vec<PerNodeCausalEvent>,
-        kv_store_capacity: Option<u64>,
+        kv_stores: Option<KvStoreSpec>,
     ) -> Result<Option<(RecordedDecodeStep, FirstNativeGraphExecutionOutput)>, InferenceApiError>
     {
         let Some(provider_binding) = execution_plan
@@ -499,7 +499,7 @@ impl E2eRuntimeModelExecutionEngine {
             node_events,
             MaterializedEdges::Only(&[]),
             Some(&graphs.decode_memo),
-            kv_store_capacity,
+            kv_stores,
         );
         let end_clock = runtime.phase_ledger().clock();
         let captured = match executed {

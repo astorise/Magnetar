@@ -25,7 +25,7 @@ The Runtime SHALL select the logits row through a Runtime-inserted `embedding` r
 
 ### Requirement: Pooled KV stores
 
-The Runtime SHALL keep the KV stores of a released bucketed request in a per-Model-Instance pool keyed by capacity bucket. The pool SHALL remain admitted in the Memory Manager under a pool owner, SHALL be bounded by a configured byte budget and set count, and SHALL be reclaimed before an admission fails for lack of memory. A pooled store set SHALL be used by at most one live request, and its valid row count SHALL be reset before reuse.
+The Runtime SHALL keep the KV stores of a released bucketed request in a per-Model-Instance pool keyed by capacity bucket. The pool SHALL remain admitted in the Memory Manager under a pool owner, SHALL be bounded by a configured byte budget and set count, and its free sets SHALL be released before a generation step refused admission is given up. A pooled store set SHALL be used by at most one live request, and its valid row count SHALL be reset before reuse.
 
 #### Scenario: Store reuse
 
@@ -34,8 +34,8 @@ The Runtime SHALL keep the KV stores of a released bucketed request in a per-Mod
 
 #### Scenario: Memory pressure
 
-- **WHEN** an admission would fail while the pool holds store sets
-- **THEN** pooled sets are released, least recently used first, before the admission is refused
+- **WHEN** a generation step is refused Memory Manager admission while the pool holds free store sets
+- **THEN** the free sets are released and the step runs once more before the refusal is returned
 
 ### Requirement: Prefill capture and replay
 

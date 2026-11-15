@@ -38,11 +38,13 @@ Non-goals: see proposal.md. They are chunked prefill, cross-request decode recor
 
 ### KV store pool
 
-- **Capacity buckets.** A bucketed request's KV capacity is rounded up to a capacity bucket: the next power of two at or above `b + max_new_tokens`, with a minimum of 256 rows. Requests of similar sizes therefore share store shapes.
-- **Release.** When a bucketed request is released, its stores are kept in a per-Model-Instance pool keyed by capacity bucket instead of being freed. They remain admitted in the Memory Manager under a pool owner, so the VRAM they hold stays visible and bounded.
-- **Reuse.** A new bucketed request with that capacity bucket takes a pooled store set if one is free. That set's stores keep their addresses, which is what lets its recordings replay.
-- **Bounds.** The pool holds at most `MAGNETAR_KV_POOL_BYTES` (default: 10 % of the Device budget used for layer placement) and at most 4 store sets per capacity bucket. It drops least recently used sets first. Under admission pressure, the Memory Manager reclaims pooled sets before failing an admission. Dropping a set releases its recordings.
-- **Isolation.** A pooled set holds no state that a later request can read: its valid row count is reset to 0, and no row is read before it is written. It is never shared by two live requests.
+- **Capacity buckets.** A bucketed request's KV capacity is rounded up to a capacity bucket: the next power of two at or above `b + max_new_tokens`, with a minimum of 256 rows, and at most the model's context length when that holds the request. Requests of similar sizes therefore share store shapes.
+- **Naming and ownership.** A pooled set's stores are named after the set (`kv.pool{set}.layer{l}.{k|v}.store`), not after a request's KV cache, and admitted in the Memory Manager under the `kv-store-pool` owner, so the memory they hold stays visible and bounded.
+- **Release.** When a bucketed request is released, its set goes back to the per-Model-Instance pool instead of being freed. A failed prefill also leaves its set's stores with the pool.
+- **Reuse.** A new bucketed request takes the most recently used free set of its capacity bucket. Its stores keep their Memory Manager admissions and their Device buffers, which is what lets its recordings replay. They are not zeroed again.
+- **Bounds.** The pool holds at most `MAGNETAR_KV_POOL_BYTES` (default 1 GiB) and at most 4 store sets per capacity bucket, free or in use. It drops least recently used free sets first. A set larger than the whole budget is not pooled: that request owns its stores. Dropping a set releases its stores; recordings are released with their request beforehand.
+- **Admission pressure.** A generation step refused Memory Manager admission is retried once, after the pool's free sets are released. The Memory Manager itself is unchanged.
+- **Isolation.** A pooled set holds no state that a later request can read: the request's valid row count starts at 0, and no row is read before it is written. It is never shared by two live requests.
 
 ### Prefill recordings
 

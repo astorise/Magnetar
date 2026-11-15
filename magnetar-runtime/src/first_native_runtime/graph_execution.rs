@@ -806,7 +806,7 @@ pub(super) fn execute_first_native_graph_materializing(
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
     memo: Option<&GraphExecutionMemo>,
-    kv_store_capacity: Option<u64>,
+    kv_stores: Option<KvStoreSpec>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     execute_first_native_graph_with_resident_input(
         runtime,
@@ -822,7 +822,7 @@ pub(super) fn execute_first_native_graph_materializing(
         node_events,
         materialized,
         memo,
-        kv_store_capacity,
+        kv_stores,
     )
 }
 
@@ -884,7 +884,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
     memo: Option<&GraphExecutionMemo>,
-    kv_store_capacity: Option<u64>,
+    kv_stores: Option<KvStoreSpec>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     let prepare_clock = runtime.phase_ledger().clock();
     let computed_order;
@@ -912,7 +912,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     let executor = resolve_kernel_execution_provider(runtime, &provider_binding)?;
     // In-place KV history (`append-kv-history-in-place`) only when the
     // Provider supports it and attention is the only reader of KV edges.
-    let kv_store_capacity = kv_store_capacity.filter(|_| {
+    let kv_stores = kv_stores.filter(|_| {
         in_place_kv_supported(runtime, &provider_binding)
             && match memo {
                 Some(memo) => memo.kv_edges_feed_only_attention(graph),
@@ -957,7 +957,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
         absolute_position_override,
         node_events,
         materialized,
-        kv_store_capacity,
+        kv_stores,
     )?;
     Ok((dispatch, bindings, layer_kv, provider_binding))
 }
@@ -978,7 +978,7 @@ pub(super) fn execute_first_native_graph_nodes(
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
-    kv_store_capacity: Option<u64>,
+    kv_stores: Option<KvStoreSpec>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
     let graph = fingerprinted.graph();
     // This step's token count, for `PlanGuardContext::sequence_length`
@@ -1264,25 +1264,41 @@ pub(super) fn execute_first_native_graph_nodes(
                 // In-place history (`append-kv-history-in-place`): a decode
                 // step continues the stores its history lives in; a prefill
                 // starts new stores when this execution keeps KV in place.
+                // A prefill's stores are named after the request's KV cache,
+                // or after the pooled store set it was given
+                // (`replay-bucketed-prefill`); a decode step continues the
+                // stores its history names.
                 let in_place = match kv_history.and_then(|history| history.get(&layer)) {
                     Some(FirstNativeLayerKvState {
-                        rows: Some(rows), ..
+                        rows: Some(rows),
+                        k,
+                        v,
                     }) => Some((
-                        kv_store_capacity.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                        kv_stores.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                             reason: format!(
                                 "layer {layer} keeps its KV history in place, but this \
                                      execution cannot continue it"
                             ),
                         })?,
                         *rows,
+                        match role {
+                            KvRole::K => k.clone(),
+                            KvRole::V => v.clone(),
+                        },
                     )),
                     Some(_) => None,
-                    None => kv_store_capacity.map(|capacity| (capacity, 0)),
+                    None => kv_stores.map(|spec| {
+                        let store = match spec.pool_set {
+                            Some(set) => pooled_kv_store_id(set, layer, role_str),
+                            None => TensorResourceId::new(format!(
+                                "kv.{kv_cache_id}.layer{layer}.{role_str}.store"
+                            )),
+                        };
+                        (spec, 0, store)
+                    }),
                 };
-                if let Some((capacity, row_offset)) = in_place {
-                    let store = TensorResourceId::new(format!(
-                        "kv.{kv_cache_id}.layer{layer}.{role_str}.store"
-                    ));
+                if let Some((spec, row_offset, store)) = in_place {
+                    let capacity = spec.capacity;
                     let (rows, width) = output_tensor.rows_cols()?;
                     let valid_rows = row_offset
                         .checked_add(rows)
@@ -1295,15 +1311,28 @@ pub(super) fn execute_first_native_graph_nodes(
                         })?;
                     let store_descriptor = f32_tensor_descriptor_from_shape(&[capacity, width]);
                     let append_clock = dispatch_ctx.runtime.phase_ledger().clock();
-                    if row_offset == 0 {
-                        // A new store, admitted once for the whole request.
+                    // A pooled store already admitted keeps its storage: no
+                    // row is read before this request writes it.
+                    let pooled_store_held = spec.pool_set.is_some()
+                        && dispatch_ctx
+                            .runtime
+                            .memory()
+                            .tensor_residency(&store)
+                            .is_some();
+                    if row_offset == 0 && !pooled_store_held {
+                        // A new store, admitted once for the whole request
+                        // (for a pooled one, for as long as the pool keeps it).
+                        let owner = match spec.pool_set {
+                            Some(_) => MemoryAllocationOwner::Session(KV_STORE_POOL_OWNER.into()),
+                            None => MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                        };
                         let target: OutputTarget = (
                             store.clone(),
                             resolved_output_placement(
                                 dispatch_ctx.prepared_plan.as_deref(),
                                 node_id,
                             ),
-                            MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                            owner,
                         );
                         let (store_id, _) = resolve_output_target(
                             &mut dispatch_ctx,

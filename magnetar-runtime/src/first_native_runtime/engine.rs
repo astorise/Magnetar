@@ -35,6 +35,9 @@ pub(super) struct E2eRuntimeModelExecutionEngine {
     pub(super) copy_based_kv: bool,
     /// Decode-step capture and replay (`capture-and-replay-cuda-graphs`).
     pub(super) step_replay: StepReplay,
+    /// Pooled in-place KV stores of bucketed requests
+    /// (`replay-bucketed-prefill`).
+    pub(super) kv_pool: KvStorePool,
 }
 
 /// How many prompt lengths' graphs one loaded model keeps.
@@ -759,8 +762,10 @@ impl E2eRuntimeModelExecutionEngine {
                 .lock()
                 .map(|states| states.contains_key(&Self::kv_state_key(request)))
                 .unwrap_or(true);
+            // A pooled store set's stores stay with the pool.
+            let pooled = self.kv_pool.current(&Self::kv_state_key(request)).is_some();
             for layer in discarded.layer_kv.values() {
-                if layer.rows.is_some() && has_committed_state {
+                if layer.rows.is_some() && (has_committed_state || pooled) {
                     continue;
                 }
                 // Best-effort: this pending state is being discarded
@@ -806,6 +811,114 @@ impl E2eRuntimeModelExecutionEngine {
 }
 
 impl E2eRuntimeModelExecutionEngine {
+    /// A prefill's in-place KV stores: a pooled store set of the request's
+    /// capacity bucket for a bucketed prefill (`replay-bucketed-prefill`),
+    /// stores of exactly `rows_needed` rows owned by the request otherwise,
+    /// or when the pool cannot hold the set.
+    fn prefill_kv_stores(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        bucketed: bool,
+        rows_needed: u64,
+        execution_plan: &PreparedExecutionPlan,
+    ) -> Result<KvStoreSpec, InferenceApiError> {
+        let key = Self::kv_state_key(request);
+        let provider = execution_plan
+            .node_bindings
+            .first()
+            .map(|binding| binding.provider.clone());
+        let (set, capacity, dropped) = match (bucketed, provider) {
+            (true, Some(provider)) => {
+                // Never past the model's context, when that holds the request.
+                let context = self.fixture.config.architecture.context_length;
+                let capacity = match kv_capacity_bucket(rows_needed) {
+                    bucket if context >= rows_needed => bucket.min(context),
+                    bucket => bucket,
+                };
+                let (set, dropped) =
+                    self.kv_pool
+                        .acquire(&key, capacity, self.kv_set_bytes(capacity), provider);
+                (set, capacity, dropped)
+            }
+            // Not pooled: a set the key still holds goes back to the pool.
+            _ => (None, rows_needed, self.kv_pool.release(&key)),
+        };
+        self.release_pooled_kv_sets(runtime, &dropped);
+        Ok(match set {
+            Some(set) => KvStoreSpec {
+                capacity,
+                pool_set: Some(set),
+            },
+            None => KvStoreSpec::owned(rows_needed),
+        })
+    }
+
+    /// The bytes of one store set of `capacity` rows: every layer's K and V.
+    fn kv_set_bytes(&self, capacity: u64) -> u64 {
+        let architecture = &self.fixture.config.architecture;
+        architecture
+            .layer_count
+            .saturating_mul(2)
+            .saturating_mul(capacity)
+            .saturating_mul(architecture.kv_head_count * architecture.head_dimension)
+            .saturating_mul(4)
+    }
+
+    /// Releases the stores of sets the pool dropped.
+    pub(super) fn release_pooled_kv_sets(&self, runtime: &mut Runtime, sets: &[PooledKvSet]) {
+        if sets.is_empty() {
+            return;
+        }
+        let Some(provider) = self
+            .kv_pool
+            .provider()
+            .and_then(|binding| resolve_kernel_execution_provider(runtime, &binding).ok())
+        else {
+            return;
+        };
+        for set in sets {
+            for layer in 0..self.fixture.config.architecture.layer_count as usize {
+                for role in ["k", "v"] {
+                    release_pending_kv_resource(
+                        runtime,
+                        &provider,
+                        &pooled_kv_store_id(set.id, layer, role),
+                    );
+                }
+            }
+        }
+    }
+
+    /// [`Self::execute_step`]; a step refused Memory Manager admission is
+    /// retried once after the pool's free store sets are released.
+    pub(super) fn execute_step_reclaiming(
+        &self,
+        runtime: &mut Runtime,
+        request: &GenerationRequest,
+        generated_tokens: &[TokenId],
+        mut execution_plan: Option<&mut PreparedExecutionPlan>,
+        greedy: Option<&crate::SamplingRequest>,
+    ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
+        match self.execute_step(
+            runtime,
+            request,
+            generated_tokens,
+            execution_plan.as_deref_mut(),
+            greedy,
+        ) {
+            Err(InferenceApiError::MemoryAdmissionFailed { reason }) => {
+                let freed = self.kv_pool.drain_free();
+                if freed.is_empty() {
+                    return Err(InferenceApiError::MemoryAdmissionFailed { reason });
+                }
+                self.release_pooled_kv_sets(runtime, &freed);
+                self.execute_step(runtime, request, generated_tokens, execution_plan, greedy)
+            }
+            result => result,
+        }
+    }
+
     /// The prefill graph length for a prompt of `prompt_tokens` tokens
     /// ([`ComponentGraphCache::prefill_graph_length`]). Copy-based KV
     /// history keeps every row it computes, so it never pads.
@@ -981,12 +1094,29 @@ impl E2eRuntimeModelExecutionEngine {
             // Every row this request's KV history can reach: its prompt and
             // every token it may generate (`append-kv-history-in-place`).
             // A bucketed prefill also writes its padding rows.
-            let kv_store_capacity = (!self.copy_based_kv).then(|| {
-                (request.input_token_ids.len() as u64)
-                    .saturating_add(request.max_new_tokens as u64)
-                    .max(graph_length)
-                    .max(1)
-            });
+            let rows_needed = (request.input_token_ids.len() as u64)
+                .saturating_add(request.max_new_tokens as u64)
+                .max(graph_length)
+                .max(1);
+            let kv_stores = if self.copy_based_kv {
+                None
+            } else if generated_tokens.is_empty() {
+                let bucketed = graph_length != prompt_token_count || component_graphs.logits_row;
+                Some(self.prefill_kv_stores(
+                    runtime,
+                    request,
+                    bucketed,
+                    rows_needed,
+                    execution_plan,
+                )?)
+            } else {
+                // The stores its prefill wrote.
+                Some(
+                    self.kv_pool
+                        .current(&Self::kv_state_key(request))
+                        .unwrap_or(KvStoreSpec::owned(rows_needed)),
+                )
+            };
             let (dispatch, mut bindings, layer_kv, resolved_provider) = if generated_tokens
                 .is_empty()
             {
@@ -1032,7 +1162,7 @@ impl E2eRuntimeModelExecutionEngine {
                         MaterializedEdges::LastRow(&["logits"])
                     },
                     Some(&component_graphs.prefill_memo),
-                    kv_store_capacity,
+                    kv_stores,
                 )?;
                 if bucketed {
                     // The padding rows lie beyond the committed length:
@@ -1061,7 +1191,7 @@ impl E2eRuntimeModelExecutionEngine {
                     absolute_position as u64,
                     generated_tokens.len(),
                     &mut node_events,
-                    kv_store_capacity,
+                    kv_stores,
                     greedy_plan.as_ref(),
                 )?;
                 device_greedy_column = selected;
@@ -1227,7 +1357,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         generated_tokens: &[TokenId],
         execution_plan: Option<&mut PreparedExecutionPlan>,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
-        self.execute_step(runtime, request, generated_tokens, execution_plan, None)
+        self.execute_step_reclaiming(runtime, request, generated_tokens, execution_plan, None)
     }
 
     fn execute_generation_step_selecting(
@@ -1238,7 +1368,7 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         execution_plan: Option<&mut PreparedExecutionPlan>,
         greedy: &crate::SamplingRequest,
     ) -> Result<RuntimeModelExecutionStep, InferenceApiError> {
-        self.execute_step(
+        self.execute_step_reclaiming(
             runtime,
             request,
             generated_tokens,
@@ -1278,6 +1408,10 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
     ) -> Result<(), InferenceApiError> {
         self.step_replay.release(&Self::kv_state_key(request));
         self.discard_pending_kv_state(runtime, request)?;
+        // A pooled store set outlives its request (`replay-bucketed-prefill`).
+        let pooled = self.kv_pool.current(&Self::kv_state_key(request)).is_some();
+        let dropped = self.kv_pool.release(&Self::kv_state_key(request));
+        self.release_pooled_kv_sets(runtime, &dropped);
         let committed = self
             .kv_states
             .lock()
@@ -1300,9 +1434,11 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         // (`execute_first_native_graph_nodes`'s KV pending writes).
         for (layer, binding) in &committed.layer_kv {
             // Copy-based generations are Provider-admitted; in-place stores
-            // are Runtime pre-admissions: release either.
-            release_pending_kv_resource(runtime, &provider, &binding.k);
-            release_pending_kv_resource(runtime, &provider, &binding.v);
+            // are Runtime pre-admissions: release either, unless pooled.
+            if !(pooled && binding.rows.is_some()) {
+                release_pending_kv_resource(runtime, &provider, &binding.k);
+                release_pending_kv_resource(runtime, &provider, &binding.v);
+            }
             for role in ["k", "v"] {
                 release_pending_kv_resource(
                     runtime,
