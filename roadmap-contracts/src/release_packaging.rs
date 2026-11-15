@@ -479,7 +479,7 @@ pub fn reject_experimental_flag_enabled_by_default(
 /// and `providers/tpu` (Google Coral `libedgetpu`) submodules -- each a
 /// real device-discovery-only Provider with no compute Kernels yet and no
 /// matching hardware in this repository's own CI, so each stays disabled
-/// by default like every other non-baseline Provider. `providers/qualcomm`
+/// by default like every other non-baseline Provider. `providers/qnn`
 /// (QNN backend discovery, no compute Kernels, nothing verified on Qualcomm
 /// hardware) is the first step toward `qnn-provider`, which stays disabled
 /// and unclaimed. `openvino-provider` remains a distinct, not-yet-implemented
