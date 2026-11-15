@@ -2035,6 +2035,7 @@ pub(super) fn execute_qwen_prefill_hidden_states_through_dispatch(
             NodeValue::Host(k),
             NodeValue::Host(v),
             architecture,
+            &BTreeMap::new(),
             None,
             None,
         )?;
@@ -2330,6 +2331,7 @@ pub(super) fn execute_qwen_decode_hidden_states_through_dispatch(
             NodeValue::Host(k),
             NodeValue::Host(v),
             architecture,
+            &BTreeMap::new(),
             None,
             None,
         )?;

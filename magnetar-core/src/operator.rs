@@ -284,6 +284,13 @@ impl Default for OperatorDeterminism {
 /// would rotate with unscaled frequencies and silently degrade every token.
 pub const ROPE_BANDED_FREQUENCY_SCALING_FEATURE: &str = "banded-frequency-scaling";
 
+/// Kernel feature an `attention` Kernel advertises when it honours the
+/// `scale` attribute (the factor on `QK^T`, replacing `1/sqrt(head_dimension)`).
+/// The Runtime sends `scale` only to a Provider whose every active
+/// `attention` Kernel advertises it: a Kernel that ignored it would compute
+/// every score with the wrong temperature.
+pub const ATTENTION_SCALE_FEATURE: &str = "attention-scale";
+
 /// Wavelength-banded RoPE frequency scaling: a model-family-neutral scheme
 /// (a source format may name it after the family that introduced it, e.g.
 /// a Hugging Face `rope_type`; the loader maps that name onto this one).

@@ -193,8 +193,6 @@ pub(super) fn resolve_qwen_component_from_lookup(
 pub(super) fn weight_shapes_for_architecture_config(
     config: &ModelArchitectureConfig,
 ) -> BTreeMap<String, Vec<u64>> {
-    let q_dim = config.num_attention_heads as u64 * config.head_dim;
-    let kv_dim = config.num_key_value_heads as u64 * config.head_dim;
     let mut shapes = BTreeMap::new();
     shapes.insert(
         "token_embedding".to_string(),
@@ -207,23 +205,46 @@ pub(super) fn weight_shapes_for_architecture_config(
     );
     for layer in 0..config.num_hidden_layers {
         let prefix = format!("layers.{layer}");
+        // Each layer's own geometry when the layers differ
+        // (`per-layer-kv-geometry`): a layer reusing an earlier layer's K/V
+        // has no K/V projections, and one deriving V from K no V projection.
+        let spec = config
+            .layer_layout
+            .as_ref()
+            .and_then(|layout| layout.get(layer as usize));
+        let head_dim = spec.map_or(config.head_dim, |spec| spec.head_dim);
+        let kv_heads = spec.map_or(config.num_key_value_heads, |spec| spec.num_key_value_heads);
+        let intermediate_size =
+            spec.map_or(config.intermediate_size, |spec| spec.intermediate_size);
+        let own_kv = spec.is_none_or(|spec| spec.kv_source_layer.is_none());
+        let own_v = own_kv && spec.is_none_or(|spec| !spec.value_from_key);
+        let q_dim = config.num_attention_heads as u64 * head_dim;
+        let kv_dim = kv_heads as u64 * head_dim;
         shapes.insert(format!("{prefix}.input_norm"), vec![config.hidden_size]);
         shapes.insert(
             format!("{prefix}.self_attn.q_proj"),
             vec![config.hidden_size, q_dim],
         );
-        shapes.insert(
-            format!("{prefix}.self_attn.k_proj"),
-            vec![config.hidden_size, kv_dim],
-        );
-        shapes.insert(
-            format!("{prefix}.self_attn.v_proj"),
-            vec![config.hidden_size, kv_dim],
-        );
+        if own_kv {
+            shapes.insert(
+                format!("{prefix}.self_attn.k_proj"),
+                vec![config.hidden_size, kv_dim],
+            );
+        }
+        if own_v {
+            shapes.insert(
+                format!("{prefix}.self_attn.v_proj"),
+                vec![config.hidden_size, kv_dim],
+            );
+        }
         if config.attention_bias {
             shapes.insert(format!("{prefix}.self_attn.q_bias"), vec![q_dim]);
-            shapes.insert(format!("{prefix}.self_attn.k_bias"), vec![kv_dim]);
-            shapes.insert(format!("{prefix}.self_attn.v_bias"), vec![kv_dim]);
+            if own_kv {
+                shapes.insert(format!("{prefix}.self_attn.k_bias"), vec![kv_dim]);
+            }
+            if own_v {
+                shapes.insert(format!("{prefix}.self_attn.v_bias"), vec![kv_dim]);
+            }
         }
         shapes.insert(
             format!("{prefix}.self_attn.o_proj"),
@@ -265,15 +286,15 @@ pub(super) fn weight_shapes_for_architecture_config(
         }
         shapes.insert(
             format!("{prefix}.mlp.gate_proj"),
-            vec![config.hidden_size, config.intermediate_size],
+            vec![config.hidden_size, intermediate_size],
         );
         shapes.insert(
             format!("{prefix}.mlp.up_proj"),
-            vec![config.hidden_size, config.intermediate_size],
+            vec![config.hidden_size, intermediate_size],
         );
         shapes.insert(
             format!("{prefix}.mlp.down_proj"),
-            vec![config.intermediate_size, config.hidden_size],
+            vec![intermediate_size, config.hidden_size],
         );
     }
     shapes
@@ -317,9 +338,9 @@ pub(super) fn architecture_config_from_first_native_model_config(
         tie_word_embeddings: config.tied_embeddings,
         attention_bias: config.attention_bias,
         mixture_of_experts: config.mixture_of_experts,
-        layer_layout: None,
-        final_logit_softcapping: None,
-        per_layer_input_size: None,
+        layer_layout: config.layer_layout.clone(),
+        final_logit_softcapping: config.final_logit_softcapping,
+        per_layer_input_size: config.per_layer_input_size,
         bos_token_id: None,
         eos_token_id: None,
     }
@@ -371,6 +392,9 @@ pub(super) fn first_native_model_config_from_architecture_config(
         tied_embeddings: config.tie_word_embeddings,
         attention_bias: config.attention_bias,
         mixture_of_experts: config.mixture_of_experts,
+        layer_layout: config.layer_layout.clone(),
+        final_logit_softcapping: config.final_logit_softcapping,
+        per_layer_input_size: config.per_layer_input_size,
         require_bos: false,
         require_pad: false,
         expected_added_tokens: None,

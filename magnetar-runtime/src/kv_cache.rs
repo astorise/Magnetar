@@ -148,6 +148,11 @@ pub struct KvCacheLayoutMetadata {
     pub position_start: u64,
     pub position_end_exclusive: u64,
     pub quantization: Option<KvCacheQuantization>,
+    /// Each layer's K (and V) row width when the layers differ, `None` for
+    /// a layer that keeps no K/V of its own (`per-layer-kv-geometry`).
+    /// When set, it replaces `layer_count * head_count * head_dimension`
+    /// in [`Self::estimated_storage_bytes`].
+    pub layer_row_widths: Option<Vec<Option<u64>>>,
 }
 
 impl KvCacheLayoutMetadata {
@@ -176,7 +181,14 @@ impl KvCacheLayoutMetadata {
             position_start: 0,
             position_end_exclusive: 0,
             quantization: None,
+            layer_row_widths: None,
         }
+    }
+
+    /// Per-layer K/V row widths (see [`Self::layer_row_widths`]).
+    pub fn with_layer_row_widths(mut self, widths: Vec<Option<u64>>) -> Self {
+        self.layer_row_widths = Some(widths);
+        self
     }
 
     pub fn with_paged_metadata(mut self, page: KvCachePageMetadata) -> Self {
@@ -214,6 +226,26 @@ impl KvCacheLayoutMetadata {
     }
 
     pub fn estimated_storage_bytes(&self) -> Result<u64, KvCacheError> {
+        if let Some(widths) = &self.layer_row_widths {
+            // K and V of each layer that keeps its own.
+            let row_elements = widths
+                .iter()
+                .flatten()
+                .try_fold(0u64, |total, width| {
+                    width
+                        .checked_mul(2)
+                        .and_then(|both| total.checked_add(both))
+                })
+                .ok_or(KvCacheError::CacheInternal)?;
+            return [
+                self.token_capacity as u64,
+                self.batch_dimension as u64,
+                self.storage_dtype.size_bytes(),
+            ]
+            .into_iter()
+            .try_fold(row_elements, |total, value| total.checked_mul(value))
+            .ok_or(KvCacheError::CacheInternal);
+        }
         let elements = [
             self.layer_count as u64,
             self.key_head_count.saturating_add(self.value_head_count) as u64,

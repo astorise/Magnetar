@@ -385,3 +385,517 @@ fn graph_execution_order_matches_the_previous_quadratic_order() {
         Err(InferenceApiError::GraphPlanningFailed { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------
+// `per-layer-kv-geometry`: decoder layers whose KV geometry differs, and a
+// layer that attends over an earlier layer's K/V.
+// ---------------------------------------------------------------------------
+
+/// One attention layer of [`layered_graph`].
+#[derive(Clone, Copy)]
+struct LayeredAttention {
+    kv_heads: u64,
+    head_dimension: u64,
+    window: Option<u64>,
+    scale: Option<f64>,
+    /// The earlier layer whose K/V this layer attends over.
+    kv_source: Option<usize>,
+}
+
+const LAYERED_HIDDEN: u64 = 4;
+const LAYERED_HEADS: u64 = 2;
+const LAYERED_VOCAB: u64 = 6;
+
+/// Sliding window with grouped K/V, then full attention with its own score
+/// scale and a wider K/V row, then a layer reusing layer 0's K/V.
+const LAYERED_LAYERS: [LayeredAttention; 3] = [
+    LayeredAttention {
+        kv_heads: 1,
+        head_dimension: 4,
+        window: Some(2),
+        scale: None,
+        kv_source: None,
+    },
+    LayeredAttention {
+        kv_heads: 2,
+        head_dimension: 3,
+        window: None,
+        scale: Some(0.25),
+        kv_source: None,
+    },
+    LayeredAttention {
+        kv_heads: 1,
+        head_dimension: 4,
+        window: Some(2),
+        scale: None,
+        kv_source: Some(0),
+    },
+];
+
+/// Deterministic weights of [`layered_graph`], keyed by input name.
+fn layered_weights() -> BTreeMap<String, HostTensor> {
+    let mut seed = 7u32;
+    let mut tensor = |rows: u64, cols: u64| {
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((seed >> 16) % 1000) as f32 / 1000.0 - 0.5
+            })
+            .collect();
+        HostTensor::new([rows, cols], values).unwrap()
+    };
+    let mut weights = BTreeMap::new();
+    for (index, layer) in LAYERED_LAYERS.iter().enumerate() {
+        let q_width = LAYERED_HEADS * layer.head_dimension;
+        let kv_width = layer.kv_heads * layer.head_dimension;
+        weights.insert(format!("w{index}q"), tensor(LAYERED_HIDDEN, q_width));
+        if layer.kv_source.is_none() {
+            weights.insert(format!("w{index}k"), tensor(LAYERED_HIDDEN, kv_width));
+            weights.insert(format!("w{index}v"), tensor(LAYERED_HIDDEN, kv_width));
+        }
+        weights.insert(format!("w{index}o"), tensor(q_width, LAYERED_HIDDEN));
+    }
+    weights.insert("wout".into(), tensor(LAYERED_HIDDEN, LAYERED_VOCAB));
+    weights
+}
+
+/// A graph of `rows` rows over [`LAYERED_LAYERS`], with every weight a
+/// graph input: `x -> [q, k, v -> attention -> o -> +x] -> logits`. A
+/// decode graph appends its K/V rows to the history.
+fn layered_graph(rows: u64, decode: bool) -> ExecutionGraph {
+    let phase = if decode {
+        ExecutionGraphPhase::Decode
+    } else {
+        ExecutionGraphPhase::Prefill
+    };
+    let mut graph = ExecutionGraph::new(
+        ExecutionGraphId::new(format!("layered-{rows}-{decode}")),
+        phase,
+    );
+    let input = |graph: &mut ExecutionGraph, name: &str, shape: Vec<u64>| {
+        let id = TensorEdgeId::new(format!("input.{name}"));
+        graph.edges.insert(
+            id.clone(),
+            TensorEdge::new(id.clone(), f32_tensor_descriptor_from_shape(&shape)),
+        );
+        id
+    };
+    let node = |graph: &mut ExecutionGraph,
+                id: &str,
+                operator: &str,
+                family: OperatorFamily,
+                attributes: Vec<(&str, OperatorAttributeValue)>,
+                inputs: Vec<TensorEdgeId>,
+                shape: Vec<u64>,
+                kv: Option<(usize, &str)>| {
+        let node_id = ExecutionNodeId::new(id);
+        let output = TensorEdgeId::new(format!("edge.{id}"));
+        let mut execution_node =
+            ExecutionNode::new(node_id.clone(), OperatorId::magnetar(operator, 1, family));
+        for edge in &inputs {
+            execution_node = execution_node.with_input(edge.clone());
+            graph
+                .edges
+                .get_mut(edge)
+                .unwrap()
+                .consumers
+                .insert(node_id.clone());
+        }
+        execution_node = execution_node.with_output(output.clone());
+        for (name, value) in attributes {
+            execution_node = execution_node.with_attribute(name, value);
+        }
+        let mut edge = TensorEdge::new(output.clone(), f32_tensor_descriptor_from_shape(&shape))
+            .with_producer(node_id.clone());
+        if let Some((layer, role)) = kv {
+            edge.kv_cache = Some(GraphKvCacheMetadata {
+                cache_id: format!("layered.layer{layer}.{role}"),
+                behavior: if decode {
+                    GraphKvCacheBehavior::Append
+                } else {
+                    GraphKvCacheBehavior::Output
+                },
+                paged: false,
+                compatibility_key: "layered".into(),
+            });
+        }
+        graph.nodes.insert(node_id, execution_node);
+        graph.edges.insert(output.clone(), edge);
+        output
+    };
+    let weights = layered_weights();
+    let mut hidden = input(&mut graph, "x", vec![rows, LAYERED_HIDDEN]);
+    let mut produced: Vec<(TensorEdgeId, TensorEdgeId)> = Vec::new();
+    for (index, layer) in LAYERED_LAYERS.iter().enumerate() {
+        let weight = |graph: &mut ExecutionGraph, role: &str| {
+            let name = format!("w{index}{role}");
+            let shape = weights[&name].shape.clone();
+            input(graph, &name, shape)
+        };
+        let q_width = LAYERED_HEADS * layer.head_dimension;
+        let kv_width = layer.kv_heads * layer.head_dimension;
+        let wq = weight(&mut graph, "q");
+        let q = node(
+            &mut graph,
+            &format!("layer{index}.q"),
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![hidden.clone(), wq],
+            vec![rows, q_width],
+            None,
+        );
+        let (k, v) = match layer.kv_source {
+            Some(source) => produced[source].clone(),
+            None => {
+                let wk = weight(&mut graph, "k");
+                let wv = weight(&mut graph, "v");
+                let k = node(
+                    &mut graph,
+                    &format!("layer{index}.k"),
+                    "matmul",
+                    OperatorFamily::LinearAlgebra,
+                    vec![],
+                    vec![hidden.clone(), wk],
+                    vec![rows, kv_width],
+                    Some((index, "k")),
+                );
+                let v = node(
+                    &mut graph,
+                    &format!("layer{index}.v"),
+                    "matmul",
+                    OperatorFamily::LinearAlgebra,
+                    vec![],
+                    vec![hidden.clone(), wv],
+                    vec![rows, kv_width],
+                    Some((index, "v")),
+                );
+                (k, v)
+            }
+        };
+        produced.push((k.clone(), v.clone()));
+        let mut attributes = vec![
+            ("causal", OperatorAttributeValue::Boolean(true)),
+            (
+                "head_count",
+                OperatorAttributeValue::Integer(LAYERED_HEADS as i64),
+            ),
+            (
+                "kv_head_count",
+                OperatorAttributeValue::Integer(layer.kv_heads as i64),
+            ),
+            (
+                "head_dimension",
+                OperatorAttributeValue::Integer(layer.head_dimension as i64),
+            ),
+        ];
+        if let Some(window) = layer.window {
+            attributes.push((
+                "window_size",
+                OperatorAttributeValue::Integer(window as i64),
+            ));
+        }
+        if let Some(scale) = layer.scale {
+            attributes.push(("scale", OperatorAttributeValue::Float(scale)));
+        }
+        let attended = node(
+            &mut graph,
+            &format!("layer{index}.attention"),
+            "attention",
+            OperatorFamily::Attention,
+            attributes,
+            vec![q, k, v],
+            vec![rows, q_width],
+            None,
+        );
+        let wo = weight(&mut graph, "o");
+        let o = node(
+            &mut graph,
+            &format!("layer{index}.o"),
+            "matmul",
+            OperatorFamily::LinearAlgebra,
+            vec![],
+            vec![attended, wo],
+            vec![rows, LAYERED_HIDDEN],
+            None,
+        );
+        hidden = node(
+            &mut graph,
+            &format!("layer{index}.residual"),
+            "add",
+            OperatorFamily::Tensor,
+            vec![],
+            vec![hidden, o],
+            vec![rows, LAYERED_HIDDEN],
+            None,
+        );
+    }
+    let wout = input(&mut graph, "wout", vec![LAYERED_HIDDEN, LAYERED_VOCAB]);
+    let logits = node(
+        &mut graph,
+        "lm_head",
+        "matmul",
+        OperatorFamily::LinearAlgebra,
+        vec![],
+        vec![hidden, wout],
+        vec![rows, LAYERED_VOCAB],
+        None,
+    );
+    // The graph's output edge is named `logits`, as a Component's is.
+    let mut edge = graph.edges.remove(&logits).unwrap();
+    edge.id = TensorEdgeId::new("logits");
+    graph.edges.insert(edge.id.clone(), edge);
+    graph
+        .nodes
+        .get_mut(&ExecutionNodeId::new("lm_head"))
+        .unwrap()
+        .outputs = vec![TensorEdgeId::new("logits")];
+    graph
+}
+
+/// Row `index` of the deterministic input sequence.
+fn layered_input_row(index: u64) -> Vec<f32> {
+    (0..LAYERED_HIDDEN)
+        .map(|column| ((index * 3 + column * 5) % 7) as f32 / 7.0 - 0.4)
+        .collect()
+}
+
+fn host_matmul(a: &[f32], rows: usize, b: &HostTensor) -> Vec<f32> {
+    let (inner, cols) = (b.shape[0] as usize, b.shape[1] as usize);
+    let mut out = vec![0.0; rows * cols];
+    for row in 0..rows {
+        for col in 0..cols {
+            out[row * cols + col] = (0..inner)
+                .map(|i| a[row * inner + i] * b.data[i * cols + col])
+                .sum();
+        }
+    }
+    out
+}
+
+/// The logits of every row of `rows` input rows, computed on the host
+/// independently of any Kernel.
+fn layered_oracle(rows: u64) -> Vec<f32> {
+    let weights = layered_weights();
+    let n = rows as usize;
+    let mut hidden: Vec<f32> = (0..rows).flat_map(layered_input_row).collect();
+    let mut produced: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+    for (index, layer) in LAYERED_LAYERS.iter().enumerate() {
+        let d = layer.head_dimension as usize;
+        let heads = LAYERED_HEADS as usize;
+        let kv_heads = layer.kv_heads as usize;
+        let q = host_matmul(&hidden, n, &weights[&format!("w{index}q")]);
+        let (k, v) = match layer.kv_source {
+            Some(source) => produced[source].clone(),
+            None => (
+                host_matmul(&hidden, n, &weights[&format!("w{index}k")]),
+                host_matmul(&hidden, n, &weights[&format!("w{index}v")]),
+            ),
+        };
+        produced.push((k.clone(), v.clone()));
+        let scale = layer.scale.unwrap_or(1.0 / (d as f64).sqrt()) as f32;
+        let mut attended = vec![0.0f32; n * heads * d];
+        for i in 0..n {
+            for h in 0..heads {
+                let g = h / (heads / kv_heads);
+                let lowest = layer
+                    .window
+                    .map_or(0, |window| (i + 1).saturating_sub(window as usize));
+                let scores: Vec<f32> = (lowest..=i)
+                    .map(|j| {
+                        (0..d)
+                            .map(|e| q[i * heads * d + h * d + e] * k[j * kv_heads * d + g * d + e])
+                            .sum::<f32>()
+                            * scale
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+                let total: f32 = exps.iter().sum();
+                for (offset, weight) in exps.iter().enumerate() {
+                    let j = lowest + offset;
+                    for e in 0..d {
+                        attended[i * heads * d + h * d + e] +=
+                            weight / total * v[j * kv_heads * d + g * d + e];
+                    }
+                }
+            }
+        }
+        let o = host_matmul(&attended, n, &weights[&format!("w{index}o")]);
+        for (value, delta) in hidden.iter_mut().zip(o) {
+            *value += delta;
+        }
+    }
+    host_matmul(&hidden, n, &weights["wout"])
+}
+
+/// Runs [`layered_graph`] on the Reference CPU: a prefill of `prompt` rows,
+/// then one decode step over its K/V history. Returns the prefill's logits,
+/// the decode step's, and each layer's K store width after the prefill.
+fn run_layered(prompt: u64, in_place: bool) -> (Vec<f32>, Vec<f32>, BTreeMap<usize, u64>) {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut runtime = build_runtime_trusting_fixture(&fixture);
+    let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+    // The graphs carry their own weights; execution reads the layer count
+    // and layout from the configuration.
+    let mut fixture = fixture;
+    fixture.config.architecture.layer_count = LAYERED_LAYERS.len() as u64;
+    fixture.config.layer_layout = Some(
+        LAYERED_LAYERS
+            .iter()
+            .map(|layer| crate::LayerSpec {
+                sliding_window: layer.window.map(|window| window as u32),
+                head_dim: layer.head_dimension,
+                num_key_value_heads: layer.kv_heads as u32,
+                rope_theta: 10_000.0,
+                partial_rotary_factor: None,
+                value_from_key: false,
+                kv_source_layer: layer.kv_source.map(|source| source as u32),
+                intermediate_size: 8,
+            })
+            .collect(),
+    );
+    let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+    let revision = require_ready_first_native_instance(&runtime, &instance)
+        .unwrap()
+        .status()
+        .mutation_version;
+    let weights = layered_weights();
+    let bindings = |rows: std::ops::Range<u64>| {
+        let count = rows.end - rows.start;
+        let mut bindings: BTreeMap<TensorEdgeId, HostTensor> = weights
+            .iter()
+            .map(|(name, tensor)| (TensorEdgeId::new(format!("input.{name}")), tensor.clone()))
+            .collect();
+        bindings.insert(
+            TensorEdgeId::new("input.x"),
+            HostTensor::new(
+                [count, LAYERED_HIDDEN],
+                rows.flat_map(layered_input_row).collect::<Vec<f32>>(),
+            )
+            .unwrap(),
+        );
+        bindings
+    };
+    let stores = in_place.then(|| KvStoreSpec::owned(prompt + 4));
+    let mut run = |graph: &ExecutionGraph,
+                   rows: std::ops::Range<u64>,
+                   cache: &str,
+                   history: Option<&LayerKvMap>| {
+        let mut plan = prepare_first_native_plan_for_graph(
+            &runtime,
+            graph,
+            &instance,
+            revision,
+            rows.end - rows.start,
+            PreparedExecutionPlanGeneration::new(1),
+            &provider,
+        )
+        .unwrap();
+        let position = rows.start;
+        execute_first_native_graph_materializing(
+            &mut runtime,
+            &fixture,
+            &instance,
+            &KvCacheId::new(cache).unwrap(),
+            graph,
+            &mut plan,
+            bindings(rows),
+            history,
+            Some(position),
+            &mut Vec::new(),
+            MaterializedEdges::Only(&["logits"]),
+            None,
+            stores,
+        )
+        .unwrap()
+    };
+    let (_, prefill, layer_kv, _) = run(&layered_graph(prompt, false), 0..prompt, "lp", None);
+    let (_, decode, _, _) = run(
+        &layered_graph(1, true),
+        prompt..prompt + 1,
+        "ld",
+        Some(&layer_kv),
+    );
+    let widths = layer_kv
+        .iter()
+        .map(|(layer, state)| {
+            let shape = resolve_kernel_execution_provider(&runtime, &provider)
+                .unwrap()
+                .resident_shape(&state.k)
+                .unwrap();
+            (*layer, shape[1])
+        })
+        .collect();
+    let logits = |bindings: &BTreeMap<TensorEdgeId, HostTensor>| {
+        bindings[&TensorEdgeId::new("logits")].data.clone()
+    };
+    (logits(&prefill), logits(&decode), widths)
+}
+
+fn assert_logits_close(actual: &[f32], expected: &[f32], what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}: logits count");
+    for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
+        assert!(
+            (a - e).abs() <= 1e-4,
+            "{what}: logit {index} is {a}, expected {e}"
+        );
+    }
+}
+
+/// Each layer attends with its own head geometry, window and score scale;
+/// the shared layer reads layer 0's K/V; only the producing layers keep K/V
+/// state, each at its own width; and a decode step over that history
+/// matches the full sequence, with the history concatenated or in place.
+#[test]
+fn layers_with_their_own_kv_geometry_and_a_shared_kv_layer_prefill_and_decode() {
+    let prompt = 4;
+    let full = layered_oracle(prompt + 1);
+    let width = LAYERED_VOCAB as usize;
+    for in_place in [false, true] {
+        let (prefill, decode, widths) = run_layered(prompt, in_place);
+        assert_logits_close(
+            &prefill,
+            &full[..prompt as usize * width],
+            &format!("prefill (in place: {in_place})"),
+        );
+        assert_logits_close(
+            &decode,
+            &full[prompt as usize * width..],
+            &format!("decode (in place: {in_place})"),
+        );
+        // Layer 2 reuses layer 0's K/V and keeps none of its own.
+        assert_eq!(
+            widths,
+            BTreeMap::from([(0, 4), (1, 6)]),
+            "K widths (in place: {in_place})"
+        );
+    }
+}
+
+/// The Reference CPU's attention Kernels honour `scale`, so the Runtime may
+/// send it there; a feature no Kernel of an operator advertises is refused.
+#[test]
+fn attention_scale_is_sent_only_to_kernels_that_declare_it() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let runtime = build_runtime_trusting_fixture(&fixture);
+    let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+    assert!(provider_kernels_declare(
+        &runtime,
+        &provider,
+        "attention",
+        crate::operator::ATTENTION_SCALE_FEATURE
+    ));
+    assert!(!provider_kernels_declare(
+        &runtime,
+        &provider,
+        "rope",
+        crate::operator::ATTENTION_SCALE_FEATURE
+    ));
+    assert!(!provider_kernels_declare(
+        &runtime,
+        &ProviderBinding::new("unregistered"),
+        "attention",
+        crate::operator::ATTENTION_SCALE_FEATURE
+    ));
+}

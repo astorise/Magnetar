@@ -479,3 +479,19 @@ fn inference_api_kv_cache_policy_covers_enabled_scope_budget_reuse_eviction_priv
     assert!(policy.privacy_redaction_required);
     assert_eq!(policy.sharing, KvCacheSharingPolicy::AllowWithinSession);
 }
+
+/// `per-layer-kv-geometry`: with per-layer row widths, the estimate sums
+/// the K and V rows of each layer that keeps its own, at its width.
+#[test]
+fn per_layer_row_widths_replace_the_uniform_kv_estimate() {
+    let uniform = KvCacheLayoutMetadata::contiguous(3, 2, 4, 10, ComputeDType::Float32);
+    assert_eq!(
+        uniform.estimated_storage_bytes().unwrap(),
+        3 * 2 * 2 * 4 * 10 * 4
+    );
+    let layered = uniform.with_layer_row_widths(vec![Some(4), Some(6), None]);
+    assert_eq!(
+        layered.estimated_storage_bytes().unwrap(),
+        (4 + 6) * 2 * 10 * 4
+    );
+}
