@@ -291,6 +291,88 @@ pub const ROPE_BANDED_FREQUENCY_SCALING_FEATURE: &str = "banded-frequency-scalin
 /// every score with the wrong temperature.
 pub const ATTENTION_SCALE_FEATURE: &str = "attention-scale";
 
+/// Kernel feature an `embedding` Kernel advertises when it honours `scale`.
+pub const EMBEDDING_SCALE_FEATURE: &str = "embedding-scale";
+
+/// Kernel feature an `rmsnorm` Kernel advertises when it honours
+/// `head_count` and `head_dimension` (per-head normalization with a
+/// `[head_dimension]` weight).
+pub const RMSNORM_PER_HEAD_FEATURE: &str = "rmsnorm-per-head";
+
+/// Kernel feature an `rmsnorm` Kernel advertises when it accepts a single
+/// input (no weight, scale 1).
+pub const RMSNORM_WITHOUT_WEIGHT_FEATURE: &str = "rmsnorm-without-weight";
+
+/// Kernel feature a `rope` Kernel advertises when it honours
+/// `partial_rotary_factor`.
+pub const ROPE_PARTIAL_ROTARY_FEATURE: &str = "partial-rotary";
+
+/// Kernel feature a `moe-experts` Kernel advertises when it honours
+/// `activation`.
+pub const MOE_EXPERTS_ACTIVATION_FEATURE: &str = "moe-experts-activation";
+
+/// Kernel feature a `moe-experts` Kernel advertises when it accepts the
+/// sixth input, `per_expert_scale`.
+pub const MOE_PER_EXPERT_SCALE_FEATURE: &str = "per-expert-scale";
+
+/// The Kernel features an `operator` node with these `attributes` and
+/// `input_count` inputs needs beyond the Operator's baseline form: the
+/// optional attributes and operand forms a Kernel could otherwise ignore
+/// and compute something else. A Runtime sends such a node only to a
+/// Provider whose every active Kernel for that Operator advertises each of
+/// them. Attributes whose absence or default value keeps the baseline
+/// behaviour need nothing.
+pub fn required_kernel_features(
+    operator: &str,
+    attributes: &BTreeMap<String, OperatorAttributeValue>,
+    input_count: usize,
+) -> Vec<&'static str> {
+    let present = |name: &str| attributes.contains_key(name);
+    let mut features = Vec::new();
+    match operator {
+        "attention" if present("scale") => features.push(ATTENTION_SCALE_FEATURE),
+        "embedding" if present("scale") => features.push(EMBEDDING_SCALE_FEATURE),
+        "rmsnorm" => {
+            if present("head_count") || present("head_dimension") {
+                features.push(RMSNORM_PER_HEAD_FEATURE);
+            }
+            if input_count < 2
+                || matches!(
+                    attributes.get("with_scale"),
+                    Some(OperatorAttributeValue::Boolean(false))
+                )
+            {
+                features.push(RMSNORM_WITHOUT_WEIGHT_FEATURE);
+            }
+        }
+        "rope" => {
+            let full_rotation = match attributes.get("partial_rotary_factor") {
+                None => true,
+                Some(OperatorAttributeValue::Float(factor)) => *factor == 1.0,
+                Some(_) => false,
+            };
+            if !full_rotation {
+                features.push(ROPE_PARTIAL_ROTARY_FEATURE);
+            }
+        }
+        "moe-experts" => {
+            let silu = match attributes.get("activation") {
+                None => true,
+                Some(OperatorAttributeValue::String(name)) => name == "silu",
+                Some(_) => false,
+            };
+            if !silu {
+                features.push(MOE_EXPERTS_ACTIVATION_FEATURE);
+            }
+            if input_count > 5 {
+                features.push(MOE_PER_EXPERT_SCALE_FEATURE);
+            }
+        }
+        _ => {}
+    }
+    features
+}
+
 /// Wavelength-banded RoPE frequency scaling: a model-family-neutral scheme
 /// (a source format may name it after the family that introduced it, e.g.
 /// a Hugging Face `rope_type`; the loader maps that name onto this one).
@@ -1294,6 +1376,13 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "head_dimension",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            // Whether the node has a weight input: `false` with one input
+            // (scale 1), `true` with two. The input count is authoritative;
+            // a Kernel refuses a node whose `with_scale` contradicts it.
+            .with_rule(
+                "with_scale",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
             ),
         "moe-experts" => OperatorAttributeSchema::default()
             .with_rule(
