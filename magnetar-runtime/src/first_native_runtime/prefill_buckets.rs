@@ -104,11 +104,56 @@ pub(crate) fn pad_prompt_ids(ids: &[TokenId], length: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Whether every output row of `node` depends on the same row of its one
+/// input alone, at the input's shape: a row selected before it passes
+/// through unchanged (`select-logits-row-through-elementwise-ops`).
+pub(crate) fn is_row_wise_unary(node: &ExecutionNode) -> bool {
+    matches!(node.operator.name(), "activation" | "gelu" | "silu")
+        && node.inputs.len() == 1
+        && node.outputs.len() == 1
+}
+
+/// The LM head behind `edge`: the plain or bias matmul producing it,
+/// directly or through row-wise unary nodes (e.g. a logit softcap), each
+/// the only reader of its input. Returns the head and those nodes, head
+/// side first.
+pub(crate) fn logits_head(
+    graph: &ExecutionGraph,
+    edge: &TensorEdgeId,
+) -> Option<(ExecutionNodeId, Vec<ExecutionNodeId>)> {
+    let mut chain = Vec::new();
+    let mut current = edge.clone();
+    // A chain longer than the graph is a cycle.
+    for _ in 0..=graph.nodes.len() {
+        let producer = graph.edges.get(&current)?.producer.clone()?;
+        let node = graph.nodes.get(&producer)?;
+        if node.outputs.as_slice() != [current.clone()] {
+            return None;
+        }
+        if matches!(node.operator.name(), "matmul" | "matmul-bias") && node.inputs.len() >= 2 {
+            chain.reverse();
+            return Some((producer, chain));
+        }
+        if !is_row_wise_unary(node) {
+            return None;
+        }
+        let input = node.inputs[0].clone();
+        let readers = &graph.edges.get(&input)?.consumers;
+        if readers.len() != 1 || !readers.contains(&producer) {
+            return None;
+        }
+        chain.push(producer);
+        current = input;
+    }
+    None
+}
+
 /// `graph` with an `embedding` node gathering one row of the LM head's
 /// input, at the index given by [`LOGITS_ROW_INPUT`]: the LM head then
-/// reads that row only and `"logits"` has one row. `None` when the graph's
-/// `"logits"` is not produced by a plain or bias matmul over a rank-2
-/// input, or has no `embedding` node to take the Operator from.
+/// reads that row only, and `"logits"` -- the head's output, or that of the
+/// row-wise unary nodes after it ([`logits_head`]) -- has one row. `None`
+/// when no plain or bias matmul over a rank-2 input produces `"logits"`
+/// that way, or there is no `embedding` node to take the Operator from.
 pub(crate) fn insert_logits_row_gather(graph: &ExecutionGraph) -> Option<ExecutionGraph> {
     let logits_edge_id = TensorEdgeId::new("logits");
     let row_input_id = TensorEdgeId::new(LOGITS_ROW_INPUT);
@@ -121,24 +166,17 @@ pub(crate) fn insert_logits_row_gather(graph: &ExecutionGraph) -> Option<Executi
         return None;
     }
     let logits_edge = graph.edges.get(&logits_edge_id)?;
-    let head_id = logits_edge.producer.clone()?;
+    let (head_id, chain) = logits_head(graph, &logits_edge_id)?;
     let head = graph.nodes.get(&head_id)?;
-    if !matches!(head.operator.name(), "matmul" | "matmul-bias")
-        || head.outputs.as_slice() != [logits_edge_id.clone()]
-        || head.inputs.len() < 2
-    {
-        return None;
-    }
     let hidden_id = head.inputs[0].clone();
     let hidden = graph.edges.get(&hidden_id)?;
     let [_, width] = hidden.descriptor.shape.dimensions.as_slice() else {
         return None;
     };
     let width = *width;
-    let [_, vocab] = logits_edge.descriptor.shape.dimensions.as_slice() else {
+    if logits_edge.descriptor.shape.dimensions.len() != 2 {
         return None;
-    };
-    let vocab = *vocab;
+    }
     let embedding = graph
         .nodes
         .values()
@@ -171,7 +209,15 @@ pub(crate) fn insert_logits_row_gather(graph: &ExecutionGraph) -> Option<Executi
     let edge = rewritten.edges.get_mut(&hidden_id)?;
     edge.consumers.remove(&head_id);
     edge.consumers.insert(node_id.clone());
-    rewritten.edges.get_mut(&logits_edge_id)?.descriptor.shape = ShapeDescriptor::new([1, vocab]);
+    // The head's output and every row-wise node's after it now hold one row.
+    for producer in std::iter::once(&head_id).chain(&chain) {
+        let output = graph.nodes.get(producer)?.outputs.first()?.clone();
+        let edge = rewritten.edges.get_mut(&output)?;
+        let [_, width] = edge.descriptor.shape.dimensions.as_slice() else {
+            return None;
+        };
+        edge.descriptor.shape = ShapeDescriptor::new([1, *width]);
+    }
     rewritten.nodes.get_mut(&head_id)?.inputs[0] = hidden_row_id;
     rewritten.edges.insert(row_input_id, row_input);
     rewritten.edges.insert(hidden_row.id.clone(), hidden_row);
