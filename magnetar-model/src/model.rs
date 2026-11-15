@@ -729,8 +729,44 @@ pub struct ModelArchitectureConfig {
     /// exposed to the Model Component through `model-config`'s
     /// `mixture-of-experts` (`1.5.0`).
     pub mixture_of_experts: Option<MixtureOfExpertsConfig>,
+    /// One entry per decoder layer when the layers differ (sliding vs.
+    /// full attention, per-layer head width, shared KV, ...), exposed to
+    /// the Model Component through `model-config`'s `layer-layout`
+    /// (`1.6.0`). `None` when every layer is described by the fields above.
+    pub layer_layout: Option<Vec<LayerSpec>>,
+    /// `cap * tanh(logits / cap)` applied to the logits (`model-config`'s
+    /// `options`, `1.6.0`).
+    pub final_logit_softcapping: Option<f64>,
+    /// Width of the per-layer input embeddings, if the checkpoint has them
+    /// (`model-config`'s `options`, `1.6.0`).
+    pub per_layer_input_size: Option<u32>,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
+}
+
+/// One decoder layer's geometry, mirroring `model-config`'s `layer-spec`
+/// record (`1.6.0`). Family-neutral: it describes what differs between
+/// layers, derived by the Runtime from the checkpoint's configuration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerSpec {
+    /// Look-back window in tokens; `None` attends over the whole context.
+    pub sliding_window: Option<u32>,
+    /// Width of one attention head in this layer.
+    pub head_dim: u64,
+    /// Key/value heads in this layer.
+    pub num_key_value_heads: u32,
+    /// RoPE base of this layer.
+    pub rope_theta: f64,
+    /// Fraction of each head that is rotated; `None` rotates all of it.
+    pub partial_rotary_factor: Option<f64>,
+    /// The layer has no value projection: V is derived from the raw key
+    /// projection.
+    pub value_from_key: bool,
+    /// The earlier layer whose K/V this layer attends over instead of
+    /// computing its own.
+    pub kv_source_layer: Option<u32>,
+    /// Width of the layer's dense feed-forward.
+    pub intermediate_size: u64,
 }
 
 /// A decoder MLP made of routed experts, mirroring `model-config`'s
@@ -826,6 +862,85 @@ impl ModelArchitectureConfig {
             scaling
                 .validate()
                 .map_err(|message| ModelArtifactError::InvalidManifest { message })?;
+        }
+        if let Some(layout) = &self.layer_layout {
+            self.validate_layer_layout(layout)
+                .map_err(|message| ModelArtifactError::InvalidManifest { message })?;
+        }
+        if let Some(cap) = self.final_logit_softcapping
+            && !(cap.is_finite() && cap > 0.0)
+        {
+            return Err(ModelArtifactError::InvalidManifest {
+                message: format!("final logit softcapping {cap} must be finite and positive"),
+            });
+        }
+        if self.per_layer_input_size == Some(0) {
+            return Err(ModelArtifactError::InvalidManifest {
+                message: "per-layer input size must not be zero".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// A layout has one entry per decoder layer, each with non-zero
+    /// widths, KV heads dividing the attention heads, a positive finite
+    /// RoPE base, a rotary fraction in `(0, 1]`, and a KV source that is an
+    /// earlier layer computing its own K/V of the same geometry.
+    fn validate_layer_layout(&self, layout: &[LayerSpec]) -> Result<(), String> {
+        if layout.len() != self.num_hidden_layers as usize {
+            return Err(format!(
+                "layer layout has {} entries for {} layers",
+                layout.len(),
+                self.num_hidden_layers
+            ));
+        }
+        for (index, layer) in layout.iter().enumerate() {
+            let invalid = |what: &str| format!("layer {index}: {what}");
+            if layer.head_dim == 0 || layer.intermediate_size == 0 {
+                return Err(invalid(
+                    "head dimension and intermediate size must not be zero",
+                ));
+            }
+            if layer.num_key_value_heads == 0
+                || !self
+                    .num_attention_heads
+                    .is_multiple_of(layer.num_key_value_heads)
+            {
+                return Err(invalid(
+                    "key/value heads must be non-zero and divide the attention heads",
+                ));
+            }
+            if layer
+                .head_dim
+                .checked_mul(self.num_attention_heads as u64)
+                .is_none()
+            {
+                return Err(invalid("head dimension overflows"));
+            }
+            if layer.sliding_window == Some(0) {
+                return Err(invalid("sliding window must not be zero"));
+            }
+            if !(layer.rope_theta.is_finite() && layer.rope_theta > 0.0) {
+                return Err(invalid("RoPE base must be finite and positive"));
+            }
+            if let Some(factor) = layer.partial_rotary_factor
+                && !(factor > 0.0 && factor <= 1.0)
+            {
+                return Err(invalid("partial rotary factor must lie in (0, 1]"));
+            }
+            if let Some(source) = layer.kv_source_layer {
+                let Some(source_layer) = layout[..index].get(source as usize) else {
+                    return Err(invalid("KV source must be an earlier layer"));
+                };
+                if source_layer.kv_source_layer.is_some()
+                    || source_layer.head_dim != layer.head_dim
+                    || source_layer.num_key_value_heads != layer.num_key_value_heads
+                {
+                    return Err(invalid(
+                        "KV source must compute its own K/V with the same head width and KV heads",
+                    ));
+                }
+            }
         }
         Ok(())
     }

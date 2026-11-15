@@ -317,6 +317,9 @@ pub(super) fn architecture_config_from_first_native_model_config(
         tie_word_embeddings: config.tied_embeddings,
         attention_bias: config.attention_bias,
         mixture_of_experts: config.mixture_of_experts,
+        layer_layout: None,
+        final_logit_softcapping: None,
+        per_layer_input_size: None,
         bos_token_id: None,
         eos_token_id: None,
     }

@@ -21,6 +21,9 @@ fn sample_config() -> ModelArchitectureConfig {
         tie_word_embeddings: true,
         attention_bias: true,
         mixture_of_experts: None,
+        layer_layout: None,
+        final_logit_softcapping: None,
+        per_layer_input_size: None,
         bos_token_id: None,
         eos_token_id: Some(151643),
     }
@@ -155,4 +158,159 @@ fn mixture_of_experts_is_none_for_a_dense_model_and_a_record_for_a_routed_one() 
             ])
         )))]
     );
+}
+
+fn sample_layer(sliding_window: Option<u32>, kv_source_layer: Option<u32>) -> LayerSpec {
+    LayerSpec {
+        sliding_window,
+        head_dim: 64,
+        num_key_value_heads: 2,
+        rope_theta: 10_000.0,
+        partial_rotary_factor: None,
+        value_from_key: false,
+        kv_source_layer,
+        intermediate_size: 4864,
+    }
+}
+
+#[test]
+fn layer_layout_and_options_are_none_for_a_uniform_model() {
+    let capability = ModelConfigCapability::new();
+    capability.bind_config("uniform", sample_config());
+    assert_eq!(
+        capability.call("uniform", "layer-layout", &[]).unwrap(),
+        vec![ComponentValue::Option(None)]
+    );
+    assert_eq!(
+        capability.call("uniform", "options", &[]).unwrap(),
+        vec![ComponentValue::Record(vec![
+            (
+                "final-logit-softcapping".into(),
+                ComponentValue::Option(None)
+            ),
+            ("per-layer-input-size".into(), ComponentValue::Option(None)),
+        ])]
+    );
+}
+
+#[test]
+fn layer_layout_encodes_one_record_per_layer_and_options_their_values() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    let mut global = sample_layer(None, None);
+    global.head_dim = 128;
+    global.num_key_value_heads = 1;
+    global.rope_theta = 1_000_000.0;
+    global.partial_rotary_factor = Some(0.25);
+    global.value_from_key = true;
+    config.layer_layout = Some(vec![sample_layer(Some(512), None), global]);
+    config.final_logit_softcapping = Some(30.0);
+    config.per_layer_input_size = Some(256);
+    capability.bind_config("layered", config);
+    let some = |value: ComponentValue| ComponentValue::Option(Some(Box::new(value)));
+    let record = |window: ComponentValue,
+                  head: i64,
+                  kv_heads: u32,
+                  theta: f64,
+                  partial: ComponentValue,
+                  value_from_key: bool| {
+        ComponentValue::Record(vec![
+            ("sliding-window".into(), window),
+            ("head-dimension".into(), ComponentValue::S64(head)),
+            ("num-key-value-heads".into(), ComponentValue::U32(kv_heads)),
+            ("rope-theta".into(), ComponentValue::F64(theta)),
+            ("partial-rotary-factor".into(), partial),
+            (
+                "value-from-key".into(),
+                ComponentValue::Bool(value_from_key),
+            ),
+            ("kv-source-layer".into(), ComponentValue::Option(None)),
+            ("intermediate-size".into(), ComponentValue::S64(4864)),
+        ])
+    };
+    assert_eq!(
+        capability.call("layered", "layer-layout", &[]).unwrap(),
+        vec![some(ComponentValue::List(vec![
+            record(
+                some(ComponentValue::U32(512)),
+                64,
+                2,
+                10_000.0,
+                ComponentValue::Option(None),
+                false
+            ),
+            record(
+                ComponentValue::Option(None),
+                128,
+                1,
+                1_000_000.0,
+                some(ComponentValue::F64(0.25)),
+                true
+            ),
+        ]))]
+    );
+    assert_eq!(
+        capability.call("layered", "options", &[]).unwrap(),
+        vec![ComponentValue::Record(vec![
+            (
+                "final-logit-softcapping".into(),
+                some(ComponentValue::F64(30.0))
+            ),
+            (
+                "per-layer-input-size".into(),
+                some(ComponentValue::U32(256))
+            ),
+        ])]
+    );
+}
+
+#[test]
+fn layer_layout_rejects_arguments() {
+    let capability = ModelConfigCapability::new();
+    capability.bind_config("uniform", sample_config());
+    assert!(
+        capability
+            .call("uniform", "layer-layout", &[ComponentValue::U32(0)])
+            .is_err()
+    );
+}
+
+#[test]
+fn layer_layout_validation_refuses_inconsistent_layouts() {
+    let mut config = sample_config();
+    config.num_hidden_layers = 3;
+    config.num_attention_heads = 14;
+    config.num_key_value_heads = 2;
+    let valid = vec![
+        sample_layer(Some(512), None),
+        sample_layer(None, None),
+        sample_layer(Some(512), Some(0)),
+    ];
+    config.layer_layout = Some(valid);
+    config.validate().expect("a consistent layout validates");
+
+    let refused = |edit: &dyn Fn(&mut ModelArchitectureConfig)| {
+        let mut config = config.clone();
+        edit(&mut config);
+        assert!(config.validate().is_err(), "{:?}", config.layer_layout);
+    };
+    refused(&|config| {
+        config.layer_layout.as_mut().unwrap().pop();
+    });
+    refused(&|config| config.layer_layout.as_mut().unwrap()[1].head_dim = 0);
+    refused(&|config| config.layer_layout.as_mut().unwrap()[1].num_key_value_heads = 3);
+    refused(&|config| config.layer_layout.as_mut().unwrap()[0].sliding_window = Some(0));
+    refused(&|config| config.layer_layout.as_mut().unwrap()[0].rope_theta = f64::NAN);
+    refused(&|config| config.layer_layout.as_mut().unwrap()[0].partial_rotary_factor = Some(1.5));
+    // A KV source must be earlier, compute its own K/V, and match geometry.
+    refused(&|config| config.layer_layout.as_mut().unwrap()[0].kv_source_layer = Some(0));
+    refused(&|config| config.layer_layout.as_mut().unwrap()[1].kv_source_layer = Some(2));
+    refused(&|config| {
+        let layout = config.layer_layout.as_mut().unwrap();
+        layout[1].kv_source_layer = Some(0);
+        layout[2].kv_source_layer = Some(1);
+    });
+    refused(&|config| config.layer_layout.as_mut().unwrap()[2].head_dim = 128);
+    refused(&|config| config.final_logit_softcapping = Some(0.0));
+    refused(&|config| config.per_layer_input_size = Some(0));
 }
