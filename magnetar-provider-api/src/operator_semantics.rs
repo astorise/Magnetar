@@ -121,10 +121,70 @@ pub fn moe_experts(
 pub fn moe_experts_local(
     h: &HostTensor,
     logits: &HostTensor,
+    weights: [&HostTensor; 3],
+    routing: MoeRouting,
+    first: u64,
+    count: u64,
+) -> Result<HostTensor, ReferenceCpuError> {
+    moe_experts_local_with(
+        h,
+        logits,
+        weights,
+        routing,
+        first,
+        count,
+        MoeExpertOptions::default(),
+    )
+}
+
+/// The gate activation of `moe-experts`' experts (`activation`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MoeExpertActivation {
+    /// `silu(gate) * up`, the default.
+    #[default]
+    Silu,
+    /// `gelu_tanh(gate) * up` (`activation = "gelu_tanh"`).
+    GeluTanh,
+}
+
+impl MoeExpertActivation {
+    /// The activation an `activation` attribute names; `None` for an
+    /// unknown name.
+    pub fn from_attribute(name: &str) -> Option<Self> {
+        match name {
+            "silu" => Some(Self::Silu),
+            "gelu_tanh" => Some(Self::GeluTanh),
+            _ => None,
+        }
+    }
+
+    fn apply(self, gate: f32) -> f32 {
+        match self {
+            Self::Silu => gate * (1.0 / (1.0 + (-gate).exp())),
+            Self::GeluTanh => gelu_tanh(gate),
+        }
+    }
+}
+
+/// `moe-experts`' optional forms (`extend-portable-operator-attributes`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MoeExpertOptions<'a> {
+    pub activation: MoeExpertActivation,
+    /// `[experts]` (all routed experts, also on a Device holding a share):
+    /// expert `e`'s output is multiplied by `per_expert_scale[e]` before
+    /// its routing weight.
+    pub per_expert_scale: Option<&'a HostTensor>,
+}
+
+/// [`moe_experts_local`] with its optional forms.
+pub fn moe_experts_local_with(
+    h: &HostTensor,
+    logits: &HostTensor,
     [gate, up, down]: [&HostTensor; 3],
     routing: MoeRouting,
     first: u64,
     count: u64,
+    options: MoeExpertOptions<'_>,
 ) -> Result<HostTensor, ReferenceCpuError> {
     let MoeRouting {
         experts,
@@ -166,6 +226,14 @@ pub fn moe_experts_local(
             down.shape
         )));
     }
+    if let Some(scale) = options.per_expert_scale
+        && scale.data.len() as u64 != experts
+    {
+        return Err(shape_error(format!(
+            "moe-experts expects a per-expert scale of [{experts}], got {:?}",
+            scale.shape
+        )));
+    }
     let (first, count) = (first as usize, count as usize);
     let (hidden, intermediate) = (hidden as usize, intermediate as usize);
     let (gate_cols, down_cols) = (gate_cols as usize, down_cols as usize);
@@ -175,6 +243,10 @@ pub fn moe_experts_local(
         let x = &h.data[token * hidden..(token + 1) * hidden];
         let row_logits = &logits.data[token * experts as usize..(token + 1) * experts as usize];
         for (expert, weight) in moe_route(row_logits, top_k as usize, normalize) {
+            let weight = weight
+                * options
+                    .per_expert_scale
+                    .map_or(1.0, |scale| scale.data[expert]);
             let Some(expert) = expert.checked_sub(first).filter(|local| *local < count) else {
                 continue;
             };
@@ -185,7 +257,7 @@ pub fn moe_experts_local(
                     g += xk * gate.data[k * gate_cols + column];
                     u += xk * up.data[k * gate_cols + column];
                 }
-                *value = g * (1.0 / (1.0 + (-g).exp())) * u;
+                *value = options.activation.apply(g) * u;
             }
             let row = &mut out[token * hidden..(token + 1) * hidden];
             for (c, slot) in row.iter_mut().enumerate() {
@@ -227,3 +299,113 @@ pub const MOE_EXPERT_FIRST_ATTRIBUTE: &str = "expert_first";
 
 /// `moe-experts`' held expert count (see [`moe_local_experts`]).
 pub const MOE_EXPERT_COUNT_ATTRIBUTE: &str = "expert_count";
+
+/// `gelu` with the tanh approximation: `0.5 x (1 + tanh(sqrt(2/pi) (x +
+/// 0.044715 x^3)))`, the portable `gelu`'s definition.
+pub fn gelu_tanh(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)).tanh())
+}
+
+fn invalid(reason: impl Into<String>) -> ReferenceCpuError {
+    ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason)
+}
+
+/// `activation` with `kind = "softcap"`: `cap * tanh(x / cap)`, `cap`
+/// finite and positive.
+pub fn softcap(input: &HostTensor, cap: f32) -> Result<HostTensor, ReferenceCpuError> {
+    if !cap.is_finite() || cap <= 0.0 {
+        return Err(invalid(format!(
+            "softcap cap {cap} must be finite and positive"
+        )));
+    }
+    Ok(HostTensor {
+        shape: input.shape.clone(),
+        data: input.data.iter().map(|&x| cap * (x / cap).tanh()).collect(),
+    })
+}
+
+/// `activation` with `kind = "scale"`: `x * factor`, `factor` finite.
+pub fn scale(input: &HostTensor, factor: f32) -> Result<HostTensor, ReferenceCpuError> {
+    if !factor.is_finite() {
+        return Err(invalid(format!("scale factor {factor} must be finite")));
+    }
+    Ok(HostTensor {
+        shape: input.shape.clone(),
+        data: input.data.iter().map(|&x| x * factor).collect(),
+    })
+}
+
+/// `mul`: element-wise, `b` of `a`'s shape or a `[1]` scalar broadcast to
+/// every element.
+pub fn mul_broadcast(a: &HostTensor, b: &HostTensor) -> Result<HostTensor, ReferenceCpuError> {
+    let data = if a.shape == b.shape {
+        a.data.iter().zip(&b.data).map(|(x, y)| x * y).collect()
+    } else if b.shape.as_slice() == [1] {
+        a.data.iter().map(|x| x * b.data[0]).collect()
+    } else {
+        return Err(invalid(format!(
+            "mul expects b of a's shape {:?} or [1], got {:?}",
+            a.shape, b.shape
+        )));
+    };
+    Ok(HostTensor {
+        shape: a.shape.clone(),
+        data,
+    })
+}
+
+/// `rmsnorm` with its optional forms: each row splits into `heads` blocks
+/// (one block when `heads` is `None`), each normalized by its own mean
+/// square, `x * rsqrt(mean(x^2) + epsilon) * weight`. `weight` is `[block]`
+/// shared by every block and row, or absent (scale 1). With `heads =
+/// Some((h, d))` the row width must be `h * d`.
+pub fn rmsnorm_blocks(
+    input: &HostTensor,
+    weight: Option<&HostTensor>,
+    epsilon: f32,
+    heads: Option<(u64, u64)>,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let cols = *input
+        .shape
+        .last()
+        .ok_or_else(|| invalid("rmsnorm expects at least one dimension"))?;
+    let block = match heads {
+        Some((count, dimension)) if count > 0 && dimension > 0 && count * dimension == cols => {
+            dimension
+        }
+        Some((count, dimension)) => {
+            return Err(invalid(format!(
+                "rmsnorm head_count {count} x head_dimension {dimension} must equal the row width {cols}"
+            )));
+        }
+        None => cols,
+    };
+    if block == 0 || !input.data.len().is_multiple_of(block as usize) {
+        return Err(invalid(format!("rmsnorm row width {cols} is not usable")));
+    }
+    if epsilon.is_nan() || epsilon <= 0.0 {
+        return Err(invalid("rmsnorm epsilon must be positive"));
+    }
+    if let Some(weight) = weight
+        && weight.data.len() as u64 != block
+    {
+        return Err(invalid(format!(
+            "rmsnorm weight must have {block} values, got {:?}",
+            weight.shape
+        )));
+    }
+    let block = block as usize;
+    let mut data = Vec::with_capacity(input.data.len());
+    for values in input.data.chunks(block) {
+        let mean_square = values.iter().map(|value| value * value).sum::<f32>() / block as f32;
+        let factor = 1.0 / (mean_square + epsilon).sqrt();
+        for (index, value) in values.iter().enumerate() {
+            data.push(value * factor * weight.map_or(1.0, |weight| weight.data[index]));
+        }
+    }
+    Ok(HostTensor {
+        shape: input.shape.clone(),
+        data,
+    })
+}
