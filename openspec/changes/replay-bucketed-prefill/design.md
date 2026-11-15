@@ -25,7 +25,7 @@ Non-goals: see proposal.md. They are chunked prefill, cross-request decode recor
 
 ### Buckets and padding
 
-- **Buckets.** The default bucket list is 16, 32, 64, 128 tokens, configurable with `MAGNETAR_PREFILL_BUCKETS=16,32,64,128`. A prompt of `n` tokens takes the smallest bucket `b >= n`. A prompt longer than the largest bucket runs today's exact-length prefill, unbucketed and per node.
+- **Buckets.** The default bucket list is 16, 32, 64, 128 tokens, configurable with `MAGNETAR_PREFILL_BUCKETS=16,32,64,128`. A prompt of `n` tokens takes the smallest bucket `b >= n`. A prompt longer than the largest bucket runs today's exact-length prefill, unbucketed and per node. Buckets longer than the model's context length are dropped, and a model split by tensor parallelism is not bucketed.
 - **Padding.** The bucket's last `b - n` ids repeat the prompt's last token. Any in-vocabulary id is valid: no real row reads a padding row, under causal attention with key count `b` at position 0. The padding rows' K and V are written at rows `n .. b`. These rows lie beyond the committed length, which stays `n` (`PrefillCompleted { tokens: n }`). The first decode step writes row `n` and attends over `n + 1` keys, so the stale rows are never read and are overwritten as decoding proceeds.
 - **Equivalence.** Each real row's outputs are a function of rows `0..=i` only, so they equal the unpadded prefill's, up to summation order. The prefill kernels' order depends on the row count: tiled and Tensor Core paths start at 64 rows. Qualification therefore compares logits within the existing f32 tolerance, and greedy tokens exactly, rather than bit-identity. Bit-identity with an unpadded prefill of the same bucket length is required.
 
@@ -33,6 +33,7 @@ Non-goals: see proposal.md. They are chunked prefill, cross-request decode recor
 
 - **Today.** The prefill's LM head is rewritten (`qualify-fusion-and-optimized-attention`) to read the last row of its input.
 - **Bucketed prefill.** The Runtime instead inserts an `embedding` node that gathers row `n - 1` of the final hidden states. Its index is a new Runtime-provided graph input, `input.logits_row` (shape `[1]`). The LM head reads that one row, and the logits keep one row.
+- **Fallback.** A graph whose `logits` is not produced by a plain or bias matmul keeps every row's logits; the engine then reads row `n - 1`. Such a prefill is bucketed but cannot be captured.
 - **Why `embedding`.** It is an existing portable Operator with a CUDA Kernel and a Reference CPU kernel, so no Operator, WIT or Component change is needed. A replay writes `input.logits_row` like it writes the token ids.
 
 ### KV store pool

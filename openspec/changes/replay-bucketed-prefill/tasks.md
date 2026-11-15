@@ -1,8 +1,8 @@
 ## 1. Runtime: bucketed prefill
 
-- [ ] 1.1 Prompt buckets (`MAGNETAR_PREFILL_BUCKETS`), right padding, committed length `n`, and an exact-length fallback above the largest bucket.
-- [ ] 1.2 `input.logits_row` and the Runtime-inserted `embedding` row gather before the LM head; logits from row `n - 1`.
-- [ ] 1.3 Tests:
+- [x] 1.1 Prompt buckets (`MAGNETAR_PREFILL_BUCKETS`), right padding, committed length `n`, and an exact-length fallback above the largest bucket.
+- [x] 1.2 `input.logits_row` and the Runtime-inserted `embedding` row gather before the LM head; logits from row `n - 1`.
+- [x] 1.3 Tests (`first_native_runtime::prefill_buckets::tests`):
   - bucketed against unpadded prefill on the Reference CPU (tokens identical, logits within tolerance);
   - the first decode step after a bucketed prefill overwrites the padding rows.
 

@@ -840,6 +840,21 @@ pub(crate) enum MaterializedEdges<'a> {
     /// logits: only the last prompt row's distribution is sampled), read
     /// through `read_tensor_rows` so the other rows stay on the Device.
     LastRow(&'a [&'a str]),
+    /// [`Self::LastRow`] for the given row instead of the last one (a
+    /// bucketed prefill's last prompt row, followed by padding rows).
+    Row(&'a [&'a str], u64),
+}
+
+impl MaterializedEdges<'_> {
+    /// The edges of which one row is materialized, and that row (`None`:
+    /// the last).
+    pub(super) fn single_row(&self) -> Option<(&[&str], Option<u64>)> {
+        match *self {
+            MaterializedEdges::LastRow(edges) => Some((edges, None)),
+            MaterializedEdges::Row(edges, row) => Some((edges, Some(row))),
+            MaterializedEdges::All | MaterializedEdges::Only(_) => None,
+        }
+    }
 }
 
 /// [`execute_first_native_graph`], generalized to additionally accept graph inputs
@@ -1067,10 +1082,12 @@ pub(super) fn execute_first_native_graph_nodes(
     let release_intermediates = sequence_length.is_some_and(|rows| rows > 1)
         && matches!(
             materialized,
-            MaterializedEdges::Only(_) | MaterializedEdges::LastRow(_)
+            MaterializedEdges::Only(_) | MaterializedEdges::LastRow(_) | MaterializedEdges::Row(..)
         );
     let kept_edges: &[&str] = match materialized {
-        MaterializedEdges::Only(edges) | MaterializedEdges::LastRow(edges) => edges,
+        MaterializedEdges::Only(edges)
+        | MaterializedEdges::LastRow(edges)
+        | MaterializedEdges::Row(edges, _) => edges,
         MaterializedEdges::All => &[],
     };
     let mut last_reader: BTreeMap<&TensorEdgeId, usize> = BTreeMap::new();
@@ -1169,10 +1186,10 @@ pub(super) fn execute_first_native_graph_nodes(
             };
             inputs.push(value);
         }
-        if let MaterializedEdges::LastRow(edges) = materialized
+        if let Some((edges, row)) = materialized.single_row()
             && last_row_suffices(node, edges)
         {
-            last_row_only(&*dispatch_ctx.provider, &mut inputs[0])?;
+            last_row_only(&*dispatch_ctx.provider, &mut inputs[0], row)?;
         }
         dispatch_ctx
             .runtime
@@ -1653,11 +1670,14 @@ pub(super) fn execute_first_native_graph_nodes(
         reason: "first-native graph executed no nodes".into(),
     })?;
     let materialize_clock = dispatch_ctx.runtime.phase_ledger().clock();
-    if let MaterializedEdges::Only(edges) | MaterializedEdges::LastRow(edges) = materialized {
+    if let MaterializedEdges::Only(edges)
+    | MaterializedEdges::LastRow(edges)
+    | MaterializedEdges::Row(edges, _) = materialized
+    {
         bindings.retain(|edge_id, _| edges.contains(&edge_id.as_str()));
     }
-    let materialized_bindings = if let MaterializedEdges::LastRow(_) = materialized {
-        materialize_last_rows(&*dispatch_ctx.provider, &bindings)?
+    let materialized_bindings = if let Some((_, row)) = materialized.single_row() {
+        materialize_last_rows(&*dispatch_ctx.provider, &bindings, row)?
     } else {
         materialize_first_native_graph_bindings(&*dispatch_ctx.provider, &bindings)?
     };

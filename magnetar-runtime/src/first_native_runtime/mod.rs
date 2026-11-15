@@ -83,6 +83,7 @@ mod executor;
 mod fixture;
 mod graph_execution;
 mod kv_state;
+mod prefill_buckets;
 mod prepared_plans;
 mod production;
 mod segments;

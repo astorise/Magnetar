@@ -56,9 +56,12 @@ pub(crate) struct ComponentGraphCache {
     /// Whether the Provider splits the model by tensor parallelism, so
     /// row-parallel matmuls must keep their addends unfused.
     pub(super) tensor_parallel: Arc<std::sync::atomic::AtomicBool>,
+    /// The prompt buckets of a bucketed prefill (`replay-bucketed-prefill`),
+    /// ascending; empty when prefills run at the prompt's exact length.
+    pub(super) prefill_buckets: Arc<Mutex<Vec<u64>>>,
 }
 
-/// One prompt length's graphs.
+/// One graph length's graphs.
 pub(super) type CachedComponentGraphs = (u64, Arc<CachedGraphs>);
 
 /// Integer attributes that advance by one from one decode step to the next
@@ -317,6 +320,9 @@ impl GraphExecutionMemo {
 /// cannot change after a memo was filled.
 pub(crate) struct CachedGraphs {
     pub(super) graphs: FirstNativeComponentGraphs,
+    /// Whether the prefill graph takes `input.logits_row` and produces the
+    /// logits of that one row (`prefill_buckets::insert_logits_row_gather`).
+    pub(crate) logits_row: bool,
     pub(crate) prefill_memo: GraphExecutionMemo,
     pub(crate) decode_memo: GraphExecutionMemo,
     /// The Prepared Execution Plans last prepared for these graphs, with
@@ -342,6 +348,7 @@ impl CachedGraphs {
     pub(crate) fn new(graphs: FirstNativeComponentGraphs) -> Self {
         Self {
             graphs,
+            logits_row: false,
             prefill_memo: GraphExecutionMemo::default(),
             decode_memo: GraphExecutionMemo::default(),
             plans: std::sync::Mutex::new(None),
@@ -457,6 +464,63 @@ impl ComponentGraphCache {
         self.tensor_parallel
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
         self.entries.lock().unwrap().clear();
+    }
+
+    /// The prefill graph length for a prompt of `prompt_tokens` tokens:
+    /// its bucket when bucketing applies, the prompt's own length
+    /// otherwise. A bucket length is never the exact length of an
+    /// unbucketed prompt (those are longer than every bucket), so graphs
+    /// stay keyed by this length alone.
+    pub(crate) fn prefill_graph_length(&self, prompt_tokens: u64) -> u64 {
+        if self.tensor_parallel() {
+            return prompt_tokens;
+        }
+        crate::first_native_runtime::prefill_buckets::prefill_bucket(
+            &self.prefill_buckets.lock().unwrap(),
+            prompt_tokens,
+        )
+        .unwrap_or(prompt_tokens)
+    }
+
+    /// Whether a prefill graph of `graph_length` rows is a bucket's.
+    pub(crate) fn is_prefill_bucket(&self, graph_length: u64) -> bool {
+        !self.tensor_parallel() && self.prefill_buckets.lock().unwrap().contains(&graph_length)
+    }
+
+    /// Sets the prompt buckets; empty turns bucketing off. Forgets every
+    /// cached graph, like [`Self::set_fusion_provider`].
+    pub(crate) fn set_prefill_buckets(&self, buckets: Vec<u64>) {
+        *self.prefill_buckets.lock().unwrap() = buckets;
+        self.entries.lock().unwrap().clear();
+    }
+
+    /// Freshly built graphs of `graph_length` prefill rows, ready to cache:
+    /// fused ([`Self::optimize`]) and, for a bucket's graphs, with the
+    /// logits row gather. A bucket graph whose LM head cannot take the
+    /// gather keeps every row's logits; the engine then reads row `n - 1`.
+    pub(crate) fn prepare(
+        &self,
+        runtime: &Runtime,
+        graphs: FirstNativeComponentGraphs,
+        graph_length: u64,
+    ) -> CachedGraphs {
+        let mut graphs = self.optimize(runtime, graphs);
+        let gathered = self
+            .is_prefill_bucket(graph_length)
+            .then(|| {
+                crate::first_native_runtime::prefill_buckets::insert_logits_row_gather(
+                    &graphs.prefill,
+                )
+            })
+            .flatten();
+        let logits_row = gathered.is_some();
+        if let Some(prefill) = gathered {
+            graphs.prefill = prefill;
+            graphs.prefill_node_count += 1;
+        }
+        let mut cached = CachedGraphs::new(graphs);
+        cached.logits_row = logits_row;
+        cached
     }
 
     /// Applies every fusion the fusion Provider currently advertises to
@@ -586,6 +650,7 @@ impl E2eRuntimeModelExecutionEngine {
                 request
                     .prompt_token_count
                     .saturating_add(request.max_new_tokens)
+                    .max(self.prefill_graph_length(request.input_token_ids.len() as u64) as usize)
                     .max(1) as u32,
                 ComputeDType::Float32,
             ),
@@ -741,6 +806,16 @@ impl E2eRuntimeModelExecutionEngine {
 }
 
 impl E2eRuntimeModelExecutionEngine {
+    /// The prefill graph length for a prompt of `prompt_tokens` tokens
+    /// ([`ComponentGraphCache::prefill_graph_length`]). Copy-based KV
+    /// history keeps every row it computes, so it never pads.
+    pub(super) fn prefill_graph_length(&self, prompt_tokens: u64) -> u64 {
+        match &self.graph_cache {
+            Some(cache) if !self.copy_based_kv => cache.prefill_graph_length(prompt_tokens),
+            _ => prompt_tokens,
+        }
+    }
+
     /// One generation step; with `greedy` (a plain greedy sampling
     /// request), a replayed decode step's token may be selected on the
     /// Device instead of returning its logits.
@@ -843,14 +918,17 @@ impl E2eRuntimeModelExecutionEngine {
             // own choice of digest exactly -- see
             // `ProductionLoadedModel::component_digest`'s doc comment.
             let prompt_token_count = request.input_token_ids.len() as u64;
+            // A bucketed prefill (`replay-bucketed-prefill`) runs its
+            // bucket's graph, which the plan was prepared against.
+            let graph_length = self.prefill_graph_length(prompt_token_count);
             let graph_build_clock = runtime.phase_ledger().clock();
             let cached_graphs = self
                 .graph_cache
                 .as_ref()
-                .and_then(|cache| cache.get(prompt_token_count));
+                .and_then(|cache| cache.get(graph_length));
             let component_graphs = match cached_graphs {
                 Some(graphs) => graphs,
-                None => Arc::new(CachedGraphs::new(
+                None => Arc::new(
                     match &self.component_digest {
                         Some(digest) => build_first_native_graphs_from_named_component(
                             digest,
@@ -858,22 +936,21 @@ impl E2eRuntimeModelExecutionEngine {
                                 &self.fixture.config,
                             ),
                             &self.fixture.identity,
-                            prompt_token_count,
+                            graph_length,
                         )
                         .map(|(graphs, _definition, _instance)| graphs),
-                        None => first_native_component_graphs_for_prompt(
-                            &self.fixture,
-                            prompt_token_count,
-                        ),
+                        None => {
+                            first_native_component_graphs_for_prompt(&self.fixture, graph_length)
+                        }
                     }
                     .map_err(|error| InferenceApiError::GraphPlanningFailed {
                         reason: error.to_string(),
                     })
                     .map(|graphs| match &self.graph_cache {
-                        Some(cache) => cache.optimize(runtime, graphs),
-                        None => graphs,
+                        Some(cache) => cache.prepare(runtime, graphs, graph_length),
+                        None => CachedGraphs::new(graphs),
                     })?,
-                )),
+                ),
             };
             runtime
                 .phase_ledger_mut()
@@ -903,61 +980,93 @@ impl E2eRuntimeModelExecutionEngine {
             // last row is a newly admitted token's distribution.
             // Every row this request's KV history can reach: its prompt and
             // every token it may generate (`append-kv-history-in-place`).
+            // A bucketed prefill also writes its padding rows.
             let kv_store_capacity = (!self.copy_based_kv).then(|| {
                 (request.input_token_ids.len() as u64)
                     .saturating_add(request.max_new_tokens as u64)
+                    .max(graph_length)
                     .max(1)
             });
-            let (dispatch, mut bindings, layer_kv, resolved_provider) =
-                if generated_tokens.is_empty() {
-                    let ids_tensor = HostTensor::new(
-                        [request.input_token_ids.len() as u64],
-                        request
-                            .input_token_ids
-                            .iter()
-                            .map(|id| *id as f32)
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(runtime_generation_failed)?;
-                    execute_first_native_graph_materializing(
-                        runtime,
-                        &self.fixture,
-                        model_instance,
-                        &kv_state.cache,
-                        &component_graphs.prefill,
-                        execution_plan,
-                        BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)]),
-                        None,
-                        Some(0),
-                        &mut node_events,
-                        // Only the last prompt row's logits are sampled.
-                        MaterializedEdges::LastRow(&["logits"]),
-                        Some(&component_graphs.prefill_memo),
-                        kv_store_capacity,
-                    )?
-                } else {
-                    let token = *generated_tokens.last().ok_or_else(|| {
-                        InferenceApiError::GenerationFailed {
-                            reason: "decode requires a newly admitted token".into(),
+            let (dispatch, mut bindings, layer_kv, resolved_provider) = if generated_tokens
+                .is_empty()
+            {
+                let bucketed = graph_length != prompt_token_count || component_graphs.logits_row;
+                // Right padding: the bucket's last rows repeat the last
+                // prompt token; no real row reads them.
+                let ids_tensor = HostTensor::new(
+                    [graph_length],
+                    crate::first_native_runtime::prefill_buckets::pad_prompt_ids(
+                        &request.input_token_ids,
+                        graph_length as usize,
+                    ),
+                )
+                .map_err(runtime_generation_failed)?;
+                let mut inputs =
+                    BTreeMap::from([(TensorEdgeId::new("input.token_ids"), ids_tensor)]);
+                let sampled_row = prompt_token_count.saturating_sub(1);
+                if component_graphs.logits_row {
+                    inputs.insert(
+                        TensorEdgeId::new(
+                            crate::first_native_runtime::prefill_buckets::LOGITS_ROW_INPUT,
+                        ),
+                        HostTensor::new([1], vec![sampled_row as f32])
+                            .map_err(runtime_generation_failed)?,
+                    );
+                }
+                let mut output = execute_first_native_graph_materializing(
+                    runtime,
+                    &self.fixture,
+                    model_instance,
+                    &kv_state.cache,
+                    &component_graphs.prefill,
+                    execution_plan,
+                    inputs,
+                    None,
+                    Some(0),
+                    &mut node_events,
+                    // Only the last prompt row's logits are sampled
+                    // (the graph's one row with a logits row gather).
+                    if bucketed && !component_graphs.logits_row {
+                        MaterializedEdges::Row(&["logits"], sampled_row)
+                    } else {
+                        MaterializedEdges::LastRow(&["logits"])
+                    },
+                    Some(&component_graphs.prefill_memo),
+                    kv_store_capacity,
+                )?;
+                if bucketed {
+                    // The padding rows lie beyond the committed length:
+                    // the first decode step writes row `n` over them.
+                    for layer in output.2.values_mut() {
+                        if layer.rows.is_some() {
+                            layer.rows = Some(prompt_token_count);
                         }
-                    })?;
-                    let (output, selected) = self.execute_decode_graph(
-                        runtime,
-                        request,
-                        &kv_state,
-                        execution_plan,
-                        &component_graphs,
-                        model_instance,
-                        token,
-                        absolute_position as u64,
-                        generated_tokens.len(),
-                        &mut node_events,
-                        kv_store_capacity,
-                        greedy_plan.as_ref(),
-                    )?;
-                    device_greedy_column = selected;
-                    output
-                };
+                    }
+                }
+                output
+            } else {
+                let token = *generated_tokens.last().ok_or_else(|| {
+                    InferenceApiError::GenerationFailed {
+                        reason: "decode requires a newly admitted token".into(),
+                    }
+                })?;
+                let (output, selected) = self.execute_decode_graph(
+                    runtime,
+                    request,
+                    &kv_state,
+                    execution_plan,
+                    &component_graphs,
+                    model_instance,
+                    token,
+                    absolute_position as u64,
+                    generated_tokens.len(),
+                    &mut node_events,
+                    kv_store_capacity,
+                    greedy_plan.as_ref(),
+                )?;
+                device_greedy_column = selected;
+                output
+            };
             // `execute_first_native_graph` topologically validates the graph (via
             // `first_native_graph_execution_order`) as its first action -- reaching
             // this point with an `Ok` result means that validation
@@ -1056,19 +1165,25 @@ pub(super) fn last_row_suffices(node: &ExecutionNode, materialized_last_rows: &[
 pub(super) fn last_row_only(
     provider: &dyn ProviderExecutionApi,
     value: &mut NodeValue,
+    row: Option<u64>,
 ) -> Result<(), InferenceApiError> {
     let (rows, cols) = value.rows_cols()?;
     if rows <= 1 {
         return Ok(());
     }
+    let row = row.unwrap_or(rows - 1);
     let row = match value {
         NodeValue::Host(tensor) => {
-            let start = usize::try_from((rows - 1) * cols).ok();
+            let start = usize::try_from(row * cols).ok();
+            let end = usize::try_from((row + 1) * cols).ok();
             start
-                .and_then(|start| tensor.data.get(start..))
+                .zip(end)
+                .and_then(|(start, end)| tensor.data.get(start..end))
                 .and_then(|row| HostTensor::new([1, cols], row.to_vec()).ok())
         }
-        NodeValue::Resident { id, .. } => provider.read_tensor_rows(id, rows - 1, 1),
+        NodeValue::Resident { id, .. } => (row < rows)
+            .then(|| provider.read_tensor_rows(id, row, 1))
+            .flatten(),
     }
     .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
         reason: "the last row of a matmul input could not be read".into(),
@@ -1080,12 +1195,19 @@ pub(super) fn last_row_only(
 pub(super) fn materialize_last_rows(
     provider: &dyn ProviderExecutionApi,
     bindings: &BTreeMap<TensorEdgeId, (TensorResourceId, Vec<u64>)>,
+    row: Option<u64>,
 ) -> Result<BTreeMap<TensorEdgeId, HostTensor>, InferenceApiError> {
     let mut materialized = BTreeMap::new();
     for (edge_id, (resource_id, shape)) in bindings {
         let rows = shape.first().copied().unwrap_or(0);
-        let tensor = (shape.len() == 2 && rows > 0)
-            .then(|| provider.read_tensor_rows(resource_id, rows - 1, 1))
+        // A single row is the selected one (the LM head already read it).
+        let row = if rows == 1 {
+            0
+        } else {
+            row.unwrap_or(rows.saturating_sub(1))
+        };
+        let tensor = (shape.len() == 2 && row < rows)
+            .then(|| provider.read_tensor_rows(resource_id, row, 1))
             .flatten()
             .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
                 reason: format!(
