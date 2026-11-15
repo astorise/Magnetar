@@ -284,3 +284,16 @@ lookups: the kernels now fetch a run's magnitudes with one AVX2 gather
 64-bit ones) from indices built in vector registers. Every IQ2/IQ3
 format then runs a Mistral-shaped matmul in 2.0-2.5 ms on 4 local cores
 (3-5.7 ms before), below `Q4_K`'s 2.3-3.0 ms on the same runs.
+
+GPU smoke run 43684729957 (commit `2458d29`), same host, 3 threads,
+Mistral 7B on the optimized CPU Provider:
+
+| Export | TPOT (before) | matmul / matmul-residual per call |
+|---|---|---|
+| `Q4_K_M` | 361.4 ms (358.7) | 1.42 / 2.02 ms |
+| `IQ3_M` | 433.8 ms (563.9) | 1.78 / 2.16 ms |
+| `IQ2_M` | 441.7 ms (467.3) | 1.77 / 2.32 ms |
+
+All answer "Paris". On this host (i7-7700) the gathered IQ kernels stay
+about 25 % above `Q4_K` per matmul call, where the local host measured
+them level or below: gathers are slower on this older core.
