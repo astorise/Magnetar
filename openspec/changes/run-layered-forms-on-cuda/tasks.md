@@ -8,4 +8,4 @@
 
 - [x] 2.1 Conformance against the Reference CPU and `operator_semantics` for every form and attention Kernel path.
 - [x] 2.2 A hardware dispatch of every form through the Kernel Registry and executor.
-- [ ] 2.3 The GPU runner passes them (astorise/Magnetar-provider-CUDA#42).
+- [x] 2.3 The GPU runner passes them (astorise/Magnetar-provider-CUDA#42): 105 tests passed, 0 ignored, on 4f67eb1 (run 43769216478, job `module / gpu`).
