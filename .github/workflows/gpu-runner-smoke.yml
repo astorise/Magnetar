@@ -320,6 +320,7 @@ jobs:
         env:
           MAGNETAR_QUALIFICATION_PROVIDERS: cuda
           MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
           MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "128"
           MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
           # Besides the short prompt, one campaign per long context: what a
@@ -332,6 +333,56 @@ jobs:
           export MAGNETAR_QUALIFICATION_DRIVER="$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n1)"
           export MAGNETAR_QUALIFICATION_SUMMARY_PATH="$GITHUB_STEP_SUMMARY"
           cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture
+      - name: Real-checkpoint prefill replay campaign on CUDA (short prompts)
+        if: ${{ env.SUITE_DENSE == 'true' }}
+        # replay-bucketed-prefill: warm TTFT of 5-, 12- and 40-token
+        # prompts. Each is right-padded to its bucket (8, 16 or 40 rows); the
+        # cold request runs the prefill per node, the warmup captures it and
+        # every measured request replays the captured CUDA graph.
+        timeout-minutes: 30
+        env:
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "16"
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
+          MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "12,40"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/prefill-replay"
+          mkdir -p "$dir/replay"
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$dir/replay"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/replay.log"
+          grep 'step capture\|pooled KV stores' "$dir/replay.log" | sed 's/.*\] //' | sort | uniq -c || true
+          grep -q 'captured: prefill' "$dir/replay.log" || {
+            echo "::error::no bucketed prefill was captured"
+            exit 1
+          }
+      - name: Real-checkpoint prefill replay campaign with replay off (disable control)
+        if: ${{ !cancelled() && env.SUITE_DENSE == 'true' }}
+        # The same campaign with MAGNETAR_PREFILL_REPLAY=0: every prefill at
+        # its prompt's exact length, per node. Greedy tokens must match.
+        timeout-minutes: 30
+        env:
+          MAGNETAR_QUALIFICATION_PROVIDERS: cuda
+          MAGNETAR_QUALIFICATION_REQUIRE_CUDA: "1"
+          MAGNETAR_PREFILL_REPLAY: "0"
+          MAGNETAR_QUALIFICATION_MAX_NEW_TOKENS: "16"
+          MAGNETAR_QUALIFICATION_MEASURED_RUNS: "5"
+          MAGNETAR_QUALIFICATION_CONTEXT_TOKENS: "12,40"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/prefill-replay"
+          mkdir -p "$dir/control"
+          export MAGNETAR_QUALIFICATION_REPORT_DIR="$dir/control"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_checkpoint_qualification_campaign -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/control.log"
+          grep -h 'warm TTFT' "$dir/replay.log" "$dir/control.log" | sed 's/; exceptions.*//'
+          if ! diff <(grep 'generated token ids' "$dir/replay.log") <(grep 'generated token ids' "$dir/control.log"); then
+            echo "::error::bucketed prefill replay changed the greedy tokens"
+            exit 1
+          fi
       - name: Real-checkpoint long-context campaign with Tensor Cores off (disable control)
         if: ${{ env.SUITE_LONG_CONTEXT == 'true' }}
         # The same 512- and 4096-token campaigns on the bit-identical
@@ -713,6 +764,17 @@ jobs:
             echo "::warning::Q8_0 GGUF (Qwen2.5-0.5B): token ids differ between int8 (default) and f32 activations"
             diff <(echo "$f32" | tr ',' '\n') <(echo "$int8" | tr ',' '\n') | head -20 || true
           fi
+      - name: CPU packed matmul bandwidth (diagnostic)
+        # The optimized CPU Provider's decode matmul time per format on
+        # Mistral shapes, on this host. Informational only.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -o pipefail
+          lscpu | grep -E 'Model name|^CPU\(s\)' || true
+          cargo test --locked --release --manifest-path providers/cpu/Cargo.toml --lib packed_matmul_bandwidth -- --ignored --nocapture 2>&1 | grep -E 'threads|GB/s' || true
       - name: Q8_0 GGUF (Qwen2.5-0.5B) on the optimized CPU Provider
         # execute-quantized-weights-on-cpu: the packed weights stay in host
         # memory in their checkpoint encoding and the matmuls read them with
@@ -965,6 +1027,7 @@ jobs:
         timeout-minutes: 30
         env:
           MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_STEP_CAPTURE_TRACE: "1"
         shell: bash
         run: |
           set -o pipefail
@@ -996,6 +1059,29 @@ jobs:
           grep -h 'TPOT' "$dir/packed.log" "$dir/f32-activations.log" || true
           grep -Eq 'generated text " ?Paris' "$dir/f32-activations.log" || {
             echo "::error::Mistral-7B-Instruct-v0.3 Q4_K_M GGUF: with f32 activations the greedy continuation of 'The capital of France is' does not start with 'Paris'"
+            exit 1
+          }
+      - name: Mistral-7B-Instruct-v0.3 Q4_K_M GGUF with prefill replay off (disable control)
+        # replay-bucketed-prefill's control on a 7B model: the measured
+        # request's prefill at its exact length, per node, instead of a
+        # replayed bucket-8 graph. Greedy tokens must match.
+        if: ${{ !cancelled() && env.SUITE_GGUF == 'true' && env.MAGNETAR_MISTRAL_7B_GGUF_Q4_K_M_REAL_CHECKPOINT_DIR != '' }}
+        timeout-minutes: 30
+        env:
+          MAGNETAR_REQUIRE_CUDA: "1"
+          MAGNETAR_PREFILL_REPLAY: "0"
+        shell: bash
+        run: |
+          set -o pipefail
+          dir="$RUNNER_TEMP/qualification-reports/mistral-7b-q4_k_m-gguf"
+          mkdir -p "$dir"
+          cargo test --locked --release --manifest-path integration-tests/production-loading/Cargo.toml real_public_mistral_7b_q4_k_m_gguf_checkpoint_generates_on_cuda -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee "$dir/prefill-replay-off.log"
+          grep -h 'step capture' "$dir/packed.log" | sort | uniq -c || true
+          grep -h 'TTFT\|prefill:' "$dir/packed.log" "$dir/prefill-replay-off.log" || true
+          replayed="$(grep -m1 'generated token ids' "$dir/packed.log")"
+          control="$(grep -m1 'generated token ids' "$dir/prefill-replay-off.log")"
+          test "$replayed" = "$control" || {
+            echo "::error::Mistral 7B Q4_K_M: bucketed prefill replay changed the greedy tokens"
             exit 1
           }
           int8="$(grep -m1 'generated token ids' "$dir/packed.log" || true)"
