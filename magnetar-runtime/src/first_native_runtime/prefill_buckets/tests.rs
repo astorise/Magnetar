@@ -529,3 +529,51 @@ fn bucket_intermediates_beyond_their_budget_are_released_least_recently_used_fir
     let steps = harness.generate("eight-again", &[3, 9, 4], 1);
     assert_close(&steps, &run(&[3, 9, 4], None, 1).0, "bucket 8 again");
 }
+
+/// A finished production request's session close never releases the pool's
+/// admissions: the next request reuses the stores with the same, still
+/// live, Memory Manager allocation.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn closing_a_session_keeps_the_pooled_stores_admitted() {
+    let (fixture, payload_source) = production_shaped_canonical_fixture();
+    let mut model = ProductionLoadedModel::load(
+        fixture.clone(),
+        &payload_source,
+        ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
+        Arc::new(ReferenceCpuProvider::new()),
+    )
+    .expect("production loading succeeds");
+    model.set_prefill_buckets(vec![16]);
+    let generate = |model: &mut ProductionLoadedModel| {
+        model
+            .generate(
+                ProductionGenerationRequest {
+                    prompt: PromptInput::PlainText("hi".into()),
+                    parameters: GenerationParameters::greedy(),
+                    stop_conditions: StopConditions::default(),
+                    max_new_tokens: Some(3),
+                    max_generation_millis: None,
+                },
+                None,
+            )
+            .unwrap()
+            .result
+            .output
+            .generated_token_ids
+    };
+    let allocation = |model: &ProductionLoadedModel| {
+        model
+            .runtime
+            .memory()
+            .tensor_residency(&pooled_kv_store_id(1, 0, "k"))
+            .and_then(|residency| residency.allocation)
+            .expect("the pooled store is resident")
+    };
+    let first = generate(&mut model);
+    let held = allocation(&model);
+    assert!(model.runtime.memory().is_live_allocation(held));
+    assert_eq!(generate(&mut model), first);
+    assert_eq!(allocation(&model), held);
+    assert!(model.runtime.memory().is_live_allocation(held));
+}

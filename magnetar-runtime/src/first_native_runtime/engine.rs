@@ -1849,6 +1849,14 @@ impl RuntimeModelExecutionEngine for E2eRuntimeModelExecutionEngine {
         let Some(committed) = committed else {
             return Ok(());
         };
+        // The pooled stores' admissions belong to the pool: detach them
+        // from the request's KV cache, whose release (when its session
+        // closes) frees every allocation its layers name.
+        if pooled && let Ok(cache) = runtime.kv_caches_mut().cache_mut(&committed.cache) {
+            cache
+                .layer_resources
+                .retain(|_, binding| !is_pooled_kv_store(&binding.k));
+        }
         let provider_binding = committed
             .provider
             .clone()

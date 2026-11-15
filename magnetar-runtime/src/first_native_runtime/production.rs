@@ -1280,6 +1280,11 @@ impl ProductionLoadedModel {
         )?;
         require_ready_first_native_instance(&runtime, &instance)?;
         graph_cache.set_fusion_provider(Some(provider_binding.clone()));
+        // A Provider that keeps no KV history in place would append a
+        // bucketed prefill's padding rows to the history.
+        if !in_place_kv_supported(&runtime, &provider_binding) {
+            graph_cache.set_prefill_buckets(Vec::new());
+        }
         Ok(Self {
             fixture,
             runtime,
@@ -1322,6 +1327,10 @@ impl ProductionLoadedModel {
     /// `MAGNETAR_PREFILL_REPLAY=0`.
     /// Buckets longer than the model's context length are dropped.
     pub fn set_prefill_buckets(&mut self, buckets: Vec<u64>) {
+        if !in_place_kv_supported(&self.runtime, &self.provider_binding) {
+            self.graph_cache.set_prefill_buckets(Vec::new());
+            return;
+        }
         self.graph_cache
             .set_prefill_buckets(super::prefill_buckets::buckets_within_context(
                 buckets,
@@ -1594,39 +1603,54 @@ impl ProductionLoadedModel {
         let prompt_token_count = tokenized.token_ids.len() as u64;
         // A bucketed prefill's graph and plan have its bucket's length
         // (`replay-bucketed-prefill`), as the engine's step expects.
-        let graph_length = self.graph_cache.prefill_graph_length(prompt_token_count);
         let clock = self.runtime.phase_ledger().clock();
-        let component_graphs = match self.graph_cache.get(graph_length) {
-            Some(graphs) => graphs,
-            None => {
-                let graphs = Arc::new(
-                    match &self.component_digest {
-                        Some(digest) => build_first_native_graphs_from_named_component(
-                            digest,
-                            &architecture_config_from_first_native_model_config(
-                                &self.fixture.config,
-                            ),
-                            &self.fixture.identity,
-                            graph_length,
-                        )
-                        .map(|(graphs, _definition, _instance)| graphs),
-                        None => build_first_native_graphs_from_real_qwen_component(
-                            &self.fixture,
-                            graph_length,
-                        )
-                        .map(|(graphs, _definition, _instance)| graphs),
-                    }
-                    .map_err(|error| InferenceApiError::GraphPlanningFailed {
-                        reason: error.to_string(),
-                    })
-                    .map(|graphs| {
-                        self.graph_cache
-                            .prepare(&self.runtime, graphs, graph_length)
-                    })?,
-                );
-                self.graph_cache.insert(graph_length, Arc::clone(&graphs));
-                graphs
+        let (graph_length, component_graphs) = loop {
+            let graph_length = self.graph_cache.prefill_graph_length(prompt_token_count);
+            let component_graphs = match self.graph_cache.get(graph_length) {
+                Some(graphs) => graphs,
+                None => {
+                    let graphs = Arc::new(
+                        match &self.component_digest {
+                            Some(digest) => build_first_native_graphs_from_named_component(
+                                digest,
+                                &architecture_config_from_first_native_model_config(
+                                    &self.fixture.config,
+                                ),
+                                &self.fixture.identity,
+                                graph_length,
+                            )
+                            .map(|(graphs, _definition, _instance)| graphs),
+                            None => build_first_native_graphs_from_real_qwen_component(
+                                &self.fixture,
+                                graph_length,
+                            )
+                            .map(|(graphs, _definition, _instance)| graphs),
+                        }
+                        .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                            reason: error.to_string(),
+                        })
+                        .map(|graphs| {
+                            self.graph_cache
+                                .prepare(&self.runtime, graphs, graph_length)
+                        })?,
+                    );
+                    self.graph_cache.insert(graph_length, Arc::clone(&graphs));
+                    graphs
+                }
+            };
+            // Padding rows are only invisible to KV history kept in place,
+            // where attention reads the first `key_count` rows: a graph whose
+            // KV edges have other readers runs at the prompt's exact length.
+            if graph_length != prompt_token_count || component_graphs.logits_row {
+                if !component_graphs
+                    .prefill_memo
+                    .kv_edges_feed_only_attention(&component_graphs.prefill)
+                {
+                    self.graph_cache.set_prefill_buckets(Vec::new());
+                    continue;
+                }
             }
+            break (graph_length, component_graphs);
         };
         self.runtime
             .phase_ledger_mut()

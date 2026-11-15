@@ -47,6 +47,11 @@ pub(crate) fn pooled_kv_store_id(set: u64, layer: usize, role: &str) -> TensorRe
     TensorResourceId::new(format!("kv.pool{set}.layer{layer}.{role}.store"))
 }
 
+/// Whether `id` names a pooled store.
+pub(crate) fn is_pooled_kv_store(id: &TensorResourceId) -> bool {
+    id.as_str().starts_with("kv.pool")
+}
+
 /// One set of stores (every layer's K and V) of one capacity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PooledKvSet {

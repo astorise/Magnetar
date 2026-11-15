@@ -1357,12 +1357,17 @@ pub(super) fn execute_first_native_graph_nodes(
                     let append_clock = dispatch_ctx.runtime.phase_ledger().clock();
                     // A pooled store already admitted keeps its storage: no
                     // row is read before this request writes it.
+                    // ...and only while its admission is live: an
+                    // admission released behind the pool's back is redone.
                     let pooled_store_held = spec.pool_set.is_some()
                         && dispatch_ctx
                             .runtime
                             .memory()
                             .tensor_residency(&store)
-                            .is_some();
+                            .and_then(|residency| residency.allocation)
+                            .is_some_and(|allocation| {
+                                dispatch_ctx.runtime.memory().is_live_allocation(allocation)
+                            });
                     if row_offset == 0 && !pooled_store_held {
                         // A new store, admitted once for the whole request
                         // (for a pooled one, for as long as the pool keeps it).
