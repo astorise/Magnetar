@@ -509,6 +509,9 @@ fn generate_gguf_with(
         model.generate(request(4), None).expect("warmup generates");
     }
 
+    // The measured request's prefill, by phase: what replaying it costs
+    // against running it per node (`replay-bucketed-prefill`).
+    model.enable_phase_attribution();
     let mut token_times = Vec::new();
     let started = Instant::now();
     let outcome = model
@@ -535,6 +538,34 @@ fn generate_gguf_with(
         if packed { "on" } else { "off" },
         tokens.len()
     );
+    let attribution = model.take_phase_attribution();
+    model.disable_phase_attribution();
+    if let Some(prefill) =
+        attribution.summary(magnetar_runtime::phase_attribution::StepKind::Prefill)
+    {
+        let mut phases: Vec<_> = prefill.phases.iter().collect();
+        phases.sort_by_key(|(_, total)| std::cmp::Reverse(total.host_micros));
+        let phases: Vec<String> = phases
+            .into_iter()
+            .take(6)
+            .map(|(key, total)| {
+                format!(
+                    "{:?}{} {:.2} ms",
+                    key.phase,
+                    key.operator
+                        .as_deref()
+                        .map(|operator| format!("({operator})"))
+                        .unwrap_or_default(),
+                    total.host_micros as f64 / 1_000.0
+                )
+            })
+            .collect();
+        eprintln!(
+            "[{label}] prefill: {:.2} ms, {}",
+            prefill.wall_micros as f64 / 1_000.0,
+            phases.join(", ")
+        );
+    }
     eprintln!("[{label}] generated token ids {tokens:?}");
     eprintln!("[{label}] generated text {:?}", outcome.text);
     model.unload().expect("the real checkpoint unloads");
