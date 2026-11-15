@@ -317,6 +317,9 @@ pub(super) fn architecture_config_from_first_native_model_config(
         tie_word_embeddings: config.tied_embeddings,
         attention_bias: config.attention_bias,
         mixture_of_experts: config.mixture_of_experts,
+        layer_layout: None,
+        final_logit_softcapping: None,
+        per_layer_input_size: None,
         bos_token_id: None,
         eos_token_id: None,
     }
@@ -864,6 +867,7 @@ pub(super) fn prepare_production_generation(
             graph_cache: None,
             copy_based_kv: false,
             step_replay: StepReplay::default(),
+            kv_pool: KvStorePool::default(),
         }))
         .trust_store(trust_store)
         .build()
@@ -1047,6 +1051,9 @@ pub struct ProductionLoadedModel {
     pub(super) graph_cache: ComponentGraphCache,
     /// Shared with this instance's execution engine.
     pub(super) step_replay: StepReplay,
+    /// Pooled in-place KV stores of bucketed prefills, shared with the
+    /// engine (`replay-bucketed-prefill`).
+    pub(super) kv_pool: KvStorePool,
 }
 
 /// `enforce-local-multigpu-and-expert-placement` tensor parallelism: with
@@ -1232,6 +1239,9 @@ impl ProductionLoadedModel {
         let provider_supports_multi_step_decode = provider.supports_multi_step_decode();
         let graph_cache = ComponentGraphCache::default();
         let step_replay = StepReplay::default();
+        step_replay
+            .set_prefill_enabled(std::env::var("MAGNETAR_PREFILL_REPLAY").as_deref() != Ok("0"));
+        let kv_pool = KvStorePool::default();
         let mut runtime = Runtime::builder()
             .register_provider(provider.clone())
             .model_execution_engine(std::sync::Arc::new(E2eRuntimeModelExecutionEngine {
@@ -1243,6 +1253,7 @@ impl ProductionLoadedModel {
                 graph_cache: Some(graph_cache.clone()),
                 copy_based_kv: false,
                 step_replay: step_replay.clone(),
+                kv_pool: kv_pool.clone(),
             }))
             .trust_store(trust_store)
             .build()
@@ -1260,6 +1271,10 @@ impl ProductionLoadedModel {
             apply_production_layer_placement(&*provider, &fixture.manifest)?;
         }
         graph_cache.set_tensor_parallel(tensor_parallel);
+        graph_cache.set_prefill_buckets(super::prefill_buckets::buckets_within_context(
+            super::prefill_buckets::prefill_buckets_from_env(),
+            fixture.config.architecture.context_length,
+        ));
         let instance = load_production_model_instance_for_provider(
             &mut runtime,
             &fixture.manifest,
@@ -1268,6 +1283,11 @@ impl ProductionLoadedModel {
         )?;
         require_ready_first_native_instance(&runtime, &instance)?;
         graph_cache.set_fusion_provider(Some(provider_binding.clone()));
+        // A Provider that keeps no KV history in place would append a
+        // bucketed prefill's padding rows to the history.
+        if !in_place_kv_supported(&runtime, &provider_binding) {
+            graph_cache.set_prefill_buckets(Vec::new());
+        }
         Ok(Self {
             fixture,
             runtime,
@@ -1278,6 +1298,7 @@ impl ProductionLoadedModel {
             component_digest,
             graph_cache,
             step_replay,
+            kv_pool,
         })
     }
 
@@ -1300,6 +1321,47 @@ impl ProductionLoadedModel {
     pub fn set_graph_fusion(&mut self, enabled: bool) {
         self.graph_cache
             .set_fusion_provider(enabled.then(|| self.provider_binding.clone()));
+    }
+
+    /// Sets the prompt buckets of later prefills (`replay-bucketed-prefill`):
+    /// a prompt runs its bucket's prefill graph, right-padded. Empty runs
+    /// every prefill at the prompt's exact length. Defaults to
+    /// `MAGNETAR_PREFILL_BUCKETS` (16, 32, 64, 128 when unset), or none with
+    /// `MAGNETAR_PREFILL_REPLAY=0`.
+    /// Buckets longer than the model's context length are dropped.
+    pub fn set_prefill_buckets(&mut self, buckets: Vec<u64>) {
+        if !in_place_kv_supported(&self.runtime, &self.provider_binding) {
+            self.graph_cache.set_prefill_buckets(Vec::new());
+            return;
+        }
+        self.graph_cache
+            .set_prefill_buckets(super::prefill_buckets::buckets_within_context(
+                buckets,
+                self.fixture.config.architecture.context_length,
+            ));
+    }
+
+    /// Turns bucketed prefill replay (`replay-bucketed-prefill`) on or off
+    /// for later requests: prompt buckets, pooled KV stores for bucketed
+    /// requests, and prefill capture and replay together. On by default
+    /// where the Provider supports step capture; off with
+    /// `MAGNETAR_PREFILL_REPLAY=0`. Off, every prefill runs at its prompt's
+    /// exact length, per node.
+    pub fn set_prefill_replay(&mut self, enabled: bool) {
+        self.step_replay.set_prefill_enabled(enabled);
+        self.set_prefill_buckets(if enabled {
+            super::prefill_buckets::parse_prefill_buckets(
+                std::env::var("MAGNETAR_PREFILL_BUCKETS").ok().as_deref(),
+            )
+        } else {
+            Vec::new()
+        });
+    }
+
+    /// Bytes the pooled KV store sets hold, free or in use
+    /// (`replay-bucketed-prefill`).
+    pub fn kv_pool_bytes(&self) -> u64 {
+        self.kv_pool.held_bytes()
     }
 
     /// Turns decode-step capture and replay (`capture-and-replay-cuda-graphs`)
@@ -1542,36 +1604,55 @@ impl ProductionLoadedModel {
             .record(clock, StepPhase::Tokenize);
         let observer = InferenceApiObserver::new();
         let prompt_token_count = tokenized.token_ids.len() as u64;
+        // A bucketed prefill's graph and plan have its bucket's length
+        // (`replay-bucketed-prefill`), as the engine's step expects.
         let clock = self.runtime.phase_ledger().clock();
-        let component_graphs = match self.graph_cache.get(prompt_token_count) {
-            Some(graphs) => graphs,
-            None => {
-                let graphs = Arc::new(CachedGraphs::new(
-                    match &self.component_digest {
-                        Some(digest) => build_first_native_graphs_from_named_component(
-                            digest,
-                            &architecture_config_from_first_native_model_config(
-                                &self.fixture.config,
-                            ),
-                            &self.fixture.identity,
-                            prompt_token_count,
-                        )
-                        .map(|(graphs, _definition, _instance)| graphs),
-                        None => build_first_native_graphs_from_real_qwen_component(
-                            &self.fixture,
-                            prompt_token_count,
-                        )
-                        .map(|(graphs, _definition, _instance)| graphs),
-                    }
-                    .map_err(|error| InferenceApiError::GraphPlanningFailed {
-                        reason: error.to_string(),
-                    })
-                    .map(|graphs| self.graph_cache.optimize(&self.runtime, graphs))?,
-                ));
-                self.graph_cache
-                    .insert(prompt_token_count, Arc::clone(&graphs));
-                graphs
+        let (graph_length, component_graphs) = loop {
+            let graph_length = self.graph_cache.prefill_graph_length(prompt_token_count);
+            let component_graphs = match self.graph_cache.get(graph_length) {
+                Some(graphs) => graphs,
+                None => {
+                    let graphs = Arc::new(
+                        match &self.component_digest {
+                            Some(digest) => build_first_native_graphs_from_named_component(
+                                digest,
+                                &architecture_config_from_first_native_model_config(
+                                    &self.fixture.config,
+                                ),
+                                &self.fixture.identity,
+                                graph_length,
+                            )
+                            .map(|(graphs, _definition, _instance)| graphs),
+                            None => build_first_native_graphs_from_real_qwen_component(
+                                &self.fixture,
+                                graph_length,
+                            )
+                            .map(|(graphs, _definition, _instance)| graphs),
+                        }
+                        .map_err(|error| InferenceApiError::GraphPlanningFailed {
+                            reason: error.to_string(),
+                        })
+                        .map(|graphs| {
+                            self.graph_cache
+                                .prepare(&self.runtime, graphs, graph_length)
+                        })?,
+                    );
+                    self.graph_cache.insert(graph_length, Arc::clone(&graphs));
+                    graphs
+                }
+            };
+            // Padding rows are only invisible to KV history kept in place,
+            // where attention reads the first `key_count` rows: a graph whose
+            // KV edges have other readers runs at the prompt's exact length.
+            if (graph_length != prompt_token_count || component_graphs.logits_row)
+                && !component_graphs
+                    .prefill_memo
+                    .kv_edges_feed_only_attention(&component_graphs.prefill)
+            {
+                self.graph_cache.set_prefill_buckets(Vec::new());
+                continue;
             }
+            break (graph_length, component_graphs);
         };
         self.runtime
             .phase_ledger_mut()
@@ -1581,7 +1662,7 @@ impl ProductionLoadedModel {
             .prepared_plans(
                 &self.runtime,
                 &self.instance,
-                tokenized.token_ids.len() as u64,
+                graph_length,
                 &self.provider_binding,
             )
             .map_err(|error| InferenceApiError::GraphPlanningFailed {

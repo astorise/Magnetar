@@ -108,6 +108,8 @@ fn resident_production_model_reuses_component_graphs_per_prompt_length() {
         Arc::new(ReferenceCpuProvider::new()),
     )
     .expect("production loading succeeds");
+    // Exact-length prefills: one graph per prompt length.
+    model.set_prefill_buckets(Vec::new());
     let request = |prompt: String| ProductionGenerationRequest {
         prompt: PromptInput::PlainText(prompt),
         parameters: GenerationParameters::greedy(),

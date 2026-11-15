@@ -82,6 +82,7 @@ fn dispatch_reference_cpu_operator_multi_binds_every_output() {
     let provider: Arc<dyn ProviderExecutionApi> = Arc::new(ReferenceCpuExecutor::new());
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
+        resource_namespace: None,
         runtime: &mut runtime,
         provider,
         prepared_plan: None,
@@ -158,6 +159,7 @@ fn resident_input_passthrough_reuses_existing_resource_and_computes_correctly() 
     let provider: Arc<dyn ProviderExecutionApi> = Arc::new(OpaqueReportingExecutor::new());
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
+        resource_namespace: None,
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: None,
@@ -259,6 +261,7 @@ fn rmsnorm_accepts_a_resident_input_without_materializing_it_first() {
 
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
+        resource_namespace: None,
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: None,

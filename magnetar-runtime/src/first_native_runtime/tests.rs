@@ -1872,6 +1872,7 @@ pub(super) fn execute_qwen_prefill_hidden_states_through_dispatch(
     )?;
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
+        resource_namespace: None,
         runtime,
         provider: provider.clone(),
         prepared_plan: Some(prepared_plan),
@@ -2147,6 +2148,7 @@ pub(super) fn execute_qwen_decode_hidden_states_through_dispatch(
     )?;
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
+        resource_namespace: None,
         runtime,
         provider: provider.clone(),
         prepared_plan: Some(prepared_plan),
@@ -2466,6 +2468,7 @@ pub(super) fn build_runtime_with_model_execution_engine_and_forced_token(
             graph_cache: None,
             copy_based_kv: false,
             step_replay: StepReplay::default(),
+            kv_pool: KvStorePool::default(),
         }))
         .trust_store(
             ModelTrustStore::default().trust_digest(fixture.manifest.id.digest.value.clone()),
@@ -5447,6 +5450,7 @@ pub(super) fn check_graph_dispatch_ignores_kernel_registry_preference_change_aft
     let token_embedding = fixture_tensor_by_name(&fixture.weights, "token_embedding")?.clone();
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
+        resource_namespace: None,
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: Some(&mut plan),
@@ -5718,6 +5722,7 @@ pub(super) fn new_kv_lifecycle_engine(fixture: &E2eFixture) -> E2eRuntimeModelEx
         graph_cache: None,
         copy_based_kv: false,
         step_replay: StepReplay::default(),
+        kv_pool: KvStorePool::default(),
     }
 }
 
@@ -6714,6 +6719,8 @@ pub(super) struct ReplayingState {
     pub(super) next_capture: u64,
     pub(super) captured: u64,
     pub(super) replayed: u64,
+    /// Each replay's offset, in order.
+    pub(super) offsets: Vec<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -6987,6 +6994,7 @@ impl ProviderExecutionApi for ReplayingExecutor {
             .ok_or_else(|| StepReplayError::Invalidated {
                 reason: "unknown capture".into(),
             })?;
+        self.state.lock().unwrap().offsets.push(offset);
         for (id, tensor) in inputs {
             self.inner.write_tensor(id, tensor);
         }

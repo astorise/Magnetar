@@ -410,6 +410,7 @@ pub(super) fn check_operator_coverage(
     let provider: Arc<dyn ProviderExecutionApi> = Arc::new(ReferenceCpuExecutor::new());
     let mut node_events = Vec::new();
     let mut dispatch_ctx = FirstNativeDispatchContext {
+        resource_namespace: None,
         runtime: &mut runtime,
         provider: provider.clone(),
         prepared_plan: None,

@@ -502,8 +502,16 @@ fn generate_gguf_with(
         max_new_tokens: Some(max_new_tokens),
         max_generation_millis: None,
     };
-    model.generate(request(4), None).expect("warmup generates");
+    // Two warmups: with bucketed prefill replay (`replay-bucketed-prefill`)
+    // the first runs its prefill per node and the second captures it, so
+    // the measured request replays it, as every later request would.
+    for _ in 0..2 {
+        model.generate(request(4), None).expect("warmup generates");
+    }
 
+    // The measured request's prefill, by phase: what replaying it costs
+    // against running it per node (`replay-bucketed-prefill`).
+    model.enable_phase_attribution();
     let mut token_times = Vec::new();
     let started = Instant::now();
     let outcome = model
@@ -530,6 +538,34 @@ fn generate_gguf_with(
         if packed { "on" } else { "off" },
         tokens.len()
     );
+    let attribution = model.take_phase_attribution();
+    model.disable_phase_attribution();
+    if let Some(prefill) =
+        attribution.summary(magnetar_runtime::phase_attribution::StepKind::Prefill)
+    {
+        let mut phases: Vec<_> = prefill.phases.iter().collect();
+        phases.sort_by_key(|(_, total)| std::cmp::Reverse(total.host_micros));
+        let phases: Vec<String> = phases
+            .into_iter()
+            .take(6)
+            .map(|(key, total)| {
+                format!(
+                    "{:?}{} {:.2} ms",
+                    key.phase,
+                    key.operator
+                        .as_deref()
+                        .map(|operator| format!("({operator})"))
+                        .unwrap_or_default(),
+                    total.host_micros as f64 / 1_000.0
+                )
+            })
+            .collect();
+        eprintln!(
+            "[{label}] prefill: {:.2} ms, {}",
+            prefill.wall_micros as f64 / 1_000.0,
+            phases.join(", ")
+        );
+    }
     eprintln!("[{label}] generated token ids {tokens:?}");
     eprintln!("[{label}] generated text {:?}", outcome.text);
     model.unload().expect("the real checkpoint unloads");
@@ -763,6 +799,21 @@ fn real_public_mistral_7b_iq3_m_gguf_checkpoint_generates_on_cuda() {
     });
 }
 
+/// The real `Mistral-7B-Instruct-v0.3` `IQ3_M` export on the optimized
+/// CPU Provider.
+#[test]
+#[ignore = "downloads/holds a real quantized checkpoint"]
+fn real_public_mistral_7b_iq3_m_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native mistral-7b iq3_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ3_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ3_M.gguf",
+        sha256: MISTRAL_7B_IQ3_M_SHA256,
+    });
+}
+
 /// `Mistral-7B-Instruct-v0.3-IQ3_XXS.gguf`'s sha256 (2,830,880,992 bytes) at
 /// [`MISTRAL_7B_Q8_0_REVISION`], as Hugging Face declares it: mostly `IQ3_XXS`
 /// matrices.
@@ -797,6 +848,21 @@ const MISTRAL_7B_IQ2_M_SHA256: &str =
 fn real_public_mistral_7b_iq2_m_gguf_checkpoint_generates_on_cuda() {
     generate_q8_0_gguf_on_cuda(&CudaQ8Checkpoint {
         label: "cuda mistral-7b iq2_m gguf",
+        dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ2_M_REAL_CHECKPOINT_DIR",
+        repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+        revision: MISTRAL_7B_Q8_0_REVISION,
+        file: "Mistral-7B-Instruct-v0.3-IQ2_M.gguf",
+        sha256: MISTRAL_7B_IQ2_M_SHA256,
+    });
+}
+
+/// The real `Mistral-7B-Instruct-v0.3` `IQ2_M` export on the optimized
+/// CPU Provider.
+#[test]
+#[ignore = "downloads/holds a real quantized checkpoint"]
+fn real_public_mistral_7b_iq2_m_gguf_checkpoint_generates_on_native_cpu() {
+    generate_gguf_on_native_cpu(&CudaQ8Checkpoint {
+        label: "cpu-native mistral-7b iq2_m gguf",
         dir_env: "MAGNETAR_MISTRAL_7B_GGUF_IQ2_M_REAL_CHECKPOINT_DIR",
         repository: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
         revision: MISTRAL_7B_Q8_0_REVISION,

@@ -4775,6 +4775,11 @@ impl MemoryManager {
         self.tensor_residency.get(tensor)
     }
 
+    /// Every recorded Tensor Resource residency, by resource id.
+    pub fn tensor_residencies(&self) -> impl Iterator<Item = &TensorResidency> {
+        self.tensor_residency.values()
+    }
+
     pub fn staging_feasibility(
         &self,
         policy: HostStagingPolicy,

@@ -254,9 +254,9 @@ pub(super) fn dispatch_first_native_graph_node(
                 .ok_or_else(|| InferenceApiError::GraphPlanningFailed {
                     reason: format!("graph node '{node_id}' has no output edge"),
                 })?;
-        let output_resource_id = TensorResourceId::new(format!("edge.{output_edge}"));
+        let output_resource_id = ctx.edge_resource(output_edge.as_str());
         let placement = resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id);
-        let owner = MemoryAllocationOwner::Session(kv_cache_id.to_string());
+        let owner = ctx.output_owner(kv_cache_id);
         (output_resource_id, placement, owner)
     };
     match node.operator.name() {
@@ -673,9 +673,9 @@ pub(super) fn dispatch_first_native_graph_node(
                         ),
                     })?;
             let second_output_target: OutputTarget = (
-                TensorResourceId::new(format!("edge.{second_output_edge}")),
+                ctx.edge_resource(second_output_edge.as_str()),
                 resolved_output_placement(ctx.prepared_plan.as_deref(), &node.id),
-                MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                ctx.output_owner(kv_cache_id),
             );
             dispatch_qwen_split(
                 ctx,
@@ -806,7 +806,45 @@ pub(super) fn execute_first_native_graph_materializing(
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
     memo: Option<&GraphExecutionMemo>,
-    kv_store_capacity: Option<u64>,
+    kv_stores: Option<KvStoreSpec>,
+) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
+    execute_first_native_graph_namespaced(
+        runtime,
+        fixture,
+        model_instance,
+        kv_cache_id,
+        graph,
+        prepared_plan,
+        initial_bindings,
+        kv_history,
+        absolute_position_override,
+        node_events,
+        materialized,
+        memo,
+        kv_stores,
+        None,
+    )
+}
+
+/// [`execute_first_native_graph_materializing`] with node outputs under
+/// `resource_namespace` (see `FirstNativeDispatchContext::resource_namespace`),
+/// which also keeps every intermediate after its last reader.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_first_native_graph_namespaced(
+    runtime: &mut Runtime,
+    fixture: &E2eFixture,
+    model_instance: &ModelInstanceId,
+    kv_cache_id: &KvCacheId,
+    graph: &ExecutionGraph,
+    prepared_plan: &mut PreparedExecutionPlan,
+    initial_bindings: BTreeMap<TensorEdgeId, HostTensor>,
+    kv_history: Option<&LayerKvMap>,
+    absolute_position_override: Option<u64>,
+    node_events: &mut Vec<PerNodeCausalEvent>,
+    materialized: MaterializedEdges<'_>,
+    memo: Option<&GraphExecutionMemo>,
+    kv_stores: Option<KvStoreSpec>,
+    resource_namespace: Option<&str>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     execute_first_native_graph_with_resident_input(
         runtime,
@@ -822,7 +860,8 @@ pub(super) fn execute_first_native_graph_materializing(
         node_events,
         materialized,
         memo,
-        kv_store_capacity,
+        kv_stores,
+        resource_namespace,
     )
 }
 
@@ -840,6 +879,21 @@ pub(crate) enum MaterializedEdges<'a> {
     /// logits: only the last prompt row's distribution is sampled), read
     /// through `read_tensor_rows` so the other rows stay on the Device.
     LastRow(&'a [&'a str]),
+    /// [`Self::LastRow`] for the given row instead of the last one (a
+    /// bucketed prefill's last prompt row, followed by padding rows).
+    Row(&'a [&'a str], u64),
+}
+
+impl MaterializedEdges<'_> {
+    /// The edges of which one row is materialized, and that row (`None`:
+    /// the last).
+    pub(super) fn single_row(&self) -> Option<(&[&str], Option<u64>)> {
+        match *self {
+            MaterializedEdges::LastRow(edges) => Some((edges, None)),
+            MaterializedEdges::Row(edges, row) => Some((edges, Some(row))),
+            MaterializedEdges::All | MaterializedEdges::Only(_) => None,
+        }
+    }
 }
 
 /// [`execute_first_native_graph`], generalized to additionally accept graph inputs
@@ -869,7 +923,8 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
     memo: Option<&GraphExecutionMemo>,
-    kv_store_capacity: Option<u64>,
+    kv_stores: Option<KvStoreSpec>,
+    resource_namespace: Option<&str>,
 ) -> Result<FirstNativeGraphExecutionOutput, InferenceApiError> {
     let prepare_clock = runtime.phase_ledger().clock();
     let computed_order;
@@ -897,7 +952,7 @@ pub(super) fn execute_first_native_graph_with_resident_input(
     let executor = resolve_kernel_execution_provider(runtime, &provider_binding)?;
     // In-place KV history (`append-kv-history-in-place`) only when the
     // Provider supports it and attention is the only reader of KV edges.
-    let kv_store_capacity = kv_store_capacity.filter(|_| {
+    let kv_stores = kv_stores.filter(|_| {
         in_place_kv_supported(runtime, &provider_binding)
             && match memo {
                 Some(memo) => memo.kv_edges_feed_only_attention(graph),
@@ -942,7 +997,8 @@ pub(super) fn execute_first_native_graph_with_resident_input(
         absolute_position_override,
         node_events,
         materialized,
-        kv_store_capacity,
+        kv_stores,
+        resource_namespace,
     )?;
     Ok((dispatch, bindings, layer_kv, provider_binding))
 }
@@ -963,7 +1019,8 @@ pub(super) fn execute_first_native_graph_nodes(
     absolute_position_override: Option<u64>,
     node_events: &mut Vec<PerNodeCausalEvent>,
     materialized: MaterializedEdges<'_>,
-    kv_store_capacity: Option<u64>,
+    kv_stores: Option<KvStoreSpec>,
+    resource_namespace: Option<&str>,
 ) -> Result<FirstNativeGraphNodesOutput, InferenceApiError> {
     let graph = fingerprinted.graph();
     // This step's token count, for `PlanGuardContext::sequence_length`
@@ -978,6 +1035,7 @@ pub(super) fn execute_first_native_graph_nodes(
         .and_then(|shape| shape.first().copied());
     let mut dispatch_ctx = FirstNativeDispatchContext {
         runtime,
+        resource_namespace: resource_namespace.map(str::to_string),
         provider: executor.clone(),
         prepared_plan: Some(prepared_plan),
         graph: Some(fingerprinted),
@@ -1065,12 +1123,15 @@ pub(super) fn execute_first_native_graph_nodes(
     // 12 GB Device next to its weights). Decode steps keep theirs: a
     // captured step replays against the same resources.
     let release_intermediates = sequence_length.is_some_and(|rows| rows > 1)
+        && resource_namespace.is_none()
         && matches!(
             materialized,
-            MaterializedEdges::Only(_) | MaterializedEdges::LastRow(_)
+            MaterializedEdges::Only(_) | MaterializedEdges::LastRow(_) | MaterializedEdges::Row(..)
         );
     let kept_edges: &[&str] = match materialized {
-        MaterializedEdges::Only(edges) | MaterializedEdges::LastRow(edges) => edges,
+        MaterializedEdges::Only(edges)
+        | MaterializedEdges::LastRow(edges)
+        | MaterializedEdges::Row(edges, _) => edges,
         MaterializedEdges::All => &[],
     };
     let mut last_reader: BTreeMap<&TensorEdgeId, usize> = BTreeMap::new();
@@ -1169,10 +1230,10 @@ pub(super) fn execute_first_native_graph_nodes(
             };
             inputs.push(value);
         }
-        if let MaterializedEdges::LastRow(edges) = materialized
+        if let Some((edges, row)) = materialized.single_row()
             && last_row_suffices(node, edges)
         {
-            last_row_only(&*dispatch_ctx.provider, &mut inputs[0])?;
+            last_row_only(&*dispatch_ctx.provider, &mut inputs[0], row)?;
         }
         dispatch_ctx
             .runtime
@@ -1213,7 +1274,7 @@ pub(super) fn execute_first_native_graph_nodes(
                     reason: format!("first-native graph is missing edge '{output_edge_id}'"),
                 }
             })?;
-            let output_resource_id = graph_edge_resource_id(output_edge_id.as_str());
+            let output_resource_id = dispatch_ctx.edge_resource(output_edge_id.as_str());
             // Whether the Kernel already wrote directly into `output_resource_id`
             // (Decision 3's pre-admission, `dispatch_first_native_graph_node`) or this
             // loop must still explicitly (re-)write it: KV-history
@@ -1247,25 +1308,41 @@ pub(super) fn execute_first_native_graph_nodes(
                 // In-place history (`append-kv-history-in-place`): a decode
                 // step continues the stores its history lives in; a prefill
                 // starts new stores when this execution keeps KV in place.
+                // A prefill's stores are named after the request's KV cache,
+                // or after the pooled store set it was given
+                // (`replay-bucketed-prefill`); a decode step continues the
+                // stores its history names.
                 let in_place = match kv_history.and_then(|history| history.get(&layer)) {
                     Some(FirstNativeLayerKvState {
-                        rows: Some(rows), ..
+                        rows: Some(rows),
+                        k,
+                        v,
                     }) => Some((
-                        kv_store_capacity.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
+                        kv_stores.ok_or_else(|| InferenceApiError::KvCacheUnavailable {
                             reason: format!(
                                 "layer {layer} keeps its KV history in place, but this \
                                      execution cannot continue it"
                             ),
                         })?,
                         *rows,
+                        match role {
+                            KvRole::K => k.clone(),
+                            KvRole::V => v.clone(),
+                        },
                     )),
                     Some(_) => None,
-                    None => kv_store_capacity.map(|capacity| (capacity, 0)),
+                    None => kv_stores.map(|spec| {
+                        let store = match spec.pool_set {
+                            Some(set) => pooled_kv_store_id(set, layer, role_str),
+                            None => TensorResourceId::new(format!(
+                                "kv.{kv_cache_id}.layer{layer}.{role_str}.store"
+                            )),
+                        };
+                        (spec, 0, store)
+                    }),
                 };
-                if let Some((capacity, row_offset)) = in_place {
-                    let store = TensorResourceId::new(format!(
-                        "kv.{kv_cache_id}.layer{layer}.{role_str}.store"
-                    ));
+                if let Some((spec, row_offset, store)) = in_place {
+                    let capacity = spec.capacity;
                     let (rows, width) = output_tensor.rows_cols()?;
                     let valid_rows = row_offset
                         .checked_add(rows)
@@ -1278,15 +1355,33 @@ pub(super) fn execute_first_native_graph_nodes(
                         })?;
                     let store_descriptor = f32_tensor_descriptor_from_shape(&[capacity, width]);
                     let append_clock = dispatch_ctx.runtime.phase_ledger().clock();
-                    if row_offset == 0 {
-                        // A new store, admitted once for the whole request.
+                    // A pooled store already admitted keeps its storage: no
+                    // row is read before this request writes it.
+                    // ...and only while its admission is live: an
+                    // admission released behind the pool's back is redone.
+                    let pooled_store_held = spec.pool_set.is_some()
+                        && dispatch_ctx
+                            .runtime
+                            .memory()
+                            .tensor_residency(&store)
+                            .and_then(|residency| residency.allocation)
+                            .is_some_and(|allocation| {
+                                dispatch_ctx.runtime.memory().is_live_allocation(allocation)
+                            });
+                    if row_offset == 0 && !pooled_store_held {
+                        // A new store, admitted once for the whole request
+                        // (for a pooled one, for as long as the pool keeps it).
+                        let owner = match spec.pool_set {
+                            Some(_) => MemoryAllocationOwner::Session(KV_STORE_POOL_OWNER.into()),
+                            None => MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                        };
                         let target: OutputTarget = (
                             store.clone(),
                             resolved_output_placement(
                                 dispatch_ctx.prepared_plan.as_deref(),
                                 node_id,
                             ),
-                            MemoryAllocationOwner::Session(kv_cache_id.to_string()),
+                            owner,
                         );
                         let (store_id, _) = resolve_output_target(
                             &mut dispatch_ctx,
@@ -1599,7 +1694,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 }
                 // Only a node output's own resource: never a graph input,
                 // a weight or a KV store an edge resolves to.
-                let own = graph_edge_resource_id(edge_id.as_str());
+                let own = dispatch_ctx.edge_resource(edge_id.as_str());
                 if bindings.get(edge_id).is_some_and(|(id, _)| *id == own) {
                     bindings.remove(edge_id);
                     let _ = dispatch_ctx
@@ -1653,11 +1748,14 @@ pub(super) fn execute_first_native_graph_nodes(
         reason: "first-native graph executed no nodes".into(),
     })?;
     let materialize_clock = dispatch_ctx.runtime.phase_ledger().clock();
-    if let MaterializedEdges::Only(edges) | MaterializedEdges::LastRow(edges) = materialized {
+    if let MaterializedEdges::Only(edges)
+    | MaterializedEdges::LastRow(edges)
+    | MaterializedEdges::Row(edges, _) = materialized
+    {
         bindings.retain(|edge_id, _| edges.contains(&edge_id.as_str()));
     }
-    let materialized_bindings = if let MaterializedEdges::LastRow(_) = materialized {
-        materialize_last_rows(&*dispatch_ctx.provider, &bindings)?
+    let materialized_bindings = if let Some((_, row)) = materialized.single_row() {
+        materialize_last_rows(&*dispatch_ctx.provider, &bindings, row)?
     } else {
         materialize_first_native_graph_bindings(&*dispatch_ctx.provider, &bindings)?
     };
@@ -1691,15 +1789,29 @@ pub(super) fn trace_step_capture(what: &str, reason: impl std::fmt::Display) {
 pub(super) fn replay_decode_step(
     runtime: &mut Runtime,
     recorded: &RecordedDecodeStep,
-    ids_tensor: HostTensor,
+    inputs: Vec<HostTensor>,
     absolute_position: u64,
     greedy: Option<&DeviceGreedyPlan>,
 ) -> Result<Option<(FirstNativeGraphExecutionOutput, Option<u64>)>, InferenceApiError> {
     let Some(offset) = absolute_position.checked_sub(recorded.position) else {
         return Ok(None);
     };
+    replay_recorded_step(runtime, recorded, inputs, offset, true, greedy)
+}
+
+/// Replays a recorded step with `offset`: a decode step's position
+/// advance, whose KV rows advance with it (`advance_kv_rows`), or a
+/// bucketed prefill's padding rows, which its KV rows ignore.
+pub(super) fn replay_recorded_step(
+    runtime: &mut Runtime,
+    recorded: &RecordedDecodeStep,
+    inputs: Vec<HostTensor>,
+    offset: u64,
+    advance_kv_rows: bool,
+    greedy: Option<&DeviceGreedyPlan>,
+) -> Result<Option<(FirstNativeGraphExecutionOutput, Option<u64>)>, InferenceApiError> {
     let mut layer_kv = recorded.layer_kv.clone();
-    for layer in layer_kv.values_mut() {
+    for layer in layer_kv.values_mut().filter(|_| advance_kv_rows) {
         let Some(rows) = layer.rows.and_then(|rows| rows.checked_add(offset)) else {
             return Ok(None);
         };
@@ -1710,7 +1822,7 @@ pub(super) fn replay_decode_step(
     let replayed = executor.replay_step(
         &recorded.capture,
         offset,
-        vec![(recorded.input.clone(), ids_tensor)],
+        recorded.inputs.iter().cloned().zip(inputs).collect(),
     );
     runtime
         .phase_ledger_mut()
