@@ -1020,8 +1020,13 @@ pub(super) fn resolve_output_target(
                 })?;
             Ok((id, descriptor))
         }
+        // A namespaced execution's synthesized outputs are its own too
+        // (a RoPE over a KV edge), never another graph's buffer.
         None => Ok((
-            TensorResourceId::new(format!("{operation_id}.out")),
+            TensorResourceId::new(match &ctx.resource_namespace {
+                Some(namespace) => format!("{namespace}.{operation_id}.out"),
+                None => format!("{operation_id}.out"),
+            }),
             descriptor,
         )),
     }

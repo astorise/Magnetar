@@ -430,6 +430,23 @@ fn bucketed_prefills_are_captured_once_then_replayed() {
     }
     // Per node, captured, then replayed twice.
     assert_eq!(counts, vec![(0, 0), (1, 0), (1, 1), (1, 2)]);
+    // Everything the recording writes is the bucket's own or a pooled
+    // store: a decode step never reallocates it.
+    let state = harness.executor.state.lock().unwrap();
+    let written: BTreeSet<String> = state
+        .captures
+        .values()
+        .flat_map(|capture| &capture.invocations)
+        .flat_map(|(_, _, invocation)| &invocation.outputs)
+        .map(|output| output.resource.id.as_str().to_string())
+        .collect();
+    assert!(!written.is_empty());
+    for id in &written {
+        assert!(
+            id.starts_with("prefill8.") || id.starts_with("kv.pool"),
+            "the prefill recording writes '{id}'"
+        );
+    }
     assert_eq!(harness.engine.step_replay.prefill_recordings(), 1);
 }
 
