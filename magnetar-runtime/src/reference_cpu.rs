@@ -491,6 +491,44 @@ pub fn rope_with_frequency_scaling(
     pairing: RopePairing,
     frequency_scaling: Option<&RopeBandedFrequencyScaling>,
 ) -> Result<HostTensor, ReferenceCpuError> {
+    rope_partial(
+        input,
+        base,
+        scale,
+        dimension,
+        position_offset,
+        head_count,
+        pairing,
+        frequency_scaling,
+        None,
+    )
+}
+
+/// [`rope_with_frequency_scaling`] where only `floor(partial_rotary_factor
+/// * dimension / 2)` pairs rotate when the factor is set
+/// (`rope.partial_rotary_factor`, `extend-portable-operator-attributes`):
+/// the other pairs have frequency 0 and are left unchanged. The pairing
+/// and the frequency denominator still span the whole `dimension`.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_partial(
+    input: &HostTensor,
+    base: f32,
+    scale: f32,
+    dimension: u64,
+    position_offset: u64,
+    head_count: u64,
+    pairing: RopePairing,
+    frequency_scaling: Option<&RopeBandedFrequencyScaling>,
+    partial_rotary_factor: Option<f32>,
+) -> Result<HostTensor, ReferenceCpuError> {
+    if partial_rotary_factor
+        .is_some_and(|factor| !(factor.is_finite() && factor > 0.0 && factor <= 1.0))
+    {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "RoPE partial_rotary_factor must lie in (0, 1]",
+        ));
+    }
     if let Some(scaling) = frequency_scaling {
         scaling.validate().map_err(|reason| {
             ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason)
@@ -528,13 +566,16 @@ pub fn rope_with_frequency_scaling(
     }
     let mut out = input.data.clone();
     let half = (dimension / 2) as usize;
+    let rotated_pairs = partial_rotary_factor.map_or(half, |factor| {
+        (factor as f64 * dimension as f64 / 2.0).floor() as usize
+    });
     let head_width = head_width as usize;
     for row in 0..rows as usize {
         let position = ((position_offset as usize + row) as f32) * scale;
         let row_start = row * cols as usize;
         for head in 0..head_count as usize {
             let col_base = row_start + head * head_width;
-            for pair in 0..half {
+            for pair in 0..rotated_pairs.min(half) {
                 let mut frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
                 if let Some(scaling) = frequency_scaling {
                     frequency = scaling.scale_frequency(frequency);
@@ -660,6 +701,40 @@ pub fn attention(
     window_size: Option<u64>,
     causal: bool,
 ) -> Result<HostTensor, ReferenceCpuError> {
+    attention_scaled(
+        q,
+        k,
+        v,
+        head_count,
+        head_dimension,
+        kv_head_count,
+        window_size,
+        causal,
+        None,
+    )
+}
+
+/// [`attention`] whose scores are scaled by `score_scale` instead of
+/// `1/sqrt(head_dimension)` when set (`attention.scale`,
+/// `extend-portable-operator-attributes`).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_scaled(
+    q: &HostTensor,
+    k: &HostTensor,
+    v: &HostTensor,
+    head_count: u64,
+    head_dimension: u64,
+    kv_head_count: Option<u64>,
+    window_size: Option<u64>,
+    causal: bool,
+    score_scale: Option<f32>,
+) -> Result<HostTensor, ReferenceCpuError> {
+    if score_scale.is_some_and(|scale| !scale.is_finite()) {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "attention scale must be finite",
+        ));
+    }
     same_shape(k, v)?;
     let kv_head_count = kv_head_count.unwrap_or(head_count);
     if head_count == 0 || head_dimension == 0 || kv_head_count == 0 {
@@ -723,7 +798,7 @@ pub fn attention(
     let q_model_dim = q_model_dim as usize;
     let kv_model_dim = kv_model_dim as usize;
     let head_dimension = head_dimension as usize;
-    let scale = 1.0 / (head_dimension as f32).sqrt();
+    let scale = score_scale.unwrap_or(1.0 / (head_dimension as f32).sqrt());
     // Queries are the *last* `seq_len` positions of the sequence the keys
     // cover. For prefill the two lengths match and this offset is zero; for a
     // decode step against a populated cache it is what places the new token at
@@ -1752,6 +1827,16 @@ impl ReferenceCpuExecutor {
         }
     }
 
+    fn attribute_float_opt(
+        attributes: &BTreeMap<String, OperatorAttributeValue>,
+        key: &str,
+    ) -> Option<f32> {
+        match attributes.get(key) {
+            Some(OperatorAttributeValue::Float(value)) => Some(*value as f32),
+            _ => None,
+        }
+    }
+
     fn attribute_integer(
         attributes: &BTreeMap<String, OperatorAttributeValue>,
         key: &str,
@@ -2248,8 +2333,37 @@ impl ReferenceCpuExecutor {
                     normalize,
                 };
                 let (first, count) = moe_local_experts(&invocation.attributes, routing.experts);
-                moe_experts_local(&h, &logits, [&gate, &up, &down], routing, first, count)
-                    .map_err(KernelError::from)?
+                let activation = match invocation.attributes.get("activation") {
+                    None => crate::operator_semantics::MoeExpertActivation::Silu,
+                    Some(OperatorAttributeValue::String(name)) => {
+                        crate::operator_semantics::MoeExpertActivation::from_attribute(name)
+                            .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                                attribute: format!("moe-experts activation '{name}'"),
+                            })?
+                    }
+                    Some(_) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "moe-experts activation must be a string".into(),
+                        });
+                    }
+                };
+                let per_expert_scale = match invocation.inputs.len() {
+                    6 => Some(self.input_tensor(invocation, 5)?),
+                    _ => None,
+                };
+                crate::operator_semantics::moe_experts_local_with(
+                    &h,
+                    &logits,
+                    [&gate, &up, &down],
+                    routing,
+                    first,
+                    count,
+                    crate::operator_semantics::MoeExpertOptions {
+                        activation,
+                        per_expert_scale: per_expert_scale.as_ref(),
+                    },
+                )
+                .map_err(KernelError::from)?
             }
             "row-scale" => {
                 let x = self.input_tensor(invocation, 0)?;
@@ -2259,13 +2373,53 @@ impl ReferenceCpuExecutor {
             "embedding" => {
                 let table = self.input_tensor(invocation, 0)?;
                 let ids = self.input_tensor(invocation, 1)?;
-                embedding_lookup(&table, &ids).map_err(KernelError::from)?
+                let rows = embedding_lookup(&table, &ids).map_err(KernelError::from)?;
+                match Self::attribute_float_opt(&invocation.attributes, "scale") {
+                    Some(factor) => crate::operator_semantics::scale(&rows, factor)
+                        .map_err(KernelError::from)?,
+                    None => rows,
+                }
             }
             "rmsnorm" => {
                 let input = self.input_tensor(invocation, 0)?;
-                let weight = self.input_tensor(invocation, 1)?;
                 let epsilon = Self::attribute_float(&invocation.attributes, "epsilon", 1e-6);
-                rmsnorm(&input, &weight, epsilon).map_err(KernelError::from)?
+                // Present head attributes must both be positive integers:
+                // a malformed one is refused, never read as absent.
+                let head = |name: &str| match invocation.attributes.get(name) {
+                    None => Ok(None),
+                    Some(OperatorAttributeValue::Integer(value)) if *value > 0 => {
+                        Ok(Some(*value as u64))
+                    }
+                    Some(other) => Err(KernelError::KernelAttributeUnsupported {
+                        attribute: format!("rmsnorm {name} {other:?} must be a positive integer"),
+                    }),
+                };
+                let heads = match (head("head_count")?, head("head_dimension")?) {
+                    (Some(count), Some(dimension)) => Some((count, dimension)),
+                    (None, None) => None,
+                    _ => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "rmsnorm head_count and head_dimension go together".into(),
+                        });
+                    }
+                };
+                let weight = match invocation.inputs.len() {
+                    1 => None,
+                    _ => Some(self.input_tensor(invocation, 1)?),
+                };
+                match (&weight, heads) {
+                    // Today's form keeps its own weight shapes.
+                    (Some(weight), None) => {
+                        rmsnorm(&input, weight, epsilon).map_err(KernelError::from)?
+                    }
+                    _ => crate::operator_semantics::rmsnorm_blocks(
+                        &input,
+                        weight.as_ref(),
+                        epsilon,
+                        heads,
+                    )
+                    .map_err(KernelError::from)?,
+                }
             }
             "rope" => {
                 let input = self.input_tensor(invocation, 0)?;
@@ -2337,7 +2491,7 @@ impl ReferenceCpuExecutor {
                     &invocation.attributes,
                 )
                 .map_err(|attribute| KernelError::KernelAttributeUnsupported { attribute })?;
-                rope_with_frequency_scaling(
+                rope_partial(
                     &input,
                     base,
                     scale,
@@ -2346,6 +2500,7 @@ impl ReferenceCpuExecutor {
                     head_count,
                     pairing,
                     frequency_scaling.as_ref(),
+                    Self::attribute_float_opt(&invocation.attributes, "partial_rotary_factor"),
                 )
                 .map_err(KernelError::from)?
             }
@@ -2416,7 +2571,7 @@ impl ReferenceCpuExecutor {
                         leading_rows(&v, key_count).map_err(KernelError::from)?,
                     ),
                 };
-                attention(
+                attention_scaled(
                     &q,
                     &k,
                     &v,
@@ -2425,6 +2580,7 @@ impl ReferenceCpuExecutor {
                     kv_head_count,
                     window_size,
                     causal,
+                    Self::attribute_float_opt(&invocation.attributes, "scale"),
                 )
                 .map_err(KernelError::from)?
             }
@@ -2433,7 +2589,19 @@ impl ReferenceCpuExecutor {
                 softmax_rows(&input).map_err(KernelError::from)?
             }
             "silu" => silu(&self.input_tensor(invocation, 0)?),
-            "gelu" => gelu(&self.input_tensor(invocation, 0)?),
+            "gelu" => {
+                // The portable `gelu` is the tanh approximation.
+                match invocation.attributes.get("approximate") {
+                    None => {}
+                    Some(OperatorAttributeValue::String(value)) if value == "tanh" => {}
+                    Some(other) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("gelu approximate {other:?} is not implemented"),
+                        });
+                    }
+                }
+                gelu(&self.input_tensor(invocation, 0)?)
+            }
             "activation" => {
                 let input = self.input_tensor(invocation, 0)?;
                 let kind = match invocation.attributes.get("kind") {
@@ -2444,10 +2612,21 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
+                let float = |name: &str| {
+                    Self::attribute_float_opt(&invocation.attributes, name).ok_or_else(|| {
+                        KernelError::KernelAttributeUnsupported {
+                            attribute: format!("activation kind '{kind}' needs '{name}'"),
+                        }
+                    })
+                };
                 match kind {
                     "silu" => silu(&input),
                     "gelu" => gelu(&input),
                     "sigmoid" => sigmoid(&input),
+                    "softcap" => crate::operator_semantics::softcap(&input, float("cap")?)
+                        .map_err(KernelError::from)?,
+                    "scale" => crate::operator_semantics::scale(&input, float("factor")?)
+                        .map_err(KernelError::from)?,
                     other => {
                         return Err(KernelError::KernelAttributeUnsupported {
                             attribute: format!("activation kind '{other}' is not implemented"),
@@ -2463,7 +2642,7 @@ impl ReferenceCpuExecutor {
             "mul" => {
                 let a = self.input_tensor(invocation, 0)?;
                 let b = self.input_tensor(invocation, 1)?;
-                mul(&a, &b).map_err(KernelError::from)?
+                crate::operator_semantics::mul_broadcast(&a, &b).map_err(KernelError::from)?
             }
             "concat" => {
                 let a = self.input_tensor(invocation, 0)?;

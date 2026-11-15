@@ -198,6 +198,10 @@ pub enum ShapeRule {
     Any,
     SameRank,
     SameShape,
+    /// Every tensor has the first input's shape, except that the second
+    /// input may instead have shape `[1]`: one value broadcast to every
+    /// element (`extend-portable-operator-attributes`).
+    SameShapeOrScalar,
     Matmul,
     RmsNorm,
     RowBroadcastAdd,
@@ -531,7 +535,11 @@ impl OperatorAttributeSchema {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperatorSpec {
     pub id: OperatorId,
+    /// The most inputs an invocation takes.
     pub inputs: usize,
+    /// The fewest inputs an invocation takes: the inputs past it are
+    /// optional and trailing (`extend-portable-operator-attributes`).
+    pub min_inputs: usize,
     pub outputs: usize,
     pub attributes: OperatorAttributeSchema,
     pub shape_rule: ShapeRule,
@@ -546,6 +554,7 @@ impl OperatorSpec {
         Self {
             id,
             inputs,
+            min_inputs: inputs,
             outputs,
             attributes: OperatorAttributeSchema::default(),
             shape_rule: ShapeRule::Any,
@@ -554,6 +563,12 @@ impl OperatorSpec {
             memory: OperatorMemoryBehavior::pure(),
             determinism: OperatorDeterminism::default(),
         }
+    }
+
+    /// Accepts as few as `min_inputs` inputs, the rest trailing and optional.
+    pub fn with_min_inputs(mut self, min_inputs: usize) -> Self {
+        self.min_inputs = min_inputs.min(self.inputs);
+        self
     }
 
     pub fn with_attributes(mut self, attributes: OperatorAttributeSchema) -> Self {
@@ -588,9 +603,13 @@ impl OperatorSpec {
         attributes: &BTreeMap<String, OperatorAttributeValue>,
     ) -> Result<(), OperatorError> {
         self.attributes.validate(attributes)?;
-        if inputs.len() != self.inputs {
+        if inputs.len() < self.min_inputs || inputs.len() > self.inputs {
             return Err(OperatorError::InputArityInvalid {
-                expected: self.inputs,
+                expected: if inputs.len() < self.min_inputs {
+                    self.min_inputs
+                } else {
+                    self.inputs
+                },
                 actual: inputs.len(),
             });
         }
@@ -928,7 +947,7 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
         (
             "moe-experts",
             OperatorFamily::LinearAlgebra,
-            5,
+            6,
             1,
             ShapeRule::Any,
         ),
@@ -999,7 +1018,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
             1,
             ShapeRule::RowBroadcastAdd,
         ),
-        ("mul", OperatorFamily::Tensor, 2, 1, ShapeRule::SameShape),
+        (
+            "mul",
+            OperatorFamily::Tensor,
+            2,
+            1,
+            ShapeRule::SameShapeOrScalar,
+        ),
         ("concat", OperatorFamily::Tensor, 2, 1, ShapeRule::RowConcat),
         // `append-kv-history-in-place`: writes `rows` into `store` at
         // `row_offset`, in place; the output resource is the store itself.
@@ -1072,6 +1097,13 @@ pub fn initial_operator_catalog() -> OperatorCatalog {
                 TensorLayoutKind::BrowserCompatible,
             ]);
         spec.attributes = default_attribute_schema(name);
+        // Optional trailing inputs: a scale-less RMSNorm, and the experts'
+        // optional per-expert output scale.
+        spec.min_inputs = match name {
+            "rmsnorm" => 1,
+            "moe-experts" => 5,
+            _ => inputs,
+        };
         if name == "kv-write" {
             spec.memory = OperatorMemoryBehavior {
                 mutates_input: true,
@@ -1148,6 +1180,11 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "key_count",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            // The factor applied to `QK^T` instead of `1/sqrt(head_dimension)`.
+            .with_rule(
+                "scale",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
             ),
         "kv-write" => OperatorAttributeSchema::default().with_rule(
             "row_offset",
@@ -1221,6 +1258,12 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "original_context_length",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            // Only `floor(factor * dimension / 2)` pairs rotate; the rest
+            // keep frequency 0. In `(0, 1]`; absent: every pair rotates.
+            .with_rule(
+                "partial_rotary_factor",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
             ),
         "rmsnorm" | "layernorm" => OperatorAttributeSchema::default()
             .with_rule(
@@ -1234,6 +1277,16 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "accumulation_dtype",
                 OperatorAttributeRule::optional(OperatorAttributeKind::DType),
+            )
+            // Per-head normalization: `head_count` blocks of
+            // `head_dimension`, each normalized alone, one shared weight.
+            .with_rule(
+                "head_count",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "head_dimension",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             ),
         "moe-experts" => OperatorAttributeSchema::default()
             .with_rule(
@@ -1255,10 +1308,37 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "expert_count",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            // The experts' gate activation: `silu` (absent) or `gelu_tanh`.
+            .with_rule(
+                "activation",
+                OperatorAttributeRule::optional(OperatorAttributeKind::String),
             ),
-        "activation" => OperatorAttributeSchema::default().with_rule(
-            "kind",
-            OperatorAttributeRule::required(OperatorAttributeKind::String),
+        "activation" => OperatorAttributeSchema::default()
+            .with_rule(
+                "kind",
+                OperatorAttributeRule::required(OperatorAttributeKind::String),
+            )
+            // `kind = "softcap"`: `cap * tanh(x / cap)`.
+            .with_rule(
+                "cap",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            // `kind = "scale"`: `x * factor`.
+            .with_rule(
+                "factor",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            ),
+        // The portable `gelu` is the tanh approximation; `approximate`
+        // states it (`"tanh"`), any other value is refused.
+        "gelu" => OperatorAttributeSchema::default().with_rule(
+            "approximate",
+            OperatorAttributeRule::optional(OperatorAttributeKind::String),
+        ),
+        // The gathered rows multiplied by `scale`.
+        "embedding" => OperatorAttributeSchema::default().with_rule(
+            "scale",
+            OperatorAttributeRule::optional(OperatorAttributeKind::Float),
         ),
         "quantize" | "dequantize" => OperatorAttributeSchema::default()
             .with_rule(
@@ -1322,6 +1402,23 @@ fn validate_shape_rule(
                     reason: "tensor shapes differ".into(),
                 })
         }
+        ShapeRule::SameShapeOrScalar => {
+            let Some(first) = inputs.first().or_else(|| outputs.first()) else {
+                return Ok(());
+            };
+            inputs
+                .iter()
+                .chain(outputs)
+                .enumerate()
+                .all(|(index, tensor)| {
+                    tensor.shape.dimensions == first.shape.dimensions
+                        || (index == 1 && tensor.shape.dimensions.as_slice() == [1])
+                })
+                .then_some(())
+                .ok_or_else(|| OperatorError::ShapeMismatch {
+                    reason: "tensor shapes differ and the second input is not a [1] scalar".into(),
+                })
+        }
         ShapeRule::Matmul => {
             if inputs.len() < 2 {
                 return Err(OperatorError::InputArityInvalid {
@@ -1339,9 +1436,9 @@ fn validate_shape_rule(
             Ok(())
         }
         ShapeRule::RmsNorm => {
-            if inputs.len() < 2 {
+            if inputs.is_empty() {
                 return Err(OperatorError::InputArityInvalid {
-                    expected: 2,
+                    expected: 1,
                     actual: inputs.len(),
                 });
             }
@@ -1352,22 +1449,35 @@ fn validate_shape_rule(
                 });
             }
             let input = &inputs[0].shape.dimensions;
-            let weight = &inputs[1].shape.dimensions;
             let output = &outputs[0].shape.dimensions;
             if output != input {
                 return Err(OperatorError::ShapeMismatch {
                     reason: "RMSNorm output shape must match input".into(),
                 });
             }
+            // A scale-less RMSNorm has no weight.
+            let Some(weight) = inputs.get(1).map(|weight| &weight.shape.dimensions) else {
+                return Ok(());
+            };
             let Some(cols) = input.last() else {
                 return Err(OperatorError::ShapeUnsupported {
                     reason: "RMSNorm input must have at least one dimension".into(),
                 });
             };
             let row_broadcast_weight = weight.len() == 2 && weight[0] == 1 && weight[1] == *cols;
-            if weight.as_slice() != [*cols] && weight != input && !row_broadcast_weight {
+            // A per-head RMSNorm's `[head_dimension]` weight divides the
+            // row (`head_count * head_dimension`); its kernel checks the
+            // attributes against it.
+            let head_weight =
+                matches!(weight.as_slice(), [width] if *width > 0 && cols.is_multiple_of(*width));
+            if weight.as_slice() != [*cols]
+                && weight != input
+                && !row_broadcast_weight
+                && !head_weight
+            {
                 return Err(OperatorError::ShapeMismatch {
-                    reason: "RMSNorm weight shape must be [cols], [1, cols], or input-shaped"
+                    reason: "RMSNorm weight shape must be [cols], [1, cols], [head_dimension] \
+                             dividing cols, or input-shaped"
                         .into(),
                 });
             }

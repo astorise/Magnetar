@@ -2763,3 +2763,359 @@ fn stream_materialize_model_instance_weights_rolls_back_on_failure_at_any_positi
         }
     }
 }
+
+// `extend-portable-operator-attributes`: every new attribute and operand
+// form, run as a Kernel invocation (so the catalog validates it too) and
+// compared with an independent computation.
+
+/// Runs the Reference CPU Kernel for `operator` on `inputs`, returning its
+/// output, or `None` when the invocation fails.
+fn invoke_extended(
+    operator: &str,
+    inputs: &[HostTensor],
+    output_shape: &[u64],
+    attributes: &[(&str, OperatorAttributeValue)],
+) -> Option<HostTensor> {
+    let provider = ReferenceCpuProvider::new();
+    let executor = provider.executor();
+    let advertisements = provider.kernel_advertisements();
+    let advertisement = reference_cpu_kernel_by_name(&advertisements, operator);
+    let catalog = initial_operator_catalog();
+    let spec = catalog.get(&advertisement.implemented_operator).unwrap();
+    let mut invocation = KernelInvocation::new(
+        KernelInvocationId::new(format!("extended-{operator}")),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    for (index, tensor) in inputs.iter().enumerate() {
+        let (id, resource) = reference_cpu_resource(
+            &format!("extended-{operator}-in{index}"),
+            tensor.shape.clone(),
+        );
+        executor.write_tensor(id, tensor.clone());
+        invocation = invocation.with_input(resource);
+    }
+    let (out_id, out_resource) =
+        reference_cpu_resource(&format!("extended-{operator}-out"), output_shape.to_vec());
+    invocation = invocation.with_output(out_resource).with_attributes(
+        attributes
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect(),
+    );
+    if advertisement.workspace.required {
+        let mut memory = MemoryManager::new(MemoryManagerConfig::default());
+        invocation =
+            invocation.with_workspace(executor.allocate_workspace(&mut memory, 4096).unwrap());
+    }
+    let result = executor.execute_invocation(advertisement, spec, &invocation);
+    (result.status == KernelResultStatus::Succeeded)
+        .then(|| executor.read_tensor(&out_id))
+        .flatten()
+}
+
+fn assert_all_close(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
+        assert!((a - e).abs() <= 1e-5, "value {index}: {a} vs {e}");
+    }
+}
+
+fn float(value: f64) -> OperatorAttributeValue {
+    OperatorAttributeValue::Float(value)
+}
+
+fn text(value: &str) -> OperatorAttributeValue {
+    OperatorAttributeValue::String(value.into())
+}
+
+#[test]
+fn attention_scale_replaces_the_inverse_square_root() {
+    // One head of width 2, three keys, the last query row, causal.
+    let q = reference_cpu_host_tensor([1, 2], [0.5, -1.0]);
+    let k = reference_cpu_host_tensor([3, 2], [1.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+    let v = reference_cpu_host_tensor([3, 2], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let attributes = [
+        ("head_count", OperatorAttributeValue::Integer(1)),
+        ("head_dimension", OperatorAttributeValue::Integer(2)),
+        ("causal", OperatorAttributeValue::Boolean(true)),
+        ("scale", float(1.0)),
+    ];
+    let actual = invoke_extended(
+        "attention",
+        &[q.clone(), k.clone(), v.clone()],
+        &[1, 2],
+        &attributes,
+    )
+    .expect("attention with a scale runs");
+    // Scores q . k_j, unscaled; softmax; weighted V.
+    let scores: Vec<f32> = (0..3)
+        .map(|j| q.data[0] * k.data[2 * j] + q.data[1] * k.data[2 * j + 1])
+        .collect();
+    let max = scores.iter().cloned().fold(f32::MIN, f32::max);
+    let weights: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+    let total: f32 = weights.iter().sum();
+    let expected: Vec<f32> = (0..2)
+        .map(|c| (0..3).map(|j| weights[j] / total * v.data[2 * j + c]).sum())
+        .collect();
+    assert_all_close(&actual.data, &expected);
+    // Absent, the default `1/sqrt(2)` gives a different result.
+    let unscaled = invoke_extended("attention", &[q, k, v], &[1, 2], &attributes[..3]).unwrap();
+    assert!(unscaled.data != actual.data);
+}
+
+#[test]
+fn partial_rope_rotates_only_its_share_of_pairs() {
+    // One head of width 8, `half_split` pairs (i, i + 4), position 3: with
+    // a factor of 0.25 only pair 0 rotates, with frequency base^0 = 1.
+    let input = reference_cpu_host_tensor([1, 8], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    let attributes = [
+        ("base", float(10000.0)),
+        ("dimension", OperatorAttributeValue::Integer(8)),
+        ("rotation_pairing", text("half_split")),
+        ("position_offset", OperatorAttributeValue::Integer(3)),
+        ("partial_rotary_factor", float(0.25)),
+    ];
+    let actual =
+        invoke_extended("rope", std::slice::from_ref(&input), &[1, 8], &attributes).unwrap();
+    let (sin, cos) = 3.0_f32.sin_cos();
+    let mut expected = input.data.clone();
+    expected[0] = input.data[0] * cos - input.data[4] * sin;
+    expected[4] = input.data[0] * sin + input.data[4] * cos;
+    assert_all_close(&actual.data, &expected);
+    // A factor of 1 is ordinary RoPE; one outside (0, 1] is refused.
+    let mut full = attributes.clone();
+    full[4].1 = float(1.0);
+    assert_eq!(
+        invoke_extended("rope", std::slice::from_ref(&input), &[1, 8], &full).unwrap(),
+        invoke_extended(
+            "rope",
+            std::slice::from_ref(&input),
+            &[1, 8],
+            &attributes[..4]
+        )
+        .unwrap()
+    );
+    full[4].1 = float(1.5);
+    assert!(invoke_extended("rope", &[input], &[1, 8], &full).is_none());
+}
+
+#[test]
+fn gelu_accepts_only_its_tanh_approximation() {
+    let input = reference_cpu_host_tensor([1, 3], [-1.0, 0.5, 2.0]);
+    let tanh = invoke_extended(
+        "gelu",
+        std::slice::from_ref(&input),
+        &[1, 3],
+        &[("approximate", text("tanh"))],
+    )
+    .unwrap();
+    let expected: Vec<f32> = input
+        .data
+        .iter()
+        .map(|&x| crate::operator_semantics::gelu_tanh(x))
+        .collect();
+    assert_all_close(&tanh.data, &expected);
+    assert!(invoke_extended("gelu", &[input], &[1, 3], &[("approximate", text("none"))]).is_none());
+}
+
+#[test]
+fn per_head_and_scale_less_rmsnorm_normalize_each_block() {
+    let input = reference_cpu_host_tensor([1, 4], [1.0, 3.0, -2.0, 2.0]);
+    let weight = reference_cpu_host_tensor([2], [0.5, 2.0]);
+    let epsilon = 1e-6_f64;
+    let heads = [
+        ("epsilon", float(epsilon)),
+        ("head_count", OperatorAttributeValue::Integer(2)),
+        ("head_dimension", OperatorAttributeValue::Integer(2)),
+    ];
+    let normalize = |block: &[f32], weight: &[f32]| -> Vec<f32> {
+        let mean = block.iter().map(|x| x * x).sum::<f32>() / block.len() as f32;
+        let factor = 1.0 / (mean + epsilon as f32).sqrt();
+        block
+            .iter()
+            .zip(weight)
+            .map(|(x, w)| x * factor * w)
+            .collect()
+    };
+    let per_head =
+        invoke_extended("rmsnorm", &[input.clone(), weight.clone()], &[1, 4], &heads).unwrap();
+    let expected = [
+        normalize(&input.data[..2], &weight.data),
+        normalize(&input.data[2..], &weight.data),
+    ]
+    .concat();
+    assert_all_close(&per_head.data, &expected);
+
+    let scale_less = invoke_extended(
+        "rmsnorm",
+        std::slice::from_ref(&input),
+        &[1, 4],
+        &heads[..1],
+    )
+    .unwrap();
+    assert_all_close(&scale_less.data, &normalize(&input.data, &[1.0; 4]));
+    let both = invoke_extended("rmsnorm", std::slice::from_ref(&input), &[1, 4], &heads).unwrap();
+    assert_all_close(
+        &both.data,
+        &[
+            normalize(&input.data[..2], &[1.0; 2]),
+            normalize(&input.data[2..], &[1.0; 2]),
+        ]
+        .concat(),
+    );
+    // Heads that do not tile the row are refused, and so is a non-positive
+    // head attribute, with or without its partner.
+    let mut wrong = heads.clone();
+    wrong[2].1 = OperatorAttributeValue::Integer(3);
+    assert!(invoke_extended("rmsnorm", std::slice::from_ref(&input), &[1, 4], &wrong).is_none());
+    for attributes in [
+        vec![
+            ("epsilon", float(epsilon)),
+            ("head_count", OperatorAttributeValue::Integer(-2)),
+            ("head_dimension", OperatorAttributeValue::Integer(-2)),
+        ],
+        vec![
+            ("epsilon", float(epsilon)),
+            ("head_count", OperatorAttributeValue::Integer(-1)),
+        ],
+        vec![
+            ("epsilon", float(epsilon)),
+            ("head_dimension", OperatorAttributeValue::Integer(0)),
+        ],
+    ] {
+        assert!(
+            invoke_extended(
+                "rmsnorm",
+                std::slice::from_ref(&input),
+                &[1, 4],
+                &attributes
+            )
+            .is_none(),
+            "{attributes:?}"
+        );
+    }
+}
+
+#[test]
+fn softcap_and_scale_activations() {
+    let input = reference_cpu_host_tensor([1, 3], [-10.0, 0.5, 40.0]);
+    let softcap = invoke_extended(
+        "activation",
+        std::slice::from_ref(&input),
+        &[1, 3],
+        &[("kind", text("softcap")), ("cap", float(30.0))],
+    )
+    .unwrap();
+    let expected: Vec<f32> = input
+        .data
+        .iter()
+        .map(|x| 30.0 * (x / 30.0).tanh())
+        .collect();
+    assert_all_close(&softcap.data, &expected);
+    let scaled = invoke_extended(
+        "activation",
+        std::slice::from_ref(&input),
+        &[1, 3],
+        &[("kind", text("scale")), ("factor", float(0.25))],
+    )
+    .unwrap();
+    assert_all_close(&scaled.data, &[-2.5, 0.125, 10.0]);
+    // A non-positive cap, or a kind without its value, is refused.
+    for attributes in [
+        vec![("kind", text("softcap")), ("cap", float(0.0))],
+        vec![("kind", text("softcap"))],
+        vec![("kind", text("scale"))],
+    ] {
+        assert!(
+            invoke_extended(
+                "activation",
+                std::slice::from_ref(&input),
+                &[1, 3],
+                &attributes
+            )
+            .is_none()
+        );
+    }
+}
+
+#[test]
+fn embedding_scale_multiplies_the_gathered_rows() {
+    let table = reference_cpu_host_tensor([3, 2], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let ids = reference_cpu_host_tensor([2], [2.0, 0.0]);
+    let rows = invoke_extended(
+        "embedding",
+        &[table, ids],
+        &[2, 2],
+        &[("scale", float(1.5))],
+    )
+    .unwrap();
+    assert_all_close(&rows.data, &[7.5, 9.0, 1.5, 3.0]);
+}
+
+#[test]
+fn mul_broadcasts_a_one_value_second_operand() {
+    let a = reference_cpu_host_tensor([2, 2], [1.0, -2.0, 3.0, 4.0]);
+    let product = invoke_extended(
+        "mul",
+        &[a.clone(), reference_cpu_host_tensor([1], [0.5])],
+        &[2, 2],
+        &[],
+    )
+    .unwrap();
+    assert_all_close(&product.data, &[0.5, -1.0, 1.5, 2.0]);
+    // Any other mismatched shape is refused.
+    assert!(
+        invoke_extended(
+            "mul",
+            &[a, reference_cpu_host_tensor([2], [1.0, 2.0])],
+            &[2, 2],
+            &[]
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn moe_experts_gelu_activation_and_per_expert_scale() {
+    // Two experts of intermediate size 1 over a hidden size of 2, top 1.
+    let h = reference_cpu_host_tensor([1, 2], [1.0, -0.5]);
+    let logits = reference_cpu_host_tensor([1, 2], [0.1, 2.0]);
+    let gate = reference_cpu_host_tensor([2, 2], [0.5, 1.0, -1.0, 2.0]);
+    let up = reference_cpu_host_tensor([2, 2], [1.0, 0.5, 0.25, -1.0]);
+    let down = reference_cpu_host_tensor([1, 4], [1.0, 2.0, -1.0, 3.0]);
+    let per_expert_scale = reference_cpu_host_tensor([2], [10.0, 0.5]);
+    let attributes = [
+        ("experts", OperatorAttributeValue::Integer(2)),
+        ("top_k", OperatorAttributeValue::Integer(1)),
+        ("normalize_top_k", OperatorAttributeValue::Boolean(true)),
+        ("activation", text("gelu_tanh")),
+    ];
+    let actual = invoke_extended(
+        "moe-experts",
+        &[h.clone(), logits, gate, up, down, per_expert_scale],
+        &[1, 2],
+        &attributes,
+    )
+    .unwrap();
+    // Expert 1 wins (renormalized weight 1): gate column 1 and up column 1.
+    let g = h.data[0] * 1.0 + h.data[1] * 2.0;
+    let u = h.data[0] * 0.5 + -h.data[1];
+    let activated = crate::operator_semantics::gelu_tanh(g) * u;
+    // down's expert-1 columns are [2, 3] of row 0; scaled by 0.5.
+    let expected = [-activated * 0.5, activated * 3.0 * 0.5];
+    assert_all_close(&actual.data, &expected);
+    let mut unknown = attributes.clone();
+    unknown[3].1 = text("relu");
+    assert!(
+        invoke_extended(
+            "moe-experts",
+            &[h, reference_cpu_host_tensor([1, 2], [0.1, 2.0])],
+            &[1, 2],
+            &unknown,
+        )
+        .is_none()
+    );
+}
