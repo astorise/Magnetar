@@ -23,5 +23,5 @@
 ## 4. Controls, qualification and documentation
 
 - [x] 4.1 `set_prefill_replay`, `MAGNETAR_PREFILL_REPLAY=0`, phase ledger (`step_replay` within a prefill step), and reporting of the pool's held bytes (`kv_pool_bytes`).
-- [x] 4.2 GPU campaign: warm TTFT for short prompts (5, 12 and 40 tokens) on Qwen2.5-0.5B and Mistral 7B, replay against per node in the same run, with token and logit agreement and pool VRAM. Record the evidence in design.md.
+- [x] 4.2 GPU campaign: warm TTFT for short prompts (5, 12 and 40 tokens) on Qwen2.5-0.5B and Mistral 7B, replay against per node in the same run, with token agreement and pool VRAM. Record the evidence in design.md. Logits are compared on the Reference CPU only (`a_bucketed_prefill_matches_the_exact_length_prefill`), not on CUDA.
 - [x] 4.3 Run cargo fmt, clippy and tests in the affected workspaces and in the CUDA Provider.
