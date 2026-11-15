@@ -21,6 +21,7 @@ Issue #187 targets models whose decoder layers differ:
 - **KV sizing:**
   - A pooled store set counts the K and V of each producing layer at its own width.
   - `KvCacheLayoutMetadata` gains optional `layer_row_widths`, which `estimated_storage_bytes` uses when set. Released pooled sets skip layers without stores.
+- **Weight shapes:** the weight shapes a Component's graph session gets follow each layer's head width, KV heads and feed-forward width. They omit the K/V projections of a layer that reuses another layer's K/V, and the V projection of a layer that derives V from K.
 - **Shared KV:**
   - A consumer layer's `attention` node reads the producer's K/V edges.
   - Those edges resolve to the producer's history (concatenated or in place), so a consumer sees the producer's full history.

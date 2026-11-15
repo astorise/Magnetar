@@ -901,3 +901,52 @@ fn production_generation_steps_are_attributed_by_phase_without_leaking_the_promp
         .expect("generation succeeds");
     assert!(model.take_phase_attribution().steps.is_empty());
 }
+
+/// `per-layer-kv-geometry`: the weight shapes a Component's graph session
+/// gets follow each layer's geometry, and omit the K/V projections a layer
+/// does not have.
+#[test]
+fn weight_shapes_follow_the_layer_layout() {
+    let layer = |head_dim: u64,
+                 kv_heads: u32,
+                 intermediate_size: u64,
+                 value_from_key: bool,
+                 kv_source_layer: Option<u32>| crate::LayerSpec {
+        sliding_window: None,
+        head_dim,
+        num_key_value_heads: kv_heads,
+        rope_theta: 10_000.0,
+        partial_rotary_factor: None,
+        value_from_key,
+        kv_source_layer,
+        intermediate_size,
+    };
+    let config = ModelArchitectureConfig {
+        hidden_size: 8,
+        intermediate_size: 16,
+        num_hidden_layers: 3,
+        num_attention_heads: 4,
+        num_key_value_heads: 2,
+        head_dim: 2,
+        vocab_size: 10,
+        layer_layout: Some(vec![
+            layer(2, 2, 16, false, None),
+            layer(4, 1, 32, true, None),
+            layer(2, 2, 16, false, Some(0)),
+        ]),
+        ..Default::default()
+    };
+    let shapes = weight_shapes_for_architecture_config(&config);
+    assert_eq!(shapes["layers.0.self_attn.k_proj"], vec![8, 4]);
+    assert_eq!(shapes["layers.0.self_attn.v_proj"], vec![8, 4]);
+    // Layer 1: wider heads, one KV head, V derived from K, wider MLP.
+    assert_eq!(shapes["layers.1.self_attn.q_proj"], vec![8, 16]);
+    assert_eq!(shapes["layers.1.self_attn.k_proj"], vec![8, 4]);
+    assert!(!shapes.contains_key("layers.1.self_attn.v_proj"));
+    assert_eq!(shapes["layers.1.self_attn.o_proj"], vec![16, 8]);
+    assert_eq!(shapes["layers.1.mlp.down_proj"], vec![32, 8]);
+    // Layer 2 reuses layer 0's K/V.
+    assert_eq!(shapes["layers.2.self_attn.q_proj"], vec![8, 8]);
+    assert!(!shapes.contains_key("layers.2.self_attn.k_proj"));
+    assert!(!shapes.contains_key("layers.2.self_attn.v_proj"));
+}
