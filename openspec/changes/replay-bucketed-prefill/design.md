@@ -69,6 +69,23 @@ Non-goals: see proposal.md. They are chunked prefill, cross-request decode recor
 - **Disable controls.** `ProductionLoadedModel::set_prefill_replay(false)` and `MAGNETAR_PREFILL_REPLAY=0` disable bucketing, the pool and prefill capture together. Every prefill then runs today's exact-length per-node path; this is the qualification's before/after switch.
 - **Reporting.** The phase ledger reports `prefill_replay` time and the step trace marks replayed prefills. The qualification reports the pool's held bytes.
 
+## Evidence
+
+GPU CI run 43717628081 (RTX 3060), replay against its disable control (`MAGNETAR_PREFILL_REPLAY=0`) in the same run. Greedy tokens are identical in every pair.
+
+| Warm TTFT | Bucket | Replayed | Control (exact length, per node) |
+|---|---|---|---|
+| Qwen2.5-0.5B, 5 tokens | 16 | 17.1 ms | 14.7 ms |
+| Qwen2.5-0.5B, 12 tokens | 16 | 17.0 ms | 18.4 ms |
+| Qwen2.5-0.5B, 40 tokens | 64 | 21.8 ms | 40.2 ms |
+| Mistral 7B `Q4_K_M`, 6 tokens | 16 | 88.5 ms | 33.7 ms |
+
+- Every bucketed prefill was captured on its second request and replayed afterwards (`[step capture] captured: prefill of 16 rows`, `... 64 rows`).
+- The pooled KV stores hold 6.0 MiB on Qwen2.5-0.5B (one 256-row set).
+- Padding is not free. The packed CUDA matmuls (`q4k_matmul_rows_kernel` and its twins) process `a` in groups of 8 rows (`Q8_MATMUL_ROWS`) and read the weights once per group. A 6-token prompt takes one pass over the weights; padded to 16 rows it takes two. On a 7B model that costs more than the per-node host work replay removes.
+- The 40-token prompt also changes kernels: at 64 rows the prefill matmuls take the Tensor Core path, which starts at 64 rows. Its gain is not replay alone.
+- Before this change, run 43693053049, which buckets per node without replay, gave a 19.2 ms warm TTFT for 5 tokens.
+
 ## Risks / Trade-offs
 
 - **VRAM held between requests.** The pool keeps stores admitted after their requests end. The budget, the Memory Manager reclaim and the disable control bound it, and the campaign reports it.
