@@ -17,4 +17,4 @@
 
 - [x] 4.1 `dequantize_q4_0` against `gguf-py` bit for bit.
 - [x] 4.2 GGUF round trip, loader packed-projection test, CPU packed tests, CUDA i-quant conformance.
-- [ ] 4.3 The CUDA PR's GPU runner passes the conformance test.
+- [x] 4.3 The CUDA conformance tests pass on the GPU runner (two RTX 3060, GPU workflow run 248, `kernels` suite).

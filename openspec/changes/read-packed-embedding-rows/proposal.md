@@ -41,6 +41,28 @@ dequantizes only the looked-up rows.
   kernels suite) times both paths at the E2B tables' shapes and at a `Q4_K`
   `[32000, 4096]` token table.
 
+## Evidence
+
+GPU workflow run 248 (`kernels` suite, one RTX 3060), `packed_embedding_lookup_times`,
+Device time per lookup:
+
+| Table | Ids | Looked-up rows | Whole table first |
+|---|---|---|---|
+| `Q6_K` per-layer `[262144, 256]` | 1 | 11.3 us | 2945.8 us (0.268 GB written) |
+| `Q6_K` per-layer `[262144, 256]` | 512 | 25.3 us | 3151.5 us |
+| `Q6_K` token `[262144, 1536]` | 1 | 11.4 us | 17600.3 us (1.611 GB written) |
+| `Q6_K` token `[262144, 1536]` | 512 | 54.7 us | 18466.1 us |
+| `Q4_K` token `[32000, 4096]` | 1 | 11.8 us | 6620.2 us (0.524 GB written) |
+| `Q4_K` token `[32000, 4096]` | 512 | 126.1 us | 9663.3 us |
+
+These lookups were timed alone. For the E2B GGUF's 35 per-layer tables and
+token table, they add up to about 121 ms of lookup time per decode step on
+the former path and about 0.4 ms on this one. No E2B generation was run, so
+the end-to-end effect is not measured. A `Q4_K` token table, as in
+Mistral 7B `Q4_K_M` files, went through the same former path. The same
+run's conformance tests, including every packed format's lookup, pass on
+the GPU.
+
 ## Impact
 
 - `providers/cuda`: `kernels.cu` (`packed_element`, the seven dequantization

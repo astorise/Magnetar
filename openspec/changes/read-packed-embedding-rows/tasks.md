@@ -1,7 +1,7 @@
 ## 1. Measurement
 
 - [x] 1.1 Resident sizes of E2B's per-layer and token tables per artifact and Provider, from the tensor headers and storage rules.
-- [ ] 1.2 Device time and bytes written of a packed lookup, rows against the whole table (`packed_embedding_lookup_times`, GPU workflow).
+- [x] 1.2 Device time and bytes written of a packed lookup, rows against the whole table (`packed_embedding_lookup_times`, GPU workflow run 248).
 
 ## 2. CUDA Provider
 
@@ -11,7 +11,7 @@
 ## 3. Tests
 
 - [x] 3.1 Every packed format: the looked-up rows equal the dequantized table's; invalid ids fail; the flag resets.
-- [ ] 3.2 The tests and the diagnostic on the GPU runner.
+- [x] 3.2 The tests and the diagnostic on the GPU runner (run 248, `kernels` suite).
 
 ## 4. Validation
 
