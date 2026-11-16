@@ -15,7 +15,7 @@ The existing transpose then orients them like every stored projection. A float t
 Slices and stacks copy stored bytes; they never re-encode them:
 - **Per-layer embedding:** each row's columns of one layer. In a block-quantized table, the cut must fall on a block boundary, and the real E2B file's `Q6_K` table has one 256-element block per layer per row. A cut inside a block is refused.
 - **Per-layer projection and experts:** whole rows.
-- **Reads:** a derivation reads only the part of the stored tensor it needs, by chunks of rows or by expert.
+- **Reads:** a derivation reads only the bytes it keeps: a column slice row by row, without the other layers' columns, and a stack one range per expert. Loading every layer therefore reads one table's worth of bytes in total, not one table per layer. On a cached 512 MB table with 4 layers, the slice reads took 0.74 s against 1.39 s for whole-row reads.
 
 ### Gate before up; router scale copied by the converter
 
