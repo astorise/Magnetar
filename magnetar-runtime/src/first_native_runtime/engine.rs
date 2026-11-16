@@ -1524,15 +1524,18 @@ impl E2eRuntimeModelExecutionEngine {
                 Some(graphs) => graphs,
                 None => Arc::new(
                     match &self.component_digest {
-                        Some(digest) => build_first_native_graphs_from_named_component(
-                            digest,
-                            &architecture_config_from_first_native_model_config(
-                                &self.fixture.config,
-                            ),
-                            &self.fixture.identity,
-                            graph_length,
-                        )
-                        .map(|(graphs, _definition, _instance)| graphs),
+                        Some(digest) => {
+                            build_first_native_graphs_from_named_component_for_artifact(
+                                digest,
+                                &architecture_config_from_first_native_model_config(
+                                    &self.fixture.config,
+                                ),
+                                &self.fixture.manifest.tensors,
+                                &self.fixture.identity,
+                                graph_length,
+                            )
+                            .map(|(graphs, _definition, _instance)| graphs)
+                        }
                         None => {
                             first_native_component_graphs_for_prompt(&self.fixture, graph_length)
                         }

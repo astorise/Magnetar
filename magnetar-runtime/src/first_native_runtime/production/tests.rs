@@ -902,6 +902,51 @@ fn production_generation_steps_are_attributed_by_phase_without_leaking_the_promp
     assert!(model.take_phase_attribution().steps.is_empty());
 }
 
+/// A loaded artifact's graph session is also offered the artifact's tensors
+/// that the configuration does not derive, with the shapes its inventory
+/// declares; a tensor both name keeps its derived shape.
+#[test]
+fn artifact_weight_shapes_add_the_tensors_the_configuration_does_not_derive() {
+    let config = ModelArchitectureConfig {
+        hidden_size: 8,
+        intermediate_size: 16,
+        num_hidden_layers: 1,
+        num_attention_heads: 4,
+        num_key_value_heads: 2,
+        head_dim: 2,
+        vocab_size: 10,
+        ..Default::default()
+    };
+    let tensor = |name: &str, shape: Vec<u64>| ModelTensorMetadata {
+        name: name.into(),
+        shape,
+        storage_dtype: ModelDType::F32,
+        layout: None,
+        shard: None,
+        offset_bytes: None,
+        size_bytes: None,
+        quantization: None,
+        expected_compute_dtype: None,
+        digest: None,
+    };
+    let derived = weight_shapes_for_architecture_config(&config);
+    let shapes = weight_shapes_for_artifact(
+        &config,
+        &[
+            tensor("layers.0.self_attn.q_norm", vec![2]),
+            tensor("layers.0.layer_scalar", vec![1]),
+            tensor("layers.0.self_attn.q_proj", vec![1, 1]),
+        ],
+    );
+    assert_eq!(shapes["layers.0.self_attn.q_norm"], vec![2]);
+    assert_eq!(shapes["layers.0.layer_scalar"], vec![1]);
+    assert_eq!(
+        shapes["layers.0.self_attn.q_proj"],
+        derived["layers.0.self_attn.q_proj"]
+    );
+    assert_eq!(shapes.len(), derived.len() + 2);
+}
+
 /// `per-layer-kv-geometry`: the weight shapes a Component's graph session
 /// gets follow each layer's geometry, and omit the K/V projections a layer
 /// does not have.
