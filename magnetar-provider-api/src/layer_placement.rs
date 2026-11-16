@@ -93,6 +93,9 @@ pub struct LayerWeightBytes {
     pub layers: Vec<u64>,
     pub first: u64,
     pub last: u64,
+    /// Whether layer `i` must stay in its predecessor's segment (see
+    /// [`Self::keep_kv_sources_together`]); empty means no layer must.
+    pub joined: Vec<bool>,
 }
 
 impl LayerWeightBytes {
@@ -115,6 +118,25 @@ impl LayerWeightBytes {
             }
         }
         bytes
+    }
+
+    /// Keeps each layer that reuses an earlier layer's K/V in that source
+    /// layer's segment, for every `(layer, source)` pair: the layer reads
+    /// the source's KV history at every step, which a segment boundary
+    /// between them would copy across Devices each time.
+    pub fn keep_kv_sources_together(&mut self, sources: impl IntoIterator<Item = (u32, u32)>) {
+        self.joined.resize(self.layers.len(), false);
+        for (layer, source) in sources {
+            let end = (layer as usize + 1).min(self.joined.len());
+            if let Some(joined) = self.joined.get_mut(source as usize + 1..end) {
+                joined.fill(true);
+            }
+        }
+    }
+
+    /// Whether no segment may start at `layer`.
+    fn joined_with_previous(&self, layer: u32) -> bool {
+        self.joined.get(layer as usize).copied().unwrap_or(false)
     }
 
     fn total(&self) -> u64 {
@@ -177,7 +199,11 @@ impl LayerPlacement {
     /// under `policy`, every segment within its Device's budget. A balanced
     /// share is a soft target: when stopping at the targets leaves too much
     /// for the remaining Devices, the placement fills the Devices instead,
-    /// so a model is rejected only when no contiguous placement fits.
+    /// so a model is rejected only when no contiguous placement fits. No
+    /// segment starts at a layer joined to its predecessor
+    /// ([`LayerWeightBytes::joined`]): a segment reaching its target there
+    /// grows to the next allowed start, and one reaching its budget ends at
+    /// the last allowed start.
     pub fn plan(
         bytes: &LayerWeightBytes,
         devices: &[(DeviceId, u64)],
@@ -240,15 +266,22 @@ impl LayerPlacement {
                 } else {
                     next
                 };
-                let over_target = with_tail > targets[index] && layer > first_layer;
-                if !last_device && over_target {
+                let may_end = layer > first_layer && !bytes.joined_with_previous(layer);
+                if !last_device && may_end && with_tail > targets[index] {
                     break;
                 }
                 if with_tail > *budget {
-                    if layer > first_layer && !last_device {
-                        break;
+                    // End at the last layer a segment may start at.
+                    match (first_layer + 1..=layer)
+                        .rev()
+                        .find(|&start| !bytes.joined_with_previous(start))
+                    {
+                        Some(start) if !last_device => {
+                            layer = start;
+                            break;
+                        }
+                        _ => return Err(does_not_fit),
                     }
-                    return Err(does_not_fit);
                 }
                 held = next;
                 layer += 1;
