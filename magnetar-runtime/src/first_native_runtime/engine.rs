@@ -449,18 +449,34 @@ pub(super) fn validate_rope_frequency_scaling(
     graph: &ExecutionGraph,
     config: &ModelArchitectureConfig,
 ) -> Result<(), E2eConformanceError> {
+    // `express-latent-attention-forms`: YaRN is checked the same way.
+    #[derive(Debug, PartialEq)]
+    enum Declared {
+        Banded(crate::operator::RopeBandedFrequencyScaling),
+        Yarn(crate::operator::RopeYarnFrequencyScaling),
+    }
     let expected = config.rope_frequency_scaling.map(|scaling| match scaling {
-        crate::RopeFrequencyScaling::Banded(banded) => banded,
+        crate::RopeFrequencyScaling::Banded(banded) => Declared::Banded(banded),
+        crate::RopeFrequencyScaling::Yarn { scaling, .. } => Declared::Yarn(scaling),
     });
     for (node_id, node) in &graph.nodes {
         if node.operator.name() != "rope" {
             continue;
         }
+        let failed = |reason: String| E2eConformanceError::ModelComponentFailed {
+            reason: format!("rope node '{node_id:?}': {reason}"),
+        };
         let declared =
-            crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes)
-                .map_err(|reason| E2eConformanceError::ModelComponentFailed {
-                    reason: format!("rope node '{node_id:?}': {reason}"),
-                })?;
+            match crate::operator::RopeYarnFrequencyScaling::from_attributes(&node.attributes)
+                .map_err(failed)?
+            {
+                Some(yarn) => Some(Declared::Yarn(yarn)),
+                None => {
+                    crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes)
+                        .map_err(failed)?
+                        .map(Declared::Banded)
+                }
+            };
         if declared != expected {
             return Err(E2eConformanceError::ModelComponentFailed {
                 reason: format!(

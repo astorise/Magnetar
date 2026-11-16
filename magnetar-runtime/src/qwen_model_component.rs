@@ -386,6 +386,12 @@ pub struct FirstNativeModelConfig {
     pub final_logit_softcapping: Option<f64>,
     /// See [`crate::ModelArchitectureConfig::per_layer_input_size`].
     pub per_layer_input_size: Option<u32>,
+    /// See [`crate::ModelArchitectureConfig::latent_attention`].
+    pub latent_attention: Option<crate::LatentAttentionConfig>,
+    /// See [`crate::ModelArchitectureConfig::moe_layers`].
+    pub moe_layers: Option<Vec<bool>>,
+    /// See [`crate::ModelArchitectureConfig::expert_routing`].
+    pub expert_routing: Option<crate::ExpertRoutingConfig>,
     /// Whether tokenizer compatibility SHALL require a BOS special token.
     pub require_bos: bool,
     /// Whether tokenizer compatibility SHALL require a pad special token.
@@ -412,6 +418,9 @@ impl FirstNativeModelConfig {
             layer_layout: None,
             final_logit_softcapping: None,
             per_layer_input_size: None,
+            latent_attention: None,
+            moe_layers: None,
+            expert_routing: None,
             require_bos: false,
             require_pad: false,
             expected_added_tokens: None,

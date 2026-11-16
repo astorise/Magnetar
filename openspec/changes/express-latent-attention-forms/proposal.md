@@ -28,6 +28,23 @@ milestone caches the expanded K and V and needs three new operator forms:
   computes the correction range and each pair's frequency, as every Provider
   will. Kernel feature `yarn-frequency-scaling`.
 - The Reference CPU implements and advertises the three forms.
+- `model-config` `1.7.0` (the review's decisions 1, 6, 7, 8 and 9):
+  - `multi-head-latent-attention: func() -> option<mla-config>`;
+  - `mixture-of-experts-layers: func() -> option<list<bool>>`;
+  - `expert-routing: func() -> option<expert-routing-config>`, with
+    `expert-scoring`, `expert-groups` and `expert-group-score`;
+  - a `yarn` case of `rope-frequency-scaling` (`yarn-rope-scaling`).
+
+  The record is named `expert-routing-config` because WIT forbids a type and
+  a function sharing a name. `ModelArchitectureConfig` and
+  `FirstNativeModelConfig` carry the matching fields, and
+  `ModelArchitectureConfig::validate` checks them against the architecture.
+  The host serves `1.2.0` to `1.7.0`.
+- **Fail closed on unread features.** The model-config capability records the
+  functions each instance calls. The Runtime refuses a graph built while the
+  configuration declares latent attention, mixed expert layers or expert
+  routing that the Component never read. YaRN is checked on the graph itself,
+  like the banded scaling: every `rope` node must declare it.
 - No `routed_scaling_factor` attribute: scaling every routing weight by `s`
   scales the routed experts' output by `s`. A Component expresses it with
   `activation{kind = "scale"}` before adding the shared expert.
@@ -40,5 +57,12 @@ milestone caches the expanded K and V and needs three new operator forms:
 - `magnetar-runtime`: `reference_cpu.rs`
   (`attention_with_value_width`, `rope_scaled` with `RopeFrequencies`, the
   `concat` axis).
+- `magnetar-model`: the `1.7.0` types and fields, and their validation.
+- `magnetar-engine`: `model_config_capability.rs` (encoding, call tracking).
+- `magnetar-runtime`: `wit/model-component-graph.wit` (`1.7.0`),
+  `component_graphs.rs` (versions, unread-feature refusal), `engine.rs` (YaRN
+  on `rope` nodes), and the config conversions.
+- `loaders/huggingface`: the new fields (none read from `config.json` yet).
 - Existing graphs and Kernels are unchanged: every new attribute is optional,
-  and a Provider receives one only if it advertises the feature.
+  and a Provider receives one only if it advertises the feature. Existing
+  Components keep linking.

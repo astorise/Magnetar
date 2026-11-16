@@ -18,3 +18,14 @@
 ## 4. Validation
 
 - [x] 4.1 `cargo fmt`, `clippy -D warnings`, rustdoc and tests for `magnetar-core`, `magnetar-provider-api` and `magnetar-runtime`; `providers/cpu` and `providers/cuda` still compile.
+
+## 5. Contract `1.7.0`
+
+- [x] 5.1 WIT: `mla-config`, `yarn-rope-scaling` and the `yarn` case, `mixture-of-experts-layers`, `expert-routing-config` with its enums and groups; validated by `wasm-tools`.
+- [x] 5.2 `ModelArchitectureConfig`/`FirstNativeModelConfig` fields and their validation; the host encoding; `1.7.0` linked beside `1.2.0`–`1.6.0`.
+- [x] 5.3 Call tracking and the refusal of graphs that leave a declared feature unread; YaRN on every `rope` node.
+- [x] 5.4 Tests:
+  - a `1.7.0` probe Component reading all four functions across the real component boundary;
+  - a `1.4.0` Component failing to receive YaRN;
+  - the real Qwen Component refused for mixed layers, routing and YaRN;
+  - validation of inconsistent declarations.
