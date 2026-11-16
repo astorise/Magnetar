@@ -1729,16 +1729,24 @@ impl E2eRuntimeModelExecutionEngine {
 
 /// [`materialize_first_native_graph_bindings`] for only the last row of
 /// each rank-2 binding.
-/// Whether `node` may run on the last row of its first input only: a
-/// row-wise matmul whose single output is an edge of which only the last
-/// row is materialized (a prefill's logits: the LM head then reads one row
-/// instead of every prompt row). Each output row of these Operators depends
-/// on the same row of `a` alone, so that row is unchanged.
-pub(super) fn last_row_suffices(node: &ExecutionNode, materialized_last_rows: &[&str]) -> bool {
-    matches!(node.operator.name(), "matmul" | "matmul-bias")
-        && node.inputs.len() >= 2
-        && matches!(node.outputs.as_slice(), [output]
-            if materialized_last_rows.contains(&output.as_str()))
+/// The nodes that may run on one row of their first input only: the LM
+/// head behind each edge of which only one row is materialized (a
+/// prefill's logits), when the head is a row-wise matmul reached directly
+/// or through row-wise unary nodes ([`super::prefill_buckets::logits_head`]).
+/// Each output row of those nodes depends on the same input row alone, so
+/// the selected row is unchanged, and the nodes after the head then
+/// process one row too.
+pub(super) fn last_row_heads(
+    graph: &ExecutionGraph,
+    materialized_rows: &[&str],
+) -> BTreeSet<ExecutionNodeId> {
+    materialized_rows
+        .iter()
+        .filter_map(|edge| {
+            super::prefill_buckets::logits_head(graph, &TensorEdgeId::new(*edge))
+                .map(|(head, _)| head)
+        })
+        .collect()
 }
 
 /// Replaces a rank-2 `value` of more than one row by its last row. A

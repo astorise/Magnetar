@@ -1221,6 +1221,10 @@ pub(super) fn execute_first_native_graph_nodes(
         }
     }
 
+    let last_row_heads = materialized
+        .single_row()
+        .map(|(edges, _)| last_row_heads(graph, edges))
+        .unwrap_or_default();
     for (node_index, node_id) in order.iter().enumerate() {
         let node =
             graph
@@ -1307,8 +1311,8 @@ pub(super) fn execute_first_native_graph_nodes(
             };
             inputs.push(value);
         }
-        if let Some((edges, row)) = materialized.single_row()
-            && last_row_suffices(node, edges)
+        if let Some((_, row)) = materialized.single_row()
+            && last_row_heads.contains(node_id)
         {
             last_row_only(&*dispatch_ctx.provider, &mut inputs[0], row)?;
         }

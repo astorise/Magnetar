@@ -85,11 +85,52 @@ fn run(
     run_with(prompt, buckets, true, decode_steps)
 }
 
+/// `graph` with `cap * tanh(x / cap)` applied to its LM head's output,
+/// which becomes `"logits"` (a logit softcap, as layered models declare).
+fn append_logit_softcap(graph: &mut ExecutionGraph, cap: f64) {
+    let logits = TensorEdgeId::new("logits");
+    let raw = TensorEdgeId::new("edge.lm_head_raw");
+    let softcap = ExecutionNodeId::new("logit_softcap");
+    let mut edge = graph.edges.remove(&logits).unwrap();
+    let head = edge.producer.clone().unwrap();
+    edge.id = raw.clone();
+    edge.consumers = BTreeSet::from([softcap.clone()]);
+    let mut capped =
+        TensorEdge::new(logits.clone(), edge.descriptor.clone()).with_producer(softcap.clone());
+    capped.consumers = BTreeSet::new();
+    graph.edges.insert(raw.clone(), edge);
+    graph.edges.insert(logits.clone(), capped);
+    graph.nodes.get_mut(&head).unwrap().outputs = vec![raw.clone()];
+    graph.nodes.insert(
+        softcap.clone(),
+        ExecutionNode::new(
+            softcap,
+            OperatorId::magnetar("activation", 1, OperatorFamily::Activation),
+        )
+        .with_input(raw)
+        .with_output(logits)
+        .with_attribute("kind", OperatorAttributeValue::String("softcap".into()))
+        .with_attribute("cap", OperatorAttributeValue::Float(cap)),
+    );
+}
+
 /// [`run`]; without `gather`, a bucket's graph keeps every row's logits.
 fn run_with(
     prompt: &[TokenId],
     buckets: Option<Vec<u64>>,
     gather: bool,
+    decode_steps: usize,
+) -> (Vec<Vec<f32>>, Vec<Option<u64>>) {
+    run_capped(prompt, buckets, gather, None, decode_steps)
+}
+
+/// [`run_with`]; with `softcap`, the bucket's graphs cap their logits
+/// ([`append_logit_softcap`]).
+fn run_capped(
+    prompt: &[TokenId],
+    buckets: Option<Vec<u64>>,
+    gather: bool,
+    softcap: Option<f64>,
     decode_steps: usize,
 ) -> (Vec<Vec<f32>>, Vec<Option<u64>>) {
     let fixture = e2e_fixture().expect("fixture builds");
@@ -123,7 +164,13 @@ fn run_with(
             let cache = ComponentGraphCache::default();
             cache.set_prefill_buckets(buckets);
             let length = cache.prefill_graph_length(prompt_tokens);
-            let graphs = first_native_component_graphs_for_prompt(&fixture, length).unwrap();
+            let mut graphs = first_native_component_graphs_for_prompt(&fixture, length).unwrap();
+            if let Some(cap) = softcap {
+                append_logit_softcap(&mut graphs.prefill, cap);
+                append_logit_softcap(&mut graphs.decode, cap);
+                graphs.prefill_node_count += 1;
+                graphs.decode_node_count += 1;
+            }
             let graphs = Arc::new(if gather {
                 cache.prepare(&runtime, graphs, length)
             } else {
@@ -215,6 +262,60 @@ fn a_bucketed_prefill_matches_the_exact_length_prefill() {
                 assert!(
                     (actual - expected).abs() <= 1e-4,
                     "prompt {prompt:?}, step {step}: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+}
+
+/// `select-logits-row-through-elementwise-ops`: the gather reaches an LM
+/// head behind a logit softcap, and only that one row is computed.
+#[test]
+fn the_logits_row_gather_reaches_the_head_behind_a_softcap() {
+    let fixture = e2e_fixture().expect("fixture builds");
+    let mut prefill = first_native_component_graphs_for_prompt(&fixture, 8)
+        .unwrap()
+        .prefill;
+    append_logit_softcap(&mut prefill, 2.0);
+    let gathered = insert_logits_row_gather(&prefill).expect("the softcap is row-wise");
+    let raw = &gathered.edges[&TensorEdgeId::new("edge.lm_head_raw")];
+    assert_eq!(raw.descriptor.shape.dimensions, vec![1, E2E_FIXTURE_VOCAB]);
+    let logits = &gathered.edges[&TensorEdgeId::new("logits")];
+    assert_eq!(
+        logits.descriptor.shape.dimensions,
+        vec![1, E2E_FIXTURE_VOCAB]
+    );
+    let head = &gathered.nodes[raw.producer.as_ref().unwrap()];
+    assert_eq!(head.inputs[0].as_str(), LOGITS_ROW_HIDDEN);
+    first_native_graph_execution_order(&gathered).expect("the rewritten graph is acyclic");
+    // Another reader of the head's output keeps every row: no gather.
+    let mut shared = prefill.clone();
+    shared
+        .edges
+        .get_mut(&TensorEdgeId::new("edge.lm_head_raw"))
+        .unwrap()
+        .consumers
+        .insert(ExecutionNodeId::new("another_reader"));
+    assert!(insert_logits_row_gather(&shared).is_none());
+}
+
+/// A softcapped bucket graph's logits, gathered or not, are the plain
+/// graph's logits capped, prefill and decode alike.
+#[test]
+fn a_softcapped_bucketed_prefill_matches_its_capped_plain_logits() {
+    let cap = 2.0;
+    let prompt = [3, 9, 4];
+    let (plain, _) = run_capped(&prompt, Some(vec![8]), true, None, 3);
+    for gather in [true, false] {
+        let (capped, _) = run_capped(&prompt, Some(vec![8]), gather, Some(cap), 3);
+        assert_eq!(capped.len(), plain.len());
+        for (step, (capped, plain)) in capped.iter().zip(&plain).enumerate() {
+            assert_eq!(capped.len(), plain.len());
+            for (capped, plain) in capped.iter().zip(plain) {
+                let expected = (cap as f32) * (plain / cap as f32).tanh();
+                assert!(
+                    (capped - expected).abs() <= 1e-5,
+                    "gather {gather}, step {step}: {capped} vs {expected}"
                 );
             }
         }
