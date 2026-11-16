@@ -1610,3 +1610,90 @@ fn kv_row_widths_follow_the_layer_layout() {
     ]);
     assert_eq!(config.kv_row_widths(), vec![Some(4), Some(16), None]);
 }
+
+/// `per-layer-kv-geometry`: a layered artifact's tensor inventory and shapes
+/// are checked against each layer's own geometry. A layer reusing an earlier
+/// layer's K/V has no K/V projections and one deriving V from K no V
+/// projection, while a layer computing its own K/V still needs both.
+#[test]
+fn a_layered_inventory_follows_each_layers_geometry() {
+    let mut config = FirstNativeModelConfig::new(
+        first_native_architecture_metadata(8, 3, 2, 2, 4, 16, 32, 64),
+        FirstNativeRopeConfig::standard(4),
+    );
+    let layer = |head_dim: u64,
+                 kv_heads: u32,
+                 intermediate_size: u64,
+                 value_from_key: bool,
+                 kv_source_layer: Option<u32>| crate::LayerSpec {
+        sliding_window: None,
+        head_dim,
+        num_key_value_heads: kv_heads,
+        rope_theta: 10_000.0,
+        partial_rotary_factor: None,
+        value_from_key,
+        kv_source_layer,
+        intermediate_size,
+    };
+    config.layer_layout = Some(vec![
+        layer(4, 2, 16, false, None),
+        // Wider heads, one KV head, V derived from K, a wider MLP.
+        layer(8, 1, 32, true, None),
+        layer(4, 2, 16, false, Some(0)),
+    ]);
+    let absent = [
+        "layers.1.self_attn.v_proj",
+        "layers.2.self_attn.k_proj",
+        "layers.2.self_attn.v_proj",
+    ];
+    let tensors: Vec<ModelTensorMetadata> =
+        first_native_expected_tensor_names(3, config.tied_embeddings)
+            .into_iter()
+            .filter(|name| !name.ends_with("mlp.gate_up_proj") && !absent.contains(&name.as_str()))
+            .map(|name| ModelTensorMetadata {
+                shape: first_native_expected_tensor_shape(&name, &config).unwrap(),
+                name,
+                storage_dtype: ModelDType::F32,
+                layout: None,
+                shard: None,
+                offset_bytes: None,
+                size_bytes: None,
+                quantization: None,
+                expected_compute_dtype: None,
+                digest: None,
+            })
+            .collect();
+    validate_first_native_tensor_inventory(&config, &tensors).unwrap();
+    validate_first_native_tensor_shapes(&config, &tensors).unwrap();
+
+    let shape = |name: &str| first_native_expected_tensor_shape(name, &config);
+    assert_eq!(shape("layers.0.self_attn.q_proj"), Some(vec![8, 8]));
+    assert_eq!(shape("layers.1.self_attn.q_proj"), Some(vec![8, 16]));
+    assert_eq!(shape("layers.1.self_attn.k_proj"), Some(vec![8, 8]));
+    assert_eq!(shape("layers.1.self_attn.o_proj"), Some(vec![16, 8]));
+    assert_eq!(shape("layers.1.mlp.down_proj"), Some(vec![32, 8]));
+
+    // Layer 1 sized with the architecture-wide head width is refused.
+    let mut uniform = tensors.clone();
+    uniform
+        .iter_mut()
+        .find(|tensor| tensor.name == "layers.1.self_attn.q_proj")
+        .unwrap()
+        .shape = vec![8, 8];
+    assert!(matches!(
+        validate_first_native_tensor_shapes(&config, &uniform),
+        Err(QwenComponentError::TensorShapeMismatch { tensor, .. })
+            if tensor == "layers.1.self_attn.q_proj"
+    ));
+    // Layer 0 computes its own V, so its V projection stays required.
+    let without_v: Vec<_> = tensors
+        .iter()
+        .filter(|tensor| tensor.name != "layers.0.self_attn.v_proj")
+        .cloned()
+        .collect();
+    assert!(matches!(
+        validate_first_native_tensor_inventory(&config, &without_v),
+        Err(QwenComponentError::TensorInventoryMissing { tensor })
+            if tensor == "layers.0.self_attn.v_proj"
+    ));
+}

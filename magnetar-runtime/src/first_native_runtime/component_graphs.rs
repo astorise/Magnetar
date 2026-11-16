@@ -386,6 +386,41 @@ pub fn build_first_native_graphs_from_named_component(
         &runtime.model_config_capability,
         runtime.definition,
         config,
+        weight_shapes_for_architecture_config(config),
+        identity,
+        prompt_token_count,
+    )
+}
+
+/// [`build_first_native_graphs_from_named_component`] for a loaded Model
+/// Artifact: the graph-builder also offers the artifact's tensors that the
+/// architecture configuration does not derive, with the shapes the
+/// artifact's inventory declares (`weight_shapes_for_artifact`), so a
+/// Component may request every weight the artifact carries and weight
+/// materialization binds.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub fn build_first_native_graphs_from_named_component_for_artifact(
+    digest: &ComponentDigest,
+    config: &ModelArchitectureConfig,
+    tensors: &[ModelTensorMetadata],
+    identity: &ModelComponentIdentity,
+    prompt_token_count: u64,
+) -> Result<
+    (
+        FirstNativeComponentGraphs,
+        ComponentDefinitionId,
+        ComponentInstanceId,
+    ),
+    E2eConformanceError,
+> {
+    let runtime = named_component_runtime(digest)?;
+    build_first_native_graphs_with_runtime(
+        &runtime.manager,
+        &runtime.capability,
+        &runtime.model_config_capability,
+        runtime.definition,
+        config,
+        weight_shapes_for_artifact(config, tensors),
         identity,
         prompt_token_count,
     )
@@ -418,6 +453,26 @@ pub fn build_first_native_graphs_from_named_component(
                  Component cannot be used here"
             .into(),
     })
+}
+
+/// No Component Engine exists on this build target/feature combination:
+/// fails closed like [`build_first_native_graphs_from_named_component`].
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine")))]
+pub fn build_first_native_graphs_from_named_component_for_artifact(
+    digest: &ComponentDigest,
+    config: &ModelArchitectureConfig,
+    _tensors: &[ModelTensorMetadata],
+    identity: &ModelComponentIdentity,
+    prompt_token_count: u64,
+) -> Result<
+    (
+        FirstNativeComponentGraphs,
+        ComponentDefinitionId,
+        ComponentInstanceId,
+    ),
+    E2eConformanceError,
+> {
+    build_first_native_graphs_from_named_component(digest, config, identity, prompt_token_count)
 }
 
 /// Builds prefill and decode Execution Graphs by instantiating the real
@@ -486,6 +541,7 @@ pub(super) fn build_first_native_graphs_for_config(
         &runtime.model_config_capability,
         runtime.definition,
         &architecture_config,
+        weight_shapes_for_architecture_config(&architecture_config),
         identity,
         prompt_token_count,
     )
@@ -511,6 +567,7 @@ pub(super) fn build_first_native_graphs_with_runtime(
     model_config_capability: &ModelConfigCapability,
     definition: ComponentDefinitionId,
     config: &ModelArchitectureConfig,
+    weight_shapes: BTreeMap<String, Vec<u64>>,
     identity: &ModelComponentIdentity,
     prompt_token_count: u64,
 ) -> Result<
@@ -540,7 +597,6 @@ pub(super) fn build_first_native_graphs_with_runtime(
             "magnetar:model-component-graph/model-component-graph-producer",
             "1.0.0",
         );
-        let weight_shapes = weight_shapes_for_architecture_config(config);
         let compatibility_key = qwen_component_compatibility_key(identity);
         let session_context = |weight_shapes: BTreeMap<String, Vec<u64>>| SessionContext {
             component_id: identity.id.as_str().to_string(),

@@ -300,6 +300,27 @@ pub(super) fn weight_shapes_for_architecture_config(
     shapes
 }
 
+/// [`weight_shapes_for_architecture_config`], plus each tensor of a Model
+/// Artifact that the configuration does not derive, with the shape its
+/// inventory declares. A Component may request weights beyond the dense
+/// decoder's (per-head and extra norms, a layer scale, a dense MLP beside
+/// routed experts); weight materialization binds every tensor of the
+/// inventory, so the graph-builder offers exactly those. A derived shape
+/// is kept for the tensors both name.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub(super) fn weight_shapes_for_artifact(
+    config: &ModelArchitectureConfig,
+    tensors: &[ModelTensorMetadata],
+) -> BTreeMap<String, Vec<u64>> {
+    let mut shapes = weight_shapes_for_architecture_config(config);
+    for tensor in tensors {
+        shapes
+            .entry(tensor.name.clone())
+            .or_insert_with(|| tensor.shape.clone());
+    }
+    shapes
+}
+
 /// Bridges the Rust-side [`FirstNativeModelConfig`] (this crate's own test-oracle
 /// architecture representation) into the generic, WIT-facing
 /// [`ModelArchitectureConfig`] the `model-config` Capability hands to a
@@ -1110,8 +1131,14 @@ pub(super) fn apply_production_tensor_parallel(
     };
     let failed = |reason: String| InferenceApiError::ModelLoadingFailed { reason };
     let (graphs, _definition, _instance) =
-        build_first_native_graphs_from_named_component(digest, config, &fixture.identity, 2)
-            .map_err(|error| failed(format!("tensor parallelism: {error}")))?;
+        build_first_native_graphs_from_named_component_for_artifact(
+            digest,
+            config,
+            &fixture.manifest.tensors,
+            &fixture.identity,
+            2,
+        )
+        .map_err(|error| failed(format!("tensor parallelism: {error}")))?;
     let plan = crate::tensor_parallel::TensorParallelPlan::from_graphs(
         [&graphs.prefill, &graphs.decode],
         devices,
@@ -1638,14 +1665,17 @@ impl ProductionLoadedModel {
                 None => {
                     let graphs = Arc::new(
                         match &self.component_digest {
-                            Some(digest) => build_first_native_graphs_from_named_component(
-                                digest,
-                                &architecture_config_from_first_native_model_config(
-                                    &self.fixture.config,
-                                ),
-                                &self.fixture.identity,
-                                graph_length,
-                            )
+                            Some(digest) => {
+                                build_first_native_graphs_from_named_component_for_artifact(
+                                    digest,
+                                    &architecture_config_from_first_native_model_config(
+                                        &self.fixture.config,
+                                    ),
+                                    &self.fixture.manifest.tensors,
+                                    &self.fixture.identity,
+                                    graph_length,
+                                )
+                            }
                             .map(|(graphs, _definition, _instance)| graphs),
                             None => build_first_native_graphs_from_real_qwen_component(
                                 &self.fixture,
