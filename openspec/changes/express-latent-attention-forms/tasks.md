@@ -59,5 +59,5 @@
 - [x] 8.1 YaRN in `rope_kernel`: the correction range computed on the host, the frequency blend and `attention_factor` on the rotated pairs' `cos` and `sin`; banded and YaRN together refused.
 - [x] 8.2 `value_head_dimension` in `attention_kernel`, `attention_block_kernel`, `attention_split_kernel` and the combine; V-wide partials and output; the Tensor Core, tiled and grouped decode Kernels only for equal widths.
 - [x] 8.3 `concat_heads_kernel` and the executor's `axis` dispatch; the three features advertised.
-- [ ] 8.4 Conformance on the GPU workflow: YaRN rope, attention with a value width (decode with one and several chunks, `key_count`, the block and one-thread Kernels, a wider V), head-wise `concat`.
+- [x] 8.4 Conformance on the GPU workflow: YaRN rope, attention with a value width (decode with one and several chunks, `key_count`, the block and one-thread Kernels, a wider V), head-wise `concat`. GPU workflow run 249 (one RTX 3060): `yarn_rope_matches_reference_cpu`, `attention_with_a_value_width_matches_reference_cpu` and `concat_heads_matches_reference_cpu` pass, with the 107 other CUDA Provider tests, `scaled_attention_matches_reference_cpu_in_every_kernel` among them.
 
