@@ -23,6 +23,8 @@
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
+mod tests_gemma4_logits;
+#[cfg(test)]
 mod tests_gguf_loading_e2e;
 #[cfg(test)]
 mod tests_gguf_real_checkpoint_smoke;
