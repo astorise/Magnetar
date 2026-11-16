@@ -749,6 +749,21 @@ pub struct ModelArchitectureConfig {
     /// Width of the per-layer input embeddings, if the checkpoint has them
     /// (`model-config`'s `options`, `1.6.0`).
     pub per_layer_input_size: Option<u32>,
+    /// Multi-head latent attention, when every layer's attention is one
+    /// (`model-config`'s `multi-head-latent-attention`, `1.7.0`). `head_dim`
+    /// is then the query/key head width, `qk_nope_head_dim +
+    /// qk_rope_head_dim`.
+    pub latent_attention: Option<LatentAttentionConfig>,
+    /// Which decoder layers' MLP is `mixture_of_experts`, one entry per layer
+    /// (`model-config`'s `mixture-of-experts-layers`, `1.7.0`); the others
+    /// are dense, `intermediate_size` wide. `None`: every layer, when the
+    /// checkpoint declares a mixture of experts.
+    pub moe_layers: Option<Vec<bool>>,
+    /// How tokens are routed to `mixture_of_experts`' experts
+    /// (`model-config`'s `expert-routing`, `1.7.0`). `None`: a softmax over
+    /// every expert, no groups, weights unscaled, no selection bias, and a
+    /// gated shared expert when the mixture declares one.
+    pub expert_routing: Option<ExpertRoutingConfig>,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
 }
@@ -801,6 +816,12 @@ pub struct MixtureOfExpertsConfig {
 pub enum RopeFrequencyScaling {
     /// Wavelength-banded scaling (Hugging Face `rope_type = "llama3"`).
     Banded(crate::operator::RopeBandedFrequencyScaling),
+    /// YaRN (`1.7.0`): the `rope` attributes, plus the `mscale_all_dim` a
+    /// Model Component may fold into its attention scale.
+    Yarn {
+        scaling: crate::operator::RopeYarnFrequencyScaling,
+        mscale_all_dim: Option<f64>,
+    },
 }
 
 impl RopeFrequencyScaling {
@@ -809,8 +830,67 @@ impl RopeFrequencyScaling {
     pub fn attribute_value(&self) -> &'static str {
         match self {
             Self::Banded(_) => crate::operator::RopeBandedFrequencyScaling::ATTRIBUTE_VALUE,
+            Self::Yarn { .. } => crate::operator::RopeYarnFrequencyScaling::ATTRIBUTE_VALUE,
         }
     }
+}
+
+/// Multi-head latent attention's geometry, mirroring `model-config`'s
+/// `mla-config` record (`1.7.0`). Queries come from a low-rank projection
+/// when `q_lora_rank` is set; keys and values from a `kv_lora_rank`-wide
+/// latent. Each query/key head is `qk_nope_head_dim` position-independent
+/// values followed by `qk_rope_head_dim` rotated ones, the rotated key part
+/// being one head shared by every head; each value head is `v_head_dim`
+/// wide.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LatentAttentionConfig {
+    pub q_lora_rank: Option<u32>,
+    pub kv_lora_rank: u32,
+    pub qk_nope_head_dim: u64,
+    pub qk_rope_head_dim: u64,
+    pub v_head_dim: u64,
+}
+
+/// How router logits become expert scores (`expert-scoring`, `1.7.0`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpertScoring {
+    Softmax,
+    Sigmoid,
+}
+
+/// How a group of experts is scored for group-limited routing
+/// (`expert-group-score`, `1.7.0`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpertGroupScore {
+    /// Its best expert's score.
+    Max,
+    /// The sum of its two best experts' scores.
+    TopTwoSum,
+}
+
+/// Group-limited routing (`expert-groups`, `1.7.0`): the experts form
+/// `count` equal groups, and a token's experts come from its `per_token`
+/// best groups only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpertGroups {
+    pub count: u32,
+    pub per_token: u32,
+    pub score: ExpertGroupScore,
+}
+
+/// How tokens are routed to the experts, mirroring `model-config`'s
+/// `expert-routing` record (`1.7.0`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExpertRoutingConfig {
+    pub scoring: ExpertScoring,
+    pub groups: Option<ExpertGroups>,
+    /// The factor on the chosen experts' combination weights.
+    pub routed_scaling_factor: f64,
+    /// A per-expert bias added to the scores to choose the experts, not to
+    /// weight them.
+    pub selection_bias: bool,
+    /// Whether the shared expert's output passes through a sigmoid gate.
+    pub shared_expert_gated: bool,
 }
 
 impl ModelArchitectureConfig {
@@ -867,11 +947,27 @@ impl ModelArchitectureConfig {
                 ),
             });
         }
-        if let Some(RopeFrequencyScaling::Banded(scaling)) = &self.rope_frequency_scaling {
-            scaling
+        match &self.rope_frequency_scaling {
+            Some(RopeFrequencyScaling::Banded(scaling)) => scaling
                 .validate()
-                .map_err(|message| ModelArtifactError::InvalidManifest { message })?;
+                .map_err(|message| ModelArtifactError::InvalidManifest { message })?,
+            Some(RopeFrequencyScaling::Yarn {
+                scaling,
+                mscale_all_dim,
+            }) => {
+                scaling
+                    .validate()
+                    .map_err(|message| ModelArtifactError::InvalidManifest { message })?;
+                if mscale_all_dim.is_some_and(|value| !value.is_finite()) {
+                    return Err(ModelArtifactError::InvalidManifest {
+                        message: "YaRN mscale_all_dim must be finite".into(),
+                    });
+                }
+            }
+            None => {}
         }
+        self.validate_latent_attention_and_experts()
+            .map_err(|message| ModelArtifactError::InvalidManifest { message })?;
         if let Some(layout) = &self.layer_layout {
             self.validate_layer_layout(layout)
                 .map_err(|message| ModelArtifactError::InvalidManifest { message })?;
@@ -887,6 +983,69 @@ impl ModelArchitectureConfig {
             return Err(ModelArtifactError::InvalidManifest {
                 message: "per-layer input size must not be zero".into(),
             });
+        }
+        Ok(())
+    }
+
+    /// Latent attention: non-zero widths whose query/key head is `head_dim`
+    /// and one K/V head per attention head. Mixed MoE layers and routing:
+    /// a declared mixture of experts, one entry per layer, groups that
+    /// divide the experts and offer enough of them, and a finite positive
+    /// scaling factor.
+    fn validate_latent_attention_and_experts(&self) -> Result<(), String> {
+        if let Some(mla) = &self.latent_attention {
+            if mla.kv_lora_rank == 0
+                || mla.q_lora_rank == Some(0)
+                || mla.qk_nope_head_dim == 0
+                || mla.qk_rope_head_dim == 0
+                || mla.v_head_dim == 0
+            {
+                return Err(format!("latent attention widths must not be zero: {mla:?}"));
+            }
+            if mla.qk_nope_head_dim + mla.qk_rope_head_dim != self.head_dim {
+                return Err(format!(
+                    "latent attention query/key heads are {} + {} wide, but head_dim is {}",
+                    mla.qk_nope_head_dim, mla.qk_rope_head_dim, self.head_dim
+                ));
+            }
+            if self.num_key_value_heads != self.num_attention_heads {
+                return Err("latent attention expands one K/V head per attention head".into());
+            }
+        }
+        if (self.moe_layers.is_some() || self.expert_routing.is_some())
+            && self.mixture_of_experts.is_none()
+        {
+            return Err("expert layers or routing without a mixture of experts".into());
+        }
+        if let Some(layers) = &self.moe_layers
+            && layers.len() != self.num_hidden_layers as usize
+        {
+            return Err(format!(
+                "mixture-of-experts layers have {} entries for {} layers",
+                layers.len(),
+                self.num_hidden_layers
+            ));
+        }
+        if let (Some(routing), Some(moe)) = (&self.expert_routing, &self.mixture_of_experts) {
+            if !(routing.routed_scaling_factor.is_finite() && routing.routed_scaling_factor > 0.0) {
+                return Err(format!(
+                    "routed scaling factor {} must be finite and positive",
+                    routing.routed_scaling_factor
+                ));
+            }
+            if let Some(groups) = &routing.groups {
+                let groups_ok = groups.count > 0
+                    && moe.experts.is_multiple_of(groups.count)
+                    && groups.per_token > 0
+                    && groups.per_token <= groups.count
+                    && groups.per_token * (moe.experts / groups.count) >= moe.experts_per_token;
+                if !groups_ok {
+                    return Err(format!(
+                        "{} experts cannot route {} per token from {} of {} groups",
+                        moe.experts, moe.experts_per_token, groups.per_token, groups.count
+                    ));
+                }
+            }
         }
         Ok(())
     }

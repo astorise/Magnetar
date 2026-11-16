@@ -153,6 +153,10 @@ pub struct KvCacheLayoutMetadata {
     /// When set, it replaces `layer_count * head_count * head_dimension`
     /// in [`Self::estimated_storage_bytes`].
     pub layer_row_widths: Option<Vec<Option<u64>>>,
+    /// Each layer's V row width when it differs from its K row width
+    /// (multi-head latent attention, `express-latent-attention-forms`);
+    /// `None` means V rows are as wide as `layer_row_widths`' K rows.
+    pub layer_value_row_widths: Option<Vec<Option<u64>>>,
 }
 
 impl KvCacheLayoutMetadata {
@@ -182,12 +186,20 @@ impl KvCacheLayoutMetadata {
             position_end_exclusive: 0,
             quantization: None,
             layer_row_widths: None,
+            layer_value_row_widths: None,
         }
     }
 
     /// Per-layer K/V row widths (see [`Self::layer_row_widths`]).
     pub fn with_layer_row_widths(mut self, widths: Vec<Option<u64>>) -> Self {
         self.layer_row_widths = Some(widths);
+        self
+    }
+
+    /// Per-layer V row widths, when they differ from the K row widths (see
+    /// [`Self::layer_value_row_widths`]).
+    pub fn with_layer_value_row_widths(mut self, widths: Vec<Option<u64>>) -> Self {
+        self.layer_value_row_widths = Some(widths);
         self
     }
 
@@ -227,13 +239,19 @@ impl KvCacheLayoutMetadata {
 
     pub fn estimated_storage_bytes(&self) -> Result<u64, KvCacheError> {
         if let Some(widths) = &self.layer_row_widths {
-            // K and V of each layer that keeps its own.
+            // K and V of each layer that keeps its own; V as wide as K unless
+            // its own width is given.
+            let value_widths = self.layer_value_row_widths.as_ref();
             let row_elements = widths
                 .iter()
-                .flatten()
-                .try_fold(0u64, |total, width| {
+                .enumerate()
+                .filter_map(|(layer, width)| width.map(|width| (layer, width)))
+                .try_fold(0u64, |total, (layer, width)| {
+                    let value = value_widths
+                        .and_then(|values| values.get(layer).copied().flatten())
+                        .unwrap_or(width);
                     width
-                        .checked_mul(2)
+                        .checked_add(value)
                         .and_then(|both| total.checked_add(both))
                 })
                 .ok_or(KvCacheError::CacheInternal)?;

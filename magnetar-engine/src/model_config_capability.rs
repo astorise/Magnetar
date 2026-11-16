@@ -13,11 +13,14 @@
 //! capability only ever hands back whatever was bound -- it never derives or
 //! infers a configuration on its own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use crate::component::{ComponentError, ComponentValue, HostCapability};
-use crate::{LayerSpec, MixtureOfExpertsConfig, ModelArchitectureConfig, RopeFrequencyScaling};
+use crate::{
+    ExpertGroupScore, ExpertRoutingConfig, ExpertScoring, LatentAttentionConfig, LayerSpec,
+    MixtureOfExpertsConfig, ModelArchitectureConfig, RopeFrequencyScaling,
+};
 
 const CAPABILITY_NAME: &str = "magnetar:model-component-graph/model-config";
 
@@ -29,7 +32,19 @@ const CAPABILITY_NAME: &str = "magnetar:model-component-graph/model-config";
 #[derive(Default)]
 pub struct ModelConfigCapability {
     bound: Mutex<BTreeMap<String, ModelArchitectureConfig>>,
+    /// The operations each bound instance has called since its binding
+    /// ([`Self::unread_declared_features`]).
+    called: Mutex<BTreeMap<String, BTreeSet<String>>>,
 }
+
+/// The `1.7.0` functions whose feature a graph does not otherwise show:
+/// when the bound configuration declares one, a Component must have read
+/// it before its graph is accepted.
+const FEATURE_FUNCTIONS: [&str; 3] = [
+    "multi-head-latent-attention",
+    "mixture-of-experts-layers",
+    "expert-routing",
+];
 
 impl ModelConfigCapability {
     pub fn new() -> Self {
@@ -44,12 +59,41 @@ impl ModelConfigCapability {
             .lock()
             .unwrap()
             .insert(instance_key.to_string(), config);
+        self.called.lock().unwrap().remove(instance_key);
     }
 
     /// Drops the bound configuration for `instance_key`, mirroring
     /// `GraphBuilderCapability::clear_session`.
     pub fn clear_config(&self, instance_key: &str) {
         self.bound.lock().unwrap().remove(instance_key);
+        self.called.lock().unwrap().remove(instance_key);
+    }
+
+    /// The `1.7.0` functions carrying a feature the configuration bound to
+    /// `instance_key` declares (latent attention, mixed expert layers,
+    /// expert routing) that the Component has not called since the binding.
+    /// A Component compiled against an earlier version cannot read them, so
+    /// a graph it built for such a checkpoint would silently leave the
+    /// feature out; the Runtime refuses that graph instead
+    /// (`express-latent-attention-forms`).
+    pub fn unread_declared_features(&self, instance_key: &str) -> Vec<&'static str> {
+        let bound = self.bound.lock().unwrap();
+        let Some(config) = bound.get(instance_key) else {
+            return Vec::new();
+        };
+        let called = self.called.lock().unwrap();
+        let called = called.get(instance_key);
+        FEATURE_FUNCTIONS
+            .into_iter()
+            .filter(|function| {
+                let declared = match *function {
+                    "multi-head-latent-attention" => config.latent_attention.is_some(),
+                    "mixture-of-experts-layers" => config.moe_layers.is_some(),
+                    _ => config.expert_routing.is_some(),
+                };
+                declared && !called.is_some_and(|called| called.contains(*function))
+            })
+            .collect()
     }
 }
 
@@ -131,7 +175,121 @@ fn encode_rope_scaling(scaling: Option<&RopeFrequencyScaling>) -> ComponentValue
                     ),
                 ]))),
             ),
+            RopeFrequencyScaling::Yarn {
+                scaling,
+                mscale_all_dim,
+            } => ComponentValue::Variant(
+                "yarn".into(),
+                Some(Box::new(ComponentValue::Record(vec![
+                    field("factor", ComponentValue::F64(scaling.factor)),
+                    field(
+                        "original-max-position-embeddings",
+                        ComponentValue::S64(scaling.original_context_length as i64),
+                    ),
+                    field("beta-fast", ComponentValue::F64(scaling.beta_fast)),
+                    field("beta-slow", ComponentValue::F64(scaling.beta_slow)),
+                    field("truncate", ComponentValue::Bool(scaling.truncate)),
+                    field(
+                        "attention-factor",
+                        ComponentValue::F64(scaling.attention_factor),
+                    ),
+                    field(
+                        "mscale-all-dim",
+                        ComponentValue::Option(
+                            mscale_all_dim.map(|value| Box::new(ComponentValue::F64(value))),
+                        ),
+                    ),
+                ]))),
+            ),
         })
+    }))
+}
+
+/// `option<mla-config>` (`1.7.0`).
+fn encode_latent_attention(mla: Option<&LatentAttentionConfig>) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Option(mla.map(|mla| {
+        Box::new(ComponentValue::Record(vec![
+            field(
+                "q-lora-rank",
+                ComponentValue::Option(
+                    mla.q_lora_rank
+                        .map(|rank| Box::new(ComponentValue::U32(rank))),
+                ),
+            ),
+            field("kv-lora-rank", ComponentValue::U32(mla.kv_lora_rank)),
+            field(
+                "qk-nope-head-dim",
+                ComponentValue::S64(mla.qk_nope_head_dim as i64),
+            ),
+            field(
+                "qk-rope-head-dim",
+                ComponentValue::S64(mla.qk_rope_head_dim as i64),
+            ),
+            field("v-head-dim", ComponentValue::S64(mla.v_head_dim as i64)),
+        ]))
+    }))
+}
+
+/// `option<list<bool>>` (`1.7.0`).
+fn encode_moe_layers(layers: Option<&[bool]>) -> ComponentValue {
+    ComponentValue::Option(layers.map(|layers| {
+        Box::new(ComponentValue::List(
+            layers
+                .iter()
+                .map(|&moe| ComponentValue::Bool(moe))
+                .collect(),
+        ))
+    }))
+}
+
+/// `option<expert-routing-config>` (`1.7.0`).
+fn encode_expert_routing(routing: Option<&ExpertRoutingConfig>) -> ComponentValue {
+    let field = |name: &str, value: ComponentValue| (name.to_string(), value);
+    ComponentValue::Option(routing.map(|routing| {
+        Box::new(ComponentValue::Record(vec![
+            field(
+                "scoring",
+                ComponentValue::Enum(
+                    match routing.scoring {
+                        ExpertScoring::Softmax => "softmax",
+                        ExpertScoring::Sigmoid => "sigmoid",
+                    }
+                    .into(),
+                ),
+            ),
+            field(
+                "groups",
+                ComponentValue::Option(routing.groups.map(|groups| {
+                    Box::new(ComponentValue::Record(vec![
+                        field("count", ComponentValue::U32(groups.count)),
+                        field("per-token", ComponentValue::U32(groups.per_token)),
+                        field(
+                            "score",
+                            ComponentValue::Enum(
+                                match groups.score {
+                                    ExpertGroupScore::Max => "max",
+                                    ExpertGroupScore::TopTwoSum => "top-two-sum",
+                                }
+                                .into(),
+                            ),
+                        ),
+                    ]))
+                })),
+            ),
+            field(
+                "routed-scaling-factor",
+                ComponentValue::F64(routing.routed_scaling_factor),
+            ),
+            field(
+                "selection-bias",
+                ComponentValue::Bool(routing.selection_bias),
+            ),
+            field(
+                "shared-expert-gated",
+                ComponentValue::Bool(routing.shared_expert_gated),
+            ),
+        ]))
     }))
 }
 
@@ -251,7 +409,14 @@ impl HostCapability for ModelConfigCapability {
         arguments: &[ComponentValue],
     ) -> Result<Vec<ComponentValue>, ComponentError> {
         match operation {
-            "model-config" | "rope-scaling" | "mixture-of-experts" | "layer-layout" | "options" => {
+            "model-config"
+            | "rope-scaling"
+            | "mixture-of-experts"
+            | "layer-layout"
+            | "options"
+            | "multi-head-latent-attention"
+            | "mixture-of-experts-layers"
+            | "expert-routing" => {
                 if !arguments.is_empty() {
                     return Err(rejected(
                         instance_key,
@@ -268,15 +433,28 @@ impl HostCapability for ModelConfigCapability {
                         "no model architecture configuration bound for this instance",
                     )
                 })?;
-                Ok(vec![match operation {
+                let encoded = match operation {
                     "model-config" => encode_architecture_config(config),
                     "rope-scaling" => encode_rope_scaling(config.rope_frequency_scaling.as_ref()),
                     "mixture-of-experts" => {
                         encode_mixture_of_experts(config.mixture_of_experts.as_ref())
                     }
                     "layer-layout" => encode_layer_layout(config.layer_layout.as_deref()),
+                    "multi-head-latent-attention" => {
+                        encode_latent_attention(config.latent_attention.as_ref())
+                    }
+                    "mixture-of-experts-layers" => encode_moe_layers(config.moe_layers.as_deref()),
+                    "expert-routing" => encode_expert_routing(config.expert_routing.as_ref()),
                     _ => encode_options(config),
-                }])
+                };
+                drop(bound);
+                self.called
+                    .lock()
+                    .unwrap()
+                    .entry(instance_key.to_string())
+                    .or_default()
+                    .insert(operation.to_string());
+                Ok(vec![encoded])
             }
             other => Err(rejected(
                 instance_key,

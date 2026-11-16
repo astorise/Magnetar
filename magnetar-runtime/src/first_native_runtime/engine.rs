@@ -449,18 +449,34 @@ pub(super) fn validate_rope_frequency_scaling(
     graph: &ExecutionGraph,
     config: &ModelArchitectureConfig,
 ) -> Result<(), E2eConformanceError> {
+    // `express-latent-attention-forms`: YaRN is checked the same way.
+    #[derive(Debug, PartialEq)]
+    enum Declared {
+        Banded(crate::operator::RopeBandedFrequencyScaling),
+        Yarn(crate::operator::RopeYarnFrequencyScaling),
+    }
     let expected = config.rope_frequency_scaling.map(|scaling| match scaling {
-        crate::RopeFrequencyScaling::Banded(banded) => banded,
+        crate::RopeFrequencyScaling::Banded(banded) => Declared::Banded(banded),
+        crate::RopeFrequencyScaling::Yarn { scaling, .. } => Declared::Yarn(scaling),
     });
     for (node_id, node) in &graph.nodes {
         if node.operator.name() != "rope" {
             continue;
         }
+        let failed = |reason: String| E2eConformanceError::ModelComponentFailed {
+            reason: format!("rope node '{node_id:?}': {reason}"),
+        };
         let declared =
-            crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes)
-                .map_err(|reason| E2eConformanceError::ModelComponentFailed {
-                    reason: format!("rope node '{node_id:?}': {reason}"),
-                })?;
+            match crate::operator::RopeYarnFrequencyScaling::from_attributes(&node.attributes)
+                .map_err(failed)?
+            {
+                Some(yarn) => Some(Declared::Yarn(yarn)),
+                None => {
+                    crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes)
+                        .map_err(failed)?
+                        .map(Declared::Banded)
+                }
+            };
         if declared != expected {
             return Err(E2eConformanceError::ModelComponentFailed {
                 reason: format!(
@@ -883,7 +899,8 @@ impl E2eRuntimeModelExecutionEngine {
                     .max(1) as u32,
                 ComputeDType::Float32,
             )
-            .with_layer_row_widths(self.fixture.config.kv_row_widths()),
+            .with_layer_row_widths(self.fixture.config.kv_row_widths())
+            .with_layer_value_row_widths(self.fixture.config.kv_value_row_widths()),
         );
         if let Some(session) = &request.session {
             cache = cache.with_session(session.clone());
@@ -1323,18 +1340,19 @@ impl E2eRuntimeModelExecutionEngine {
     }
 
     /// The bytes of one store set of `capacity` rows: the K and V of every
-    /// layer that keeps its own, at that layer's width
-    /// (`per-layer-kv-geometry`).
+    /// layer that keeps its own, at that layer's widths
+    /// (`per-layer-kv-geometry`; V's own width under latent attention,
+    /// `express-latent-attention-forms`).
     fn kv_set_bytes(&self, capacity: u64) -> u64 {
-        self.fixture
-            .config
+        let config = &self.fixture.config;
+        config
             .kv_row_widths()
             .into_iter()
-            .flatten()
-            .fold(0u64, |bytes, width| {
+            .zip(config.kv_value_row_widths())
+            .filter_map(|(key, value)| key.zip(value))
+            .fold(0u64, |bytes, (key, value)| {
                 bytes.saturating_add(
-                    width
-                        .saturating_mul(2)
+                    key.saturating_add(value)
                         .saturating_mul(capacity)
                         .saturating_mul(4),
                 )

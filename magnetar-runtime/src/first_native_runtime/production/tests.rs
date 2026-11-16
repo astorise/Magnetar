@@ -61,6 +61,9 @@ fn production_loading_generates_end_to_end_with_a_non_canonical_qwen_config() {
         layer_layout: None,
         final_logit_softcapping: None,
         per_layer_input_size: None,
+        latent_attention: None,
+        moe_layers: None,
+        expert_routing: None,
         require_bos: false,
         require_pad: false,
         expected_added_tokens: None,
@@ -1035,4 +1038,90 @@ fn weight_shapes_follow_the_layer_layout() {
     assert_eq!(shapes["layers.2.self_attn.q_proj"], vec![8, 8]);
     assert!(!shapes.contains_key("layers.2.self_attn.k_proj"));
     assert!(!shapes.contains_key("layers.2.self_attn.v_proj"));
+}
+
+/// `express-latent-attention-forms`: a DeepSeek-V2-Lite-shaped configuration
+/// derives the split latent-attention projections instead of q/k/v, a dense
+/// first layer and routed later ones, no gate for an ungated shared expert,
+/// and the selection bias when routing declares one.
+#[test]
+fn latent_attention_and_mixed_expert_layers_derive_their_weight_shapes() {
+    let mla = crate::LatentAttentionConfig {
+        q_lora_rank: None,
+        kv_lora_rank: 512,
+        qk_nope_head_dim: 128,
+        qk_rope_head_dim: 64,
+        v_head_dim: 128,
+    };
+    let config = ModelArchitectureConfig {
+        hidden_size: 2048,
+        intermediate_size: 10944,
+        num_hidden_layers: 2,
+        num_attention_heads: 16,
+        num_key_value_heads: 16,
+        head_dim: 192,
+        vocab_size: 102400,
+        rms_norm_eps: 1e-6,
+        rope_theta: 10_000.0,
+        mixture_of_experts: Some(crate::MixtureOfExpertsConfig {
+            experts: 64,
+            experts_per_token: 6,
+            expert_intermediate_size: 1408,
+            shared_expert_intermediate_size: Some(2816),
+            normalize_top_k: false,
+        }),
+        latent_attention: Some(mla),
+        moe_layers: Some(vec![false, true]),
+        expert_routing: Some(crate::ExpertRoutingConfig {
+            scoring: crate::ExpertScoring::Softmax,
+            groups: None,
+            routed_scaling_factor: 1.0,
+            selection_bias: true,
+            shared_expert_gated: false,
+        }),
+        ..Default::default()
+    };
+    let shapes = weight_shapes_for_architecture_config(&config);
+    for (name, shape) in [
+        ("layers.0.self_attn.q_nope_proj", vec![2048, 16 * 128]),
+        ("layers.0.self_attn.q_rope_proj", vec![2048, 16 * 64]),
+        ("layers.0.self_attn.kv_a_proj", vec![2048, 512]),
+        ("layers.0.self_attn.kv_a_norm", vec![512]),
+        ("layers.0.self_attn.k_rope_proj", vec![2048, 64]),
+        ("layers.0.self_attn.k_nope_proj", vec![512, 16 * 128]),
+        ("layers.0.self_attn.v_proj", vec![512, 16 * 128]),
+        ("layers.0.self_attn.o_proj", vec![16 * 128, 2048]),
+        ("layers.0.mlp.gate_proj", vec![2048, 10944]),
+        ("layers.1.moe.router_proj", vec![2048, 64]),
+        ("layers.1.moe.shared_down_proj", vec![2816, 2048]),
+        ("layers.1.moe.selection_bias", vec![64]),
+    ] {
+        assert_eq!(shapes.get(name), Some(&shape), "{name}");
+    }
+    for absent in [
+        "layers.0.self_attn.q_proj",
+        "layers.0.self_attn.k_proj",
+        "layers.0.self_attn.q_a_proj",
+        "layers.0.moe.router_proj",
+        "layers.1.mlp.gate_proj",
+        "layers.1.moe.shared_expert_gate",
+    ] {
+        assert!(!shapes.contains_key(absent), "{absent}");
+    }
+    // A low-rank query adds its projection and norm and narrows the split
+    // query projections' input.
+    let low_rank = ModelArchitectureConfig {
+        latent_attention: Some(crate::LatentAttentionConfig {
+            q_lora_rank: Some(1536),
+            ..mla
+        }),
+        ..config
+    };
+    let shapes = weight_shapes_for_architecture_config(&low_rank);
+    assert_eq!(shapes["layers.0.self_attn.q_a_proj"], vec![2048, 1536]);
+    assert_eq!(shapes["layers.0.self_attn.q_a_norm"], vec![1536]);
+    assert_eq!(
+        shapes["layers.0.self_attn.q_nope_proj"],
+        vec![1536, 16 * 128]
+    );
 }

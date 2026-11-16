@@ -140,11 +140,13 @@ use crate::memory::{
     MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
 };
 use crate::operator::{
-    ATTENTION_SCALE_FEATURE, EMBEDDING_SCALE_FEATURE, MOE_EXPERTS_ACTIVATION_FEATURE,
+    ATTENTION_SCALE_FEATURE, ATTENTION_VALUE_HEAD_DIMENSION_FEATURE, CONCAT_HEADS_FEATURE,
+    ConcatAxis, EMBEDDING_SCALE_FEATURE, MOE_EXPERTS_ACTIVATION_FEATURE,
     MOE_PER_EXPERT_SCALE_FEATURE, OperatorAttributeValue, OperatorFamily, OperatorId, OperatorSpec,
     RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE,
-    ROPE_BANDED_FREQUENCY_SCALING_FEATURE, ROPE_PARTIAL_ROTARY_FEATURE, RopeBandedFrequencyScaling,
-    TensorLayoutKind, TensorRole,
+    ROPE_BANDED_FREQUENCY_SCALING_FEATURE, ROPE_PARTIAL_ROTARY_FEATURE,
+    ROPE_YARN_FREQUENCY_SCALING_FEATURE, RopeBandedFrequencyScaling, RopeYarnFrequencyScaling,
+    TensorLayoutKind, TensorRole, concat_axis,
 };
 pub use crate::operator_semantics::{
     MOE_EXPERT_COUNT_ATTRIBUTE, MOE_EXPERT_FIRST_ATTRIBUTE, MoeRouting, NATIVE_CPU_PROVIDER_NAME,
@@ -523,6 +525,89 @@ pub fn rope_partial(
     frequency_scaling: Option<&RopeBandedFrequencyScaling>,
     partial_rotary_factor: Option<f32>,
 ) -> Result<HostTensor, ReferenceCpuError> {
+    rope_scaled(
+        input,
+        base,
+        scale,
+        dimension,
+        position_offset,
+        head_count,
+        pairing,
+        RopeFrequencies::from_banded(frequency_scaling),
+        partial_rotary_factor,
+    )
+}
+
+/// The per-pair frequency scaling of a `rope` invocation.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum RopeFrequencies<'a> {
+    /// `base^(-2i/dimension)` unchanged.
+    #[default]
+    Unscaled,
+    Banded(&'a RopeBandedFrequencyScaling),
+    /// YaRN (`express-latent-attention-forms`), which also multiplies `cos`
+    /// and `sin` by its `attention_factor`.
+    Yarn(&'a RopeYarnFrequencyScaling),
+}
+
+impl<'a> RopeFrequencies<'a> {
+    pub fn from_banded(scaling: Option<&'a RopeBandedFrequencyScaling>) -> Self {
+        scaling.map_or(Self::Unscaled, Self::Banded)
+    }
+
+    fn validate(&self) -> Result<(), ReferenceCpuError> {
+        let invalid =
+            |reason| ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason);
+        match self {
+            Self::Unscaled => Ok(()),
+            Self::Banded(scaling) => scaling.validate().map_err(invalid),
+            Self::Yarn(scaling) => scaling.validate().map_err(invalid),
+        }
+    }
+
+    /// Each of the `pairs` first rotated pairs' frequency, in `f32` as every
+    /// Kernel computes it.
+    fn table(&self, base: f32, dimension: u64, pairs: usize) -> Vec<f32> {
+        let range = match self {
+            Self::Yarn(scaling) => Some(scaling.correction_range(dimension, base)),
+            _ => None,
+        };
+        (0..pairs)
+            .map(|pair| {
+                let frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
+                match (self, range) {
+                    (Self::Banded(scaling), _) => scaling.scale_frequency(frequency),
+                    (Self::Yarn(scaling), Some(range)) => {
+                        scaling.scale_frequency(frequency, pair, range)
+                    }
+                    _ => frequency,
+                }
+            })
+            .collect()
+    }
+
+    /// The factor on `cos` and `sin`.
+    fn amplitude(&self) -> f32 {
+        match self {
+            Self::Yarn(scaling) => scaling.attention_factor as f32,
+            _ => 1.0,
+        }
+    }
+}
+
+/// [`rope_partial`] with any [`RopeFrequencies`].
+#[allow(clippy::too_many_arguments)]
+pub fn rope_scaled(
+    input: &HostTensor,
+    base: f32,
+    scale: f32,
+    dimension: u64,
+    position_offset: u64,
+    head_count: u64,
+    pairing: RopePairing,
+    frequencies: RopeFrequencies<'_>,
+    partial_rotary_factor: Option<f32>,
+) -> Result<HostTensor, ReferenceCpuError> {
     if partial_rotary_factor
         .is_some_and(|factor| !(factor.is_finite() && factor > 0.0 && factor <= 1.0))
     {
@@ -531,11 +616,7 @@ pub fn rope_partial(
             "RoPE partial_rotary_factor must lie in (0, 1]",
         ));
     }
-    if let Some(scaling) = frequency_scaling {
-        scaling.validate().map_err(|reason| {
-            ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason)
-        })?;
-    }
+    frequencies.validate()?;
     let (rows, cols) = input.rows_cols()?;
     if head_count == 0 || !cols.is_multiple_of(head_count) {
         return Err(ReferenceCpuError::new(
@@ -572,18 +653,17 @@ pub fn rope_partial(
         (factor as f64 * dimension as f64 / 2.0).floor() as usize
     });
     let head_width = head_width as usize;
+    let table = frequencies.table(base, dimension, rotated_pairs.min(half));
+    let amplitude = frequencies.amplitude();
     for row in 0..rows as usize {
         let position = ((position_offset as usize + row) as f32) * scale;
         let row_start = row * cols as usize;
         for head in 0..head_count as usize {
             let col_base = row_start + head * head_width;
-            for pair in 0..rotated_pairs.min(half) {
-                let mut frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
-                if let Some(scaling) = frequency_scaling {
-                    frequency = scaling.scale_frequency(frequency);
-                }
+            for (pair, &frequency) in table.iter().enumerate() {
                 let angle = position * frequency;
                 let (sin, cos) = angle.sin_cos();
+                let (sin, cos) = (sin * amplitude, cos * amplitude);
                 let (first, second) = match pairing {
                     RopePairing::Interleaved => (col_base + 2 * pair, col_base + 2 * pair + 1),
                     RopePairing::HalfSplit => (col_base + pair, col_base + pair + half),
@@ -731,15 +811,48 @@ pub fn attention_scaled(
     causal: bool,
     score_scale: Option<f32>,
 ) -> Result<HostTensor, ReferenceCpuError> {
+    attention_with_value_width(
+        q,
+        k,
+        v,
+        head_count,
+        head_dimension,
+        head_dimension,
+        kv_head_count,
+        window_size,
+        causal,
+        score_scale,
+    )
+}
+
+/// [`attention_scaled`] whose V rows and output are `value_head_dimension`
+/// wide per head while Q and K rows are `head_dimension` wide
+/// (`attention.value_head_dimension`, `express-latent-attention-forms`).
+/// The output is `[T, head_count * value_head_dimension]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_with_value_width(
+    q: &HostTensor,
+    k: &HostTensor,
+    v: &HostTensor,
+    head_count: u64,
+    head_dimension: u64,
+    value_head_dimension: u64,
+    kv_head_count: Option<u64>,
+    window_size: Option<u64>,
+    causal: bool,
+    score_scale: Option<f32>,
+) -> Result<HostTensor, ReferenceCpuError> {
     if score_scale.is_some_and(|scale| !scale.is_finite()) {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
             "attention scale must be finite",
         ));
     }
-    same_shape(k, v)?;
+    if value_head_dimension == head_dimension {
+        same_shape(k, v)?;
+    }
     let kv_head_count = kv_head_count.unwrap_or(head_count);
-    if head_count == 0 || head_dimension == 0 || kv_head_count == 0 {
+    if head_count == 0 || head_dimension == 0 || kv_head_count == 0 || value_head_dimension == 0 {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
             "head_count, kv_head_count, and head_dimension must all be positive",
@@ -794,12 +907,25 @@ pub fn attention_scaled(
             ),
         ));
     }
+    let (v_rows, v_model_dim) = v.rows_cols()?;
+    if v_rows != kv_seq_len || kv_head_count * value_head_dimension != v_model_dim {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "v must be [{kv_seq_len}, {kv_head_count} * {value_head_dimension}], got {:?}",
+                v.shape
+            ),
+        ));
+    }
     let group_size = (head_count / kv_head_count) as usize;
     let seq_len = seq_len as usize;
     let kv_seq_len = kv_seq_len as usize;
     let q_model_dim = q_model_dim as usize;
     let kv_model_dim = kv_model_dim as usize;
     let head_dimension = head_dimension as usize;
+    let value_head_dimension = value_head_dimension as usize;
+    let v_model_dim = v_model_dim as usize;
+    let out_model_dim = head_count as usize * value_head_dimension;
     let scale = score_scale.unwrap_or(1.0 / (head_dimension as f32).sqrt());
     // Queries are the *last* `seq_len` positions of the sequence the keys
     // cover. For prefill the two lengths match and this offset is zero; for a
@@ -807,7 +933,7 @@ pub fn attention_scaled(
     // its true position, so causal masking and the sliding window bound the
     // right keys instead of treating the token as if it were at position 0.
     let query_position_offset = kv_seq_len - seq_len;
-    let mut out = vec![0.0_f32; seq_len * q_model_dim];
+    let mut out = vec![0.0_f32; seq_len * out_model_dim];
     // Both scratch buffers are rewritten from scratch for every (head, query)
     // pair and carry nothing between iterations, so they are allocated once
     // here instead of twice per pair. Only the admitted key window is ever
@@ -844,18 +970,20 @@ pub fn attention_scaled(
             exponentials.clear();
             exponentials.extend(scores.iter().map(|value| (value - max).exp()));
             let sum: f32 = exponentials.iter().sum();
-            for dim in 0..head_dimension {
+            let value_offset = kv_head * value_head_dimension;
+            let out_base = query_index * out_model_dim + head * value_head_dimension;
+            for dim in 0..value_head_dimension {
                 let mut accumulator = 0.0_f32;
                 for (offset, weight) in exponentials.iter().enumerate() {
                     let key_index = key_lower + offset;
                     accumulator +=
-                        (weight / sum) * v.data[key_index * kv_model_dim + kv_offset + dim];
+                        (weight / sum) * v.data[key_index * v_model_dim + value_offset + dim];
                 }
-                out[query_base + dim] = accumulator;
+                out[out_base + dim] = accumulator;
             }
         }
     }
-    HostTensor::new(q.shape.clone(), out)
+    HostTensor::new(vec![seq_len as u64, out_model_dim as u64], out)
 }
 
 /// SiLU activation: `x * sigmoid(x)`.
@@ -1323,6 +1451,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         .id
         .features
         .insert(ATTENTION_SCALE_FEATURE.to_string());
+    // Honours `value_head_dimension` (`express-latent-attention-forms`).
+    attention
+        .id
+        .features
+        .insert(ATTENTION_VALUE_HEAD_DIMENSION_FEATURE.to_string());
     let with_features = |operator: &str, family: OperatorFamily, features: &[&str]| {
         let mut advertisement = baseline_advertisement(operator, family);
         advertisement
@@ -1355,8 +1488,10 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         &[
             ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
             ROPE_PARTIAL_ROTARY_FEATURE,
+            ROPE_YARN_FREQUENCY_SCALING_FEATURE,
         ],
     );
+    let concat = with_features("concat", OperatorFamily::Tensor, &[CONCAT_HEADS_FEATURE]);
 
     vec![
         baseline_advertisement("matmul", OperatorFamily::LinearAlgebra),
@@ -1376,7 +1511,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("activation", OperatorFamily::Activation),
         baseline_advertisement("add", OperatorFamily::Tensor),
         baseline_advertisement("mul", OperatorFamily::Tensor),
-        baseline_advertisement("concat", OperatorFamily::Tensor),
+        concat,
         baseline_advertisement("kv-write", OperatorFamily::Tensor),
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
@@ -2533,11 +2668,19 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
-                let frequency_scaling = RopeBandedFrequencyScaling::from_attributes(
-                    &invocation.attributes,
-                )
-                .map_err(|attribute| KernelError::KernelAttributeUnsupported { attribute })?;
-                rope_partial(
+                let unsupported = |attribute| KernelError::KernelAttributeUnsupported { attribute };
+                let yarn = RopeYarnFrequencyScaling::from_attributes(&invocation.attributes)
+                    .map_err(unsupported)?;
+                let banded = match yarn {
+                    Some(_) => None,
+                    None => RopeBandedFrequencyScaling::from_attributes(&invocation.attributes)
+                        .map_err(unsupported)?,
+                };
+                let frequencies = match (&yarn, &banded) {
+                    (Some(yarn), _) => RopeFrequencies::Yarn(yarn),
+                    (None, banded) => RopeFrequencies::from_banded(banded.as_ref()),
+                };
+                rope_scaled(
                     &input,
                     base,
                     scale,
@@ -2545,7 +2688,7 @@ impl ReferenceCpuExecutor {
                     position_offset,
                     head_count,
                     pairing,
-                    frequency_scaling.as_ref(),
+                    frequencies,
                     Self::attribute_float_opt(&invocation.attributes, "partial_rotary_factor"),
                 )
                 .map_err(KernelError::from)?
@@ -2617,12 +2760,24 @@ impl ReferenceCpuExecutor {
                         leading_rows(&v, key_count).map_err(KernelError::from)?,
                     ),
                 };
-                attention_scaled(
+                // `express-latent-attention-forms`: V rows and the output
+                // may be narrower or wider than Q/K rows.
+                let value_head_dimension = match invocation.attributes.get("value_head_dimension") {
+                    None => head_dimension,
+                    Some(OperatorAttributeValue::Integer(width)) if *width > 0 => *width as u64,
+                    Some(_) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "value_head_dimension must be a positive integer".into(),
+                        });
+                    }
+                };
+                attention_with_value_width(
                     &q,
                     &k,
                     &v,
                     head_count,
                     head_dimension,
+                    value_head_dimension,
                     kv_head_count,
                     window_size,
                     causal,
@@ -2693,7 +2848,32 @@ impl ReferenceCpuExecutor {
             "concat" => {
                 let a = self.input_tensor(invocation, 0)?;
                 let b = self.input_tensor(invocation, 1)?;
-                concat(&a, &b).map_err(KernelError::from)?
+                match concat_axis(&invocation.attributes) {
+                    Some(ConcatAxis::Rows) => concat(&a, &b).map_err(KernelError::from)?,
+                    // `express-latent-attention-forms`: head by head.
+                    Some(ConcatAxis::Heads) => {
+                        let head_count =
+                            Self::attribute_integer(&invocation.attributes, "head_count")
+                                .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                                    attribute: "head_count".into(),
+                                })?;
+                        let second_head_count =
+                            Self::attribute_integer(&invocation.attributes, "second_head_count")
+                                .unwrap_or(head_count);
+                        crate::operator_semantics::concat_heads(
+                            &a,
+                            &b,
+                            head_count,
+                            second_head_count,
+                        )
+                        .map_err(KernelError::from)?
+                    }
+                    None => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "concat axis must be 'rows' or 'heads'".into(),
+                        });
+                    }
+                }
             }
             "kv-write" => {
                 let store = self.input_tensor(invocation, 0)?;

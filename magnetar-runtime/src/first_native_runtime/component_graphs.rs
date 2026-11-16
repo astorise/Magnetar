@@ -293,7 +293,9 @@ pub fn register_inference_component_artifact(
     // `1.6.0` (`add-layer-layout-model-config`) adds `model-config`'s
     // `layer-layout` and `options`; Components compiled against an earlier
     // version keep linking.
-    for version in ["1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0"] {
+    // `1.7.0` (`express-latent-attention-forms`) adds latent attention,
+    // mixed expert layers, expert routing and the YaRN RoPE case.
+    for version in ["1.2.0", "1.3.0", "1.4.0", "1.5.0", "1.6.0", "1.7.0"] {
         manager.provide_capability(
             WitInterface::new("magnetar:model-component-graph/graph-builder", version),
             capability.clone() as Arc<dyn HostCapability>,
@@ -624,6 +626,11 @@ pub(super) fn build_first_native_graphs_with_runtime(
             .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
                 reason: "build-prefill-graph handle did not resolve to a finished graph".into(),
             })?;
+        require_declared_features_read(
+            model_config_capability,
+            &engine_key,
+            "build-prefill-graph",
+        )?;
 
         model_config_capability.bind_config(&engine_key, config.clone());
         capability.prepare_session(&engine_key, session_context(weight_shapes));
@@ -642,6 +649,7 @@ pub(super) fn build_first_native_graphs_with_runtime(
             .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
                 reason: "build-decode-graph handle did not resolve to a finished graph".into(),
             })?;
+        require_declared_features_read(model_config_capability, &engine_key, "build-decode-graph")?;
 
         validate_first_scope_graph(&prefill)?;
         validate_first_scope_graph(&decode)?;
@@ -742,6 +750,11 @@ pub(super) fn build_first_native_prefill_graph_segment_with_runtime(
                 reason: "build-prefill-graph-segment handle did not resolve to a finished graph"
                     .into(),
             })?;
+        require_declared_features_read(
+            model_config_capability,
+            &engine_key,
+            "build-prefill-graph-segment",
+        )?;
 
         validate_first_scope_graph(&segment)?;
         validate_rope_frequency_scaling(&segment, &expected_scaling)?;
@@ -854,6 +867,11 @@ pub(super) fn build_first_native_decode_graph_segment_with_runtime(
                 reason: "build-decode-graph-segment handle did not resolve to a finished graph"
                     .into(),
             })?;
+        require_declared_features_read(
+            model_config_capability,
+            &engine_key,
+            "build-decode-graph-segment",
+        )?;
 
         validate_first_scope_graph(&segment)?;
         validate_rope_frequency_scaling(&segment, &expected_scaling)?;
@@ -1001,6 +1019,30 @@ pub(super) fn inference_component_runtime_limits() -> ComponentResourceLimits {
         engine_execution_budget: Some(20_000_000),
         require_memory_limit: true,
     }
+}
+
+/// Refuses a graph built while the bound configuration declares a `1.7.0`
+/// feature (latent attention, mixed expert layers, expert routing) that the
+/// Model Component never read (`express-latent-attention-forms`): a
+/// Component compiled against an earlier version cannot know of it, and a
+/// graph that ignores it computes another model.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+fn require_declared_features_read(
+    model_config: &ModelConfigCapability,
+    instance_key: &str,
+    export: &str,
+) -> Result<(), E2eConformanceError> {
+    let unread = model_config.unread_declared_features(instance_key);
+    if unread.is_empty() {
+        return Ok(());
+    }
+    Err(E2eConformanceError::ModelComponentFailed {
+        reason: format!(
+            "{export}: the checkpoint declares {}, which the Model Component never read from \
+             model-config; it does not implement this model",
+            unread.join(", ")
+        ),
+    })
 }
 
 #[cfg(test)]

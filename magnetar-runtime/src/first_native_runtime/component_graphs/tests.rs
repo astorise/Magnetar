@@ -582,3 +582,81 @@ fn the_qwen_component_builds_a_mixture_of_experts_graph_when_the_config_declares
         assert_eq!(shard(canonical), expected, "{name}");
     }
 }
+
+/// `express-latent-attention-forms`: the real Qwen Component predates
+/// `model-config` 1.7.0, so it never reads mixed expert layers or expert
+/// routing. A checkpoint declaring either is refused instead of being built
+/// as if every layer were routed the `1.5.0` way.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+#[test]
+fn a_component_that_never_reads_a_declared_1_7_0_feature_is_refused() {
+    let digest = ComponentDigest::sha256(QWEN_REAL_COMPONENT_BYTES);
+    let trust = ComponentTrustStore::default().trust_digest(&digest.value);
+    register_inference_component_artifact(
+        QWEN_REAL_COMPONENT_BYTES.to_vec(),
+        QWEN_REAL_COMPONENT_MANIFEST_BYTES.to_vec(),
+        &trust,
+    )
+    .expect("the real Qwen Component must register");
+    let fixture = e2e_fixture().expect("fixture builds");
+    let dense = architecture_config_from_first_native_model_config(&fixture.config);
+    let routed = ModelArchitectureConfig {
+        mixture_of_experts: Some(crate::MixtureOfExpertsConfig {
+            experts: 6,
+            experts_per_token: 2,
+            expert_intermediate_size: 4,
+            shared_expert_intermediate_size: Some(8),
+            normalize_top_k: false,
+        }),
+        ..dense.clone()
+    };
+    let build = |config: &ModelArchitectureConfig| {
+        build_first_native_graphs_from_named_component(&digest, config, &fixture.identity, 2)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    };
+    build(&routed).expect("an all-MoE checkpoint still builds");
+
+    let layers = dense.num_hidden_layers as usize;
+    let mixed = ModelArchitectureConfig {
+        moe_layers: Some((0..layers).map(|layer| layer > 0).collect()),
+        ..routed.clone()
+    };
+    // Its dense first layer has no expert weights, so the Component, which
+    // routes every layer, fails as soon as it asks for them.
+    build(&mixed).expect_err("unread mixed expert layers are refused");
+
+    // Routing that keeps every weight the Component asks for (a gated
+    // shared expert, no selection bias): the graph builds, and is refused
+    // for the unread function.
+    let custom_routing = ModelArchitectureConfig {
+        expert_routing: Some(crate::ExpertRoutingConfig {
+            scoring: crate::ExpertScoring::Softmax,
+            groups: None,
+            routed_scaling_factor: 2.0,
+            selection_bias: false,
+            shared_expert_gated: true,
+        }),
+        ..routed
+    };
+    let error = build(&custom_routing).expect_err("unread expert routing is refused");
+    assert!(error.contains("expert-routing"), "{error}");
+
+    // A YaRN checkpoint: the Component's `1.5.0` view of `rope-scaling` has no
+    // `yarn` case, so it cannot build an unscaled graph for it.
+    let yarn = ModelArchitectureConfig {
+        rope_frequency_scaling: Some(crate::RopeFrequencyScaling::Yarn {
+            scaling: crate::operator::RopeYarnFrequencyScaling {
+                factor: 40.0,
+                original_context_length: 4096,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                attention_factor: 1.0,
+                truncate: true,
+            },
+            mscale_all_dim: Some(0.707),
+        }),
+        ..dense
+    };
+    build(&yarn).expect_err("a YaRN checkpoint is refused to a Component predating it");
+}

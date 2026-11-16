@@ -189,3 +189,107 @@ fn model_revoking_a_key_does_not_distrust_a_digest_pinned_artifact() {
     assert_eq!(decision.status(), ModelTrustStatus::Trusted);
     assert_eq!(decision.reason(), "digest trusted by policy");
 }
+
+/// `express-latent-attention-forms`: DeepSeek-V2-Lite's shape validates;
+/// each inconsistent 1.7.0 declaration is refused.
+#[test]
+fn latent_attention_and_expert_declarations_validate_against_the_architecture() {
+    let moe = MixtureOfExpertsConfig {
+        experts: 64,
+        experts_per_token: 6,
+        expert_intermediate_size: 1408,
+        shared_expert_intermediate_size: Some(2816),
+        normalize_top_k: false,
+    };
+    let valid = ModelArchitectureConfig {
+        hidden_size: 2048,
+        intermediate_size: 10944,
+        num_hidden_layers: 27,
+        num_attention_heads: 16,
+        num_key_value_heads: 16,
+        head_dim: 192,
+        vocab_size: 102400,
+        rms_norm_eps: 1e-6,
+        rope_theta: 10_000.0,
+        mixture_of_experts: Some(moe),
+        latent_attention: Some(LatentAttentionConfig {
+            q_lora_rank: None,
+            kv_lora_rank: 512,
+            qk_nope_head_dim: 128,
+            qk_rope_head_dim: 64,
+            v_head_dim: 128,
+        }),
+        moe_layers: Some((0..27).map(|layer| layer >= 1).collect()),
+        expert_routing: Some(ExpertRoutingConfig {
+            scoring: ExpertScoring::Softmax,
+            groups: Some(ExpertGroups {
+                count: 8,
+                per_token: 3,
+                score: ExpertGroupScore::Max,
+            }),
+            routed_scaling_factor: 1.0,
+            selection_bias: false,
+            shared_expert_gated: false,
+        }),
+        ..Default::default()
+    };
+    valid.validate().unwrap();
+    let refused = |change: fn(&mut ModelArchitectureConfig)| {
+        let mut config = valid.clone();
+        change(&mut config);
+        assert!(config.validate().is_err(), "{config:?}");
+    };
+    // A query/key head that is not nope + rope wide.
+    refused(|config| config.head_dim = 128);
+    // Fewer K/V heads than attention heads.
+    refused(|config| config.num_key_value_heads = 1);
+    // A zero latent width.
+    refused(|config| {
+        config.latent_attention.as_mut().unwrap().kv_lora_rank = 0;
+    });
+    // Expert layers for another layer count, or without experts.
+    refused(|config| config.moe_layers = Some(vec![true; 26]));
+    refused(|config| {
+        config.mixture_of_experts = None;
+        config.expert_routing = None;
+    });
+    // Groups that do not divide the experts, or offer too few of them.
+    refused(|config| {
+        config
+            .expert_routing
+            .as_mut()
+            .unwrap()
+            .groups
+            .as_mut()
+            .unwrap()
+            .count = 7;
+    });
+    refused(|config| {
+        config
+            .expert_routing
+            .as_mut()
+            .unwrap()
+            .groups
+            .as_mut()
+            .unwrap()
+            .per_token = 0;
+    });
+    refused(|config| {
+        let groups = config
+            .expert_routing
+            .as_mut()
+            .unwrap()
+            .groups
+            .as_mut()
+            .unwrap();
+        groups.count = 32;
+        groups.per_token = 2;
+    });
+    refused(|config| {
+        config
+            .expert_routing
+            .as_mut()
+            .unwrap()
+            .routed_scaling_factor = 0.0
+    });
+}

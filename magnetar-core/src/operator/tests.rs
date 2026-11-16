@@ -493,3 +493,136 @@ fn required_kernel_features_name_only_non_baseline_forms() {
         vec![MOE_EXPERTS_ACTIVATION_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE]
     );
 }
+
+/// `express-latent-attention-forms`: the value width, head-wise `concat`
+/// and YaRN each need their Kernel feature; row `concat` needs none.
+#[test]
+fn latent_attention_forms_require_their_kernel_features() {
+    let attributes = |pairs: &[(&str, OperatorAttributeValue)]| {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        required_kernel_features(
+            "attention",
+            &attributes(&[("value_head_dimension", OperatorAttributeValue::Integer(128))]),
+            3
+        ),
+        vec![ATTENTION_VALUE_HEAD_DIMENSION_FEATURE]
+    );
+    assert!(required_kernel_features("concat", &BTreeMap::new(), 2).is_empty());
+    assert_eq!(
+        required_kernel_features(
+            "concat",
+            &attributes(&[("axis", OperatorAttributeValue::String("heads".into()))]),
+            2
+        ),
+        vec![CONCAT_HEADS_FEATURE]
+    );
+    let mut yarn = BTreeMap::new();
+    RopeYarnFrequencyScaling {
+        factor: 40.0,
+        original_context_length: 4096,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        attention_factor: 1.0,
+        truncate: true,
+    }
+    .insert_attributes(&mut yarn);
+    assert_eq!(
+        required_kernel_features("rope", &yarn, 1),
+        vec![ROPE_YARN_FREQUENCY_SCALING_FEATURE]
+    );
+    // YaRN attributes round-trip, and the banded parser refuses them.
+    assert!(
+        RopeYarnFrequencyScaling::from_attributes(&yarn)
+            .unwrap()
+            .is_some()
+    );
+    assert!(RopeBandedFrequencyScaling::from_attributes(&yarn).is_err());
+}
+
+#[test]
+fn concat_across_heads_validates_its_widths() {
+    let catalog = initial_operator_catalog();
+    let concat = catalog
+        .get(&OperatorId::magnetar("concat", 1, OperatorFamily::Tensor))
+        .unwrap();
+    let tensor = |dimensions: [u64; 2]| {
+        TensorDescriptor::materialized(
+            ShapeDescriptor::new(dimensions),
+            DTypeDescriptor::portable(ComputeDType::Float32),
+        )
+    };
+    let heads = |second: i64| {
+        [
+            ("axis", OperatorAttributeValue::String("heads".into())),
+            ("head_count", OperatorAttributeValue::Integer(16)),
+            ("second_head_count", OperatorAttributeValue::Integer(second)),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect::<BTreeMap<_, _>>()
+    };
+    // q = [q_nope | q_pe]: 16 heads of 128 and 16 of 64.
+    assert!(
+        concat
+            .validate_invocation(
+                &[tensor([5, 2048]), tensor([5, 1024])],
+                &[tensor([5, 3072])],
+                &heads(16)
+            )
+            .is_ok()
+    );
+    // k = [k_nope | k_pe]: one shared 64-wide head for all 16.
+    assert!(
+        concat
+            .validate_invocation(
+                &[tensor([5, 2048]), tensor([5, 64])],
+                &[tensor([5, 3072])],
+                &heads(1)
+            )
+            .is_ok()
+    );
+    for (inputs, output, attributes) in [
+        // A wrong output width.
+        (
+            [tensor([5, 2048]), tensor([5, 64])],
+            tensor([5, 2112]),
+            heads(1),
+        ),
+        // Different row counts.
+        (
+            [tensor([5, 2048]), tensor([4, 64])],
+            tensor([5, 3072]),
+            heads(1),
+        ),
+        // A second input of neither 1 nor 16 heads.
+        (
+            [tensor([5, 2048]), tensor([5, 64])],
+            tensor([5, 2560]),
+            heads(4),
+        ),
+    ] {
+        assert!(matches!(
+            concat.validate_invocation(&inputs, &[output], &attributes),
+            Err(OperatorError::ShapeMismatch { .. })
+        ));
+    }
+    let unknown_axis = [(
+        "axis".to_string(),
+        OperatorAttributeValue::String("columns".into()),
+    )]
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    assert!(matches!(
+        concat.validate_invocation(
+            &[tensor([5, 2048]), tensor([5, 2048])],
+            &[tensor([10, 2048])],
+            &unknown_axis
+        ),
+        Err(OperatorError::OperatorAttributeInvalid { .. })
+    ));
+}

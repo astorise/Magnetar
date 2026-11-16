@@ -24,6 +24,9 @@ fn sample_config() -> ModelArchitectureConfig {
         layer_layout: None,
         final_logit_softcapping: None,
         per_layer_input_size: None,
+        latent_attention: None,
+        moe_layers: None,
+        expert_routing: None,
         bos_token_id: None,
         eos_token_id: Some(151643),
     }
@@ -313,4 +316,56 @@ fn layer_layout_validation_refuses_inconsistent_layouts() {
     refused(&|config| config.layer_layout.as_mut().unwrap()[2].head_dim = 128);
     refused(&|config| config.final_logit_softcapping = Some(0.0));
     refused(&|config| config.per_layer_input_size = Some(0));
+}
+
+/// `express-latent-attention-forms`: a declared `1.7.0` feature stays
+/// "unread" until the instance calls its function, and a new binding resets
+/// what was read.
+#[test]
+fn unread_declared_features_track_the_1_7_0_functions_each_instance_calls() {
+    let capability = ModelConfigCapability::new();
+    let mut config = sample_config();
+    assert!(capability.unread_declared_features("a").is_empty());
+    capability.bind_config("a", config.clone());
+    assert!(capability.unread_declared_features("a").is_empty());
+
+    config.mixture_of_experts = Some(MixtureOfExpertsConfig {
+        experts: 4,
+        experts_per_token: 2,
+        expert_intermediate_size: 8,
+        shared_expert_intermediate_size: None,
+        normalize_top_k: true,
+    });
+    config.moe_layers = Some(vec![true; config.num_hidden_layers as usize]);
+    config.latent_attention = Some(crate::LatentAttentionConfig {
+        q_lora_rank: None,
+        kv_lora_rank: 32,
+        qk_nope_head_dim: 48,
+        qk_rope_head_dim: 16,
+        v_head_dim: 48,
+    });
+    capability.bind_config("a", config.clone());
+    assert_eq!(
+        capability.unread_declared_features("a"),
+        vec!["multi-head-latent-attention", "mixture-of-experts-layers"]
+    );
+    let latent = capability
+        .call("a", "multi-head-latent-attention", &[])
+        .unwrap();
+    assert!(matches!(&latent[..], [ComponentValue::Option(Some(_))]));
+    assert_eq!(
+        capability.unread_declared_features("a"),
+        vec!["mixture-of-experts-layers"]
+    );
+    capability
+        .call("a", "mixture-of-experts-layers", &[])
+        .unwrap();
+    assert!(capability.unread_declared_features("a").is_empty());
+    // Another instance, and a fresh binding of the same one, start over.
+    capability.bind_config("b", config.clone());
+    assert_eq!(capability.unread_declared_features("b").len(), 2);
+    capability.bind_config("a", config);
+    assert_eq!(capability.unread_declared_features("a").len(), 2);
+    capability.clear_config("a");
+    assert!(capability.unread_declared_features("a").is_empty());
 }

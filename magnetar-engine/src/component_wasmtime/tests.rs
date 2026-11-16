@@ -45,6 +45,43 @@ const CAPABILITY_ECHO_COMPONENT: &str =
 /// through the canonical ABI (`add-layer-layout-model-config`).
 const LAYER_LAYOUT_PROBE_COMPONENT: &str =
     include_str!("../../../magnetar-runtime/fixtures/components/layer-layout-probe.component.wat");
+const LATENT_ATTENTION_PROBE_COMPONENT: &str = include_str!(
+    "../../../magnetar-runtime/fixtures/components/latent-attention-probe.component.wat"
+);
+/// Imports `model-config@1.4.0`'s `rope-scaling`, whose variant has only the
+/// `banded` case, and returns the scaling's case (`run`).
+const BANDED_ONLY_PROBE_COMPONENT: &str = r#"
+(component
+    (import "magnetar:model-component-graph/model-config@1.4.0" (instance $cfg
+        (type $banded (record
+            (field "factor" float64)
+            (field "low-freq-factor" float64)
+            (field "high-freq-factor" float64)
+            (field "original-max-position-embeddings" u64)))
+        (export "banded-rope-scaling" (type $banded_e (eq $banded)))
+        (type $scaling (variant (case "banded" $banded_e)))
+        (export "rope-frequency-scaling" (type $scaling_e (eq $scaling)))
+        (export "rope-scaling" (func (result (option $scaling_e))))))
+    (core module $memory
+        (memory (export "memory") 1)
+        (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 1024))
+    (core instance $mem (instantiate $memory))
+    (alias core export $mem "memory" (core memory $linear))
+    (alias core export $mem "realloc" (core func $realloc))
+    (core func $rope (canon lower (func $cfg "rope-scaling") (memory $linear) (realloc $realloc)))
+    (core module $probe
+        (import "" "memory" (memory 1))
+        (import "" "rope" (func $rope (param i32)))
+        (func (export "run") (result i32)
+            i32.const 0
+            call $rope
+            i32.const 0
+            i32.load8_u))
+    (core instance $i (instantiate $probe
+        (with "" (instance (export "memory" (memory $linear)) (export "rope" (func $rope))))))
+    (func (export "run") (result u32) (canon lift (core func $i "run")))
+)
+"#;
 const QWEN_REAL_COMPONENT: &[u8] =
     include_bytes!("../../../magnetar-runtime/fixtures/components/qwen-real.component.wasm");
 
@@ -395,6 +432,9 @@ fn wasmtime_engine_builds_a_real_qwen_prefill_graph_through_the_graph_builder_ca
             layer_layout: None,
             final_logit_softcapping: None,
             per_layer_input_size: None,
+            latent_attention: None,
+            moe_layers: None,
+            expert_routing: None,
             bos_token_id: None,
             eos_token_id: None,
         },
@@ -1411,4 +1451,209 @@ fn wasmtime_engine_lowers_the_1_6_0_layer_layout_and_options_into_a_real_compone
     );
     engine.destroy(instance).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// Instantiates `wat` as a Component importing `model-config` at
+/// `version` (export interface `example:test/<name>`), binds `config`, and
+/// invokes each of `exports`.
+fn run_model_config_probe(
+    name: &str,
+    wat: &str,
+    version: &str,
+    config: crate::ModelArchitectureConfig,
+    exports: &[&str],
+) -> Vec<Result<u32, String>> {
+    let directory =
+        std::env::temp_dir().join(format!("magnetar-wasmtime-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let artifact = directory.join(format!("{name}.component.wasm"));
+    std::fs::write(&artifact, wat).unwrap();
+    let model_config_capability = Arc::new(crate::ModelConfigCapability::new());
+    let mut engine = WasmtimeComponentEngine::new().unwrap();
+    let interface = WitInterface::new("magnetar:model-component-graph/model-config", version);
+    engine.register_capability(
+        interface.clone(),
+        model_config_capability.clone() as Arc<dyn HostCapability>,
+    );
+    let export_interface = WitInterface::new(format!("example:test/{name}"), "1.0.0");
+    let definition = ComponentDefinition {
+        id: ComponentDefinitionId::new(202),
+        metadata: crate::ComponentMetadata::new(name, "1", "model-config probe")
+            .with_import(interface.clone())
+            .with_export(export_interface.clone()),
+        artifact_path: artifact,
+        manifest_path: None,
+        artifact_digest: None,
+        trust_decision: None,
+        state: crate::ComponentDefinitionState::Registered,
+    };
+    let prepared = engine
+        .prepare(&definition, &ComponentResourceLimits::default())
+        .unwrap();
+    let mut link_plan = ComponentLinkPlan::default();
+    link_plan.insert_for_test(crate::ComponentEndpoint::Capability { interface });
+    let instance = engine.instantiate(&prepared, &link_plan).unwrap();
+    model_config_capability.bind_config(instance.engine_key(), config);
+    let results = exports
+        .iter()
+        .map(|export| {
+            engine
+                .invoke(
+                    &instance,
+                    &ComponentInvocation::new(
+                        crate::ComponentInstanceId::new(202),
+                        export_interface.clone(),
+                        *export,
+                    ),
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|result| match result.values.as_slice() {
+                    [ComponentValue::U32(value)] => Ok(*value),
+                    other => Err(format!("unexpected result {other:?}")),
+                })
+        })
+        .collect();
+    engine.destroy(instance).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+    results
+}
+
+fn yarn_scaling() -> crate::RopeFrequencyScaling {
+    crate::RopeFrequencyScaling::Yarn {
+        scaling: crate::operator::RopeYarnFrequencyScaling {
+            factor: 40.0,
+            original_context_length: 4096,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            attention_factor: 1.0,
+            truncate: true,
+        },
+        mscale_all_dim: Some(0.707),
+    }
+}
+
+#[test]
+fn wasmtime_engine_lowers_the_1_7_0_latent_attention_routing_and_yarn_into_a_real_component() {
+    let u32_result = |value: u32| Ok::<u32, String>(value);
+    let exports = ["mla", "layers", "routing", "rope"];
+    let declared = crate::ModelArchitectureConfig {
+        hidden_size: 8,
+        intermediate_size: 16,
+        num_hidden_layers: 3,
+        num_attention_heads: 2,
+        num_key_value_heads: 2,
+        head_dim: 5,
+        vocab_size: 258,
+        rms_norm_eps: 1e-6,
+        rope_theta: 10_000.0,
+        rope_frequency_scaling: Some(yarn_scaling()),
+        mixture_of_experts: Some(crate::MixtureOfExpertsConfig {
+            experts: 8,
+            experts_per_token: 2,
+            expert_intermediate_size: 4,
+            shared_expert_intermediate_size: Some(8),
+            normalize_top_k: false,
+        }),
+        latent_attention: Some(crate::LatentAttentionConfig {
+            q_lora_rank: Some(24),
+            kv_lora_rank: 16,
+            qk_nope_head_dim: 3,
+            qk_rope_head_dim: 2,
+            v_head_dim: 5,
+        }),
+        moe_layers: Some(vec![false, true, true]),
+        expert_routing: Some(crate::ExpertRoutingConfig {
+            scoring: crate::ExpertScoring::Sigmoid,
+            groups: Some(crate::ExpertGroups {
+                count: 4,
+                per_token: 2,
+                score: crate::ExpertGroupScore::TopTwoSum,
+            }),
+            routed_scaling_factor: 2.5,
+            selection_bias: true,
+            shared_expert_gated: false,
+        }),
+        ..Default::default()
+    };
+    let results = run_model_config_probe(
+        "latent-attention-probe",
+        LATENT_ATTENTION_PROBE_COMPONENT,
+        "1.7.0",
+        declared.clone(),
+        &exports,
+    );
+    assert_eq!(
+        results,
+        vec![
+            // some, q-lora 24, kv 16, rope 2, nope 3, v 5.
+            u32_result(1_000_000_000 + 24 + 16 * 10_000 + 2 * 100_000 + 3 + 5),
+            // some, three layers, two of them MoE.
+            u32_result(10_000 + 3 * 100 + 2),
+            // some, sigmoid, factor 2, 4 groups, 2 per token, top-two-sum,
+            // selection bias, ungated shared expert.
+            u32_result(
+                1_000_000_000 + 100_000_000 + 2 * 10_000_000 + 4 * 100_000 + 2 * 1000 + 100 + 10
+            ),
+            // some, yarn, factor 40, truncate, mscale-all-dim, 4096 positions.
+            u32_result(1_000_000_000 + 100_000_000 + 40 * 1_000_000 + 100_000 + 10_000 + 4096),
+        ]
+    );
+    // Nothing declared: every function answers `none`.
+    let plain = crate::ModelArchitectureConfig {
+        latent_attention: None,
+        moe_layers: None,
+        expert_routing: None,
+        rope_frequency_scaling: None,
+        ..declared
+    };
+    let results = run_model_config_probe(
+        "latent-attention-probe-none",
+        LATENT_ATTENTION_PROBE_COMPONENT,
+        "1.7.0",
+        plain,
+        &exports,
+    );
+    assert_eq!(results, vec![u32_result(0); 4]);
+}
+
+/// A Component compiled against `1.4.0` knows only the `banded` case: asked
+/// for a YaRN checkpoint's scaling, its call fails instead of returning a
+/// scheme it would ignore.
+#[test]
+fn a_component_predating_yarn_cannot_receive_it() {
+    let config = |scaling| crate::ModelArchitectureConfig {
+        hidden_size: 8,
+        intermediate_size: 16,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        num_key_value_heads: 2,
+        head_dim: 4,
+        vocab_size: 258,
+        rms_norm_eps: 1e-6,
+        rope_theta: 10_000.0,
+        rope_frequency_scaling: scaling,
+        ..Default::default()
+    };
+    let banded = crate::RopeFrequencyScaling::Banded(crate::operator::RopeBandedFrequencyScaling {
+        factor: 8.0,
+        low_freq_factor: 1.0,
+        high_freq_factor: 4.0,
+        original_context_length: 8192,
+    });
+    let results = run_model_config_probe(
+        "banded-only-probe",
+        BANDED_ONLY_PROBE_COMPONENT,
+        "1.4.0",
+        config(Some(banded)),
+        &["run"],
+    );
+    assert_eq!(results, vec![Ok(1)]);
+    let results = run_model_config_probe(
+        "banded-only-probe-yarn",
+        BANDED_ONLY_PROBE_COMPONENT,
+        "1.4.0",
+        config(Some(yarn_scaling())),
+        &["run"],
+    );
+    assert!(results[0].is_err(), "{results:?}");
 }

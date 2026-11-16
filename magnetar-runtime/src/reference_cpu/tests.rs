@@ -3119,3 +3119,256 @@ fn moe_experts_gelu_activation_and_per_expert_scale() {
         .is_none()
     );
 }
+
+// `express-latent-attention-forms`: the forms multi-head latent attention
+// needs, run as Kernel invocations and compared with independent
+// computations or with transformers' own values.
+
+/// Attention whose V rows are narrower than Q/K rows (two heads, Q/K width
+/// 3, V width 2, causal), against a direct computation.
+#[test]
+fn attention_value_head_dimension_narrows_v_and_the_output() {
+    let (heads, qk, dv, rows) = (2usize, 3usize, 2usize, 3usize);
+    let values = |count: usize, seed: f32| -> Vec<f32> {
+        (0..count)
+            .map(|i| (i as f32 * 0.37 + seed).sin() * 1.5)
+            .collect()
+    };
+    let q = reference_cpu_host_tensor(
+        [rows as u64, (heads * qk) as u64],
+        values(rows * heads * qk, 0.1),
+    );
+    let k = reference_cpu_host_tensor(
+        [rows as u64, (heads * qk) as u64],
+        values(rows * heads * qk, 0.7),
+    );
+    let v = reference_cpu_host_tensor(
+        [rows as u64, (heads * dv) as u64],
+        values(rows * heads * dv, 1.3),
+    );
+    let scale = 0.4_f32;
+    let attributes = [
+        ("head_count", OperatorAttributeValue::Integer(heads as i64)),
+        ("head_dimension", OperatorAttributeValue::Integer(qk as i64)),
+        (
+            "value_head_dimension",
+            OperatorAttributeValue::Integer(dv as i64),
+        ),
+        ("causal", OperatorAttributeValue::Boolean(true)),
+        ("scale", float(scale as f64)),
+    ];
+    let actual = invoke_extended(
+        "attention",
+        &[q.clone(), k.clone(), v.clone()],
+        &[rows as u64, (heads * dv) as u64],
+        &attributes,
+    )
+    .expect("attention with a value head dimension runs");
+    assert_eq!(actual.shape, vec![rows as u64, (heads * dv) as u64]);
+    let mut expected = vec![0.0_f32; rows * heads * dv];
+    for head in 0..heads {
+        for t in 0..rows {
+            let scores: Vec<f32> = (0..=t)
+                .map(|j| {
+                    (0..qk)
+                        .map(|d| {
+                            q.data[t * heads * qk + head * qk + d]
+                                * k.data[j * heads * qk + head * qk + d]
+                        })
+                        .sum::<f32>()
+                        * scale
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let weights: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+            let total: f32 = weights.iter().sum();
+            for d in 0..dv {
+                expected[t * heads * dv + head * dv + d] = weights
+                    .iter()
+                    .enumerate()
+                    .map(|(j, w)| w / total * v.data[j * heads * dv + head * dv + d])
+                    .sum();
+            }
+        }
+    }
+    assert_all_close(&actual.data, &expected);
+
+    // V of the Q/K width is refused when the attribute says otherwise.
+    assert!(
+        invoke_extended(
+            "attention",
+            &[q.clone(), k.clone(), k.clone()],
+            &[rows as u64, (heads * dv) as u64],
+            &attributes,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn concat_across_heads_interleaves_heads_and_broadcasts_a_single_one() {
+    // Two rows, three heads of width 2, then a second input of width 1 per
+    // head, then one shared head of width 2.
+    let a = reference_cpu_host_tensor([2, 6], (0..12).map(|i| i as f32).collect::<Vec<_>>());
+    let per_head = reference_cpu_host_tensor([2, 3], [100.0, 101.0, 102.0, 200.0, 201.0, 202.0]);
+    let shared = reference_cpu_host_tensor([2, 2], [-1.0, -2.0, -3.0, -4.0]);
+    let heads = |second: i64| {
+        [
+            ("axis", text("heads")),
+            ("head_count", OperatorAttributeValue::Integer(3)),
+            ("second_head_count", OperatorAttributeValue::Integer(second)),
+        ]
+    };
+    let joined = invoke_extended("concat", &[a.clone(), per_head], &[2, 9], &heads(3))
+        .expect("concat across heads runs");
+    assert_eq!(
+        joined.data,
+        vec![
+            0.0, 1.0, 100.0, 2.0, 3.0, 101.0, 4.0, 5.0, 102.0, //
+            6.0, 7.0, 200.0, 8.0, 9.0, 201.0, 10.0, 11.0, 202.0,
+        ]
+    );
+    let broadcast = invoke_extended("concat", &[a.clone(), shared.clone()], &[2, 12], &heads(1))
+        .expect("concat across heads with a broadcast head runs");
+    assert_eq!(
+        broadcast.data,
+        vec![
+            0.0, 1.0, -1.0, -2.0, 2.0, 3.0, -1.0, -2.0, 4.0, 5.0, -1.0, -2.0, //
+            6.0, 7.0, -3.0, -4.0, 8.0, 9.0, -3.0, -4.0, 10.0, 11.0, -3.0, -4.0,
+        ]
+    );
+    // A second input holding neither one nor every head is refused, and so
+    // is an unknown axis.
+    assert!(invoke_extended("concat", &[a.clone(), shared.clone()], &[2, 8], &heads(2)).is_none());
+    assert!(
+        invoke_extended(
+            "concat",
+            &[a.clone(), a.clone()],
+            &[4, 6],
+            &[("axis", text("columns"))],
+        )
+        .is_none()
+    );
+    // Without `axis`, rows are still concatenated.
+    let rows = invoke_extended("concat", &[a.clone(), a.clone()], &[4, 6], &[])
+        .expect("row concat still runs");
+    assert_eq!(rows.shape, vec![4, 6]);
+}
+
+/// transformers 5.23's `_compute_yarn_parameters` inverse frequencies, as
+/// f32 bits: DeepSeek-V2-Lite's YaRN (64 rotated dimensions, base 1e4,
+/// factor 40, 4096 original positions, beta 32/1, truncated range), then a
+/// factor-4 scaling over 32768 positions without truncation.
+const YARN_DEEPSEEK_V2_LITE_BITS: [u32; 32] = [
+    0x3f800000, 0x3f3ff911, 0x3f0ff59a, 0x3ed7e89b, 0x3ea1e89b, 0x3e72d423, 0x3e361887, 0x3e088d77,
+    0x3dcccccd, 0x3d99940d, 0x3d6655c2, 0x3d1fc5ba, 0x3cdc321b, 0x3c968dc3, 0x3c4bf283, 0x3c088d77,
+    0x3bb43959, 0x3b697066, 0x3b136a16, 0x3ab3a2cd, 0x3a4f3e37, 0x39d99312, 0x393a7753, 0x380bd471,
+    0x37d1b717, 0x379d43a3, 0x376bdcf0, 0x3730df51, 0x3704a2b3, 0x36c6ecdd, 0x36952c42, 0x365fba4f,
+];
+const YARN_UNTRUNCATED_BITS: [u32; 32] = [
+    0x3f800000, 0x3f3ff911, 0x3f0ff59a, 0x3ed7e89b, 0x3ea1e89b, 0x3e72d423, 0x3e361887, 0x3e088d77,
+    0x3dcccccd, 0x3d99940d, 0x3d6655c2, 0x3d2cba15, 0x3d0186e3, 0x3cc2434f, 0x3c91ad39, 0x3c5a7bf2,
+    0x3c23d70a, 0x3bf5b9b0, 0x3bb4ca38, 0x3b7deedb, 0x3b3183ba, 0x3af6dfdb, 0x3aaa9ca4, 0x3a6a1bab,
+    0x3a1f3a76, 0x39d65203, 0x398e5a95, 0x3939f57b, 0x38ed979e, 0x3893317f, 0x383a7753, 0x380bd472,
+];
+
+fn yarn(
+    factor: f64,
+    original: u64,
+    attention_factor: f64,
+    truncate: bool,
+) -> RopeYarnFrequencyScaling {
+    RopeYarnFrequencyScaling {
+        factor,
+        original_context_length: original,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        attention_factor,
+        truncate,
+    }
+}
+
+/// Each pair's rotation angle at position 1 is its frequency: rotating
+/// `(1, 0)` gives `(af cos f, af sin f)`.
+fn yarn_frequencies(scaling: &RopeYarnFrequencyScaling) -> Vec<f32> {
+    let input = reference_cpu_host_tensor(
+        [1, 64],
+        (0..64)
+            .map(|i| if i % 2 == 0 { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>(),
+    );
+    let mut attributes = BTreeMap::new();
+    scaling.insert_attributes(&mut attributes);
+    attributes.insert("base".into(), float(10_000.0));
+    attributes.insert("dimension".into(), OperatorAttributeValue::Integer(64));
+    attributes.insert("position_offset".into(), OperatorAttributeValue::Integer(1));
+    let attributes: Vec<(&str, OperatorAttributeValue)> = attributes
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.clone()))
+        .collect();
+    let out = invoke_extended("rope", &[input], &[1, 64], &attributes).expect("YaRN rope runs");
+    out.data
+        .chunks(2)
+        .map(|pair| {
+            let af = scaling.attention_factor as f32;
+            (pair[1] / af).atan2(pair[0] / af)
+        })
+        .collect()
+}
+
+#[test]
+fn yarn_rope_frequencies_match_transformers() {
+    for (scaling, bits) in [
+        (yarn(40.0, 4096, 1.0, true), &YARN_DEEPSEEK_V2_LITE_BITS),
+        (
+            yarn(4.0, 32768, 1.138_629_436_111_989, false),
+            &YARN_UNTRUNCATED_BITS,
+        ),
+    ] {
+        let actual = yarn_frequencies(&scaling);
+        for (pair, (&got, &want)) in actual.iter().zip(bits.iter()).enumerate() {
+            let want = f32::from_bits(want);
+            assert!(
+                (got - want).abs() <= want * 2e-6,
+                "pair {pair}: {got} vs transformers {want} ({scaling:?})"
+            );
+        }
+    }
+    // DeepSeek-V2-Lite's correction range covers pairs 10 to 23.
+    assert_eq!(
+        yarn(40.0, 4096, 1.0, true).correction_range(64, 10_000.0),
+        (10.0, 23.0)
+    );
+}
+
+#[test]
+fn yarn_rope_multiplies_cos_and_sin_by_its_attention_factor() {
+    let scaling = yarn(4.0, 32768, 1.25, true);
+    let input = reference_cpu_host_tensor([1, 4], [1.0, 2.0, 3.0, 4.0]);
+    let mut attributes = BTreeMap::new();
+    scaling.insert_attributes(&mut attributes);
+    attributes.insert("base".into(), float(10_000.0));
+    attributes.insert("dimension".into(), OperatorAttributeValue::Integer(4));
+    let attributes: Vec<(&str, OperatorAttributeValue)> = attributes
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.clone()))
+        .collect();
+    // Position 0: no rotation, every value scaled.
+    let out = invoke_extended("rope", &[input], &[1, 4], &attributes).expect("YaRN rope runs");
+    assert_all_close(&out.data, &[1.25, 2.5, 3.75, 5.0]);
+    // A missing parameter is refused, never defaulted.
+    let without_beta: Vec<(&str, OperatorAttributeValue)> = attributes
+        .iter()
+        .filter(|(name, _)| *name != "beta_fast")
+        .cloned()
+        .collect();
+    assert!(
+        invoke_extended(
+            "rope",
+            &[reference_cpu_host_tensor([1, 4], [1.0, 2.0, 3.0, 4.0])],
+            &[1, 4],
+            &without_beta,
+        )
+        .is_none()
+    );
+}

@@ -484,11 +484,18 @@ pub(super) fn dispatch_first_native_graph_node(
             // Per-frequency scaling is model-family
             // semantics: the Model Component declares it on the node and the
             // Runtime forwards it unchanged, never deriving it itself.
-            let frequency_scaling =
-                crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes)
-                    .map_err(|reason| InferenceApiError::GraphPlanningFailed {
-                        reason: format!("graph node '{node_id}': {reason}"),
-                    })?;
+            let planning = |reason: String| InferenceApiError::GraphPlanningFailed {
+                reason: format!("graph node '{node_id}': {reason}"),
+            };
+            let yarn = crate::operator::RopeYarnFrequencyScaling::from_attributes(&node.attributes)
+                .map_err(planning)?;
+            let frequency_scaling = match yarn {
+                Some(_) => None,
+                None => {
+                    crate::operator::RopeBandedFrequencyScaling::from_attributes(&node.attributes)
+                        .map_err(planning)?
+                }
+            };
             let rope_config = FirstNativeRopeConfig {
                 base,
                 scale: fixture.config.rope.scale,
@@ -535,9 +542,41 @@ pub(super) fn dispatch_first_native_graph_node(
                 &rope_config,
                 pairing,
                 frequency_scaling.as_ref(),
+                yarn.as_ref(),
                 partial_rotary_factor,
                 position_offset,
                 (!output_has_kv_semantics).then_some(output_target),
+            )
+            .map(|(dispatch, value)| (dispatch, vec![value]))
+        }
+        // `express-latent-attention-forms`: the only `concat` a graph
+        // declares joins heads; KV-history concatenation is the Runtime's own.
+        "concat" => {
+            if inputs.len() != 2
+                || crate::operator::concat_axis(&node.attributes)
+                    != Some(crate::operator::ConcatAxis::Heads)
+            {
+                return Err(InferenceApiError::GraphPlanningFailed {
+                    reason: format!(
+                        "graph node '{node_id}' must be a two-input concat with axis 'heads'"
+                    ),
+                });
+            }
+            let head_count = node_attribute_u64(node, "head_count")?;
+            let second_head_count = match node.attributes.get("second_head_count") {
+                None => head_count,
+                Some(_) => node_attribute_u64(node, "second_head_count")?,
+            };
+            let first = inputs.remove(0);
+            let second = inputs.remove(0);
+            dispatch_concat_heads(
+                ctx,
+                node_id,
+                first,
+                second,
+                head_count,
+                second_head_count,
+                Some(output_target),
             )
             .map(|(dispatch, value)| (dispatch, vec![value]))
         }

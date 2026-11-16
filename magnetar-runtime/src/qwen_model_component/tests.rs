@@ -1697,3 +1697,75 @@ fn a_layered_inventory_follows_each_layers_geometry() {
             if tensor == "layers.0.self_attn.v_proj"
     ));
 }
+
+/// `express-latent-attention-forms`: under latent attention the inventory
+/// needs the split projections instead of q/k, each at its shape; the
+/// expanded K/V widths size K and V apart.
+#[test]
+fn a_latent_attention_inventory_needs_the_split_projections() {
+    // hidden 8, 3 layers, 2 heads, 2 KV heads, head width 4.
+    let mut config = FirstNativeModelConfig::new(
+        first_native_architecture_metadata(8, 3, 2, 2, 4, 16, 32, 64),
+        FirstNativeRopeConfig::standard(4),
+    );
+    let mla = crate::LatentAttentionConfig {
+        q_lora_rank: None,
+        kv_lora_rank: 8,
+        qk_nope_head_dim: 2,
+        qk_rope_head_dim: 2,
+        v_head_dim: 3,
+    };
+    config.latent_attention = Some(mla);
+    let metadata = |name: String, shape: Vec<u64>| ModelTensorMetadata {
+        shape,
+        name,
+        storage_dtype: ModelDType::F32,
+        layout: None,
+        shard: None,
+        offset_bytes: None,
+        size_bytes: None,
+        quantization: None,
+        expected_compute_dtype: None,
+        digest: None,
+    };
+    let mut tensors: Vec<ModelTensorMetadata> =
+        first_native_expected_tensor_names(3, config.tied_embeddings)
+            .into_iter()
+            .filter(|name| {
+                !name.ends_with("mlp.gate_up_proj")
+                    && !["q_proj", "k_proj", "v_proj", "o_proj"]
+                        .iter()
+                        .any(|projection| name.ends_with(&format!("self_attn.{projection}")))
+            })
+            .map(|name| {
+                let shape = first_native_expected_tensor_shape(&name, &config).unwrap();
+                metadata(name, shape)
+            })
+            .collect();
+    for layer in 0..3 {
+        for (projection, shape) in latent_attention_projection_shapes(8, 2, &mla) {
+            tensors.push(metadata(format!("layers.{layer}.{projection}"), shape));
+        }
+    }
+    validate_first_native_tensor_inventory(&config, &tensors).unwrap();
+    validate_first_native_tensor_shapes(&config, &tensors).unwrap();
+    // Expected shapes follow the latent geometry, V and the output included.
+    let shape = |name: &str| first_native_expected_tensor_shape(name, &config);
+    assert_eq!(shape("layers.0.self_attn.v_proj"), Some(vec![8, 2 * 3]));
+    assert_eq!(shape("layers.0.self_attn.o_proj"), Some(vec![2 * 3, 8]));
+    assert_eq!(shape("layers.0.self_attn.k_rope_proj"), Some(vec![8, 2]));
+    // A missing split projection is reported.
+    let without: Vec<_> = tensors
+        .iter()
+        .filter(|tensor| tensor.name != "layers.1.self_attn.k_nope_proj")
+        .cloned()
+        .collect();
+    assert!(matches!(
+        validate_first_native_tensor_inventory(&config, &without),
+        Err(QwenComponentError::TensorInventoryMissing { tensor })
+            if tensor == "layers.1.self_attn.k_nope_proj"
+    ));
+    // K rows are heads * (nope + rope) wide, V rows heads * v.
+    assert_eq!(config.kv_row_widths(), vec![Some(8); 3]);
+    assert_eq!(config.kv_value_row_widths(), vec![Some(6); 3]);
+}
