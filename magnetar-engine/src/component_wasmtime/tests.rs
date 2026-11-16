@@ -1657,3 +1657,5 @@ fn a_component_predating_yarn_cannot_receive_it() {
     );
     assert!(results[0].is_err(), "{results:?}");
 }
+
+mod gemma_component_tests;
