@@ -1,0 +1,48 @@
+schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "sha256:aae4961d4cb18d9f7d3338025315522b95c93135b4b7b7404a1785e305111f51"
+component:
+  name: "magnetar.gemma.real"
+  version: "0.1.0"
+  description: "The Gemma 4 text decoder Model Component"
+  role: "gemma-model-component"
+runtime:
+  magnetar:
+    min_version: "0.1.2"
+compatibility:
+  architecture_families:
+    - gemma4
+    - gemma4_text
+    - gemma4_unified
+  artifact_formats:
+    - huggingface
+    - gguf
+wit:
+  imports:
+    - package: "magnetar:model-component-graph"
+      interface: "graph-builder"
+      version: "1.6.0"
+    - package: "magnetar:model-component-graph"
+      interface: "model-config"
+      version: "1.6.0"
+  exports: []
+capabilities:
+  requires: []
+authority:
+  requires: []
+engine:
+  profile: "native"
+  features:
+    - component-model
+    - resource-limits
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./fixtures/components/gemma-real.component.wasm"
+signatures: []
