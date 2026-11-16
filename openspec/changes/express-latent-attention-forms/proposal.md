@@ -63,6 +63,13 @@ milestone caches the expanded K and V and needs three new operator forms:
   split the fused latent-attention projections by rows into the projections
   the graph uses; the GGUF loader also reads the split `attn_k_b`/`attn_v_b`
   form of newer files.
+- **CUDA Provider.** YaRN in the `rope` Kernel; `value_head_dimension` in the
+  general attention Kernels (block, one thread per head and query,
+  split-key decode), the Tensor Core, tiled and grouped decode Kernels
+  keeping equal widths; a head-wise `concat` Kernel. It advertises the three
+  features. Providers that do not advertise a feature never receive it; the
+  CPU Provider crate does not implement these forms, as it does not
+  implement the layered forms, and the Runtime's Reference CPU serves them.
 - No `routed_scaling_factor` attribute: scaling every routing weight by `s`
   scales the routed experts' output by `s`. A Component expresses it with
   `activation{kind = "scale"}` before adding the shared expert.
@@ -85,6 +92,10 @@ milestone caches the expanded K and V and needs three new operator forms:
   stacking).
 - `loaders/gguf`: `deepseek2` in `config.rs`, `naming.rs` and
   `layered_tensors.rs` (row splits, the `attn_k_b` head transpose).
+- `providers/cuda`: `kernels.cu` (YaRN in `rope_kernel`; the value width in
+  `attention_kernel`, `attention_block_kernel` and `attention_split_kernel`;
+  `concat_heads_kernel`), `kernels.rs` (`rope_scaled`, `attention_valued`,
+  `concat_heads`), `executor.rs`, `advertisements.rs`, conformance tests.
 - Existing graphs and Kernels are unchanged: every new attribute is optional,
   and a Provider receives one only if it advertises the feature. Existing
   Components keep linking.

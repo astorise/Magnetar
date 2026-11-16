@@ -54,3 +54,10 @@
   - the real V2-Lite GGUF's metadata and tensor names; both key and value forms giving the same projections; a `Q8_0` `attn_k_b`; refusals of incomplete metadata, mismatched shapes and unknown gating;
   - a mutation of either split's row order is caught.
 
+## 8. CUDA Provider
+
+- [x] 8.1 YaRN in `rope_kernel`: the correction range computed on the host, the frequency blend and `attention_factor` on the rotated pairs' `cos` and `sin`; banded and YaRN together refused.
+- [x] 8.2 `value_head_dimension` in `attention_kernel`, `attention_block_kernel`, `attention_split_kernel` and the combine; V-wide partials and output; the Tensor Core, tiled and grouped decode Kernels only for equal widths.
+- [x] 8.3 `concat_heads_kernel` and the executor's `axis` dispatch; the three features advertised.
+- [ ] 8.4 Conformance on the GPU workflow: YaRN rope, attention with a value width (decode with one and several chunks, `key_count`, the block and one-thread Kernels, a wider V), head-wise `concat`.
+
