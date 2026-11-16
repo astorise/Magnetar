@@ -9,11 +9,16 @@ storage rules:
 | Artifact and Provider | Per layer | 35 layers |
 |---|---|---|
 | Hugging Face bundle, `BF16` (storage) | 134.2 MB | 4.70 GB |
+| Same, CUDA Provider (stored as bfloat16, admitted at 4 bytes a value) | 134.2 MB stored, 268.4 MB admitted | 4.70 GB stored, 9.40 GB admitted |
 | Reference CPU (dequantized to f32) | 268.4 MB | 9.40 GB |
 | `gemma-4-E2B-it-qat-q4_0-gguf`, `Q6_K` (storage, CPU native Provider) | 55.1 MB | 1.93 GB |
 | Same, CUDA Provider (208 quant bytes and an f32 `d` per super-block) | 55.6 MB | 1.95 GB |
 
 The token table `[262144, 1536]` adds 0.33 GB in `Q6_K` (1.61 GB in f32).
+The admission row follows `execute-native-half-precision`: the Memory
+Manager still counts 4 bytes per weight value, so on a 12 GB Device a
+Hugging Face E2B bundle is admitted at about twice the memory its compact
+weights use. This change does not alter that.
 
 Both of the GGUF's tables are `Q6_K` (`per_layer_token_embd.weight`,
 `token_embd.weight`, read from the file's header). Both loaders keep them
