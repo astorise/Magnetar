@@ -41,3 +41,16 @@
   - weight shapes and inventory for DeepSeek-V2-Lite's shape;
   - the V-width estimate;
   - the Reference CPU declares the new forms.
+
+## 7. Loaders
+
+- [x] 7.1 Hugging Face: latent attention from `kv_lora_rank`; YaRN from `rope_scaling` or a flat `rope_parameters`; routed experts, `moe_layers` and `expert_routing` from DeepSeek's keys.
+- [x] 7.2 Hugging Face: row splits of `q_proj`/`q_b_proj`, `kv_a_proj_with_mqa` and `kv_b_proj`; experts stored one by one stacked; router, selection bias and shared experts named.
+- [x] 7.3 GGUF `deepseek2`: the metadata of both converter forms, YaRN as llama.cpp applies it, routing and selection bias.
+- [x] 7.4 GGUF `deepseek2`: row splits; `attn_v_b` as the value projection; `attn_k_b` transposed back per head, dequantized when block-quantized.
+- [x] 7.5 Tests:
+  - DeepSeek-V2-Lite, V2 and V3 configurations, a tiny transformers export and YaRN's `attention_factor` rules;
+  - the split projections against transformers 5.23's own computations on tiny random bundles, with and without a low-rank query (exact; experts within 1e-10);
+  - the real V2-Lite GGUF's metadata and tensor names; both key and value forms giving the same projections; a `Q8_0` `attn_k_b`; refusals of incomplete metadata, mismatched shapes and unknown gating;
+  - a mutation of either split's row order is caught.
+

@@ -35,8 +35,30 @@ widths.
   linear in the output; group-limited and sigmoid routing come in a later
   milestone with their own Kernel forms.
 
+- **Loaders split, the Runtime never fuses.** Both loaders cut the fused
+  projections by rows into the projections the graph uses
+  (`latent_attention_projection_shapes`); a row split copies bytes, so it is
+  exact for float and block-quantized rows alike. A GGUF `attn_k_b` holds
+  each head's key rows transposed, with its quantization blocks along the
+  wrong dimension: its heads are transposed back, in `f32` when it is
+  block-quantized.
+- **Group score by scoring function in GGUF files.** A GGUF file does not
+  record `topk_method`. Its group score follows the checkpoints' own routing:
+  the best expert for softmax routers (DeepSeek-V2's
+  `group_limited_greedy`) and the best two for sigmoid routers (V3's
+  `noaux_tc`). llama.cpp sums the best two in both cases.
+
 ## Risks
 
 - **YaRN conventions differ** between Hugging Face and GGUF files (llama.cpp
-  derives `mscale` from `yarn_log_multiplier`). The loaders will map both onto
-  these attributes; the golden test pins the Hugging Face definition.
+  derives `mscale` from `yarn_log_multiplier`). The Hugging Face loader keeps
+  `attention_factor = mscale(factor, mscale) / mscale(factor,
+  mscale_all_dim)`. A GGUF file does not record `mscale`, and llama.cpp
+  leaves cosines and sines unscaled, so the GGUF loader declares
+  `attention_factor = 1`. Both agree when `mscale` equals `mscale_all_dim`,
+  as in the published DeepSeek-V2 and V3 configurations. `mscale_all_dim`
+  from a GGUF file carries the `f32` rounding of `0.1 * m`.
+- **The split GGUF form was not read from a converted file.** The
+  `attn_k_b`/`attn_v_b` test writes them from `kv_b` as the converter's source
+  does (`view`, `split`, `transpose(1, 2)`); running llama.cpp's converter
+  was not possible in this environment.

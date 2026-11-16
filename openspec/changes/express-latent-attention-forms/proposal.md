@@ -58,6 +58,11 @@ milestone caches the expanded K and V and needs three new operator forms:
     dense MLP for layers outside `moe_layers`, no shared expert gate when
     routing says it is ungated, and a selection bias when routing declares
     one.
+- **Loaders.** The Hugging Face loader reads DeepSeek-V2/V3 `config.json`
+  files and the GGUF loader reads `deepseek2` files into these fields. Both
+  split the fused latent-attention projections by rows into the projections
+  the graph uses; the GGUF loader also reads the split `attn_k_b`/`attn_v_b`
+  form of newer files.
 - No `routed_scaling_factor` attribute: scaling every routing weight by `s`
   scales the routed experts' output by `s`. A Component expresses it with
   `activation{kind = "scale"}` before adding the shared expert.
@@ -75,7 +80,11 @@ milestone caches the expanded K and V and needs three new operator forms:
 - `magnetar-runtime`: `wit/model-component-graph.wit` (`1.7.0`),
   `component_graphs.rs` (versions, unread-feature refusal), `engine.rs` (YaRN
   on `rope` nodes), and the config conversions.
-- `loaders/huggingface`: the new fields (none read from `config.json` yet).
+- `loaders/huggingface`: `config.rs` (latent attention, YaRN, expert layers
+  and routing), `naming.rs`, `layered_tensors.rs` (row splits, expert
+  stacking).
+- `loaders/gguf`: `deepseek2` in `config.rs`, `naming.rs` and
+  `layered_tensors.rs` (row splits, the `attn_k_b` head transpose).
 - Existing graphs and Kernels are unchanged: every new attribute is optional,
   and a Provider receives one only if it advertises the feature. Existing
   Components keep linking.
