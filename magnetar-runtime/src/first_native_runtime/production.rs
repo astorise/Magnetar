@@ -1159,6 +1159,36 @@ pub(super) fn apply_production_tensor_parallel(
 /// the rest holds activations, KV history and Kernel workspace.
 pub(super) const LAYER_PLACEMENT_WEIGHT_SHARE: (u64, u64) = (85, 100);
 
+/// What [`apply_production_layer_placement`] places: each weight's
+/// resident bytes by layer, every layer reusing an earlier layer's K/V
+/// (`per-layer-kv-geometry`) kept on that layer's Device.
+#[cfg(all(not(target_arch = "wasm32"), feature = "wasmtime-component-engine"))]
+pub(super) fn layer_placement_bytes(
+    layer_count: u32,
+    tensors: &[ModelTensorMetadata],
+    layout: Option<&[crate::LayerSpec]>,
+) -> crate::layer_placement::LayerWeightBytes {
+    let mut bytes = crate::layer_placement::LayerWeightBytes::from_weights(
+        layer_count,
+        tensors.iter().map(|tensor| {
+            // What each weight occupies on its Device, not its checkpoint
+            // bytes: an F16 or a dequantized quantized weight is larger.
+            (
+                tensor.name.as_str(),
+                crate::model_loading::resident_weight_bytes(tensor),
+            )
+        }),
+    );
+    if let Some(layout) = layout {
+        bytes.keep_kv_sources_together(
+            layout.iter().enumerate().filter_map(|(layer, spec)| {
+                spec.kv_source_layer.map(|source| (layer as u32, source))
+            }),
+        );
+    }
+    bytes
+}
+
 /// `enforce-local-multigpu-and-expert-placement` G05: when `provider`
 /// exposes several Devices, the Runtime places the Model Instance's decoder
 /// layers across them ([`crate::layer_placement::LayerPlacement::plan`],
@@ -1170,7 +1200,7 @@ pub(super) fn apply_production_layer_placement(
     provider: &dyn Provider,
     manifest: &ModelManifest,
 ) -> Result<(), InferenceApiError> {
-    use crate::layer_placement::{LayerPlacement, LayerPlacementPolicy, LayerWeightBytes};
+    use crate::layer_placement::{LayerPlacement, LayerPlacementPolicy};
     let devices: Vec<_> = provider
         .devices()
         .iter()
@@ -1191,19 +1221,13 @@ pub(super) fn apply_production_layer_placement(
     else {
         return Ok(());
     };
-    let bytes = LayerWeightBytes::from_weights(
+    let bytes = layer_placement_bytes(
         layer_count,
+        &manifest.tensors,
         manifest
-            .tensors
-            .iter()
-            // What each weight occupies on its Device, not its checkpoint
-            // bytes: an F16 or a dequantized quantized weight is larger.
-            .map(|tensor| {
-                (
-                    tensor.name.as_str(),
-                    crate::model_loading::resident_weight_bytes(tensor),
-                )
-            }),
+            .architecture_config
+            .as_ref()
+            .and_then(|config| config.layer_layout.as_deref()),
     );
     let failed = |reason: String| InferenceApiError::ModelLoadingFailed { reason };
     let placement = LayerPlacement::plan(&bytes, &devices, LayerPlacementPolicy::from_env())

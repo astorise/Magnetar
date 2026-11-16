@@ -55,6 +55,10 @@ pub enum PackedWeightFormat {
     /// packing sixteen 6-bit scales, then an `f16` `d`; `value = d *
     /// (scale - 32) * (q - 4)` per 16-value sub-block.
     Q3K,
+    /// GGUF `block_q4_0`: 32 values per block, 18 bytes -- an `f16` `d`,
+    /// then 16 bytes of 4-bit quants laid out like `IQ4_NL`'s indices;
+    /// `value = d * (q - 8)` ([`crate::quantization::Q4_0_VALUES`]).
+    Q4_0,
     /// GGUF `block_iq4_nl`: 32 values per block, 18 bytes -- an `f16`
     /// `d`, then 16 bytes of 4-bit indices into [`crate::quantization::
     /// IQ4_NL_VALUES`]; `value = d * table[index]`.
@@ -83,7 +87,7 @@ pub enum PackedWeightFormat {
 impl PackedWeightFormat {
     pub const fn block_elements(self) -> u64 {
         match self {
-            Self::Q8_0 | Self::Iq4Nl => 32,
+            Self::Q8_0 | Self::Q4_0 | Self::Iq4Nl => 32,
             Self::Q2K
             | Self::Q3K
             | Self::Q4K
@@ -106,7 +110,7 @@ impl PackedWeightFormat {
             Self::Q6K => 210,
             Self::Q2K => 84,
             Self::Q3K => 110,
-            Self::Iq4Nl => 18,
+            Self::Q4_0 | Self::Iq4Nl => 18,
             Self::Iq4Xs => 136,
             Self::Iq2Xxs => 66,
             Self::Iq2Xs => 74,
@@ -124,6 +128,7 @@ impl PackedWeightFormat {
             Self::Q6K => "q6_k",
             Self::Q2K => "q2_k",
             Self::Q3K => "q3_k",
+            Self::Q4_0 => "q4_0",
             Self::Iq4Nl => "iq4_nl",
             Self::Iq4Xs => "iq4_xs",
             Self::Iq2Xxs => "iq2_xxs",
@@ -216,7 +221,7 @@ impl PackedWeight {
     }
 
     /// The stored values in row-major stored order, dequantized exactly as
-    /// `ggml-quants.c`'s `dequantize_row_q8_0`, `dequantize_row_q{2,3,4,5,6}_K` and
+    /// `ggml-quants.c`'s `dequantize_row_q{4,8}_0`, `dequantize_row_q{2,3,4,5,6}_K` and
     /// `dequantize_row_iq4_{nl,xs}`
     /// do.
     pub fn dequantize_stored(&self) -> Vec<f32> {
@@ -226,6 +231,7 @@ impl PackedWeight {
             PackedWeightFormat::Q6K => crate::quantization::dequantize_q6_k(&self.bytes),
             PackedWeightFormat::Q2K => crate::quantization::dequantize_q2_k(&self.bytes),
             PackedWeightFormat::Q3K => crate::quantization::dequantize_q3_k(&self.bytes),
+            PackedWeightFormat::Q4_0 => crate::quantization::dequantize_q4_0(&self.bytes),
             PackedWeightFormat::Iq4Nl => crate::quantization::dequantize_iq4_nl(&self.bytes),
             PackedWeightFormat::Iq4Xs => crate::quantization::dequantize_iq4_xs(&self.bytes),
             PackedWeightFormat::Iq2Xxs => crate::quantization::dequantize_iq2_xxs(&self.bytes),

@@ -1066,6 +1066,7 @@ fn expected_storage_bytes(
         ModelDType::F32 => element_count.checked_mul(4).ok_or_else(overflow),
         ModelDType::F16 | ModelDType::Bf16 => element_count.checked_mul(2).ok_or_else(overflow),
         ModelDType::Q8 => block_based(Q8_0_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, "Q8_0"),
+        ModelDType::Q4 => block_based(Q8_0_BLOCK_ELEMENTS, Q4_0_BLOCK_BYTES, "Q4_0"),
         ModelDType::Q4K => block_based(QK_BLOCK_ELEMENTS, Q4_K_BLOCK_BYTES, "Q4_K"),
         ModelDType::Q5K => block_based(QK_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, "Q5_K"),
         ModelDType::Q6K => block_based(QK_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES, "Q6_K"),
@@ -1257,6 +1258,7 @@ pub fn tensor_from_raw_bytes(
             .map(|chunk| bf16_to_f32(u16::from_le_bytes(*chunk)))
             .collect(),
         ModelDType::Q8 => dequantize_q8_0(raw),
+        ModelDType::Q4 => dequantize_q4_0(raw),
         ModelDType::Q4K => dequantize_q4_k(raw),
         ModelDType::Q5K => dequantize_q5_k(raw),
         ModelDType::Q6K => dequantize_q6_k(raw),
@@ -1368,6 +1370,7 @@ pub fn packed_weight_format(
 ) -> Result<Option<crate::packed_weight::PackedWeightFormat>, ModelLoadingError> {
     let format = match tensor.storage_dtype {
         ModelDType::Q8 => crate::packed_weight::PackedWeightFormat::Q8_0,
+        ModelDType::Q4 => crate::packed_weight::PackedWeightFormat::Q4_0,
         ModelDType::Q4K => crate::packed_weight::PackedWeightFormat::Q4K,
         ModelDType::Q5K => crate::packed_weight::PackedWeightFormat::Q5K,
         ModelDType::Q6K => crate::packed_weight::PackedWeightFormat::Q6K,

@@ -902,6 +902,47 @@ fn production_generation_steps_are_attributed_by_phase_without_leaking_the_promp
     assert!(model.take_phase_attribution().steps.is_empty());
 }
 
+/// `per-layer-kv-geometry`: the multi-Device layer placement keeps every
+/// layer reusing an earlier layer's K/V with that layer, so no segment
+/// starts between them.
+#[test]
+fn layer_placement_keeps_kv_sharing_layers_with_their_source() {
+    let tensor = |name: &str| ModelTensorMetadata {
+        name: name.into(),
+        shape: vec![4],
+        storage_dtype: ModelDType::F32,
+        layout: None,
+        shard: None,
+        offset_bytes: Some(0),
+        size_bytes: Some(16),
+        quantization: None,
+        expected_compute_dtype: None,
+        digest: None,
+    };
+    let tensors: Vec<_> = (0..4)
+        .map(|layer| tensor(&format!("layers.{layer}.input_norm")))
+        .chain([tensor("token_embedding"), tensor("final_norm")])
+        .collect();
+    let layer = |kv_source_layer: Option<u32>| crate::LayerSpec {
+        sliding_window: None,
+        head_dim: 2,
+        num_key_value_heads: 1,
+        rope_theta: 10_000.0,
+        partial_rotary_factor: None,
+        value_from_key: false,
+        kv_source_layer,
+        intermediate_size: 4,
+    };
+    // Layer 3 reuses layer 1's K/V.
+    let layout = [layer(None), layer(None), layer(None), layer(Some(1))];
+    let bytes = layer_placement_bytes(4, &tensors, Some(&layout));
+    assert_eq!(bytes.layers, vec![16; 4]);
+    assert_eq!((bytes.first, bytes.last), (16, 16));
+    assert_eq!(bytes.joined, vec![false, false, true, true]);
+    let uniform = layer_placement_bytes(4, &tensors, None);
+    assert!(uniform.joined.is_empty());
+}
+
 /// A loaded artifact's graph session is also offered the artifact's tensors
 /// that the configuration does not derive, with the shapes its inventory
 /// declares; a tensor both name keeps its derived shape.

@@ -43,6 +43,10 @@ pub const Q2_K_BLOCK_BYTES: u64 = 84;
 #[doc(hidden)]
 pub const Q3_K_BLOCK_BYTES: u64 = 110;
 
+/// `block_q4_0`: `2 (d) + 16 (qs) = 18` bytes for 32 values.
+#[doc(hidden)]
+pub const Q4_0_BLOCK_BYTES: u64 = 18;
+
 /// `block_iq4_nl`: `2 (d) + 16 (qs) = 18` bytes for 32 values.
 #[doc(hidden)]
 pub const IQ4_NL_BLOCK_BYTES: u64 = 18;
@@ -77,6 +81,11 @@ pub const IQ3_S_BLOCK_BYTES: u64 = 110;
 pub const IQ4_NL_VALUES: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
+
+/// The values `Q4_0`'s 4-bit quants stand for, `q - 8`, as a 16-entry
+/// table: a `Q4_0` block is laid out like an `IQ4_NL` one, so it decodes
+/// with the same code and this table in place of [`IQ4_NL_VALUES`].
+pub const Q4_0_VALUES: [i8; 16] = [-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7];
 
 /// Both K-quant formats' shared 12-byte packed 6-bit scale/min encoding.
 #[doc(hidden)]
@@ -271,14 +280,34 @@ pub fn dequantize_iq4_nl(raw: &[u8]) -> Vec<f32> {
     out
 }
 
+/// Dequantizes `block_q4_0` blocks (`raw.len()` a multiple of 18 bytes),
+/// porting `ggml-quants.c`'s `dequantize_row_q4_0`: value `j` and `j + 16`
+/// of a block are the low and high nibbles `q` of `qs[j]`, each
+/// `d * (q - 8)`.
+#[doc(hidden)]
+pub fn dequantize_q4_0(raw: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(raw.len() / Q4_0_BLOCK_BYTES as usize * 32);
+    for block in raw.as_chunks::<{ Q4_0_BLOCK_BYTES as usize }>().0 {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        nibble_values(d, &block[2..18], &Q4_0_VALUES, &mut out);
+    }
+    out
+}
+
 /// One 32-value `IQ4_NL`-encoded run: `qs[j]`'s low nibble is value `j`,
 /// its high nibble value `j + 16`.
 #[doc(hidden)]
 pub fn iq4_values(scale: f32, qs: &[u8], out: &mut Vec<f32>) {
+    nibble_values(scale, qs, &IQ4_NL_VALUES, out);
+}
+
+/// One 32-value run of 4-bit indices into `table`: `qs[j]`'s low nibble is
+/// value `j`, its high nibble value `j + 16`.
+fn nibble_values(scale: f32, qs: &[u8], table: &[i8; 16], out: &mut Vec<f32>) {
     for shift in [0, 4] {
         out.extend(
             qs.iter()
-                .map(|&q| scale * f32::from(IQ4_NL_VALUES[usize::from((q >> shift) & 0xF)])),
+                .map(|&q| scale * f32::from(table[usize::from((q >> shift) & 0xF)])),
         );
     }
 }
