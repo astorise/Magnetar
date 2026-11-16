@@ -409,3 +409,49 @@ pub fn rmsnorm_blocks(
         data,
     })
 }
+
+/// `concat` with `axis = "heads"` (`express-latent-attention-forms`): joins
+/// `[T, head_count * a]` and `[T, second_head_count * b]` rows head by head
+/// into `[T, head_count * (a + b)]`, output head `h` being the first input's
+/// head `h` followed by the second input's head `h` (its only head when
+/// `second_head_count` is 1, given to every head).
+pub fn concat_heads(
+    first: &HostTensor,
+    second: &HostTensor,
+    head_count: u64,
+    second_head_count: u64,
+) -> Result<HostTensor, ReferenceCpuError> {
+    let invalid =
+        |reason: String| ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, reason);
+    let (rows, first_cols) = rows_cols_of(first, "concat's first input")?;
+    let (second_rows, second_cols) = rows_cols_of(second, "concat's second input")?;
+    if rows != second_rows {
+        return Err(invalid(format!(
+            "concat across heads needs inputs with the same rows, got {:?} and {:?}",
+            first.shape, second.shape
+        )));
+    }
+    let (a, b) = magnetar_core::operator::concat_heads_widths(
+        first_cols,
+        second_cols,
+        head_count,
+        second_head_count,
+    )
+    .map_err(invalid)?;
+    let (a, b) = (a as usize, b as usize);
+    let (first_cols, second_cols) = (first_cols as usize, second_cols as usize);
+    let mut data = Vec::with_capacity(rows as usize * head_count as usize * (a + b));
+    for row in 0..rows as usize {
+        for head in 0..head_count as usize {
+            let start = row * first_cols + head * a;
+            data.extend_from_slice(&first.data[start..start + a]);
+            let second_head = if second_head_count == 1 { 0 } else { head };
+            let start = row * second_cols + second_head * b;
+            data.extend_from_slice(&second.data[start..start + b]);
+        }
+    }
+    Ok(HostTensor {
+        shape: vec![rows, head_count * (a + b) as u64],
+        data,
+    })
+}

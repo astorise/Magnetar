@@ -315,6 +315,20 @@ pub const MOE_EXPERTS_ACTIVATION_FEATURE: &str = "moe-experts-activation";
 /// sixth input, `per_expert_scale`.
 pub const MOE_PER_EXPERT_SCALE_FEATURE: &str = "per-expert-scale";
 
+/// Kernel feature an `attention` Kernel advertises when it honours
+/// `value_head_dimension`: V rows and the output are that wide per head
+/// while Q and K rows stay `head_dimension` wide (multi-head latent
+/// attention, `express-latent-attention-forms`).
+pub const ATTENTION_VALUE_HEAD_DIMENSION_FEATURE: &str = "attention-value-head-dimension";
+
+/// Kernel feature a `concat` Kernel advertises when it honours `axis =
+/// "heads"`: the inputs joined head by head instead of row after row.
+pub const CONCAT_HEADS_FEATURE: &str = "concat-heads";
+
+/// Kernel feature a `rope` Kernel advertises when it honours YaRN frequency
+/// scaling ([`RopeYarnFrequencyScaling`]).
+pub const ROPE_YARN_FREQUENCY_SCALING_FEATURE: &str = "yarn-frequency-scaling";
+
 /// The Kernel features an `operator` node with these `attributes` and
 /// `input_count` inputs needs beyond the Operator's baseline form: the
 /// optional attributes and operand forms a Kernel could otherwise ignore
@@ -330,7 +344,19 @@ pub fn required_kernel_features(
     let present = |name: &str| attributes.contains_key(name);
     let mut features = Vec::new();
     match operator {
-        "attention" if present("scale") => features.push(ATTENTION_SCALE_FEATURE),
+        "attention" => {
+            if present("scale") {
+                features.push(ATTENTION_SCALE_FEATURE);
+            }
+            if present("value_head_dimension") {
+                features.push(ATTENTION_VALUE_HEAD_DIMENSION_FEATURE);
+            }
+        }
+        "concat" => {
+            if concat_axis(attributes) == Some(ConcatAxis::Heads) {
+                features.push(CONCAT_HEADS_FEATURE);
+            }
+        }
         "embedding" if present("scale") => features.push(EMBEDDING_SCALE_FEATURE),
         "rmsnorm" => {
             if present("head_count") || present("head_dimension") {
@@ -353,6 +379,13 @@ pub fn required_kernel_features(
             };
             if !full_rotation {
                 features.push(ROPE_PARTIAL_ROTARY_FEATURE);
+            }
+            if matches!(
+                attributes.get("frequency_scaling"),
+                Some(OperatorAttributeValue::String(value))
+                    if value == RopeYarnFrequencyScaling::ATTRIBUTE_VALUE
+            ) {
+                features.push(ROPE_YARN_FREQUENCY_SCALING_FEATURE);
             }
         }
         "moe-experts" => {
@@ -495,6 +528,199 @@ impl RopeBandedFrequencyScaling {
         scaling.validate()?;
         Ok(Some(scaling))
     }
+}
+
+/// YaRN RoPE frequency scaling (`express-latent-attention-forms`): a
+/// model-family-neutral scheme the loaders map a checkpoint's
+/// `rope_scaling.type = "yarn"` onto. Each rotated pair `i` of a
+/// `dimension`-wide rotation blends its frequency `f` with `f / factor`:
+/// pairs below the correction range keep `f`, pairs above it take
+/// `f / factor`, linearly in between. The correction range comes from the
+/// numbers of rotations `beta_fast` and `beta_slow` complete over
+/// `original_context_length` positions. Both `cos` and `sin` are multiplied
+/// by `attention_factor`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeYarnFrequencyScaling {
+    pub factor: f64,
+    pub original_context_length: u64,
+    pub beta_fast: f64,
+    pub beta_slow: f64,
+    pub attention_factor: f64,
+    /// Whether the correction range is widened to whole pairs.
+    pub truncate: bool,
+}
+
+impl RopeYarnFrequencyScaling {
+    /// The `frequency_scaling` attribute value naming this scheme.
+    pub const ATTRIBUTE_VALUE: &'static str = "yarn";
+
+    pub fn validate(&self) -> Result<(), String> {
+        let positive = |name: &str, value: f64| {
+            if value.is_finite() && value > 0.0 {
+                Ok(())
+            } else {
+                Err(format!("YaRN RoPE {name} must be finite and positive"))
+            }
+        };
+        positive("factor", self.factor)?;
+        positive("beta_fast", self.beta_fast)?;
+        positive("beta_slow", self.beta_slow)?;
+        positive("attention_factor", self.attention_factor)?;
+        if self.original_context_length == 0 {
+            return Err("YaRN RoPE original_context_length must be positive".into());
+        }
+        Ok(())
+    }
+
+    /// The pairs `[low, high]` over which a `dimension`-wide rotation with
+    /// RoPE base `base` blends the two frequencies, computed in `f64` and
+    /// returned as the `f32` bounds every Kernel uses.
+    pub fn correction_range(&self, dimension: u64, base: f32) -> (f32, f32) {
+        let dimension = dimension as f64;
+        let base = base as f64;
+        let original = self.original_context_length as f64;
+        let pair_for = |rotations: f64| {
+            dimension * (original / (rotations * 2.0 * std::f64::consts::PI)).ln()
+                / (2.0 * base.ln())
+        };
+        let (mut low, mut high) = (pair_for(self.beta_fast), pair_for(self.beta_slow));
+        if self.truncate {
+            low = low.floor();
+            high = high.ceil();
+        }
+        (low.max(0.0) as f32, high.min(dimension - 1.0) as f32)
+    }
+
+    /// The scaled inverse frequency of rotated pair `pair`, whose unscaled
+    /// frequency is `frequency`, given [`Self::correction_range`].
+    pub fn scale_frequency(&self, frequency: f32, pair: usize, (low, high): (f32, f32)) -> f32 {
+        let high = if low == high { high + 0.001 } else { high };
+        let ramp = ((pair as f32 - low) / (high - low)).clamp(0.0, 1.0);
+        let interpolated = frequency / self.factor as f32;
+        interpolated * ramp + frequency * (1.0 - ramp)
+    }
+
+    /// Writes this scaling as `rope` attributes.
+    pub fn insert_attributes(&self, attributes: &mut BTreeMap<String, OperatorAttributeValue>) {
+        attributes.insert(
+            "frequency_scaling".into(),
+            OperatorAttributeValue::String(Self::ATTRIBUTE_VALUE.into()),
+        );
+        attributes.insert(
+            "frequency_scaling_factor".into(),
+            OperatorAttributeValue::Float(self.factor),
+        );
+        attributes.insert(
+            "original_context_length".into(),
+            OperatorAttributeValue::Integer(self.original_context_length as i64),
+        );
+        attributes.insert(
+            "beta_fast".into(),
+            OperatorAttributeValue::Float(self.beta_fast),
+        );
+        attributes.insert(
+            "beta_slow".into(),
+            OperatorAttributeValue::Float(self.beta_slow),
+        );
+        attributes.insert(
+            "attention_factor".into(),
+            OperatorAttributeValue::Float(self.attention_factor),
+        );
+        attributes.insert(
+            "truncate".into(),
+            OperatorAttributeValue::Boolean(self.truncate),
+        );
+    }
+
+    /// Reads the YaRN scaling a `rope` invocation carries: `None` when its
+    /// `frequency_scaling` is absent or names another scheme, an error for a
+    /// missing or invalid parameter. Every parameter is required: a Kernel
+    /// never assumes one.
+    pub fn from_attributes(
+        attributes: &BTreeMap<String, OperatorAttributeValue>,
+    ) -> Result<Option<Self>, String> {
+        match attributes.get("frequency_scaling") {
+            Some(OperatorAttributeValue::String(value)) if value == Self::ATTRIBUTE_VALUE => {}
+            _ => return Ok(None),
+        }
+        let float = |name: &str| match attributes.get(name) {
+            Some(OperatorAttributeValue::Float(value)) => Ok(*value),
+            _ => Err(format!("YaRN frequency scaling requires a float '{name}'")),
+        };
+        let original_context_length = match attributes.get("original_context_length") {
+            Some(OperatorAttributeValue::Integer(value)) if *value > 0 => *value as u64,
+            _ => {
+                return Err(
+                    "YaRN frequency scaling requires a positive integer 'original_context_length'"
+                        .into(),
+                );
+            }
+        };
+        let truncate = match attributes.get("truncate") {
+            Some(OperatorAttributeValue::Boolean(value)) => *value,
+            _ => return Err("YaRN frequency scaling requires a boolean 'truncate'".into()),
+        };
+        let scaling = Self {
+            factor: float("frequency_scaling_factor")?,
+            original_context_length,
+            beta_fast: float("beta_fast")?,
+            beta_slow: float("beta_slow")?,
+            attention_factor: float("attention_factor")?,
+            truncate,
+        };
+        scaling.validate()?;
+        Ok(Some(scaling))
+    }
+}
+
+/// How `concat` joins its inputs (`axis`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConcatAxis {
+    /// Row after row (absent `axis`): the KV-history concatenation.
+    Rows,
+    /// Head by head (`axis = "heads"`, `express-latent-attention-forms`):
+    /// `[T, H * a]` and `[T, H * b]` (or `[T, b]`, one head given to every
+    /// head) give `[T, H * (a + b)]`, each output head being the first
+    /// input's head followed by the second's.
+    Heads,
+}
+
+/// A `concat` node's axis; `None` for an unknown `axis` value.
+pub fn concat_axis(attributes: &BTreeMap<String, OperatorAttributeValue>) -> Option<ConcatAxis> {
+    match attributes.get("axis") {
+        None => Some(ConcatAxis::Rows),
+        Some(OperatorAttributeValue::String(value)) if value == "rows" => Some(ConcatAxis::Rows),
+        Some(OperatorAttributeValue::String(value)) if value == "heads" => Some(ConcatAxis::Heads),
+        Some(_) => None,
+    }
+}
+
+/// The per-head widths `(a, b)` of a head-wise `concat` of `[T, first]` and
+/// `[T, second]` rows into `head_count` heads, the second input holding
+/// `second_head_count` heads (`1`: broadcast to every head, or
+/// `head_count`).
+pub fn concat_heads_widths(
+    first: u64,
+    second: u64,
+    head_count: u64,
+    second_head_count: u64,
+) -> Result<(u64, u64), String> {
+    if head_count == 0 || !first.is_multiple_of(head_count) {
+        return Err(format!(
+            "concat across {head_count} heads needs a first input width divisible by them, got {first}"
+        ));
+    }
+    if second_head_count != 1 && second_head_count != head_count {
+        return Err(format!(
+            "concat's second input holds 1 or {head_count} heads, not {second_head_count}"
+        ));
+    }
+    if !second.is_multiple_of(second_head_count) {
+        return Err(format!(
+            "concat's second input width {second} is not divisible by its {second_head_count} heads"
+        ));
+    }
+    Ok((first / head_count, second / second_head_count))
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -708,7 +934,7 @@ impl OperatorSpec {
                 actual: outputs.len(),
             });
         }
-        validate_shape_rule(&self.shape_rule, inputs, outputs)?;
+        validate_shape_rule(&self.shape_rule, inputs, outputs, attributes)?;
         for tensor in inputs.iter().chain(outputs) {
             validate_dtype_contracts(&self.dtype_contracts, tensor)?;
             let layout = layout_kind(&tensor.layout);
@@ -1274,6 +1500,28 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "scale",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            // Width of each head's V rows and output, when it differs from
+            // the Q/K `head_dimension` (`express-latent-attention-forms`).
+            .with_rule(
+                "value_head_dimension",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            ),
+        // `axis = "heads"` joins the inputs head by head (see [`ConcatAxis`]):
+        // `head_count` heads, the second input holding `second_head_count`
+        // of them (absent: `head_count`; `1`: broadcast).
+        "concat" => OperatorAttributeSchema::default()
+            .with_rule(
+                "axis",
+                OperatorAttributeRule::optional(OperatorAttributeKind::String),
+            )
+            .with_rule(
+                "head_count",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
+            )
+            .with_rule(
+                "second_head_count",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Integer),
             ),
         "kv-write" => OperatorAttributeSchema::default().with_rule(
             "row_offset",
@@ -1353,6 +1601,23 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
             .with_rule(
                 "partial_rotary_factor",
                 OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            // `frequency_scaling = "yarn"` ([`RopeYarnFrequencyScaling`]).
+            .with_rule(
+                "beta_fast",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "beta_slow",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "attention_factor",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Float),
+            )
+            .with_rule(
+                "truncate",
+                OperatorAttributeRule::optional(OperatorAttributeKind::Boolean),
             ),
         "rmsnorm" | "layernorm" => OperatorAttributeSchema::default()
             .with_rule(
@@ -1457,10 +1722,56 @@ fn default_attribute_schema(name: &str) -> OperatorAttributeSchema {
     }
 }
 
+/// A head-wise `concat` ([`ConcatAxis::Heads`]): `[T, H * a]` and `[T, b']`
+/// rows (`b'` = `b` or `H * b`) giving `[T, H * (a + b)]`.
+fn validate_concat_heads(
+    a: &[u64],
+    b: &[u64],
+    output: &[u64],
+    attributes: &BTreeMap<String, OperatorAttributeValue>,
+) -> Result<(), OperatorError> {
+    let integer = |name: &str| match attributes.get(name) {
+        Some(OperatorAttributeValue::Integer(value)) if *value > 0 => Ok(Some(*value as u64)),
+        None => Ok(None),
+        Some(_) => Err(OperatorError::OperatorAttributeInvalid {
+            attribute: name.into(),
+            reason: "must be a positive integer".into(),
+        }),
+    };
+    let head_count =
+        integer("head_count")?.ok_or_else(|| OperatorError::OperatorAttributeInvalid {
+            attribute: "head_count".into(),
+            reason: "concat across heads requires head_count".into(),
+        })?;
+    let second_head_count = integer("second_head_count")?.unwrap_or(head_count);
+    let (&[a_rows, a_width], &[b_rows, b_width]) = (a, b) else {
+        return Err(OperatorError::ShapeUnsupported {
+            reason: "concat across heads takes two-dimensional inputs".into(),
+        });
+    };
+    if a_rows != b_rows {
+        return Err(OperatorError::ShapeMismatch {
+            reason: "concat across heads needs inputs with the same rows".into(),
+        });
+    }
+    let (first, second) = concat_heads_widths(a_width, b_width, head_count, second_head_count)
+        .map_err(|reason| OperatorError::ShapeMismatch { reason })?;
+    if output != [a_rows, head_count * (first + second)] {
+        return Err(OperatorError::ShapeMismatch {
+            reason: format!(
+                "concat across heads expects output [{a_rows}, {}], got {output:?}",
+                head_count * (first + second)
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn validate_shape_rule(
     rule: &ShapeRule,
     inputs: &[TensorDescriptor],
     outputs: &[TensorDescriptor],
+    attributes: &BTreeMap<String, OperatorAttributeValue>,
 ) -> Result<(), OperatorError> {
     match rule {
         ShapeRule::Any => Ok(()),
@@ -1652,6 +1963,16 @@ fn validate_shape_rule(
             let a = &inputs[0].shape.dimensions;
             let b = &inputs[1].shape.dimensions;
             let output = &outputs[0].shape.dimensions;
+            match concat_axis(attributes) {
+                Some(ConcatAxis::Rows) => {}
+                Some(ConcatAxis::Heads) => return validate_concat_heads(a, b, output, attributes),
+                None => {
+                    return Err(OperatorError::OperatorAttributeInvalid {
+                        attribute: "axis".into(),
+                        reason: "concat axis must be 'rows' or 'heads'".into(),
+                    });
+                }
+            }
             let (Some((&a_rows, a_rest)), Some((&b_rows, b_rest))) =
                 (a.split_first(), b.split_first())
             else {
