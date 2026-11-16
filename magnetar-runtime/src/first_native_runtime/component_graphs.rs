@@ -649,11 +649,7 @@ pub(super) fn build_first_native_graphs_with_runtime(
             .ok_or_else(|| E2eConformanceError::ModelComponentFailed {
                 reason: "build-decode-graph handle did not resolve to a finished graph".into(),
             })?;
-        require_declared_features_read(
-            model_config_capability,
-            &engine_key,
-            "build-decode-graph",
-        )?;
+        require_declared_features_read(model_config_capability, &engine_key, "build-decode-graph")?;
 
         validate_first_scope_graph(&prefill)?;
         validate_first_scope_graph(&decode)?;

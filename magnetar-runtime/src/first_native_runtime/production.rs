@@ -221,83 +221,145 @@ pub(super) fn weight_shapes_for_architecture_config(
         let q_dim = config.num_attention_heads as u64 * head_dim;
         let kv_dim = kv_heads as u64 * head_dim;
         shapes.insert(format!("{prefix}.input_norm"), vec![config.hidden_size]);
-        shapes.insert(
-            format!("{prefix}.self_attn.q_proj"),
-            vec![config.hidden_size, q_dim],
-        );
-        if own_kv {
-            shapes.insert(
-                format!("{prefix}.self_attn.k_proj"),
-                vec![config.hidden_size, kv_dim],
-            );
-        }
-        if own_v {
-            shapes.insert(
-                format!("{prefix}.self_attn.v_proj"),
-                vec![config.hidden_size, kv_dim],
-            );
-        }
-        if config.attention_bias {
-            shapes.insert(format!("{prefix}.self_attn.q_bias"), vec![q_dim]);
-            if own_kv {
-                shapes.insert(format!("{prefix}.self_attn.k_bias"), vec![kv_dim]);
-            }
-            if own_v {
-                shapes.insert(format!("{prefix}.self_attn.v_bias"), vec![kv_dim]);
-            }
-        }
-        shapes.insert(
-            format!("{prefix}.self_attn.o_proj"),
-            vec![q_dim, config.hidden_size],
-        );
         shapes.insert(format!("{prefix}.post_attn_norm"), vec![config.hidden_size]);
-        if let Some(moe) = &config.mixture_of_experts {
-            // `execute-and-cache-moe-experts` F02: stacked expert weights,
-            // each expert a column range (see the `moe-experts` Operator).
-            let hidden = config.hidden_size;
-            let experts = u64::from(moe.experts);
-            let intermediate = moe.expert_intermediate_size;
-            shapes.insert(format!("{prefix}.moe.router_proj"), vec![hidden, experts]);
-            shapes.insert(
-                format!("{prefix}.moe.experts_gate_proj"),
-                vec![hidden, experts * intermediate],
-            );
-            shapes.insert(
-                format!("{prefix}.moe.experts_up_proj"),
-                vec![hidden, experts * intermediate],
-            );
-            shapes.insert(
-                format!("{prefix}.moe.experts_down_proj"),
-                vec![intermediate, experts * hidden],
-            );
-            if let Some(shared) = moe.shared_expert_intermediate_size {
-                shapes.insert(
-                    format!("{prefix}.moe.shared_gate_proj"),
-                    vec![hidden, shared],
-                );
-                shapes.insert(format!("{prefix}.moe.shared_up_proj"), vec![hidden, shared]);
-                shapes.insert(
-                    format!("{prefix}.moe.shared_down_proj"),
-                    vec![shared, hidden],
-                );
-                shapes.insert(format!("{prefix}.moe.shared_expert_gate"), vec![hidden, 1]);
+        if let Some(mla) = &config.latent_attention {
+            // `express-latent-attention-forms`: the split latent-attention
+            // projections replace q/k/v/o.
+            for (projection, shape) in
+                crate::qwen_model_component::latent_attention_projection_shapes(
+                    config.hidden_size,
+                    u64::from(config.num_attention_heads),
+                    mla,
+                )
+            {
+                shapes.insert(format!("{prefix}.{projection}"), shape);
             }
-            continue;
+        } else {
+            insert_attention_projection_shapes(
+                &mut shapes,
+                &prefix,
+                config,
+                (q_dim, kv_dim),
+                (own_kv, own_v),
+            );
         }
-        shapes.insert(
-            format!("{prefix}.mlp.gate_proj"),
-            vec![config.hidden_size, intermediate_size],
-        );
-        shapes.insert(
-            format!("{prefix}.mlp.up_proj"),
-            vec![config.hidden_size, intermediate_size],
-        );
-        shapes.insert(
-            format!("{prefix}.mlp.down_proj"),
-            vec![intermediate_size, config.hidden_size],
-        );
+        insert_mlp_shapes(&mut shapes, &prefix, config, layer, intermediate_size);
     }
     shapes
+}
+
+/// A layer's ordinary query, key, value and output projections (and biases).
+fn insert_attention_projection_shapes(
+    shapes: &mut BTreeMap<String, Vec<u64>>,
+    prefix: &str,
+    config: &ModelArchitectureConfig,
+    (q_dim, kv_dim): (u64, u64),
+    (own_kv, own_v): (bool, bool),
+) {
+    shapes.insert(
+        format!("{prefix}.self_attn.q_proj"),
+        vec![config.hidden_size, q_dim],
+    );
+    if own_kv {
+        shapes.insert(
+            format!("{prefix}.self_attn.k_proj"),
+            vec![config.hidden_size, kv_dim],
+        );
+    }
+    if own_v {
+        shapes.insert(
+            format!("{prefix}.self_attn.v_proj"),
+            vec![config.hidden_size, kv_dim],
+        );
+    }
+    if config.attention_bias {
+        shapes.insert(format!("{prefix}.self_attn.q_bias"), vec![q_dim]);
+        if own_kv {
+            shapes.insert(format!("{prefix}.self_attn.k_bias"), vec![kv_dim]);
+        }
+        if own_v {
+            shapes.insert(format!("{prefix}.self_attn.v_bias"), vec![kv_dim]);
+        }
+    }
+    shapes.insert(
+        format!("{prefix}.self_attn.o_proj"),
+        vec![q_dim, config.hidden_size],
+    );
+}
+
+/// A layer's MLP: the routed experts (and shared expert) when the layer is
+/// one of the mixture of experts' (`moe_layers`, every layer when unset),
+/// the dense MLP otherwise.
+fn insert_mlp_shapes(
+    shapes: &mut BTreeMap<String, Vec<u64>>,
+    prefix: &str,
+    config: &ModelArchitectureConfig,
+    layer: u32,
+    intermediate_size: u64,
+) {
+    let routed = config
+        .moe_layers
+        .as_ref()
+        .is_none_or(|layers| layers.get(layer as usize).copied().unwrap_or(true));
+    if let Some(moe) = config.mixture_of_experts.as_ref().filter(|_| routed) {
+        // `execute-and-cache-moe-experts` F02: stacked expert weights,
+        // each expert a column range (see the `moe-experts` Operator).
+        let hidden = config.hidden_size;
+        let experts = u64::from(moe.experts);
+        let intermediate = moe.expert_intermediate_size;
+        shapes.insert(format!("{prefix}.moe.router_proj"), vec![hidden, experts]);
+        shapes.insert(
+            format!("{prefix}.moe.experts_gate_proj"),
+            vec![hidden, experts * intermediate],
+        );
+        shapes.insert(
+            format!("{prefix}.moe.experts_up_proj"),
+            vec![hidden, experts * intermediate],
+        );
+        shapes.insert(
+            format!("{prefix}.moe.experts_down_proj"),
+            vec![intermediate, experts * hidden],
+        );
+        if let Some(shared) = moe.shared_expert_intermediate_size {
+            shapes.insert(
+                format!("{prefix}.moe.shared_gate_proj"),
+                vec![hidden, shared],
+            );
+            shapes.insert(format!("{prefix}.moe.shared_up_proj"), vec![hidden, shared]);
+            shapes.insert(
+                format!("{prefix}.moe.shared_down_proj"),
+                vec![shared, hidden],
+            );
+            // An ungated shared expert has no gate
+            // (`express-latent-attention-forms`).
+            if config
+                .expert_routing
+                .is_none_or(|routing| routing.shared_expert_gated)
+            {
+                shapes.insert(format!("{prefix}.moe.shared_expert_gate"), vec![hidden, 1]);
+            }
+        }
+        // A selection-only bias per expert.
+        if config
+            .expert_routing
+            .is_some_and(|routing| routing.selection_bias)
+        {
+            shapes.insert(format!("{prefix}.moe.selection_bias"), vec![experts]);
+        }
+        return;
+    }
+    shapes.insert(
+        format!("{prefix}.mlp.gate_proj"),
+        vec![config.hidden_size, intermediate_size],
+    );
+    shapes.insert(
+        format!("{prefix}.mlp.up_proj"),
+        vec![config.hidden_size, intermediate_size],
+    );
+    shapes.insert(
+        format!("{prefix}.mlp.down_proj"),
+        vec![intermediate_size, config.hidden_size],
+    );
 }
 
 /// [`weight_shapes_for_architecture_config`], plus each tensor of a Model

@@ -495,3 +495,16 @@ fn per_layer_row_widths_replace_the_uniform_kv_estimate() {
         (4 + 6) * 2 * 10 * 4
     );
 }
+
+/// `express-latent-attention-forms`: V rows narrower than K rows (expanded
+/// latent attention) are counted at their own width.
+#[test]
+fn per_layer_value_row_widths_size_v_apart_from_k() {
+    let layered = KvCacheLayoutMetadata::contiguous(2, 2, 4, 10, ComputeDType::Float32)
+        .with_layer_row_widths(vec![Some(12), Some(12)])
+        .with_layer_value_row_widths(vec![Some(8), Some(8)]);
+    assert_eq!(
+        layered.estimated_storage_bytes().unwrap(),
+        2 * (12 + 8) * 10 * 4
+    );
+}

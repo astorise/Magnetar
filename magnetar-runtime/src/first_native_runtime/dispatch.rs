@@ -1621,6 +1621,7 @@ pub(super) fn dispatch_qwen_rope(
         pairing,
         frequency_scaling,
         None,
+        None,
         position_offset,
         output_target,
     )
@@ -1638,11 +1639,17 @@ pub(super) fn dispatch_rope_node(
     rope_config: &FirstNativeRopeConfig,
     pairing: RopePairing,
     frequency_scaling: Option<&crate::operator::RopeBandedFrequencyScaling>,
+    yarn: Option<&crate::operator::RopeYarnFrequencyScaling>,
     partial_rotary_factor: Option<f64>,
     position_offset: u64,
     output_target: Option<OutputTarget>,
 ) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
     let mut attributes = BTreeMap::new();
+    // YaRN (`express-latent-attention-forms`): the graph executor already
+    // refused a Provider whose `rope` Kernels do not all declare it.
+    if let Some(yarn) = yarn {
+        yarn.insert_attributes(&mut attributes);
+    }
     attributes.insert(
         "rotation_pairing".into(),
         OperatorAttributeValue::String(pairing.as_attribute().into()),
@@ -1714,12 +1721,15 @@ pub(super) fn dispatch_rope_node(
 /// sets them (`per-layer-kv-geometry`): a layer's own head geometry, its
 /// sliding window and its score scale. Absent geometry falls back to the
 /// architecture's.
-const ATTENTION_NODE_ATTRIBUTES: [&str; 5] = [
+const ATTENTION_NODE_ATTRIBUTES: [&str; 6] = [
     "head_count",
     "kv_head_count",
     "head_dimension",
     "window_size",
     "scale",
+    // `express-latent-attention-forms`: V rows and the output narrower or
+    // wider than Q/K rows.
+    "value_head_dimension",
 ];
 
 #[allow(clippy::too_many_arguments)]
@@ -1765,7 +1775,21 @@ pub(super) fn dispatch_qwen_attention(
             attributes.insert(name.into(), value.clone());
         }
     }
-    let output_descriptor = f32_tensor_descriptor_from_shape(q.shape());
+    // One output row per query, `head_count * value_head_dimension` wide:
+    // Q's own width unless V's head width differs.
+    let mut output_shape = q.shape().to_vec();
+    if let (
+        Some(OperatorAttributeValue::Integer(heads)),
+        Some(OperatorAttributeValue::Integer(value_width)),
+        Some(last),
+    ) = (
+        attributes.get("head_count"),
+        attributes.get("value_head_dimension"),
+        output_shape.last_mut(),
+    ) {
+        *last = (*heads as u64).saturating_mul(*value_width as u64);
+    }
+    let output_descriptor = f32_tensor_descriptor_from_shape(&output_shape);
     dispatch_reference_cpu_operator_pre_admitted(
         ctx,
         operation_id,
@@ -1776,6 +1800,60 @@ pub(super) fn dispatch_qwen_attention(
             node_input_resource(operation_id, "v", v),
         ],
         output_descriptor,
+        output_target,
+        attributes,
+    )
+}
+
+/// Dispatches a graph's head-wise `concat` (`express-latent-attention-forms`):
+/// `[T, head_count * a]` and `[T, second_head_count * b]` joined head by head
+/// into `[T, head_count * (a + b)]`.
+pub(super) fn dispatch_concat_heads(
+    ctx: &mut FirstNativeDispatchContext<'_>,
+    operation_id: &str,
+    first: NodeValue,
+    second: NodeValue,
+    head_count: u64,
+    second_head_count: u64,
+    output_target: Option<OutputTarget>,
+) -> Result<(KernelDispatchResult, NodeValue), InferenceApiError> {
+    let planning = |reason: String| InferenceApiError::GraphPlanningFailed {
+        reason: format!("graph node '{operation_id}': {reason}"),
+    };
+    let (&[rows, first_width], &[_, second_width]) = (first.shape(), second.shape()) else {
+        return Err(planning(
+            "concat across heads takes two-dimensional inputs".into(),
+        ));
+    };
+    let (a, b) = crate::operator::concat_heads_widths(
+        first_width,
+        second_width,
+        head_count,
+        second_head_count,
+    )
+    .map_err(planning)?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "axis".into(),
+        OperatorAttributeValue::String("heads".into()),
+    );
+    attributes.insert(
+        "head_count".into(),
+        OperatorAttributeValue::Integer(head_count as i64),
+    );
+    attributes.insert(
+        "second_head_count".into(),
+        OperatorAttributeValue::Integer(second_head_count as i64),
+    );
+    dispatch_reference_cpu_operator_pre_admitted(
+        ctx,
+        operation_id,
+        dispatch_operator_id("concat", OperatorFamily::Tensor),
+        vec![
+            node_input_resource(operation_id, "first", first),
+            node_input_resource(operation_id, "second", second),
+        ],
+        f32_tensor_descriptor_from_shape(&[rows, head_count * (a + b)]),
         output_target,
         attributes,
     )

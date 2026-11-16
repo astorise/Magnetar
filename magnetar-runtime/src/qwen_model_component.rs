@@ -428,9 +428,29 @@ impl FirstNativeModelConfig {
         }
     }
 
-    /// Each decoder layer's K (and V) row width, `kv_head_count *
-    /// head_dimension` of that layer, or `None` for a layer that attends
-    /// over an earlier layer's K/V and keeps none of its own
+    /// Each decoder layer's V row width: [`Self::kv_row_widths`], except
+    /// under multi-head latent attention, whose expanded V rows are
+    /// `kv_head_count * v_head_dim` wide (`express-latent-attention-forms`).
+    pub fn kv_value_row_widths(&self) -> Vec<Option<u64>> {
+        let widths = self.kv_row_widths();
+        match &self.latent_attention {
+            Some(mla) => widths
+                .into_iter()
+                .map(|width| {
+                    width.map(|_| {
+                        self.architecture
+                            .kv_head_count
+                            .saturating_mul(mla.v_head_dim)
+                    })
+                })
+                .collect(),
+            None => widths,
+        }
+    }
+
+    /// Each decoder layer's K (and, without latent attention, V) row width,
+    /// `kv_head_count * head_dimension` of that layer, or `None` for a layer
+    /// that attends over an earlier layer's K/V and keeps none of its own
     /// (`per-layer-kv-geometry`).
     pub fn kv_row_widths(&self) -> Vec<Option<u64>> {
         let layers = self.architecture.layer_count as usize;
@@ -808,6 +828,13 @@ pub fn validate_first_native_tensor_inventory(
         }
         // A layer reusing an earlier layer's K/V (`per-layer-kv-geometry`)
         // has no K/V projections, and one deriving V from K no V projection.
+        // Latent attention replaces the query and key projections
+        // (`express-latent-attention-forms`); its own are required below.
+        if config.latent_attention.is_some()
+            && (expected.ends_with(".self_attn.q_proj") || expected.ends_with(".self_attn.k_proj"))
+        {
+            continue;
+        }
         if let Some((layer, rest)) = expected
             .strip_prefix("layers.")
             .and_then(|rest| rest.split_once('.'))
@@ -844,7 +871,58 @@ pub fn validate_first_native_tensor_inventory(
             return Err(QwenComponentError::TensorInventoryMissing { tensor: expected });
         }
     }
+    if let Some(mla) = &config.latent_attention {
+        let a = &config.architecture;
+        for layer in 0..a.layer_count {
+            for (projection, _) in
+                latent_attention_projection_shapes(a.hidden_size, a.attention_head_count, mla)
+            {
+                let name = format!("layers.{layer}.{projection}");
+                if !present.contains(name.as_str()) {
+                    return Err(QwenComponentError::TensorInventoryMissing { tensor: name });
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// A latent-attention layer's projections and norms (`express-latent-
+/// attention-forms`), each name relative to `layers.N.` with its shape,
+/// projections as `[in, out]`. The loaders split the checkpoint's fused
+/// projections by rows into these (issue #198, decision 2): the query's
+/// position-independent and rotated parts, the latent and the shared rotated
+/// key from the hidden state, and the keys' position-independent part and
+/// the values from the normalized latent.
+pub fn latent_attention_projection_shapes(
+    hidden_size: u64,
+    attention_heads: u64,
+    mla: &crate::LatentAttentionConfig,
+) -> Vec<(&'static str, Vec<u64>)> {
+    let nope = attention_heads * mla.qk_nope_head_dim;
+    let rope = attention_heads * mla.qk_rope_head_dim;
+    let values = attention_heads * mla.v_head_dim;
+    let latent = u64::from(mla.kv_lora_rank);
+    let query_input = mla.q_lora_rank.map_or(hidden_size, u64::from);
+    let mut shapes = Vec::with_capacity(10);
+    if let Some(rank) = mla.q_lora_rank {
+        shapes.push(("self_attn.q_a_proj", vec![hidden_size, u64::from(rank)]));
+        shapes.push(("self_attn.q_a_norm", vec![u64::from(rank)]));
+    }
+    shapes.extend([
+        ("self_attn.q_nope_proj", vec![query_input, nope]),
+        ("self_attn.q_rope_proj", vec![query_input, rope]),
+        ("self_attn.kv_a_proj", vec![hidden_size, latent]),
+        ("self_attn.kv_a_norm", vec![latent]),
+        (
+            "self_attn.k_rope_proj",
+            vec![hidden_size, mla.qk_rope_head_dim],
+        ),
+        ("self_attn.k_nope_proj", vec![latent, nope]),
+        ("self_attn.v_proj", vec![latent, values]),
+        ("self_attn.o_proj", vec![values, hidden_size]),
+    ]);
+    shapes
 }
 
 /// `layer`'s entry in `config`'s layer layout, when it declares one.
@@ -869,6 +947,14 @@ pub fn first_native_expected_tensor_shape(
         _ => {}
     }
     let (layer, rest) = name.strip_prefix("layers.")?.split_once('.')?;
+    if let Some(mla) = &config.latent_attention
+        && let Some((_, shape)) =
+            latent_attention_projection_shapes(a.hidden_size, a.attention_head_count, mla)
+                .into_iter()
+                .find(|(projection, _)| *projection == rest)
+    {
+        return Some(shape);
+    }
     // Each layer's own geometry when the layers differ
     // (`per-layer-kv-geometry`).
     let (q_dim, kv_dim, intermediate_size) = match layer_spec(config, layer) {

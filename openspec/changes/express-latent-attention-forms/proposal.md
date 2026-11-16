@@ -45,6 +45,19 @@ milestone caches the expanded K and V and needs three new operator forms:
   configuration declares latent attention, mixed expert layers or expert
   routing that the Component never read. YaRN is checked on the graph itself,
   like the banded scaling: every `rope` node must declare it.
+- **Engine.**
+  - Component graphs may use head-wise `concat`; its dispatch has its own
+    branch. A graph's row `concat` is refused, since KV-history concatenation
+    stays the Runtime's own.
+  - `attention` forwards `value_head_dimension` and sizes its output from it.
+  - `rope` forwards YaRN.
+  - KV stores take each edge's own width, so expanded K and V stores already
+    differ. The estimates now count V at `kv_value_row_widths`.
+  - Weight shapes and inventory validation derive the split latent-attention
+    projections (`latent_attention_projection_shapes`) instead of q/k/v/o, a
+    dense MLP for layers outside `moe_layers`, no shared expert gate when
+    routing says it is ungated, and a selection bias when routing declares
+    one.
 - No `routed_scaling_factor` attribute: scaling every routing weight by `s`
   scales the routed experts' output by `s`. A Component expresses it with
   `activation{kind = "scale"}` before adding the shared expert.

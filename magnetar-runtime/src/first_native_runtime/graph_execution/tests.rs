@@ -1342,10 +1342,490 @@ fn the_reference_cpu_declares_every_layered_form() {
         ("rope", ROPE_PARTIAL_ROTARY_FEATURE),
         ("moe-experts", MOE_EXPERTS_ACTIVATION_FEATURE),
         ("moe-experts", MOE_PER_EXPERT_SCALE_FEATURE),
+        // `express-latent-attention-forms`.
+        ("attention", ATTENTION_VALUE_HEAD_DIMENSION_FEATURE),
+        ("concat", CONCAT_HEADS_FEATURE),
+        ("rope", ROPE_YARN_FREQUENCY_SCALING_FEATURE),
     ] {
         assert!(
             provider_kernels_declare(&runtime, &provider, operator, feature),
             "{operator} declares {feature}"
+        );
+    }
+}
+
+// `express-latent-attention-forms`: one multi-head latent attention layer
+// in its expanded form, through the graph executor.
+
+const MLA_HIDDEN: u64 = 6;
+const MLA_HEADS: u64 = 2;
+const MLA_NOPE: u64 = 3;
+const MLA_ROPE: u64 = 4;
+const MLA_VALUE: u64 = 4;
+const MLA_LATENT: u64 = 5;
+const MLA_VOCAB: u64 = 7;
+const MLA_SCALE: f64 = 0.45;
+
+fn mla_yarn() -> crate::operator::RopeYarnFrequencyScaling {
+    crate::operator::RopeYarnFrequencyScaling {
+        factor: 4.0,
+        original_context_length: 16,
+        beta_fast: 2.0,
+        beta_slow: 1.0,
+        attention_factor: 1.2,
+        truncate: true,
+    }
+}
+
+fn mla_weights() -> BTreeMap<String, HostTensor> {
+    let mut seed = 29u32;
+    let mut tensor = |shape: Vec<u64>| {
+        let count: u64 = shape.iter().product();
+        let values: Vec<f32> = (0..count)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((seed >> 16) % 1000) as f32 / 1000.0 - 0.5
+            })
+            .collect();
+        HostTensor::new(shape, values).unwrap()
+    };
+    let mut weights = BTreeMap::new();
+    weights.insert(
+        "q_nope".into(),
+        tensor(vec![MLA_HIDDEN, MLA_HEADS * MLA_NOPE]),
+    );
+    weights.insert(
+        "q_rope".into(),
+        tensor(vec![MLA_HIDDEN, MLA_HEADS * MLA_ROPE]),
+    );
+    weights.insert("kv_a".into(), tensor(vec![MLA_HIDDEN, MLA_LATENT]));
+    weights.insert("kv_a_norm".into(), tensor(vec![MLA_LATENT]));
+    weights.insert("k_rope".into(), tensor(vec![MLA_HIDDEN, MLA_ROPE]));
+    weights.insert(
+        "k_nope".into(),
+        tensor(vec![MLA_LATENT, MLA_HEADS * MLA_NOPE]),
+    );
+    weights.insert("v".into(), tensor(vec![MLA_LATENT, MLA_HEADS * MLA_VALUE]));
+    weights.insert("o".into(), tensor(vec![MLA_HEADS * MLA_VALUE, MLA_HIDDEN]));
+    weights.insert("out".into(), tensor(vec![MLA_HIDDEN, MLA_VOCAB]));
+    weights
+}
+
+/// `q = [x Wqn | rope(x Wqr)]` and `k = [c Wkn | rope(x Wkr) for every
+/// head]` with `c = rmsnorm(x Wkva)`, `v = c Wv`, attention with Q/K heads
+/// of `MLA_NOPE + MLA_ROPE` and V heads of `MLA_VALUE`, then `o`, the
+/// residual and the head. K and V are the layer's KV edges.
+fn mla_graph(rows: u64, decode: bool) -> ExecutionGraph {
+    let phase = if decode {
+        ExecutionGraphPhase::Decode
+    } else {
+        ExecutionGraphPhase::Prefill
+    };
+    let mut graph =
+        ExecutionGraph::new(ExecutionGraphId::new(format!("mla-{rows}-{decode}")), phase);
+    let input = |graph: &mut ExecutionGraph, name: &str, shape: Vec<u64>| {
+        let id = TensorEdgeId::new(format!("input.{name}"));
+        graph.edges.insert(
+            id.clone(),
+            TensorEdge::new(id.clone(), f32_tensor_descriptor_from_shape(&shape)),
+        );
+        id
+    };
+    let node = |graph: &mut ExecutionGraph,
+                id: &str,
+                operator: &str,
+                family: OperatorFamily,
+                attributes: Vec<(&str, OperatorAttributeValue)>,
+                inputs: Vec<TensorEdgeId>,
+                shape: Vec<u64>,
+                kv: Option<&str>| {
+        let node_id = ExecutionNodeId::new(id);
+        let output = TensorEdgeId::new(format!("edge.{id}"));
+        let mut execution_node =
+            ExecutionNode::new(node_id.clone(), OperatorId::magnetar(operator, 1, family));
+        for edge in &inputs {
+            execution_node = execution_node.with_input(edge.clone());
+            graph
+                .edges
+                .get_mut(edge)
+                .unwrap()
+                .consumers
+                .insert(node_id.clone());
+        }
+        execution_node = execution_node.with_output(output.clone());
+        for (name, value) in attributes {
+            execution_node = execution_node.with_attribute(name, value);
+        }
+        let mut edge = TensorEdge::new(output.clone(), f32_tensor_descriptor_from_shape(&shape))
+            .with_producer(node_id.clone());
+        if let Some(role) = kv {
+            edge.kv_cache = Some(GraphKvCacheMetadata {
+                cache_id: format!("mla.layer0.{role}"),
+                behavior: if decode {
+                    GraphKvCacheBehavior::Append
+                } else {
+                    GraphKvCacheBehavior::Output
+                },
+                paged: false,
+                compatibility_key: "mla".into(),
+            });
+        }
+        graph.nodes.insert(node_id, execution_node);
+        graph.edges.insert(output.clone(), edge);
+        output
+    };
+    let weights = mla_weights();
+    let weight = |graph: &mut ExecutionGraph, name: &str| {
+        let shape = weights[name].shape.clone();
+        input(graph, name, shape)
+    };
+    let matmul =
+        |graph: &mut ExecutionGraph, id: &str, a: TensorEdgeId, b: TensorEdgeId, cols: u64, kv| {
+            node(
+                graph,
+                id,
+                "matmul",
+                OperatorFamily::LinearAlgebra,
+                vec![],
+                vec![a, b],
+                vec![rows, cols],
+                kv,
+            )
+        };
+    let rope = |graph: &mut ExecutionGraph, id: &str, a: TensorEdgeId, heads: u64| {
+        let mut attributes = BTreeMap::new();
+        mla_yarn().insert_attributes(&mut attributes);
+        attributes.insert("base".into(), OperatorAttributeValue::Float(100.0));
+        attributes.insert(
+            "dimension".into(),
+            OperatorAttributeValue::Integer(MLA_ROPE as i64),
+        );
+        attributes.insert(
+            "head_count".into(),
+            OperatorAttributeValue::Integer(heads as i64),
+        );
+        attributes.insert("position_offset".into(), OperatorAttributeValue::Integer(0));
+        let attributes: Vec<(&str, OperatorAttributeValue)> = attributes
+            .into_iter()
+            .map(|(name, value)| (&*Box::leak(name.into_boxed_str()), value))
+            .collect();
+        node(
+            graph,
+            id,
+            "rope",
+            OperatorFamily::PositionEncoding,
+            attributes,
+            vec![a],
+            vec![rows, heads * MLA_ROPE],
+            None,
+        )
+    };
+    let concat = |graph: &mut ExecutionGraph,
+                  id: &str,
+                  a: TensorEdgeId,
+                  b: TensorEdgeId,
+                  second: u64,
+                  kv| {
+        node(
+            graph,
+            id,
+            "concat",
+            OperatorFamily::Tensor,
+            vec![
+                ("axis", OperatorAttributeValue::String("heads".into())),
+                (
+                    "head_count",
+                    OperatorAttributeValue::Integer(MLA_HEADS as i64),
+                ),
+                (
+                    "second_head_count",
+                    OperatorAttributeValue::Integer(second as i64),
+                ),
+            ],
+            vec![a, b],
+            vec![rows, MLA_HEADS * (MLA_NOPE + MLA_ROPE)],
+            kv,
+        )
+    };
+    let x = input(&mut graph, "x", vec![rows, MLA_HIDDEN]);
+    let w = weight(&mut graph, "q_nope");
+    let q_nope = matmul(
+        &mut graph,
+        "q_nope",
+        x.clone(),
+        w,
+        MLA_HEADS * MLA_NOPE,
+        None,
+    );
+    let w = weight(&mut graph, "q_rope");
+    let q_pe = matmul(&mut graph, "q_pe", x.clone(), w, MLA_HEADS * MLA_ROPE, None);
+    let q_pe = rope(&mut graph, "rope_q", q_pe, MLA_HEADS);
+    let w = weight(&mut graph, "kv_a");
+    let latent = matmul(&mut graph, "kv_a", x.clone(), w, MLA_LATENT, None);
+    let norm = weight(&mut graph, "kv_a_norm");
+    let latent = node(
+        &mut graph,
+        "kv_a_norm",
+        "rmsnorm",
+        OperatorFamily::Normalization,
+        vec![("epsilon", OperatorAttributeValue::Float(1e-6))],
+        vec![latent, norm],
+        vec![rows, MLA_LATENT],
+        None,
+    );
+    let w = weight(&mut graph, "k_rope");
+    let k_pe = matmul(&mut graph, "k_pe", x.clone(), w, MLA_ROPE, None);
+    let k_pe = rope(&mut graph, "rope_k", k_pe, 1);
+    let w = weight(&mut graph, "k_nope");
+    let k_nope = matmul(
+        &mut graph,
+        "k_nope",
+        latent.clone(),
+        w,
+        MLA_HEADS * MLA_NOPE,
+        None,
+    );
+    let w = weight(&mut graph, "v");
+    let v = matmul(&mut graph, "v", latent, w, MLA_HEADS * MLA_VALUE, Some("v"));
+    let q = concat(&mut graph, "q", q_nope, q_pe, MLA_HEADS, None);
+    let k = concat(&mut graph, "k", k_nope, k_pe, 1, Some("k"));
+    let attended = node(
+        &mut graph,
+        "attention",
+        "attention",
+        OperatorFamily::Attention,
+        vec![
+            ("causal", OperatorAttributeValue::Boolean(true)),
+            (
+                "head_count",
+                OperatorAttributeValue::Integer(MLA_HEADS as i64),
+            ),
+            (
+                "kv_head_count",
+                OperatorAttributeValue::Integer(MLA_HEADS as i64),
+            ),
+            (
+                "head_dimension",
+                OperatorAttributeValue::Integer((MLA_NOPE + MLA_ROPE) as i64),
+            ),
+            (
+                "value_head_dimension",
+                OperatorAttributeValue::Integer(MLA_VALUE as i64),
+            ),
+            ("scale", OperatorAttributeValue::Float(MLA_SCALE)),
+        ],
+        vec![q, k, v],
+        vec![rows, MLA_HEADS * MLA_VALUE],
+        None,
+    );
+    let w = weight(&mut graph, "o");
+    let o = matmul(&mut graph, "o", attended, w, MLA_HIDDEN, None);
+    let hidden = node(
+        &mut graph,
+        "residual",
+        "add",
+        OperatorFamily::Tensor,
+        vec![],
+        vec![x, o],
+        vec![rows, MLA_HIDDEN],
+        None,
+    );
+    let w = weight(&mut graph, "out");
+    let logits = matmul(&mut graph, "lm_head", hidden, w, MLA_VOCAB, None);
+    let mut edge = graph.edges.remove(&logits).unwrap();
+    edge.id = TensorEdgeId::new("logits");
+    graph.edges.insert(edge.id.clone(), edge);
+    graph
+        .nodes
+        .get_mut(&ExecutionNodeId::new("lm_head"))
+        .unwrap()
+        .outputs = vec![TensorEdgeId::new("logits")];
+    graph
+}
+
+/// Row `index` of the latent-attention test's input sequence.
+fn mla_input_row(index: u64) -> Vec<f32> {
+    (0..MLA_HIDDEN)
+        .map(|column| ((index * 3 + column * 5) % 7) as f32 / 7.0 - 0.4)
+        .collect()
+}
+
+/// [`mla_graph`]'s logits for `rows` rows of [`mla_input_row`], on the
+/// host: interleaved YaRN rotation by hand from the shared frequency rule,
+/// the head-wise joins and the attention by direct loops.
+fn mla_oracle(rows: u64) -> Vec<f32> {
+    let weights = mla_weights();
+    let n = rows as usize;
+    let x: Vec<f32> = (0..rows).flat_map(mla_input_row).collect();
+    let yarn = mla_yarn();
+    let range = yarn.correction_range(MLA_ROPE, 100.0);
+    let rotate = |values: &mut [f32], heads: usize| {
+        let d = MLA_ROPE as usize;
+        for row in 0..n {
+            for head in 0..heads {
+                for pair in 0..d / 2 {
+                    let frequency = yarn.scale_frequency(
+                        100f32.powf(-2.0 * pair as f32 / d as f32),
+                        pair,
+                        range,
+                    );
+                    let angle = row as f32 * frequency;
+                    let at = row * heads * d + head * d + 2 * pair;
+                    let (a, b) = (values[at], values[at + 1]);
+                    let af = yarn.attention_factor as f32;
+                    values[at] = (a * angle.cos() - b * angle.sin()) * af;
+                    values[at + 1] = (a * angle.sin() + b * angle.cos()) * af;
+                }
+            }
+        }
+    };
+    let heads = MLA_HEADS as usize;
+    let (nope, rope, dv) = (MLA_NOPE as usize, MLA_ROPE as usize, MLA_VALUE as usize);
+    let q_nope = host_matmul(&x, n, &weights["q_nope"]);
+    let mut q_pe = host_matmul(&x, n, &weights["q_rope"]);
+    rotate(&mut q_pe, heads);
+    let mut latent = host_matmul(&x, n, &weights["kv_a"]);
+    for row in latent.chunks_mut(MLA_LATENT as usize) {
+        let mean = row.iter().map(|v| v * v).sum::<f32>() / row.len() as f32;
+        let inverse = 1.0 / (mean + 1e-6).sqrt();
+        for (index, value) in row.iter_mut().enumerate() {
+            *value *= inverse * weights["kv_a_norm"].data[index];
+        }
+    }
+    let mut k_pe = host_matmul(&x, n, &weights["k_rope"]);
+    rotate(&mut k_pe, 1);
+    let k_nope = host_matmul(&latent, n, &weights["k_nope"]);
+    let v = host_matmul(&latent, n, &weights["v"]);
+    let qk = nope + rope;
+    let mut attended = vec![0.0f32; n * heads * dv];
+    for i in 0..n {
+        for h in 0..heads {
+            let query: Vec<f32> = q_nope[i * heads * nope + h * nope..][..nope]
+                .iter()
+                .chain(&q_pe[i * heads * rope + h * rope..][..rope])
+                .copied()
+                .collect();
+            let scores: Vec<f32> = (0..=i)
+                .map(|j| {
+                    let key = k_nope[j * heads * nope + h * nope..][..nope]
+                        .iter()
+                        .chain(&k_pe[j * rope..][..rope]);
+                    query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>() * MLA_SCALE as f32
+                })
+                .collect();
+            assert_eq!(query.len(), qk);
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+            let total: f32 = exps.iter().sum();
+            for (j, weight) in exps.iter().enumerate() {
+                for e in 0..dv {
+                    attended[i * heads * dv + h * dv + e] +=
+                        weight / total * v[j * heads * dv + h * dv + e];
+                }
+            }
+        }
+    }
+    let o = host_matmul(&attended, n, &weights["o"]);
+    let hidden: Vec<f32> = x.iter().zip(o).map(|(a, b)| a + b).collect();
+    host_matmul(&hidden, n, &weights["out"])
+}
+
+/// A prefill of 4 rows, then one decode step over its K/V history, with the
+/// history concatenated or in place: the logits match the host, and the K
+/// and V stores keep their own widths.
+#[test]
+fn an_expanded_latent_attention_layer_prefills_and_decodes() {
+    let prompt = 4u64;
+    let full = mla_oracle(prompt + 1);
+    let vocab = MLA_VOCAB as usize;
+    for in_place in [false, true] {
+        let fixture = e2e_fixture().expect("fixture builds");
+        let mut runtime = build_runtime_trusting_fixture(&fixture);
+        let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
+        let mut fixture = fixture;
+        fixture.config.architecture.layer_count = 1;
+        let provider = ProviderBinding::new(crate::REFERENCE_CPU_PROVIDER_NAME);
+        let revision = require_ready_first_native_instance(&runtime, &instance)
+            .unwrap()
+            .status()
+            .mutation_version;
+        let weights = mla_weights();
+        let bindings = |rows: std::ops::Range<u64>| {
+            let count = rows.end - rows.start;
+            let mut bindings: BTreeMap<TensorEdgeId, HostTensor> = weights
+                .iter()
+                .map(|(name, tensor)| (TensorEdgeId::new(format!("input.{name}")), tensor.clone()))
+                .collect();
+            bindings.insert(
+                TensorEdgeId::new("input.x"),
+                HostTensor::new(
+                    [count, MLA_HIDDEN],
+                    rows.flat_map(mla_input_row).collect::<Vec<f32>>(),
+                )
+                .unwrap(),
+            );
+            bindings
+        };
+        let stores = in_place.then(|| KvStoreSpec::owned(prompt + 4));
+        let mut run = |graph: &ExecutionGraph,
+                       rows: std::ops::Range<u64>,
+                       cache: &str,
+                       history: Option<&LayerKvMap>| {
+            let mut plan = prepare_first_native_plan_for_graph(
+                &runtime,
+                graph,
+                &instance,
+                revision,
+                rows.end - rows.start,
+                PreparedExecutionPlanGeneration::new(1),
+                &provider,
+            )
+            .unwrap();
+            let position = rows.start;
+            execute_first_native_graph_materializing(
+                &mut runtime,
+                &fixture,
+                &instance,
+                &KvCacheId::new(cache).unwrap(),
+                graph,
+                &mut plan,
+                bindings(rows),
+                history,
+                Some(position),
+                &mut Vec::new(),
+                MaterializedEdges::Only(&["logits"]),
+                None,
+                stores,
+            )
+            .unwrap()
+        };
+        let (_, prefill, layer_kv, _) = run(&mla_graph(prompt, false), 0..prompt, "mp", None);
+        let (_, decode, _, _) = run(
+            &mla_graph(1, true),
+            prompt..prompt + 1,
+            "md",
+            Some(&layer_kv),
+        );
+        let what = |phase: &str| format!("{phase} (in place: {in_place})");
+        assert_logits_close(
+            &prefill[&TensorEdgeId::new("logits")].data,
+            &full[..prompt as usize * vocab],
+            &what("prefill"),
+        );
+        assert_logits_close(
+            &decode[&TensorEdgeId::new("logits")].data,
+            &full[prompt as usize * vocab..],
+            &what("decode"),
+        );
+        let executor = resolve_kernel_execution_provider(&runtime, &provider).unwrap();
+        let state = &layer_kv[&0];
+        assert_eq!(
+            executor.resident_shape(&state.k).unwrap()[1],
+            MLA_HEADS * (MLA_NOPE + MLA_ROPE)
+        );
+        assert_eq!(
+            executor.resident_shape(&state.v).unwrap()[1],
+            MLA_HEADS * MLA_VALUE
         );
     }
 }

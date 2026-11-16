@@ -434,6 +434,19 @@ fn validate_first_scope_attributes(
             }
             Ok(())
         }
+        // A graph joins heads (`express-latent-attention-forms`); joining KV
+        // history rows is the Runtime's own.
+        "concat" => {
+            if crate::operator::concat_axis(attributes) != Some(crate::operator::ConcatAxis::Heads)
+            {
+                return Err(FirstScopeError::new(
+                    FirstScopeErrorCode::AttributeUnsupported,
+                    "a graph's concat must join heads (axis 'heads')",
+                )
+                .with_operator(operator.clone()));
+            }
+            Ok(())
+        }
         "rope" => {
             if let Some(OperatorAttributeValue::String(position_mode)) =
                 attributes.get("position_mode")
@@ -451,7 +464,7 @@ fn validate_first_scope_attributes(
     }
 }
 
-const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 35] = [
+const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 36] = [
     required_now("embedding", OperatorFamily::Tensor, true),
     required_now("matmul", OperatorFamily::LinearAlgebra, true),
     required_now("rmsnorm", OperatorFamily::Normalization, true),
@@ -469,6 +482,8 @@ const FIRST_OPERATOR_SCOPE: [OperatorScopeEntry; 35] = [
     // and its shared expert's sigmoid-scaled output.
     first_decoder_optional("moe-experts", OperatorFamily::LinearAlgebra),
     first_decoder_optional("row-scale", OperatorFamily::Tensor),
+    // `express-latent-attention-forms`: queries and keys joined head by head.
+    first_decoder_optional("concat", OperatorFamily::Tensor),
     first_decoder_optional("activation", OperatorFamily::Activation),
     placeholder("batched-matmul", OperatorFamily::LinearAlgebra),
     placeholder("layernorm", OperatorFamily::Normalization),

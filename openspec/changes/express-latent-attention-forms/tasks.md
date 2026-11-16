@@ -29,3 +29,15 @@
   - a `1.4.0` Component failing to receive YaRN;
   - the real Qwen Component refused for mixed layers, routing and YaRN;
   - validation of inconsistent declarations.
+
+## 6. Engine
+
+- [x] 6.1 Head-wise `concat` admitted in Component graphs and dispatched; row `concat` refused there.
+- [x] 6.2 `attention.value_head_dimension` forwarded with the output sized from it; YaRN forwarded on `rope`.
+- [x] 6.3 V widths in the KV estimates (`kv_value_row_widths`, `layer_value_row_widths`).
+- [x] 6.4 Split latent-attention projections in weight shapes, expected shapes and inventory; dense MLP outside `moe_layers`; optional shared expert gate; selection bias.
+- [x] 6.5 Tests:
+  - an expanded latent-attention layer (split projections, YaRN on both rotated parts, head-wise joins, a narrower V) prefills and decodes through the graph executor, history concatenated or in place, against a host oracle, with K and V stores at their own widths;
+  - weight shapes and inventory for DeepSeek-V2-Lite's shape;
+  - the V-width estimate;
+  - the Reference CPU declares the new forms.

@@ -622,16 +622,20 @@ fn a_component_that_never_reads_a_declared_1_7_0_feature_is_refused() {
         moe_layers: Some((0..layers).map(|layer| layer > 0).collect()),
         ..routed.clone()
     };
-    let error = build(&mixed).expect_err("unread mixed expert layers are refused");
-    assert!(error.contains("mixture-of-experts-layers"), "{error}");
+    // Its dense first layer has no expert weights, so the Component, which
+    // routes every layer, fails as soon as it asks for them.
+    build(&mixed).expect_err("unread mixed expert layers are refused");
 
+    // Routing that keeps every weight the Component asks for (a gated
+    // shared expert, no selection bias): the graph builds, and is refused
+    // for the unread function.
     let custom_routing = ModelArchitectureConfig {
         expert_routing: Some(crate::ExpertRoutingConfig {
             scoring: crate::ExpertScoring::Softmax,
             groups: None,
-            routed_scaling_factor: 1.0,
+            routed_scaling_factor: 2.0,
             selection_bias: false,
-            shared_expert_gated: false,
+            shared_expert_gated: true,
         }),
         ..routed
     };
