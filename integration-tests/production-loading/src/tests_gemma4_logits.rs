@@ -13,7 +13,7 @@
 //! error.
 
 use crate::logit_comparison::{Format, compare_on, compare_with_reference};
-use crate::resident_reference_cpu::ResidentReferenceCpuProvider;
+use magnetar_integration_resident_provider::ResidentReferenceCpuProvider;
 
 fn compare(variant: &str, format: Format, family: &str) -> f32 {
     compare_with_reference("gemma4", variant, format, family)

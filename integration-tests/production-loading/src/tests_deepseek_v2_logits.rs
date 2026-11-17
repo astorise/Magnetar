@@ -12,7 +12,7 @@
 //! up-projection, not the quantization error.
 
 use crate::logit_comparison::{Format, compare_on, compare_with_reference};
-use crate::resident_reference_cpu::ResidentReferenceCpuProvider;
+use magnetar_integration_resident_provider::ResidentReferenceCpuProvider;
 
 fn compare(variant: &str) -> f32 {
     let difference =

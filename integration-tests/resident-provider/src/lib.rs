@@ -26,13 +26,13 @@ use magnetar_runtime::{
 use std::sync::Arc;
 
 /// See the module documentation.
-pub(crate) struct ResidentReferenceCpuProvider {
+pub struct ResidentReferenceCpuProvider {
     inner: ReferenceCpuProvider,
     executor: Arc<ResidentExecutor>,
 }
 
 impl ResidentReferenceCpuProvider {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let inner = ReferenceCpuProvider::new();
         let executor = Arc::new(ResidentExecutor {
             inner: inner
@@ -40,6 +40,12 @@ impl ResidentReferenceCpuProvider {
                 .expect("the Reference CPU Provider executes Kernels"),
         });
         Self { inner, executor }
+    }
+}
+
+impl Default for ResidentReferenceCpuProvider {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

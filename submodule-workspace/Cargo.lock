@@ -1005,6 +1005,7 @@ version = "0.1.0"
 dependencies = [
  "magnetar-format-gguf",
  "magnetar-inference-qualification",
+ "magnetar-integration-resident-provider",
  "magnetar-loader-gguf",
  "magnetar-loader-huggingface",
  "magnetar-provider-cpu",
@@ -1013,6 +1014,13 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+]
+
+[[package]]
+name = "magnetar-integration-resident-provider"
+version = "0.1.0"
+dependencies = [
+ "magnetar-runtime",
 ]
 
 [[package]]

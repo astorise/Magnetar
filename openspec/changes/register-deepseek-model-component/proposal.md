@@ -190,9 +190,13 @@ continuation contained "D. Paris" in both.
 - `providers/cuda`: the rope dispatch reads YaRN before the banded scaling.
 - `magnetar-runtime/src/first_native_runtime/graph_execution.rs`: `concat`
   takes device-resident inputs; its test runs on resident values too.
-- `integration-tests/production-loading`: `resident_reference_cpu.rs` and
-  the resident-value cases of `tests_deepseek_v2_logits.rs` and
-  `tests_gemma4_logits.rs`.
+- `integration-tests/resident-provider` (new, test only): the Reference
+  CPU with every value reported resident. It is a Provider, so it has a
+  crate of its own, a member of `submodule-workspace`.
+  `production-loading` stays on the public surface its source guard
+  checks.
+- `integration-tests/production-loading`: the resident-value cases of
+  `tests_deepseek_v2_logits.rs` and `tests_gemma4_logits.rs`.
 - `.github/workflows/gpu-runner-smoke.yml`: three steps in the `moe` suite;
   the Qwen1.5-MoE steps' check; the packed-against-dequantized comparison
   of the Qwen2.5-0.5B `Q8_0` file.
