@@ -24,7 +24,7 @@
 - [x] 5.1 The tiny DeepSeek-V2 checkpoints (Hugging Face and GGUF) against `transformers`: they match on the Reference CPU, both CPU Providers and with every value device-resident (largest logit difference 1.2e-5); on CUDA too, largest logit difference 1.3e-5 (run 44183609847).
 - [x] 5.2 DeepSeek-V2-Lite-Chat Q8_0 on two GPUs continues "The capital of France is" with " Paris." (run 44183609847). Its history is 576 values per token and layer against 5,120. TPOT after a short prompt: 20.30 ms against 12.25 ms with the expanded history (run of 11:12 UTC the same day): slower, see 5.3.
 
-- [ ] 5.3 The absorbed decode's TPOT at least the expanded form's after a short prompt: find where the 8 ms per token go (decode phase attribution in the real-checkpoint test) and remove it.
+- [ ] 5.3 The absorbed decode's TPOT at least the expanded form's after a short prompt. Run 44195880740: 13.02 ms with the f32 latent history and 13.45 ms with the tq4 one (was 20.30 ms), against 12.25 ms expanded. The decode steps are captured and replayed (`[step capture] captured: decode step 2`); 7.3 ms of the difference came from the transposed `batched-matmul` reading one weight row per thread, which a warp per output now reads coalesced. Of the 13 ms per step, replay takes 7.1 ms and the logits' materialization 4.9 ms (for both histories).
 
 ## 6. TurboQuant on the latent history (`turboquant-kv-history`, second step)
 

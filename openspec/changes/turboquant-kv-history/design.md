@@ -188,12 +188,24 @@ contexts on this GPU.
 
 Findings:
 - The history shrinks as designed (7.1-7.5× in `tq4`, 9.1-9.9× in `tq3`).
-- Decode on codes is slower than the f32 split-KV kernel, increasingly
+- Decode on codes was slower than the f32 split-KV kernel, increasingly
   with the context (0.43× at 32,768 tokens on Qwen2.5-0.5B): its blocks
-  serve one query head each, so a KV head's codes are decoded once per
+  served one query head each, so a KV head's codes were decoded once per
   grouped query head (7 for Qwen2.5-0.5B, 4 for Mistral 7B), each code
-  extracted bit by bit. Task 5.4 addresses it; until then `f32` stays
-  the default.
+  extracted bit by bit. The grouped kernel (task 5.4) serves a KV head's
+  query heads in one block; run 44195880740 measures TPOT against f32:
+
+  | Qwen2.5-0.5B | 512 | 4,096 | 16,384 | 32,768 |
+  |---|---|---|---|---|
+  | f32 | 3.64 ms | 4.34 ms | 6.50 ms | 9.38 ms |
+  | tq4 | 4.49 ms (0.81×) | 4.69 ms (0.92×) | 6.93 ms (0.94×) | 9.39 ms (1.00×) |
+  | tq3 | 4.80 ms (0.76×) | 5.05 ms (0.86×) | 7.39 ms (0.88×) | 11.74 ms (0.80×) |
+
+  Mistral 7B Q4_K_M at 4,096 tokens: 23.33 ms (f32), 23.52 ms (tq4,
+  0.99×), 27.93 ms (tq3, 0.84×). `tq4` now decodes as fast as f32 with a
+  7× smaller history; short histories still pay the fixed rotations, and
+  3-bit codes, read one by one, cost more. `f32` stays the default until
+  short histories match too.
 - Greedy agreement counts stop at the first near-tie and vary between
   contexts (Qwen2.5-0.5B `tq4`: 64, 36, 16, 64).
 
