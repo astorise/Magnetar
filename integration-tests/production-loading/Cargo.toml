@@ -23,6 +23,7 @@ magnetar-format-gguf = { path = "../../formats/gguf" }
 magnetar-provider-cuda = { path = "../../providers/cuda" }
 magnetar-provider-cpu = { path = "../../providers/cpu" }
 magnetar-inference-qualification = { path = "../../tools/inference-qualification" }
+magnetar-integration-resident-provider = { path = "../resident-provider" }
 serde_json = "1"
 sha2 = "0.11"
 tempfile = "3"

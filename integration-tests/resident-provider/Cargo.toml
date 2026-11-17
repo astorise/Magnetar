@@ -1,0 +1,18 @@
+[package]
+name = "magnetar-integration-resident-provider"
+version = "0.1.0"
+edition = "2024"
+# #64: member of ../../submodule-workspace -- see that manifest's own
+# comment.
+workspace = "../../submodule-workspace"
+license = "MIT"
+# Never published: a test Provider for the integration tests -- the
+# Reference CPU with every value it holds reported device-resident, as a
+# device Provider's are. It is a Provider implementation, so it lives in a
+# crate of its own like providers/cpu and providers/cuda, and
+# integration-tests/production-loading consumes it through the public
+# Provider surface only.
+publish = false
+
+[dependencies]
+magnetar-runtime = { path = "../../magnetar-runtime" }

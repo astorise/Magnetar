@@ -12,7 +12,8 @@
 //! weights, so they test the handling of the format, not the quantization
 //! error.
 
-use crate::logit_comparison::{Format, compare_with_reference};
+use crate::logit_comparison::{Format, compare_on, compare_with_reference};
+use magnetar_integration_resident_provider::ResidentReferenceCpuProvider;
 
 fn compare(variant: &str, format: Format, family: &str) -> f32 {
     compare_with_reference("gemma4", variant, format, family)
@@ -44,5 +45,30 @@ fn quantized_gemma4_gguf_files_match_transformers() {
     for variant in ["gguf-dense", "gguf-shared", "gguf-ple", "gguf-moe"] {
         let difference = compare(variant, Format::Gguf, "gemma4");
         eprintln!("{variant}: max |logit difference| {difference:.3e}");
+    }
+}
+
+/// Every checkpoint above with every value held "on the Device"
+/// ([`ResidentReferenceCpuProvider`]), so that no step of the Gemma 4
+/// graph asks a device Provider for an intermediate value's host bytes.
+#[test]
+fn the_tiny_gemma4_checkpoints_match_transformers_with_resident_values() {
+    for (variant, format, family) in [
+        ("dense", Format::HuggingFace, "gemma4"),
+        ("unified", Format::HuggingFace, "gemma4_unified"),
+        ("gguf-dense", Format::Gguf, "gemma4"),
+        ("gguf-shared", Format::Gguf, "gemma4"),
+        ("gguf-ple", Format::Gguf, "gemma4"),
+        ("gguf-moe", Format::Gguf, "gemma4"),
+    ] {
+        let difference = compare_on(
+            std::sync::Arc::new(ResidentReferenceCpuProvider::new()),
+            "magnetar-reference-cpu-resident",
+            "gemma4",
+            variant,
+            format,
+            family,
+        );
+        eprintln!("resident {variant}: max |logit difference| {difference:.3e}");
     }
 }

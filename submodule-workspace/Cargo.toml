@@ -16,5 +16,6 @@ members = [
     "../integration-tests/production-loading",
     "../integration-tests/multi-device-cpu-cuda",
     "../integration-tests/cuda-first-native",
+    "../integration-tests/resident-provider",
 ]
 resolver = "2"
