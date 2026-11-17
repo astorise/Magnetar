@@ -1735,12 +1735,37 @@ fn mla_oracle(rows: u64) -> Vec<f32> {
 /// and V stores keep their own widths.
 #[test]
 fn an_expanded_latent_attention_layer_prefills_and_decodes() {
+    prefill_and_decode_an_expanded_latent_attention_layer(false);
+}
+
+/// The same layer on a Provider whose values stay resident, as a device
+/// Provider's do (`ReplayingExecutor` answers every read with `Opaque`):
+/// the head-wise `concat` takes its inputs where they are, instead of
+/// asking for host bytes the Provider declines (found running DeepSeek on
+/// CUDA).
+#[test]
+fn an_expanded_latent_attention_layer_runs_on_device_resident_values() {
+    prefill_and_decode_an_expanded_latent_attention_layer(true);
+}
+
+fn prefill_and_decode_an_expanded_latent_attention_layer(device_resident: bool) {
     let prompt = 4u64;
     let full = mla_oracle(prompt + 1);
     let vocab = MLA_VOCAB as usize;
     for in_place in [false, true] {
         let fixture = e2e_fixture().expect("fixture builds");
-        let mut runtime = build_runtime_trusting_fixture(&fixture);
+        let mut runtime = if device_resident {
+            build_runtime_with_model_execution_engine_and_provider(
+                &fixture,
+                Arc::new(ReplayingProvider {
+                    inner: ReferenceCpuProvider::new(),
+                    executor: Arc::new(ReplayingExecutor::new()),
+                }),
+            )
+            .expect("the Runtime builds")
+        } else {
+            build_runtime_trusting_fixture(&fixture)
+        };
         let (instance, _memory) = load_fixture_instance(&fixture, &mut runtime).unwrap();
         let mut fixture = fixture;
         fixture.config.architecture.layer_count = 1;
@@ -1806,7 +1831,9 @@ fn an_expanded_latent_attention_layer_prefills_and_decodes() {
             "md",
             Some(&layer_kv),
         );
-        let what = |phase: &str| format!("{phase} (in place: {in_place})");
+        let what = |phase: &str| {
+            format!("{phase} (in place: {in_place}, device resident: {device_resident})")
+        };
         assert_logits_close(
             &prefill[&TensorEdgeId::new("logits")].data,
             &full[..prompt as usize * vocab],

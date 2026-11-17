@@ -133,9 +133,34 @@ The first GPU run (`moe` suite) found two problems:
   greedily in `transformers`, answers " Paris." with and without the
   leading space.
 
+The second GPU run (`gguf`, `multi-gpu` and `moe` suites) passed the
+YaRN rope and found two more problems:
+
+- **The head-wise `concat` asked for host bytes.** The engine passes an
+  input it holds on a device straight to a Kernel only for a listed set
+  of operators, and `concat` was not in it. So on CUDA, the latent
+  attention's key `concat` asked for its `k_nope` input on the host. The
+  CUDA Provider declined, and the tiny checkpoints and DeepSeek-V2-Lite
+  failed at graph planning. Its dispatch reads only the inputs' shapes,
+  so `concat` joins the set. The latent-attention layer test now also
+  runs on a Provider whose values stay resident, as a device Provider's
+  do. That variant failed with the same error before the change.
+- **Qwen2.5-0.5B's packed run left its dequantized one at token 13.**
+  With the corrected prompt, the default packed run rounds its
+  activations to int8, which turns " city" into " in". The packed run
+  with f32 activations generates the dequantized run's 64 tokens exactly.
+  The workflow compared the int8 run with the dequantized one, mixing
+  packing with activation rounding. It now compares the f32-activation
+  run, and the int8 difference stays a warning. "Mistral Q8_0 packed" was
+  skipped after that failure, since its step does not run once another
+  has failed.
+
+Qwen1.5-MoE passed on layer segments and tensor parallel. Its
+continuation contained "D. Paris" in both.
+
 **Limits:**
 - The checkpoints are tiny.
-- CUDA and the real DeepSeek-V2-Lite weights wait for the second GPU run.
+- CUDA and the real DeepSeek-V2-Lite weights wait for a third GPU run.
 - Qwen1.5-MoE's new continuation was not compared with `transformers`.
   The model is 14B parameters, too large to run here.
 - The GGUF tokenizer splits text with GPT-2's pattern, not each
@@ -158,6 +183,9 @@ The first GPU run (`moe` suite) found two problems:
   `tests_gemma4_logits.rs`, `tests_gguf_real_checkpoint_smoke.rs`,
   `test_support.rs`.
 - `providers/cuda`: the rope dispatch reads YaRN before the banded scaling.
+- `magnetar-runtime/src/first_native_runtime/graph_execution.rs`: `concat`
+  takes device-resident inputs; its test runs on resident values too.
 - `.github/workflows/gpu-runner-smoke.yml`: three steps in the `moe` suite;
-  the Qwen1.5-MoE steps' check.
+  the Qwen1.5-MoE steps' check; the packed-against-dequantized comparison
+  of the Qwen2.5-0.5B `Q8_0` file.
 - `components/deepseek`, `SUBMODULES.md`.

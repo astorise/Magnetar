@@ -1280,7 +1280,9 @@ pub(super) fn execute_first_native_graph_nodes(
         // broadcast and `rope`'s per-head Rust slicing were both removed --
         // neither operator's own dispatch function dereferences raw floats
         // anymore, both take `NodeValue` straight through to their Kernel
-        // dispatch like every operator here.
+        // dispatch like every operator here. So does the head-wise
+        // `concat` (`express-latent-attention-forms`): it reads only its
+        // inputs' shapes.
         let passthrough_eligible = matches!(
             node.operator.name(),
             "matmul"
@@ -1300,6 +1302,7 @@ pub(super) fn execute_first_native_graph_nodes(
                 | "embedding"
                 | "rmsnorm"
                 | "rope"
+                | "concat"
         );
         let inputs_clock = dispatch_ctx.runtime.phase_ledger().clock();
         let mut inputs = Vec::with_capacity(node.inputs.len());
