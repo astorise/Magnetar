@@ -927,7 +927,7 @@ pub fn latent_attention_projection_shapes(
     let values = attention_heads * mla.v_head_dim;
     let latent = u64::from(mla.kv_lora_rank);
     let query_input = mla.q_lora_rank.map_or(hidden_size, u64::from);
-    let mut shapes = Vec::with_capacity(10);
+    let mut shapes = Vec::with_capacity(12);
     if let Some(rank) = mla.q_lora_rank {
         shapes.push(("self_attn.q_a_proj", vec![hidden_size, u64::from(rank)]));
         shapes.push(("self_attn.q_a_norm", vec![u64::from(rank)]));
@@ -944,6 +944,10 @@ pub fn latent_attention_projection_shapes(
         ("self_attn.k_nope_proj", vec![latent, nope]),
         ("self_attn.v_proj", vec![latent, values]),
         ("self_attn.o_proj", vec![values, hidden_size]),
+        // The absorbed decode's tables (`cache-latent-attention-history`):
+        // the up-projection's key and value rows, `[out, in]` as stored.
+        ("self_attn.k_absorb", vec![nope, latent]),
+        ("self_attn.v_absorb", vec![values, latent]),
     ]);
     shapes
 }

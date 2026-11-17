@@ -7,9 +7,9 @@
 
 ## 2. Weights
 
-- [ ] 2.1 Hugging Face loader: `k_absorb`, `v_absorb` from `kv_b_proj`.
-- [ ] 2.2 GGUF loader: the same from `attn_kv_b` and from `attn_k_b` / `attn_v_b`, packed tables dequantized.
-- [ ] 2.3 Runtime: expected shapes of the absorbed tables.
+- [x] 2.1 Hugging Face loader: `k_absorb`, `v_absorb` from `kv_b_proj` (row selections, `[out, in]`).
+- [x] 2.2 GGUF loader: the same from `attn_kv_b` and from `attn_k_b` / `attn_v_b` (heads transposed back as for `k_nope_proj`, `f32` from a block-quantized `attn_k_b`).
+- [x] 2.3 Runtime: expected shapes of the absorbed tables; the tiny DeepSeek-V2 checkpoints still match `transformers` with them loaded.
 
 ## 3. Runtime
 
