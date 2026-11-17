@@ -19,3 +19,27 @@ The DeepSeek Model Component run by the Reference CPU Provider SHALL generate th
 #### Scenario: A low-rank query with scaled rotations and routing
 - **WHEN** a bundle with a low-rank query, YaRN scaling the cosines and sines, and a routed scaling factor of 2.5 generates 12 tokens
 - **THEN** the tokens are the reference's and the logits are within 1e-3
+
+### Requirement: The DeepSeek Model Component Matches transformers On deepseek2 GGUF Files
+
+The DeepSeek Model Component SHALL generate, from `deepseek2` GGUF files ingested by the GGUF loader, the same greedy tokens as `transformers`' `DeepseekV2ForCausalLM` computes on the files' dequantized weights, with every step's top-8 logits within 1e-3, whether the latent attention's up-projection is one `attn_kv_b` matrix or split into `attn_k_b` and `attn_v_b`.
+
+#### Scenario: One key-value up-projection
+- **WHEN** a `deepseek2` file holding `attn_kv_b`, with the head widths in `key_length`/`value_length` and no YaRN betas, generates 12 tokens on the Reference CPU
+- **THEN** the tokens are the reference's and the logits are within 1e-3
+
+#### Scenario: Split key and value up-projections
+- **WHEN** a `deepseek2` file holding a quantized `attn_k_b` (each head's key rows transposed) and `attn_v_b`, with `head_count_kv` 1 and the head widths in `key_length_mla`/`value_length_mla`, generates 12 tokens on the Reference CPU
+- **THEN** the tokens are the reference's and the logits are within 1e-3
+
+#### Scenario: On CUDA
+- **WHEN** the tiny bundles and `deepseek2` files generate on CUDA with f32 activations
+- **THEN** the tokens are the references' and the logits are within 1e-3
+
+### Requirement: DeepSeek-V2-Lite Generates On CUDA
+
+Magnetar SHALL load the published DeepSeek-V2-Lite-Chat `Q8_0` GGUF file, pinned by its revision and checked against its declared digest, across two CUDA Devices with the DeepSeek Model Component, and SHALL continue "The capital of France is" greedily with "Paris".
+
+#### Scenario: The capital of France
+- **WHEN** the file is loaded with `MAGNETAR_CUDA_DEVICES` listing two GPUs and generates greedily from "The capital of France is"
+- **THEN** the generated text starts with "Paris"

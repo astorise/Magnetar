@@ -7,6 +7,11 @@ Variants:
   qlora  a low-rank query, YaRN with mscale != mscale_all_dim (cos/sin
          scaled), routed scaling 2.5.
   plain  like lite without any RoPE scaling.
+  wide   like lite with every projection's input a multiple of 32 wide, so
+         a GGUF file can quantize it (make_tiny_deepseek2_gguf.py): latent
+         96, 32 + 8-wide query and key heads, 64-wide values, YaRN with
+         the published beta_fast 32 and beta_slow 1.
+  wide-qlora  wide with a low-rank query (rank 32) and routed scaling 2.5.
 Usage: make_tiny_deepseek_v2.py <out_dir> <variant>
 """
 import json, os, sys
@@ -34,6 +39,12 @@ def config(variant):
         kwargs["rope_parameters"] = dict(rope, mscale=1.0, mscale_all_dim=0.707)
     elif variant == "plain":
         kwargs["rope_parameters"] = {"rope_type": "default", "rope_theta": 100.0}
+    elif variant in ("wide", "wide-qlora"):
+        kwargs.update(hidden_size=64, intermediate_size=64, moe_intermediate_size=32,
+                      kv_lora_rank=96, qk_nope_head_dim=32, qk_rope_head_dim=8, v_head_dim=64)
+        kwargs["rope_parameters"] = dict(rope, beta_fast=32.0, beta_slow=1.0)
+        if variant == "wide-qlora":
+            kwargs.update(q_lora_rank=32, routed_scaling_factor=2.5)
     elif variant != "lite":
         raise SystemExit(f"unknown variant {variant}")
     return DeepseekV2Config(**kwargs)
@@ -61,7 +72,7 @@ def main():
     out, variant = sys.argv[1], sys.argv[2]
     torch.manual_seed(0)
     model = DeepseekV2ForCausalLM(config(variant)).float().eval()
-    scaled_init(model, {"lite": 1, "qlora": 2, "plain": 3}[variant])
+    scaled_init(model, {"lite": 1, "qlora": 2, "plain": 3, "wide": 4, "wide-qlora": 5}[variant])
     model.save_pretrained(out, safe_serialization=True)
     vocab = {f"t{i}": i for i in range(VOCAB)}
     tokenizer = {
