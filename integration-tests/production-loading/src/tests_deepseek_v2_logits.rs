@@ -12,6 +12,7 @@
 //! up-projection, not the quantization error.
 
 use crate::logit_comparison::{Format, compare_on, compare_with_reference};
+use crate::resident_reference_cpu::ResidentReferenceCpuProvider;
 
 fn compare(variant: &str) -> f32 {
     let difference =
@@ -73,6 +74,37 @@ fn a_deepseek2_gguf_file_with_a_low_rank_query_matches_transformers() {
     compare_gguf("gguf-qlora");
 }
 
+/// Every checkpoint above with every value held "on the Device"
+/// ([`ResidentReferenceCpuProvider`]: the Reference CPU, each value it holds
+/// reported resident, as a device Provider's). It catches what a device
+/// Provider declines, a request for an intermediate value's host bytes, on
+/// any machine. A head-wise `concat` that made one failed DeepSeek on CUDA
+/// at graph planning.
+#[test]
+fn the_tiny_deepseek_v2_checkpoints_match_transformers_with_resident_values() {
+    for (variant, format, family) in VARIANTS {
+        let difference = compare_on(
+            std::sync::Arc::new(ResidentReferenceCpuProvider::new()),
+            "magnetar-reference-cpu-resident",
+            "deepseek_v2",
+            variant,
+            format,
+            family,
+        );
+        eprintln!("resident {variant}: max |logit difference| {difference:.3e}");
+    }
+}
+
+/// Every checkpoint of this file, with its format and declared family.
+const VARIANTS: [(&str, Format, &str); 6] = [
+    ("lite", Format::HuggingFace, "deepseek_v2"),
+    ("qlora", Format::HuggingFace, "deepseek_v2"),
+    ("plain", Format::HuggingFace, "deepseek_v2"),
+    ("gguf-kv-b", Format::Gguf, "deepseek2"),
+    ("gguf-split", Format::Gguf, "deepseek2"),
+    ("gguf-qlora", Format::Gguf, "deepseek2"),
+];
+
 /// Every checkpoint above on CUDA: the CUDA Kernels for the latent
 /// attention's forms, YaRN and the routed experts, reading the GGUF files'
 /// packed `Q8_0` and `Q4_0` weights, against the same references. Run with
@@ -94,15 +126,7 @@ fn the_tiny_deepseek_v2_checkpoints_match_transformers_on_cuda() {
         Ok("0"),
         "run with MAGNETAR_CUDA_INT8_ACTIVATIONS=0: int8 activations round beyond 1e-3"
     );
-    let variants = [
-        ("lite", Format::HuggingFace, "deepseek_v2"),
-        ("qlora", Format::HuggingFace, "deepseek_v2"),
-        ("plain", Format::HuggingFace, "deepseek_v2"),
-        ("gguf-kv-b", Format::Gguf, "deepseek2"),
-        ("gguf-split", Format::Gguf, "deepseek2"),
-        ("gguf-qlora", Format::Gguf, "deepseek2"),
-    ];
-    for (variant, format, family) in variants {
+    for (variant, format, family) in VARIANTS {
         let difference = compare_on(
             std::sync::Arc::new(magnetar_provider_cuda::CudaProvider::new()),
             "magnetar-cuda",

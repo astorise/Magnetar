@@ -23,6 +23,8 @@
 #[cfg(test)]
 mod logit_comparison;
 #[cfg(test)]
+mod resident_reference_cpu;
+#[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod tests_deepseek_v2_logits;

@@ -145,6 +145,11 @@ YaRN rope and found two more problems:
   so `concat` joins the set. The latent-attention layer test now also
   runs on a Provider whose values stay resident, as a device Provider's
   do. That variant failed with the same error before the change.
+  The tiny DeepSeek-V2 and Gemma 4 checkpoints also run on such a
+  Provider in `production-loading`: the Reference CPU with every value it
+  holds reported resident. All twelve match `transformers` there as on
+  the Reference CPU. Without the change, the DeepSeek case fails with
+  CUDA's error, on any machine.
 - **Qwen2.5-0.5B's packed run left its dequantized one at token 13.**
   With the corrected prompt, the default packed run rounds its
   activations to int8, which turns " city" into " in". The packed run
@@ -185,6 +190,9 @@ continuation contained "D. Paris" in both.
 - `providers/cuda`: the rope dispatch reads YaRN before the banded scaling.
 - `magnetar-runtime/src/first_native_runtime/graph_execution.rs`: `concat`
   takes device-resident inputs; its test runs on resident values too.
+- `integration-tests/production-loading`: `resident_reference_cpu.rs` and
+  the resident-value cases of `tests_deepseek_v2_logits.rs` and
+  `tests_gemma4_logits.rs`.
 - `.github/workflows/gpu-runner-smoke.yml`: three steps in the `moe` suite;
   the Qwen1.5-MoE steps' check; the packed-against-dequantized comparison
   of the Qwen2.5-0.5B `Q8_0` file.
